@@ -2713,3 +2713,302 @@ fn a_write_whose_bytes_the_trip_never_read_is_not_pinned() {
     open2.reads.insert(CELL, (0xAABB_CCDD, u32::MAX));
     assert!(write_is_pinned(&open2, CELL, obs.mask));
 }
+
+// ---------------------------------------------------------------------------
+// The learn protocol, option E + D
+// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`).
+//
+// A trip's write MODEL is confirmed on the eight natural samples by PEEK -- no journal,
+// no extra trip, no clock sample spent -- and the period-64 runtime audit stays on as the
+// permanent net for what eight samples cannot see.
+// ---------------------------------------------------------------------------
+
+/// Drive one synthetic trip whose Class W cell takes `write_value`, and whose extra
+/// `also` cells are written too. Each `also` entry is `(address, value)`; passing the same
+/// address with a different value on different trips is how a moving cell is simulated.
+fn run_trip_writing(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u32, also: &[(u32, u32)]) {
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    let _ = on_int(cpu, bus, VECTOR);
+    note_write(
+        cpu,
+        bus,
+        CLASS_W_ADDR,
+        BusWidth::Dword,
+        write_value,
+        false,
+        None,
+    );
+    bus.write_raw(CLASS_W_ADDR, BusWidth::Dword, write_value);
+    for &(addr, value) in also {
+        note_write(cpu, bus, addr, BusWidth::Dword, value, false, None);
+        bus.write_raw(addr, BusWidth::Dword, value);
+    }
+    cpu.elapsed_clocks += 100;
+    cpu.perf.instructions += 7;
+    bus.bus_clock += 50;
+    cpu.registers.set_esp(STACK_TOP - 2);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    on_far_return(cpu, bus);
+}
+
+/// Test 1. **Mutation bite**: delete `confirm_write_model_at_close`, or the
+/// `write_model_unstable` clause in `finish_trip`'s natural-success arm. A memo is then
+/// built carrying `0xCAFEBABE` for a cell that took `0xDEADBEEF` on one of the eight
+/// natural samples -- which is exactly the shape the fixture-scale audit caught on
+/// `tyrian-specs-586`: `0x1a3ea4`, replayed as `…1f96` while the trip wrote `…1f99`,
+/// 54,988 of 55,188 audits.
+#[test]
+fn a_class_w_value_that_moves_on_a_natural_sample_refuses_the_learn() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+
+    // Trips 1-3 warm and journal; trips 4-11 are the eight natural samples. Trip 7 (the
+    // fourth natural sample) writes a different value.
+    for trip in 1..=11 {
+        let value = if trip == 7 { 0xDEAD_BEEF } else { 0xCAFE_BABE };
+        run_one_synthetic_trip(&mut cpu, &mut bus, value);
+    }
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    let ks = &state.keys[&key];
+    assert_eq!(
+        ks.learn_refused[LearnRefused::WriteValueUnstable.index()],
+        1,
+        "a Class W cell that moves twice across the natural samples must refuse the learn"
+    );
+    assert_eq!(ks.learned, 0);
+    assert!(
+        state.memos.get(&key).is_none_or(|m| m.is_empty()),
+        "and no memo may exist to answer from"
+    );
+}
+
+/// Test 2. The cadence sweep the task asks for: a cell that moves on every `k`-th trip,
+/// for every `k` the eight natural samples can see.
+///
+/// **Mutation bite**: the same as test 1 -- without the confirmation every `k` builds a
+/// memo carrying a value the trip does not always write.
+///
+/// **The residual hole is documented here rather than asserted**: a cadence LONGER than
+/// the natural-sample window (say `k = 12`) is invisible to option E, and a test for it
+/// would be green both before and after the fix -- an assertion that cannot fail. Its
+/// owner is option D, the period-64 runtime audit, which stays on permanently for exactly
+/// this reason and disarms the key on the second strike.
+#[test]
+fn a_cell_moving_every_kth_trip_is_caught_for_every_k_up_to_the_sample_count() {
+    for k in 2..=8u32 {
+        let (mut cpu, mut bus) = synthetic_reflected_client();
+        arm(&mut cpu);
+        let key = key_for(&cpu, VECTOR, 0);
+        for trip in 1..=11u32 {
+            let value = if trip % k == 0 {
+                0xDEAD_0000 + trip
+            } else {
+                0xCAFE_BABE
+            };
+            run_one_synthetic_trip(&mut cpu, &mut bus, value);
+        }
+        let state = cpu.reflected_call.as_ref().unwrap();
+        let ks = &state.keys[&key];
+        assert_eq!(
+            ks.learned, 0,
+            "k={k}: a cell moving every {k} trips must not produce a memo"
+        );
+        assert!(
+            state.memos.get(&key).is_none_or(|m| m.is_empty()),
+            "k={k}: and no memo may be cached"
+        );
+    }
+}
+
+/// Test 3, **the one that protects the hit rate**, and the one that separates option E
+/// from the options that only refuse.
+///
+/// The `0x127150` shape: a cell the trip READS and then writes back, where the journal
+/// pair sees `0 -> 0` (so it is classified Class R and SKIPPED) while the natural trips
+/// see `0x1a -> 0`. Option E demotes it to Class W carrying the observed `0`, and the key
+/// KEEPS ANSWERING.
+///
+/// **Mutation bite**: drop the Class R demotion arm from
+/// `confirm_write_model_at_close` (refuse instead of demote). The key stops answering
+/// altogether, which is a correctness-preserving but needlessly expensive outcome -- and
+/// it is the difference between this design and options A/B/C.
+#[test]
+fn a_class_r_write_whose_pre_value_alternates_is_demoted_to_class_w() {
+    const CELL: u32 = 0x7900;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+
+    for trip in 1..=11u32 {
+        // Someone else sets the cell before the trip runs. On the journal trips it is
+        // already 0, so the trip's write of 0 looks like a restoration; on the natural
+        // trips it is 0x1a, so the same write is a real change.
+        let pre = if trip <= 3 { 0u32 } else { 0x1a };
+        bus.write_raw(CELL, BusWidth::Dword, pre);
+        cpu.registers.set_esp(STACK_TOP);
+        cpu.set_eip(CLIENT_RETURN_EIP);
+        let _ = on_int(&mut cpu, &mut bus, VECTOR);
+        // Read before writing, so the write is PINNED and Class R is reachable at all.
+        note_read(&mut cpu, &bus, CELL, BusWidth::Dword);
+        note_write(&mut cpu, &bus, CELL, BusWidth::Dword, 0, false, None);
+        bus.write_raw(CELL, BusWidth::Dword, 0);
+        cpu.elapsed_clocks += 100;
+        cpu.perf.instructions += 7;
+        bus.bus_clock += 50;
+        cpu.registers.set_esp(STACK_TOP - 2);
+        cpu.set_eip(CLIENT_RETURN_EIP);
+        on_far_return(&mut cpu, &bus);
+    }
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    let ks = &state.keys[&key];
+    assert_eq!(
+        ks.learned, 1,
+        "the key must still learn: a demotion is not a refusal"
+    );
+    let memo = &state.memos[&key][0];
+    assert!(
+        memo.replay
+            .iter()
+            .any(|&(addr, mask, value)| addr == CELL && mask == u32::MAX && value == 0),
+        "the demoted cell must be REPLAYED at its observed value, not skipped: {:?}",
+        memo.replay
+    );
+    assert!(
+        !memo
+            .class_r_ranges
+            .iter()
+            .any(|&(lo, hi)| lo <= CELL && CELL <= hi),
+        "and it must no longer be screened as a Class R range"
+    );
+}
+
+/// Test 4. Option E's whole premise: the confirmation is invisible to the guest clock, by
+/// the TYPE SIGNATURE of `CpuBus::peek_direct_ram` (`&self`), not by an argument about
+/// what it happens to do. That is what lets the eight natural samples keep measuring
+/// NATIVE clocks while also gathering write evidence.
+///
+/// **Mutation bite**: replace a `peek_direct_ram` in `sample_write_model_at_open` or
+/// `confirm_write_model_at_close` with a charging read (`bus.read_memory`). The bus clock
+/// moves, the natural samples' triples stop being native, and the clock agreement that
+/// arms the memo is measuring the instrument instead of the guest.
+#[test]
+fn the_natural_samples_write_confirmation_never_charges_a_bus_clock() {
+    // Two runs of the same eleven trips. The second drives the confirmation over a check
+    // set an order of magnitude larger; if either peek charged, the totals would diverge.
+    let mut totals = Vec::new();
+    for extra_cells in [0usize, 16] {
+        let (mut cpu, mut bus) = synthetic_reflected_client();
+        arm(&mut cpu);
+        let also: Vec<(u32, u32)> = (0..extra_cells)
+            .map(|i| (0x7A00 + (i as u32) * 4, 0x1111_0000 + i as u32))
+            .collect();
+        for _ in 0..11 {
+            run_trip_writing(&mut cpu, &mut bus, 0xCAFE_BABE, &also);
+        }
+        totals.push((bus.bus_clock, cpu.elapsed_clocks));
+    }
+    assert_eq!(
+        totals[0], totals[1],
+        "confirming a 17-cell write model must cost the same guest clock as a 1-cell one"
+    );
+    // And the totals are exactly what the fixture itself drove: 11 trips x (50 bus, 100
+    // core). Nothing else touched either clock.
+    assert_eq!(totals[0].0, 11 * 50);
+    assert_eq!(totals[0].1, 11 * 100);
+}
+
+/// Test 5. Option D's two-strikes rule, driven through the real hook.
+///
+/// **Mutation bite**: disarm on the FIRST strike (or never disarm). One strike is most
+/// likely a cadence longer than option E's eight-sample window, which the next learn
+/// cycle's demotion may capture, so disarming there throws away a learnable key; never
+/// disarming leaves a genuinely unmemoisable key paying for a full learn cycle forever.
+#[test]
+fn two_write_value_audit_strikes_disarm_the_key_one_does_not() {
+    let (mut cpu, _bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    cpu.reflected_call
+        .as_mut()
+        .unwrap()
+        .keys
+        .entry(key)
+        .or_default();
+
+    record_audit(&mut cpu, key, &[AuditMismatch::WriteValue], 0);
+    let ks = &cpu.reflected_call.as_ref().unwrap().keys[&key];
+    assert!(
+        !ks.disarmed,
+        "one strike retires and re-learns, it does not disarm"
+    );
+    assert_eq!(ks.write_value_disarms, 0);
+    assert_eq!(ks.slot, SlotState::Warm);
+
+    record_audit(&mut cpu, key, &[AuditMismatch::WriteValue], 0);
+    let ks = &cpu.reflected_call.as_ref().unwrap().keys[&key];
+    assert!(ks.disarmed, "the second strike disarms the key");
+    assert_eq!(ks.write_value_disarms, 1);
+
+    // The disarm is BOUNDED: the existing re-arm brings the key back rather than writing
+    // it off for the run.
+    let ks = cpu
+        .reflected_call
+        .as_mut()
+        .unwrap()
+        .keys
+        .get_mut(&key)
+        .unwrap();
+    ks.trips_seen += MEMO_REARM_TRIPS_SEEN;
+    ks.maybe_rearm();
+    assert!(
+        !ks.disarmed,
+        "and it re-arms after MEMO_REARM_TRIPS_SEEN trips"
+    );
+
+    // A mismatch in a DIFFERENT lane must not count toward the write-value strikes.
+    let (mut cpu2, _b2) = synthetic_reflected_client();
+    arm(&mut cpu2);
+    let key2 = key_for(&cpu2, VECTOR, 0);
+    cpu2.reflected_call
+        .as_mut()
+        .unwrap()
+        .keys
+        .entry(key2)
+        .or_default();
+    for _ in 0..4 {
+        record_audit(&mut cpu2, key2, &[AuditMismatch::BusClocks], 0);
+    }
+    assert!(!cpu2.reflected_call.as_ref().unwrap().keys[&key2].disarmed);
+}
+
+/// Test 6. The `[u64; 24] -> [u64; 25]` widening cannot half-land: the array must be
+/// exactly as long as the lane table, and every lane must have a distinct name and index.
+///
+/// **Mutation bite**: add a variant to `LearnRefused` without adding it to
+/// `LEARN_REFUSED_ALL`. `index()` panics on it at runtime, in production, on a cold
+/// refusal path -- which is the worst possible place to find out.
+#[test]
+fn the_new_refusal_lane_is_in_learn_refused_all_and_the_array_is_sized_for_it() {
+    let ks = KeyState::default();
+    assert_eq!(
+        ks.learn_refused.len(),
+        LEARN_REFUSED_ALL.len(),
+        "the counter array and the lane table must be the same length"
+    );
+    assert!(
+        LEARN_REFUSED_ALL.contains(&LearnRefused::WriteValueUnstable),
+        "the new lane must be in the table, or its index() panics in production"
+    );
+    let mut names: Vec<&str> = LEARN_REFUSED_ALL.iter().map(|r| r.name()).collect();
+    let count = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), count, "every lane name must be distinct");
+    for (i, lane) in LEARN_REFUSED_ALL.iter().enumerate() {
+        assert_eq!(lane.index(), i, "lane {i} must report its own position");
+    }
+}

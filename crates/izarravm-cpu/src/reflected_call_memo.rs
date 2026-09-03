@@ -131,6 +131,12 @@ pub(crate) const MEMO_MAX_TRANSLATION_SET: usize = 64;
 /// Replay-write cap, raised from 32 to 192 by R2.3/R2.17 (the pinned-pre-
 /// value fix moves most same-address writes from R to W).
 pub(crate) const MEMO_MAX_REPLAY_WRITES: usize = 192;
+/// Runtime-audit `write_value` strikes a key may take before the bounded disarm
+/// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`, option D as
+/// recommended). Two, not one: with option E confirming the write model across eight
+/// natural samples, a single strike is most likely a cadence longer than that window, and
+/// the next learn cycle's demotion may capture it.
+pub(crate) const MEMO_WRITE_VALUE_STRIKES: u32 = 2;
 /// Default audit period: one answer in 64 is refused and run NATURALLY so its real end
 /// state can be compared with what the memo would have produced (measure-first review,
 /// campaign verdict (2c)). Chosen, not tuned: it bounds the charged-clock error a regime
@@ -284,9 +290,10 @@ pub(crate) enum LearnRefused {
     ControlEffectUnreplayable,
     Mmx,
     ReadSetUnstable,
+    WriteValueUnstable,
 }
 
-pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 24] = [
+pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 25] = [
     LearnRefused::PortIo,
     LearnRefused::NondeterministicRead,
     LearnRefused::PendingSoftInt,
@@ -311,6 +318,7 @@ pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 24] = [
     LearnRefused::ControlEffectUnreplayable,
     LearnRefused::Mmx,
     LearnRefused::ReadSetUnstable,
+    LearnRefused::WriteValueUnstable,
 ];
 
 impl LearnRefused {
@@ -347,6 +355,7 @@ impl LearnRefused {
             Self::ControlEffectUnreplayable => "control_effect_unreplayable",
             Self::Mmx => "mmx",
             Self::ReadSetUnstable => "read_set_unstable",
+            Self::WriteValueUnstable => "write_value_unstable",
         }
     }
 }
@@ -944,12 +953,20 @@ pub(crate) struct KeyState {
     pub rearms: u64,
     pub learn_attempts: u64,
     pub learned: u64,
-    pub learn_refused: [u64; 24],
+    pub learn_refused: [u64; 25],
     /// Answers this key has applied since its last audit, and the signed bus-clock drift
     /// the memo has accumulated against what the audits actually observed (amendment 6).
     answers_since_audit: u64,
     bus_drift_acc: i64,
     pub audits: u64,
+    /// Runtime-audit `write_value` strikes (option D). ONE strike retires and re-learns --
+    /// with option E in place a single strike is most likely a cadence longer than the
+    /// eight natural samples, which the next learn cycle's demotion may well capture. TWO
+    /// strikes means the key is not memoisable and it stops paying for attempts.
+    write_value_strikes: u32,
+    /// Times this key was disarmed by the two-strikes rule (bounded: `maybe_rearm` still
+    /// re-arms it after `MEMO_REARM_TRIPS_SEEN`).
+    pub write_value_disarms: u64,
     /// The distinct read-set cells that have made this key's memo fall through, with the
     /// value the memo pinned, the value found live, and how often. Capped: a handful of
     /// addresses is what a real "this input is not actually an input" looks like, and an
@@ -1447,6 +1464,7 @@ pub(crate) fn on_int<B: CpuBus>(
     // opens, which is the state an answer would screen against. See the function.
     if matches!(slot, Slot::Natural(_)) {
         sample_read_set_at_open(cpu, &*bus, key);
+        sample_write_model_at_open(cpu, &*bus, key);
     }
     Ok(IntOutcome::NotAnswered)
 }
@@ -1513,6 +1531,116 @@ fn sample_read_set_at_open<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoKey) {
             confirmed.read_set_unstable = true;
             return;
         }
+    }
+}
+
+/// Option E, half one: peek the write CHECK SET at a natural trip's OPEN.
+///
+/// This is `sample_read_set_at_open`'s sibling and it rests on the same property:
+/// `CpuBus::peek_direct_ram` takes `&self`, so it cannot charge a bus clock or move a
+/// counter. The eight natural samples therefore keep measuring NATIVE clocks while also
+/// gathering write evidence -- which is the whole reason option E costs no learn latency
+/// and no clock sample, where journaling a confirmation trip would cost both.
+fn sample_write_model_at_open<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoKey) {
+    let pre: Vec<Option<u32>> = {
+        let Some(state) = cpu.reflected_call.as_ref() else {
+            return;
+        };
+        let Some(confirmed) = state.keys.get(&key).and_then(|ks| ks.confirmed.as_ref()) else {
+            return;
+        };
+        confirmed
+            .write_check
+            .iter()
+            .map(|c| bus.peek_direct_ram(c.dword, BusWidth::Dword))
+            .collect()
+    };
+    if let Some(confirmed) = cpu
+        .reflected_call
+        .as_mut()
+        .and_then(|state| state.keys.get_mut(&key))
+        .and_then(|ks| ks.confirmed.as_mut())
+    {
+        confirmed.write_open_pre = pre;
+        confirmed.write_model_pinned = true;
+    }
+}
+
+/// Option E, half two: at the natural trip's CLOSE, evaluate the AUDIT'S OWN FORMULA
+/// against the candidate model, and act on the shape of any disagreement.
+///
+/// `predicted` is `pre` for a Class R entry (the model says "unchanged") and
+/// `(pre & !mask) | (value & mask)` for a Class W one -- the same splice
+/// `audit_write_values_disagree` applies to a live `Memo`, here applied to the candidate.
+/// Everything is compared UNDER the entry's own mask: bytes the trip never wrote are not
+/// part of its model.
+///
+/// The two actions are option C's demotion rule, on evidence this gathers for free:
+///
+/// * **A Class R entry disagrees** -- the "restoration" was an accident of phase. DEMOTE it
+///   to Class W carrying the observed value. That is what keeps a key answering when its
+///   trip really does write a constant; it is the difference between this design and one
+///   that simply refuses.
+/// * **A Class W entry disagrees** -- its recorded value is not the value it takes. Take the
+///   observed value ONCE; a second disagreement means the cell genuinely varies and the
+///   learn is refused (`LearnRefused::WriteValueUnstable`). A per-trip counter is not
+///   memoisable and no amount of re-taking makes it so.
+///
+/// **What it cannot see**, written down rather than left implicit: a cadence longer than the
+/// eight natural samples, and an address the Journal-A/B pair never saw written at all
+/// (the check set is built from that pair, so E walks it rather than the natural trip's
+/// writes -- a natural trip has no journal). Both are option D's, the period-64 runtime
+/// audit, which is why D stays on permanently rather than being retired by E.
+fn confirm_write_model_at_close<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoKey) {
+    let observed: Vec<Option<u32>> = {
+        let Some(state) = cpu.reflected_call.as_ref() else {
+            return;
+        };
+        let Some(confirmed) = state.keys.get(&key).and_then(|ks| ks.confirmed.as_ref()) else {
+            return;
+        };
+        if !confirmed.write_model_pinned {
+            return;
+        }
+        confirmed
+            .write_check
+            .iter()
+            .map(|c| bus.peek_direct_ram(c.dword, BusWidth::Dword))
+            .collect()
+    };
+    let Some(confirmed) = cpu
+        .reflected_call
+        .as_mut()
+        .and_then(|state| state.keys.get_mut(&key))
+        .and_then(|ks| ks.confirmed.as_mut())
+    else {
+        return;
+    };
+    for (index, check) in confirmed.write_check.iter_mut().enumerate() {
+        let (Some(pre), Some(Some(now))) = (
+            confirmed.write_open_pre.get(index).copied().flatten(),
+            observed.get(index).copied(),
+        ) else {
+            // A cell that is not plain RAM at one end of the trip cannot be modelled, and
+            // the answer's own screens would refuse it anyway.
+            confirmed.write_model_unstable = true;
+            return;
+        };
+        let predicted = if check.is_class_r {
+            pre
+        } else {
+            (pre & !check.mask) | (check.value & check.mask)
+        };
+        if (predicted ^ now) & check.mask == 0 {
+            continue;
+        }
+        if check.retaken {
+            confirmed.write_model_unstable = true;
+            return;
+        }
+        check.value = now;
+        check.is_class_r = false;
+        check.retaken = true;
     }
 }
 
@@ -2245,6 +2373,16 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
     let is_flags_arm = is_match && open.is_return_match(cpu) == Some(true);
 
     let key = open.key;
+    // Option E, at the close of every natural sample and BEFORE the clock recovery below,
+    // so an unstable write model short-circuits the rest of the learn. It runs here, at the
+    // top of the close, rather than inside the `Slot::Natural` arm for a borrow reason
+    // worth stating: that arm holds a `&mut KeyState` borrowed out of `cpu`, and the
+    // confirmation needs `&mut CpuGsw` to reach the same state. Hoisting it is not a
+    // compromise -- the arm's own first act is the clock recovery, so "before the clock
+    // recovery" and "at the top of the close" are the same instant.
+    if is_match && matches!(open.slot, Slot::Natural(_)) {
+        confirm_write_model_at_close(cpu, bus, key);
+    }
     let state = cpu.reflected_call.as_mut().expect("checked by callers");
     let key_state = state.keys.entry(key).or_default();
 
@@ -2400,6 +2538,17 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
                     && key_state
                         .confirmed
                         .as_ref()
+                        .is_some_and(|c| c.write_model_unstable)
+                {
+                    // Option E's refusal: a check-set cell disagreed twice across the eight
+                    // natural samples, so its value genuinely varies and no memo can carry
+                    // it. This is the lane that stops a per-trip counter being frozen into
+                    // a replay set -- the defect the fixture-scale audit named.
+                    key_state.record_failure(LearnRefused::WriteValueUnstable);
+                } else if all_equal
+                    && key_state
+                        .confirmed
+                        .as_ref()
                         .is_some_and(|c| c.read_set_unstable)
                 {
                     key_state.record_failure(LearnRefused::ReadSetUnstable);
@@ -2408,14 +2557,19 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
                     let confirmed = key_state.confirmed.take();
                     key_state.record_success_and_reset();
                     if let Some(c) = confirmed {
+                        // Re-derived from the check set AFTER the natural samples' own
+                        // demotions, so what the answer replays and what it skips is the
+                        // classification the eight samples confirmed, not the one Journal B
+                        // guessed.
+                        let (replay, class_r_ranges) = derive_replay_and_ranges(&c.write_check);
                         let memo = Arc::new(Memo {
                             image: c.entry_image,
                             reads: c.reads.into_boxed_slice(),
                             translations: c.translations.into_boxed_slice(),
                             epilogue: c.epilogue,
                             return_eip: c.return_eip,
-                            replay: c.replay.into_boxed_slice(),
-                            class_r_ranges: c.class_r_ranges.into_boxed_slice(),
+                            replay: replay.into_boxed_slice(),
+                            class_r_ranges: class_r_ranges.into_boxed_slice(),
                             raw_core_clocks: raw_core,
                             raw_bus_clocks: raw_bus,
                             insns,
@@ -2618,6 +2772,22 @@ fn record_audit(cpu: &mut CpuGsw, key: MemoKey, mismatches: &[AuditMismatch], bu
         key_state.natural_samples.clear();
         state.relearned += 1;
         key_state.bus_drift_acc = 0;
+        // Option D's two-strikes rule. With option E confirming the write model over eight
+        // natural samples, ONE `write_value` strike is most likely a cadence longer than
+        // that window -- which the next learn cycle's own demotion may well capture -- so
+        // it still costs only a retire and a re-learn. A SECOND strike says the key is not
+        // memoisable, and it stops paying for attempts. The disarm is the existing BOUNDED
+        // one: `maybe_rearm` brings the key back after `MEMO_REARM_TRIPS_SEEN` trips, so a
+        // key that becomes learnable later is not written off for the run.
+        if mismatches.contains(&AuditMismatch::WriteValue) {
+            key_state.write_value_strikes = key_state.write_value_strikes.saturating_add(1);
+            if key_state.write_value_strikes >= MEMO_WRITE_VALUE_STRIKES {
+                key_state.disarmed = true;
+                key_state.disarmed_at_trips_seen = key_state.trips_seen;
+                key_state.write_value_disarms += 1;
+                key_state.write_value_strikes = 0;
+            }
+        }
     } else {
         // Amendment 6: every answer since the last audit charged the memo's own bus total,
         // and this audit is the only evidence of what that total should have been, so the
@@ -2707,6 +2877,73 @@ fn write_is_pinned(open: &OpenTrip, dword: u32, write_mask: u32) -> bool {
     read_mask & write_mask == write_mask
 }
 
+/// The Class W cells the answer WRITES: aligned physical dword, the mask of the bytes the
+/// trip wrote, and the dword's post-trip value.
+type ReplaySet = Vec<(u32, u32, u32)>;
+/// The Class R cells the answer SKIPS, coalesced into inclusive physical ranges for the
+/// answer-time observer test.
+type ClassRRanges = Vec<(u32, u32)>;
+
+/// Derive the answer path's two write descriptions from the check set: `replay` (the Class
+/// W cells, written at answer time) and `class_r_ranges` (the Class R cells, SKIPPED at
+/// answer time and screened by the observer test). Called once when the candidate is built
+/// and again after the eight natural samples have demoted whatever they caught, so the two
+/// descriptions are never derived from different classifications.
+fn derive_replay_and_ranges(write_check: &[WriteCheck]) -> (ReplaySet, ClassRRanges) {
+    let mut replay: ReplaySet = Vec::new();
+    let mut class_r_dwords: Vec<u32> = Vec::new();
+    for c in write_check {
+        if c.is_class_r {
+            class_r_dwords.push(c.dword);
+        } else {
+            replay.push((c.dword, c.mask, c.value));
+        }
+    }
+    replay.sort_unstable_by_key(|&(addr, _, _)| addr);
+    class_r_dwords.sort_unstable();
+    class_r_dwords.dedup();
+    let mut class_r_ranges: ClassRRanges = Vec::new();
+    for dword in class_r_dwords {
+        if let Some((_, hi)) = class_r_ranges.last_mut()
+            && dword <= hi.wrapping_add(1)
+        {
+            *hi = dword + 3;
+            continue;
+        }
+        class_r_ranges.push((dword, dword + 3));
+    }
+    (replay, class_r_ranges)
+}
+
+/// One address of the WRITE CHECK SET: the union of Class W and Class R, which is what the
+/// eight natural samples confirm the write MODEL against
+/// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`, option E).
+///
+/// Class D never enters it -- a dead-stack write is unobservable by construction -- which
+/// is why the set is ~42 dwords rather than the ~250 the raw write set holds.
+///
+/// The design writes this as `(u32, u32, u32, bool)`; it is a named struct because the
+/// confirmation needs a fifth field (`retaken`) that the tuple has no room for, and four
+/// same-typed positional `u32`s at a call site are exactly how a mask and a value get
+/// swapped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WriteCheck {
+    /// Aligned physical dword.
+    dword: u32,
+    /// The bytes the trip wrote. Every comparison below is made UNDER this mask: bytes the
+    /// trip never wrote are not part of its model and may move freely.
+    mask: u32,
+    /// For Class W, the value the trip leaves in the masked bytes. Meaningless (and never
+    /// read) while `is_class_r`.
+    value: u32,
+    /// Class R -- the trip restored what was there, so the model predicts UNCHANGED.
+    is_class_r: bool,
+    /// Has this entry already had its value re-taken once (a Class R demotion, or a Class W
+    /// value replaced)? A SECOND disagreement after that is a genuinely varying cell, and
+    /// the learn is refused.
+    retaken: bool,
+}
+
 /// JournalB's classification, carried forward to Natural-sample completion so a `Memo` can be
 /// built (plan section 3) once the raw-clock samples confirm the trip is worth memoising.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2724,6 +2961,16 @@ struct ConfirmedTrip {
     /// sample disagree with it? See that function.
     read_set_pinned: bool,
     read_set_unstable: bool,
+    /// The write CHECK SET (option E). `replay` and `class_r_ranges` above are DERIVED from
+    /// this at memo-build time (`derive_replay_and_ranges`), so there is exactly one
+    /// classification and the natural samples' demotions cannot drift away from it.
+    write_check: Vec<WriteCheck>,
+    /// Scratch, parallel to `write_check`: the values peeked at the CURRENT natural trip's
+    /// open. `None` where the peek declined.
+    write_open_pre: Vec<Option<u32>>,
+    /// The twins of the read set's two flags, for the write model.
+    write_model_pinned: bool,
+    write_model_unstable: bool,
 }
 
 /// Amendment 2: classify JournalB's write set into Class R (restored, admitted classes only --
@@ -2791,8 +3038,10 @@ fn build_confirmed<B: CpuBus>(
     if replayed_cr3 != exit_image.cr3 {
         return Err(LearnRefused::ControlEffectUnreplayable);
     }
-    let mut replay: HashMap<u32, (u32, u32)> = HashMap::new();
-    let mut class_r_dwords: Vec<u32> = Vec::new();
+    // The CHECK SET is the single classification (option E): `replay` and `class_r_ranges`
+    // are derived from it, here and again after the natural samples have had their say, so
+    // a demotion cannot leave the two descriptions disagreeing.
+    let mut write_check: Vec<WriteCheck> = Vec::new();
     for (&dword, obs) in &open.writes {
         if obs.class.never_restored() {
             return Err(LearnRefused::WriteClassN);
@@ -2812,11 +3061,14 @@ fn build_confirmed<B: CpuBus>(
         let restored = obs
             .pre_dword
             .is_some_and(|pre| (pre ^ obs.latest_dword) & obs.mask == 0);
-        if pinned && restored {
-            class_r_dwords.push(dword); // Class R: restored, admitted, skip.
-        } else {
-            replay.insert(dword, (obs.mask, obs.latest_dword)); // Class W.
-        }
+        write_check.push(WriteCheck {
+            dword,
+            mask: obs.mask,
+            value: obs.latest_dword,
+            // Class R: restored, admitted, skipped at answer time. Class W: replayed.
+            is_class_r: pinned && restored,
+            retaken: false,
+        });
     }
 
     // Plan 4.4, the live stack tail: the `RETF`-with-flags shape leaves the `INT`-pushed
@@ -2831,39 +3083,36 @@ fn build_confirmed<B: CpuBus>(
     {
         let dword = aligned_dword(phys);
         let (byte_mask, shifted) = splice(phys - dword, 2, close_value);
-        let entry = replay
-            .get(&dword)
-            .map(|&(_, v)| v)
-            .or_else(|| bus.peek_direct_ram(dword, BusWidth::Dword))
-            .unwrap_or(0);
-        let existing_mask = replay.get(&dword).map(|&(m, _)| m).unwrap_or(0);
-        replay.insert(
-            dword,
-            (existing_mask | byte_mask, (entry & !byte_mask) | shifted),
-        );
+        // Folded into the check set as Class W, so the natural samples confirm the FLAGS
+        // word like any other replayed byte rather than trusting one observation of it.
+        match write_check.iter_mut().find(|c| c.dword == dword) {
+            Some(existing) => {
+                let base = if existing.is_class_r {
+                    bus.peek_direct_ram(dword, BusWidth::Dword).unwrap_or(0)
+                } else {
+                    existing.value
+                };
+                existing.value = (base & !byte_mask) | shifted;
+                existing.mask |= byte_mask;
+                existing.is_class_r = false;
+            }
+            None => {
+                let base = bus.peek_direct_ram(dword, BusWidth::Dword).unwrap_or(0);
+                write_check.push(WriteCheck {
+                    dword,
+                    mask: byte_mask,
+                    value: (base & !byte_mask) | shifted,
+                    is_class_r: false,
+                    retaken: false,
+                });
+            }
+        }
     }
 
+    write_check.sort_unstable_by_key(|c| c.dword);
+    let (replay, class_r_ranges) = derive_replay_and_ranges(&write_check);
     if replay.len() > MEMO_MAX_REPLAY_WRITES {
         return Err(LearnRefused::ReplaySetTooLarge);
-    }
-
-    let mut replay: Vec<(u32, u32, u32)> = replay
-        .into_iter()
-        .map(|(addr, (m, v))| (addr, m, v))
-        .collect();
-    replay.sort_unstable_by_key(|&(addr, _, _)| addr);
-
-    class_r_dwords.sort_unstable();
-    class_r_dwords.dedup();
-    let mut class_r_ranges: Vec<(u32, u32)> = Vec::new();
-    for dword in class_r_dwords {
-        if let Some((_, hi)) = class_r_ranges.last_mut()
-            && dword <= hi.wrapping_add(1)
-        {
-            *hi = dword + 3;
-            continue;
-        }
-        class_r_ranges.push((dword, dword + 3));
     }
 
     // The values recorded here are the ones the READ observed, which is NOT what the
@@ -2902,6 +3151,10 @@ fn build_confirmed<B: CpuBus>(
         control_effects: open.control_effects.clone(),
         read_set_pinned: false,
         read_set_unstable: false,
+        write_open_pre: vec![None; write_check.len()],
+        write_check,
+        write_model_pinned: false,
+        write_model_unstable: false,
     })
 }
 
@@ -3096,7 +3349,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         first = false;
         out.push_str(&format!(
             "{{\"vector\":{},\"ax\":{},\"int_eip\":{},\"cs_selector\":{},\"ss_selector\":{},\"cpl\":{},\"vm\":{},\
-             \"disarmed\":{},\"trips_seen\":{},\"disarmed_returns\":{},\"rearms\":{},\"learn_attempts\":{},\"learned\":{},\"audits\":{},\"bus_drift_acc\":{},\"memos\":{},\
+             \"disarmed\":{},\"trips_seen\":{},\"disarmed_returns\":{},\"rearms\":{},\"learn_attempts\":{},\"learned\":{},\"audits\":{},\"write_value_disarms\":{},\"bus_drift_acc\":{},\"memos\":{},\
              \"write_class_r_pinned\":{},\"write_class_r_unpinned\":{},\
              \"write_class_d\":{},\"write_class_w_other\":{},\
              \"stability_total_attempts\":{},\"stability_stable_attempts\":{},\
@@ -3119,6 +3372,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
             ks.learn_attempts,
             ks.learned,
             ks.audits,
+            ks.write_value_disarms,
             ks.bus_drift_acc,
             state.memos.get(key).map(Vec::len).unwrap_or(0),
             ks.write_class_r_pinned,
