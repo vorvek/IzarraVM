@@ -537,3 +537,76 @@ fn the_classifiers_pick_the_documented_shapes() {
     assert_eq!(EPOCH2_I586.raw(TimingClass::Div32), 492);
     assert_eq!(EPOCH2_I486.raw(TimingClass::Div32), 480);
 }
+
+/// `max_raw` is what the budget bound's per-slot term reads (review B3), so it
+/// must be the maximum over the WHOLE table, not over some subset that happens
+/// to be the largest today.
+#[test]
+fn max_raw_is_the_largest_entry_in_the_table() {
+    for (name, table) in [
+        ("EPOCH1", &EPOCH1),
+        ("I486", &EPOCH2_I486),
+        ("I586", &EPOCH2_I586),
+    ] {
+        let expected = TimingClass::ALL
+            .iter()
+            .map(|class| table.raw(*class))
+            .max()
+            .expect("the table is not empty");
+        assert_eq!(table.max_raw(), expected, "{name}");
+        // And it dominates every class, which is the property the bound needs.
+        for class in TimingClass::ALL {
+            assert!(
+                table.raw(*class) <= table.max_raw(),
+                "{name} {}",
+                class.name()
+            );
+        }
+    }
+    // The old literal the bound carried was 4, and it was ALREADY an under-bound
+    // at epoch 1: `RetFar` charges 17. That is the finding, pinned.
+    assert_eq!(EPOCH1.raw(TimingClass::RetFar), 17);
+    assert!(EPOCH1.max_raw() > 4);
+}
+
+/// The `InterpretOne` budget term is a maximum over an allowlist, and the
+/// allowlist has to contain the group-3 classes: `0xF7 /2../7` at Word and
+/// `0xF6 /2../7` are both call-out rows, and `Idiv32` charges 552 raw under
+/// epoch 2 where the epoch-1 constant is 7.
+///
+/// Without this the chain quota's DIVISOR would price a group-3 call-out at
+/// 7/12ths of a clock while the slot charged 46 -- an under-budget of 78x, in
+/// the release builds the campaign measures.
+#[test]
+fn the_interpret_one_budget_term_covers_the_group_three_rows() {
+    let allowlist = crate::run::INTERPRET_ONE_CLASSES;
+    for class in [
+        TimingClass::Div32,
+        TimingClass::Idiv32,
+        TimingClass::Mul32,
+        TimingClass::NotNegMem,
+        TimingClass::TestImmMem,
+    ] {
+        assert!(
+            allowlist.contains(&class),
+            "{} is a call-out row and must be in the budget allowlist",
+            class.name()
+        );
+    }
+    let max_at = |table: &ClassTable| {
+        allowlist
+            .iter()
+            .map(|class| table.raw(*class))
+            .max()
+            .expect("the allowlist is not empty")
+    };
+    // Epoch 1: the fold equals the constant it replaces, which the compile-time
+    // tripwire in `timing_class.rs` also asserts.
+    assert_eq!(max_at(&EPOCH1), crate::INTERPRET_ONE_MAX_CORE_CLOCKS);
+    assert_eq!(max_at(&EPOCH1), 7);
+    // Epoch 2: it moves, and it moves to the divide.
+    assert_eq!(max_at(&EPOCH2_I586), EPOCH2_I586.raw(TimingClass::Idiv32));
+    assert_eq!(max_at(&EPOCH2_I586), 552);
+    assert_eq!(max_at(&EPOCH2_I486), EPOCH2_I486.raw(TimingClass::Idiv32));
+    assert_eq!(max_at(&EPOCH2_I486), 528);
+}

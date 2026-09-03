@@ -206,7 +206,12 @@ macro_rules! timing_classes {
 
         /// The epoch-1 column: today's literal for every class, for every
         /// persona. This array IS the byte-identity proof -- see the module docs.
-        pub(crate) static EPOCH1: ClassTable = ClassTable([ $( $e1, )+ ]);
+        pub(crate) static EPOCH1: ClassTable = ClassTable(EPOCH1_ENTRIES);
+
+        /// `EPOCH1`'s array as a `const`, so the tripwire block below it can be
+        /// evaluated at compile time: a `const` may not read a `static`, and
+        /// `EPOCH1` has to be a `static` for its address to be stable.
+        const EPOCH1_ENTRIES: [u16; N_CLASSES] = [ $( $e1, )+ ];
 
         /// The I486 epoch-2 column (`dev_docs/2026-09-05-486-timing-audit.md` §5).
         pub(crate) static EPOCH2_I486: ClassTable = ClassTable([ $( $i486, )+ ]);
@@ -685,6 +690,25 @@ impl ClassTable {
         }
     }
 
+    /// The largest charge in the table -- "the epoch's own maximum-class
+    /// constant" the budget bound needs (review B3).
+    ///
+    /// Taken over every class, including the x87 and system rows a native JIT
+    /// slot can never carry, because the bound's job is to DOMINATE and the only
+    /// alternative is a hand-maintained mirror of `DirectKind::timing_class`'s
+    /// codomain that drifts silently.
+    pub(crate) fn max_raw(&self) -> u32 {
+        let mut max = 0u16;
+        let mut i = 0;
+        while i < N_CLASSES {
+            if self.0[i] > max {
+                max = self.0[i];
+            }
+            i += 1;
+        }
+        u32::from(max)
+    }
+
     /// The table as a slice, for the tests that iterate it.
     #[cfg(test)]
     pub(crate) const fn entries(&self) -> &[u16; N_CLASSES] {
@@ -725,3 +749,97 @@ pub(crate) fn class_table(persona: CpuPersona, epoch: u32) -> &'static ClassTabl
 #[cfg(test)]
 #[path = "timing_class_test.rs"]
 mod tests;
+
+/// THE EPOCH-1 TRIPWIRES, checked at compile time.
+///
+/// `lib.rs`'s per-opcode `*_CORE_CLOCKS` constants no longer feed anything: the
+/// charge sites read the class table and, since slice 1c, so does the budget
+/// path. They stay because the review asked for them as tripwires, and this
+/// block is what makes them one rather than dead code -- each is asserted equal
+/// to its class's epoch-1 entry, so a table edit that moves an epoch-1 value
+/// fails the BUILD rather than a test.
+///
+/// `INTERPRET_ONE_MAX_CORE_CLOCKS` and `MAX_CALL_OUT_CORE_CLOCKS` are folds of
+/// the others and are asserted against the same folds taken over the table, so
+/// the allowlist in `run.rs`'s `INTERPRET_ONE_CLASSES` cannot silently stop
+/// covering a row the const covers.
+const _: () = {
+    const fn entry(class: TimingClass) -> u32 {
+        EPOCH1_ENTRIES[class.index()] as u32
+    }
+    assert!(entry(TimingClass::PopMem) == crate::POP_RM_CORE_CLOCKS);
+    assert!(entry(TimingClass::MovRegSreg) == crate::MOV_RM_SREG_CORE_CLOCKS);
+    assert!(entry(TimingClass::Xchg) == crate::XCHG_CORE_CLOCKS);
+    assert!(entry(TimingClass::BitTest) == crate::BIT_STRING_CORE_CLOCKS);
+    assert!(entry(TimingClass::BitTestModify) == crate::BIT_STRING_CORE_CLOCKS);
+    // Group 3's thirteen classes all replaced ONE `clocks(GROUP3_CORE_CLOCKS)`,
+    // so all thirteen carry its literal at epoch 1. That is the whole reason the
+    // split is invisible under the knob-unset identity fixture.
+    assert!(entry(TimingClass::TestImmReg) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::TestImmMem) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::NotNegReg) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::NotNegMem) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Mul8) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Mul16) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Mul32) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Div8) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Div16) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Div32) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Idiv8) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Idiv16) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::Idiv32) == crate::GROUP3_CORE_CLOCKS);
+    assert!(entry(TimingClass::IncDecRm) == crate::INC_DEC_RM8_CORE_CLOCKS);
+    assert!(entry(TimingClass::PushMem) == crate::PUSH_RM_CORE_CLOCKS);
+    assert!(entry(TimingClass::Cli) == crate::CLI_CORE_CLOCKS);
+    assert!(entry(TimingClass::Sti) == crate::STI_CORE_CLOCKS);
+    assert!(entry(TimingClass::MovSregReg) == crate::MOV_SREG_CORE_CLOCKS);
+    assert!(entry(TimingClass::PopSs) == crate::POP_SS_CORE_CLOCKS);
+    assert!(entry(TimingClass::StringElem) == crate::STRING_CORE_CLOCKS);
+    assert!(entry(TimingClass::PushFlags) == crate::PUSHF_CORE_CLOCKS);
+    assert!(entry(TimingClass::PopFlags) == crate::POPF_CORE_CLOCKS);
+    assert!(entry(TimingClass::InPort) == crate::IN_PORT_CORE_CLOCKS);
+    assert!(entry(TimingClass::InPortDword) == crate::IN_PORT_CORE_CLOCKS);
+    assert!(entry(TimingClass::OutPort) == crate::OUT_PORT_CORE_CLOCKS);
+    assert!(entry(TimingClass::PushAll) == crate::PUSH_ALL_CORE_CLOCKS);
+    assert!(entry(TimingClass::PopAll) == crate::POP_ALL_CORE_CLOCKS);
+    assert!(entry(TimingClass::IntN) == crate::INT_IMM8_CORE_CLOCKS);
+    assert!(entry(TimingClass::Lar) == crate::LAR_LSL_CORE_CLOCKS);
+    assert!(entry(TimingClass::Lsl) == crate::LAR_LSL_CORE_CLOCKS);
+
+    // The two folds. `INTERPRET_ONE_MAX_CORE_CLOCKS` is the maximum over the
+    // allowlist; the budget path takes the same maximum over
+    // `run.rs`'s `INTERPRET_ONE_CLASSES`, and this asserts the two agree at
+    // epoch 1 -- which is the only epoch at which they can, since the const
+    // cannot be persona-keyed.
+    let mut interpret_one = 0u32;
+    let mut i = 0;
+    while i < crate::run::INTERPRET_ONE_CLASSES.len() {
+        let value = entry(crate::run::INTERPRET_ONE_CLASSES[i]);
+        if value > interpret_one {
+            interpret_one = value;
+        }
+        i += 1;
+    }
+    assert!(interpret_one == crate::INTERPRET_ONE_MAX_CORE_CLOCKS);
+
+    let mut max = interpret_one;
+    if entry(TimingClass::InPort) > max {
+        max = entry(TimingClass::InPort);
+    }
+    if entry(TimingClass::OutPort) > max {
+        max = entry(TimingClass::OutPort);
+    }
+    if entry(TimingClass::PushAll) > max {
+        max = entry(TimingClass::PushAll);
+    }
+    if entry(TimingClass::PopAll) > max {
+        max = entry(TimingClass::PopAll);
+    }
+    if entry(TimingClass::IntN) > max {
+        max = entry(TimingClass::IntN);
+    }
+    if entry(TimingClass::Lar) > max {
+        max = entry(TimingClass::Lar);
+    }
+    assert!(max == crate::MAX_CALL_OUT_CORE_CLOCKS);
+};

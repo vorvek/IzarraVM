@@ -115,6 +115,106 @@ struct ContinuationBudget {
     cap: u64,
 }
 
+/// The `InterpretOne` call-out allowlist, as CLASSES.
+///
+/// `INTERPRET_ONE_MAX_CORE_CLOCKS` (lib.rs) is the same allowlist as a `const`
+/// fold of per-opcode `const`s, and a `const` cannot be persona-keyed -- review
+/// B3's finding. This is the list the budget path reads instead: the maximum
+/// over it under the RUNNING table is what an `InterpretOne` slot can charge.
+///
+/// Keep it in step with `INTERPRET_ONE_MAX_CORE_CLOCKS`'s own table. A row
+/// admitted to the allowlist without a class here is under-budgeted; the const
+/// stays beside it as the epoch-1 tripwire the string call-out tests pin.
+///
+/// All thirteen group-3 classes are here, not just the Word ones. `0xF7 /2../7`
+/// at Word is the named row, but `0xF6 /2../7` is intercepted as an
+/// `InterpretOne` call-out too (see `classify`'s group-3 arm), and a ceiling
+/// that has to dominate may not depend on which of the two a block holds.
+pub(crate) const INTERPRET_ONE_CLASSES: &[TimingClass] = &[
+    TimingClass::PopMem,
+    TimingClass::MovRegSreg,
+    TimingClass::Xchg,
+    TimingClass::BitTest,
+    TimingClass::BitTestModify,
+    TimingClass::TestImmReg,
+    TimingClass::TestImmMem,
+    TimingClass::NotNegReg,
+    TimingClass::NotNegMem,
+    TimingClass::Mul8,
+    TimingClass::Mul16,
+    TimingClass::Mul32,
+    TimingClass::Div8,
+    TimingClass::Div16,
+    TimingClass::Div32,
+    TimingClass::Idiv8,
+    TimingClass::Idiv16,
+    TimingClass::Idiv32,
+    TimingClass::IncDecRm,
+    TimingClass::PushMem,
+    TimingClass::Cli,
+    TimingClass::MovSregReg,
+    TimingClass::Sti,
+    TimingClass::PopSs,
+    TimingClass::StringElem,
+    TimingClass::PushFlags,
+    TimingClass::PopFlags,
+];
+
+/// The five call-out budget terms and the per-slot ceiling, resolved from the
+/// RUNNING persona-and-epoch table instead of from `const`s.
+///
+/// Review B3: `compute_iteration_upper` is the chain quota's DIVISOR, and its
+/// call-out terms were `const`s -- `IN_PORT_CORE_CLOCKS` 12,
+/// `MAX_CALL_OUT_CORE_CLOCKS` 37, `PUSH_ALL_CORE_CLOCKS` 18,
+/// `INT_IMM8_CORE_CLOCKS` 37, `LAR_LSL_CORE_CLOCKS` 11 -- so under epoch 2 they
+/// would have priced a `DIV r/m32` call-out at two clocks where the slot charges
+/// 41. The `const`s remain in `lib.rs` as the epoch-1 tripwires the string
+/// call-out tests pin; nothing on the budget path reads them any more.
+#[derive(Clone, Copy)]
+#[cfg(feature = "jit")]
+struct CallOutBudgetTerms {
+    memory: u32,
+    interpret_one: u32,
+    int_imm8: u32,
+    lar_lsl: u32,
+    /// The largest of the five: what a bound that cannot see which helper a slot
+    /// carries has to price every slot at.
+    max: u32,
+}
+
+#[cfg(feature = "jit")]
+impl CallOutBudgetTerms {
+    /// `epoch` is taken rather than derived from `table`, because the PORT term
+    /// is not a class term: the port slices (P1-P3) own the port charge and key
+    /// it on the live CPL/IOPL column, which no class row can carry, so the
+    /// ceiling comes from `port_slot_core_upper` and this reads it rather than
+    /// keeping a second copy in the class table.
+    fn from_table(table: &crate::timing_class::ClassTable, epoch: u32) -> Self {
+        let port = crate::port_slot_core_upper(epoch);
+        let memory = table
+            .raw(TimingClass::PushAll)
+            .max(table.raw(TimingClass::PopAll));
+        let mut interpret_one = 0;
+        for class in INTERPRET_ONE_CLASSES {
+            interpret_one = interpret_one.max(table.raw(*class));
+        }
+        let int_imm8 = table.raw(TimingClass::IntN);
+        let lar_lsl = table.raw(TimingClass::Lar).max(table.raw(TimingClass::Lsl));
+        let max = port
+            .max(memory)
+            .max(interpret_one)
+            .max(int_imm8)
+            .max(lar_lsl);
+        Self {
+            memory,
+            interpret_one,
+            int_imm8,
+            lar_lsl,
+            max,
+        }
+    }
+}
+
 impl CpuGsw {
     pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CycleOutcome, CpuError> {
         // `cycle` is the per-instruction prologue (halt-wake + hardware interrupt
@@ -2156,7 +2256,14 @@ impl CpuGsw {
     /// `scale_core` of it, ceil(5,240 / 12) = 437 at the 1/12 persona pair); the integer figures
     /// do not.
     #[cfg(feature = "jit")]
-    fn compute_global_block_upper<B: CpuBus>(bus: &B, num: u32, den: u32, has_x87: bool) -> u64 {
+    fn compute_global_block_upper<B: CpuBus>(
+        bus: &B,
+        num: u32,
+        den: u32,
+        has_x87: bool,
+        table: &crate::timing_class::ClassTable,
+    ) -> u64 {
+        let terms = CallOutBudgetTerms::from_table(table, bus.timing_epoch());
         let scale_core = |unscaled: u64| {
             unscaled
                 .saturating_mul(u64::from(num))
@@ -2176,10 +2283,25 @@ impl CpuGsw {
         // returns. That is 18 (PUSHAD/POPAD) rather than 12 (IN AL,DX) as of the memory class, and
         // the constant is derived from the three per-opcode constants so a fourth helper raises it
         // by construction.
-        let callout_core = u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
-            .saturating_mul(u64::from(MAX_CALL_OUT_CORE_CLOCKS));
+        let callout_core =
+            u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS).saturating_mul(u64::from(terms.max));
+        // THE EPOCH'S OWN MAXIMUM CLASS, not the literal 4 this term used to carry
+        // (review B3). `4` was already an under-bound at epoch 1 -- `RetFar` charges
+        // 17 -- and at epoch 2 it is 3x to 138x too small, so the ceiling stopped
+        // dominating exactly where its `debug_assert` was supposed to catch it.
+        //
+        // The maximum is taken over the WHOLE table rather than over the classes a
+        // native slot can actually carry, deliberately. The alternative is a
+        // hand-maintained mirror of `DirectKind::timing_class`'s codomain that
+        // drifts silently the first time a variant moves class, and this bound's
+        // entire job is to dominate: a looser ceiling weakens no invariant, where a
+        // stale one breaks the assert it exists for. It costs nothing either way --
+        // see the note at the chain-pricing site: in a release build this function's
+        // result is dead except for the memo.
         let integer_core = scale_core(
-            4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6 + callout_core,
+            u64::from(table.max_raw()).saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
+                + 6
+                + callout_core,
         );
         // The x87 class needs no call-out term: x87 and call-out slots never share a block
         // (the compile walk refuses the mix in either order), so an x87 block's `callout_slots`
@@ -2335,7 +2457,13 @@ impl CpuGsw {
         block: &jit::direct::CompiledBlock,
         num: u32,
         den: u32,
+        table: &crate::timing_class::ClassTable,
     ) -> u64 {
+        // The five call-out quota terms, resolved from the RUNNING table. They were
+        // `const`s, and a `const` cannot be persona-keyed (review B3): under epoch 2
+        // they would price a group-3 call-out at two clocks where the slot charges
+        // up to 46. The `const`s stay in `lib.rs` as epoch-1 tripwires.
+        let terms = CallOutBudgetTerms::from_table(table, bus.timing_epoch());
         let fp_core_upper = u64::from(block.weighted_fp_clocks())
             .saturating_add(u64::from(FP_TIMING_DEN) - 1)
             / u64::from(FP_TIMING_DEN);
@@ -2388,12 +2516,11 @@ impl CpuGsw {
         let callout_core_upper = u64::from(block.callout_port_slots())
             .saturating_mul(u64::from(port_slot_core_upper(bus.timing_epoch())))
             .saturating_add(
-                u64::from(block.callout_memory_slots())
-                    .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),
+                u64::from(block.callout_memory_slots()).saturating_mul(u64::from(terms.memory)),
             )
             .saturating_add(
                 u64::from(block.callout_interpret_one_slots())
-                    .saturating_mul(u64::from(INTERPRET_ONE_MAX_CORE_CLOCKS)),
+                    .saturating_mul(u64::from(terms.interpret_one)),
             )
             // The FOURTH class, `0xCD` INT imm8. It shares the generic helper with the class above
             // but not its budget term: 37 against that class's 7, so folding it in would have
@@ -2401,8 +2528,7 @@ impl CpuGsw {
             // none of them carries. Its own count is bounded at one per block by
             // `DirectKind::is_terminal`.
             .saturating_add(
-                u64::from(block.callout_int_imm8_slots())
-                    .saturating_mul(u64::from(INT_IMM8_CORE_CLOCKS)),
+                u64::from(block.callout_int_imm8_slots()).saturating_mul(u64::from(terms.int_imm8)),
             )
             // The FIFTH class, `0x0F02`/`0x0F03` LAR/LSL. Shares the generic helper too, but not
             // the budget term: 11 against the interpret-one class's 7, so folding it in would have
@@ -2411,8 +2537,7 @@ impl CpuGsw {
             // a block can carry several -- which is why it is a genuine `u8` counter rather than a
             // packed flag; see `CompiledBlock::callout_lar_lsl_slots`.
             .saturating_add(
-                u64::from(block.callout_lar_lsl_slots())
-                    .saturating_mul(u64::from(LAR_LSL_CORE_CLOCKS)),
+                u64::from(block.callout_lar_lsl_slots()).saturating_mul(u64::from(terms.lar_lsl)),
             );
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
@@ -2589,14 +2714,14 @@ impl CpuGsw {
         let value = if cached != 0 {
             cached
         } else {
-            let computed = Self::compute_iteration_upper(bus, block, num, den);
+            let computed = Self::compute_iteration_upper(bus, block, num, den, self.class_table());
             self.jit_direct
                 .set_iteration_upper_cached(block.id(), epoch, computed);
             computed
         };
         debug_assert_eq!(
             value,
-            Self::compute_iteration_upper(bus, block, num, den),
+            Self::compute_iteration_upper(bus, block, num, den, self.class_table()),
             "cached iteration_upper went stale"
         );
         value
@@ -3106,14 +3231,26 @@ impl CpuGsw {
                     cached
                 } else {
                     self.perf.jit_direct_chain_quota_cache_misses += 1;
-                    let computed = Self::compute_global_block_upper(bus, num, den, block.has_x87());
+                    let computed = Self::compute_global_block_upper(
+                        bus,
+                        num,
+                        den,
+                        block.has_x87(),
+                        self.class_table(),
+                    );
                     self.jit_direct
                         .set_global_block_upper_cached(x87_index, epoch, computed);
                     computed
                 };
                 debug_assert_eq!(
                     global_block_upper,
-                    Self::compute_global_block_upper(bus, num, den, block.has_x87()),
+                    Self::compute_global_block_upper(
+                        bus,
+                        num,
+                        den,
+                        block.has_x87(),
+                        self.class_table()
+                    ),
                     "cached global_block_upper went stale"
                 );
                 // CHAIN PRICING. `global_block_upper` is a SOUND bound — it prices every hop as
@@ -3145,7 +3282,23 @@ impl CpuGsw {
                 // function's result is dead except for the memo, so changing it moves no guest
                 // number and no wall number. Only the divisor below does.
                 let per_hop_estimate = iteration_upper.max(1);
-                debug_assert!(per_hop_estimate <= global_block_upper.max(1));
+                // RELEASE-VISIBLE UNDER EPOCH 2 (review B3, slice 1 item 4). This
+                // check is the only thing that says the ceiling still dominates,
+                // and a `debug_assert` alone means the builds the campaign
+                // actually MEASURES enforce nothing -- which is how the `4u64`
+                // per-slot term above stayed 3x-138x too small without a red test.
+                // Epoch 2 is a development knob, never a shipped default, so a
+                // hard failure there is a signal and not a user-facing crash;
+                // epoch 1 keeps the debug-only form so no release behaviour moves.
+                if self.timing_epoch() >= 2 {
+                    assert!(
+                        per_hop_estimate <= global_block_upper.max(1),
+                        "chain pricing: per-hop estimate {per_hop_estimate} exceeds the global                          block upper bound {global_block_upper} under epoch {}; the bound has                          stopped dominating",
+                        self.timing_epoch()
+                    );
+                } else {
+                    debug_assert!(per_hop_estimate <= global_block_upper.max(1));
+                }
                 let additional = available
                     .saturating_sub(iteration_upper)
                     .checked_div(per_hop_estimate)
@@ -3927,7 +4080,7 @@ impl CpuGsw {
         block: &jit::direct::CompiledBlock,
     ) -> u64 {
         let (num, den) = level_timing(self.persona());
-        Self::compute_iteration_upper(bus, block, num, den)
+        Self::compute_iteration_upper(bus, block, num, den, self.class_table())
     }
 
     #[cfg(all(feature = "jit", test))]
