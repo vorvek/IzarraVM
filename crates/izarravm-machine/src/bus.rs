@@ -520,6 +520,7 @@ impl Machine {
             rtc: &mut self.rtc,
             dma: &mut self.dma,
             device_timing: self.device_timing,
+            inta_diag: &mut self.inta_diag,
             fdc: &mut self.fdc,
             opl: &mut self.opl,
             sb16: &mut self.sb16,
@@ -3936,7 +3937,23 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn acknowledge_interrupt(&mut self) -> Option<u8> {
-        self.pic.acknowledge()
+        let now = self.guest_tick_now();
+        let (vector, master_irq) = self.pic.acknowledge_with_irq()?;
+        // Slice 9A instrument: always-on, never gated by `IZARRAVM_DEVICE_TIMING`.
+        self.inta_diag.acknowledge_count += 1;
+        // IRQ0 is never a cascade pin on this model's wiring (the PIT drives
+        // the master directly), so `master_irq == 0` is exactly "this
+        // acknowledge resolved the PIT's request".
+        if master_irq == 0
+            && let Some(edge_tick) = self.inta_diag.pending_edge_tick.take()
+        {
+            let delay_ticks = now.saturating_sub(edge_tick);
+            let delay_clocks = self
+                .timeline_at_batch_start
+                .cpu_clocks_for_master_ticks_ceil(delay_ticks);
+            self.inta_diag.record_irq0_entry(delay_clocks);
+        }
+        Some(vector)
     }
 
     #[inline]

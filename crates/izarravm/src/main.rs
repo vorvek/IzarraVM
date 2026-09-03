@@ -2304,6 +2304,7 @@ fn write_hdd_profile_json(
         "atapi_packet_commands": machine.atapi_packet_command_count(),
         "ata_poll_skip": ata_poll_skip_json(machine),
         "device_timing": device_timing_json(machine),
+        "inta": inta_json(machine),
         "katea": machine.katea_storage_counters().as_ref().map(katea_counters_json),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
@@ -3614,6 +3615,18 @@ fn device_timing_json(machine: &izarravm_machine::Machine) -> serde_json::Value 
         map.insert(name.to_string(), json!(armed));
     }
     serde_json::Value::Object(map)
+}
+
+/// Slice 9A: the 8259A INTA instrument -- always-on, never gated by
+/// `IZARRAVM_DEVICE_TIMING`. `histogram` buckets are
+/// `[0], [1,2), [2,4), [4,8), [8,16), [16,32), [32,64), [64,128), [128,256),
+/// [256,512), [512, inf)` in guest clocks (`InterruptEntryDiagnostics`).
+fn inta_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
+    json!({
+        "acknowledge_count": machine.inta_acknowledge_count(),
+        "irq0_entry_samples": machine.irq0_entry_samples(),
+        "irq0_entry_histogram": machine.irq0_entry_histogram().to_vec(),
+    })
 }
 
 fn ata_poll_skip_json(machine: &izarravm_machine::Machine) -> serde_json::Value {

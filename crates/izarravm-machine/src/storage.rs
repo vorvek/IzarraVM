@@ -483,6 +483,24 @@ impl Machine {
         self.device_timing
     }
 
+    /// Slice 9A: total 8259A acknowledge (INTA) cycles serviced. Always-on,
+    /// never gated by `IZARRAVM_DEVICE_TIMING`.
+    pub fn inta_acknowledge_count(&self) -> u64 {
+        self.inta_diag.acknowledge_count
+    }
+
+    /// Slice 9A: the PIT-edge-to-IRQ0-handler-entry delay histogram, in guest
+    /// clocks, per `InterruptEntryDiagnostics::histogram`'s bucket layout.
+    pub fn irq0_entry_histogram(&self) -> [u64; IRQ0_ENTRY_HISTOGRAM_BUCKETS] {
+        self.inta_diag.histogram
+    }
+
+    /// Slice 9A: total IRQ0 handler-entry delay samples recorded (the sum of
+    /// `irq0_entry_histogram`).
+    pub fn irq0_entry_samples(&self) -> u64 {
+        self.inta_diag.samples
+    }
+
     /// The slice-9 `IZARRAVM_DEVICE_TIMING` per-family armed state, in the
     /// design's own family order (`pic dma ata cd fdc kbc sb`). Every entry is
     /// `false` on the knob-unset default. Exposed for the whole-run profile
