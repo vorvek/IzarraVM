@@ -921,8 +921,11 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // pin 4776 -> 4784 -- measured, not derived. The win-gate diagnostic counter, not
     // architectural state; `Tlb`'s own growth does not move this pin (see cpu_test.rs's twin
     // comment).
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
+    // The 2026-09-05 issue-charge prototype adds two knob-gated fields (`issue_raw: u32`,
+    // `x87_intconvert32_num: Option<u32>`), moving the pin 4784 -> 4792 -- measured, not
+    // derived. Host-side timing knobs, not architectural state; see cpu_test.rs's twin comment.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
 }

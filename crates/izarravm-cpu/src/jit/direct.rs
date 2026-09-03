@@ -6034,10 +6034,13 @@ impl DirectKind {
         }
     }
 
-    fn weighted_fp_clocks(self, persona: CpuPersona) -> u32 {
+    fn weighted_fp_clocks(self, persona: CpuPersona, x87_intconvert32_num: Option<u32>) -> u32 {
         match self {
-            Self::X87 { insn, .. } => u32::try_from(insn.metadata().weighted_fp_clocks(persona))
-                .expect("one x87 instruction's weighted clocks fit u32"),
+            Self::X87 { insn, .. } => u32::try_from(
+                insn.metadata()
+                    .weighted_fp_clocks(persona, x87_intconvert32_num),
+            )
+            .expect("one x87 instruction's weighted clocks fit u32"),
             _ => 0,
         }
     }
@@ -8731,7 +8734,8 @@ fn compile_with_budget(
             stop = CompileStop::Boundary;
             break;
         }
-        let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.persona());
+        let slot_weighted_fp_clocks =
+            kind.weighted_fp_clocks(cpu.persona(), cpu.x87_intconvert32_num);
         let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks()) else {
             stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
@@ -30007,7 +30011,20 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                                 fetch_count: poll.fetch_count() as u8,
                                 status_mask: poll.status_mask(),
                                 spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
-                                raw_core_clocks: poll.raw_core_clocks(),
+                                // 2026-09-05 issue-charge prototype: the poll-skip edge oracle
+                                // projects `iterations` copies of this ONE loop body without
+                                // interpreting them, so for exactness against an interpreted or
+                                // natively-run replay of the same loop, each projected iteration
+                                // must carry the same IZARRAVM_ISSUE_RAW issue cost every OTHER
+                                // retire path charges per instruction -- `fetch_count()` raw
+                                // clocks per iteration, since each fetch in a certified poll
+                                // shape is exactly one instruction (IN/TEST/Jcc). Zero with the
+                                // knob unset, so `raw_core_clocks` is unchanged from before the
+                                // slice.
+                                raw_core_clocks: poll.raw_core_clocks().saturating_add(
+                                    u64::from(cpu.issue_raw)
+                                        .saturating_mul(poll.fetch_count() as u64),
+                                ),
                                 core_clocks_at_block_entry: cpu.core_clocks_so_far,
                                 prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
                                 core_num,

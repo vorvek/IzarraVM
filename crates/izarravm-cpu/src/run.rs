@@ -571,7 +571,7 @@ impl CpuGsw {
         if self.registers.eip == 0x1_0000 {
             self.wrap_16bit_sequential_run_off();
         }
-        let charged = self.scale_clocks(outcome.core_clocks);
+        let charged = self.scale_clocks(outcome.core_clocks.saturating_add(self.issue_raw));
         self.elapsed_clocks += charged;
         #[cfg(feature = "reflected-call-diagnostic")]
         if self.retire_gates.reflected_call_diag_armed {
@@ -3350,7 +3350,16 @@ impl CpuGsw {
         let instructions = exit.instructions;
         let fp = jit::native_x87::scale_weighted_fp_clocks(exit.weighted_fp_clocks, self.fp_rem);
         self.fp_rem = fp.remainder;
-        let raw_clocks = exit.raw_clocks.saturating_add(fp.clocks);
+        // 2026-09-05 issue-charge prototype: IZARRAVM_ISSUE_RAW's per-instruction issue cost,
+        // applied to a native run the same way `finish_instruction` / `run_one_cached` apply it
+        // to an interpreted retire -- `self.issue_raw` raw clocks per instruction, summed over
+        // every instruction this native run retired (`instructions`, already the whole chain's
+        // count, iterations included for a looping block). `self.issue_raw` is 0 with the knob
+        // unset, so this term vanishes and `raw_clocks` is exactly what it was before the slice.
+        let raw_clocks = exit
+            .raw_clocks
+            .saturating_add(fp.clocks)
+            .saturating_add(u64::from(self.issue_raw).saturating_mul(instructions));
         let byte_reads = exit.byte_reads & u64::from(u32::MAX);
         let word_reads = exit.byte_reads >> 32;
         // The static dword-read count must not carry into the lane's HIGH half, which is about to
@@ -3939,7 +3948,8 @@ impl CpuGsw {
                 .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus))
             {
                 Ok(outcome) => {
-                    let charged = self.scale_clocks(outcome.core_clocks);
+                    let charged =
+                        self.scale_clocks(outcome.core_clocks.saturating_add(self.issue_raw));
                     self.elapsed_clocks += charged;
                     #[cfg(feature = "reflected-call-diagnostic")]
                     if self.retire_gates.reflected_call_diag_armed {
@@ -4037,7 +4047,8 @@ impl CpuGsw {
                     Ok(self.pause_rep_instruction(*insn, start_eip, start_cs_register, outcome))
                 }
                 Ok(outcome) => {
-                    let charged = self.scale_clocks(outcome.core_clocks);
+                    let charged =
+                        self.scale_clocks(outcome.core_clocks.saturating_add(self.issue_raw));
                     self.elapsed_clocks += charged;
                     #[cfg(feature = "reflected-call-diagnostic")]
                     if self.retire_gates.reflected_call_diag_armed {

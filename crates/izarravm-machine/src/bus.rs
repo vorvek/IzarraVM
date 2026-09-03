@@ -353,6 +353,7 @@ impl Machine {
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
             ata_poll_skip_enabled: self.ata_poll_skip_enabled,
+            video_mode13_ws_override: self.video_mode13_ws_override,
             ata_poll_skip_armed: &mut self.ata_poll_skip_armed,
             ata_poll_skip_slice_too_short: self.ata_poll_skip_slice_too_short,
             ata_poll_skip: &mut self.ata_poll_skip,
@@ -1774,7 +1775,10 @@ impl CpuBus for MachineBus<'_> {
                 self.vega.note_direct_write(address, width.bytes() as usize);
             }
             let ws = if self.active_mode.uses_approximate_timing() {
-                video_wait_states_approx(self.active_mode.persona())
+                video_wait_states_approx_effective(
+                    self.active_mode.persona(),
+                    self.video_mode13_ws_override,
+                )
             } else {
                 self.wait_states.video
             };
@@ -2041,7 +2045,10 @@ impl CpuBus for MachineBus<'_> {
 
     fn jit_mode13_data_cost_clocks(&self, width: BusWidth) -> u64 {
         let wait_states = if self.active_mode.uses_approximate_timing() {
-            video_wait_states_approx(self.active_mode.persona())
+            video_wait_states_approx_effective(
+                self.active_mode.persona(),
+                self.video_mode13_ws_override,
+            )
         } else {
             self.wait_states.video
         };
@@ -2076,7 +2083,10 @@ impl CpuBus for MachineBus<'_> {
                 .max(self.cache.cost.ram)
         };
         let video = if self.flat_data_cost {
-            video_wait_states_approx(self.active_mode.persona())
+            video_wait_states_approx_effective(
+                self.active_mode.persona(),
+                self.video_mode13_ws_override,
+            )
         } else {
             self.wait_states.video
         };
@@ -2096,7 +2106,10 @@ impl CpuBus for MachineBus<'_> {
 
     fn rep_page_walk_cost_upper(&self) -> Option<u64> {
         let video = if self.active_mode.uses_approximate_timing() {
-            video_wait_states_approx(self.active_mode.persona())
+            video_wait_states_approx_effective(
+                self.active_mode.persona(),
+                self.video_mode13_ws_override,
+            )
         } else {
             self.wait_states.video
         };
@@ -4092,7 +4105,10 @@ impl MachineBus<'_> {
     ) {
         self.vega.record_direct_access(address, bytes, kind);
         let wait_states = if self.active_mode.uses_approximate_timing() {
-            video_wait_states_approx(self.active_mode.persona())
+            video_wait_states_approx_effective(
+                self.active_mode.persona(),
+                self.video_mode13_ws_override,
+            )
         } else {
             self.wait_states.video
         };
@@ -4569,7 +4585,10 @@ impl MachineBus<'_> {
             // card (see `video_wait_states_approx`); the Accurate class keeps the
             // frozen profile value bit-for-bit.
             if self.active_mode.uses_approximate_timing() {
-                video_wait_states_approx(self.active_mode.persona())
+                video_wait_states_approx_effective(
+                    self.active_mode.persona(),
+                    self.video_mode13_ws_override,
+                )
             } else {
                 self.wait_states.video
             }

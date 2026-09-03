@@ -5,7 +5,7 @@
 
 use super::super::{
     AddrMode, CR0_EM, CR0_NE, CR0_TS, CpuPersona, DecodeGroup, DecodedInsn, DecodedOperand,
-    FP_TIMING_DEN, FpOpClass, fp_timing_class,
+    FP_TIMING_DEN, FpOpClass, effective_fp_timing_class,
 };
 
 #[cfg(all(
@@ -338,8 +338,17 @@ pub(crate) struct NativeX87Metadata {
 }
 
 impl NativeX87Metadata {
-    pub(crate) const fn weighted_fp_clocks(self, persona: CpuPersona) -> u64 {
-        self.raw_clocks as u64 * fp_timing_class(persona, self.fp_class) as u64
+    /// `x87_intconvert32_num` is `CpuGsw::x87_intconvert32_num` (2026-09-05 issue-charge
+    /// prototype knob), threaded through so a native block compiled with the knob set bakes the
+    /// SAME override the interpreter's `scale_fp_clocks` would apply, byte-for-byte, and `None`
+    /// (the knob unset) reproduces the pre-slice `fp_timing_class` call exactly.
+    pub(crate) const fn weighted_fp_clocks(
+        self,
+        persona: CpuPersona,
+        x87_intconvert32_num: Option<u32>,
+    ) -> u64 {
+        self.raw_clocks as u64
+            * effective_fp_timing_class(persona, self.fp_class, x87_intconvert32_num) as u64
     }
 }
 

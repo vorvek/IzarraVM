@@ -6879,3 +6879,45 @@ fn interpret_one_closes_the_callout_attribution_ledger() {
         assert!(snapshot.ports.is_empty(), "{name}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 2026-09-05 issue-charge prototype: IZARRAVM_ISSUE_RAW must land identically on the
+// interpreted leg and the native (InterpretOne call-out) leg, exactly like every other
+// quantity `assert_legs_agree` checks.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn perturb_issue_raw_seven(cpu: &mut CpuGsw, _: &mut TestBus) {
+    cpu.issue_raw = 7;
+}
+
+/// The exactness claim the issue-charge design cites `assert_legs_agree` for: with
+/// IZARRAVM_ISSUE_RAW=7 armed on BOTH legs (the knob is a plain field, so the fixture sets it
+/// directly rather than through the environment), a block run natively and the same bytes run
+/// wholly interpreted must still agree on `elapsed_clocks` and `perf.instructions` -- the native
+/// leg's per-block batch charge (`raw_clocks + issue_raw * instructions`, `run.rs`) must equal the
+/// interpreter's per-instruction charge (`scale_clocks(core_clocks + issue_raw)` at every retire
+/// site) summed over the same instructions, including the one instruction that crosses the
+/// call-out seam.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn issue_raw_seven_agrees_between_the_native_and_interpreted_legs() {
+    let mut legs = run_both(CODE, STARTS, perturb_issue_raw_seven);
+    assert_legs_agree(&mut legs);
+    // Anti-vacuity: issue_raw=7 must actually have moved the bill relative to the knob-unset
+    // case, or this test would pass by construction even with the charge site never firing.
+    let mut baseline = run_both(CODE, STARTS, no_perturb);
+    assert!(
+        legs.interp.elapsed_clocks > baseline.interp.elapsed_clocks,
+        "issue_raw=7 must charge MORE than the knob-unset baseline"
+    );
+    assert_legs_agree(&mut baseline);
+}

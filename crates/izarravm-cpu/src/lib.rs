@@ -2917,6 +2917,19 @@ pub struct CpuGsw {
     /// memset every instruction.
     written_count: u8,
     written_pages_overflow: bool,
+    /// IZARRAVM_ISSUE_RAW knob-gated prototype (2026-09-05 issue-charge design): extra
+    /// RAW clocks charged per retired instruction, before the persona's scale_clocks
+    /// dial, approximating the P5's minimum issue/retire cost that the flat 486-shaped
+    /// core table has never charged. Read ONCE at construction from the environment;
+    /// unset or empty = 0 = today's model, bit-identical. Never read per instruction --
+    /// a plain field on the hot path, per the audit rule that hoists knobs out of it.
+    issue_raw: u32,
+    /// IZARRAVM_X87_INTCONVERT_MUL knob-gated prototype: override for the I586
+    /// FpOpClass::IntConvert32 numerator over FP_TIMING_DEN (8) -- the override
+    /// VALUE is the multiplier itself (2 means x2), matching the doc's re-solve toward
+    /// x1-x3 against the fitted x34 in fp_timing_class. None (env unset or empty)
+    /// keeps today's 272/8. Read ONCE at construction.
+    x87_intconvert32_num: Option<u32>,
     /// The call-out window: whether an `InterpretOne` slot is running one interpreter instruction
     /// with a native block live on the host stack, and the code writes that window has deferred.
     ///
@@ -3150,6 +3163,8 @@ impl Default for CpuGsw {
             written_pages: [None; TRACKED_WRITE_PAGES],
             written_count: 0,
             written_pages_overflow: false,
+            issue_raw: issue_raw_default(),
+            x87_intconvert32_num: x87_intconvert32_override_default(),
             #[cfg(feature = "jit")]
             deferred_code_writes: DeferredCodeWrites::default(),
             decode_cache,
@@ -4300,6 +4315,40 @@ thread_local! {
 #[cfg(all(test, feature = "jit"))]
 pub(crate) fn set_decode_pack_for_test(forced: Option<bool>) {
     DECODE_PACK_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The whole `IZARRAVM_ISSUE_RAW` spelling table, split out from the environment read (like
+/// `poll_neg_cache_policy`) so it is testable without touching process state. Unset or empty
+/// parses to 0, today's model, bit-identical; any other value that does not parse as a u32 also
+/// falls back to 0 rather than panicking, so a malformed knob degrades to off instead of
+/// aborting the process.
+pub(crate) fn issue_raw_policy(value: Option<&str>) -> u32 {
+    value
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// IZARRAVM_ISSUE_RAW ambient default, read fresh at CPU construction (2026-09-05
+/// issue-charge prototype).
+pub(crate) fn issue_raw_default() -> u32 {
+    issue_raw_policy(std::env::var("IZARRAVM_ISSUE_RAW").ok().as_deref())
+}
+
+/// The whole `IZARRAVM_X87_INTCONVERT_MUL` spelling table, split out for the same reason
+/// `issue_raw_policy` is. Unset, empty, or unparseable keeps `None`, which leaves
+/// `fp_timing_class`'s fitted 272/8 (x34) untouched -- today's model, bit-identical. A parsed
+/// value `n` is the multiplier itself (numerator = n * 8).
+pub(crate) fn x87_intconvert32_override_policy(value: Option<&str>) -> Option<u32> {
+    value
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u32>().ok())
+}
+
+/// IZARRAVM_X87_INTCONVERT_MUL ambient default, read fresh at CPU construction
+/// (2026-09-05 issue-charge prototype).
+pub(crate) fn x87_intconvert32_override_default() -> Option<u32> {
+    x87_intconvert32_override_policy(std::env::var("IZARRAVM_X87_INTCONVERT_MUL").ok().as_deref())
 }
 
 /// Ambient default for the poll negative cache, read fresh at CPU construction.
@@ -6004,6 +6053,23 @@ const fn fp_timing_class(persona: CpuPersona, class: FpOpClass) -> u32 {
             FpOpClass::Register => 2,       // x0.25: pairing/issue-rate honesty
             FpOpClass::Wait => 1,           // x0.125: FWAIT is ~free on a P5
         },
+    }
+}
+
+/// `fp_timing_class` with the IZARRAVM_X87_INTCONVERT_MUL knob-gated override applied
+/// (2026-09-05 issue-charge prototype). `x87_intconvert32_num` is `CpuGsw::x87_intconvert32_num`,
+/// read once at construction; `None` returns `fp_timing_class` unchanged, byte-for-byte the
+/// pre-slice behavior. A `Some(n)` override applies ONLY to `(I586, IntConvert32)`, the one class
+/// the research note's re-solve names -- every other persona/class pair is untouched even with
+/// the knob set, so IntConvert16/F32Mem/F64Mem/Register/Wait keep their fitted values.
+const fn effective_fp_timing_class(
+    persona: CpuPersona,
+    class: FpOpClass,
+    x87_intconvert32_num: Option<u32>,
+) -> u32 {
+    match (persona, class, x87_intconvert32_num) {
+        (CpuPersona::I586, FpOpClass::IntConvert32, Some(mul)) => mul * FP_TIMING_DEN,
+        _ => fp_timing_class(persona, class),
     }
 }
 

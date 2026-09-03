@@ -459,6 +459,35 @@ const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
     }
 }
 
+/// `video_wait_states_approx` with the IZARRAVM_VIDEO_MODE13_WS knob-gated override applied
+/// (2026-09-05 issue-charge prototype). `override_ws` is `Machine::video_mode13_ws_override`,
+/// copied into `MachineBus` once per batch construction (`make_bus`), never read from the
+/// environment on the hot path. `None` reproduces `video_wait_states_approx` unchanged; a
+/// `Some(n)` override applies ONLY to I586, the persona the research note's re-solve names --
+/// I386/I486 stay on the unmodified table even with the knob set.
+const fn video_wait_states_approx_effective(persona: CpuPersona, override_ws: Option<u8>) -> u8 {
+    match (persona, override_ws) {
+        (CpuPersona::I586, Some(ws)) => ws,
+        _ => video_wait_states_approx(persona),
+    }
+}
+
+/// The whole `IZARRAVM_VIDEO_MODE13_WS` spelling table, split out from the environment read so
+/// it is testable without touching process state. Unset, empty, or unparseable keeps `None` --
+/// today's 147 wait states, bit-identical. A parsed value replaces the I586 mode 13h aperture
+/// wait-state count.
+fn video_mode13_ws_override_policy(value: Option<&str>) -> Option<u8> {
+    value
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<u8>().ok())
+}
+
+/// IZARRAVM_VIDEO_MODE13_WS ambient default, read fresh at `Machine` construction (2026-09-05
+/// issue-charge prototype).
+fn video_mode13_ws_override_default() -> Option<u8> {
+    video_mode13_ws_override_policy(std::env::var("IZARRAVM_VIDEO_MODE13_WS").ok().as_deref())
+}
+
 /// Which modeled cache tier a data access resolves to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tier {
@@ -1552,6 +1581,12 @@ pub struct Machine {
     // all guest memory outside the driver's own two counter words (which end
     // HIGHER, making the driver's timeout strictly less likely to fire).
     ata_poll_skip_enabled: bool,
+    // IZARRAVM_VIDEO_MODE13_WS knob-gated prototype (2026-09-05 issue-charge design): override
+    // for `video_wait_states_approx(I586)`, one of the two fitted absorbers the research note's
+    // joint re-solve names. `None` (env unset or empty) keeps today's 147; a `Some(n)` replaces
+    // it with `n` for the I586 persona only -- I386/I486 are untouched even with the knob set.
+    // Read ONCE at construction and copied into `MachineBus` per batch, like `isa_io_wait`.
+    video_mode13_ws_override: Option<u8>,
     // Reset at batch ENTRY next to `io_touched`, so no arm can survive into a
     // batch that did not raise it; taken at batch end by the actuation.
     ata_poll_skip_armed: bool,
@@ -2079,6 +2114,7 @@ impl Machine {
             io_touched: false,
             exempt_io_touched: false,
             ata_poll_skip_enabled: run::ata_poll_skip_default(),
+            video_mode13_ws_override: video_mode13_ws_override_default(),
             ata_poll_skip_armed: false,
             ata_poll_skip_slice_too_short: false,
             ata_poll_skip: AtaPollSkipDiagnostics::new(run::ata_poll_skip_diag_default()),
@@ -3813,6 +3849,9 @@ struct MachineBus<'a> {
     // byte-identical to its pre-slice form: no counting, no suppressed clear,
     // no counter movement.
     ata_poll_skip_enabled: bool,
+    // `Machine::video_mode13_ws_override`, copied in per batch. `None` with the knob unset
+    // keeps `video_wait_states_approx` unchanged; see that function's knob-gated wrapper.
+    video_mode13_ws_override: Option<u8>,
     // Raised by the IDE arm when the device says a run of alt-status reads
     // crossed the threshold with a command pending and the remaining deadline
     // above the floor. Points at `Machine::ata_poll_skip_armed`, which the run

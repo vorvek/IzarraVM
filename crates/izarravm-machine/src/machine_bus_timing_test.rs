@@ -3092,6 +3092,47 @@ fn approximate_video_wait_states_keep_the_doom_calibration() {
     assert_eq!(video_wait_states_approx(CpuPersona::I586), 147);
 }
 
+// ---------------------------------------------------------------------------
+// 2026-09-05 issue-charge prototype: IZARRAVM_VIDEO_MODE13_WS's knob-gated override.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn video_mode13_ws_override_none_reproduces_the_table_exactly() {
+    for persona in [CpuPersona::I386, CpuPersona::I486, CpuPersona::I586] {
+        assert_eq!(
+            video_wait_states_approx_effective(persona, None),
+            video_wait_states_approx(persona),
+            "{persona:?}: None must be a true no-op"
+        );
+    }
+}
+
+#[test]
+fn video_mode13_ws_override_applies_only_to_i586() {
+    assert_eq!(
+        video_wait_states_approx_effective(CpuPersona::I586, Some(72)),
+        72
+    );
+    // I386/I486 stay on the unmodified table even with the knob set: only the persona the
+    // research note's re-solve names moves.
+    assert_eq!(
+        video_wait_states_approx_effective(CpuPersona::I486, Some(72)),
+        video_wait_states_approx(CpuPersona::I486)
+    );
+    assert_eq!(
+        video_wait_states_approx_effective(CpuPersona::I386, Some(72)),
+        video_wait_states_approx(CpuPersona::I386)
+    );
+}
+
+#[test]
+fn video_mode13_ws_override_policy_defaults_off() {
+    assert_eq!(video_mode13_ws_override_policy(None), None);
+    assert_eq!(video_mode13_ws_override_policy(Some("")), None);
+    assert_eq!(video_mode13_ws_override_policy(Some("nope")), None);
+    assert_eq!(video_mode13_ws_override_policy(Some("72")), Some(72));
+}
+
 #[test]
 #[ignore]
 fn ram_lookup_profile() {

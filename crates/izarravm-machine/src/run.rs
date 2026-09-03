@@ -1444,6 +1444,7 @@ impl Machine {
             // is: a `Copy` policy bool, resolved once per machine.
             let ata_poll_skip_enabled = self.ata_poll_skip_enabled;
             let ata_poll_skip_slice_too_short = self.ata_poll_skip_slice_too_short;
+            let video_mode13_ws_override = self.video_mode13_ws_override;
             // Read before the destructure for the same reason, and because both sources are
             // moved into the bus below as mutable borrows. See `MachineBus::a20_open` and
             // `MachineBus::device_free_extended_floor` for what keeps them live.
@@ -1579,6 +1580,7 @@ impl Machine {
                     io_touched,
                     exempt_io_touched,
                     ata_poll_skip_enabled,
+                    video_mode13_ws_override,
                     ata_poll_skip_armed,
                     ata_poll_skip_slice_too_short,
                     ata_poll_skip,

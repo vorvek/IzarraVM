@@ -426,6 +426,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         io_touched: &mut machine.io_touched,
         exempt_io_touched: &mut machine.exempt_io_touched,
         ata_poll_skip_enabled: machine.ata_poll_skip_enabled,
+        video_mode13_ws_override: machine.video_mode13_ws_override,
         ata_poll_skip_armed: &mut machine.ata_poll_skip_armed,
         ata_poll_skip_slice_too_short: machine.ata_poll_skip_slice_too_short,
         ata_poll_skip: &mut machine.ata_poll_skip,

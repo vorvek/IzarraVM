@@ -109,8 +109,12 @@ fn cpu_registers_field_offset_is_stable() {
     // The CR3 code-cache gate grows `DecodeCache` (which sits ahead of `registers`) with the
     // two-slot ring and the `translation_pages` bitmap, moving this pin from 520 to 576 --
     // measured, not derived.
+    // The 2026-09-05 issue-charge prototype adds two knob-gated fields ahead of `registers`
+    // (`issue_raw: u32`, `x87_intconvert32_num: Option<u32>`), moving this pin from 576 to 584
+    // -- measured, not derived. Both are host-side timing knobs (0/None with the knob unset),
+    // not architectural state.
     assert_eq!(
-        off, 576,
+        off, 584,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -1996,7 +2000,11 @@ fn pending_flags_offset() {
     // TLB's own growth (`Tlb::generations`/`live`/`next_generation`) does not move this pin at
     // all, because `Tlb` sits ahead of `pending_flags` as part of the SAME by-value block that
     // was already counted, and none of its three new fields change `CpuGsw`'s own field order.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
+    // The 2026-09-05 issue-charge prototype adds two knob-gated fields ahead of `pending_flags`
+    // (`issue_raw: u32`, `x87_intconvert32_num: Option<u32>`), moving this pin 4784 -> 4792 --
+    // measured, not derived. Host-side timing knobs (0/None with the knob unset), not
+    // architectural state.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and
@@ -4566,3 +4574,6 @@ fn range_hits_code_masked_test_matches_the_per_byte_definition_at_both_edges() {
 
 #[path = "cpu_cr0_flush_test.rs"]
 mod cr0_flush;
+
+#[path = "cpu_issue_charge_test.rs"]
+mod issue_charge;

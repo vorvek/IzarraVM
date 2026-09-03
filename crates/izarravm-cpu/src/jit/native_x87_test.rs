@@ -1118,15 +1118,17 @@ fn weighted_timing_batches_exactly() {
     for persona in [CpuPersona::I486, CpuPersona::I586] {
         let weighted = sequence
             .iter()
-            .map(|op| op.metadata().weighted_fp_clocks(persona))
+            .map(|op| op.metadata().weighted_fp_clocks(persona, None))
             .sum::<u64>();
         let aggregate = scale_weighted_fp_clocks(weighted, 3);
 
         let mut individual_clocks = 0;
         let mut remainder = 3;
         for op in sequence {
-            let step =
-                scale_weighted_fp_clocks(op.metadata().weighted_fp_clocks(persona), remainder);
+            let step = scale_weighted_fp_clocks(
+                op.metadata().weighted_fp_clocks(persona, None),
+                remainder,
+            );
             individual_clocks += step.clocks;
             remainder = step.remainder;
         }
@@ -1281,7 +1283,7 @@ fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
         .iter()
         .map(|insn| {
             insn.metadata()
-                .weighted_fp_clocks(CpuPersona::I586)
+                .weighted_fp_clocks(CpuPersona::I586, None)
                 .div_ceil(u64::from(FP_TIMING_DEN))
         })
         .max()
