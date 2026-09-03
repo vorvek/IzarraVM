@@ -537,6 +537,10 @@ impl Vega {
         self.vga.mode_census()
     }
 
+    pub(crate) fn vga_text_rows_rendered(&self) -> u64 {
+        self.vga.text_rows_rendered()
+    }
+
     pub(crate) fn distira_census(&self) -> &DistiraCensus {
         self.distira.census()
     }
@@ -903,7 +907,13 @@ impl Vega {
         self.margo.advance_busy(margo_nanoseconds);
         self.margo.advance_frames(margo_frames);
         self.distira.advance_frame_phase(distira_lines);
-        self.vga.advance(vga_dots);
+        // A real SST-1's pass-through cable switches the monitor to the
+        // Voodoo, not the VGA -- the VGA's dot clock keeps running (beam
+        // timing, retrace bits, the CRTC status the guest polls all stay
+        // exact) but nothing of its raster is ever shown, so painting it is
+        // dead work. `display_enabled` is exactly that cable fact.
+        self.vga
+            .advance_cable_aware(vga_dots, self.distira.display_enabled());
     }
 
     pub(crate) fn screen_text(&self) -> TextFrame {

@@ -140,7 +140,17 @@ impl Vga {
 
     /// Render scanlines from last_line up to (not including) the current beam
     /// line, using current register state. Returns how many lines were drawn.
+    ///
+    /// While the Voodoo owns the cable (`skip_render`) this raster is not
+    /// being shown, so there is nothing to catch up: the beam geometry these
+    /// lines would have been drawn from is exactly the geometry a status-port
+    /// read or register write already sees (`status1_bits` et al. read the
+    /// beam position directly, never `work`), so skipping costs nothing
+    /// guest-visible.
     pub fn catch_up(&mut self) -> u32 {
+        if self.skip_render {
+            return 0;
+        }
         let current = beam_line(&self.crtc, self.beam);
         let mut drawn = 0;
         while self.last_line < current {
@@ -1068,7 +1078,10 @@ impl Vga {
             } else if counter_line < self.crtc.vdisp_end {
                 match self.mode {
                     VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
-                    VideoMode::Text => self.render_text_row(counter_line),
+                    VideoMode::Text => {
+                        self.text_rows_rendered = self.text_rows_rendered.saturating_add(1);
+                        self.render_text_row(counter_line)
+                    }
                     VideoMode::Cga => self.render_cga_row(counter_line),
                     VideoMode::Hercules => self.render_hgc_row(counter_line),
                     _ => self.render_active_row(counter_line),
@@ -1102,14 +1115,26 @@ impl Vga {
     fn finalize_frame(&mut self) {
         // Render the lines the beam has not yet crossed, with the current register
         // state, so a mid-frame change shows below the seam.
-        while self.last_line < self.crtc.vtotal {
-            self.render_scanline(self.last_line);
-            self.last_line += 1;
+        //
+        // Unless the Voodoo owns the cable: then this raster is dead work --
+        // `presented_frame_argb` bypasses the VGA raster entirely whenever
+        // `active_display() != VgaRaster`, so nobody will ever read `work` or
+        // `presented` while `skip_render` holds. `last_line` still resets to 0
+        // at the bottom of every call, skipped or not, so the very next
+        // non-skipped frame renders every line from scratch (the `while` loop
+        // below always starts at 0 the first time skip_render goes false) and
+        // republishes a fully current raster -- the switch-back frame is
+        // exactly what a non-skipping VGA would have produced.
+        if !self.skip_render {
+            while self.last_line < self.crtc.vtotal {
+                self.render_scanline(self.last_line);
+                self.last_line += 1;
+            }
         }
         // Every mode (planar, mode X, mode 13h, and text) sizes `work` at its
         // mode-set, so a frame built from it has the matching pixel count. The
         // empty-work guard only suppresses publication before any mode is set.
-        let mut presented = if self.work.is_empty() {
+        let mut presented = if self.skip_render || self.work.is_empty() {
             None
         } else {
             Some(VgaRaster {
@@ -1159,6 +1184,19 @@ impl Vga {
     /// Advance the beam by whole dots, rolling over each completed frame
     /// arithmetically (O(1)).
     pub fn advance(&mut self, dots: u64) {
+        self.advance_cable_aware(dots, false);
+    }
+
+    /// [`Self::advance`] plus the cable-ownership fact: `skip_render` true
+    /// means a Voodoo-style device owns the monitor cable this tick, so the
+    /// VGA's own raster is not being shown. The beam timing (retrace bits,
+    /// the frame counter blink derives from, the CRTC status the guest
+    /// polls) is pure beam-position geometry and is completely unaffected --
+    /// only the per-pixel render work in `finalize_frame`/`catch_up` is
+    /// elided. See `finalize_frame` for why the switch-back frame is still
+    /// exactly right.
+    pub fn advance_cable_aware(&mut self, dots: u64, skip_render: bool) {
+        self.skip_render = skip_render;
         let frame = self.frame_dots();
         if frame == 0 {
             return; // guard: un-programmed CRTC

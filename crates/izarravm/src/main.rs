@@ -2178,6 +2178,7 @@ fn write_hdd_profile_json(
         "direct_slow_exits_per_100_instructions": 100.0 * perf.jit_direct_side_exits as f64 / instructions as f64,
         "active_display": format!("{:?}", machine.active_display()),
         "legacy_video_mode": format!("{:?}", machine.active_video_mode()),
+        "vga_text_rows_rendered": machine.vga_text_rows_rendered(),
         "margo_display": margo_display.map(|display| json!({
             "mode": format!("0x{:04x}", display.mode),
             "width": display.width,
