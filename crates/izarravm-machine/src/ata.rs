@@ -60,6 +60,48 @@ const COMMAND_LATENCY_TICKS: u64 = 0;
 const PIO_BYTES_PER_SECOND: u64 = 16_700_000;
 const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 
+// ---------------------------------------------------------------------------
+// Slice 9C (`dev_docs/2026-09-05-device-timing-slice9-design.md` §3.2, §6, §5
+// risk 2): the ATA seek / rotational / drive-buffer / sustained-media model.
+// Every constant below is dark unless `DeviceTimingProfile::ata` is armed --
+// `charge_pio_transfer` below is the ONLY consumer, and it takes today's
+// exact `COMMAND_LATENCY_TICKS` / `pio_sector_ticks()` formula whenever the
+// family is unarmed, byte-identical to the pre-9C model.
+// ---------------------------------------------------------------------------
+
+/// The period fixed per-command overhead floor, replacing `COMMAND_LATENCY_TICKS`
+/// (0) under the `ata` family: 50 us, 86Box `hdd.c:33`'s `HDD_OVERHEAD_TIME`.
+const COMMAND_LATENCY_TICKS_PERIOD: u64 = MASTER_CLOCK_HZ / 20_000;
+
+/// Track-to-track seek, the FLOOR of `seek_ticks` for any nonzero distance:
+/// 2 ms, 1996 IDE, UNVERIFIED (design §3.2).
+const SEEK_TRACK_TO_TRACK_TICKS: u64 = MASTER_CLOCK_HZ / 500;
+
+/// Full-stroke seek, the CEILING `seek_ticks` scales to linearly by distance:
+/// 22 ms, the same shape `ide.rs:934`'s `media_delay` uses for the ATAPI
+/// channel (`distance / total * MAX_SEEK_TICKS`). UNVERIFIED (design §3.2).
+const SEEK_FULL_STROKE_TICKS: u64 = (MASTER_CLOCK_HZ / 1_000) * 22;
+
+/// Average rotational latency charged on every non-sequential access: 5.55 ms,
+/// a 5400 rpm half-revolution (arithmetic, design §3.2).
+const ROTATIONAL_LATENCY_TICKS: u64 = (MASTER_CLOCK_HZ / 100_000) * 555;
+
+/// The drive's sequential read-ahead buffer: 256 KiB, period drive spec
+/// sheets, UNVERIFIED (design §3.2). Bytes within it, on a SEQUENTIAL
+/// continuation of the previous transfer, cost the cable-burst rate
+/// (`PIO_BYTES_PER_SECOND`) rather than the sustained media rate -- this is
+/// what design §5 risk 2 means by "take the guest-visible charge from the
+/// modelled drive buffer": a real drive's read-ahead already has the next
+/// sequential sector staged by the time the host asks for it. Bytes beyond
+/// it, or any part of a non-sequential (random-LBA) transfer, cost
+/// `MEDIA_BYTES_PER_SECOND` instead -- the platter has to feed them live.
+const DRIVE_BUFFER_BYTES: u64 = 256 * 1024;
+
+/// Sustained off-the-platter rate: 5 MB/s (census: PIO-4/16.7 MB/s is "~3x
+/// over as sustained", design §3.2). `PIO_BYTES_PER_SECOND` keeps its old
+/// role as the cable-burst rate, used only for buffer hits.
+const MEDIA_BYTES_PER_SECOND: u64 = 5_000_000;
+
 /// Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6): the
 /// primary-channel analogue of `ide::ATA_POLL_RUN`, reusing the same value --
 /// this is a PORT, not an independent tuning. See `ide.rs`'s doc comment for
@@ -278,6 +320,22 @@ pub struct AtaDisk {
     /// rather than from the environment per access.
     poll_run_threshold: u32,
     poll_floor_ticks: u64,
+
+    // ------------------------------------------------------------------
+    // Slice 9C: the drive-buffer / seek model's host bookkeeping. HOST
+    // STATE, never canonical -- see `charge_pio_transfer`. Dark (never
+    // updated, never consulted) unless `DeviceTimingProfile::ata` is armed.
+    // ------------------------------------------------------------------
+    /// Current head position, in LBA. Moves to `lba + sectors` at the end of
+    /// every charged transfer, the same distance-linear seek shape
+    /// `ide.rs`'s `head_lba` uses for the ATAPI channel.
+    head_lba: u32,
+    /// The LBA immediately after the last charged transfer (updated after
+    /// EVERY one, sequential or not). A request whose start LBA equals this
+    /// is a SEQUENTIAL CONTINUATION: the drive's read-ahead already has it
+    /// staged. `None` before the first charged transfer, so the very first
+    /// access is never free.
+    last_transfer_end_lba: Option<u32>,
 }
 
 /// Whether new disks get a live sector cache. Read once per disk from
@@ -347,6 +405,8 @@ impl AtaDisk {
             poll_skip_blocked: false,
             poll_run_threshold: ATA_POLL_RUN,
             poll_floor_ticks: ATA_POLL_FLOOR_TICKS,
+            head_lba: 0,
+            last_transfer_end_lba: None,
         }
     }
 
@@ -735,6 +795,96 @@ impl AtaDisk {
     /// Whether the master device is selected (drive bit 4 == 0).
     fn master_selected(&self) -> bool {
         self.drive_head & 0x10 == 0
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 9C: the ATA seek / rotational / drive-buffer / sustained-media
+    // model. See the constants above for citations; this is the ONLY
+    // consumer of them and the ONLY writer of `head_lba` /
+    // `last_transfer_end_lba`.
+    // ------------------------------------------------------------------
+
+    /// Distance-linear seek to `to`, from the drive's current head position:
+    /// the same shape `ide.rs:934`'s `media_delay` uses (`distance / total *
+    /// full-stroke`), floored at `SEEK_TRACK_TO_TRACK_TICKS` for any nonzero
+    /// distance so an adjacent-track seek is never charged less than a real
+    /// track step.
+    fn seek_ticks(&self, to: u32) -> u64 {
+        let total = self.total_sectors().max(1);
+        let distance = self.head_lba.abs_diff(to).min(total);
+        if distance == 0 {
+            return 0;
+        }
+        let linear = (u128::from(distance) * u128::from(SEEK_FULL_STROKE_TICKS)
+            / u128::from(total)) as u64;
+        linear.max(SEEK_TRACK_TO_TRACK_TICKS)
+    }
+
+    /// The guest-visible PIO transfer charge for `sectors` sectors starting
+    /// at `lba`, less the `hits` the host-side sector cache already served
+    /// (identical role to `pio_transfer_ticks_cached`'s `hits`: a cache hit
+    /// charges NOTHING, because on real hardware SMARTDRV's hook returned
+    /// before the drive ever saw the request).
+    ///
+    /// With `DeviceTimingProfile::ata` UNARMED this is BYTE-IDENTICAL to
+    /// `pio_transfer_ticks_cached`'s pre-9C formula, and touches neither
+    /// `head_lba` nor `last_transfer_end_lba` -- the whole seek/buffer model
+    /// stays dark, matching every other slice-9 family.
+    ///
+    /// Armed, the charge separates the HOST sector cache (still zero-cost,
+    /// per `hits` above -- design §5 risk 1: the host cache is a host-time
+    /// avoider, real machines never had one) from the modelled DRIVE buffer
+    /// (`DRIVE_BUFFER_BYTES`, a guest-time thing, §5 risk 2): a request whose
+    /// start LBA continues immediately where the last charged transfer left
+    /// off is a SEQUENTIAL CONTINUATION and costs only `COMMAND_LATENCY_
+    /// TICKS_PERIOD` plus a cable-burst transfer (up to the buffer's own
+    /// size, beyond which the drive falls back to the sustained rate); any
+    /// other request is COLD -- it pays seek plus rotational latency, and
+    /// every byte comes off the platter at the sustained media rate, because
+    /// nothing was staged for it.
+    pub(crate) fn charge_pio_transfer(
+        &mut self,
+        lba: u32,
+        sectors: u32,
+        hits: u32,
+        profile: crate::device_timing::DeviceTimingProfile,
+    ) -> u64 {
+        if sectors == 0 {
+            return 0;
+        }
+        let charged = u64::from(sectors.saturating_sub(hits.min(sectors)));
+        if !profile.ata {
+            return COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(charged));
+        }
+        if charged == 0 {
+            // A fully host-cached transfer never touched the modelled drive
+            // either: no command, no seek, no buffer-state move.
+            return 0;
+        }
+        let sequential = self.last_transfer_end_lba == Some(lba);
+        let mut ticks = COMMAND_LATENCY_TICKS_PERIOD;
+        if !sequential {
+            ticks = ticks
+                .saturating_add(self.seek_ticks(lba))
+                .saturating_add(ROTATIONAL_LATENCY_TICKS);
+        }
+        let bytes = charged.saturating_mul(SECTOR as u64);
+        let (cable_bytes, media_bytes) = if sequential {
+            (
+                bytes.min(DRIVE_BUFFER_BYTES),
+                bytes.saturating_sub(DRIVE_BUFFER_BYTES),
+            )
+        } else {
+            (0, bytes)
+        };
+        let cable_ticks = (u128::from(cable_bytes) * u128::from(MASTER_CLOCK_HZ))
+            .div_ceil(u128::from(PIO_BYTES_PER_SECOND)) as u64;
+        let media_ticks = (u128::from(media_bytes) * u128::from(MASTER_CLOCK_HZ))
+            .div_ceil(u128::from(MEDIA_BYTES_PER_SECOND)) as u64;
+        ticks = ticks.saturating_add(cable_ticks).saturating_add(media_ticks);
+        self.head_lba = lba.saturating_add(sectors);
+        self.last_transfer_end_lba = Some(self.head_lba);
+        ticks
     }
 
     /// Whether LBA addressing is selected (drive/head bit 6).

@@ -1873,8 +1873,22 @@ impl Machine {
     /// would not be, because a restored machine restarts with an empty cache;
     /// `sector_cache`'s module docs state that consequence in full and it is
     /// unowned until a restore path exists.
-    fn stall_for_hdd_sectors_cached(&mut self, sectors: u32, hits: u32) {
-        self.stall_for_master_ticks(ata::pio_transfer_ticks_cached(sectors, hits));
+    ///
+    /// Slice 9C: this is the SOLE production caller of `AtaDisk::charge_pio_transfer`,
+    /// so it is also the sole writer of the drive-buffer/seek model's head-position
+    /// state -- a caller must not recompute the charge separately (that would move
+    /// the modelled head twice for one transfer). Callers that also need the ticks
+    /// for a census or a diagnostic (`note_int13_data`, `note_guest_read_batch`,
+    /// `note_guest_write_wait`) take the value THIS returns rather than deriving
+    /// their own.
+    fn stall_for_hdd_sectors_cached(&mut self, lba: u32, sectors: u32, hits: u32) -> u64 {
+        let profile = self.device_timing_profile();
+        let ticks = self
+            .ata
+            .as_mut()
+            .map_or(0, |disk| disk.charge_pio_transfer(lba, sectors, hits, profile));
+        self.stall_for_master_ticks(ticks);
+        ticks
     }
 
     /// Sector-cache hits since mount, or 0 with no disk. A transfer reads this
