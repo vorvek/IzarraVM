@@ -187,6 +187,85 @@ pub struct DistiraTriangleCensus {
     /// Of those drains, how many batch was large enough to reach the
     /// parallel lanes (see `Distira::batch_lanes`).
     pub queue_drains_parallel: u64,
+    /// Slice 0 of the texture-queue lever
+    /// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6):
+    /// which caller forced each of the `queue_drains` above. Named at the
+    /// call site (`DrainCause`, passed to `Distira::drain_raster_queue`), not
+    /// inferred after the fact, so it never drifts from the real trigger.
+    pub queue_drain_causes: DistiraDrainCauses,
+}
+
+/// Per-reason breakdown of [`DistiraTriangleCensus::queue_drains`]. Answers
+/// "a frame with hundreds of triangles takes dozens of drains -- which
+/// caller is doing that?" without a sampling profiler. See
+/// `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6, slice 0:
+/// on `tombraid3d-586`'s Lara's Home walk this is expected to show
+/// `texture_write` dominating, at roughly one drain per accepted texture
+/// aperture write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DistiraDrainCauses {
+    /// `Distira::write_texture_u32`. The profile's headline suspect.
+    pub texture_write: u64,
+    /// `read_lfb_u8/u16/u32`.
+    pub lfb_read: u64,
+    /// `write_lfb_u8/u16/u32`.
+    pub lfb_write: u64,
+    /// A statistics-register read (`register_read_needs_raster`).
+    pub register_read_stats: u64,
+    /// A register write `raster_snapshot_covers_register` does not cover --
+    /// this is where `swapbufferCMD`, `fastfillCMD` and the framebuffer
+    /// layout registers live (see that function's doc comment).
+    pub register_write_uncovered: u64,
+    /// `nopCMD` with the reset-statistics bit set.
+    pub nop_cmd_reset_stats: u64,
+    /// `Distira::swap_buffers` / `scanout_argb` / `scanout_state`: the
+    /// present and diagnostic-snapshot paths.
+    pub swap_or_scanout: u64,
+    /// The queue was already at `RASTER_QUEUE_CAPACITY` and had to be
+    /// drawn before the new triangle could be pushed.
+    pub queue_full: u64,
+    /// A triangle that cannot defer (rotating stipple) or a queue disabled
+    /// by `set_raster_queue_enabled(false)`: the immediate-draw path.
+    pub immediate_triangle: u64,
+    /// Every other caller: the rare setup/config setters
+    /// (`set_dither_enabled`, `set_force_point_sampling`,
+    /// `set_raster_lanes`, `set_frame_size`, `clear_back_rgb`).
+    pub config: u64,
+}
+
+/// Which caller is asking `Distira::drain_raster_queue` to draw the queue.
+/// Purely a census tag -- it changes no behaviour -- so a call site that adds
+/// a new drain point but forgets to name it correctly under-counts silently.
+/// See [`DistiraDrainCauses`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DrainCause {
+    TextureWrite,
+    LfbRead,
+    LfbWrite,
+    RegisterReadStats,
+    RegisterWriteUncovered,
+    NopCmdResetStats,
+    SwapOrScanout,
+    QueueFull,
+    ImmediateTriangle,
+    Config,
+}
+
+impl DistiraDrainCauses {
+    fn record(&mut self, cause: DrainCause) {
+        match cause {
+            DrainCause::TextureWrite => self.texture_write += 1,
+            DrainCause::LfbRead => self.lfb_read += 1,
+            DrainCause::LfbWrite => self.lfb_write += 1,
+            DrainCause::RegisterReadStats => self.register_read_stats += 1,
+            DrainCause::RegisterWriteUncovered => self.register_write_uncovered += 1,
+            DrainCause::NopCmdResetStats => self.nop_cmd_reset_stats += 1,
+            DrainCause::SwapOrScanout => self.swap_or_scanout += 1,
+            DrainCause::QueueFull => self.queue_full += 1,
+            DrainCause::ImmediateTriangle => self.immediate_triangle += 1,
+            DrainCause::Config => self.config += 1,
+        }
+    }
 }
 
 /// Traffic through the three non-register apertures. A guest can look idle in
@@ -986,7 +1065,7 @@ impl Distira {
     }
 
     pub fn scanout_state(&mut self) -> DistiraScanoutState {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::SwapOrScanout);
         DistiraScanoutState {
             width: self.display.width,
             height: self.display.height,
@@ -1028,7 +1107,7 @@ impl Distira {
     }
 
     pub fn set_dither_enabled(&mut self, enabled: bool) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::Config);
         self.dither_enabled = enabled;
     }
 
@@ -1038,7 +1117,7 @@ impl Distira {
     /// old value in their `RasterParams`, so this drains them first, same as
     /// [`Self::set_dither_enabled`].
     pub fn set_force_point_sampling(&mut self, enabled: bool) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::Config);
         self.force_point_sampling = enabled;
     }
 
@@ -1058,7 +1137,7 @@ impl Distira {
     /// triangle at submission, which is the behavior the queue is graded
     /// against.
     pub fn set_raster_queue_enabled(&mut self, enabled: bool) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::Config);
         self.raster_queue_enabled = enabled;
     }
 
@@ -1070,12 +1149,12 @@ impl Distira {
     /// Override the raster thread count (clamped to 1..=4). One lane
     /// disables the worker pool entirely.
     pub fn set_raster_lanes(&mut self, lanes: usize) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::Config);
         self.raster_lanes = lanes.clamp(1, 4);
     }
 
     pub fn set_frame_size(&mut self, width: u32, height: u32) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::Config);
         let width = width.clamp(1, DISTIRA_MAX_WIDTH);
         let height = height.clamp(1, DISTIRA_MAX_HEIGHT);
         // Recorded AFTER the clamp: the census reports the geometry the device
@@ -1100,7 +1179,7 @@ impl Distira {
     }
 
     pub fn clear_back_rgb(&mut self, r: u8, g: u8, b: u8) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::Config);
         let pixel = pack_rgb565(r, g, b);
         let start = self.display.back_base as usize;
         let len = (self.display.pitch as usize).saturating_mul(self.display.height as usize);
@@ -1111,7 +1190,7 @@ impl Distira {
     }
 
     pub fn swap_buffers(&mut self) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::SwapOrScanout);
         self.rotate_buffers();
         self.present_swap(self.display.front_base);
     }
@@ -1268,7 +1347,7 @@ impl Distira {
                 // queue, so a triangle is never dropped. The second push
                 // cannot refuse: the drain above leaves the queue at zero and
                 // the capacity is not zero.
-                self.drain_raster_queue();
+                self.drain_raster_queue(DrainCause::QueueFull);
                 // Not inside the assertion: a release build compiles the
                 // assertion's expression away, and the push has to happen.
                 let queued = self.raster_queue.push(triangle);
@@ -1280,10 +1359,10 @@ impl Distira {
         // The immediate path. Draining first leaves this triangle alone in
         // the batch, so the pixel count belongs to it and to nothing else,
         // and the push cannot refuse for the same reason.
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::ImmediateTriangle);
         let queued = self.raster_queue.push(triangle);
         debug_assert!(queued, "a drained queue accepts");
-        self.drain_raster_queue()
+        self.drain_raster_queue(DrainCause::ImmediateTriangle)
     }
 
     /// Draw every triangle waiting on the queue and return how many pixels
@@ -1294,13 +1373,14 @@ impl Distira {
     /// submission order, so overlapping triangles land in the order the guest
     /// sent them. `distira/raster_queue.rs` has why the framebuffer row is the
     /// one that has to partition and not the triangle's own row.
-    fn drain_raster_queue(&mut self) -> u64 {
+    fn drain_raster_queue(&mut self, cause: DrainCause) -> u64 {
         if self.raster_queue.is_empty() {
             return 0;
         }
         let jobs = self.raster_queue.take();
         let lanes = self.batch_lanes(&jobs);
         self.triangle_census.queue_drains += 1;
+        self.triangle_census.queue_drain_causes.record(cause);
         if lanes > 1 {
             self.triangle_census.queue_drains_parallel += 1;
         }
@@ -1437,7 +1517,7 @@ impl Distira {
     }
 
     pub fn scanout_argb(&mut self) -> Vec<u32> {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::SwapOrScanout);
         let width = self.display.width as usize;
         let height = self.display.height as usize;
         let pitch = self.display.pitch as u64;
@@ -1502,7 +1582,7 @@ impl Distira {
     }
 
     pub fn read_lfb_u8(&mut self, offset: usize) -> u8 {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::LfbRead);
         self.lfb_reads.increment();
         self.lfb_byte_offset(self.lfb_read_base(), offset)
             .and_then(|offset| self.fb.get(offset))
@@ -1510,12 +1590,12 @@ impl Distira {
     }
 
     pub fn read_lfb_u16(&mut self, offset: usize) -> u16 {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::LfbRead);
         u16::from_le_bytes(self.read_lfb_bytes::<2>(offset & !1))
     }
 
     pub fn read_lfb_u32(&mut self, offset: usize) -> u32 {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::LfbRead);
         u32::from_le_bytes(self.read_lfb_bytes::<4>(offset & !1))
     }
 
@@ -1533,7 +1613,7 @@ impl Distira {
     // the LFB a byte at a time would lose every pixel) and is not this PR's
     // to fix.
     pub fn write_lfb_u8(&mut self, offset: usize, value: u8) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::LfbWrite);
         self.aperture_traffic.lfb_writes += 1;
         let base = if self.lfb_mode & LFB_FORMAT_MASK == LFB_FORMAT_DEPTH {
             self.aux_base
@@ -1546,7 +1626,7 @@ impl Distira {
     }
 
     pub fn write_lfb_u16(&mut self, offset: usize, value: u16) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::LfbWrite);
         self.aperture_traffic.lfb_writes += 1;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
@@ -1598,7 +1678,7 @@ impl Distira {
     }
 
     pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::LfbWrite);
         self.aperture_traffic.lfb_writes += 1;
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
@@ -1833,7 +1913,7 @@ impl Distira {
         } else {
             reg
         }) {
-            self.drain_raster_queue();
+            self.drain_raster_queue(DrainCause::RegisterReadStats);
         }
         let byte = offset & 0x3;
         let chip = tmu_chip_mask(offset);
@@ -1885,12 +1965,12 @@ impl Distira {
         // firing.
         if voodoo_reg == SST_NOP_CMD {
             if nop_cmd_needs_drain(byte, value) {
-                self.drain_raster_queue();
+                self.drain_raster_queue(DrainCause::NopCmdResetStats);
             }
         } else if !raster_snapshot_covers_register(register)
             || !raster_snapshot_covers_register(voodoo_reg)
         {
-            self.drain_raster_queue();
+            self.drain_raster_queue(DrainCause::RegisterWriteUncovered);
         }
         let chip = tmu_chip_mask(offset);
         if self.ncc.write_register(chip, register, byte, value) {
@@ -2281,7 +2361,7 @@ impl Distira {
         // Texture memory is NOT part of the snapshot: it is megabytes, and a
         // game uploads it at level load rather than between triangles. So the
         // queue is drawn before an upload lands instead of copied.
-        self.drain_raster_queue();
+        self.drain_raster_queue(DrainCause::TextureWrite);
         self.aperture_traffic.texture_writes += 1;
         let Some((tmu, offset)) = self.texture_write_offset(aperture_offset) else {
             let traffic = &mut self.aperture_traffic;
