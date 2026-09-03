@@ -115,6 +115,7 @@ fn golden_channel(index: u8) -> DmaChannel {
         dreq: index & 4 != 0,
         active: index & 1 != 0,
         transfer_cycles: 0x0102_0304_0506_0708 + u64::from(index),
+        transfer_window: None,
     }
 }
 
@@ -1288,5 +1289,175 @@ fn slave_channel_5_reads_the_buffer_the_driver_programmed() {
         dma.read_word(5, &mut mem),
         Some(0xABCD),
         "channel 5 must fetch from the programmed physical address"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`): current-count interpolation.
+// `dev_docs/2026-09-05-device-timing-slice9-design.md` §3.4, §4 "DMA count-poll
+// test". Every test here programs master channel 1 for a 64 KiB block (count
+// register 0xFFFF -> 65536 bytes, matching the design's SB16 example) and
+// reads the current-count register (port 0x03) through `read_port_timed`.
+// ---------------------------------------------------------------------------
+
+/// Program master channel 1 for a 64 KiB single-mode read transfer and return
+/// the controller with the channel unmasked and ready.
+fn dma_with_64kib_channel1() -> DmaController {
+    let mut dma = DmaController::default();
+    dma.write_port(0x0B, 0x49); // mode ch1: single, read
+    dma.write_port(0x02, 0x00); // address 0
+    dma.write_port(0x02, 0x00);
+    dma.write_port(0x03, 0xFF); // count 0xFFFF -> 65536 bytes
+    dma.write_port(0x03, 0xFF);
+    dma.write_port(0x0A, 0x01); // unmask ch1
+    dma
+}
+
+/// Read the 16-bit current-count register (port 0x03, LSB then MSB) through
+/// `read_port_timed`, resetting the flip-flop first so repeated calls in one
+/// test do not interfere with each other's byte order.
+fn read_count16_timed(
+    dma: &mut DmaController,
+    now_ticks: u64,
+    profile: DeviceTimingProfile,
+) -> u16 {
+    dma.write_port(0x0C, 0); // reset the LSB/MSB flip-flop
+    let lo = dma.read_port_timed(0x03, now_ticks, profile).unwrap();
+    let hi = dma.read_port_timed(0x03, now_ticks, profile).unwrap();
+    u16::from(lo) | (u16::from(hi) << 8)
+}
+
+#[test]
+fn armed_count_slides_monotonically_at_quarter_marks() {
+    let mut dma = dma_with_64kib_channel1();
+    let armed = DeviceTimingProfile {
+        dma: true,
+        ..DeviceTimingProfile::default()
+    };
+    let start_tick = 1_000_000u64;
+    let span = 1_000_000_000u64; // a "wall" long enough that the bus floor never binds
+    let deadline_tick = start_tick + span;
+    dma.arm_transfer_window(1, start_tick, deadline_tick);
+
+    let at_start = read_count16_timed(&mut dma, start_tick, armed);
+    let at_quarter = read_count16_timed(&mut dma, start_tick + span / 4, armed);
+    let at_half = read_count16_timed(&mut dma, start_tick + span / 2, armed);
+    let at_three_quarter = read_count16_timed(&mut dma, start_tick + 3 * span / 4, armed);
+    let at_deadline = read_count16_timed(&mut dma, deadline_tick, armed);
+
+    assert_eq!(at_start, 0xFFFF, "no time has elapsed: full count");
+    assert!(
+        at_start > at_quarter && at_quarter > at_half && at_half > at_three_quarter,
+        "count must decrease strictly at each later instant: {at_start:#06x} {at_quarter:#06x} \
+         {at_half:#06x} {at_three_quarter:#06x}"
+    );
+    // At the deadline the window steps aside and reports the live cur_count,
+    // which no byte has actually moved in this test (arm_transfer_window was
+    // called with no read_byte/read_word grants in between) -- so it is back
+    // at the raw, un-interpolated value. This is deliberate: slice 9B never
+    // changes what the device itself does, only what a PEEK reports while the
+    // window is open.
+    assert_eq!(at_deadline, 0xFFFF);
+
+    // Roughly proportional: at the quarter mark, about a quarter of the block
+    // (16384 bytes) should have been counted down.
+    let expected_quarter = 0xFFFFu32.wrapping_sub(65536 / 4) as u16;
+    let tolerance = 100i32; // interpolation rounding, not an exact byte count
+    assert!(
+        (i32::from(at_quarter) - i32::from(expected_quarter)).abs() <= tolerance,
+        "at_quarter={at_quarter:#06x} expected near {expected_quarter:#06x}"
+    );
+}
+
+#[test]
+fn unarmed_family_reads_todays_raw_jump() {
+    let mut dma = dma_with_64kib_channel1();
+    let unarmed = DeviceTimingProfile::default();
+    let start_tick = 0u64;
+    let deadline_tick = 1_000_000_000u64;
+    dma.arm_transfer_window(1, start_tick, deadline_tick);
+
+    // With the family unarmed, read_port_timed must be byte-identical to
+    // read_port at every instant: the window is written (a device could still
+    // call arm_transfer_window unconditionally) but never consulted.
+    let mid_tick = deadline_tick / 2;
+    let via_timed = read_count16_timed(&mut dma, mid_tick, unarmed);
+    dma.write_port(0x0C, 0);
+    let lo = dma.read_port(0x03).unwrap();
+    let hi = dma.read_port(0x03).unwrap();
+    let via_plain = u16::from(lo) | (u16::from(hi) << 8);
+    assert_eq!(
+        via_timed, via_plain,
+        "unarmed: no interpolation, no drift from read_port"
+    );
+    assert_eq!(
+        via_timed, 0xFFFF,
+        "no byte has actually been granted; the raw value never moved"
+    );
+}
+
+#[test]
+fn no_window_falls_back_to_the_live_raw_count() {
+    // A channel that never had arm_transfer_window called at all (the shape of
+    // every channel today, and every channel this slice hasn't wired a device
+    // into) must read exactly like read_port even when the family IS armed.
+    let mut dma = dma_with_64kib_channel1();
+    let armed = DeviceTimingProfile {
+        dma: true,
+        ..DeviceTimingProfile::default()
+    };
+    let via_timed = read_count16_timed(&mut dma, 123_456_789, armed);
+    dma.write_port(0x0C, 0);
+    let lo = dma.read_port(0x03).unwrap();
+    let hi = dma.read_port(0x03).unwrap();
+    let via_plain = u16::from(lo) | (u16::from(hi) << 8);
+    assert_eq!(via_timed, via_plain);
+}
+
+#[test]
+fn interpolation_never_implies_a_rate_faster_than_the_bus_can_drive() {
+    // An unrealistically fast device deadline (the whole 64 KiB block done in
+    // far less time than the 8237 bus's own 600 ns/byte floor could move it)
+    // must not make the count appear to fall faster than BYTE_CYCLE_TICKS per
+    // byte allows.
+    let mut dma = dma_with_64kib_channel1();
+    let armed = DeviceTimingProfile {
+        dma: true,
+        ..DeviceTimingProfile::default()
+    };
+    let start_tick = 0u64;
+    let elapsed = BYTE_CYCLE_TICKS * 10; // ten byte-times in
+    // A deadline far tighter than the bus could ever achieve for 65536 bytes,
+    // but still after the probed instant: the whole block "done" in about
+    // twenty byte-times, when moving it for real takes 65536.
+    let deadline_tick = BYTE_CYCLE_TICKS * 20;
+    dma.arm_transfer_window(1, start_tick, deadline_tick);
+
+    let observed = read_count16_timed(&mut dma, start_tick + elapsed, armed);
+    // The proportional interpolation alone would report near-zero (the window
+    // "closed" after one tick); the bus-cycle floor must instead cap the fall
+    // to about ten bytes.
+    assert!(
+        observed >= 0xFFFF - 20,
+        "count fell faster than the 8237 bus could physically drive it: {observed:#06x}"
+    );
+}
+
+#[test]
+fn a_fresh_count_program_clears_a_stale_window() {
+    let mut dma = dma_with_64kib_channel1();
+    let armed = DeviceTimingProfile {
+        dma: true,
+        ..DeviceTimingProfile::default()
+    };
+    dma.arm_transfer_window(1, 0, 1_000_000_000);
+    // Re-program the count register for a new, unrelated block. The stale
+    // window from the old block must not leak into a read against the new one.
+    dma.write_port(0x03, 0x0F);
+    dma.write_port(0x03, 0x00); // new count 0x000F
+    let observed = read_count16_timed(&mut dma, 500_000_000, armed);
+    assert_eq!(
+        observed, 0x000F,
+        "a fresh count program must clear the stale window"
     );
 }

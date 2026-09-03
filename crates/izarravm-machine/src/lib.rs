@@ -3912,9 +3912,6 @@ struct MachineBus<'a> {
     // A per-batch copy of `Machine::device_timing`, resolved once at
     // construction from `IZARRAVM_DEVICE_TIMING`. `Copy`, so no lifetime, the
     // same shape as `ata_poll_skip_enabled` above.
-    //
-    // Limit: no consumer yet -- 9B lands the first one, `dma::read_port_timed`.
-    #[allow(dead_code)]
     device_timing: device_timing::DeviceTimingProfile,
     // Slice 9A: the 8259A INTA instrument, mutated on every acknowledge
     // (`MachineBus::acknowledge_interrupt`). PIT edges are recorded outside

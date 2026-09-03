@@ -3428,7 +3428,11 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.pic.read_port(port) {
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.dma.read_port(dma_page_register_port(port)) {
+        if let Some(value) = self.dma.read_port_timed(
+            dma_page_register_port(port),
+            self.guest_tick_now(),
+            self.device_timing,
+        ) {
             return Ok(u32::from(value));
         }
         if port == 0x00e0 {
