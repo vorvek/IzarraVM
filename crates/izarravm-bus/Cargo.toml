@@ -10,5 +10,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# S1d slice 2 of the shadow-cache-differentiation design's shadow-cache probe:
+# the entry-sampling hook on CpuBus (`shadow_probe_should_sample_entry`). NOT in
+# any default feature set -- forwarded from izarravm-machine/izarravm like
+# reflected-call-diagnostic; see izarravm-machine's Cargo.toml.
+shadow-cache-probe = []
+
 [dependencies]
 thiserror.workspace = true

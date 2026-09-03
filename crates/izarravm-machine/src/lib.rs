@@ -53,6 +53,18 @@ pub(crate) use pci::PciConfig;
 mod cache_config;
 mod ram_lookup;
 mod sb16_path;
+#[cfg(feature = "shadow-cache-probe")]
+#[path = "shadow_cache_probe.rs"]
+mod shadow_cache;
+// OFF-FEATURE: plain `mod shadow_cache;` (no `#[path]` override) resolves to
+// `shadow_cache.rs`, byte-for-byte the pre-S1a module -- including its
+// `file!()`-embedded panic/debug_assert! location strings. A `#[path]`
+// override to a differently-named file (tried first, reverted) changes those
+// embedded strings even when the file's CONTENT is identical, which showed up
+// as ~430 KiB of spurious whole-binary diff against a same-directory rebuild
+// of 64b379c9 -- the file's NAME, not just its content, is part of what must
+// stay identical for the plain build's byte-identity claim.
+#[cfg(not(feature = "shadow-cache-probe"))]
 mod shadow_cache;
 mod timeline;
 mod timing;
@@ -92,7 +104,12 @@ pub(crate) use cache_config::{
     cache_level_config, code_fetch_ws, tier_cost,
 };
 
+#[cfg(not(feature = "shadow-cache-probe"))]
 pub use shadow_cache::{ShadowAccessClass, ShadowClassCounts, ShadowL1Diagnostics};
+#[cfg(feature = "shadow-cache-probe")]
+pub use shadow_cache::{
+    ShadowAccessClass, ShadowClassCounts, ShadowL1Diagnostics, ShadowLevelDiagnostics,
+};
 pub(crate) use shadow_cache::{ShadowL1Probe, shadow_class_for};
 
 #[allow(unused_imports)]
@@ -2089,6 +2106,9 @@ impl Machine {
             device_edge_batches: 0,
             device_edge_scans: 0,
             opl_probe: OplProbe::from_env(),
+            #[cfg(feature = "shadow-cache-probe")]
+            shadow_l1: ShadowL1Probe::from_env(active_mode.persona()),
+            #[cfg(not(feature = "shadow-cache-probe"))]
             shadow_l1: ShadowL1Probe::from_env(),
             device_wrote_memory: false,
             pending_device_memory_write_range: None,
@@ -3170,7 +3190,12 @@ impl Machine {
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
         // The shadow L1 probe's array is likewise per-mode state on real silicon
-        // (a persona change is a different part); start it cold too.
+        // (a persona change is a different part); start it cold too. The probe
+        // feature's array is ALSO per-mode geometry (a persona change is a
+        // different part's cache), so it re-selects on top of flushing.
+        #[cfg(feature = "shadow-cache-probe")]
+        self.shadow_l1.set_persona_and_flush(mode.persona());
+        #[cfg(not(feature = "shadow-cache-probe"))]
         self.shadow_l1.flush();
         // The bus scaler's fractional carry is per-mode (the ratio changes); start
         // a new mode with no carried remainder, exactly like the CPU does for its

@@ -2983,6 +2983,14 @@ struct TestBus {
     direct_memory_max_clock_override: Option<u64>,
     project_additional_bus_clocks: bool,
     native_aggregate_accounting_disabled: bool,
+    // S1d slice 2's diversion hook (`CpuBus::shadow_probe_should_sample_entry`), a plain
+    // bool rather than a counter/divisor model: the machine-side `ShadowL1Probe::
+    // should_sample_entry` divisor logic already has its own unit tests
+    // (`shadow_cache_probe_test.rs`); this field only needs to prove `run_direct_block`
+    // reacts correctly to a `true` answer, matching every sibling refusal's TestBus shape
+    // above (a bool flag flipped around one `try_run_direct_block_for_test` call).
+    #[cfg(feature = "shadow-cache-probe")]
+    shadow_probe_sample_next_entry: bool,
     jit_cached_fetch_requests: std::cell::RefCell<Vec<(u32, u32)>>,
     fail_write_address: Option<u32>,
     mode13_dirty_pages: u16,
@@ -3028,6 +3036,8 @@ impl TestBus {
             direct_memory_max_clock_override: None,
             project_additional_bus_clocks: false,
             native_aggregate_accounting_disabled: false,
+            #[cfg(feature = "shadow-cache-probe")]
+            shadow_probe_sample_next_entry: false,
             jit_cached_fetch_requests: std::cell::RefCell::new(Vec::new()),
             fail_write_address: None,
             mode13_dirty_pages: 0,
@@ -3351,6 +3361,11 @@ impl CpuBus for TestBus {
 
     fn native_aggregate_accounting_allowed(&self) -> bool {
         !self.native_aggregate_accounting_disabled
+    }
+
+    #[cfg(feature = "shadow-cache-probe")]
+    fn shadow_probe_should_sample_entry(&mut self) -> bool {
+        self.shadow_probe_sample_next_entry
     }
 
     fn jit_data_cost_clocks(&self, width: BusWidth) -> u64 {

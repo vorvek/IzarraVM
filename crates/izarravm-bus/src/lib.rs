@@ -1239,6 +1239,20 @@ pub trait CpuBus {
         false
     }
 
+    /// S1d slice 2 of the shadow-cache-probe feature (`shadow-cache-probe`): whether
+    /// THIS entry into a compiled block should be diverted to the interpreter instead
+    /// of running native, so the interpreter's existing per-address shadow-probe seam
+    /// sees every data access of the sampled iteration (the JIT's compiled body never
+    /// carries per-access addresses; see `izarravm-machine`'s `shadow_cache` module
+    /// doc). Called once per compiled-block ENTRY attempt, never per instruction. The
+    /// default never diverts, so a bus without this feature (or with the probe
+    /// unarmed) runs every block native, unchanged -- one predictable branch on the
+    /// call site's side, zero cost here.
+    #[cfg(feature = "shadow-cache-probe")]
+    fn shadow_probe_should_sample_entry(&mut self) -> bool {
+        false
+    }
+
     /// Observe and charge repeated warm instruction fetches from one page-local direct block.
     /// `linear_start` is the guest-visible code address, while `physical_start` selects memory
     /// timing. Returning `true` tells the CPU that all observations and charges were applied.

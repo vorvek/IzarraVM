@@ -21,6 +21,14 @@ poll-head-probe = ["jit", "izarravm-cpu/poll-head-probe"]
 # crate is the batch-straddle counter (`on_batch_boundary`, called from
 # `run.rs`'s `event_batch_cap_cached` site). NOT in `default`.
 reflected-call-diagnostic = ["izarravm-cpu/reflected-call-diagnostic"]
+# S1a/b/c/d of dev_docs/2026-09-05-s2-cache-differentiation-design.md: the shadow-
+# cache probe (persona geometry, L2 shadow, JIT fetch coverage, JIT native-entry
+# sampling). NOT in `default`; the plain build must be byte-identical to a plain
+# main build, which is why every S1a/b/c/d addition lives behind this feature
+# rather than behind the pre-existing IZARRAVM_SHADOW_L1_PROBE env check alone --
+# see shadow_cache.rs (the off-feature module, verbatim pre-S1a) vs
+# shadow_cache_probe.rs (the on-feature module) in lib.rs's cfg'd `mod` pair.
+shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-bus/shadow-cache-probe"]
 
 [dependencies]
 thiserror.workspace = true

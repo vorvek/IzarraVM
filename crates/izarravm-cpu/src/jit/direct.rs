@@ -38536,17 +38536,21 @@ pub(crate) mod site {
     pub(crate) const OBSERVER_OR_DIFF_TRACE: usize = 14;
     pub(crate) const INTERRUPT_SHADOW: usize = 15;
     pub(crate) const AGGREGATE_ACCOUNTING: usize = 16;
-    pub(crate) const NATIVE_FETCH_TRACE: usize = 17;
-    pub(crate) const X87_TOP: usize = 18;
-    pub(crate) const CS_LAYOUT: usize = 19;
-    pub(crate) const CPL: usize = 20;
-    pub(crate) const CALLOUT_PRIVILEGED: usize = 21;
-    pub(crate) const DATA_SEGMENT: usize = 22;
-    pub(crate) const ALIGNMENT: usize = 23;
-    pub(crate) const FETCH_LIMIT: usize = 24;
-    pub(crate) const ENTRY_DEFERRED_SHORT: usize = 25;
-    pub(crate) const ZERO_BUDGET: usize = 26;
-    pub(crate) const BLOCK_REGENERATED_NONE: usize = 27;
+    // Only referenced when `shadow-cache-probe` is ALSO compiled in (the call site in
+    // run.rs is gated on it); a direct-entry-attribution-only build never reaches it.
+    #[cfg_attr(not(feature = "shadow-cache-probe"), allow(dead_code))]
+    pub(crate) const SHADOW_PROBE_SAMPLE: usize = 17;
+    pub(crate) const NATIVE_FETCH_TRACE: usize = 18;
+    pub(crate) const X87_TOP: usize = 19;
+    pub(crate) const CS_LAYOUT: usize = 20;
+    pub(crate) const CPL: usize = 21;
+    pub(crate) const CALLOUT_PRIVILEGED: usize = 22;
+    pub(crate) const DATA_SEGMENT: usize = 23;
+    pub(crate) const ALIGNMENT: usize = 24;
+    pub(crate) const FETCH_LIMIT: usize = 25;
+    pub(crate) const ENTRY_DEFERRED_SHORT: usize = 26;
+    pub(crate) const ZERO_BUDGET: usize = 27;
+    pub(crate) const BLOCK_REGENERATED_NONE: usize = 28;
 }
 
 #[cfg(feature = "direct-entry-attribution")]

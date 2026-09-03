@@ -2356,14 +2356,14 @@ fn opl_diagnostics_json(
     })
 }
 
-/// S1 (`dev_docs/2026-09-01-bus-clock-diag.md`) shadow-tag probe counters:
-/// hit/miss per access class against the real 486 L1 geometry (8 KiB, 4-way,
-/// 16-byte lines, 128 sets, pseudo-LRU), charging nothing. `enabled` is false
-/// unless `IZARRAVM_SHADOW_L1_PROBE=1`; every count is 0 when disabled, and
-/// `hit_ratio` reports 0.0 on an empty class rather than dividing by zero.
-/// Coverage is the interpreter / FastMap-direct access stream only -- see the
-/// `shadow_cache` module doc in `izarravm-machine` for what the JIT's bulk
-/// per-block charges leave uncovered.
+/// OFF-FEATURE: byte-identical to pre-S1a main. S1 (`dev_docs/2026-09-01-bus-clock-diag.md`)
+/// shadow-tag probe counters: hit/miss per access class against the real 486 L1 geometry
+/// (8 KiB, 4-way, 16-byte lines, 128 sets, pseudo-LRU), charging nothing. `enabled` is false
+/// unless `IZARRAVM_SHADOW_L1_PROBE=1`; every count is 0 when disabled, and `hit_ratio`
+/// reports 0.0 on an empty class rather than dividing by zero. Coverage is the interpreter /
+/// FastMap-direct access stream only -- see the `shadow_cache` module doc in
+/// `izarravm-machine` for what the JIT's bulk per-block charges leave uncovered.
+#[cfg(not(feature = "shadow-cache-probe"))]
 fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Value {
     fn class_json(counts: izarravm_machine::ShadowClassCounts) -> serde_json::Value {
         json!({
@@ -2378,6 +2378,51 @@ fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Va
         "code_fetch": class_json(diag.code_fetch),
         "data_read": class_json(diag.data_read),
         "data_write": class_json(diag.data_write),
+    })
+}
+
+/// S1a-d (`dev_docs/2026-09-05-s2-cache-differentiation-design.md`) shadow-tag probe
+/// counters: hit/miss per access class against the real per-persona L1 geometry (486: 8 KiB
+/// unified, 4-way, 16-byte lines, 128 sets, pseudo-LRU, write-through; 586: split 16+16 KiB,
+/// 2-way, 32-byte lines, 256 sets, 1-bit LRU, write-back with a 512 KiB / 32-byte / 4-way /
+/// 4096-set L2), charging nothing. `enabled` is false unless `IZARRAVM_SHADOW_L1_PROBE=1`;
+/// every count is 0 when disabled, and `hit_ratio` reports 0.0 on an empty class rather than
+/// dividing by zero. Coverage: the interpreter / FastMap-direct access stream, PLUS (S1b) the
+/// JIT's per-block code-fetch stream once armed, PLUS (S1d slice 2) the DATA accesses of every
+/// Kth JIT block entry diverted to the interpreter (`sample_k`/`total_entries`/
+/// `sampled_entries`/`sampled_fraction`) -- see the `shadow_cache` module doc in
+/// `izarravm-machine` for what remains unprobed (the un-sampled 1-1/K of JIT data accesses).
+#[cfg(feature = "shadow-cache-probe")]
+fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Value {
+    fn class_json(counts: izarravm_machine::ShadowClassCounts) -> serde_json::Value {
+        json!({
+            "hits": counts.hits,
+            "misses": counts.misses,
+            "accesses": counts.accesses(),
+            "hit_ratio": counts.hit_ratio(),
+            "miss_ratio": counts.miss_ratio(),
+        })
+    }
+    fn level_json(level: izarravm_machine::ShadowLevelDiagnostics) -> serde_json::Value {
+        json!({
+            "code_fetch": class_json(level.code_fetch),
+            "data_read": class_json(level.data_read),
+            "data_write": class_json(level.data_write),
+            "write_back_victims": level.write_back_victims,
+        })
+    }
+    json!({
+        "enabled": diag.enabled,
+        "persona": diag.persona.map(|p| format!("{p:?}")),
+        "code_fetch": class_json(diag.code_fetch),
+        "data_read": class_json(diag.data_read),
+        "data_write": class_json(diag.data_write),
+        "write_back_victims": diag.write_back_victims,
+        "l2": level_json(diag.l2),
+        "sample_k": diag.sample_k,
+        "total_entries": diag.total_entries,
+        "sampled_entries": diag.sampled_entries,
+        "sampled_fraction": diag.sampled_fraction(),
     })
 }
 

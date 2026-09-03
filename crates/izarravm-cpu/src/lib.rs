@@ -917,6 +917,11 @@ pub struct PerfCounters {
     pub jit_direct_reject_observer: u64,
     pub jit_direct_reject_interrupt_shadow: u64,
     pub jit_direct_reject_aggregate_accounting: u64,
+    /// S1d slice 2 of the shadow-cache-probe feature: compiled-block entries
+    /// diverted to the interpreter for shadow-probe data sampling. Always 0
+    /// without the feature, and 0 with it compiled in but unarmed.
+    #[cfg(feature = "shadow-cache-probe")]
+    pub jit_direct_reject_shadow_sample: u64,
     /// Machine-level VGA poll spans and complete guest loop iterations elided while
     /// `IZARRAVM_POLL_SKIP` is enabled. They are diagnostics, not retired instructions.
     pub poll_skip_spans: u64,
