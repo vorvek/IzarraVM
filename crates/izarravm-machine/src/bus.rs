@@ -1991,8 +1991,14 @@ impl CpuBus for MachineBus<'_> {
         self.active_mode as u64 + 1
     }
 
+    /// S1b: while the shadow probe is armed, resident blocks must carry the
+    /// `NativeBlockTrace` append preamble even under `flat_data_cost` (the
+    /// Approximate class's normal bulk-aggregate shape), so
+    /// `charge_native_cached_fetches` sees every fetch's own physical address
+    /// and can feed the shadow. Off (the default), this is exactly the
+    /// pre-S1b `self.flat_data_cost` -- byte-identical codegen.
     fn native_fetches_are_uniform(&self) -> bool {
-        self.flat_data_cost
+        self.flat_data_cost && !self.shadow_l1.wants_native_fetch_trace()
     }
 
     fn native_aggregate_accounting_allowed(&self) -> bool {
@@ -2012,6 +2018,23 @@ impl CpuBus for MachineBus<'_> {
                 for &len in fetch_lens {
                     self.note_code_fetch_linear(linear);
                     linear = linear.wrapping_add(u32::from(len));
+                }
+            }
+        }
+        // S1b: this is the JIT's own per-instruction fetch trace (`fetch_lens` and
+        // `iterations` fully reconstruct every fetch's physical address), the seam
+        // used only while the shadow probe forces `!native_fetches_are_uniform()`
+        // (see that method's doc). Gated on `wants_native_fetch_trace()` rather
+        // than firing unconditionally: this loop is O(iterations * fetch_lens.len())
+        // and the non-flat Accurate class already reaches this function today for
+        // its own reasons, with the probe disabled -- keep it a true no-op there.
+        if self.shadow_l1.wants_native_fetch_trace() {
+            let physical_run = self.apply_a20(physical_start);
+            for _ in 0..iterations {
+                let mut phys = physical_run;
+                for &len in fetch_lens {
+                    self.shadow_l1.probe(ShadowAccessClass::CodeFetch, phys);
+                    phys = phys.wrapping_add(u32::from(len));
                 }
             }
         }

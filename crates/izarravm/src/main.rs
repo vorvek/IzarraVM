@@ -2356,14 +2356,18 @@ fn opl_diagnostics_json(
     })
 }
 
-/// S1 (`dev_docs/2026-09-01-bus-clock-diag.md`) shadow-tag probe counters:
-/// hit/miss per access class against the real 486 L1 geometry (8 KiB, 4-way,
-/// 16-byte lines, 128 sets, pseudo-LRU), charging nothing. `enabled` is false
-/// unless `IZARRAVM_SHADOW_L1_PROBE=1`; every count is 0 when disabled, and
-/// `hit_ratio` reports 0.0 on an empty class rather than dividing by zero.
-/// Coverage is the interpreter / FastMap-direct access stream only -- see the
-/// `shadow_cache` module doc in `izarravm-machine` for what the JIT's bulk
-/// per-block charges leave uncovered.
+/// S1 (`dev_docs/2026-09-05-s2-cache-differentiation-design.md`, predecessor
+/// `dev_docs/2026-09-01-bus-clock-diag.md`) shadow-tag probe counters: hit/miss
+/// per access class against the real per-persona L1 geometry (486: 8 KiB
+/// unified, 4-way, 16-byte lines, 128 sets, pseudo-LRU, write-through; 586:
+/// split 16+16 KiB, 2-way, 32-byte lines, 256 sets, 1-bit LRU, write-back with
+/// a 512 KiB / 32-byte / 4-way / 4096-set L2), charging nothing. `enabled` is
+/// false unless `IZARRAVM_SHADOW_L1_PROBE=1`; every count is 0 when disabled,
+/// and `hit_ratio` reports 0.0 on an empty class rather than dividing by zero.
+/// Coverage is the interpreter / FastMap-direct access stream plus (S1b) the
+/// JIT's per-block code-fetch stream once armed -- see the `shadow_cache`
+/// module doc in `izarravm-machine` for what the JIT's bulk per-block DATA
+/// charge still leaves unprobed.
 fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Value {
     fn class_json(counts: izarravm_machine::ShadowClassCounts) -> serde_json::Value {
         json!({
@@ -2371,13 +2375,25 @@ fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Va
             "misses": counts.misses,
             "accesses": counts.accesses(),
             "hit_ratio": counts.hit_ratio(),
+            "miss_ratio": counts.miss_ratio(),
+        })
+    }
+    fn level_json(level: izarravm_machine::ShadowLevelDiagnostics) -> serde_json::Value {
+        json!({
+            "code_fetch": class_json(level.code_fetch),
+            "data_read": class_json(level.data_read),
+            "data_write": class_json(level.data_write),
+            "write_back_victims": level.write_back_victims,
         })
     }
     json!({
         "enabled": diag.enabled,
+        "persona": diag.persona.map(|p| format!("{p:?}")),
         "code_fetch": class_json(diag.code_fetch),
         "data_read": class_json(diag.data_read),
         "data_write": class_json(diag.data_write),
+        "write_back_victims": diag.write_back_victims,
+        "l2": level_json(diag.l2),
     })
 }
 

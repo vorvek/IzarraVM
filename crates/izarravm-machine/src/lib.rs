@@ -92,7 +92,9 @@ pub(crate) use cache_config::{
     cache_level_config, code_fetch_ws, tier_cost,
 };
 
-pub use shadow_cache::{ShadowAccessClass, ShadowClassCounts, ShadowL1Diagnostics};
+pub use shadow_cache::{
+    ShadowAccessClass, ShadowClassCounts, ShadowL1Diagnostics, ShadowLevelDiagnostics,
+};
 pub(crate) use shadow_cache::{ShadowL1Probe, shadow_class_for};
 
 #[allow(unused_imports)]
@@ -2089,7 +2091,7 @@ impl Machine {
             device_edge_batches: 0,
             device_edge_scans: 0,
             opl_probe: OplProbe::from_env(),
-            shadow_l1: ShadowL1Probe::from_env(),
+            shadow_l1: ShadowL1Probe::from_env(active_mode.persona()),
             device_wrote_memory: false,
             pending_device_memory_write_range: None,
             direct_map_changed: false,
@@ -3170,8 +3172,9 @@ impl Machine {
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
         // The shadow L1 probe's array is likewise per-mode state on real silicon
-        // (a persona change is a different part); start it cold too.
-        self.shadow_l1.flush();
+        // (a persona change is a different part, with different geometry); start
+        // it cold too, re-selecting the geometry for the new persona.
+        self.shadow_l1.set_persona_and_flush(mode.persona());
         // The bus scaler's fractional carry is per-mode (the ratio changes); start
         // a new mode with no carried remainder, exactly like the CPU does for its
         // instruction-clock scaler.
