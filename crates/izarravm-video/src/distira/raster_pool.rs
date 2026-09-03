@@ -14,19 +14,58 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// How many raster threads to use on a host with `cores` logical CPUs.
-/// Two by default; four only when six or more cores are available, so
-/// the rasteriser leaves room for the main emulation thread and the
-/// GUI/audio threads.
+/// Two by default; four from six cores, eight from eight cores, so the
+/// rasteriser leaves room for the main emulation thread and the GUI/audio
+/// threads on smaller hosts while a big-enough box gets the 8-lane
+/// default the ladder verdict picked
+/// (`dev_docs/2026-09-05-lane-cap-ladder.md`: -9.36% min-wall on
+/// `tombraid3d-586` at 8 lanes vs 4, noise-floor-neutral on
+/// `descent2-3dfx-586`; 16 regresses that row and stays an opt-in knob
+/// via `IZARRAVM_DISTIRA_LANES=16`).
 pub(super) fn lanes_for_cores(cores: usize) -> usize {
-    if cores >= 6 { 4 } else { 2 }
+    if cores >= 8 {
+        8
+    } else if cores >= 6 {
+        4
+    } else {
+        2
+    }
+}
+
+/// The upper bound both the pool size and `Distira::set_raster_lanes`
+/// clamp to. Not a hardware limit -- `render_band`'s `y % lanes`
+/// partition works for any lane count -- just a sanity ceiling on the
+/// number of OS threads a single Distira instance will ask the process
+/// for.
+pub(super) const MAX_LANES: usize = 32;
+
+/// `IZARRAVM_DISTIRA_LANES`, read and clamped ONCE per process and cached:
+/// the A/B knob for the raised-lane-cap lever
+/// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 5, lever
+/// B). Unset (or unparsable, or zero) keeps today's `lanes_for_cores`
+/// policy. This is the single read site -- both the pool's thread count
+/// and `Distira::new`'s default `raster_lanes` go through it, so the pool
+/// always has at least as many OS threads as any instance's default asks
+/// for.
+fn lane_override() -> Option<usize> {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("IZARRAVM_DISTIRA_LANES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&lanes| lanes >= 1)
+            .map(|lanes| lanes.min(MAX_LANES))
+    })
 }
 
 pub(super) fn host_lanes() -> usize {
-    lanes_for_cores(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    )
+    lane_override().unwrap_or_else(|| {
+        lanes_for_cores(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        )
+    })
 }
 
 /// The dedicated raster pool, sized by [`host_lanes`] and started on
@@ -40,6 +79,15 @@ pub(super) fn raster_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("build the Distira raster pool")
     })
+}
+
+/// The raster pool's REALIZED OS thread count, for diagnostics
+/// (`--mode-census`'s `distira_raster_lanes.pool_size`). Building the
+/// pool is lazy (`raster_pool`'s `OnceLock`), so this forces that build
+/// on first call the same as any other use of the pool would -- it never
+/// reports a size for a pool that has not started yet.
+pub(super) fn pool_size() -> usize {
+    raster_pool().current_num_threads()
 }
 
 /// The frame store, held as relaxed byte atomics so raster lanes can
