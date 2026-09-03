@@ -1496,12 +1496,10 @@ pub struct Machine {
     /// (`dev_docs/2026-09-05-port-io-repricing-design.md`). Reported in the profile JSON as the
     /// EFFECTIVE epoch via `Machine::timing_epoch`.
     timing_epoch: u32,
-    /// F7 (`dev_docs/2026-09-05-port-io-repricing-review.md`): count of times
-    /// `poll_bus_certificate_from` refused a certificate STRUCTURALLY because the epoch was 2
-    /// or higher, independent of `IZARRAVM_ISA_IO_WAIT`/`IZARRAVM_DIRECT_POLL_SKIP`. A `Cell`
-    /// because the certificate path is `&self` (shared with the interpreter's read-only poll
-    /// probe) and this is diagnostic-only: it charges no guest clock and gates no decision.
-    poll_skip_epoch_refusals: std::cell::Cell<u64>,
+    /// P2's certificate ledger (see `PollSkipCertificateCounters`). Replaced P1's single
+    /// `poll_skip_epoch_refusals`, which P2's admission lane makes structurally unreachable --
+    /// a counter that can never move is a gate that cannot fail.
+    poll_skip_certificate: PollSkipCertificateCounters,
     profile: MachineProfile,
     active_mode: GswMode,
     pending_mode: Option<GswMode>,
@@ -2055,6 +2053,27 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
+/// Why the io poll skip's own bus certificate was granted or declined, since machine
+/// construction. Slice P2 of the port-io repricing.
+///
+/// `Cell`s because `poll_bus_certificate_from` is `&self` (it is shared with the interpreter's
+/// read-only poll probe) and every lane here is diagnostic: none charges a guest clock and none
+/// gates a decision. They exist because P2 turns two refusals into an admission, and the only
+/// honest way to report that is a counter that says how often the admission fired.
+#[derive(Debug, Default)]
+pub(crate) struct PollSkipCertificateCounters {
+    /// Certificates GRANTED with the epoch at 2 or higher -- i.e. spans the skip elided while
+    /// projecting the repriced per-iteration charge. Zero under epoch 1 by construction.
+    pub(crate) admitted_epoch2: std::cell::Cell<u64>,
+    /// Refused because the polled port is not `POLL_SKIP_IO_PORT` (F9's explicit admission).
+    /// Unreachable today -- both entry points establish the port first -- and that is the
+    /// point: it is the lane a future second-port shape would light up.
+    pub(crate) refused_unpriced_port: std::cell::Cell<u64>,
+    /// Refused because tracing is armed or the lazy port path is off, which is the screen that
+    /// predates the repricing entirely.
+    pub(crate) refused_inactive: std::cell::Cell<u64>,
+}
+
 /// The JSON/report key for each row of `Machine::port_accesses_by_class`, in that array's order.
 /// Re-exported from the private `bus` module so the reporting crate does not carry its own copy of
 /// the class names, and so a new class cannot be added without this list failing to compile.
@@ -2094,7 +2113,7 @@ impl Machine {
         patch_rom(&mut rom);
         let mut machine = Self {
             timing_epoch: bus::timing_epoch_from_env(),
-            poll_skip_epoch_refusals: std::cell::Cell::new(0),
+            poll_skip_certificate: PollSkipCertificateCounters::default(),
             memory,
             ram_lookup,
             profile,
@@ -3351,10 +3370,17 @@ impl Machine {
         self.port_accesses_by_class
     }
 
-    /// F7: how many times the io poll skip's own certificate refused structurally because the
-    /// epoch was >= 2, since construction. Diagnostic only.
-    pub fn poll_skip_epoch_refusals(&self) -> u64 {
-        self.poll_skip_epoch_refusals.get()
+    /// P2's poll-skip certificate ledger, since construction: `(admitted_epoch2,
+    /// refused_unpriced_port, refused_inactive)`. Diagnostic only -- no emulation decision
+    /// reads it. `admitted_epoch2` is the counter that says the skip is ALIVE under epoch 2,
+    /// which is the whole point of the slice; the two refusal lanes name why a certificate was
+    /// declined, replacing P1's single structural-epoch refusal.
+    pub fn poll_skip_certificate_counters(&self) -> (u64, u64, u64) {
+        (
+            self.poll_skip_certificate.admitted_epoch2.get(),
+            self.poll_skip_certificate.refused_unpriced_port.get(),
+            self.poll_skip_certificate.refused_inactive.get(),
+        )
     }
 
     pub fn cache_tier_lookups(&self) -> u64 {
@@ -3846,9 +3872,9 @@ struct MachineBus<'a> {
     /// byte-identical to before this slice; `2` arms the per-class port-bus charge in
     /// `charge_port_bus` (`dev_docs/2026-09-05-port-io-repricing-design.md`).
     timing_epoch: u32,
-    /// Points at `Machine::poll_skip_epoch_refusals`. `&Cell`, not `&mut u64`: the certificate
-    /// path this counts is `&self` (see F7).
-    poll_skip_epoch_refusals: &'a std::cell::Cell<u64>,
+    /// Points at `Machine::poll_skip_certificate`. `&`, not `&mut`: the certificate path this
+    /// counts is `&self` (see the struct's own doc).
+    poll_skip_certificate: &'a PollSkipCertificateCounters,
     /// The Accurate-class (386) extension of the lazy time-derived port reads:
     /// 3DA/3BA/3C2 (VGA status), 0x61 (PIT channel 1/2 OUT), and 0x200-0x207
     /// (the gameport RC one-shots) answer WITHOUT ending the CPU batch.

@@ -1775,9 +1775,46 @@ impl CpuGsw {
         }
     }
 
+    /// The per-iteration RAW core-clock charge an elided iteration of `poll` must project,
+    /// under the bus's live guest-clock model epoch and this CPU's live I/O privilege column.
+    ///
+    /// P2 of the port-io repricing (`dev_docs/2026-09-05-port-io-repricing-design.md` §2, and
+    /// review F8). Every certified `Io`-family shape bakes exactly ONE `IN` slot into its
+    /// `raw_core_clocks` at epoch 1's flat `IN_PORT_CORE_CLOCKS` -- 17 = 12 + `TEST` 2 +
+    /// taken `Jcc` 3 for the 3-slot shape, and the 21 / 28 shapes the same way. Under epoch 2
+    /// that one term becomes Intel's privilege column, so the elided iteration advances the
+    /// guest clock by exactly what the executed `IN` would have charged, and the skip stays a
+    /// host-side elision rather than a guest-visible speed-up.
+    ///
+    /// **Derived from the LIVE mode, never baked** (F8): the poll skip is unavailable in V86
+    /// (`direct.rs`'s `permission.is_none()` decline and `poll_skip_eligible`'s V86 reject), so
+    /// a certified iteration is real-mode or protected `CPL<=IOPL` and the V86 row -- the one
+    /// the design's own §2 arithmetic used -- is exactly the row this path never takes.
+    ///
+    /// The `Memory` family has no port slot and is returned unchanged in both epochs.
     #[cfg(feature = "jit")]
-    fn poll_skip_core_projection(&self, poll: PollLoop, iterations: u64) -> Option<(u64, u64)> {
-        let raw = poll.raw_core_clocks().checked_mul(iterations)?;
+    pub fn poll_skip_raw_core_clocks<B: izarravm_bus::CpuBus>(
+        &self,
+        poll: PollLoop,
+        bus: &B,
+    ) -> u64 {
+        let raw = poll.raw_core_clocks();
+        let epoch = bus.timing_epoch();
+        if epoch < 2 || poll.family() != crate::PollFamily::Io {
+            return raw;
+        }
+        let mode = self.port_io_priv_mode();
+        raw.saturating_sub(u64::from(crate::port_core_clocks(1, false, mode)))
+            .saturating_add(u64::from(crate::port_core_clocks(epoch, false, mode)))
+    }
+
+    #[cfg(feature = "jit")]
+    fn poll_skip_core_projection(
+        &self,
+        raw_per_iteration: u64,
+        iterations: u64,
+    ) -> Option<(u64, u64)> {
+        let raw = raw_per_iteration.checked_mul(iterations)?;
         let (num, den) = level_timing(self.persona());
         let scaled = raw
             .checked_mul(u64::from(num))?
@@ -1787,8 +1824,8 @@ impl CpuGsw {
 
     /// Exact non-mutating core-clock projection for complete poll-loop iterations.
     #[cfg(feature = "jit")]
-    pub fn project_poll_skip_core(&self, poll: PollLoop, iterations: u64) -> Option<u64> {
-        let (charged, _) = self.poll_skip_core_projection(poll, iterations)?;
+    pub fn project_poll_skip_core(&self, raw_per_iteration: u64, iterations: u64) -> Option<u64> {
+        let (charged, _) = self.poll_skip_core_projection(raw_per_iteration, iterations)?;
         self.elapsed_clocks.checked_add(charged)?;
         Some(charged)
     }
@@ -1822,8 +1859,13 @@ impl CpuGsw {
     /// used by normal execution. Retired-instruction and unit-simulator counts stay
     /// unchanged because these instructions did not execute.
     #[cfg(feature = "jit")]
-    pub fn commit_poll_skip_core(&mut self, poll: PollLoop, iterations: u64) -> Option<u64> {
-        let (charged, remainder) = self.poll_skip_core_projection(poll, iterations)?;
+    pub fn commit_poll_skip_core(
+        &mut self,
+        poll: PollLoop,
+        raw_per_iteration: u64,
+        iterations: u64,
+    ) -> Option<u64> {
+        let (charged, remainder) = self.poll_skip_core_projection(raw_per_iteration, iterations)?;
         self.elapsed_clocks = self.elapsed_clocks.checked_add(charged)?;
         self.timing_rem = remainder;
         self.perf.poll_skip_spans = self.perf.poll_skip_spans.saturating_add(1);

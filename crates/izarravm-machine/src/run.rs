@@ -531,6 +531,11 @@ pub(super) fn try_poll_skip(
         diagnostics.vga_bus_certificate_rejection();
         return None;
     };
+    // P2: the per-iteration RAW core charge, with the shape's baked epoch-1 `IN` term replaced
+    // by the live privilege column under epoch 2 (F8). Read ONCE, before the binary search, so
+    // every projection in this call and the commit that follows price the same iteration --
+    // nothing between here and the commit can change the mode.
+    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll, bus);
     let beam = bus.predicted_beam();
     let status = bus.vega.status1_bits(beam);
     if !poll.fresh_iteration_spins(status) {
@@ -563,7 +568,7 @@ pub(super) fn try_poll_skip(
         let Some(reserved) = iterations.checked_add(1) else {
             return false;
         };
-        let Some(reserved_core) = cpu.project_poll_skip_core(poll, reserved) else {
+        let Some(reserved_core) = cpu.project_poll_skip_core(raw_per_iteration, reserved) else {
             return false;
         };
         let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
@@ -579,7 +584,7 @@ pub(super) fn try_poll_skip(
             return false;
         }
 
-        let Some(skipped_core) = cpu.project_poll_skip_core(poll, iterations) else {
+        let Some(skipped_core) = cpu.project_poll_skip_core(raw_per_iteration, iterations) else {
             return false;
         };
         let Some(skipped_bus) = bus.poll_project_scaled_bus_clocks(certificate, iterations) else {
@@ -612,12 +617,12 @@ pub(super) fn try_poll_skip(
         return None;
     }
 
-    let charged = cpu.project_poll_skip_core(poll, best)?;
+    let charged = cpu.project_poll_skip_core(raw_per_iteration, best)?;
     let charged_u32 = u32::try_from(charged).ok()?;
     bus.poll_project_scaled_bus_clocks(certificate, best)?;
 
     let committed = cpu
-        .commit_poll_skip_core(poll, best)
+        .commit_poll_skip_core(poll, raw_per_iteration, best)
         .expect("projected poll core commit must succeed");
     debug_assert_eq!(committed, charged);
     cpu.poll_skip_backedge_housekeeping();
@@ -657,6 +662,10 @@ fn try_poll_skip_memory(
         diagnostics.memory_translate_or_certificate_rejection();
         return None;
     };
+    // The memory family has no port slot, so this is `poll.raw_core_clocks()` in both epochs
+    // (`poll_skip_raw_core_clocks` returns it unchanged for a non-`Io` family). Taken through
+    // the same function anyway so the two executors cannot drift.
+    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll, bus);
     // R1: read the polled cell through the plain, uncharged backing-store
     // read (never CpuBus::read_memory/read_memory_direct/charge_direct_memory,
     // which all record trace clocks and would break timing identity), then
@@ -689,7 +698,7 @@ fn try_poll_skip_memory(
         let Some(reserved) = iterations.checked_add(1) else {
             return false;
         };
-        let Some(reserved_core) = cpu.project_poll_skip_core(poll, reserved) else {
+        let Some(reserved_core) = cpu.project_poll_skip_core(raw_per_iteration, reserved) else {
             return false;
         };
         let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
@@ -721,12 +730,12 @@ fn try_poll_skip_memory(
         return None;
     }
 
-    let charged = cpu.project_poll_skip_core(poll, best)?;
+    let charged = cpu.project_poll_skip_core(raw_per_iteration, best)?;
     let charged_u32 = u32::try_from(charged).ok()?;
     bus.poll_project_scaled_bus_clocks(certificate, best)?;
 
     let committed = cpu
-        .commit_poll_skip_core(poll, best)
+        .commit_poll_skip_core(poll, raw_per_iteration, best)
         .expect("projected poll core commit must succeed");
     debug_assert_eq!(committed, charged);
     cpu.poll_skip_backedge_housekeeping();
@@ -1453,7 +1462,7 @@ impl Machine {
             let outcome = {
                 let Machine {
                     timing_epoch,
-                    poll_skip_epoch_refusals,
+                    poll_skip_certificate,
                     profile,
                     active_mode,
                     pending_mode,
@@ -1557,7 +1566,7 @@ impl Machine {
                     last_int_vector,
                     active_mode: *active_mode,
                     timing_epoch: *timing_epoch,
-                    poll_skip_epoch_refusals: &*poll_skip_epoch_refusals,
+                    poll_skip_certificate: &*poll_skip_certificate,
                     pending_mode,
                     fast_post: *fast_post,
                     booter_inert: *booter_inert,

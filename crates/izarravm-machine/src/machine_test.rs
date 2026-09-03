@@ -423,7 +423,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
         isa_io_wait: crate::bus::isa_io_wait_armed(),
         timing_epoch: machine.timing_epoch,
-        poll_skip_epoch_refusals: &machine.poll_skip_epoch_refusals,
+        poll_skip_certificate: &machine.poll_skip_certificate,
         lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),
         io_touched: &mut machine.io_touched,
         exempt_io_touched: &mut machine.exempt_io_touched,

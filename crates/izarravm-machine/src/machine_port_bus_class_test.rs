@@ -302,30 +302,85 @@ fn epoch_2_does_not_double_charge_the_opl_status_read() {
     );
 }
 
-/// F7: the io poll skip's certificate must refuse structurally once `timing_epoch >= 2`,
-/// independent of `IZARRAVM_ISA_IO_WAIT`/`IZARRAVM_DIRECT_POLL_SKIP` defaults.
+/// P2 replaces F7's structural epoch refusal (and the older ISA refusal) with an explicit
+/// admission: under epoch 2 the certificate ADMITS 0x3DA and carries the port's own class
+/// charge on its third, unscaled lane. The counter that says so must move.
 #[test]
 #[cfg(feature = "jit")]
-fn epoch_2_refuses_the_poll_skip_certificate_structurally() {
+fn epoch_2_admits_the_poll_skip_certificate_with_the_port_lane() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
     machine.timing_epoch = 2;
     // `test_machine()` arms detailed bus tracing, which is its own certificate refusal
     // (`trace.tracing_mode() != TracingMode::Off`) -- turn it off so this test exercises the
-    // epoch refusal specifically, not that unrelated one.
+    // admission specifically.
     machine.trace.set_tracing_mode(TracingMode::Off);
-    let before = machine.poll_skip_epoch_refusals();
-    let refused = with_bus(&mut machine, |bus| {
-        bus.poll_bus_certificate_from_for_test(0x03da).is_none()
+    let (admitted_before, _, _) = machine.poll_skip_certificate_counters();
+    let lane = with_bus(&mut machine, |bus| {
+        bus.poll_bus_certificate_from_for_test(0x03da)
+            .map(|certificate| certificate.port_bus_clocks_per_iteration())
     });
-    assert!(
-        refused,
-        "epoch 2 must refuse the poll-skip certificate on 0x3DA"
-    );
+    // `PciLegacyVga` 56, minus the generic byte cycle `read_io` records and scales (4 raw
+    // through the I586 bus dial 16/105 = 0), so lane + generic == the class figure exactly.
     assert_eq!(
-        machine.poll_skip_epoch_refusals(),
-        before + 1,
-        "the structural refusal must be counted"
+        lane,
+        Some(56),
+        "epoch 2 must ADMIT 0x3DA and price the iteration at the PciLegacyVga class charge"
+    );
+    let (admitted_after, _, _) = machine.poll_skip_certificate_counters();
+    assert_eq!(
+        admitted_after,
+        admitted_before + 1,
+        "the epoch-2 admission must be counted"
+    );
+}
+
+/// F9: the refusal is REPLACED, not deleted. Any port other than `POLL_SKIP_IO_PORT` is
+/// declined by name and counted -- the lane prices a port, it cannot express a port whose read
+/// is not idempotent (the 8254 read-back latch, the 0x61 refresh toggle).
+#[test]
+#[cfg(feature = "jit")]
+fn a_port_other_than_3da_is_refused_by_name_in_both_epochs() {
+    for epoch in [1, 2] {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        machine.timing_epoch = epoch;
+        machine.trace.set_tracing_mode(TracingMode::Off);
+        let (_, refused_before, _) = machine.poll_skip_certificate_counters();
+        let refused = with_bus(&mut machine, |bus| {
+            bus.poll_bus_certificate_from_for_test(0x0040).is_none()
+        });
+        assert!(
+            refused,
+            "epoch {epoch}: the certificate must refuse a port it is not admitted for"
+        );
+        let (_, refused_after, _) = machine.poll_skip_certificate_counters();
+        assert_eq!(
+            refused_after,
+            refused_before + 1,
+            "epoch {epoch}: the named refusal must be counted"
+        );
+    }
+}
+
+/// Epoch 1 keeps the pre-P2 certificate byte for byte: 0x3DA is admitted, and its third lane is
+/// structurally zero, so nothing about the elided iteration's price moves on a knob-unset build.
+#[test]
+#[cfg(feature = "jit")]
+fn epoch_1_admits_3da_with_a_zero_port_lane() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    machine.timing_epoch = 1;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    let lane = with_bus(&mut machine, |bus| {
+        bus.poll_bus_certificate_from_for_test(0x03da)
+            .map(|certificate| certificate.port_bus_clocks_per_iteration())
+    });
+    assert_eq!(lane, Some(0));
+    let (admitted, _, _) = machine.poll_skip_certificate_counters();
+    assert_eq!(
+        admitted, 0,
+        "the epoch-2 admission counter must stay zero under epoch 1"
     );
 }
 

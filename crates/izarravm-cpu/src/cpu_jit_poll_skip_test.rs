@@ -596,3 +596,77 @@ fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
 //     becomes catchable only if a future shape admits a body that can write the
 //     mask register. Carried forward from the design as a known gap.
 // ---------------------------------------------------------------------------
+
+/// **P2 / F8.** The per-iteration RAW core charge an elided iteration projects must be read from
+/// the LIVE I/O privilege column, never baked. Every certified `Io` shape carries exactly one
+/// `IN` slot at epoch 1's flat `IN_PORT_CORE_CLOCKS` (12) inside its `raw_core_clocks`; under
+/// epoch 2 that one term becomes Intel's column for the mode the CPU is actually in, so an
+/// elided iteration advances the guest clock by exactly what the executed `IN` would have.
+///
+/// The four expected values are written as literals -- Intel's `IN` 7 / 4 / 21 / 19 times the
+/// I586 `level_timing` denominator 12 -- rather than read back from the table under test.
+///
+/// Epoch 1 must return the shape's own 17 in every column, byte-identically: that is the
+/// knob-unset merge bar.
+#[test]
+fn poll_skip_raw_core_clocks_reads_the_live_privilege_column() {
+    let (mut cpu, mut bus) = warm_poll_code(D1_CODE, POLL3_STARTS, true, 0xffff_ffff, 0);
+    let PollScanOutcome::Found(poll) = build_poll_loop_from(&cpu, POLL16_ENTRY, false) else {
+        panic!("the 3-slot shape must certify");
+    };
+    assert_eq!(poll.raw_core_clocks(), 17, "12 + TEST 2 + taken Jcc 3");
+
+    // (set-up closure, expected epoch-2 raw): real, protected CPL<=IOPL, protected CPL>IOPL, V86.
+    type Column = (fn(&mut CpuGsw), u64);
+    let columns: [Column; 4] = [
+        (
+            |cpu| {
+                cpu.control.cr0 &= !CR0_PE;
+                cpu.registers.eflags &= !FLAG_VM;
+                cpu.cpl = 0;
+            },
+            17 - 12 + 84,
+        ),
+        (
+            |cpu| {
+                cpu.control.cr0 |= CR0_PE;
+                cpu.registers.eflags &= !FLAG_VM;
+                cpu.registers.eflags |= 3 << 12;
+                cpu.cpl = 0;
+            },
+            17 - 12 + 48,
+        ),
+        (
+            |cpu| {
+                cpu.control.cr0 |= CR0_PE;
+                cpu.registers.eflags &= !FLAG_VM;
+                cpu.registers.eflags &= !(3 << 12);
+                cpu.cpl = 3;
+            },
+            17 - 12 + 252,
+        ),
+        (
+            |cpu| {
+                cpu.control.cr0 |= CR0_PE;
+                cpu.registers.eflags |= FLAG_VM | (3 << 12);
+                cpu.cpl = 3;
+            },
+            17 - 12 + 228,
+        ),
+    ];
+    for (index, (setup, expected)) in columns.into_iter().enumerate() {
+        setup(&mut cpu);
+        bus.timing_epoch_two = false;
+        assert_eq!(
+            cpu.poll_skip_raw_core_clocks(poll, &bus),
+            17,
+            "column {index}: epoch 1 must return the shape's own baked figure, byte-identically"
+        );
+        bus.timing_epoch_two = true;
+        assert_eq!(
+            cpu.poll_skip_raw_core_clocks(poll, &bus),
+            expected,
+            "column {index}: epoch 2 must swap the baked IN for Intel's own column"
+        );
+    }
+}

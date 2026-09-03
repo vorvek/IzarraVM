@@ -30158,7 +30158,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                                 fetch_count: poll.fetch_count() as u8,
                                 status_mask: poll.status_mask(),
                                 spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
-                                raw_core_clocks: poll.raw_core_clocks(),
+                                raw_core_clocks: cpu.poll_skip_raw_core_clocks(poll, bus),
                                 core_clocks_at_block_entry: cpu.core_clocks_so_far,
                                 prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
                                 core_num,

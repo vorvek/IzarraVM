@@ -9,6 +9,17 @@ use izarravm_cpu::TLB_ENTRIES;
 
 #[cfg(feature = "jit")]
 fn poll_skip_test_machine(enabled: bool, tracing: TracingMode, mode: GswMode, mask: u8) -> Machine {
+    poll_skip_test_machine_at_epoch(enabled, tracing, mode, mask, 1)
+}
+
+#[cfg(feature = "jit")]
+fn poll_skip_test_machine_at_epoch(
+    enabled: bool,
+    tracing: TracingMode,
+    mode: GswMode,
+    mask: u8,
+    epoch: u32,
+) -> Machine {
     let program = [
         0xba, 0xda, 0x03, // mov dx,3DAh
         0xec, 0xa8, mask, 0x75, 0xfb, // wait while the status bit is set
@@ -27,6 +38,7 @@ fn poll_skip_test_machine(enabled: bool, tracing: TracingMode, mode: GswMode, ma
     machine.cpu.set_native_backend_enabled(false);
     machine.poll_skip_enabled = enabled;
     machine.trace.set_tracing_mode(tracing);
+    machine.timing_epoch = epoch;
     machine
 }
 
@@ -80,62 +92,172 @@ fn assert_poll_machine_boundary_eq(skipped: &Machine, baseline: &Machine) {
 #[cfg(feature = "jit")]
 #[test]
 fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
-    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        for mask in [0x01, 0x08] {
-            let mut baseline = poll_skip_test_machine(false, TracingMode::Off, mode, mask);
-            let mut skipped = poll_skip_test_machine(true, TracingMode::Off, mode, mask);
+    // P2 adds the epoch dimension. Under epoch 2 an elided iteration must project the port's
+    // full class charge on the certificate's third lane and the live privilege column's `IN`
+    // count on the core lane, so a span of N elided iterations has to land the guest clock in
+    // exactly the place N naturally executed iterations land it -- which is what
+    // `assert_poll_machine_boundary_eq`'s `elapsed_clocks` / `trace.elapsed_clocks()` /
+    // `timeline` / beam comparisons say. This machine runs in REAL mode, which is one of the
+    // two privilege columns the skip can actually take (F8: V86 is structurally refused, see
+    // `poll_skip_is_refused_in_v86_but_would_price_the_v86_column`), and the epoch-2 leg fails
+    // on any per-iteration term that is wrong by a single clock.
+    for epoch in [1, 2] {
+        for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+            for mask in [0x01, 0x08] {
+                let mut baseline =
+                    poll_skip_test_machine_at_epoch(false, TracingMode::Off, mode, mask, epoch);
+                let mut skipped =
+                    poll_skip_test_machine_at_epoch(true, TracingMode::Off, mode, mask, epoch);
 
-            skipped.poll_skip_enabled = false;
-            baseline.run_cycles(1_000).unwrap();
-            skipped.run_cycles(1_000).unwrap();
-            assert_eq!(skipped.cpu, baseline.cpu);
-            for machine in [&mut baseline, &mut skipped] {
-                machine.cpu.registers.eip = 0x108;
-                machine.cpu.poll_skip_backedge_housekeeping();
-                let poll = machine.cpu.poll_loop().expect("warm direct poll loop");
-                for _ in 0..2 {
-                    machine
-                        .cpu
-                        .commit_poll_skip_core(poll, 1)
-                        .expect("one iteration advances the CPU timing remainder");
-                    if machine.cpu.poll_skip_timing_remainder() != 0 {
-                        break;
+                skipped.poll_skip_enabled = false;
+                baseline.run_cycles(1_000).unwrap();
+                skipped.run_cycles(1_000).unwrap();
+                assert_eq!(skipped.cpu, baseline.cpu);
+                for machine in [&mut baseline, &mut skipped] {
+                    machine.cpu.registers.eip = 0x108;
+                    machine.cpu.poll_skip_backedge_housekeeping();
+                    let poll = machine.cpu.poll_loop().expect("warm direct poll loop");
+                    for _ in 0..2 {
+                        machine
+                            .cpu
+                            .commit_poll_skip_core(poll, poll.raw_core_clocks(), 1)
+                            .expect("one iteration advances the CPU timing remainder");
+                        if machine.cpu.poll_skip_timing_remainder() != 0 {
+                            break;
+                        }
                     }
+                    machine.cpu.reset_perf_counters();
+                    machine.bus_rem = 2;
+                    assert_ne!(machine.cpu.poll_skip_timing_remainder(), 0);
+                    assert_ne!(machine.bus_rem, 0);
                 }
-                machine.cpu.reset_perf_counters();
-                machine.bus_rem = 2;
-                assert_ne!(machine.cpu.poll_skip_timing_remainder(), 0);
-                assert_ne!(machine.bus_rem, 0);
-            }
-            skipped.poll_skip_enabled = true;
+                skipped.poll_skip_enabled = true;
 
-            let baseline_stop = baseline.run_cycles(100_000).unwrap();
-            let skipped_stop = skipped.run_cycles(100_000).unwrap();
-            assert_eq!(
-                skipped_stop, baseline_stop,
-                "mode={mode:?} mask={mask:#04x}"
-            );
-            // poll_loop now borrows &mut, so materialize the diagnostic before the
-            // assert rather than inside its format args (which hold the other &self
-            // borrows). Its only effect is host bookkeeping, invisible to every
-            // field assert_poll_machine_boundary_eq compares.
-            let loop_diag = skipped.cpu.poll_loop();
-            assert!(
-                skipped.cpu.perf_counters().poll_skip_spans > 0,
-                "mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={loop_diag:?}",
-                skipped.cpu.registers.eip,
-                skipped.cpu.linear_eip(),
-                skipped.cpu.registers.edx() as u16,
-                skipped.cpu.poll_skip_eligible(),
-            );
-            assert!(skipped.cpu.perf_counters().poll_skip_iterations > 1);
-            assert!(
-                skipped.cpu.perf_counters().instructions
-                    < baseline.cpu.perf_counters().instructions
-            );
-            assert_poll_machine_boundary_eq(&skipped, &baseline);
+                let baseline_stop = baseline.run_cycles(100_000).unwrap();
+                let skipped_stop = skipped.run_cycles(100_000).unwrap();
+                assert_eq!(
+                    skipped_stop, baseline_stop,
+                    "epoch={epoch} mode={mode:?} mask={mask:#04x}"
+                );
+                // poll_loop now borrows &mut, so materialize the diagnostic before the
+                // assert rather than inside its format args (which hold the other &self
+                // borrows). Its only effect is host bookkeeping, invisible to every
+                // field assert_poll_machine_boundary_eq compares.
+                let loop_diag = skipped.cpu.poll_loop();
+                assert!(
+                    skipped.cpu.perf_counters().poll_skip_spans > 0,
+                    "epoch={epoch} mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={loop_diag:?}",
+                    skipped.cpu.registers.eip,
+                    skipped.cpu.linear_eip(),
+                    skipped.cpu.registers.edx() as u16,
+                    skipped.cpu.poll_skip_eligible(),
+                );
+                assert!(skipped.cpu.perf_counters().poll_skip_iterations > 1);
+                assert!(
+                    skipped.cpu.perf_counters().instructions
+                        < baseline.cpu.perf_counters().instructions
+                );
+                assert_poll_machine_boundary_eq(&skipped, &baseline);
+            }
         }
     }
+}
+
+/// P2's projection equality, stated as arithmetic rather than as a boundary comparison: an
+/// elided run of N iterations must charge EXACTLY N times the per-iteration cost on all three
+/// lanes -- core (through `level_timing`), bus (through `scale_bus`) and port (unscaled) -- and
+/// the per-iteration figures must be the same ones an executed access pays.
+///
+/// The lane values are written here as literals, not read back from the code under test:
+/// `PciLegacyVga` 56 minus the scaled generic byte cycle (4 raw through the I586 bus dial
+/// 16/105, which floors to 0), and Intel's real-mode `IN` 7 x 12 = 84 raw replacing epoch 1's
+/// flat 12 inside the shape's own 17.
+#[cfg(feature = "jit")]
+#[test]
+fn an_elided_span_charges_exactly_n_times_one_iteration_on_every_lane() {
+    const N: u64 = 7;
+    let mut machine =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
+    prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
+    machine.timing_epoch = 2;
+    machine.port_bus_batch_clocks = 0;
+
+    let (raw_per_iteration, port_lane, raw_bus_per_iteration) =
+        with_cpu_and_bus(&mut machine, |cpu, bus| {
+            let poll = cpu.poll_loop().expect("warm poll descriptor");
+            let certificate = bus
+                .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
+                .expect("0x3DA is admitted under epoch 2");
+            (
+                cpu.poll_skip_raw_core_clocks(poll, bus),
+                certificate.port_bus_clocks_per_iteration(),
+                certificate.raw_clocks_per_iteration(),
+            )
+        });
+    assert_eq!(
+        raw_per_iteration,
+        21 - 12 + 84,
+        "the core lane must swap the shape's baked epoch-1 IN (12 raw) for Intel's real-mode          column (7 x 12 = 84 raw), leaving the 5-slot shape's other four slots (21 - 12 = 9          raw) alone -- the rest of the core class table is the recalibration's slice 1, not          this one's"
+    );
+    assert_eq!(
+        port_lane, 56,
+        "the port lane must be the PciLegacyVga class charge minus the scaled generic cycle"
+    );
+
+    let core_before = machine.cpu.elapsed_clocks;
+    let bus_before = machine.trace.elapsed_clocks();
+    let carry_before = machine.cpu.poll_skip_timing_remainder();
+    with_cpu_and_bus(&mut machine, |cpu, bus| {
+        let poll = cpu.poll_loop().expect("warm poll descriptor");
+        let certificate = bus
+            .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
+            .expect("0x3DA is admitted under epoch 2");
+        cpu.commit_poll_skip_core(poll, raw_per_iteration, N)
+            .expect("core commit");
+        bus.poll_commit_bus(certificate, N);
+    });
+
+    // Core: one scaling of (raw x N), carrying the remainder -- never N separate scalings.
+    // `level_timing(I586)` is (1, 12) -- written as a literal here, not read back from the
+    // function under test, so a dial change has to come and edit this line deliberately.
+    let scaled = raw_per_iteration * N + carry_before;
+    assert_eq!(
+        machine.cpu.elapsed_clocks - core_before,
+        scaled / 12,
+        "the core lane must charge one scaling of N x the per-iteration raw"
+    );
+    assert_eq!(
+        machine.trace.elapsed_clocks() - bus_before,
+        raw_bus_per_iteration * N,
+        "the bus lane must charge exactly N raw certificates"
+    );
+    assert_eq!(
+        machine.port_bus_batch_clocks,
+        port_lane * N,
+        "the port lane must accrue exactly N x the class charge, unscaled"
+    );
+}
+
+/// F8's machine half. The poll skip is unavailable in V86 by construction, so the V86 column
+/// (Intel's 19 -- the row the design's own §2 arithmetic used) is exactly the row this path
+/// never takes; the per-iteration figure is nonetheless DERIVED from the live mode rather than
+/// baked, which is what would keep it right if the eligibility rule ever changed. The four
+/// columns themselves are pinned in `izarravm-cpu`'s
+/// `poll_skip_raw_core_clocks_reads_the_live_privilege_column`; this is the eligibility half.
+#[cfg(feature = "jit")]
+#[test]
+fn the_poll_skip_prices_the_real_mode_column_because_v86_can_never_reach_it() {
+    let mut machine =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
+    prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
+    machine.timing_epoch = 2;
+    assert!(!machine.cpu.is_v86_mode(), "the fixture runs in real mode");
+    assert!(machine.cpu.poll_skip_eligible());
+    let poll = machine.cpu.poll_loop().expect("warm poll descriptor");
+    let raw = with_cpu_and_bus(&mut machine, |cpu, bus| {
+        cpu.poll_skip_raw_core_clocks(poll, bus)
+    });
+    assert_eq!(raw, 21 - 12 + 84, "real mode: Intel's IN 7 x 12 = 84 raw");
 }
 
 #[cfg(feature = "jit")]
@@ -202,42 +324,40 @@ fn poll_bus_certificate_rejects_instruction_fetches_from_a_device_window() {
 
 #[cfg(feature = "jit")]
 #[test]
-fn poll_bus_certificate_refuses_a_port_the_isa_wait_charge_covers() {
-    // THE BLOCKER from dev_docs/isa-io-waitstate-research-2026-08-30.md section 5.2. This
-    // certificate is denominated in RAW BUS CLOCKS and is scaled by `scale_bus` on the way
-    // out; the `IZARRAVM_ISA_IO_WAIT` charge is unscaled CPU clocks accrued outside that
-    // scaler, so it cannot be expressed as a term here. A certificate that ignored it would
-    // let the skip machinery fast-forward a span each of whose iterations the guest would
-    // have paid ~1 us for -- under-pricing exactly the loops the charge exists to slow.
-    //
-    // So a charged port must REFUSE. Today 0x3DA is not a charged port (86Box parity), so
-    // the production path is unaffected in both arms; this test drives the certification
-    // entry point with a charged port directly, which is what makes the guard provable
-    // rather than merely present. Remove the guard and the 0x40 case below certifies.
+fn poll_bus_certificate_admits_only_the_one_port_it_prices() {
+    // WAS `poll_bus_certificate_refuses_a_port_the_isa_wait_charge_covers`. P2 retires the ISA
+    // refusal's REASON -- the certificate now carries an unscaled third lane
+    // (`port_bus_clocks_per_iteration`), so a charged port CAN be priced -- but replaces it
+    // with an explicit admission rather than deleting it (review F9). The lane prices a port;
+    // it cannot express a port whose read is not idempotent, and an elided span performs the
+    // port's side effects ONCE rather than per iteration. 0x40 (the 8254 read-back latch) is
+    // exactly such a port, and it must still refuse -- in BOTH epochs and with the ISA knob in
+    // either position, because the admission no longer depends on either.
     let mut machine =
         setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
     prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
-    // The arm has to be set BEFORE `with_cpu_and_bus`: the bus caches the resolved knob at
-    // construction (one bool test per access instead of a lazy-static touch), which is also
-    // the production shape -- the environment is read once per process.
-    for armed in [false, true] {
-        crate::bus::set_isa_io_wait_for_test(Some(armed));
-        with_cpu_and_bus(&mut machine, |cpu, bus| {
-            let poll = cpu.poll_loop().expect("warm poll descriptor");
-            assert_eq!(
-                bus.poll_bus_certificate(poll, 0x0040).is_some(),
-                !armed,
-                "armed={armed}: a charged port must disable poll skip rather than certify a \
-                 per-iteration cost that omits the ISA charge"
-            );
-            assert!(
-                bus.poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
-                    .is_some(),
-                "armed={armed}: 0x3DA is NOT charged (86Box parity), so the production shape \
-                 must still certify in BOTH arms -- the refusal must not be a blanket one"
-            );
-        });
+    for epoch in [1, 2] {
+        machine.timing_epoch = epoch;
+        // The arm has to be set BEFORE `with_cpu_and_bus`: the bus caches the resolved knob at
+        // construction (one bool test per access instead of a lazy-static touch), which is also
+        // the production shape -- the environment is read once per process.
+        for armed in [false, true] {
+            crate::bus::set_isa_io_wait_for_test(Some(armed));
+            with_cpu_and_bus(&mut machine, |cpu, bus| {
+                let poll = cpu.poll_loop().expect("warm poll descriptor");
+                assert!(
+                    bus.poll_bus_certificate(poll, 0x0040).is_none(),
+                    "epoch={epoch} armed={armed}: a port the admission does not name must                      refuse, whatever the ISA knob and whatever the epoch"
+                );
+                assert!(
+                    bus.poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
+                        .is_some(),
+                    "epoch={epoch} armed={armed}: 0x3DA is the admitted port in BOTH epochs --                      under epoch 2 it is priced by the third lane, not refused"
+                );
+            });
+        }
     }
+    machine.timing_epoch = 1;
     crate::bus::set_isa_io_wait_for_test(None);
 }
 
@@ -382,7 +502,7 @@ fn projected_poll_total(machine: &mut Machine, iterations: u64, batch_core: u32)
             .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("RAM poll bus certificate");
         let core = cpu
-            .project_poll_skip_core(poll, iterations)
+            .project_poll_skip_core(cpu.poll_skip_raw_core_clocks(poll, bus), iterations)
             .expect("poll core projection");
         let scaled_bus = bus
             .poll_project_scaled_bus_clocks(certificate, iterations)
@@ -399,7 +519,7 @@ fn projected_poll_dots(machine: &mut Machine, iterations: u64, batch_core: u32) 
             .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("RAM poll bus certificate");
         let core = cpu
-            .project_poll_skip_core(poll, iterations)
+            .project_poll_skip_core(cpu.poll_skip_raw_core_clocks(poll, bus), iterations)
             .expect("poll core projection");
         let scaled_bus = bus
             .poll_project_scaled_bus_clocks(certificate, iterations)
@@ -577,7 +697,7 @@ fn poll_skip_reserves_k_plus_one_at_the_exact_cap_with_fractional_carries() {
         machine.bus_rem = 2;
         with_cpu_and_bus(&mut machine, |cpu, _| {
             let poll = cpu.poll_loop().expect("warm direct setup poll");
-            cpu.commit_poll_skip_core(poll, 1)
+            cpu.commit_poll_skip_core(poll, poll.raw_core_clocks(), 1)
                 .expect("seed nonzero CPU timing carry");
             assert_ne!(cpu.poll_skip_timing_remainder(), 0);
             cpu.reset_perf_counters();
