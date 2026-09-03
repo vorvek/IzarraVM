@@ -30759,6 +30759,8 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
     // guest that runs both `0xE4` and `0xE6` call-outs it cannot say whether THIS arm served
     // anything -- which is the acceptance question this row's shipped ON default is graded on.
     cpu.jit_direct.note_callout_port_out_imm8_served();
+    #[cfg(feature = "reflected-call-memo")]
+    crate::reflected_call_memo::note_port_io(cpu);
 
     // THE UNCONDITIONAL STEP BREAK. `bus.requires_step_break()` is deliberately not consulted:
     // see this function's doc for why its answer is false on exactly the guest class that carries
@@ -30981,6 +30983,8 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
     // reasoning one opcode over: `callout_executed` sums every helper class, so on a guest that
     // runs both the DX and imm8 OUT call-outs it cannot say whether THIS arm served anything.
     cpu.jit_direct.note_callout_port_out_dx_served();
+    #[cfg(feature = "reflected-call-memo")]
+    crate::reflected_call_memo::note_port_io(cpu);
 
     // THE UNCONDITIONAL STEP BREAK, verbatim from `port_write_al_imm8`: `bus.requires_step_break()`
     // is deliberately not consulted, for the same reason stated on that function's doc.
