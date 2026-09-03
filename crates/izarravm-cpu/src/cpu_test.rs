@@ -2002,6 +2002,11 @@ fn pending_flags_offset() {
     // reference is the 8 bytes). Neither is architectural state: both are resolved ONCE at
     // machine construction from `IZARRAVM_TIMING_EPOCH` and never observed by a guest
     // instruction, so both canonical payloads are unchanged by them.
+    // The `timing-class-histogram` feature adds one boxed field ahead of this
+    // pin, so the offset moves on that build alone. The pin is a PLAIN-build
+    // invariant -- emitted code bakes these offsets and the instrument arm is
+    // never the one that ships -- so it is checked where it means something.
+    #[cfg(not(feature = "timing-class-histogram"))]
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
 }
 

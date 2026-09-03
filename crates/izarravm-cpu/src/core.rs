@@ -1366,11 +1366,29 @@ impl CpuGsw {
     /// reads one already-resolved `&'static` table and indexes it: no persona
     /// match, no epoch branch, no environment read on the hot path.
     #[inline]
-    pub(crate) fn charge(&self, class: crate::timing_class::TimingClass) -> CycleOutcome {
+    pub(crate) fn charge(&mut self, class: crate::timing_class::TimingClass) -> CycleOutcome {
+        #[cfg(feature = "timing-class-histogram")]
+        self.class_histogram.record(class);
         CycleOutcome {
             core_clocks: self.class_table.raw(class),
             halted: false,
         }
+    }
+
+    /// The per-class retire histogram, for the profile JSON.
+    #[cfg(feature = "timing-class-histogram")]
+    pub fn class_histogram_rows(&self) -> Vec<(&'static str, u64)> {
+        self.class_histogram.rows()
+    }
+
+    /// `(class clocks, attributed retires, unattributed retires)`.
+    #[cfg(feature = "timing-class-histogram")]
+    pub fn class_histogram_totals(&self) -> (u64, u64, u64) {
+        (
+            self.class_histogram.class_clocks(self.class_table),
+            self.class_histogram.attributed(),
+            self.class_histogram.unattributed(),
+        )
     }
 
     /// The active GSW compatibility mode.

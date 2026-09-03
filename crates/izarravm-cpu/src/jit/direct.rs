@@ -989,6 +989,17 @@ pub(crate) struct BlockCache {
     /// was 116 of that struct's 240 bytes while every hot-path read goes through a `&self`
     /// method that never needed the copy. Entry reads it exactly once.
     segment_layouts: Vec<SegmentLayout>,
+    /// One block's SLOT CLASSES, in slot order, parallel to `segment_layouts`.
+    ///
+    /// Design section 9.1's sparse list: a block's class vector is known at
+    /// compile time, so a block execution adds it once instead of the emitted
+    /// code counting per instruction. It lives here rather than on
+    /// `CompiledBlock` for the reason `segment_layouts` does -- that struct is
+    /// copied several times per entry and is size-pinned -- and it exists only
+    /// under the `timing-class-histogram` feature, so a plain build carries
+    /// neither the vector nor the `Vec` that holds it.
+    #[cfg(feature = "timing-class-histogram")]
+    class_vectors: Vec<Box<[u8]>>,
     /// Parallel to `blocks`, same `BlockId::index()`: this block's CHAIN segment requirement --
     /// its own `SegmentLayout` merged with the requirement of every block reachable from it
     /// through currently live links. Only `used` ever differs from `segment_layouts[i]`, because
@@ -1451,6 +1462,8 @@ impl BlockCache {
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
             segment_layouts: Vec::new(),
+            #[cfg(feature = "timing-class-histogram")]
+            class_vectors: Vec::new(),
             chain_layouts: Vec::new(),
             written_segments: Vec::new(),
             #[cfg(feature = "seg-head-diagnostic")]
@@ -1757,6 +1770,8 @@ impl BlockCache {
         if index == self.blocks.len() {
             self.blocks.push(block);
             self.segment_layouts.push(compilation.segment_layout);
+            #[cfg(feature = "timing-class-histogram")]
+            self.class_vectors.push(compilation.class_vector.clone());
             self.chain_layouts.push(compilation.segment_layout);
             self.written_segments.push(compilation.written_segments);
             #[cfg(feature = "seg-head-diagnostic")]
@@ -1791,6 +1806,10 @@ impl BlockCache {
             debug_assert!(self.block_decode_slots[index].is_empty());
             self.blocks[index] = block;
             self.segment_layouts[index] = compilation.segment_layout;
+            #[cfg(feature = "timing-class-histogram")]
+            {
+                self.class_vectors[index] = compilation.class_vector.clone();
+            }
             // A recycled slot must never inherit the retired occupant's WIDENED chain
             // requirement: the new block reaches a different successor set entirely.
             self.chain_layouts[index] = compilation.segment_layout;
@@ -3625,6 +3644,12 @@ impl BlockCache {
     /// re-resolve in `run_direct_block`, which fails for both a retired and a reused id.
     /// `None` means the whole cache was reset out from under the copy, which that re-resolve
     /// would have refused a few lines later anyway.
+    /// The block's slot classes, for the class histogram. See `class_vectors`.
+    #[cfg(feature = "timing-class-histogram")]
+    pub(crate) fn class_vector(&self, id: BlockId) -> Option<&[u8]> {
+        self.class_vectors.get(id.index()).map(|v| v.as_ref())
+    }
+
     pub(crate) fn segment_layout(&self, id: BlockId) -> Option<SegmentLayout> {
         self.segment_layouts.get(id.index()).copied()
     }
@@ -3926,6 +3951,8 @@ impl BlockCache {
         self.physical_keys.clear();
         self.blocks.clear();
         self.segment_layouts.clear();
+        #[cfg(feature = "timing-class-histogram")]
+        self.class_vectors.clear();
         self.chain_layouts.clear();
         self.written_segments.clear();
         #[cfg(feature = "seg-head-diagnostic")]
@@ -4152,6 +4179,10 @@ impl CompileOutcome {
 
 pub(crate) struct Compilation {
     pub span: BlockSpan,
+    /// This block's slot classes, in slot order, for the class histogram
+    /// (design section 9.1). Feature-gated: a plain build carries no field.
+    #[cfg(feature = "timing-class-histogram")]
+    pub class_vector: Box<[u8]>,
     pub fetch_lens: [u8; MAX_BLOCK_INSTRUCTIONS],
     pub raw_clocks: u32,
     pub weighted_fp_clocks: u32,
@@ -5947,6 +5978,21 @@ pub(crate) struct DirectAddr {
     /// the flag capture reads the host flags of one instruction it emitted itself, so a lane
     /// staged inside the address work would have to be proven not to disturb them.
     pub(crate) disp_lane: Option<ImmLane>,
+}
+
+/// One block's slot classes as dense indices, in slot order.
+///
+/// Slots whose charge arrives at run time (`X87`, `CallOut`) have no class and
+/// are absent: an x87 slot's cost comes through `weighted_fp_clocks` and a
+/// call-out's through the helper's return value, so attributing either to a
+/// class here would double-count it in the histogram's own terms.
+#[cfg(feature = "timing-class-histogram")]
+fn class_vector(slots: &[DirectInsn]) -> Box<[u8]> {
+    slots
+        .iter()
+        .filter_map(|slot| slot.kind.timing_class())
+        .map(|class| class.index() as u8)
+        .collect()
 }
 
 impl DirectKind {
@@ -9813,6 +9859,8 @@ fn compile_with_budget(
     };
     CompileOutcome::Compiled(Compilation {
         span,
+        #[cfg(feature = "timing-class-histogram")]
+        class_vector: class_vector(&slots),
         fetch_lens,
         raw_clocks,
         weighted_fp_clocks,

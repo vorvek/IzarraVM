@@ -926,8 +926,18 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // Both are resolved once at machine construction from `IZARRAVM_TIMING_EPOCH` and never
     // observed by a guest instruction, so both canonical payloads are unchanged by them; see
     // cpu_test.rs's twin comment.
+    // The `timing-class-histogram` feature adds one boxed field ahead of this
+    // pin, so the offset moves on that build alone. The pin is a PLAIN-build
+    // invariant -- emitted code bakes these offsets and the instrument arm is
+    // never the one that ships -- so it is checked where it means something.
+    #[cfg(not(feature = "timing-class-histogram"))]
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
+    // The `timing-class-histogram` feature adds one boxed field ahead of this
+    // pin, so the offset moves on that build alone. The pin is a PLAIN-build
+    // invariant -- emitted code bakes these offsets and the instrument arm is
+    // never the one that ships -- so it is checked where it means something.
+    #[cfg(not(feature = "timing-class-histogram"))]
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
 }

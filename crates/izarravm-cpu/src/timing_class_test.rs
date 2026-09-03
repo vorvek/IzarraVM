@@ -666,3 +666,57 @@ fn the_widest_epoch_two_charges_survive_every_stage() {
          is the defect slice 1d fixed; if this stops being true the test is no longer a proof"
     );
 }
+
+/// The histogram's arithmetic, including the one thing it must never do:
+/// invent a distribution for retires it cannot place.
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn the_histogram_attributes_a_block_exactly_and_never_guesses() {
+    let mut hist = TimingHistogram::default();
+    // A three-slot block: Reg, AluRegMem, Jcc.
+    let vector = [
+        TimingClass::Reg.index() as u8,
+        TimingClass::AluRegMem.index() as u8,
+        TimingClass::Jcc.index() as u8,
+    ];
+    // Ten complete passes plus a two-slot prefix -- 32 retires, which is what a
+    // self-loop that stopped mid-iteration actually did.
+    hist.record_block(&vector, 10, 2);
+    assert_eq!(hist.attributed(), 32);
+    assert_eq!(hist.unattributed(), 0);
+    let rows: std::collections::HashMap<_, _> = hist.rows().into_iter().collect();
+    assert_eq!(rows["Reg"], 11);
+    assert_eq!(rows["AluRegMem"], 11);
+    assert_eq!(rows["Jcc"], 10);
+    assert_eq!(
+        rows.len(),
+        3,
+        "no class the block does not carry may appear"
+    );
+
+    // The class-clock term is the serial, pre-pairing sum review R5(i) wants.
+    assert_eq!(
+        hist.class_clocks(&EPOCH1),
+        11 * 2 + 11 * 2 + 10 * 3,
+        "epoch 1: Reg 2, AluRegMem 2, Jcc 3"
+    );
+    assert_eq!(
+        hist.class_clocks(&EPOCH2_I586),
+        11 * 12 + 11 * 24 + 10 * 16,
+        "epoch 2 on the 586: Reg 12, AluRegMem 24, Jcc 16"
+    );
+
+    // An interpreter retire lands in its class; a `Legacy` site has no class row
+    // and is counted honestly rather than folded into a neighbour.
+    hist.record(TimingClass::Reg);
+    assert_eq!(hist.attributed(), 33);
+    hist.record(TimingClass::Legacy(9));
+    assert_eq!(hist.attributed(), 33, "Legacy must not enter a class row");
+    assert_eq!(hist.unattributed(), 1);
+
+    // A chained native entry hands over instructions the head block's vector
+    // cannot place. They are counted, not spread.
+    hist.record_unattributed(500);
+    assert_eq!(hist.unattributed(), 501);
+    assert_eq!(hist.attributed(), 33);
+}

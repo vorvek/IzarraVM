@@ -33,6 +33,10 @@ shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-bus/sh
 # reflected-call-diagnostic's batch-straddle counter); kept for CI symmetry.
 reflected-call-memo = ["izarravm-cpu/reflected-call-memo"]
 
+# Passthrough for the per-class retire histogram; see izarravm-cpu. The machine has no hook of
+# its own -- every increment is in izarravm-cpu and the only reader is the binary's profile JSON.
+timing-class-histogram = ["izarravm-cpu/timing-class-histogram"]
+
 [dependencies]
 thiserror.workspace = true
 izarravm-audio = { path = "../izarravm-audio" }

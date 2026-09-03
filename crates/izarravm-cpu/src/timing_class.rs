@@ -850,3 +850,130 @@ const _: () = {
     }
     assert!(max == crate::MAX_CALL_OUT_CORE_CLOCKS);
 };
+
+/// Per-class retire counts, plus the one honesty counter that keeps them
+/// readable (design section 9.1, and review R5, which makes this the load-bearing
+/// falsifier now that Dhrystone is demoted).
+///
+/// # What it counts, and what it cannot
+///
+/// The interpreter increments exactly once per retire, in `CpuGsw::charge`. The
+/// JIT cannot: a compiled block's instructions retire inside emitted code that
+/// never calls `charge`, so a native ENTRY adds its block's compile-time class
+/// vector instead -- design section 9.1's "sparse list", walked once per entry
+/// rather than once per instruction.
+///
+/// That attribution is exact for an entry that runs one block, and for a
+/// self-loop, whose retires are that same vector repeated. It is NOT exact for a
+/// CHAINED entry: `NativeExit::instructions` counts the whole chain from its
+/// head, and only the head block's vector is in hand. Those instructions are
+/// counted in [`TimingHistogram::unattributed`] rather than spread over the head
+/// block's classes, so a share read off this table is a share of the
+/// ATTRIBUTED population and the reader can see how much is missing. Anything
+/// else would invent a distribution.
+///
+/// Slots whose charge arrives at run time -- x87 (through `weighted_fp_clocks`)
+/// and call-outs (through the helper's return value) -- carry no class and are
+/// absent from a block's vector, so they are unattributed too.
+#[derive(Clone)]
+pub(crate) struct TimingHistogram {
+    counts: [u64; N_CLASSES],
+    unattributed: u64,
+}
+
+/// ALWAYS EQUAL, on the `FarCallLedger` precedent (`lib.rs`), and for its exact
+/// reason: `CpuGsw` derives `PartialEq` and the differential tests compare whole
+/// CPUs, so a diagnostic counter that compared by value would make the native
+/// and interpreted legs of every sweep unequal on a field no guest instruction
+/// can observe. The two legs' histograms differ legitimately -- the interpreter
+/// attributes per retire and the JIT per block entry, and a chained entry lands
+/// in `unattributed` on one side only.
+impl PartialEq for TimingHistogram {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TimingHistogram {}
+
+/// 157 rows of mostly zeros stay out of every `{:?}` dump.
+impl std::fmt::Debug for TimingHistogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TimingHistogram {{ {} attributed, {} unattributed }}",
+            self.attributed(),
+            self.unattributed
+        )
+    }
+}
+
+impl Default for TimingHistogram {
+    fn default() -> Self {
+        Self {
+            counts: [0; N_CLASSES],
+            unattributed: 0,
+        }
+    }
+}
+
+impl TimingHistogram {
+    /// One interpreter retire.
+    #[inline]
+    pub(crate) fn record(&mut self, class: TimingClass) {
+        match class {
+            // A `Legacy` site has no class row, so it cannot be attributed. It
+            // is one site (ARPL) and it is counted honestly rather than folded
+            // into a neighbour.
+            TimingClass::Legacy(_) => self.unattributed += 1,
+            other => self.counts[other.index()] += 1,
+        }
+    }
+
+    /// One compiled-block entry: `passes` complete traversals of `vector` plus a
+    /// `remainder`-long prefix of it, which is exactly how a block's slots
+    /// retire on a completed run, a self-loop and a mid-block side exit alike.
+    pub(crate) fn record_block(&mut self, vector: &[u8], passes: u64, remainder: usize) {
+        if passes > 0 {
+            for index in vector {
+                self.counts[usize::from(*index)] += passes;
+            }
+        }
+        for index in vector.iter().take(remainder) {
+            self.counts[usize::from(*index)] += 1;
+        }
+    }
+
+    /// Instructions this histogram knows retired but cannot place in a class.
+    pub(crate) fn record_unattributed(&mut self, instructions: u64) {
+        self.unattributed += instructions;
+    }
+
+    /// `(class name, count)` for every class with a nonzero count, plus the
+    /// unattributed total. Sparse on purpose: 157 rows of mostly zeros in a
+    /// profile JSON is noise, and the reader needs the shares.
+    pub(crate) fn rows(&self) -> Vec<(&'static str, u64)> {
+        TimingClass::ALL
+            .iter()
+            .filter(|class| self.counts[class.index()] != 0)
+            .map(|class| (class.name(), self.counts[class.index()]))
+            .collect()
+    }
+
+    /// The class clocks these retires cost under `table` -- the numerator of
+    /// review R5(i)'s serial, pre-pairing class term.
+    pub(crate) fn class_clocks(&self, table: &ClassTable) -> u64 {
+        TimingClass::ALL
+            .iter()
+            .map(|class| u64::from(table.raw(*class)) * self.counts[class.index()])
+            .sum()
+    }
+
+    pub(crate) fn attributed(&self) -> u64 {
+        self.counts.iter().sum()
+    }
+
+    pub(crate) fn unattributed(&self) -> u64 {
+        self.unattributed
+    }
+}

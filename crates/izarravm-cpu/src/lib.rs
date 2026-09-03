@@ -2878,6 +2878,12 @@ pub struct CpuGsw {
     // position is load-bearing only through `offset_of!`, which computes it.
     #[cfg(feature = "jit")]
     pub(crate) native_callout: jit::direct::CallOutTable,
+    /// Per-class retire counts (design section 9.1). Boxed because it is
+    /// `N_CLASSES` `u64`s and `CpuGsw` is already large; feature-gated because
+    /// the campaign's own rule forbids a default-off instrument that taxes the
+    /// hot path, so there is no env knob and a plain build has no field.
+    #[cfg(feature = "timing-class-histogram")]
+    class_histogram: Box<timing_class::TimingHistogram>,
     // The guest-clock model epoch (`IZARRAVM_TIMING_EPOCH`), copied in ONCE from
     // `Machine::timing_epoch` at construction via `set_timing_epoch`. Unset = 1.
     // It may never change mid-run -- the JIT caches per-block raw clocks
@@ -3173,6 +3179,8 @@ impl Default for CpuGsw {
             native_callout: jit::direct::CallOutTable::default(),
             #[cfg(feature = "jit")]
             native_table_slots: jit::direct::NativeTableSlots::default(),
+            #[cfg(feature = "timing-class-histogram")]
+            class_histogram: Box::default(),
             timing_epoch: 1,
             class_table: &timing_class::EPOCH1,
             timing_rem: 0,

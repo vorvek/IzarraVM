@@ -50,6 +50,13 @@ shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-machin
 # Passthrough for the reflected-call HLE design's slice-1 memo; see izarravm-cpu.
 reflected-call-memo = ["jit", "izarravm-cpu/reflected-call-memo"]
 
+# Passthrough for the per-class retire histogram; see izarravm-cpu. This crate IS the reader:
+# `timing_class_histogram` in the profile JSON.
+timing-class-histogram = [
+    "izarravm-cpu/timing-class-histogram",
+    "izarravm-machine/timing-class-histogram",
+]
+
 [dependencies]
 clap.workspace = true
 egui.workspace = true
