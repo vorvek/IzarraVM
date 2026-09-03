@@ -6894,18 +6894,20 @@ fn interpret_one_closes_the_callout_attribution_ledger() {
 // 6's protected-mode machinery (`protected_cpu`, `seed_protected_tables`, the GDT at `GDT_BASE`)
 // is reused rather than duplicated; only the extra inaccessible descriptor below is new.
 
-/// Index 7: a PRESENT, findable data descriptor at DPL 0 -- so `try_read_descriptor` returns
+/// Index 6: a PRESENT, findable data descriptor at DPL 0 -- so `try_read_descriptor` returns
 /// `Some`, and only `descriptor_accessible`'s privilege check refuses it. This is what makes
 /// "invalid selector, ZF clear" a DIFFERENT case from "null selector" and "selector beyond the
 /// GDT limit": all three clear ZF, but only this one exercises the descriptor found/refused arm.
-const LAR_LSL_GDT_EXTRA_OFFSET: u32 = 0x40;
+///
+/// Placed at `SEL_SS16`'s own offset (`0x30`) and OVERWRITES it in this file's own program
+/// buffer -- safe because none of the LAR/LSL fixtures below ever select `SEL_SS16`, each test in
+/// this file builds its own `program` array from scratch, and `0x30` is deliberately the LAST
+/// usable entry (`0x30 + 7 == GDT_LIMIT`), which is what keeps `SEL_BAD` (`0x38`) genuinely past
+/// the table under the UNCHANGED `GDT_LIMIT` -- no widened limit, no `protected_cpu` override.
+const LAR_LSL_GDT_EXTRA_OFFSET: u32 = 0x30;
 /// The same descriptor, selected with RPL 3 against its DPL 0 -- `descriptor_accessible`'s
 /// `dpl >= max(cpl, rpl)` fails since CPL is 0 and RPL is 3.
 const SEL_LOW_DPL: u16 = (LAR_LSL_GDT_EXTRA_OFFSET as u16) | 3;
-/// The table limit these tests need: `SEL_LOW_DPL`'s index (7) plus the six `seed_protected_tables`
-/// already seeds. `SEL_BAD` (`0x38`) stays unpopulated and beyond this limit too -- it is still the
-/// "selector beyond the GDT limit" case even though the limit itself moved.
-const LAR_LSL_GDT_LIMIT: u16 = LAR_LSL_GDT_EXTRA_OFFSET as u16 + 7;
 
 /// `mov eax,0x1111; lar eax,edx / lsl eax,edx; inc eax; hlt`, register-source form. The slot sits
 /// in the MIDDLE for the reason `CODE`'s doc gives.
@@ -6921,7 +6923,7 @@ fn lar_lsl_memory_code(opcode: u8) -> Vec<u8> {
 const LAR_LSL_MEMORY_STARTS: &[u32] = &[0, 5, 8];
 const LAR_LSL_BLOCK_INSTRUCTIONS: u8 = 3;
 
-/// Seed the extra low-DPL descriptor beside `seed_protected_tables`'s own six.
+/// Seed the low-DPL descriptor over `SEL_SS16`'s slot, beside `seed_protected_tables`'s own six.
 fn seed_lar_lsl_tables(program: &mut [u8]) {
     seed_protected_tables(program);
     let at = (GDT_BASE + LAR_LSL_GDT_EXTRA_OFFSET) as usize;
@@ -6930,18 +6932,11 @@ fn seed_lar_lsl_tables(program: &mut [u8]) {
     program[at..at + 8].copy_from_slice(&descriptor(0x0000_ffff, 0x0000_9200));
 }
 
-/// A protected-mode CPU with `LAR_LSL_GDT_LIMIT` rather than `GDT_LIMIT`, so `SEL_LOW_DPL`
-/// resolves through the table while `SEL_BAD` still does not.
-fn lar_lsl_protected_cpu() -> CpuGsw {
-    let mut cpu = protected_cpu();
-    cpu.gdtr.limit = LAR_LSL_GDT_LIMIT;
-    cpu
-}
-
 fn arm_lar_lsl(cpu: &mut CpuGsw, bus: &mut TestBus, selector: u16) {
     cpu.halted = false;
     cpu.interrupt_shadow = false;
     cpu.registers.gpr.fill(0);
+    cpu.registers.set_esp(STACK_TOP);
     cpu.registers.set_edx(u32::from(selector));
     cpu.registers.set_ebx(DATA_PAGE);
     cpu.registers.eflags = 0x202;
@@ -6967,7 +6962,7 @@ fn build_lar_lsl_program(
     program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
     seed_lar_lsl_tables(&mut program);
     let mut bus = sixteen_bit_bus(program);
-    let mut cpu = lar_lsl_protected_cpu();
+    let mut cpu = protected_cpu();
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
     let linears: Vec<u32> = starts.iter().map(|offset| ENTRY + offset).collect();
     for &linear in &linears {
@@ -7014,7 +7009,7 @@ fn run_both_lar_lsl(code: &[u8], starts: &[u32], selector: u16) -> Legs {
     program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
     seed_lar_lsl_tables(&mut program);
     let mut interp_bus = sixteen_bit_bus(program);
-    let mut interp = lar_lsl_protected_cpu();
+    let mut interp = protected_cpu();
     arm_lar_lsl(&mut interp, &mut interp_bus, selector);
     drive(&mut interp, &mut interp_bus);
 
@@ -7131,4 +7126,105 @@ fn lar_and_lsl_ud_fault_outside_protected_mode() {
 #[test]
 fn lar_lsl_core_clocks_is_what_the_interpreter_charges() {
     assert_eq!(crate::LAR_LSL_CORE_CLOCKS, 11);
+}
+
+/// `run_both_lar_lsl`, but with ES forced to a NON-flat, small-limit descriptor and EBX pointed
+/// past it, so the memory form's operand read itself faults `#GP` -- a case none of the register
+/// forms above can reach. LAR/LSL's own arm never touches ES, so overriding a segment the fixture
+/// otherwise leaves flat is the only way to reach this arm without disturbing anything else.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn run_both_lar_lsl_memory_limit_fault(code: &[u8], starts: &[u32]) -> Legs {
+    // A small, non-flat data segment: base 0, limit 0xFFFF, present, DPL 0, data read/write --
+    // the same access byte `SEL_OTHER`'s own GDT entry carries, applied directly to ES rather
+    // than loaded through a selector (LAR/LSL never reads ES, so no descriptor fetch has to agree
+    // with this by construction; only the bound check the memory read itself performs matters).
+    fn small_es(cpu: &mut CpuGsw) {
+        cpu.registers.set_segment(
+            SegmentIndex::Es,
+            SegmentRegister {
+                selector: SEL_OTHER,
+                base: 0,
+                limit: 0xffff,
+                access: 0x93,
+                default_size_32: true,
+            },
+        );
+    }
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
+    seed_lar_lsl_tables(&mut program);
+    let mut interp_bus = sixteen_bit_bus(program);
+    let mut interp = protected_cpu();
+    arm_lar_lsl(&mut interp, &mut interp_bus, SEL_DATA);
+    interp.registers.set_ebx(0x0002_0000);
+    small_es(&mut interp);
+    drive(&mut interp, &mut interp_bus);
+
+    let (mut native, mut native_bus, block) = build_lar_lsl_program(code, starts);
+    arm_lar_lsl(&mut native, &mut native_bus, SEL_DATA);
+    native.registers.set_ebx(0x0002_0000);
+    small_es(&mut native);
+
+    let before = native.perf_counters().jit_direct_insns;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the installed block must actually run"
+    );
+    let native_insns = native.perf_counters().jit_direct_insns - before;
+    let exit_reason = native.jit_direct.last_side_exit_reason_for_test();
+    drive(&mut native, &mut native_bus);
+
+    Legs {
+        interp,
+        interp_bus,
+        native,
+        native_bus,
+        exit_reason,
+        native_insns,
+    }
+}
+
+/// A memory operand beyond the segment limit faults `#GP` on the operand read itself, before
+/// LAR/LSL's own descriptor fetch ever runs: the memory-form counterpart to
+/// `lar_and_lsl_ud_fault_outside_protected_mode`'s `#UD`, exercising the shared STEP 7 fault path
+/// from a different trigger. Both legs agree on the fault.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn lar_and_lsl_memory_operand_beyond_segment_limit_faults() {
+    for opcode in [0x02u8, 0x03] {
+        let code = lar_lsl_memory_code(opcode);
+        // ES: override (0x26) ahead of the LAR/LSL bytes, so the memory form reads through the
+        // small segment `run_both_lar_lsl_memory_limit_fault` arms instead of the flat DS every
+        // other memory-form case in this section uses.
+        let mut es_code = code[..5].to_vec();
+        es_code.push(0x26);
+        es_code.extend_from_slice(&code[5..]);
+        let starts = vec![0, 5, 9];
+
+        // Anti-vacuity: the row still compiles into a call-out slot with the ES override present.
+        let (_, _, block) = build_lar_lsl_program(&es_code, &starts);
+        assert_eq!(block.span().instructions, LAR_LSL_BLOCK_INSTRUCTIONS);
+        assert_eq!(block.callout_lar_lsl_slots(), 1);
+
+        let mut legs = run_both_lar_lsl_memory_limit_fault(&es_code, &starts);
+        assert_legs_agree(&mut legs);
+        assert_ne!(
+            legs.exit_reason, None,
+            "opcode 0x0f{opcode:02x}: a memory operand past the segment limit must not resume \
+             the block"
+        );
+        let stalls = legs.native.direct_stall_snapshot();
+        assert_eq!(stalls.callout_interpret_one_executed, 1);
+        assert_eq!(stalls.callout_interpret_one_abnormal, 0);
+    }
 }

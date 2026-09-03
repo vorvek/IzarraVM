@@ -1533,7 +1533,7 @@ fn far_returns_match_the_interpreter_across_a_swept_grid() {
 ///
 /// The design's fallback branch put `far_dynamic` in a parallel `BlockCache` lane, where a
 /// recycled block slot could inherit the retired occupant's bit and a reset site was needed. It
-/// lives in `CompiledBlock`'s packed `dynamic_flags` byte instead, and `install`'s recycled arm
+/// lives in `CompiledBlock`'s packed `block_flags` byte instead, and `install`'s recycled arm
 /// assigns the WHOLE struct, so there is no reset site to forget and no state to inherit.
 ///
 /// Asserted structurally, so that a future move to a lane makes this row fail rather than quietly
@@ -1543,15 +1543,13 @@ fn far_dynamic_cannot_be_inherited_by_a_recycled_block_slot() {
     // 120 -> 128: the CR3 JIT-half gate's `LinkTarget.context: u8` field
     // (`2026-09-02-cr3-jit-half-design.md` L2) grows `successors: [Option<LinkTarget>; 2]`,
     // measured off a failing-test readout, not derived; see `direct_test.rs`'s twin comment.
-    // 128 -> 136: the LAR/LSL `InterpretOne` allowlist entries add `callout_lar_lsl_slots: u8`,
-    // again measured off a failing-test readout; see `direct_test.rs`'s twin comment for why the
-    // fifth class could not fit the existing `CallOutSlotCounts` byte. Unrelated to
-    // `dynamic_flags`, which still keeps `far_dynamic` inside the whole-struct assignment this
-    // row tests.
+    // The LAR/LSL `InterpretOne` allowlist entries add a call-out slot COUNT, packed into
+    // `block_flags` (renamed from `dynamic_flags`) bits 2..4 rather than a new field, so the
+    // struct stays at 128; see `direct_test.rs`'s twin comment.
     assert_eq!(
         core::mem::size_of::<jit::direct::CompiledBlock>(),
-        136,
-        "the far bit is packed into `dynamic_flags`, which is what keeps this struct's size fixed \
+        128,
+        "the far bit is packed into `block_flags`, which is what keeps this struct's size fixed \
          and keeps `far_dynamic` inside the whole-struct assignment `install`'s recycle arm makes"
     );
 }

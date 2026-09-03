@@ -462,27 +462,24 @@ pub(crate) struct CompiledBlock {
     self_loop: bool,
     has_x87: bool,
     callout_slots: CallOutSlotCounts,
-    /// LAR/LSL call-out slots, the FIFTH class. NOT packed into `callout_slots`: unlike the INT
-    /// row, LAR/LSL is not terminal and is not bounded at one per block, so it needs a genuine
-    /// `0..=MAX_BLOCK_CALLOUT_SLOTS` count rather than a flag, and the base-5 byte `callout_slots`
-    /// already packs is full (see that type's doc). A plain sibling field is the simplest thing
-    /// that is still correct; `compiled_block_stays_small_enough_to_copy_per_entry` is the pin
-    /// that says what it costs.
-    callout_lar_lsl_slots: u8,
     x87_entry_top: u8,
     x87_exit_top: u8,
-    /// `DYNAMIC_SUCCESSOR` and `FAR_DYNAMIC`, packed into one byte.
+    /// `DYNAMIC_SUCCESSOR` and `FAR_DYNAMIC` in bits 0..1, plus the LAR/LSL `InterpretOne`
+    /// call-out slot count (`0..=MAX_BLOCK_CALLOUT_SLOTS`, a 3-bit quantity) in bits 2..4.
     ///
-    /// BIT-PACKED rather than two `bool`s, and that is a size decision measured rather than
-    /// assumed: `compiled_block_stays_small_enough_to_copy_per_entry` pins this struct at 120
-    /// bytes, the budget is exactly full, and adding a second `bool` rounds it to 128 -- eight
-    /// bytes on each of the three per-entry memcpys, on a row with 283 M entries. `CallOutSlotCounts`
-    /// beside it is bit-packed for the same reason. The alternative the design named -- a parallel
-    /// `BlockCache::far_dynamic` lane -- would grow `BlockCache`, therefore `JitState`, therefore
-    /// shift every `CpuGsw` field after `jit_direct` including the offsets emitted code bakes, and
-    /// would additionally need an `active_index` lookup at the per-entry reader below, which has a
-    /// `CompiledBlock` by value and no index. Packing costs neither.
-    dynamic_flags: u8,
+    /// BIT-PACKED rather than separate fields, and that is a size decision measured rather than
+    /// assumed: `compiled_block_stays_small_enough_to_copy_per_entry` pins this struct at 128
+    /// bytes, the budget is exactly full, and a whole extra `u8` for the LAR/LSL count rounds it
+    /// to 136 -- eight bytes on each of the three per-entry memcpys, on a row that measures
+    /// 383 M entries. The two flag bits are read only through masks (`dynamic_successor`,
+    /// `far_dynamic` below) and written once at `install`, so three bits were spare here before
+    /// the LAR/LSL count needed a home; `CallOutSlotCounts` beside it is bit-packed for the same
+    /// reason. The alternative the design named -- a parallel `BlockCache::far_dynamic` lane --
+    /// would grow `BlockCache`, therefore `JitState`, therefore shift every `CpuGsw` field after
+    /// `jit_direct` including the offsets emitted code bakes, and would additionally need an
+    /// `active_index` lookup at the per-entry reader below, which has a `CompiledBlock` by value
+    /// and no index. Packing costs neither.
+    block_flags: u8,
     successors: [Option<LinkTarget>; 2],
 }
 
@@ -492,16 +489,42 @@ pub(crate) const DYNAMIC_SUCCESSOR: u8 = 1 << 0;
 /// on its EIP, it merges through `SegmentLayout::far_merge` rather than `link_merge`, and the
 /// backward chain propagation CUTS it rather than merging through it when either CS bit arrives.
 pub(crate) const FAR_DYNAMIC: u8 = 1 << 1;
+/// Where the LAR/LSL call-out slot count starts inside `block_flags`, above the two flag bits.
+const LAR_LSL_COUNT_SHIFT: u8 = 2;
+/// The 3-bit field itself, bits 2..4 of `block_flags`. `MAX_BLOCK_CALLOUT_SLOTS` (4) fits in 3
+/// bits with one value to spare, so the count never needs a fourth bit.
+const LAR_LSL_COUNT_MASK: u8 = 0b111 << LAR_LSL_COUNT_SHIFT;
+
+/// Pack a LAR/LSL slot count into its `block_flags` bits. `count` must be
+/// `<= MAX_BLOCK_CALLOUT_SLOTS`, which the walk cap (`direct.rs` compile loop) already
+/// guarantees for every class sharing the one per-block slot budget.
+fn pack_lar_lsl_count(count: u8) -> u8 {
+    debug_assert!(
+        count <= MAX_BLOCK_CALLOUT_SLOTS,
+        "the LAR/LSL count must fit the 3-bit field packed beside DYNAMIC_SUCCESSOR/FAR_DYNAMIC"
+    );
+    (count << LAR_LSL_COUNT_SHIFT) & LAR_LSL_COUNT_MASK
+}
 
 impl CompiledBlock {
     pub(crate) fn dynamic_successor(&self) -> bool {
-        self.dynamic_flags & DYNAMIC_SUCCESSOR != 0
+        self.block_flags & DYNAMIC_SUCCESSOR != 0
     }
 
     /// Whether this block's dynamic terminal is a FAR return. Implies `dynamic_successor`.
     pub(crate) fn far_dynamic(&self) -> bool {
-        debug_assert!(self.dynamic_flags & FAR_DYNAMIC == 0 || self.dynamic_successor());
-        self.dynamic_flags & FAR_DYNAMIC != 0
+        debug_assert!(self.block_flags & FAR_DYNAMIC == 0 || self.dynamic_successor());
+        self.block_flags & FAR_DYNAMIC != 0
+    }
+
+    /// Call-out slots carrying `0x0F02` LAR or `0x0F03` LSL, i.e. the FIFTH class. Priced at
+    /// `LAR_LSL_CORE_CLOCKS` plus `LAR_LSL_MAX_DATA_ACCESSES` worst-width data accesses each in
+    /// `compute_iteration_upper`, for the same admission-change reason `callout_int_imm8_slots`
+    /// gives: LAR/LSL charges 11 core clocks against the interpret-one class's 7. Unlike that
+    /// class it is a genuine COUNT, not a flag -- packed into `block_flags` bits 2..4 rather than
+    /// carried as its own field, per that field's doc.
+    pub(crate) fn callout_lar_lsl_slots(&self) -> u32 {
+        u32::from((self.block_flags & LAR_LSL_COUNT_MASK) >> LAR_LSL_COUNT_SHIFT)
     }
 
     pub(crate) fn id(&self) -> BlockId {
@@ -652,15 +675,6 @@ impl CompiledBlock {
     /// already refuses that trade in writing for exactly this reason.
     pub(crate) fn callout_int_imm8_slots(&self) -> u32 {
         self.callout_slots.int_imm8()
-    }
-
-    /// Call-out slots carrying `0x0F02` LAR or `0x0F03` LSL, i.e. the FIFTH class. Priced at
-    /// `LAR_LSL_CORE_CLOCKS` plus `LAR_LSL_MAX_DATA_ACCESSES` worst-width data accesses each in
-    /// `compute_iteration_upper`, for the same admission-change reason `callout_int_imm8_slots`
-    /// gives: LAR/LSL charges 11 core clocks against the interpret-one class's 7. Unlike that
-    /// class it is a genuine COUNT, not a flag -- see `CompiledBlock::callout_lar_lsl_slots`'s doc.
-    pub(crate) fn callout_lar_lsl_slots(&self) -> u32 {
-        u32::from(self.callout_lar_lsl_slots)
     }
 
     pub(crate) fn weighted_fp_clocks(&self) -> u32 {
@@ -1725,12 +1739,13 @@ impl BlockCache {
                 compilation.callout_memory_slots,
                 compilation.callout_interpret_one_slots,
                 compilation.callout_int_imm8_slots,
+                compilation.callout_lar_lsl_slots,
             ),
-            callout_lar_lsl_slots: compilation.callout_lar_lsl_slots,
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
-            dynamic_flags: (u8::from(compilation.dynamic_successor) * DYNAMIC_SUCCESSOR)
-                | (u8::from(compilation.far_dynamic) * FAR_DYNAMIC),
+            block_flags: (u8::from(compilation.dynamic_successor) * DYNAMIC_SUCCESSOR)
+                | (u8::from(compilation.far_dynamic) * FAR_DYNAMIC)
+                | pack_lar_lsl_count(compilation.callout_lar_lsl_slots),
             successors: compilation.successors,
         };
         pending_watch_edges.extend(
@@ -29703,7 +29718,12 @@ const SLOT_COUNT_RADIX: u8 = 5;
 const INT_IMM8_SLOT_STRIDE: u8 = SLOT_COUNT_RADIX * SLOT_COUNT_RADIX * SLOT_COUNT_RADIX;
 
 impl CallOutSlotCounts {
-    fn new(port: u8, memory: u8, interpret_one: u8, int_imm8: u8) -> Self {
+    /// `lar_lsl` is NOT packed into the returned byte -- that class lives in `CompiledBlock::block_flags`
+    /// now, not here -- but it is still taken as a parameter so the budget assert below sums every
+    /// class the walk can produce rather than the four this type happens to store. Passing it and
+    /// dropping it silently would be the same omission the assert exists to catch, moved one line
+    /// up instead of fixed.
+    fn new(port: u8, memory: u8, interpret_one: u8, int_imm8: u8, lar_lsl: u8) -> Self {
         debug_assert!(
             port < SLOT_COUNT_RADIX
                 && memory < SLOT_COUNT_RADIX
@@ -29715,7 +29735,7 @@ impl CallOutSlotCounts {
             "the INT class is a flag: `is_terminal` stops the walk at the slot, so a block holds              at most one"
         );
         debug_assert!(
-            port + memory + interpret_one + int_imm8 <= MAX_BLOCK_CALLOUT_SLOTS,
+            port + memory + interpret_one + int_imm8 + lar_lsl <= MAX_BLOCK_CALLOUT_SLOTS,
             "the classes share one per-block slot budget"
         );
         Self(
