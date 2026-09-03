@@ -188,6 +188,31 @@ pub struct ShadowL1Diagnostics {
     /// an L1 miss. All-zero (and `None` would be equally honest, but a
     /// zeroed struct keeps the JSON shape stable across personas) on 486.
     pub l2: ShadowLevelDiagnostics,
+    /// S1d slice 2: JIT native-entry sampling. `sample_k` is the configured
+    /// divisor (`IZARRAVM_SHADOW_PROBE_SAMPLE`, default 64); `total_entries`
+    /// counts every compiled-block entry attempt seen while armed;
+    /// `sampled_entries` counts the ones diverted to the interpreter so its
+    /// existing per-address probe seam sees that iteration's DATA accesses
+    /// (the JIT's own compiled body never carries them -- see the module
+    /// doc). `sampled_fraction()` is `sampled_entries / total_entries`, the
+    /// estimator's own sampling rate; the design's `mpi` for the DATA classes
+    /// should be read as "misses per SAMPLED instruction", not per
+    /// instruction overall, until scaled by this fraction's inverse.
+    pub sample_k: u64,
+    pub total_entries: u64,
+    pub sampled_entries: u64,
+}
+
+impl ShadowL1Diagnostics {
+    /// `sampled_entries / total_entries`, or `0.0` on no entries yet (never
+    /// divides by zero).
+    pub fn sampled_fraction(&self) -> f64 {
+        if self.total_entries == 0 {
+            0.0
+        } else {
+            self.sampled_entries as f64 / self.total_entries as f64
+        }
+    }
 }
 
 /// 3 bits of tree pseudo-LRU state per set, packed as `b0 | b1<<1 | b2<<2`:
@@ -416,7 +441,7 @@ enum ShadowArrays {
     I586Split {
         instr: ShadowLevel,
         data: ShadowLevel,
-        l2: ShadowLevel,
+        l2: Box<ShadowLevel>,
     },
 }
 
@@ -435,7 +460,7 @@ impl ShadowArrays {
             CpuPersona::I586 => ShadowArrays::I586Split {
                 instr: ShadowLevel::new(ShadowTags::new_i586_split(false)),
                 data: ShadowLevel::new(ShadowTags::new_i586_split(true)),
-                l2: ShadowLevel::new(ShadowTags::new_i586_l2()),
+                l2: Box::new(ShadowLevel::new(ShadowTags::new_i586_l2())),
             },
         }
     }
@@ -549,6 +574,9 @@ pub struct ShadowL1Probe {
     persona: CpuPersona,
     arrays: ShadowArrays,
     enabled: bool,
+    sample_k: u64,
+    total_entries: u64,
+    sampled_entries: u64,
 }
 
 /// `IZARRAVM_SHADOW_L1_PROBE`: unset or any value other than exactly `"1"` is
@@ -558,12 +586,51 @@ fn shadow_l1_probe_enabled() -> bool {
     std::env::var("IZARRAVM_SHADOW_L1_PROBE").as_deref() == Ok("1")
 }
 
+/// `IZARRAVM_SHADOW_PROBE_SAMPLE`: every Kth compiled-block entry, while
+/// armed, is diverted to the interpreter (S1d slice 2, S2 design §3c's
+/// sampling shape reused for measurement rather than charging). Unset,
+/// empty, non-numeric or `0` all fall back to the default 64 -- `0` would
+/// divide by zero in `should_sample_entry`, and it is not a meaningful "off"
+/// spelling for a divisor (the probe's own enable bit is `off`'s spelling).
+const DEFAULT_SAMPLE_K: u64 = 64;
+
+fn shadow_sample_k_from_env() -> u64 {
+    std::env::var("IZARRAVM_SHADOW_PROBE_SAMPLE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(DEFAULT_SAMPLE_K)
+}
+
 impl ShadowL1Probe {
     pub(crate) fn from_env(persona: CpuPersona) -> Self {
         Self {
             persona,
             arrays: ShadowArrays::for_persona(persona),
             enabled: shadow_l1_probe_enabled(),
+            sample_k: shadow_sample_k_from_env(),
+            total_entries: 0,
+            sampled_entries: 0,
+        }
+    }
+
+    /// One compiled-block entry attempt. Disabled (or unarmed): always
+    /// `false`, no counters move -- the caller (`MachineBus::
+    /// shadow_probe_should_sample_entry`) is the one predictable branch this
+    /// costs on the hot entry path. Armed: counts the attempt, and every Kth
+    /// one (`total_entries % sample_k == 0`) is diverted -- `K = 1` diverts
+    /// every entry, matching the unit test's "every entry interpreted" case.
+    #[inline]
+    pub(crate) fn should_sample_entry(&mut self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.total_entries += 1;
+        if self.total_entries.is_multiple_of(self.sample_k) {
+            self.sampled_entries += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -614,10 +681,13 @@ impl ShadowL1Probe {
             data_write,
             write_back_victims,
             l2,
+            sample_k: self.sample_k,
+            total_entries: self.total_entries,
+            sampled_entries: self.sampled_entries,
         }
     }
 }
 
 #[cfg(test)]
-#[path = "shadow_cache_test.rs"]
+#[path = "shadow_cache_probe_test.rs"]
 mod tests;

@@ -82,6 +82,12 @@ int-trace = []
 # `journal` mode forces the native backend off for the run, on the design's
 # own precondition for guest-memory-access journaling.
 reflected-call-diagnostic = ["jit"]
+# S1d slice 2 of dev_docs/2026-09-05-s2-cache-differentiation-design.md: the JIT
+# native-entry sampling hook (diverts every Kth compiled-block entry to the
+# interpreter while izarravm-machine's shadow probe is armed) plus the
+# `shadow_probe_should_sample_entry` CpuBus method it needs from izarravm-bus.
+# NOT in `default`.
+shadow-cache-probe = ["jit", "izarravm-bus/shadow-cache-probe"]
 
 [dependencies]
 thiserror.workspace = true

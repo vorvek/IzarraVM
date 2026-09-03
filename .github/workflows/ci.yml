@@ -110,6 +110,18 @@ jobs:
           cargo check -p izarravm-machine --no-default-features --features reflected-call-diagnostic
           cargo test -p izarravm-cpu --no-default-features --features reflected-call-diagnostic reflected_call_diag
           cargo clippy -p izarravm-cpu -p izarravm -p izarravm-machine --all-targets --no-default-features --features reflected-call-diagnostic -- -D warnings
+          # S1a/b/c/d of the S2 cache-differentiation design's shadow-cache probe. Off by
+          # default (`IZARRAVM_SHADOW_L1_PROBE`/`IZARRAVM_SHADOW_PROBE_SAMPLE` are inert without
+          # this feature), so the plain build below compiles NEITHER the persona-geometry/L2
+          # module (`shadow_cache_probe.rs`) NOR the entry-sampling hook -- it stays on
+          # `shadow_cache_plain.rs`, byte-identical to pre-S1a main. This quartet proves the
+          # feature wires through izarravm-bus (the CpuBus sampling hook) -> izarravm-cpu (the
+          # entry-diversion site in run.rs) -> izarravm-machine (the probe itself) -> izarravm,
+          # every shadow_cache test passes armed, and the armed arm is warning-clean end to end.
+          cargo check -p izarravm --no-default-features --features shadow-cache-probe
+          cargo check -p izarravm-machine --no-default-features --features shadow-cache-probe
+          cargo test -p izarravm-machine --no-default-features --features shadow-cache-probe shadow_cache
+          cargo clippy -p izarravm-cpu -p izarravm -p izarravm-machine --all-targets --no-default-features --features shadow-cache-probe -- -D warnings
 
       - name: Format
         run: cargo fmt --check

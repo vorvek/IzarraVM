@@ -1991,20 +1991,68 @@ impl CpuBus for MachineBus<'_> {
         self.active_mode as u64 + 1
     }
 
-    /// S1b: while the shadow probe is armed, resident blocks must carry the
-    /// `NativeBlockTrace` append preamble even under `flat_data_cost` (the
-    /// Approximate class's normal bulk-aggregate shape), so
-    /// `charge_native_cached_fetches` sees every fetch's own physical address
-    /// and can feed the shadow. Off (the default), this is exactly the
-    /// pre-S1b `self.flat_data_cost` -- byte-identical codegen.
+    /// OFF-FEATURE: byte-identical to pre-S1 main (`self.flat_data_cost`).
+    #[cfg(not(feature = "shadow-cache-probe"))]
+    fn native_fetches_are_uniform(&self) -> bool {
+        self.flat_data_cost
+    }
+
+    /// S1b (feature `shadow-cache-probe`): while the shadow probe is armed,
+    /// resident blocks must carry the `NativeBlockTrace` append preamble even
+    /// under `flat_data_cost` (the Approximate class's normal bulk-aggregate
+    /// shape), so `charge_native_cached_fetches` sees every fetch's own
+    /// physical address and can feed the shadow. Unarmed (the runtime
+    /// default even with the feature compiled in), this reduces to exactly
+    /// the off-feature expression above -- one predictable branch.
+    #[cfg(feature = "shadow-cache-probe")]
     fn native_fetches_are_uniform(&self) -> bool {
         self.flat_data_cost && !self.shadow_l1.wants_native_fetch_trace()
+    }
+
+    /// S1d slice 2: divert every Kth compiled-block entry to the interpreter
+    /// while the probe is armed (`ShadowL1Probe::should_sample_entry`), so its
+    /// data-access shadow-probe seam sees a real sample of the JIT's data
+    /// stream. Unarmed (the default even with the feature compiled in): one
+    /// bool test inside `should_sample_entry`, always `false`.
+    #[cfg(feature = "shadow-cache-probe")]
+    fn shadow_probe_should_sample_entry(&mut self) -> bool {
+        self.shadow_l1.should_sample_entry()
     }
 
     fn native_aggregate_accounting_allowed(&self) -> bool {
         self.trace.tracing_mode() == TracingMode::Off
     }
 
+    /// OFF-FEATURE: byte-identical to pre-S1 main.
+    #[cfg(not(feature = "shadow-cache-probe"))]
+    fn charge_native_cached_fetches(
+        &mut self,
+        linear_start: u32,
+        physical_start: u32,
+        fetch_lens: &[u8],
+        iterations: u64,
+    ) -> bool {
+        if linear_start & !0x0fff == (BIOS_LEGACY_IRET_LINEAR & !0x0fff) {
+            for _ in 0..iterations {
+                let mut linear = linear_start;
+                for &len in fetch_lens {
+                    self.note_code_fetch_linear(linear);
+                    linear = linear.wrapping_add(u32::from(len));
+                }
+            }
+        }
+        let physical = self.apply_a20(physical_start);
+        let fetch_cost = u64::from(izarravm_bus::BusCycle::clocks_for(
+            BusWidth::Byte,
+            self.code_fetch_wait_states(physical),
+        ));
+        let instruction_count = (fetch_lens.len() as u64).saturating_mul(iterations);
+        self.trace
+            .add_elapsed_clocks(fetch_cost.saturating_mul(instruction_count));
+        true
+    }
+
+    #[cfg(feature = "shadow-cache-probe")]
     fn charge_native_cached_fetches(
         &mut self,
         linear_start: u32,

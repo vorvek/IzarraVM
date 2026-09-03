@@ -21,6 +21,17 @@ fn probe_for(persona: CpuPersona) -> ShadowL1Probe {
         persona,
         arrays: ShadowArrays::for_persona(persona),
         enabled: true,
+        sample_k: DEFAULT_SAMPLE_K,
+        total_entries: 0,
+        sampled_entries: 0,
+    }
+}
+
+/// Same as `probe_for`, with an explicit sample divisor for the sampling tests.
+fn probe_for_k(persona: CpuPersona, k: u64) -> ShadowL1Probe {
+    ShadowL1Probe {
+        sample_k: k,
+        ..probe_for(persona)
     }
 }
 
@@ -484,4 +495,120 @@ fn wants_native_fetch_trace_follows_the_enable_bit() {
     assert!(probe.wants_native_fetch_trace());
     probe.enabled = false;
     assert!(!probe.wants_native_fetch_trace());
+}
+
+// ---------------------------------------------------------------------------
+// S1d slice 2: JIT native-entry sampling (`should_sample_entry`).
+// ---------------------------------------------------------------------------
+
+/// Disabled probe never diverts, whatever K is, and touches neither counter.
+#[test]
+fn should_sample_entry_disabled_never_diverts() {
+    let mut probe = probe_for_k(CpuPersona::I586, 1);
+    probe.enabled = false;
+    for _ in 0..10 {
+        assert!(!probe.should_sample_entry());
+    }
+    let diag = probe.diagnostics();
+    assert_eq!(diag.total_entries, 0);
+    assert_eq!(diag.sampled_entries, 0);
+}
+
+/// K = 1: every entry is diverted -- the design's "every entry interpreted"
+/// case. `total_entries` and `sampled_entries` end up equal.
+#[test]
+fn should_sample_entry_k1_diverts_every_entry() {
+    let mut probe = probe_for_k(CpuPersona::I586, 1);
+    for _ in 0..25 {
+        assert!(probe.should_sample_entry(), "K=1 must divert every entry");
+    }
+    let diag = probe.diagnostics();
+    assert_eq!(diag.total_entries, 25);
+    assert_eq!(diag.sampled_entries, 25);
+    assert!((diag.sampled_fraction() - 1.0).abs() < 1e-12);
+}
+
+/// K = 64: the sampled fraction converges to 1/64 within rounding, and the
+/// diverted entries land exactly on the Kth call (64, 128, ...), not just
+/// at the right COUNT -- both are checked, matching the design's "sampled
+/// fraction is 1/64 within rounding" wording.
+#[test]
+fn should_sample_entry_k64_samples_one_in_64() {
+    let mut probe = probe_for_k(CpuPersona::I586, 64);
+    let total_calls = 64 * 100;
+    let mut diverted_at = Vec::new();
+    for i in 1..=total_calls {
+        if probe.should_sample_entry() {
+            diverted_at.push(i);
+        }
+    }
+    let diag = probe.diagnostics();
+    assert_eq!(diag.total_entries, total_calls);
+    assert_eq!(diag.sampled_entries, 100);
+    assert_eq!(
+        diverted_at,
+        (1..=100).map(|n| n * 64).collect::<Vec<_>>(),
+        "diversion must land on exactly every 64th entry"
+    );
+    let fraction = diag.sampled_fraction();
+    assert!(
+        (fraction - 1.0 / 64.0).abs() < 1e-9,
+        "sampled_fraction {fraction} must be 1/64 within rounding"
+    );
+}
+
+/// A count that is not an exact multiple of K still reads within rounding:
+/// `sampled_entries` is `floor(total_entries / K)`, so the fraction is never
+/// more than one sample's worth off `1/K`.
+#[test]
+fn should_sample_entry_k64_partial_run_within_rounding() {
+    let mut probe = probe_for_k(CpuPersona::I586, 64);
+    for _ in 0..(64 * 10 + 37) {
+        probe.should_sample_entry();
+    }
+    let diag = probe.diagnostics();
+    assert_eq!(diag.total_entries, 677);
+    assert_eq!(diag.sampled_entries, 10);
+    let fraction = diag.sampled_fraction();
+    assert!(
+        (fraction - 1.0 / 64.0).abs() < 1.0 / 64.0,
+        "a partial run must still read within one sample's worth of 1/64, got {fraction}"
+    );
+}
+
+/// `sampled_fraction()` never divides by zero on a probe that has taken no
+/// entries yet.
+#[test]
+fn sampled_fraction_is_zero_on_no_entries() {
+    let probe = probe_for(CpuPersona::I586);
+    assert_eq!(probe.diagnostics().sampled_fraction(), 0.0);
+}
+
+/// `IZARRAVM_SHADOW_PROBE_SAMPLE` parsing: unset, empty, non-numeric and `0`
+/// all fall back to the default 64 (0 would divide by zero; the probe's own
+/// enable bit is the "off" spelling, not a 0 divisor).
+#[test]
+fn shadow_sample_k_from_env_defaults_and_rejects_zero() {
+    // SAFETY (test-only, single-threaded within this process's test harness
+    // for this specific var): mirrors the existing env-var tests in this
+    // module; no other test in this crate reads IZARRAVM_SHADOW_PROBE_SAMPLE.
+    unsafe {
+        std::env::remove_var("IZARRAVM_SHADOW_PROBE_SAMPLE");
+    }
+    assert_eq!(shadow_sample_k_from_env(), DEFAULT_SAMPLE_K);
+    unsafe {
+        std::env::set_var("IZARRAVM_SHADOW_PROBE_SAMPLE", "0");
+    }
+    assert_eq!(shadow_sample_k_from_env(), DEFAULT_SAMPLE_K);
+    unsafe {
+        std::env::set_var("IZARRAVM_SHADOW_PROBE_SAMPLE", "not-a-number");
+    }
+    assert_eq!(shadow_sample_k_from_env(), DEFAULT_SAMPLE_K);
+    unsafe {
+        std::env::set_var("IZARRAVM_SHADOW_PROBE_SAMPLE", "8");
+    }
+    assert_eq!(shadow_sample_k_from_env(), 8);
+    unsafe {
+        std::env::remove_var("IZARRAVM_SHADOW_PROBE_SAMPLE");
+    }
 }

@@ -2710,6 +2710,20 @@ impl CpuGsw {
             ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
+        // S1d slice 2 (shadow-cache-probe feature): while the shadow probe is
+        // armed, every Kth entry is diverted here to the interpreter instead
+        // of running native, so the interpreter's existing per-address probe
+        // seam sees that iteration's data accesses -- the JIT's own compiled
+        // body never carries them (see izarravm-machine's shadow_cache
+        // module doc). `should_sample_entry` itself is the ONE predictable
+        // branch this costs when the feature is compiled in but unarmed
+        // (always false, no counters move); off-feature this whole `if` does
+        // not exist.
+        #[cfg(feature = "shadow-cache-probe")]
+        if bus.shadow_probe_should_sample_entry() {
+            self.perf.jit_direct_reject_shadow_sample += 1;
+            return Ok(DirectBlockOutcome::NotRun);
+        }
         // Emission-shape backstop, guarding the ONE unsafe combination: a trace-elided block
         // about to be entered by a bus that wants fetch observations. `try_direct_continuation`
         // already synchronised this ahead of the probe, so the production path never sees it;
