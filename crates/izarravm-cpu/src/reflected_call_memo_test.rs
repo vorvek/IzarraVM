@@ -368,6 +368,7 @@ fn a_retf_return_leaving_the_flags_word_closes_as_a_return_match() {
         code_pages: Vec::new(),
         code_pages_over_cap: false,
         retired_insns: 0,
+        audit: None,
         hw_interrupt_seen: false,
         entry_tail: None,
     };
@@ -443,6 +444,7 @@ fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
         code_pages: Vec::new(),
         code_pages_over_cap: false,
         retired_insns: 0,
+        audit: None,
         hw_interrupt_seen: false,
         entry_tail: None,
     }
@@ -522,6 +524,7 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
         writes: HashMap::from([(
             addr,
             WriteObs {
+                pre_dword: None,
                 linear: addr,
                 ss_selector: DATA_SELECTOR,
                 pinned_pre: None,
@@ -538,6 +541,7 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
     writes_b.insert(
         addr,
         WriteObs {
+            pre_dword: None,
             linear: addr,
             ss_selector: DATA_SELECTOR,
             pinned_pre: None,
@@ -577,6 +581,7 @@ fn a_write_of_a_constant_the_trip_never_read_is_class_w_not_class_r() {
     writes.insert(
         0x9000u32,
         WriteObs {
+            pre_dword: None,
             linear: 0x9000,
             ss_selector: DATA_SELECTOR,
             pinned_pre: None, // never read before the write: NOT pinned
@@ -905,6 +910,7 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
     writes.insert(
         0x9080u32, // below low_water_esp (0x9100): a deeper push than ever reached again
         WriteObs {
+            pre_dword: None,
             linear: 0x9080,
             ss_selector: HOST_SS_SELECTOR,
             pinned_pre: None,
@@ -940,6 +946,7 @@ fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
     writes.insert(
         0x9150u32,
         WriteObs {
+            pre_dword: None,
             linear: 0x9150,
             ss_selector: HOST_SS_SELECTOR,
             pinned_pre: None,
@@ -1278,7 +1285,11 @@ fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
     let _ = on_int(cpu, bus, VECTOR);
-    bus.write_raw(CLASS_W_ADDR, BusWidth::Dword, write_value);
+    // `note_write` BEFORE the store commits, which is the production seam order
+    // (`write_system_linear`: "Hooked BEFORE the write below ... `note_write` needs the
+    // pre-write value, which this function's own doc says is gone once the write below
+    // commits"). The audit's write formula reads that pre-value, so a fixture that stored
+    // first would hand it the POST value and grade every memo against itself.
     note_write(
         cpu,
         bus,
@@ -1288,6 +1299,7 @@ fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u
         false,
         None,
     );
+    bus.write_raw(CLASS_W_ADDR, BusWidth::Dword, write_value);
     // What real instruction execution would have charged between the `INT` and the return --
     // applied HERE, between open and close, is what the raw-clock recovery (an
     // open/close DELTA) actually measures.
@@ -2034,4 +2046,331 @@ fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
         SlotState::Warm
     );
     assert!(!cpu.reflected_call_wants_interpreter());
+}
+
+// ---------------------------------------------------------------------------
+// Amendments 5 and 6: audited charging, and the drift accumulator.
+// ---------------------------------------------------------------------------
+
+/// **Mutation bite**: make `""` (or an unset variable) mean OFF instead of the default.
+/// A ladder leg that forgot to export the knob would then run with no audit at all and
+/// report `audit_mismatch = 0` for the best possible reason -- nothing was ever checked.
+/// The numeric-knob convention is that `=0` is the ONLY off spelling.
+#[test]
+fn the_audit_knob_spelling_table() {
+    use std::env::VarError;
+    assert_eq!(
+        parse_reflected_call_memo_audit(Err(VarError::NotPresent)),
+        MEMO_AUDIT_PERIOD_DEFAULT
+    );
+    assert_eq!(
+        parse_reflected_call_memo_audit(Ok(String::new())),
+        MEMO_AUDIT_PERIOD_DEFAULT
+    );
+    assert_eq!(
+        parse_reflected_call_memo_audit(Ok("  ".into())),
+        MEMO_AUDIT_PERIOD_DEFAULT
+    );
+    assert_eq!(parse_reflected_call_memo_audit(Ok("0".into())), 0);
+    assert_eq!(parse_reflected_call_memo_audit(Ok("1".into())), 1);
+    assert_eq!(parse_reflected_call_memo_audit(Ok("64".into())), 64);
+    assert!(
+        std::panic::catch_unwind(|| parse_reflected_call_memo_audit(Ok("yes".into()))).is_err()
+    );
+}
+
+/// Install a memo whose recorded shape MATCHES what `run_one_synthetic_trip` produces, so
+/// an audit of that trip is expected to agree in every lane.
+fn matching_memo(cpu: &CpuGsw, bus: &FlatMemBus, write_value: u32) -> Memo {
+    let entry = EntryImage::capture(cpu);
+    let mut epilogue = entry;
+    epilogue.esp = STACK_TOP - 2;
+    let (num, den) = crate::level_timing(cpu.persona());
+    let _ = bus;
+    Memo {
+        image: entry,
+        reads: Box::new([]),
+        translations: Box::new([]),
+        epilogue,
+        return_eip: CLIENT_RETURN_EIP,
+        replay: Box::new([(CLASS_W_ADDR, 4, write_value)]),
+        class_r_ranges: Box::new([]),
+        raw_core_clocks: 100 * u64::from(den) / u64::from(num),
+        raw_bus_clocks: 50,
+        insns: 7,
+        code_pages: Box::new([]),
+        nested_acks: Box::new([]),
+        control_effects: Box::new([]),
+    }
+}
+
+fn set_audit_period(cpu: &mut CpuGsw, period: u64) {
+    cpu.reflected_call.as_mut().unwrap().audit_period = period;
+}
+
+/// **Mutation bite**: make the audit ANSWER first and compare afterwards. There is then
+/// nothing left to compare against -- the memo's own epilogue IS the state -- and the
+/// audit reports agreement on every trip forever (plan R2.7: "AUDIT is record-and-compare
+/// ... `AUDIT=1` therefore answers nothing").
+///
+/// A second bite: place the audit decision BEFORE the screens. It would then grade the
+/// memo against trips it was never going to serve.
+#[test]
+fn an_audit_refuses_the_answer_and_runs_the_real_trip() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    set_audit_period(&mut cpu, 1); // every answer audited: nothing may ever answer
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = matching_memo(&cpu, &bus, 0xCAFEBABE);
+    install_memo(&mut cpu, key, memo);
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered,
+        "at AUDIT=1 nothing is answered"
+    );
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.answered, 0);
+    assert_eq!(
+        state.would_answer, 1,
+        "every screen passed: the audit is what refused"
+    );
+    let open = state.open.as_ref().expect("an audit trip is open");
+    assert_eq!(open.slot, Slot::Audit);
+    assert!(
+        open.journaling,
+        "an audit trip must journal, or it sees no writes"
+    );
+    assert!(
+        open.audit.is_some(),
+        "and it carries the memo it is grading"
+    );
+}
+
+/// The whole audit, end to end, on a trip that AGREES: no mismatch, no retire, and the
+/// memo is still there to answer the next trip.
+///
+/// **Mutation bite**: compare the write SETS instead of the values by the formula, or
+/// drop the `pre_dword` capture -- an agreeing trip then reports a `write_value`
+/// mismatch and the mechanism retires its own memo on every audit.
+#[test]
+fn an_agreeing_audit_leaves_the_memo_standing() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    set_audit_period(&mut cpu, 1);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = matching_memo(&cpu, &bus, 0xCAFEBABE);
+    install_memo(&mut cpu, key, memo);
+
+    run_one_synthetic_trip(&mut cpu, &mut bus, 0xCAFEBABE);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.audited, 1);
+    assert_eq!(
+        state.audit_mismatch, [0u64; 6],
+        "an agreeing trip must report no mismatch in any lane"
+    );
+    assert_eq!(state.retired[RetireCause::Audit.index()], 0);
+    assert_eq!(state.relearned, 0);
+    assert_eq!(
+        state.memos[&key].len(),
+        1,
+        "the memo survives an agreeing audit"
+    );
+}
+
+/// **Mutation bite**: let a core-clock or instruction-count disagreement pass. The memo
+/// then goes on charging a constant the real trip no longer costs, and the accumulated
+/// error slips an `irq0` edge -- the exact failure the measure-first review's section 2
+/// derived (a persistent one-clock error moves `irq0_edges` on a 31 s row with ~22%
+/// probability).
+#[test]
+fn a_core_clock_disagreement_retires_the_memo_and_relearns() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    set_audit_period(&mut cpu, 1);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let mut memo = matching_memo(&cpu, &bus, 0xCAFEBABE);
+    memo.raw_core_clocks += 12; // one charged 586 clock more than the trip really costs
+    install_memo(&mut cpu, key, memo);
+    // Strand the key MID-CYCLE, so "the retire puts it back at the head of a learn cycle"
+    // is a real assertion rather than one the fixture satisfies by construction.
+    cpu.reflected_call
+        .as_mut()
+        .unwrap()
+        .keys
+        .entry(key)
+        .or_default()
+        .slot = SlotState::Natural(3);
+
+    run_one_synthetic_trip(&mut cpu, &mut bus, 0xCAFEBABE);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.audited, 1);
+    assert_eq!(state.audit_mismatch[AuditMismatch::CoreClocks.index()], 1);
+    assert_eq!(state.retired[RetireCause::Audit.index()], 1);
+    assert_eq!(state.relearned, 1);
+    assert!(state.memos[&key].is_empty());
+    assert!(
+        !state.keys[&key].disarmed,
+        "a retire is never a disarm: the key must be free to learn again at once"
+    );
+    assert_eq!(
+        state.keys[&key].slot,
+        SlotState::Warm,
+        "and it must be back at the head of a learn cycle, not stranded mid-journal"
+    );
+}
+
+/// The formula's load-bearing case (plan R2.18): an address the memo classified R --
+/// predicted "no change" -- that the real trip WRITES. A set comparison would see the
+/// address in both worlds and report agreement.
+///
+/// **Mutation bite**: predict `observed_now` instead of the trip's ENTRY value for a
+/// non-replayed address. Every audit then agrees with itself, vacuously.
+#[test]
+fn an_address_the_memo_predicts_unchanged_but_the_trip_writes_is_a_mismatch() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    set_audit_period(&mut cpu, 1);
+    bus.gate_allowance = Some(1_000_000);
+    bus.write_raw(CLASS_W_ADDR, BusWidth::Dword, 0x1111_1111);
+    let key = key_for(&cpu, VECTOR, 0);
+    let mut memo = matching_memo(&cpu, &bus, 0xCAFEBABE);
+    memo.replay = Box::new([]); // the memo skips this address entirely: "no change"
+    install_memo(&mut cpu, key, memo);
+
+    // The real trip writes it.
+    run_one_synthetic_trip(&mut cpu, &mut bus, 0x2222_2222);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.audited, 1);
+    assert_eq!(
+        state.audit_mismatch[AuditMismatch::WriteValue.index()],
+        1,
+        "the memo predicted the entry value and the trip wrote a different one"
+    );
+    assert_eq!(state.retired[RetireCause::Audit.index()], 1);
+}
+
+/// **Mutation bite**: make the bus band an exact equality. Exact bus conservation is
+/// unattainable in principle (an answered trip touches no cache line, so the cache model
+/// sees a different access stream whatever is charged), so an exact bar would retire the
+/// memo on the 0.007% of trips that jitter and the mechanism would thrash.
+/// The opposite bite -- no band at all -- lets an arbitrarily wrong bus total stand.
+#[test]
+fn the_bus_total_is_graded_against_a_band_not_an_equality() {
+    for (delta, expect_mismatch) in [
+        (MEMO_AUDIT_BUS_BAND, false),
+        (MEMO_AUDIT_BUS_BAND + 1, true),
+    ] {
+        let (mut cpu, mut bus) = synthetic_reflected_client();
+        arm(&mut cpu);
+        set_audit_period(&mut cpu, 1);
+        bus.gate_allowance = Some(1_000_000);
+        let key = key_for(&cpu, VECTOR, 0);
+        let mut memo = matching_memo(&cpu, &bus, 0xCAFEBABE);
+        memo.raw_bus_clocks += delta;
+        install_memo(&mut cpu, key, memo);
+
+        run_one_synthetic_trip(&mut cpu, &mut bus, 0xCAFEBABE);
+
+        let state = cpu.reflected_call.as_ref().unwrap();
+        assert_eq!(
+            state.audit_mismatch[AuditMismatch::BusClocks.index()] == 1,
+            expect_mismatch,
+            "delta {delta} inside the band should not be a mismatch"
+        );
+    }
+}
+
+/// **Mutation bite**: ignore `audit_period == 0`. The knob's OFF spelling would then not
+/// turn the audit off, and the ladder's un-audited legs would be measuring a different
+/// mechanism from the one they name.
+#[test]
+fn audit_period_zero_turns_the_audit_off() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    set_audit_period(&mut cpu, 0);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = matching_memo(&cpu, &bus, 0xCAFEBABE);
+    install_memo(&mut cpu, key, memo);
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::Answered
+    );
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.audited, 0);
+    assert_eq!(state.answered, 1);
+}
+
+/// Amendment 6, the DRIFT ACCUMULATOR. The threshold is derived from the persona's own
+/// clock, not baked: one IRQ0 edge is `clock_hz / 18.2065` guest clocks, and half an edge
+/// at 166 MHz is 4,558,812.
+///
+/// **Mutation bite**: bake a constant instead. A 486 row (33 MHz) would then audit at the
+/// 586's threshold, i.e. five times later than half of ITS edge, and the accumulator would
+/// stop bounding anything on that persona.
+#[test]
+fn the_drift_threshold_is_half_an_irq0_edge_at_this_personas_clock() {
+    assert_eq!(half_irq0_edge_clocks(166_000_000), 4_558_811);
+    assert_eq!(half_irq0_edge_clocks(33_000_000), 906_269);
+    // The formula, restated: clock_hz / 18.2065 / 2, in integer arithmetic.
+    assert_eq!(
+        half_irq0_edge_clocks(166_000_000),
+        166_000_000u64 * 10_000 / 182_065 / 2
+    );
+}
+
+/// **Mutation bite**: never accumulate (or reset the accumulator on every answer). A
+/// persistent one-signed bus error would then run unbounded between the period's audits,
+/// and at 64,840 trips per guest second even a small per-trip error slips an `irq0` edge
+/// long before 64 answers have gone by on a busy key.
+#[test]
+fn accumulated_bus_drift_forces_an_audit_before_half_an_edge_is_lost() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    // A long period, so ONLY the accumulator can force the next audit.
+    set_audit_period(&mut cpu, 1_000_000);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = matching_memo(&cpu, &bus, 0xCAFEBABE);
+    install_memo(&mut cpu, key, memo);
+
+    // Answer once, so the key exists with a zero accumulator.
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::Answered
+    );
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().keys[&key].bus_drift_acc,
+        0
+    );
+
+    // Poison the accumulator past half an edge, the way a long run of one-signed bus
+    // errors would.
+    let half_edge = half_irq0_edge_clocks(cpu.mode_clock_hz());
+    cpu.reflected_call
+        .as_mut()
+        .unwrap()
+        .keys
+        .get_mut(&key)
+        .unwrap()
+        .bus_drift_acc = -(half_edge as i64);
+
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered,
+        "the accumulator forces the next trip to run naturally"
+    );
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.drift_forced_audits, 1);
+    assert_eq!(state.open.as_ref().unwrap().slot, Slot::Audit);
 }

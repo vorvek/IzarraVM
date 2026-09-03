@@ -122,6 +122,19 @@ pub(crate) const MEMO_MAX_TRANSLATION_SET: usize = 64;
 /// Replay-write cap, raised from 32 to 192 by R2.3/R2.17 (the pinned-pre-
 /// value fix moves most same-address writes from R to W).
 pub(crate) const MEMO_MAX_REPLAY_WRITES: usize = 192;
+/// Default audit period: one answer in 64 is refused and run NATURALLY so its real end
+/// state can be compared with what the memo would have produced (measure-first review,
+/// campaign verdict (2c)). Chosen, not tuned: it bounds the charged-clock error a regime
+/// shift can accumulate to `64 x delta` before the audit catches it, and costs 1.6% of the
+/// answer rate.
+pub(crate) const MEMO_AUDIT_PERIOD_DEFAULT: u64 = 64;
+/// The band, in RAW bus clocks, inside which an audited trip's bus total must land.
+/// Exact bus conservation is unattainable in principle (measure-first re-review (1)): an
+/// answered trip touches no cache line, so the cache model's answer to the next access
+/// stream differs from the real one whatever is charged. The observed jitter on the
+/// dominant key is +38/-4 raw at 0.007% of samples; 64 is 5x that, and ~0.0007% of an
+/// irq0 edge.
+pub(crate) const MEMO_AUDIT_BUS_BAND: u64 = 64;
 /// Physical code pages a memo may carry (plan section 4.5's `code_pages_too_many`).
 /// The dominant key's trip spans the client, the DPMI host and the DOS kernel; 16 is
 /// the plan's own figure.
@@ -159,6 +172,30 @@ pub(crate) fn parse_reflected_call_memo_arm(spec: Result<String, std::env::VarEr
             ),
         },
     }
+}
+
+/// Parse `IZARRAVM_REFLECTED_CALL_MEMO_AUDIT`, the numeric-knob convention (`sweep_knob`):
+/// unset and `""` both mean the DEFAULT, never "off" -- `=0` is the off spelling and it is
+/// the only one (`parameter-knobs-have-no-off-spelling`). An unparseable value panics
+/// naming the accepted forms, so a mistyped ladder leg cannot silently run the default.
+pub(crate) fn parse_reflected_call_memo_audit(spec: Result<String, std::env::VarError>) -> u64 {
+    match spec {
+        Err(_) => MEMO_AUDIT_PERIOD_DEFAULT,
+        Ok(s) if s.trim().is_empty() => MEMO_AUDIT_PERIOD_DEFAULT,
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => panic!(
+                "IZARRAVM_REFLECTED_CALL_MEMO_AUDIT={s:?} not recognised; want unset, \"\"                  (both = {MEMO_AUDIT_PERIOD_DEFAULT}), \"0\" (off), or a positive integer"
+            ),
+        },
+    }
+}
+
+fn knob_audit_period() -> u64 {
+    static PERIOD: OnceLock<u64> = OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        parse_reflected_call_memo_audit(std::env::var("IZARRAVM_REFLECTED_CALL_MEMO_AUDIT"))
+    })
 }
 
 fn knob_armed() -> bool {
@@ -309,6 +346,91 @@ impl LearnRefused {
     }
 }
 
+/// What an audited trip disagreed with the memo about (plan R2.7 / R2.18 as amended:
+/// the audit is a FORMULA over the observed write set, not a set comparison, and it is
+/// content-only -- it never answers, so it exercises no apply-path bug).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AuditMismatch {
+    /// The exit architectural state (registers, EFLAGS, six segments, ESP) differed.
+    Epilogue,
+    /// Some address's real final value differed from the memo's prediction: its replay
+    /// value where the memo replays it, else the value it held at trip entry.
+    WriteValue,
+    /// The raw core-clock total differed. EXACT is the bar here: core and instruction
+    /// sums were unanimous over 525,352 measured samples.
+    CoreClocks,
+    /// The instruction count differed -- a different path through the handler.
+    Instructions,
+    /// The raw bus total fell outside `MEMO_AUDIT_BUS_BAND`.
+    BusClocks,
+    /// The trip did not close as a return match at all, or was refused, so there is
+    /// nothing to compare. Counted, never acted on.
+    Unusable,
+}
+
+pub(crate) const AUDIT_MISMATCH_ALL: [AuditMismatch; 6] = [
+    AuditMismatch::Epilogue,
+    AuditMismatch::WriteValue,
+    AuditMismatch::CoreClocks,
+    AuditMismatch::Instructions,
+    AuditMismatch::BusClocks,
+    AuditMismatch::Unusable,
+];
+
+impl AuditMismatch {
+    fn index(self) -> usize {
+        AUDIT_MISMATCH_ALL
+            .iter()
+            .position(|k| *k == self)
+            .expect("in AUDIT_MISMATCH_ALL")
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Epilogue => "epilogue",
+            Self::WriteValue => "write_value",
+            Self::CoreClocks => "core_clocks",
+            Self::Instructions => "instructions",
+            Self::BusClocks => "bus_clocks",
+            Self::Unusable => "unusable",
+        }
+    }
+}
+
+/// Why a memo was retired, one named lane per cause (plan section 7.4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RetireCause {
+    A20,
+    CodeWatch,
+    CodeMarkEpoch,
+    Audit,
+}
+
+pub(crate) const RETIRE_CAUSE_ALL: [RetireCause; 4] = [
+    RetireCause::A20,
+    RetireCause::CodeWatch,
+    RetireCause::CodeMarkEpoch,
+    RetireCause::Audit,
+];
+
+impl RetireCause {
+    fn index(self) -> usize {
+        RETIRE_CAUSE_ALL
+            .iter()
+            .position(|k| *k == self)
+            .expect("in RETIRE_CAUSE_ALL")
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::A20 => "a20",
+            Self::CodeWatch => "code_watch",
+            Self::CodeMarkEpoch => "code_mark_epoch",
+            Self::Audit => "audit",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Write classification
 // ---------------------------------------------------------------------------
@@ -327,6 +449,12 @@ struct WriteObs {
     /// comparing against the entry segment's own tracker regardless of which segment the
     /// write actually fell in.
     ss_selector: u16,
+    /// The value of the WHOLE aligned dword immediately before this trip's FIRST write to
+    /// it, peeked directly rather than inferred from the read set. Used only by the audit
+    /// (plan R2.18's formula needs "the value the address held at trip entry" for EVERY
+    /// written address, including the ones the trip never read -- which `pinned_pre`, by
+    /// construction, cannot supply). `None` when the peek declined.
+    pre_dword: Option<u32>,
     /// The pre-value, if pinned: `Some` only when this trip's own read set
     /// (or translation set, for a page-table entry) already covers this
     /// dword before the first write to it.
@@ -372,6 +500,10 @@ enum Slot {
     JournalA,
     JournalB,
     Natural(u8),
+    /// An AUDIT trip: the screens all passed and the memo WOULD have answered, and the
+    /// answer was refused on purpose so the real trip's end state can be compared with
+    /// the memo's prediction (plan R2.7). It leaves the key's own learn slot untouched.
+    Audit,
 }
 
 impl From<SlotState> for Slot {
@@ -382,6 +514,12 @@ impl From<SlotState> for Slot {
             SlotState::JournalB => Slot::JournalB,
             SlotState::Natural(i) => Slot::Natural(i),
         }
+    }
+}
+
+impl Slot {
+    fn journals(self) -> bool {
+        matches!(self, Slot::JournalA | Slot::JournalB | Slot::Audit)
     }
 }
 
@@ -438,6 +576,8 @@ struct OpenTrip {
     /// own instruction count: if they disagree the trip ran partly on the native
     /// backend, so `code_pages` is INCOMPLETE and no memo may be built from it.
     retired_insns: u64,
+    /// The memo this trip is auditing (`Slot::Audit` only).
+    audit: Option<Arc<Memo>>,
     hw_interrupt_seen: bool,
     /// Plan 4.4, the live stack tail: the physical address and WORD value at
     /// `[entry_esp - 2, entry_esp)` sampled at trip OPEN, before the `INT`'s own push --
@@ -527,7 +667,7 @@ impl OpenTrip {
             open_bus_raw: bus.cumulative_raw_bus_clocks(),
             stacks,
             stack_segments_over_cap: false,
-            journaling: matches!(slot, Slot::JournalA | Slot::JournalB),
+            journaling: slot.journals(),
             reads: HashMap::new(),
             writes: HashMap::new(),
             translations: HashMap::new(),
@@ -542,6 +682,7 @@ impl OpenTrip {
             code_pages: Vec::new(),
             code_pages_over_cap: false,
             retired_insns: 0,
+            audit: None,
             hw_interrupt_seen: false,
             entry_tail,
         }
@@ -786,6 +927,11 @@ pub(crate) struct KeyState {
     pub learn_attempts: u64,
     pub learned: u64,
     pub learn_refused: [u64; 25],
+    /// Answers this key has applied since its last audit, and the signed bus-clock drift
+    /// the memo has accumulated against what the audits actually observed (amendment 6).
+    answers_since_audit: u64,
+    bus_drift_acc: i64,
+    pub audits: u64,
     pub write_class_r_pinned: u64,
     pub write_class_r_unpinned: u64,
     pub write_class_d: u64,
@@ -852,7 +998,7 @@ impl KeyState {
 // The per-CPU state
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ReflectedCallMemoState {
     keys: HashMap<MemoKey, KeyState>,
     open: Option<OpenTrip>,
@@ -907,6 +1053,57 @@ pub(crate) struct ReflectedCallMemoState {
     /// Keys currently sitting in a journal slot; the batch loop forces the interpreter
     /// while this is non-zero.
     journal_keys: u32,
+    /// `IZARRAVM_REFLECTED_CALL_MEMO_AUDIT`, read ONCE when this state is created.
+    pub(crate) audit_period: u64,
+    /// Trips refused on purpose so the memo's prediction could be compared against the
+    /// real thing, and what they disagreed about.
+    pub(crate) audited: u64,
+    pub(crate) audit_mismatch: [u64; 6],
+    /// Memos retired, per cause.
+    pub(crate) retired: [u64; 4],
+    /// Memos a retire made room for and a later learn cycle rebuilt.
+    pub(crate) relearned: u64,
+    /// Audits forced by the drift accumulator rather than by the period (amendment 6).
+    pub(crate) drift_forced_audits: u64,
+}
+
+impl Default for ReflectedCallMemoState {
+    fn default() -> Self {
+        ReflectedCallMemoState {
+            keys: HashMap::new(),
+            open: None,
+            memos: HashMap::new(),
+            a20_retires: 0,
+            not_memoised: 0,
+            entry_state_mismatch: 0,
+            read_set_mismatch: 0,
+            read_set_unreadable: 0,
+            would_answer: 0,
+            answered: 0,
+            insns_elided: 0,
+            core_clocks_charged: 0,
+            bus_clocks_charged: 0,
+            fell_through_pending_interrupt: 0,
+            fell_through_cap: 0,
+            fell_through_device_edge: 0,
+            fell_through_dma_visible: 0,
+            fell_through_not_armed: 0,
+            fell_through_clock_projection: 0,
+            code_watch_retires: 0,
+            code_mark_epoch_retires: 0,
+            code_mark_epoch: 0,
+            learn_batches: 0,
+            journal_keys: 0,
+            // Read ONCE, here, exactly as the arm knob is: the answer path afterwards only
+            // ever reads this field.
+            audit_period: knob_audit_period(),
+            audited: 0,
+            audit_mismatch: [0; 6],
+            retired: [0; 4],
+            relearned: 0,
+            drift_forced_audits: 0,
+        }
+    }
 }
 
 /// Why a candidate memo did not answer (plan section 5, screens 2/3/6): the entry-image and
@@ -990,12 +1187,18 @@ impl ReflectedCallMemoState {
     }
 
     pub(crate) fn retire_all_memos(&mut self) {
+        let retired = self.clear_all_memos();
+        self.a20_retires += retired;
+        self.retired[RetireCause::A20.index()] += retired;
+    }
+
+    fn clear_all_memos(&mut self) -> u64 {
         let mut retired = 0u64;
         for memos in self.memos.values_mut() {
             retired += memos.len() as u64;
             memos.clear();
         }
-        self.a20_retires += retired;
+        retired
     }
 }
 
@@ -1156,6 +1359,18 @@ pub(crate) fn on_int<B: CpuBus>(
     if try_answer(cpu, bus, key)?.is_some() {
         return Ok(IntOutcome::Answered);
     }
+    // An AUDIT fall-through has already opened its own trip in place of the answer
+    // (`open_audit_trip`), and the learn path below must not overwrite it -- the audit
+    // grades the memo, the learn cycle builds one, and the two use the same single-trip
+    // slot. Every other fall-through leaves `open` untouched and falls into the learn
+    // path exactly as before.
+    if cpu
+        .reflected_call
+        .as_ref()
+        .is_some_and(|state| state.open.is_some())
+    {
+        return Ok(IntOutcome::NotAnswered);
+    }
 
     let key_state = cpu
         .reflected_call
@@ -1248,8 +1463,81 @@ fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecRes
         }
     }
 
+    // Screen 8, and the last one: is this the answer that gets AUDITED? Every Nth answer
+    // of a key is refused ON PURPOSE and run naturally, so its real end state can be
+    // compared with what the memo would have produced (plan R2.7 as amended: the audit is
+    // record-and-compare, never rollback, because no machine-level snapshot of CPU plus
+    // 64 MiB plus device state exists in this tree). It is placed HERE, after every screen
+    // has passed, so an audited trip is one the memo really would have answered -- an
+    // audit taken before the screens would grade a memo against a trip it was never going
+    // to serve.
+    if audit_is_due(cpu, key) {
+        open_audit_trip(cpu, bus, key, memo);
+        return Ok(None);
+    }
+
     apply_answer(cpu, bus, &memo, scaled_core)?;
+    note_answer_for_audit(cpu, key);
     Ok(Some(()))
+}
+
+/// Is this key's next answer the audited one? Two ways it can be: the ordinary period
+/// (`IZARRAVM_REFLECTED_CALL_MEMO_AUDIT`, default 64), and the DRIFT ACCUMULATOR
+/// (amendment 6) -- see `KeyState::bus_drift_acc`.
+fn audit_is_due(cpu: &mut CpuGsw, key: MemoKey) -> bool {
+    let half_edge = half_irq0_edge_clocks(cpu.mode_clock_hz());
+    let state = cpu.reflected_call.as_mut().expect("caller checked");
+    let period = state.audit_period;
+    if period == 0 {
+        return false;
+    }
+    let Some(key_state) = state.keys.get_mut(&key) else {
+        return false;
+    };
+    if key_state.bus_drift_acc.unsigned_abs() >= half_edge {
+        state.drift_forced_audits += 1;
+        return true;
+    }
+    key_state.answers_since_audit >= period.saturating_sub(1)
+}
+
+fn note_answer_for_audit(cpu: &mut CpuGsw, key: MemoKey) {
+    if let Some(key_state) = cpu
+        .reflected_call
+        .as_mut()
+        .and_then(|state| state.keys.get_mut(&key))
+    {
+        key_state.answers_since_audit = key_state.answers_since_audit.saturating_add(1);
+    }
+}
+
+/// Half the spacing between two IRQ0 edges, in the guest clocks `elapsed_clocks` counts.
+///
+/// The PIT's channel 0 runs at the standard 1.19318 MHz / 65536 = **18.2065 Hz**, so one
+/// edge is `clock_hz / 18.2065` guest clocks and half an edge is that over two. Stated as
+/// integer arithmetic over the persona's own clock rather than as a baked constant, so a
+/// 486 row and a 586 row each get their own figure: at 166 MHz that is
+/// `166e6 * 10_000 / 182_065 / 2 = 4,558,812`.
+///
+/// The accumulator it bounds is in RAW BUS clocks while this is in GUEST clocks, and the
+/// comparison is deliberately made across that gap: `bus_timing` is `(16, 105)` on the 586
+/// and `(1, 3)` on the 486, both well under 1, so a raw bus total always maps to FEWER
+/// guest clocks than itself. Comparing raw against a guest-clock bound therefore fires
+/// EARLY -- more audits than strictly needed, never fewer -- which is the safe direction
+/// and needs no bus-scale accessor the CPU crate does not have.
+pub(crate) fn half_irq0_edge_clocks(clock_hz: u64) -> u64 {
+    clock_hz.saturating_mul(10_000) / 182_065 / 2
+}
+
+/// Refuse the answer and open a journaled AUDIT trip in its place. The key's own learn
+/// slot is untouched: an audit is not a learn attempt, and a key mid-cycle must not lose
+/// its place to one.
+fn open_audit_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoKey, memo: Arc<Memo>) {
+    cpu.reflected_call_journal = true;
+    let mut open = OpenTrip::start(cpu, bus, key, Slot::Audit);
+    open.audit = Some(memo);
+    let state = cpu.reflected_call.as_mut().expect("caller checked");
+    state.open = Some(open);
 }
 
 /// Bring the memo cache into line with the decode cache's wholesale-mark-clear counter
@@ -1264,12 +1552,9 @@ fn sync_code_mark_epoch(cpu: &mut CpuGsw) {
     if state.code_mark_epoch == live {
         return;
     }
-    let mut retired = 0u64;
-    for memos in state.memos.values_mut() {
-        retired += memos.len() as u64;
-        memos.clear();
-    }
+    let retired = state.clear_all_memos();
     state.code_mark_epoch_retires += retired;
+    state.retired[RetireCause::CodeMarkEpoch.index()] += retired;
     state.code_mark_epoch = live;
 }
 
@@ -1505,6 +1790,7 @@ pub(crate) fn note_code_write_range(cpu: &mut CpuGsw, physical: u32, width: u32)
         retired += (before - memos.len()) as u64;
     }
     state.code_watch_retires += retired;
+    state.retired[RetireCause::CodeWatch.index()] += retired;
 }
 
 /// Production seam: `CpuGsw::flush_tlb_and_code_caches_for_cr3_write` (`core.rs`), the
@@ -1704,11 +1990,13 @@ pub(crate) fn note_write<B: CpuBus>(
         } else if open.writes.len() >= MEMO_MAX_REPLAY_WRITES {
             open.hazard.get_or_insert(LearnRefused::ReplaySetTooLarge);
         } else {
+            let pre_dword = bus.peek_direct_ram(dword, BusWidth::Dword);
             open.writes.insert(
                 dword,
                 WriteObs {
                     linear,
                     ss_selector: ss.selector,
+                    pre_dword,
                     pinned_pre,
                     latest: masked,
                     class,
@@ -1925,6 +2213,26 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
                 }
             }
         }
+        Slot::Audit => {
+            let memo = open.audit.clone().expect("an audit trip carries its memo");
+            let insns = close_instructions.saturating_sub(open.open_instructions);
+            let raw_core = recover_raw_core_clocks(
+                open.open_elapsed_clocks,
+                open.open_timing_rem,
+                close_elapsed,
+                close_rem,
+                open.entry_persona,
+                close_persona,
+            );
+            let raw_bus = recover_raw_bus_clocks(open.open_bus_raw, close_bus_raw);
+            let observed = AuditObservation {
+                raw_core,
+                raw_bus,
+                insns,
+                exit_image,
+            };
+            finish_audit(cpu, bus, key, &memo, &open, &observed);
+        }
         Slot::Natural(i) => {
             let raw_core = recover_raw_core_clocks(
                 open.open_elapsed_clocks,
@@ -2014,6 +2322,161 @@ fn code_page_refusal(open: &OpenTrip, close_instructions: u64) -> Option<LearnRe
         return Some(LearnRefused::CodePagesIncomplete);
     }
     None
+}
+
+/// What an audited trip actually did, gathered at its close.
+struct AuditObservation {
+    raw_core: Option<u64>,
+    raw_bus: Option<u64>,
+    insns: u64,
+    exit_image: EntryImage,
+}
+
+/// Grade one audited trip against the memo that would have answered it, and act.
+///
+/// **The write comparison is a FORMULA, not a set comparison** (plan R2.18): *for every
+/// address in the OBSERVED write set, the memo's predicted final value -- its replay value
+/// where the memo replays it, else the value the address held at trip entry -- equals the
+/// observed final value.* Set-vs-set would miss the case that matters most: an address the
+/// memo classified R that is unpinned at audit time, where the memo predicts "no change"
+/// and the real trip writes. The union with the memo's OWN replay set covers the mirror
+/// case: an address the memo would write that this trip did not.
+///
+/// **What each disagreement costs the memo.** A core-clock or instruction-count
+/// disagreement retires it and lets the key re-learn: those two were unanimous over
+/// 525,352 measured samples, so a disagreement is a genuinely different trip and charging
+/// the old constant would break the conservation the whole slice rests on. A bus total
+/// outside `MEMO_AUDIT_BUS_BAND` does the same. An epilogue or write-value disagreement is
+/// a soundness failure, and retires it too. Retiring is never a DISARM: the key may learn
+/// again immediately, which is what stops one regime shift from switching the mechanism
+/// off for the rest of the run.
+fn finish_audit<B: CpuBus>(
+    cpu: &mut CpuGsw,
+    bus: &B,
+    key: MemoKey,
+    memo: &Memo,
+    open: &OpenTrip,
+    observed: &AuditObservation,
+) {
+    let mut mismatches: Vec<AuditMismatch> = Vec::new();
+    let (Some(raw_core), Some(raw_bus)) = (observed.raw_core, observed.raw_bus) else {
+        record_audit(cpu, key, &[AuditMismatch::Unusable], 0);
+        return;
+    };
+    if observed.exit_image != memo.epilogue {
+        mismatches.push(AuditMismatch::Epilogue);
+    }
+    if raw_core != memo.raw_core_clocks {
+        mismatches.push(AuditMismatch::CoreClocks);
+    }
+    if observed.insns != memo.insns {
+        mismatches.push(AuditMismatch::Instructions);
+    }
+    let bus_delta = i64::try_from(memo.raw_bus_clocks).unwrap_or(i64::MAX)
+        - i64::try_from(raw_bus).unwrap_or(i64::MAX);
+    if bus_delta.unsigned_abs() > MEMO_AUDIT_BUS_BAND {
+        mismatches.push(AuditMismatch::BusClocks);
+    }
+    if audit_write_values_disagree(bus, memo, open) {
+        mismatches.push(AuditMismatch::WriteValue);
+    }
+    record_audit(cpu, key, &mismatches, bus_delta);
+}
+
+/// The write half of the audit formula. Walks the UNION of the observed write set and the
+/// memo's replay set, at aligned-dword granularity, comparing the memo's prediction with
+/// the live post-trip value.
+fn audit_write_values_disagree<B: CpuBus>(bus: &B, memo: &Memo, open: &OpenTrip) -> bool {
+    let mut dwords: Vec<u32> = open.writes.keys().copied().collect();
+    for &(addr, _, _) in memo.replay.iter() {
+        dwords.push(aligned_dword(addr));
+    }
+    dwords.sort_unstable();
+    dwords.dedup();
+    for dword in dwords {
+        let Some(observed_now) = bus.peek_direct_ram(dword, BusWidth::Dword) else {
+            // The cell is not plain RAM any more. A memo may not carry such an address at
+            // all (`build_confirmed` refuses `never_restored` classes), so this is a
+            // disagreement, not an excuse.
+            return true;
+        };
+        // "The value the address held at trip entry": the peek `note_write` took before
+        // this trip's FIRST write to the dword. An address the trip never wrote still
+        // holds its entry value now, so the live read is that value.
+        let entry = open
+            .writes
+            .get(&dword)
+            .and_then(|obs| obs.pre_dword)
+            .unwrap_or(observed_now);
+        let mut predicted = entry;
+        for &(addr, width_bytes, value) in memo.replay.iter() {
+            if aligned_dword(addr) != dword {
+                continue;
+            }
+            let shift = (addr - dword) * 8;
+            let mask = match width_bytes {
+                1 => 0xFFu32,
+                2 => 0xFFFFu32,
+                _ => 0xFFFF_FFFFu32,
+            };
+            predicted = (predicted & !(mask << shift)) | ((value & mask) << shift);
+        }
+        if predicted != observed_now {
+            return true;
+        }
+    }
+    false
+}
+
+/// Book one audit's outcome and act on it: retire the memo on any disagreement, and fold
+/// the observed bus error into the key's drift accumulator (amendment 6).
+fn record_audit(cpu: &mut CpuGsw, key: MemoKey, mismatches: &[AuditMismatch], bus_delta: i64) {
+    let state = cpu.reflected_call.as_mut().expect("caller checked");
+    state.audited += 1;
+    for m in mismatches {
+        state.audit_mismatch[m.index()] += 1;
+    }
+    let actionable = mismatches
+        .iter()
+        .any(|m| !matches!(m, AuditMismatch::Unusable));
+    if actionable {
+        let retired = state
+            .memos
+            .get_mut(&key)
+            .map(|memos| {
+                let n = memos.len() as u64;
+                memos.clear();
+                n
+            })
+            .unwrap_or(0);
+        state.retired[RetireCause::Audit.index()] += retired;
+    }
+    let Some(key_state) = state.keys.get_mut(&key) else {
+        return;
+    };
+    key_state.audits += 1;
+    if actionable {
+        // Retiring is not disarming: the key restarts its learn cycle at Warm and may
+        // rebuild a memo immediately (measure-first review: "a disagreement retires the
+        // memo and re-learns; never disarms"). `relearned` is what makes a key that is
+        // thrashing between learn and retire visible as a counter rather than as a quiet
+        // collapse in the answer rate.
+        key_state.slot = SlotState::Warm;
+        key_state.pending_journal = None;
+        key_state.confirmed = None;
+        key_state.natural_samples.clear();
+        state.relearned += 1;
+        key_state.bus_drift_acc = 0;
+    } else {
+        // Amendment 6: every answer since the last audit charged the memo's own bus total,
+        // and this audit is the only evidence of what that total should have been, so the
+        // whole batch of answers carries the error this one trip revealed.
+        let answers = i64::try_from(key_state.answers_since_audit).unwrap_or(i64::MAX);
+        key_state.bus_drift_acc = key_state
+            .bus_drift_acc
+            .saturating_add(bus_delta.saturating_mul(answers));
+    }
+    key_state.answers_since_audit = 0;
 }
 
 fn compare_journal(
@@ -2356,7 +2819,59 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
     let Some(state) = cpu.reflected_call.as_ref() else {
         return "{\"armed\":false}".to_string();
     };
-    let mut out = String::from("{\"armed\":true,\"keys\":[");
+    let mut out = format!(
+        "{{\"armed\":true,\"audit_period\":{},\"answered\":{},\"would_answer\":{},         \"insns_elided\":{},\"core_clocks_charged\":{},\"bus_clocks_charged\":{},         \"audited\":{},\"relearned\":{},\"drift_forced_audits\":{},\"learn_batches\":{},         \"a20_retires\":{},\"code_watch_retires\":{},\"code_mark_epoch_retires\":{},         \"fell_through\":{{\"not_memoised\":{},\"entry_state_mismatch\":{},         \"read_set_mismatch\":{},\"read_set_unreadable\":{},\"pending_interrupt\":{},         \"cap\":{},\"device_edge\":{},\"dma_visible\":{},\"not_armed\":{},         \"clock_projection\":{}}},",
+        state.audit_period,
+        state.answered,
+        state.would_answer,
+        state.insns_elided,
+        state.core_clocks_charged,
+        state.bus_clocks_charged,
+        state.audited,
+        state.relearned,
+        state.drift_forced_audits,
+        state.learn_batches,
+        state.a20_retires,
+        state.code_watch_retires,
+        state.code_mark_epoch_retires,
+        state.not_memoised,
+        state.entry_state_mismatch,
+        state.read_set_mismatch,
+        state.read_set_unreadable,
+        state.fell_through_pending_interrupt,
+        state.fell_through_cap,
+        state.fell_through_device_edge,
+        state.fell_through_dma_visible,
+        state.fell_through_not_armed,
+        state.fell_through_clock_projection,
+    );
+    out.push_str("\"audit_mismatch\":{");
+    let mut afirst = true;
+    for kind in AUDIT_MISMATCH_ALL {
+        if !afirst {
+            out.push(',');
+        }
+        afirst = false;
+        out.push_str(&format!(
+            "\"{}\":{}",
+            kind.name(),
+            state.audit_mismatch[kind.index()]
+        ));
+    }
+    out.push_str("},\"retired\":{");
+    let mut rfirst = true;
+    for cause in RETIRE_CAUSE_ALL {
+        if !rfirst {
+            out.push(',');
+        }
+        rfirst = false;
+        out.push_str(&format!(
+            "\"{}\":{}",
+            cause.name(),
+            state.retired[cause.index()]
+        ));
+    }
+    out.push_str("},\"keys\":[");
     let mut first = true;
     for (key, ks) in &state.keys {
         if !first {
@@ -2365,7 +2880,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         first = false;
         out.push_str(&format!(
             "{{\"vector\":{},\"ax\":{},\"int_eip\":{},\"cs_selector\":{},\"ss_selector\":{},\"cpl\":{},\"vm\":{},\
-             \"disarmed\":{},\"trips_seen\":{},\"disarmed_returns\":{},\"rearms\":{},\"learn_attempts\":{},\"learned\":{},\
+             \"disarmed\":{},\"trips_seen\":{},\"disarmed_returns\":{},\"rearms\":{},\"learn_attempts\":{},\"learned\":{},\"audits\":{},\"bus_drift_acc\":{},\"memos\":{},\
              \"write_class_r_pinned\":{},\"write_class_r_unpinned\":{},\
              \"write_class_d\":{},\"write_class_w_other\":{},\
              \"stability_total_attempts\":{},\"stability_stable_attempts\":{},\
@@ -2387,6 +2902,9 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
             ks.rearms,
             ks.learn_attempts,
             ks.learned,
+            ks.audits,
+            ks.bus_drift_acc,
+            state.memos.get(key).map(Vec::len).unwrap_or(0),
             ks.write_class_r_pinned,
             ks.write_class_r_unpinned,
             ks.write_class_d,

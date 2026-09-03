@@ -2042,6 +2042,14 @@ impl CpuGsw {
         Some(charged)
     }
 
+    /// This CPU's configured core clock, in Hz, for the reflected-call memo's drift
+    /// accumulator (which needs the irq0 edge spacing in guest clocks, and that is a
+    /// per-persona figure, not a constant).
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn mode_clock_hz(&self) -> u64 {
+        self.mode.clock_hz()
+    }
+
     /// The reflected-call memo's CODE-MARK EPOCH: `perf.code_invalidations`.
     ///
     /// The memo's code watch rests on its trip's code pages staying MARKED in the decode
