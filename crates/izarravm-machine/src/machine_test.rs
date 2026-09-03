@@ -422,6 +422,8 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
         isa_io_wait: crate::bus::isa_io_wait_armed(),
+        timing_epoch: machine.timing_epoch,
+        poll_skip_epoch_refusals: &machine.poll_skip_epoch_refusals,
         lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),
         io_touched: &mut machine.io_touched,
         exempt_io_touched: &mut machine.exempt_io_touched,
@@ -429,7 +431,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         ata_poll_skip_armed: &mut machine.ata_poll_skip_armed,
         ata_poll_skip_slice_too_short: machine.ata_poll_skip_slice_too_short,
         ata_poll_skip: &mut machine.ata_poll_skip,
-        isa_io_clocks: &mut machine.isa_io_batch_clocks,
+        isa_io_clocks: &mut machine.port_bus_batch_clocks,
         pit_observer_fine_until: &mut machine.pit_observer_fine_until,
         opl_probe: &mut machine.opl_probe,
         shadow_l1: &mut machine.shadow_l1,
@@ -661,6 +663,9 @@ mod mouse;
 #[cfg(test)]
 #[path = "machine_native_bus_timing_test.rs"]
 mod native_bus_timing;
+#[cfg(test)]
+#[path = "machine_port_bus_class_test.rs"]
+mod port_bus_class;
 #[cfg(test)]
 #[path = "machine_storage_test.rs"]
 mod storage;

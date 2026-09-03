@@ -1452,6 +1452,8 @@ impl Machine {
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
+                    timing_epoch,
+                    poll_skip_epoch_refusals,
                     profile,
                     active_mode,
                     pending_mode,
@@ -1503,7 +1505,7 @@ impl Machine {
                     exempt_io_touched,
                     ata_poll_skip_armed,
                     ata_poll_skip,
-                    isa_io_batch_clocks,
+                    port_bus_batch_clocks,
                     pit_observer_fine_until,
                     opl_probe,
                     shadow_l1,
@@ -1553,6 +1555,8 @@ impl Machine {
                     pending_bios32,
                     last_int_vector,
                     active_mode: *active_mode,
+                    timing_epoch: *timing_epoch,
+                    poll_skip_epoch_refusals: &*poll_skip_epoch_refusals,
                     pending_mode,
                     fast_post: *fast_post,
                     booter_inert: *booter_inert,
@@ -1582,7 +1586,7 @@ impl Machine {
                     ata_poll_skip_armed,
                     ata_poll_skip_slice_too_short,
                     ata_poll_skip,
-                    isa_io_clocks: isa_io_batch_clocks,
+                    isa_io_clocks: port_bus_batch_clocks,
                     pit_observer_fine_until,
                     opl_probe,
                     shadow_l1,
@@ -1829,7 +1833,7 @@ impl Machine {
                     let scaled_bus_clocks = self.scale_bus(bus_clocks);
                     let step = u64::from(outcome.core_clocks)
                         + scaled_bus_clocks
-                        + std::mem::take(&mut self.isa_io_batch_clocks);
+                        + std::mem::take(&mut self.port_bus_batch_clocks);
                     self.scaled_bus_clocks =
                         self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
                     // Advance the OPL timers so AdLib detection's delay loops see
@@ -1941,7 +1945,7 @@ impl Machine {
                                 //       budget;
                                 //   (b) the batch-entry `service_pending_interrupt`
                                 //       is charged before any cap test runs;
-                                //   (c) `isa_io_batch_clocks` joins the batch-end
+                                //   (c) `port_bus_batch_clocks` joins the batch-end
                                 //       `step` without ever having been counted
                                 //       against the cap (`spent` is core plus
                                 //       in-batch bus only);

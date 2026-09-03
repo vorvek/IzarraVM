@@ -2167,10 +2167,13 @@ fn write_hdd_profile_json(
         "schema": "izarravm-hdd-profile-v2",
         "workload": workload.display().to_string(),
         "mode": mode.canonical_name(),
-        // Guest-clock model version (see `izarravm_cpu::TIMING_MODEL_EPOCH`). Bumped whenever
+        // The EFFECTIVE guest-clock model epoch this run used (`Machine::timing_epoch`, set
+        // once at construction from `IZARRAVM_TIMING_EPOCH`) -- not the static
+        // `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal (#843) sees
+        // `2` whenever the knob armed the port-io repricing, not the base `1`. Bumped whenever
         // a change alters guest clocks charged per instruction for any persona; rt numbers
         // recorded under different epochs are not comparable as performance.
-        "timing_model_epoch": izarravm_cpu::TIMING_MODEL_EPOCH,
+        "timing_model_epoch": machine.timing_epoch(),
         "cycle_budget": budget,
         "stop": stop_reason_json(stop_reason),
         "wall_seconds": wall_seconds,

@@ -1489,6 +1489,19 @@ impl ReportedFault {
 
 #[derive(Debug)]
 pub struct Machine {
+    /// `IZARRAVM_TIMING_EPOCH`, read ONCE at construction (`bus::timing_epoch_from_env`) into
+    /// this plain field -- never re-read mid-run, because the JIT caches per-block raw clocks
+    /// that would otherwise go stale under a live epoch flip. `1` (unset, or `""`) is today's
+    /// guest-clock model, byte-identical; `2` is the port-io repricing
+    /// (`dev_docs/2026-09-05-port-io-repricing-design.md`). Reported in the profile JSON as the
+    /// EFFECTIVE epoch via `Machine::timing_epoch`.
+    timing_epoch: u32,
+    /// F7 (`dev_docs/2026-09-05-port-io-repricing-review.md`): count of times
+    /// `poll_bus_certificate_from` refused a certificate STRUCTURALLY because the epoch was 2
+    /// or higher, independent of `IZARRAVM_ISA_IO_WAIT`/`IZARRAVM_DIRECT_POLL_SKIP`. A `Cell`
+    /// because the certificate path is `&self` (shared with the interpreter's read-only poll
+    /// probe) and this is diagnostic-only: it charges no guest clock and gates no decision.
+    poll_skip_epoch_refusals: std::cell::Cell<u64>,
     profile: MachineProfile,
     active_mode: GswMode,
     pending_mode: Option<GswMode>,
@@ -1585,7 +1598,7 @@ pub struct Machine {
     // poll cannot outrun the 80 us OPL timer. See the batch-end use in
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
-    isa_io_batch_clocks: u64,
+    port_bus_batch_clocks: u64,
     // Master-timeline instant until which a PIT counter observer is assumed live,
     // set by any access to the counter data ports or the control port and read by
     // `fine_batch_grain_required`. Counter VALUES no longer depend on it:
@@ -1608,7 +1621,7 @@ pub struct Machine {
     device_edge_scans: u64,
     // Diagnostic-only OPL counters plus an optional access trace; see `OplProbe`.
     // Never read by an emulation decision and never part of canonical state, so
-    // unlike `isa_io_batch_clocks` above it does not gate a canonical capture.
+    // unlike `port_bus_batch_clocks` above it does not gate a canonical capture.
     opl_probe: OplProbe,
     // S1 shadow-tag probe (`dev_docs/2026-09-01-bus-clock-diag.md`): diagnostic
     // ONLY, exactly like `opl_probe` above -- never read by an emulation
@@ -2068,6 +2081,8 @@ impl Machine {
         let execution_backend = process_execution_backend();
         patch_rom(&mut rom);
         let mut machine = Self {
+            timing_epoch: bus::timing_epoch_from_env(),
+            poll_skip_epoch_refusals: std::cell::Cell::new(0),
             memory,
             ram_lookup,
             profile,
@@ -2100,7 +2115,7 @@ impl Machine {
             ata_poll_skip_slice_too_short: false,
             ata_poll_skip: AtaPollSkipDiagnostics::new(run::ata_poll_skip_diag_default()),
             ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
-            isa_io_batch_clocks: 0,
+            port_bus_batch_clocks: 0,
             pit_observer_fine_until: 0,
             device_edge_cache: timing::DeviceEdgeCache::Stale,
             device_edge_batches: 0,
@@ -3305,6 +3320,21 @@ impl Machine {
         self.active_mode
     }
 
+    /// The EFFECTIVE guest-clock model epoch this machine was constructed under
+    /// (`IZARRAVM_TIMING_EPOCH`, read once at construction): `1` unless the knob named `2`. The
+    /// profile JSON's `timing_model_epoch` field reports this, not the static
+    /// `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal sees the epoch
+    /// that actually ran.
+    pub fn timing_epoch(&self) -> u32 {
+        self.timing_epoch
+    }
+
+    /// F7: how many times the io poll skip's own certificate refused structurally because the
+    /// epoch was >= 2, since construction. Diagnostic only.
+    pub fn poll_skip_epoch_refusals(&self) -> u64 {
+        self.poll_skip_epoch_refusals.get()
+    }
+
     pub fn cache_tier_lookups(&self) -> u64 {
         self.cache_model.lookups()
     }
@@ -3789,6 +3819,14 @@ struct MachineBus<'a> {
     /// deliberate: see `MachineBus::charge_isa_io_wait` for why the Accurate 386
     /// class stays out of it.
     isa_io_wait: bool,
+    /// `Machine::timing_epoch`, copied at bus construction (a plain `u32`, not a reference:
+    /// the epoch never changes mid-run). `1` (unset knob) keeps every port charge
+    /// byte-identical to before this slice; `2` arms the per-class port-bus charge in
+    /// `charge_port_bus` (`dev_docs/2026-09-05-port-io-repricing-design.md`).
+    timing_epoch: u32,
+    /// Points at `Machine::poll_skip_epoch_refusals`. `&Cell`, not `&mut u64`: the certificate
+    /// path this counts is `&self` (see F7).
+    poll_skip_epoch_refusals: &'a std::cell::Cell<u64>,
     /// The Accurate-class (386) extension of the lazy time-derived port reads:
     /// 3DA/3BA/3C2 (VGA status), 0x61 (PIT channel 1/2 OUT), and 0x200-0x207
     /// (the gameport RC one-shots) answer WITHOUT ending the CPU batch.
@@ -3853,7 +3891,7 @@ struct MachineBus<'a> {
     ata_poll_skip: &'a mut AtaPollSkipDiagnostics,
     // Accrues fixed ISA-bus time (CPU clocks) for the OPL status poll in the
     // Approximate class; the run loop folds it into the batch's device advance.
-    // Points at `Machine::isa_io_batch_clocks`.
+    // Points at `Machine::port_bus_batch_clocks`.
     isa_io_clocks: &'a mut u64,
     // Points at `Machine::pit_observer_fine_until`. Armed by any PIT counter or
     // control port access; see that field.

@@ -1576,7 +1576,7 @@ fn rtc_pic_and_timeline_payloads_share_one_read_only_capture() {
     // capture boundary, not ISA batch-timing accounting -- the `write_rtc_port` calls
     // below are setup, going through `machine.make_bus()` directly rather than a CPU
     // batch. Pin the ISA-wait arm OFF for this test so those raw setup pokes don't
-    // leave an uncommitted charge sitting on `isa_io_batch_clocks`, which would refuse
+    // leave an uncommitted charge sitting on `port_bus_batch_clocks`, which would refuse
     // the capture below with `UncommittedBatchTiming` for a reason unrelated to what
     // this test pins. The armed arm's capture-after-a-charged-batch behavior is
     // covered by `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
@@ -3160,7 +3160,7 @@ fn uncommitted_coherence_is_rejected_independently() {
 #[test]
 fn uncommitted_batch_timing_is_rejected() {
     let mut machine = test_machine();
-    machine.isa_io_batch_clocks = 17;
+    machine.port_bus_batch_clocks = 17;
     assert_eq!(
         capture_error(&machine),
         MachineCanonicalCaptureError::UncommittedBatchTiming { clocks: 17 }
@@ -3172,7 +3172,7 @@ fn construction_seed_writes_never_accrue_isa_bus_time() {
     // Adversarial-review finding on the `IZARRAVM_ISA_IO_WAIT` slice. `new_raw_program`
     // seeds PIT counter 0 with three `write_io` calls (dos.rs) and programs the 8259 pair,
     // modelling POST work that happened before the guest existed. With the charge armed
-    // those writes accrued three ISA periods into `isa_io_batch_clocks` -- an accrual with no
+    // those writes accrued three ISA periods into `port_bus_batch_clocks` -- an accrual with no
     // batch to belong to, which whichever batch ran first would have paid, and which made
     // the machine uncapturable in the meantime. They go through `make_construction_bus`,
     // which disarms the charge; a freshly constructed machine must therefore hold zero and
@@ -3184,7 +3184,7 @@ fn construction_seed_writes_never_accrue_isa_bus_time() {
     crate::bus::set_isa_io_wait_for_test(None);
 
     assert_eq!(
-        machine.isa_io_batch_clocks, 0,
+        machine.port_bus_batch_clocks, 0,
         "construction must not charge the guest for POST-time device programming"
     );
     assert!(
@@ -3198,7 +3198,7 @@ fn armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary() {
     // The shipped default (armed, since the 2026-08-30 flip) must not leave a machine
     // permanently uncaptureable: a guest OUT to a charged port inside a normal CPU
     // batch is flushed by the run loop's own batch-end step
-    // (`std::mem::take(&mut self.isa_io_batch_clocks)` in `run_until_tick`) before the
+    // (`std::mem::take(&mut self.port_bus_batch_clocks)` in `run_until_tick`) before the
     // run call returns, so canonical capture succeeds right after. No per-thread
     // override is used here -- this is the armed arm's OWN contract, complementing the
     // arm-pinned-OFF sibling tests elsewhere in this module that isolate PIT/RTC/
@@ -3214,7 +3214,7 @@ fn armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary() {
 
     assert_eq!(reason, StopReason::Halted);
     assert_eq!(
-        machine.isa_io_batch_clocks, 0,
+        machine.port_bus_batch_clocks, 0,
         "the batch-end step must flush the charge before the run call returns"
     );
     assert!(
