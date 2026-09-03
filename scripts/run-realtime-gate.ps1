@@ -79,6 +79,15 @@ $ErrorActionPreference = "Stop"
 # tight as they were; neither role is given slack it did not earn. Quake has
 # no realtics band and needed no change; the rt and coverage floors are
 # untouched because the storage charge did not move them.
+# The guest-clock model epoch (`izarravm_cpu::TIMING_MODEL_EPOCH`) this pin's rt/realtics
+# floors in Get-WorkloadPolicy were calibrated against. A change that alters guest clocks
+# charged per instruction for any persona bumps TIMING_MODEL_EPOCH; a leg whose build
+# reports a different epoch is doing a different amount of guest work per guest second, so
+# its rt is not comparable to these floors and Invoke-Observation refuses it outright rather
+# than silently gating on a stale ratchet. A profile JSON with no `timing_model_epoch` field
+# predates the marker and is treated as epoch 1. Whoever bumps TIMING_MODEL_EPOCH and
+# re-derives the floors updates this alongside them.
+$expectedTimingModelEpoch = 1
 $acceptedBaselineTree = "5aabe720c492cbcf5f31c776c5c58d33d89cd6c8"
 $highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 $minimumDirectCoverage = 0.90
@@ -2409,6 +2418,19 @@ function Invoke-Observation(
          $sample.schema -ne "izarravm-hdd-profile-v2") -or
         $sample.mode -ne $Policy.mode) {
         throw "$context produced an unexpected schema or CPU mode."
+    }
+    $sampleEpochProperty = $sample.PSObject.Properties["timing_model_epoch"]
+    $sampleTimingModelEpoch = if ($null -ne $sampleEpochProperty) {
+        [uint32]$sampleEpochProperty.Value
+    } else {
+        [uint32]1
+    }
+    if ($sampleTimingModelEpoch -ne $expectedTimingModelEpoch) {
+        throw ("$context reports timing_model_epoch $sampleTimingModelEpoch but this " +
+            "script's floors (Get-WorkloadPolicy) were calibrated under epoch " +
+            "$expectedTimingModelEpoch. rt numbers across timing-model epochs are not " +
+            "comparable as performance -- re-derive the floors under the new epoch (see " +
+            "izarravm_cpu::TIMING_MODEL_EPOCH) before gating this leg.")
     }
     Assert-UninstrumentedProfileSample $sample $context
     if (-not $captureProofArtifacts -and
