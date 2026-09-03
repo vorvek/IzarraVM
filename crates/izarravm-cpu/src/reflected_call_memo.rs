@@ -122,6 +122,10 @@ pub(crate) const MEMO_MAX_TRANSLATION_SET: usize = 64;
 /// Replay-write cap, raised from 32 to 192 by R2.3/R2.17 (the pinned-pre-
 /// value fix moves most same-address writes from R to W).
 pub(crate) const MEMO_MAX_REPLAY_WRITES: usize = 192;
+/// Physical code pages a memo may carry (plan section 4.5's `code_pages_too_many`).
+/// The dominant key's trip spans the client, the DPMI host and the DOS kernel; 16 is
+/// the plan's own figure.
+pub(crate) const MEMO_MAX_CODE_PAGES: usize = 16;
 /// Nested `interrupt_acknowledge` calls a memo may carry (plan R2.6). Over the cap ->
 /// `nested_acks_too_many`. The dominant key nests two `INT 16h`, an `INT 28h` and the
 /// reflected `INT 21h`; 16 is 4x that.
@@ -234,9 +238,11 @@ pub(crate) enum LearnRefused {
     ControlEffectsTooMany,
     ControlEffectUnreplayable,
     Mmx,
+    CodePagesTooMany,
+    CodePagesIncomplete,
 }
 
-pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 23] = [
+pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 25] = [
     LearnRefused::PortIo,
     LearnRefused::NondeterministicRead,
     LearnRefused::PendingSoftInt,
@@ -260,6 +266,8 @@ pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 23] = [
     LearnRefused::ControlEffectsTooMany,
     LearnRefused::ControlEffectUnreplayable,
     LearnRefused::Mmx,
+    LearnRefused::CodePagesTooMany,
+    LearnRefused::CodePagesIncomplete,
 ];
 
 impl LearnRefused {
@@ -295,6 +303,8 @@ impl LearnRefused {
             Self::ControlEffectsTooMany => "control_effects_too_many",
             Self::ControlEffectUnreplayable => "control_effect_unreplayable",
             Self::Mmx => "mmx",
+            Self::CodePagesTooMany => "code_pages_too_many",
+            Self::CodePagesIncomplete => "code_pages_incomplete",
         }
     }
 }
@@ -420,6 +430,14 @@ struct OpenTrip {
     /// The trip's TLB/decode invalidations, in trip order (plan R2.5).
     control_effects: Vec<ControlEffect>,
     control_effects_over_cap: bool,
+    /// Physical PAGES this trip fetched code from, collected at the interpreter's retire
+    /// seam (plan R2.4). Sorted-unique, capped at `MEMO_MAX_CODE_PAGES`.
+    code_pages: Vec<u32>,
+    code_pages_over_cap: bool,
+    /// How many instructions the retire seam SAW. Compared at close against the trip's
+    /// own instruction count: if they disagree the trip ran partly on the native
+    /// backend, so `code_pages` is INCOMPLETE and no memo may be built from it.
+    retired_insns: u64,
     hw_interrupt_seen: bool,
     /// Plan 4.4, the live stack tail: the physical address and WORD value at
     /// `[entry_esp - 2, entry_esp)` sampled at trip OPEN, before the `INT`'s own push --
@@ -521,6 +539,9 @@ impl OpenTrip {
             nested_acks_over_cap: false,
             control_effects: Vec::new(),
             control_effects_over_cap: false,
+            code_pages: Vec::new(),
+            code_pages_over_cap: false,
+            retired_insns: 0,
             hw_interrupt_seen: false,
             entry_tail,
         }
@@ -764,7 +785,7 @@ pub(crate) struct KeyState {
     pub rearms: u64,
     pub learn_attempts: u64,
     pub learned: u64,
-    pub learn_refused: [u64; 23],
+    pub learn_refused: [u64; 25],
     pub write_class_r_pinned: u64,
     pub write_class_r_unpinned: u64,
     pub write_class_d: u64,
@@ -869,6 +890,23 @@ pub(crate) struct ReflectedCallMemoState {
     pub(crate) fell_through_dma_visible: u64,
     pub(crate) fell_through_not_armed: u64,
     pub(crate) fell_through_clock_projection: u64,
+    /// Memos retired because a guest write landed on a physical range one of their trips
+    /// fetched code from (plan R2.4 / BLOCKING finding 4).
+    pub(crate) code_watch_retires: u64,
+    /// Memos retired because the decode cache cleared its SMC marks wholesale, so the
+    /// marks the overlap retire above depends on no longer stand.
+    pub(crate) code_mark_epoch_retires: u64,
+    /// The `DecodeCache::code_mark_epoch` every live memo was built under. A memo cache
+    /// is only ever populated under ONE epoch: the first build after a bump retires the
+    /// rest, so this single field stands for every memo in the map.
+    pub(crate) code_mark_epoch: u64,
+    /// Batches the machine ran on the interpreter for this module's sake (R2.10 item 12:
+    /// a LEARNING fall-through is not bit-identical to `main`, and the cost is bounded
+    /// and counted rather than argued away).
+    pub(crate) learn_batches: u64,
+    /// Keys currently sitting in a journal slot; the batch loop forces the interpreter
+    /// while this is non-zero.
+    journal_keys: u32,
 }
 
 /// Why a candidate memo did not answer (plan section 5, screens 2/3/6): the entry-image and
@@ -946,6 +984,11 @@ impl ReflectedCallMemoState {
     /// the gate changes. Called from `CpuGsw::note_a20_changed`, the single production seam
     /// (`izarravm-machine/src/run.rs:2023`); a coarse whole-cache flush is fine, exactly like
     /// the code-cache/decode-cache invalidation A20 already triggers there.
+    /// See `CpuGsw::reflected_call_wants_interpreter`.
+    pub(crate) fn wants_interpreter(&self) -> bool {
+        self.journal_keys > 0
+    }
+
     pub(crate) fn retire_all_memos(&mut self) {
         let mut retired = 0u64;
         for memos in self.memos.values_mut() {
@@ -996,6 +1039,19 @@ pub(crate) struct Memo {
     /// BEFORE the epilogue (plan R2.16 item 2: control effects LAST, so a replayed write
     /// into a page-table entry cannot leave a TLB that predates it).
     pub(crate) control_effects: Box<[ControlEffect]>,
+}
+
+impl Memo {
+    /// Does this memo's trip fetch code from any byte of `[physical, physical + width)`?
+    /// Page granularity, which is the granularity `code_pages` records, and the
+    /// conservative direction: a write anywhere on a fetched page retires the memo.
+    fn code_overlaps(&self, physical: u32, width: u32) -> bool {
+        let first = physical >> 12;
+        let last = physical.wrapping_add(width.saturating_sub(1)) >> 12;
+        self.code_pages
+            .iter()
+            .any(|&page| page >= first && page <= last)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,6 +1183,8 @@ pub(crate) fn on_int<B: CpuBus>(
 /// itself. `Err` can only come from a replayed nested ack, and is the fault the real
 /// trip would have taken at its first nested `INT`.
 fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecResult<Option<()>> {
+    // Screen 0: the code watch's wholesale half (plan R2.4). One `u64` compare.
+    sync_code_mark_epoch(cpu);
     // Screen 2/3/6: bucket lookup, the 43-field entry-image compare, then the
     // pre-resolved physical read and translation sets against LIVE memory. Read-only.
     let screened = {
@@ -1192,6 +1250,27 @@ fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecRes
 
     apply_answer(cpu, bus, &memo, scaled_core)?;
     Ok(Some(()))
+}
+
+/// Bring the memo cache into line with the decode cache's wholesale-mark-clear counter
+/// (plan R2.4). A memo's code watch rests on its code pages STAYING MARKED, and marks are
+/// cleared only wholesale, in `DecodeCache::retire_ring`; so the instant that counter
+/// moves, every memo built under the old epoch has lost the thing that would have caught a
+/// patch to its code, and must go. Called before any screen runs, and again before a memo
+/// is inserted, so the cache is only ever populated under ONE epoch.
+fn sync_code_mark_epoch(cpu: &mut CpuGsw) {
+    let live = cpu.reflected_call_code_mark_epoch();
+    let state = cpu.reflected_call.as_mut().expect("caller checked");
+    if state.code_mark_epoch == live {
+        return;
+    }
+    let mut retired = 0u64;
+    for memos in state.memos.values_mut() {
+        retired += memos.len() as u64;
+        memos.clear();
+    }
+    state.code_mark_epoch_retires += retired;
+    state.code_mark_epoch = live;
 }
 
 fn note_fell_through(cpu: &mut CpuGsw, reason: FellThrough) {
@@ -1374,6 +1453,58 @@ pub(crate) fn on_far_transfer<B: CpuBus>(cpu: &mut CpuGsw, bus: &B) {
     } else {
         cpu.reflected_call.as_mut().expect("checked above").open = Some(open);
     }
+}
+
+/// Production seam: the interpreter's retire seam (`run.rs`'s `finish_instruction`),
+/// called for every instruction of a JOURNALED trip. Records the physical PAGE the
+/// instruction was fetched from and counts the retire, so `finish_trip` can prove the
+/// page set is complete (plan R2.4).
+pub(crate) fn note_retired_instruction<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, linear: u32) {
+    let resolved = probe_physical(cpu, &*bus, linear);
+    let Some(open) = cpu
+        .reflected_call
+        .as_mut()
+        .and_then(|state| state.open.as_mut())
+    else {
+        return;
+    };
+    open.retired_insns = open.retired_insns.saturating_add(1);
+    let Some((physical, _walk)) = resolved else {
+        // The page walk declined (a device window, an unmapped page). Mark the set
+        // incomplete rather than silently narrow: a memo whose code pages cannot all be
+        // named is a memo whose code watch has a hole in it.
+        open.code_pages_over_cap = true;
+        return;
+    };
+    let page = physical >> 12;
+    if open.code_pages.contains(&page) {
+        return;
+    }
+    if open.code_pages.len() >= MEMO_MAX_CODE_PAGES {
+        open.code_pages_over_cap = true;
+        return;
+    }
+    open.code_pages.push(page);
+}
+
+/// Production seam: `CpuGsw::note_code_write_inner` (`core.rs`). Retires every memo whose
+/// trip fetched code from the written range (plan R2.4 / BLOCKING finding 4: a slice that
+/// answers with no code-write retirement answers from stale code forever -- a TSR
+/// chaining `INT 21h`, a DPMI host rewriting its own hook, ordinary self-modifying code).
+pub(crate) fn note_code_write_range(cpu: &mut CpuGsw, physical: u32, width: u32) {
+    let Some(state) = cpu.reflected_call.as_mut() else {
+        return;
+    };
+    if state.memos.is_empty() {
+        return;
+    }
+    let mut retired = 0u64;
+    for memos in state.memos.values_mut() {
+        let before = memos.len();
+        memos.retain(|memo| !memo.code_overlaps(physical, width));
+        retired += (before - memos.len()) as u64;
+    }
+    state.code_watch_retires += retired;
 }
 
 /// Production seam: `CpuGsw::flush_tlb_and_code_caches_for_cr3_write` (`core.rs`), the
@@ -1644,7 +1775,37 @@ fn classify_write<B: CpuBus>(
 // Trip finalisation
 // ---------------------------------------------------------------------------
 
+/// Wrapper around the real close, maintaining `journal_keys` -- the count of keys sitting
+/// in a journal slot, which is what tells the machine's batch loop to force the
+/// interpreter (see `CpuGsw::reflected_call_wants_interpreter`). Kept as a before/after
+/// delta around ONE key rather than a scan of the map: `finish_trip` is per tracked trip,
+/// not per answer, but the map holds every key the run has ever seen.
 fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: bool) {
+    let key = open.key;
+    let before = key_is_journaling(cpu, key);
+    finish_trip_inner(cpu, bus, open, is_match);
+    let after = key_is_journaling(cpu, key);
+    if before != after
+        && let Some(state) = cpu.reflected_call.as_mut()
+    {
+        if after {
+            state.journal_keys = state.journal_keys.saturating_add(1);
+        } else {
+            state.journal_keys = state.journal_keys.saturating_sub(1);
+        }
+    }
+}
+
+fn key_is_journaling(cpu: &CpuGsw, key: MemoKey) -> bool {
+    cpu.reflected_call.as_ref().is_some_and(|state| {
+        state
+            .keys
+            .get(&key)
+            .is_some_and(|ks| matches!(ks.slot, SlotState::JournalA | SlotState::JournalB))
+    })
+}
+
+fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: bool) {
     cpu.reflected_call_journal = false;
     let close_bus_raw = bus.cumulative_raw_bus_clocks();
     let close_elapsed = cpu.elapsed_clocks;
@@ -1695,6 +1856,10 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
             key_state.slot = SlotState::JournalA;
         }
         Slot::JournalA => {
+            if let Some(reason) = code_page_refusal(&open, close_instructions) {
+                key_state.record_failure(reason);
+                return;
+            }
             if open.read_set_over_cap {
                 key_state.record_failure(LearnRefused::ReadSetTooLarge);
                 return;
@@ -1716,6 +1881,10 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
             key_state.slot = SlotState::JournalB;
         }
         Slot::JournalB => {
+            if let Some(reason) = code_page_refusal(&open, close_instructions) {
+                key_state.record_failure(reason);
+                return;
+            }
             if open.read_set_over_cap {
                 key_state.record_failure(LearnRefused::ReadSetTooLarge);
                 return;
@@ -1796,10 +1965,15 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
                             raw_core_clocks: raw_core,
                             raw_bus_clocks: raw_bus,
                             insns,
-                            code_pages: Box::new([]),
+                            code_pages: c.code_pages.into_boxed_slice(),
                             nested_acks: c.nested_acks.into_boxed_slice(),
                             control_effects: c.control_effects.into_boxed_slice(),
                         });
+                        // The cache is only ever populated under ONE `code_mark_epoch`
+                        // (see `sync_code_mark_epoch`): a bump between the last answer
+                        // attempt and this insert wipes the older memos first, rather
+                        // than leaving a mixed cache the single epoch field misdescribes.
+                        sync_code_mark_epoch(cpu);
                         let state = cpu.reflected_call.as_mut().expect("checked above");
                         let slot_vec = state.memos.entry(key).or_default();
                         // Same entry image relearned (e.g. after an A20 retire): replace
@@ -1818,6 +1992,28 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
             }
         }
     }
+}
+
+/// Is this journaled trip's CODE-PAGE set usable (plan R2.4)? Two ways it is not, and
+/// both are refusals rather than a narrowed watch:
+///
+/// * **Over the cap, or a page whose walk declined.** The set would name fewer pages than
+///   the trip fetched from, so a patch to an unnamed page would never retire the memo.
+/// * **Incomplete.** The retire seam saw fewer instructions than the trip retired, which
+///   means part of it ran on the native backend and never passed that seam. The batch
+///   loop forces the interpreter for a journaling batch precisely to prevent this; the
+///   check is what makes that forcing's correctness a PROOF rather than an assumption,
+///   and what stops a mistimed toggle (the flag is read at batch entry, and a trip can
+///   open mid-batch) from producing an unsound memo instead of a lost learn attempt.
+fn code_page_refusal(open: &OpenTrip, close_instructions: u64) -> Option<LearnRefused> {
+    if open.code_pages_over_cap {
+        return Some(LearnRefused::CodePagesTooMany);
+    }
+    let insns = close_instructions.saturating_sub(open.open_instructions);
+    if open.retired_insns != insns {
+        return Some(LearnRefused::CodePagesIncomplete);
+    }
+    None
 }
 
 fn compare_journal(
@@ -1875,6 +2071,7 @@ struct ConfirmedTrip {
     class_r_ranges: Vec<(u32, u32)>,
     nested_acks: Vec<(u8, u16)>,
     control_effects: Vec<ControlEffect>,
+    code_pages: Vec<u32>,
 }
 
 /// Amendment 2: classify JournalB's write set into Class R (restored, admitted classes only --
@@ -2026,6 +2223,7 @@ fn build_confirmed<B: CpuBus>(
         class_r_ranges,
         nested_acks: open.nested_acks.clone(),
         control_effects: open.control_effects.clone(),
+        code_pages: open.code_pages.clone(),
     })
 }
 

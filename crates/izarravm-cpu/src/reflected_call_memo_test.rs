@@ -365,6 +365,9 @@ fn a_retf_return_leaving_the_flags_word_closes_as_a_return_match() {
         nested_acks_over_cap: false,
         control_effects: Vec::new(),
         control_effects_over_cap: false,
+        code_pages: Vec::new(),
+        code_pages_over_cap: false,
+        retired_insns: 0,
         hw_interrupt_seen: false,
         entry_tail: None,
     };
@@ -437,6 +440,9 @@ fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
         nested_acks_over_cap: false,
         control_effects: Vec::new(),
         control_effects_over_cap: false,
+        code_pages: Vec::new(),
+        code_pages_over_cap: false,
+        retired_insns: 0,
         hw_interrupt_seen: false,
         entry_tail: None,
     }
@@ -1286,6 +1292,13 @@ fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u
     // applied HERE, between open and close, is what the raw-clock recovery (an
     // open/close DELTA) actually measures.
     cpu.elapsed_clocks += 100;
+    // Seven instructions, each announced at the retire seam the way the interpreter
+    // announces them -- which is what builds the memo's CODE-PAGE set and what
+    // `code_page_refusal` checks the count of. Driving `perf.instructions` without
+    // driving this seam is exactly the "the trip ran natively" shape the check refuses.
+    for i in 0..7u32 {
+        note_retired_instruction(cpu, bus, HANDLER_EIP + i * 4);
+    }
     cpu.perf.instructions += 7;
     bus.bus_clock += 50;
     cpu.registers.set_esp(STACK_TOP - 2); // RETF-with-flags: leaves the FLAGS word behind.
@@ -1405,11 +1418,7 @@ fn on_int_screening_never_mutates_state_on_a_poisoned_cell() {
         nested_acks: Box::new([]),
         control_effects: Box::new([]),
     };
-    cpu.reflected_call
-        .as_mut()
-        .unwrap()
-        .memos
-        .insert(key, vec![Arc::new(memo)]);
+    install_memo(&mut cpu, key, memo);
     bus.write_raw(addr, BusWidth::Dword, 0x2222_2222); // poison after caching the memo
 
     let regs_before = cpu.registers.clone();
@@ -1488,11 +1497,13 @@ fn distinguishable_memo(cpu: &CpuGsw, replay_addr: u32, cr3_after: u32) -> Memo 
 }
 
 fn install_memo(cpu: &mut CpuGsw, key: MemoKey, memo: Memo) {
-    cpu.reflected_call
-        .as_mut()
-        .unwrap()
-        .memos
-        .insert(key, vec![Arc::new(memo)]);
+    // Stamp the LIVE decode-cache mark epoch, which is what a real memo build does
+    // (`sync_code_mark_epoch`). Without it every fixture below would be wiped by the
+    // answer path's screen 0 before it could exercise anything else.
+    let live = cpu.reflected_call_code_mark_epoch();
+    let state = cpu.reflected_call.as_mut().unwrap();
+    state.code_mark_epoch = live;
+    state.memos.insert(key, vec![Arc::new(memo)]);
 }
 
 /// **Mutation bites, four, each verified red on its own**: (a) drop the epilogue's
@@ -1871,4 +1882,156 @@ fn a_nested_int_outside_the_opening_window_is_still_recorded_as_an_ack() {
         .expect("the trip stays open across a nested INT")
         .nested_acks;
     assert_eq!(acks, &vec![(0x60u8, 0x1234u16)]);
+}
+
+// ---------------------------------------------------------------------------
+// Amendment 4: the code-watch retire (plan R2.4 / BLOCKING finding 4).
+// ---------------------------------------------------------------------------
+
+/// **Mutation bite**: delete the `note_code_write_range` call at the top of
+/// `CpuGsw::note_code_write_inner`. A TSR chaining `INT 21h`, a DPMI host rewriting its
+/// own hook, or ordinary self-modifying code then patches the handler and the memo goes
+/// on answering from the code that USED to be there, for the rest of the run -- and
+/// nothing in any screen can see it, because the read set covers DATA and never
+/// instruction fetch.
+#[test]
+fn a_code_write_into_a_memos_fetched_range_retires_it() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    // The trip fetched code from physical page 6 (0x6000..0x6fff).
+    memo.code_pages = Box::new([0x6]);
+    install_memo(&mut cpu, key, memo);
+    assert_eq!(cpu.reflected_call.as_ref().unwrap().memos[&key].len(), 1);
+
+    // A write on a page the trip never fetched from leaves it alone.
+    cpu.note_code_write(0x9000, 4);
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().memos[&key].len(),
+        1,
+        "a write off the trip's code pages must not retire anything"
+    );
+    assert_eq!(cpu.reflected_call.as_ref().unwrap().code_watch_retires, 0);
+
+    // A write INSIDE it retires the memo.
+    cpu.note_code_write(0x6abc, 1);
+    assert!(
+        cpu.reflected_call.as_ref().unwrap().memos[&key].is_empty(),
+        "a write onto a fetched code page must retire the memo"
+    );
+    assert_eq!(cpu.reflected_call.as_ref().unwrap().code_watch_retires, 1);
+
+    // And with no memo left, the same INT falls through instead of answering.
+    bus.gate_allowance = Some(1_000_000);
+    let regs_before = cpu.registers.clone();
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered
+    );
+    assert_eq!(cpu.registers, regs_before);
+}
+
+/// **Mutation bite**: stop bumping `DecodeCache::code_mark_epoch` in `retire_ring`, or
+/// drop the `sync_code_mark_epoch` call from `try_answer`. The overlap retire above rests
+/// on the memo's code pages still being MARKED -- marks are what route a write into
+/// `note_code_write_inner` at all -- and a wholesale mark clear silently removes that
+/// routing while the memo lives on. This is the half of the code watch that no
+/// range-overlap test can cover.
+#[test]
+fn a_wholesale_decode_mark_clear_retires_every_memo() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    install_memo(&mut cpu, key, memo);
+    // Populate the cache's epoch field the way the answer path does.
+    {
+        let live = cpu.reflected_call_code_mark_epoch();
+        cpu.reflected_call.as_mut().unwrap().code_mark_epoch = live;
+    }
+
+    // A wholesale invalidation: every SMC mark the decode cache held is gone.
+    let _ = cpu.invalidate_translation_code_caches(true);
+
+    let regs_before = cpu.registers.clone();
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered,
+        "a memo whose code marks were cleared wholesale may not answer"
+    );
+    assert_eq!(cpu.registers, regs_before);
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.code_mark_epoch_retires, 1);
+    assert!(state.memos[&key].is_empty());
+}
+
+/// **Mutation bite**: drop the `retired_insns != insns` arm of `code_page_refusal`. A
+/// journaled trip that ran partly on the native backend -- which is exactly what happens
+/// if the batch loop's interpreter forcing is mistimed, and a trip CAN open mid-batch --
+/// then produces a memo whose code-page set names fewer pages than the trip fetched from,
+/// so a patch to an unnamed page never retires it.
+#[test]
+fn a_journal_trip_the_retire_seam_did_not_see_in_full_refuses() {
+    let (mut cpu, _bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let mut open = test_open_trip(&cpu);
+    open.open_instructions = 0;
+    open.retired_insns = 3; // the seam saw three...
+    assert_eq!(
+        code_page_refusal(&open, 10), // ...but the trip retired ten.
+        Some(LearnRefused::CodePagesIncomplete)
+    );
+    open.retired_insns = 10;
+    assert_eq!(code_page_refusal(&open, 10), None);
+    open.code_pages_over_cap = true;
+    assert_eq!(
+        code_page_refusal(&open, 10),
+        Some(LearnRefused::CodePagesTooMany)
+    );
+}
+
+/// **Mutation bite**: make `reflected_call_wants_interpreter` always answer `false` (or
+/// never maintain `journal_keys`). The batch loop then never forces the interpreter, every
+/// journaled trip runs natively, and `code_page_refusal`'s completeness arm refuses every
+/// learn attempt -- the mechanism goes quietly inert rather than becoming unsound, which
+/// is the direction this pairing is built to fail in.
+#[test]
+fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    assert!(!cpu.reflected_call_wants_interpreter(), "idle: no forcing");
+
+    // Close a WARM trip as a return match: the key advances to JournalA.
+    let key = key_for(&cpu, VECTOR, 0);
+    let open = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+    on_far_return(&mut cpu, &bus);
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().keys[&key].slot,
+        SlotState::JournalA
+    );
+    assert!(
+        cpu.reflected_call_wants_interpreter(),
+        "a key in a journal slot forces the interpreter for the next batch"
+    );
+
+    // A refusal drops it back to Warm, and the forcing lifts with it.
+    cpu.reflected_call
+        .as_mut()
+        .unwrap()
+        .keys
+        .get_mut(&key)
+        .unwrap()
+        .slot = SlotState::JournalB;
+    let mut open2 = OpenTrip::start(&cpu, &bus, key, Slot::JournalB);
+    open2.hazard = Some(LearnRefused::PortIo);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open2);
+    on_far_return(&mut cpu, &bus);
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().keys[&key].slot,
+        SlotState::Warm
+    );
+    assert!(!cpu.reflected_call_wants_interpreter());
 }

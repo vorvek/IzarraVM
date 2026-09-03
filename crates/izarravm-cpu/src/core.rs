@@ -926,6 +926,21 @@ impl CpuGsw {
     /// runs, and a block cannot patch its own lane from under itself.
     #[inline]
     fn note_code_write_inner(&mut self, physical: u32, width: u32, lanes: bool) -> bool {
+        // The reflected-call memo's code watch (slice1 plan R2.4 / finding 4): retire
+        // every memo whose trip FETCHED code from the physical range this write touches,
+        // by range overlap and not by page identity.
+        //
+        // Why this seam suffices. A write reaches here only when `code_write_watched`
+        // said the range holds cached code, and a memo's code pages were marked when its
+        // journal trip decoded them. Marks are cleared only WHOLESALE, in
+        // `DecodeCache::retire_ring`, which bumps `code_mark_epoch` -- and a stale epoch
+        // retires every memo at the answer path's first screen. So: memo alive implies no
+        // wholesale clear since it was built, implies its marks stand, implies a write to
+        // its code arrives here. Neither half is sufficient alone.
+        #[cfg(feature = "reflected-call-memo")]
+        if self.reflected_call.is_some() {
+            crate::reflected_call_memo::note_code_write_range(self, physical, width);
+        }
         // THE CALL-OUT WINDOW. `InterpretOne` runs one interpreter instruction with a native block
         // live on the host stack, and that instruction is allowed to STORE. The proof this
         // function's doc comment rests on -- "no compiled block is mid-execution when this runs" --
@@ -2025,6 +2040,59 @@ impl CpuGsw {
                 self.poll_skip_memory.iterations.saturating_add(iterations);
         }
         Some(charged)
+    }
+
+    /// The reflected-call memo's CODE-MARK EPOCH: `perf.code_invalidations`.
+    ///
+    /// The memo's code watch rests on its trip's code pages staying MARKED in the decode
+    /// cache -- marks are what route a guest write into `note_code_write_inner` at all,
+    /// which is where the range-overlap retire lives. Marks are cleared WHOLESALE by
+    /// `DecodeCache::retire_ring`, and every CPU-side door that reaches it
+    /// (`invalidate_code_caches`, `invalidate_translation_code_caches`,
+    /// `flush_tlb_and_code_caches_for_cr3_write`'s R3 take arm, and both wholesale arms of
+    /// `note_code_write_inner`) bumps this counter on its way there. So "this counter has
+    /// not moved" implies "no wholesale clear has happened", which is exactly the
+    /// condition the overlap retire needs -- and it is answered with a field the CPU
+    /// already keeps, adding NOTHING to `CpuGsw`'s layout or to any hot path.
+    ///
+    /// It is a strict SUPERSET of the wholesale clears: the narrow-SMC-kill arm bumps it
+    /// without retiring the ring, and `reset_perf_counters` zeroes it. Both make the memo
+    /// cache retire when it did not strictly have to, which is the safe direction.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn reflected_call_code_mark_epoch(&self) -> u64 {
+        self.perf.code_invalidations
+    }
+
+    /// Count one batch the machine ran on the interpreter for this module's sake
+    /// (R2.10 item 12: a LEARNING fall-through is NOT bit-identical to a run without
+    /// the knob, because forcing the interpreter moves fetch wait states. The cost is
+    /// bounded -- 11 trips per key, plus retries -- and this is what makes it visible
+    /// in the report rather than merely argued to be small).
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_note_learn_batch(&mut self) {
+        if let Some(state) = self.reflected_call.as_mut() {
+            state.learn_batches += 1;
+        }
+    }
+
+    /// True while the reflected-call memo needs the INTERPRETER for the whole next
+    /// batch (slice1 plan section 4.2's last paragraph). The batch loop owns the
+    /// toggle, never the call-out (design R9/A9): this is a read-only question the
+    /// machine asks once at batch entry.
+    ///
+    /// A journaled trip must retire every one of its instructions through
+    /// `finish_instruction`, because that is the seam its CODE-PAGE set is built from
+    /// and a set built from a partly-native trip would be INCOMPLETE -- and an
+    /// incomplete code-page set means a guest patch to the handler could miss the
+    /// memo's retire. The completeness is not assumed: `finish_trip` compares the
+    /// retire-seam count against the trip's own instruction count and refuses
+    /// (`code_pages_incomplete`) when they disagree, so the worst a mistimed toggle can
+    /// do is cost a learn attempt.
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_wants_interpreter(&self) -> bool {
+        self.reflected_call
+            .as_ref()
+            .is_some_and(|state| state.wants_interpreter())
     }
 
     /// Core clocks the CURRENT straight-line run has retired before the instruction
