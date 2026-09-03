@@ -6,6 +6,15 @@
 
 use super::*;
 
+// The one function `build.rs` uses to turn an `ea_refusal!`/`ea_compile_site!` call line into
+// the `return` line the generated tables cite, `include!`d here (not re-typed) so
+// `scan_forward_finds_the_return_a_sibling_line_macro_independently_confirms` below exercises
+// the SAME code the generator runs, not a copy that could quietly diverge from it.
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/build/site_line_scan.rs"
+));
+
 /// The tables are indexed by enum discriminant, so a phase added without a name -- or named
 /// out of order -- mis-labels every export from then on. Checking `len()` against the constant
 /// beside it proves nothing (the arrays are DECLARED at that length); checking that each name
@@ -137,6 +146,80 @@ fn the_p0_mark_line_is_where_the_p0_mark_is() {
         run_rs_line(P0_MARK_LINE).contains("ea_mark!(Phase::DispatchGates)"),
         "P0_MARK_LINE = {P0_MARK_LINE} reads {:?}",
         run_rs_line(P0_MARK_LINE)
+    );
+}
+
+/// Every refusal and compile site name is unique, and `Phase::DispatchGates` -- the one phase
+/// `P0_MARK_LINE` depends on being unambiguous -- is marked from exactly one place in `run.rs`.
+/// `REFUSAL_SITES`/`COMPILE_SITES` are `build.rs`-generated now (see `jit/direct.rs`), so a
+/// duplicate name or a second `mark(P0)` would no longer surface as a hand-table typo; this is
+/// what still catches it.
+#[test]
+fn every_site_name_is_unique_and_dispatch_gates_is_marked_exactly_once() {
+    let mut refusal_names = std::collections::HashSet::new();
+    for (label, _) in REFUSAL_SITES {
+        assert!(
+            refusal_names.insert(label),
+            "refusal site {label} is registered more than once"
+        );
+    }
+    assert_eq!(refusal_names.len(), N_REFUSAL_SITES);
+
+    let mut compile_names = std::collections::HashSet::new();
+    for (label, _) in COMPILE_SITES {
+        assert!(
+            compile_names.insert(label),
+            "compile site {label} is registered more than once"
+        );
+    }
+    assert_eq!(compile_names.len(), N_COMPILE_SITES);
+
+    let dispatch_gates_marks = RUN_RS
+        .lines()
+        .filter(|line| line.contains("ea_mark!(Phase::DispatchGates)"))
+        .count();
+    assert_eq!(
+        dispatch_gates_marks, 1,
+        "run.rs must mark Phase::DispatchGates exactly once for P0_MARK_LINE to name a single \
+         line unambiguously"
+    );
+}
+
+/// `build.rs`'s `scan_forward` -- the primitive that turns an `ea_refusal!`/`ea_compile_site!`
+/// call line into the `return` line the generated tables cite -- is `include!`d here too (not
+/// re-typed), so this exercises the SAME code the generator runs, against a ground truth this
+/// test computes independently: `line!()` on the sibling `return` below a real `ea_mark!` /
+/// `ea_refusal!` pair, arranged exactly the way `run.rs`'s sites are.
+#[test]
+fn scan_forward_finds_the_return_a_sibling_line_macro_independently_confirms() {
+    #[allow(clippy::needless_return)]
+    fn shaped_like_a_refusal_site() -> (&'static str, u32) {
+        ea_mark!(Phase::Refused);
+        ea_refusal!(site::PROBE_INTERPRET);
+        ea_end!(Population::Refused);
+        return ("marker", line!());
+    }
+    let (marker, want_line) = shaped_like_a_refusal_site();
+
+    // This file's own source, as `scan_forward` itself would see it: find the sample function's
+    // signature, then scan forward from there. `line!()` on the `return` inside that function is
+    // Rust's own ground truth for where that statement sits; the assertion is that scanning
+    // forward for the first `return` lands on that exact line, which is the whole contract
+    // `build.rs` relies on for every real site.
+    let this_file = include_str!("armed_test.rs");
+    let signature_line = this_file
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("fn shaped_like_a_refusal_site"))
+        .map(|(index, _)| index as u32 + 1)
+        .expect("the sample function is defined in this file");
+    let found_line = scan_forward(this_file, signature_line as usize, 6, "return ")
+        .expect("a `return` sits a few lines below the sample function's signature");
+    assert_eq!(marker, "marker");
+    assert_eq!(
+        found_line, want_line,
+        "scan_forward found run.rs-shaped return at line {found_line}, but line!() on the actual \
+         return says {want_line}"
     );
 }
 
