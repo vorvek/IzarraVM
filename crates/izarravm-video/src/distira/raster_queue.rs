@@ -33,14 +33,35 @@
 //! result is the serial result, byte for byte. Splitting per triangle instead
 //! would need a barrier between triangles, which is the cost this exists to
 //! remove.
+//!
+//! **Texture-aperture writes ride the same queue.** `write_texture_u32` used
+//! to drain unconditionally -- 65 times a frame on `tombraid3d-586`'s Lara's
+//! Home walk, once per accepted write, which is what actually forced the 60
+//! drains a frame the module doc above is written against (see
+//! `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6). A
+//! [`QueuedCommand::TextureWrite`] entry orders a write against the
+//! triangles around it instead: `Distira::drain_raster_queue` walks the
+//! batch in submission order and splits it at every `TextureWrite`, so a
+//! triangle queued before the write still samples the OLD texel (its
+//! segment rasterises before the write is applied) and a triangle queued
+//! after samples the NEW one (its segment rasterises after). The write
+//! itself always applies serially, between segments, on the thread that
+//! calls `drain_raster_queue` -- never inside a lane. `texture: &'a [Vec<u8>;
+//! 2]` in [`ViewMemory`] is a plain shared borrow, not `FrameStore`'s atomic
+//! one, and the crate forbids unsafe, so a lane touching it while another
+//! lane (or the write) touches it too would be undefined behaviour, not
+//! merely a race the tests might catch. Splitting at the write is what keeps
+//! every lane's borrow and the write's `&mut` from ever overlapping in time.
 
 use super::raster_kernel::{ModeKey, select_kernel};
 use super::*;
 
-/// How many triangles wait before the queue rasterises itself. A batch that
+/// How many entries wait before the queue rasterises itself. A batch that
 /// grows without bound would hold the frame's whole geometry in memory and
-/// spend the win on cache misses; a few hundred triangles is already more
-/// than enough to amortise one fork.
+/// spend the win on cache misses; a few hundred entries is already more
+/// than enough to amortise one fork. Texture writes share the capacity with
+/// triangles -- both are queued commands now, and both need the guest to
+/// keep moving without a synchronous drain.
 pub(super) const RASTER_QUEUE_CAPACITY: usize = 512;
 
 /// A triangle waiting to be drawn, with the register state it was submitted
@@ -52,10 +73,38 @@ pub(super) struct QueuedTriangle {
     pub(super) context: TriangleContext,
 }
 
-/// The pending triangles.
+/// A texture-aperture write waiting to be applied, already decoded to a TMU
+/// and a byte offset (masked into `0..DISTIRA_TEX_SIZE`) -- the decode reads
+/// live register state (`Distira::texture_write_offset`), so it happens at
+/// enqueue time, exactly as it always did. Only the STORE into texture
+/// memory is deferred.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct QueuedTextureWrite {
+    pub(super) tmu: usize,
+    pub(super) offset: usize,
+    pub(super) bytes: [u8; 4],
+}
+
+/// One entry on the raster queue, in submission order.
+///
+/// `TextureWrite` pays `QueuedTriangle`'s full size (~600 bytes, mostly the
+/// `f32`/`f64` interpolation planes in `TriangleContext`) as padding.
+/// Boxing the triangle would shrink that, but it would also make the queue
+/// allocate per triangle and lose `Copy` -- exactly the cost this queue
+/// exists to avoid paying per entry (see this module's header). The queue
+/// is capacity-bounded (`RASTER_QUEUE_CAPACITY`), so the wasted bytes are a
+/// few hundred KB at most, once, not a per-pixel cost.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Copy)]
+pub(super) enum QueuedCommand {
+    Triangle(QueuedTriangle),
+    TextureWrite(QueuedTextureWrite),
+}
+
+/// The pending commands.
 #[derive(Default)]
 pub(super) struct RasterQueue {
-    pending: Vec<QueuedTriangle>,
+    pending: Vec<QueuedCommand>,
 }
 
 impl RasterQueue {
@@ -67,24 +116,24 @@ impl RasterQueue {
         self.pending.len()
     }
 
-    /// Add a triangle. Returns false when the queue is full and the caller
+    /// Add a command. Returns false when the queue is full and the caller
     /// must drain before it can add this one.
-    pub(super) fn push(&mut self, triangle: QueuedTriangle) -> bool {
+    pub(super) fn push(&mut self, command: QueuedCommand) -> bool {
         if self.pending.len() >= RASTER_QUEUE_CAPACITY {
             return false;
         }
-        self.pending.push(triangle);
+        self.pending.push(command);
         true
     }
 
     /// Hand the batch to the caller, leaving the queue empty.
-    pub(super) fn take(&mut self) -> Vec<QueuedTriangle> {
+    pub(super) fn take(&mut self) -> Vec<QueuedCommand> {
         std::mem::take(&mut self.pending)
     }
 
     /// Take the drained batch's allocation back, so a steady render loop
     /// stops allocating after its first frame.
-    pub(super) fn recycle(&mut self, mut batch: Vec<QueuedTriangle>) {
+    pub(super) fn recycle(&mut self, mut batch: Vec<QueuedCommand>) {
         if self.pending.is_empty() && batch.capacity() > self.pending.capacity() {
             batch.clear();
             self.pending = batch;

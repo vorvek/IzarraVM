@@ -21,7 +21,9 @@ use crate::{DistiraCensus, DistiraCensusKey};
 use ncc::NccState;
 use raster_math::*;
 use raster_pool::{DiagCounter, FrameStore, raster_pool};
-use raster_queue::{QueuedTriangle, RasterQueue, ViewMemory, render_band};
+use raster_queue::{
+    QueuedCommand, QueuedTextureWrite, QueuedTriangle, RasterQueue, ViewMemory, render_band,
+};
 use raster_view::{RasterParams, RasterView};
 pub use registers::*;
 use texture_combine::TextureCombineTarget;
@@ -198,13 +200,20 @@ pub struct DistiraTriangleCensus {
 /// Per-reason breakdown of [`DistiraTriangleCensus::queue_drains`]. Answers
 /// "a frame with hundreds of triangles takes dozens of drains -- which
 /// caller is doing that?" without a sampling profiler. See
-/// `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6, slice 0:
-/// on `tombraid3d-586`'s Lara's Home walk this is expected to show
-/// `texture_write` dominating, at roughly one drain per accepted texture
-/// aperture write.
+/// `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6.
+///
+/// Slice 0 (measured on `tombraid3d-586`'s Lara's Home walk, before the
+/// fix): `texture_write` dominated, at roughly one drain per accepted
+/// texture aperture write -- 364,713 of 370,680 drains, 98.4%. Slice 1 made
+/// `Distira::write_texture_u32` stop draining outright (it queues a
+/// `QueuedCommand::TextureWrite` instead), which is why that variant no
+/// longer exists on [`DrainCause`] and this field is now a regression
+/// sentinel: it stays zero by construction, and the day it is not, the
+/// direct-drain path came back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DistiraDrainCauses {
-    /// `Distira::write_texture_u32`. The profile's headline suspect.
+    /// ALWAYS ZERO after the texture-queue fix (slice 1). See this struct's
+    /// doc comment.
     pub texture_write: u64,
     /// `read_lfb_u8/u16/u32`.
     pub lfb_read: u64,
@@ -239,7 +248,6 @@ pub struct DistiraDrainCauses {
 /// See [`DistiraDrainCauses`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DrainCause {
-    TextureWrite,
     LfbRead,
     LfbWrite,
     RegisterReadStats,
@@ -254,7 +262,6 @@ pub(super) enum DrainCause {
 impl DistiraDrainCauses {
     fn record(&mut self, cause: DrainCause) {
         match cause {
-            DrainCause::TextureWrite => self.texture_write += 1,
             DrainCause::LfbRead => self.lfb_read += 1,
             DrainCause::LfbWrite => self.lfb_write += 1,
             DrainCause::RegisterReadStats => self.register_read_stats += 1,
@@ -1341,8 +1348,9 @@ impl Distira {
             params: self.raster_params(),
             context,
         };
+        let command = QueuedCommand::Triangle(triangle);
         if defer && self.raster_queue_enabled && triangle_defers(&triangle) {
-            if !self.raster_queue.push(triangle) {
+            if !self.raster_queue.push(command) {
                 // Full. Draw what is waiting, then this one joins an empty
                 // queue, so a triangle is never dropped. The second push
                 // cannot refuse: the drain above leaves the queue at zero and
@@ -1350,7 +1358,7 @@ impl Distira {
                 self.drain_raster_queue(DrainCause::QueueFull);
                 // Not inside the assertion: a release build compiles the
                 // assertion's expression away, and the push has to happen.
-                let queued = self.raster_queue.push(triangle);
+                let queued = self.raster_queue.push(command);
                 debug_assert!(queued, "a drained queue accepts");
             }
             return 0;
@@ -1360,35 +1368,85 @@ impl Distira {
         // the batch, so the pixel count belongs to it and to nothing else,
         // and the push cannot refuse for the same reason.
         self.drain_raster_queue(DrainCause::ImmediateTriangle);
-        let queued = self.raster_queue.push(triangle);
+        let queued = self.raster_queue.push(command);
         debug_assert!(queued, "a drained queue accepts");
         self.drain_raster_queue(DrainCause::ImmediateTriangle)
     }
 
-    /// Draw every triangle waiting on the queue and return how many pixels
-    /// they stored.
+    /// Draw every triangle waiting on the queue -- and apply every queued
+    /// texture-aperture write, in submission order -- and return how many
+    /// pixels the triangles stored.
     ///
-    /// One fork and one join for the whole batch. Lane `i` owns the
-    /// FRAMEBUFFER rows where `draw_y(y) % lanes == i` and walks the batch in
-    /// submission order, so overlapping triangles land in the order the guest
-    /// sent them. `distira/raster_queue.rs` has why the framebuffer row is the
-    /// one that has to partition and not the triangle's own row.
+    /// `queue_drains`/`queue_drains_parallel` count this call ONCE: the
+    /// certifying counters the texture-queue lever is graded on
+    /// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6)
+    /// name how often the GUEST is made to wait for the raster join, and a
+    /// texture write no longer forces that wait at all -- it rides the same
+    /// queue as the triangles around it and only the eventual real
+    /// synchronisation point (a swap, an LFB access, a full queue, ...)
+    /// pays for a drain.
+    ///
+    /// Internally the batch still has to respect the write's ordering: a
+    /// triangle queued before a `TextureWrite` must sample the OLD texel,
+    /// one queued after must sample the NEW one, and a lane's borrow of
+    /// `self.texture` can never overlap the write's `&mut` (see
+    /// `distira/raster_queue.rs`'s module doc). So the batch is split into
+    /// runs of triangles at every `TextureWrite`, each run gets its own
+    /// fork/join through [`Self::render_triangle_segment`], and the write is
+    /// applied serially, on this thread, between the two runs it separates.
     fn drain_raster_queue(&mut self, cause: DrainCause) -> u64 {
         if self.raster_queue.is_empty() {
             return 0;
         }
-        let jobs = self.raster_queue.take();
-        let lanes = self.batch_lanes(&jobs);
+        let commands = self.raster_queue.take();
         self.triangle_census.queue_drains += 1;
         self.triangle_census.queue_drain_causes.record(cause);
-        if lanes > 1 {
+        let mut written = 0u64;
+        let mut any_parallel = false;
+        let mut segment: Vec<QueuedTriangle> = Vec::new();
+        for command in &commands {
+            match *command {
+                QueuedCommand::Triangle(triangle) => segment.push(triangle),
+                QueuedCommand::TextureWrite(write) => {
+                    if !segment.is_empty() {
+                        let (segment_written, parallel) = self.render_triangle_segment(&segment);
+                        written += segment_written;
+                        any_parallel |= parallel;
+                        segment.clear();
+                    }
+                    let mask = DISTIRA_TEX_SIZE - 1;
+                    for (index, byte) in write.bytes.into_iter().enumerate() {
+                        self.texture[write.tmu][(write.offset + index) & mask] = byte;
+                    }
+                }
+            }
+        }
+        if !segment.is_empty() {
+            let (segment_written, parallel) = self.render_triangle_segment(&segment);
+            written += segment_written;
+            any_parallel |= parallel;
+        }
+        if any_parallel {
             self.triangle_census.queue_drains_parallel += 1;
         }
+        self.raster_queue.recycle(commands);
+        written
+    }
+
+    /// Rasterise one run of triangles with no queued texture write between
+    /// them: one fork and one join for the run. Lane `i` owns the
+    /// FRAMEBUFFER rows where `draw_y(y) % lanes == i` and walks the run in
+    /// submission order, so overlapping triangles land in the order the
+    /// guest sent them. `distira/raster_queue.rs` has why the framebuffer
+    /// row is the one that has to partition and not the triangle's own row.
+    /// Returns the pixels stored and whether the run reached the parallel
+    /// lanes.
+    fn render_triangle_segment(&mut self, jobs: &[QueuedTriangle]) -> (u64, bool) {
+        let lanes = self.batch_lanes(jobs);
         let mut lane_stats: Vec<PixelStats> = (0..lanes).map(|_| PixelStats::new(0)).collect();
         if lanes == 1 {
-            render_band(&jobs, self.view_memory(), 0, 1, &mut lane_stats[0]);
+            render_band(jobs, self.view_memory(), 0, 1, &mut lane_stats[0]);
         } else {
-            let jobs = &jobs;
             let memory = self.view_memory();
             let lane_count = lanes as u32;
             // A lane accumulates into a stack-local `PixelStats` and stores
@@ -1417,9 +1475,8 @@ impl Distira {
                 });
             });
         }
-        let written = self.merge_pixel_stats(&lane_stats, &jobs, lanes);
-        self.raster_queue.recycle(jobs);
-        written
+        let written = self.merge_pixel_stats(&lane_stats, jobs, lanes);
+        (written, lanes > 1)
     }
 
     /// How many lanes a batch is worth. Below the threshold the wake-up cost
@@ -2357,11 +2414,20 @@ impl Distira {
         }
     }
 
+    /// Texture memory is NOT part of the [`RasterParams`] snapshot: it is
+    /// megabytes, and a lane's borrow of it can never overlap a write's
+    /// `&mut` (`#![forbid(unsafe_code)]`, so there is no atomic fallback the
+    /// way `FrameStore` has one). A write therefore no longer drains the
+    /// queue outright -- see `distira/raster_queue.rs`'s module doc and
+    /// `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6. It
+    /// queues as a [`QueuedCommand::TextureWrite`] instead, which orders it
+    /// against the triangles around it without forcing the guest to wait for
+    /// a raster join every time a title uploads a texture.
+    ///
+    /// The DECODE still happens now, against the CURRENT register state,
+    /// exactly as it always did -- only the STORE into texture memory is
+    /// deferred to `drain_raster_queue`.
     pub fn write_texture_u32(&mut self, aperture_offset: usize, value: u32) {
-        // Texture memory is NOT part of the snapshot: it is megabytes, and a
-        // game uploads it at level load rather than between triangles. So the
-        // queue is drawn before an upload lands instead of copied.
-        self.drain_raster_queue(DrainCause::TextureWrite);
         self.aperture_traffic.texture_writes += 1;
         let Some((tmu, offset)) = self.texture_write_offset(aperture_offset) else {
             let traffic = &mut self.aperture_traffic;
@@ -2374,9 +2440,33 @@ impl Distira {
             }
             return;
         };
-        let mask = DISTIRA_TEX_SIZE - 1;
-        for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-            self.texture[tmu][(offset + index) & mask] = byte;
+        if !self.raster_queue_enabled {
+            // `set_raster_queue_enabled` drains before it flips the flag, and
+            // nothing pushes while it is off, so the queue is guaranteed
+            // empty here: apply synchronously, exactly as every write did
+            // before this lever existed. `queued_triangles_answer_
+            // interleaved_reads_like_synchronous_ones` (queue OFF arm) is
+            // what this keeps honest -- with the queue off there is no
+            // ordering to build, only the same store there always was.
+            let mask = DISTIRA_TEX_SIZE - 1;
+            for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+                self.texture[tmu][(offset + index) & mask] = byte;
+            }
+            return;
+        }
+        let command = QueuedCommand::TextureWrite(QueuedTextureWrite {
+            tmu,
+            offset,
+            bytes: value.to_le_bytes(),
+        });
+        if !self.raster_queue.push(command) {
+            // Full. Draw what is waiting, then this write joins an empty
+            // queue, so it is never dropped. The second push cannot refuse:
+            // the drain above leaves the queue at zero and the capacity is
+            // not zero.
+            self.drain_raster_queue(DrainCause::QueueFull);
+            let queued = self.raster_queue.push(command);
+            debug_assert!(queued, "a drained queue accepts");
         }
     }
 
