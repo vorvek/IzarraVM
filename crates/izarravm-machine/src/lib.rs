@@ -3393,6 +3393,20 @@ impl Machine {
     /// profile JSON's `timing_model_epoch` field reports this, not the static
     /// `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal sees the epoch
     /// that actually ran.
+    /// Move a constructed machine onto another epoch, for tests that must not
+    /// write a process-global environment variable.
+    ///
+    /// It exists because `Machine::timing_epoch` alone is HALF the epoch: the
+    /// CPU carries its own copy and resolves its charge table from it, so a test
+    /// that assigns the field directly would leave the bus on epoch 2 and every
+    /// instruction charge on epoch 1. Production has one writer -- `Machine::new`
+    /// -- and this is the only other one.
+    #[cfg(test)]
+    pub(crate) fn set_timing_epoch_for_test(&mut self, epoch: u32) {
+        self.timing_epoch = epoch;
+        self.cpu.set_timing_epoch(epoch);
+    }
+
     pub fn timing_epoch(&self) -> u32 {
         self.timing_epoch
     }
