@@ -66,6 +66,7 @@ pub use reflected_call_memo::reflected_call_memo_json;
 mod run;
 mod smc_trace;
 mod strings;
+mod timing_class;
 pub use fpu::X87;
 
 /// Whether this build contains the native x64 execution backend.
