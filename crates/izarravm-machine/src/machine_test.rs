@@ -455,6 +455,9 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         bus_rem_at_batch_start: machine.bus_rem,
         bus_num_at_batch_start,
         bus_den_at_batch_start,
+        reflected_call_batch_cap: 0,
+        reflected_call_cap_is_device_edge: false,
+        reflected_call_answered: false,
     };
     f(&mut bus)
 }

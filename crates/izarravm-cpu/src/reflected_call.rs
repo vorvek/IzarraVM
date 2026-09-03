@@ -67,6 +67,14 @@ pub(crate) struct CachedSegment {
     pub base: u32,
     pub limit: u32,
     pub access: u8,
+    /// The descriptor's D/B bit as the CPU caches it. Part of the closure rule for
+    /// the same reason the base is: `SS.B` decides the stack width every push and pop
+    /// inside the trip uses, and `CS.D` decides the default operand and address size
+    /// of every instruction it executes -- so two entries agreeing on selector, base,
+    /// limit and access but not on this bit are NOT the same architectural state, and
+    /// an epilogue that restores the other five fields and not this one leaves the
+    /// guest running at the wrong width.
+    pub default_size_32: bool,
 }
 
 impl CachedSegment {
@@ -76,6 +84,19 @@ impl CachedSegment {
             base: reg.base,
             limit: reg.limit,
             access: reg.access,
+            default_size_32: reg.default_size_32,
+        }
+    }
+
+    /// Rebuild the `SegmentRegister` this was captured from, for the answer's
+    /// epilogue: every field of `SegmentRegister` is covered, so this is lossless.
+    pub(crate) fn to_segment(self) -> SegmentRegister {
+        SegmentRegister {
+            selector: self.selector,
+            base: self.base,
+            limit: self.limit,
+            access: self.access,
+            default_size_32: self.default_size_32,
         }
     }
 }
@@ -145,7 +166,15 @@ impl EntryImage {
             ebp: regs.ebp(),
             esi: regs.esi(),
             edi: regs.edi(),
-            eflags_masked: regs.eflags & EFLAGS_ARCH_MASK,
+            // `cpu.eflags()`, NOT `regs.eflags`: this CPU carries its arithmetic
+            // flags lazily, so `registers.eflags` alone is a REPRESENTATION of the
+            // flags and not the architectural value (`CpuGsw::settled`'s doc says so
+            // in as many words). Capturing the base would let two trips whose
+            // architectural flags genuinely differ -- one with the difference still
+            // living in `pending_flags` -- compare EQUAL here, which is precisely the
+            // closure-rule violation R2.1 exists to close, one level below the
+            // register file.
+            eflags_masked: cpu.eflags() & EFLAGS_ARCH_MASK,
             cs: CachedSegment::capture(regs.segment(SegmentIndex::Cs)),
             ss: CachedSegment::capture(regs.segment(SegmentIndex::Ss)),
             ds: CachedSegment::capture(regs.segment(SegmentIndex::Ds)),

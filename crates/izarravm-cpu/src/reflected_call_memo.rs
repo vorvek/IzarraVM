@@ -92,7 +92,9 @@
 
 use super::*;
 use crate::reflected_call::*;
+use izarravm_bus::{ReflectedCallDecline, ReflectedCallGateRequest};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
@@ -120,6 +122,13 @@ pub(crate) const MEMO_MAX_TRANSLATION_SET: usize = 64;
 /// Replay-write cap, raised from 32 to 192 by R2.3/R2.17 (the pinned-pre-
 /// value fix moves most same-address writes from R to W).
 pub(crate) const MEMO_MAX_REPLAY_WRITES: usize = 192;
+/// Nested `interrupt_acknowledge` calls a memo may carry (plan R2.6). Over the cap ->
+/// `nested_acks_too_many`. The dominant key nests two `INT 16h`, an `INT 28h` and the
+/// reflected `INT 21h`; 16 is 4x that.
+pub(crate) const MEMO_MAX_NESTED_ACKS: usize = 16;
+/// TLB/decode control effects a memo may carry (plan R2.5). The dominant key's trips
+/// write CR3 exactly twice (the VCPI pair); 8 is 4x that.
+pub(crate) const MEMO_MAX_CONTROL_EFFECTS: usize = 8;
 /// Per-key image cache depth, LRU (plan section 3): 0b measured top-8 images cover 99.99% of
 /// trips on both dominant keys.
 pub(crate) const MEMO_IMAGES_PER_KEY: usize = 8;
@@ -221,9 +230,13 @@ pub(crate) enum LearnRefused {
     VmeOrPvi,
     DebugState,
     LevelChanged,
+    NestedAcksTooMany,
+    ControlEffectsTooMany,
+    ControlEffectUnreplayable,
+    Mmx,
 }
 
-pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 19] = [
+pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 23] = [
     LearnRefused::PortIo,
     LearnRefused::NondeterministicRead,
     LearnRefused::PendingSoftInt,
@@ -243,6 +256,10 @@ pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 19] = [
     LearnRefused::VmeOrPvi,
     LearnRefused::DebugState,
     LearnRefused::LevelChanged,
+    LearnRefused::NestedAcksTooMany,
+    LearnRefused::ControlEffectsTooMany,
+    LearnRefused::ControlEffectUnreplayable,
+    LearnRefused::Mmx,
 ];
 
 impl LearnRefused {
@@ -274,6 +291,10 @@ impl LearnRefused {
             Self::VmeOrPvi => "vme_or_pvi",
             Self::DebugState => "debug_state",
             Self::LevelChanged => "level_changed",
+            Self::NestedAcksTooMany => "nested_acks_too_many",
+            Self::ControlEffectsTooMany => "control_effects_too_many",
+            Self::ControlEffectUnreplayable => "control_effect_unreplayable",
+            Self::Mmx => "mmx",
         }
     }
 }
@@ -309,6 +330,26 @@ struct WriteObs {
     /// clobbering neighbouring bytes the trip never touched.
     phys_addr: u32,
     width_bytes: u8,
+}
+
+/// One TLB / decode-cache invalidation effect the trip caused, captured in TRIP ORDER
+/// at the CPU's own seams and REPLAYED at answer time through those same functions
+/// (slice1 plan R2.5). A real `AH=0Bh` trip runs `flush_tlb_and_code_caches_for_cr3_write`
+/// twice (the VCPI CR3 pair, `cr3_writes_per_trip` median 2), and an answered trip that
+/// skipped it would leave the TLB holding entries the real trip retired -- so a guest
+/// that edits a page table and relies on the reflected call's mode switch to publish the
+/// edit would read a stale translation.
+///
+/// `Cr3Write` carries the value ALREADY MASKED the way `MOV CR3`'s executor masks it,
+/// because that is what `flush_tlb_and_code_caches_for_cr3_write` stores into
+/// `control.cr3` -- which makes "replaying the effects reproduces the exit image's CR3"
+/// an exact equality the memo build checks rather than an argument.
+///
+/// A CR0 write is deliberately NOT a variant: see `note_cr0_write`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ControlEffect {
+    Cr3Write(u32),
+    Invlpg(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +407,19 @@ struct OpenTrip {
     translation_set_over_cap: bool,
     hazard: Option<LearnRefused>,
     nested_int_count: u32,
+    /// Every nested `INT n` inside this trip, in TRIP ORDER, as the
+    /// `(vector, ax)` pair its `interrupt_acknowledge` was issued with (plan R2.6).
+    /// `MachineBus::interrupt_acknowledge` records a bus-trace entry with I/O wait
+    /// states, posts `pending_soft_int` for the program-runtime vectors and stashes
+    /// `last_int_vector`, so eliding these acks would silently drop a device side
+    /// effect the real trip made. Recorded on EVERY trip, not only a journaled one:
+    /// the acks are part of the trip's effect regardless of which learn slot observed
+    /// it, and the memo is built from the JournalB trip's copy.
+    nested_acks: Vec<(u8, u16)>,
+    nested_acks_over_cap: bool,
+    /// The trip's TLB/decode invalidations, in trip order (plan R2.5).
+    control_effects: Vec<ControlEffect>,
+    control_effects_over_cap: bool,
     hw_interrupt_seen: bool,
     /// Plan 4.4, the live stack tail: the physical address and WORD value at
     /// `[entry_esp - 2, entry_esp)` sampled at trip OPEN, before the `INT`'s own push --
@@ -463,6 +517,10 @@ impl OpenTrip {
             translation_set_over_cap: false,
             hazard,
             nested_int_count: 0,
+            nested_acks: Vec::new(),
+            nested_acks_over_cap: false,
+            control_effects: Vec::new(),
+            control_effects_over_cap: false,
             hw_interrupt_seen: false,
             entry_tail,
         }
@@ -706,7 +764,7 @@ pub(crate) struct KeyState {
     pub rearms: u64,
     pub learn_attempts: u64,
     pub learned: u64,
-    pub learn_refused: [u64; 19],
+    pub learn_refused: [u64; 23],
     pub write_class_r_pinned: u64,
     pub write_class_r_unpinned: u64,
     pub write_class_d: u64,
@@ -780,23 +838,37 @@ pub(crate) struct ReflectedCallMemoState {
     /// The answer-path memo cache: per key, up to `MEMO_IMAGES_PER_KEY` learned memos, most
     /// recently used last (plan section 3). Empty on the record-and-measure build; the
     /// answer-path commit populates it once a learn cycle's 8 natural samples all agree.
-    pub(crate) memos: HashMap<MemoKey, Vec<Memo>>,
+    /// `Arc` rather than a bare `Memo`: the answer path must hold the memo while it
+    /// MUTATES the `CpuGsw` that owns this cache, and an `Arc` clone is one refcount
+    /// bump against the several-hundred-cell deep copy a `Memo` clone would be at
+    /// 726,000 answers per guest second.
+    pub(crate) memos: HashMap<MemoKey, Vec<Arc<Memo>>>,
     /// `reflected_call_a20_retires` (plan Revision 2 amendments, item A): incremented by the
     /// COUNT of memos discarded, every time `retire_all_memos` runs.
     pub(crate) a20_retires: u64,
-    /// Amendment 2 screening counters (a partial slice of plan section 7.4's full
-    /// `fell_through[]` surface -- `not_memoised`, `entry_state_mismatch`,
-    /// `read_set_mismatch` and `read_set_unreadable` only; the remaining lanes
-    /// (`pending_interrupt`, `edge_or_cap`, `dma_visible`, `device_window`, ...) are wired as
-    /// their own screens land). `would_answer` counts a full screen PASS: in this commit
-    /// nothing is actually applied yet (that is amendment 3), so a pass still falls through
-    /// to native execution exactly like a miss -- this counter is purely observational,
-    /// proving the screen would have fired once the apply path exists.
+    /// Plan section 7.4's `fell_through[]` surface: the screens 3 and 6 lanes
+    /// (`not_memoised`, `entry_state_mismatch`, `read_set_mismatch`,
+    /// `read_set_unreadable`); the later screens' lanes are the `fell_through_*` fields
+    /// below. `would_answer` counts a screens-3-and-6 PASS, so `would_answer - answered`
+    /// is exactly what the pending-interrupt screen, the clamp and the observer test
+    /// refused -- a number no single lane carries.
     pub(crate) not_memoised: u64,
     pub(crate) entry_state_mismatch: u64,
     pub(crate) read_set_mismatch: u64,
     pub(crate) read_set_unreadable: u64,
     pub(crate) would_answer: u64,
+    /// Answer-path counters (plan section 7.4). `answered` counts trips the memo
+    /// actually applied; the `fell_through_*` lanes are one per screen.
+    pub(crate) answered: u64,
+    pub(crate) insns_elided: u64,
+    pub(crate) core_clocks_charged: u64,
+    pub(crate) bus_clocks_charged: u64,
+    pub(crate) fell_through_pending_interrupt: u64,
+    pub(crate) fell_through_cap: u64,
+    pub(crate) fell_through_device_edge: u64,
+    pub(crate) fell_through_dma_visible: u64,
+    pub(crate) fell_through_not_armed: u64,
+    pub(crate) fell_through_clock_projection: u64,
 }
 
 /// Why a candidate memo did not answer (plan section 5, screens 2/3/6): the entry-image and
@@ -808,6 +880,12 @@ pub(crate) enum FellThrough {
     EntryStateMismatch,
     ReadSetMismatch,
     ReadSetUnreadable,
+    PendingInterrupt,
+    Cap,
+    DeviceEdge,
+    DmaVisible,
+    NotArmed,
+    ClockProjection,
 }
 
 /// Screen ONE candidate memo (plan section 5, steps 3 and 6): compare all 43 entry-image
@@ -843,8 +921,8 @@ pub(crate) fn screen_memo<B: CpuBus>(
 pub(crate) fn screen_key<'a, B: CpuBus>(
     cpu: &CpuGsw,
     bus: &B,
-    memos: &'a [Memo],
-) -> Result<&'a Memo, FellThrough> {
+    memos: &'a [Arc<Memo>],
+) -> Result<&'a Arc<Memo>, FellThrough> {
     if memos.is_empty() {
         return Err(FellThrough::NotMemoised);
     }
@@ -911,6 +989,13 @@ pub(crate) struct Memo {
     /// Physical pages the trip fetched code from (slice 2's code-watch retire; plan section
     /// 4 module layout, `code_pages: Box<[u32]>`).
     pub(crate) code_pages: Box<[u32]>,
+    /// Nested `interrupt_acknowledge` pairs, in TRIP ORDER, re-issued as the answer's
+    /// FIRST mutation (plan R2.6).
+    pub(crate) nested_acks: Box<[(u8, u16)]>,
+    /// TLB/decode control effects, in trip order, replayed AFTER the Class W writes and
+    /// BEFORE the epilogue (plan R2.16 item 2: control effects LAST, so a replayed write
+    /// into a page-table entry cannot leave a TLB that predates it).
+    pub(crate) control_effects: Box<[ControlEffect]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -936,16 +1021,37 @@ fn key_for(cpu: &CpuGsw, vector: u8, ax: u16) -> MemoKey {
     }
 }
 
-/// `CpuGsw::software_interrupt`'s hook. Only tracks a software `INT` taken
-/// from protected mode outside V86 (plan section 1's IN scope), vectors
-/// `0x10..=0x33` (the same window the diagnostic journals -- BIOS/DOS/DPMI).
-pub(crate) fn on_int<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, vector: u8) {
+/// What `on_int` did, so `CpuGsw::software_interrupt` knows whether to run the real
+/// trip. `Answered` means the memo APPLIED: every screen passed, the nested acks were
+/// re-issued, the Class W writes replayed, the control effects reproduced, the epilogue
+/// installed and the clocks charged -- so the caller must return WITHOUT calling
+/// `deliver_interrupt`. Every other path is `NotAnswered` and the guest runs the real
+/// trip, bit-identically to a build with the knob off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IntOutcome {
+    Answered,
+    NotAnswered,
+}
+
+/// `CpuGsw::software_interrupt`'s hook, called immediately AFTER
+/// `bus.interrupt_acknowledge(vector, AX)` and BEFORE `deliver_interrupt` -- which is
+/// why the outer ack is never replayed (it has already run and is part of the trip's
+/// effect either way) while the NESTED ones are.
+///
+/// Only opens a record for a software `INT` taken from protected mode outside V86
+/// (plan section 1's IN scope), vectors `0x10..=0x33` (BIOS/DOS/DPMI). A nested `INT`
+/// inside an already-open trip is recorded at ANY vector: its `interrupt_acknowledge`
+/// has already been issued on the bus above this hook, so a vector outside the opening
+/// window is still an effect the answer must reproduce.
+pub(crate) fn on_int<B: CpuBus>(
+    cpu: &mut CpuGsw,
+    bus: &mut B,
+    vector: u8,
+) -> ExecResult<IntOutcome> {
     if cpu.reflected_call.is_none() {
-        return;
+        return Ok(IntOutcome::NotAnswered);
     }
-    if !(0x10..=0x33).contains(&vector) {
-        return;
-    }
+    let ax = (cpu.registers.eax() & 0xFFFF) as u16;
     let state = cpu.reflected_call.as_mut().expect("checked above");
     if let Some(open) = state.open.take() {
         // A fresh `INT` while one is already open: either a re-entry (this
@@ -959,44 +1065,42 @@ pub(crate) fn on_int<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, vector: u8) {
         let over_budget =
             cpu.perf.instructions.saturating_sub(open.open_instructions) >= MEMO_MAX_TRIP_INSNS;
         if is_reentry || over_budget {
-            finish_trip(cpu, bus, open, false);
+            finish_trip(cpu, &*bus, open, false);
         } else {
             let state = cpu.reflected_call.as_mut().expect("checked above");
             let mut open = open;
             open.nested_int_count = open.nested_int_count.saturating_add(1);
+            // Plan R2.6: the pair its `interrupt_acknowledge` was issued with, in trip
+            // order. `ax` is read from the SAME register the caller passed
+            // (`self.read_gpr16(0)`), one statement above this hook.
+            if open.nested_acks.len() >= MEMO_MAX_NESTED_ACKS {
+                open.nested_acks_over_cap = true;
+            } else {
+                open.nested_acks.push((vector, ax));
+            }
             state.open = Some(open);
-            return;
+            return Ok(IntOutcome::NotAnswered);
         }
     }
-    if !(cpu.is_protected_mode() && !cpu.is_v86_mode()) {
-        return;
+    if !(0x10..=0x33).contains(&vector) {
+        return Ok(IntOutcome::NotAnswered);
     }
-    let ax = (cpu.registers.eax() & 0xFFFF) as u16;
+    if !(cpu.is_protected_mode() && !cpu.is_v86_mode()) {
+        return Ok(IntOutcome::NotAnswered);
+    }
     let key = key_for(cpu, vector, ax);
     let state = cpu.reflected_call.as_mut().expect("checked above");
     let key_state = state.keys.entry(key).or_default();
     key_state.trips_seen += 1;
     key_state.maybe_rearm();
-    // Amendment 2, observational only: screen any cached memo for this key against the LIVE
-    // entry state and physical read set, BEFORE any mutation happens anywhere below. Nothing
-    // is applied on a pass yet (amendment 3) -- production control flow is unchanged by this
-    // block's outcome either way, so the plain/feature-off and even the feature-on arm's
-    // GUEST-VISIBLE behaviour cannot move from adding this counter.
-    {
-        let state = cpu.reflected_call.as_ref().expect("checked above");
-        let outcome: Result<(), FellThrough> = match state.memos.get(&key) {
-            Some(memos) => screen_key(cpu, bus, memos).map(|_memo| ()),
-            None => Err(FellThrough::NotMemoised),
-        };
-        let state = cpu.reflected_call.as_mut().expect("checked above");
-        match outcome {
-            Ok(_) => state.would_answer += 1,
-            Err(FellThrough::NotMemoised) => state.not_memoised += 1,
-            Err(FellThrough::EntryStateMismatch) => state.entry_state_mismatch += 1,
-            Err(FellThrough::ReadSetMismatch) => state.read_set_mismatch += 1,
-            Err(FellThrough::ReadSetUnreadable) => state.read_set_unreadable += 1,
-        }
+
+    // The answer path (plan section 5). Every screen precedes every mutation, and a
+    // miss at any screen is a FALL-THROUGH: nothing written, no register moved, the
+    // guest runs the real trip.
+    if try_answer(cpu, bus, key)?.is_some() {
+        return Ok(IntOutcome::Answered);
     }
+
     let key_state = cpu
         .reflected_call
         .as_mut()
@@ -1006,14 +1110,223 @@ pub(crate) fn on_int<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, vector: u8) {
         .expect("just touched above");
     if key_state.disarmed {
         key_state.disarmed_returns += 1;
-        return;
+        return Ok(IntOutcome::NotAnswered);
     }
     let slot: Slot = key_state.slot.into();
     let journaling = matches!(slot, Slot::JournalA | Slot::JournalB);
     cpu.reflected_call_journal = journaling;
-    let open = OpenTrip::start(cpu, bus, key, slot);
+    let open = OpenTrip::start(cpu, &*bus, key, slot);
     let state = cpu.reflected_call.as_mut().expect("checked above");
     state.open = Some(open);
+    Ok(IntOutcome::NotAnswered)
+}
+
+/// Screen and, if every screen passes, APPLY one memo (plan section 5, steps 2-8).
+/// `Ok(Some(()))` means answered; `Ok(None)` is a fall-through with ZERO state changed
+/// anywhere -- registers, memory, clocks and counters other than the fall-through lane
+/// itself. `Err` can only come from a replayed nested ack, and is the fault the real
+/// trip would have taken at its first nested `INT`.
+fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecResult<Option<()>> {
+    // Screen 2/3/6: bucket lookup, the 43-field entry-image compare, then the
+    // pre-resolved physical read and translation sets against LIVE memory. Read-only.
+    let screened = {
+        let state = cpu.reflected_call.as_ref().expect("caller checked");
+        match state.memos.get(&key) {
+            Some(memos) => screen_key(cpu, &*bus, memos).map(Arc::clone),
+            None => Err(FellThrough::NotMemoised),
+        }
+    };
+    let memo = match screened {
+        Ok(memo) => memo,
+        Err(reason) => {
+            note_fell_through(cpu, reason);
+            return Ok(None);
+        }
+    };
+    cpu.reflected_call
+        .as_mut()
+        .expect("caller checked")
+        .would_answer += 1;
+
+    // Screen 4: the pending-interrupt predicate. An interrupt that is deliverable at
+    // this instant must be taken at this instant, not after a lump.
+    if bus.interrupt_pending() && cpu.can_take_interrupt() {
+        note_fell_through(cpu, FellThrough::PendingInterrupt);
+        return Ok(None);
+    }
+
+    // Screen 5: the clamp (plan section 6 / R4.2). Project the core charge FIRST --
+    // it is the number the gate bounds, and projecting after a mutation would mean
+    // discovering an overflow with the answer half applied.
+    let Some(scaled_core) = cpu.project_reflected_call_core(memo.raw_core_clocks) else {
+        note_fell_through(cpu, FellThrough::ClockProjection);
+        return Ok(None);
+    };
+    let gate = bus.reflected_call_gate(&ReflectedCallGateRequest {
+        scaled_core_clocks: scaled_core,
+        raw_bus_clocks: memo.raw_bus_clocks,
+        run_core_clocks_so_far: cpu.reflected_call_run_core_clocks(),
+    });
+    if let Err(decline) = gate {
+        note_fell_through(
+            cpu,
+            match decline {
+                ReflectedCallDecline::Cap => FellThrough::Cap,
+                ReflectedCallDecline::DeviceEdge => FellThrough::DeviceEdge,
+                ReflectedCallDecline::DmaVisible => FellThrough::DmaVisible,
+                ReflectedCallDecline::NotArmed => FellThrough::NotArmed,
+            },
+        );
+        return Ok(None);
+    }
+
+    // Screen 7: the answer-time observer test over the coalesced Class R ranges
+    // (review A.4). A Class R write is SKIPPED, so its intermediate value must not be
+    // visible to a device window, the framebuffer aperture or an armed DMA region.
+    for &(lo, hi) in memo.class_r_ranges.iter() {
+        if bus.reflected_call_dma_visible(lo, hi) {
+            note_fell_through(cpu, FellThrough::DmaVisible);
+            return Ok(None);
+        }
+    }
+
+    apply_answer(cpu, bus, &memo, scaled_core)?;
+    Ok(Some(()))
+}
+
+fn note_fell_through(cpu: &mut CpuGsw, reason: FellThrough) {
+    let state = cpu.reflected_call.as_mut().expect("caller checked");
+    match reason {
+        FellThrough::NotMemoised => state.not_memoised += 1,
+        FellThrough::EntryStateMismatch => state.entry_state_mismatch += 1,
+        FellThrough::ReadSetMismatch => state.read_set_mismatch += 1,
+        FellThrough::ReadSetUnreadable => state.read_set_unreadable += 1,
+        FellThrough::PendingInterrupt => state.fell_through_pending_interrupt += 1,
+        FellThrough::Cap => state.fell_through_cap += 1,
+        FellThrough::DeviceEdge => state.fell_through_device_edge += 1,
+        FellThrough::DmaVisible => state.fell_through_dma_visible += 1,
+        FellThrough::NotArmed => state.fell_through_not_armed += 1,
+        FellThrough::ClockProjection => state.fell_through_clock_projection += 1,
+    }
+}
+
+/// The apply order, exactly (plan section 5.8 as amended by R2.16 item 2):
+///
+/// 1. **Nested acks**, in trip order -- the first mutation, and the only step that can
+///    `Err`; it does so before any register, memory cell or clock has moved.
+/// 2. **Class W replay writes**, at their own physical address and width, through
+///    `CpuGsw::write_physical_replay`, so each reaches `note_code_write_inner` and the
+///    device write path exactly as the original write did.
+/// 3. **Control effects**, LAST among the memory-visible steps: a replayed write into a
+///    page-table entry must not leave a TLB that predates it.
+/// 4. **The epilogue** -- eight GPRs, EFLAGS as a full architectural image, all six
+///    segment registers WITH their cached descriptors, CPL, `EIP = int_eip + insn_len`
+///    and the recorded final `ESP` (which reproduces the `RETF`-with-flags SP delta
+///    exactly, because it was RECORDED rather than computed).
+/// 5. **Clocks** -- the raw core total through the same remainder-carry scaler the
+///    guest's own retirement uses, and the raw bus total NET OF what this answer's own
+///    acks and writes just charged (plan R2.6's double-count rule).
+/// 6. **`perf.instructions`**, advanced by the trip's own count: the guest really did
+///    advance past those instructions, so the ON and OFF arms' instruction totals are
+///    equal rather than merely reconcilable.
+/// 7. **End the batch**, so no interrupt is ever deferred across a lump.
+fn apply_answer<B: CpuBus>(
+    cpu: &mut CpuGsw,
+    bus: &mut B,
+    memo: &Memo,
+    scaled_core: u64,
+) -> ExecResult<()> {
+    // Sampled BEFORE the first mutation: everything the answer itself charges to the
+    // bus between here and the commit below is subtracted from the memo's recorded
+    // bus total, so the answer charges only the REMAINDER of what it did not itself
+    // spend (plan R2.6).
+    let bus_raw_before = bus.cumulative_raw_bus_clocks();
+
+    for &(vector, ax) in memo.nested_acks.iter() {
+        bus.interrupt_acknowledge(vector, ax)?;
+    }
+
+    for &(phys, width_bytes, value) in memo.replay.iter() {
+        let width = match width_bytes {
+            1 => BusWidth::Byte,
+            2 => BusWidth::Word,
+            _ => BusWidth::Dword,
+        };
+        cpu.write_physical_replay(bus, phys, width, value)?;
+    }
+
+    for effect in memo.control_effects.iter() {
+        match *effect {
+            ControlEffect::Cr3Write(value) => cpu.flush_tlb_and_code_caches_for_cr3_write(value),
+            ControlEffect::Invlpg(linear) => cpu.apply_invlpg(linear),
+        }
+    }
+
+    apply_epilogue(cpu, memo);
+
+    let self_charged = bus
+        .cumulative_raw_bus_clocks()
+        .saturating_sub(bus_raw_before);
+    debug_assert!(
+        self_charged <= memo.raw_bus_clocks,
+        "an answer charged more bus clocks itself than the whole recorded trip did"
+    );
+    let bus_charged =
+        bus.reflected_call_commit_bus(memo.raw_bus_clocks.saturating_sub(self_charged));
+    let core_charged = cpu
+        .commit_reflected_call_core(memo.raw_core_clocks)
+        .unwrap_or(0);
+    debug_assert_eq!(
+        core_charged, scaled_core,
+        "the committed core charge must equal the projection the clamp was granted on"
+    );
+    cpu.perf.instructions = cpu.perf.instructions.saturating_add(memo.insns);
+
+    let state = cpu.reflected_call.as_mut().expect("caller checked");
+    state.answered += 1;
+    state.insns_elided = state.insns_elided.saturating_add(memo.insns);
+    state.core_clocks_charged = state.core_clocks_charged.saturating_add(core_charged);
+    state.bus_clocks_charged = state.bus_clocks_charged.saturating_add(bus_charged);
+
+    bus.note_reflected_call_answered();
+    Ok(())
+}
+
+/// Install the trip's recorded EXIT architectural state. Deliberately does NOT touch
+/// CR0/CR3/CR4, the descriptor-table registers or DR7: CR3 is moved by the replayed
+/// control effects (and `build_confirmed` proves replaying them lands on the exit
+/// image's own CR3), and every other one of those is pinned EQUAL between the entry
+/// and exit images by `build_confirmed`'s system-state check, so there is nothing to
+/// restore and writing them here would only be a second, unchecked path to the same
+/// value.
+fn apply_epilogue(cpu: &mut CpuGsw, memo: &Memo) {
+    let ep = &memo.epilogue;
+    // Read the architectural EFLAGS through the lazy-flag model, then tear the
+    // descriptor down: leaving `pending_flags` standing over a freshly assigned base
+    // would construct a state no execution path produces (a settled base with a live
+    // descriptor over it), which `CpuGsw::settled`'s doc names explicitly.
+    let live_eflags = cpu.eflags();
+    cpu.clear_pending_flags();
+    let regs = &mut cpu.registers;
+    regs.set_eax(ep.eax);
+    regs.set_ebx(ep.ebx);
+    regs.set_ecx(ep.ecx);
+    regs.set_edx(ep.edx);
+    regs.set_ebp(ep.ebp);
+    regs.set_esi(ep.esi);
+    regs.set_edi(ep.edi);
+    regs.set_esp(ep.esp);
+    regs.eflags = (live_eflags & !EFLAGS_ARCH_MASK) | ep.eflags_masked;
+    regs.set_segment(SegmentIndex::Cs, ep.cs.to_segment());
+    regs.set_segment(SegmentIndex::Ss, ep.ss.to_segment());
+    regs.set_segment(SegmentIndex::Ds, ep.ds.to_segment());
+    regs.set_segment(SegmentIndex::Es, ep.es.to_segment());
+    regs.set_segment(SegmentIndex::Fs, ep.fs.to_segment());
+    regs.set_segment(SegmentIndex::Gs, ep.gs.to_segment());
+    cpu.set_current_privilege_level(ep.cpl);
+    // Last, and through `set_eip`: it clears the REP resume state and invalidates the
+    // prefetch queue, both of which a real far return does on its way out.
+    cpu.set_eip(memo.return_eip);
 }
 
 /// `CpuGsw::iret`/`CpuGsw::return_far`'s hook: a far RETURN boundary.
@@ -1061,6 +1374,49 @@ pub(crate) fn on_far_transfer<B: CpuBus>(cpu: &mut CpuGsw, bus: &B) {
     } else {
         cpu.reflected_call.as_mut().expect("checked above").open = Some(open);
     }
+}
+
+/// Production seam: `CpuGsw::flush_tlb_and_code_caches_for_cr3_write` (`core.rs`), the
+/// single entry point every `MOV CR3` reaches. Records the effect in TRIP ORDER so the
+/// answer can replay it by calling that same function (plan R2.5). Called only while
+/// `reflected_call_journal` is set -- the memo is built from the JournalB trip.
+pub(crate) fn note_cr3_write(cpu: &mut CpuGsw, new_cr3: u32) {
+    push_control_effect(cpu, ControlEffect::Cr3Write(new_cr3));
+}
+
+/// Production seam: the `INVLPG m` arm of `execute_extended.rs`, recorded before
+/// `CpuGsw::apply_invlpg` runs so the replay calls the same extracted function.
+pub(crate) fn note_invlpg(cpu: &mut CpuGsw, linear: u32) {
+    push_control_effect(cpu, ControlEffect::Invlpg(linear));
+}
+
+/// Production seam: `CpuGsw::flush_tlb_for_cr0_write` (`core.rs`). A CR0 write inside a
+/// trip REFUSES the memo. Unlike a CR3 write or an INVLPG, whose whole effect is a
+/// TLB/decode teardown this module replays by calling the same function, a CR0 write
+/// can move PE, PG or WP -- the guest's addressing mode -- and replaying only "the
+/// flush" would reproduce the cache effect while dropping every other consequence the
+/// writer's own call site carries. Refusing is sound by construction and free here:
+/// the measured dominant key writes CR3 twice per trip and CR0 never.
+pub(crate) fn note_cr0_write(cpu: &mut CpuGsw) {
+    refuse_open(cpu, LearnRefused::ControlRegisterDelta);
+}
+
+fn push_control_effect(cpu: &mut CpuGsw, effect: ControlEffect) {
+    let Some(open) = cpu
+        .reflected_call
+        .as_mut()
+        .and_then(|state| state.open.as_mut())
+    else {
+        return;
+    };
+    if !open.journaling {
+        return;
+    }
+    if open.control_effects.len() >= MEMO_MAX_CONTROL_EFFECTS {
+        open.control_effects_over_cap = true;
+        return;
+    }
+    open.control_effects.push(effect);
 }
 
 /// Production seam: `execute.rs`'s port-I/O call-out, sibling to
@@ -1429,7 +1785,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
                     let confirmed = key_state.confirmed.take();
                     key_state.record_success_and_reset();
                     if let Some(c) = confirmed {
-                        let memo = Memo {
+                        let memo = Arc::new(Memo {
                             image: c.entry_image,
                             reads: c.reads.into_boxed_slice(),
                             translations: c.translations.into_boxed_slice(),
@@ -1441,7 +1797,9 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
                             raw_bus_clocks: raw_bus,
                             insns,
                             code_pages: Box::new([]),
-                        };
+                            nested_acks: c.nested_acks.into_boxed_slice(),
+                            control_effects: c.control_effects.into_boxed_slice(),
+                        });
                         let state = cpu.reflected_call.as_mut().expect("checked above");
                         let slot_vec = state.memos.entry(key).or_default();
                         // Same entry image relearned (e.g. after an A20 retire): replace
@@ -1515,6 +1873,8 @@ struct ConfirmedTrip {
     return_eip: u32,
     replay: Vec<(u32, u8, u32)>,
     class_r_ranges: Vec<(u32, u32)>,
+    nested_acks: Vec<(u8, u16)>,
+    control_effects: Vec<ControlEffect>,
 }
 
 /// Amendment 2: classify JournalB's write set into Class R (restored, admitted classes only --
@@ -1532,6 +1892,56 @@ fn build_confirmed<B: CpuBus>(
     is_flags_arm: bool,
     exit_image: &EntryImage,
 ) -> Result<ConfirmedTrip, LearnRefused> {
+    if open.nested_acks_over_cap {
+        return Err(LearnRefused::NestedAcksTooMany);
+    }
+    if open.control_effects_over_cap {
+        return Err(LearnRefused::ControlEffectsTooMany);
+    }
+    // The epilogue restores registers, EFLAGS, the six segment registers and CPL, and
+    // the control-effect replay moves CR3. NOTHING restores the descriptor-table
+    // registers, CR0, CR4 or DR7 -- so a trip that moves any of them NET cannot be
+    // answered, and says so here rather than leaving a silent hole in the epilogue.
+    // (The entry image PINS all of them at entry; this is the exit-side half of the
+    // same closure rule.)
+    let entry = &open.entry_image;
+    let system_state_moved = exit_image.cr0 != entry.cr0
+        || exit_image.cr4 != entry.cr4
+        || exit_image.dr7 != entry.dr7
+        || exit_image.idtr_base != entry.idtr_base
+        || exit_image.idtr_limit != entry.idtr_limit
+        || exit_image.gdtr_base != entry.gdtr_base
+        || exit_image.gdtr_limit != entry.gdtr_limit
+        || exit_image.ldtr_selector != entry.ldtr_selector
+        || exit_image.ldtr_base != entry.ldtr_base
+        || exit_image.ldtr_limit != entry.ldtr_limit
+        || exit_image.ldtr_access != entry.ldtr_access
+        || exit_image.tr_selector != entry.tr_selector
+        || exit_image.tr_base != entry.tr_base
+        || exit_image.tr_limit != entry.tr_limit
+        || exit_image.tr_access != entry.tr_access
+        || exit_image.vm != entry.vm;
+    if system_state_moved {
+        return Err(LearnRefused::ControlRegisterDelta);
+    }
+    // CR3 IS licensed to vary (the VCPI pair), but only because the control-effect
+    // replay moves it. Prove that here, as an equality rather than an argument:
+    // `flush_tlb_and_code_caches_for_cr3_write` stores its argument into `control.cr3`,
+    // so replaying the recorded effects from the entry's CR3 must land on the exit
+    // image's. If it does not, the trip changed CR3 through a path this journal does
+    // not see, and no memo may exist for it.
+    let replayed_cr3 = open
+        .control_effects
+        .iter()
+        .rev()
+        .find_map(|e| match *e {
+            ControlEffect::Cr3Write(v) => Some(v),
+            ControlEffect::Invlpg(_) => None,
+        })
+        .unwrap_or(entry.cr3);
+    if replayed_cr3 != exit_image.cr3 {
+        return Err(LearnRefused::ControlEffectUnreplayable);
+    }
     let mut replay: HashMap<u32, (u8, u32)> = HashMap::new();
     let mut class_r_dwords: Vec<u32> = Vec::new();
     for (&dword, obs) in &open.writes {
@@ -1614,6 +2024,8 @@ fn build_confirmed<B: CpuBus>(
         return_eip: open.return_eip,
         replay,
         class_r_ranges,
+        nested_acks: open.nested_acks.clone(),
+        control_effects: open.control_effects.clone(),
     })
 }
 

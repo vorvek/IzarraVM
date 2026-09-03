@@ -58,6 +58,20 @@ fn write_interrupt_gate(mem: &mut [u8], vector: u8, offset: u32) {
 
 struct FlatMemBus {
     mem: Vec<u8>,
+    /// `Some(allowance)` arms `reflected_call_gate` with that many CPU clocks of room;
+    /// `None` (the DEFAULT, and what every pre-existing test in this file gets) leaves
+    /// the trait's own refuse-by-default answer standing, which is the property
+    /// `an_unarmed_test_double_can_never_fake_a_hit` pins.
+    gate_allowance: Option<u64>,
+    /// Every `interrupt_acknowledge` this bus saw, in order -- the replayed nested acks
+    /// land here, so their ORDER and their `(vector, ax)` pairs are assertable.
+    acks: Vec<(u8, u16)>,
+    /// What `reflected_call_commit_bus` was handed, and whether
+    /// `note_reflected_call_answered` fired.
+    committed_bus: u64,
+    answered_flag: bool,
+    /// The answer's observer test (screen 7) asks this; `false` admits the Class R skip.
+    dma_visible: bool,
     /// Test-controllable cumulative raw bus clock counter (Fable review 2026-09-03, finding
     /// 1's regression test): unlike `in_batch_raw_bus_clocks`, this must NEVER reset, even
     /// across a simulated machine-batch re-entry -- the test drives it directly to prove the
@@ -70,6 +84,11 @@ impl FlatMemBus {
         Self {
             mem: vec![0u8; size],
             bus_clock: 0,
+            gate_allowance: None,
+            acks: Vec::new(),
+            committed_bus: 0,
+            answered_flag: false,
+            dma_visible: false,
         }
     }
 
@@ -167,16 +186,40 @@ impl CpuBus for FlatMemBus {
         Ok(())
     }
 
-    fn interrupt_acknowledge(
-        &mut self,
-        _vector: u8,
-        _ax: u16,
-    ) -> Result<(), izarravm_bus::BusError> {
+    fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), izarravm_bus::BusError> {
+        self.acks.push((vector, ax));
         Ok(())
     }
 
     fn cumulative_raw_bus_clocks(&self) -> u64 {
         self.bus_clock
+    }
+
+    fn reflected_call_gate(
+        &self,
+        req: &izarravm_bus::ReflectedCallGateRequest,
+    ) -> Result<(), izarravm_bus::ReflectedCallDecline> {
+        let Some(allowance) = self.gate_allowance else {
+            return Err(izarravm_bus::ReflectedCallDecline::NotArmed);
+        };
+        if req.scaled_core_clocks + req.raw_bus_clocks > allowance {
+            return Err(izarravm_bus::ReflectedCallDecline::DeviceEdge);
+        }
+        Ok(())
+    }
+
+    fn reflected_call_commit_bus(&mut self, raw: u64) -> u64 {
+        self.committed_bus += raw;
+        self.bus_clock += raw;
+        raw
+    }
+
+    fn reflected_call_dma_visible(&self, _lo: u32, _hi: u32) -> bool {
+        self.dma_visible
+    }
+
+    fn note_reflected_call_answered(&mut self) {
+        self.answered_flag = true;
     }
 }
 
@@ -318,6 +361,10 @@ fn a_retf_return_leaving_the_flags_word_closes_as_a_return_match() {
         translation_set_over_cap: false,
         hazard: None,
         nested_int_count: 0,
+        nested_acks: Vec::new(),
+        nested_acks_over_cap: false,
+        control_effects: Vec::new(),
+        control_effects_over_cap: false,
         hw_interrupt_seen: false,
         entry_tail: None,
     };
@@ -386,6 +433,10 @@ fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
         translation_set_over_cap: false,
         hazard: None,
         nested_int_count: 0,
+        nested_acks: Vec::new(),
+        nested_acks_over_cap: false,
+        control_effects: Vec::new(),
+        control_effects_over_cap: false,
         hw_interrupt_seen: false,
         entry_tail: None,
     }
@@ -401,7 +452,7 @@ fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
 /// captured in a different activation of the same code (review A.3).
 #[test]
 fn frame_gone_and_re_entry_never_produce_a_memo() {
-    let (mut cpu, bus) = synthetic_reflected_client();
+    let (mut cpu, mut bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key = key_for(&cpu, VECTOR, 0);
     // Frame-gone: CS/SS match the entry but SP has moved PAST it.
@@ -431,7 +482,7 @@ fn frame_gone_and_re_entry_never_produce_a_memo() {
     let open2 = test_open_trip(&cpu2);
     cpu2.reflected_call.as_mut().unwrap().open = Some(open2);
     cpu2.registers.set_esp(STACK_TOP); // back at entry: re-entry shape
-    on_int(&mut cpu2, &bus, VECTOR);
+    let _ = on_int(&mut cpu2, &mut bus, VECTOR);
     let ks2 = cpu2
         .reflected_call
         .as_ref()
@@ -938,14 +989,14 @@ fn classify_write_returns_the_two_never_restored_device_classes() {
 
 #[test]
 fn disarmed_key_still_counts_trips_seen_and_disarmed_returns() {
-    let (mut cpu, bus) = synthetic_reflected_client();
+    let (mut cpu, mut bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key = key_for(&cpu, VECTOR, 0);
     {
         let state = cpu.reflected_call.as_mut().unwrap();
         state.keys.entry(key).or_default().disarmed = true;
     }
-    on_int(&mut cpu, &bus, VECTOR);
+    let _ = on_int(&mut cpu, &mut bus, VECTOR);
     let state = cpu.reflected_call.as_ref().unwrap();
     let ks = state.keys.get(&key).expect("recorded");
     assert_eq!(ks.trips_seen, 1);
@@ -1024,7 +1075,7 @@ fn a_disarmed_key_rearms_after_trips_seen_advances_by_the_rearm_window() {
 /// window.
 #[test]
 fn on_int_rearms_a_disarmed_key_through_the_real_hook() {
-    let (mut cpu, bus) = synthetic_reflected_client();
+    let (mut cpu, mut bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key = key_for(&cpu, VECTOR, 0);
     {
@@ -1041,7 +1092,7 @@ fn on_int_rearms_a_disarmed_key_through_the_real_hook() {
             "test setup: four consecutive failures must disarm"
         );
     }
-    on_int(&mut cpu, &bus, VECTOR); // trips_seen -> 1,000,001: still far short of the window
+    let _ = on_int(&mut cpu, &mut bus, VECTOR); // trips_seen -> 1,000,001: still far short of the window
     {
         let ks = cpu.reflected_call.as_ref().unwrap().keys.get(&key).unwrap();
         assert!(
@@ -1055,7 +1106,7 @@ fn on_int_rearms_a_disarmed_key_through_the_real_hook() {
         let ks = state.keys.get_mut(&key).unwrap();
         ks.trips_seen = 1_000_001 + MEMO_REARM_TRIPS_SEEN;
     }
-    on_int(&mut cpu, &bus, VECTOR);
+    let _ = on_int(&mut cpu, &mut bus, VECTOR);
     let ks = cpu.reflected_call.as_ref().unwrap().keys.get(&key).unwrap();
     assert!(
         !ks.disarmed,
@@ -1104,8 +1155,8 @@ fn the_epoch_is_part_of_the_memo_key() {
 // Amendment 1: A20 retire (plan Revision 2 amendments, item A, BLOCKING).
 // ---------------------------------------------------------------------------
 
-fn fake_memo() -> Memo {
-    Memo {
+fn fake_memo() -> Arc<Memo> {
+    Arc::new(Memo {
         image: blank_entry_image(),
         reads: Box::new([]),
         translations: Box::new([]),
@@ -1117,7 +1168,9 @@ fn fake_memo() -> Memo {
         raw_bus_clocks: 1,
         insns: 1,
         code_pages: Box::new([]),
-    }
+        nested_acks: Box::new([]),
+        control_effects: Box::new([]),
+    })
 }
 
 /// **Mutation bite**: skip the retire call in `CpuGsw::note_a20_changed` (or leave the memo
@@ -1218,7 +1271,7 @@ const CLASS_W_ADDR: u32 = 0x7000;
 fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u32) {
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
-    on_int(cpu, bus, VECTOR);
+    let _ = on_int(cpu, bus, VECTOR);
     bus.write_raw(CLASS_W_ADDR, BusWidth::Dword, write_value);
     note_write(
         cpu,
@@ -1308,6 +1361,8 @@ fn a_poisoned_read_cell_falls_through_with_zero_state_change() {
         raw_bus_clocks: 7,
         insns: 3,
         code_pages: Box::new([]),
+        nested_acks: Box::new([]),
+        control_effects: Box::new([]),
     };
     // Sanity: an UNPOISONED read set matches, so the screen would pass.
     assert_eq!(screen_memo(&cpu, &bus, &memo), Ok(()));
@@ -1347,17 +1402,19 @@ fn on_int_screening_never_mutates_state_on_a_poisoned_cell() {
         raw_bus_clocks: 1,
         insns: 1,
         code_pages: Box::new([]),
+        nested_acks: Box::new([]),
+        control_effects: Box::new([]),
     };
     cpu.reflected_call
         .as_mut()
         .unwrap()
         .memos
-        .insert(key, vec![memo]);
+        .insert(key, vec![Arc::new(memo)]);
     bus.write_raw(addr, BusWidth::Dword, 0x2222_2222); // poison after caching the memo
 
     let regs_before = cpu.registers.clone();
     let mem_before = bus.mem.clone();
-    on_int(&mut cpu, &bus, VECTOR);
+    let _ = on_int(&mut cpu, &mut bus, VECTOR);
     assert_eq!(
         cpu.registers, regs_before,
         "on_int must not move any register on a screen miss"
@@ -1372,4 +1429,446 @@ fn on_int_screening_never_mutates_state_on_a_poisoned_cell() {
         "the read-set-mismatch counter must have moved"
     );
     assert_eq!(cpu.reflected_call.as_ref().unwrap().would_answer, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Amendment 3: THE APPLY PATH (plan section 5.8 as amended by R2.16 item 2).
+// ---------------------------------------------------------------------------
+
+/// The scaler's `(num, den)` on the persona these fixtures run
+/// (`GswMode::Gsw586` -> `(1, 12)`), so a test can state the expected charge as
+/// arithmetic rather than as a copied constant.
+fn scaler() -> (u64, u64) {
+    let (num, den) = crate::level_timing(CpuPersona::I586);
+    (u64::from(num), u64::from(den))
+}
+
+/// A memo whose ANSWER is distinguishable in every lane the apply path touches:
+/// a different value in every GPR, a moved ESP, moved EFLAGS, a re-loaded DS, a
+/// nested ack pair, a Class W replay write, a CR3 control effect, and a raw core
+/// total that is deliberately NOT a multiple of the scaler denominator.
+fn distinguishable_memo(cpu: &CpuGsw, replay_addr: u32, cr3_after: u32) -> Memo {
+    let entry = EntryImage::capture(cpu);
+    let mut epilogue = entry;
+    epilogue.eax = 0xAAAA_0001;
+    epilogue.ebx = 0xBBBB_0002;
+    epilogue.ecx = 0xCCCC_0003;
+    epilogue.edx = 0xDDDD_0004;
+    epilogue.ebp = 0x0000_0BB0;
+    epilogue.esi = 0x0000_0551;
+    epilogue.edi = 0x0000_0DD1;
+    // The `RETF`-with-flags shape: the answer's ESP is entry - 2, RECORDED not computed.
+    epilogue.esp = entry.esp.wrapping_sub(2);
+    // CF | ZF, both inside `EFLAGS_ARCH_MASK`.
+    epilogue.eflags_masked = (entry.eflags_masked | 0x0041) & EFLAGS_ARCH_MASK;
+    epilogue.ds.selector = CODE_SELECTOR;
+    epilogue.ds.access = 0x9b;
+    epilogue.cr3 = cr3_after;
+    Memo {
+        image: entry,
+        reads: Box::new([]),
+        translations: Box::new([]),
+        epilogue,
+        // `int_eip + insn_len`: DELIBERATELY not the EIP the fixture's CPU already
+        // holds, or a mutation deleting the `set_eip` would pass unnoticed and the
+        // real guest would re-execute the `INT`.
+        return_eip: CLIENT_RETURN_EIP + 2,
+        replay: Box::new([(replay_addr, 2, 0xBEEF)]),
+        class_r_ranges: Box::new([(0x7000, 0x7003)]),
+        // 1,000 is NOT a multiple of `den` (12) on this persona, so a committer that
+        // fed a PRE-SCALED delta back through the scaler would leave a different
+        // `timing_rem` and this fixture would see it (R2.11's test for finding 2).
+        raw_core_clocks: 1_000,
+        raw_bus_clocks: 500,
+        insns: 1_579,
+        code_pages: Box::new([]),
+        nested_acks: Box::new([(0x16, 0x0100), (0x28, 0x0000)]),
+        control_effects: Box::new([ControlEffect::Cr3Write(cr3_after)]),
+    }
+}
+
+fn install_memo(cpu: &mut CpuGsw, key: MemoKey, memo: Memo) {
+    cpu.reflected_call
+        .as_mut()
+        .unwrap()
+        .memos
+        .insert(key, vec![Arc::new(memo)]);
+}
+
+/// **Mutation bites, four, each verified red on its own**: (a) drop the epilogue's
+/// segment restore -- DS keeps the caller's selector and the next reflected call runs
+/// the DOS half against the wrong data segment (BLOCKING finding 1's shape); (b) drop
+/// the `ESP` restore -- the `RETF`-with-flags SP delta is lost and the client stack
+/// walks; (c) drop the EFLAGS restore -- the answer returns the wrong carry, which
+/// `AH=0Bh` uses as its result; (d) drop the `set_eip` -- the guest re-executes the
+/// `INT`.
+#[test]
+fn the_answer_reproduces_the_epilogue_registers_flags_segments_and_sp() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    let expected = memo.epilogue;
+    install_memo(&mut cpu, key, memo);
+
+    let outcome = on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault");
+    assert_eq!(outcome, IntOutcome::Answered);
+
+    let regs = &cpu.registers;
+    assert_eq!(regs.eax(), expected.eax);
+    assert_eq!(regs.ebx(), expected.ebx);
+    assert_eq!(regs.ecx(), expected.ecx);
+    assert_eq!(regs.edx(), expected.edx);
+    assert_eq!(regs.ebp(), expected.ebp);
+    assert_eq!(regs.esi(), expected.esi);
+    assert_eq!(regs.edi(), expected.edi);
+    assert_eq!(
+        regs.esp(),
+        expected.esp,
+        "the recorded final SP, not a computed one"
+    );
+    assert_eq!(
+        cpu.eflags() & EFLAGS_ARCH_MASK,
+        expected.eflags_masked,
+        "EFLAGS restored as a full architectural image, with the lazy descriptor torn down"
+    );
+    for (index, want) in [
+        (SegmentIndex::Cs, expected.cs),
+        (SegmentIndex::Ss, expected.ss),
+        (SegmentIndex::Ds, expected.ds),
+        (SegmentIndex::Es, expected.es),
+        (SegmentIndex::Fs, expected.fs),
+        (SegmentIndex::Gs, expected.gs),
+    ] {
+        let live = cpu.registers.segment(index);
+        assert_eq!(live.selector, want.selector, "{index:?} selector");
+        assert_eq!(live.base, want.base, "{index:?} cached base");
+        assert_eq!(live.limit, want.limit, "{index:?} cached limit");
+        assert_eq!(live.access, want.access, "{index:?} cached access");
+        assert_eq!(
+            live.default_size_32, want.default_size_32,
+            "{index:?} cached D/B bit"
+        );
+    }
+    assert_eq!(
+        cpu.registers.eip,
+        CLIENT_RETURN_EIP + 2,
+        "EIP lands on the instruction AFTER the INT, from the memo's own recorded value"
+    );
+    assert_eq!(cpu.reflected_call.as_ref().unwrap().answered, 1);
+}
+
+/// **Mutation bite**: delete the `bus.interrupt_acknowledge` loop in `apply_answer` --
+/// the trip's nested `INT 16h`/`INT 28h` acks vanish, so the bus trace, its I/O wait
+/// states and `last_int_vector` all diverge from the real trip (BLOCKING finding 6).
+/// A second bite: replay the list in reverse -- the ORDER assertion below fails.
+#[test]
+fn nested_acks_are_re_issued_in_trip_order() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    install_memo(&mut cpu, key, memo);
+    bus.acks.clear();
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::Answered
+    );
+    assert_eq!(
+        bus.acks,
+        vec![(0x16u8, 0x0100u16), (0x28u8, 0x0000u16)],
+        "the recorded nested acks, in trip order, with their own AX"
+    );
+}
+
+/// **Mutation bite**: skip the `memo.replay` loop -- the deterministic net writes the
+/// trip made (the DPMI host's register block, a DOS data byte) are never made, and the
+/// guest reads stale data with nothing in the read set to catch it. A second bite:
+/// write `BusWidth::Dword` regardless of the recorded width -- the two bytes above the
+/// word are clobbered, which the neighbour assertion below catches.
+#[test]
+fn a_class_w_write_is_replayed_at_its_own_address_and_width() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    bus.write_raw(0x7200, BusWidth::Dword, 0x1234_5678);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    install_memo(&mut cpu, key, memo);
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::Answered
+    );
+    assert_eq!(bus.read_raw(0x7200, BusWidth::Word), 0xBEEF);
+    assert_eq!(
+        bus.read_raw(0x7202, BusWidth::Word),
+        0x1234,
+        "a WORD replay must not smear across the neighbouring bytes the trip never wrote"
+    );
+}
+
+/// **Mutation bite**: drop `memo.control_effects` from the apply path -- an answered
+/// trip leaves CR3 (and therefore the TLB and the decode ring) where the CALLER left
+/// it, so a guest that edits a page table and relies on the reflected call's own mode
+/// switch to publish the edit reads through a stale translation (BLOCKING finding 5).
+#[test]
+fn an_answered_trip_replays_the_cr3_writes() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    let cr3_after = 0x0002_1000u32;
+    assert_ne!(cpu.control.cr3, cr3_after);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cr3_after);
+    let flushes_before = cpu.perf.decode_inval_cr3;
+    install_memo(&mut cpu, key, memo);
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::Answered
+    );
+    assert_eq!(
+        cpu.control.cr3, cr3_after,
+        "the replayed CR3 write moved CR3"
+    );
+    assert_eq!(
+        cpu.perf.decode_inval_cr3,
+        flushes_before + 1,
+        "and it ran the SAME teardown a real MOV CR3 runs, once per recorded effect"
+    );
+}
+
+/// **Mutation bite**: feed `commit_reflected_call_core` a pre-scaled delta instead of
+/// the RAW total (BLOCKING finding 2's double-scale). With `raw = 1,000` and
+/// `den = 12` the charge is `1000/12 = 83` and the carry left behind is `1000 % 12 =
+/// 4`; a double-scale charges 6 and leaves 11, and both halves of this assertion move.
+/// The raw total is deliberately not a multiple of `den`, or the carry check is vacuous
+/// (review item 20's complaint about the plan's own test 5).
+#[test]
+fn the_answer_charges_raw_core_clocks_through_the_carry_scaler() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    let raw_core = memo.raw_core_clocks;
+    let raw_bus = memo.raw_bus_clocks;
+    install_memo(&mut cpu, key, memo);
+
+    let (num, den) = scaler();
+    let elapsed_before = cpu.elapsed_clocks;
+    let rem_before = cpu.reflected_call_timing_rem();
+    let bus_before = bus.bus_clock;
+    let insns_before = cpu.perf.instructions;
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::Answered
+    );
+
+    let scaled = raw_core * num + rem_before;
+    assert_eq!(cpu.elapsed_clocks - elapsed_before, scaled / den);
+    assert_eq!(cpu.reflected_call_timing_rem(), scaled % den);
+    assert_ne!(
+        scaled % den,
+        0,
+        "the fixture must exercise a non-zero carry"
+    );
+    // The bus half is charged NET of what the answer's own acks and replay writes
+    // spent (this bus charges nothing for either, so the whole recorded total lands).
+    assert_eq!(bus.committed_bus, raw_bus);
+    assert_eq!(bus.bus_clock - bus_before, raw_bus);
+    // The guest really did advance past the trip's instructions, so the ON arm's
+    // `perf.instructions` matches the OFF arm's exactly rather than merely
+    // reconciling with an elided counter.
+    assert_eq!(cpu.perf.instructions - insns_before, 1_579);
+    assert_eq!(cpu.reflected_call.as_ref().unwrap().insns_elided, 1_579);
+    assert!(bus.answered_flag, "the answered trip must end the batch");
+}
+
+/// **Mutation bite**: remove the clamp (the `reflected_call_gate` call, or its `Err`
+/// arm) -- a lump the remaining batch allowance cannot hold is applied anyway, running
+/// the batch past the next device edge, and the guest's timer ISR loses ticks the real
+/// PIT delivers. The assertion is on the FALL-THROUGH, not merely on a counter: every
+/// register, the memory image, the clock and the carry must be untouched.
+#[test]
+fn a_lump_that_does_not_fit_the_remaining_allowance_falls_through() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    // 1,000 raw core scales to 83, plus 500 raw bus: 583 needed, 100 offered.
+    bus.gate_allowance = Some(100);
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    install_memo(&mut cpu, key, memo);
+
+    let regs_before = cpu.registers.clone();
+    let mem_before = bus.mem.clone();
+    let elapsed_before = cpu.elapsed_clocks;
+    let rem_before = cpu.reflected_call_timing_rem();
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered
+    );
+    assert_eq!(cpu.registers, regs_before);
+    assert_eq!(bus.mem, mem_before);
+    assert_eq!(cpu.elapsed_clocks, elapsed_before);
+    assert_eq!(cpu.reflected_call_timing_rem(), rem_before);
+    assert!(
+        bus.acks.is_empty(),
+        "not one ack may be issued on a refusal"
+    );
+    assert!(!bus.answered_flag);
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.answered, 0);
+    assert_eq!(state.fell_through_device_edge, 1);
+    assert_eq!(
+        state.would_answer, 1,
+        "screens 3 and 6 passed; the clamp is what refused"
+    );
+}
+
+/// **Mutation bite**: move the observer test AFTER the apply (or delete it) -- a Class R
+/// write inside a device window or the framebuffer aperture is SKIPPED, so the device
+/// never sees the intermediate value the real trip showed it (review A.4, plan 5.7).
+#[test]
+fn a_class_r_range_a_device_can_observe_falls_through_at_answer_time() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    bus.dma_visible = true;
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    install_memo(&mut cpu, key, memo);
+
+    let regs_before = cpu.registers.clone();
+    let mem_before = bus.mem.clone();
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered
+    );
+    assert_eq!(cpu.registers, regs_before);
+    assert_eq!(bus.mem, mem_before);
+    assert_eq!(
+        cpu.reflected_call
+            .as_ref()
+            .unwrap()
+            .fell_through_dma_visible,
+        1
+    );
+}
+
+/// The FALL-THROUGH INVARIANT, driven through the real hook with the gate ARMED and
+/// every other screen passing, so the only thing standing between the memo and an
+/// answer is one poisoned read cell.
+///
+/// **Mutation bite**: apply the replay before the read-set compare (partial
+/// application) -- the memory assertion fails; charge the clocks before the compare --
+/// the clock assertions fail; bump `answered` before the screens -- the counter
+/// assertion fails.
+#[test]
+fn a_poisoned_read_cell_leaves_every_register_memory_clock_and_counter_untouched() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    let addr = 0x7100u32;
+    bus.write_raw(addr, BusWidth::Dword, 0x1111_1111);
+    let key = key_for(&cpu, VECTOR, 0);
+    let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    memo.reads = Box::new([(addr, 0x1111_1111)]);
+    install_memo(&mut cpu, key, memo);
+    bus.write_raw(addr, BusWidth::Dword, 0x2222_2222); // poison, after caching
+
+    let regs_before = cpu.registers.clone();
+    let mem_before = bus.mem.clone();
+    let elapsed_before = cpu.elapsed_clocks;
+    let rem_before = cpu.reflected_call_timing_rem();
+    let insns_before = cpu.perf.instructions;
+    let cr3_before = cpu.control.cr3;
+
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered
+    );
+    assert_eq!(cpu.registers, regs_before, "no register may move");
+    assert_eq!(bus.mem, mem_before, "no memory cell may move");
+    assert_eq!(
+        cpu.elapsed_clocks, elapsed_before,
+        "no clock may be charged"
+    );
+    assert_eq!(
+        cpu.reflected_call_timing_rem(),
+        rem_before,
+        "no carry may move"
+    );
+    assert_eq!(cpu.perf.instructions, insns_before);
+    assert_eq!(
+        cpu.control.cr3, cr3_before,
+        "no control effect may be replayed"
+    );
+    assert!(bus.acks.is_empty());
+    assert_eq!(bus.committed_bus, 0);
+    assert!(!bus.answered_flag);
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.answered, 0);
+    assert_eq!(state.would_answer, 0);
+    assert_eq!(state.read_set_mismatch, 1);
+}
+
+/// **Mutation bite**: give `CpuBus::reflected_call_gate` a permissive default
+/// (`Ok(())`) instead of `Err(NotArmed)`. Every clamp fixture in this file, and every
+/// test double in the whole CPU crate, would then silently ADMIT answers -- the
+/// vacuity `callout_poll_skip`'s own default-to-decline exists to rule out.
+#[test]
+fn an_unarmed_test_double_can_never_fake_a_hit() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    assert!(bus.gate_allowance.is_none(), "the default, deliberately");
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    install_memo(&mut cpu, key, memo);
+
+    let regs_before = cpu.registers.clone();
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered
+    );
+    assert_eq!(cpu.registers, regs_before);
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().fell_through_not_armed,
+        1
+    );
+}
+
+/// **Mutation bite**: record nested acks only for vectors inside the `0x10..=0x33`
+/// opening window. `INT 2Fh` (multiplex) and `INT 0x60`-range TSR hooks then acknowledge
+/// on the real trip and not on the answered one, so the bus trace diverges with nothing
+/// in any screen able to see it.
+#[test]
+fn a_nested_int_outside_the_opening_window_is_still_recorded_as_an_ack() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    let mut open = test_open_trip(&cpu);
+    open.key = key;
+    open.journaling = true;
+    // Not the trip's own signature, and not at the entry SP: a genuine NESTED call.
+    cpu.registers.set_esp(STACK_TOP - 64);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+    cpu.registers.set_eax(0x1234);
+
+    let _ = on_int(&mut cpu, &mut bus, 0x60);
+    let acks = &cpu
+        .reflected_call
+        .as_ref()
+        .unwrap()
+        .open
+        .as_ref()
+        .expect("the trip stays open across a nested INT")
+        .nested_acks;
+    assert_eq!(acks, &vec![(0x60u8, 0x1234u16)]);
 }

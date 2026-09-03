@@ -461,6 +461,22 @@ pub(super) const fn is_ata_data_port(port: u16) -> bool {
 #[cfg(feature = "jit")]
 pub(super) const POLL_SKIP_IO_PORT: u16 = 0x03da;
 
+/// CPU clocks held back from the reflected-call memo's answer allowance
+/// (`reflected_call_gate`). The CPU publishes `core_clocks_so_far` BEFORE each
+/// instruction runs, so at the `INT` asking the gate that figure excludes the `INT`'s
+/// own charge (and, on the Direct backend, whatever a block has retired since its last
+/// publish). One 586 `INT n` through a gate is on the order of 40-80 clocks; 512 covers
+/// that with room to spare, and every clock of the margin is spent in the REFUSING
+/// direction, so an over-generous margin costs hit rate and can never cross an edge.
+const REFLECTED_CALL_GATE_MARGIN: u64 = 512;
+
+/// The widest coalesced Class R range `reflected_call_dma_visible` will walk before
+/// refusing outright. A memo's Class R ranges are per-dword coalesced runs of ordinary
+/// scratch (a DOS request header, a DPMI register block), which are tens of bytes;
+/// anything a page wide is not a shape this mechanism was measured on, so it refuses
+/// rather than paying a 1,024-iteration peek loop on the answer path.
+const REFLECTED_CALL_MAX_OBSERVER_SPAN: u32 = 4096;
+
 /// The whole composition rule for `MachineBus::lazy_ports_386`, split out from
 /// the environment read so it is testable without touching process state.
 ///
@@ -587,6 +603,11 @@ impl Machine {
             bus_rem_at_batch_start: self.bus_rem,
             bus_num_at_batch_start,
             bus_den_at_batch_start,
+            // Zero: a bus built outside the batch loop has no cap to bound a lump by,
+            // so `reflected_call_gate` refuses on it (`ReflectedCallDecline::NotArmed`).
+            reflected_call_batch_cap: 0,
+            reflected_call_cap_is_device_edge: false,
+            reflected_call_answered: false,
         }
     }
 
@@ -4179,6 +4200,116 @@ impl CpuBus for MachineBus<'_> {
         );
         self.string_port_element_bytes = 0;
         result
+    }
+
+    /// The reflected-call memo's answer-time clamp (slice1 plan section 6 / R4.2).
+    ///
+    /// `spent` is composed EXACTLY as the batch loop composes its own: this batch's
+    /// prior runs' core clocks (`prior_runs_core_clocks`, published at every run
+    /// entry), plus the core clocks the CURRENT run has retired before the asking
+    /// `INT` (`req.run_core_clocks_so_far`, which only the CPU knows), plus the
+    /// batch-absolute scaled bus clocks. `cap` is the batch cap the loop itself is
+    /// bounded by, published at batch entry, so "the lump fits inside `cap - spent`"
+    /// is the same question as "this batch will not run past its own cap", and
+    /// `next_device_edge_ticks` is inside that cap by construction -- which is what
+    /// makes "no device edge is ever inside an answered lump" true without a second
+    /// device scan here.
+    ///
+    /// Three deliberate conservatisms, all in the refusing direction:
+    ///
+    /// 1. The raw bus lump is scaled with `div_ceil`, never `floor`: a floor could
+    ///    admit a lump that lands one clock past the cap.
+    /// 2. `REFLECTED_CALL_GATE_MARGIN` is subtracted from the allowance. The CPU's
+    ///    `core_clocks_so_far` is set BEFORE each instruction runs, so at the `INT`
+    ///    that is asking it excludes that `INT`'s own charge; the margin covers it
+    ///    with room to spare rather than leaving a few-clock hole in the clamp.
+    /// 3. A zero cap (a bus built outside the batch loop) refuses outright.
+    fn reflected_call_gate(
+        &self,
+        req: &ReflectedCallGateRequest,
+    ) -> Result<(), ReflectedCallDecline> {
+        let cap = self.reflected_call_batch_cap;
+        if cap == 0 {
+            return Err(ReflectedCallDecline::NotArmed);
+        }
+        let spent = self
+            .prior_runs_core_clocks
+            .saturating_add(req.run_core_clocks_so_far)
+            .saturating_add(self.in_batch_scaled_bus_clocks());
+        let allowance = cap
+            .saturating_sub(spent)
+            .saturating_sub(REFLECTED_CALL_GATE_MARGIN);
+        let scaled_bus = (u128::from(req.raw_bus_clocks) * u128::from(self.bus_num_at_batch_start))
+            .div_ceil(u128::from(self.bus_den_at_batch_start));
+        let lump = u128::from(req.scaled_core_clocks).saturating_add(scaled_bus);
+        if lump > u128::from(allowance) {
+            return Err(if self.reflected_call_cap_is_device_edge {
+                ReflectedCallDecline::DeviceEdge
+            } else {
+                ReflectedCallDecline::Cap
+            });
+        }
+        Ok(())
+    }
+
+    /// Commit the BUS half of an answered reflected call, the way `poll_commit_bus`
+    /// commits the poll skip's: straight onto `trace.elapsed_clocks()`, which is the
+    /// same total `in_batch_scaled_bus_clocks` scales and the batch-end step folds
+    /// into the guest clock stream. No device side effect is replayed (unlike
+    /// `poll_commit_bus`'s `status1_side_effects`): the answered trip's own device
+    /// effects were re-issued by the CPU as `interrupt_acknowledge` calls and replay
+    /// writes before this runs.
+    fn reflected_call_commit_bus(&mut self, raw: u64) -> u64 {
+        if raw == 0 {
+            return 0;
+        }
+        self.trace.add_elapsed_clocks(raw);
+        raw
+    }
+
+    /// Answer-time observer test over one coalesced Class R range (plan 5.7).
+    ///
+    /// The question is whether an intermediate value written and restored inside the
+    /// trip could be seen by anything but the CPU. Two claimants:
+    ///
+    /// * **Device windows and the framebuffer aperture.** `peek_direct_ram` is the
+    ///   single mechanism (plan Revision 2 item 18): `direct_page_ram_bytes` declines
+    ///   an A20-masked address, a misaligned access, a page-crossing range, and every
+    ///   page `ram_lookup_page_is_direct` excludes -- which is `0xA0000-0xFFFFF` and
+    ///   every Vega memory BAR. So one `peek_direct_ram` per covered dword answers
+    ///   both, and a range too large to walk cheaply is refused rather than admitted.
+    /// * **DMA.** Every DMA writer in this machine (the FDC's `advance_fdc_to`, the
+    ///   SB16's block transfer) runs inside `apply_device_advance`, i.e. at a BATCH
+    ///   BOUNDARY, never while the CPU is executing. `reflected_call_gate` above
+    ///   refuses any lump that would reach the batch cap, and the cap is at or before
+    ///   the next device edge, so no DMA transfer can land inside an answered lump.
+    ///   A device that advances at the batch end sees the trip's FINAL memory state
+    ///   in both worlds -- which is exactly what a Class R skip preserves. This is an
+    ///   argument, not a query: it is written down here rather than turned into a
+    ///   per-channel address test because no such query exists on this bus, and the
+    ///   argument is what the cap already buys.
+    fn reflected_call_dma_visible(&self, lo: u32, hi: u32) -> bool {
+        if hi < lo {
+            return true;
+        }
+        let span = u64::from(hi - lo);
+        if span >= u64::from(REFLECTED_CALL_MAX_OBSERVER_SPAN) {
+            return true;
+        }
+        let mut addr = lo & !0x3;
+        loop {
+            if self.peek_direct_ram(addr, BusWidth::Dword).is_none() {
+                return true;
+            }
+            if addr >= (hi & !0x3) {
+                return false;
+            }
+            addr += 4;
+        }
+    }
+
+    fn note_reflected_call_answered(&mut self) {
+        self.reflected_call_answered = true;
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
