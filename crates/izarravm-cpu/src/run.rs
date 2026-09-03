@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::execute::{group1_class, group2_class, test_rm_class};
+use crate::timing_class::TimingClass;
 
 // The entry-attribution observer's phase, population and site names. The `ea_*!` macros
 // themselves are `#[macro_use]`-imported from `crate::entry_attribution_macros`, which is compiled
@@ -4262,7 +4264,7 @@ impl CpuGsw {
                     insn.operand_size,
                     u32::from(self.read_gpr8(index)),
                 );
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x0fb7 => {
                 let modrm = insn.modrm?;
@@ -4274,7 +4276,7 @@ impl CpuGsw {
                     insn.operand_size,
                     self.read_gpr_sized(index, OperandSize::Word),
                 );
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x0fbe => {
                 let modrm = insn.modrm?;
@@ -4283,7 +4285,7 @@ impl CpuGsw {
                 };
                 let value = self.read_gpr8(index) as i8 as i32 as u32;
                 self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x0fbf => {
                 let modrm = insn.modrm?;
@@ -4292,7 +4294,7 @@ impl CpuGsw {
                 };
                 let value = self.read_gpr_sized(index, OperandSize::Word) as i16 as i32 as u32;
                 self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x70..=0x7f | 0x0f80..=0x0f8f => {
                 let cc = (insn.opcode & 0x0f) as u8;
@@ -4304,7 +4306,7 @@ impl CpuGsw {
                 if taken {
                     self.relative_jump(insn.imm as i32, insn.operand_size);
                 }
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             opcode if opcode <= 0xff => match opcode as u8 {
                 0x40..=0x4f => {
@@ -4316,14 +4318,14 @@ impl CpuGsw {
                         insn.operand_size.bus_width(),
                     );
                     self.write_gpr_sized(index, insn.operand_size, result);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::Reg))
                 }
                 0x84 => {
                     let modrm = insn.modrm?;
                     if modrm.mode == 3 && modrm.reg == modrm.rm {
                         let value = self.read_gpr8(modrm.rm);
                         self.alu_logic(u32::from(value), BusWidth::Byte);
-                        return Some(clocks(2));
+                        return Some(self.charge(test_rm_class(insn)));
                     }
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
@@ -4331,14 +4333,14 @@ impl CpuGsw {
                     let value = self.read_gpr8(index);
                     let result = value & self.read_gpr8(modrm.reg);
                     self.alu_logic(u32::from(result), BusWidth::Byte);
-                    Some(clocks(2))
+                    Some(self.charge(test_rm_class(insn)))
                 }
                 0x85 => {
                     let modrm = insn.modrm?;
                     if modrm.mode == 3 && modrm.reg == modrm.rm {
                         let value = self.read_gpr_sized(modrm.rm, insn.operand_size);
                         self.alu_logic(value, insn.operand_size.bus_width());
-                        return Some(clocks(2));
+                        return Some(self.charge(test_rm_class(insn)));
                     }
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
@@ -4346,7 +4348,7 @@ impl CpuGsw {
                     let value = self.read_gpr_sized(index, insn.operand_size);
                     let result = value & self.read_gpr_sized(modrm.reg, insn.operand_size);
                     self.alu_logic(result, insn.operand_size.bus_width());
-                    Some(clocks(2))
+                    Some(self.charge(test_rm_class(insn)))
                 }
                 0x88 => {
                     let modrm = insn.modrm?;
@@ -4354,7 +4356,7 @@ impl CpuGsw {
                         return None;
                     };
                     self.write_gpr8(index, self.read_gpr8(modrm.reg));
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovMemReg))
                 }
                 0x89 => {
                     let modrm = insn.modrm?;
@@ -4366,7 +4368,7 @@ impl CpuGsw {
                     } else {
                         self.write_gpr32(index, self.read_gpr32(modrm.reg));
                     }
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovMemReg))
                 }
                 0x8a => {
                     let modrm = insn.modrm?;
@@ -4374,7 +4376,7 @@ impl CpuGsw {
                         return None;
                     };
                     self.write_gpr8(modrm.reg, self.read_gpr8(index));
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovRegMem))
                 }
                 0x8b => {
                     let modrm = insn.modrm?;
@@ -4386,7 +4388,7 @@ impl CpuGsw {
                     } else {
                         self.write_gpr32(modrm.reg, self.read_gpr32(index));
                     }
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovRegMem))
                 }
                 0x8d => {
                     let modrm = insn.modrm?;
@@ -4395,24 +4397,24 @@ impl CpuGsw {
                     };
                     let memory = self.resolve_memory_addr_mode(&addr);
                     self.write_gpr_sized(modrm.reg, insn.operand_size, memory.offset);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::Lea))
                 }
-                0x90 => Some(clocks(3)),
+                0x90 => Some(self.charge(TimingClass::Nop)),
                 0x91..=0x97 => {
                     let reg = opcode as u8 & 0x07;
                     let acc = self.read_gpr_sized(0, insn.operand_size);
                     let other = self.read_gpr_sized(reg, insn.operand_size);
                     self.write_gpr_sized(0, insn.operand_size, other);
                     self.write_gpr_sized(reg, insn.operand_size, acc);
-                    Some(clocks(3))
+                    Some(self.charge(TimingClass::Xchg))
                 }
                 0xb0..=0xb7 => {
                     self.write_gpr8(insn.opcode as u8 - 0xb0, insn.imm as u8);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovImmReg))
                 }
                 0xb8..=0xbf => {
                     self.write_gpr_sized(insn.opcode as u8 - 0xb8, insn.operand_size, insn.imm);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovImmReg))
                 }
                 0xe0 | 0xe1 => {
                     let count_nonzero = match insn.address_size {
@@ -4431,7 +4433,7 @@ impl CpuGsw {
                     if count_nonzero && (if insn.opcode as u8 == 0xe1 { zf } else { !zf }) {
                         self.relative_jump(insn.imm as i32, insn.operand_size);
                     }
-                    Some(clocks(11))
+                    Some(self.charge(TimingClass::LoopCc))
                 }
                 0xe2 => {
                     let taken = match insn.address_size {
@@ -4449,7 +4451,7 @@ impl CpuGsw {
                     if taken {
                         self.relative_jump(insn.imm as i32, insn.operand_size);
                     }
-                    Some(clocks(11))
+                    Some(self.charge(TimingClass::Loop))
                 }
                 0xe3 => {
                     let taken = match insn.address_size {
@@ -4459,11 +4461,11 @@ impl CpuGsw {
                     if taken {
                         self.relative_jump(insn.imm as i32, insn.operand_size);
                     }
-                    Some(clocks(9))
+                    Some(self.charge(TimingClass::Jcxz))
                 }
                 0xe9 | 0xeb => {
                     self.relative_jump(insn.imm as i32, insn.operand_size);
-                    Some(clocks(7))
+                    Some(self.charge(TimingClass::CallJmpRel))
                 }
                 _ => None,
             },
@@ -4560,7 +4562,7 @@ impl CpuGsw {
             _ => return None,
         }
 
-        Some(clocks(2))
+        Some(self.charge(TimingClass::Reg))
     }
 
     #[inline]
@@ -4602,7 +4604,7 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::AluMemReg)))
             }
             1 => {
                 let value = self.read_memory_sized(
@@ -4624,7 +4626,7 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::AluMemReg)))
             }
             2 => {
                 let value = self.read_memory_u8(
@@ -4638,7 +4640,7 @@ impl CpuGsw {
                 if write_back {
                     self.write_gpr8(modrm.reg, result);
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::AluRegMem)))
             }
             3 => {
                 let value = self.read_memory_sized(
@@ -4653,7 +4655,7 @@ impl CpuGsw {
                 if write_back {
                     self.write_gpr_sized(modrm.reg, insn.operand_size, result);
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::AluRegMem)))
             }
             _ => Ok(None),
         }
@@ -4696,7 +4698,7 @@ impl CpuGsw {
             _ => return None,
         }
 
-        Some(clocks(2))
+        Some(self.charge(TimingClass::Reg))
     }
 
     #[inline]
@@ -4733,7 +4735,7 @@ impl CpuGsw {
             self.write_gpr_sized(index, insn.operand_size, result);
         }
 
-        Some(clocks(2))
+        Some(self.charge(group2_class(opcode)))
     }
 
     #[inline]
@@ -4772,7 +4774,10 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(group1_class(
+                    modrm.reg,
+                    RmOperand::Memory(memory),
+                ))))
             }
             0x81 | 0x83 => {
                 let value = self.read_memory_sized(
@@ -4793,7 +4798,10 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(group1_class(
+                    modrm.reg,
+                    RmOperand::Memory(memory),
+                ))))
             }
             _ => Ok(None),
         }
@@ -4827,7 +4835,7 @@ impl CpuGsw {
                     value,
                     BusAccessKind::DataWrite,
                 )?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovMemReg)))
             }
             0x89 => {
                 let value = self.read_gpr_sized(modrm.reg, insn.operand_size);
@@ -4839,7 +4847,7 @@ impl CpuGsw {
                     value,
                     BusAccessKind::DataWrite,
                 )?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovMemReg)))
             }
             0x8a => {
                 let value = self.read_memory_u8(
@@ -4849,7 +4857,7 @@ impl CpuGsw {
                     BusAccessKind::DataRead,
                 )?;
                 self.write_gpr8(modrm.reg, value);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovRegMem)))
             }
             0x8b => {
                 let value = self.read_memory_sized(
@@ -4860,7 +4868,7 @@ impl CpuGsw {
                     BusAccessKind::DataRead,
                 )?;
                 self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovRegMem)))
             }
             _ => Ok(None),
         }
@@ -4889,7 +4897,7 @@ impl CpuGsw {
                 )?;
                 let reg = self.read_gpr8(modrm.reg);
                 self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(test_rm_class(insn))))
             }
             0x85 => {
                 let Some(modrm) = insn.modrm else {
@@ -4908,7 +4916,7 @@ impl CpuGsw {
                 )?;
                 let reg = self.read_gpr_sized(modrm.reg, insn.operand_size);
                 self.alu(4, value, reg, insn.operand_size.bus_width());
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(test_rm_class(insn))))
             }
             0x98 => {
                 match insn.operand_size {
@@ -4921,7 +4929,7 @@ impl CpuGsw {
                         self.write_gpr32(0, eax);
                     }
                 }
-                Ok(Some(clocks(3)))
+                Ok(Some(self.charge(TimingClass::Cbw)))
             }
             0x99 => {
                 match insn.operand_size {
@@ -4942,39 +4950,39 @@ impl CpuGsw {
                         self.write_gpr32(2, edx);
                     }
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::Cwd)))
             }
             0x9e => {
                 self.materialize_flags();
                 let ah = u32::from(self.read_gpr8(4));
                 self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
-                Ok(Some(clocks(3)))
+                Ok(Some(self.charge(TimingClass::Sahf)))
             }
             0x9f => {
                 self.materialize_flags();
                 let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
                 self.write_gpr8(4, ah);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::Lahf)))
             }
             0xf5 => {
                 self.set_flag(FLAG_CF, !self.flag(FLAG_CF));
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xf8 => {
                 self.set_flag(FLAG_CF, false);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xf9 => {
                 self.set_flag(FLAG_CF, true);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xfc => {
                 self.set_flag(FLAG_DF, false);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xfd => {
                 self.set_flag(FLAG_DF, true);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             _ => Ok(None),
         }
@@ -4992,20 +5000,20 @@ impl CpuGsw {
             0x50..=0x57 => {
                 let value = self.read_gpr_sized(opcode - 0x50, operand_size);
                 self.push(bus, value, operand_size)?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::PushReg)))
             }
             0x58..=0x5f => {
                 let value = self.pop(bus, operand_size)?;
                 self.write_gpr_sized(opcode - 0x58, operand_size, value);
-                Ok(Some(clocks(4)))
+                Ok(Some(self.charge(TimingClass::PopReg)))
             }
             0x68 => {
                 self.push(bus, insn.imm, operand_size)?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::PushImm)))
             }
             0x6a => {
                 self.push(bus, sign_extend_u8(insn.imm as u8), operand_size)?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::PushImm)))
             }
             _ => Ok(None),
         }
@@ -5023,6 +5031,6 @@ impl CpuGsw {
 
         self.push(bus, self.registers.eip, insn.operand_size)?;
         self.relative_jump(insn.imm as i32, insn.operand_size);
-        Ok(Some(clocks(7)))
+        Ok(Some(self.charge(TimingClass::CallJmpRel)))
     }
 }

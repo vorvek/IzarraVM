@@ -368,3 +368,51 @@ fn epoch_two_entries_are_whole_twelfths_except_the_declared_blends() {
         "the blended-entry list moved; a fractional epoch-2 entry needs a documented reason"
     );
 }
+
+/// The seam, end to end on a real CPU: the epoch and the persona pick the
+/// column, `charge` reads it, and epoch 1 charges the same number for all three
+/// personas.
+///
+/// This is the live half of the identity argument. The dead half -- that every
+/// ROUTED site picks the right class -- is carried by the tree's existing
+/// exact-clock assertions, which all still hold with 131 sites routed.
+#[test]
+fn the_cpu_charges_the_epoch_and_persona_column() {
+    use crate::CpuGsw;
+    use izarravm_core::GswMode;
+
+    for (mode, persona) in [
+        (GswMode::Gsw386, CpuPersona::I386),
+        (GswMode::Gsw486, CpuPersona::I486),
+        (GswMode::Gsw586, CpuPersona::I586),
+    ] {
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(mode);
+        assert_eq!(cpu.timing_epoch(), 1, "a fresh CPU is epoch 1");
+        assert_eq!(cpu.persona(), persona);
+        // Epoch 1: today's literal, the same for every persona.
+        assert_eq!(cpu.charge(TimingClass::Reg).core_clocks, 2);
+        assert_eq!(cpu.charge(TimingClass::Group3Unsplit).core_clocks, 2);
+        assert_eq!(cpu.charge(TimingClass::Legacy(37)).core_clocks, 37);
+
+        cpu.set_timing_epoch(2);
+        assert_eq!(cpu.timing_epoch(), 2);
+        let expected = class_table(persona, 2);
+        assert_eq!(
+            cpu.charge(TimingClass::Reg).core_clocks,
+            expected.raw(TimingClass::Reg)
+        );
+        // The 386 stays on the epoch-1 column; the other two move.
+        let moved = cpu.charge(TimingClass::Reg).core_clocks != 2;
+        assert_eq!(moved, persona != CpuPersona::I386, "{persona:?}");
+
+        // And the epoch survives a later mode switch, which re-resolves the
+        // table rather than dropping back to epoch 1.
+        cpu.set_mode(GswMode::Gsw586);
+        assert_eq!(cpu.timing_epoch(), 2);
+        assert_eq!(
+            cpu.charge(TimingClass::Reg).core_clocks,
+            EPOCH2_I586.raw(TimingClass::Reg)
+        );
+    }
+}

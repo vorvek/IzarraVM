@@ -41,16 +41,34 @@
 //!   hard failure"). These are the rows slice 4 must source or re-solve; the
 //!   count is asserted in the tests so it cannot grow silently.
 //!
+//! # EPOCH 2 IS NOT YET COHERENT. Do not measure it.
+//!
+//! Slice 1a routes the INTERPRETER's `execute.rs` and `run.rs` charge sites onto
+//! the table (131 of the 274). Three things are still on their literals:
+//! `execute_extended.rs` and `fpu_exec.rs` (142 sites, disjoint opcodes -- they
+//! simply under-charge under epoch 2), and, importantly, the JIT's
+//! `DirectKind::raw_clocks`, which mirrors the SAME opcodes `execute.rs` serves.
+//! So under epoch 2 a natively compiled block and an interpreted one charge
+//! DIFFERENT numbers for the same instruction. That is fixed by slice 1 item 2
+//! (the class index in the slot), which is the next sub-slice; until it lands,
+//! `IZARRAVM_TIMING_EPOCH=2` is a development knob and no epoch-2 rate is a
+//! measurement.
+//!
+//! Epoch 1 is unaffected by all of it: every routed site charges the literal it
+//! carried before, which is what the tree's several hundred exact-clock
+//! assertions check.
+//!
 //! # What this slice does NOT do
 //!
 //! The slot-index migration, the budget path, the four width sites, the class
 //! histogram and the Dhrystone reconciliation are items 2-6 of slice 1 and are
 //! later sub-slices. Nothing here changes a charge under epoch 1.
 
-// Slice 1a lands the table; the commits that follow route the charge sites onto
-// it and the class histogram (design section 9.1) consumes `name`/`provenance`.
-// Until then the plain build sees most of this as unused, and `-D warnings` would
-// refuse a table that is correct and simply not wired up yet.
+// `name`, `provenance`, `ALL` and `N_CLASSES` are consumed by the tests today and
+// by the class histogram (design section 9.1) when it lands in a later sub-slice;
+// the classes for the sites this slice has not routed yet are likewise
+// constructed only from `ALL`. A plain build therefore sees them as unused, and
+// `-D warnings` would refuse a table that is correct and simply not wired up yet.
 #![allow(dead_code)]
 
 use izarravm_core::CpuPersona;

@@ -1327,6 +1327,44 @@ impl CpuGsw {
         key | (u32::from(self.mode.rank()) << 8)
     }
 
+    /// Install the guest-clock model epoch, ONCE, at machine construction.
+    ///
+    /// `izarravm-machine` reads `IZARRAVM_TIMING_EPOCH` into `Machine::timing_epoch`
+    /// and hands it here; nothing else may call this. The epoch may not change
+    /// mid-run: the JIT caches a block's raw clock sum at compile time, so a
+    /// live change would leave already-compiled blocks charging the old epoch
+    /// while the interpreter charged the new one
+    /// (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4).
+    pub fn set_timing_epoch(&mut self, epoch: u32) {
+        self.timing_epoch = epoch;
+        self.refresh_class_table();
+    }
+
+    /// The epoch this CPU is charging under. `1` unless the knob named `2`.
+    pub fn timing_epoch(&self) -> u32 {
+        self.timing_epoch
+    }
+
+    /// Re-resolve the `(persona, epoch)` charge table. The two callers are the
+    /// two things that can move either input: `set_timing_epoch` and `set_mode`.
+    fn refresh_class_table(&mut self) {
+        self.class_table = crate::timing_class::class_table(self.persona(), self.timing_epoch);
+    }
+
+    /// What this CPU charges for one instruction of `class`, before
+    /// `level_timing`'s scaling.
+    ///
+    /// This is the single seam every interpreter charge site goes through. It
+    /// reads one already-resolved `&'static` table and indexes it: no persona
+    /// match, no epoch branch, no environment read on the hot path.
+    #[inline]
+    pub(crate) fn charge(&self, class: crate::timing_class::TimingClass) -> CycleOutcome {
+        CycleOutcome {
+            core_clocks: self.class_table.raw(class),
+            halted: false,
+        }
+    }
+
     /// The active GSW compatibility mode.
     pub fn mode(&self) -> GswMode {
         self.mode
@@ -1347,6 +1385,11 @@ impl CpuGsw {
     /// that share the 386 persona.
     pub fn set_mode(&mut self, mode: GswMode) {
         self.mode = mode;
+        // The persona just moved, and the charge table is persona-keyed. Under
+        // epoch 1 this re-resolves to the same table for every persona, so a
+        // mode switch cannot move a charge; under epoch 2 it is what lets a
+        // 486-mode guest charge the 486 column.
+        self.refresh_class_table();
         self.timing_rem = 0;
         self.fp_rem = 0;
         self.rep_resume_active = false;

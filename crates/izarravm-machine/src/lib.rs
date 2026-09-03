@@ -2130,6 +2130,12 @@ impl Machine {
             dma: profile.wss.dma.channel() as u8,
         });
         let active_mode = profile.cpu;
+        let timing_epoch = bus::timing_epoch_from_env();
+        // The CPU resolves its own persona-keyed charge table from the epoch, so
+        // it has to learn the epoch BEFORE `set_mode` picks the persona -- and
+        // this is the only place either is installed. `set_mode` re-resolves the
+        // table itself, so the order is belt and braces rather than load-bearing.
+        cpu.set_timing_epoch(timing_epoch);
         cpu.set_mode(active_mode);
         let vega = Vega::default();
         let pci = PciConfig::new();
@@ -2138,7 +2144,10 @@ impl Machine {
         let execution_backend = process_execution_backend();
         patch_rom(&mut rom);
         let mut machine = Self {
-            timing_epoch: bus::timing_epoch_from_env(),
+            // The local, not a second `timing_epoch_from_env()` call: the CPU
+            // is handed the SAME value a few lines above, so one read of the
+            // knob configures both halves and they cannot disagree.
+            timing_epoch,
             retrace_poll: RetracePollCensus::default(),
             poll_skip_certificate: PollSkipCertificateCounters::default(),
             memory,

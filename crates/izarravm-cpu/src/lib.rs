@@ -2878,6 +2878,18 @@ pub struct CpuGsw {
     // position is load-bearing only through `offset_of!`, which computes it.
     #[cfg(feature = "jit")]
     pub(crate) native_callout: jit::direct::CallOutTable,
+    // The guest-clock model epoch (`IZARRAVM_TIMING_EPOCH`), copied in ONCE from
+    // `Machine::timing_epoch` at construction via `set_timing_epoch`. Unset = 1.
+    // It may never change mid-run -- the JIT caches per-block raw clocks
+    // (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4) -- so nothing
+    // reads the environment here and nothing on the hot path branches on it.
+    timing_epoch: u32,
+    // The resolved charge table for (persona, epoch), the ONE thing every charge
+    // site reads. Refreshed by `set_timing_epoch` and by `set_mode` (which can
+    // move the persona), never per instruction. Under epoch 1 this is
+    // `timing_class::EPOCH1` for every persona, which is what makes a knob-unset
+    // run byte-identical to the pre-slice tree by construction.
+    class_table: &'static timing_class::ClassTable,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
     timing_rem: u64,
@@ -3161,6 +3173,8 @@ impl Default for CpuGsw {
             native_callout: jit::direct::CallOutTable::default(),
             #[cfg(feature = "jit")]
             native_table_slots: jit::direct::NativeTableSlots::default(),
+            timing_epoch: 1,
+            class_table: &timing_class::EPOCH1,
             timing_rem: 0,
             fp_rem: 0,
             halted: false,

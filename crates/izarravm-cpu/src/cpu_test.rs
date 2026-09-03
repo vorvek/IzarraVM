@@ -1996,7 +1996,13 @@ fn pending_flags_offset() {
     // TLB's own growth (`Tlb::generations`/`live`/`next_generation`) does not move this pin at
     // all, because `Tlb` sits ahead of `pending_flags` as part of the SAME by-value block that
     // was already counted, and none of its three new fields change `CpuGsw`'s own field order.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
+    // The timing-recalibration class table (slice 1a) adds `timing_epoch: u32` and
+    // `class_table: &'static ClassTable` to `CpuGsw`, moving this pin 4784 -> 4792 -- measured
+    // off a failing-test readout, not derived (the `u32` lands in existing padding; the
+    // reference is the 8 bytes). Neither is architectural state: both are resolved ONCE at
+    // machine construction from `IZARRAVM_TIMING_EPOCH` and never observed by a guest
+    // instruction, so both canonical payloads are unchanged by them.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and
