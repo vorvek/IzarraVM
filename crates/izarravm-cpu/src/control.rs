@@ -1904,6 +1904,12 @@ impl CpuGsw {
         new_selector: u16,
         kind: TaskSwitchKind,
     ) -> ExecResult<()> {
+        // The reflected-call memo's `task_switch` refusal (slice1 plan section 4.5), at
+        // the one function every task gate, TSS `CALL`/`JMP` and `IRET` back-link return
+        // passes through. A task switch replaces the whole architectural context, and a
+        // memo's epilogue -- registers, segments, CPL -- cannot reproduce a TSS load.
+        #[cfg(feature = "reflected-call-memo")]
+        crate::reflected_call_memo::note_task_switch(self);
         // An IRET task return faults with #TS, not #GP, on every back-link
         // malformation (386 PRM 9.5): a null or out-of-limit selector comes back
         // from `read_transfer_descriptor` as #GP and is re-vectored here.

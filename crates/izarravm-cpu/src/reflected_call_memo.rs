@@ -83,12 +83,21 @@
 //! * A20 retirement (R2.14) is answer-path soundness (it protects a memo's
 //!   pre-resolved read set from going stale); this commit builds no memo body
 //!   to protect, so it is not wired here -- left for the answer-path commit.
-//! * `pending_soft_int` and `task_switch` refusal exist as classification
-//!   reasons (`LearnRefused`) exercised by unit test injection
-//!   (`test_force_refuse`); no production seam posting either condition was
-//!   identified in this tree in the time budget for this commit, so neither
-//!   is wired to a real hook. `port_io`, `nondeterministic_read` (RDTSC/
-//!   RDMSR) and `x87` ARE wired to real production seams.
+//! * Every refusal lane is now wired to a real production seam (answer-path
+//!   amendment 7): `pending_soft_int` to `CpuBus::reflected_call_soft_int_posted`
+//!   (asked of the bus at trip close AND as an answer-time screen, because the
+//!   poster is the machine's own field and no CPU-side seam sees every one),
+//!   `task_switch` to `CpuGsw::task_switch`, `port_io` to the interpreter's and
+//!   the JIT's `OUT` call-outs, `nondeterministic_read` to RDTSC/RDMSR, `x87` to
+//!   `fpu_exec`, `page_fault` to exception delivery, `hardware_interrupt` to the
+//!   IRQ hook, `level_changed` to the raw-clock recovery, `debug_state`/`vme_or_pvi`
+//!   to the entry-image hazard test, and the device-edge / cap / DMA-visible lanes
+//!   to the bus gate. The one lane with no seam is `mmx`, and that is structural
+//!   rather than missing: `two_byte_isa_generation` marks the WHOLE MMX
+//!   integer-SIMD block `IsaGeneration::Never` on every persona, so an MMX form
+//!   #UDs at the shared decode gate before execute is reached and can never
+//!   mutate the shared FPU register file inside a trip. The lane is kept for a
+//!   future persona that adds the extension.
 
 use super::*;
 use crate::reflected_call::*;
@@ -1036,6 +1045,7 @@ pub(crate) struct ReflectedCallMemoState {
     pub(crate) fell_through_dma_visible: u64,
     pub(crate) fell_through_not_armed: u64,
     pub(crate) fell_through_clock_projection: u64,
+    pub(crate) fell_through_soft_int_posted: u64,
     /// Memos retired because a guest write landed on a physical range one of their trips
     /// fetched code from (plan R2.4 / BLOCKING finding 4).
     pub(crate) code_watch_retires: u64,
@@ -1089,6 +1099,7 @@ impl Default for ReflectedCallMemoState {
             fell_through_dma_visible: 0,
             fell_through_not_armed: 0,
             fell_through_clock_projection: 0,
+            fell_through_soft_int_posted: 0,
             code_watch_retires: 0,
             code_mark_epoch_retires: 0,
             code_mark_epoch: 0,
@@ -1121,6 +1132,7 @@ pub(crate) enum FellThrough {
     DmaVisible,
     NotArmed,
     ClockProjection,
+    SoftIntPosted,
 }
 
 /// Screen ONE candidate memo (plan section 5, steps 3 and 6): compare all 43 entry-image
@@ -1428,6 +1440,14 @@ fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecRes
         return Ok(None);
     }
 
+    // Screen 4b (amendment 7): an HLE software interrupt already posted. The machine
+    // services it at the next batch boundary, and a lump taken now would run guest work
+    // past the instant it was posted at.
+    if bus.reflected_call_soft_int_posted() {
+        note_fell_through(cpu, FellThrough::SoftIntPosted);
+        return Ok(None);
+    }
+
     // Screen 5: the clamp (plan section 6 / R4.2). Project the core charge FIRST --
     // it is the number the gate bounds, and projecting after a mutation would mean
     // discovering an overflow with the answer half applied.
@@ -1571,6 +1591,7 @@ fn note_fell_through(cpu: &mut CpuGsw, reason: FellThrough) {
         FellThrough::DmaVisible => state.fell_through_dma_visible += 1,
         FellThrough::NotArmed => state.fell_through_not_armed += 1,
         FellThrough::ClockProjection => state.fell_through_clock_projection += 1,
+        FellThrough::SoftIntPosted => state.fell_through_soft_int_posted += 1,
     }
 }
 
@@ -1834,6 +1855,16 @@ fn push_control_effect(cpu: &mut CpuGsw, effect: ControlEffect) {
         return;
     }
     open.control_effects.push(effect);
+}
+
+/// Production seam: `CpuGsw::task_switch` (`control.rs`), reached by every task gate,
+/// `CALL`/`JMP` through a TSS descriptor and `IRET` back-link return. A task switch
+/// replaces the whole architectural context -- the memo's epilogue restores registers,
+/// segments and CPL, and nothing it carries can reproduce a TSS load -- so a trip
+/// containing one can never be answered (plan section 4.5's `task_switch` lane, wired to
+/// a real seam here rather than left as a classification reason the tests inject).
+pub(crate) fn note_task_switch(cpu: &mut CpuGsw) {
+    refuse_open(cpu, LearnRefused::TaskSwitch);
 }
 
 /// Production seam: `execute.rs`'s port-I/O call-out, sibling to
@@ -2101,6 +2132,7 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
     let close_persona = cpu.persona();
     let close_instructions = cpu.perf.instructions;
     let exit_image = EntryImage::capture(cpu);
+    let soft_int_posted = bus.reflected_call_soft_int_posted();
     // Plan 4.4: which return arm actually matched, so a JournalB success knows whether the
     // live stack tail (the `RETF`-with-flags shape's `INT`-pushed FLAGS word) applies. Cheap,
     // pure, and safe to compute even when `is_match` is false (then unused).
@@ -2117,6 +2149,15 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
     // real reason a trip could not be learned.
     if open.hw_interrupt_seen {
         key_state.record_failure(LearnRefused::HardwareInterrupt);
+        return;
+    }
+    // Amendment 7: an HLE software interrupt posted during this trip. The posted vector is
+    // guest-visible work the memo carries no record of, and the machine services it at the
+    // next batch boundary -- so a memo built from such a trip would answer without it.
+    // Asked of the BUS at close rather than tracked per-seam: `pending_soft_int` is the
+    // machine's own field and this is the one predicate that sees every poster.
+    if soft_int_posted {
+        key_state.record_failure(LearnRefused::PendingSoftInt);
         return;
     }
     if let Some(hazard) = open.hazard {
@@ -2820,7 +2861,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         return "{\"armed\":false}".to_string();
     };
     let mut out = format!(
-        "{{\"armed\":true,\"audit_period\":{},\"answered\":{},\"would_answer\":{},         \"insns_elided\":{},\"core_clocks_charged\":{},\"bus_clocks_charged\":{},         \"audited\":{},\"relearned\":{},\"drift_forced_audits\":{},\"learn_batches\":{},         \"a20_retires\":{},\"code_watch_retires\":{},\"code_mark_epoch_retires\":{},         \"fell_through\":{{\"not_memoised\":{},\"entry_state_mismatch\":{},         \"read_set_mismatch\":{},\"read_set_unreadable\":{},\"pending_interrupt\":{},         \"cap\":{},\"device_edge\":{},\"dma_visible\":{},\"not_armed\":{},         \"clock_projection\":{}}},",
+        "{{\"armed\":true,\"audit_period\":{},\"answered\":{},\"would_answer\":{},         \"insns_elided\":{},\"core_clocks_charged\":{},\"bus_clocks_charged\":{},         \"audited\":{},\"relearned\":{},\"drift_forced_audits\":{},\"learn_batches\":{},         \"a20_retires\":{},\"code_watch_retires\":{},\"code_mark_epoch_retires\":{},         \"fell_through\":{{\"not_memoised\":{},\"entry_state_mismatch\":{},         \"read_set_mismatch\":{},\"read_set_unreadable\":{},\"pending_interrupt\":{},         \"cap\":{},\"device_edge\":{},\"dma_visible\":{},\"not_armed\":{},         \"clock_projection\":{},\"soft_int_posted\":{}}},",
         state.audit_period,
         state.answered,
         state.would_answer,
@@ -2844,6 +2885,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         state.fell_through_dma_visible,
         state.fell_through_not_armed,
         state.fell_through_clock_projection,
+        state.fell_through_soft_int_posted,
     );
     out.push_str("\"audit_mismatch\":{");
     let mut afirst = true;

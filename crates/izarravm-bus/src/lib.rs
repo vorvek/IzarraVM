@@ -1616,6 +1616,18 @@ pub trait CpuBus {
         true
     }
 
+    /// Is an HLE software interrupt already POSTED and waiting to be serviced at the next
+    /// batch boundary? The reflected-call memo refuses a trip that has one pending at
+    /// entry, and refuses to LEARN from a trip that acquired one on its way through: the
+    /// posted vector is guest-visible work the memo carries no record of, so an answered
+    /// trip would either skip it or deliver it at the wrong instant.
+    ///
+    /// Non-mutating, and DEFAULTED TO TRUE (posted, therefore refuse) for the same reason
+    /// the gate defaults to refuse: a bus that cannot tell must not be able to admit.
+    fn reflected_call_soft_int_posted(&self) -> bool {
+        true
+    }
+
     /// Tell the bus an answered reflected call just landed, so the machine's batch
     /// loop can END THE BATCH at this instant (slice1 plan section 6's batch-end
     /// mitigation). A real trip contains 6-8 IF-enable batch boundaries and an

@@ -72,6 +72,11 @@ struct FlatMemBus {
     answered_flag: bool,
     /// The answer's observer test (screen 7) asks this; `false` admits the Class R skip.
     dma_visible: bool,
+    /// `CpuBus::reflected_call_soft_int_posted` DEFAULTS to `true` (posted, therefore
+    /// refuse), the safe answer for a bus that cannot tell. This double genuinely models a
+    /// machine with no HLE poster at all, so it answers `false` -- and the field lets one
+    /// test flip it to prove the refusal is live.
+    soft_int_posted: bool,
     /// Test-controllable cumulative raw bus clock counter (Fable review 2026-09-03, finding
     /// 1's regression test): unlike `in_batch_raw_bus_clocks`, this must NEVER reset, even
     /// across a simulated machine-batch re-entry -- the test drives it directly to prove the
@@ -89,6 +94,7 @@ impl FlatMemBus {
             committed_bus: 0,
             answered_flag: false,
             dma_visible: false,
+            soft_int_posted: false,
         }
     }
 
@@ -216,6 +222,10 @@ impl CpuBus for FlatMemBus {
 
     fn reflected_call_dma_visible(&self, _lo: u32, _hi: u32) -> bool {
         self.dma_visible
+    }
+
+    fn reflected_call_soft_int_posted(&self) -> bool {
+        self.soft_int_posted
     }
 
     fn note_reflected_call_answered(&mut self) {
@@ -2373,4 +2383,115 @@ fn accumulated_bus_drift_forces_an_audit_before_half_an_edge_is_lost() {
     let state = cpu.reflected_call.as_ref().unwrap();
     assert_eq!(state.drift_forced_audits, 1);
     assert_eq!(state.open.as_ref().unwrap().slot, Slot::Audit);
+}
+
+// ---------------------------------------------------------------------------
+// Amendment 7: the remaining refusals, each on a REAL production seam.
+// ---------------------------------------------------------------------------
+
+/// **Mutation bite**: drop the `reflected_call_soft_int_posted` screen from `try_answer`.
+/// The machine services a posted HLE software interrupt at the next batch boundary, so a
+/// lump taken with one pending runs guest work past the instant it was posted at -- and
+/// nothing in the entry image or the read set can see it, because `pending_soft_int` is
+/// the MACHINE's field, not the CPU's.
+#[test]
+fn a_posted_soft_int_refuses_the_answer() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    bus.gate_allowance = Some(1_000_000);
+    bus.soft_int_posted = true;
+    let key = key_for(&cpu, VECTOR, 0);
+    let memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    install_memo(&mut cpu, key, memo);
+
+    let regs_before = cpu.registers.clone();
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered
+    );
+    assert_eq!(cpu.registers, regs_before);
+    assert_eq!(
+        cpu.reflected_call
+            .as_ref()
+            .unwrap()
+            .fell_through_soft_int_posted,
+        1
+    );
+}
+
+/// **Mutation bite**: drop the same predicate from `finish_trip_inner`. A trip that
+/// ACQUIRED a posted soft interrupt on its way through would then be learned from, and the
+/// memo built from it would answer without ever posting one.
+#[test]
+fn a_trip_that_posts_a_soft_int_is_never_learned_from() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    let open = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+    bus.soft_int_posted = true; // posted somewhere inside the trip
+    on_far_return(&mut cpu, &bus);
+
+    let ks = &cpu.reflected_call.as_ref().unwrap().keys[&key];
+    assert_eq!(ks.learn_refused[LearnRefused::PendingSoftInt.index()], 1);
+    assert_eq!(
+        ks.slot,
+        SlotState::Warm,
+        "and the key stays at the head of the cycle rather than advancing"
+    );
+}
+
+/// **Mutation bite**: delete the `note_task_switch` call from `CpuGsw::task_switch`. A
+/// trip containing a task gate, a TSS `CALL`/`JMP` or an `IRET` back-link return would
+/// then be learned from, and the memo's epilogue -- registers, segments, CPL -- cannot
+/// reproduce a TSS load, so answering it would leave the guest in the WRONG TASK.
+#[test]
+fn a_task_switch_inside_a_trip_refuses_the_memo() {
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    let open = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+
+    // Reach the REAL seam, not the hook function: an `IRET` with `EFLAGS.NT` set in
+    // protected mode is a task RETURN through the current TSS's back-link
+    // (`iret_body`, 386 PRM 9.5), and it calls `CpuGsw::task_switch`. The switch itself
+    // is expected to FAULT here -- this fixture has no valid back-link TSS -- and that is
+    // exactly what makes the test cheap AND sharp: `note_task_switch` is the first
+    // statement of `task_switch`, so reaching the function at all is what has to be
+    // proved, and a fault on the way out cannot un-record the refusal.
+    cpu.registers.eflags |= FLAG_NT;
+    cpu.tr.base = 0x3000;
+    let _ = cpu.iret(&mut bus, OperandSize::Dword);
+    cpu.registers.eflags &= !FLAG_NT;
+
+    on_far_return(&mut cpu, &bus);
+    let ks = &cpu.reflected_call.as_ref().unwrap().keys[&key];
+    assert_eq!(
+        ks.learn_refused[LearnRefused::TaskSwitch.index()],
+        1,
+        "a task switch reached inside the trip must refuse the memo"
+    );
+    assert_eq!(ks.learned, 0);
+}
+
+/// The `mmx` lane has no seam because the refusal is STRUCTURAL, one layer below this
+/// module: `two_byte_isa_generation` marks the whole MMX integer-SIMD block
+/// `IsaGeneration::Never` on every persona, so an MMX form #UDs at the shared decode gate
+/// before execute is reached and can never mutate the FPU register file inside a trip.
+///
+/// **Mutation bite**: gate the MMX block to `IsaGeneration::I586` instead of `Never`. The
+/// encodings would then execute (or fall to the undefined-opcode fallback) on the persona
+/// every reflected trip runs on, and the memo would need a lane it does not have.
+#[test]
+fn the_mmx_refusal_is_the_isa_gate_not_a_memo_lane() {
+    // A representative from each contiguous run of the MMX block.
+    for opcode in [0x60u8, 0x6e, 0x6f, 0x71, 0x77, 0x7e, 0x7f, 0xd1, 0xd5] {
+        for persona in [CpuPersona::I386, CpuPersona::I486, CpuPersona::I586] {
+            assert!(
+                !crate::persona_supports(persona, crate::two_byte_isa_generation(opcode)),
+                "0F {opcode:02X} must be invalid on {persona:?}"
+            );
+        }
+    }
 }

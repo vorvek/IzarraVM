@@ -4308,6 +4308,10 @@ impl CpuBus for MachineBus<'_> {
         }
     }
 
+    fn reflected_call_soft_int_posted(&self) -> bool {
+        self.pending_soft_int.is_some()
+    }
+
     fn note_reflected_call_answered(&mut self) {
         self.reflected_call_answered = true;
     }
