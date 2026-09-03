@@ -1565,13 +1565,13 @@ impl CpuGsw {
                 // TEST AL, imm8: AND-for-flags, no write-back. `decode` fetched the imm8.
                 let al = self.read_gpr8(0);
                 self.alu(4, u32::from(al), insn.imm, BusWidth::Byte);
-                Ok(self.charge(TimingClass::Reg))
+                Ok(self.charge(TimingClass::TestImmReg))
             }
             0xa9 => {
                 // TEST AX/EAX, imm: AND-for-flags, no write-back. `decode` fetched the immediate.
                 let acc = self.read_gpr_sized(0, operand_size);
                 self.alu(4, acc, insn.imm, operand_size.bus_width());
-                Ok(self.charge(TimingClass::Reg))
+                Ok(self.charge(TimingClass::TestImmReg))
             }
             0xd4 => {
                 // AAM: AH = AL / imm8, AL = AL % imm8. OF/AF/CF undefined; SF/ZF/PF from AL.

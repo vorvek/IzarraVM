@@ -917,7 +917,7 @@ impl CpuGsw {
                         return Err(undefined_opcode());
                     }
                 }
-                Ok(self.charge(TimingClass::Group3Unsplit))
+                Ok(self.charge(group3_class(modrm.reg, BusWidth::Byte, operand)))
             }
             0xf7 => {
                 // Group 3 word/dword. Same sub-op layout as 0xf6 at the operand width.
@@ -945,10 +945,12 @@ impl CpuGsw {
                         return Err(undefined_opcode());
                     }
                 }
-                // Named for the reason the `0x8f` and `0x8c` charges are: `/2../7` at Word are
-                // `InterpretOne` call-out rows, and their budget bound
-                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same number.
-                Ok(self.charge(TimingClass::Group3Unsplit))
+                // The `/2../7` Word forms are `InterpretOne` call-out rows, and their budget
+                // bound (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same
+                // number; under epoch 1 every class `group3_class` can return charges
+                // `GROUP3_CORE_CLOCKS`, so the bound still holds. Re-deriving the bound from the
+                // table is slice 1 item 4.
+                Ok(self.charge(group3_class(modrm.reg, operand_size.bus_width(), operand)))
             }
             0xfe => {
                 // Group 4 INC/DEC byte. /0 INC, /1 DEC; any other reg is #UD (the fused reference's
@@ -1489,6 +1491,14 @@ pub(crate) fn group1_class(sub_opcode: u8, operand: RmOperand) -> TimingClass {
 /// 1 issues in one clock on a P5 where a `CL` count is unpairable and costs four
 /// (comparison section 3 row 11).
 ///
+/// The by-1 forms (`0xd0`/`0xd1`) share `ShiftImm` with the immediate forms
+/// rather than taking a class of their own, because the JIT cannot separate
+/// them: `0xd1` and `0xc1` with an immediate of 1 produce the same
+/// `DirectKind::Shift` and `DirectInsn` carries no opcode. Splitting here alone
+/// would make a compiled block and an interpreted one charge the same
+/// instruction differently on the 486, which is the divergence the arm-equality
+/// bar exists to stop. See `TimingClass::ShiftImm`.
+///
 /// `RCL`/`RCR` by `CL` is more expensive again on both parts (486 8-30, P5 7-24)
 /// and wants its own class; the sub-opcode that would separate it also separates
 /// nothing else here, and splitting it one-sidedly would break native/interpreted
@@ -1496,8 +1506,7 @@ pub(crate) fn group1_class(sub_opcode: u8, operand: RmOperand) -> TimingClass {
 /// under-charge recorded on `TimingClass::ShiftCl`.
 pub(crate) fn group2_class(opcode: u8) -> TimingClass {
     match opcode {
-        0xc0 | 0xc1 => TimingClass::ShiftImm,
-        0xd0 | 0xd1 => TimingClass::ShiftOne,
+        0xc0 | 0xc1 | 0xd0 | 0xd1 => TimingClass::ShiftImm,
         _ => TimingClass::ShiftCl,
     }
 }
@@ -1509,5 +1518,49 @@ pub(crate) fn test_rm_class(insn: &DecodedInsn) -> TimingClass {
     match insn.operand {
         Some(DecodedOperand::Mem(_)) => TimingClass::AluRegMem,
         _ => TimingClass::Reg,
+    }
+}
+
+/// The charge class for one group-3 sub-opcode (`0xf6`/`0xf7`), which the
+/// interpreter serves from a single arm per opcode.
+///
+/// This is design section 9.1's headline row. One `clocks(2)` used to cover
+/// `TEST`, `NOT`, `NEG`, `MUL`, `IMUL`, `DIV` and `IDIV` at every width, which
+/// gave `DIV EAX, ECX` the cost of `MOV EAX, EBX` -- 0.167 guest clocks against
+/// Intel's 41, a 246x under-charge and the largest single error in the old
+/// table.
+///
+/// `MUL` and `IMUL` share a class per width because both references price them
+/// together (comparison section 3 row 13; audit section 5's `Mul` row);
+/// `DIV` and `IDIV` do not, because both references price them apart.
+/// `TEST` (`/0`) reads without writing back, so its memory form is a load;
+/// `NOT`/`NEG` write back, so theirs is a read/modify/write.
+///
+/// The JIT reaches the same classes from `DirectKind`, which `classify` already
+/// splits into `TestImmReg`/`TestImmMem`/`NegReg`/`MulReg`/`MulMemAcc`/
+/// `ImulRegAcc`/`ImulMemAcc`/`DivReg`/`DivMem` -- all admitted at Dword only --
+/// so the two arms agree instruction for instruction.
+pub(crate) fn group3_class(sub_opcode: u8, width: BusWidth, operand: RmOperand) -> TimingClass {
+    let memory = matches!(operand, RmOperand::Memory(_));
+    match sub_opcode {
+        0 | 1 if memory => TimingClass::TestImmMem,
+        0 | 1 => TimingClass::TestImmReg,
+        2 | 3 if memory => TimingClass::NotNegMem,
+        2 | 3 => TimingClass::NotNegReg,
+        4 | 5 => match width {
+            BusWidth::Byte => TimingClass::Mul8,
+            BusWidth::Word => TimingClass::Mul16,
+            _ => TimingClass::Mul32,
+        },
+        6 => match width {
+            BusWidth::Byte => TimingClass::Div8,
+            BusWidth::Word => TimingClass::Div16,
+            _ => TimingClass::Div32,
+        },
+        _ => match width {
+            BusWidth::Byte => TimingClass::Idiv8,
+            BusWidth::Word => TimingClass::Idiv16,
+            _ => TimingClass::Idiv32,
+        },
     }
 }

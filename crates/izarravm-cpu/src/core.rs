@@ -1351,6 +1351,14 @@ impl CpuGsw {
         self.class_table = crate::timing_class::class_table(self.persona(), self.timing_epoch);
     }
 
+    /// The resolved `(persona, epoch)` charge table, for the JIT's compile-time
+    /// walk and its emitter: both must read the SAME table the interpreter
+    /// charges from, or a compiled block and an interpreted one price the same
+    /// instruction differently.
+    pub(crate) fn class_table(&self) -> &'static crate::timing_class::ClassTable {
+        self.class_table
+    }
+
     /// What this CPU charges for one instruction of `class`, before
     /// `level_timing`'s scaling.
     ///

@@ -138,6 +138,25 @@ macro_rules! timing_classes {
                 }
             }
 
+            /// The class at a dense index, the inverse of [`TimingClass::index`].
+            ///
+            /// The JIT's `Load`/`LoadExtend`/`Store` slots store their class as a
+            /// `u8` INDEX where they used to store a raw clock count -- the same
+            /// byte, so the slot does not widen (review B4) -- and this is how a
+            /// slot turns back into a class at charge time.
+            ///
+            /// # Panics
+            /// On an index no class owns. That can only happen if a slot's byte
+            /// was built from something other than `index()`, which is a bug in
+            /// the emitter rather than a runtime condition.
+            /// One indexed load out of `ALL`, which `class_indices_are_a_dense_
+            /// permutation` and `epoch_one_charges_the_pinned_literal_for_every_
+            /// class` together pin to be in table order.
+            #[inline]
+            pub(crate) fn from_index(index: u8) -> TimingClass {
+                TimingClass::ALL[index as usize]
+            }
+
             /// The variant's name, for test failure messages and the future
             /// class histogram (design §9.1).
             pub(crate) const fn name(self) -> &'static str {
@@ -318,10 +337,19 @@ timing_classes! {
     Iret = (22, 180, 84, "486 §5 (15 clk) / cmp §3 row 17 (7 clk real)"),
 
     // --- shifts, rotates, and the group-3 arm --------------------------------
-    /// Shift/rotate by an immediate count (`0xc0`/`0xc1`).
-    ShiftImm = (2, 24, 12, "486 §5 (2 clk) / cmp §3 row 11 (1 clk, PU)"),
-    /// Shift/rotate by 1 (`0xd0`/`0xd1`).
-    ShiftOne = (2, 36, 12, "486 §5 (3 clk) / cmp §3 row 11 (1 clk, PU)"),
+    /// Shift/rotate by an immediate count OR by 1 (`0xc0`/`0xc1`/`0xd0`/`0xd1`).
+    ///
+    /// The two encodings are ONE class deliberately, and the reason is the JIT.
+    /// `0xd1` and `0xc1` with an immediate of 1 produce the **same**
+    /// `DirectKind::Shift` (`jit/direct.rs`'s own note beside the `0xc1 | 0xd1`
+    /// arm), and `DirectInsn` carries no opcode, so the compiled block cannot
+    /// tell them apart at charge time. The 486 prices them differently (2 vs 3
+    /// clocks) and the 586 does not (1 clock either way), so keeping them apart
+    /// would buy one clock on one persona at the cost of native and interpreted
+    /// code charging differently for the same instruction -- the exact
+    /// divergence the arm-equality bar exists to stop. The shared entry takes the
+    /// SLOWER of the two 486 counts, per the owner's 12:15 ruling.
+    ShiftImm = (2, 36, 12, "486 §5 (3 clk, the slower of 2/3) / cmp §3 row 11 (1 clk, PU)"),
     /// Shift/rotate by `CL` (`0xd2`/`0xd3`).
     ///
     /// `RCL`/`RCR` by `CL` is a much more expensive instruction on both parts
@@ -332,20 +360,42 @@ timing_classes! {
     ShiftCl = (2, 36, 48, "486 §5 (3 clk) / cmp §3 row 11 (4 clk, NP)"),
     /// `SHLD`/`SHRD` (`0x0fa4`/`0x0fa5`/`0x0fac`/`0x0fad`).
     DoubleShift = (3, 36, 48, "UNSOURCED x12 (486 3 / P5 4 clk assumed)"),
-    /// **The 246x row, still unsplit.** Group 3 (`0xf6`/`0xf7`):
-    /// `TEST`/`NOT`/`NEG`/`MUL`/`IMUL`/`DIV`/`IDIV`, all seven sub-opcodes and
-    /// both operand forms, from one `Ok(clocks(GROUP3_CORE_CLOCKS))`.
-    ///
-    /// Design §9.1's headline finding is that this literal gives `DIV EAX, ECX`
-    /// the cost of `MOV EAX, EBX` -- 0.167 guest clocks against Intel's 41, a
-    /// **246x** under-charge. Splitting it into `Mul`/`Div`/`Idiv` by width is
-    /// cheap on the interpreter side (`modrm.reg` is in hand) and NOT cheap on
-    /// the JIT side, where `DirectKind` does not carry the sub-opcode and the
-    /// arm rides `raw_clocks`'s `_ => 2` default -- so a one-sided split would
-    /// break native/interpreted charge equality under epoch 2. It is therefore
-    /// a later sub-slice, and this entry stays a documented placeholder rather
-    /// than a fabricated blend.
-    Group3Unsplit = (2, 24, 24, "PLACEHOLDER x12 -- the MUL/DIV split is a later sub-slice"),
+    // --- group 3 (`0xf6`/`0xf7`), SPLIT -------------------------------------
+    // Design §9.1's headline finding: one `clocks(2)` used to serve all seven
+    // sub-opcodes at every width, giving `DIV EAX, ECX` the cost of
+    // `MOV EAX, EBX` -- 0.167 guest clocks against Intel's 41, a **246x**
+    // under-charge. The interpreter splits on `modrm.reg` plus the operand
+    // shape; the JIT splits on the kind, since `classify` already produces
+    // separate `MulReg`/`MulMemAcc`/`ImulRegAcc`/`ImulMemAcc`/`DivReg`/`DivMem`/
+    // `NegReg`/`TestImmReg`/`TestImmMem` kinds and admits them at Dword only.
+    /// `TEST r, imm` -- group 3 `/0` register form, and `0xa8`/`0xa9`.
+    TestImmReg = (2, 12, 12, "cmp §3 row 1 (1 clk)"),
+    /// `TEST m, imm` -- group 3 `/0` memory form, a load rather than an RMW.
+    TestImmMem = (2, 24, 24, "cmp §3 row 3 (2 clk load)"),
+    /// `NOT`/`NEG r` -- group 3 `/2`, `/3` register form.
+    NotNegReg = (2, 12, 12, "cmp §3 row 1 (1 clk)"),
+    /// `NOT`/`NEG m` -- group 3 `/2`, `/3` memory form, a read/modify/write.
+    NotNegMem = (2, 36, 36, "cmp §3 row 4 (3 clk RMW)"),
+    /// `MUL`/`IMUL r/m8` -- group 3 `/4`, `/5` at byte width. One class for both
+    /// sub-opcodes because both references price them together (comparison
+    /// §3 row 13; audit §5 `Mul` 8/16/32).
+    Mul8 = (2, 186, 132, "486 §5 (13-18, midpoint 15.5) / cmp §3 row 13 (11 clk)"),
+    /// `MUL`/`IMUL r/m16`.
+    Mul16 = (2, 234, 132, "486 §5 (13-26, midpoint 19.5) / cmp §3 row 13 (11 clk)"),
+    /// `MUL`/`IMUL r/m32`.
+    Mul32 = (2, 330, 120, "486 §5 (13-42, midpoint 27.5) / cmp §3 row 13 (10 clk)"),
+    /// `DIV r/m8` -- group 3 `/6` at byte width.
+    Div8 = (2, 192, 204, "486 §5 (16 clk) / cmp §3 row 14 (17 clk)"),
+    /// `DIV r/m16`.
+    Div16 = (2, 288, 300, "486 §5 (24 clk) / cmp §3 row 14 (25 clk)"),
+    /// `DIV r/m32` -- the 246x row itself.
+    Div32 = (2, 480, 492, "486 §5 (40 clk) / cmp §3 row 14 (41 clk)"),
+    /// `IDIV r/m8` -- group 3 `/7` at byte width.
+    Idiv8 = (2, 228, 264, "486 §5 (19 clk) / cmp §3 row 14 (22 clk)"),
+    /// `IDIV r/m16`.
+    Idiv16 = (2, 324, 360, "486 §5 (27 clk) / cmp §3 row 14 (30 clk)"),
+    /// `IDIV r/m32`.
+    Idiv32 = (2, 516, 552, "486 §5 (43 clk) / cmp §3 row 14 (46 clk)"),
     /// `INC`/`DEC r/m8` (`0xfe`), today's `INC_DEC_RM8_CORE_CLOCKS`. The memory
     /// form is a read/modify/write, so it takes `AluMemReg`'s shape.
     IncDecRm = (2, 36, 36, "cmp §3 row 4 (3 clk RMW)"),

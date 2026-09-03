@@ -4306,7 +4306,7 @@ impl CpuGsw {
                 if taken {
                     self.relative_jump(insn.imm as i32, insn.operand_size);
                 }
-                Some(self.charge(TimingClass::MovExtend))
+                Some(self.charge(TimingClass::Jcc))
             }
             opcode if opcode <= 0xff => match opcode as u8 {
                 0x40..=0x4f => {
@@ -4604,7 +4604,15 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(self.charge(TimingClass::AluMemReg)))
+                // CMP (`op == 7`) writes nothing back, so its memory form is
+                // Intel's 2-clock load and not the 3-clock read/modify/write --
+                // the same split `alu_class` makes in `execute.rs` and
+                // `DirectKind::timing_class` makes for `AluMemDest { op: 7 }`.
+                Ok(Some(self.charge(if write_back {
+                    TimingClass::AluMemReg
+                } else {
+                    TimingClass::AluRegMem
+                })))
             }
             1 => {
                 let value = self.read_memory_sized(
@@ -4626,7 +4634,15 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(self.charge(TimingClass::AluMemReg)))
+                // CMP (`op == 7`) writes nothing back, so its memory form is
+                // Intel's 2-clock load and not the 3-clock read/modify/write --
+                // the same split `alu_class` makes in `execute.rs` and
+                // `DirectKind::timing_class` makes for `AluMemDest { op: 7 }`.
+                Ok(Some(self.charge(if write_back {
+                    TimingClass::AluMemReg
+                } else {
+                    TimingClass::AluRegMem
+                })))
             }
             2 => {
                 let value = self.read_memory_u8(

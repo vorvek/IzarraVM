@@ -84,10 +84,21 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::IntONotTaken, 3),
     (TimingClass::Iret, 22),
     (TimingClass::ShiftImm, 2),
-    (TimingClass::ShiftOne, 2),
     (TimingClass::ShiftCl, 2),
     (TimingClass::DoubleShift, 3),
-    (TimingClass::Group3Unsplit, 2),
+    (TimingClass::TestImmReg, 2),
+    (TimingClass::TestImmMem, 2),
+    (TimingClass::NotNegReg, 2),
+    (TimingClass::NotNegMem, 2),
+    (TimingClass::Mul8, 2),
+    (TimingClass::Mul16, 2),
+    (TimingClass::Mul32, 2),
+    (TimingClass::Div8, 2),
+    (TimingClass::Div16, 2),
+    (TimingClass::Div32, 2),
+    (TimingClass::Idiv8, 2),
+    (TimingClass::Idiv16, 2),
+    (TimingClass::Idiv32, 2),
     (TimingClass::IncDecRm, 2),
     (TimingClass::ImulRm, 9),
     (TimingClass::ImulImm, 14),
@@ -315,7 +326,7 @@ fn the_unsourced_and_placeholder_census_is_pinned() {
         .count();
     assert_eq!(
         (unsourced, placeholder),
-        (81, 2),
+        (81, 1),
         "the unsourced/placeholder census moved; update the pin and say why"
     );
     for class in TimingClass::ALL {
@@ -340,12 +351,16 @@ fn the_unsourced_and_placeholder_census_is_pinned() {
 /// * I586 `Loop` / `LoopCc` / `Jcxz` raw 66 / 90 / 66 (5.5 / 7.5 / 5.5) --
 ///   section 3.2's midpoints of Intel's taken/not-taken ranges (5-6, 7-8, 6-5),
 ///   which the interpreter's one-arm charge cannot separate.
-/// * I486 `ImulRm` / `ImulImm` raw 234 (19.5 clk) -- the audit's own midpoint of
-///   the i486's 13-26 multiply range, which it prints as `~234` and tells us to
-///   record as a range.
+/// * I486 `ImulRm` / `ImulImm` raw 234 (19.5 clk) and `Mul8` / `Mul16` / `Mul32`
+///   raw 186 / 234 / 330 (15.5 / 19.5 / 27.5 clk) -- the audit's own midpoints of
+///   the i486's 13-18, 13-26 and 13-42 multiply ranges, which it prints as `~186
+///   / 234 / 330` and tells us to record as ranges.
 const DECLARED_BLENDS: &[(&str, &str)] = &[
     ("I486", "ImulRm"),
     ("I486", "ImulImm"),
+    ("I486", "Mul8"),
+    ("I486", "Mul16"),
+    ("I486", "Mul32"),
     ("I586", "Jcc"),
     ("I586", "Loop"),
     ("I586", "LoopCc"),
@@ -395,7 +410,7 @@ fn the_cpu_charges_the_epoch_and_persona_column() {
         assert_eq!(cpu.persona(), persona);
         // Epoch 1: today's literal, the same for every persona.
         assert_eq!(cpu.charge(TimingClass::Reg).core_clocks, 2);
-        assert_eq!(cpu.charge(TimingClass::Group3Unsplit).core_clocks, 2);
+        assert_eq!(cpu.charge(TimingClass::Div32).core_clocks, 2);
         assert_eq!(cpu.charge(TimingClass::Legacy(37)).core_clocks, 37);
 
         cpu.set_timing_epoch(2);
@@ -437,8 +452,22 @@ fn every_class_a_classifier_can_return_is_pinned_at_the_sites_literal() {
         TimingClass::AluRegMem,
         TimingClass::AluMemReg,
         TimingClass::ShiftImm,
-        TimingClass::ShiftOne,
         TimingClass::ShiftCl,
+        // ... and `group3_class`, whose thirteen classes all replace the single
+        // `Ok(clocks(GROUP3_CORE_CLOCKS))` the `0xf6`/`0xf7` arms returned.
+        TimingClass::TestImmReg,
+        TimingClass::TestImmMem,
+        TimingClass::NotNegReg,
+        TimingClass::NotNegMem,
+        TimingClass::Mul8,
+        TimingClass::Mul16,
+        TimingClass::Mul32,
+        TimingClass::Div8,
+        TimingClass::Div16,
+        TimingClass::Div32,
+        TimingClass::Idiv8,
+        TimingClass::Idiv16,
+        TimingClass::Idiv32,
     ] {
         assert_eq!(
             EPOCH1.raw(class),
@@ -453,12 +482,49 @@ fn every_class_a_classifier_can_return_is_pinned_at_the_sites_literal() {
 /// against the enum rather than against prose.
 #[test]
 fn the_classifiers_pick_the_documented_shapes() {
-    use crate::execute::group2_class;
+    use crate::execute::{group2_class, group3_class};
+    use izarravm_bus::BusWidth;
 
     assert_eq!(group2_class(0xc0), TimingClass::ShiftImm);
     assert_eq!(group2_class(0xc1), TimingClass::ShiftImm);
-    assert_eq!(group2_class(0xd0), TimingClass::ShiftOne);
-    assert_eq!(group2_class(0xd1), TimingClass::ShiftOne);
+    assert_eq!(group2_class(0xd0), TimingClass::ShiftImm);
+    assert_eq!(group2_class(0xd1), TimingClass::ShiftImm);
     assert_eq!(group2_class(0xd2), TimingClass::ShiftCl);
     assert_eq!(group2_class(0xd3), TimingClass::ShiftCl);
+
+    // Group 3: the sub-opcode picks the family, the width picks the row, and the
+    // operand shape picks load-vs-RMW for the two families that have both.
+    let reg = crate::RmOperand::Register(0);
+    let mem = crate::RmOperand::Memory(crate::MemoryOperand {
+        segment: crate::SegmentIndex::Ds,
+        offset: 0,
+    });
+    for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+        assert_eq!(group3_class(0, width, reg), TimingClass::TestImmReg);
+        assert_eq!(group3_class(1, width, reg), TimingClass::TestImmReg);
+        assert_eq!(group3_class(0, width, mem), TimingClass::TestImmMem);
+        assert_eq!(group3_class(2, width, reg), TimingClass::NotNegReg);
+        assert_eq!(group3_class(3, width, mem), TimingClass::NotNegMem);
+    }
+    for (sub, byte, word, dword) in [
+        (4, TimingClass::Mul8, TimingClass::Mul16, TimingClass::Mul32),
+        (5, TimingClass::Mul8, TimingClass::Mul16, TimingClass::Mul32),
+        (6, TimingClass::Div8, TimingClass::Div16, TimingClass::Div32),
+        (
+            7,
+            TimingClass::Idiv8,
+            TimingClass::Idiv16,
+            TimingClass::Idiv32,
+        ),
+    ] {
+        assert_eq!(group3_class(sub, BusWidth::Byte, reg), byte);
+        assert_eq!(group3_class(sub, BusWidth::Word, reg), word);
+        assert_eq!(group3_class(sub, BusWidth::Dword, mem), dword);
+    }
+
+    // And the 246x row itself: `DIV r/m32` charges 41 P5 clocks under epoch 2
+    // where it charged 1/6 of a clock under epoch 1.
+    assert_eq!(EPOCH1.raw(TimingClass::Div32), 2);
+    assert_eq!(EPOCH2_I586.raw(TimingClass::Div32), 492);
+    assert_eq!(EPOCH2_I486.raw(TimingClass::Div32), 480);
 }
