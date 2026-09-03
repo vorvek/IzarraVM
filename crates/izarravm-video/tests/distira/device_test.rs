@@ -1281,11 +1281,35 @@ fn parallel_raster_output_is_identical_to_single_threaded_output() {
     };
 
     let serial = draw_scene(1);
-    let parallel = draw_scene(4);
-    assert_eq!(serial.0, parallel.0, "colour output must match");
-    assert_eq!(serial.1, parallel.1, "depth output must match");
-    assert_eq!(serial.2, parallel.2, "pixels_in must match");
-    assert_eq!(serial.3, parallel.3, "color_written must match");
+    // Lanes 4 is today's default cap; 8 and 16 are the raised-cap A/B arms
+    // (`IZARRAVM_DISTIRA_LANES`) the raster-lane-cap lever grades
+    // (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 5, lever
+    // B). Rows partition the frame store the same way at any lane count, so
+    // this must stay byte-identical whether the cap is today's 4 or the
+    // raised 8/16.
+    for lanes in [4usize, 8, 16] {
+        let parallel = draw_scene(lanes);
+        assert_eq!(
+            serial.0, parallel.0,
+            "colour output must match at {lanes} lanes"
+        );
+        assert_eq!(
+            serial.1, parallel.1,
+            "depth output must match at {lanes} lanes"
+        );
+        assert_eq!(
+            serial.2, parallel.2,
+            "pixels_in must match at {lanes} lanes"
+        );
+        assert_eq!(
+            serial.3, parallel.3,
+            "color_written must match at {lanes} lanes"
+        );
+        assert!(
+            parallel.3 > 0,
+            "the scene must actually paint at {lanes} lanes"
+        );
+    }
     assert!(serial.3 > 0, "the scene must actually paint");
 }
 

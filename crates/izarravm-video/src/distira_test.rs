@@ -135,3 +135,37 @@ fn lfb_write_above_the_fbi_limit_wraps_instead_of_dropping() {
          not vanish"
     );
 }
+
+/// The graduated lane split (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md`
+/// section 5, lever B): raising the cap must not force a small batch out to
+/// every lane the cap allows. `lanes_for_rows` grants a batch only as many
+/// lanes as its own row span is worth (`rows / MIN_ROWS_PER_LANE`, capped at
+/// `cap`), so a ten-row batch gets the same 2 lanes whether the cap is 4, 8,
+/// or 16, while a 400- or 4000-row batch (typical post-#840, where triangles
+/// per drain went 6.6 -> 395) always fills the whole cap.
+#[test]
+fn lane_split_is_graduated_by_row_span_not_forced_to_the_cap() {
+    let cases: &[(usize, usize, usize)] = &[
+        // (rows, cap, expected lanes)
+        (1, 4, 1),
+        (1, 8, 1),
+        (1, 16, 1),
+        (10, 4, 2),
+        (10, 8, 2),
+        (10, 16, 2),
+        (400, 4, 4),
+        (400, 8, 8),
+        (400, 16, 16),
+        (4000, 4, 4),
+        (4000, 8, 8),
+        (4000, 16, 16),
+    ];
+    for &(rows, cap, expected) in cases {
+        assert_eq!(
+            lanes_for_rows(rows, cap),
+            expected,
+            "rows={rows} cap={cap}: a batch's own row span decides its lane \
+             count, not the cap alone"
+        );
+    }
+}

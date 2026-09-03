@@ -42,6 +42,28 @@ const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], 
 /// raster lanes. Below it, the wake-up cost of the pool beats the win.
 const PARALLEL_PIXEL_THRESHOLD: usize = 2048;
 
+/// Framebuffer rows a lane needs before it is worth forking out on its
+/// own. `lanes_for_rows` divides a batch's row span into shares this
+/// size, so raising the lane cap (`IZARRAVM_DISTIRA_LANES`) never forces
+/// a batch that only has a handful of rows to share out across every
+/// lane the cap allows -- it gets as many lanes as its own row span is
+/// worth, same as before the cap could go past 4.
+const MIN_ROWS_PER_LANE: usize = 4;
+
+/// The graduated lane split: a batch's row span, cut into
+/// `MIN_ROWS_PER_LANE`-row shares, capped at `cap`. A ten-row batch gets
+/// two lanes whether `cap` is 4, 8, or 16 -- it is the row span that
+/// decides, not the cap. This is the review's small-batch mitigation
+/// (`dev_docs/2026-09-05-distira-texture-queue-review.md` finding 5)
+/// generalised past a binary all-or-nothing choice: today, with texture
+/// writes ordered instead of draining, batches are usually large (395
+/// triangles/drain measured on `tombraid3d-586`'s Lara's Home walk,
+/// up from 6.6 before #840), so this mostly returns `cap`; it stays
+/// correct on the rare small batch too.
+fn lanes_for_rows(rows: usize, cap: usize) -> usize {
+    (rows / MIN_ROWS_PER_LANE).clamp(1, cap.max(1))
+}
+
 /// The triangle-constant inputs of `raster_row`, so a lane needs only
 /// this, the snapshot, and the frame-store view.
 #[derive(Debug, Clone, Copy)]
@@ -500,8 +522,11 @@ pub struct Distira {
     /// GUI setting, and it is the only thing that ever sets this true.
     force_point_sampling: bool,
     /// How many threads rasterise a batch of triangles, caller included.
-    /// Chosen from the host core count at construction; see
-    /// [`Distira::raster_lanes_for_cores`].
+    /// Chosen from the host core count at construction (or from
+    /// `IZARRAVM_DISTIRA_LANES` when it is set -- read once, at process
+    /// start, never per drain; see `raster_pool::host_lanes`); see also
+    /// [`Distira::raster_lanes_for_cores`]. `set_raster_lanes` overrides it
+    /// after construction, which is what the A/B lane-cap tests use.
     raster_lanes: usize,
     /// Triangles submitted but not yet drawn. See `distira/raster_queue.rs`.
     raster_queue: RasterQueue,
@@ -1153,11 +1178,12 @@ impl Distira {
         self.raster_queue.len()
     }
 
-    /// Override the raster thread count (clamped to 1..=4). One lane
-    /// disables the worker pool entirely.
+    /// Override the raster thread count (clamped to
+    /// `1..=raster_pool::MAX_LANES`). One lane disables the worker pool
+    /// entirely.
     pub fn set_raster_lanes(&mut self, lanes: usize) {
         self.drain_raster_queue(DrainCause::Config);
-        self.raster_lanes = lanes.clamp(1, 4);
+        self.raster_lanes = lanes.clamp(1, raster_pool::MAX_LANES);
     }
 
     pub fn set_frame_size(&mut self, width: u32, height: u32) {
@@ -1485,8 +1511,11 @@ impl Distira {
         (written, lanes > 1)
     }
 
-    /// How many lanes a batch is worth. Below the threshold the wake-up cost
-    /// of the pool beats the win and the calling thread draws the batch.
+    /// How many lanes a batch is worth. Below the pixel threshold the
+    /// wake-up cost of the pool beats the win outright and the calling
+    /// thread draws the batch (`lanes == 1`); above it, [`lanes_for_rows`]
+    /// grants only as many lanes as the batch's row span can fill, up to
+    /// `self.raster_lanes`.
     ///
     /// The two measures answer different questions. Pixels are the work, so
     /// they sum over the batch. Rows are the parallelism, and lanes divide
@@ -1515,12 +1544,11 @@ impl Distira {
             highest = highest.max(job.context.max_y);
             pixels += job_rows.saturating_mul(columns);
         }
-        let rows = highest.saturating_sub(lowest) as usize;
-        if rows >= self.raster_lanes * 2 && pixels >= PARALLEL_PIXEL_THRESHOLD {
-            self.raster_lanes
-        } else {
-            1
+        if pixels < PARALLEL_PIXEL_THRESHOLD {
+            return 1;
         }
+        let rows = highest.saturating_sub(lowest) as usize;
+        lanes_for_rows(rows, self.raster_lanes)
     }
 
     /// Fold a batch's lane counters into the device.

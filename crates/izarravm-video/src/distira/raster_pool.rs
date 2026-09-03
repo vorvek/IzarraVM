@@ -21,12 +21,40 @@ pub(super) fn lanes_for_cores(cores: usize) -> usize {
     if cores >= 6 { 4 } else { 2 }
 }
 
+/// The upper bound both the pool size and `Distira::set_raster_lanes`
+/// clamp to. Not a hardware limit -- `render_band`'s `y % lanes`
+/// partition works for any lane count -- just a sanity ceiling on the
+/// number of OS threads a single Distira instance will ask the process
+/// for.
+pub(super) const MAX_LANES: usize = 32;
+
+/// `IZARRAVM_DISTIRA_LANES`, read and clamped ONCE per process and cached:
+/// the A/B knob for the raised-lane-cap lever
+/// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 5, lever
+/// B). Unset (or unparsable, or zero) keeps today's `lanes_for_cores`
+/// policy. This is the single read site -- both the pool's thread count
+/// and `Distira::new`'s default `raster_lanes` go through it, so the pool
+/// always has at least as many OS threads as any instance's default asks
+/// for.
+fn lane_override() -> Option<usize> {
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("IZARRAVM_DISTIRA_LANES")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|&lanes| lanes >= 1)
+            .map(|lanes| lanes.min(MAX_LANES))
+    })
+}
+
 pub(super) fn host_lanes() -> usize {
-    lanes_for_cores(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    )
+    lane_override().unwrap_or_else(|| {
+        lanes_for_cores(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        )
+    })
 }
 
 /// The dedicated raster pool, sized by [`host_lanes`] and started on
