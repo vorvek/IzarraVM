@@ -464,18 +464,22 @@ pub(crate) struct CompiledBlock {
     callout_slots: CallOutSlotCounts,
     x87_entry_top: u8,
     x87_exit_top: u8,
-    /// `DYNAMIC_SUCCESSOR` and `FAR_DYNAMIC`, packed into one byte.
+    /// `DYNAMIC_SUCCESSOR` and `FAR_DYNAMIC` in bits 0..1, plus the LAR/LSL `InterpretOne`
+    /// call-out slot count (`0..=MAX_BLOCK_CALLOUT_SLOTS`, a 3-bit quantity) in bits 2..4.
     ///
-    /// BIT-PACKED rather than two `bool`s, and that is a size decision measured rather than
-    /// assumed: `compiled_block_stays_small_enough_to_copy_per_entry` pins this struct at 120
-    /// bytes, the budget is exactly full, and adding a second `bool` rounds it to 128 -- eight
-    /// bytes on each of the three per-entry memcpys, on a row with 283 M entries. `CallOutSlotCounts`
-    /// beside it is bit-packed for the same reason. The alternative the design named -- a parallel
-    /// `BlockCache::far_dynamic` lane -- would grow `BlockCache`, therefore `JitState`, therefore
-    /// shift every `CpuGsw` field after `jit_direct` including the offsets emitted code bakes, and
-    /// would additionally need an `active_index` lookup at the per-entry reader below, which has a
-    /// `CompiledBlock` by value and no index. Packing costs neither.
-    dynamic_flags: u8,
+    /// BIT-PACKED rather than separate fields, and that is a size decision measured rather than
+    /// assumed: `compiled_block_stays_small_enough_to_copy_per_entry` pins this struct at 128
+    /// bytes, the budget is exactly full, and a whole extra `u8` for the LAR/LSL count rounds it
+    /// to 136 -- eight bytes on each of the three per-entry memcpys, on a row that measures
+    /// 383 M entries. The two flag bits are read only through masks (`dynamic_successor`,
+    /// `far_dynamic` below) and written once at `install`, so three bits were spare here before
+    /// the LAR/LSL count needed a home; `CallOutSlotCounts` beside it is bit-packed for the same
+    /// reason. The alternative the design named -- a parallel `BlockCache::far_dynamic` lane --
+    /// would grow `BlockCache`, therefore `JitState`, therefore shift every `CpuGsw` field after
+    /// `jit_direct` including the offsets emitted code bakes, and would additionally need an
+    /// `active_index` lookup at the per-entry reader below, which has a `CompiledBlock` by value
+    /// and no index. Packing costs neither.
+    block_flags: u8,
     successors: [Option<LinkTarget>; 2],
 }
 
@@ -485,16 +489,42 @@ pub(crate) const DYNAMIC_SUCCESSOR: u8 = 1 << 0;
 /// on its EIP, it merges through `SegmentLayout::far_merge` rather than `link_merge`, and the
 /// backward chain propagation CUTS it rather than merging through it when either CS bit arrives.
 pub(crate) const FAR_DYNAMIC: u8 = 1 << 1;
+/// Where the LAR/LSL call-out slot count starts inside `block_flags`, above the two flag bits.
+const LAR_LSL_COUNT_SHIFT: u8 = 2;
+/// The 3-bit field itself, bits 2..4 of `block_flags`. `MAX_BLOCK_CALLOUT_SLOTS` (4) fits in 3
+/// bits with one value to spare, so the count never needs a fourth bit.
+const LAR_LSL_COUNT_MASK: u8 = 0b111 << LAR_LSL_COUNT_SHIFT;
+
+/// Pack a LAR/LSL slot count into its `block_flags` bits. `count` must be
+/// `<= MAX_BLOCK_CALLOUT_SLOTS`, which the walk cap (`direct.rs` compile loop) already
+/// guarantees for every class sharing the one per-block slot budget.
+fn pack_lar_lsl_count(count: u8) -> u8 {
+    debug_assert!(
+        count <= MAX_BLOCK_CALLOUT_SLOTS,
+        "the LAR/LSL count must fit the 3-bit field packed beside DYNAMIC_SUCCESSOR/FAR_DYNAMIC"
+    );
+    (count << LAR_LSL_COUNT_SHIFT) & LAR_LSL_COUNT_MASK
+}
 
 impl CompiledBlock {
     pub(crate) fn dynamic_successor(&self) -> bool {
-        self.dynamic_flags & DYNAMIC_SUCCESSOR != 0
+        self.block_flags & DYNAMIC_SUCCESSOR != 0
     }
 
     /// Whether this block's dynamic terminal is a FAR return. Implies `dynamic_successor`.
     pub(crate) fn far_dynamic(&self) -> bool {
-        debug_assert!(self.dynamic_flags & FAR_DYNAMIC == 0 || self.dynamic_successor());
-        self.dynamic_flags & FAR_DYNAMIC != 0
+        debug_assert!(self.block_flags & FAR_DYNAMIC == 0 || self.dynamic_successor());
+        self.block_flags & FAR_DYNAMIC != 0
+    }
+
+    /// Call-out slots carrying `0x0F02` LAR or `0x0F03` LSL, i.e. the FIFTH class. Priced at
+    /// `LAR_LSL_CORE_CLOCKS` plus `LAR_LSL_MAX_DATA_ACCESSES` worst-width data accesses each in
+    /// `compute_iteration_upper`, for the same admission-change reason `callout_int_imm8_slots`
+    /// gives: LAR/LSL charges 11 core clocks against the interpret-one class's 7. Unlike that
+    /// class it is a genuine COUNT, not a flag -- packed into `block_flags` bits 2..4 rather than
+    /// carried as its own field, per that field's doc.
+    pub(crate) fn callout_lar_lsl_slots(&self) -> u32 {
+        u32::from((self.block_flags & LAR_LSL_COUNT_MASK) >> LAR_LSL_COUNT_SHIFT)
     }
 
     pub(crate) fn id(&self) -> BlockId {
@@ -1669,16 +1699,19 @@ impl BlockCache {
             compilation.callout_port_slots
                 + compilation.callout_memory_slots
                 + compilation.callout_interpret_one_slots
-                + compilation.callout_int_imm8_slots,
+                + compilation.callout_int_imm8_slots
+                + compilation.callout_lar_lsl_slots,
             compilation.callout_slots,
-            "a call-out slot belongs to none of the four helper classes"
+            "a call-out slot belongs to none of the five helper classes"
         );
-        // The INT class shares the generic helper, so it owns a cell too and both counts feed the
-        // cell tally. It does NOT share the budget term, which is the whole reason the counts are
-        // separate; see `CompiledBlock::callout_int_imm8_slots`.
+        // The INT and LAR/LSL classes share the generic helper, so each owns a cell too and all
+        // three counts feed the cell tally. Neither shares the budget term, which is the whole
+        // reason the counts are separate; see `CompiledBlock::callout_int_imm8_slots` and
+        // `CompiledBlock::callout_lar_lsl_slots`.
         debug_assert_eq!(
             usize::from(compilation.callout_interpret_one_slots)
-                + usize::from(compilation.callout_int_imm8_slots),
+                + usize::from(compilation.callout_int_imm8_slots)
+                + usize::from(compilation.callout_lar_lsl_slots),
             compilation.interpret_one_cells.len(),
             "every InterpretOne slot owns exactly one governor cell"
         );
@@ -1706,11 +1739,13 @@ impl BlockCache {
                 compilation.callout_memory_slots,
                 compilation.callout_interpret_one_slots,
                 compilation.callout_int_imm8_slots,
+                compilation.callout_lar_lsl_slots,
             ),
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
-            dynamic_flags: (u8::from(compilation.dynamic_successor) * DYNAMIC_SUCCESSOR)
-                | (u8::from(compilation.far_dynamic) * FAR_DYNAMIC),
+            block_flags: (u8::from(compilation.dynamic_successor) * DYNAMIC_SUCCESSOR)
+                | (u8::from(compilation.far_dynamic) * FAR_DYNAMIC)
+                | pack_lar_lsl_count(compilation.callout_lar_lsl_slots),
             successors: compilation.successors,
         };
         pending_watch_edges.extend(
@@ -4140,13 +4175,18 @@ pub(crate) struct Compilation {
     /// The memory-class subset (`0x60`, `0x61`), each of which moves
     /// `CALL_OUT_STACK_FRAME_DWORDS` dwords of guest stack.
     pub callout_memory_slots: u8,
-    /// Slots whose helper runs one interpreter instruction, EXCLUDING the INT row; see
-    /// `CallOutHelper::interprets_one`. Together with `callout_int_imm8_slots` this is the length
-    /// of `interpret_one_cells`, asserted at install.
+    /// Slots whose helper runs one interpreter instruction, EXCLUDING the INT row and the
+    /// LAR/LSL rows; see `CallOutHelper::interprets_one`. Together with `callout_int_imm8_slots`
+    /// and `callout_lar_lsl_slots` this is the length of `interpret_one_cells`, asserted at
+    /// install.
     pub callout_interpret_one_slots: u8,
     /// The INT-class subset (`0xCD`), priced separately from the interpret-one class; see
     /// `CompiledBlock::callout_int_imm8_slots`. Bounded at ONE by `DirectKind::is_terminal`.
     pub callout_int_imm8_slots: u8,
+    /// The LAR/LSL-class subset (`0x0F02`/`0x0F03`), priced separately from the interpret-one
+    /// class for the same reason `callout_int_imm8_slots` is; see
+    /// `CompiledBlock::callout_lar_lsl_slots`. NOT bounded at one: LAR/LSL is not terminal.
+    pub callout_lar_lsl_slots: u8,
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
     /// Readable outside this module for the same reason as `successors` below: a terminal that
@@ -6988,6 +7028,14 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
     // quietly under-reporting it. The arms are a subset of the `matches!`, so it folds away.
     non_continuable_walk_candidate(insn.opcode)
         && (matches!(insn.opcode, 0x69 | 0x6b | 0xee)
+            // LAR (`0x0F02`) and LSL (`0x0F03`), the descent2 L2 lever. `SystemSeg` is not in
+            // `block_continuable`'s (decode.rs) admitted group list, so `insn.continuable` is
+            // false for both opcodes and the walk would refuse them before `classify` is ever
+            // reached without this entry -- exactly the `0xCD` INT imm8 gap this OR-chain exists
+            // to close, except LAR/LSL need no CPU-state predicate the way `int_imm8_admitted_here`
+            // does: the row is admitted unconditionally, at every operand size and every mode
+            // (real mode and V86 raise `#UD` at execute time, not at compile time).
+            || matches!(insn.opcode, 0x0f02 | 0x0f03)
             || (insn.opcode == 0xe6 && out_imm8_rows_armed())
             // LES/LDS (0xc4/0xc5), the L4 slice, WORD form only -- the inverse shape from `0xe6`
             // above: real-mode DOS code is unprefixed 16-bit code, so the Word form is the census
@@ -7029,7 +7077,7 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
 pub(crate) const fn non_continuable_walk_candidate(opcode: u16) -> bool {
     matches!(
         opcode,
-        0x69 | 0x6b | 0x9a | 0xc4 | 0xc5 | 0xca | 0xcb | 0xcd | 0xe6 | 0xee
+        0x69 | 0x6b | 0x9a | 0xc4 | 0xc5 | 0xca | 0xcb | 0xcd | 0xe6 | 0xee | 0x0f02 | 0x0f03
     )
 }
 
@@ -8105,6 +8153,7 @@ fn compile_with_budget(
     let mut callout_memory_slots = 0u8;
     let mut callout_interpret_one_slots = 0u8;
     let mut callout_int_imm8_slots = 0u8;
+    let mut callout_lar_lsl_slots = 0u8;
     // Built during the walk rather than after it, because each cell carries its slot's GUEST
     // OFFSET and length, which are in hand here and would have to be recovered from `slots` and
     // `span.key.linear` afterwards.
@@ -8771,12 +8820,17 @@ fn compile_with_budget(
         if let Some(helper) = kind.call_out_helper() {
             callout_port_slots += u8::from(helper.probes_io_permission());
             callout_memory_slots += u8::from(helper.moves_a_stack_frame());
-            // The interpret-one count EXCLUDES the INT row, which takes its own class so its
-            // 37-clock charge cannot inflate the allowlist maximum the other eighteen rows are
-            // priced at. Both counters read the same helper, so a row can never land in neither.
+            // The interpret-one count EXCLUDES the INT row and the LAR/LSL rows, each of which
+            // takes its own class so its own-clock charge cannot inflate the allowlist maximum
+            // the other rows are priced at. All three counters read the same helper, so a row can
+            // never land in neither this count nor exactly one of the other two.
             callout_int_imm8_slots += u8::from(helper.prices_as_int_imm8());
-            callout_interpret_one_slots +=
-                u8::from(helper.interprets_one() && !helper.prices_as_int_imm8());
+            callout_lar_lsl_slots += u8::from(helper.prices_as_lar_lsl());
+            callout_interpret_one_slots += u8::from(
+                helper.interprets_one()
+                    && !helper.prices_as_int_imm8()
+                    && !helper.prices_as_lar_lsl(),
+            );
             if helper.interprets_one() {
                 // The slot's offset from the block's ENTRY linear, which is what the helper adds
                 // to the live `cpu.eip` to reach the instruction. `lin` is this instruction's
@@ -9719,6 +9773,7 @@ fn compile_with_budget(
         callout_memory_slots,
         callout_interpret_one_slots,
         callout_int_imm8_slots,
+        callout_lar_lsl_slots,
         x87_entry_top,
         x87_exit_top,
         dynamic_successor,
@@ -16001,6 +16056,13 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 | 0x0fb7
                 | 0x0fbe
                 | 0x0fbf
+                // LAR (`0x0F02`) and LSL (`0x0F03`), the descent2 L2 lever, admitted to the
+                // `InterpretOne` allowlist. In a 16-bit segment both decode at Word; without this
+                // entry a Word-operand site never reaches the classifier arm at all. No width
+                // field to get wrong: the helper runs the decode line through the interpreter's
+                // own `0x0f02`/`0x0f03` arm at whatever width the decode line carries.
+                | 0x0f02
+                | 0x0f03
                 | 0xe8
                 | 0xe9
                 | 0xeb
@@ -16342,6 +16404,36 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 },
             });
         }
+    }
+    // `0x0F02` LAR and `0x0F03` LSL, the descent2 L2 lever
+    // (`dev_docs/2026-09-05-586-laggard-board.md`): 20.6 M block-stopping exits on
+    // descent2-3dfx-586, the identical `0x0f02 /1 register dword` row on tombraid-loader-586.
+    // Keyed on the full u16 opcode and placed ABOVE the `u8::try_from(insn.opcode).ok()`
+    // truncation for the same reason `0x0faf` and the bit-string family are: that truncation
+    // returns None for every two-byte opcode, so an arm among the u8 arms below would be
+    // UNREACHABLE. Nothing would fail; the admission would simply never fire.
+    //
+    // Both register and memory forms are admitted, and every operand size: the helper runs the
+    // decode line through the interpreter (`execute_extended.rs` `0x0f02`/`0x0f03`), which handles
+    // both forms and both widths identically, so there is no emitter and no width field to get
+    // wrong here -- the same shape `BitString`'s memory forms take immediately above. The
+    // interpreter's own first statement is the mode check (`!self.is_protected_mode()` raises
+    // `#UD`), so a block compiled in real mode or V86 still admits the slot and the fault delivers
+    // normally at execute time, exactly as an out-of-range or null selector clears ZF rather than
+    // faulting -- neither path needs a compile-time gate.
+    //
+    // Priced in the LAR/LSL slot class rather than through `INTERPRET_ONE_MAX_CORE_CLOCKS`; see
+    // `InterpretOneRow::Lar`'s doc for why.
+    if matches!(insn.opcode, 0x0f02 | 0x0f03) {
+        let _ = insn.modrm?;
+        let row = if insn.opcode == 0x0f02 {
+            InterpretOneRow::Lar
+        } else {
+            InterpretOneRow::Lsl
+        };
+        return Some(DirectKind::CallOut {
+            helper: CallOutHelper::InterpretOne { row },
+        });
     }
     // BT r/m32, r32, REGISTER form only. Keyed on the full u16 opcode and placed ABOVE the
     // `u8::try_from(insn.opcode).ok()` truncation for the same reason 0x0faf and the MOVZX/MOVSX
@@ -29170,13 +29262,40 @@ pub(crate) enum InterpretOneRow {
     /// the board -- an admission change, which is guest-visible, for a row those blocks do not
     /// carry).
     IntImm8,
+    /// `0x0F02` LAR reg, r/m16/32. Descent II's DOS/4GW loader lever: 20.6 M block-stopping
+    /// exits on descent2-3dfx-586, the identical `0x0f02 /1 register dword` row on the
+    /// tombraid-loader-586 census (481,769 exits). The population measured is 100% register-source,
+    /// so the fault-path descriptor lookup (`try_read_descriptor`, control.rs) is compiled but
+    /// never actually reached by the corpus; it stays in the allowlist because a memory-source
+    /// site is architecturally reachable and the interpreter arm handles both forms identically.
+    ///
+    /// Protected mode only: real mode and V86 raise `#UD` (vector 6) as the arm's first statement,
+    /// before it touches any register or memory. Writes the destination GPR and ZF alone --
+    /// `may_write_segment` is false -- so this row inherits none of the segment-record obligations
+    /// `MovSreg`/`MovSsReg`/`PopSs` carry. Priced in its OWN slot class, `LAR_LSL_CORE_CLOCKS`,
+    /// rather than through `INTERPRET_ONE_MAX_CORE_CLOCKS`: see that constant's doc for why (11
+    /// core clocks against the allowlist's 7 would raise the budget bound of every CLI/STI/
+    /// segment/string block on the board). Unlike `IntImm8` it is NOT terminal -- the whole point
+    /// of admitting it is that the block continues past it -- so it is not bounded at one per
+    /// block; see `CompiledBlock::callout_lar_lsl_slots`.
+    Lar,
+    /// `0x0F03` LSL reg, r/m16/32. The sibling row LAR shares its census population with: the
+    /// same DOS/4GW descriptor-check idiom (`SLDT`/`LAR`/`LSL` pairs Watcom emits around a far
+    /// call or a selector validation) puts both opcodes at the same sites.
+    ///
+    /// Every property `Lar`'s doc states holds here identically -- protected-mode-only, `#UD`
+    /// elsewhere, writes a GPR and ZF alone, `LAR_LSL_CORE_CLOCKS`, not terminal -- because both
+    /// rows share one interpreter shape (`try_read_descriptor` plus a mask) and one census
+    /// rationale; they are two rows rather than one because the census ranks them separately, the
+    /// same reason the four string rows are four instead of one.
+    Lsl,
 }
 
 impl InterpretOneRow {
     /// Every row, in discriminant order. The census array is indexed by `as usize`, so this is
     /// what keeps the two in step: a variant added without an entry here fails the length pin in
     /// `interpret_one_row_labels_cover_every_variant`.
-    pub(crate) const ALL: [Self; 19] = [
+    pub(crate) const ALL: [Self; 21] = [
         Self::PopRm,
         Self::MovRmSreg,
         Self::Xchg,
@@ -29196,6 +29315,8 @@ impl InterpretOneRow {
         Self::Pushf,
         Self::Popf,
         Self::IntImm8,
+        Self::Lar,
+        Self::Lsl,
     ];
 
     /// How many rows the census array holds.
@@ -29224,6 +29345,8 @@ impl InterpretOneRow {
             Self::Pushf => "0x9c_pushf_word",
             Self::Popf => "0x9d_popf_word",
             Self::IntImm8 => "0xcd_int_imm8",
+            Self::Lar => "0x0f02_lar",
+            Self::Lsl => "0x0f03_lsl",
         }
     }
 
@@ -29351,7 +29474,12 @@ impl InterpretOneRow {
             | Self::StringStore
             | Self::StringLoad
             | Self::Pushf
-            | Self::Popf => false,
+            | Self::Popf
+            // LAR and LSL write a general-purpose register and ZF alone -- the ModRM `reg` field
+            // is always a GPR, never a segment encoding -- so both answer false exactly as
+            // `PopRm`/`MovRmSreg`/`Xchg` do.
+            | Self::Lar
+            | Self::Lsl => false,
         }
     }
 
@@ -29495,6 +29623,23 @@ impl CallOutHelper {
         )
     }
 
+    /// Whether this slot is PRICED as the LAR/LSL class rather than as the interpret-one class.
+    ///
+    /// The same split `prices_as_int_imm8` makes and for the same reason: `interprets_one` stays
+    /// TRUE for both `Lar` and `Lsl`, because the generic helper runs them too and the emitted
+    /// slot's fourth argument and governor cell do not vary by row; this predicate is the one
+    /// place `LAR`/`LSL`'s 11-clock charge is kept OUT of `INTERPRET_ONE_MAX_CORE_CLOCKS`, since
+    /// folding an 11-clock row into a 7-clock allowlist maximum would change block admission
+    /// across the whole board.
+    pub(crate) fn prices_as_lar_lsl(self) -> bool {
+        matches!(
+            self,
+            Self::InterpretOne {
+                row: InterpretOneRow::Lar | InterpretOneRow::Lsl
+            }
+        )
+    }
+
     /// True for every helper whose slot is allocated a `PortSlotCell` -- the governor's per-site
     /// kill switch. `InterpretOne` needs one for `republish_flags`'s reason (below) as well as the
     /// governor; `PortReadAlDx` needs one PURELY as a `slot_delta` data channel for the poll-skip
@@ -29573,7 +29718,12 @@ const SLOT_COUNT_RADIX: u8 = 5;
 const INT_IMM8_SLOT_STRIDE: u8 = SLOT_COUNT_RADIX * SLOT_COUNT_RADIX * SLOT_COUNT_RADIX;
 
 impl CallOutSlotCounts {
-    fn new(port: u8, memory: u8, interpret_one: u8, int_imm8: u8) -> Self {
+    /// `lar_lsl` is NOT packed into the returned byte -- that class lives in `CompiledBlock::block_flags`
+    /// now, not here -- but it is still taken as a parameter so the budget assert below sums every
+    /// class the walk can produce rather than the four this type happens to store. Passing it and
+    /// dropping it silently would be the same omission the assert exists to catch, moved one line
+    /// up instead of fixed.
+    fn new(port: u8, memory: u8, interpret_one: u8, int_imm8: u8, lar_lsl: u8) -> Self {
         debug_assert!(
             port < SLOT_COUNT_RADIX
                 && memory < SLOT_COUNT_RADIX
@@ -29585,7 +29735,7 @@ impl CallOutSlotCounts {
             "the INT class is a flag: `is_terminal` stops the walk at the slot, so a block holds              at most one"
         );
         debug_assert!(
-            port + memory + interpret_one + int_imm8 <= MAX_BLOCK_CALLOUT_SLOTS,
+            port + memory + interpret_one + int_imm8 + lar_lsl <= MAX_BLOCK_CALLOUT_SLOTS,
             "the classes share one per-block slot budget"
         );
         Self(
@@ -38387,20 +38537,20 @@ pub const REFUSAL_SITES: [(&str, u32); N_REFUSAL_SITES] = [
     ("link_line_not_live", 1928),
     ("revalidate_none", 1934),
     ("dispatch_deferred_short", 1972),
-    ("observer_or_diff_trace", 2670),
-    ("interrupt_shadow", 2677),
-    ("aggregate_accounting", 2684),
-    ("native_fetch_trace", 2698),
-    ("x87_top", 2726),
-    ("cs_layout", 2744),
-    ("cpl", 2752),
-    ("callout_privileged", 2833),
-    ("data_segment", 2964),
-    ("alignment", 2973),
-    ("fetch_limit", 2988),
-    ("entry_deferred_short", 3002),
-    ("zero_budget", 3110),
-    ("block_regenerated_none", 3149),
+    ("observer_or_diff_trace", 2697),
+    ("interrupt_shadow", 2704),
+    ("aggregate_accounting", 2711),
+    ("native_fetch_trace", 2725),
+    ("x87_top", 2753),
+    ("cs_layout", 2771),
+    ("cpl", 2779),
+    ("callout_privileged", 2860),
+    ("data_segment", 2991),
+    ("alignment", 3000),
+    ("fetch_limit", 3015),
+    ("entry_deferred_short", 3029),
+    ("zero_budget", 3137),
+    ("block_regenerated_none", 3176),
 ];
 
 #[cfg(feature = "direct-entry-attribution")]

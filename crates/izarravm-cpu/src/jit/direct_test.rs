@@ -73,6 +73,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         callout_memory_slots: 0,
         callout_interpret_one_slots: 0,
         callout_int_imm8_slots: 0,
+        callout_lar_lsl_slots: 0,
         x87_entry_top: 0,
         x87_exit_top: 0,
         dynamic_successor: false,
@@ -2943,6 +2944,12 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
 /// added byte is read only at link-resolution time (`resolve_successors`,
 /// `make_link_visible`), never on the uniform-fetch entry path itself, so the per-entry copy
 /// cost this test guards is unaffected in kind, only in the fixed size of the copy.
+///
+/// The LAR/LSL `InterpretOne` allowlist entries add a call-out slot COUNT
+/// (`0..=MAX_BLOCK_CALLOUT_SLOTS`, a 3-bit quantity), but NOT a new field: `dynamic_flags`
+/// (renamed `block_flags`) used only its bottom two bits for `DYNAMIC_SUCCESSOR`/`FAR_DYNAMIC`,
+/// read exclusively through masks, so the count packs into bits 2..4 of the byte already there.
+/// The struct stays at 128 -- see `block_flags`'s own doc and `CompiledBlock::callout_lar_lsl_slots`.
 #[test]
 fn compiled_block_stays_small_enough_to_copy_per_entry() {
     assert_eq!(
@@ -2951,6 +2958,50 @@ fn compiled_block_stays_small_enough_to_copy_per_entry() {
         "CompiledBlock size changed; if a field was added, check it is actually read on the \
          uniform-fetch entry path before letting it ride every per-entry copy"
     );
+}
+
+/// The LAR/LSL count round-trips through every value `0..=MAX_BLOCK_CALLOUT_SLOTS` (0..=4) and
+/// does not touch `DYNAMIC_SUCCESSOR`/`FAR_DYNAMIC` (bits 0..1), and the reverse: setting either
+/// flag bit, in any combination, does not disturb a packed count sharing the same byte.
+/// `pack_lar_lsl_count` and the `LAR_LSL_COUNT_MASK`/`LAR_LSL_COUNT_SHIFT` pair are exactly what
+/// `install` and `CompiledBlock::callout_lar_lsl_slots` use, so this exercises the real packing
+/// rather than a re-derivation of it.
+#[test]
+fn lar_lsl_count_round_trips_through_block_flags_without_disturbing_the_flag_bits() {
+    for count in 0..=MAX_BLOCK_CALLOUT_SLOTS {
+        let packed_count = pack_lar_lsl_count(count);
+        // The count alone: no flag bit set by packing it.
+        assert_eq!(
+            packed_count & (DYNAMIC_SUCCESSOR | FAR_DYNAMIC),
+            0,
+            "packing count {count} must not set DYNAMIC_SUCCESSOR or FAR_DYNAMIC"
+        );
+        for flags in [
+            0u8,
+            DYNAMIC_SUCCESSOR,
+            FAR_DYNAMIC,
+            DYNAMIC_SUCCESSOR | FAR_DYNAMIC,
+        ] {
+            let block_flags = flags | packed_count;
+            // The count reads back exactly, whichever flags share the byte.
+            assert_eq!(
+                u32::from((block_flags & LAR_LSL_COUNT_MASK) >> LAR_LSL_COUNT_SHIFT),
+                u32::from(count),
+                "count {count} did not round-trip with flags {flags:#04b}"
+            );
+            // The flag bits read back exactly, whichever count shares the byte.
+            assert_eq!(
+                block_flags & DYNAMIC_SUCCESSOR,
+                flags & DYNAMIC_SUCCESSOR,
+                "DYNAMIC_SUCCESSOR disturbed by count {count}"
+            );
+            assert_eq!(
+                block_flags & FAR_DYNAMIC,
+                flags & FAR_DYNAMIC,
+                "FAR_DYNAMIC disturbed by count {count}"
+            );
+        }
+    }
 }
 
 /// T9 (code-smell batch 2, S1). `entry_ptr_for` must agree with `block(id).entry_ptr()` for a

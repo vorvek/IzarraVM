@@ -2237,6 +2237,11 @@ impl CpuGsw {
         // over-pricing would change block admission, while this one is a ceiling whose whole job is
         // to dominate, and a ceiling that failed to cover the INT class would trip the
         // chain-pricing `debug_assert!(per_hop_estimate <= global_block_upper)` on a zero-dial bus.
+        //
+        // LAR/LSL folds into the SAME `per_slot` maximum for the identical reason: their own class
+        // shares this generic ceiling too. `LAR_LSL_MAX_DATA_ACCESSES` (3) does not move the value
+        // today -- it is under both of the other two -- but it has to be read here rather than
+        // assumed dominated, the same argument `MAX_CALL_OUT_CORE_CLOCKS` makes for its own fold.
         let callout_interpret_one_bus = if has_x87 {
             0
         } else {
@@ -2244,6 +2249,11 @@ impl CpuGsw {
                 INT_IMM8_MAX_DATA_ACCESSES
             } else {
                 INTERPRET_ONE_MAX_DATA_ACCESSES
+            };
+            let per_slot = if LAR_LSL_MAX_DATA_ACCESSES > per_slot {
+                LAR_LSL_MAX_DATA_ACCESSES
+            } else {
+                per_slot
             };
             u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
                 .saturating_mul(per_slot)
@@ -2380,6 +2390,16 @@ impl CpuGsw {
             .saturating_add(
                 u64::from(block.callout_int_imm8_slots())
                     .saturating_mul(u64::from(INT_IMM8_CORE_CLOCKS)),
+            )
+            // The FIFTH class, `0x0F02`/`0x0F03` LAR/LSL. Shares the generic helper too, but not
+            // the budget term: 11 against the interpret-one class's 7, so folding it in would have
+            // raised the same CLI/STI/segment/string blocks' bound for a row none of them carries.
+            // Unlike the INT class its count is NOT bounded at one -- LAR/LSL is not terminal, so
+            // a block can carry several -- which is why it is a genuine `u8` counter rather than a
+            // packed flag; see `CompiledBlock::callout_lar_lsl_slots`.
+            .saturating_add(
+                u64::from(block.callout_lar_lsl_slots())
+                    .saturating_mul(u64::from(LAR_LSL_CORE_CLOCKS)),
             );
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
@@ -2516,6 +2536,13 @@ impl CpuGsw {
             .saturating_add(
                 u64::from(block.callout_int_imm8_slots())
                     .saturating_mul(INT_IMM8_MAX_DATA_ACCESSES)
+                    .saturating_mul(dword_data_upper),
+            )
+            // The LAR/LSL class's own bus term, for the same `callout_core_upper` reason: a
+            // memory-source form reads its operand plus two descriptor dwords, `LAR_LSL_MAX_DATA_ACCESSES`.
+            .saturating_add(
+                u64::from(block.callout_lar_lsl_slots())
+                    .saturating_mul(LAR_LSL_MAX_DATA_ACCESSES)
                     .saturating_mul(dword_data_upper),
             );
         let raw_bus_upper = fetch_upper
