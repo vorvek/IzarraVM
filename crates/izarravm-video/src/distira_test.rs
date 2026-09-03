@@ -238,3 +238,174 @@ fn raster_owned_is_present_after_every_call_that_could_take_it() {
         "an NCC-routed register write leaves the box in place"
     );
 }
+
+fn write_reg(distira: &mut Distira, reg: usize, value: u32) {
+    for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
+        distira.write_mmio_u8(reg + index, byte);
+    }
+}
+
+/// Queue one small, non-degenerate, non-textured triangle through the guest
+/// register path (`SST_TRIANGLE_CMD`) -- the same path `run_triangle_command`
+/// drives -- so it defers onto `raster_queue` instead of drawing at
+/// submission (`draw_triangle`, by contrast, always draws immediately: see
+/// its `defer: false` argument to `draw_triangle_inner`).
+fn queue_triangle(distira: &mut Distira, red: u32) {
+    write_reg(
+        distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | FBZ_DRAW_FRONT,
+    );
+    write_reg(distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(distira, SST_VERTEX_BX, 8 << 4);
+    write_reg(distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(distira, SST_VERTEX_CY, 8 << 4);
+    write_reg(distira, SST_START_R, red << 12);
+    write_reg(distira, SST_START_G, 0);
+    write_reg(distira, SST_START_B, 0);
+    write_reg(distira, SST_TRIANGLE_CMD, 1);
+}
+
+/// Slice 1 of `dev_docs/2026-09-05-distira-async-overlap-review.md`: a
+/// batch flushed at the guest's `swapbufferCMD` write (`write_mmio_u8`'s
+/// `SST_SWAPBUFFER_CMD` arm calls `flush_raster_queue` alone, never
+/// `drain_raster_queue` -- see `dev_docs/2026-09-05-distira-async-overlap-design.md`
+/// section 2, item 2) is left running on the raster pool, and the next call
+/// that could observe its pixels -- here, an LFB read -- joins it first.
+/// The result must be byte-identical to the fully synchronous
+/// (queue-disabled) path: async changes WHEN the batch runs, never WHAT it
+/// computes.
+#[test]
+fn a_batch_flushed_at_swap_is_joined_by_the_next_lfb_read_with_identical_pixels_to_the_synchronous_path()
+ {
+    // The synchronous reference: the queue off, so every triangle draws at
+    // submission -- the exact pre-async (and pre-#840) behaviour.
+    let mut sync = Distira::new();
+    sync.set_frame_size(8, 8);
+    sync.set_raster_queue_enabled(false);
+    queue_triangle(&mut sync, 0xff);
+    write_reg(&mut sync, SST_SWAPBUFFER_CMD, 0);
+    write_reg(&mut sync, SST_LFB_MODE, LFB_READ_FRONT);
+    let sync_pixels: Vec<u16> = (0..8 * 8).map(|i| sync.read_lfb_u16(i * 2)).collect();
+
+    // The async path: the queue on (the default), so the triangle defers.
+    let mut asynchronous = Distira::new();
+    asynchronous.set_frame_size(8, 8);
+    queue_triangle(&mut asynchronous, 0xff);
+    write_reg(&mut asynchronous, SST_SWAPBUFFER_CMD, 0);
+    assert!(
+        asynchronous.in_flight.is_some(),
+        "the swap must flush the queued triangle to the raster pool and \
+         return without joining"
+    );
+    write_reg(&mut asynchronous, SST_LFB_MODE, LFB_READ_FRONT);
+    let async_pixels: Vec<u16> = (0..8 * 8)
+        .map(|i| asynchronous.read_lfb_u16(i * 2))
+        .collect();
+    assert!(
+        asynchronous.in_flight.is_none(),
+        "the LFB read must have joined the batch the swap left in flight"
+    );
+
+    assert_eq!(
+        sync_pixels, async_pixels,
+        "a batch flushed at the swap and joined at the next LFB read must \
+         produce the same pixels as the fully synchronous path"
+    );
+    assert!(
+        sync_pixels.iter().any(|&pixel| pixel != 0),
+        "the scene must actually paint something, or this test proves nothing"
+    );
+}
+
+/// Slice 1: `raster_owned` moves to the raster pool for the whole time a
+/// batch is in flight, not just for the duration of one method call the
+/// way the fully synchronous model (slice 0b) held it. It comes back the
+/// instant `join_raster` folds the batch in, whichever call triggered
+/// that join.
+#[test]
+fn raster_owned_is_absent_exactly_while_a_batch_is_in_flight_and_present_after_every_join() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(8, 8);
+    queue_triangle(&mut distira, 0xff);
+    assert_eq!(distira.raster_queue_depth(), 1, "the triangle must defer");
+    assert!(
+        distira.raster_owned.is_some(),
+        "the box is untouched before anything flushes the queue"
+    );
+
+    distira.flush_raster_queue(DrainCause::Config);
+    assert!(
+        distira.in_flight.is_some(),
+        "a non-empty queue must produce an in-flight batch"
+    );
+    assert!(
+        distira.raster_owned.is_none(),
+        "the box belongs to the worker for the whole time the batch is in \
+         flight, not just for the duration of the flush call"
+    );
+
+    let written = distira.join_raster();
+    assert!(
+        written.is_some(),
+        "the join must actually wait on the batch it just flushed"
+    );
+    assert!(distira.in_flight.is_none(), "the join clears in_flight");
+    assert!(
+        distira.raster_owned.is_some(),
+        "the box comes back the moment the batch is joined"
+    );
+
+    // A join with nothing in flight is free and reports no wait.
+    assert!(
+        distira.join_raster().is_none(),
+        "a join with nothing outstanding must not fabricate a wait"
+    );
+}
+
+/// Slice 1, depth one, deliberately
+/// (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 2): at
+/// most one batch is ever in flight. A second `flush_raster_queue` call
+/// while one is still outstanding must join it FIRST, and that forced join
+/// is attributed to whichever cause forced it -- the caller that pays for
+/// the wait, not the flush that originally started the batch it waited on.
+#[test]
+fn a_second_flush_while_one_is_in_flight_joins_it_first() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(8, 8);
+
+    queue_triangle(&mut distira, 0xff);
+    distira.flush_raster_queue(DrainCause::Config);
+    assert!(
+        distira.in_flight.is_some(),
+        "the first flush must leave a batch in flight"
+    );
+    assert_eq!(
+        distira.triangle_census.joins_by_cause.swap_or_scanout, 0,
+        "nothing has forced a join yet"
+    );
+
+    queue_triangle(&mut distira, 0x80);
+    distira.flush_raster_queue(DrainCause::SwapOrScanout);
+    assert_eq!(
+        distira.triangle_census.joins_by_cause.swap_or_scanout, 1,
+        "the depth-one pre-join inside the second flush must be attributed \
+         to the cause that forced it, not to the first flush's own cause"
+    );
+    assert!(
+        distira.in_flight.is_some(),
+        "the second flush's own batch is now the one in flight"
+    );
+
+    // Never more than one batch outstanding: joining once must be enough
+    // to observe both triangles' pixels.
+    let written = distira.join_raster();
+    assert!(
+        written.is_some(),
+        "the second batch must still be waitable after the pre-join \
+         consumed the first"
+    );
+    assert!(distira.in_flight.is_none());
+}

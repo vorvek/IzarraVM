@@ -143,6 +143,33 @@ pub fn mode_census_json(
                         state.triangles.queue_drain_causes.immediate_triangle,
                     "config": state.triangles.queue_drain_causes.config,
                 },
+                // Slice 1 of the async-overlap review
+                // (`dev_docs/2026-09-05-distira-async-overlap-review.md`
+                // section 2, `dev_docs/2026-09-05-distira-async-overlap-design.md`
+                // section 8): the async-lever win metrics. `async_batches`
+                // is how many batches were handed to the raster pool
+                // instead of drawn on the calling thread; `joins_by_cause`
+                // is how many of THOSE joins actually waited, broken down
+                // by which call forced the wait -- a `register_write_uncovered`
+                // entry here answers finding 2's fastfill-after-swap
+                // question directly; `overlap_ns` is the summed wall-clock
+                // nanoseconds every join spent blocked, the direct
+                // read-out of the lever.
+                "async_batches": state.triangles.async_batches,
+                "joins_by_cause": {
+                    "texture_write": state.triangles.joins_by_cause.texture_write,
+                    "lfb_read": state.triangles.joins_by_cause.lfb_read,
+                    "lfb_write": state.triangles.joins_by_cause.lfb_write,
+                    "register_read_stats": state.triangles.joins_by_cause.register_read_stats,
+                    "register_write_uncovered":
+                        state.triangles.joins_by_cause.register_write_uncovered,
+                    "nop_cmd_reset_stats": state.triangles.joins_by_cause.nop_cmd_reset_stats,
+                    "swap_or_scanout": state.triangles.joins_by_cause.swap_or_scanout,
+                    "queue_full": state.triangles.joins_by_cause.queue_full,
+                    "immediate_triangle": state.triangles.joins_by_cause.immediate_triangle,
+                    "config": state.triangles.joins_by_cause.config,
+                },
+                "overlap_ns": state.triangles.overlap_ns,
             },
             "retrace_count": state.retrace_count,
             "painted_bytes": state.painted_bytes,

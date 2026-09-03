@@ -68,6 +68,22 @@ impl Default for NccState {
 }
 
 impl NccState {
+    /// Whether `register` names an NCC table entry at all, without
+    /// touching `self`. Slice 1 of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md`: `write_mmio_u8`
+    /// used to call `Distira::raster_owned_mut` (which joins any in-flight
+    /// batch) unconditionally before this check, on every register write --
+    /// harmless while `join_raster` was a no-op (slice 0b), but under real
+    /// async it collapsed the swap's overlap window to "until the next
+    /// register write of any kind", which is every register write a Glide
+    /// driver issues setting up the next triangle. A write that does not
+    /// name an NCC register never needs `RasterOwned` at all -- gating the
+    /// join on this cheap, `&self`-free check first is what gets the window
+    /// back.
+    pub(super) fn touches_register(register: usize) -> bool {
+        decode_register(register).is_some()
+    }
+
     pub(super) fn write_register(
         &mut self,
         chip: usize,
