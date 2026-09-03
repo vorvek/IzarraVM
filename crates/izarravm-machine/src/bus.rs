@@ -534,6 +534,7 @@ impl Machine {
             isa_io_wait: isa_io_wait_armed(),
             timing_epoch: self.timing_epoch,
             poll_skip_certificate: &self.poll_skip_certificate,
+            retrace_poll: &mut self.retrace_poll,
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
@@ -1452,10 +1453,49 @@ impl MachineBus<'_> {
     ///
     /// `None` means decline and fall through, which is exactly what the inactive status1 alias
     /// does in the non-lazy class. The lazy class answers 0xFF itself rather than declining.
+    /// F14's instrument. Count the retrace-bit EDGES a guest observes through its own reads of
+    /// the status-1 register -- i.e. the instants at which a `VL_WaitVBL`-shaped poll loop
+    /// EXITS.
+    ///
+    /// WHY THIS IS THE DESIGN'S ONE SELF-CERTIFYING ANCHOR (review F14). Every other certifier
+    /// for the port reprice is a band derived from a duty-cycle bracket we do not have a
+    /// document for. This one is fixed by construction: mode 13h retraces at 70.086 Hz, and
+    /// Wolfenstein 3-D's `VL_WaitVBL` is two loops -- `in al,dx / test al,8 / jnz` (spin until
+    /// the retrace ENDS) then `in al,dx / test al,8 / jz` (spin until it STARTS) -- each of
+    /// which exits on exactly one edge per frame. So `rising` and `falling` must both read
+    /// ~70.086 per guest second whatever the polls-per-frame figure is. Below that, the guest
+    /// is no longer reaching the retrace in time and the model has OVER-charged; the poll count
+    /// alone cannot tell that apart from a guest that simply polls less.
+    ///
+    /// EDGES OBSERVED BY THE GUEST, not edges that happened. The comparison is against the last
+    /// value a guest READ, so an elided poll span (which performs no reads at all and replays
+    /// `status1_side_effects` once) contributes nothing, and the exit read that follows it
+    /// carries the edge exactly as an un-elided loop's would. That is what makes the counter
+    /// comparable across the skip's arms as well as across the epoch.
+    ///
+    /// Feature-free: one branch and one compare at a site that has already predicted the beam.
+    /// It counts only reads that the VGA actually answered with status bits -- the inactive
+    /// alias's flat `0xFF` (bit 3 set) is returned by the caller without reaching here, so it
+    /// cannot manufacture an edge. 0x3C2 (status 0) is excluded by the caller for the same
+    /// reason: its bit 3 is not the retrace bit this instrument is about.
+    fn note_status1_retrace_edge(&mut self, port: u16, value: u8) {
+        if port == 0x3C2 {
+            return;
+        }
+        let retrace = value & 0x08 != 0;
+        let previous = self.retrace_poll.last_observed.replace(retrace);
+        match previous {
+            Some(false) if retrace => self.retrace_poll.rising_edges += 1,
+            Some(true) if !retrace => self.retrace_poll.falling_edges += 1,
+            _ => {}
+        }
+    }
+
     fn read_vga_status_port(&mut self, port: u16, skip_io_touched: bool) -> Option<u32> {
         if self.lazy_port_reads || self.lazy_ports_386 {
             let beam = self.predicted_beam();
             if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
+                self.note_status1_retrace_edge(port, value);
                 return Some(u32::from(value));
             }
             // Inactive alias (e.g. 3BA polled in a color setup): no side
@@ -1498,7 +1538,9 @@ impl MachineBus<'_> {
         // where `read_port` declines -- the inactive status1 alias --
         // so the fallthrough at the call site is unchanged.
         let beam = self.predicted_beam();
-        self.vega.read_status_port_lazy(port, beam).map(u32::from)
+        let value = self.vega.read_status_port_lazy(port, beam)?;
+        self.note_status1_retrace_edge(port, value);
+        Some(u32::from(value))
     }
 }
 

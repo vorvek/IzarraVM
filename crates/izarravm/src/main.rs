@@ -2169,6 +2169,7 @@ fn write_hdd_profile_json(
             .map(|(label, count)| ((*label).to_string(), json!(count)))
             .collect(),
     );
+    let retrace_poll_exits = machine.retrace_poll_exits();
     #[allow(unused_mut)]
     let mut report = json!({
         "schema": "izarravm-hdd-profile-v2",
@@ -2186,6 +2187,17 @@ fn write_hdd_profile_json(
         // "the same accesses cost more" -- the accounting-closure check the design's section 6
         // requires on every moved row. Diagnostic only; no emulation decision reads it.
         "port_accesses_by_class": port_accesses_by_class_json,
+        // F14's `VL_WaitVBL` exit-rate instrument: vertical-retrace bit edges the guest observed
+        // through its OWN 0x3DA/0x3BA reads, i.e. the number of times a retrace poll loop
+        // EXITED. At mode 13h's 70.086 Hz both rows must read ~70.086 per guest second BY
+        // CONSTRUCTION, whatever the polls-per-frame figure is -- which is why this, and not the
+        // poll count, is the port repricing's self-certifying anchor. Diagnostic only.
+        "retrace_poll_exits": {
+            "rising": retrace_poll_exits.0,
+            "falling": retrace_poll_exits.1,
+            "rising_per_guest_second": retrace_poll_exits.0 as f64 / guest_seconds.max(f64::MIN_POSITIVE),
+            "falling_per_guest_second": retrace_poll_exits.1 as f64 / guest_seconds.max(f64::MIN_POSITIVE),
+        },
         "cycle_budget": budget,
         "stop": stop_reason_json(stop_reason),
         "wall_seconds": wall_seconds,

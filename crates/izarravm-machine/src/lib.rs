@@ -1496,6 +1496,8 @@ pub struct Machine {
     /// (`dev_docs/2026-09-05-port-io-repricing-design.md`). Reported in the profile JSON as the
     /// EFFECTIVE epoch via `Machine::timing_epoch`.
     timing_epoch: u32,
+    /// F14's `VL_WaitVBL` exit-rate instrument (see `RetracePollCensus`).
+    retrace_poll: RetracePollCensus,
     /// P2's certificate ledger (see `PollSkipCertificateCounters`). Replaced P1's single
     /// `poll_skip_epoch_refusals`, which P2's admission lane makes structurally unreachable --
     /// a counter that can never move is a gate that cannot fail.
@@ -2053,6 +2055,25 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
+/// F14's `VL_WaitVBL` exit-rate instrument: the vertical-retrace bit edges a guest has observed
+/// through its OWN reads of the status-1 register (0x3DA / 0x3BA), since machine construction.
+/// See `MachineBus::note_status1_retrace_edge` for what an edge means and why this is the port
+/// repricing's only self-certifying anchor.
+///
+/// Plain fields behind a `&mut` borrow rather than `Cell`s: the counting site is `&mut self`
+/// (it has just predicted the beam), unlike the certificate ledger's `&self` path.
+#[derive(Debug, Default)]
+pub(crate) struct RetracePollCensus {
+    /// The retrace bit as the guest last read it, or `None` before its first read. The
+    /// comparand -- edges are measured between consecutive GUEST reads, so an elided poll span
+    /// contributes none and the exit read that follows still carries its edge.
+    pub(crate) last_observed: Option<bool>,
+    /// Reads that saw the retrace bit go 0 -> 1: a `wait until the retrace STARTS` loop's exit.
+    pub(crate) rising_edges: u64,
+    /// Reads that saw it go 1 -> 0: a `wait until the retrace ENDS` loop's exit.
+    pub(crate) falling_edges: u64,
+}
+
 /// Why the io poll skip's own bus certificate was granted or declined, since machine
 /// construction. Slice P2 of the port-io repricing.
 ///
@@ -2113,6 +2134,7 @@ impl Machine {
         patch_rom(&mut rom);
         let mut machine = Self {
             timing_epoch: bus::timing_epoch_from_env(),
+            retrace_poll: RetracePollCensus::default(),
             poll_skip_certificate: PollSkipCertificateCounters::default(),
             memory,
             ram_lookup,
@@ -3370,6 +3392,18 @@ impl Machine {
         self.port_accesses_by_class
     }
 
+    /// F14: `(rising, falling)` vertical-retrace edges the guest has observed through its own
+    /// 0x3DA/0x3BA reads since construction -- the number of times a `VL_WaitVBL`-shaped poll
+    /// loop EXITED. At mode 13h's 70.086 Hz both must read ~70.086 per guest second by
+    /// construction, whatever the polls-per-frame figure is; that is what makes this the port
+    /// repricing's one self-certifying anchor (review F14). Diagnostic only.
+    pub fn retrace_poll_exits(&self) -> (u64, u64) {
+        (
+            self.retrace_poll.rising_edges,
+            self.retrace_poll.falling_edges,
+        )
+    }
+
     /// P2's poll-skip certificate ledger, since construction: `(admitted_epoch2,
     /// refused_unpriced_port, refused_inactive)`. Diagnostic only -- no emulation decision
     /// reads it. `admitted_epoch2` is the counter that says the skip is ALIVE under epoch 2,
@@ -3872,6 +3906,8 @@ struct MachineBus<'a> {
     /// byte-identical to before this slice; `2` arms the per-class port-bus charge in
     /// `charge_port_bus` (`dev_docs/2026-09-05-port-io-repricing-design.md`).
     timing_epoch: u32,
+    /// Points at `Machine::retrace_poll` (F14's instrument).
+    retrace_poll: &'a mut RetracePollCensus,
     /// Points at `Machine::poll_skip_certificate`. `&`, not `&mut`: the certificate path this
     /// counts is `&self` (see the struct's own doc).
     poll_skip_certificate: &'a PollSkipCertificateCounters,

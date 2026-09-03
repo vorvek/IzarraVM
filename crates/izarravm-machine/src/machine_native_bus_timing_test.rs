@@ -260,6 +260,48 @@ fn the_poll_skip_prices_the_real_mode_column_because_v86_can_never_reach_it() {
     assert_eq!(raw, 21 - 12 + 84, "real mode: Intel's IN 7 x 12 = 84 raw");
 }
 
+/// F14's instrument, as a RATE. The fixture is the `VL_WaitVBL` shape itself -- spin while the
+/// retrace bit is set, then spin until it is set, repeat -- so each of its two loops exits
+/// exactly once per displayed frame, and the two edge counters must track the VGA's own frame
+/// sequence rather than the number of polls. That is the whole point of the instrument: the
+/// poll count moves by design under the reprice and under the skip, and this does not.
+///
+/// Run across BOTH epochs and BOTH skip arms, because those are the four legs the certifier is
+/// read on. The skip arm is the load-bearing one: an elided span's edge solve admits only
+/// iterations whose projected instant lands strictly BEFORE the edge the loop is waiting for,
+/// so a loop's OWN exit edge can never be elided past, and the exit count survives the elision.
+///
+/// What this does NOT claim, deliberately: that eliding preserves every edge the guest would
+/// have observed. Edges observed are a function of when the guest READS, and a loop spinning on
+/// one sense of the bit can be elided across an edge it is not waiting for. Measured on the
+/// artificial `setup_poll_machine_case` fixture (whose beam is teleported into place), skip-on
+/// and skip-off can differ by one edge for exactly that reason. It does not touch the certifier:
+/// a `VL_WaitVBL` loop's exit IS the edge it waits for.
+#[cfg(feature = "jit")]
+#[test]
+fn retrace_poll_exits_track_frames_not_polls() {
+    for (epoch, skip) in [(1, false), (1, true), (2, false), (2, true)] {
+        let mut machine =
+            poll_skip_test_machine_at_epoch(skip, TracingMode::Off, GswMode::Gsw586, 0x08, epoch);
+        machine.run_cycles(1_000).unwrap();
+        let frames_before = machine.vega.frame_sequence();
+        let (rising_before, falling_before) = machine.retrace_poll_exits();
+        machine.run_cycles(20_000_000).unwrap();
+        let frames = machine.vega.frame_sequence() - frames_before;
+        let (rising, falling) = machine.retrace_poll_exits();
+        let (rising, falling) = (rising - rising_before, falling - falling_before);
+        assert!(
+            frames > 2,
+            "epoch {epoch} skip={skip}: the fixture must cross frames"
+        );
+        // One exit per edge per frame, +/- the partial frame at each end of the window.
+        assert!(
+            rising.abs_diff(frames) <= 1 && falling.abs_diff(frames) <= 1,
+            "epoch {epoch} skip={skip}: exits must track frames -- frames={frames}              rising={rising} falling={falling}"
+        );
+    }
+}
+
 #[cfg(feature = "jit")]
 #[test]
 fn poll_skip_declines_when_bus_tracing_is_active() {

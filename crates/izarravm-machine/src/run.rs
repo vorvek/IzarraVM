@@ -1463,6 +1463,7 @@ impl Machine {
                 let Machine {
                     timing_epoch,
                     poll_skip_certificate,
+                    retrace_poll,
                     profile,
                     active_mode,
                     pending_mode,
@@ -1567,6 +1568,7 @@ impl Machine {
                     active_mode: *active_mode,
                     timing_epoch: *timing_epoch,
                     poll_skip_certificate: &*poll_skip_certificate,
+                    retrace_poll,
                     pending_mode,
                     fast_post: *fast_post,
                     booter_inert: *booter_inert,
