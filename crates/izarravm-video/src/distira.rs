@@ -1403,26 +1403,32 @@ impl Distira {
         self.triangle_census.queue_drain_causes.record(cause);
         let mut written = 0u64;
         let mut any_parallel = false;
-        let mut segment: Vec<QueuedTriangle> = Vec::new();
-        for command in &commands {
-            match *command {
-                QueuedCommand::Triangle(triangle) => segment.push(triangle),
-                QueuedCommand::TextureWrite(write) => {
-                    if !segment.is_empty() {
-                        let (segment_written, parallel) = self.render_triangle_segment(&segment);
-                        written += segment_written;
-                        any_parallel |= parallel;
-                        segment.clear();
-                    }
-                    let mask = DISTIRA_TEX_SIZE - 1;
-                    for (index, byte) in write.bytes.into_iter().enumerate() {
-                        self.texture[write.tmu][(write.offset + index) & mask] = byte;
-                    }
-                }
+        // A run of triangles between two `TextureWrite`s (or the batch's
+        // edges) is a CONTIGUOUS subslice of `commands` -- `run_start..index`
+        // tracks it by index instead of copying triangles into a side `Vec`,
+        // which used to memcpy every queued triangle (~600 B each) on every
+        // drain, even the common case with no write in the batch at all.
+        // `commands` is a local, not a borrow of `self`, so slicing it and
+        // then mutating `self.texture` below never conflicts.
+        let mut run_start = 0usize;
+        for (index, command) in commands.iter().enumerate() {
+            let QueuedCommand::TextureWrite(write) = *command else {
+                continue;
+            };
+            if index > run_start {
+                let (segment_written, parallel) =
+                    self.render_triangle_segment(&commands[run_start..index]);
+                written += segment_written;
+                any_parallel |= parallel;
             }
+            let mask = DISTIRA_TEX_SIZE - 1;
+            for (byte_index, byte) in write.bytes.into_iter().enumerate() {
+                self.texture[write.tmu][(write.offset + byte_index) & mask] = byte;
+            }
+            run_start = index + 1;
         }
-        if !segment.is_empty() {
-            let (segment_written, parallel) = self.render_triangle_segment(&segment);
+        if run_start < commands.len() {
+            let (segment_written, parallel) = self.render_triangle_segment(&commands[run_start..]);
             written += segment_written;
             any_parallel |= parallel;
         }
@@ -1441,7 +1447,7 @@ impl Distira {
     /// row is the one that has to partition and not the triangle's own row.
     /// Returns the pixels stored and whether the run reached the parallel
     /// lanes.
-    fn render_triangle_segment(&mut self, jobs: &[QueuedTriangle]) -> (u64, bool) {
+    fn render_triangle_segment(&mut self, jobs: &[QueuedCommand]) -> (u64, bool) {
         let lanes = self.batch_lanes(jobs);
         let mut lane_stats: Vec<PixelStats> = (0..lanes).map(|_| PixelStats::new(0)).collect();
         if lanes == 1 {
@@ -1487,7 +1493,7 @@ impl Distira {
     /// DISTINCT rows, so they take the union span rather than the sum: a stack
     /// of small triangles sitting on top of each other has one triangle's
     /// worth of rows to share out however many triangles it holds.
-    fn batch_lanes(&self, jobs: &[QueuedTriangle]) -> usize {
+    fn batch_lanes(&self, jobs: &[QueuedCommand]) -> usize {
         if self.raster_lanes < 2 {
             return 1;
         }
@@ -1495,6 +1501,11 @@ impl Distira {
         let mut highest = 0;
         let mut pixels = 0usize;
         for job in jobs {
+            // See `render_band`: every entry in a run is a `Triangle` by
+            // construction.
+            let QueuedCommand::Triangle(job) = job else {
+                continue;
+            };
             let job_rows = job.context.max_y.saturating_sub(job.context.min_y) as usize;
             let columns = job.context.max_x.saturating_sub(job.context.min_x) as usize;
             if job_rows == 0 {
@@ -1520,7 +1531,7 @@ impl Distira {
     fn merge_pixel_stats(
         &mut self,
         lane_stats: &[PixelStats],
-        jobs: &[QueuedTriangle],
+        jobs: &[QueuedCommand],
         lanes: usize,
     ) -> u64 {
         let mut written = 0;
@@ -1562,7 +1573,7 @@ impl Distira {
         // A rotating triangle is never batched with another (see
         // `triangle_defers`), so the batch that reaches this is one triangle
         // long whenever the value matters.
-        if let Some(job) = jobs.last()
+        if let Some(QueuedCommand::Triangle(job)) = jobs.last()
             && job.params.fbz_mode & FBZ_STIPPLE != 0
             && job.params.fbz_mode & FBZ_STIPPLE_PATT == 0
             && job.context.max_y > job.context.min_y
@@ -2441,13 +2452,22 @@ impl Distira {
             return;
         };
         if !self.raster_queue_enabled {
-            // `set_raster_queue_enabled` drains before it flips the flag, and
-            // nothing pushes while it is off, so the queue is guaranteed
-            // empty here: apply synchronously, exactly as every write did
-            // before this lever existed. `queued_triangles_answer_
+            // `set_raster_queue_enabled` drains before it flips the flag, so
+            // the queue starts empty when it goes false. The
+            // immediate-triangle path in `draw_triangle_inner` still pushes
+            // while the flag is off -- it does that regardless of
+            // `raster_queue_enabled` -- but that push is always immediately
+            // followed by its own drain in the same call, with no
+            // reentrancy in between, so the queue is back to empty by the
+            // time control returns here. The real invariant is that weaker
+            // "push is always paired with its drain", not "nothing pushes":
+            // a future edit that separated the two would let this
+            // synchronous store apply out of order against a still-queued
+            // triangle, silently. `queued_triangles_answer_
             // interleaved_reads_like_synchronous_ones` (queue OFF arm) is
-            // what this keeps honest -- with the queue off there is no
-            // ordering to build, only the same store there always was.
+            // what keeps the OBSERVABLE behaviour honest -- with the queue
+            // off there is no ordering to build, only the same store there
+            // always was.
             let mask = DISTIRA_TEX_SIZE - 1;
             for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
                 self.texture[tmu][(offset + index) & mask] = byte;

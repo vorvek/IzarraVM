@@ -62,7 +62,17 @@ use super::*;
 /// than enough to amortise one fork. Texture writes share the capacity with
 /// triangles -- both are queued commands now, and both need the guest to
 /// keep moving without a synchronous drain.
-pub(super) const RASTER_QUEUE_CAPACITY: usize = 512;
+///
+/// 512 was sized for a triangle-only queue. `tombraid3d-586`'s Lara's Home
+/// walk pushes ~387 triangles and ~65 texture writes a frame (
+/// `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 4) -- ~452
+/// entries against a 512 cap, one entry-fill from an extra `queue_full`
+/// drain most frames. 1024 buys headroom back without a redesign: each
+/// `QueuedCommand` slot costs ~600 B (`QueuedTriangle`'s size dominates,
+/// see the `large_enum_variant` allow below), so the doubled capacity is
+/// ~300 KB more on the one allocation `RasterQueue::recycle` keeps alive,
+/// not a per-pixel cost.
+pub(super) const RASTER_QUEUE_CAPACITY: usize = 1024;
 
 /// A triangle waiting to be drawn, with the register state it was submitted
 /// against. Both halves are `Copy`: the queue holds no borrow of the device,
@@ -188,7 +198,7 @@ impl std::fmt::Debug for RasterQueue {
 /// with a neighbour, because rotating stipple chains from one triangle to the
 /// next and that chain cannot be split across lanes.
 pub(super) fn render_band(
-    jobs: &[QueuedTriangle],
+    jobs: &[QueuedCommand],
     view_memory: ViewMemory<'_>,
     lane: u32,
     lanes: u32,
@@ -196,6 +206,14 @@ pub(super) fn render_band(
 ) {
     let mut local = PixelStats::new(0);
     for job in jobs {
+        // Every entry in `jobs` is a `Triangle` by construction: the caller
+        // (`Distira::drain_raster_queue`) splits the batch into runs at
+        // every `TextureWrite`, so a run never holds one. Matching instead
+        // of asserting keeps this function total even if that invariant is
+        // ever loosened.
+        let QueuedCommand::Triangle(job) = job else {
+            continue;
+        };
         local.stipple = job.params.stipple;
         let view = view_memory.view(job.params);
         // Picked once per triangle, never per row or per pixel: the mode

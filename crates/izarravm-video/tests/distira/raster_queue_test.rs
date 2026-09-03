@@ -701,7 +701,11 @@ fn submit_flat_textured_triangle(distira: &mut Distira, vertices: [(u32, u32); 3
 /// write drained triangle A out from under it. The pixel-level assertions
 /// (A shows the OLD texel, B shows the NEW one) hold under EITHER design --
 /// this test's whole point is that they must ALSO hold once the write stops
-/// forcing a drain, which the depth assertions are what actually pin.
+/// forcing a drain, which the depth assertions are what actually pin. The
+/// sample point is `(8, y)`, not the triangles' own midpoints: `(32, y)`
+/// sits past B's hypotenuse (`[(0, 32), (64, 32), (0, 64)]` covers `x < 28`
+/// at `y=50`) and would silently compare A's colour against unpainted
+/// background instead of B's real sample.
 #[test]
 fn a_texture_write_orders_against_triangles_instead_of_draining_them() {
     let mut distira = Distira::new();
@@ -770,8 +774,8 @@ fn a_texture_write_orders_against_triangles_instead_of_draining_them() {
     );
 
     let width = 64usize;
-    let old_pixel = frame[10 * width + 32];
-    let new_pixel = frame[50 * width + 32];
+    let old_pixel = frame[10 * width + 8];
+    let new_pixel = frame[50 * width + 8];
     assert_ne!(
         old_pixel, new_pixel,
         "triangle A (queued before the write) and triangle B (queued after \
@@ -862,5 +866,127 @@ fn a_texture_write_mid_batch_splits_lanes_without_moving_a_pixel() {
         parallel_parallel, 1,
         "raster_lanes(4) with triangles this large must reach the parallel \
          lanes on at least one of the two segments the write splits"
+    );
+}
+
+/// THE SAFETY CLAIM THE WHOLE LEVER RESTS ON: a queued triangle's texture
+/// coordinates resolve against the register snapshot it was submitted
+/// with, not against live device state at raster time
+/// (`dev_docs/2026-09-05-distira-texture-queue-review.md` section 1/finding
+/// F). Triangle A is enqueued, `SST_TEX_BASE_ADDR` changes (a
+/// snapshot-covered register -- it does NOT drain), a texture write lands
+/// at the NEW base, then triangle B is enqueued. A must resolve through its
+/// OWN (old) base and see the OLD texel; B must resolve through the NEW
+/// base and see the NEW one.
+///
+/// This is a materially different case from
+/// `a_texture_write_orders_against_triangles_instead_of_draining_them`:
+/// that test holds the registers fixed and only changes texture CONTENT: A
+/// and B could share the exact same `RasterParams` and it would still pass.
+/// Here A and B decode to two DIFFERENT physical texture addresses, so a
+/// broken snapshot (say, `QueuedTriangle` resolving its texel through
+/// `self.raster_params()` at DRAIN time instead of carrying its own copy
+/// from ENQUEUE time) would make A read the NEW base too and see whatever
+/// this test's control run below can distinguish. Manually confirmed RED:
+/// forcing `triangle.params.tex_base_addr` to the OLD value at enqueue time
+/// for every queued triangle (simulating a snapshot that a later live
+/// register write could still reach) makes both A and B resolve through the
+/// OLD base -- both come back `0x0010208c`, the OLD texel's exact RGB565
+/// expansion, and the pixel comparison below panics with `left == right`.
+/// (The sample point matters here: an earlier draft of this test sampled
+/// `(32, 50)`, which sits past triangle B's hypotenuse -- `[(0, 32), (64,
+/// 32), (0, 64)]` only covers `x < 28` at `y=50` -- so it silently compared
+/// A's colour against unpainted background instead of B's real sample. `(8,
+/// 50)` stays interior to every triangle shape both tests here use.)
+#[test]
+fn a_queued_triangle_resolves_its_own_texture_register_snapshot_not_live_state() {
+    let mut distira = Distira::new();
+    distira.set_raster_queue_enabled(true);
+    distira.set_frame_size(64, 64);
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        FBZCP_TEXTURE_ENABLED | RGB_SELECT_TEXTURE,
+    );
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEXTUREMODE_LOCAL | (TEX_R5G6B5 << 8),
+    );
+    write_reg(&mut distira, SST_TLOD, 0);
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_FRONT | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+
+    // The OLD base, and the OLD texel sitting there.
+    write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
+    distira.write_texture_u32(0, 0x1111_1111);
+    assert_eq!(
+        distira.raster_queue_depth(),
+        1,
+        "the first write must queue"
+    );
+
+    // Triangle A: queued against the OLD base. Must NOT see anything past
+    // this point.
+    submit_flat_textured_triangle(&mut distira, [(0, 0), (64, 0), (0, 32)], 10_000_000);
+    assert_eq!(distira.raster_queue_depth(), 2, "triangle A must be queued");
+
+    // A base-address change. `raster_snapshot_covers_register` lists
+    // SST_TEX_BASE_ADDR, so this must NOT drain -- triangle A stays queued,
+    // still holding its OLD base in its own snapshot.
+    const NEW_BASE: u32 = 2 * 1024 * 1024;
+    assert_eq!(
+        NEW_BASE & 0x7,
+        0,
+        "must round-trip the <<3 base-address shift"
+    );
+    write_reg(&mut distira, SST_TEX_BASE_ADDR, NEW_BASE >> 3);
+    assert_eq!(
+        distira.raster_queue_depth(),
+        2,
+        "a snapshot-covered register write must not drain triangle A"
+    );
+
+    // The NEW texel, written at the NEW base (decode is always live, at
+    // write time -- this lands at NEW_BASE + 0, a different physical
+    // address than A's write above).
+    distira.write_texture_u32(0, 0x2222_2222);
+    assert_eq!(
+        distira.raster_queue_depth(),
+        3,
+        "the write must queue alongside A, not drain it"
+    );
+
+    // Triangle B: queued against the NEW base. Must see the NEW texel.
+    submit_flat_textured_triangle(&mut distira, [(0, 32), (64, 32), (0, 64)], 20_000_000);
+    assert_eq!(
+        distira.raster_queue_depth(),
+        4,
+        "triangle B must also just queue"
+    );
+
+    let frame = distira.scanout_argb();
+    assert_eq!(
+        distira.scanout_state().triangles.queue_drains,
+        1,
+        "everything queued -- two triangles, a register write and a texture \
+         write -- must collapse into ONE drain at scanout"
+    );
+
+    let width = 64usize;
+    let old_pixel = frame[10 * width + 8];
+    let new_pixel = frame[50 * width + 8];
+    assert_ne!(
+        old_pixel, new_pixel,
+        "A (old base, old snapshot) and B (new base, new snapshot) must \
+         resolve to different texels: old={old_pixel:#010x} new={new_pixel:#010x}"
+    );
+    assert_ne!(
+        red_channel(old_pixel),
+        red_channel(new_pixel),
+        "the two texels differ in every channel, including red"
     );
 }
