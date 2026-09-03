@@ -292,7 +292,16 @@ impl CpuGsw {
                 self.record_fault_site(boundary_eip, false);
                 return Err(error);
             }
-            let charged = self.scale_clocks(61);
+            // Was a bare `61`. The INTA cycles the 8259A drives are still not
+            // modelled anywhere -- the census lists them as missing entirely --
+            // so this is the CPU's own entry cost and nothing else.
+            let charged = self.scale_clocks(
+                self.class_table()
+                    .raw(crate::timing_class::TimingClass::HardwareInterrupt),
+            );
+            #[cfg(feature = "timing-class-histogram")]
+            self.class_histogram
+                .record_system_event(crate::timing_class::TimingClass::HardwareInterrupt);
             self.elapsed_clocks += charged;
             #[cfg(feature = "reflected-call-diagnostic")]
             if self.retire_gates.reflected_call_diag_armed {
@@ -615,6 +624,13 @@ impl CpuGsw {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
+                // Both reads are INSIDE the arm, so the success path pays for
+                // neither. `deliver_exception` clears VM on the way into a
+                // ring-0 monitor handler, and this sits above the delivery
+                // call, so it still sees the mode the fault was RAISED in --
+                // which is exactly what census row 7 is about.
+                let faulted_in_v86 = self.is_v86_mode();
+                let faulting_class = self.pending_faulting_class.take();
                 // Captured BEFORE the rewind, because the rewind destroys the
                 // evidence. `load_segment_real` installs a fabricated real-mode
                 // descriptor (base = selector << 4), which is wrong in protected
@@ -646,8 +662,33 @@ impl CpuGsw {
                     self.record_fault_site(start_eip, cs_was_moved);
                     return Err(error);
                 }
+                // Census row 7, the worst in its group: a flat 59 for every
+                // mode, **16.7x under** on the V86 monitor trip, and it REPLACED
+                // the faulting instruction's own charge rather than adding to
+                // it (this arm is reached only when the instruction returned
+                // `Err`, so the outcome that carried its class was discarded).
+                //
+                // Both halves are fixed here. The delivery cost is now
+                // mode-keyed -- V86 takes Intel's V86/trap-gate-different-level
+                // row -- and the faulting instruction's own class is added back
+                // when the decode got far enough to know it. Under epoch 1 both
+                // classes carry the old 59 and the instruction term is zero, so
+                // the charge is unchanged; see `pending_faulting_class`.
+                let delivery = if faulted_in_v86 {
+                    crate::timing_class::TimingClass::ExceptionDeliveryV86
+                } else {
+                    crate::timing_class::TimingClass::ExceptionDelivery
+                };
+                #[cfg(feature = "timing-class-histogram")]
+                self.class_histogram.record_system_event(delivery);
+                let mut core_clocks = self.class_table().raw(delivery);
+                if self.timing_epoch() >= 2
+                    && let Some(class) = faulting_class
+                {
+                    core_clocks = core_clocks.saturating_add(self.class_table().raw(class));
+                }
                 CycleOutcome {
-                    core_clocks: 59,
+                    core_clocks,
                     halted: false,
                 }
             }

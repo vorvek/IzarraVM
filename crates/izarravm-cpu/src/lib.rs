@@ -15,7 +15,7 @@ mod cpu_core;
 pub(crate) use cpu_core::TranslationFlushReason;
 mod decode;
 mod execute;
-mod execute_extended;
+pub(crate) mod execute_extended;
 mod flags;
 mod fpu;
 mod fpu_exec;
@@ -2884,6 +2884,18 @@ pub struct CpuGsw {
     /// hot path, so there is no env knob and a plain build has no field.
     #[cfg(feature = "timing-class-histogram")]
     class_histogram: Box<timing_class::TimingHistogram>,
+    /// The class the instruction that is ABOUT to fault would have charged.
+    ///
+    /// Written only on a path that immediately returns `Err`, and `take`n by
+    /// `finish_instruction`'s exception arm, so the success path never touches
+    /// it and no stale value can be read. See
+    /// `check_io_permission_charging`, the one family wired up.
+    pending_faulting_class: Option<timing_class::TimingClass>,
+    /// The class a far transfer's DESCRIPTOR earns -- gate, TSS or plain
+    /// protected-mode segment. Written by `far_system_transfer`, which is the
+    /// only place the descriptor type is known, and taken by the `0x9a` /
+    /// `0xea` / `0xca` / `0xcb` charge sites. `None` means a real-mode transfer.
+    pending_transfer_class: Option<timing_class::TimingClass>,
     // The guest-clock model epoch (`IZARRAVM_TIMING_EPOCH`), copied in ONCE from
     // `Machine::timing_epoch` at construction via `set_timing_epoch`. Unset = 1.
     // It may never change mid-run -- the JIT caches per-block raw clocks
@@ -3179,6 +3191,8 @@ impl Default for CpuGsw {
             native_callout: jit::direct::CallOutTable::default(),
             #[cfg(feature = "jit")]
             native_table_slots: jit::direct::NativeTableSlots::default(),
+            pending_faulting_class: None,
+            pending_transfer_class: None,
             #[cfg(feature = "timing-class-histogram")]
             class_histogram: Box::default(),
             timing_epoch: 1,

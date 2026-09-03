@@ -1343,7 +1343,7 @@ impl CpuGsw {
             0xe4 => {
                 // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::InPort)?;
                 let value = bus.read_io(
                     port,
                     BusWidth::Byte,
@@ -1356,7 +1356,12 @@ impl CpuGsw {
             0xe5 => {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::InPortDword,
+                )?;
                 let value = bus.read_io(
                     port,
                     operand_size.bus_width(),
@@ -1369,7 +1374,7 @@ impl CpuGsw {
             0xe6 => {
                 // OUT imm8, AL: byte port output from AL.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::OutPort)?;
                 bus.write_io(
                     port,
                     BusWidth::Byte,
@@ -1382,7 +1387,12 @@ impl CpuGsw {
             0xe7 => {
                 // OUT imm8, AX/EAX: word/dword port output from the accumulator.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::OutPort,
+                )?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -1395,7 +1405,7 @@ impl CpuGsw {
             0xec => {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::InPort)?;
                 let value = bus.read_io(
                     port,
                     BusWidth::Byte,
@@ -1408,7 +1418,12 @@ impl CpuGsw {
             0xed => {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::InPortDword,
+                )?;
                 let value = bus.read_io(
                     port,
                     operand_size.bus_width(),
@@ -1421,7 +1436,7 @@ impl CpuGsw {
             0xee => {
                 // OUT DX, AL: byte port output addressed by DX.
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::OutPort)?;
                 bus.write_io(
                     port,
                     BusWidth::Byte,
@@ -1434,7 +1449,12 @@ impl CpuGsw {
             0xef => {
                 // OUT DX, AX/EAX: word/dword port output addressed by DX.
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::OutPort,
+                )?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -1562,5 +1582,39 @@ pub(crate) fn group3_class(sub_opcode: u8, width: BusWidth, operand: RmOperand) 
             BusWidth::Word => TimingClass::Idiv16,
             _ => TimingClass::Idiv32,
         },
+    }
+}
+
+impl CpuGsw {
+    /// `check_io_permission`, naming the class the FAULTING INSTRUCTION would
+    /// have charged had it completed.
+    ///
+    /// Slice 8, and the reason the wrapper exists at all: the exception arm in
+    /// `finish_instruction` REPLACES the faulting instruction's charge with the
+    /// delivery cost, so a reflected V86 `IN` used to cost 4.92 guest clocks
+    /// where a real one costs the trap gate PLUS the `IN` -- census row 7. The
+    /// class is stashed only on the path that is about to return `Err`, so the
+    /// success path pays nothing and no stale value can survive: the Err arm
+    /// `take`s it, and nothing else writes it.
+    ///
+    /// SCOPE, stated rather than implied: port I/O is the only family wired up.
+    /// It is the one the census names and the one the reflected-call memo
+    /// replays. Every other fault still charges delivery alone, which is the
+    /// pre-slice behaviour and is recorded as such on
+    /// `TimingClass::ExceptionDelivery`.
+    fn check_io_permission_charging<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        port: u16,
+        width: BusWidth,
+        class: TimingClass,
+    ) -> ExecResult<()> {
+        match self.check_io_permission(bus, port, width) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.pending_faulting_class = Some(class);
+                Err(error)
+            }
+        }
     }
 }

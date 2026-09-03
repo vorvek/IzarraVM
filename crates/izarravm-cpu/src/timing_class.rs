@@ -355,6 +355,21 @@ timing_classes! {
     /// epoch-1 value. The epoch-2 entries take the slower of the two families,
     /// `CallFar`, per the 12:15 ruling.
     CallJmpFarMem = (11, 216, 60, "F2 (CALL far indirect 5 real) / T10.1 (18 real)"),
+    /// A far `CALL`/`JMP`/`RETF` to a protected-mode CODE SEGMENT at the same
+    /// privilege level -- no gate, no stack switch. The one flat 17 covered
+    /// this and the three rows below it; the census measures the gate row at
+    /// 15.5x under and the TSS row at ~122x.
+    FarTransferPm = (17, 408, 264, "F2 (CALL far pm same level 22) / T10.1 (34 clk)"),
+    /// A far transfer through a CALL GATE, which switches stacks and copies
+    /// parameters.
+    FarTransferGate = (17, 828, 528, "F2 (CALL gate different level 44) / T10.1 (69 clk)"),
+    /// A far transfer through a TASK GATE or a TSS selector -- a full task
+    /// switch, and the single largest missing term the census found.
+    ///
+    /// It is here AND `TaskSwitch` is charged on the switch path itself,
+    /// because a task switch is also reachable from `IRET` with NT set and from
+    /// an interrupt through a task gate, which never touch this class.
+    FarTransferTss = (17, 2388, 2076, "F2 (CALL far to TSS 173) / T10.1 (199 clk)"),
     /// `LOOP` (`0xe2`) -- charged taken or not, one arm past both branches.
     Loop = (11, 84, 66, "486 §5 (7 clk taken) / design §3.2 (5.5 clk)"),
     /// `LOOPE`/`LOOPNE` (`0xe0`/`0xe1`).
@@ -369,6 +384,16 @@ timing_classes! {
     /// site and is a later sub-slice; charging the real-mode number in V86 is
     /// an under-charge and is recorded here rather than guessed at.
     IntN = (37, 360, 204, "486 §5 (30 clk real) / cmp §3 row 17 (17 clk real)"),
+    /// `INT imm8` taken from **V86** through a trap or interrupt gate to a
+    /// different level -- the mode `IntN` used to serve from one flat 37.
+    ///
+    /// This is the row `dev_docs/2026-09-05-v86-port-io-timing-research.md`
+    /// section 1.2 re-anchored: Intel's Interrupt Clock Counts Table gives the
+    /// V86 / trap gate, different level entry as **54**, plus **12** on a cache
+    /// miss, so 66 clocks and raw 792. The 486's own V86 gate row is 86.
+    IntNV86 = (37, 1032, 792, "F2 INT table, V86/trap gate different level 54 +12 miss / 486 §5 (86 clk)"),
+    /// `INT imm8` taken in protected mode to a different privilege level.
+    IntNPm = (37, 828, 480, "F2 INT table, pm trap gate different level 40 / T10.1 (69 clk)"),
     /// `INT 3` (`0xcc`).
     Int3 = (33, 360, 204, "486 §5 IntN / cmp §3 row 17 (INT n family)"),
     /// `INTO` (`0xce`) when the overflow flag is set.
@@ -377,6 +402,15 @@ timing_classes! {
     IntONotTaken = (3, 36, 48, "F2 (INTO not taken 4) / T10.1 (3)"),
     /// `IRET`/`IRETD` (`0xcf`).
     Iret = (22, 180, 84, "486 §5 (15 clk) / cmp §3 row 17 (7 clk real)"),
+    /// `IRET` in protected mode returning to the SAME privilege level. One flat
+    /// 22 served all four modes before slice 8; the census measures that as
+    /// 4.4x under at real mode and **14.7x** under here.
+    IretPm = (22, 432, 120, "F2 (IRET pm same level 10) / T10.1 (36 clk)"),
+    /// `IRET` in protected mode returning to a LOWER privilege level, and the
+    /// protected-to-V86 return, which Intel prices together.
+    IretPmToV86 = (22, 432, 324, "F2 (IRET pm different level 27) / T10.1 (36 clk)"),
+    /// `IRET` executed inside V86 mode.
+    IretV86 = (22, 432, 324, "F2 (IRET V86 27) / T10.1 (36 clk)"),
 
     // --- shifts, rotates, and the group-3 arm --------------------------------
     /// Shift/rotate by an immediate count OR by 1 (`0xc0`/`0xc1`/`0xd0`/`0xd1`).
@@ -544,6 +578,37 @@ timing_classes! {
     /// `IN eAX, imm8`/`IN eAX, DX` at the dword width, which charge 12 from a
     /// literal rather than through `IN_PORT_CORE_CLOCKS`.
     InPortDword = (12, 204, 168, "T10.2 DX2 (IN 17 real; base i486 14). The bus term is P1's"),
+
+    // --- system events (slice 8) ----------------------------------------------
+    // Control-flow-shaped rather than opcode-shaped: these fire on a delivery
+    // path, not on a decode. Every one of them was a bare literal in `run.rs`
+    // or `control.rs`, and two of them did not exist at all.
+    /// Delivering an exception or a V86 monitor trip, from real or protected
+    /// mode. `run.rs`'s `Err(Exception)` arm charged a flat 59 for every mode.
+    ExceptionDelivery = (59, 828, 480, "F2 INT table, pm trap gate different level 40 / T10.1 (69 clk)"),
+    /// Delivering a V86 monitor trip -- the reflected-call path, and census row
+    /// 7: **16.7x under**, the worst row in its group.
+    ///
+    /// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 1.2
+    /// re-anchored it: Intel's V86 / trap gate, different level row is 54 plus
+    /// 12 on a cache miss, so 66 clocks, and a reflected V86 `IN` costs that
+    /// plus the instruction's own class -- the ~88-100 the research quotes,
+    /// once the `IN` itself is added back.
+    ExceptionDeliveryV86 = (59, 1032, 792, "F2 INT table, V86/trap gate different level 54 +12 miss / 486 §5 (86 clk)"),
+    /// Delivering a maskable hardware interrupt. `run.rs` charged a flat 61.
+    /// The INTA cycles the PIC drives are NOT in this number and are not
+    /// modelled anywhere -- the census lists 8259A INTA as missing entirely.
+    HardwareInterrupt = (61, 372, 192, "F2 INT table, real mode 11 + external INTA / T10.1 (31 clk)"),
+    /// A TASK SWITCH: `JMP`/`CALL` through a TSS or task gate, an interrupt
+    /// through a task gate, and `IRET` with NT set.
+    ///
+    /// **This term did not exist.** The switch rode whichever of 17 / 22 / 37 /
+    /// 59 delivered it, which the census scores as under by 100x or more. Its
+    /// epoch-1 entry is ZERO for exactly that reason -- there was no literal to
+    /// preserve, and charging one at epoch 1 would break the knob-unset
+    /// identity bar. It is the one class whose epoch-1 value is not a literal
+    /// it replaced, and the only class exempt from the non-zero test.
+    TaskSwitch = (0, 2388, 2076, "F2 (task switch 173+) / T10.1 (199 clk); NEW, no epoch-1 term existed"),
 
     // --- x87 -----------------------------------------------------------------
     // Every x87 charge is scaled a second time by `fp_timing_class`, which is a
@@ -889,6 +954,9 @@ const _: () = assert!(
 #[derive(Clone)]
 pub(crate) struct TimingHistogram {
     counts: [u64; N_CLASSES],
+    /// Slice 8's system events, counted apart from retires. See
+    /// `record_system_event`.
+    system_events: Box<[u64; N_CLASSES]>,
     unattributed: u64,
 }
 
@@ -923,6 +991,7 @@ impl Default for TimingHistogram {
     fn default() -> Self {
         Self {
             counts: [0; N_CLASSES],
+            system_events: Box::new([0; N_CLASSES]),
             unattributed: 0,
         }
     }
@@ -965,6 +1034,38 @@ impl TimingHistogram {
     /// Instructions this histogram knows retired but cannot place in a class.
     pub(crate) fn record_unattributed(&mut self, instructions: u64) {
         self.unattributed += instructions;
+    }
+
+    /// One SYSTEM EVENT: a delivery, a task switch, a mode-keyed far transfer.
+    ///
+    /// Kept apart from the retire counts on purpose. A system event is not a
+    /// retire -- an exception delivery charges clocks without retiring an
+    /// instruction, and a task switch charges them from inside `control.rs` --
+    /// so folding either into `counts` would make `class_clocks / attributed`
+    /// stop meaning clocks per retired instruction. Slice 8 is the slice that
+    /// makes these numbers move, and this is how their contribution is read.
+    pub(crate) fn record_system_event(&mut self, class: TimingClass) {
+        if let TimingClass::Legacy(_) = class {
+            return;
+        }
+        self.system_events[class.index()] += 1;
+    }
+
+    /// `(class name, count)` for every system event that fired.
+    pub(crate) fn system_event_rows(&self) -> Vec<(&'static str, u64)> {
+        TimingClass::ALL
+            .iter()
+            .filter(|class| self.system_events[class.index()] != 0)
+            .map(|class| (class.name(), self.system_events[class.index()]))
+            .collect()
+    }
+
+    /// The clocks those system events cost under `table`.
+    pub(crate) fn system_event_clocks(&self, table: &ClassTable) -> u64 {
+        TimingClass::ALL
+            .iter()
+            .map(|class| u64::from(table.raw(*class)) * self.system_events[class.index()])
+            .sum()
     }
 
     /// `(class name, count)` for every class with a nonzero count, plus the

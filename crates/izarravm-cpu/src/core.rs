@@ -1381,6 +1381,18 @@ impl CpuGsw {
         self.class_histogram.rows()
     }
 
+    /// Slice 8's system events that fired, by class.
+    #[cfg(feature = "timing-class-histogram")]
+    pub fn class_histogram_system_event_rows(&self) -> Vec<(&'static str, u64)> {
+        self.class_histogram.system_event_rows()
+    }
+
+    /// The clocks those system events cost under the running table.
+    #[cfg(feature = "timing-class-histogram")]
+    pub fn class_histogram_system_event_clocks(&self) -> u64 {
+        self.class_histogram.system_event_clocks(self.class_table)
+    }
+
     /// `(class clocks, attributed retires, unattributed retires)`.
     #[cfg(feature = "timing-class-histogram")]
     pub fn class_histogram_totals(&self) -> (u64, u64, u64) {

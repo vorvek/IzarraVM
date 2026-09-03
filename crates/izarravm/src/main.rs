@@ -2315,6 +2315,11 @@ fn write_hdd_profile_json(
     #[cfg(feature = "timing-class-histogram")]
     {
         let (class_clocks, attributed, unattributed) = machine.cpu().class_histogram_totals();
+        let system_event_clocks = machine.cpu().class_histogram_system_event_clocks();
+        let mut events = serde_json::Map::new();
+        for (name, count) in machine.cpu().class_histogram_system_event_rows() {
+            events.insert(name.to_string(), json!(count));
+        }
         let mut rows = serde_json::Map::new();
         for (name, count) in machine.cpu().class_histogram_rows() {
             rows.insert(name.to_string(), json!(count));
@@ -2327,6 +2332,13 @@ fn write_hdd_profile_json(
             "class_clocks_per_attributed_retire":
                 class_clocks as f64 / (attributed as f64).max(1.0),
             "counts": serde_json::Value::Object(rows),
+            // Slice 8's system events, counted APART from retires: an exception
+            // delivery charges clocks without retiring an instruction and a task
+            // switch charges them from inside `control.rs`, so folding either
+            // into `counts` would stop `class_clocks / attributed_retires`
+            // meaning clocks per retired instruction.
+            "system_event_clocks": system_event_clocks,
+            "system_events": serde_json::Value::Object(events),
         });
     }
     #[cfg(feature = "direct-link-refusal-census")]

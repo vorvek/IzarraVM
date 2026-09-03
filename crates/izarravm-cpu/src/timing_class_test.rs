@@ -74,15 +74,23 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::JmpFar, 17),
     (TimingClass::RetFar, 17),
     (TimingClass::CallJmpFarMem, 11),
+    (TimingClass::FarTransferPm, 17),
+    (TimingClass::FarTransferGate, 17),
+    (TimingClass::FarTransferTss, 17),
     (TimingClass::Loop, 11),
     (TimingClass::LoopCc, 11),
     (TimingClass::Jcxz, 9),
     (TimingClass::Nop, 3),
     (TimingClass::IntN, 37),
+    (TimingClass::IntNV86, 37),
+    (TimingClass::IntNPm, 37),
     (TimingClass::Int3, 33),
     (TimingClass::IntO, 35),
     (TimingClass::IntONotTaken, 3),
     (TimingClass::Iret, 22),
+    (TimingClass::IretPm, 22),
+    (TimingClass::IretPmToV86, 22),
+    (TimingClass::IretV86, 22),
     (TimingClass::ShiftImm, 2),
     (TimingClass::ShiftCl, 2),
     (TimingClass::DoubleShift, 3),
@@ -138,6 +146,10 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::InPort, 12),
     (TimingClass::OutPort, 10),
     (TimingClass::InPortDword, 12),
+    (TimingClass::ExceptionDelivery, 59),
+    (TimingClass::ExceptionDeliveryV86, 59),
+    (TimingClass::HardwareInterrupt, 61),
+    (TimingClass::TaskSwitch, 0),
     (TimingClass::X87Wait, 6),
     (TimingClass::X87MemArith32, 20),
     (TimingClass::X87MemArith64, 20),
@@ -226,6 +238,16 @@ fn epoch_one_charges_the_pinned_literal_for_every_class() {
 fn every_class_charges_something_in_every_persona_table() {
     for table in [&EPOCH1, &EPOCH2_I486, &EPOCH2_I586] {
         for class in TimingClass::ALL {
+            // `TaskSwitch` is the one class whose epoch-1 entry is not a literal
+            // it replaced: no task-switch term existed at all before slice 8
+            // (the census scores that as under by 100x or more), and inventing
+            // one at epoch 1 would break the knob-unset identity bar. Its
+            // epoch-2 columns are real and are asserted instead.
+            if *class == TimingClass::TaskSwitch {
+                assert_eq!(EPOCH1.raw(*class), 0);
+                assert!(EPOCH2_I486.raw(*class) > 0 && EPOCH2_I586.raw(*class) > 0);
+                continue;
+            }
             assert!(
                 table.raw(*class) > 0,
                 "{} charges zero clocks",
@@ -742,4 +764,118 @@ fn the_histogram_attributes_a_block_exactly_and_never_guesses() {
     assert_eq!(rows["Reg"], 4);
     assert_eq!(rows["Jcc"], 4);
     assert_eq!(rows.len(), 2);
+}
+
+/// Slice 8's mode-keyed system rows. Every one of them was a single flat
+/// literal that covered two to four modes Intel prices apart, and every one of
+/// them still charges that literal at epoch 1.
+#[test]
+fn the_system_event_rows_are_mode_keyed_and_epoch_one_flat() {
+    use crate::execute_extended::{int_n_class, iret_class};
+
+    // At epoch 1 every mode row carries the literal its one flat arm charged, so
+    // the split is invisible to a knob-unset run. That is the merge bar.
+    for class in [TimingClass::IntN, TimingClass::IntNPm, TimingClass::IntNV86] {
+        assert_eq!(EPOCH1.raw(class), crate::INT_IMM8_CORE_CLOCKS);
+    }
+    for class in [
+        TimingClass::Iret,
+        TimingClass::IretPm,
+        TimingClass::IretV86,
+        TimingClass::IretPmToV86,
+    ] {
+        assert_eq!(EPOCH1.raw(class), 22);
+    }
+    for class in [
+        TimingClass::CallFar,
+        TimingClass::JmpFar,
+        TimingClass::RetFar,
+        TimingClass::FarTransferPm,
+        TimingClass::FarTransferGate,
+        TimingClass::FarTransferTss,
+    ] {
+        assert_eq!(EPOCH1.raw(class), 17);
+    }
+    assert_eq!(EPOCH1.raw(TimingClass::ExceptionDelivery), 59);
+    assert_eq!(EPOCH1.raw(TimingClass::ExceptionDeliveryV86), 59);
+    assert_eq!(EPOCH1.raw(TimingClass::HardwareInterrupt), 61);
+
+    // At epoch 2 they separate, and in the direction the census measured.
+    assert!(EPOCH2_I586.raw(TimingClass::IntNV86) > EPOCH2_I586.raw(TimingClass::IntN));
+    assert!(EPOCH2_I586.raw(TimingClass::IretPmToV86) > EPOCH2_I586.raw(TimingClass::Iret));
+    assert!(
+        EPOCH2_I586.raw(TimingClass::FarTransferTss)
+            > 7 * EPOCH2_I586.raw(TimingClass::FarTransferPm),
+        "the census scores the TSS row at ~122x the flat 17 it rode"
+    );
+    // Census row 7: the V86 monitor trip, 16.7x under at epoch 1.
+    let trip = f64::from(EPOCH2_I586.raw(TimingClass::ExceptionDeliveryV86))
+        / f64::from(EPOCH1.raw(TimingClass::ExceptionDeliveryV86));
+    assert!(
+        (13.0..=14.0).contains(&trip),
+        "the V86 trip moved by {trip:.1}x; the census predicted ~16.7x against a 59 that also \
+         replaced the faulting instruction's charge, and slice 8 adds that charge back separately"
+    );
+
+    // The classifiers pick the documented rows.
+    assert_eq!(int_n_class(false, false), TimingClass::IntN);
+    assert_eq!(int_n_class(true, false), TimingClass::IntNPm);
+    assert_eq!(int_n_class(true, true), TimingClass::IntNV86);
+    assert_eq!(iret_class(false, false, 0, false, 0), TimingClass::Iret);
+    assert_eq!(iret_class(true, true, 3, true, 3), TimingClass::IretV86);
+    assert_eq!(
+        iret_class(true, false, 0, true, 3),
+        TimingClass::IretPmToV86
+    );
+    assert_eq!(
+        iret_class(true, false, 0, false, 3),
+        TimingClass::IretPmToV86
+    );
+    assert_eq!(iret_class(true, false, 0, false, 0), TimingClass::IretPm);
+    assert_eq!(iret_class(true, false, 3, false, 3), TimingClass::IretPm);
+}
+
+/// The task-switch term is the one class with NO epoch-1 literal, because there
+/// was no term at all: a switch rode whichever of 17 / 22 / 37 / 59 delivered
+/// it. Charging zero at epoch 1 is what keeps the knob-unset identity bar.
+#[test]
+fn the_task_switch_term_is_new_and_free_at_epoch_one() {
+    assert_eq!(EPOCH1.raw(TimingClass::TaskSwitch), 0);
+    assert_eq!(EPOCH2_I586.raw(TimingClass::TaskSwitch), 2076);
+    assert_eq!(EPOCH2_I486.raw(TimingClass::TaskSwitch), 2388);
+    // It is the ONLY zero in the epoch-1 column; anything else at zero is a
+    // class that lost its literal.
+    let zeros: Vec<_> = TimingClass::ALL
+        .iter()
+        .filter(|class| EPOCH1.raw(**class) == 0)
+        .map(|class| class.name())
+        .collect();
+    assert_eq!(zeros, vec!["TaskSwitch"]);
+}
+
+/// System events are counted APART from retires, so `class_clocks / attributed`
+/// keeps meaning clocks per retired instruction.
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn system_events_do_not_enter_the_retire_counts() {
+    let mut hist = TimingHistogram::default();
+    hist.record(TimingClass::Reg);
+    hist.record_system_event(TimingClass::ExceptionDeliveryV86);
+    hist.record_system_event(TimingClass::ExceptionDeliveryV86);
+    hist.record_system_event(TimingClass::TaskSwitch);
+
+    assert_eq!(hist.attributed(), 1, "a delivery retires no instruction");
+    assert_eq!(
+        hist.class_clocks(&EPOCH2_I586),
+        12,
+        "one Reg, and nothing else"
+    );
+    let events: std::collections::HashMap<_, _> = hist.system_event_rows().into_iter().collect();
+    assert_eq!(events["ExceptionDeliveryV86"], 2);
+    assert_eq!(events["TaskSwitch"], 1);
+    assert_eq!(
+        hist.system_event_clocks(&EPOCH2_I586),
+        2 * 792 + 2076,
+        "two V86 trips and a task switch"
+    );
 }

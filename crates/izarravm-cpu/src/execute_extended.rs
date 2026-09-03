@@ -918,7 +918,10 @@ impl CpuGsw {
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 #[cfg(feature = "reflected-call-memo")]
                 crate::reflected_call_memo::on_far_transfer(self, bus);
-                Ok(self.charge(TimingClass::CallFar))
+                {
+                    let class = self.far_transfer_class(TimingClass::CallFar);
+                    Ok(self.charge(class))
+                }
             }
             0xea => {
                 // JMP far direct. Same far-pointer reconstruction, via the far-jump helper.
@@ -929,7 +932,10 @@ impl CpuGsw {
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 #[cfg(feature = "reflected-call-memo")]
                 crate::reflected_call_memo::on_far_transfer(self, bus);
-                Ok(self.charge(TimingClass::JmpFar))
+                {
+                    let class = self.far_transfer_class(TimingClass::JmpFar);
+                    Ok(self.charge(class))
+                }
             }
             0xc2 => {
                 // RET near, release imm16 bytes of arguments. `decode` fetched the release count into
@@ -951,7 +957,10 @@ impl CpuGsw {
                 #[cfg(feature = "retf-arity-census")]
                 self.note_retf_target(site);
                 self.release_stack(release);
-                Ok(self.charge(TimingClass::RetFar))
+                {
+                    let class = self.far_transfer_class(TimingClass::RetFar);
+                    Ok(self.charge(class))
+                }
             }
             0xcb => {
                 #[cfg(feature = "retf-arity-census")]
@@ -959,7 +968,10 @@ impl CpuGsw {
                 self.return_far(bus, operand_size, 0)?;
                 #[cfg(feature = "retf-arity-census")]
                 self.note_retf_target(site);
-                Ok(self.charge(TimingClass::RetFar))
+                {
+                    let class = self.far_transfer_class(TimingClass::RetFar);
+                    Ok(self.charge(class))
+                }
             }
             0xcc => {
                 // INT 3: one-byte breakpoint trap to vector 3, via the shared delivery path.
@@ -992,8 +1004,12 @@ impl CpuGsw {
                     bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
                     self.check_v86_iopl()?;
                 }
+                // Read BEFORE delivery: `software_interrupt` loads the handler's
+                // CS and can leave V86, and Intel prices the gate by the mode the
+                // INSTRUCTION executed in.
+                let mode = int_n_class(self.control.cr0 & CR0_PE != 0, self.is_v86_mode());
                 self.software_interrupt(bus, vector)?;
-                Ok(self.charge(TimingClass::IntN))
+                Ok(self.charge(mode))
             }
             0xce => {
                 // INTO: trap to vector 4 only when OF is set; otherwise a no-op.
@@ -1010,8 +1026,21 @@ impl CpuGsw {
                 // and the pop reaches real EFLAGS; the gate still serves any IOPL-0
                 // V86 configuration. Mirrors CLI/STI/PUSHF/POPF.
                 self.check_v86_iopl()?;
+                // The MODE is read BEFORE the return, deliberately: `iret` can
+                // switch mode (a protected-mode return into V86 sets VM), and
+                // Intel prices the transfer by where it STARTED and where it
+                // landed, not by where it ended up alone.
+                let from_v86 = self.is_v86_mode();
+                let from_cpl = self.current_privilege_level();
+                let protected = self.control.cr0 & CR0_PE != 0;
                 self.iret(bus, operand_size)?;
-                Ok(self.charge(TimingClass::Iret))
+                Ok(self.charge(iret_class(
+                    protected,
+                    from_v86,
+                    from_cpl,
+                    self.is_v86_mode(),
+                    self.current_privilege_level(),
+                )))
             }
             0xff => {
                 // Group 5. The /ext is `modrm.reg`. `decode` pre-parsed the ModRM + descriptor; the
@@ -1699,5 +1728,72 @@ pub(crate) fn bit_string_class(op: u8) -> TimingClass {
         TimingClass::BitTest
     } else {
         TimingClass::BitTestModify
+    }
+}
+
+/// The charge class for `IRET`, by the mode it left and the mode it reached.
+///
+/// One flat `clocks(22)` covered all four rows before slice 8, which the census
+/// scores as 4.4x under at real mode and **14.7x** under on a
+/// different-privilege protected-mode return. Intel prices them apart: real 8,
+/// protected same-level 10, protected different-level and V86 27 on a P5.
+///
+/// Real mode (`CR0.PE` clear) keeps `Iret`. Inside V86 the instruction is
+/// `IretV86`. A protected-mode return that LANDS in V86, or that drops to a
+/// lower privilege level, is `IretPmToV86` -- Intel gives those the same count.
+/// Everything else is `IretPm`.
+pub(crate) fn iret_class(
+    protected: bool,
+    from_v86: bool,
+    from_cpl: u8,
+    to_v86: bool,
+    to_cpl: u8,
+) -> TimingClass {
+    if !protected {
+        return TimingClass::Iret;
+    }
+    if from_v86 {
+        return TimingClass::IretV86;
+    }
+    if to_v86 || to_cpl > from_cpl {
+        return TimingClass::IretPmToV86;
+    }
+    TimingClass::IretPm
+}
+
+/// The charge class for `INT n`, by the mode it is taken in.
+///
+/// One flat `clocks(INT_IMM8_CORE_CLOCKS)` covered all three rows, which the
+/// census scores at 5.2x under on its own units. Intel resolves the symbolic
+/// `INT` of Table F-2 through the Interrupt Clock Counts Table, and the three
+/// rows are far apart: real mode 11, a protected-mode trap gate to a different
+/// level 40, and V86 through a trap gate to a different level **54 plus 12 on a
+/// cache miss** -- the row
+/// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 1.2 re-anchored
+/// when it found the reflected-trip figure of 45 was taken from the unreachable
+/// real-mode row.
+pub(crate) fn int_n_class(protected: bool, v86: bool) -> TimingClass {
+    if v86 {
+        TimingClass::IntNV86
+    } else if protected {
+        TimingClass::IntNPm
+    } else {
+        TimingClass::IntN
+    }
+}
+
+impl CpuGsw {
+    /// The class a far transfer earns, given the real-mode default its opcode
+    /// would otherwise charge.
+    ///
+    /// `far_system_transfer` records a gate / TSS / protected class when the
+    /// transfer went through a system descriptor; a real-mode transfer records
+    /// nothing and keeps its own row. Taking rather than peeking is what stops a
+    /// gate transfer's class from being read a second time by the next
+    /// real-mode `RETF`.
+    fn far_transfer_class(&mut self, real_mode_default: TimingClass) -> TimingClass {
+        self.pending_transfer_class
+            .take()
+            .unwrap_or(real_mode_default)
     }
 }
