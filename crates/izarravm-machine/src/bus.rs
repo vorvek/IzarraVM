@@ -327,7 +327,34 @@ pub(super) enum PortBusClass {
     Unclaimed,
 }
 
+/// How many `PortBusClass` variants there are, and therefore how wide the per-class access
+/// histogram is. Written beside the enum, and `PortBusClass::LABELS` below is asserted to be this
+/// long, so a new class cannot land with a histogram that silently drops it.
+pub(crate) const PORT_BUS_CLASS_COUNT: usize = 5;
+
 impl PortBusClass {
+    /// The histogram index for this class -- `Machine::port_accesses_by_class` and the profile
+    /// JSON's `port_accesses_by_class` are both in this order, and `LABELS` names the same rows.
+    pub(super) const fn index(self) -> usize {
+        match self {
+            PortBusClass::IsaXBus => 0,
+            PortBusClass::PciLegacyVga => 1,
+            PortBusClass::PciTarget => 2,
+            PortBusClass::ChipsetInternal => 3,
+            PortBusClass::Unclaimed => 4,
+        }
+    }
+
+    /// The JSON key for each histogram row, in `index()` order. Exported so the reporting crate
+    /// does not carry its own copy of the class names.
+    pub const LABELS: [&'static str; PORT_BUS_CLASS_COUNT] = [
+        "isa_x_bus",
+        "pci_legacy_vga",
+        "pci_target",
+        "chipset_internal",
+        "unclaimed",
+    ];
+
     /// Unscaled guest clocks at 166.667 MHz, before the `saturating_sub` composition in
     /// `port_bus_batch_clocks` (design §1.3).
     pub(super) const fn clocks(self) -> u64 {
@@ -498,6 +525,7 @@ impl Machine {
             ata_poll_skip_slice_too_short: self.ata_poll_skip_slice_too_short,
             ata_poll_skip: &mut self.ata_poll_skip,
             isa_io_clocks: &mut self.port_bus_batch_clocks,
+            port_accesses_by_class: &mut self.port_accesses_by_class,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
             shadow_l1: &mut self.shadow_l1,
@@ -1250,8 +1278,13 @@ impl MachineBus<'_> {
     /// recalibration slice 2), the subtrahend must be scaled by it too, exactly as the design's
     /// §7 slice-order note requires.
     fn charge_port_bus(&mut self, port: u16) {
+        let class = port_bus_class(port);
+        // Counted FIRST and in every epoch, before any charge decision: this is the ladder's
+        // denominator, and a count taken inside the epoch-2 arm could not tell a row that makes
+        // fewer accesses from one whose accesses merely cost more.
+        self.port_accesses_by_class[class.index()] += 1;
         if self.timing_epoch >= 2 {
-            let class_clocks = port_bus_class(port).clocks();
+            let class_clocks = class.clocks();
             let generic_raw = u64::from(BusCycle::clocks_for(BusWidth::Byte, self.wait_states.io));
             let scaled_generic = (generic_raw * u64::from(self.bus_num_at_batch_start))
                 / u64::from(self.bus_den_at_batch_start);

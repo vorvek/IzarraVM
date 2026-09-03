@@ -1599,6 +1599,12 @@ pub struct Machine {
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
     port_bus_batch_clocks: u64,
+    // DIAGNOSTIC ONLY, never read by an emulation decision: how many port accesses this run has
+    // made in each `PortBusClass`, indexed by `PortBusClass::index()`. Counted in BOTH epochs and
+    // whatever the class charge is, which is the point -- the P1 ladder compares the SAME
+    // population across the epoch, and a counter that only existed under epoch 2 could not say
+    // whether a row's accesses moved or only their price did. Never canonical.
+    port_accesses_by_class: [u64; crate::bus::PORT_BUS_CLASS_COUNT],
     // Master-timeline instant until which a PIT counter observer is assumed live,
     // set by any access to the counter data ports or the control port and read by
     // `fine_batch_grain_required`. Counter VALUES no longer depend on it:
@@ -2049,6 +2055,12 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
+/// The JSON/report key for each row of `Machine::port_accesses_by_class`, in that array's order.
+/// Re-exported from the private `bus` module so the reporting crate does not carry its own copy of
+/// the class names, and so a new class cannot be added without this list failing to compile.
+pub const PORT_BUS_CLASS_LABELS: [&str; crate::bus::PORT_BUS_CLASS_COUNT] =
+    crate::bus::PortBusClass::LABELS;
+
 impl Machine {
     /// Shared field initialization for the public constructors. They differ only
     /// in the CPU entry state and the ROM image, so each hands those in and
@@ -2116,6 +2128,7 @@ impl Machine {
             ata_poll_skip: AtaPollSkipDiagnostics::new(run::ata_poll_skip_diag_default()),
             ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
             port_bus_batch_clocks: 0,
+            port_accesses_by_class: [0; crate::bus::PORT_BUS_CLASS_COUNT],
             pit_observer_fine_until: 0,
             device_edge_cache: timing::DeviceEdgeCache::Stale,
             device_edge_batches: 0,
@@ -3329,6 +3342,15 @@ impl Machine {
         self.timing_epoch
     }
 
+    /// Port accesses this run, by bus class, in `PortBusClass::index()` order --
+    /// `[IsaXBus, PciLegacyVga, PciTarget, ChipsetInternal, Unclaimed]`. Counted in both epochs
+    /// (see the field), so the P1 ladder can separate "the row makes fewer accesses" from "the
+    /// same accesses cost more". Diagnostic only; the profile JSON reports it as
+    /// `port_accesses_by_class`.
+    pub fn port_accesses_by_class(&self) -> [u64; crate::bus::PORT_BUS_CLASS_COUNT] {
+        self.port_accesses_by_class
+    }
+
     /// F7: how many times the io poll skip's own certificate refused structurally because the
     /// epoch was >= 2, since construction. Diagnostic only.
     pub fn poll_skip_epoch_refusals(&self) -> u64 {
@@ -3893,6 +3915,8 @@ struct MachineBus<'a> {
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::port_bus_batch_clocks`.
     isa_io_clocks: &'a mut u64,
+    // Points at `Machine::port_accesses_by_class`. Diagnostic only; see that field.
+    port_accesses_by_class: &'a mut [u64; crate::bus::PORT_BUS_CLASS_COUNT],
     // Points at `Machine::pit_observer_fine_until`. Armed by any PIT counter or
     // control port access; see that field.
     pit_observer_fine_until: &'a mut u64,

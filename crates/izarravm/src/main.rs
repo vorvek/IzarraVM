@@ -2162,6 +2162,13 @@ fn write_hdd_profile_json(
         .sum::<u64>();
     let total_wall_ns = wall.as_nanos().min(u128::from(u64::MAX)) as u64;
     let margo_display = machine.margo_display();
+    let port_accesses_by_class_json = serde_json::Value::Object(
+        izarravm_machine::PORT_BUS_CLASS_LABELS
+            .iter()
+            .zip(machine.port_accesses_by_class())
+            .map(|(label, count)| ((*label).to_string(), json!(count)))
+            .collect(),
+    );
     #[allow(unused_mut)]
     let mut report = json!({
         "schema": "izarravm-hdd-profile-v2",
@@ -2174,6 +2181,11 @@ fn write_hdd_profile_json(
         // a change alters guest clocks charged per instruction for any persona; rt numbers
         // recorded under different epochs are not comparable as performance.
         "timing_model_epoch": machine.timing_epoch(),
+        // Port accesses this run, by bus class (`izarravm_machine::PortBusClass`). Counted in
+        // BOTH epochs, so a P1 ladder leg can separate "this row makes fewer port accesses" from
+        // "the same accesses cost more" -- the accounting-closure check the design's section 6
+        // requires on every moved row. Diagnostic only; no emulation decision reads it.
+        "port_accesses_by_class": port_accesses_by_class_json,
         "cycle_budget": budget,
         "stop": stop_reason_json(stop_reason),
         "wall_seconds": wall_seconds,
