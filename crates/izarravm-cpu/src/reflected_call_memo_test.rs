@@ -935,3 +935,114 @@ fn disarmed_key_still_counts_trips_seen_and_disarmed_returns() {
     assert_eq!(ks.disarmed_returns, 1);
     assert!(state.open.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Fable re-review 2026-09-03, nit (i): a hardware interrupt inside a trip
+// must report as `hardware_interrupt`, not whatever hazard its own EOI
+// (an `OUT`) happens to also set.
+// ---------------------------------------------------------------------------
+
+/// **Mutation bite**: swap the order back (test `open.hazard` before
+/// `open.hw_interrupt_seen`) and this test fails: the trip reports
+/// `port_io` instead of `hardware_interrupt`, exactly the defect the
+/// re-review traced (447 misattributed refusals on one recipe-A run).
+#[test]
+fn a_hardware_interrupt_inside_a_trip_reports_as_hardware_interrupt_not_port_io() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let mut open = test_open_trip(&cpu);
+    open.hw_interrupt_seen = true;
+    open.hazard = Some(LearnRefused::PortIo); // the IRQ's own EOI, an OUT
+    finish_trip(&mut cpu, &bus, open, true);
+    let key = key_for(&cpu, VECTOR, 0);
+    let ks = cpu
+        .reflected_call
+        .as_ref()
+        .unwrap()
+        .keys
+        .get(&key)
+        .expect("recorded");
+    assert_eq!(ks.learn_refused[LearnRefused::HardwareInterrupt.index()], 1);
+    assert_eq!(ks.learn_refused[LearnRefused::PortIo.index()], 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fable re-review 2026-09-03, campaign verdict (2c): a disarmed key must
+// re-arm after MEMO_REARM_TRIPS_SEEN more trips are seen, so a budget spent
+// entirely in a menu phase cannot blind the dwell for the rest of the run.
+// ---------------------------------------------------------------------------
+
+/// **Mutation bite**: delete `maybe_rearm`'s call from `on_int` (or its threshold check): a
+/// key disarmed early (e.g. in a menu phase) would drop every remaining trip for the rest of
+/// the run, exactly INT 33h's `0x0003` key's fate before this fix.
+#[test]
+fn a_disarmed_key_rearms_after_trips_seen_advances_by_the_rearm_window() {
+    let mut ks = KeyState::default();
+    for _ in 0..MEMO_LEARN_BUDGET {
+        ks.trips_seen += 1;
+        ks.record_failure(LearnRefused::ClocksUnstable);
+    }
+    assert!(ks.disarmed);
+    let disarmed_at = ks.trips_seen;
+
+    // Just under the window: must stay disarmed.
+    ks.trips_seen = disarmed_at + MEMO_REARM_TRIPS_SEEN - 1;
+    ks.maybe_rearm();
+    assert!(
+        ks.disarmed,
+        "must not re-arm before the full window has elapsed"
+    );
+    assert_eq!(ks.rearms, 0);
+
+    // At the window: must re-arm, resetting the streak and slot.
+    ks.trips_seen = disarmed_at + MEMO_REARM_TRIPS_SEEN;
+    ks.maybe_rearm();
+    assert!(!ks.disarmed);
+    assert_eq!(ks.rearms, 1);
+    assert_eq!(ks.slot, SlotState::Warm);
+}
+
+/// Integration-level companion: a key disarmed through the real `on_int` hook re-arms through
+/// the real hook too, once `trips_seen` (bumped every occurrence, disarmed or not) reaches the
+/// window.
+#[test]
+fn on_int_rearms_a_disarmed_key_through_the_real_hook() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    {
+        let state = cpu.reflected_call.as_mut().unwrap();
+        let ks = state.keys.entry(key).or_default();
+        ks.trips_seen = 1_000_000;
+        // Disarm through the real path (four consecutive ClocksUnstable failures), so
+        // `disarmed_at_trips_seen` is stamped exactly as production code stamps it.
+        for _ in 0..MEMO_LEARN_BUDGET {
+            ks.record_failure(LearnRefused::ClocksUnstable);
+        }
+        assert!(
+            ks.disarmed,
+            "test setup: four consecutive failures must disarm"
+        );
+    }
+    on_int(&mut cpu, &bus, VECTOR); // trips_seen -> 1,000,001: still far short of the window
+    {
+        let ks = cpu.reflected_call.as_ref().unwrap().keys.get(&key).unwrap();
+        assert!(
+            ks.disarmed,
+            "must still be disarmed one trip after the disarm"
+        );
+    }
+    // Fast-forward trips_seen past the window and drive one more occurrence.
+    {
+        let state = cpu.reflected_call.as_mut().unwrap();
+        let ks = state.keys.get_mut(&key).unwrap();
+        ks.trips_seen = 1_000_001 + MEMO_REARM_TRIPS_SEEN;
+    }
+    on_int(&mut cpu, &bus, VECTOR);
+    let ks = cpu.reflected_call.as_ref().unwrap().keys.get(&key).unwrap();
+    assert!(
+        !ks.disarmed,
+        "must re-arm once trips_seen has advanced by the full window"
+    );
+    assert_eq!(ks.rearms, 1);
+}

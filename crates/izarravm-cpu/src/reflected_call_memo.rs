@@ -105,6 +105,11 @@ pub(crate) const MEMO_MAX_TRIP_INSNS: u64 = 12_608;
 /// Consecutive learn-attempt failures before a key is disarmed (plan section
 /// 4.5, corrected to count CONSECUTIVE failures by R2.9(i)).
 pub(crate) const MEMO_LEARN_BUDGET: u32 = 4;
+/// Trips a disarmed key must be SEEN (not learned -- `KeyState::trips_seen`) before it is
+/// re-armed (Fable re-review, 2026-09-03, campaign verdict 2c): a budget spent entirely inside
+/// a menu phase must not blind the dwell for the rest of the run. `2^16`, the review's own
+/// figure.
+pub(crate) const MEMO_REARM_TRIPS_SEEN: u64 = 65_536;
 /// Natural warm trips whose raw-clock triple must agree before a learn is
 /// counted (plan section 4.2 point 4).
 pub(crate) const MEMO_CLOCK_SAMPLES: usize = 8;
@@ -647,6 +652,13 @@ pub(crate) struct KeyState {
     pub trips_seen: u64,
     /// Of `trips_seen`, how many were dropped specifically because `disarmed` was already true.
     pub disarmed_returns: u64,
+    /// `trips_seen` at the moment this key was last disarmed; `on_int` re-arms once
+    /// `trips_seen` has advanced by `MEMO_REARM_TRIPS_SEEN` past this (Fable re-review,
+    /// 2026-09-03: "the disarm is never permanent... a budget spent in a menu cannot blind
+    /// the dwell").
+    disarmed_at_trips_seen: u64,
+    /// Times this key has been re-armed after a permanent-looking disarm.
+    pub rearms: u64,
     pub learn_attempts: u64,
     pub learned: u64,
     pub learn_refused: [u64; 19],
@@ -675,11 +687,29 @@ impl KeyState {
             self.consecutive_failures += 1;
             if self.consecutive_failures >= MEMO_LEARN_BUDGET {
                 self.disarmed = true;
+                self.disarmed_at_trips_seen = self.trips_seen;
             }
         }
         self.slot = SlotState::Warm;
         self.pending_journal = None;
         self.natural_samples.clear();
+    }
+
+    /// Fable re-review, 2026-09-03, campaign verdict (2c): "disarm is never permanent -- re-arm
+    /// after `trips_seen` advances by 2^16, so a budget spent in a menu cannot blind the
+    /// dwell." Called from `on_int` before the disarmed-drop check; a no-op unless the key is
+    /// both disarmed and has seen `MEMO_REARM_TRIPS_SEEN` more trips since it was disarmed.
+    fn maybe_rearm(&mut self) {
+        if self.disarmed
+            && self.trips_seen.saturating_sub(self.disarmed_at_trips_seen) >= MEMO_REARM_TRIPS_SEEN
+        {
+            self.disarmed = false;
+            self.consecutive_failures = 0;
+            self.slot = SlotState::Warm;
+            self.pending_journal = None;
+            self.natural_samples.clear();
+            self.rearms += 1;
+        }
     }
 
     fn record_success_and_reset(&mut self) {
@@ -759,6 +789,7 @@ pub(crate) fn on_int<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, vector: u8) {
     let state = cpu.reflected_call.as_mut().expect("checked above");
     let key_state = state.keys.entry(key).or_default();
     key_state.trips_seen += 1;
+    key_state.maybe_rearm();
     if key_state.disarmed {
         key_state.disarmed_returns += 1;
         return;
@@ -1052,16 +1083,21 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: b
     let state = cpu.reflected_call.as_mut().expect("checked by callers");
     let key_state = state.keys.entry(key).or_default();
 
+    // Fable re-review, 2026-09-03, nit (i): checked BEFORE `open.hazard` -- a hardware
+    // interrupt taken inside the trip (its EOI is an `OUT`) used to be reported as `port_io`
+    // (447 of them on one recipe-A run) because the port-I/O hazard was set first and this
+    // check ran second, so `hardware_interrupt` read 0 on every key even when IRQs were the
+    // real reason a trip could not be learned.
+    if open.hw_interrupt_seen {
+        key_state.record_failure(LearnRefused::HardwareInterrupt);
+        return;
+    }
     if let Some(hazard) = open.hazard {
         key_state.record_failure(hazard);
         return;
     }
     if !is_match {
         key_state.record_failure(LearnRefused::ClosedWithoutReturn);
-        return;
-    }
-    if open.hw_interrupt_seen {
-        key_state.record_failure(LearnRefused::HardwareInterrupt);
         return;
     }
     if open.stack_segments_over_cap {
@@ -1311,9 +1347,14 @@ pub(crate) fn run_compare_bench(r: usize) -> (f64, f64) {
     let start = std::time::Instant::now();
     let mut sink = 0u64;
     for _ in 0..ITERS {
+        // `black_box` on both operands of the comparison (Fable re-review, 2026-09-03, nit
+        // (v)): without it the optimizer can prove `buf[idx]` is always 0 and `expect` is
+        // always non-zero (both come from a compile-time-transparent `vec![0; r]` and an XOR
+        // with a constant) and fold the whole inner loop to nothing, which is exactly the
+        // "meaningless" result the implementer's own caveat warned about.
         for (idx, (_, expect)) in cells.iter().enumerate() {
-            let v = buf[idx];
-            sink += u64::from(v == *expect);
+            let v = std::hint::black_box(buf[idx]);
+            sink += u64::from(v == std::hint::black_box(*expect));
         }
     }
     std::hint::black_box(sink);
@@ -1340,7 +1381,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         first = false;
         out.push_str(&format!(
             "{{\"vector\":{},\"ax\":{},\"int_eip\":{},\"cs_selector\":{},\"ss_selector\":{},\"cpl\":{},\"vm\":{},\
-             \"disarmed\":{},\"trips_seen\":{},\"disarmed_returns\":{},\"learn_attempts\":{},\"learned\":{},\
+             \"disarmed\":{},\"trips_seen\":{},\"disarmed_returns\":{},\"rearms\":{},\"learn_attempts\":{},\"learned\":{},\
              \"write_class_r_pinned\":{},\"write_class_r_unpinned\":{},\
              \"write_class_d\":{},\"write_class_w_other\":{},\
              \"stability_total_attempts\":{},\"stability_stable_attempts\":{},\
@@ -1359,6 +1400,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
             ks.disarmed,
             ks.trips_seen,
             ks.disarmed_returns,
+            ks.rearms,
             ks.learn_attempts,
             ks.learned,
             ks.write_class_r_pinned,
