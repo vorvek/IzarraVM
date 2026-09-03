@@ -44,6 +44,7 @@ mod cddriver;
 mod cdimage;
 mod cdiso;
 mod cdredir;
+mod device_timing;
 mod dma;
 mod dos;
 mod pci;
@@ -1558,6 +1559,11 @@ pub struct Machine {
     // batch -- which is exactly the case the device-edge deadline cache must not
     // miss. Reset per batch alongside `io_touched`.
     exempt_io_touched: bool,
+    // The slice-9 device-timing knob (`IZARRAVM_DEVICE_TIMING`). Parsed exactly
+    // once, here at construction, and handed by copy to whichever device code
+    // path later slices (9A onward) wire it into. Unset/empty is `is_none()`
+    // and today's behaviour is byte-identical -- see `device_timing.rs`.
+    device_timing: device_timing::DeviceTimingProfile,
     // The device-armed ATA/ATAPI clock skip (`IZARRAVM_ATA_POLL_SKIP`).
     //
     // WHY THIS IS NOT THE 0x3DA POLL SKIP. That one is an instruction-eliding
@@ -2177,6 +2183,7 @@ impl Machine {
             last_int_vector: None,
             io_touched: false,
             exempt_io_touched: false,
+            device_timing: device_timing::device_timing_profile_default(),
             ata_poll_skip_enabled: run::ata_poll_skip_default(),
             ata_poll_skip_armed: false,
             ata_poll_skip_slice_too_short: false,
@@ -3836,6 +3843,15 @@ struct MachineBus<'a> {
     speaker: &'a mut speaker::Speaker,
     rtc: &'a mut rtc::Rtc,
     dma: &'a mut dma::DmaController,
+    // A per-batch copy of `Machine::device_timing`, resolved once at
+    // construction from `IZARRAVM_DEVICE_TIMING`. `Copy`, so no lifetime, the
+    // same shape as `ata_poll_skip_enabled` above.
+    //
+    // Limit: no consumer yet in slice 9-0 -- this slice adds only the knob and
+    // the plumbing that hands it to the bus; a device-family slice (9B lands
+    // the first one, `dma::read_port_timed`) is what reads it.
+    #[allow(dead_code)]
+    device_timing: device_timing::DeviceTimingProfile,
     fdc: &'a mut fdc::Fdc,
     opl: &'a mut OplChip,
     sb16: &'a mut Sb16Path,

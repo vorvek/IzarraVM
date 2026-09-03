@@ -477,6 +477,31 @@ impl Machine {
         self.ata_poll_skip_enabled
     }
 
+    /// The slice-9 `IZARRAVM_DEVICE_TIMING` profile this machine was built
+    /// with. `Copy`, resolved once at construction; see `device_timing.rs`.
+    pub(crate) fn device_timing_profile(&self) -> crate::device_timing::DeviceTimingProfile {
+        self.device_timing
+    }
+
+    /// The slice-9 `IZARRAVM_DEVICE_TIMING` per-family armed state, in the
+    /// design's own family order (`pic dma ata cd fdc kbc sb`). Every entry is
+    /// `false` on the knob-unset default. Exposed for the whole-run profile
+    /// JSON (`device_timing_json`, `izarravm/src/main.rs`) so a fixture can
+    /// confirm which families a run actually armed without re-deriving the
+    /// parse from the raw environment string.
+    pub fn device_timing_families(&self) -> [(&'static str, bool); 7] {
+        let p = self.device_timing_profile();
+        [
+            ("pic", p.pic),
+            ("dma", p.dma),
+            ("ata", p.ata),
+            ("cd", p.cd),
+            ("fdc", p.fdc),
+            ("kbc", p.kbc),
+            ("sb", p.sb),
+        ]
+    }
+
     /// Force the arm for one machine, in either direction.
     ///
     /// The shipped gate is per-MACHINE state read once at construction, not a

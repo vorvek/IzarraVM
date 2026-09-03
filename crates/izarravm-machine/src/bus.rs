@@ -519,6 +519,7 @@ impl Machine {
             speaker: &mut self.speaker,
             rtc: &mut self.rtc,
             dma: &mut self.dma,
+            device_timing: self.device_timing,
             fdc: &mut self.fdc,
             opl: &mut self.opl,
             sb16: &mut self.sb16,

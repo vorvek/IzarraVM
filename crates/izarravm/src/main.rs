@@ -2303,6 +2303,7 @@ fn write_hdd_profile_json(
         "cd_accesses": machine.cd_access_count(),
         "atapi_packet_commands": machine.atapi_packet_command_count(),
         "ata_poll_skip": ata_poll_skip_json(machine),
+        "device_timing": device_timing_json(machine),
         "katea": machine.katea_storage_counters().as_ref().map(katea_counters_json),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
         "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
@@ -3601,6 +3602,18 @@ fn pit_bulk_advance_json(machine: &izarravm_machine::Machine) -> serde_json::Val
         "declines_span_too_wide": c.declines_span_too_wide,
         "transitions": c.transitions,
     })
+}
+
+/// Slice 9 (`dev_docs/2026-09-05-device-timing-slice9-design.md`):
+/// `IZARRAVM_DEVICE_TIMING`'s per-family armed state, so a fixture can confirm
+/// which families a run actually armed without re-deriving the parse from the
+/// raw environment string. Every family is `false` on the knob-unset default.
+fn device_timing_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (name, armed) in machine.device_timing_families() {
+        map.insert(name.to_string(), json!(armed));
+    }
+    serde_json::Value::Object(map)
 }
 
 fn ata_poll_skip_json(machine: &izarravm_machine::Machine) -> serde_json::Value {

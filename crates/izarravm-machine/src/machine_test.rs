@@ -387,6 +387,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         speaker: &mut machine.speaker,
         rtc: &mut machine.rtc,
         dma: &mut machine.dma,
+        device_timing: machine.device_timing,
         fdc: &mut machine.fdc,
         opl: &mut machine.opl,
         sb16: &mut machine.sb16,

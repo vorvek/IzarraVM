@@ -1453,6 +1453,9 @@ impl Machine {
             // is: a `Copy` policy bool, resolved once per machine.
             let ata_poll_skip_enabled = self.ata_poll_skip_enabled;
             let ata_poll_skip_slice_too_short = self.ata_poll_skip_slice_too_short;
+            // Read before the destructure for the same reason: a `Copy` policy
+            // value resolved once per machine at construction.
+            let device_timing = self.device_timing;
             // Read before the destructure for the same reason, and because both sources are
             // moved into the bus below as mutable borrows. See `MachineBus::a20_open` and
             // `MachineBus::device_free_extended_floor` for what keeps them live.
@@ -1550,6 +1553,7 @@ impl Machine {
                     speaker,
                     rtc,
                     dma,
+                    device_timing,
                     fdc,
                     opl,
                     sb16,
