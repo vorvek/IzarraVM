@@ -1085,4 +1085,107 @@ fn the_epoch_is_part_of_the_memo_key() {
     set.insert(MemoKey { epoch: 1, ..b });
     set.insert(b);
     assert_eq!(set.len(), 2, "the two epochs must occupy two buckets");
+
+// ---------------------------------------------------------------------------
+// Amendment 1: A20 retire (plan Revision 2 amendments, item A, BLOCKING).
+// ---------------------------------------------------------------------------
+
+fn fake_memo() -> Memo {
+    Memo {
+        image: blank_entry_image(),
+        reads: Box::new([]),
+        translations: Box::new([]),
+        epilogue: blank_entry_image(),
+        return_eip: CLIENT_RETURN_EIP,
+        replay: Box::new([]),
+        class_r_ranges: Box::new([]),
+        raw_core_clocks: 1,
+        raw_bus_clocks: 1,
+        insns: 1,
+        code_pages: Box::new([]),
+    }
+}
+
+/// **Mutation bite**: skip the retire call in `CpuGsw::note_a20_changed` (or leave the memo
+/// cache untouched) and this test fails: a memo built while A20 was open (or closed) survives
+/// a gate toggle and the answer path would go on comparing and replaying cells resolved under
+/// the STALE gate state -- silent guest-memory corruption near the 1 MB wrap.
+#[test]
+fn an_a20_toggle_retires_every_memo() {
+    let (mut cpu, _bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key_a = MemoKey {
+        vector: VECTOR,
+        ax: 0,
+        cs_selector: CODE_SELECTOR,
+        int_eip: CLIENT_RETURN_EIP,
+        ss_selector: DATA_SELECTOR,
+        ss_big: true,
+        cpl: 0,
+        vm: false,
+    };
+    let mut key_b = key_a;
+    key_b.ax = 1;
+    {
+        let state = cpu.reflected_call.as_mut().unwrap();
+        state.memos.insert(key_a, vec![fake_memo(), fake_memo()]);
+        state.memos.insert(key_b, vec![fake_memo()]);
+    }
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().a20_retires,
+        0,
+        "no toggle yet"
+    );
+
+    cpu.note_a20_changed();
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert!(
+        state.memos.values().all(Vec::is_empty),
+        "every key's memo list must be emptied by one A20 toggle"
+    );
+    assert_eq!(
+        state.a20_retires, 3,
+        "the counter must record the COUNT of memos retired, not the number of keys"
+    );
+
+    // A second toggle with an empty cache must not double-count or panic.
+    cpu.note_a20_changed();
+    assert_eq!(cpu.reflected_call.as_ref().unwrap().a20_retires, 3);
+}
+
+/// The A20 hook fires from `izarravm-machine`'s single production seam
+/// (`izarravm-machine/src/run.rs:2023`) through `CpuGsw::note_a20_changed`; this test drives
+/// that exact public method rather than a private helper, so a future refactor that stops
+/// calling `retire_all_memos` from `note_a20_changed` (moving it to some other seam) is caught
+/// here even though it would not be caught by a unit test against `retire_all_memos` alone.
+#[test]
+fn note_a20_changed_is_the_seam_that_retires() {
+    let (mut cpu, _bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = MemoKey {
+        vector: VECTOR,
+        ax: 0,
+        cs_selector: CODE_SELECTOR,
+        int_eip: CLIENT_RETURN_EIP,
+        ss_selector: DATA_SELECTOR,
+        ss_big: true,
+        cpl: 0,
+        vm: false,
+    };
+    cpu.reflected_call
+        .as_mut()
+        .unwrap()
+        .memos
+        .insert(key, vec![fake_memo()]);
+    cpu.note_a20_changed();
+    assert!(
+        cpu.reflected_call
+            .as_ref()
+            .unwrap()
+            .memos
+            .get(&key)
+            .unwrap()
+            .is_empty()
+    );
 }

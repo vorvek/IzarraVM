@@ -741,6 +741,67 @@ impl KeyState {
 pub(crate) struct ReflectedCallMemoState {
     keys: HashMap<MemoKey, KeyState>,
     open: Option<OpenTrip>,
+    /// The answer-path memo cache: per key, up to `MEMO_IMAGES_PER_KEY` learned memos, most
+    /// recently used last (plan section 3). Empty on the record-and-measure build; the
+    /// answer-path commit populates it once a learn cycle's 8 natural samples all agree.
+    pub(crate) memos: HashMap<MemoKey, Vec<Memo>>,
+    /// `reflected_call_a20_retires` (plan Revision 2 amendments, item A): incremented by the
+    /// COUNT of memos discarded, every time `retire_all_memos` runs.
+    pub(crate) a20_retires: u64,
+}
+
+impl ReflectedCallMemoState {
+    /// Plan Revision 2 amendments, item A (BLOCKING): A20 is neither a register nor memory --
+    /// it changes the PHYSICAL address every linear access resolves to -- while every memo's
+    /// read/translation/replay set was pre-resolved to physical at record time under
+    /// whatever A20 state was in force then. A memo learned with the gate open and answered
+    /// with it closed (or vice versa) would compare and replay the WRONG physical cells.
+    /// Rather than add a 44th image field, every memo -- for every key -- retires the instant
+    /// the gate changes. Called from `CpuGsw::note_a20_changed`, the single production seam
+    /// (`izarravm-machine/src/run.rs:2023`); a coarse whole-cache flush is fine, exactly like
+    /// the code-cache/decode-cache invalidation A20 already triggers there.
+    pub(crate) fn retire_all_memos(&mut self) {
+        let mut retired = 0u64;
+        for memos in self.memos.values_mut() {
+            retired += memos.len() as u64;
+            memos.clear();
+        }
+        self.a20_retires += retired;
+    }
+}
+
+/// One learned answer-path memo (plan section 3): everything the answer path needs to
+/// reproduce a trip without running it. `image` is the ENTRY state (screen 3's comparison
+/// baseline); `epilogue` is the EXIT state captured the same way (`EntryImage::capture`),
+/// reused verbatim rather than a separate hand-rolled struct, since the two share every
+/// field the epilogue must restore (all six segments with cached descriptors, EFLAGS, the
+/// GPRs including ESP) plus fields the epilogue does not need (CR0/CR3/CR4/CPL/VM, pinned
+/// equal to the entry's own by the control-register-delta refusal already enforced at learn
+/// time) -- reusing the type costs a few unread fields, not a soundness gap.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Memo {
+    pub(crate) image: EntryImage,
+    /// Pre-resolved aligned physical dword -> value, the inputs (plan section 3/5.6).
+    pub(crate) reads: Box<[(u32, u32)]>,
+    /// Pre-resolved aligned physical PDE/PTE dword -> value (plan section 5.6).
+    pub(crate) translations: Box<[(u32, u32)]>,
+    /// The EXIT architectural state, reused for the epilogue (see the struct doc above).
+    pub(crate) epilogue: EntryImage,
+    /// `EIP` the epilogue sets: `int_eip + insn_len`, constant for a given key (plan 5.8d).
+    pub(crate) return_eip: u32,
+    /// Class W: deterministic net writes plus the live stack tail (plan 4.3/4.4), applied at
+    /// answer time through `CpuGsw::write_physical_replay`. Pre-resolved aligned physical
+    /// dword -> value.
+    pub(crate) replay: Box<[(u32, u32)]>,
+    /// Class R ranges, coalesced, for the answer-time observer test (plan 5.7 / review A.4):
+    /// (physical_lo, physical_hi_inclusive).
+    pub(crate) class_r_ranges: Box<[(u32, u32)]>,
+    pub(crate) raw_core_clocks: u64,
+    pub(crate) raw_bus_clocks: u64,
+    pub(crate) insns: u64,
+    /// Physical pages the trip fetched code from (slice 2's code-watch retire; plan section
+    /// 4 module layout, `code_pages: Box<[u32]>`).
+    pub(crate) code_pages: Box<[u32]>,
 }
 
 // ---------------------------------------------------------------------------

@@ -612,6 +612,18 @@ impl CpuGsw {
         {
             self.jit_direct.fast_map_audit.wipes_a20 += 1;
         }
+        // Reflected-call memo answer path (plan Revision 2 amendments, item A, BLOCKING):
+        // every memo's read/translation/replay set is pre-resolved to PHYSICAL addresses, and
+        // A20 changes what physical address a linear one resolves to. Retire everything.
+        // Reflected-call memo answer path (plan Revision 2 amendments, item A, BLOCKING):
+        // every memo's read/translation/replay set is pre-resolved to PHYSICAL addresses, and
+        // A20 changes what physical address a linear one resolves to. Retire everything.
+        #[cfg(feature = "reflected-call-memo")]
+        {
+            if let Some(state) = self.reflected_call.as_mut() {
+                state.retire_all_memos();
+            }
+        }
     }
 
     pub fn note_direct_map_changed(&mut self) {
