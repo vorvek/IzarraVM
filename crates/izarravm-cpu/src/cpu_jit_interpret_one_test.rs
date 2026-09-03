@@ -6879,3 +6879,256 @@ fn interpret_one_closes_the_callout_attribution_ledger() {
         assert!(snapshot.ports.is_empty(), "{name}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. LAR / LSL (`0x0F02` / `0x0F03`), the descent2 L2 lever.
+// ---------------------------------------------------------------------------
+//
+// `dev_docs/2026-09-05-586-laggard-board.md` L2: 20.6 M block-stopping exits on
+// descent2-3dfx-586, the identical `0x0f02 /1 register dword` row on tombraid-loader-586. Both
+// rows share one interpreter shape (`try_read_descriptor` plus `descriptor_accessible`,
+// `execute_extended.rs` `0x0f02`/`0x0f03`) and are exercised together here.
+//
+// Unlike every other row in this file, LAR/LSL are PROTECTED-MODE-ONLY: the interpreter's first
+// statement raises `#UD` outside protected mode, before touching any register or memory. Section
+// 6's protected-mode machinery (`protected_cpu`, `seed_protected_tables`, the GDT at `GDT_BASE`)
+// is reused rather than duplicated; only the extra inaccessible descriptor below is new.
+
+/// Index 7: a PRESENT, findable data descriptor at DPL 0 -- so `try_read_descriptor` returns
+/// `Some`, and only `descriptor_accessible`'s privilege check refuses it. This is what makes
+/// "invalid selector, ZF clear" a DIFFERENT case from "null selector" and "selector beyond the
+/// GDT limit": all three clear ZF, but only this one exercises the descriptor found/refused arm.
+const LAR_LSL_GDT_EXTRA_OFFSET: u32 = 0x40;
+/// The same descriptor, selected with RPL 3 against its DPL 0 -- `descriptor_accessible`'s
+/// `dpl >= max(cpl, rpl)` fails since CPL is 0 and RPL is 3.
+const SEL_LOW_DPL: u16 = (LAR_LSL_GDT_EXTRA_OFFSET as u16) | 3;
+/// The table limit these tests need: `SEL_LOW_DPL`'s index (7) plus the six `seed_protected_tables`
+/// already seeds. `SEL_BAD` (`0x38`) stays unpopulated and beyond this limit too -- it is still the
+/// "selector beyond the GDT limit" case even though the limit itself moved.
+const LAR_LSL_GDT_LIMIT: u16 = LAR_LSL_GDT_EXTRA_OFFSET as u16 + 7;
+
+/// `mov eax,0x1111; lar eax,edx / lsl eax,edx; inc eax; hlt`, register-source form. The slot sits
+/// in the MIDDLE for the reason `CODE`'s doc gives.
+fn lar_lsl_register_code(opcode: u8) -> Vec<u8> {
+    vec![0xB8, 0x11, 0x11, 0x00, 0x00, 0x0F, opcode, 0xC2, 0x40, 0xF4]
+}
+const LAR_LSL_REGISTER_STARTS: &[u32] = &[0, 5, 8];
+/// `mov eax,0x1111; lar eax,[ebx] / lsl eax,[ebx]; inc eax; hlt`, memory-source form. `ebx` is set
+/// to `DATA_PAGE`, off the block's own code page, the same rule every fixture in this file follows.
+fn lar_lsl_memory_code(opcode: u8) -> Vec<u8> {
+    vec![0xB8, 0x11, 0x11, 0x00, 0x00, 0x0F, opcode, 0x03, 0x40, 0xF4]
+}
+const LAR_LSL_MEMORY_STARTS: &[u32] = &[0, 5, 8];
+const LAR_LSL_BLOCK_INSTRUCTIONS: u8 = 3;
+
+/// Seed the extra low-DPL descriptor beside `seed_protected_tables`'s own six.
+fn seed_lar_lsl_tables(program: &mut [u8]) {
+    seed_protected_tables(program);
+    let at = (GDT_BASE + LAR_LSL_GDT_EXTRA_OFFSET) as usize;
+    // access 0x92: P=1, DPL=0, S=1 (segment), type=2 (data, read/write). Present and a legal data
+    // type, so only the privilege check can refuse it.
+    program[at..at + 8].copy_from_slice(&descriptor(0x0000_ffff, 0x0000_9200));
+}
+
+/// A protected-mode CPU with `LAR_LSL_GDT_LIMIT` rather than `GDT_LIMIT`, so `SEL_LOW_DPL`
+/// resolves through the table while `SEL_BAD` still does not.
+fn lar_lsl_protected_cpu() -> CpuGsw {
+    let mut cpu = protected_cpu();
+    cpu.gdtr.limit = LAR_LSL_GDT_LIMIT;
+    cpu
+}
+
+fn arm_lar_lsl(cpu: &mut CpuGsw, bus: &mut TestBus, selector: u16) {
+    cpu.halted = false;
+    cpu.interrupt_shadow = false;
+    cpu.registers.gpr.fill(0);
+    cpu.registers.set_edx(u32::from(selector));
+    cpu.registers.set_ebx(DATA_PAGE);
+    cpu.registers.eflags = 0x202;
+    cpu.pending_flags = PendingFlags::default();
+    cpu.set_eip(ENTRY);
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
+    bus.memory[DATA_PAGE as usize..DATA_PAGE as usize + 2].copy_from_slice(&selector.to_le_bytes());
+    bus.trace = BusTrace::default();
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn build_lar_lsl_program(
+    code: &[u8],
+    starts: &[u32],
+) -> (CpuGsw, TestBus, jit::direct::CompiledBlock) {
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
+    seed_lar_lsl_tables(&mut program);
+    let mut bus = sixteen_bit_bus(program);
+    let mut cpu = lar_lsl_protected_cpu();
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
+    let linears: Vec<u32> = starts.iter().map(|offset| ENTRY + offset).collect();
+    for &linear in &linears {
+        cpu.set_eip(linear);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+    }
+    cpu.set_eip(ENTRY);
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true)
+        .expect("the LAR/LSL fixture must compile as a block");
+    assert_eq!(
+        compilation.span.instructions, LAR_LSL_BLOCK_INSTRUCTIONS,
+        "the block stopped early, so the row is still a boundary"
+    );
+    assert_eq!(
+        compilation.callout_lar_lsl_slots, 1,
+        "the row must be priced in the LAR/LSL slot class, not the generic interpret-one one"
+    );
+    assert_eq!(
+        compilation.callout_interpret_one_slots, 0,
+        "LAR/LSL must NOT be counted in the generic interpret-one class (see \
+         CallOutHelper::prices_as_lar_lsl)"
+    );
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("a key for the fixture block");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install the fixture block");
+    let block = cpu.jit_direct.block(id).expect("the block must be live");
+    (cpu, bus, block)
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn run_both_lar_lsl(code: &[u8], starts: &[u32], selector: u16) -> Legs {
+    let mut program = vec![0u8; 0x2000];
+    program[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
+    seed_lar_lsl_tables(&mut program);
+    let mut interp_bus = sixteen_bit_bus(program);
+    let mut interp = lar_lsl_protected_cpu();
+    arm_lar_lsl(&mut interp, &mut interp_bus, selector);
+    drive(&mut interp, &mut interp_bus);
+
+    let (mut native, mut native_bus, block) = build_lar_lsl_program(code, starts);
+    arm_lar_lsl(&mut native, &mut native_bus, selector);
+
+    let before = native.perf_counters().jit_direct_insns;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .expect("the fixture block must not stop the machine"),
+        "the installed block must actually run"
+    );
+    let native_insns = native.perf_counters().jit_direct_insns - before;
+    let exit_reason = native.jit_direct.last_side_exit_reason_for_test();
+    drive(&mut native, &mut native_bus);
+
+    Legs {
+        interp,
+        interp_bus,
+        native,
+        native_bus,
+        exit_reason,
+        native_insns,
+    }
+}
+
+/// The whole census claim: a block that used to end `non_continuable` at LAR/LSL now carries on,
+/// for both rows, both operand forms, and every selector shape the design names -- a valid
+/// selector, an invalid-but-present one (ZF clear via `descriptor_accessible`), a null selector,
+/// and one past the GDT limit. Every case is checked against the wholly-interpreted leg, which is
+/// the architectural oracle; a lowering bug and an accounting bug both show up as a disagreement.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn lar_and_lsl_resume_for_every_selector_shape() {
+    for opcode in [0x02u8, 0x03] {
+        for (code, starts) in [
+            (lar_lsl_register_code(opcode), LAR_LSL_REGISTER_STARTS),
+            (lar_lsl_memory_code(opcode), LAR_LSL_MEMORY_STARTS),
+        ] {
+            for selector in [
+                SEL_DATA,    // valid: found and accessible, ZF set
+                SEL_LOW_DPL, // invalid: found, refused by privilege, ZF clear
+                0x0000,      // null: index 0, ZF clear
+                SEL_BAD,     // beyond the GDT limit: not found, ZF clear
+            ] {
+                let mut legs = run_both_lar_lsl(&code, starts, selector);
+                assert_legs_agree(&mut legs);
+                assert_eq!(
+                    legs.exit_reason, None,
+                    "opcode 0x0f{opcode:02x}, selector {selector:#06x}: the block should have \
+                     completed"
+                );
+                assert_eq!(
+                    legs.native_insns,
+                    u64::from(LAR_LSL_BLOCK_INSTRUCTIONS),
+                    "opcode 0x0f{opcode:02x}, selector {selector:#06x}: the block did not resume \
+                     past the row"
+                );
+                let stalls = legs.native.direct_stall_snapshot();
+                assert_eq!(stalls.callout_interpret_one_executed, 1);
+                assert_eq!(stalls.callout_interpret_one_resync, 0);
+                assert_eq!(stalls.callout_interpret_one_resync_fault, 0);
+                assert_eq!(stalls.callout_interpret_one_abnormal, 0);
+            }
+        }
+    }
+}
+
+/// Outside protected mode -- real mode and V86 -- LAR and LSL `#UD` (vector 6) as the
+/// interpreter's first statement, before touching any register or memory. The InterpretOne slot
+/// still compiles (the allowlist admits the opcode unconditionally, per `InterpretOneRow::Lar`'s
+/// doc), and the fault delivers identically on both legs: this is NOT a resume case, it is a
+/// differential proof that the call-out's fault path matches the interpreter's exactly, the same
+/// shape every other faulting row in this file uses (`seed_fault_handler` plants a `HLT` at the
+/// zeroed real-mode IVT target so both legs have somewhere to land).
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn lar_and_lsl_ud_fault_outside_protected_mode() {
+    for opcode in [0x02u8, 0x03] {
+        // mov ax,0x1111; lar/lsl ax,bx; inc ax; hlt, real mode, register form -- CS starts real
+        // and no descriptor table is needed, since the arm faults before reading one.
+        let code = vec![0xB8, 0x11, 0x11, 0x0F, opcode, 0xC3, 0x40, 0xF4];
+        let starts = vec![0, 3, 6];
+        // Anti-vacuity: the row still compiles into a call-out slot rather than staying a
+        // boundary, exactly as the protected-mode population does.
+        let (_, _, block) = build_native(&code, &starts);
+        assert_eq!(block.span().instructions, 3);
+        assert_eq!(block.callout_lar_lsl_slots(), 1);
+        assert_eq!(block.callout_interpret_one_slots(), 0);
+
+        let mut legs = run_both(&code, &starts, no_perturb);
+        assert_legs_agree(&mut legs);
+        assert_ne!(
+            legs.exit_reason, None,
+            "opcode 0x0f{opcode:02x}: #UD outside protected mode must not resume the block"
+        );
+        let stalls = legs.native.direct_stall_snapshot();
+        assert_eq!(stalls.callout_interpret_one_executed, 1);
+        assert_eq!(stalls.callout_interpret_one_abnormal, 0);
+    }
+}
+
+/// `LAR_LSL_CORE_CLOCKS` is what the interpreter charges (both rows, `Ok(clocks(11))`), stated
+/// so a future divergence in either arm has a number to fail against.
+#[test]
+fn lar_lsl_core_clocks_is_what_the_interpreter_charges() {
+    assert_eq!(crate::LAR_LSL_CORE_CLOCKS, 11);
+}

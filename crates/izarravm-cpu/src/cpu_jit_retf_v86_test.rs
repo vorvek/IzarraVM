@@ -1543,12 +1543,15 @@ fn far_dynamic_cannot_be_inherited_by_a_recycled_block_slot() {
     // 120 -> 128: the CR3 JIT-half gate's `LinkTarget.context: u8` field
     // (`2026-09-02-cr3-jit-half-design.md` L2) grows `successors: [Option<LinkTarget>; 2]`,
     // measured off a failing-test readout, not derived; see `direct_test.rs`'s twin comment.
-    // Unrelated to `dynamic_flags`, which still keeps `far_dynamic` inside the whole-struct
-    // assignment this row tests.
+    // 128 -> 136: the LAR/LSL `InterpretOne` allowlist entries add `callout_lar_lsl_slots: u8`,
+    // again measured off a failing-test readout; see `direct_test.rs`'s twin comment for why the
+    // fifth class could not fit the existing `CallOutSlotCounts` byte. Unrelated to
+    // `dynamic_flags`, which still keeps `far_dynamic` inside the whole-struct assignment this
+    // row tests.
     assert_eq!(
         core::mem::size_of::<jit::direct::CompiledBlock>(),
-        128,
-        "the far bit is packed into `dynamic_flags`, which is what keeps this struct at 120 bytes \
+        136,
+        "the far bit is packed into `dynamic_flags`, which is what keeps this struct's size fixed \
          and keeps `far_dynamic` inside the whole-struct assignment `install`'s recycle arm makes"
     );
 }

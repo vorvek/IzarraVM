@@ -73,6 +73,7 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         callout_memory_slots: 0,
         callout_interpret_one_slots: 0,
         callout_int_imm8_slots: 0,
+        callout_lar_lsl_slots: 0,
         x87_entry_top: 0,
         x87_exit_top: 0,
         dynamic_successor: false,
@@ -2943,11 +2944,21 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
 /// added byte is read only at link-resolution time (`resolve_successors`,
 /// `make_link_visible`), never on the uniform-fetch entry path itself, so the per-entry copy
 /// cost this test guards is unaffected in kind, only in the fixed size of the copy.
+///
+/// The LAR/LSL `InterpretOne` allowlist entries add `callout_lar_lsl_slots: u8`, a plain sibling
+/// of `callout_slots` -- 128 -> 136, again measured off a failing-test readout. The base-5
+/// `CallOutSlotCounts` byte the struct already carries had NO room for a fifth class (LAR/LSL is
+/// not terminal, so unlike the INT row it needs a genuine `0..=MAX_BLOCK_CALLOUT_SLOTS` count
+/// rather than a one-bit flag, and the byte's remaining value space -- six unused states past the
+/// existing 250 -- is too small to hold one); see that field's doc. 128 had no slack of its own
+/// (this is a full 8-byte alignment step, not a byte absorbed into padding), so the new field is
+/// read on the entry path via `compute_iteration_upper`, exactly like `callout_slots` beside it,
+/// and could not be moved to a side lane the way `written_segments` was.
 #[test]
 fn compiled_block_stays_small_enough_to_copy_per_entry() {
     assert_eq!(
         core::mem::size_of::<CompiledBlock>(),
-        128,
+        136,
         "CompiledBlock size changed; if a field was added, check it is actually read on the \
          uniform-fetch entry path before letting it ride every per-entry copy"
     );

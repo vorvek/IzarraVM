@@ -5721,6 +5721,40 @@ pub(crate) const INT_IMM8_CORE_CLOCKS: u32 = 37;
 /// the owner's ruling of 2026-07-30 accepted that class of overshoot for the chain quota.
 pub(crate) const INT_IMM8_MAX_DATA_ACCESSES: u64 = 16;
 
+/// What LAR and LSL charge (`execute_extended.rs`, the `0x0f02` and `0x0f03` arms: both
+/// `Ok(clocks(11))`). One constant for both rows because both interpreter arms return the
+/// identical charge whatever the selector or the descriptor they land on.
+///
+/// Deliberately NOT a term in `INTERPRET_ONE_MAX_CORE_CLOCKS`, for the `INT_IMM8_CORE_CLOCKS`
+/// reason stated on that constant: 11 is above the fold's current value of 7, and
+/// `compute_iteration_upper` multiplies that value by the block's interpret-one slot count, so
+/// folding this in would raise the budget bound of every block carrying a CLI, an STI, a segment
+/// load, a string row, a PUSHF or a POPF -- none of which can charge anything like it -- and shrink
+/// `budget_quota`, changing WHICH blocks are admitted. LAR and LSL take their own slot class
+/// instead; see `jit::direct::CompiledBlock::callout_lar_lsl_slots`. Unlike the INT row they are
+/// NOT terminal and are not bounded at one per block, so the class is a genuine count rather than
+/// a flag.
+pub(crate) const LAR_LSL_CORE_CLOCKS: u32 = 11;
+
+/// The most DATA ACCESSES one LAR or LSL call-out slot can present, and the multiplicand
+/// `compute_iteration_upper` prices its bus traffic at.
+///
+/// | form | accesses |
+/// |---|---|
+/// | register source | descriptor low + high dword = 2 |
+/// | memory source | operand read + descriptor low + high dword = 3 |
+///
+/// Neither row writes an accessed bit back (unlike the segment-load rows `MOV Sreg` and `POP SS`
+/// price into `INTERPRET_ONE_MAX_DATA_ACCESSES`): `try_read_descriptor` (control.rs) only reads.
+/// **3**, the memory form's worst case, and it stays under `INTERPRET_ONE_MAX_DATA_ACCESSES`'s 4 --
+/// the row does not need its own bound the way `INT_IMM8_MAX_DATA_ACCESSES` does, it is carried
+/// beside the core-clocks constant anyway so the two travel together and a widened form (a future
+/// row with a bigger footprint) cannot silently start under-pricing this class alone.
+///
+/// PAGE WALKS are not priced, exactly as `INTERPRET_ONE_MAX_DATA_ACCESSES` does not price them:
+/// the owner's ruling of 2026-07-30 accepted that class of overshoot for the chain quota.
+pub(crate) const LAR_LSL_MAX_DATA_ACCESSES: u64 = 3;
+
 /// The two-argument `max` the constant below folds with. A `const fn` rather than
 /// `core::cmp::max`, which is not const, and rather than a nest of `if` expressions inside one
 /// `const` block, which is what `MAX_CALL_OUT_CORE_CLOCKS` still is: that one folds three terms
@@ -5884,10 +5918,20 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     // multiplied by a class count, so a row that cannot occur in a block must not raise it. This
     // one is a GLOBAL CEILING that must dominate every helper by construction, and a ceiling that
     // failed to cover an admitted row would trip the chain-pricing `debug_assert` it exists for.
-    if c > INT_IMM8_CORE_CLOCKS {
+    let d = if c > INT_IMM8_CORE_CLOCKS {
         c
     } else {
         INT_IMM8_CORE_CLOCKS
+    };
+    // LAR/LSL, folded in for the identical reason: their own slot class, deliberately out of
+    // `INTERPRET_ONE_MAX_CORE_CLOCKS`, still has to be covered by this GLOBAL ceiling. 11 does not
+    // move the value today -- `INT_IMM8_CORE_CLOCKS` already dominates it -- but the derivation has
+    // to read the constant rather than assume the ordering, or a future change to either one could
+    // silently stop being covered.
+    if d > LAR_LSL_CORE_CLOCKS {
+        d
+    } else {
+        LAR_LSL_CORE_CLOCKS
     }
 };
 
