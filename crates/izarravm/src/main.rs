@@ -2170,6 +2170,7 @@ fn write_hdd_profile_json(
             .collect(),
     );
     let retrace_poll_exits = machine.retrace_poll_exits();
+    let retrace_poll_reads = machine.retrace_poll_reads();
     #[allow(unused_mut)]
     let mut report = json!({
         "schema": "izarravm-hdd-profile-v2",
@@ -2193,6 +2194,8 @@ fn write_hdd_profile_json(
         // CONSTRUCTION, whatever the polls-per-frame figure is -- which is why this, and not the
         // poll count, is the port repricing's self-certifying anchor. Diagnostic only.
         "retrace_poll_exits": {
+            "reads": retrace_poll_reads,
+            "reads_per_rising_exit": retrace_poll_reads as f64 / (retrace_poll_exits.0.max(1)) as f64,
             "rising": retrace_poll_exits.0,
             "falling": retrace_poll_exits.1,
             "rising_per_guest_second": retrace_poll_exits.0 as f64 / guest_seconds.max(f64::MIN_POSITIVE),

@@ -1482,6 +1482,7 @@ impl MachineBus<'_> {
         if port == 0x3C2 {
             return;
         }
+        self.retrace_poll.reads += 1;
         let retrace = value & 0x08 != 0;
         let previous = self.retrace_poll.last_observed.replace(retrace);
         match previous {

@@ -2068,6 +2068,11 @@ pub(crate) struct RetracePollCensus {
     /// comparand -- edges are measured between consecutive GUEST reads, so an elided poll span
     /// contributes none and the exit read that follows still carries its edge.
     pub(crate) last_observed: Option<bool>,
+    /// Status-1 reads the instrument saw at all -- the DENOMINATOR. Without it, "polls per
+    /// exit" has to be inferred from the `PciLegacyVga` class total, which also carries every
+    /// other VGA-file access; with it, the ratio is exact and an instrument that is silently
+    /// missing reads can be told apart from a guest that genuinely polls in bursts.
+    pub(crate) reads: u64,
     /// Reads that saw the retrace bit go 0 -> 1: a `wait until the retrace STARTS` loop's exit.
     pub(crate) rising_edges: u64,
     /// Reads that saw it go 1 -> 0: a `wait until the retrace ENDS` loop's exit.
@@ -3402,6 +3407,13 @@ impl Machine {
             self.retrace_poll.rising_edges,
             self.retrace_poll.falling_edges,
         )
+    }
+
+    /// F14's denominator: status-1 reads the exit instrument observed. `reads / rising` is
+    /// polls per exit for the retrace-wait loop specifically, without needing the per-site
+    /// call-out attribution feature.
+    pub fn retrace_poll_reads(&self) -> u64 {
+        self.retrace_poll.reads
     }
 
     /// P2's poll-skip certificate ledger, since construction: `(admitted_epoch2,
