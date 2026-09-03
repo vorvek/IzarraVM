@@ -719,6 +719,21 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
         1
     );
 
+    // S1d slice 2 (shadow-cache-probe feature): the entry-sampling diversion is its own
+    // refusal reason, sitting right beside aggregate_accounting in run.rs -- same NotRun
+    // contract, same counter-bump shape as every other refusal proved in this test.
+    #[cfg(feature = "shadow-cache-probe")]
+    {
+        let shadow_sample_rejects = cpu.perf_counters().jit_direct_reject_shadow_sample;
+        bus.shadow_probe_sample_next_entry = true;
+        assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        bus.shadow_probe_sample_next_entry = false;
+        assert_eq!(
+            cpu.perf_counters().jit_direct_reject_shadow_sample - shadow_sample_rejects,
+            1
+        );
+    }
+
     let shadow_rejects = cpu.perf_counters().jit_direct_reject_interrupt_shadow;
     cpu.interrupt_shadow = true;
     assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());

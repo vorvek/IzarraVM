@@ -26,7 +26,7 @@ reflected-call-diagnostic = ["izarravm-cpu/reflected-call-diagnostic"]
 # sampling). NOT in `default`; the plain build must be byte-identical to a plain
 # main build, which is why every S1a/b/c/d addition lives behind this feature
 # rather than behind the pre-existing IZARRAVM_SHADOW_L1_PROBE env check alone --
-# see shadow_cache_plain.rs (the off-feature module, verbatim pre-S1a) vs
+# see shadow_cache.rs (the off-feature module, verbatim pre-S1a) vs
 # shadow_cache_probe.rs (the on-feature module) in lib.rs's cfg'd `mod` pair.
 shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-bus/shadow-cache-probe"]
 

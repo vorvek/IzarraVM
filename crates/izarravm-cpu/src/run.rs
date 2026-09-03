@@ -2722,6 +2722,9 @@ impl CpuGsw {
         #[cfg(feature = "shadow-cache-probe")]
         if bus.shadow_probe_should_sample_entry() {
             self.perf.jit_direct_reject_shadow_sample += 1;
+            ea_mark!(Phase::Refused);
+            ea_refusal!(site::SHADOW_PROBE_SAMPLE);
+            ea_end!(Population::Refused);
             return Ok(DirectBlockOutcome::NotRun);
         }
         // Emission-shape backstop, guarding the ONE unsafe combination: a trace-elided block
