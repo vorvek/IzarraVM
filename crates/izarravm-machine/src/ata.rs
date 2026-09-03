@@ -27,6 +27,7 @@
 //! plenty for the era. Lift by decoding the READ/WRITE SECTORS EXT (0x24/0x34)
 //! commands and the high-order LBA bytes.
 
+use crate::device_timing::DeviceTimingProfile;
 use izarravm_core::MASTER_CLOCK_HZ;
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
@@ -815,8 +816,8 @@ impl AtaDisk {
         if distance == 0 {
             return 0;
         }
-        let linear = (u128::from(distance) * u128::from(SEEK_FULL_STROKE_TICKS)
-            / u128::from(total)) as u64;
+        let linear =
+            (u128::from(distance) * u128::from(SEEK_FULL_STROKE_TICKS) / u128::from(total)) as u64;
         linear.max(SEEK_TRACK_TO_TRACK_TICKS)
     }
 
@@ -847,14 +848,15 @@ impl AtaDisk {
         lba: u32,
         sectors: u32,
         hits: u32,
-        profile: crate::device_timing::DeviceTimingProfile,
+        profile: DeviceTimingProfile,
     ) -> u64 {
         if sectors == 0 {
             return 0;
         }
         let charged = u64::from(sectors.saturating_sub(hits.min(sectors)));
         if !profile.ata {
-            return COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(charged));
+            return COMMAND_LATENCY_TICKS
+                .saturating_add(pio_sector_ticks().saturating_mul(charged));
         }
         if charged == 0 {
             // A fully host-cached transfer never touched the modelled drive
@@ -881,7 +883,9 @@ impl AtaDisk {
             .div_ceil(u128::from(PIO_BYTES_PER_SECOND)) as u64;
         let media_ticks = (u128::from(media_bytes) * u128::from(MASTER_CLOCK_HZ))
             .div_ceil(u128::from(MEDIA_BYTES_PER_SECOND)) as u64;
-        ticks = ticks.saturating_add(cable_ticks).saturating_add(media_ticks);
+        ticks = ticks
+            .saturating_add(cable_ticks)
+            .saturating_add(media_ticks);
         self.head_lba = lba.saturating_add(sectors);
         self.last_transfer_end_lba = Some(self.head_lba);
         ticks

@@ -1883,10 +1883,9 @@ impl Machine {
     /// their own.
     fn stall_for_hdd_sectors_cached(&mut self, lba: u32, sectors: u32, hits: u32) -> u64 {
         let profile = self.device_timing_profile();
-        let ticks = self
-            .ata
-            .as_mut()
-            .map_or(0, |disk| disk.charge_pio_transfer(lba, sectors, hits, profile));
+        let ticks = self.ata.as_mut().map_or(0, |disk| {
+            disk.charge_pio_transfer(lba, sectors, hits, profile)
+        });
         self.stall_for_master_ticks(ticks);
         ticks
     }
@@ -1912,6 +1911,7 @@ impl Machine {
         hits: u32,
         start_lba: u32,
         buf_seg: u16,
+        stall_ticks: u64,
     ) {
         let region = self
             .ata
@@ -1953,9 +1953,11 @@ impl Machine {
             }
         }
         p.cache_hits = p.cache_hits.saturating_add(u64::from(hits.min(sectors)));
-        p.stall_ticks = p
-            .stall_ticks
-            .saturating_add(ata::pio_transfer_ticks_cached(sectors, hits));
+        // Slice 9C: take the caller's already-computed charge rather than
+        // recomputing it -- `AtaDisk::charge_pio_transfer` mutates the
+        // modelled drive-head state, so it must run exactly once per real
+        // transfer, and `stall_for_hdd_sectors_cached` is that one call.
+        p.stall_ticks = p.stall_ticks.saturating_add(stall_ticks);
     }
 
     /// Real-mode paragraph of ES, which is the CHS/long-sector transfer buffer.
@@ -2058,6 +2060,10 @@ impl Machine {
             }
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        // Slice 9C: the ONE authoritative charge for this transfer -- see
+        // `stall_for_hdd_sectors_cached`'s doc comment. Every other consumer
+        // below takes its return rather than recomputing.
+        let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = if ah == 0x02 {
                 Int13DataKind::Read
@@ -2070,9 +2076,9 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
+                wait_ticks,
             );
         }
-        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
             if ah == 0x02 {
                 disk.note_guest_read_batch(
@@ -2084,7 +2090,6 @@ impl Machine {
                 disk.note_guest_write_wait(crate::katea_tree::GuestStorageRoute::Int13, wait_ticks);
             }
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         let status = if host_write_failed {
             HOST_WRITE_FAULT_STATUS
@@ -2182,6 +2187,7 @@ impl Machine {
             });
 
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = if ah == 0x0A {
                 Int13DataKind::Read
@@ -2194,9 +2200,9 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
+                wait_ticks,
             );
         }
-        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
             if ah == 0x0A {
                 disk.note_guest_read_batch(
@@ -2208,7 +2214,6 @@ impl Machine {
                 disk.note_guest_write_wait(crate::katea_tree::GuestStorageRoute::Int13, wait_ticks);
             }
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         match if host_write_failed {
             HOST_WRITE_FAULT_STATUS
@@ -2261,6 +2266,7 @@ impl Machine {
             disk.end_read_command();
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             self.note_int13_data(
                 Int13DataKind::Verify,
@@ -2268,9 +2274,9 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
+                wait_ticks,
             );
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -2486,6 +2492,8 @@ impl Machine {
                     == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
             });
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        let edd_lba = u32::try_from(lba).expect("validated EDD LBA fits ATA");
+        let wait_ticks = self.stall_for_hdd_sectors_cached(edd_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = match ah {
                 0x42 => Int13DataKind::Read,
@@ -2496,11 +2504,11 @@ impl Machine {
                 kind,
                 u32::from(done),
                 cache_hits,
-                u32::try_from(lba).expect("validated EDD LBA fits ATA"),
+                edd_lba,
                 buf_seg,
+                wait_ticks,
             );
         }
-        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
             match ah {
                 0x42 => disk.note_guest_read_batch(
@@ -2513,7 +2521,6 @@ impl Machine {
                 _ => {}
             }
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
         let status = if host_write_failed {
