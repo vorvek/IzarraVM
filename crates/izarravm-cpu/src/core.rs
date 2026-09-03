@@ -1805,6 +1805,7 @@ impl CpuGsw {
     /// recovery (slice1 plan Revision 2, R2.2/R2.15) is production code behind a
     /// runtime knob, not a diagnostic feature, and needs this carry sampled at a
     /// trip's open and close regardless of which cargo features are compiled in.
+    #[cfg(feature = "reflected-call-memo")]
     pub(crate) fn reflected_call_timing_rem(&self) -> u64 {
         self.timing_rem
     }

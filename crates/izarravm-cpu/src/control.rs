@@ -73,6 +73,7 @@ impl CpuGsw {
         // own state check and the `ARMED` flag itself).
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::on_int_entry(self, bus, vector);
+        #[cfg(feature = "reflected-call-memo")]
         crate::reflected_call_memo::on_int(self, bus, vector);
         if self.is_protected_mode() {
             // `SoftwareInterrupt`, not `External`: this is the one source the
@@ -108,6 +109,7 @@ impl CpuGsw {
             crate::reflected_call_diag::note_read(self, bus, vector_address);
             crate::reflected_call_diag::note_read(self, bus, vector_address + 2);
         }
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_read(self, bus, vector_address);
             crate::reflected_call_memo::note_read(self, bus, vector_address + 2);
@@ -129,6 +131,7 @@ impl CpuGsw {
         // section 8 item 5 / review B6).
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::on_hardware_interrupt(vector);
+        #[cfg(feature = "reflected-call-memo")]
         crate::reflected_call_memo::on_hardware_interrupt(self);
         if self.is_protected_mode() {
             self.deliver_interrupt(bus, vector, None, DeliverySource::External)
@@ -503,6 +506,7 @@ impl CpuGsw {
         if source.pushes_error_code() {
             crate::reflected_call_diag::on_exception_delivered(vector);
         }
+        #[cfg(feature = "reflected-call-memo")]
         crate::reflected_call_memo::note_exception(self, vector);
         if vector == 6 && source.pushes_error_code() {
             self.trace_ud_if_enabled(bus);
@@ -942,6 +946,7 @@ impl CpuGsw {
         // GDT/LDT/IDT/TSS reads (design section 3.3's seam table).
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_read(self, bus, linear);
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_read(self, bus, linear);
         }
@@ -985,6 +990,7 @@ impl CpuGsw {
         // function's own doc says is gone once the write below commits.
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_write(self, bus, linear, width, value, false, None);
         }
@@ -1077,6 +1083,7 @@ impl CpuGsw {
         if result.is_ok() {
             crate::reflected_call_diag::on_far_return(self, bus);
         }
+        #[cfg(feature = "reflected-call-memo")]
         if result.is_ok() {
             crate::reflected_call_memo::on_far_return(self, bus);
         }
@@ -1410,6 +1417,7 @@ impl CpuGsw {
         if result.is_ok() {
             crate::reflected_call_diag::on_far_return(self, bus);
         }
+        #[cfg(feature = "reflected-call-memo")]
         if result.is_ok() {
             crate::reflected_call_memo::on_far_return(self, bus);
         }

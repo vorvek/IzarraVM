@@ -125,6 +125,15 @@ jobs:
           cargo test -p izarravm-machine --no-default-features --features shadow-cache-probe shadow_cache
           cargo test -p izarravm-cpu --no-default-features --features shadow-cache-probe direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions
           cargo clippy -p izarravm-cpu -p izarravm -p izarravm-machine --all-targets --no-default-features --features shadow-cache-probe -- -D warnings
+          # Slice 1 of the reflected-call HLE design's record-and-measure memo. Off by
+          # default (Fable review 2026-09-03: gated under its own feature, not merely the
+          # runtime knob, so the plain build carries none of it); this quartet proves the
+          # feature still wires through izarravm AND izarravm-machine, every test in
+          # reflected_call_memo_test.rs still passes, and the armed arm is warning-clean.
+          cargo check -p izarravm --no-default-features --features reflected-call-memo
+          cargo check -p izarravm-machine --no-default-features --features reflected-call-memo
+          cargo test -p izarravm-cpu --no-default-features --features reflected-call-memo reflected_call_memo
+          cargo clippy -p izarravm-cpu -p izarravm -p izarravm-machine --all-targets --no-default-features --features reflected-call-memo -- -D warnings
 
       - name: Format
         run: cargo fmt --check

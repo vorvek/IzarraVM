@@ -1268,6 +1268,7 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_read(self, bus, linear);
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_read(self, bus, linear);
         }
@@ -1334,6 +1335,7 @@ impl CpuGsw {
             false,
             None,
         );
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_write(
                 self,
@@ -1567,6 +1569,7 @@ impl CpuGsw {
         if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
             crate::reflected_call_diag::note_read(self, bus, linear);
         }
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal
             && !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()))
         {
@@ -1661,6 +1664,7 @@ impl CpuGsw {
         if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
             crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
         }
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal
             && !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()))
         {
@@ -1769,6 +1773,7 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_read(self, bus, linear);
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_read(self, bus, linear);
         }
@@ -1830,6 +1835,7 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::note_write(self, bus, linear, width, value, false, None);
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_write(self, bus, linear, width, value, false, None);
         }
@@ -2033,6 +2039,7 @@ impl CpuGsw {
             true,
             Some(crate::reflected_call::AddressClass::PageTable),
         );
+        #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
             crate::reflected_call_memo::note_write(
                 self,

@@ -47,6 +47,8 @@ int-trace = ["izarravm-cpu/int-trace"]
 reflected-call-diagnostic = ["jit", "izarravm-cpu/reflected-call-diagnostic", "izarravm-machine/reflected-call-diagnostic"]
 # Passthrough for the S1a/b/c/d shadow-cache probe; see izarravm-machine.
 shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-machine/shadow-cache-probe", "izarravm-bus/shadow-cache-probe"]
+# Passthrough for the reflected-call HLE design's slice-1 memo; see izarravm-cpu.
+reflected-call-memo = ["jit", "izarravm-cpu/reflected-call-memo"]
 
 [dependencies]
 clap.workspace = true
