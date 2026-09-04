@@ -75,28 +75,40 @@ const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 const COMMAND_LATENCY_TICKS_PERIOD: u64 = MASTER_CLOCK_HZ / 20_000;
 
 /// Track-to-track seek, the FLOOR of `seek_ticks` for any nonzero distance:
-/// 2 ms, 1996 IDE, UNVERIFIED (design §3.2).
-const SEEK_TRACK_TO_TRACK_TICKS: u64 = MASTER_CLOCK_HZ / 500;
+/// 3.5 ms. Verified against the two 1996-class drives named in the census
+/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2): above the
+/// Quantum Fireball 1280AT (3.1 ms) and 86Box's own 1996-generic preset
+/// (3 ms), just under the Seagate Medalist 1276 (3.8 ms) -- erring toward the
+/// slower drive of the pair, per the owner's anchor rule.
+const SEEK_TRACK_TO_TRACK_TICKS: u64 = MASTER_CLOCK_HZ / 1_000 * 7 / 2;
 
 /// Full-stroke seek, the CEILING `seek_ticks` scales to linearly by distance:
-/// 22 ms, the same shape `ide.rs:934`'s `media_delay` uses for the ATAPI
-/// channel (`distance / total * MAX_SEEK_TICKS`). UNVERIFIED (design §3.2).
-const SEEK_FULL_STROKE_TICKS: u64 = (MASTER_CLOCK_HZ / 1_000) * 22;
+/// 28 ms, the same shape `ide.rs:934`'s `media_delay` uses for the ATAPI
+/// channel (`distance / total * MAX_SEEK_TICKS`). Verified
+/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2): between
+/// the Medalist 1276 (25 ms) and the WD Caviar 21600/22100 (30 ms), erring
+/// slower than the Fireball 1280AT (24 ms).
+const SEEK_FULL_STROKE_TICKS: u64 = (MASTER_CLOCK_HZ / 1_000) * 28;
 
 /// Average rotational latency charged on every non-sequential access: 5.55 ms,
 /// a 5400 rpm half-revolution (arithmetic, design §3.2).
 const ROTATIONAL_LATENCY_TICKS: u64 = (MASTER_CLOCK_HZ / 100_000) * 555;
 
-/// The drive's sequential read-ahead buffer: 256 KiB, period drive spec
-/// sheets, UNVERIFIED (design §3.2). Bytes within it, on a SEQUENTIAL
-/// continuation of the previous transfer, cost the cable-burst rate
-/// (`PIO_BYTES_PER_SECOND`) rather than the sustained media rate -- this is
-/// what design §5 risk 2 means by "take the guest-visible charge from the
-/// modelled drive buffer": a real drive's read-ahead already has the next
-/// sequential sector staged by the time the host asks for it. Bytes beyond
-/// it, or any part of a non-sequential (random-LBA) transfer, cost
-/// `MEDIA_BYTES_PER_SECOND` instead -- the platter has to feed them live.
-const DRIVE_BUFFER_BYTES: u64 = 256 * 1024;
+/// The drive's sequential read-ahead buffer: 128 KiB. Verified
+/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2) against
+/// the real Quantum Fireball 1280AT spec sheet (128 KB) -- the Seagate
+/// Medalist 1276's real buffer is smaller still (64 KB), so 128 KiB errs
+/// toward the larger of the two named period drives while still being the
+/// slower (smaller) choice against the previous 256 KiB, which sat above
+/// both. Bytes within it, on a SEQUENTIAL continuation of the previous
+/// transfer, cost the cable-burst rate (`PIO_BYTES_PER_SECOND`) rather than
+/// the sustained media rate -- this is what design §5 risk 2 means by "take
+/// the guest-visible charge from the modelled drive buffer": a real drive's
+/// read-ahead already has the next sequential sector staged by the time the
+/// host asks for it. Bytes beyond it, or any part of a non-sequential
+/// (random-LBA) transfer, cost `MEDIA_BYTES_PER_SECOND` instead -- the
+/// platter has to feed them live.
+const DRIVE_BUFFER_BYTES: u64 = 128 * 1024;
 
 /// Sustained off-the-platter rate: 5 MB/s (census: PIO-4/16.7 MB/s is "~3x
 /// over as sustained", design §3.2). `PIO_BYTES_PER_SECOND` keeps its old
