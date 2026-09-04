@@ -75,28 +75,40 @@ const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 const COMMAND_LATENCY_TICKS_PERIOD: u64 = MASTER_CLOCK_HZ / 20_000;
 
 /// Track-to-track seek, the FLOOR of `seek_ticks` for any nonzero distance:
-/// 2 ms, 1996 IDE, UNVERIFIED (design §3.2).
-const SEEK_TRACK_TO_TRACK_TICKS: u64 = MASTER_CLOCK_HZ / 500;
+/// 3.5 ms. Verified against the two 1996-class drives named in the census
+/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2): above the
+/// Quantum Fireball 1280AT (3.1 ms) and 86Box's own 1996-generic preset
+/// (3 ms), just under the Seagate Medalist 1276 (3.8 ms) -- erring toward the
+/// slower drive of the pair, per the owner's anchor rule.
+const SEEK_TRACK_TO_TRACK_TICKS: u64 = MASTER_CLOCK_HZ / 1_000 * 7 / 2;
 
 /// Full-stroke seek, the CEILING `seek_ticks` scales to linearly by distance:
-/// 22 ms, the same shape `ide.rs:934`'s `media_delay` uses for the ATAPI
-/// channel (`distance / total * MAX_SEEK_TICKS`). UNVERIFIED (design §3.2).
-const SEEK_FULL_STROKE_TICKS: u64 = (MASTER_CLOCK_HZ / 1_000) * 22;
+/// 28 ms, the same shape `ide.rs:934`'s `media_delay` uses for the ATAPI
+/// channel (`distance / total * MAX_SEEK_TICKS`). Verified
+/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2): between
+/// the Medalist 1276 (25 ms) and the WD Caviar 21600/22100 (30 ms), erring
+/// slower than the Fireball 1280AT (24 ms).
+const SEEK_FULL_STROKE_TICKS: u64 = (MASTER_CLOCK_HZ / 1_000) * 28;
 
 /// Average rotational latency charged on every non-sequential access: 5.55 ms,
 /// a 5400 rpm half-revolution (arithmetic, design §3.2).
 const ROTATIONAL_LATENCY_TICKS: u64 = (MASTER_CLOCK_HZ / 100_000) * 555;
 
-/// The drive's sequential read-ahead buffer: 256 KiB, period drive spec
-/// sheets, UNVERIFIED (design §3.2). Bytes within it, on a SEQUENTIAL
-/// continuation of the previous transfer, cost the cable-burst rate
-/// (`PIO_BYTES_PER_SECOND`) rather than the sustained media rate -- this is
-/// what design §5 risk 2 means by "take the guest-visible charge from the
-/// modelled drive buffer": a real drive's read-ahead already has the next
-/// sequential sector staged by the time the host asks for it. Bytes beyond
-/// it, or any part of a non-sequential (random-LBA) transfer, cost
-/// `MEDIA_BYTES_PER_SECOND` instead -- the platter has to feed them live.
-const DRIVE_BUFFER_BYTES: u64 = 256 * 1024;
+/// The drive's sequential read-ahead buffer: 128 KiB. Verified
+/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2) against
+/// the real Quantum Fireball 1280AT spec sheet (128 KB) -- the Seagate
+/// Medalist 1276's real buffer is smaller still (64 KB), so 128 KiB errs
+/// toward the larger of the two named period drives while still being the
+/// slower (smaller) choice against the previous 256 KiB, which sat above
+/// both. Bytes within it, on a SEQUENTIAL continuation of the previous
+/// transfer, cost the cable-burst rate (`PIO_BYTES_PER_SECOND`) rather than
+/// the sustained media rate -- this is what design §5 risk 2 means by "take
+/// the guest-visible charge from the modelled drive buffer": a real drive's
+/// read-ahead already has the next sequential sector staged by the time the
+/// host asks for it. Bytes beyond it, or any part of a non-sequential
+/// (random-LBA) transfer, cost `MEDIA_BYTES_PER_SECOND` instead -- the
+/// platter has to feed them live.
+const DRIVE_BUFFER_BYTES: u64 = 128 * 1024;
 
 /// Sustained off-the-platter rate: 5 MB/s (census: PIO-4/16.7 MB/s is "~3x
 /// over as sustained", design §3.2). `PIO_BYTES_PER_SECOND` keeps its old
@@ -248,6 +260,36 @@ pub(crate) struct AtaDmaRequest {
 impl AtaDmaRequest {
     pub(crate) fn byte_len(self) -> usize {
         self.sectors as usize * SECTOR
+    }
+}
+
+/// The components of a `charge_pio_transfer` / `pio_transfer_breakdown`
+/// result. Diagnostic shape for the `IZARRAVM_INT13_PROFILE` census: the four
+/// tick fields always sum to `total()`, which is the same number
+/// `charge_pio_transfer` returns for the same call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PioChargeBreakdown {
+    /// Whether this request continued the previous charged transfer (no seek
+    /// or rotation charged). False for a cold/random access, and false (with
+    /// every tick field 0) for an all-cache-hit or unarmed-and-zero-sector
+    /// request.
+    pub(crate) sequential: bool,
+    pub(crate) command_ticks: u64,
+    pub(crate) seek_ticks: u64,
+    pub(crate) rotation_ticks: u64,
+    pub(crate) transfer_ticks: u64,
+    /// Sectors this call actually charged (`sectors - hits`, clamped). Zero
+    /// for an all-hit transfer; the census uses it to tell "no charge because
+    /// every sector hit" apart from "no charge because nothing was asked for".
+    pub(crate) charged_sectors: u64,
+}
+
+impl PioChargeBreakdown {
+    pub(crate) fn total(&self) -> u64 {
+        self.command_ticks
+            .saturating_add(self.seek_ticks)
+            .saturating_add(self.rotation_ticks)
+            .saturating_add(self.transfer_ticks)
     }
 }
 
@@ -850,26 +892,66 @@ impl AtaDisk {
         hits: u32,
         profile: DeviceTimingProfile,
     ) -> u64 {
+        let breakdown = self.pio_transfer_breakdown_impl(lba, sectors, hits, profile);
+        if profile.ata && breakdown.charged_sectors > 0 {
+            self.head_lba = lba.saturating_add(sectors);
+            self.last_transfer_end_lba = Some(self.head_lba);
+        }
+        breakdown.total()
+    }
+
+    /// The same computation `charge_pio_transfer` makes, without the mutation
+    /// (`head_lba` / `last_transfer_end_lba` are left untouched) and split
+    /// into its named components. Diagnostic-only, for the
+    /// `IZARRAVM_INT13_PROFILE` census (`storage.rs`'s `note_int13_data`):
+    /// **must be called BEFORE the matching `charge_pio_transfer` for the
+    /// same request**, since it reads the pre-transfer head/sequential state
+    /// that `charge_pio_transfer` then advances. Calling it after would
+    /// report the NEXT request's baseline, not this one's.
+    pub(crate) fn pio_transfer_breakdown(
+        &self,
+        lba: u32,
+        sectors: u32,
+        hits: u32,
+        profile: DeviceTimingProfile,
+    ) -> PioChargeBreakdown {
+        self.pio_transfer_breakdown_impl(lba, sectors, hits, profile)
+    }
+
+    /// Shared, side-effect-free computation behind both `charge_pio_transfer`
+    /// (which applies the mutation) and `pio_transfer_breakdown` (which does
+    /// not) -- one formula, so the census can never drift from the model it
+    /// is reporting on.
+    fn pio_transfer_breakdown_impl(
+        &self,
+        lba: u32,
+        sectors: u32,
+        hits: u32,
+        profile: DeviceTimingProfile,
+    ) -> PioChargeBreakdown {
         if sectors == 0 {
-            return 0;
+            return PioChargeBreakdown::default();
         }
         let charged = u64::from(sectors.saturating_sub(hits.min(sectors)));
         if !profile.ata {
-            return COMMAND_LATENCY_TICKS
-                .saturating_add(pio_sector_ticks().saturating_mul(charged));
+            return PioChargeBreakdown {
+                command_ticks: COMMAND_LATENCY_TICKS,
+                transfer_ticks: pio_sector_ticks().saturating_mul(charged),
+                charged_sectors: charged,
+                ..PioChargeBreakdown::default()
+            };
         }
         if charged == 0 {
             // A fully host-cached transfer never touched the modelled drive
             // either: no command, no seek, no buffer-state move.
-            return 0;
+            return PioChargeBreakdown::default();
         }
         let sequential = self.last_transfer_end_lba == Some(lba);
-        let mut ticks = COMMAND_LATENCY_TICKS_PERIOD;
-        if !sequential {
-            ticks = ticks
-                .saturating_add(self.seek_ticks(lba))
-                .saturating_add(ROTATIONAL_LATENCY_TICKS);
-        }
+        let (seek_ticks, rotation_ticks) = if sequential {
+            (0, 0)
+        } else {
+            (self.seek_ticks(lba), ROTATIONAL_LATENCY_TICKS)
+        };
         let bytes = charged.saturating_mul(SECTOR as u64);
         let (cable_bytes, media_bytes) = if sequential {
             (
@@ -883,12 +965,14 @@ impl AtaDisk {
             .div_ceil(u128::from(PIO_BYTES_PER_SECOND)) as u64;
         let media_ticks = (u128::from(media_bytes) * u128::from(MASTER_CLOCK_HZ))
             .div_ceil(u128::from(MEDIA_BYTES_PER_SECOND)) as u64;
-        ticks = ticks
-            .saturating_add(cable_ticks)
-            .saturating_add(media_ticks);
-        self.head_lba = lba.saturating_add(sectors);
-        self.last_transfer_end_lba = Some(self.head_lba);
-        ticks
+        PioChargeBreakdown {
+            sequential,
+            command_ticks: COMMAND_LATENCY_TICKS_PERIOD,
+            seek_ticks,
+            rotation_ticks,
+            transfer_ticks: cable_ticks.saturating_add(media_ticks),
+            charged_sectors: charged,
+        }
     }
 
     /// Whether LBA addressing is selected (drive/head bit 6).
