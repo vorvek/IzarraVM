@@ -6,7 +6,7 @@ use izarravm_core::{SbDma8, SbDma16, SbIrq};
 use izarravm_firmware::I386DX25_TEST_ROM;
 use izarravm_video::{VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE, VGA_TEXT_BASE};
 // Re-exported cache test helpers.
-use super::cache_config::{CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK, cache_geometry};
+use super::cache_config::{CACHE_TIER_DISABLED_MASK, cache_geometry};
 
 const BIOS_TEXT_WHITE: u8 = 0x3F;
 
@@ -361,14 +361,22 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
     let beam_at_batch_start = machine.scanout_beam_dots();
     let margo_scanout_at_batch_start = machine.vega.margo_scanout().is_some();
     let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
-    let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.cpu.level());
-    let icache_fetch_clocks = u64::from(izarravm_bus::BusCycle::clocks_for(
-        BusWidth::Byte,
-        machine.cache_model.code_fetch_wait_states(),
-    ));
+    let (bus_num_at_batch_start, bus_den_at_batch_start) =
+        bus_timing(machine.cpu.level(), machine.timing_epoch);
+    let l1_charges_folded =
+        crate::bus::l1_charges_folded(machine.active_mode, machine.timing_epoch);
+    let icache_fetch_clocks = if l1_charges_folded {
+        0
+    } else {
+        u64::from(izarravm_bus::BusCycle::clocks_for(
+            BusWidth::Byte,
+            machine.cache_model.code_fetch_wait_states(),
+        ))
+    };
     let a20_open = machine.keyboard.a20_enabled();
     let device_free_extended_floor = machine.vega.device_free_extended_floor();
     let mut bus = MachineBus {
+        l1_charges_folded,
         memory: &mut machine.memory,
         ram_lookup: &mut machine.ram_lookup,
         vega: &mut machine.vega,
@@ -687,6 +695,9 @@ mod timed_io;
 #[cfg(test)]
 #[path = "machine_video_services_test.rs"]
 mod video_services;
+#[cfg(test)]
+#[path = "machine_whole_bill_fold_test.rs"]
+mod whole_bill_fold;
 
 #[test]
 fn margo_caps_match_the_end_to_end_coverage_matrix() {

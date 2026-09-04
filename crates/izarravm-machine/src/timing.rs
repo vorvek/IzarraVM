@@ -215,7 +215,7 @@ impl Machine {
     /// scale. Cheap by construction: one multiply + a modulo per call, not per
     /// access. Mirrors the CPU's `scale_clocks` for instruction clocks.
     pub(super) fn scale_bus(&mut self, raw: u64) -> u64 {
-        let (num, den) = bus_timing(self.cpu.level());
+        let (num, den) = bus_timing(self.cpu.level(), self.timing_epoch);
         let scaled = raw * u64::from(num) + self.bus_rem;
         self.bus_rem = scaled % u64::from(den);
         scaled / u64::from(den)

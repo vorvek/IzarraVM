@@ -6424,7 +6424,23 @@ const fn fp_timing_class(persona: CpuPersona, class: FpOpClass) -> u32 {
 /// pull those tiers down to SpeedSys on the 486; on the 586 the u8 wait-state cap
 /// (255) over a 16-dword line floors L2/RAM above SpeedSys. Era anchors and the gap
 /// are recorded in each bandwidth `cite`.
-pub const fn bus_timing(persona: CpuPersona) -> (u32, u32) {
+///
+/// EPOCH 2 (`IZARRAVM_TIMING_EPOCH=2`, slice 2's whole-bill fold): both fast
+/// personas become `(1, 1)`. Every guest clock is a real clock and no dial
+/// survives anywhere in the 486/586 bus path -- which is the whole point of the
+/// fold: it is what makes our bill directly comparable to 86Box's and
+/// DOSBox-X's. `(1,1)` is a 6.56x multiplier on the 586's surviving bus terms
+/// (`(16,105) = 0.152381`) and a 3x one on the 486's, so `tier_cost` is
+/// re-solved in the SAME commit and the L1 fetch/data terms the class counts
+/// already contain are folded out on the same gate. The 386 is out of the
+/// recalibration's scope and keeps `(23, 31)` under both epochs.
+pub const fn bus_timing(persona: CpuPersona, epoch: u32) -> (u32, u32) {
+    if epoch >= 2 {
+        return match persona {
+            CpuPersona::I386 => (23, 31),
+            CpuPersona::I486 | CpuPersona::I586 => (1, 1),
+        };
+    }
     match persona {
         CpuPersona::I386 => (23, 31),
         CpuPersona::I486 => (1, 3),

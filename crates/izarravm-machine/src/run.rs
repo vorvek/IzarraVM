@@ -1488,7 +1488,8 @@ impl Machine {
             // bus_timing's (num, den), read from the same authoritative CPU mode
             // that scale_bus uses. Machine's active_mode copy exists for Lotura
             // register readback and is updated in the same set_mode call.
-            let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
+            let (bus_num_at_batch_start, bus_den_at_batch_start) =
+                bus_timing(self.cpu.level(), self.timing_epoch);
             // Test seam: open this batch's per-run prior_runs_core_clocks push log.
             #[cfg(test)]
             self.test_prior_core_pushes.push(Vec::new());
@@ -1689,11 +1690,19 @@ impl Machine {
                     cd_redirector_armed: cd_redirector_dos_ds.is_some(),
                     unittester,
                     wait_states: profile.wait_states,
-                    icache_fetch_clocks: u64::from(izarravm_bus::BusCycle::clocks_for(
-                        BusWidth::Byte,
-                        cache_model.code_fetch_wait_states(),
-                    )),
+                    icache_fetch_clocks: if crate::bus::l1_charges_folded(
+                        *active_mode,
+                        *timing_epoch,
+                    ) {
+                        0
+                    } else {
+                        u64::from(izarravm_bus::BusCycle::clocks_for(
+                            BusWidth::Byte,
+                            cache_model.code_fetch_wait_states(),
+                        ))
+                    },
                     cache: cache_model,
+                    l1_charges_folded: crate::bus::l1_charges_folded(*active_mode, *timing_epoch),
                     flat_data_cost: active_mode.uses_approximate_timing(),
                     a20_open,
                     device_free_extended_floor,

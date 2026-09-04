@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::cache_config::cache_line_bytes;
 
 #[test]
 fn cache_level_config_matches_geometry() {
@@ -11,33 +12,39 @@ fn cache_level_config_matches_geometry() {
         GswMode::Gsw486,
         GswMode::Gsw586,
     ] {
-        let g = cache_geometry(mode);
-        let config = cache_level_config(mode);
-        let l1_lines = g.l1_bytes / CACHE_LINE_BYTES;
-        let l2_lines = g.l2_bytes / CACHE_LINE_BYTES;
+        // Both epochs: slice 2 gives the 486 a 16-byte line and the 586 a 32-byte
+        // one, so the mask must follow the epoch's line size, not a constant.
+        for epoch in [1, 2] {
+            let g = cache_geometry(mode);
+            let config = cache_level_config(mode, epoch);
+            let line = cache_line_bytes(mode, epoch);
+            assert_eq!(1u32 << config.line_shift, line, "{mode:?} epoch {epoch}");
+            let l1_lines = g.l1_bytes / line;
+            let l2_lines = g.l2_bytes / line;
 
-        assert_eq!(
-            config.l1_mask,
-            if l1_lines == 0 {
-                CACHE_TIER_DISABLED_MASK
-            } else {
-                l1_lines - 1
-            }
-        );
-        assert_eq!(
-            config.l2_mask,
-            if l2_lines == 0 {
-                CACHE_TIER_DISABLED_MASK
-            } else {
-                l2_lines - 1
-            }
-        );
+            assert_eq!(
+                config.l1_mask,
+                if l1_lines == 0 {
+                    CACHE_TIER_DISABLED_MASK
+                } else {
+                    l1_lines - 1
+                }
+            );
+            assert_eq!(
+                config.l2_mask,
+                if l2_lines == 0 {
+                    CACHE_TIER_DISABLED_MASK
+                } else {
+                    l2_lines - 1
+                }
+            );
+        }
     }
 }
 
 #[test]
 fn cache_model_resolves_tiers_by_working_set() {
-    let mut c = CacheModel::new(GswMode::Gsw486);
+    let mut c = CacheModel::new(GswMode::Gsw486, 1);
     let warm = |c: &mut CacheModel, base: u32, len: u32| {
         for off in (0..len).step_by(64) {
             c.data_tier(GswMode::Gsw486, base + off);
@@ -53,7 +60,7 @@ fn cache_model_resolves_tiers_by_working_set() {
 
 #[test]
 fn cache_model_reset_goes_cold() {
-    let mut c = CacheModel::new(GswMode::Gsw586);
+    let mut c = CacheModel::new(GswMode::Gsw586, 1);
     c.data_tier(GswMode::Gsw586, 0x30_0000); // installs the line
     assert_eq!(c.data_tier(GswMode::Gsw586, 0x30_0000), Tier::L1); // hot
     c.reset();
@@ -175,7 +182,7 @@ fn scaled_bus_loop_machine(mode: GswMode) -> Machine {
 }
 
 fn expected_scaled_bus_delta(raw: u64, remainder: u64, mode: GswMode) -> (u64, u64) {
-    let (num, den) = bus_timing(mode.persona());
+    let (num, den) = bus_timing(mode.persona(), 1);
     let numerator = u128::from(raw) * u128::from(num) + u128::from(remainder);
     (
         u64::try_from(numerator / u128::from(den)).unwrap(),

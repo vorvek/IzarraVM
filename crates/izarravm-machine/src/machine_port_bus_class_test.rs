@@ -249,27 +249,32 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
         "epoch 1 must not charge a gameport read (not in the seven-port legacy set)"
     );
 
-    // Epoch 2: every port charges its class figure. IsaXBus (gameport 0x201) -> 160.
+    // Epoch 2: every port charges its class figure. IsaXBus (gameport 0x201) = 160
+    // clocks, of which the generic byte cycle `read_io` records through `trace.record`
+    // now carries 4 -- slice 2 took `bus_timing(I586)` to `(1, 1)`, so the scaled
+    // subtrahend that used to floor to 0 is the whole 4 raw. Lane 156 + cycle 4 = 160,
+    // the same class figure by the same composition (design section 9.6 pre-registered
+    // exactly this re-derivation: "156 / 52 / 52 / 0 once bus_timing is (1,1)").
     machine.set_timing_epoch_for_test(2);
     machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap();
     });
     assert_eq!(
-        machine.port_bus_batch_clocks, 160,
-        "epoch 2 IsaXBus charge must be exactly 160 (the generic 4-raw cycle scales to 0 \
-         under I586's (16,105) bus ratio)"
+        machine.port_bus_batch_clocks, 156,
+        "epoch 2 IsaXBus lane must be 160 less the generic 4-raw cycle, which is no longer \
+         scaled away now that the fold has taken I586's bus ratio to (1,1)"
     );
 
-    // PciLegacyVga (0x3DA) -> 56. Reset between accesses since 0x3DA has its own fast-path
-    // read arm but still routes through the same `charge_port_bus` call.
+    // PciLegacyVga (0x3DA) -> 56 - 4 = 52. Reset between accesses since 0x3DA has its own
+    // fast-path read arm but still routes through the same `charge_port_bus` call.
     machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         bus.read_io(0x03DA, BusWidth::Byte, 0, false).unwrap();
     });
     assert_eq!(
-        machine.port_bus_batch_clocks, 56,
-        "epoch 2 PciLegacyVga charge must be 56"
+        machine.port_bus_batch_clocks, 52,
+        "epoch 2 PciLegacyVga lane must be 52 (56 less the generic cycle)"
     );
 
     // ChipsetInternal (Lotura 0xE0) -> 0.
@@ -296,9 +301,9 @@ fn epoch_2_does_not_double_charge_the_opl_status_read() {
         bus.read_io(0x0388, BusWidth::Byte, 0, false).unwrap();
     });
     assert_eq!(
-        machine.port_bus_batch_clocks, 160,
-        "IN 0x388 under epoch 2 must charge IsaXBus (160) exactly once, not 160 + 166 from the \
-         OPL arm's own pre-slice hand accrual"
+        machine.port_bus_batch_clocks, 156,
+        "IN 0x388 under epoch 2 must charge the IsaXBus lane (160 less the generic cycle) \
+         exactly once, not that plus 166 from the OPL arm's own pre-slice hand accrual"
     );
 }
 
@@ -321,10 +326,11 @@ fn epoch_2_admits_the_poll_skip_certificate_with_the_port_lane() {
             .map(|certificate| certificate.port_bus_clocks_per_iteration())
     });
     // `PciLegacyVga` 56, minus the generic byte cycle `read_io` records and scales (4 raw
-    // through the I586 bus dial 16/105 = 0), so lane + generic == the class figure exactly.
+    // through the I586 bus dial, which slice 2's fold made (1,1), so the subtrahend is the
+    // whole 4), so lane + generic == the class figure exactly.
     assert_eq!(
         lane,
-        Some(56),
+        Some(52),
         "epoch 2 must ADMIT 0x3DA and price the iteration at the PciLegacyVga class charge"
     );
     let (admitted_after, _, _) = machine.poll_skip_certificate_counters();
@@ -422,8 +428,8 @@ fn epoch_2_counts_the_port_lane_against_the_batch_cap() {
     // pre-slice behaviour, byte-identical); under epoch 2 it must be there in full.
     const BURST: u32 = 100;
     // PciLegacyVga (0x3C9 is in the 0x3C0-0x3CF VGA register block) = 56 clocks a byte cycle,
-    // less the generic 4-raw cycle scaled by I586's (16, 105), which floors to 0.
-    const PER_ACCESS: u64 = 56;
+    // less the generic 4-raw cycle, which slice 2's `(1, 1)` bus ratio no longer scales away.
+    const PER_ACCESS: u64 = 52;
 
     for epoch in [1u32, 2] {
         let mut machine = test_machine();
@@ -565,8 +571,9 @@ fn the_monitors_own_0x92_access_pays_the_isa_class_charge_once() {
         bus.read_io(0x0092, BusWidth::Byte, 0, true).unwrap();
     });
     assert_eq!(
-        machine.port_bus_batch_clocks, 160,
-        "the monitor's 0x92 read must pay IsaXBus (160) exactly once"
+        machine.port_bus_batch_clocks, 156,
+        "the monitor's 0x92 read must pay the IsaXBus lane (160 less the generic cycle) exactly \
+         once"
     );
 
     machine.port_bus_batch_clocks = 0;
@@ -574,8 +581,8 @@ fn the_monitors_own_0x92_access_pays_the_isa_class_charge_once() {
         bus.write_io(0x0092, BusWidth::Byte, 0x02, true).unwrap();
     });
     assert_eq!(
-        machine.port_bus_batch_clocks, 160,
-        "the monitor's 0x92 write must pay IsaXBus (160) exactly once -- 0x92 is one of the four \
+        machine.port_bus_batch_clocks, 156,
+        "the monitor's 0x92 write must pay the IsaXBus lane (156) exactly once -- 0x92 is one of the four \
          ports the ring-0 io_touched exemption does NOT cover, so this arm has side effects (A20) \
          the charge must not be folded into or duplicated by"
     );

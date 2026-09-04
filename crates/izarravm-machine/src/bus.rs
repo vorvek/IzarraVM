@@ -495,6 +495,15 @@ pub(super) fn lazy_ports_386_for(mode: GswMode) -> bool {
     lazy_ports_386_composed(mode, lazy_port_reads_386_enabled())
 }
 
+/// Whether `MachineBus::l1_charges_folded` is armed for this mode and epoch.
+///
+/// Epoch 2 and a fast persona. The I386 is out of the recalibration's scope: it
+/// has no epoch-2 class table (`izarravm_cpu`'s `class_table`), so nothing has
+/// absorbed its fetch and data terms and folding them would simply delete them.
+pub(super) const fn l1_charges_folded(mode: GswMode, epoch: u32) -> bool {
+    epoch >= 2 && mode.uses_approximate_timing()
+}
+
 impl Machine {
     pub(super) fn make_bus(&mut self) -> MachineBus<'_> {
         // Captured before the struct literal below since VEGA and trace are also
@@ -504,14 +513,20 @@ impl Machine {
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
         // Read from the CPU, the same authoritative mode owner that scale_bus
         // uses. Machine's active_mode copy is kept for bus register readback.
-        let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
+        let (bus_num_at_batch_start, bus_den_at_batch_start) =
+            bus_timing(self.cpu.level(), self.timing_epoch);
         // The per-persona I-cache fetch cost, snapshotted for the batch alongside the bus scale
         // (see `MachineBus::icache_fetch_clocks`). Captured here because `cache_model` is also
         // mutably borrowed by the literal below.
-        let icache_fetch_clocks = u64::from(izarravm_bus::BusCycle::clocks_for(
-            BusWidth::Byte,
-            self.cache_model.code_fetch_wait_states(),
-        ));
+        let l1_charges_folded = l1_charges_folded(self.active_mode, self.timing_epoch);
+        let icache_fetch_clocks = if l1_charges_folded {
+            0
+        } else {
+            u64::from(izarravm_bus::BusCycle::clocks_for(
+                BusWidth::Byte,
+                self.cache_model.code_fetch_wait_states(),
+            ))
+        };
         // Captured before the literal for the reason the four above it are: `keyboard` and `vega`
         // are moved into it as mutable borrows, so they cannot be read from inside it.
         let a20_open = self.keyboard.a20_enabled();
@@ -565,6 +580,7 @@ impl Machine {
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
+            l1_charges_folded,
             icache_fetch_clocks,
             flat_data_cost: self.active_mode.uses_approximate_timing(),
             a20_open,
@@ -1080,10 +1096,9 @@ impl MachineBus<'_> {
                     return None;
                 }
             }
-            raw = raw.checked_add(u64::from(BusCycle::clocks_for(
-                BusWidth::Byte,
-                self.cache.code_fetch_wait_states(),
-            )))?;
+            // Every byte of the run was just proved to be non-device cacheable RAM,
+            // so this is exactly the cached-fetch route -- 0 under the epoch-2 fold.
+            raw = raw.checked_add(self.cached_fetch_clocks())?;
         }
         Some(raw)
     }
@@ -1646,12 +1661,14 @@ impl MachineBus<'_> {
             // already guarantees identity for every caller of this arm), so this is a
             // probe-only fold with no effect on `address` used below.
             self.shadow_probe(kind, self.apply_a20(address));
-            self.trace.record(kind, address, width, self.cache.cost.l1);
+            if !self.l1_charges_folded {
+                self.trace.record(kind, address, width, self.cache.cost.l1);
+            }
             return;
         }
         let address = self.apply_a20(address);
         let ws = self.data_access_wait_states(address, width, kind);
-        self.trace.record(kind, address, width, ws);
+        self.record_data_cycle(kind, address, width, ws);
     }
 
     /// S1 shadow-tag probe call-out: folds a bus access kind to its shadow class
@@ -1707,14 +1724,20 @@ impl MachineBus<'_> {
             // per-byte loop below to preserve firmware/POST and device-execution
             // timing unchanged.
             if first >= 0x000A_0000 && self.is_device_window(first, BusWidth::Byte) {
-                self.trace
-                    .record_instruction_fetch_run(first, count, first_ws);
+                // Uncached route: `first_ws` is always `Some` here.
+                if let Some(first_ws) = first_ws {
+                    self.trace
+                        .record_instruction_fetch_run(first, count, first_ws);
+                }
             } else {
-                // Single I-cache access for the whole instruction run.
+                // Single I-cache access for the whole instruction run -- and none
+                // at all once epoch 2 has folded it into the class count.
                 if self.flat_data_cost {
                     self.shadow_l1.probe(ShadowAccessClass::CodeFetch, first);
                 }
-                self.trace.record_instruction_fetch_run(first, 1, first_ws);
+                if let Some(first_ws) = first_ws {
+                    self.trace.record_instruction_fetch_run(first, 1, first_ws);
+                }
             }
         } else {
             for i in 0..count {
@@ -1722,6 +1745,34 @@ impl MachineBus<'_> {
             }
         }
         Ok(())
+    }
+
+    /// One instruction-fetch access of CACHEABLE RAM: `clocks_for(_, code_fetch_wait_states)`
+    /// = 2 + the per-mode I-cache constant, and **0** once epoch 2 has folded the L1 fetch into
+    /// the instruction class count. Matches what `charge_physical_instruction_fetch_run`'s
+    /// cacheable-RAM fast path records for one access, which is what `icache_fetch_clocks`
+    /// caches per batch.
+    #[inline]
+    fn cached_fetch_clocks(&self) -> u64 {
+        if self.l1_charges_folded {
+            0
+        } else {
+            2 + u64::from(self.cache.code_fetch_wait_states())
+        }
+    }
+
+    /// One `flat_data_cost` (L1-resident) data access of `width`, and **0** once
+    /// epoch 2 has folded the L1 data access into the instruction class count.
+    #[inline]
+    fn flat_data_clocks(&self, width: BusWidth) -> u64 {
+        if self.l1_charges_folded {
+            0
+        } else {
+            u64::from(izarravm_bus::BusCycle::clocks_for(
+                width,
+                self.cache.cost.l1,
+            ))
+        }
     }
 }
 
@@ -1772,7 +1823,7 @@ impl CpuBus for MachineBus<'_> {
             self.direct_page_ram_bytes(address, width.bytes() as usize, width)
         {
             let ws = self.data_access_wait_states(address, width, kind);
-            self.trace.record(kind, address, width, ws);
+            self.record_data_cycle(kind, address, width, ws);
             let data = &self.memory.as_slice()[start..end];
             let value = match width {
                 BusWidth::Byte => u32::from(data[0]),
@@ -1875,7 +1926,7 @@ impl CpuBus for MachineBus<'_> {
             self.direct_page_ram_bytes(address, width.bytes() as usize, width)
         {
             let ws = self.data_access_wait_states(address, width, kind);
-            self.trace.record(kind, address, width, ws);
+            self.record_data_cycle(kind, address, width, ws);
             match width {
                 BusWidth::Byte => self.memory.write_u8(start, value as u8)?,
                 BusWidth::Word => self.memory.write_u16(start, value as u16)?,
@@ -2289,15 +2340,22 @@ impl CpuBus for MachineBus<'_> {
             for i in 0..count {
                 self.shadow_probe(kind, address.wrapping_add(i));
             }
-            self.trace
-                .record_memory_run(kind, address, count, BusWidth::Byte, self.cache.cost.l1);
+            if !self.l1_charges_folded {
+                self.trace.record_memory_run(
+                    kind,
+                    address,
+                    count,
+                    BusWidth::Byte,
+                    self.cache.cost.l1,
+                );
+            }
             return Ok(());
         }
         let base = self.apply_a20(address);
         for i in 0..count {
             let at = base.wrapping_add(i);
             let ws = self.data_access_wait_states(at, BusWidth::Byte, kind);
-            self.trace.record(kind, at, BusWidth::Byte, ws);
+            self.record_data_cycle(kind, at, BusWidth::Byte, ws);
         }
         Ok(())
     }
@@ -2332,16 +2390,17 @@ impl CpuBus for MachineBus<'_> {
     /// value for all three widths and a MISALIGNED access costs `width.bytes()` times it. See the
     /// trait's declaration for the full caveat and for why the multiplier is the caller's.
     fn jit_direct_memory_max_clocks(&self, width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
-        let ram_wait_states = if self.flat_data_cost {
-            self.cache.cost.l1
+        let ram = if self.flat_data_cost {
+            self.flat_data_clocks(width)
         } else {
-            self.cache
+            let ram_wait_states = self
+                .cache
                 .cost
                 .l1
                 .max(self.cache.cost.l2)
-                .max(self.cache.cost.ram)
+                .max(self.cache.cost.ram);
+            u64::from(BusCycle::clocks_for(width, ram_wait_states))
         };
-        let ram = u64::from(BusCycle::clocks_for(width, ram_wait_states));
         Some(ram.max(self.jit_mode13_data_cost_clocks(width)))
     }
 
@@ -2351,7 +2410,7 @@ impl CpuBus for MachineBus<'_> {
         }
         let end = start.checked_add(count - 1)?;
         if end < 0x000A_0000 {
-            return Some(2 + u64::from(self.cache.code_fetch_wait_states()));
+            return Some(self.cached_fetch_clocks());
         }
         let first = self.apply_a20(start);
         let last = self.apply_a20(end);
@@ -2360,6 +2419,11 @@ impl CpuBus for MachineBus<'_> {
         {
             return None;
         }
+        // `None` is the folded cached-RAM route: zero clocks, whatever the run's
+        // length.
+        let Some(wait_states) = wait_states else {
+            return Some(0);
+        };
         let accesses = if first >= 0x000A_0000 && self.is_device_window(first, BusWidth::Byte) {
             count
         } else {
@@ -2376,11 +2440,10 @@ impl CpuBus for MachineBus<'_> {
             .map(|scaled| scaled / u64::from(self.bus_den_at_batch_start))
     }
 
-    /// One instruction-fetch access of cacheable RAM: `clocks_for(_, code_fetch_wait_states)` = 2 +
-    /// the per-mode I-cache constant. Matches what `charge_physical_instruction_fetch_run`'s
-    /// cacheable-RAM fast path records for one access. The JIT cost-fold folds this per slot.
+    /// One instruction-fetch access of cacheable RAM: see `cached_fetch_clocks`.
+    /// The JIT cost-fold folds this per slot.
     fn jit_fetch_cost_clocks(&self) -> u64 {
-        2 + u64::from(self.cache.code_fetch_wait_states())
+        self.cached_fetch_clocks()
     }
 
     /// Every JIT cost dial on this bus is a pure function of the active mode: the cache tier and
@@ -2444,10 +2507,11 @@ impl CpuBus for MachineBus<'_> {
             }
         }
         let physical = self.apply_a20(physical_start);
-        let fetch_cost = u64::from(izarravm_bus::BusCycle::clocks_for(
-            BusWidth::Byte,
-            self.code_fetch_wait_states(physical),
-        ));
+        // `None` is the folded cached-RAM route: the fetch is inside the class
+        // count already, so the native run charges nothing for it.
+        let fetch_cost = self.code_fetch_wait_states(physical).map_or(0, |ws| {
+            u64::from(izarravm_bus::BusCycle::clocks_for(BusWidth::Byte, ws))
+        });
         let instruction_count = (fetch_lens.len() as u64).saturating_mul(iterations);
         self.trace
             .add_elapsed_clocks(fetch_cost.saturating_mul(instruction_count));
@@ -2489,10 +2553,11 @@ impl CpuBus for MachineBus<'_> {
             }
         }
         let physical = self.apply_a20(physical_start);
-        let fetch_cost = u64::from(izarravm_bus::BusCycle::clocks_for(
-            BusWidth::Byte,
-            self.code_fetch_wait_states(physical),
-        ));
+        // `None` is the folded cached-RAM route: the fetch is inside the class
+        // count already, so the native run charges nothing for it.
+        let fetch_cost = self.code_fetch_wait_states(physical).map_or(0, |ws| {
+            u64::from(izarravm_bus::BusCycle::clocks_for(BusWidth::Byte, ws))
+        });
         let instruction_count = (fetch_lens.len() as u64).saturating_mul(iterations);
         self.trace
             .add_elapsed_clocks(fetch_cost.saturating_mul(instruction_count));
@@ -2502,14 +2567,11 @@ impl CpuBus for MachineBus<'_> {
     /// One byte-wide direct data access: `clocks_for(Byte, cost.l1)` = 2 + the flat L1 wait-state,
     /// exactly what `charge_direct_memory` records for a direct-page hit in the Approximate class.
     fn jit_data_byte_cost_clocks(&self) -> u64 {
-        2 + u64::from(self.cache.cost.l1)
+        self.flat_data_clocks(BusWidth::Byte)
     }
 
     fn jit_data_cost_clocks(&self, width: BusWidth) -> u64 {
-        u64::from(izarravm_bus::BusCycle::clocks_for(
-            width,
-            self.cache.cost.l1,
-        ))
+        self.flat_data_clocks(width)
     }
 
     fn jit_mode13_data_cost_clocks(&self, width: BusWidth) -> u64 {
@@ -2531,14 +2593,35 @@ impl CpuBus for MachineBus<'_> {
         ))
     }
 
+    /// EPOCH 2 (census row 4): carry the batch's own `bus_rem` instead of the
+    /// `den - 1` worst case. `scale_bus` accumulates its remainder across a
+    /// batch's calls, and a sequence of floors with a carried remainder sums to
+    /// `floor((sum(raw) * num + rem_0) / den)` exactly -- so with the real
+    /// remainder this bound is EXACT rather than merely an upper bound, and it
+    /// still never under-estimates (`rem < den`). Epoch-gated because tightening
+    /// an admission bound changes what the JIT admits, which would move epoch 1.
+    ///
+    /// RECORDED FINDING: at `bus_timing = (1, 1)` -- which is every epoch-2
+    /// 486/586 batch -- `den = 1`, so `den - 1` and `bus_rem` are both 0 and the
+    /// two expressions are identical. This item is therefore behaviourally inert
+    /// in slice 2; it is here so the bound is right if a fast persona ever runs
+    /// under a non-unit ratio again.
     fn jit_scale_bus_cost_upper(&self, raw_clocks: u64) -> u64 {
+        let carry = if self.timing_epoch >= 2 {
+            self.bus_rem_at_batch_start
+        } else {
+            u64::from(self.bus_den_at_batch_start) - 1
+        };
         raw_clocks
             .saturating_mul(u64::from(self.bus_num_at_batch_start))
-            .saturating_add(u64::from(self.bus_den_at_batch_start) - 1)
+            .saturating_add(carry)
             / u64::from(self.bus_den_at_batch_start)
     }
 
     fn rep_data_byte_cost_upper(&self) -> u64 {
+        // The FOLD is not applied to this upper bound: it must never
+        // under-estimate, and a REP element can land in the aperture (the `video`
+        // term below), which is not folded.
         let ram = if self.flat_data_cost {
             self.cache.cost.l1
         } else {
@@ -2561,7 +2644,7 @@ impl CpuBus for MachineBus<'_> {
             BusWidth::Byte,
             wait_states,
         ));
-        let (num, den) = bus_timing(self.active_mode.persona());
+        let (num, den) = bus_timing(self.active_mode.persona(), self.timing_epoch);
         raw.saturating_mul(u64::from(num))
             .saturating_add(u64::from(den) - 1)
             / u64::from(den)
@@ -2717,7 +2800,7 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some(value) = self.vega.read_wide_memory(address, width) {
             let ws = self.data_access_wait_states(address, width, kind);
-            self.trace.record(kind, address, width, ws);
+            self.record_data_cycle(kind, address, width, ws);
             return Ok(value);
         }
 
@@ -2732,7 +2815,7 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some((start, end)) = self.direct_ram_range(address, width) {
             let ws = self.data_access_wait_states(address, width, kind);
-            self.trace.record(kind, address, width, ws);
+            self.record_data_cycle(kind, address, width, ws);
             let data = &self.memory.as_slice()[start..end];
             return Ok(match width {
                 BusWidth::Byte => u32::from(data[0]),
@@ -2742,7 +2825,7 @@ impl CpuBus for MachineBus<'_> {
         }
 
         let ws = self.data_access_wait_states(address, width, kind);
-        self.trace.record(kind, address, width, ws);
+        self.record_data_cycle(kind, address, width, ws);
 
         let mut data = [0u8; 4];
         self.read_phys(address, &mut data[..bytes])?;
@@ -2819,13 +2902,14 @@ impl CpuBus for MachineBus<'_> {
 
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
         let address = self.apply_a20(address);
-        let ws = self.code_fetch_wait_states(address);
-        self.trace.record(
-            BusAccessKind::InstructionPrefetch,
-            address,
-            BusWidth::Byte,
-            ws,
-        );
+        if let Some(ws) = self.code_fetch_wait_states(address) {
+            self.trace.record(
+                BusAccessKind::InstructionPrefetch,
+                address,
+                BusWidth::Byte,
+                ws,
+            );
+        }
         Ok(())
     }
 
@@ -2886,10 +2970,14 @@ impl CpuBus for MachineBus<'_> {
         {
             debug_assert_eq!(
                 self.icache_fetch_clocks,
-                u64::from(izarravm_bus::BusCycle::clocks_for(
-                    BusWidth::Byte,
-                    self.cache.code_fetch_wait_states()
-                )),
+                if self.l1_charges_folded {
+                    0
+                } else {
+                    u64::from(izarravm_bus::BusCycle::clocks_for(
+                        BusWidth::Byte,
+                        self.cache.code_fetch_wait_states(),
+                    ))
+                },
                 "icache_fetch_clocks is stale relative to the live cache model; a mode change \
                  landed without rebuilding the bus"
             );
@@ -2904,7 +2992,10 @@ impl CpuBus for MachineBus<'_> {
                 self.shadow_l1
                     .probe(ShadowAccessClass::CodeFetch, physical_start);
             }
-            if self.trace.tracing_mode() == TracingMode::Off {
+            if self.l1_charges_folded {
+                // Folded into the class count: no bus cycle, on either trace arm.
+                // `icache_fetch_clocks` is 0 here, so the two arms agree.
+            } else if self.trace.tracing_mode() == TracingMode::Off {
                 self.trace.add_elapsed_clocks(self.icache_fetch_clocks);
             } else {
                 self.trace.record_instruction_fetch_run(
@@ -4874,14 +4965,21 @@ impl MachineBus<'_> {
                 let at = address.wrapping_add((i * width.bytes() as usize) as u32);
                 self.shadow_probe(kind, at);
             }
-            self.trace
-                .record_memory_run(kind, address, count as u32, width, self.cache.cost.l1);
+            if !self.l1_charges_folded {
+                self.trace.record_memory_run(
+                    kind,
+                    address,
+                    count as u32,
+                    width,
+                    self.cache.cost.l1,
+                );
+            }
             return;
         }
         for offset in (0..bytes).step_by(width.bytes() as usize) {
             let at = address + offset as u32;
             let wait_states = self.data_access_wait_states(at, width, kind);
-            self.trace.record(kind, at, width, wait_states);
+            self.record_data_cycle(kind, at, width, wait_states);
         }
     }
 
@@ -5028,7 +5126,7 @@ impl MachineBus<'_> {
         let address = self.apply_a20(address);
         if self.vega.write_wide_memory(address, width, value) {
             let ws = self.data_access_wait_states(address, width, kind);
-            self.trace.record(kind, address, width, ws);
+            self.record_data_cycle(kind, address, width, ws);
             return Ok(());
         }
 
@@ -5047,7 +5145,7 @@ impl MachineBus<'_> {
 
         if let Some((start, _)) = self.direct_ram_range(address, width) {
             let ws = self.data_access_wait_states(address, width, kind);
-            self.trace.record(kind, address, width, ws);
+            self.record_data_cycle(kind, address, width, ws);
             match width {
                 BusWidth::Byte => self.memory.write_u8(start, value as u8),
                 BusWidth::Word => self.memory.write_u16(start, value as u16),
@@ -5058,7 +5156,7 @@ impl MachineBus<'_> {
         }
 
         let ws = self.data_access_wait_states(address, width, kind);
-        self.trace.record(kind, address, width, ws);
+        self.record_data_cycle(kind, address, width, ws);
 
         match width {
             BusWidth::Byte => self.write_memory_byte_recorded(address, value as u8, recorder),
@@ -5165,10 +5263,11 @@ impl MachineBus<'_> {
         address: u32,
         width: BusWidth,
         kind: BusAccessKind,
-    ) -> u8 {
+    ) -> Option<u8> {
         if address >= 0x000A_0000 && self.is_device_window(address, width) {
-            // Device/ROM: untiered, unchanged timing (both classes).
-            return self.memory_wait_states(address);
+            // Device/ROM: untiered, unchanged timing (both classes). NEVER folded:
+            // an aperture or ROM access is not inside anyone's instruction count.
+            return Some(self.memory_wait_states(address));
         }
         if self.flat_data_cost {
             // Approximate class (486/586): charge the flat L1-resident cost and skip
@@ -5176,20 +5275,48 @@ impl MachineBus<'_> {
             // benchmarks are L1-resident so cyc/iter stays near the accurate model;
             // the win is skipping ~3M tag lookups per run. Guest-invisible: only time.
             self.shadow_probe(kind, address);
-            return self.cache.cost.l1;
+            if self.l1_charges_folded {
+                return None;
+            }
+            return Some(self.cache.cost.l1);
         }
-        self.cache.data_wait_states(address, width)
+        let tier = self.cache.data_tier_and_wait_states(address, width);
+        if self.l1_charges_folded && tier.0 == Tier::L1 {
+            return None;
+        }
+        Some(tier.1)
+    }
+
+    /// Record one DATA bus cycle, or nothing when the epoch-2 fold has already
+    /// charged it inside the instruction's class count (`ws == None`). An access
+    /// that produces no bus cycle is not counted as one either: `BusTrace`
+    /// records bus cycles, and an L1 hit does not reach the bus.
+    #[inline]
+    fn record_data_cycle(
+        &mut self,
+        kind: BusAccessKind,
+        address: u32,
+        width: BusWidth,
+        ws: Option<u8>,
+    ) {
+        if let Some(ws) = ws {
+            self.trace.record(kind, address, width, ws);
+        }
     }
 
     /// Wait-states for a single code-fetch byte at the post-A20 physical `address`.
     /// Code in cacheable RAM is charged the per-mode L1 constant (code is assumed
     /// I-cache resident); code fetched from ROM/device keeps `memory_wait_states`,
     /// so firmware/POST and any execution out of a device window are unchanged.
-    fn code_fetch_wait_states(&self, address: u32) -> u8 {
+    fn code_fetch_wait_states(&self, address: u32) -> Option<u8> {
         if address >= 0x000A_0000 && self.is_device_window(address, BusWidth::Byte) {
-            self.memory_wait_states(address)
+            // ROM, UMB, shadow and device-window code: never folded (design
+            // section 9.5), so firmware and option ROMs keep their route cost.
+            Some(self.memory_wait_states(address))
+        } else if self.l1_charges_folded {
+            None
         } else {
-            self.cache.code_fetch_wait_states()
+            Some(self.cache.code_fetch_wait_states())
         }
     }
 

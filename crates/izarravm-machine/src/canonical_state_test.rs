@@ -15,6 +15,8 @@ use izarravm_cpu::CpuCanonicalCaptureError;
 use izarravm_cpu::SegmentIndex;
 
 use super::*;
+// The epoch-1 line size, which is what every machine in this file runs under.
+use crate::cache_config::CACHE_LINE_BYTES;
 use crate::{
     BIOS_ROM_SIZE, Bios32Call, JoystickState, MachineProfile, StopReason, WaitStateProfile,
     unittester,
@@ -3310,7 +3312,7 @@ fn inconsistent_modeled_cache_state_is_rejected_independently() {
         }
     );
 
-    let expected_config = cache_level_config(GswMode::Gsw386);
+    let expected_config = cache_level_config(GswMode::Gsw386, 1);
     let mut l1_mask = test_machine();
     l1_mask.cache_model.config.l1_mask = 0;
     assert_eq!(
@@ -3335,7 +3337,7 @@ fn inconsistent_modeled_cache_state_is_rejected_independently() {
         }
     );
 
-    let expected_cost = tier_cost(GswMode::Gsw386);
+    let expected_cost = tier_cost(GswMode::Gsw386, 1);
     for (index, actual) in [[1, 0, 3], [0, 1, 3], [0, 0, 4]].into_iter().enumerate() {
         let mut machine = test_machine();
         machine.cache_model.cost.l1 = actual[0];

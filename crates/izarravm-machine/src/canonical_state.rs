@@ -10,7 +10,7 @@ use crate::{
     ata::CanonicalAtaDisk,
     bmide::CanonicalBusMasterIde,
     cache_config::{
-        CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK,
+        CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_MIN_LINE_BYTES, CACHE_TIER_DISABLED_MASK,
         cache_level_config, code_fetch_ws, tier_cost,
     },
     dma::{CanonicalDma8237Pair, CanonicalDmaEventTotalsV1},
@@ -397,7 +397,10 @@ impl CanonicalMachineControl {
     }
 }
 
-const MAX_MODELED_CACHE_LINE: u32 = u32::MAX / CACHE_LINE_BYTES;
+/// The largest line number a 32-bit physical address can produce, over the
+/// SMALLEST line any epoch models (16 bytes, the 486's). A larger line yields
+/// smaller line numbers, so this bound accepts every epoch's tags.
+const MAX_MODELED_CACHE_LINE: u32 = u32::MAX / CACHE_MIN_LINE_BYTES;
 
 #[derive(Debug, Clone, Copy)]
 struct CanonicalModeledCacheProjection<'a> {
@@ -493,7 +496,7 @@ impl CacheModel {
             );
         }
 
-        let expected_config = cache_level_config(mode);
+        let expected_config = cache_level_config(mode, self.epoch());
         if self.config.l1_mask != expected_config.l1_mask
             || self.config.l2_mask != expected_config.l2_mask
         {
@@ -507,7 +510,7 @@ impl CacheModel {
             );
         }
 
-        let expected_cost = tier_cost(mode);
+        let expected_cost = tier_cost(mode, self.epoch());
         let expected_costs = [expected_cost.l1, expected_cost.l2, expected_cost.ram];
         let actual_costs = [self.cost.l1, self.cost.l2, self.cost.ram];
         if actual_costs != expected_costs {
@@ -914,7 +917,7 @@ impl Machine {
                 elapsed_clocks: self.elapsed_clocks,
             });
         }
-        let denominator = bus_timing(self.active_mode.persona()).1;
+        let denominator = bus_timing(self.active_mode.persona(), self.timing_epoch).1;
         if self.bus_rem >= u64::from(denominator) {
             return Err(MachineCanonicalCaptureError::InvalidBusRemainder {
                 remainder: self.bus_rem,

@@ -200,8 +200,9 @@ fn an_elided_span_charges_exactly_n_times_one_iteration_on_every_lane() {
         "the core lane must swap the shape's baked epoch-1 IN (12 raw) for Intel's real-mode          column (7 x 12 = 84 raw), leaving the 5-slot shape's other four slots (21 - 12 = 9          raw) alone -- the rest of the core class table is the recalibration's slice 1, not          this one's"
     );
     assert_eq!(
-        port_lane, 56,
-        "the port lane must be the PciLegacyVga class charge minus the scaled generic cycle"
+        port_lane, 52,
+        "the port lane must be the PciLegacyVga class charge (56) minus the scaled generic \
+         cycle, which slice 2's (1,1) bus ratio no longer scales away"
     );
 
     let core_before = machine.cpu.elapsed_clocks;
@@ -1397,7 +1398,7 @@ fn native_deadline_bound_uses_the_same_bus_scale_as_batch_accounting() {
 
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
         machine.set_mode(mode);
-        let (num, den) = bus_timing(mode.persona());
+        let (num, den) = bus_timing(mode.persona(), machine.timing_epoch);
         let expected = RAW_CLOCKS
             .saturating_mul(u64::from(num))
             .saturating_add(u64::from(den) - 1)
@@ -1860,8 +1861,8 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     assert_eq!(native_machine.bus_rem, interp_machine.bus_rem);
     assert_eq!(
         native_scaled,
-        (native_raw * u64::from(bus_timing(GswMode::Gsw486.persona()).0) + 2)
-            / u64::from(bus_timing(GswMode::Gsw486.persona()).1)
+        (native_raw * u64::from(bus_timing(GswMode::Gsw486.persona(), 1).0) + 2)
+            / u64::from(bus_timing(GswMode::Gsw486.persona(), 1).1)
     );
     assert_eq!(
         interp_machine
