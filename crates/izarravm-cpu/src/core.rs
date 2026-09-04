@@ -2067,6 +2067,36 @@ impl CpuGsw {
         self.mode.clock_hz()
     }
 
+    /// True while the reflected-call memo needs the INTERPRETER for the next batch (plan
+    /// section 4.2: the batch loop owns the toggle, never the call-out). A journaled trip's
+    /// write set is only complete under the interpreter -- a compiled block's stores go
+    /// through the store-stub pad and are bulk-charged at block exit, reaching no journal
+    /// seam -- so the learn cycle's two journaled trips, and any audit trip, must run there.
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_wants_interpreter(&self) -> bool {
+        self.reflected_call
+            .as_ref()
+            .is_some_and(|state| state.wants_interpreter())
+    }
+
+    /// Count one batch the machine ran interpreted for this module's sake, and spend one
+    /// of the window. R2.10 item 12 is explicit that a LEARNING fall-through is not
+    /// bit-identical to a run without the knob, because forcing the interpreter moves fetch
+    /// wait states; this is what makes the cost visible in the report rather than argued.
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_note_learn_batch(&mut self) {
+        if let Some(state) = self.reflected_call.as_mut() {
+            state.learn_batches += 1;
+            state.spend_interpreter_batch();
+        }
+    }
+
+    /// The machine's HLE software-interrupt SERVICE seam (Fable review F2).
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_note_soft_int_serviced(&mut self) {
+        crate::reflected_call_memo::note_soft_int_serviced(self);
+    }
+
     /// The reflected-call memo's CODE-MARK EPOCH: `perf.code_invalidations`.
     ///
     /// The memo's code watch rests on its trip's code pages staying MARKED in the decode

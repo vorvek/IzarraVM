@@ -1435,6 +1435,23 @@ impl Machine {
                 .timeline
                 .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
                 .max(1);
+            // The reflected-call memo's interpreter forcing (slice1 plan section 4.2: the
+            // batch loop owns this toggle, never the call-out). A learn cycle's two JOURNALED
+            // trips, and any audit trip, must retire through the interpreter's write seams --
+            // a compiled block's stores reach none of them. Read once per batch and acted on
+            // only when the answer CHANGES, so a run with the knob off pays one bool compare.
+            #[cfg(all(feature = "jit", feature = "reflected-call-memo"))]
+            {
+                let want = self.cpu.reflected_call_wants_interpreter();
+                if want != self.reflected_call_interpreter_forced {
+                    self.cpu
+                        .set_native_backend_enabled(!want && self.native_backend_configured);
+                    self.reflected_call_interpreter_forced = want;
+                }
+                if want {
+                    self.cpu.reflected_call_note_learn_batch();
+                }
+            }
             let cap = self.event_batch_cap_cached(remaining);
             // Published to `MachineBus` below so the reflected-call memo's answer gate
             // bounds a lump by THIS cap rather than a second, drift-prone derivation;
@@ -1915,6 +1932,17 @@ impl Machine {
                         && let Some(vector) = self.pending_soft_int
                     {
                         serviced = true;
+                        // The reflected-call memo's HLE seam (Fable review 2026-09-05,
+                        // BLOCKING F2). This is the instant a posted software interrupt is
+                        // SERVICED, and the machine writes guest registers and memory here,
+                        // outside every CPU seam. A reflected trip straddles 6-8 batch
+                        // boundaries, so a nested `INT 1Ah`/`INT 10h`/`INT 13h`/`INT 2Fh`
+                        // inside a trip is serviced mid-trip and the flag is cleared at the
+                        // next batch entry -- long before `finish_trip` or the answer screen
+                        // could ask the bus whether one was posted. Refusing the open trip
+                        // HERE is the only place that sees it.
+                        #[cfg(feature = "reflected-call-memo")]
+                        self.cpu.reflected_call_note_soft_int_serviced();
                         match vector {
                             0x10 | 0x42 => self.handle_int10(),
                             0x11 => self.handle_int11(),

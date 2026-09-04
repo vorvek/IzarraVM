@@ -1161,6 +1161,7 @@ fn the_epoch_is_part_of_the_memo_key() {
     set.insert(MemoKey { epoch: 1, ..b });
     set.insert(b);
     assert_eq!(set.len(), 2, "the two epochs must occupy two buckets");
+}
 
 // ---------------------------------------------------------------------------
 // Amendment 1: A20 retire (plan Revision 2 amendments, item A, BLOCKING).
@@ -1192,6 +1193,7 @@ fn an_a20_toggle_retires_every_memo() {
     let (mut cpu, _bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key_a = MemoKey {
+        epoch: 0,
         vector: VECTOR,
         ax: 0,
         cs_selector: CODE_SELECTOR,
@@ -1241,6 +1243,7 @@ fn note_a20_changed_is_the_seam_that_retires() {
     let (mut cpu, _bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key = MemoKey {
+        epoch: 0,
         vector: VECTOR,
         ax: 0,
         cs_selector: CODE_SELECTOR,
@@ -3141,4 +3144,175 @@ fn a_byte_moving_outside_the_claimed_mask_widens_the_claim_and_is_confirmed() {
     );
     assert_eq!(entry.2 & 0xFFFF, 0x2222, "and carry the observed low half");
     assert_eq!(entry.2 >> 16, 0xBEEF, "alongside the journaled high half");
+}
+
+// ---------------------------------------------------------------------------
+// The Fable review's two BLOCKING findings (2026-09-05).
+// ---------------------------------------------------------------------------
+
+/// F1. A journaled trip whose compiled block STORED anything has an incomplete write set:
+/// native stores go through the store-stub pad and are charged in bulk at block exit, so
+/// none of them reaches `write_linear_*` and none reaches `note_write`. A memo built from
+/// such a trip would skip guest writes it never saw.
+///
+/// **Mutation bite**: delete the `note_native_stores` call at the block-exit accounting, or
+/// gate it on anything but `reflected_call_journal`. The trip is then learned from a write
+/// set with a hole in it -- and the audit cannot see the hole either, because
+/// `audit_write_values_disagree` walks the audited trip's OWN journal, which has the same
+/// one. E, D and the audit become three views of a single incomplete record.
+#[test]
+fn a_journaled_trip_whose_native_block_stored_is_refused() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    let mut open = OpenTrip::start(&cpu, &bus, key, Slot::JournalA);
+    open.journaling = true;
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+
+    // What the block exit does when its store counters are non-zero.
+    note_native_stores(&mut cpu);
+    on_far_return(&mut cpu, &bus);
+
+    let ks = &cpu.reflected_call.as_ref().unwrap().keys[&key];
+    assert_eq!(
+        ks.learn_refused[LearnRefused::NativeStore.index()],
+        1,
+        "a journaled trip with native stores must be refused, not learned from"
+    );
+    assert_eq!(ks.learned, 0);
+    assert_eq!(
+        ks.slot,
+        SlotState::Warm,
+        "and the key restarts its cycle rather than advancing on an incomplete journal"
+    );
+}
+
+/// F1, the other half: the batch loop is ASKED for the interpreter while a key is in a
+/// journal slot, so the refusal above stays rare. Armed by the WARM trip's own close --
+/// which is what makes the JournalA trip's batch already interpreted when it opens -- and
+/// disarmed the moment the key leaves the journal slots.
+///
+/// **Mutation bite**: never arm the window (the state this branch shipped in until the
+/// review). Every journaled trip then runs natively, `note_native_stores` refuses every
+/// one, and the mechanism goes inert -- which is the safe direction, and exactly why the
+/// refusal is the belt and this is the braces.
+#[test]
+fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    assert!(!cpu.reflected_call_wants_interpreter(), "idle: no forcing");
+
+    // A WARM trip closing as a return match advances the key to JournalA and arms it.
+    let key = key_for(&cpu, VECTOR, 0);
+    let open = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+    on_far_return(&mut cpu, &bus);
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().keys[&key].slot,
+        SlotState::JournalA
+    );
+    assert!(
+        cpu.reflected_call_wants_interpreter(),
+        "the JournalA trip's batch must already be interpreted when it opens"
+    );
+
+    // Leaving the journal slots disarms it at once -- the forcing lasts the two journaled
+    // trips, not a fixed window.
+    let mut open2 = OpenTrip::start(&cpu, &bus, key, Slot::JournalA);
+    open2.hazard = Some(LearnRefused::PortIo);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open2);
+    on_far_return(&mut cpu, &bus);
+    assert_eq!(
+        cpu.reflected_call.as_ref().unwrap().keys[&key].slot,
+        SlotState::Warm
+    );
+    assert!(
+        !cpu.reflected_call_wants_interpreter(),
+        "and it lifts the moment the key leaves the journal slots"
+    );
+
+    // The bound exists for the STRANDED case -- a key that enters JournalA and whose next
+    // trip never comes -- so the window cannot pin the interpreter on for the whole run.
+    let open3 = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open3);
+    on_far_return(&mut cpu, &bus);
+    assert!(cpu.reflected_call_wants_interpreter());
+    for _ in 0..MEMO_LEARN_BATCH_WINDOW {
+        cpu.reflected_call_note_learn_batch();
+    }
+    assert!(
+        !cpu.reflected_call_wants_interpreter(),
+        "the window must decay on its own after MEMO_LEARN_BATCH_WINDOW batches"
+    );
+}
+
+/// F2. An HLE software interrupt SERVICED inside a trip writes guest registers and memory
+/// from the machine, outside every CPU seam, and the posted flag is cleared at the next
+/// batch entry -- long before `finish_trip` or the answer screen could ask the bus about
+/// it. A reflected trip straddles 6-8 batch boundaries, so a nested `INT 1Ah`/`INT 10h`/
+/// `INT 13h`/`INT 2Fh` is serviced mid-trip and vanishes.
+///
+/// **Mutation bite**: delete the `reflected_call_note_soft_int_serviced` call at the
+/// machine's service site. The trip is then learned as if nothing happened; an answered
+/// trip skips the service entirely, and an `INT 1Ah` tick read inside a trip freezes in the
+/// epilogue -- caught, if at all, only by the period-64 audit and only when a tick boundary
+/// falls inside its window.
+#[test]
+fn an_hle_soft_int_serviced_inside_a_trip_refuses_the_memo() {
+    let (mut cpu, bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+    let open = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
+    cpu.reflected_call.as_mut().unwrap().open = Some(open);
+
+    // What the machine does at the instant it services a posted vector.
+    cpu.reflected_call_note_soft_int_serviced();
+    on_far_return(&mut cpu, &bus);
+
+    let ks = &cpu.reflected_call.as_ref().unwrap().keys[&key];
+    assert_eq!(
+        ks.learn_refused[LearnRefused::PendingSoftInt.index()],
+        1,
+        "a trip that had an HLE service run inside it must be refused"
+    );
+    assert_eq!(ks.learned, 0);
+}
+
+/// F1's block-exit CONDITION, named and tested. A block that stored nothing leaves the
+/// journal complete and must not be refused; a block that stored anything, while the trip
+/// is journaling, must be.
+///
+/// **Mutation bites**: drop the `journal` term (every JIT block refuses every trip, and the
+/// mechanism never learns); drop the store term (no block is ever refused, and the journal
+/// keeps its hole); use `&` instead of `|` over the three counts (a block that made only
+/// byte stores escapes).
+///
+/// **What this test does NOT cover, said plainly**: that the call site at the block exit
+/// still exists. Reaching it needs a real compiled block with real stores, which this
+/// fixture has no scaffolding for. The fixture-scale evidence is what covers it -- the
+/// acceptance run reports `learn_refused[native_store]` per key, and the interpreter
+/// forcing is what keeps that number small rather than zero-by-absence.
+#[test]
+fn the_native_store_refusal_fires_only_on_a_journaling_trip_that_actually_stored() {
+    assert!(
+        !native_stores_refuse(false, 1, 1, 1),
+        "not journaling: no refusal"
+    );
+    assert!(
+        !native_stores_refuse(true, 0, 0, 0),
+        "journaling but stored nothing"
+    );
+    assert!(
+        native_stores_refuse(true, 1, 0, 0),
+        "a byte store alone must refuse"
+    );
+    assert!(
+        native_stores_refuse(true, 0, 1, 0),
+        "a word store alone must refuse"
+    );
+    assert!(
+        native_stores_refuse(true, 0, 0, 1),
+        "a dword store alone must refuse"
+    );
+    assert!(native_stores_refuse(true, 3, 7, 11));
 }

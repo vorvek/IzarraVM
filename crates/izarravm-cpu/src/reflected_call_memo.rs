@@ -131,6 +131,13 @@ pub(crate) const MEMO_MAX_TRANSLATION_SET: usize = 64;
 /// Replay-write cap, raised from 32 to 192 by R2.3/R2.17 (the pinned-pre-
 /// value fix moves most same-address writes from R to W).
 pub(crate) const MEMO_MAX_REPLAY_WRITES: usize = 192;
+/// Batches of forced interpretation a journal stage is granted. It is a BOUND, not the
+/// expected duration: the forcing is armed when a key enters a journal slot and cleared the
+/// moment it leaves one, so in the normal case it lasts exactly the two journaled trips.
+/// The bound is what stops a key STRANDED mid-journal -- one that enters `JournalA` and
+/// whose next trip never comes -- from pinning the interpreter on for the rest of the run,
+/// which is the shape that cost a measured run 99.4% interpretation.
+pub(crate) const MEMO_LEARN_BATCH_WINDOW: u32 = 256;
 /// Runtime-audit `write_value` strikes a key may take before the bounded disarm
 /// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`, option D as
 /// recommended). Two, not one: with option E confirming the write model across eight
@@ -291,9 +298,10 @@ pub(crate) enum LearnRefused {
     Mmx,
     ReadSetUnstable,
     WriteValueUnstable,
+    NativeStore,
 }
 
-pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 25] = [
+pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 26] = [
     LearnRefused::PortIo,
     LearnRefused::NondeterministicRead,
     LearnRefused::PendingSoftInt,
@@ -319,6 +327,7 @@ pub(crate) const LEARN_REFUSED_ALL: [LearnRefused; 25] = [
     LearnRefused::Mmx,
     LearnRefused::ReadSetUnstable,
     LearnRefused::WriteValueUnstable,
+    LearnRefused::NativeStore,
 ];
 
 impl LearnRefused {
@@ -356,6 +365,7 @@ impl LearnRefused {
             Self::Mmx => "mmx",
             Self::ReadSetUnstable => "read_set_unstable",
             Self::WriteValueUnstable => "write_value_unstable",
+            Self::NativeStore => "native_store",
         }
     }
 }
@@ -965,7 +975,7 @@ pub(crate) struct KeyState {
     pub rearms: u64,
     pub learn_attempts: u64,
     pub learned: u64,
-    pub learn_refused: [u64; 25],
+    pub learn_refused: [u64; 26],
     /// Answers this key has applied since its last audit, and the signed bus-clock drift
     /// the memo has accumulated against what the audits actually observed (amendment 6).
     answers_since_audit: u64,
@@ -1141,6 +1151,14 @@ pub(crate) struct ReflectedCallMemoState {
     /// is only ever populated under ONE epoch: the first build after a bump retires the
     /// rest, so this single field stands for every memo in the map.
     pub(crate) code_mark_epoch: u64,
+    /// Batches of interpreter forcing still owed (see `MEMO_LEARN_BATCH_WINDOW`). The plan
+    /// requires the JOURNALED trips to run interpreted (section 4.2: "`on_int` sets
+    /// `state.want_interpreter`; the batch loop reads it at the next batch entry and calls
+    /// `set_native_backend_enabled(false)` for the whole batch"), because the journal seams
+    /// live on the interpreter's write paths and a compiled block's stores bypass them all.
+    interpreter_batches_left: u32,
+    /// Batches the machine ran on the interpreter for this module's sake.
+    pub(crate) learn_batches: u64,
     /// `IZARRAVM_REFLECTED_CALL_MEMO_AUDIT`, read ONCE when this state is created.
     pub(crate) audit_period: u64,
     /// Trips refused on purpose so the memo's prediction could be compared against the
@@ -1183,6 +1201,8 @@ impl Default for ReflectedCallMemoState {
             code_mark_epoch: 0,
             // Read ONCE, here, exactly as the arm knob is: the answer path afterwards only
             // ever reads this field.
+            interpreter_batches_left: 0,
+            learn_batches: 0,
             audit_period: knob_audit_period(),
             audited: 0,
             audit_mismatch: [0; 6],
@@ -1273,6 +1293,26 @@ pub(crate) fn screen_key_detailed<'a, B: CpuBus>(
 }
 
 impl ReflectedCallMemoState {
+    /// The batch loop asks this once per batch entry; see
+    /// `CpuGsw::reflected_call_wants_interpreter`.
+    pub(crate) fn wants_interpreter(&self) -> bool {
+        self.interpreter_batches_left > 0
+    }
+
+    /// One batch of the window spent. Called by the batch loop on every batch it forces, so
+    /// the window decays on its own and a key stranded mid-journal cannot hold it open.
+    pub(crate) fn spend_interpreter_batch(&mut self) {
+        self.interpreter_batches_left = self.interpreter_batches_left.saturating_sub(1);
+    }
+
+    fn arm_interpreter_window(&mut self) {
+        self.interpreter_batches_left = MEMO_LEARN_BATCH_WINDOW;
+    }
+
+    fn disarm_interpreter_window(&mut self) {
+        self.interpreter_batches_left = 0;
+    }
+
     /// Plan Revision 2 amendments, item A (BLOCKING): A20 is neither a register nor memory --
     /// it changes the PHYSICAL address every linear access resolves to -- while every memo's
     /// read/translation/replay set was pre-resolved to physical at record time under
@@ -1807,12 +1847,20 @@ fn audit_is_due(cpu: &mut CpuGsw, key: MemoKey) -> bool {
 }
 
 fn note_answer_for_audit(cpu: &mut CpuGsw, key: MemoKey) {
-    if let Some(key_state) = cpu
-        .reflected_call
-        .as_mut()
-        .and_then(|state| state.keys.get_mut(&key))
-    {
-        key_state.answers_since_audit = key_state.answers_since_audit.saturating_add(1);
+    let Some(state) = cpu.reflected_call.as_mut() else {
+        return;
+    };
+    let period = state.audit_period;
+    let Some(key_state) = state.keys.get_mut(&key) else {
+        return;
+    };
+    key_state.answers_since_audit = key_state.answers_since_audit.saturating_add(1);
+    // One answer AHEAD of a due audit, ask the batch loop for the interpreter: an audit
+    // trip journals, and a journal is only complete under the interpreter (F1). Without
+    // this the audit would grade the memo against a write set with the same hole the learn
+    // had, which is how three views of one incomplete record all agreed with each other.
+    if period >= 2 && key_state.answers_since_audit + 1 >= period.saturating_sub(1) {
+        state.arm_interpreter_window();
     }
 }
 
@@ -2103,6 +2151,61 @@ pub(crate) fn note_code_hit(cpu: &mut CpuGsw) {
     let retired = state.clear_all_memos();
     state.code_watch_retires += retired;
     state.retired[RetireCause::CodeWatch.index()] += retired;
+}
+
+/// Production seam: the Direct backend's block-exit accounting (`run.rs`), where a
+/// compiled block reports how many stores it made.
+///
+/// **The journal does not see a native store.** Every INTERPRETER write path is hooked
+/// before its fast-map probe (`memory.rs`'s `write_linear_u8`, the sized writes,
+/// `write_linear_fragment`, the page-walk A/D stores, and `control.rs`'s
+/// `write_system_linear`), but a compiled block emits its stores through the R15-relative
+/// store-stub pad and the block exit charges them in BULK from counters -- no native store
+/// ever reaches `write_linear_*`, so none reaches `note_write`. This module's own scope-cut
+/// note used to assert the opposite ("the journal seams already fire uniformly from both
+/// the interpreter and the Direct backend, verified by inspection"); that assertion was
+/// FALSE for exactly the accesses a JIT exists to inline, and it is what the Fable review
+/// of 2026-09-05 named as BLOCKING finding F1.
+///
+/// A journaled trip whose block stored anything therefore has an incomplete write set, and
+/// a memo built from it would skip guest writes it never saw. This refuses it. The refusal
+/// is sound BY CONSTRUCTION -- it needs no argument about which stores were missed -- and
+/// it costs one test on a path that already holds the counts.
+///
+/// It is the belt; the braces is `ReflectedCallMemoState::wants_interpreter`, which asks
+/// the batch loop to run the journal batches interpreted so this rarely fires at all.
+pub(crate) fn note_native_stores(cpu: &mut CpuGsw) {
+    refuse_open(cpu, LearnRefused::NativeStore);
+}
+
+/// The block-exit condition, named so it can be tested rather than only read.
+///
+/// `journal` is `CpuGsw::reflected_call_journal`; the three counts are the block's own
+/// `total_byte_stores` / `total_word_stores` / `total_dword_stores`. A block that stored
+/// NOTHING leaves the journal complete and must not be refused -- that is the difference
+/// between "the JIT is on" (almost always) and "this trip's journal has a hole in it"
+/// (only when the block actually stored), and getting it wrong either refuses every
+/// journaled trip under the JIT or none of them.
+pub(crate) fn native_stores_refuse(journal: bool, byte: u64, word: u64, dword: u64) -> bool {
+    journal && (byte | word | dword) != 0
+}
+
+/// Production seam: the machine's HLE software-interrupt SERVICE site.
+///
+/// **An HLE-serviced nested `INT` escapes every other check.** `interrupt_acknowledge` does
+/// not post for the BIOS service vectors -- posting is landing-based, in the bus's stub-fetch
+/// hook -- and the machine services the posted vector at a BATCH END and clears it at the
+/// NEXT batch entry. A reflected trip straddles 6-8 batch boundaries, so a nested `INT 1Ah`,
+/// `INT 10h`, `INT 13h` or `INT 2Fh` inside a trip is serviced MID-TRIP by the machine,
+/// writing registers and guest memory outside every CPU seam, and is gone before
+/// `finish_trip` asks `CpuBus::reflected_call_soft_int_posted`. The answer-time screen has
+/// the same blind spot, and the memo's re-issued ack never posts -- so an answered trip
+/// would skip the service entirely. Fable review 2026-09-05, BLOCKING finding F2.
+///
+/// This is the seam that actually sees it: one call on a cold path, at the instant the
+/// service happens. The close-time check and the answer screen stay as belt-and-braces.
+pub(crate) fn note_soft_int_serviced(cpu: &mut CpuGsw) {
+    refuse_open(cpu, LearnRefused::PendingSoftInt);
 }
 
 /// Production seam: `CpuGsw::flush_tlb_and_code_caches_for_cr3_write` (`core.rs`), the
@@ -2418,7 +2521,37 @@ fn classify_write<B: CpuBus>(
 /// interpreter (see `CpuGsw::reflected_call_wants_interpreter`). Kept as a before/after
 /// delta around ONE key rather than a scan of the map: `finish_trip` is per tracked trip,
 /// not per answer, but the map holds every key the run has ever seen.
+/// Wrapper around the real close, owning the interpreter-forcing window (plan section
+/// 4.2, restored after the Fable review's BLOCKING F1).
+///
+/// ARMED the moment a key is in a journal slot -- which is set by the WARM trip's own
+/// close, so the JournalA trip's batch is already interpreted when it opens -- and
+/// DISARMED the moment it leaves one. In the normal case the forcing therefore lasts
+/// exactly the two journaled trips; `MEMO_LEARN_BATCH_WINDOW` is a bound for the stranded
+/// case, not the expected duration.
+///
+/// The straddle this cannot cover -- a journal trip that opens mid-batch while native code
+/// is still live -- is covered by `note_native_stores` REFUSING it, rather than by the trip
+/// being silently learned from an incomplete journal.
 fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: bool) {
+    let key = open.key;
+    finish_trip_inner(cpu, bus, open, is_match);
+    let journaling = cpu.reflected_call.as_ref().is_some_and(|state| {
+        state
+            .keys
+            .get(&key)
+            .is_some_and(|ks| matches!(ks.slot, SlotState::JournalA | SlotState::JournalB))
+    });
+    if let Some(state) = cpu.reflected_call.as_mut() {
+        if journaling {
+            state.arm_interpreter_window();
+        } else {
+            state.disarm_interpreter_window();
+        }
+    }
+}
+
+fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_match: bool) {
     cpu.reflected_call_journal = false;
     let close_bus_raw = bus.cumulative_raw_bus_clocks();
     let close_elapsed = cpu.elapsed_clocks;
@@ -3354,7 +3487,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         return "{\"armed\":false}".to_string();
     };
     let mut out = format!(
-        "{{\"armed\":true,\"audit_period\":{},\"answered\":{},\"would_answer\":{},         \"insns_elided\":{},\"core_clocks_charged\":{},\"bus_clocks_charged\":{},         \"audited\":{},\"relearned\":{},\"drift_forced_audits\":{},         \"a20_retires\":{},\"code_watch_retires\":{},\"code_mark_epoch_retires\":{},         \"fell_through\":{{\"not_memoised\":{},\"entry_state_mismatch\":{},         \"read_set_mismatch\":{},\"read_set_unreadable\":{},\"pending_interrupt\":{},         \"cap\":{},\"device_edge\":{},\"dma_visible\":{},\"not_armed\":{},         \"clock_projection\":{},\"soft_int_posted\":{}}},",
+        "{{\"armed\":true,\"audit_period\":{},\"answered\":{},\"would_answer\":{},         \"insns_elided\":{},\"core_clocks_charged\":{},\"bus_clocks_charged\":{},         \"audited\":{},\"relearned\":{},\"drift_forced_audits\":{},\"learn_batches\":{},         \"a20_retires\":{},\"code_watch_retires\":{},\"code_mark_epoch_retires\":{},         \"fell_through\":{{\"not_memoised\":{},\"entry_state_mismatch\":{},         \"read_set_mismatch\":{},\"read_set_unreadable\":{},\"pending_interrupt\":{},         \"cap\":{},\"device_edge\":{},\"dma_visible\":{},\"not_armed\":{},         \"clock_projection\":{},\"soft_int_posted\":{}}},",
         state.audit_period,
         state.answered,
         state.would_answer,
@@ -3364,6 +3497,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         state.audited,
         state.relearned,
         state.drift_forced_audits,
+        state.learn_batches,
         state.a20_retires,
         state.code_watch_retires,
         state.code_mark_epoch_retires,
