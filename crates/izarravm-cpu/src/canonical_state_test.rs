@@ -921,8 +921,23 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // pin 4776 -> 4784 -- measured, not derived. The win-gate diagnostic counter, not
     // architectural state; `Tlb`'s own growth does not move this pin (see cpu_test.rs's twin
     // comment).
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
+    // The timing-recalibration class table (slice 1a) adds `timing_epoch: u32` and
+    // `class_table: &'static ClassTable`, moving the pin 4784 -> 4792 -- measured, not derived.
+    // Both are resolved once at machine construction from `IZARRAVM_TIMING_EPOCH` and never
+    // observed by a guest instruction, so both canonical payloads are unchanged by them; see
+    // cpu_test.rs's twin comment.
+    // The `timing-class-histogram` feature adds one boxed field ahead of this
+    // pin, so the offset moves on that build alone. The pin is a PLAIN-build
+    // invariant -- emitted code bakes these offsets and the instrument arm is
+    // never the one that ships -- so it is checked where it means something.
+    #[cfg(not(feature = "timing-class-histogram"))]
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4784);
+    // The `timing-class-histogram` feature adds one boxed field ahead of this
+    // pin, so the offset moves on that build alone. The pin is a PLAIN-build
+    // invariant -- emitted code bakes these offsets and the instrument arm is
+    // never the one that ships -- so it is checked where it means something.
+    #[cfg(not(feature = "timing-class-histogram"))]
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
 }

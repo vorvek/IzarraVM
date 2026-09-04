@@ -105,7 +105,15 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         GswMode::Gsw586,
         337_200.0,
         "iters/sec",
-        "Project reference: GSW-586 at 166 MHz on the PC100 board, about 337000 Dhrystones/sec",
+        // THE one Dhrystone-586 number in the tree. `izarravm-cpu`'s `level_timing`
+        // comment carried a stale ~250,000 beside it until slice 1f; that value
+        // matched neither this band nor the ~337,000 an era Pentium 166 scores at
+        // ~190 DMIPS, and it is gone. NOT A TARGET: the owner demoted Dhrystone
+        // from the recalibration's grading entirely (12:10, 2026-09-03), behind
+        // quake's demo time and doom's realtics window. It stays as a recorded
+        // reference and as the Neurketa harness's own band, and the epoch-2 class
+        // tables are EXPECTED to move it on both fast personas.
+        "Recorded reference, not a target: GSW-586 at 166 MHz on the PC100 board, about 337,200          Dhrystones/sec",
     ),
     band(
         "sieve",

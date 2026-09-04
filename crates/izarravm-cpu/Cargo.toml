@@ -95,6 +95,17 @@ shadow-cache-probe = ["jit", "izarravm-bus/shadow-cache-probe"]
 # only when this feature is compiled in.
 reflected-call-memo = ["jit"]
 
+# The per-class retire histogram (design section 9.1 of
+# dev_docs/2026-09-05-586-recalibration-design.md). A `[u64; N_CLASSES]` on the CPU plus one
+# sparse add per compiled-block entry, reported in the profile JSON. Compiled out unless
+# selected -- there is NO env knob, deliberately: a default-off instrument that costs a
+# hot-path branch is exactly what the campaign's own rule
+# (`default-off-instruments-tax-hot-path`) forbids, so the gate is the feature and nothing else.
+#
+# GRADE ON PLAIN BUILDS. This one is not zero-cost while built: every interpreter retire pays an
+# indexed increment and every native entry pays a walk of its block's class vector.
+timing-class-histogram = []
+
 [dependencies]
 thiserror.workspace = true
 izarravm-bus = { path = "../izarravm-bus" }

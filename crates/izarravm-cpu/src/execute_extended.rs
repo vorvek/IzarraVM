@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::timing_class::TimingClass;
 
 /// The SECOND word of a far-pointer memory operand -- LES/LDS/LSS/LFS/LGS's selector, which sits
 /// `operand_size_bytes` past the offset word this instruction family reads first.
@@ -112,7 +113,7 @@ impl CpuGsw {
                     self.set_flag(FLAG_ZF, false);
                     self.write_gpr_sized(modrm.reg, operand_size, src.trailing_zeros());
                 }
-                Ok(clocks(10))
+                Ok(self.charge(TimingClass::BitScan))
             }
             0x0fbd => {
                 // BSR: index of the highest set bit. Source 0 -> ZF=1, destination unchanged
@@ -126,7 +127,7 @@ impl CpuGsw {
                     self.set_flag(FLAG_ZF, false);
                     self.write_gpr_sized(modrm.reg, operand_size, 31 - src.leading_zeros());
                 }
-                Ok(clocks(10))
+                Ok(self.charge(TimingClass::BitScan))
             }
             0x0fa3 | 0x0fab | 0x0fb3 | 0x0fbb => {
                 // BT/BTS/BTR/BTC r/m, r. The opcodes are 8 apart: A3=BT, AB=BTS, B3=BTR, BB=BTC.
@@ -137,7 +138,7 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let index = self.read_gpr_sized(modrm.reg, operand_size);
                 self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
-                Ok(clocks(BIT_STRING_CORE_CLOCKS))
+                Ok(self.charge(bit_string_class(op)))
             }
             0x0fba => {
                 // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 was fetched by
@@ -161,7 +162,7 @@ impl CpuGsw {
                     address_size,
                     false,
                 )?;
-                Ok(clocks(BIT_STRING_CORE_CLOCKS))
+                Ok(self.charge(bit_string_class(op)))
             }
             0x0fa4 | 0x0fac => {
                 // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 count was fetched by `decode` into
@@ -173,7 +174,7 @@ impl CpuGsw {
                 let result =
                     self.double_shift(insn.opcode == 0x0fa4, dest, src, count, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, result)?;
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::DoubleShift))
             }
             0x0fa5 | 0x0fad => {
                 // SHLD (A5) / SHRD (AD) r/m, r, CL. No immediate — the count is the low byte of CL.
@@ -184,7 +185,7 @@ impl CpuGsw {
                 let result =
                     self.double_shift(insn.opcode == 0x0fa5, dest, src, count, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, result)?;
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::DoubleShift))
             }
             0x0fb0 | 0x0fb1 => {
                 // CMPXCHG r/m, r. B0 is the byte form, B1 the word/dword form. Compare the
@@ -228,7 +229,7 @@ impl CpuGsw {
                         }
                     }
                 }
-                Ok(clocks(6))
+                Ok(self.charge(TimingClass::CmpXchg))
             }
             0x0fc0 | 0x0fc1 => {
                 // XADD r/m, r. C0 is the byte form, C1 the word/dword form. The exchange-and-add
@@ -250,7 +251,7 @@ impl CpuGsw {
                     self.write_operand_sized(bus, operand, operand_size, sum)?;
                     self.write_gpr_sized(modrm.reg, operand_size, dest);
                 }
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::Xadd))
             }
             opcode => unreachable!("bit-manipulation opcode {opcode:#x}"),
         }
@@ -273,7 +274,7 @@ impl CpuGsw {
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
                 let set = self.condition((insn.opcode & 0x0f) as u8);
                 self.write_operand_u8(bus, operand, u8::from(set))?;
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::SetCc))
             }
             0x0faf => {
                 // IMUL reg, r/m: two-operand signed multiply into the reg destination. The full
@@ -285,7 +286,7 @@ impl CpuGsw {
                 let dst = self.read_gpr_sized(modrm.reg, operand_size);
                 let result = self.imul_truncated(dst, src, operand_size);
                 self.write_gpr_sized(modrm.reg, operand_size, result);
-                Ok(clocks(9))
+                Ok(self.charge(TimingClass::ImulRm))
             }
             opcode => unreachable!("condmove opcode {opcode:#x}"),
         }
@@ -325,13 +326,13 @@ impl CpuGsw {
                         // SLDT r/m16: store the LDTR selector.
                         let selector = u32::from(self.ldtr.selector);
                         self.write_operand_sized(bus, operand, OperandSize::Word, selector)?;
-                        Ok(clocks(2))
+                        Ok(self.charge(TimingClass::SldtStr))
                     }
                     1 => {
                         // STR r/m16: store the task-register selector.
                         let selector = u32::from(self.tr.selector);
                         self.write_operand_sized(bus, operand, OperandSize::Word, selector)?;
-                        Ok(clocks(2))
+                        Ok(self.charge(TimingClass::SldtStr))
                     }
                     2 => {
                         // LLDT r/m16: load the local descriptor table register. Privileged.
@@ -339,7 +340,7 @@ impl CpuGsw {
                         let selector =
                             self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
                         self.load_ldtr(bus, selector)?;
-                        Ok(clocks(11))
+                        Ok(self.charge(TimingClass::LldtLtr))
                     }
                     3 => {
                         // LTR r/m16: load the task register. Privileged.
@@ -347,7 +348,7 @@ impl CpuGsw {
                         let selector =
                             self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
                         self.load_tr(bus, selector)?;
-                        Ok(clocks(11))
+                        Ok(self.charge(TimingClass::LldtLtr))
                     }
                     4 | 5 => {
                         // VERR (/4) / VERW (/5): set ZF if the segment is readable / writable.
@@ -355,7 +356,7 @@ impl CpuGsw {
                             self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
                         let ok = self.verify_segment(bus, selector, modrm.reg == 5)?;
                         self.set_flag(FLAG_ZF, ok);
-                        Ok(clocks(10))
+                        Ok(self.charge(TimingClass::VerRw))
                     }
                     _reg => Err(undefined_opcode()),
                 }
@@ -368,7 +369,7 @@ impl CpuGsw {
                         // SMSW r/m16: store the machine status word (low 16 bits of CR0).
                         let msw = self.control.cr0 as u16;
                         self.write_operand_sized(bus, operand, OperandSize::Word, u32::from(msw))?;
-                        Ok(clocks(2))
+                        Ok(self.charge(TimingClass::Smsw))
                     }
                     6 => {
                         // LMSW r/m16: load MP/EM/TS; PE can be set but not cleared. Privileged.
@@ -395,7 +396,7 @@ impl CpuGsw {
                             // cpl == 0 -- entering protected mode this way starts at ring 0
                             // per the PRM, and cpl was already 0, so no assignment needed.
                         }
-                        Ok(clocks(3))
+                        Ok(self.charge(TimingClass::Lmsw))
                     }
                     reg => {
                         // SGDT/SIDT/LGDT/LIDT/INVLPG all require a memory operand.
@@ -412,12 +413,12 @@ impl CpuGsw {
                             0 => {
                                 // SGDT m: store the GDTR pseudo-descriptor.
                                 self.store_descriptor_table(bus, memory, self.gdtr)?;
-                                Ok(clocks(11))
+                                Ok(self.charge(TimingClass::SgdtSidt))
                             }
                             1 => {
                                 // SIDT m: store the IDTR pseudo-descriptor.
                                 self.store_descriptor_table(bus, memory, self.idtr)?;
-                                Ok(clocks(11))
+                                Ok(self.charge(TimingClass::SgdtSidt))
                             }
                             2 | 3 => {
                                 // LGDT (/2) / LIDT (/3): load the GDTR/IDTR from a 6-byte image.
@@ -448,7 +449,7 @@ impl CpuGsw {
                                 } else {
                                     self.idtr = table;
                                 }
-                                Ok(clocks(11))
+                                Ok(self.charge(TimingClass::LgdtLidt))
                             }
                             7 => {
                                 // INVLPG m: privileged on the 486. The operand supplies an address;
@@ -495,7 +496,7 @@ impl CpuGsw {
                                 // them, which `retire_all_slots` cannot do (it always retires both).
                                 let retired = self.invalidate_translation_code_caches(false);
                                 let _ = retired;
-                                Ok(clocks(12))
+                                Ok(self.charge(TimingClass::Invlpg))
                             }
                             _ => Err(undefined_opcode()),
                         }
@@ -523,7 +524,7 @@ impl CpuGsw {
                     }
                     _ => self.set_flag(FLAG_ZF, false),
                 }
-                Ok(clocks(11))
+                Ok(self.charge(TimingClass::Lar))
             }
             0x0f03 => {
                 // LSL reg, r/m16: read the descriptor segment limit. Protected mode only.
@@ -546,13 +547,13 @@ impl CpuGsw {
                     }
                     _ => self.set_flag(FLAG_ZF, false),
                 }
-                Ok(clocks(11))
+                Ok(self.charge(TimingClass::Lsl))
             }
             0x0f06 => {
                 // CLTS: clear the task-switched flag. Privileged.
                 self.require_cpl0()?;
                 self.control.cr0 &= !CR0_TS;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::Clts))
             }
             0x0f20 => {
                 // MOV reg, CR: whole-32-bit read of the selected control register. The ModRM is a
@@ -583,7 +584,7 @@ impl CpuGsw {
                     _ => return Err(undefined_opcode()),
                 };
                 self.write_gpr32(modrm.rm, value);
-                Ok(clocks(6))
+                Ok(self.charge(TimingClass::MovCrDr))
             }
             0x0f22 => {
                 // MOV CR, reg: whole-32-bit write of the selected control register. CR0 (paging
@@ -658,7 +659,7 @@ impl CpuGsw {
                     }
                     _ => unreachable!("undefined CR numbers are rejected by the check above"),
                 }
-                Ok(clocks(6))
+                Ok(self.charge(TimingClass::MovCrDr))
             }
             0x0f21 => {
                 // MOV reg, DR: whole-32-bit read of the selected debug register. Same shape as
@@ -688,7 +689,7 @@ impl CpuGsw {
                     _ => return Err(undefined_opcode()),
                 };
                 self.write_gpr32(modrm.rm, value);
-                Ok(clocks(6))
+                Ok(self.charge(TimingClass::MovCrDr))
             }
             0x0f23 => {
                 // MOV DR, reg: whole-32-bit write of the selected debug register. Same shape as
@@ -711,7 +712,7 @@ impl CpuGsw {
                     5 | 7 => self.control.dr7 = (value & !DR7_FIXED_ONE) | DR7_FIXED_ONE,
                     _ => return Err(undefined_opcode()),
                 }
-                Ok(clocks(6))
+                Ok(self.charge(TimingClass::MovCrDr))
             }
             0x63 => {
                 // ARPL r/m16,r16 raises a selector's requested privilege level when the source
@@ -729,12 +730,21 @@ impl CpuGsw {
                     self.write_operand_sized(bus, operand, OperandSize::Word, u32::from(selector))?;
                 }
                 self.set_flag(FLAG_ZF, adjusted);
-                let clocks_used = match self.persona() {
+                // ARPL is the ONE charge site in the tree that was already
+                // persona-keyed before the class table existed, so it cannot be a
+                // class: a class holds one epoch-1 value for all three personas
+                // and this arm holds three. It takes the `Legacy` escape, which
+                // charges the literal handed to it under every epoch -- exactly
+                // today's behaviour, and an epoch-2 under-charge recorded here
+                // rather than guessed at. Folding it in needs a per-persona
+                // epoch-1 column, which is a table shape change, not a routing
+                // one.
+                let clocks_used: u16 = match self.persona() {
                     CpuPersona::I386 => 20,
                     CpuPersona::I486 => 9,
                     CpuPersona::I586 => 7,
                 };
-                Ok(clocks(clocks_used))
+                Ok(self.charge(TimingClass::Legacy(clocks_used)))
             }
             0x62 => {
                 // BOUND r, m: the memory operand holds the signed lower and upper array bounds;
@@ -779,7 +789,7 @@ impl CpuGsw {
                         error_code: None,
                     });
                 }
-                Ok(clocks(10))
+                Ok(self.charge(TimingClass::Bound))
             }
             0xc4 | 0xc5 => {
                 // LES (0xc4) / LDS (0xc5): load a far pointer from memory. The low half (operand
@@ -822,7 +832,7 @@ impl CpuGsw {
                 };
                 self.load_segment(bus, segment, selector)?;
                 self.write_gpr_sized(modrm.reg, operand_size, offset);
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::LesLds))
             }
             0x0fb2 | 0x0fb4 | 0x0fb5 => {
                 // LSS (0F B2) / LFS (0F B4) / LGS (0F B5): 386 PRM 17-56 -- same far-pointer
@@ -875,7 +885,7 @@ impl CpuGsw {
                     self.load_segment(bus, segment, selector)?;
                 }
                 self.write_gpr_sized(modrm.reg, operand_size, offset);
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::LesLds))
             }
             opcode => unreachable!("system/segment opcode {opcode:#x}"),
         }
@@ -908,7 +918,10 @@ impl CpuGsw {
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 #[cfg(feature = "reflected-call-memo")]
                 crate::reflected_call_memo::on_far_transfer(self, bus);
-                Ok(clocks(17))
+                {
+                    let class = self.far_transfer_class(TimingClass::CallFar);
+                    Ok(self.charge(class))
+                }
             }
             0xea => {
                 // JMP far direct. Same far-pointer reconstruction, via the far-jump helper.
@@ -919,17 +932,20 @@ impl CpuGsw {
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 #[cfg(feature = "reflected-call-memo")]
                 crate::reflected_call_memo::on_far_transfer(self, bus);
-                Ok(clocks(17))
+                {
+                    let class = self.far_transfer_class(TimingClass::JmpFar);
+                    Ok(self.charge(class))
+                }
             }
             0xc2 => {
                 // RET near, release imm16 bytes of arguments. `decode` fetched the release count into
                 // `imm`; validate the return offset before committing either stack adjustment.
                 self.near_return(bus, operand_size, insn.imm as u16)?;
-                Ok(clocks(10))
+                Ok(self.charge(TimingClass::RetNearImm))
             }
             0xc3 => {
                 self.near_return(bus, operand_size, 0)?;
-                Ok(clocks(10))
+                Ok(self.charge(TimingClass::RetNear))
             }
             0xca => {
                 // RETF, release imm16 bytes. `decode` fetched the count into `imm`; pop CS:IP via the
@@ -941,7 +957,10 @@ impl CpuGsw {
                 #[cfg(feature = "retf-arity-census")]
                 self.note_retf_target(site);
                 self.release_stack(release);
-                Ok(clocks(17))
+                {
+                    let class = self.far_transfer_class(TimingClass::RetFar);
+                    Ok(self.charge(class))
+                }
             }
             0xcb => {
                 #[cfg(feature = "retf-arity-census")]
@@ -949,12 +968,15 @@ impl CpuGsw {
                 self.return_far(bus, operand_size, 0)?;
                 #[cfg(feature = "retf-arity-census")]
                 self.note_retf_target(site);
-                Ok(clocks(17))
+                {
+                    let class = self.far_transfer_class(TimingClass::RetFar);
+                    Ok(self.charge(class))
+                }
             }
             0xcc => {
                 // INT 3: one-byte breakpoint trap to vector 3, via the shared delivery path.
                 self.software_interrupt(bus, 3)?;
-                Ok(clocks(33))
+                Ok(self.charge(TimingClass::Int3))
             }
             0xcd => {
                 // INT n. IOPL-sensitive in V86 (checked here, exactly as the fused handler did,
@@ -982,16 +1004,20 @@ impl CpuGsw {
                     bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
                     self.check_v86_iopl()?;
                 }
+                // Read BEFORE delivery: `software_interrupt` loads the handler's
+                // CS and can leave V86, and Intel prices the gate by the mode the
+                // INSTRUCTION executed in.
+                let mode = int_n_class(self.control.cr0 & CR0_PE != 0, self.is_v86_mode());
                 self.software_interrupt(bus, vector)?;
-                Ok(clocks(37))
+                Ok(self.charge(mode))
             }
             0xce => {
                 // INTO: trap to vector 4 only when OF is set; otherwise a no-op.
                 if self.flag(FLAG_OF) {
                     self.software_interrupt(bus, 4)?;
-                    Ok(clocks(35))
+                    Ok(self.charge(TimingClass::IntO))
                 } else {
-                    Ok(clocks(3))
+                    Ok(self.charge(TimingClass::IntONotTaken))
                 }
             }
             0xcf => {
@@ -1000,8 +1026,21 @@ impl CpuGsw {
                 // and the pop reaches real EFLAGS; the gate still serves any IOPL-0
                 // V86 configuration. Mirrors CLI/STI/PUSHF/POPF.
                 self.check_v86_iopl()?;
+                // The MODE is read BEFORE the return, deliberately: `iret` can
+                // switch mode (a protected-mode return into V86 sets VM), and
+                // Intel prices the transfer by where it STARTED and where it
+                // landed, not by where it ended up alone.
+                let from_v86 = self.is_v86_mode();
+                let from_cpl = self.current_privilege_level();
+                let protected = self.control.cr0 & CR0_PE != 0;
                 self.iret(bus, operand_size)?;
-                Ok(clocks(22))
+                Ok(self.charge(iret_class(
+                    protected,
+                    from_v86,
+                    from_cpl,
+                    self.is_v86_mode(),
+                    self.current_privilege_level(),
+                )))
             }
             0xff => {
                 // Group 5. The /ext is `modrm.reg`. `decode` pre-parsed the ModRM + descriptor; the
@@ -1013,25 +1052,25 @@ impl CpuGsw {
                         let value = self.read_operand_sized(bus, operand, operand_size)?;
                         let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
                         self.write_operand_sized(bus, operand, operand_size, result)?;
-                        Ok(clocks(2))
+                        Ok(self.charge(TimingClass::IncDecRm))
                     }
                     2 => {
                         let target = self.read_operand_sized(bus, operand, operand_size)?;
                         self.push(bus, self.registers.eip, operand_size)?;
                         self.set_eip(target & operand_size.mask());
-                        Ok(clocks(7))
+                        Ok(self.charge(TimingClass::CallJmpRm))
                     }
                     4 => {
                         let target = self.read_operand_sized(bus, operand, operand_size)?;
                         self.set_eip(target & operand_size.mask());
-                        Ok(clocks(7))
+                        Ok(self.charge(TimingClass::CallJmpRm))
                     }
                     6 => {
                         let value = self.read_operand_sized(bus, operand, operand_size)?;
                         self.push(bus, value, operand_size)?;
                         // Named because the Word memory form is an `InterpretOne` call-out row:
                         // its budget bound and this arm must charge the same number.
-                        Ok(clocks(PUSH_RM_CORE_CLOCKS))
+                        Ok(self.charge(TimingClass::PushMem))
                     }
                     3 | 5 => {
                         // Far CALL (/3) and far JMP (/5) via memory. The operand must be memory;
@@ -1083,7 +1122,7 @@ impl CpuGsw {
                         crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                         #[cfg(feature = "reflected-call-memo")]
                         crate::reflected_call_memo::on_far_transfer(self, bus);
-                        Ok(clocks(11))
+                        Ok(self.charge(TimingClass::CallJmpFarMem))
                     }
                     _extension => Err(undefined_opcode()),
                 }
@@ -1138,7 +1177,7 @@ impl CpuGsw {
                         });
                     }
                 }
-                Ok(clocks(30))
+                Ok(self.charge(TimingClass::Wrmsr))
             }
             0x31 => {
                 // RDTSC: read the time-stamp counter into EDX:EAX. When CR4.TSD is set the
@@ -1156,7 +1195,7 @@ impl CpuGsw {
                 crate::reflected_call_diag::on_rdtsc_or_rdmsr_tsc();
                 #[cfg(feature = "reflected-call-memo")]
                 crate::reflected_call_memo::note_rdtsc_or_rdmsr(self);
-                Ok(clocks(11))
+                Ok(self.charge(TimingClass::Rdtsc))
             }
             0x32 => {
                 // RDMSR: read the model-specific register selected by ECX into EDX:EAX.
@@ -1182,7 +1221,7 @@ impl CpuGsw {
                     }
                 };
                 self.set_edx_eax(value);
-                Ok(clocks(11))
+                Ok(self.charge(TimingClass::Rdmsr))
             }
             // 0F 20 (MOV reg,CR) and 0F 22 (MOV CR,reg) are converted to the decode/execute split
             // (task A12): `route_group` classifies them as `DecodeGroup::SystemSeg` and
@@ -1216,7 +1255,15 @@ impl CpuGsw {
                     });
                 }
                 bus.note_cache_flush();
-                Ok(clocks(4))
+                // Sourced apart, not together: `INVD` is 15 P5 clocks and
+                // `WBINVD` is Intel's printed "2000+" (a floor, not a count) --
+                // a 133x spread that shared one `clocks(4)` until the manual
+                // pass. The 486's own 4-vs-5 could never have shown it.
+                Ok(self.charge(if opcode & 1 == 0 {
+                    TimingClass::Invd
+                } else {
+                    TimingClass::Wbinvd
+                }))
             }
             // CMPXCHG (0xb0/0xb1) and XADD (0xc0/0xc1) are converted to the decode/execute split
             // (task A10): `route_group` classifies them as `DecodeGroup::BitManip` and
@@ -1246,7 +1293,7 @@ impl CpuGsw {
                 self.write_gpr32(3, ebx); // EBX
                 self.write_gpr32(1, ecx); // ECX
                 self.write_gpr32(2, edx); // EDX
-                Ok(clocks(14))
+                Ok(self.charge(TimingClass::Cpuid))
             }
             // CMPXCHG8B m64 (0F C7 /1) is converted to the decode/execute split (task A14):
             // `route_group` classifies it as `DecodeGroup::Misc` and `execute_misc_decoded` runs it
@@ -1263,7 +1310,7 @@ impl CpuGsw {
                     let value = self.read_gpr32(reg);
                     self.write_gpr32(reg, value.swap_bytes());
                 }
-                Ok(clocks(1))
+                Ok(self.charge(TimingClass::Bswap))
             }
             // PUSH FS / PUSH GS (0F A0 / 0F A8): 386+ additions, otherwise identical to the
             // one-byte PUSH ES/CS/SS/DS handlers in `execute_stack_decoded` (0x06/0x0e/0x16/
@@ -1278,7 +1325,7 @@ impl CpuGsw {
                     u32::from(self.registers.segment(SegmentIndex::Fs).selector),
                     operand_size,
                 )?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushSeg))
             }
             0xa8 => {
                 self.push(
@@ -1286,7 +1333,7 @@ impl CpuGsw {
                     u32::from(self.registers.segment(SegmentIndex::Gs).selector),
                     operand_size,
                 )?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushSeg))
             }
             // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f) -- pop a
             // selector off the stack, then run it through the same `load_segment`
@@ -1297,12 +1344,12 @@ impl CpuGsw {
             0xa1 => {
                 let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Fs, value)?;
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::PopSeg))
             }
             0xa9 => {
                 let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Gs, value)?;
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::PopSeg))
             }
             _ => Err(undefined_opcode()),
         }
@@ -1411,7 +1458,7 @@ impl CpuGsw {
                 }
                 self.write_gpr8(0, al);
                 self.set_szp(u32::from(al), BusWidth::Byte);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::DecimalAdjust))
             }
             0x2f => {
                 // DAS: decimal adjust AL after subtraction. OF is left undefined.
@@ -1433,7 +1480,7 @@ impl CpuGsw {
                 }
                 self.write_gpr8(0, al);
                 self.set_szp(u32::from(al), BusWidth::Byte);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::DecimalAdjust))
             }
             0x37 => {
                 // AAA: ASCII adjust AL after addition. OF/SF/ZF/PF are left undefined.
@@ -1448,7 +1495,7 @@ impl CpuGsw {
                 }
                 let al = self.read_gpr8(0) & 0x0f;
                 self.write_gpr8(0, al);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::DecimalAdjust))
             }
             0x3f => {
                 // AAS: ASCII adjust AL after subtraction. OF/SF/ZF/PF are left undefined.
@@ -1463,7 +1510,7 @@ impl CpuGsw {
                 }
                 let al = self.read_gpr8(0) & 0x0f;
                 self.write_gpr8(0, al);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::DecimalAdjust))
             }
             0x69 => {
                 // IMUL r, r/m, imm16/32: signed multiply of r/m by a full-width immediate.
@@ -1472,7 +1519,7 @@ impl CpuGsw {
                 let src = self.read_operand_sized(bus, operand, operand_size)?;
                 let result = self.imul_truncated(src, insn.imm, operand_size);
                 self.write_gpr_sized(modrm.reg, operand_size, result);
-                Ok(clocks(14))
+                Ok(self.charge(TimingClass::ImulImm))
             }
             0x6b => {
                 // IMUL r, r/m, imm8: signed multiply of r/m by a sign-extended byte immediate.
@@ -1481,7 +1528,7 @@ impl CpuGsw {
                 let src = self.read_operand_sized(bus, operand, operand_size)?;
                 let result = self.imul_truncated(src, insn.imm, operand_size);
                 self.write_gpr_sized(modrm.reg, operand_size, result);
-                Ok(clocks(14))
+                Ok(self.charge(TimingClass::ImulImm))
             }
             0x6c => {
                 self.run_string(
@@ -1555,13 +1602,13 @@ impl CpuGsw {
                 // TEST AL, imm8: AND-for-flags, no write-back. `decode` fetched the imm8.
                 let al = self.read_gpr8(0);
                 self.alu(4, u32::from(al), insn.imm, BusWidth::Byte);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::TestImmReg))
             }
             0xa9 => {
                 // TEST AX/EAX, imm: AND-for-flags, no write-back. `decode` fetched the immediate.
                 let acc = self.read_gpr_sized(0, operand_size);
                 self.alu(4, acc, insn.imm, operand_size.bus_width());
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::TestImmReg))
             }
             0xd4 => {
                 // AAM: AH = AL / imm8, AL = AL % imm8. OF/AF/CF undefined; SF/ZF/PF from AL.
@@ -1575,7 +1622,7 @@ impl CpuGsw {
                 let rem = al % divisor;
                 self.write_gpr8(0, rem);
                 self.set_szp(u32::from(rem), BusWidth::Byte);
-                Ok(clocks(17))
+                Ok(self.charge(TimingClass::Aam))
             }
             0xd5 => {
                 // AAD: AL = (AL + AH*imm8) & 0xff, AH = 0. OF/AF/CF undefined; SF/ZF/PF from AL.
@@ -1586,13 +1633,13 @@ impl CpuGsw {
                 self.write_gpr8(0, result);
                 self.write_gpr8(4, 0);
                 self.set_szp(u32::from(result), BusWidth::Byte);
-                Ok(clocks(19))
+                Ok(self.charge(TimingClass::Aad))
             }
             0xd6 => {
                 // SALC/SETALC (undocumented): AL = CF ? 0xFF : 0x00. Flags unaffected.
                 let value = if self.flag(FLAG_CF) { 0xff } else { 0x00 };
                 self.write_gpr8(0, value);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::FlagOp))
             }
             0xd7 => {
                 // XLAT: AL = [segment:(B)X + AL]. DS is the default, overridable; the 16-bit base
@@ -1605,7 +1652,7 @@ impl CpuGsw {
                 };
                 let value = self.read_memory_u8(bus, segment, offset, BusAccessKind::DataRead)?;
                 self.write_gpr8(0, value);
-                Ok(clocks(5))
+                Ok(self.charge(TimingClass::Xlat))
             }
             0xf4 => {
                 // HLT: privileged on real 386+ (#GP(0) at CPL != 0). A V86 task is
@@ -1646,7 +1693,7 @@ impl CpuGsw {
                     self.write_qword(bus, mem, current)?;
                     self.set_flag(FLAG_ZF, false);
                 }
-                Ok(clocks(10))
+                Ok(self.charge(TimingClass::CmpXchg8b))
             }
             // The remaining 0F system/serializing/CPU-id/stack ops re-read no further instruction
             // bytes in `execute_two_byte`, so reuse that leaf logic verbatim: INVD/WBINVD (08/09),
@@ -1666,5 +1713,87 @@ impl CpuGsw {
             | 0x0fc8..=0x0fcf => self.execute_two_byte(bus, insn.opcode as u8, insn.operand_size),
             opcode => unreachable!("misc opcode {opcode:#x}"),
         }
+    }
+}
+
+/// `BT` against `BTS`/`BTR`/`BTC`, by the sub-operation both encodings decode to
+/// (`0` = `BT`).
+///
+/// `BT` reads and writes nothing, so it costs 8-9 clocks on both parts; the other
+/// three are read/modify/writes that lock their memory form and cost 13. They
+/// shared one `clocks(BIT_STRING_CORE_CLOCKS)` until the manual sourcing
+/// separated them.
+pub(crate) fn bit_string_class(op: u8) -> TimingClass {
+    if op == 0 {
+        TimingClass::BitTest
+    } else {
+        TimingClass::BitTestModify
+    }
+}
+
+/// The charge class for `IRET`, by the mode it left and the mode it reached.
+///
+/// One flat `clocks(22)` covered all four rows before slice 8, which the census
+/// scores as 4.4x under at real mode and **14.7x** under on a
+/// different-privilege protected-mode return. Intel prices them apart: real 8,
+/// protected same-level 10, protected different-level and V86 27 on a P5.
+///
+/// Real mode (`CR0.PE` clear) keeps `Iret`. Inside V86 the instruction is
+/// `IretV86`. A protected-mode return that LANDS in V86, or that drops to a
+/// lower privilege level, is `IretPmToV86` -- Intel gives those the same count.
+/// Everything else is `IretPm`.
+pub(crate) fn iret_class(
+    protected: bool,
+    from_v86: bool,
+    from_cpl: u8,
+    to_v86: bool,
+    to_cpl: u8,
+) -> TimingClass {
+    if !protected {
+        return TimingClass::Iret;
+    }
+    if from_v86 {
+        return TimingClass::IretV86;
+    }
+    if to_v86 || to_cpl > from_cpl {
+        return TimingClass::IretPmToV86;
+    }
+    TimingClass::IretPm
+}
+
+/// The charge class for `INT n`, by the mode it is taken in.
+///
+/// One flat `clocks(INT_IMM8_CORE_CLOCKS)` covered all three rows, which the
+/// census scores at 5.2x under on its own units. Intel resolves the symbolic
+/// `INT` of Table F-2 through the Interrupt Clock Counts Table, and the three
+/// rows are far apart: real mode 11, a protected-mode trap gate to a different
+/// level 40, and V86 through a trap gate to a different level **54 plus 12 on a
+/// cache miss** -- the row
+/// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 1.2 re-anchored
+/// when it found the reflected-trip figure of 45 was taken from the unreachable
+/// real-mode row.
+pub(crate) fn int_n_class(protected: bool, v86: bool) -> TimingClass {
+    if v86 {
+        TimingClass::IntNV86
+    } else if protected {
+        TimingClass::IntNPm
+    } else {
+        TimingClass::IntN
+    }
+}
+
+impl CpuGsw {
+    /// The class a far transfer earns, given the real-mode default its opcode
+    /// would otherwise charge.
+    ///
+    /// `far_system_transfer` records a gate / TSS / protected class when the
+    /// transfer went through a system descriptor; a real-mode transfer records
+    /// nothing and keeps its own row. Taking rather than peeking is what stops a
+    /// gate transfer's class from being read a second time by the next
+    /// real-mode `RETF`.
+    fn far_transfer_class(&mut self, real_mode_default: TimingClass) -> TimingClass {
+        self.pending_transfer_class
+            .take()
+            .unwrap_or(real_mode_default)
     }
 }

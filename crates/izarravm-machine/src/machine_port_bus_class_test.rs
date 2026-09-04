@@ -250,7 +250,7 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
     );
 
     // Epoch 2: every port charges its class figure. IsaXBus (gameport 0x201) -> 160.
-    machine.timing_epoch = 2;
+    machine.set_timing_epoch_for_test(2);
     machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap();
@@ -290,7 +290,7 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
 fn epoch_2_does_not_double_charge_the_opl_status_read() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
-    machine.timing_epoch = 2;
+    machine.set_timing_epoch_for_test(2);
     machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         bus.read_io(0x0388, BusWidth::Byte, 0, false).unwrap();
@@ -310,7 +310,7 @@ fn epoch_2_does_not_double_charge_the_opl_status_read() {
 fn epoch_2_admits_the_poll_skip_certificate_with_the_port_lane() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
-    machine.timing_epoch = 2;
+    machine.set_timing_epoch_for_test(2);
     // `test_machine()` arms detailed bus tracing, which is its own certificate refusal
     // (`trace.tracing_mode() != TracingMode::Off`) -- turn it off so this test exercises the
     // admission specifically.

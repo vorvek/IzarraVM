@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::timing_class::TimingClass;
 
 impl CpuGsw {
     /// Stage A executor. For the opcodes converted to the split (the whole ALU block), execute from
@@ -187,7 +188,7 @@ impl CpuGsw {
             _ => unreachable!("alu form {form}"),
         }
 
-        Ok(clocks(2))
+        Ok(self.charge(alu_class(form, write_back, insn)))
     }
 
     /// The data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms, plus the two-byte
@@ -214,21 +215,21 @@ impl CpuGsw {
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = u32::from(self.read_operand_u8(bus, operand)?);
                 self.write_gpr_sized(modrm.reg, operand_size, value);
-                return Ok(clocks(3));
+                return Ok(self.charge(TimingClass::MovExtend));
             }
             0x0fb7 => {
                 // MOVZX r, r/m16: zero-extend the word into the destination.
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
                 self.write_gpr_sized(modrm.reg, operand_size, value);
-                return Ok(clocks(3));
+                return Ok(self.charge(TimingClass::MovExtend));
             }
             0x0fbe => {
                 // MOVSX r, r/m8: sign-extend the byte into the destination.
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = sign_extend_u8(self.read_operand_u8(bus, operand)?);
                 self.write_gpr_sized(modrm.reg, operand_size, value);
-                return Ok(clocks(3));
+                return Ok(self.charge(TimingClass::MovExtend));
             }
             0x0fbf => {
                 // MOVSX r, r/m16: sign-extend the word into the destination.
@@ -236,7 +237,7 @@ impl CpuGsw {
                 let value =
                     self.read_operand_sized(bus, operand, OperandSize::Word)? as i16 as i32 as u32;
                 self.write_gpr_sized(modrm.reg, operand_size, value);
-                return Ok(clocks(3));
+                return Ok(self.charge(TimingClass::MovExtend));
             }
             _ => {}
         }
@@ -252,7 +253,7 @@ impl CpuGsw {
                 let reg = self.read_gpr8(modrm.reg);
                 self.write_operand_u8(bus, operand, reg)?;
                 self.write_gpr8(modrm.reg, rm);
-                Ok(clocks(XCHG_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::Xchg))
             }
             0x87 => {
                 // XCHG r/m16/32, r16/32. Cross-write.
@@ -261,7 +262,7 @@ impl CpuGsw {
                 let reg = self.read_gpr_sized(modrm.reg, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, reg)?;
                 self.write_gpr_sized(modrm.reg, operand_size, rm);
-                Ok(clocks(XCHG_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::Xchg))
             }
             0x88 => {
                 // MOV r/m8, r8.
@@ -280,7 +281,7 @@ impl CpuGsw {
                         )?;
                     }
                 }
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovMemReg))
             }
             0x89 => {
                 // MOV r/m16/32, r16/32.
@@ -302,7 +303,7 @@ impl CpuGsw {
                         )?;
                     }
                 }
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovMemReg))
             }
             0x8a => {
                 // MOV r8, r/m8.
@@ -320,7 +321,7 @@ impl CpuGsw {
                     }
                 };
                 self.write_gpr8(modrm.reg, value);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovRegMem))
             }
             0x8b => {
                 // MOV r16/32, r/m16/32.
@@ -339,7 +340,7 @@ impl CpuGsw {
                     }
                 };
                 self.write_gpr_sized(modrm.reg, operand_size, value);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovRegMem))
             }
             0x8c => {
                 // MOV r/m16, Sreg. Always a word store regardless of operand size.
@@ -349,7 +350,7 @@ impl CpuGsw {
                 // Named rather than a literal for the reason the `0x8f` arm's charge is: the
                 // memory form is an `InterpretOne` call-out row, and its budget bound
                 // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same number.
-                Ok(clocks(MOV_RM_SREG_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::MovRegSreg))
             }
             0x8d => {
                 // LEA reg, m: load the effective address, not the memory it points at. mod=3 (a
@@ -358,7 +359,7 @@ impl CpuGsw {
                 match operand {
                     RmOperand::Memory(mem) => {
                         self.write_gpr_sized(modrm.reg, operand_size, mem.offset);
-                        Ok(clocks(2))
+                        Ok(self.charge(TimingClass::Lea))
                     }
                     RmOperand::Register(_) => Err(InternalFault::Exception {
                         vector: 6,
@@ -401,11 +402,11 @@ impl CpuGsw {
                 }
                 // Named because FS, GS and every memory form are `InterpretOne` call-out rows:
                 // their budget bound and this arm must charge the same number.
-                Ok(clocks(MOV_SREG_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::MovSregReg))
             }
             0x90 => {
                 // NOP (XCHG (E)AX, (E)AX): a no-op with the same clocks as the other XCHG-acc forms.
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::Nop))
             }
             0x91..=0x97 => {
                 // XCHG (E)AX, reg. The register index is the low 3 opcode bits.
@@ -414,7 +415,7 @@ impl CpuGsw {
                 let other = self.read_gpr_sized(reg, operand_size);
                 self.write_gpr_sized(0, operand_size, other);
                 self.write_gpr_sized(reg, operand_size, acc);
-                Ok(clocks(XCHG_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::Xchg))
             }
             0xa0 => {
                 // MOV AL, moffs8: byte form, ignores the operand-size prefix, flags untouched. The
@@ -426,7 +427,7 @@ impl CpuGsw {
                     BusAccessKind::DataRead,
                 )?;
                 self.write_gpr8(0, value);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::MovAccMoffs))
             }
             0xa1 => {
                 // MOV (E)AX, moffs.
@@ -438,7 +439,7 @@ impl CpuGsw {
                     BusAccessKind::DataRead,
                 )?;
                 self.write_gpr_sized(0, operand_size, value);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::MovAccMoffs))
             }
             0xa2 => {
                 // MOV moffs8, AL.
@@ -450,7 +451,7 @@ impl CpuGsw {
                     value,
                     BusAccessKind::DataWrite,
                 )?;
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::MovAccMoffs))
             }
             0xa3 => {
                 // MOV moffs, (E)AX.
@@ -463,17 +464,17 @@ impl CpuGsw {
                     value,
                     BusAccessKind::DataWrite,
                 )?;
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::MovAccMoffs))
             }
             0xb0..=0xb7 => {
                 // MOV r8, imm8. The immediate was captured into `imm` by decode.
                 self.write_gpr8(opcode - 0xb0, insn.imm as u8);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovImmReg))
             }
             0xb8..=0xbf => {
                 // MOV r16/32, imm16/32.
                 self.write_gpr_sized(opcode - 0xb8, operand_size, insn.imm);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovImmReg))
             }
             0xc6 => {
                 // MOV r/m8, imm8 (group 11). Only reg=000 is defined; decode left `operand`/`imm`
@@ -484,7 +485,7 @@ impl CpuGsw {
                 }
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
                 self.write_operand_u8(bus, operand, insn.imm as u8)?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovImmMem))
             }
             0xc7 => {
                 // MOV r/m16/32, imm16/32 (group 11). Same reg=000 gate as 0xc6.
@@ -494,7 +495,7 @@ impl CpuGsw {
                 }
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
                 self.write_operand_sized(bus, operand, operand_size, insn.imm)?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::MovImmMem))
             }
             _ => unreachable!("data-move opcode {opcode:#x}"),
         }
@@ -527,14 +528,14 @@ impl CpuGsw {
                     u32::from(self.registers.segment(SegmentIndex::Es).selector),
                     operand_size,
                 )?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushSeg))
             }
             0x07 => {
                 // POP ES. 386 PRM: a 32-bit operand size pops a full dword and loads the
                 // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
                 let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Es, value)?;
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::PopSeg))
             }
             0x0e => {
                 // PUSH CS. Same 386 PRM operand-size rule as PUSH ES above.
@@ -543,7 +544,7 @@ impl CpuGsw {
                     u32::from(self.registers.segment(SegmentIndex::Cs).selector),
                     operand_size,
                 )?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushSeg))
             }
             0x16 => {
                 // PUSH SS. Same 386 PRM operand-size rule as PUSH ES above.
@@ -552,7 +553,7 @@ impl CpuGsw {
                     u32::from(self.registers.segment(SegmentIndex::Ss).selector),
                     operand_size,
                 )?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushSeg))
             }
             0x17 => {
                 // POP SS. Arms the one-instruction interrupt shadow like MOV SS (386 PRM 11-16),
@@ -570,7 +571,7 @@ impl CpuGsw {
                 // NAMED, because `POP_SS_CORE_CLOCKS` is what the block budget bound
                 // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) folds for this row: a literal here and a
                 // constant there are two numbers that can drift apart silently.
-                Ok(clocks(POP_SS_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::PopSs))
             }
             0x1e => {
                 // PUSH DS. Same 386 PRM operand-size rule as PUSH ES above.
@@ -579,44 +580,44 @@ impl CpuGsw {
                     u32::from(self.registers.segment(SegmentIndex::Ds).selector),
                     operand_size,
                 )?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushSeg))
             }
             0x1f => {
                 // POP DS. Same 386 PRM operand-size rule as POP ES above.
                 let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Ds, value)?;
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::PopSeg))
             }
             0x50..=0x57 => {
                 let index = opcode - 0x50;
                 let value = self.read_gpr_sized(index, operand_size);
                 self.push(bus, value, operand_size)?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushReg))
             }
             0x58..=0x5f => {
                 let index = opcode - 0x58;
                 let value = self.pop(bus, operand_size)?;
                 self.write_gpr_sized(index, operand_size, value);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::PopReg))
             }
             0x60 => {
                 self.push_all_gpr(bus, operand_size)?;
-                Ok(clocks(PUSH_ALL_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::PushAll))
             }
             0x61 => {
                 self.pop_all_gpr(bus, operand_size)?;
-                Ok(clocks(POP_ALL_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::PopAll))
             }
             0x68 => {
                 // PUSH imm16/32: `decode` fetched the full-width immediate into `insn.imm`.
                 self.push(bus, insn.imm, operand_size)?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushImm))
             }
             0x6a => {
                 // PUSH imm8: sign-extend the byte (stored in `insn.imm`) to the operand size.
                 let value = sign_extend_u8(insn.imm as u8);
                 self.push(bus, value, operand_size)?;
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::PushImm))
             }
             0x8f => {
                 // POP r/m16/32 (group 1A). Only reg=000 is defined; other reg values are an
@@ -646,7 +647,7 @@ impl CpuGsw {
                     self.registers.set_esp(esp_before);
                     return Err(err);
                 }
-                Ok(clocks(POP_RM_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::PopMem))
             }
             0x9c => {
                 // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The
@@ -667,14 +668,14 @@ impl CpuGsw {
                     }
                 };
                 self.push(bus, value, operand_size)?;
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::PushFlags))
             }
             0x9d => {
                 // POPF / POPFD: load the popped image through the shared flag-load.
                 self.check_v86_iopl()?;
                 let value = self.pop(bus, operand_size)?;
                 self.load_flags(value, operand_size, false);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::PopFlags))
             }
             0xc8 => {
                 // ENTER imm16, imm8: build a stack frame. NestingLevel (already masked to 5
@@ -720,7 +721,7 @@ impl CpuGsw {
                     let sp = self.read_gpr16(4).wrapping_sub(alloc);
                     self.write_gpr16(4, sp);
                 }
-                Ok(clocks(10))
+                Ok(self.charge(TimingClass::Enter))
             }
             0xc9 => {
                 // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop (386 PRM 17-96). Both the
@@ -738,7 +739,7 @@ impl CpuGsw {
                 }
                 let saved = self.pop(bus, operand_size)?;
                 self.write_gpr_sized(5, operand_size, saved);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::Leave))
             }
             _ => unreachable!("stack opcode {opcode:#x}"),
         }
@@ -845,7 +846,7 @@ impl CpuGsw {
                 if modrm.reg != 7 {
                     self.write_operand_u8(bus, operand, result)?;
                 }
-                Ok(clocks(2))
+                Ok(self.charge(group1_class(modrm.reg, operand)))
             }
             0x81 => {
                 // Group 1 ALU r/m16/32, imm16/32. Full-width immediate from `decode`.
@@ -855,7 +856,7 @@ impl CpuGsw {
                 if modrm.reg != 7 {
                     self.write_operand_sized(bus, operand, operand_size, result)?;
                 }
-                Ok(clocks(2))
+                Ok(self.charge(group1_class(modrm.reg, operand)))
             }
             0x83 => {
                 // Group 1 ALU r/m16/32, imm8 sign-extended to the operand width. `decode` already
@@ -866,7 +867,7 @@ impl CpuGsw {
                 if modrm.reg != 7 {
                     self.write_operand_sized(bus, operand, operand_size, result)?;
                 }
-                Ok(clocks(2))
+                Ok(self.charge(group1_class(modrm.reg, operand)))
             }
             0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3 => {
                 // Group 2 shift/rotate. `reg` selects ROL/ROR/RCL/RCR/SHL/SHR/SAL/SAR; the count
@@ -888,7 +889,7 @@ impl CpuGsw {
                     let result = self.shift_rotate(op, value, count, operand_size.bus_width());
                     self.write_operand_sized(bus, operand, operand_size, result)?;
                 }
-                Ok(clocks(2))
+                Ok(self.charge(group2_class(opcode)))
             }
             0xf6 => {
                 // Group 3 byte. /0 TEST (AND-for-flags, no write-back) takes the imm8 `decode`
@@ -916,7 +917,7 @@ impl CpuGsw {
                         return Err(undefined_opcode());
                     }
                 }
-                Ok(clocks(2))
+                Ok(self.charge(group3_class(modrm.reg, BusWidth::Byte, operand)))
             }
             0xf7 => {
                 // Group 3 word/dword. Same sub-op layout as 0xf6 at the operand width.
@@ -944,10 +945,12 @@ impl CpuGsw {
                         return Err(undefined_opcode());
                     }
                 }
-                // Named for the reason the `0x8f` and `0x8c` charges are: `/2../7` at Word are
-                // `InterpretOne` call-out rows, and their budget bound
-                // (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same number.
-                Ok(clocks(GROUP3_CORE_CLOCKS))
+                // The `/2../7` Word forms are `InterpretOne` call-out rows, and their budget
+                // bound (`INTERPRET_ONE_MAX_CORE_CLOCKS`) and this arm must charge the same
+                // number; under epoch 1 every class `group3_class` can return charges
+                // `GROUP3_CORE_CLOCKS`, so the bound still holds. Re-deriving the bound from the
+                // table is slice 1 item 4.
+                Ok(self.charge(group3_class(modrm.reg, operand_size.bus_width(), operand)))
             }
             0xfe => {
                 // Group 4 INC/DEC byte. /0 INC, /1 DEC; any other reg is #UD (the fused reference's
@@ -959,7 +962,7 @@ impl CpuGsw {
                         self.write_operand_u8(bus, operand, result)?;
                         // Named because the MEMORY form is an `InterpretOne` call-out row: its
                         // budget bound and this arm must charge the same number.
-                        Ok(clocks(INC_DEC_RM8_CORE_CLOCKS))
+                        Ok(self.charge(TimingClass::IncDecRm))
                     }
                     _extension => Err(undefined_opcode()),
                 }
@@ -994,7 +997,7 @@ impl CpuGsw {
             if self.condition((insn.opcode & 0x0f) as u8) {
                 self.relative_jump(rel, operand_size);
             }
-            return Ok(clocks(3));
+            return Ok(self.charge(TimingClass::Jcc));
         }
 
         match insn.opcode as u8 {
@@ -1017,7 +1020,7 @@ impl CpuGsw {
                 if taken {
                     self.relative_jump(rel, operand_size);
                 }
-                Ok(clocks(11))
+                Ok(self.charge(TimingClass::LoopCc))
             }
             0xe2 => {
                 // LOOP: decrement (E)CX, branch while non-zero.
@@ -1036,7 +1039,7 @@ impl CpuGsw {
                 if taken {
                     self.relative_jump(rel, operand_size);
                 }
-                Ok(clocks(11))
+                Ok(self.charge(TimingClass::Loop))
             }
             0xe3 => {
                 // JCXZ / JECXZ: no decrement; branch when (E)CX is zero.
@@ -1047,24 +1050,24 @@ impl CpuGsw {
                 if count_zero {
                     self.relative_jump(rel, operand_size);
                 }
-                Ok(clocks(9))
+                Ok(self.charge(TimingClass::Jcxz))
             }
             0xe8 => {
                 // CALL near, relative. Push the return address (eip, already at the instruction
                 // end) before branching — the same order the fused handler used.
                 self.push(bus, self.registers.eip, operand_size)?;
                 self.relative_jump(rel, operand_size);
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::CallJmpRel))
             }
             0xe9 => {
                 // JMP near, relative.
                 self.relative_jump(rel, operand_size);
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::CallJmpRel))
             }
             0xeb => {
                 // JMP short, relative.
                 self.relative_jump(rel, operand_size);
-                Ok(clocks(7))
+                Ok(self.charge(TimingClass::CallJmpRel))
             }
             opcode => unreachable!("branch opcode {opcode:#x}"),
         }
@@ -1105,7 +1108,7 @@ impl CpuGsw {
                 };
                 let reg = self.read_gpr8(modrm.reg);
                 self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
-                Ok(clocks(2))
+                Ok(self.charge(test_rm_class(insn)))
             }
             0x85 => {
                 // TEST r/m16/32, reg16/32. AND-for-flags only; no write-back.
@@ -1125,7 +1128,7 @@ impl CpuGsw {
                 };
                 let reg = self.read_gpr_sized(modrm.reg, operand_size);
                 self.alu(4, value, reg, operand_size.bus_width());
-                Ok(clocks(2))
+                Ok(self.charge(test_rm_class(insn)))
             }
             opcode @ 0x40..=0x4f => {
                 // INC (0x40-0x47) / DEC (0x48-0x4f) register. CF is preserved by `inc_dec`.
@@ -1134,7 +1137,7 @@ impl CpuGsw {
                 let value = self.read_gpr_sized(index, operand_size);
                 let result = self.inc_dec(value, is_dec, operand_size.bus_width());
                 self.write_gpr_sized(index, operand_size, result);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::Reg))
             }
             0x98 => {
                 // CBW / CWDE: sign-extend the accumulator into the next width.
@@ -1148,7 +1151,7 @@ impl CpuGsw {
                         self.write_gpr32(0, eax);
                     }
                 }
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::Cbw))
             }
             0x99 => {
                 // CWD / CDQ: fill (E)DX with the sign of the accumulator.
@@ -1170,7 +1173,7 @@ impl CpuGsw {
                         self.write_gpr32(2, edx);
                     }
                 }
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::Cwd))
             }
             0x9e => {
                 // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
@@ -1180,7 +1183,7 @@ impl CpuGsw {
                 self.materialize_flags();
                 let ah = u32::from(self.read_gpr8(4));
                 self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::Sahf))
             }
             0x9f => {
                 // LAHF: AH = low flag byte with bit1 forced 1, bits 3 and 5 forced 0.
@@ -1188,22 +1191,22 @@ impl CpuGsw {
                 self.materialize_flags();
                 let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
                 self.write_gpr8(4, ah);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::Lahf))
             }
             0xf5 => {
                 // CMC: complement the carry flag.
                 self.set_flag(FLAG_CF, !self.flag(FLAG_CF));
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::FlagOp))
             }
             0xf8 => {
                 // CLC: clear the carry flag.
                 self.set_flag(FLAG_CF, false);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::FlagOp))
             }
             0xf9 => {
                 // STC: set the carry flag.
                 self.set_flag(FLAG_CF, true);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::FlagOp))
             }
             0xfa => {
                 // CLI. IOPL-sensitive: faults to the monitor in a V86 task below IOPL 3.
@@ -1211,7 +1214,7 @@ impl CpuGsw {
                 self.set_flag(FLAG_IF, false);
                 // Named because CLI is an `InterpretOne` call-out row: its budget bound and this
                 // arm must charge the same number.
-                Ok(clocks(CLI_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::Cli))
             }
             0xfb => {
                 // STI sets IF and arms the one-instruction shadow so the instruction immediately
@@ -1220,17 +1223,17 @@ impl CpuGsw {
                 self.check_v86_iopl()?;
                 self.set_flag(FLAG_IF, true);
                 self.interrupt_shadow = true;
-                Ok(clocks(STI_CORE_CLOCKS))
+                Ok(self.charge(TimingClass::Sti))
             }
             0xfc => {
                 // CLD: clear the direction flag.
                 self.set_flag(FLAG_DF, false);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::FlagOp))
             }
             0xfd => {
                 // STD: set the direction flag.
                 self.set_flag(FLAG_DF, true);
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::FlagOp))
             }
             opcode => unreachable!("flags-misc opcode {opcode:#x}"),
         }
@@ -1275,7 +1278,7 @@ impl CpuGsw {
             opcode => unreachable!("string opcode {opcode:#x}"),
         };
         self.run_string(bus, op, width, prefixes, address_size)?;
-        Ok(clocks(4))
+        Ok(self.charge(TimingClass::StringElem))
     }
 
     /// The port I/O block through the decode/execute split (task A9). Calls `bus.read_io` /
@@ -1340,7 +1343,7 @@ impl CpuGsw {
             0xe4 => {
                 // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::InPort)?;
                 let value = bus.read_io(
                     port,
                     BusWidth::Byte,
@@ -1353,7 +1356,12 @@ impl CpuGsw {
             0xe5 => {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::InPortDword,
+                )?;
                 let value = bus.read_io(
                     port,
                     operand_size.bus_width(),
@@ -1366,7 +1374,7 @@ impl CpuGsw {
             0xe6 => {
                 // OUT imm8, AL: byte port output from AL.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::OutPort)?;
                 bus.write_io(
                     port,
                     BusWidth::Byte,
@@ -1379,7 +1387,12 @@ impl CpuGsw {
             0xe7 => {
                 // OUT imm8, AX/EAX: word/dword port output from the accumulator.
                 let port = insn.imm as u16;
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::OutPort,
+                )?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -1392,7 +1405,7 @@ impl CpuGsw {
             0xec => {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::InPort)?;
                 let value = bus.read_io(
                     port,
                     BusWidth::Byte,
@@ -1405,7 +1418,12 @@ impl CpuGsw {
             0xed => {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::InPortDword,
+                )?;
                 let value = bus.read_io(
                     port,
                     operand_size.bus_width(),
@@ -1418,7 +1436,7 @@ impl CpuGsw {
             0xee => {
                 // OUT DX, AL: byte port output addressed by DX.
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, BusWidth::Byte)?;
+                self.check_io_permission_charging(bus, port, BusWidth::Byte, TimingClass::OutPort)?;
                 bus.write_io(
                     port,
                     BusWidth::Byte,
@@ -1431,7 +1449,12 @@ impl CpuGsw {
             0xef => {
                 // OUT DX, AX/EAX: word/dword port output addressed by DX.
                 let port = self.read_gpr16(2);
-                self.check_io_permission(bus, port, operand_size.bus_width())?;
+                self.check_io_permission_charging(
+                    bus,
+                    port,
+                    operand_size.bus_width(),
+                    TimingClass::OutPort,
+                )?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -1442,6 +1465,156 @@ impl CpuGsw {
                 Ok(clocks(self.port_io_core_clocks(bus, true)))
             }
             opcode => unreachable!("port-I/O opcode {opcode:#x}"),
+        }
+    }
+}
+
+/// The charge class for one `execute_alu_decoded` form.
+///
+/// The interpreter serves all six ALU forms from one arm and one
+/// `Ok(clocks(2))`, so the class has to be recovered here from the form number
+/// and the decoded operand. Both references split them three ways
+/// (`dev_docs/2026-09-05-86box-pentium-timing-comparison.md` section 3 rows 1,
+/// 3 and 4): a register-only form is 1 clock, a memory SOURCE is the 2-clock
+/// load form, and a memory DESTINATION that writes back is the 3-clock
+/// read/modify/write. `CMP`/`TEST` against memory write nothing, so they are a
+/// load however the operand is addressed.
+///
+/// Forms 4 and 5 are the accumulator/immediate encodings and carry no ModRM at
+/// all, so `insn.operand` is `None` and they fall out as register-only.
+pub(crate) fn alu_class(form: u8, write_back: bool, insn: &DecodedInsn) -> TimingClass {
+    if !matches!(insn.operand, Some(DecodedOperand::Mem(_))) {
+        return TimingClass::Reg;
+    }
+    match form {
+        0 | 1 if write_back => TimingClass::AluMemReg,
+        0..=3 => TimingClass::AluRegMem,
+        _ => TimingClass::Reg,
+    }
+}
+
+/// The charge class for a group-1 `ALU r/m, imm` (`0x80`..`0x83`).
+///
+/// Same three-way split as `alu_class`, decided by the resolved r/m operand and
+/// the sub-opcode: `/7` is `CMP`, which computes flags without writing back and
+/// is therefore a load rather than a read/modify/write.
+pub(crate) fn group1_class(sub_opcode: u8, operand: RmOperand) -> TimingClass {
+    match operand {
+        RmOperand::Register(_) => TimingClass::Reg,
+        RmOperand::Memory(_) if sub_opcode == 7 => TimingClass::AluRegMem,
+        RmOperand::Memory(_) => TimingClass::AluMemReg,
+    }
+}
+
+/// The charge class for a group-2 shift/rotate (`0xc0`..`0xd3`), decided by the
+/// count SOURCE, which is what both references price: an immediate or a literal
+/// 1 issues in one clock on a P5 where a `CL` count is unpairable and costs four
+/// (comparison section 3 row 11).
+///
+/// The by-1 forms (`0xd0`/`0xd1`) share `ShiftImm` with the immediate forms
+/// rather than taking a class of their own, because the JIT cannot separate
+/// them: `0xd1` and `0xc1` with an immediate of 1 produce the same
+/// `DirectKind::Shift` and `DirectInsn` carries no opcode. Splitting here alone
+/// would make a compiled block and an interpreted one charge the same
+/// instruction differently on the 486, which is the divergence the arm-equality
+/// bar exists to stop. See `TimingClass::ShiftImm`.
+///
+/// `RCL`/`RCR` by `CL` is more expensive again on both parts (486 8-30, P5 7-24)
+/// and wants its own class; the sub-opcode that would separate it also separates
+/// nothing else here, and splitting it one-sidedly would break native/interpreted
+/// equality the same way the group-3 split would. It rides `ShiftCl`, an
+/// under-charge recorded on `TimingClass::ShiftCl`.
+pub(crate) fn group2_class(opcode: u8) -> TimingClass {
+    match opcode {
+        0xc0 | 0xc1 | 0xd0 | 0xd1 => TimingClass::ShiftImm,
+        _ => TimingClass::ShiftCl,
+    }
+}
+
+/// The charge class for `TEST r/m, r` (`0x84`/`0x85`), which reads its r/m
+/// operand and writes nothing: the memory form is Intel's 2-clock load shape,
+/// the register form its 1-clock ALU shape.
+pub(crate) fn test_rm_class(insn: &DecodedInsn) -> TimingClass {
+    match insn.operand {
+        Some(DecodedOperand::Mem(_)) => TimingClass::AluRegMem,
+        _ => TimingClass::Reg,
+    }
+}
+
+/// The charge class for one group-3 sub-opcode (`0xf6`/`0xf7`), which the
+/// interpreter serves from a single arm per opcode.
+///
+/// This is design section 9.1's headline row. One `clocks(2)` used to cover
+/// `TEST`, `NOT`, `NEG`, `MUL`, `IMUL`, `DIV` and `IDIV` at every width, which
+/// gave `DIV EAX, ECX` the cost of `MOV EAX, EBX` -- 0.167 guest clocks against
+/// Intel's 41, a 246x under-charge and the largest single error in the old
+/// table.
+///
+/// `MUL` and `IMUL` share a class per width because both references price them
+/// together (comparison section 3 row 13; audit section 5's `Mul` row);
+/// `DIV` and `IDIV` do not, because both references price them apart.
+/// `TEST` (`/0`) reads without writing back, so its memory form is a load;
+/// `NOT`/`NEG` write back, so theirs is a read/modify/write.
+///
+/// The JIT reaches the same classes from `DirectKind`, which `classify` already
+/// splits into `TestImmReg`/`TestImmMem`/`NegReg`/`MulReg`/`MulMemAcc`/
+/// `ImulRegAcc`/`ImulMemAcc`/`DivReg`/`DivMem` -- all admitted at Dword only --
+/// so the two arms agree instruction for instruction.
+pub(crate) fn group3_class(sub_opcode: u8, width: BusWidth, operand: RmOperand) -> TimingClass {
+    let memory = matches!(operand, RmOperand::Memory(_));
+    match sub_opcode {
+        0 | 1 if memory => TimingClass::TestImmMem,
+        0 | 1 => TimingClass::TestImmReg,
+        2 | 3 if memory => TimingClass::NotNegMem,
+        2 | 3 => TimingClass::NotNegReg,
+        4 | 5 => match width {
+            BusWidth::Byte => TimingClass::Mul8,
+            BusWidth::Word => TimingClass::Mul16,
+            _ => TimingClass::Mul32,
+        },
+        6 => match width {
+            BusWidth::Byte => TimingClass::Div8,
+            BusWidth::Word => TimingClass::Div16,
+            _ => TimingClass::Div32,
+        },
+        _ => match width {
+            BusWidth::Byte => TimingClass::Idiv8,
+            BusWidth::Word => TimingClass::Idiv16,
+            _ => TimingClass::Idiv32,
+        },
+    }
+}
+
+impl CpuGsw {
+    /// `check_io_permission`, naming the class the FAULTING INSTRUCTION would
+    /// have charged had it completed.
+    ///
+    /// Slice 8, and the reason the wrapper exists at all: the exception arm in
+    /// `finish_instruction` REPLACES the faulting instruction's charge with the
+    /// delivery cost, so a reflected V86 `IN` used to cost 4.92 guest clocks
+    /// where a real one costs the trap gate PLUS the `IN` -- census row 7. The
+    /// class is stashed only on the path that is about to return `Err`, so the
+    /// success path pays nothing and no stale value can survive: the Err arm
+    /// `take`s it, and nothing else writes it.
+    ///
+    /// SCOPE, stated rather than implied: port I/O is the only family wired up.
+    /// It is the one the census names and the one the reflected-call memo
+    /// replays. Every other fault still charges delivery alone, which is the
+    /// pre-slice behaviour and is recorded as such on
+    /// `TimingClass::ExceptionDelivery`.
+    fn check_io_permission_charging<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        port: u16,
+        width: BusWidth,
+        class: TimingClass,
+    ) -> ExecResult<()> {
+        match self.check_io_permission(bus, port, width) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.pending_faulting_class = Some(class);
+                Err(error)
+            }
         }
     }
 }

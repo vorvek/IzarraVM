@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::timing_class::TimingClass;
 
 /// The loop-invariant half of `rep_chunk_limit`'s admission math, priced once before a REP's
 /// loop starts instead of on every fast chunk and every slow iteration. `per_iteration` and the
@@ -51,7 +52,29 @@ impl RepLimitPlan {
         // A misaligned wide access may split into byte cycles. Use that larger cost as the
         // admission bound even though the aligned bulk path normally charges one wide cycle.
         let access_upper = byte_cost.saturating_mul(u64::from(width.bytes()));
-        let per_iteration = access_upper.saturating_mul(CpuGsw::rep_memory_accesses(op));
+        let bus_per_iteration = access_upper.saturating_mul(CpuGsw::rep_memory_accesses(op));
+        // THE PER-ELEMENT CORE TERM (review B4.3). `per_iteration` was BUS-ONLY,
+        // so a chunk could over-admit by `MAX_BUDGETED_REP_ITERATIONS` times the
+        // whole core cost of an element. At epoch 1 that cost is
+        // `StringElem`'s 4 raw -- a third of a guest clock at the 1/12 personas,
+        // swamped by the bus terms -- and adding it would move `rep_chunk_limit`
+        // on every fixture, which the knob-unset byte-identity merge bar forbids.
+        // At epoch 2 it is 48 raw, four whole clocks per element, and the
+        // omission is material. So the term is charged UNDER EPOCH 2 ONLY, and
+        // the epoch-1 over-admission is recorded here as a pre-existing defect
+        // that slice 7's default flip resolves rather than one this slice
+        // introduces.
+        let per_iteration = if cpu.timing_epoch() >= 2 {
+            let raw = u64::from(cpu.class_table().raw(TimingClass::StringElem));
+            let (num, den) = crate::level_timing(cpu.persona());
+            let core = raw
+                .saturating_mul(u64::from(num))
+                .saturating_add(u64::from(den) - 1)
+                / u64::from(den);
+            bus_per_iteration.saturating_add(core)
+        } else {
+            bus_per_iteration
+        };
         let paging_setup = if cpu.is_paging_enabled() {
             let Some(walk_cost) = bus.rep_page_walk_cost_upper() else {
                 return Self::Yield;

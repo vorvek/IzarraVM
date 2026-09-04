@@ -2130,6 +2130,12 @@ impl Machine {
             dma: profile.wss.dma.channel() as u8,
         });
         let active_mode = profile.cpu;
+        let timing_epoch = bus::timing_epoch_from_env();
+        // The CPU resolves its own persona-keyed charge table from the epoch, so
+        // it has to learn the epoch BEFORE `set_mode` picks the persona -- and
+        // this is the only place either is installed. `set_mode` re-resolves the
+        // table itself, so the order is belt and braces rather than load-bearing.
+        cpu.set_timing_epoch(timing_epoch);
         cpu.set_mode(active_mode);
         let vega = Vega::default();
         let pci = PciConfig::new();
@@ -2138,7 +2144,10 @@ impl Machine {
         let execution_backend = process_execution_backend();
         patch_rom(&mut rom);
         let mut machine = Self {
-            timing_epoch: bus::timing_epoch_from_env(),
+            // The local, not a second `timing_epoch_from_env()` call: the CPU
+            // is handed the SAME value a few lines above, so one read of the
+            // knob configures both halves and they cannot disagree.
+            timing_epoch,
             retrace_poll: RetracePollCensus::default(),
             poll_skip_certificate: PollSkipCertificateCounters::default(),
             memory,
@@ -3384,6 +3393,20 @@ impl Machine {
     /// profile JSON's `timing_model_epoch` field reports this, not the static
     /// `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal sees the epoch
     /// that actually ran.
+    /// Move a constructed machine onto another epoch, for tests that must not
+    /// write a process-global environment variable.
+    ///
+    /// It exists because `Machine::timing_epoch` alone is HALF the epoch: the
+    /// CPU carries its own copy and resolves its charge table from it, so a test
+    /// that assigns the field directly would leave the bus on epoch 2 and every
+    /// instruction charge on epoch 1. Production has one writer -- `Machine::new`
+    /// -- and this is the only other one.
+    #[cfg(test)]
+    pub(crate) fn set_timing_epoch_for_test(&mut self, epoch: u32) {
+        self.timing_epoch = epoch;
+        self.cpu.set_timing_epoch(epoch);
+    }
+
     pub fn timing_epoch(&self) -> u32 {
         self.timing_epoch
     }

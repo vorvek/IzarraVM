@@ -53,6 +53,8 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
     Compilation {
         far_dynamic: false,
         span,
+        #[cfg(feature = "timing-class-histogram")]
+        class_vector: Box::default(),
         fetch_lens,
         raw_clocks: 1,
         weighted_fp_clocks: 0,

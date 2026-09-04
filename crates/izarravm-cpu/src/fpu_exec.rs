@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::timing_class::TimingClass;
 
 impl CpuGsw {
     // ============================ x87 FPU ============================
@@ -49,7 +50,7 @@ impl CpuGsw {
                 });
             }
             // Fall through to the single tail so scale_fp_clocks is applied uniformly.
-            let raw = clocks(6);
+            let raw = self.charge(TimingClass::X87Wait);
             return Ok(CycleOutcome {
                 core_clocks: self.scale_fp_clocks(raw.core_clocks, FpOpClass::Wait),
                 halted: raw.halted,
@@ -128,18 +129,18 @@ impl CpuGsw {
             0xd8 => {
                 let operand = self.read_real32(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(clocks(20))
+                Ok(self.charge(TimingClass::X87MemArith32))
             }
             0xdc => {
                 let operand = self.read_real64(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(clocks(20))
+                Ok(self.charge(TimingClass::X87MemArith64))
             }
             0xd9 => match reg {
                 0 => {
                     let v = self.read_real32(bus, mem)?;
                     self.fpu.push(v);
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87LoadReal32))
                 }
                 2 | 3 => {
                     let v = self.fpu.get(0);
@@ -147,7 +148,7 @@ impl CpuGsw {
                     if reg == 3 {
                         self.fpu.pop();
                     }
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreReal32))
                 }
                 5 => {
                     let cw = self.read_memory_sized(
@@ -158,7 +159,7 @@ impl CpuGsw {
                         BusAccessKind::DataRead,
                     )?;
                     self.fpu.control = cw as u16;
-                    Ok(clocks(4))
+                    Ok(self.charge(TimingClass::X87LoadControl))
                 }
                 7 => {
                     let cw = u32::from(self.fpu.control);
@@ -170,17 +171,17 @@ impl CpuGsw {
                         cw,
                         BusAccessKind::DataWrite,
                     )?;
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreControl))
                 }
                 4 => {
                     // FLDENV: load the control, status, and tag words.
                     self.fpu_load_environment(bus, mem.segment, mem.offset, operand_size)?;
-                    Ok(clocks(44))
+                    Ok(self.charge(TimingClass::X87LoadEnv))
                 }
                 6 => {
                     // FNSTENV: store the FPU environment.
                     self.fpu_store_environment(bus, mem.segment, mem.offset, operand_size)?;
-                    Ok(clocks(56))
+                    Ok(self.charge(TimingClass::X87StoreEnv))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -188,7 +189,7 @@ impl CpuGsw {
                 0 => {
                     let v = self.read_real64(bus, mem)?;
                     self.fpu.push(v);
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87LoadReal64))
                 }
                 2 | 3 => {
                     let v = self.fpu.get(0);
@@ -196,7 +197,7 @@ impl CpuGsw {
                     if reg == 3 {
                         self.fpu.pop();
                     }
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreReal64))
                 }
                 7 => {
                     let sw = u32::from(self.fpu.status);
@@ -208,17 +209,17 @@ impl CpuGsw {
                         sw,
                         BusAccessKind::DataWrite,
                     )?;
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreStatus))
                 }
                 4 => {
                     // FRSTOR: restore the environment and all eight registers.
                     self.fpu_restore_state(bus, mem.segment, mem.offset, operand_size)?;
-                    Ok(clocks(75))
+                    Ok(self.charge(TimingClass::X87Restore))
                 }
                 6 => {
                     // FNSAVE: store the environment and registers, then reinitialize.
                     self.fpu_save_state(bus, mem.segment, mem.offset, operand_size)?;
-                    Ok(clocks(150))
+                    Ok(self.charge(TimingClass::X87Save))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -226,7 +227,7 @@ impl CpuGsw {
                 0 => {
                     let v = self.read_int32(bus, mem)?;
                     self.fpu.push(v);
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87LoadInt32))
                 }
                 2 | 3 => {
                     let v = self.fpu.get(0);
@@ -234,20 +235,20 @@ impl CpuGsw {
                     if reg == 3 {
                         self.fpu.pop();
                     }
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreInt32))
                 }
                 5 => {
                     // FLD m80: load an 80-bit extended-precision real.
                     let v = self.read_extended80(bus, mem)?;
                     self.fpu.push(v);
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87LoadExtended80))
                 }
                 7 => {
                     // FSTP m80: store ST(0) as 80-bit extended, then pop.
                     let v = self.fpu.get(0);
                     self.write_extended80(bus, mem, v)?;
                     self.fpu.pop();
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreExtended80))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -255,19 +256,31 @@ impl CpuGsw {
                 // FIADD/FIMUL/FICOM/FICOMP/FISUB/FISUBR/FIDIV/FIDIVR m32int.
                 let operand = self.read_int32(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(clocks(20))
+                // `/6` FIDIV and `/7` FIDIVR are 42 P5 clocks against the rest of
+                // the family's 7-8, and 85.5 against 20 on the 486. They shared
+                // one `clocks(20)` until the manual sourcing separated them.
+                Ok(self.charge(if reg >= 6 {
+                    TimingClass::X87MemArithIntDiv32
+                } else {
+                    TimingClass::X87MemArithInt32
+                }))
             }
             0xde => {
                 // Integer-operand arithmetic with an m16 source.
                 let operand = self.read_int16(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(clocks(20))
+                // See the `0xda` arm: FIDIV/FIDIVR are the family's outlier.
+                Ok(self.charge(if reg >= 6 {
+                    TimingClass::X87MemArithIntDiv16
+                } else {
+                    TimingClass::X87MemArithInt16
+                }))
             }
             0xdf => match reg {
                 0 => {
                     let v = self.read_int16(bus, mem)?;
                     self.fpu.push(v);
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87LoadInt16))
                 }
                 2 | 3 => {
                     let v = self.fpu.get(0);
@@ -275,31 +288,31 @@ impl CpuGsw {
                     if reg == 3 {
                         self.fpu.pop();
                     }
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreInt16))
                 }
                 5 => {
                     let v = self.read_int64(bus, mem)?;
                     self.fpu.push(v);
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87LoadInt64))
                 }
                 7 => {
                     let v = self.fpu.get(0);
                     self.write_int64(bus, mem, v)?;
                     self.fpu.pop();
-                    Ok(clocks(14))
+                    Ok(self.charge(TimingClass::X87StoreInt64))
                 }
                 4 => {
                     // FBLD: load an 80-bit packed-BCD integer.
                     let v = self.read_bcd80(bus, mem.segment, mem.offset)?;
                     self.fpu.push(v);
-                    Ok(clocks(75))
+                    Ok(self.charge(TimingClass::X87LoadBcd))
                 }
                 6 => {
                     // FBSTP: store ST(0) as 80-bit packed BCD, then pop.
                     let v = self.fpu.get(0);
                     self.write_bcd80(bus, mem.segment, mem.offset, v)?;
                     self.fpu.pop();
-                    Ok(clocks(160))
+                    Ok(self.charge(TimingClass::X87StoreBcd))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -322,7 +335,7 @@ impl CpuGsw {
                     self.fpu_compare(a, b);
                     self.fpu.pop();
                     self.fpu.pop();
-                    Ok(clocks(5))
+                    Ok(self.charge(TimingClass::X87ComparePop))
                 } else {
                     self.fpu_reg_arith_sti(reg, i, true)
                 }
@@ -335,7 +348,7 @@ impl CpuGsw {
                     self.fpu_compare(a, b);
                     self.fpu.pop();
                     self.fpu.pop();
-                    Ok(clocks(5))
+                    Ok(self.charge(TimingClass::X87ComparePop))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -347,7 +360,7 @@ impl CpuGsw {
                     // FNSTSW AX.
                     let sw = self.fpu.status;
                     self.write_gpr16(0, sw);
-                    Ok(clocks(3))
+                    Ok(self.charge(TimingClass::X87StatusReg))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -386,7 +399,7 @@ impl CpuGsw {
                 self.fpu.set(0, r);
             }
         }
-        Ok(clocks(20))
+        Ok(self.charge(TimingClass::X87RegArith))
     }
 
     /// Set the IE (invalid) and ZE (divide-by-zero) status flags after an arithmetic
@@ -426,7 +439,7 @@ impl CpuGsw {
         if pop {
             self.fpu.pop();
         }
-        Ok(clocks(20))
+        Ok(self.charge(TimingClass::X87RegArith))
     }
 
     fn fpu_d9_register(&mut self, byte: u8, i: u8) -> ExecResult<CycleOutcome> {
@@ -435,59 +448,61 @@ impl CpuGsw {
                 // FLD ST(i): push a copy.
                 let v = self.fpu.get(i);
                 self.fpu.push(v);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87RegExchange))
             }
             0xc8..=0xcf => {
                 self.fpu.exchange(i);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87RegExchange))
             }
-            0xd0 => Ok(clocks(4)), // FNOP
+            0xd0 => Ok(self.charge(TimingClass::X87RegExchange)), // FNOP
             0xe0 => {
                 let v = -self.fpu.get(0);
                 self.fpu.set(0, v);
-                Ok(clocks(6))
+                Ok(self.charge(TimingClass::X87RegSign))
             }
             0xe1 => {
                 let v = self.fpu.get(0).abs();
                 self.fpu.set(0, v);
-                Ok(clocks(6))
+                Ok(self.charge(TimingClass::X87RegSign))
             }
             0xe4 => {
                 let a = self.fpu.get(0);
                 self.fpu_compare(a, 0.0);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87RegConstCheap))
             }
+            // FXAM: 21 P5 clocks, where the five constant loads it shared a
+            // `clocks(8)` with are 5. It is not a constant load.
             0xe5 => {
                 self.fpu_examine();
-                Ok(clocks(8))
+                Ok(self.charge(TimingClass::X87Xam))
             }
             0xe8 => {
                 self.fpu.push(1.0);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87RegConstCheap))
             }
             0xe9 => {
                 self.fpu.push(std::f64::consts::LOG2_10);
-                Ok(clocks(8))
+                Ok(self.charge(TimingClass::X87RegConst))
             }
             0xea => {
                 self.fpu.push(std::f64::consts::LOG2_E);
-                Ok(clocks(8))
+                Ok(self.charge(TimingClass::X87RegConst))
             }
             0xeb => {
                 self.fpu.push(std::f64::consts::PI);
-                Ok(clocks(8))
+                Ok(self.charge(TimingClass::X87RegConst))
             }
             0xec => {
                 self.fpu.push(std::f64::consts::LOG10_2);
-                Ok(clocks(8))
+                Ok(self.charge(TimingClass::X87RegConst))
             }
             0xed => {
                 self.fpu.push(std::f64::consts::LN_2);
-                Ok(clocks(8))
+                Ok(self.charge(TimingClass::X87RegConst))
             }
             0xee => {
                 self.fpu.push(0.0);
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87RegConstCheap))
             }
             0xfa => {
                 let operand = self.fpu.get(0);
@@ -496,27 +511,27 @@ impl CpuGsw {
                     self.fpu.raise_exception(0x01); // IE: sqrt of a negative
                 }
                 self.fpu.set(0, v);
-                Ok(clocks(70))
+                Ok(self.charge(TimingClass::X87Sqrt))
             }
             0xfc => {
                 // FRNDINT: round to integer per the control word's RC field.
                 let v = fpu_round_rc(self.fpu.control, self.fpu.get(0));
                 self.fpu.set(0, v);
-                Ok(clocks(20))
+                Ok(self.charge(TimingClass::X87RoundInt))
             }
             0xf6 => {
                 self.fpu.dec_top();
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87StackPointer))
             }
             0xf7 => {
                 self.fpu.inc_top();
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87StackPointer))
             }
             0xf0 => {
                 // F2XM1: ST0 = 2^ST0 - 1.
                 let v = self.fpu.get(0);
                 self.fpu.set(0, v.exp2() - 1.0);
-                Ok(clocks(200))
+                Ok(self.charge(TimingClass::X87Exp))
             }
             0xf1 => {
                 // FYL2X: ST1 = ST1 * log2(ST0), then pop.
@@ -524,7 +539,7 @@ impl CpuGsw {
                 let y = self.fpu.get(1);
                 self.fpu.set(1, y * x.log2());
                 self.fpu.pop();
-                Ok(clocks(300))
+                Ok(self.charge(TimingClass::X87Transcendental))
             }
             0xf2 => {
                 // FPTAN: ST0 = tan(ST0), then push 1.0. C2 cleared (reduction complete).
@@ -532,7 +547,7 @@ impl CpuGsw {
                 self.fpu.set(0, v.tan());
                 self.fpu.push(1.0);
                 self.fpu.set_condition(false, false, false, false);
-                Ok(clocks(300))
+                Ok(self.charge(TimingClass::X87Transcendental))
             }
             0xf3 => {
                 // FPATAN: ST1 = atan2(ST1, ST0), then pop.
@@ -540,7 +555,7 @@ impl CpuGsw {
                 let y = self.fpu.get(1);
                 self.fpu.set(1, y.atan2(x));
                 self.fpu.pop();
-                Ok(clocks(300))
+                Ok(self.charge(TimingClass::X87Transcendental))
             }
             0xf4 => {
                 // FXTRACT: ST0 = unbiased exponent, then push the significand (in [1,2)).
@@ -555,17 +570,17 @@ impl CpuGsw {
                     self.fpu.set(0, exponent);
                     self.fpu.push(significand);
                 }
-                Ok(clocks(70))
+                Ok(self.charge(TimingClass::X87Sqrt))
             }
             0xf5 => {
                 // FPREM1: IEEE partial remainder (round-to-nearest quotient).
                 self.fpu_partial_remainder(true);
-                Ok(clocks(100))
+                Ok(self.charge(TimingClass::X87Rem))
             }
             0xf8 => {
                 // FPREM: 8087-style partial remainder (truncated quotient).
                 self.fpu_partial_remainder(false);
-                Ok(clocks(100))
+                Ok(self.charge(TimingClass::X87Rem))
             }
             0xf9 => {
                 // FYL2XP1: ST1 = ST1 * log2(ST0 + 1), then pop.
@@ -573,7 +588,7 @@ impl CpuGsw {
                 let y = self.fpu.get(1);
                 self.fpu.set(1, y * (x.ln_1p() / std::f64::consts::LN_2));
                 self.fpu.pop();
-                Ok(clocks(300))
+                Ok(self.charge(TimingClass::X87Transcendental))
             }
             0xfb => {
                 // FSINCOS: ST0 = sin, then push cos. Result: ST1 = sin, ST0 = cos.
@@ -581,28 +596,28 @@ impl CpuGsw {
                 self.fpu.set(0, v.sin());
                 self.fpu.push(v.cos());
                 self.fpu.set_condition(false, false, false, false);
-                Ok(clocks(300))
+                Ok(self.charge(TimingClass::X87Transcendental))
             }
             0xfd => {
                 // FSCALE: ST0 = ST0 * 2^trunc(ST1).
                 let st0 = self.fpu.get(0);
                 let st1 = self.fpu.get(1);
                 self.fpu.set(0, st0 * st1.trunc().exp2());
-                Ok(clocks(30))
+                Ok(self.charge(TimingClass::X87Scale))
             }
             0xfe => {
                 // FSIN.
                 let v = self.fpu.get(0);
                 self.fpu.set(0, v.sin());
                 self.fpu.set_condition(false, false, false, false);
-                Ok(clocks(300))
+                Ok(self.charge(TimingClass::X87Transcendental))
             }
             0xff => {
                 // FCOS.
                 let v = self.fpu.get(0);
                 self.fpu.set(0, v.cos());
                 self.fpu.set_condition(false, false, false, false);
-                Ok(clocks(300))
+                Ok(self.charge(TimingClass::X87Transcendental))
             }
             _ => self.fpu_unsupported(0xd9),
         }
@@ -635,14 +650,14 @@ impl CpuGsw {
 
     fn fpu_db_register(&mut self, byte: u8) -> ExecResult<CycleOutcome> {
         match byte {
-            0xe0 | 0xe1 | 0xe4 => Ok(clocks(2)), // FNENI / FNDISI / FNSETPM: 387 no-ops
+            0xe0 | 0xe1 | 0xe4 => Ok(self.charge(TimingClass::X87Control)), // FNENI / FNDISI / FNSETPM: 387 no-ops
             0xe2 => {
                 self.fpu.clear_exceptions();
-                Ok(clocks(2))
+                Ok(self.charge(TimingClass::X87Control))
             }
             0xe3 => {
                 self.fpu.finit();
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::X87Init))
             }
             _ => self.fpu_unsupported(0xdb),
         }
@@ -652,7 +667,7 @@ impl CpuGsw {
         match reg {
             0 => {
                 self.fpu.free(i);
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::X87Free))
             }
             2 | 3 => {
                 let v = self.fpu.get(0);
@@ -660,7 +675,7 @@ impl CpuGsw {
                 if reg == 3 {
                     self.fpu.pop();
                 }
-                Ok(clocks(3))
+                Ok(self.charge(TimingClass::X87RegStore))
             }
             4 | 5 => {
                 // FUCOM / FUCOMP. Limit: treated like FCOM/FCOMP; the unordered-vs-
@@ -671,7 +686,7 @@ impl CpuGsw {
                 if reg == 5 {
                     self.fpu.pop();
                 }
-                Ok(clocks(4))
+                Ok(self.charge(TimingClass::X87RegCompare))
             }
             _ => self.fpu_unsupported(0xdd),
         }

@@ -15,7 +15,7 @@ mod cpu_core;
 pub(crate) use cpu_core::TranslationFlushReason;
 mod decode;
 mod execute;
-mod execute_extended;
+pub(crate) mod execute_extended;
 mod flags;
 mod fpu;
 mod fpu_exec;
@@ -66,6 +66,7 @@ pub use reflected_call_memo::reflected_call_memo_json;
 mod run;
 mod smc_trace;
 mod strings;
+mod timing_class;
 pub use fpu::X87;
 
 /// Whether this build contains the native x64 execution backend.
@@ -2877,6 +2878,36 @@ pub struct CpuGsw {
     // position is load-bearing only through `offset_of!`, which computes it.
     #[cfg(feature = "jit")]
     pub(crate) native_callout: jit::direct::CallOutTable,
+    /// Per-class retire counts (design section 9.1). Boxed because it is
+    /// `N_CLASSES` `u64`s and `CpuGsw` is already large; feature-gated because
+    /// the campaign's own rule forbids a default-off instrument that taxes the
+    /// hot path, so there is no env knob and a plain build has no field.
+    #[cfg(feature = "timing-class-histogram")]
+    class_histogram: Box<timing_class::TimingHistogram>,
+    /// The class the instruction that is ABOUT to fault would have charged.
+    ///
+    /// Written only on a path that immediately returns `Err`, and `take`n by
+    /// `finish_instruction`'s exception arm, so the success path never touches
+    /// it and no stale value can be read. See
+    /// `check_io_permission_charging`, the one family wired up.
+    pending_faulting_class: Option<timing_class::TimingClass>,
+    /// The class a far transfer's DESCRIPTOR earns -- gate, TSS or plain
+    /// protected-mode segment. Written by `far_system_transfer`, which is the
+    /// only place the descriptor type is known, and taken by the `0x9a` /
+    /// `0xea` / `0xca` / `0xcb` charge sites. `None` means a real-mode transfer.
+    pending_transfer_class: Option<timing_class::TimingClass>,
+    // The guest-clock model epoch (`IZARRAVM_TIMING_EPOCH`), copied in ONCE from
+    // `Machine::timing_epoch` at construction via `set_timing_epoch`. Unset = 1.
+    // It may never change mid-run -- the JIT caches per-block raw clocks
+    // (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4) -- so nothing
+    // reads the environment here and nothing on the hot path branches on it.
+    timing_epoch: u32,
+    // The resolved charge table for (persona, epoch), the ONE thing every charge
+    // site reads. Refreshed by `set_timing_epoch` and by `set_mode` (which can
+    // move the persona), never per instruction. Under epoch 1 this is
+    // `timing_class::EPOCH1` for every persona, which is what makes a knob-unset
+    // run byte-identical to the pre-slice tree by construction.
+    class_table: &'static timing_class::ClassTable,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
     timing_rem: u64,
@@ -3160,6 +3191,12 @@ impl Default for CpuGsw {
             native_callout: jit::direct::CallOutTable::default(),
             #[cfg(feature = "jit")]
             native_table_slots: jit::direct::NativeTableSlots::default(),
+            pending_faulting_class: None,
+            pending_transfer_class: None,
+            #[cfg(feature = "timing-class-histogram")]
+            class_histogram: Box::default(),
+            timing_epoch: 1,
+            class_table: &timing_class::EPOCH1,
             timing_rem: 0,
             fp_rem: 0,
             halted: false,
@@ -6178,6 +6215,19 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     }
 };
 
+/// The last free clock constructor, and it no longer takes a LITERAL from
+/// anybody.
+///
+/// Slice 1a/1b routed every one of the 273 interpreter charge sites through
+/// `CpuGsw::charge(TimingClass)`, and this function was deleted with them. It
+/// comes back for the twelve port and string-port arms the port slices (P1-P3)
+/// own: those compute their charge at RUN TIME from
+/// `port_core_clocks(epoch, is_out, priv_mode)`, which is keyed on a privilege
+/// column the class table has no row for, so they cannot go through a class.
+///
+/// **Every argument here is a computed value.** A bare integer at a call site is
+/// the thing slice 1 removed; if a new site needs one, it needs a class, or
+/// `TimingClass::Legacy(n)` to say out loud that it has none yet.
 fn clocks(core_clocks: u32) -> CycleOutcome {
     CycleOutcome {
         core_clocks,
@@ -6209,10 +6259,26 @@ pub const TIMING_MODEL_EPOCH: u32 = 1;
 /// scales the whole bus portion (fetch + data access), so every guest clock is
 /// `scale_clocks(instruction) + scale_bus(bus)`. The bus dial carries the absolute
 /// per-mode magnitude (it lets a fast part pull away from the old flat per-access
-/// floor), so this dial only trims the compute share. Dhrystone (the PRIMARY
-/// oracle) is a fetch+data mix split roughly compute/bus; these values plus
-/// `bus_timing` seat all four modes' Dhrystones/sec on the owner's authoritative
-/// era targets (386 ~9200, 486 ~61000, 586 ~250000 at 166 MHz) to within ~0.3%.
+/// floor), so this dial only trims the compute share. Dhrystone is a fetch+data
+/// mix split roughly compute/bus; these values plus `bus_timing` seat all four
+/// modes' Dhrystones/sec on the era references (386 ~9,200, 486 ~61,000,
+/// 586 ~337,200 at 166 MHz) to within ~0.3%.
+///
+/// **DHRYSTONE IS NOT A TARGET** (owner ruling of 2026-09-03, 12:10, recorded in
+/// `dev_docs/2026-09-05-586-recalibration-review.md`). It ranked behind quake's
+/// 969-frame demo time and doom's realtics window and was then demoted
+/// entirely: a synthetic loop at IPC ~1.5 is not the code the personas exist to
+/// run, and the recalibration's class tables break the very fit these two dials
+/// came from -- on BOTH the 486 and the 586 -- which is expected and is not a
+/// regression. The figures above are recorded because they say where the dials
+/// came from, not because anything is graded on them.
+///
+/// The 586 figure is **337,200**, one number, taken from
+/// `izarravm/src/bench_reference.rs`'s band, which is the single authority.
+/// This comment carried ~250,000 until slice 1f; that value matched nothing --
+/// not the band, not the ~337,000 the era reference and the recalibration
+/// design both cite for a Pentium 166 at ~190 DMIPS. It was stale text, not a
+/// second measurement.
 ///
 /// fp-mandel TRADE-OFF: fp-mandel is x87-compute-bound (~7280 instruction clocks
 /// vs ~6247 bus per pixel), so it rides this dial. Dhrystone pinned to its owner
@@ -6220,7 +6286,7 @@ pub const TIMING_MODEL_EPOCH: u32 = 1;
 /// run well above its ratio-anchored band and at a 586/486 ratio of ~8x (the model
 /// floor with Dhrystone pinned is ~7.8x; see bench_reference.rs). Matching both the
 /// fp-mandel ratio AND the Dhrystone target needs a separate x87 latency dial (a
-/// deferred Whetstone-payload follow-up); Dhrystone is PRIMARY, so fp-mandel's band
+/// deferred Whetstone-payload follow-up); Dhrystone anchored the dials, so fp-mandel's band
 /// is recentered on the achieved value and the ratio gap recorded.
 pub(crate) const fn level_timing(persona: CpuPersona) -> (u32, u32) {
     match persona {
@@ -6324,7 +6390,8 @@ const fn fp_timing_class(persona: CpuPersona, class: FpOpClass) -> u32 {
 /// `tier_cost` wait-states. The slow modes keep num/den ~ 1 (their flat-floor bus
 /// was already near band); the fast modes use a smaller ratio to reach their
 /// targets (486 ~0.33, 586 ~0.18). These values, with `level_timing`, seat all four
-/// Dhrystone modes on the owner's authoritative targets (the PRIMARY oracle).
+/// Dhrystone modes on their era references. Those are references and not targets;
+/// see `level_timing`'s note on the 12:10 demotion.
 ///
 /// BANDWIDTH coupling (see bench_reference.rs): the bandwidth tool now reports the
 /// SCALED bus delta, so a tier's MB/s is `4 * clock_hz / ((2 + ws) * (num/den)) /

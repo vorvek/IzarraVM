@@ -24,6 +24,8 @@ use std::{
 
 use izarravm_core::{CpuPersona, GswMode};
 
+use crate::timing_class::{ClassTable, TimingClass};
+
 use super::code_watch::NativeCodeWatch;
 #[cfg(target_os = "windows")]
 use super::encoder::Xmm;
@@ -987,6 +989,17 @@ pub(crate) struct BlockCache {
     /// was 116 of that struct's 240 bytes while every hot-path read goes through a `&self`
     /// method that never needed the copy. Entry reads it exactly once.
     segment_layouts: Vec<SegmentLayout>,
+    /// One block's SLOT CLASSES, in slot order, parallel to `segment_layouts`.
+    ///
+    /// Design section 9.1's sparse list: a block's class vector is known at
+    /// compile time, so a block execution adds it once instead of the emitted
+    /// code counting per instruction. It lives here rather than on
+    /// `CompiledBlock` for the reason `segment_layouts` does -- that struct is
+    /// copied several times per entry and is size-pinned -- and it exists only
+    /// under the `timing-class-histogram` feature, so a plain build carries
+    /// neither the vector nor the `Vec` that holds it.
+    #[cfg(feature = "timing-class-histogram")]
+    class_vectors: Vec<Box<[u8]>>,
     /// Parallel to `blocks`, same `BlockId::index()`: this block's CHAIN segment requirement --
     /// its own `SegmentLayout` merged with the requirement of every block reachable from it
     /// through currently live links. Only `used` ever differs from `segment_layouts[i]`, because
@@ -1449,6 +1462,8 @@ impl BlockCache {
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
             segment_layouts: Vec::new(),
+            #[cfg(feature = "timing-class-histogram")]
+            class_vectors: Vec::new(),
             chain_layouts: Vec::new(),
             written_segments: Vec::new(),
             #[cfg(feature = "seg-head-diagnostic")]
@@ -1755,6 +1770,8 @@ impl BlockCache {
         if index == self.blocks.len() {
             self.blocks.push(block);
             self.segment_layouts.push(compilation.segment_layout);
+            #[cfg(feature = "timing-class-histogram")]
+            self.class_vectors.push(compilation.class_vector.clone());
             self.chain_layouts.push(compilation.segment_layout);
             self.written_segments.push(compilation.written_segments);
             #[cfg(feature = "seg-head-diagnostic")]
@@ -1789,6 +1806,10 @@ impl BlockCache {
             debug_assert!(self.block_decode_slots[index].is_empty());
             self.blocks[index] = block;
             self.segment_layouts[index] = compilation.segment_layout;
+            #[cfg(feature = "timing-class-histogram")]
+            {
+                self.class_vectors[index] = compilation.class_vector.clone();
+            }
             // A recycled slot must never inherit the retired occupant's WIDENED chain
             // requirement: the new block reaches a different successor set entirely.
             self.chain_layouts[index] = compilation.segment_layout;
@@ -3623,6 +3644,12 @@ impl BlockCache {
     /// re-resolve in `run_direct_block`, which fails for both a retired and a reused id.
     /// `None` means the whole cache was reset out from under the copy, which that re-resolve
     /// would have refused a few lines later anyway.
+    /// The block's slot classes, for the class histogram. See `class_vectors`.
+    #[cfg(feature = "timing-class-histogram")]
+    pub(crate) fn class_vector(&self, id: BlockId) -> Option<&[u8]> {
+        self.class_vectors.get(id.index()).map(|v| v.as_ref())
+    }
+
     pub(crate) fn segment_layout(&self, id: BlockId) -> Option<SegmentLayout> {
         self.segment_layouts.get(id.index()).copied()
     }
@@ -3924,6 +3951,8 @@ impl BlockCache {
         self.physical_keys.clear();
         self.blocks.clear();
         self.segment_layouts.clear();
+        #[cfg(feature = "timing-class-histogram")]
+        self.class_vectors.clear();
         self.chain_layouts.clear();
         self.written_segments.clear();
         #[cfg(feature = "seg-head-diagnostic")]
@@ -4150,6 +4179,10 @@ impl CompileOutcome {
 
 pub(crate) struct Compilation {
     pub span: BlockSpan,
+    /// This block's slot classes, in slot order, for the class histogram
+    /// (design section 9.1). Feature-gated: a plain build carries no field.
+    #[cfg(feature = "timing-class-histogram")]
+    pub class_vector: Box<[u8]>,
     pub fetch_lens: [u8; MAX_BLOCK_INSTRUCTIONS],
     pub raw_clocks: u32,
     pub weighted_fp_clocks: u32,
@@ -5123,7 +5156,10 @@ pub(crate) enum DirectKind {
         dst: u8,
         width: MemoryWidth,
         addr: DirectAddr,
-        raw_clocks: u8,
+        /// This slot's `TimingClass` INDEX (`TimingClass::index`), where the raw
+        /// clock count used to sit. Same `u8`, same slot width -- review B4 bars
+        /// widening this field and the class migration does not need to.
+        class: u8,
     },
     /// MOVZX/MOVSX r16/r32, r/m8 or r/m16, MEMORY form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF).
     ///
@@ -5148,7 +5184,8 @@ pub(crate) enum DirectKind {
         dst_width: MemoryWidth,
         signed: bool,
         addr: DirectAddr,
-        raw_clocks: u8,
+        /// This slot's `TimingClass` index. See `Load::class`.
+        class: u8,
     },
     /// MOVZX/MOVSX r16/r32, r8 or r16, REGISTER form (0x0FB6, 0x0FB7, 0x0FBE, 0x0FBF, mod == 3).
     ///
@@ -5175,7 +5212,8 @@ pub(crate) enum DirectKind {
         source: StoreSource,
         width: MemoryWidth,
         addr: DirectAddr,
-        raw_clocks: u8,
+        /// This slot's `TimingClass` index. See `Load::class`.
+        class: u8,
     },
     RmwIncDec {
         is_dec: bool,
@@ -5942,134 +5980,206 @@ pub(crate) struct DirectAddr {
     pub(crate) disp_lane: Option<ImmLane>,
 }
 
+/// One block's slot classes as dense indices, in slot order, ONE ENTRY PER SLOT.
+///
+/// Slots whose charge arrives at run time (`X87`, `CallOut`) have no class --
+/// an x87 slot's cost comes through `weighted_fp_clocks` and a call-out's
+/// through the helper's return value, so attributing either to a class would
+/// double-count it in the histogram's own terms. They are marked with
+/// `UNCLASSED_SLOT` rather than dropped, because the vector's LENGTH is the
+/// divisor `record_block` uses to turn a retire count into passes: dropping a
+/// slot would shorten the block and smear that slot's retires across its
+/// classed neighbours.
+#[cfg(feature = "timing-class-histogram")]
+fn class_vector(slots: &[DirectInsn]) -> Box<[u8]> {
+    slots
+        .iter()
+        .map(|slot| match slot.kind.timing_class() {
+            Some(class) => class.index() as u8,
+            None => crate::timing_class::UNCLASSED_SLOT,
+        })
+        .collect()
+}
+
 impl DirectKind {
-    pub(crate) fn raw_clocks(self) -> u32 {
-        match self {
-            // NOP joins Jcc at 3. Both interpreter arms charge `clocks(3)` and neither consults
-            // `operand_size`. Without this arm it rides the `_ => 2` default and undercharges
-            // every lowered NOP by one core clock, which NO other assertion in the tree can see:
-            // the same gap shipped twice this campaign and was caught only by a mutation.
-            Self::Jcc { .. } | Self::Nop => 3,
-            // LOOP charges clocks(11) TAKEN OR NOT (execute.rs, the 0xe2 arm returns one
-            // `Ok(clocks(11))` past both branches). Against the `_ => 2` default an omitted arm
-            // undercharges every lowered LOOP by NINE core clocks, and nothing inside the
-            // emitter can see it: `completed_raw` sums this same accessor, so the end-of-emit
-            // assertion agrees with itself whatever this returns. Only a fixture catches it.
-            Self::Loop { .. } | Self::LoopCc { .. } => 11,
-            // Both widths charge the same: the interpreter returns clocks(4) for 0x58..=0x5f
-            // irrespective of operand size. Unlike Push, which correctly rides the `_ => 2`
-            // default, an omitted arm here undercharges every pop by 2 core clocks and no test
-            // would fail. LEAVE joins them: it is `ESP <- EBP` then POP and the interpreter
-            // charges the same clocks(4) for the 0xc9 arm.
-            // `Leave16` joins them: the interpreter's 0xc9 arm returns one `clocks(4)` for both
-            // operand sizes and both stack widths.
-            Self::Pop { .. } | Self::Pop16 { .. } | Self::Leave | Self::Leave16 { .. } => 4,
-            // ENTER's interpreter arm returns `clocks(10)` (execute.rs, 0xc8) against a default
-            // of 2, so an omitted arm here under-charges every lowered ENTER by eight raw clocks.
-            // Invisible from inside the emitter for the reason the `CallOut` note below gives:
-            // `completed_raw` sums this same accessor, so the end-of-emit assertion agrees with
-            // itself whatever this returns.
-            Self::Enter16 { .. } => 10,
-            // 0F A3 returns clocks(6) irrespective of operand size. Without this arm it rides
-            // the `_ => 2` default and undercharges every BT by 4.
-            Self::Bt { .. } => 6,
-            Self::Call { .. }
-            | Self::Call16 { .. }
-            | Self::Jmp { .. }
-            | Self::JmpMem { .. }
-            | Self::JmpReg { .. }
-            | Self::CallReg { .. }
-            | Self::CallMem { .. } => 7,
-            // Both widths charge the same: 0xc2 and 0xc3 return clocks(10) irrespective of
-            // operand size. An omitted arm here falls to `_ => 2` and undercharges by 8.
-            Self::Ret { .. } | Self::Ret16 { .. } => 10,
-            // And the FAR forms charge 17, also irrespective of operand size
-            // (`execute_extended.rs`, the 0xca and 0xcb arms). Riding `Ret`'s 10 would
-            // undercharge by 7 and riding the `_ => 2` default by 15; this is a PIN against the
-            // interpreter, not an approximation, because `elapsed_clocks` and `raw_bus_clocks`
-            // feed the cycle budget the fixtures stop on.
-            // CALL FAR (`0x9a`) charges clocks(17) regardless of operand size
-            // (`execute_extended.rs`, the 0x9a arm), exactly like the RETF forms above -- a PIN
-            // against the interpreter, not an approximation, for the identical reason: it feeds
-            // `elapsed_clocks`/`raw_bus_clocks`, the cycle budget the fixtures stop on.
-            Self::RetFar { .. } | Self::RetFar16 { .. } | Self::CallFar16 { .. } => 17,
-            Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => 3,
-            // PUSHFD is clocks(3) where PUSH r32 is clocks(2), so it cannot ride the `_ => 2`
-            // default the other push forms use.
+    /// The charge class for this slot, or `None` when the slot's whole charge
+    /// arrives somewhere else at run time.
+    ///
+    /// This replaces the old `raw_clocks` literal table, and the replacement is
+    /// the point: a slot no longer names a NUMBER, it names the same
+    /// `TimingClass` the interpreter's arm for that opcode names, and both sides
+    /// read it out of the one persona-and-epoch table the CPU resolved at
+    /// construction. That is what makes native and interpreted charges equal by
+    /// construction rather than by two literals happening to agree -- the
+    /// failure mode the `_ => 2` default this function used to end with shipped
+    /// twice this campaign.
+    ///
+    /// **There is no `_` arm, deliberately.** Every one of `DirectKind`'s
+    /// variants is listed, so a new variant is a compile error here -- exactly
+    /// the review the old default silently skipped. Nothing inside the emitter
+    /// can catch a wrong arm: `completed_raw` sums this same accessor, so the
+    /// end-of-`emit` assertion agrees with itself whatever the arm returns, and
+    /// only an interpreter differential that ACCUMULATES separates a wrong arm
+    /// from a right one.
+    pub(crate) fn timing_class(self) -> Option<TimingClass> {
+        Some(match self {
+            // --- data movement, register-resident ---------------------------
+            Self::MovReg { .. } | Self::MovRegByte { .. } => TimingClass::Reg,
+            Self::MovImm { .. } | Self::MovImmByte { .. } => TimingClass::MovImmReg,
+            Self::Lea { .. } => TimingClass::Lea,
+            Self::IncDecReg { .. } => TimingClass::Reg,
+            Self::AluReg { .. }
+            | Self::AluImm { .. }
+            | Self::AluByteImm { .. }
+            | Self::AluRegByte { .. } => TimingClass::Reg,
+            Self::AluMemSource { .. } => TimingClass::AluRegMem,
+            // `op == 7` is CMP, which computes flags and writes NOTHING back, so
+            // its memory form is Intel's 2-clock load rather than the 3-clock
+            // read/modify/write. `alu_class` and `group1_class` make the same
+            // split from the interpreter side; without it a compiled `cmp
+            // [mem], eax` would charge a clock more than an interpreted one.
+            Self::AluMemDest { op: 7, .. } => TimingClass::AluRegMem,
+            Self::AluMemDest { .. } => TimingClass::AluMemReg,
+            // `TEST r, r` reads and writes nothing, so it is an ALU register op
+            // on both references; `test_rm_class` reaches the same class from
+            // the interpreter's `0x84`/`0x85` arm.
+            Self::Test { .. } | Self::TestByte { .. } => TimingClass::Reg,
+            // The slot's own class INDEX, stored where the raw clock count used
+            // to be. Same `u8`, same slot width -- the review's B4 bars widening
+            // these three fields and this migration does not need to.
+            Self::Load { class, .. }
+            | Self::LoadExtend { class, .. }
+            | Self::Store { class, .. } => TimingClass::from_index(class),
+            Self::MovExtendReg { .. } => TimingClass::MovExtend,
+            Self::RmwIncDec { .. } => TimingClass::IncDecRm,
+
+            // --- flags and accumulator housekeeping -------------------------
+            Self::CarryFlag { .. } | Self::DirectionFlag { .. } => TimingClass::FlagOp,
+            Self::Sahf => TimingClass::Sahf,
+            Self::Cwde { .. } => TimingClass::Cbw,
+            Self::Cdq { .. } => TimingClass::Cwd,
+            Self::SetCc { .. } | Self::SetCcMem { .. } => TimingClass::SetCc,
+
+            // --- segment ------------------------------------------------------
+            Self::MovSegToReg { .. } => TimingClass::MovRegSreg,
+            Self::LoadSegReal { .. } | Self::LoadSegRealMem { .. } => TimingClass::MovSregReg,
+            Self::PopSegReal { .. } => TimingClass::PopSeg,
+            Self::LesLds { .. } => TimingClass::LesLds,
+
+            // --- group 3, split -----------------------------------------------
+            // `classify` admits every one of these at Dword ONLY: the
+            // `OperandSize::Word` gate at the top of `classify` excludes the
+            // 0xf7 Word forms, and the 0xf6 byte forms become `InterpretOne`
+            // call-outs. So the WIDTH is a property of the kind rather than a
+            // field, and widening that admission means giving these kinds a
+            // width field and splitting these arms -- never adding a default.
+            Self::TestImmReg { .. } => TimingClass::TestImmReg,
+            Self::TestImmMem { .. } => TimingClass::TestImmMem,
+            Self::NegReg { .. } => TimingClass::NotNegReg,
+            Self::MulReg { .. }
+            | Self::MulMemAcc { .. }
+            | Self::ImulRegAcc { .. }
+            | Self::ImulMemAcc { .. } => TimingClass::Mul32,
+            Self::DivReg { signed, .. } | Self::DivMem { signed, .. } => {
+                if signed {
+                    TimingClass::Idiv32
+                } else {
+                    TimingClass::Div32
+                }
+            }
+            Self::Imul { .. } | Self::ImulMem { .. } => TimingClass::ImulRm,
+            Self::ImulImm { .. } => TimingClass::ImulImm,
+
+            // --- shifts, rotates, bit ops --------------------------------------
+            // `Shift`/`RotateReg`/`RotateRegByte`/`RotateShiftMem` all cover
+            // `0xc0`/`0xc1`/`0xd0`/`0xd1`, and `0xd1` and `0xc1` with an
+            // immediate of 1 produce the SAME kind (see the note beside the
+            // `0xc1 | 0xd1` classifier arm). That is why `TimingClass::ShiftImm`
+            // fuses the by-1 and by-immediate counts rather than the interpreter
+            // splitting what a compiled block cannot.
+            Self::Shift { .. }
+            | Self::RotateReg { .. }
+            | Self::RotateRegByte { .. }
+            | Self::RotateShiftMem { .. } => TimingClass::ShiftImm,
+            Self::ShiftCl { .. } => TimingClass::ShiftCl,
+            Self::DoubleShiftReg { .. } | Self::DoubleShiftMem { .. } => TimingClass::DoubleShift,
+            Self::Bt { .. } => TimingClass::BitTest,
+
+            // --- stack ----------------------------------------------------------
+            // PUSHFD charges more than PUSH r on both references, and the
+            // operand shape is what separates them.
             Self::Push {
                 source: StoreSource::Flags { .. },
             }
             | Self::Push16 {
                 source: StoreSource::Flags { .. },
-            } => 3,
-            Self::Load { raw_clocks, .. }
-            | Self::LoadExtend { raw_clocks, .. }
-            | Self::Store { raw_clocks, .. } => u32::from(raw_clocks),
-            // All four MOVZX/MOVSX interpreter arms return clocks(3) for BOTH operand forms
-            // (execute.rs, and the hot-cached path in run.rs charges the same), against a default
-            // of 2. The memory forms carry it as a field because Load and Store do; the register
-            // form has no other field worth carrying, so it is a constant arm.
-            Self::MovExtendReg { .. } => 3,
-            // The interpreter's 0x0f90..=0x0f9f arm returns clocks(4) for both operand forms
-            // against a default of 2, so this cannot ride the `_ => 2` arm below.
-            // ... and the SAME arm covers the memory form: `execute_condmove_decoded` returns one
-            // `clocks(4)` for the whole `0x0f90..=0x0f9f` range without looking at the operand
-            // shape, so the two kinds share this line rather than each guessing.
-            Self::SetCc { .. } | Self::SetCcMem { .. } => 4,
-            // SAHF's interpreter arm (execute.rs, 0x9e) returns clocks(3) -- one more than the
-            // `_ => 2` default, which is exactly the size of gap the campaign has shipped twice
-            // and that no emitter assertion can see (`completed_raw` sums this same accessor).
-            // LAHF's arm returns clocks(2) and is not lowered at all.
-            Self::Sahf => 3,
-            // 0x98 (CBW/CWDE) returns clocks(3) for both operand forms (execute.rs); 0x99
-            // (CWD/CDQ) returns clocks(2) for both, which is what the `_ => 2` default already
-            // gives, so Cdq deliberately has no arm here.
-            Self::Cwde { .. } => 3,
-            Self::X87 { .. } => 0,
-            // ZERO, and it MUST carry an explicit arm for exactly the reason `X87` above does: a
-            // call-out's whole charge arrives at RUNTIME, through the helper's return value and
-            // the lane add at the call site. The `_ => 2` default is not a harmless approximation
-            // here, it is a DOUBLE CHARGE -- the static 2 lands on top of the runtime 12 and every
-            // native `IN AL,DX` costs 14 raw where the interpreter costs 12.
-            //
-            // It shipped, and the way it hid is worth recording. Nothing in the emitter can see
-            // it: `completed_raw` sums this same function, so the end-of-`emit` assertion agrees
-            // with itself whichever value the arm returns. And a single-slot differential rounds
-            // it away -- at the 586 dial a three-slot block charges 18 raw against the
-            // interpreter's 16, and both floor to the same scaled clock. It takes ACCUMULATION to
-            // separate them, which is what the Task 2 matrix does (`call_out_charge_matches_the_
-            // interpreter_across_slot_counts`, one to four slots).
-            Self::CallOut { .. } => 0,
-            // Matches the interpreter's clocks(7) for 0x8E (`execute.rs`, the arm that ends in
-            // `load_segment_arming_ss_shadow`). The `_ => 2` default would under-charge by 5, and
-            // the CallOut note above is the precedent for why that is invisible from inside the
-            // emitter: `completed_raw` sums this same function, so the end-of-emit assertion
-            // agrees with itself whatever this returns. Only an interpreter differential that
-            // ACCUMULATES across slot counts separates a wrong arm from a right one.
-            // `PopSegReal` joins it at the same 7: the interpreter's 0x07 / 0x1f arms return
-            // clocks(7) too, and the stack read is charged separately through `word_reads` the
-            // way `Pop16`'s is. `LoadSegRealMem` joins it for the reason `LoadSegReal` is here:
-            // it is the SAME 0x8E arm, memory-sourced. `LesLds` joins it because
-            // `execute_system_seg_decoded`'s 0xc4/0xc5 arm returns the same `clocks(7)`; its two
-            // memory reads are charged separately through `word_reads`, exactly like `PopSegReal`'s
-            // stack read.
-            Self::LoadSegReal { .. }
-            | Self::LoadSegRealMem { .. }
-            | Self::PopSegReal { .. }
-            | Self::LesLds { .. } => 7,
-            // Matches the interpreter's clocks(9) for 0x0FAF at execute_extended.rs. The default
-            // arm below returns 2, which would under-charge this instruction by 7. Both operand
-            // forms share the arm because the interpreter charges them from one `Ok(clocks(9))`.
-            Self::Imul { .. } | Self::ImulMem { .. } => 9,
-            // The THREE-operand IMUL charges clocks(14), not the two-operand form's clocks(9)
-            // (execute_extended.rs, the 0x69 and 0x6b arms), so it cannot share the arm above and
-            // it cannot ride the `_ => 2` default either -- that would under-charge it by TWELVE
-            // raw clocks, the largest single-arm error this table could carry. The Phase 5
-            // call-out double-charge is the precedent for why an omitted arm here is invisible to
-            // the emitter's own `completed_raw` assertion: that assertion sums this same
-            // accessor, so it agrees with itself whatever the arm returns.
-            Self::ImulImm { .. } => 14,
-            _ => 2,
+            } => TimingClass::PushFlags,
+            Self::Push {
+                source: StoreSource::Selector(..),
+            }
+            | Self::Push16 {
+                source: StoreSource::Selector(..),
+            } => TimingClass::PushSeg,
+            Self::Push {
+                source: StoreSource::Imm(..) | StoreSource::EipDelta(..),
+            }
+            | Self::Push16 {
+                source: StoreSource::Imm(..) | StoreSource::EipDelta(..),
+            } => TimingClass::PushImm,
+            Self::Push {
+                source: StoreSource::Reg(..) | StoreSource::ParkedByte,
+            }
+            | Self::Push16 {
+                source: StoreSource::Reg(..) | StoreSource::ParkedByte,
+            } => TimingClass::PushReg,
+            Self::PushMem { .. } => TimingClass::PushMem,
+            Self::Pop { .. } | Self::Pop16 { .. } => TimingClass::PopReg,
+            Self::Leave | Self::Leave16 { .. } => TimingClass::Leave,
+            Self::Enter16 { .. } => TimingClass::Enter,
+
+            // --- control transfer -------------------------------------------------
+            Self::Jcc { .. } => TimingClass::Jcc,
+            Self::Nop => TimingClass::Nop,
+            Self::Loop { .. } => TimingClass::Loop,
+            Self::LoopCc { .. } => TimingClass::LoopCc,
+            Self::Call { .. } | Self::Call16 { .. } | Self::Jmp { .. } => TimingClass::CallJmpRel,
+            Self::JmpMem { .. }
+            | Self::JmpReg { .. }
+            | Self::CallReg { .. }
+            | Self::CallMem { .. } => TimingClass::CallJmpRm,
+            // `Ret`/`Ret16` carry `release`, which is `0xc3`'s zero and `0xc2`'s
+            // immediate, so the two encodings ARE separable here -- unlike the
+            // shift pair above. A `0xc2 0x0000` is indistinguishable from `0xc3`
+            // and charges `0xc3`'s count, which both references give as the
+            // cheaper of the two; it is a two-byte-longer encoding of the same
+            // instruction and no compiler emits it.
+            Self::Ret { release } | Self::Ret16 { release } => {
+                if release == 0 {
+                    TimingClass::RetNear
+                } else {
+                    TimingClass::RetNearImm
+                }
+            }
+            Self::RetFar { .. } | Self::RetFar16 { .. } => TimingClass::RetFar,
+            Self::CallFar16 { .. } => TimingClass::CallFar,
+
+            // --- charged elsewhere --------------------------------------------------
+            // ZERO, and both MUST stay explicit. An x87 slot's charge arrives
+            // through `weighted_fp_clocks`; a call-out slot's arrives at RUNTIME
+            // through the helper's return value and the lane add at the call
+            // site. A charge here would be a DOUBLE charge, not an
+            // approximation: it shipped once, and the static 2 landed on top of
+            // the runtime 12 so every native `IN AL,DX` cost 14 raw where the
+            // interpreter cost 12.
+            Self::X87 { .. } | Self::CallOut { .. } => return None,
+        })
+    }
+
+    /// This slot's raw core clocks under one persona-and-epoch charge table.
+    pub(crate) fn raw_clocks(self, table: &ClassTable) -> u32 {
+        match self.timing_class() {
+            Some(class) => table.raw(class),
+            None => 0,
         }
     }
 
@@ -8780,7 +8890,8 @@ fn compile_with_budget(
             break;
         }
         let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.persona());
-        let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks()) else {
+        let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks(cpu.class_table()))
+        else {
             stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
             break;
         };
@@ -9708,6 +9819,7 @@ fn compile_with_budget(
         slots: &slots,
         span,
         raw_clocks,
+        class_table: cpu.class_table(),
         weighted_fp_clocks,
         byte_reads,
         word_reads,
@@ -9753,6 +9865,8 @@ fn compile_with_budget(
     };
     CompileOutcome::Compiled(Compilation {
         span,
+        #[cfg(feature = "timing-class-histogram")]
+        class_vector: class_vector(&slots),
         fetch_lens,
         raw_clocks,
         weighted_fp_clocks,
@@ -15426,7 +15540,7 @@ pub(crate) fn disp_lane_for(
         dst,
         width,
         addr,
-        raw_clocks,
+        class,
     } = kind
     else {
         return None;
@@ -15475,7 +15589,7 @@ pub(crate) fn disp_lane_for(
                 disp_lane: Some(lane),
                 ..addr
             },
-            raw_clocks,
+            class,
         },
         lane,
     ))
@@ -15589,7 +15703,7 @@ fn disp_store_lane_for(
         source,
         width,
         addr,
-        raw_clocks,
+        class,
     } = kind
     else {
         return None;
@@ -15613,7 +15727,7 @@ fn disp_store_lane_for(
                 disp_lane: Some(lane),
                 ..addr
             },
-            raw_clocks,
+            class,
         },
         lane,
     ))
@@ -15649,7 +15763,7 @@ fn disp_load_widen_lane_for(
         dst,
         width,
         addr,
-        raw_clocks,
+        class,
     } = kind
     else {
         return None;
@@ -15673,7 +15787,7 @@ fn disp_load_widen_lane_for(
                 disp_lane: Some(lane),
                 ..addr
             },
-            raw_clocks,
+            class,
         },
         lane,
     ))
@@ -16512,7 +16626,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // DirectKind::raw_clocks default arm returns 2, which would undercharge each of these
             // by one clock and break byte identity on executed_cpu_core_clocks without failing any
             // unit test, so this is carried as a field the way Load and Store carry theirs.
-            raw_clocks: 3,
+            class: TimingClass::MovExtend.index() as u8,
         });
     }
     if matches!(insn.opcode, 0x0fa4 | 0x0fa5 | 0x0fac | 0x0fad) {
@@ -17584,7 +17698,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         source: StoreSource::Reg(m.reg),
                         width: MemoryWidth::Byte,
                         addr: direct_addr(addr)?,
-                        raw_clocks: 2,
+                        class: TimingClass::MovMemReg.index() as u8,
                     }),
                 };
             }
@@ -17600,7 +17714,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         source: StoreSource::Reg(m.reg),
                         width: operand_width,
                         addr: direct_addr(addr)?,
-                        raw_clocks: 2,
+                        class: TimingClass::MovMemReg.index() as u8,
                     }),
                 };
             }
@@ -17612,7 +17726,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         dst: m.reg,
                         width: MemoryWidth::Byte,
                         addr: direct_addr(addr)?,
-                        raw_clocks: 2,
+                        class: TimingClass::MovRegMem.index() as u8,
                     }),
                 };
             }
@@ -17628,7 +17742,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         dst: m.reg,
                         width: operand_width,
                         addr: direct_addr(addr)?,
-                        raw_clocks: 2,
+                        class: TimingClass::MovRegMem.index() as u8,
                     }),
                 };
             }
@@ -17840,7 +17954,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         disp: insn.imm,
                         disp_lane: None,
                     },
-                    raw_clocks: 4,
+                    class: TimingClass::MovAccMoffs.index() as u8,
                 });
             }
             // MOV AX/EAX, moffs. `width` is `operand_width` as of the V86 loop-A slice; it was a
@@ -17871,7 +17985,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         disp: insn.imm,
                         disp_lane: None,
                     },
-                    raw_clocks: 4,
+                    class: TimingClass::MovAccMoffs.index() as u8,
                 });
             }
             0xa2 => {
@@ -17886,7 +18000,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         disp: insn.imm,
                         disp_lane: None,
                     },
-                    raw_clocks: 4,
+                    class: TimingClass::MovAccMoffs.index() as u8,
                 });
             }
             // MOV moffs, AX/EAX. `width` is `operand_width` for `0xa1`'s reason above, and the
@@ -17913,7 +18027,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         disp: insn.imm,
                         disp_lane: None,
                     },
-                    raw_clocks: 4,
+                    class: TimingClass::MovAccMoffs.index() as u8,
                 });
             }
             // THE FOUR UNPREFIXED STRING FAMILIES, as `InterpretOne` call-outs, behind
@@ -18042,7 +18156,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         source: StoreSource::Imm(insn.imm),
                         width,
                         addr: direct_addr(addr)?,
-                        raw_clocks: 2,
+                        class: TimingClass::MovImmMem.index() as u8,
                     }),
                 };
             }
@@ -18979,6 +19093,14 @@ struct EmitInput<'a> {
     slots: &'a [DirectInsn],
     span: BlockSpan,
     raw_clocks: u32,
+    /// The persona-and-epoch charge table the COMPILING CPU resolved at
+    /// construction, carried in so the emitter's own accounting reads the same
+    /// numbers the compile walk summed into `raw_clocks` above. It is a
+    /// `&'static`, so a block compiled under one epoch cannot silently start
+    /// charging another: the epoch is fixed for the life of the machine
+    /// (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4) and a block
+    /// cache outlives no epoch change.
+    class_table: &'static ClassTable,
     weighted_fp_clocks: u32,
     byte_reads: u8,
     word_reads: u8,
@@ -19202,6 +19324,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         slots,
         span,
         raw_clocks,
+        class_table,
         weighted_fp_clocks,
         byte_reads,
         word_reads,
@@ -19219,7 +19342,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     } = input;
     let full_accounting = StaticAccounting {
         instructions: span.instructions,
-        raw_clocks: raw_clocks as u16,
+        raw_clocks,
         byte_reads,
         word_reads,
         dword_reads,
@@ -20324,7 +20447,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.alu_r16_imm16(0, home(4), release.wrapping_add(2));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20434,7 +20557,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_RET_FAR_OFFSET);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20550,7 +20673,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // costs nothing extra anyway, since `segment_write_block` already forces
                 // `successors = [None, None]` regardless of which completion path is chosen.
                 e.mov_r32_imm32(Reg::RDX, u32::from(offset));
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -20872,7 +20995,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r32_imm32(5, home(4), 4);
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -20919,7 +21042,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 e.alu_r16_imm16(5, home(4), 2);
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -20936,7 +21059,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 break;
             }
             DirectKind::Jmp { target_delta } => {
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_path(
                     &mut e,
                     span,
@@ -20983,7 +21106,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.add_r32_imm32(home(4), 4 + u32::from(release));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21029,7 +21152,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21072,7 +21195,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // Reading `home(dst)` is safe for EVERY dst including ESP: nothing in this arm has
                 // written a guest home, so the value is the architectural pre-instruction one.
                 e.mov_r32_r32(Reg::RDX, home(dst));
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21125,7 +21248,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // AFTER the side exit is published, the same faulting-push invariant `Call` keeps:
                 // a faulting push must leave ESP at its pre-instruction value.
                 e.alu_r32_imm32(5, home(4), 4);
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21189,7 +21312,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // target is live in RDX across this and stays live: `home(4)` is a GUEST_HOMES
                 // register, never a scratch one.
                 e.alu_r32_imm32(5, home(4), 4);
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 emit_completed_dynamic_path(
                     &mut e,
                     span,
@@ -21232,7 +21355,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 wanted_zf,
                 taken_delta,
             } => {
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 let taken = e.label();
                 let counter_dead = e.label();
                 e.alu_r32_imm32(5, home(1), 1);
@@ -21294,7 +21417,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 taken_delta,
                 counter_word,
             } => {
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 let taken = e.label();
                 // The width swap the `counter_word` field exists for. `alu_r16_imm16` writes
                 // only CX and preserves ECX's bits 31..16, exactly as `alu_r32_imm32` writes all
@@ -21358,7 +21481,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 condition,
                 taken_delta,
             } => {
-                completed.retire(slot);
+                completed.retire(slot, class_table);
                 let taken = e.label();
                 // The one arm switch of the `IZARRAVM_JCC_SHADOW` slice, read at the emission
                 // site so both arms live in ONE binary and a ladder needs no rebuild. The OFF
@@ -21415,7 +21538,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 break;
             }
         }
-        completed.retire(slot);
+        completed.retire(slot, class_table);
     }
     if !terminal {
         emit_completed_path(
@@ -21521,7 +21644,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     emit_store_homes(&mut e);
     emit_return(&mut e);
     debug_assert_eq!(usize::from(completed.instructions), slots.len());
-    debug_assert_eq!(u32::from(completed.raw_clocks), raw_clocks);
+    debug_assert_eq!(completed.raw_clocks, raw_clocks);
     debug_assert_eq!(completed.weighted_fp_clocks, weighted_fp_clocks);
     debug_assert_eq!(completed.byte_reads, byte_reads);
     debug_assert_eq!(completed.word_reads, word_reads);
@@ -21587,7 +21710,7 @@ fn emit_accounting(
 fn accounting_fields(accounting: StaticAccounting) -> [(i8, u32); 7] {
     [
         (STACK_INSTRUCTIONS, u32::from(accounting.instructions)),
-        (STACK_RAW_CLOCKS, u32::from(accounting.raw_clocks)),
+        (STACK_RAW_CLOCKS, accounting.raw_clocks),
         (STACK_BYTE_READS, u32::from(accounting.byte_reads)),
         (STACK_DWORD_READS, u32::from(accounting.dword_reads)),
         (STACK_WEIGHTED_FP_CLOCKS, accounting.weighted_fp_clocks),
@@ -22083,7 +22206,21 @@ fn emit_completed_dynamic_path(
 #[derive(Clone, Copy, Default)]
 struct StaticAccounting {
     instructions: u8,
-    raw_clocks: u16,
+    /// `u32`, not `u16`, since slice 1d (review B4.2).
+    ///
+    /// This accumulator used to be a `u16` fed by `slot.kind.raw_clocks() as u16`
+    /// -- a TRUNCATING cast -- and an unchecked `+=` that panics in debug and
+    /// wraps in release. At epoch 1 the widest slot charge is 17 and 32 of them
+    /// cannot overflow a byte and a half; at epoch 2 a single class reaches
+    /// 24,000 (`WBINVD`), so the pair was a latent wrap. `u32` makes the sum
+    /// unreachable rather than merely checked: 32 slots at the table's widest
+    /// entry is under 800,000 against a `u32`'s four billion, and `emit` has no
+    /// refusal path to take if it were not.
+    ///
+    /// `accounting_fields` already hands these to the encoder as `u32`, and
+    /// `CompiledBlock::raw_clocks` keeps its own `u16` with the refusal at
+    /// `compile`'s install site, so nothing downstream widens with it.
+    raw_clocks: u32,
     byte_reads: u8,
     word_reads: u8,
     dword_reads: u8,
@@ -22094,9 +22231,16 @@ struct StaticAccounting {
 }
 
 impl StaticAccounting {
-    fn retire(&mut self, slot: &DirectInsn) {
+    fn retire(&mut self, slot: &DirectInsn, table: &ClassTable) {
         self.instructions += 1;
-        self.raw_clocks += slot.kind.raw_clocks() as u16;
+        // `saturating_add` and not `+=`: the `u32` above makes saturation
+        // unreachable for any block the compile walk can build, and this is the
+        // shape that stays correct if a later slice raises either bound.
+        self.raw_clocks = self.raw_clocks.saturating_add(slot.kind.raw_clocks(table));
+        debug_assert!(
+            self.raw_clocks < u32::MAX,
+            "static accounting saturated: a block's raw clocks no longer fit u32"
+        );
         self.weighted_fp_clocks += slot.weighted_fp_clocks;
         self.byte_reads += slot.kind.byte_reads();
         self.word_reads += slot.kind.word_reads();
@@ -32261,7 +32405,10 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 fn emit_call_out(
     e: &mut Encoder,
     helper: CallOutHelper,
-    static_prefix_raw: u16,
+    // `u32` since slice 1d, with `StaticAccounting::raw_clocks` (review B4.2):
+    // this is that accumulator's value for the slots before the call-out, and the
+    // two must not disagree about width.
+    static_prefix_raw: u32,
     abnormal: Label,
     step_break: Label,
     exit_arg: Option<u64>,
@@ -32307,7 +32454,7 @@ fn emit_call_out(
     // two values across the frame adjust costs nothing.
     e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_RAW_CLOCKS);
     if static_prefix_raw != 0 {
-        e.add_r64_imm32(Reg::RAX, u32::from(static_prefix_raw));
+        e.add_r64_imm32(Reg::RAX, static_prefix_raw);
     }
     e.load_r64_disp8(Reg::RDX, Reg::RSP, STACK_WEIGHTED_FP_CLOCKS);
     e.sub_r64_imm32(Reg::RSP, CALLOUT_CALL_FRAME);

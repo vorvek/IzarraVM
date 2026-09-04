@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::execute::{group1_class, group2_class, test_rm_class};
+use crate::timing_class::TimingClass;
 
 // The entry-attribution observer's phase, population and site names. The `ea_*!` macros
 // themselves are `#[macro_use]`-imported from `crate::entry_attribution_macros`, which is compiled
@@ -113,6 +115,106 @@ struct ContinuationBudget {
     cap: u64,
 }
 
+/// The `InterpretOne` call-out allowlist, as CLASSES.
+///
+/// `INTERPRET_ONE_MAX_CORE_CLOCKS` (lib.rs) is the same allowlist as a `const`
+/// fold of per-opcode `const`s, and a `const` cannot be persona-keyed -- review
+/// B3's finding. This is the list the budget path reads instead: the maximum
+/// over it under the RUNNING table is what an `InterpretOne` slot can charge.
+///
+/// Keep it in step with `INTERPRET_ONE_MAX_CORE_CLOCKS`'s own table. A row
+/// admitted to the allowlist without a class here is under-budgeted; the const
+/// stays beside it as the epoch-1 tripwire the string call-out tests pin.
+///
+/// All thirteen group-3 classes are here, not just the Word ones. `0xF7 /2../7`
+/// at Word is the named row, but `0xF6 /2../7` is intercepted as an
+/// `InterpretOne` call-out too (see `classify`'s group-3 arm), and a ceiling
+/// that has to dominate may not depend on which of the two a block holds.
+pub(crate) const INTERPRET_ONE_CLASSES: &[TimingClass] = &[
+    TimingClass::PopMem,
+    TimingClass::MovRegSreg,
+    TimingClass::Xchg,
+    TimingClass::BitTest,
+    TimingClass::BitTestModify,
+    TimingClass::TestImmReg,
+    TimingClass::TestImmMem,
+    TimingClass::NotNegReg,
+    TimingClass::NotNegMem,
+    TimingClass::Mul8,
+    TimingClass::Mul16,
+    TimingClass::Mul32,
+    TimingClass::Div8,
+    TimingClass::Div16,
+    TimingClass::Div32,
+    TimingClass::Idiv8,
+    TimingClass::Idiv16,
+    TimingClass::Idiv32,
+    TimingClass::IncDecRm,
+    TimingClass::PushMem,
+    TimingClass::Cli,
+    TimingClass::MovSregReg,
+    TimingClass::Sti,
+    TimingClass::PopSs,
+    TimingClass::StringElem,
+    TimingClass::PushFlags,
+    TimingClass::PopFlags,
+];
+
+/// The five call-out budget terms and the per-slot ceiling, resolved from the
+/// RUNNING persona-and-epoch table instead of from `const`s.
+///
+/// Review B3: `compute_iteration_upper` is the chain quota's DIVISOR, and its
+/// call-out terms were `const`s -- `IN_PORT_CORE_CLOCKS` 12,
+/// `MAX_CALL_OUT_CORE_CLOCKS` 37, `PUSH_ALL_CORE_CLOCKS` 18,
+/// `INT_IMM8_CORE_CLOCKS` 37, `LAR_LSL_CORE_CLOCKS` 11 -- so under epoch 2 they
+/// would have priced a `DIV r/m32` call-out at two clocks where the slot charges
+/// 41. The `const`s remain in `lib.rs` as the epoch-1 tripwires the string
+/// call-out tests pin; nothing on the budget path reads them any more.
+#[derive(Clone, Copy)]
+#[cfg(feature = "jit")]
+struct CallOutBudgetTerms {
+    memory: u32,
+    interpret_one: u32,
+    int_imm8: u32,
+    lar_lsl: u32,
+    /// The largest of the five: what a bound that cannot see which helper a slot
+    /// carries has to price every slot at.
+    max: u32,
+}
+
+#[cfg(feature = "jit")]
+impl CallOutBudgetTerms {
+    /// `epoch` is taken rather than derived from `table`, because the PORT term
+    /// is not a class term: the port slices (P1-P3) own the port charge and key
+    /// it on the live CPL/IOPL column, which no class row can carry, so the
+    /// ceiling comes from `port_slot_core_upper` and this reads it rather than
+    /// keeping a second copy in the class table.
+    fn from_table(table: &crate::timing_class::ClassTable, epoch: u32) -> Self {
+        let port = crate::port_slot_core_upper(epoch);
+        let memory = table
+            .raw(TimingClass::PushAll)
+            .max(table.raw(TimingClass::PopAll));
+        let mut interpret_one = 0;
+        for class in INTERPRET_ONE_CLASSES {
+            interpret_one = interpret_one.max(table.raw(*class));
+        }
+        let int_imm8 = table.raw(TimingClass::IntN);
+        let lar_lsl = table.raw(TimingClass::Lar).max(table.raw(TimingClass::Lsl));
+        let max = port
+            .max(memory)
+            .max(interpret_one)
+            .max(int_imm8)
+            .max(lar_lsl);
+        Self {
+            memory,
+            interpret_one,
+            int_imm8,
+            lar_lsl,
+            max,
+        }
+    }
+}
+
 impl CpuGsw {
     pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CycleOutcome, CpuError> {
         // `cycle` is the per-instruction prologue (halt-wake + hardware interrupt
@@ -190,7 +292,16 @@ impl CpuGsw {
                 self.record_fault_site(boundary_eip, false);
                 return Err(error);
             }
-            let charged = self.scale_clocks(61);
+            // Was a bare `61`. The INTA cycles the 8259A drives are still not
+            // modelled anywhere -- the census lists them as missing entirely --
+            // so this is the CPU's own entry cost and nothing else.
+            let charged = self.scale_clocks(
+                self.class_table()
+                    .raw(crate::timing_class::TimingClass::HardwareInterrupt),
+            );
+            #[cfg(feature = "timing-class-histogram")]
+            self.class_histogram
+                .record_system_event(crate::timing_class::TimingClass::HardwareInterrupt);
             self.elapsed_clocks += charged;
             #[cfg(feature = "reflected-call-diagnostic")]
             if self.retire_gates.reflected_call_diag_armed {
@@ -513,6 +624,13 @@ impl CpuGsw {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
+                // Both reads are INSIDE the arm, so the success path pays for
+                // neither. `deliver_exception` clears VM on the way into a
+                // ring-0 monitor handler, and this sits above the delivery
+                // call, so it still sees the mode the fault was RAISED in --
+                // which is exactly what census row 7 is about.
+                let faulted_in_v86 = self.is_v86_mode();
+                let faulting_class = self.pending_faulting_class.take();
                 // Captured BEFORE the rewind, because the rewind destroys the
                 // evidence. `load_segment_real` installs a fabricated real-mode
                 // descriptor (base = selector << 4), which is wrong in protected
@@ -544,8 +662,33 @@ impl CpuGsw {
                     self.record_fault_site(start_eip, cs_was_moved);
                     return Err(error);
                 }
+                // Census row 7, the worst in its group: a flat 59 for every
+                // mode, **16.7x under** on the V86 monitor trip, and it REPLACED
+                // the faulting instruction's own charge rather than adding to
+                // it (this arm is reached only when the instruction returned
+                // `Err`, so the outcome that carried its class was discarded).
+                //
+                // Both halves are fixed here. The delivery cost is now
+                // mode-keyed -- V86 takes Intel's V86/trap-gate-different-level
+                // row -- and the faulting instruction's own class is added back
+                // when the decode got far enough to know it. Under epoch 1 both
+                // classes carry the old 59 and the instruction term is zero, so
+                // the charge is unchanged; see `pending_faulting_class`.
+                let delivery = if faulted_in_v86 {
+                    crate::timing_class::TimingClass::ExceptionDeliveryV86
+                } else {
+                    crate::timing_class::TimingClass::ExceptionDelivery
+                };
+                #[cfg(feature = "timing-class-histogram")]
+                self.class_histogram.record_system_event(delivery);
+                let mut core_clocks = self.class_table().raw(delivery);
+                if self.timing_epoch() >= 2
+                    && let Some(class) = faulting_class
+                {
+                    core_clocks = core_clocks.saturating_add(self.class_table().raw(class));
+                }
                 CycleOutcome {
-                    core_clocks: 59,
+                    core_clocks,
                     halted: false,
                 }
             }
@@ -2154,7 +2297,14 @@ impl CpuGsw {
     /// `scale_core` of it, ceil(5,240 / 12) = 437 at the 1/12 persona pair); the integer figures
     /// do not.
     #[cfg(feature = "jit")]
-    fn compute_global_block_upper<B: CpuBus>(bus: &B, num: u32, den: u32, has_x87: bool) -> u64 {
+    fn compute_global_block_upper<B: CpuBus>(
+        bus: &B,
+        num: u32,
+        den: u32,
+        has_x87: bool,
+        table: &crate::timing_class::ClassTable,
+    ) -> u64 {
+        let terms = CallOutBudgetTerms::from_table(table, bus.timing_epoch());
         let scale_core = |unscaled: u64| {
             unscaled
                 .saturating_mul(u64::from(num))
@@ -2174,10 +2324,25 @@ impl CpuGsw {
         // returns. That is 18 (PUSHAD/POPAD) rather than 12 (IN AL,DX) as of the memory class, and
         // the constant is derived from the three per-opcode constants so a fourth helper raises it
         // by construction.
-        let callout_core = u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS)
-            .saturating_mul(u64::from(MAX_CALL_OUT_CORE_CLOCKS));
+        let callout_core =
+            u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS).saturating_mul(u64::from(terms.max));
+        // THE EPOCH'S OWN MAXIMUM CLASS, not the literal 4 this term used to carry
+        // (review B3). `4` was already an under-bound at epoch 1 -- `RetFar` charges
+        // 17 -- and at epoch 2 it is 3x to 138x too small, so the ceiling stopped
+        // dominating exactly where its `debug_assert` was supposed to catch it.
+        //
+        // The maximum is taken over the WHOLE table rather than over the classes a
+        // native slot can actually carry, deliberately. The alternative is a
+        // hand-maintained mirror of `DirectKind::timing_class`'s codomain that
+        // drifts silently the first time a variant moves class, and this bound's
+        // entire job is to dominate: a looser ceiling weakens no invariant, where a
+        // stale one breaks the assert it exists for. It costs nothing either way --
+        // see the note at the chain-pricing site: in a release build this function's
+        // result is dead except for the memo.
         let integer_core = scale_core(
-            4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6 + callout_core,
+            u64::from(table.max_raw()).saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
+                + 6
+                + callout_core,
         );
         // The x87 class needs no call-out term: x87 and call-out slots never share a block
         // (the compile walk refuses the mix in either order), so an x87 block's `callout_slots`
@@ -2333,7 +2498,13 @@ impl CpuGsw {
         block: &jit::direct::CompiledBlock,
         num: u32,
         den: u32,
+        table: &crate::timing_class::ClassTable,
     ) -> u64 {
+        // The five call-out quota terms, resolved from the RUNNING table. They were
+        // `const`s, and a `const` cannot be persona-keyed (review B3): under epoch 2
+        // they would price a group-3 call-out at two clocks where the slot charges
+        // up to 46. The `const`s stay in `lib.rs` as epoch-1 tripwires.
+        let terms = CallOutBudgetTerms::from_table(table, bus.timing_epoch());
         let fp_core_upper = u64::from(block.weighted_fp_clocks())
             .saturating_add(u64::from(FP_TIMING_DEN) - 1)
             / u64::from(FP_TIMING_DEN);
@@ -2386,12 +2557,11 @@ impl CpuGsw {
         let callout_core_upper = u64::from(block.callout_port_slots())
             .saturating_mul(u64::from(port_slot_core_upper(bus.timing_epoch())))
             .saturating_add(
-                u64::from(block.callout_memory_slots())
-                    .saturating_mul(u64::from(PUSH_ALL_CORE_CLOCKS.max(POP_ALL_CORE_CLOCKS))),
+                u64::from(block.callout_memory_slots()).saturating_mul(u64::from(terms.memory)),
             )
             .saturating_add(
                 u64::from(block.callout_interpret_one_slots())
-                    .saturating_mul(u64::from(INTERPRET_ONE_MAX_CORE_CLOCKS)),
+                    .saturating_mul(u64::from(terms.interpret_one)),
             )
             // The FOURTH class, `0xCD` INT imm8. It shares the generic helper with the class above
             // but not its budget term: 37 against that class's 7, so folding it in would have
@@ -2399,8 +2569,7 @@ impl CpuGsw {
             // none of them carries. Its own count is bounded at one per block by
             // `DirectKind::is_terminal`.
             .saturating_add(
-                u64::from(block.callout_int_imm8_slots())
-                    .saturating_mul(u64::from(INT_IMM8_CORE_CLOCKS)),
+                u64::from(block.callout_int_imm8_slots()).saturating_mul(u64::from(terms.int_imm8)),
             )
             // The FIFTH class, `0x0F02`/`0x0F03` LAR/LSL. Shares the generic helper too, but not
             // the budget term: 11 against the interpret-one class's 7, so folding it in would have
@@ -2409,8 +2578,7 @@ impl CpuGsw {
             // a block can carry several -- which is why it is a genuine `u8` counter rather than a
             // packed flag; see `CompiledBlock::callout_lar_lsl_slots`.
             .saturating_add(
-                u64::from(block.callout_lar_lsl_slots())
-                    .saturating_mul(u64::from(LAR_LSL_CORE_CLOCKS)),
+                u64::from(block.callout_lar_lsl_slots()).saturating_mul(u64::from(terms.lar_lsl)),
             );
         let scaled_core_upper = u64::from(block.raw_clocks())
             .saturating_add(fp_core_upper)
@@ -2587,14 +2755,14 @@ impl CpuGsw {
         let value = if cached != 0 {
             cached
         } else {
-            let computed = Self::compute_iteration_upper(bus, block, num, den);
+            let computed = Self::compute_iteration_upper(bus, block, num, den, self.class_table());
             self.jit_direct
                 .set_iteration_upper_cached(block.id(), epoch, computed);
             computed
         };
         debug_assert_eq!(
             value,
-            Self::compute_iteration_upper(bus, block, num, den),
+            Self::compute_iteration_upper(bus, block, num, den, self.class_table()),
             "cached iteration_upper went stale"
         );
         value
@@ -3104,14 +3272,26 @@ impl CpuGsw {
                     cached
                 } else {
                     self.perf.jit_direct_chain_quota_cache_misses += 1;
-                    let computed = Self::compute_global_block_upper(bus, num, den, block.has_x87());
+                    let computed = Self::compute_global_block_upper(
+                        bus,
+                        num,
+                        den,
+                        block.has_x87(),
+                        self.class_table(),
+                    );
                     self.jit_direct
                         .set_global_block_upper_cached(x87_index, epoch, computed);
                     computed
                 };
                 debug_assert_eq!(
                     global_block_upper,
-                    Self::compute_global_block_upper(bus, num, den, block.has_x87()),
+                    Self::compute_global_block_upper(
+                        bus,
+                        num,
+                        den,
+                        block.has_x87(),
+                        self.class_table()
+                    ),
                     "cached global_block_upper went stale"
                 );
                 // CHAIN PRICING. `global_block_upper` is a SOUND bound — it prices every hop as
@@ -3143,7 +3323,23 @@ impl CpuGsw {
                 // function's result is dead except for the memo, so changing it moves no guest
                 // number and no wall number. Only the divisor below does.
                 let per_hop_estimate = iteration_upper.max(1);
-                debug_assert!(per_hop_estimate <= global_block_upper.max(1));
+                // RELEASE-VISIBLE UNDER EPOCH 2 (review B3, slice 1 item 4). This
+                // check is the only thing that says the ceiling still dominates,
+                // and a `debug_assert` alone means the builds the campaign
+                // actually MEASURES enforce nothing -- which is how the `4u64`
+                // per-slot term above stayed 3x-138x too small without a red test.
+                // Epoch 2 is a development knob, never a shipped default, so a
+                // hard failure there is a signal and not a user-facing crash;
+                // epoch 1 keeps the debug-only form so no release behaviour moves.
+                if self.timing_epoch() >= 2 {
+                    assert!(
+                        per_hop_estimate <= global_block_upper.max(1),
+                        "chain pricing: per-hop estimate {per_hop_estimate} exceeds the global                          block upper bound {global_block_upper} under epoch {}; the bound has                          stopped dominating",
+                        self.timing_epoch()
+                    );
+                } else {
+                    debug_assert!(per_hop_estimate <= global_block_upper.max(1));
+                }
                 let additional = available
                     .saturating_sub(iteration_upper)
                     .checked_div(per_hop_estimate)
@@ -3633,6 +3829,24 @@ impl CpuGsw {
         self.perf.instructions += instructions;
         self.perf.jit_direct_entries += 1;
         self.perf.jit_direct_insns += instructions;
+        // The class histogram's native half: design section 9.1's sparse list,
+        // walked once per ENTRY rather than once per instruction. See
+        // `TimingHistogram` for why a chained entry lands in `unattributed`
+        // instead of being spread over the head block's classes.
+        #[cfg(feature = "timing-class-histogram")]
+        {
+            match self.jit_direct.class_vector(block.id()) {
+                Some(vector) if !vector.is_empty() => {
+                    let slots = vector.len() as u64;
+                    let passes = instructions / slots;
+                    let remainder = (instructions % slots) as usize;
+                    let vector: Vec<u8> = vector.to_vec();
+                    self.class_histogram
+                        .record_block(&vector, passes, remainder);
+                }
+                _ => self.class_histogram.record_unattributed(instructions),
+            }
+        }
         // The CS.D = 0 split of the two lines above. Mode-key bit 0 is CS.D, so a clear bit is a
         // 16-bit code segment. Branchless because this is the hottest path in the backend: the
         // predicate is a compare into a flag and the add is unconditional, so a 32-bit block
@@ -3925,7 +4139,7 @@ impl CpuGsw {
         block: &jit::direct::CompiledBlock,
     ) -> u64 {
         let (num, den) = level_timing(self.persona());
-        Self::compute_iteration_upper(bus, block, num, den)
+        Self::compute_iteration_upper(bus, block, num, den, self.class_table())
     }
 
     #[cfg(all(feature = "jit", test))]
@@ -4262,7 +4476,7 @@ impl CpuGsw {
                     insn.operand_size,
                     u32::from(self.read_gpr8(index)),
                 );
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x0fb7 => {
                 let modrm = insn.modrm?;
@@ -4274,7 +4488,7 @@ impl CpuGsw {
                     insn.operand_size,
                     self.read_gpr_sized(index, OperandSize::Word),
                 );
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x0fbe => {
                 let modrm = insn.modrm?;
@@ -4283,7 +4497,7 @@ impl CpuGsw {
                 };
                 let value = self.read_gpr8(index) as i8 as i32 as u32;
                 self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x0fbf => {
                 let modrm = insn.modrm?;
@@ -4292,7 +4506,7 @@ impl CpuGsw {
                 };
                 let value = self.read_gpr_sized(index, OperandSize::Word) as i16 as i32 as u32;
                 self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-                Some(clocks(3))
+                Some(self.charge(TimingClass::MovExtend))
             }
             0x70..=0x7f | 0x0f80..=0x0f8f => {
                 let cc = (insn.opcode & 0x0f) as u8;
@@ -4304,7 +4518,7 @@ impl CpuGsw {
                 if taken {
                     self.relative_jump(insn.imm as i32, insn.operand_size);
                 }
-                Some(clocks(3))
+                Some(self.charge(TimingClass::Jcc))
             }
             opcode if opcode <= 0xff => match opcode as u8 {
                 0x40..=0x4f => {
@@ -4316,14 +4530,14 @@ impl CpuGsw {
                         insn.operand_size.bus_width(),
                     );
                     self.write_gpr_sized(index, insn.operand_size, result);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::Reg))
                 }
                 0x84 => {
                     let modrm = insn.modrm?;
                     if modrm.mode == 3 && modrm.reg == modrm.rm {
                         let value = self.read_gpr8(modrm.rm);
                         self.alu_logic(u32::from(value), BusWidth::Byte);
-                        return Some(clocks(2));
+                        return Some(self.charge(test_rm_class(insn)));
                     }
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
@@ -4331,14 +4545,14 @@ impl CpuGsw {
                     let value = self.read_gpr8(index);
                     let result = value & self.read_gpr8(modrm.reg);
                     self.alu_logic(u32::from(result), BusWidth::Byte);
-                    Some(clocks(2))
+                    Some(self.charge(test_rm_class(insn)))
                 }
                 0x85 => {
                     let modrm = insn.modrm?;
                     if modrm.mode == 3 && modrm.reg == modrm.rm {
                         let value = self.read_gpr_sized(modrm.rm, insn.operand_size);
                         self.alu_logic(value, insn.operand_size.bus_width());
-                        return Some(clocks(2));
+                        return Some(self.charge(test_rm_class(insn)));
                     }
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
@@ -4346,7 +4560,7 @@ impl CpuGsw {
                     let value = self.read_gpr_sized(index, insn.operand_size);
                     let result = value & self.read_gpr_sized(modrm.reg, insn.operand_size);
                     self.alu_logic(result, insn.operand_size.bus_width());
-                    Some(clocks(2))
+                    Some(self.charge(test_rm_class(insn)))
                 }
                 0x88 => {
                     let modrm = insn.modrm?;
@@ -4354,7 +4568,7 @@ impl CpuGsw {
                         return None;
                     };
                     self.write_gpr8(index, self.read_gpr8(modrm.reg));
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovMemReg))
                 }
                 0x89 => {
                     let modrm = insn.modrm?;
@@ -4366,7 +4580,7 @@ impl CpuGsw {
                     } else {
                         self.write_gpr32(index, self.read_gpr32(modrm.reg));
                     }
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovMemReg))
                 }
                 0x8a => {
                     let modrm = insn.modrm?;
@@ -4374,7 +4588,7 @@ impl CpuGsw {
                         return None;
                     };
                     self.write_gpr8(modrm.reg, self.read_gpr8(index));
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovRegMem))
                 }
                 0x8b => {
                     let modrm = insn.modrm?;
@@ -4386,7 +4600,7 @@ impl CpuGsw {
                     } else {
                         self.write_gpr32(modrm.reg, self.read_gpr32(index));
                     }
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovRegMem))
                 }
                 0x8d => {
                     let modrm = insn.modrm?;
@@ -4395,24 +4609,24 @@ impl CpuGsw {
                     };
                     let memory = self.resolve_memory_addr_mode(&addr);
                     self.write_gpr_sized(modrm.reg, insn.operand_size, memory.offset);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::Lea))
                 }
-                0x90 => Some(clocks(3)),
+                0x90 => Some(self.charge(TimingClass::Nop)),
                 0x91..=0x97 => {
                     let reg = opcode as u8 & 0x07;
                     let acc = self.read_gpr_sized(0, insn.operand_size);
                     let other = self.read_gpr_sized(reg, insn.operand_size);
                     self.write_gpr_sized(0, insn.operand_size, other);
                     self.write_gpr_sized(reg, insn.operand_size, acc);
-                    Some(clocks(3))
+                    Some(self.charge(TimingClass::Xchg))
                 }
                 0xb0..=0xb7 => {
                     self.write_gpr8(insn.opcode as u8 - 0xb0, insn.imm as u8);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovImmReg))
                 }
                 0xb8..=0xbf => {
                     self.write_gpr_sized(insn.opcode as u8 - 0xb8, insn.operand_size, insn.imm);
-                    Some(clocks(2))
+                    Some(self.charge(TimingClass::MovImmReg))
                 }
                 0xe0 | 0xe1 => {
                     let count_nonzero = match insn.address_size {
@@ -4431,7 +4645,7 @@ impl CpuGsw {
                     if count_nonzero && (if insn.opcode as u8 == 0xe1 { zf } else { !zf }) {
                         self.relative_jump(insn.imm as i32, insn.operand_size);
                     }
-                    Some(clocks(11))
+                    Some(self.charge(TimingClass::LoopCc))
                 }
                 0xe2 => {
                     let taken = match insn.address_size {
@@ -4449,7 +4663,7 @@ impl CpuGsw {
                     if taken {
                         self.relative_jump(insn.imm as i32, insn.operand_size);
                     }
-                    Some(clocks(11))
+                    Some(self.charge(TimingClass::Loop))
                 }
                 0xe3 => {
                     let taken = match insn.address_size {
@@ -4459,11 +4673,11 @@ impl CpuGsw {
                     if taken {
                         self.relative_jump(insn.imm as i32, insn.operand_size);
                     }
-                    Some(clocks(9))
+                    Some(self.charge(TimingClass::Jcxz))
                 }
                 0xe9 | 0xeb => {
                     self.relative_jump(insn.imm as i32, insn.operand_size);
-                    Some(clocks(7))
+                    Some(self.charge(TimingClass::CallJmpRel))
                 }
                 _ => None,
             },
@@ -4560,7 +4774,7 @@ impl CpuGsw {
             _ => return None,
         }
 
-        Some(clocks(2))
+        Some(self.charge(TimingClass::Reg))
     }
 
     #[inline]
@@ -4602,7 +4816,15 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                // CMP (`op == 7`) writes nothing back, so its memory form is
+                // Intel's 2-clock load and not the 3-clock read/modify/write --
+                // the same split `alu_class` makes in `execute.rs` and
+                // `DirectKind::timing_class` makes for `AluMemDest { op: 7 }`.
+                Ok(Some(self.charge(if write_back {
+                    TimingClass::AluMemReg
+                } else {
+                    TimingClass::AluRegMem
+                })))
             }
             1 => {
                 let value = self.read_memory_sized(
@@ -4624,7 +4846,15 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                // CMP (`op == 7`) writes nothing back, so its memory form is
+                // Intel's 2-clock load and not the 3-clock read/modify/write --
+                // the same split `alu_class` makes in `execute.rs` and
+                // `DirectKind::timing_class` makes for `AluMemDest { op: 7 }`.
+                Ok(Some(self.charge(if write_back {
+                    TimingClass::AluMemReg
+                } else {
+                    TimingClass::AluRegMem
+                })))
             }
             2 => {
                 let value = self.read_memory_u8(
@@ -4638,7 +4868,7 @@ impl CpuGsw {
                 if write_back {
                     self.write_gpr8(modrm.reg, result);
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::AluRegMem)))
             }
             3 => {
                 let value = self.read_memory_sized(
@@ -4653,7 +4883,7 @@ impl CpuGsw {
                 if write_back {
                     self.write_gpr_sized(modrm.reg, insn.operand_size, result);
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::AluRegMem)))
             }
             _ => Ok(None),
         }
@@ -4696,7 +4926,7 @@ impl CpuGsw {
             _ => return None,
         }
 
-        Some(clocks(2))
+        Some(self.charge(TimingClass::Reg))
     }
 
     #[inline]
@@ -4733,7 +4963,7 @@ impl CpuGsw {
             self.write_gpr_sized(index, insn.operand_size, result);
         }
 
-        Some(clocks(2))
+        Some(self.charge(group2_class(opcode)))
     }
 
     #[inline]
@@ -4772,7 +5002,10 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(group1_class(
+                    modrm.reg,
+                    RmOperand::Memory(memory),
+                ))))
             }
             0x81 | 0x83 => {
                 let value = self.read_memory_sized(
@@ -4793,7 +5026,10 @@ impl CpuGsw {
                         BusAccessKind::DataWrite,
                     )?;
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(group1_class(
+                    modrm.reg,
+                    RmOperand::Memory(memory),
+                ))))
             }
             _ => Ok(None),
         }
@@ -4827,7 +5063,7 @@ impl CpuGsw {
                     value,
                     BusAccessKind::DataWrite,
                 )?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovMemReg)))
             }
             0x89 => {
                 let value = self.read_gpr_sized(modrm.reg, insn.operand_size);
@@ -4839,7 +5075,7 @@ impl CpuGsw {
                     value,
                     BusAccessKind::DataWrite,
                 )?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovMemReg)))
             }
             0x8a => {
                 let value = self.read_memory_u8(
@@ -4849,7 +5085,7 @@ impl CpuGsw {
                     BusAccessKind::DataRead,
                 )?;
                 self.write_gpr8(modrm.reg, value);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovRegMem)))
             }
             0x8b => {
                 let value = self.read_memory_sized(
@@ -4860,7 +5096,7 @@ impl CpuGsw {
                     BusAccessKind::DataRead,
                 )?;
                 self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::MovRegMem)))
             }
             _ => Ok(None),
         }
@@ -4889,7 +5125,7 @@ impl CpuGsw {
                 )?;
                 let reg = self.read_gpr8(modrm.reg);
                 self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(test_rm_class(insn))))
             }
             0x85 => {
                 let Some(modrm) = insn.modrm else {
@@ -4908,7 +5144,7 @@ impl CpuGsw {
                 )?;
                 let reg = self.read_gpr_sized(modrm.reg, insn.operand_size);
                 self.alu(4, value, reg, insn.operand_size.bus_width());
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(test_rm_class(insn))))
             }
             0x98 => {
                 match insn.operand_size {
@@ -4921,7 +5157,7 @@ impl CpuGsw {
                         self.write_gpr32(0, eax);
                     }
                 }
-                Ok(Some(clocks(3)))
+                Ok(Some(self.charge(TimingClass::Cbw)))
             }
             0x99 => {
                 match insn.operand_size {
@@ -4942,39 +5178,39 @@ impl CpuGsw {
                         self.write_gpr32(2, edx);
                     }
                 }
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::Cwd)))
             }
             0x9e => {
                 self.materialize_flags();
                 let ah = u32::from(self.read_gpr8(4));
                 self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
-                Ok(Some(clocks(3)))
+                Ok(Some(self.charge(TimingClass::Sahf)))
             }
             0x9f => {
                 self.materialize_flags();
                 let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
                 self.write_gpr8(4, ah);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::Lahf)))
             }
             0xf5 => {
                 self.set_flag(FLAG_CF, !self.flag(FLAG_CF));
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xf8 => {
                 self.set_flag(FLAG_CF, false);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xf9 => {
                 self.set_flag(FLAG_CF, true);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xfc => {
                 self.set_flag(FLAG_DF, false);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             0xfd => {
                 self.set_flag(FLAG_DF, true);
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::FlagOp)))
             }
             _ => Ok(None),
         }
@@ -4992,20 +5228,20 @@ impl CpuGsw {
             0x50..=0x57 => {
                 let value = self.read_gpr_sized(opcode - 0x50, operand_size);
                 self.push(bus, value, operand_size)?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::PushReg)))
             }
             0x58..=0x5f => {
                 let value = self.pop(bus, operand_size)?;
                 self.write_gpr_sized(opcode - 0x58, operand_size, value);
-                Ok(Some(clocks(4)))
+                Ok(Some(self.charge(TimingClass::PopReg)))
             }
             0x68 => {
                 self.push(bus, insn.imm, operand_size)?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::PushImm)))
             }
             0x6a => {
                 self.push(bus, sign_extend_u8(insn.imm as u8), operand_size)?;
-                Ok(Some(clocks(2)))
+                Ok(Some(self.charge(TimingClass::PushImm)))
             }
             _ => Ok(None),
         }
@@ -5023,6 +5259,6 @@ impl CpuGsw {
 
         self.push(bus, self.registers.eip, insn.operand_size)?;
         self.relative_jump(insn.imm as i32, insn.operand_size);
-        Ok(Some(clocks(7)))
+        Ok(Some(self.charge(TimingClass::CallJmpRel)))
     }
 }

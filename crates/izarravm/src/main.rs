@@ -2323,6 +2323,46 @@ fn write_hdd_profile_json(
             None,
         ),
     });
+    // The per-class retire histogram (design section 9.1; review R5, which makes
+    // it the load-bearing falsifier now that Dhrystone is demoted). Sparse: only
+    // classes with a nonzero count appear, since 157 rows of mostly zeros is
+    // noise and the reader wants the shares.
+    //
+    // `class_clocks` is review R5(i)'s SERIAL, pre-pairing class term -- the sum
+    // of `count x table[class]` over the attributed population. It is not the
+    // whole guest bill (no bus, no x87 dial, no call-out runtime charges) and it
+    // is not comparable to `executed_cpu_core_clocks`; `attributed` and
+    // `unattributed` are printed beside it so a share can be read as a share of
+    // what was actually placed.
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let (class_clocks, attributed, unattributed) = machine.cpu().class_histogram_totals();
+        let system_event_clocks = machine.cpu().class_histogram_system_event_clocks();
+        let mut events = serde_json::Map::new();
+        for (name, count) in machine.cpu().class_histogram_system_event_rows() {
+            events.insert(name.to_string(), json!(count));
+        }
+        let mut rows = serde_json::Map::new();
+        for (name, count) in machine.cpu().class_histogram_rows() {
+            rows.insert(name.to_string(), json!(count));
+        }
+        report["timing_class_histogram"] = json!({
+            "epoch": machine.timing_epoch(),
+            "class_clocks": class_clocks,
+            "attributed_retires": attributed,
+            "unattributed_retires": unattributed,
+            "class_clocks_per_attributed_retire":
+                class_clocks as f64 / (attributed as f64).max(1.0),
+            "counts": serde_json::Value::Object(rows),
+            // Slice 8's system events, counted APART from retires: an exception
+            // delivery charges clocks without retiring an instruction and a task
+            // switch charges them from inside `control.rs`, so folding either
+            // into `counts` would stop `class_clocks / attributed_retires`
+            // meaning clocks per retired instruction.
+            "system_event_clocks": system_event_clocks,
+            "system_events": serde_json::Value::Object(events),
+        });
+    }
     #[cfg(feature = "direct-link-refusal-census")]
     {
         report["direct_link_refusal_census"] =

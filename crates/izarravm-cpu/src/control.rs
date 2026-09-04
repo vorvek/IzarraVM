@@ -1546,6 +1546,19 @@ impl CpuGsw {
         } else {
             TaskSwitchKind::Jump
         };
+        // Slice 8: the far-transfer charge sites see only `0x9a`/`0xea`/`0xca`,
+        // not which DESCRIPTOR the transfer went through, and Intel prices a
+        // gate at twice a plain protected transfer and a TSS at eight times it
+        // (the census scores the flat 17 as 15.5x under on a gate and ~122x on a
+        // TSS). This dispatch is where the descriptor type is known, so it is
+        // where the class is recorded; the charge site takes it. Written on the
+        // protected-mode system-descriptor path only, so real-mode transfers pay
+        // nothing for it.
+        self.pending_transfer_class = Some(match (high >> 8) & 0x0f {
+            0x04 | 0x0c => crate::timing_class::TimingClass::FarTransferGate,
+            0x05 | 0x09 => crate::timing_class::TimingClass::FarTransferTss,
+            _ => crate::timing_class::TimingClass::FarTransferPm,
+        });
         match (high >> 8) & 0x0f {
             0x04 | 0x0c if is_call => self.far_call_gate(bus, selector, low, high),
             0x04 | 0x0c => self.far_jump_gate(bus, selector, low, high),
@@ -1912,8 +1925,30 @@ impl CpuGsw {
         // is reported as terminal instead of being handed to a caller that would
         // retry (exception delivery's escalation) or rewind (an instruction's own
         // fault path) from a state belonging to no task.
-        self.commit_task_switch(bus, kind, new_tss, old_selector, new_selector)
-            .map_err(fault_after_task_switch_commit)
+        let committed = self.commit_task_switch(bus, kind, new_tss, old_selector, new_selector);
+        if committed.is_ok() {
+            // THE TERM THAT DID NOT EXIST. A task switch rode whichever of the
+            // far-transfer, IRET or interrupt charges delivered it, which the
+            // census scores as under by 100x or more. It is charged HERE rather
+            // than at a call site because the three paths that reach a switch --
+            // `JMP`/`CALL` through a TSS or task gate, `IRET` with NT set, and
+            // an interrupt through a task gate -- do not share one.
+            //
+            // At epoch 1 `TaskSwitch` is ZERO, so this adds nothing and the
+            // knob-unset identity bar holds; it is the one class whose epoch-1
+            // entry is not a literal it replaced, because there was none.
+            #[cfg(feature = "timing-class-histogram")]
+            self.class_histogram
+                .record_system_event(crate::timing_class::TimingClass::TaskSwitch);
+            let raw = self
+                .class_table()
+                .raw(crate::timing_class::TimingClass::TaskSwitch);
+            if raw != 0 {
+                let charged = self.scale_clocks(raw);
+                self.elapsed_clocks += charged;
+            }
+        }
+        committed.map_err(fault_after_task_switch_commit)
     }
 
     /// The committing tail of `task_switch`. See the comment at its only call

@@ -170,6 +170,19 @@ pub(crate) fn armed_at_construction() -> bool {
 /// on, say, `BX`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct MemoKey {
+    /// The guest-clock model epoch the trip was LEARNED under.
+    ///
+    /// A memo records the trip's clocks (`raw_core`, `raw_bus`) and replays
+    /// them instead of re-running it, so a memo learned under one charge model
+    /// would go on answering with that model's numbers after the model changed
+    /// -- and slice 8 changes exactly the numbers a reflected trip is made of
+    /// (the V86 monitor trip, the faulting instruction's own class, `IRET`'s
+    /// mode rows). Under epoch 1 that would replay a 16.7x-light trip forever.
+    ///
+    /// In-process the epoch is fixed at construction, so this tag cannot fire
+    /// today: it guards a PERSISTED memo and a future per-persona epoch
+    /// selection, at one byte in a key that is already eighteen.
+    pub epoch: u8,
     pub vector: u8,
     pub ax: u16,
     pub cs_selector: u16,
@@ -738,6 +751,10 @@ fn key_for(cpu: &CpuGsw, vector: u8, ax: u16) -> MemoKey {
     let cs = cpu.registers.cs();
     let ss = cpu.registers.segment(SegmentIndex::Ss);
     MemoKey {
+        // Saturating rather than truncating: an epoch above 255 is not
+        // expressible by the knob, and a wrap would silently make two epochs
+        // share a key -- the one thing this field exists to prevent.
+        epoch: u8::try_from(cpu.timing_epoch()).unwrap_or(u8::MAX),
         vector,
         ax,
         cs_selector: cs.selector,
