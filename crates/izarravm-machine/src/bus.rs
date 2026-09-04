@@ -519,6 +519,8 @@ impl Machine {
             speaker: &mut self.speaker,
             rtc: &mut self.rtc,
             dma: &mut self.dma,
+            device_timing: self.device_timing,
+            inta_diag: &mut self.inta_diag,
             fdc: &mut self.fdc,
             opl: &mut self.opl,
             sb16: &mut self.sb16,
@@ -565,6 +567,7 @@ impl Machine {
             ata_poll_skip_armed: &mut self.ata_poll_skip_armed,
             ata_poll_skip_slice_too_short: self.ata_poll_skip_slice_too_short,
             ata_poll_skip: &mut self.ata_poll_skip,
+            ata_hdd_poll_skip_armed: &mut self.ata_hdd_poll_skip_armed,
             isa_io_clocks: &mut self.port_bus_batch_clocks,
             port_accesses_by_class: &mut self.port_accesses_by_class,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
@@ -3388,11 +3391,37 @@ impl CpuBus for MachineBus<'_> {
         if ata::AtaDisk::owns_port(port) {
             // The primary channel: a mounted disk drives the task file; an empty
             // channel reads open-bus (0xFF), so a probe sees no device.
+            //
+            // Slice 9C-pre: THE ARM SITE for the primary-channel poll skip, the
+            // fixed-disk analogue of the ATAPI arm just above. It is dark unless
+            // `DeviceTimingProfile::ata` is armed on this machine -- there is no
+            // separate `IZARRAVM_ATA_HDD_POLL_SKIP` enable bool the way the ATAPI
+            // mechanism has one, by design, so the knob-unset identity bar (the
+            // whole point of 9C-pre being "pure plumbing") holds without a second
+            // gate to keep in sync.
+            let lazy_alt_status = self.device_timing.ata
+                && self.lazy_port_reads
+                && port == ata::PRIMARY_CTRL
+                && !io_touched_before_read;
+            let arm = lazy_alt_status
+                && !skip_io_touched
+                && self
+                    .ata
+                    .as_mut()
+                    .is_some_and(ata::AtaDisk::note_alt_status_read);
             let value = self
                 .ata
                 .as_mut()
                 .and_then(|d| d.read_port(port))
                 .unwrap_or(0xff);
+            // SUPPRESS THE CLEAR, never force the set -- same contract as the
+            // ATAPI arm above.
+            if lazy_alt_status && !arm {
+                *self.io_touched = false;
+            }
+            if arm {
+                *self.ata_hdd_poll_skip_armed = true;
+            }
             return Ok(u32::from(value));
         }
         if fdc::Fdc::owns_port(port) {
@@ -3426,7 +3455,11 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.pic.read_port(port) {
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.dma.read_port(dma_page_register_port(port)) {
+        if let Some(value) = self.dma.read_port_timed(
+            dma_page_register_port(port),
+            self.guest_tick_now(),
+            self.device_timing,
+        ) {
             return Ok(u32::from(value));
         }
         if port == 0x00e0 {
@@ -3935,7 +3968,23 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn acknowledge_interrupt(&mut self) -> Option<u8> {
-        self.pic.acknowledge()
+        let now = self.guest_tick_now();
+        let (vector, master_irq) = self.pic.acknowledge_with_irq()?;
+        // Slice 9A instrument: always-on, never gated by `IZARRAVM_DEVICE_TIMING`.
+        self.inta_diag.acknowledge_count += 1;
+        // IRQ0 is never a cascade pin on this model's wiring (the PIT drives
+        // the master directly), so `master_irq == 0` is exactly "this
+        // acknowledge resolved the PIT's request".
+        if master_irq == 0
+            && let Some(edge_tick) = self.inta_diag.pending_edge_tick.take()
+        {
+            let delay_ticks = now.saturating_sub(edge_tick);
+            let delay_clocks = self
+                .timeline_at_batch_start
+                .cpu_clocks_for_master_ticks_ceil(delay_ticks);
+            self.inta_diag.record_irq0_entry(delay_clocks);
+        }
+        Some(vector)
     }
 
     #[inline]

@@ -44,6 +44,7 @@ mod cddriver;
 mod cdimage;
 mod cdiso;
 mod cdredir;
+mod device_timing;
 mod dma;
 mod dos;
 mod pci;
@@ -791,6 +792,68 @@ pub struct PitBulkAdvanceCounters {
 /// ALWAYS ON, machine-side, and every decline names its own cause, so a
 /// zero-win leg is diagnosable without a rebuild. That is not decoration: the
 /// wall number alone cannot tell "the arm never fired" from "the arm fired and
+/// Slice 9A (`dev_docs/2026-09-05-device-timing-slice9-design.md`): the 8259A
+/// INTA instrument. Always-on, gated by nothing in `IZARRAVM_DEVICE_TIMING`
+/// (no family in that knob owns this -- it is read-only evidence for slice 8's
+/// future interrupt-entry charge, not a behaviour switch), and cheap: one u64
+/// increment per delivered interrupt, plus one Option check and one histogram
+/// bucket per IRQ0 delivery specifically.
+///
+/// `pending_edge_tick` and `histogram`/`samples` measure the SAME thing the
+/// design's table calls out: "a guest that reads the PIT or TSC on entry to
+/// the IRQ0 handler measures the PIT-edge -> first-handler-instruction delay".
+/// Today's model charges nothing extra for INTA turnaround (`run.rs`'s 61 raw
+/// hardware-interrupt-entry charge is unaffected by this slice), so every
+/// sample under the current model is expected to land in the ZERO bucket --
+/// that is the certifier slice 8 needs before it can charge `INTA_SEQUENCE_CLOCKS`
+/// and expect the histogram to shift.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InterruptEntryDiagnostics {
+    /// Total 8259A acknowledge (INTA) cycles serviced across both master and
+    /// slave, one per CPU-visible delivered interrupt (a cascaded slave IRQ is
+    /// one delivery from the CPU's perspective even though it is two INTA bus
+    /// cycles on real hardware).
+    pub(crate) acknowledge_count: u64,
+    /// Master tick of the oldest PIT ch0 OUT rising edge (an IRQ0 request)
+    /// that has not yet been resolved by an IRQ0 acknowledge. `None` when no
+    /// IRQ0 request is currently outstanding. Cleared by the matching
+    /// acknowledge; a second edge arriving before that acknowledge does NOT
+    /// overwrite it -- IRR already coalesces repeat edges into the same
+    /// pending request, and this instrument should measure from the same edge
+    /// IRR did, the earliest one.
+    pub(crate) pending_edge_tick: Option<u64>,
+    /// Histogram of PIT-edge-to-IRQ0-handler-entry delay, in GUEST CLOCKS
+    /// (matching the unit slice 8's charge will be stated in, not master
+    /// ticks). Fixed geometric buckets, upper-exclusive:
+    /// `[0], [1,2), [2,4), [4,8), [8,16), [16,32), [32,64), [64,128),
+    /// [128,256), [256,512), [512, inf)`.
+    pub(crate) histogram: [u64; IRQ0_ENTRY_HISTOGRAM_BUCKETS],
+    /// Total samples recorded (the sum of `histogram`, kept separately so a
+    /// reader does not have to sum an array to know whether anything fired).
+    pub(crate) samples: u64,
+}
+
+/// `InterruptEntryDiagnostics::histogram`'s bucket count: 10 finite geometric
+/// buckets (`[0]` plus `[1,2) .. [256,512)`) plus one overflow bucket.
+pub(crate) const IRQ0_ENTRY_HISTOGRAM_BUCKETS: usize = 11;
+
+impl InterruptEntryDiagnostics {
+    /// Record one IRQ0 handler-entry delay sample, in guest clocks.
+    pub(crate) fn record_irq0_entry(&mut self, delay_clocks: u64) {
+        let bucket = if delay_clocks == 0 {
+            0
+        } else {
+            // delay_clocks >= 1: bucket 1 covers [1,2), bucket 2 covers [2,4),
+            // ..., bucket 9 covers [256,512), bucket 10 is the [512, inf)
+            // overflow. `ilog2` of 1..=511 yields 0..=8, so +1 lands exactly on
+            // buckets 1..=9; anything >= 512 is clamped to the overflow bucket.
+            (delay_clocks.ilog2() as usize + 1).min(IRQ0_ENTRY_HISTOGRAM_BUCKETS - 1)
+        };
+        self.histogram[bucket] += 1;
+        self.samples += 1;
+    }
+}
+
 /// the target was wrong", and those two have completely different fixes.
 ///
 /// The counters live outside `PERF_COUNTER_KEYS` (that list enumerates CPU perf
@@ -893,6 +956,21 @@ impl Drop for AtaPollSkipDiagnostics {
             c.monitor_exempt,
         );
     }
+}
+
+/// Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6):
+/// mechanism counters for the primary-channel (fixed-disk) analogue of the
+/// ATAPI poll skip. All zero unless `IZARRAVM_DEVICE_TIMING` armed the `ata`
+/// family AND the mechanism actually committed a skip -- there is no separate
+/// enable flag the way `ata_poll_skip_enabled` is one, by design: the family
+/// flag IS the gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AtaHddPollSkipCounters {
+    /// Committed skips: a run of alt-status reads while a primary-channel
+    /// command was pending, elided straight to its completion deadline.
+    pub skips: u64,
+    /// Master ticks actually skipped across every committed span.
+    pub skipped_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1558,6 +1636,14 @@ pub struct Machine {
     // batch -- which is exactly the case the device-edge deadline cache must not
     // miss. Reset per batch alongside `io_touched`.
     exempt_io_touched: bool,
+    // The slice-9 device-timing knob (`IZARRAVM_DEVICE_TIMING`). Parsed exactly
+    // once, here at construction, and handed by copy to whichever device code
+    // path later slices (9A onward) wire it into. Unset/empty is `is_none()`
+    // and today's behaviour is byte-identical -- see `device_timing.rs`.
+    device_timing: device_timing::DeviceTimingProfile,
+    // Slice 9A: the 8259A INTA instrument. Always-on; see
+    // `InterruptEntryDiagnostics`.
+    inta_diag: InterruptEntryDiagnostics,
     // The device-armed ATA/ATAPI clock skip (`IZARRAVM_ATA_POLL_SKIP`).
     //
     // WHY THIS IS NOT THE 0x3DA POLL SKIP. That one is an instruction-eliding
@@ -1593,6 +1679,14 @@ pub struct Machine {
     // The minimum skip, in master ticks. A copy of the channel's own floor so
     // the batch-end check does not have to reach through the device for it.
     ata_poll_floor_ticks: u64,
+    // Slice 9C-pre: the primary-channel (fixed-disk) analogue of
+    // `ata_poll_skip_armed`, above. Gated by `DeviceTimingProfile::ata`
+    // ONLY -- there is no separate `IZARRAVM_ATA_HDD_POLL_SKIP` knob, by
+    // design: this whole mechanism stays dark until the family is armed.
+    // Reset at batch ENTRY next to `ata_poll_skip_armed`; taken at batch end
+    // by `actuate_ata_hdd_poll_skip`.
+    ata_hdd_poll_skip_armed: bool,
+    ata_hdd_poll_skip_counters: AtaHddPollSkipCounters,
     // Fixed ISA-bus time (in CPU clocks) accrued this batch by the OPL status poll,
     // added to the batch's device advance in the fast modes so a fast CPU
     // poll cannot outrun the 80 us OPL timer. See the batch-end use in
@@ -2177,6 +2271,8 @@ impl Machine {
             last_int_vector: None,
             io_touched: false,
             exempt_io_touched: false,
+            device_timing: device_timing::device_timing_profile_default(),
+            inta_diag: InterruptEntryDiagnostics::default(),
             ata_poll_skip_enabled: run::ata_poll_skip_default(),
             ata_poll_skip_armed: false,
             ata_poll_skip_slice_too_short: false,
@@ -2184,6 +2280,8 @@ impl Machine {
             ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
             port_bus_batch_clocks: 0,
             port_accesses_by_class: [0; crate::bus::PORT_BUS_CLASS_COUNT],
+            ata_hdd_poll_skip_armed: false,
+            ata_hdd_poll_skip_counters: AtaHddPollSkipCounters::default(),
             pit_observer_fine_until: 0,
             device_edge_cache: timing::DeviceEdgeCache::Stale,
             device_edge_batches: 0,
@@ -3836,6 +3934,15 @@ struct MachineBus<'a> {
     speaker: &'a mut speaker::Speaker,
     rtc: &'a mut rtc::Rtc,
     dma: &'a mut dma::DmaController,
+    // A per-batch copy of `Machine::device_timing`, resolved once at
+    // construction from `IZARRAVM_DEVICE_TIMING`. `Copy`, so no lifetime, the
+    // same shape as `ata_poll_skip_enabled` above.
+    device_timing: device_timing::DeviceTimingProfile,
+    // Slice 9A: the 8259A INTA instrument, mutated on every acknowledge
+    // (`MachineBus::acknowledge_interrupt`). PIT edges are recorded outside
+    // the batch, in `Machine::apply_device_advance`, which touches
+    // `Machine::inta_diag` directly rather than through this borrow.
+    inta_diag: &'a mut InterruptEntryDiagnostics,
     fdc: &'a mut fdc::Fdc,
     opl: &'a mut OplChip,
     sb16: &'a mut Sb16Path,
@@ -4015,6 +4122,10 @@ struct MachineBus<'a> {
     // Points at `Machine::ata_poll_skip`. The bus half owns `arms` and
     // `monitor_exempt`; every other field is written by the batch-end actuation.
     ata_poll_skip: &'a mut AtaPollSkipDiagnostics,
+    // Slice 9C-pre: the primary-channel arm site's own armed flag, mirroring
+    // `ata_poll_skip_armed` above but gated by `device_timing.ata` alone (see
+    // that field, also in this struct) rather than a separate enable bool.
+    ata_hdd_poll_skip_armed: &'a mut bool,
     // Accrues fixed ISA-bus time (CPU clocks) for the OPL status poll in the
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::port_bus_batch_clocks`.

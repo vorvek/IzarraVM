@@ -687,3 +687,135 @@ fn image_backed_drive_refuses_fat_chain_mapping() {
     let disk = marked_disk(8);
     assert_eq!(disk.map_fat_chain(2, 1), None);
 }
+
+// ---------------------------------------------------------------------------
+// Slice 9C (`dev_docs/2026-09-05-device-timing-slice9-design.md`, the 9C row
+// and §5 risk 2): the ATA seek / rotational / drive-buffer / sustained-media
+// model, `charge_pio_transfer`. Every fixture states its `DeviceTimingProfile`
+// arm explicitly, the same discipline the 9C-pre poll-skip fixtures follow.
+// ---------------------------------------------------------------------------
+
+/// UNARMED must be byte-identical to the pre-9C `pio_transfer_ticks_cached`
+/// formula, and must touch neither the modelled head nor the sequential-run
+/// state -- the knob-unset identity bar every slice-9 family holds.
+#[test]
+fn pio_transfer_charge_is_inert_while_the_ata_family_is_unarmed() {
+    let mut disk = marked_disk(64);
+    let unarmed = DeviceTimingProfile::default();
+    for (lba, sectors, hits) in [(0u32, 1u32, 0u32), (5, 3, 1), (100, 1, 0)] {
+        assert_eq!(
+            disk.charge_pio_transfer(lba, sectors, hits, unarmed),
+            pio_transfer_ticks_cached(sectors, hits),
+            "unarmed must stay byte-identical to the pre-9C formula"
+        );
+    }
+    assert_eq!(disk.head_lba, 0, "the modelled head never moved");
+    assert_eq!(
+        disk.last_transfer_end_lba, None,
+        "the sequential-run state never armed"
+    );
+}
+
+/// A request whose start LBA continues immediately where the previous
+/// charged transfer left off costs only the command-latency floor plus a
+/// cable-burst transfer -- no seek, no rotation. This is design §5 risk 2's
+/// "a sequential single-sector stream... costs 50 us + cable transfer and no
+/// seek", the property the ≤25%/≤15% Duke bar depends on (98.7% of its reads
+/// are single-sector).
+#[test]
+fn sequential_pio_transfer_costs_the_buffer_price_not_a_seek() {
+    let mut disk = marked_disk(1_000_000);
+    let armed = DeviceTimingProfile {
+        ata: true,
+        ..DeviceTimingProfile::default()
+    };
+    // First transfer is necessarily cold (no prior state); its own cost is
+    // not what this fixture is about.
+    let first = disk.charge_pio_transfer(10, 1, 0, armed);
+    assert!(first > 0);
+    assert_eq!(disk.last_transfer_end_lba, Some(11));
+
+    // Second transfer starts exactly at LBA 11, where the first left off.
+    let second = disk.charge_pio_transfer(11, 1, 0, armed);
+    let expected = COMMAND_LATENCY_TICKS_PERIOD + pio_sector_ticks();
+    assert_eq!(
+        second, expected,
+        "a sequential continuation costs the command floor plus a cable-rate \
+         transfer, exactly -- no seek, no rotation"
+    );
+    assert!(
+        second < ROTATIONAL_LATENCY_TICKS,
+        "and is nowhere near the 5.55 ms rotational latency a cold access pays"
+    );
+}
+
+/// A sequential run longer than the drive's read-ahead buffer falls back to
+/// the sustained media rate for the overflow -- the buffer only hides
+/// latency, it does not raise the drive's throughput ceiling.
+#[test]
+fn a_sequential_run_beyond_the_buffer_falls_back_to_the_media_rate() {
+    let sectors_in_buffer = (DRIVE_BUFFER_BYTES / SECTOR as u64) as u32;
+    let total = sectors_in_buffer + 8;
+    let mut disk = marked_disk((total + 16) as usize);
+    let armed = DeviceTimingProfile {
+        ata: true,
+        ..DeviceTimingProfile::default()
+    };
+    let first = disk.charge_pio_transfer(0, 1, 0, armed);
+    assert!(first > 0);
+
+    // One big sequential transfer that overruns the buffer.
+    let second = disk.charge_pio_transfer(1, total, 0, armed);
+    let cable_only = COMMAND_LATENCY_TICKS_PERIOD
+        + (u128::from(u64::from(total) * SECTOR as u64) * u128::from(MASTER_CLOCK_HZ))
+            .div_ceil(u128::from(PIO_BYTES_PER_SECOND)) as u64;
+    assert!(
+        second > cable_only,
+        "the overflow past the buffer must cost more than an all-cable-rate \
+         transfer would: second={second} cable_only={cable_only}"
+    );
+}
+
+/// A random (non-continuing) LBA pays both the seek and the rotational
+/// latency, and costs strictly more than a sequential access of the same
+/// size -- design §5 risk 2's other half.
+#[test]
+fn random_lba_pio_transfer_costs_seek_and_rotation() {
+    let mut disk = marked_disk(1_000_000);
+    let armed = DeviceTimingProfile {
+        ata: true,
+        ..DeviceTimingProfile::default()
+    };
+    let _ = disk.charge_pio_transfer(10, 1, 0, armed);
+    // Far away from LBA 11 (where the first transfer left off): not a
+    // sequential continuation.
+    let random = disk.charge_pio_transfer(500_000, 1, 0, armed);
+
+    let sequential_cost = COMMAND_LATENCY_TICKS_PERIOD + pio_sector_ticks();
+    assert!(
+        random > sequential_cost,
+        "a random jump must cost strictly more than a sequential access: \
+         random={random} sequential_cost={sequential_cost}"
+    );
+    assert!(
+        random
+            >= COMMAND_LATENCY_TICKS_PERIOD + SEEK_TRACK_TO_TRACK_TICKS + ROTATIONAL_LATENCY_TICKS,
+        "and at least the command floor plus the seek floor plus one full \
+         rotational latency: random={random}"
+    );
+}
+
+/// A fully host-cache-served transfer (every sector a hit) touches the
+/// modelled drive at all: no charge, no head move -- design §5 risk 1, the
+/// host cache stays a pure host-time avoider.
+#[test]
+fn a_fully_cached_transfer_charges_nothing_and_does_not_move_the_modelled_head() {
+    let mut disk = marked_disk(64);
+    let armed = DeviceTimingProfile {
+        ata: true,
+        ..DeviceTimingProfile::default()
+    };
+    assert_eq!(disk.charge_pio_transfer(10, 4, 4, armed), 0);
+    assert_eq!(disk.head_lba, 0);
+    assert_eq!(disk.last_transfer_end_lba, None);
+}

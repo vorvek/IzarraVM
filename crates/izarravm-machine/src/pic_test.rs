@@ -704,3 +704,52 @@ fn master_initialized_sfnm() -> Pic8259Pair {
     pic.write_port(0x21, 0x11);
     pic
 }
+
+// ---------------------------------------------------------------------------
+// Slice 9A (`IZARRAVM_DEVICE_TIMING`, the INTA instrument):
+// `acknowledge_with_irq`'s reported master-side IRQ line.
+// `dev_docs/2026-09-05-device-timing-slice9-design.md` §3.4, §6 "9A".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn acknowledge_with_irq_reports_line_zero_for_irq0() {
+    let mut pic = master_initialized();
+    pic.request(0);
+    assert_eq!(
+        pic.acknowledge_with_irq(),
+        Some((0x08, 0)),
+        "IRQ0 -> vector 0x08, line 0"
+    );
+}
+
+#[test]
+fn acknowledge_with_irq_matches_acknowledge_for_every_line() {
+    // acknowledge() must still equal acknowledge_with_irq()'s vector half --
+    // the refactor that split them must not have changed acknowledge()'s own
+    // behaviour or state transition.
+    let mut plain = master_initialized();
+    let mut with_irq = master_initialized();
+    for irq in 0..8 {
+        plain.request(irq);
+        with_irq.request(irq);
+        let vector = plain.acknowledge();
+        let (vector2, line) = with_irq.acknowledge_with_irq().unwrap();
+        assert_eq!(vector, Some(vector2), "line {irq}");
+        assert_eq!(line, irq, "line {irq}");
+        plain.write_port(0x20, 0x20); // non-specific EOI
+        with_irq.write_port(0x20, 0x20);
+    }
+}
+
+#[test]
+fn acknowledge_with_irq_reports_the_master_cascade_pin_for_a_slave_irq() {
+    let mut pic = master_initialized();
+    slave_initialized(&mut pic);
+    pic.request(9); // slave line 1 -> cascades through master pin 2
+    let (vector, master_line) = pic.acknowledge_with_irq().unwrap();
+    assert_eq!(vector, 0x71, "slave base 0x70 | line 1");
+    assert_eq!(
+        master_line, 2,
+        "the master pin the slave cascades through, not IRQ0"
+    );
+}

@@ -352,3 +352,118 @@ fn ltim_keyboard_request_stays_asserted_until_the_guest_reads_obf() {
         "the port read deasserts the LTIM input in the same I/O cycle"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Slice 9A (`dev_docs/2026-09-05-device-timing-slice9-design.md`): the 8259A
+// INTA instrument's PIT-edge-to-IRQ0-handler-entry histogram. Certifies that
+// under TODAY's model (no INTA-turnaround charge -- that belongs to slice 8)
+// a PIT edge immediately followed by the IRQ0 acknowledge records exactly one
+// sample at zero extra delay, so slice 8 has a certifier to move the sample
+// off the zero bucket against.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn irq0_entry_diagnostics_record_a_zero_delay_sample_under_todays_model() {
+    let mut machine = int15_machine(4);
+    initialize_pic(&mut machine, 0xfe, 0xff); // unmask IRQ0 only, on the master
+    // PIT channel 0, mode 0 (interrupt on terminal count), lobyte/hibyte, binary,
+    // count 16 -> one OUT rising edge 16 PIT input clocks later.
+    out(&mut machine, 0x43, 0x30);
+    out(&mut machine, 0x40, 16);
+    out(&mut machine, 0x40, 0);
+
+    assert_eq!(
+        machine.irq0_entry_samples(),
+        0,
+        "nothing recorded before the edge"
+    );
+    assert_eq!(machine.inta_acknowledge_count(), 0);
+
+    // Advance one master tick at a time until the edge lands, so the
+    // acknowledge below happens at EXACTLY the edge's own master tick: the
+    // zero-extra-delay case.
+    let mut fired = false;
+    for _ in 0..500_000 {
+        if machine.pic.irr_bit(0) {
+            fired = true;
+            break;
+        }
+        machine.advance_devices_ticks(1);
+    }
+    assert!(fired, "IRQ0 never asserted");
+
+    let vector = with_bus(&mut machine, |bus| bus.acknowledge_interrupt());
+    assert_eq!(vector, Some(0x08), "IRQ0 vector at ICW2 base 0x08");
+
+    assert_eq!(machine.inta_acknowledge_count(), 1);
+    assert_eq!(machine.irq0_entry_samples(), 1, "exactly one IRQ0 delivery");
+    let histogram = machine.irq0_entry_histogram();
+    assert_eq!(
+        histogram[0], 1,
+        "today's model charges no INTA turnaround: the sample lands in the zero bucket"
+    );
+    assert_eq!(
+        histogram.iter().skip(1).sum::<u64>(),
+        0,
+        "no sample should land in any non-zero bucket under today's model"
+    );
+}
+
+#[test]
+fn irq0_entry_diagnostics_bucket_a_deliberately_delayed_acknowledge() {
+    let mut machine = int15_machine(4);
+    initialize_pic(&mut machine, 0xfe, 0xff);
+    out(&mut machine, 0x43, 0x30);
+    out(&mut machine, 0x40, 16);
+    out(&mut machine, 0x40, 0);
+
+    let mut fired = false;
+    for _ in 0..500_000 {
+        if machine.pic.irr_bit(0) {
+            fired = true;
+            break;
+        }
+        machine.advance_devices_ticks(1);
+    }
+    assert!(fired, "IRQ0 never asserted");
+
+    // Let a handful of guest clocks pass BEFORE the acknowledge, so the sample
+    // must NOT land in the zero bucket -- proving the histogram actually
+    // measures elapsed time rather than always recording zero.
+    let delay_ticks = machine.timeline.master_ticks_for_cpu_clocks(40);
+    machine.advance_devices_ticks(delay_ticks);
+    let vector = with_bus(&mut machine, |bus| bus.acknowledge_interrupt());
+    assert_eq!(vector, Some(0x08));
+
+    assert_eq!(machine.irq0_entry_samples(), 1);
+    let histogram = machine.irq0_entry_histogram();
+    assert_eq!(
+        histogram[0], 0,
+        "a real delay must not land in the zero bucket"
+    );
+    assert_eq!(histogram.iter().skip(1).sum::<u64>(), 1);
+}
+
+#[test]
+fn irq0_entry_diagnostics_ignore_a_non_irq0_acknowledge() {
+    let mut machine = int15_machine(4);
+    initialize_pic(&mut machine, 0xfd, 0xff); // unmask IRQ1 only
+    machine.inject_key_scancodes(&[0x1e]);
+    let deadline = machine.keyboard.ticks_until_event().unwrap();
+    machine.advance_devices_ticks(deadline);
+    assert!(machine.pic.irr_bit(1), "IRQ1 never asserted");
+
+    let vector = with_bus(&mut machine, |bus| bus.acknowledge_interrupt());
+    assert_eq!(vector, Some(0x09), "IRQ1 vector");
+
+    assert_eq!(
+        machine.inta_acknowledge_count(),
+        1,
+        "the counter is not IRQ0-specific"
+    );
+    assert_eq!(
+        machine.irq0_entry_samples(),
+        0,
+        "a non-IRQ0 acknowledge must not touch the IRQ0-specific histogram"
+    );
+}

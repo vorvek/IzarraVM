@@ -12,8 +12,29 @@
 //! programming share that cycle path; cascade channels do not use its memory
 //! datapath.
 
+use crate::device_timing::DeviceTimingProfile;
 use izarravm_bus::Memory;
-use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, MASTER_CLOCK_HZ};
+
+/// Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`): the 8237's per-byte bus cycle, 5 ISA
+/// BCLK at 8.33 MHz = 600 ns, per 86Box `dma.c:265`
+/// (`dev_docs/2026-09-05-device-timing-slice9-design.md` §3.2). This is a
+/// DEADLINE-lane bound on the current-count interpolation `count_after` below,
+/// never a charge -- it does not appear in any `clocks(N)` or `scale_*` call.
+/// Rounded to the nearest master tick: 600 ns * `MASTER_CLOCK_HZ` / 1e9.
+pub(crate) const BYTE_CYCLE_TICKS: u64 = (600 * MASTER_CLOCK_HZ).div_ceil(1_000_000_000);
+
+/// The interior state a mid-transfer current-count/current-address peek
+/// interpolates against, once `arm_transfer_window` sets it. `start_count` is
+/// the channel's `cur_count` at the moment the window opened (i.e. the whole
+/// block still ahead of it), and `deadline_tick` is the requesting device's OWN
+/// completion deadline -- slice 9B never moves that deadline, it only reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct TransferWindow {
+    start_tick: u64,
+    deadline_tick: u64,
+    start_count: u16,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DmaChannel {
@@ -31,6 +52,11 @@ pub(crate) struct DmaChannel {
     pub dreq: bool,           // hardware request input level
     pub active: bool,         // a granted transfer cycle is in progress
     pub transfer_cycles: u64, // completed byte or word cycles
+    // Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`) instrument state only: never
+    // written to canonical state, never consulted unless the family is armed,
+    // and reset by anything that would otherwise leave it referring to a stale
+    // block (a fresh count-register program, a mask, a master clear).
+    transfer_window: Option<TransferWindow>,
 }
 
 impl Default for DmaChannel {
@@ -50,11 +76,78 @@ impl Default for DmaChannel {
             dreq: false,
             active: false,
             transfer_cycles: 0,
+            transfer_window: None,
         }
     }
 }
 
 impl DmaChannel {
+    /// Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`): open a current-count
+    /// interpolation window for this channel. `deadline_tick` is the
+    /// requesting device's OWN completion deadline for the block this channel
+    /// is now programmed for -- this call never changes that deadline, it only
+    /// hands it to the interpolator. `start_count` is read from `cur_count` at
+    /// the moment of the call, so this must be called AFTER the channel's
+    /// count registers are programmed for the block and BEFORE the first byte
+    /// is granted.
+    // Limit: no device wires this yet -- slice 9B lands the interpolator and
+    // its unit tests only. A device-side follow-up (SB16/FDC calling this each
+    // time it knows its own completion deadline) is what makes the slide
+    // guest-visible; until then this is exercised by `dma_test.rs` directly.
+    #[allow(dead_code)]
+    pub(crate) fn arm_transfer_window(&mut self, now_ticks: u64, deadline_tick: u64) {
+        self.transfer_window = Some(TransferWindow {
+            start_tick: now_ticks,
+            deadline_tick: deadline_tick.max(now_ticks),
+            start_count: self.cur_count,
+        });
+    }
+
+    /// Slice 9B: the current-count register as a PEEK at `now_ticks`, sliding
+    /// linearly from the window's `start_count` toward its value at the
+    /// deadline instead of jumping there when the owning device's next
+    /// `read_byte`/`read_word` call actually lands. Falls back to the raw,
+    /// live `cur_count` -- today's behaviour, unchanged -- when no window is
+    /// armed (the unarmed default, and any channel this slice hasn't wired
+    /// up yet).
+    ///
+    /// The slide is bounded two ways, both floors on the elapsed time, so
+    /// interpolation can only ever be CONSERVATIVE relative to what actually
+    /// happened:
+    /// * proportionally, against the window's own span (start..deadline), so
+    ///   a slow device's count never appears to finish early;
+    /// * against `BYTE_CYCLE_TICKS`, the 8237 bus's own per-byte floor, so the
+    ///   count can never appear to advance faster than the bus could
+    ///   physically drive it, independent of how fast the device's rate is.
+    ///
+    /// The transfer's own completion deadline is untouched by this method --
+    /// it is read out of the window, never written back.
+    fn count_after(&self, now_ticks: u64) -> u16 {
+        let Some(window) = self.transfer_window else {
+            return self.cur_count;
+        };
+        if now_ticks <= window.start_tick {
+            return window.start_count;
+        }
+        if now_ticks >= window.deadline_tick {
+            // At or past the device's own completion deadline: this peek
+            // steps aside and reports whatever `cur_count` actually is,
+            // exactly as an unarmed read would -- the device's real grants
+            // are the source of truth once the window has closed.
+            return self.cur_count;
+        }
+        let elapsed = now_ticks - window.start_tick;
+        let span = (window.deadline_tick - window.start_tick).max(1);
+        let total_bytes = u64::from(window.start_count) + 1;
+        let proportional_done =
+            (u128::from(elapsed) * u128::from(total_bytes) / u128::from(span)) as u64;
+        let bus_bound_done = elapsed / BYTE_CYCLE_TICKS.max(1);
+        let bytes_done = proportional_done
+            .min(bus_bound_done)
+            .min(total_bytes.saturating_sub(1));
+        window.start_count.saturating_sub(bytes_done as u16)
+    }
+
     /// Mode register write (bits 2-3 transfer kind, bit4 auto-init, bit5 addr dec,
     /// bits 6-7 transfer mode). Device calls grant one cycle at a time. Block
     /// mode keeps its grant until terminal count, while cascade has no datapath.
@@ -339,6 +432,9 @@ impl DmaChip {
         // Loading a new count clears a latched TC.
         self.channels[ci].reached_tc = false;
         self.status &= !(1 << ci);
+        // A fresh count program starts a fresh block; any slice-9B window from
+        // a prior transfer no longer describes anything.
+        self.channels[ci].transfer_window = None;
         self.hi_lo = !self.hi_lo;
     }
 
@@ -380,6 +476,22 @@ impl DmaChip {
             (self.channels[ci].cur_count & 0xFF) as u8
         } else {
             (self.channels[ci].cur_count >> 8) as u8
+        };
+        self.hi_lo = !self.hi_lo;
+        v
+    }
+
+    /// Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`): `read_count`'s interpolating
+    /// twin. Same flip-flop and trace semantics; sources the 16-bit value from
+    /// `DmaChannel::count_after(now_ticks)` instead of the raw, live
+    /// `cur_count`. With no window armed on the channel the two are identical.
+    fn read_count_timed(&mut self, ci: usize, now_ticks: u64) -> u8 {
+        self.trace_position_read(ci, "count");
+        let interpolated = self.channels[ci].count_after(now_ticks);
+        let v = if !self.hi_lo {
+            (interpolated & 0xFF) as u8
+        } else {
+            (interpolated >> 8) as u8
         };
         self.hi_lo = !self.hi_lo;
         v
@@ -813,6 +925,60 @@ impl DmaController {
             return Some(self.page_scratch[(port & 0x0F) as usize]);
         }
         None
+    }
+
+    /// Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`): `read_port`'s guest-visible
+    /// entry point when the profile's `dma` family may be armed. Every port
+    /// that is NOT a current-count register, and every read when `!profile.dma`,
+    /// is delegated to `read_port` unchanged -- so an unarmed machine is
+    /// byte-identical to one built before this method existed, on every port,
+    /// on every read. Only a current-count register read, with the family
+    /// armed, takes the interpolating path (`DmaChip::read_count_timed`)
+    /// instead of the raw jump.
+    pub(crate) fn read_port_timed(
+        &mut self,
+        port: u16,
+        now_ticks: u64,
+        profile: DeviceTimingProfile,
+    ) -> Option<u8> {
+        if !profile.dma {
+            return self.read_port(port);
+        }
+        if port <= 0x0F {
+            if let Some(ci) = DmaChip::count_channel(port as u8) {
+                return Some(self.master.read_count_timed(ci, now_ticks));
+            }
+            return self.read_port(port);
+        }
+        if let Some(local) = Self::slave_local(port)
+            && let Some(ci) = DmaChip::count_channel(local)
+        {
+            return Some(self.slave.read_count_timed(ci, now_ticks));
+        }
+        self.read_port(port)
+    }
+
+    /// Slice 9B: open a current-count interpolation window on `channel`
+    /// (0-3 master, 4-7 slave). `deadline_tick` is the requesting device's OWN
+    /// completion deadline for the block just programmed on this channel --
+    /// this call reads that deadline, it never sets or changes it. A no-op on
+    /// the guest-visible transfer itself: with `profile.dma` unarmed the window
+    /// is written but never consulted (`read_port_timed` falls through to
+    /// `read_port` unconditionally), so arming this window on every transfer
+    /// unconditionally is safe and is what a future device-side slice should do.
+    // Limit: no device calls this yet -- see `DmaChannel::arm_transfer_window`.
+    #[allow(dead_code)]
+    pub(crate) fn arm_transfer_window(
+        &mut self,
+        channel: usize,
+        now_ticks: u64,
+        deadline_tick: u64,
+    ) {
+        if channel < 4 {
+            self.master.channels[channel].arm_transfer_window(now_ticks, deadline_tick);
+        } else {
+            self.slave.channels[channel - 4].arm_transfer_window(now_ticks, deadline_tick);
+        }
     }
 
     /// Read one byte for DMA channel `channel` (0-3 master, 4-7 slave).

@@ -353,6 +353,13 @@ impl Machine {
         let now = self.timeline.now_ticks();
         for _ in 0..edges {
             self.opl_probe.count_irq0_edge(now);
+            // Slice 9A: record the EARLIEST outstanding edge only. IRR already
+            // coalesces repeat edges into one pending request, so a second
+            // edge before the matching acknowledge must not push the recorded
+            // instant later than the one IRR is actually holding.
+            if self.inta_diag.pending_edge_tick.is_none() {
+                self.inta_diag.pending_edge_tick = Some(now);
+            }
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
 

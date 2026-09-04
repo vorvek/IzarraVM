@@ -387,6 +387,8 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         speaker: &mut machine.speaker,
         rtc: &mut machine.rtc,
         dma: &mut machine.dma,
+        device_timing: machine.device_timing,
+        inta_diag: &mut machine.inta_diag,
         fdc: &mut machine.fdc,
         opl: &mut machine.opl,
         sb16: &mut machine.sb16,
@@ -433,6 +435,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         ata_poll_skip_armed: &mut machine.ata_poll_skip_armed,
         ata_poll_skip_slice_too_short: machine.ata_poll_skip_slice_too_short,
         ata_poll_skip: &mut machine.ata_poll_skip,
+        ata_hdd_poll_skip_armed: &mut machine.ata_hdd_poll_skip_armed,
         isa_io_clocks: &mut machine.port_bus_batch_clocks,
         port_accesses_by_class: &mut machine.port_accesses_by_class,
         pit_observer_fine_until: &mut machine.pit_observer_fine_until,
@@ -609,6 +612,9 @@ fn boot_and_read_font_rows(cmos_codepage: u8, glyph: u8, rows: usize) -> Vec<u8>
 #[cfg(test)]
 #[path = "machine_ata_dma_test.rs"]
 mod ata_dma;
+#[cfg(test)]
+#[path = "machine_ata_hdd_poll_skip_test.rs"]
+mod ata_hdd_poll_skip;
 #[cfg(test)]
 #[path = "machine_atapi_poll_skip_test.rs"]
 mod atapi_poll_skip;

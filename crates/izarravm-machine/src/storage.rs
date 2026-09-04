@@ -477,6 +477,66 @@ impl Machine {
         self.ata_poll_skip_enabled
     }
 
+    /// The slice-9 `IZARRAVM_DEVICE_TIMING` profile this machine was built
+    /// with. `Copy`, resolved once at construction; see `device_timing.rs`.
+    pub(crate) fn device_timing_profile(&self) -> crate::device_timing::DeviceTimingProfile {
+        self.device_timing
+    }
+
+    /// Force the `ata` family arm for one machine, in either direction, the
+    /// same shape as `set_ata_poll_skip_enabled` but for the whole-family
+    /// flag rather than a dedicated enable bool -- there is no
+    /// `IZARRAVM_ATA_HDD_POLL_SKIP` knob, by design.
+    #[doc(hidden)]
+    pub fn set_device_timing_ata_for_test(&mut self, enabled: bool) {
+        self.device_timing.ata = enabled;
+    }
+
+    /// Slice 9C-pre: mechanism counters for the primary-channel (fixed-disk)
+    /// poll skip. All zero on a fixture that never armed the `ata` family,
+    /// and all zero while `ata::COMMAND_LATENCY_TICKS` stays 0 and no
+    /// test-injected latency is scheduled.
+    pub fn ata_hdd_poll_skip_counters(&self) -> crate::AtaHddPollSkipCounters {
+        self.ata_hdd_poll_skip_counters
+    }
+
+    /// Slice 9A: total 8259A acknowledge (INTA) cycles serviced. Always-on,
+    /// never gated by `IZARRAVM_DEVICE_TIMING`.
+    pub fn inta_acknowledge_count(&self) -> u64 {
+        self.inta_diag.acknowledge_count
+    }
+
+    /// Slice 9A: the PIT-edge-to-IRQ0-handler-entry delay histogram, in guest
+    /// clocks, per `InterruptEntryDiagnostics::histogram`'s bucket layout.
+    pub fn irq0_entry_histogram(&self) -> [u64; IRQ0_ENTRY_HISTOGRAM_BUCKETS] {
+        self.inta_diag.histogram
+    }
+
+    /// Slice 9A: total IRQ0 handler-entry delay samples recorded (the sum of
+    /// `irq0_entry_histogram`).
+    pub fn irq0_entry_samples(&self) -> u64 {
+        self.inta_diag.samples
+    }
+
+    /// The slice-9 `IZARRAVM_DEVICE_TIMING` per-family armed state, in the
+    /// design's own family order (`pic dma ata cd fdc kbc sb`). Every entry is
+    /// `false` on the knob-unset default. Exposed for the whole-run profile
+    /// JSON (`device_timing_json`, `izarravm/src/main.rs`) so a fixture can
+    /// confirm which families a run actually armed without re-deriving the
+    /// parse from the raw environment string.
+    pub fn device_timing_families(&self) -> [(&'static str, bool); 7] {
+        let p = self.device_timing_profile();
+        [
+            ("pic", p.pic),
+            ("dma", p.dma),
+            ("ata", p.ata),
+            ("cd", p.cd),
+            ("fdc", p.fdc),
+            ("kbc", p.kbc),
+            ("sb", p.sb),
+        ]
+    }
+
     /// Force the arm for one machine, in either direction.
     ///
     /// The shipped gate is per-MACHINE state read once at construction, not a
@@ -1813,8 +1873,21 @@ impl Machine {
     /// would not be, because a restored machine restarts with an empty cache;
     /// `sector_cache`'s module docs state that consequence in full and it is
     /// unowned until a restore path exists.
-    fn stall_for_hdd_sectors_cached(&mut self, sectors: u32, hits: u32) {
-        self.stall_for_master_ticks(ata::pio_transfer_ticks_cached(sectors, hits));
+    ///
+    /// Slice 9C: this is the SOLE production caller of `AtaDisk::charge_pio_transfer`,
+    /// so it is also the sole writer of the drive-buffer/seek model's head-position
+    /// state -- a caller must not recompute the charge separately (that would move
+    /// the modelled head twice for one transfer). Callers that also need the ticks
+    /// for a census or a diagnostic (`note_int13_data`, `note_guest_read_batch`,
+    /// `note_guest_write_wait`) take the value THIS returns rather than deriving
+    /// their own.
+    fn stall_for_hdd_sectors_cached(&mut self, lba: u32, sectors: u32, hits: u32) -> u64 {
+        let profile = self.device_timing_profile();
+        let ticks = self.ata.as_mut().map_or(0, |disk| {
+            disk.charge_pio_transfer(lba, sectors, hits, profile)
+        });
+        self.stall_for_master_ticks(ticks);
+        ticks
     }
 
     /// Sector-cache hits since mount, or 0 with no disk. A transfer reads this
@@ -1838,6 +1911,7 @@ impl Machine {
         hits: u32,
         start_lba: u32,
         buf_seg: u16,
+        stall_ticks: u64,
     ) {
         let region = self
             .ata
@@ -1879,9 +1953,11 @@ impl Machine {
             }
         }
         p.cache_hits = p.cache_hits.saturating_add(u64::from(hits.min(sectors)));
-        p.stall_ticks = p
-            .stall_ticks
-            .saturating_add(ata::pio_transfer_ticks_cached(sectors, hits));
+        // Slice 9C: take the caller's already-computed charge rather than
+        // recomputing it -- `AtaDisk::charge_pio_transfer` mutates the
+        // modelled drive-head state, so it must run exactly once per real
+        // transfer, and `stall_for_hdd_sectors_cached` is that one call.
+        p.stall_ticks = p.stall_ticks.saturating_add(stall_ticks);
     }
 
     /// Real-mode paragraph of ES, which is the CHS/long-sector transfer buffer.
@@ -1984,6 +2060,10 @@ impl Machine {
             }
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        // Slice 9C: the ONE authoritative charge for this transfer -- see
+        // `stall_for_hdd_sectors_cached`'s doc comment. Every other consumer
+        // below takes its return rather than recomputing.
+        let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = if ah == 0x02 {
                 Int13DataKind::Read
@@ -1996,9 +2076,9 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
+                wait_ticks,
             );
         }
-        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
             if ah == 0x02 {
                 disk.note_guest_read_batch(
@@ -2010,7 +2090,6 @@ impl Machine {
                 disk.note_guest_write_wait(crate::katea_tree::GuestStorageRoute::Int13, wait_ticks);
             }
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         let status = if host_write_failed {
             HOST_WRITE_FAULT_STATUS
@@ -2108,6 +2187,7 @@ impl Machine {
             });
 
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = if ah == 0x0A {
                 Int13DataKind::Read
@@ -2120,9 +2200,9 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
+                wait_ticks,
             );
         }
-        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
             if ah == 0x0A {
                 disk.note_guest_read_batch(
@@ -2134,7 +2214,6 @@ impl Machine {
                 disk.note_guest_write_wait(crate::katea_tree::GuestStorageRoute::Int13, wait_ticks);
             }
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         match if host_write_failed {
             HOST_WRITE_FAULT_STATUS
@@ -2187,6 +2266,7 @@ impl Machine {
             disk.end_read_command();
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             self.note_int13_data(
                 Int13DataKind::Verify,
@@ -2194,9 +2274,9 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
+                wait_ticks,
             );
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -2412,6 +2492,8 @@ impl Machine {
                     == crate::katea_tree::CommitGuestWriteResult::HostIoFailure
             });
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        let edd_lba = u32::try_from(lba).expect("validated EDD LBA fits ATA");
+        let wait_ticks = self.stall_for_hdd_sectors_cached(edd_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = match ah {
                 0x42 => Int13DataKind::Read,
@@ -2422,11 +2504,11 @@ impl Machine {
                 kind,
                 u32::from(done),
                 cache_hits,
-                u32::try_from(lba).expect("validated EDD LBA fits ATA"),
+                edd_lba,
                 buf_seg,
+                wait_ticks,
             );
         }
-        let wait_ticks = ata::pio_transfer_ticks_cached(u32::from(done), cache_hits);
         if let Some(disk) = self.ata.as_ref() {
             match ah {
                 0x42 => disk.note_guest_read_batch(
@@ -2439,7 +2521,6 @@ impl Machine {
                 _ => {}
             }
         }
-        self.stall_for_hdd_sectors_cached(u32::from(done), cache_hits);
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
         let status = if host_write_failed {
