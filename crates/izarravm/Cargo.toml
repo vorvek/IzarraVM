@@ -48,7 +48,17 @@ reflected-call-diagnostic = ["jit", "izarravm-cpu/reflected-call-diagnostic", "i
 # Passthrough for the S1a/b/c/d shadow-cache probe; see izarravm-machine.
 shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-machine/shadow-cache-probe", "izarravm-bus/shadow-cache-probe"]
 # Passthrough for the reflected-call HLE design's slice-1 memo; see izarravm-cpu.
-reflected-call-memo = ["jit", "izarravm-cpu/reflected-call-memo"]
+# `izarravm-machine`'s arm is NOT optional and never was "CI symmetry": the batch loop's
+# interpreter forcing (F1) and the HLE soft-int SERVICE refusal (F2) both live behind it,
+# in `izarravm-machine/src/run.rs`. Without it a feature build of this crate carries the
+# memo module and neither of its two soundness fixes -- measured on `tyrian-specs-586`
+# 2026-09-04: `learn_batches` 0, `learn_refused[native_store]` 363,377 on the dominant key,
+# `answered` 0 over 1,459,467 trips.
+reflected-call-memo = [
+    "jit",
+    "izarravm-cpu/reflected-call-memo",
+    "izarravm-machine/reflected-call-memo",
+]
 
 # Passthrough for the per-class retire histogram; see izarravm-cpu. This crate IS the reader:
 # `timing_class_histogram` in the profile JSON.
