@@ -819,3 +819,69 @@ fn a_fully_cached_transfer_charges_nothing_and_does_not_move_the_modelled_head()
     assert_eq!(disk.head_lba, 0);
     assert_eq!(disk.last_transfer_end_lba, None);
 }
+
+// ---------------------------------------------------------------------------
+// Slice 9D (`dev_docs/2026-09-05-device-9d-result.md`): the `pio_transfer_
+// breakdown` diagnostic and the `IZARRAVM_INT13_PROFILE` call-pattern census
+// it feeds. `pio_transfer_breakdown` must never drift from `charge_pio_
+// transfer` -- both are backed by the same private computation, and this is
+// the test that would catch a fork between them.
+// ---------------------------------------------------------------------------
+
+/// The breakdown's four components must sum to exactly what `charge_pio_
+/// transfer` charges for the SAME request, across a cold call, a sequential
+/// continuation, a run that overflows the drive buffer, and an all-cache-hit
+/// call. `pio_transfer_breakdown` is read-only, so it is called first (its own
+/// ordering contract) and `charge_pio_transfer` afterward for comparison.
+#[test]
+fn pio_transfer_breakdown_components_sum_to_the_charge() {
+    let mut disk = marked_disk(1_000_000);
+    let armed = DeviceTimingProfile {
+        ata: true,
+        ..DeviceTimingProfile::default()
+    };
+
+    // Cold (first-ever) access.
+    let breakdown = disk.pio_transfer_breakdown(10, 1, 0, armed);
+    let charged = disk.charge_pio_transfer(10, 1, 0, armed);
+    assert_eq!(breakdown.total(), charged);
+    assert!(!breakdown.sequential);
+    assert_eq!(
+        breakdown.command_ticks
+            + breakdown.seek_ticks
+            + breakdown.rotation_ticks
+            + breakdown.transfer_ticks,
+        charged
+    );
+
+    // Sequential continuation (LBA 11, right after the first transfer's end).
+    let breakdown = disk.pio_transfer_breakdown(11, 1, 0, armed);
+    let charged = disk.charge_pio_transfer(11, 1, 0, armed);
+    assert_eq!(breakdown.total(), charged);
+    assert!(breakdown.sequential);
+    assert_eq!(breakdown.seek_ticks, 0);
+    assert_eq!(breakdown.rotation_ticks, 0);
+
+    // A big sequential run that overflows the drive buffer.
+    let sectors_in_buffer = (DRIVE_BUFFER_BYTES / SECTOR as u64) as u32;
+    let overflow = sectors_in_buffer + 8;
+    let breakdown = disk.pio_transfer_breakdown(12, overflow, 0, armed);
+    let charged = disk.charge_pio_transfer(12, overflow, 0, armed);
+    assert_eq!(breakdown.total(), charged);
+
+    // All-cache-hit call: every component zero, total zero.
+    let breakdown = disk.pio_transfer_breakdown(999, 4, 4, armed);
+    let charged = disk.charge_pio_transfer(999, 4, 4, armed);
+    assert_eq!(breakdown.total(), 0);
+    assert_eq!(charged, 0);
+    assert_eq!(breakdown.charged_sectors, 0);
+
+    // Unarmed: the breakdown still sums to the pre-9C formula, with no seek
+    // or rotation component (the model has no head concept when dark).
+    let unarmed = DeviceTimingProfile::default();
+    let breakdown = disk.pio_transfer_breakdown(50, 2, 0, unarmed);
+    let charged = disk.charge_pio_transfer(50, 2, 0, unarmed);
+    assert_eq!(breakdown.total(), charged);
+    assert_eq!(breakdown.seek_ticks, 0);
+    assert_eq!(breakdown.rotation_ticks, 0);
+}

@@ -3571,6 +3571,12 @@ fn direct_callout_attribution_json(
 /// so the histogram no longer predicts a rate — read it as the call-size shape of
 /// the workload, and read `stall_ticks` against `read_sectors - cache_hits` for
 /// the charge.
+///
+/// Slice 9D adds the call-pattern fields (`sequential_calls`, `cold_calls`,
+/// `cache_full_hit_calls`, and the four `*_ticks` charge components): all zero
+/// unless `DeviceTimingProfile::ata` is ALSO armed alongside the census, since
+/// there is no seek/rotation/buffer model to report on otherwise. The four
+/// tick fields sum to `stall_ticks` for the same run.
 /// The device-armed ATA/ATAPI clock-skip mechanism counters.
 ///
 /// READ THESE BEFORE READING THE WALL. The wall number alone cannot separate
@@ -3672,6 +3678,13 @@ fn int13_profile_json(p: izarravm_machine::Int13Profile) -> serde_json::Value {
         "read_buf_conv": p.read_buf_conv,
         "read_buf_uma": p.read_buf_uma,
         "read_buf_hma": p.read_buf_hma,
+        "sequential_calls": p.sequential_calls,
+        "cold_calls": p.cold_calls,
+        "cache_full_hit_calls": p.cache_full_hit_calls,
+        "command_latency_ticks": p.command_latency_ticks,
+        "seek_ticks": p.seek_ticks,
+        "rotation_ticks": p.rotation_ticks,
+        "transfer_ticks": p.transfer_ticks,
     })
 }
 

@@ -100,6 +100,30 @@ pub struct Int13Profile {
     pub read_buf_conv: u64,
     pub read_buf_uma: u64,
     pub read_buf_hma: u64,
+    /// Slice 9D call-pattern extension (`dev_docs/2026-09-05-device-9d-result.md`):
+    /// every field below is aggregated over ALL data calls (read, write and
+    /// verify alike, matching `stall_ticks`'s own scope), and every field is
+    /// computed from `AtaDisk::pio_transfer_breakdown` -- the SAME formula
+    /// `charge_pio_transfer` charges, never a second guess at it. All zero
+    /// unless `DeviceTimingProfile::ata` is armed alongside the census: with
+    /// the family unarmed there is no seek/rotation/buffer model to report on.
+    ///
+    /// Calls whose start LBA continued the previous charged transfer
+    /// (`AtaDisk::last_transfer_end_lba == Some(lba)`, no seek/rotation
+    /// charged).
+    pub sequential_calls: u64,
+    /// Calls that were not a sequential continuation and charged at least one
+    /// sector (paid seek + rotation).
+    pub cold_calls: u64,
+    /// Calls where every requested sector was a host-cache hit (`charged ==
+    /// 0`): the drive model was never touched, no seek, no transfer.
+    pub cache_full_hit_calls: u64,
+    /// The four charge components, summed across every armed call. Their sum
+    /// equals `stall_ticks` for the same run (a unit test asserts this).
+    pub command_latency_ticks: u64,
+    pub seek_ticks: u64,
+    pub rotation_ticks: u64,
+    pub transfer_ticks: u64,
 }
 
 /// Caller-buffer segment class for the INT 13h census.
@@ -1878,9 +1902,12 @@ impl Machine {
     /// so it is also the sole writer of the drive-buffer/seek model's head-position
     /// state -- a caller must not recompute the charge separately (that would move
     /// the modelled head twice for one transfer). Callers that also need the ticks
-    /// for a census or a diagnostic (`note_int13_data`, `note_guest_read_batch`,
-    /// `note_guest_write_wait`) take the value THIS returns rather than deriving
-    /// their own.
+    /// (`note_guest_read_batch`, `note_guest_write_wait`) take the value THIS
+    /// returns rather than deriving their own. `note_int13_data` (slice 9D) is
+    /// the one exception: it takes a `PioChargeBreakdown` computed by
+    /// `int13_breakdown_if_profiled` BEFORE this call, since that is a
+    /// read-only diagnostic query and must run before the mutation below --
+    /// see that method's own doc comment.
     fn stall_for_hdd_sectors_cached(&mut self, lba: u32, sectors: u32, hits: u32) -> u64 {
         let profile = self.device_timing_profile();
         let ticks = self.ata.as_mut().map_or(0, |disk| {
@@ -1888,6 +1915,31 @@ impl Machine {
         });
         self.stall_for_master_ticks(ticks);
         ticks
+    }
+
+    /// Slice 9D call-pattern census: the `AtaDisk::pio_transfer_breakdown` for
+    /// this request, or `None` if `IZARRAVM_INT13_PROFILE` is off -- in which
+    /// case nothing runs, per `default-off-instruments-tax-hot-path`.
+    ///
+    /// Callers MUST call this before the matching `stall_for_hdd_sectors_cached`
+    /// for the same request (`pio_transfer_breakdown`'s own doc comment: it
+    /// reads pre-transfer head state that the charge then advances).
+    fn int13_breakdown_if_profiled(
+        &self,
+        lba: u32,
+        sectors: u32,
+        hits: u32,
+    ) -> Option<ata::PioChargeBreakdown> {
+        if !self.int13_profile_enabled {
+            return None;
+        }
+        let profile = self.device_timing_profile();
+        Some(
+            self.ata
+                .as_ref()
+                .map(|disk| disk.pio_transfer_breakdown(lba, sectors, hits, profile))
+                .unwrap_or_default(),
+        )
     }
 
     /// Sector-cache hits since mount, or 0 with no disk. A transfer reads this
@@ -1911,7 +1963,7 @@ impl Machine {
         hits: u32,
         start_lba: u32,
         buf_seg: u16,
-        stall_ticks: u64,
+        breakdown: ata::PioChargeBreakdown,
     ) {
         let region = self
             .ata
@@ -1953,11 +2005,28 @@ impl Machine {
             }
         }
         p.cache_hits = p.cache_hits.saturating_add(u64::from(hits.min(sectors)));
-        // Slice 9C: take the caller's already-computed charge rather than
-        // recomputing it -- `AtaDisk::charge_pio_transfer` mutates the
-        // modelled drive-head state, so it must run exactly once per real
-        // transfer, and `stall_for_hdd_sectors_cached` is that one call.
-        p.stall_ticks = p.stall_ticks.saturating_add(stall_ticks);
+        // Slice 9C/9D: `breakdown` is the caller's already-computed charge
+        // (`int13_breakdown_if_profiled`, taken BEFORE the mutating
+        // `AtaDisk::charge_pio_transfer` ran for the same request), so
+        // `breakdown.total()` is exactly what `stall_for_hdd_sectors_cached`
+        // charged -- one formula, never recomputed.
+        p.stall_ticks = p.stall_ticks.saturating_add(breakdown.total());
+        // Slice 9D: the call-pattern breakdown, split into its components.
+        if breakdown.charged_sectors > 0 {
+            if breakdown.sequential {
+                p.sequential_calls += 1;
+            } else {
+                p.cold_calls += 1;
+            }
+        } else if sectors > 0 {
+            p.cache_full_hit_calls += 1;
+        }
+        p.command_latency_ticks = p
+            .command_latency_ticks
+            .saturating_add(breakdown.command_ticks);
+        p.seek_ticks = p.seek_ticks.saturating_add(breakdown.seek_ticks);
+        p.rotation_ticks = p.rotation_ticks.saturating_add(breakdown.rotation_ticks);
+        p.transfer_ticks = p.transfer_ticks.saturating_add(breakdown.transfer_ticks);
     }
 
     /// Real-mode paragraph of ES, which is the CHS/long-sector transfer buffer.
@@ -2060,6 +2129,9 @@ impl Machine {
             }
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        // Slice 9D: computed BEFORE the mutating charge below, per
+        // `int13_breakdown_if_profiled`'s ordering contract.
+        let breakdown = self.int13_breakdown_if_profiled(start_lba, u32::from(done), cache_hits);
         // Slice 9C: the ONE authoritative charge for this transfer -- see
         // `stall_for_hdd_sectors_cached`'s doc comment. Every other consumer
         // below takes its return rather than recomputing.
@@ -2076,7 +2148,7 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
-                wait_ticks,
+                breakdown.unwrap_or_default(),
             );
         }
         if let Some(disk) = self.ata.as_ref() {
@@ -2187,6 +2259,7 @@ impl Machine {
             });
 
         let cache_hits = self.sector_cache_hits_since(hits_before);
+        let breakdown = self.int13_breakdown_if_profiled(start_lba, u32::from(done), cache_hits);
         let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = if ah == 0x0A {
@@ -2200,7 +2273,7 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
-                wait_ticks,
+                breakdown.unwrap_or_default(),
             );
         }
         if let Some(disk) = self.ata.as_ref() {
@@ -2266,7 +2339,10 @@ impl Machine {
             disk.end_read_command();
         }
         let cache_hits = self.sector_cache_hits_since(hits_before);
-        let wait_ticks = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
+        let breakdown = self.int13_breakdown_if_profiled(start_lba, u32::from(done), cache_hits);
+        // Verify has no read/write batch consumer for the ticks; only the
+        // stall itself and the census (via `breakdown`) need this call to run.
+        let _ = self.stall_for_hdd_sectors_cached(start_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             self.note_int13_data(
                 Int13DataKind::Verify,
@@ -2274,7 +2350,7 @@ impl Machine {
                 cache_hits,
                 start_lba,
                 self.int13_es_seg(),
-                wait_ticks,
+                breakdown.unwrap_or_default(),
             );
         }
         self.set_eax_al(done);
@@ -2493,6 +2569,7 @@ impl Machine {
             });
         let cache_hits = self.sector_cache_hits_since(hits_before);
         let edd_lba = u32::try_from(lba).expect("validated EDD LBA fits ATA");
+        let breakdown = self.int13_breakdown_if_profiled(edd_lba, u32::from(done), cache_hits);
         let wait_ticks = self.stall_for_hdd_sectors_cached(edd_lba, u32::from(done), cache_hits);
         if self.int13_profile_enabled {
             let kind = match ah {
@@ -2506,7 +2583,7 @@ impl Machine {
                 cache_hits,
                 edd_lba,
                 buf_seg,
-                wait_ticks,
+                breakdown.unwrap_or_default(),
             );
         }
         if let Some(disk) = self.ata.as_ref() {
