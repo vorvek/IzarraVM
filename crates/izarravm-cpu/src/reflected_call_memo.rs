@@ -1855,13 +1855,13 @@ fn note_answer_for_audit(cpu: &mut CpuGsw, key: MemoKey) {
         return;
     };
     key_state.answers_since_audit = key_state.answers_since_audit.saturating_add(1);
-    // One answer AHEAD of a due audit, ask the batch loop for the interpreter: an audit
-    // trip journals, and a journal is only complete under the interpreter (F1). Without
-    // this the audit would grade the memo against a write set with the same hole the learn
-    // had, which is how three views of one incomplete record all agreed with each other.
-    if period >= 2 && key_state.answers_since_audit + 1 >= period.saturating_sub(1) {
-        state.arm_interpreter_window();
-    }
+    // An audit trip deliberately does NOT ask for the interpreter. Its clock triple is
+    // compared against a memo learned from NATIVE natural samples, and an interpreted trip
+    // retires a different instruction count for different core clocks -- so forcing it
+    // would make every audit report a core/instruction mismatch that says nothing about
+    // the memo (measured: 166 of 166). Its write check does not need a journal either: it
+    // peeks the memo's own claimed cells at the trip's entry and exit.
+    let _ = period;
 }
 
 /// Half the spacing between two IRQ0 edges, in the guest clocks `elapsed_clocks` counts.
@@ -2175,7 +2175,23 @@ pub(crate) fn note_code_hit(cpu: &mut CpuGsw) {
 /// It is the belt; the braces is `ReflectedCallMemoState::wants_interpreter`, which asks
 /// the batch loop to run the journal batches interpreted so this rarely fires at all.
 pub(crate) fn note_native_stores(cpu: &mut CpuGsw) {
-    refuse_open(cpu, LearnRefused::NativeStore);
+    // JOURNAL trips only. `reflected_call_journal` is also true for an AUDIT trip, and an
+    // audit is graded differently: it compares the memo's OWN claimed cells by peek at the
+    // trip's entry and exit (`audit_open_pre`), which needs no journal at all, plus the
+    // epilogue and the clocks. Refusing an audit here would throw away the runtime net for
+    // the one reason the net exists to survive -- and forcing audits onto the interpreter
+    // instead makes their clocks incomparable with a memo learned from NATIVE natural
+    // samples, which is exactly what a measured run showed: 166 of 166 audits reporting a
+    // core-clock and instruction-count mismatch that was an artefact of the backend, not of
+    // the memo.
+    let is_journal_trip = cpu
+        .reflected_call
+        .as_ref()
+        .and_then(|state| state.open.as_ref())
+        .is_some_and(|open| matches!(open.slot, Slot::JournalA | Slot::JournalB));
+    if is_journal_trip {
+        refuse_open(cpu, LearnRefused::NativeStore);
+    }
 }
 
 /// The block-exit condition, named so it can be tested rather than only read.
@@ -2873,9 +2889,25 @@ fn audit_write_values_disagree<B: CpuBus>(
     open: &OpenTrip,
     offender: &mut Option<(u32, u32, u32)>,
 ) -> bool {
+    // Every cell the memo has an opinion about, plus everything this trip journaled. The
+    // Class R ranges are in the list because the memo CLAIMS them unchanged, and that claim
+    // has to be checked whether or not the trip's own journal saw the write -- a natively
+    // stored Class R cell is otherwise invisible to the audit, which is the residue F1 left
+    // behind once audit trips were allowed to run native again. `audit_open_pre` already
+    // holds their entry values, peeked at the open.
     let mut dwords: Vec<u32> = open.writes.keys().copied().collect();
     for &(addr, _, _) in memo.replay.iter() {
         dwords.push(addr);
+    }
+    for &(lo, hi) in memo.class_r_ranges.iter() {
+        let mut dword = lo & !0x3;
+        loop {
+            dwords.push(dword);
+            if dword >= (hi & !0x3) {
+                break;
+            }
+            dword += 4;
+        }
     }
     dwords.sort_unstable();
     dwords.dedup();
