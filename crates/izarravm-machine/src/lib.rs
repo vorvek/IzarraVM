@@ -10,8 +10,8 @@ use izarravm_audio::{Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, TimedMidi
 use izarravm_bus::{
     BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CalloutPollDecline,
     CalloutPollSkipOutcome, CalloutPollSkipRequest, CompiledBusDelta, CompiledBusWindow, CpuBus,
-    DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, TracingMode,
-    scale_core_clocks,
+    DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, ReflectedCallDecline,
+    ReflectedCallGateRequest, TracingMode, scale_core_clocks,
 };
 use izarravm_core::{
     CpuPersona, GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard,
@@ -1730,6 +1730,22 @@ pub struct Machine {
     // Set only when a bus-side DMA block copy writes guest RAM without exposing
     // its destination range. Range-aware HLE and device paths notify the CPU directly.
     device_wrote_memory: bool,
+    /// The native-backend setting this machine was CONFIGURED with. The batch loop may force
+    /// the interpreter for a batch on the reflected-call memo's behalf -- a journaled trip's
+    /// write set is only complete under the interpreter -- and this is what it restores to,
+    /// so the forcing can never silently promote an `ExecutionBackend::Interpreter` machine
+    /// to the JIT.
+    #[cfg_attr(
+        not(all(feature = "jit", feature = "reflected-call-memo")),
+        allow(dead_code)
+    )]
+    native_backend_configured: bool,
+    /// Whether the batch loop currently has the interpreter forced for that reason.
+    #[cfg_attr(
+        not(all(feature = "jit", feature = "reflected-call-memo")),
+        allow(dead_code)
+    )]
+    reflected_call_interpreter_forced: bool,
     // An exact RAM write performed while MachineBus owns the memory borrow. The CPU cannot be
     // notified until that borrow ends, so the run loop consumes this before another CPU entry.
     pending_device_memory_write_range: Option<(u32, u32)>,
@@ -2292,6 +2308,8 @@ impl Machine {
             #[cfg(not(feature = "shadow-cache-probe"))]
             shadow_l1: ShadowL1Probe::from_env(),
             device_wrote_memory: false,
+            native_backend_configured: false,
+            reflected_call_interpreter_forced: false,
             pending_device_memory_write_range: None,
             direct_map_changed: false,
             direct_data_map_changed: false,
@@ -2407,9 +2425,13 @@ impl Machine {
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
         #[cfg(feature = "jit")]
-        machine
-            .cpu
-            .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
+        {
+            machine.native_backend_configured =
+                matches!(execution_backend, ExecutionBackend::Automatic);
+            machine
+                .cpu
+                .set_native_backend_enabled(machine.native_backend_configured);
+        }
         machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
         // Both sweep knobs are read ONCE, here, and pushed onto the channel --
         // never per access. See `ata_poll_run_default`.
@@ -4188,6 +4210,21 @@ struct MachineBus<'a> {
     // end-of-batch `scale_bus` call.
     bus_num_at_batch_start: u32,
     bus_den_at_batch_start: u32,
+    // The batch cap this batch was entered with, in CPU clocks from batch start --
+    // exactly the `cap` the run loop bounds itself by
+    // (`compose_batch_cap(next_device_edge_ticks(), remaining)`). Published here so
+    // `CpuBus::reflected_call_gate` can answer "does this lump fit inside the
+    // remaining allowance" against THE SAME number, rather than re-deriving a second
+    // one that could drift. Zero on a bus built outside the batch loop
+    // (`make_bus`/`make_construction_bus`), which is what makes the gate refuse there.
+    reflected_call_batch_cap: u64,
+    // Whether `reflected_call_batch_cap` came from a DEVICE EDGE rather than the
+    // mode-class fallback grain, so a refusal can name the right counter lane
+    // (`DeviceEdge` vs `Cap`, split on the `actuate_ata_poll_skip` precedent).
+    reflected_call_cap_is_device_edge: bool,
+    // Set by `note_reflected_call_answered`, read (and cleared) by the batch loop's
+    // break check: an answered reflected call ends the batch. See the trait doc.
+    reflected_call_answered: bool,
 }
 
 fn advance_direct_mapping_epoch(epoch: &mut u64) {

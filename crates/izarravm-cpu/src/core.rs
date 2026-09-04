@@ -365,6 +365,17 @@ impl CpuGsw {
     /// and only that arm calls `invalidate_translation()` (and, after it, `allocate_link_context`,
     /// which mints a FRESH epoch for slot 0 after the wholesale retire).
     pub(super) fn flush_tlb_and_code_caches_for_cr3_write(&mut self, new_cr3: u32) {
+        // The reflected-call memo's control-effect journal (slice1 plan R2.5): a trip
+        // that writes CR3 (the VCPI pair, median 2 per trip on the dominant key) runs
+        // this whole teardown twice, and an answered trip that skipped it would leave
+        // the TLB holding entries the real trip retired. Recorded here, at the single
+        // entry point every `MOV CR3` reaches, so the replay reproduces the effect by
+        // calling this same function. Guarded by the journal bool: this is a hot-ish
+        // path and a closed trip must not pay for a hook it has no use for.
+        #[cfg(feature = "reflected-call-memo")]
+        if self.reflected_call_journal {
+            crate::reflected_call_memo::note_cr3_write(self, new_cr3);
+        }
         self.perf.decode_inval_cr3 += 1;
         // `wipes_tlb_flush` stays first and unconditional (design section (d) point 1): it counts
         // the EVENT, not the outcome, and is the divergence check against `cr3_code_flush_taken +
@@ -565,11 +576,56 @@ impl CpuGsw {
     /// `delta & CR0_PG == 0`, at which point `old & CR0_PG == new & CR0_PG`. The mutation ledger
     /// at the foot of `cpu_cr0_flush_test.rs` records this as a non-gate rather than as coverage.
     pub(super) fn flush_tlb_for_cr0_write(&mut self, old_cr0: u32, new_cr0: u32) {
+        // A CR0 write inside a reflected trip REFUSES the memo outright (slice1 plan
+        // R2.5, narrowed): unlike a CR3 write or an INVLPG -- both pure TLB/decode
+        // teardowns this module can replay by calling the same function -- a CR0 write
+        // can move PE, PG or WP, i.e. the guest's whole addressing mode, and replaying
+        // "the flush" would reproduce the cache effect while silently dropping every
+        // other consequence the writer's own call site carries. The refusal is sound
+        // by construction (the trip falls through and runs for real) and costs nothing
+        // measurable: the dominant key's trips write CR3 twice and CR0 never.
+        #[cfg(feature = "reflected-call-memo")]
+        crate::reflected_call_memo::note_cr0_write(self);
         if Self::cr0_write_moves_code_translation(old_cr0, new_cr0) {
             self.flush_tlb_and_code_caches(TranslationFlushReason::Cr0);
         } else {
             self.flush_tlb_keep_code_caches(new_cr0);
         }
+    }
+
+    /// `INVLPG m`'s whole TLB / decode / link-graph effect, EXTRACTED from the
+    /// `execute_extended.rs` opcode arm so the reflected-call memo's control-effect
+    /// replay (slice1 plan R2.5) reproduces it by CALLING THE SAME CODE rather than
+    /// by re-deriving a second, drift-prone copy of it. The opcode arm keeps the
+    /// privilege check, the `IsaGeneration` gate and the operand's linear
+    /// computation; this is everything after them, verbatim.
+    ///
+    /// Each line's reason, moved with it:
+    ///
+    /// * `tlb.invalidate` clears the entry only under the LIVE generation, so
+    ///   `retire_dormant_slot` retires the whole dormant ring slot -- INVLPG's own,
+    ///   narrower T2 fix. The live slot must NOT be retired: a real INVLPG
+    ///   invalidates exactly one page, and
+    ///   `invlpg_invalidates_only_the_addressed_page_at_cpl0` pins that an unrelated
+    ///   page's TLB entry survives.
+    /// * `false` to `invalidate_translation_code_caches`: `translation_pages` must
+    ///   not clear here (F11) -- another linear address's TLB entry can still serve a
+    ///   code translation with no walk to re-mark it. The decode ring and link graph
+    ///   are still torn down wholesale (pre-existing coarseness, design review D2);
+    ///   the returned token is discarded, deliberately, for the reason above.
+    pub(super) fn apply_invlpg(&mut self, linear: u32) {
+        self.tlb.invalidate(linear >> 12);
+        self.tlb.retire_dormant_slot();
+        self.data_read_pages.invalidate();
+        self.data_write_pages.invalidate();
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_fast_map.invalidate_page(linear);
+        let retired = self.invalidate_translation_code_caches(false);
+        let _ = retired;
     }
 
     pub(super) fn set_eip(&mut self, eip: u32) {
@@ -611,6 +667,18 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         {
             self.jit_direct.fast_map_audit.wipes_a20 += 1;
+        }
+        // Reflected-call memo answer path (plan Revision 2 amendments, item A, BLOCKING):
+        // every memo's read/translation/replay set is pre-resolved to PHYSICAL addresses, and
+        // A20 changes what physical address a linear one resolves to. Retire everything.
+        // Reflected-call memo answer path (plan Revision 2 amendments, item A, BLOCKING):
+        // every memo's read/translation/replay set is pre-resolved to PHYSICAL addresses, and
+        // A20 changes what physical address a linear one resolves to. Retire everything.
+        #[cfg(feature = "reflected-call-memo")]
+        {
+            if let Some(state) = self.reflected_call.as_mut() {
+                state.retire_all_memos();
+            }
         }
     }
 
@@ -1112,6 +1180,38 @@ impl CpuGsw {
             && let Some(trace) = self.smc_trace.0.as_mut()
         {
             trace.record(physical, width, pre, action);
+        }
+        // The reflected-call memo's code watch (slice1 plan R2.4 / BLOCKING finding 4).
+        //
+        // `invalidated` is true iff this write hit a compiled block, a cached decode line
+        // or a marked translation page -- i.e. iff it touched CODE the CPU had cached. Any
+        // such write retires EVERY memo, not merely the ones whose own trip fetched from
+        // the written range.
+        //
+        // **Why the whole cache and not a range overlap**, which is what the plan asked
+        // for. A per-memo page set has to be COMPLETE or the watch has a hole in it, and
+        // the only seam that sees every instruction of a trip is the interpreter's retire
+        // path -- which means forcing the interpreter for every journaled trip. Measured on
+        // `tyrian-specs-586` (2026-09-03), that forcing cost the row 99.4% interpretation
+        // in one shape and livelocked the learn cycle in another (a journal trip opens
+        // mid-batch, the forcing only takes effect at the next batch entry, and the trip
+        // is then refused as incomplete, resetting the key -- 362,795 times, zero learns).
+        // Retiring the whole cache is STRICTLY MORE CONSERVATIVE than a range overlap,
+        // costs nothing on any path (`invalidated` is already computed), needs no page set,
+        // no completeness proof and no backend toggle, and leaves the soundness argument
+        // intact and simpler:
+        //
+        //   a memo is alive  =>  no wholesale mark clear since it was built (the
+        //   `code_mark_epoch` screen)  =>  its code pages are still MARKED (marks are
+        //   cleared only in `DecodeCache::retire_ring`)  =>  a write onto its code sets
+        //   `invalidated` here  =>  the memo is retired.
+        //
+        // The cost is that unrelated self-modifying code elsewhere in the guest also
+        // retires the memo cache. `reflected_call_code_watch_retires` is what makes that
+        // visible if it ever matters.
+        #[cfg(feature = "reflected-call-memo")]
+        if invalidated && self.reflected_call.is_some() {
+            crate::reflected_call_memo::note_code_hit(self);
         }
         invalidated
     }
@@ -1957,6 +2057,155 @@ impl CpuGsw {
                 self.poll_skip_memory.iterations.saturating_add(iterations);
         }
         Some(charged)
+    }
+
+    /// This CPU's configured core clock, in Hz, for the reflected-call memo's drift
+    /// accumulator (which needs the irq0 edge spacing in guest clocks, and that is a
+    /// per-persona figure, not a constant).
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn mode_clock_hz(&self) -> u64 {
+        self.mode.clock_hz()
+    }
+
+    /// True while the reflected-call memo needs the INTERPRETER for the next batch (plan
+    /// section 4.2: the batch loop owns the toggle, never the call-out). A journaled trip's
+    /// write set is only complete under the interpreter -- a compiled block's stores go
+    /// through the store-stub pad and are bulk-charged at block exit, reaching no journal
+    /// seam -- so the learn cycle's two journaled trips, and any audit trip, must run there.
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_wants_interpreter(&self) -> bool {
+        self.reflected_call
+            .as_ref()
+            .is_some_and(|state| state.wants_interpreter())
+    }
+
+    /// Count one batch the machine ran interpreted for this module's sake, and spend one
+    /// of the window. R2.10 item 12 is explicit that a LEARNING fall-through is not
+    /// bit-identical to a run without the knob, because forcing the interpreter moves fetch
+    /// wait states; this is what makes the cost visible in the report rather than argued.
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_note_learn_batch(&mut self) {
+        if let Some(state) = self.reflected_call.as_mut() {
+            state.learn_batches += 1;
+            state.spend_interpreter_batch();
+        }
+    }
+
+    /// The machine's HLE software-interrupt SERVICE seam (Fable review F2).
+    #[cfg(feature = "reflected-call-memo")]
+    pub fn reflected_call_note_soft_int_serviced(&mut self) {
+        crate::reflected_call_memo::note_soft_int_serviced(self);
+    }
+
+    /// The reflected-call memo's CODE-MARK EPOCH: `perf.code_invalidations`.
+    ///
+    /// The memo's code watch rests on its trip's code pages staying MARKED in the decode
+    /// cache -- marks are what route a guest write into `note_code_write_inner` at all,
+    /// which is where the retire lives. Marks are cleared WHOLESALE by
+    /// `DecodeCache::retire_ring`, and every CPU-side door that reaches it
+    /// (`invalidate_code_caches`, `invalidate_translation_code_caches`,
+    /// `flush_tlb_and_code_caches_for_cr3_write`'s R3 take arm, and both wholesale arms of
+    /// `note_code_write_inner`) bumps this counter on its way there. So "this counter has
+    /// not moved" implies "no wholesale clear has happened", which is exactly the
+    /// condition the write-hit retire needs -- and it is answered with a field the CPU
+    /// already keeps, adding NOTHING to `CpuGsw`'s layout or to any hot path.
+    ///
+    /// It is a strict SUPERSET of the wholesale clears: the narrow-SMC-kill arm bumps it
+    /// without retiring the ring, and `reset_perf_counters` zeroes it. Both make the memo
+    /// cache retire when it did not strictly have to, which is the safe direction.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn reflected_call_code_mark_epoch(&self) -> u64 {
+        self.perf.code_invalidations
+    }
+
+    /// Core clocks the CURRENT straight-line run has retired before the instruction
+    /// now executing. The reflected-call memo's answer gate needs this term because
+    /// the machine's own `prior_runs_core_clocks` deliberately covers every PRIOR run
+    /// of the batch and nothing of this one, so without it the gate's `spent` is
+    /// under-counted by however far into the run the asking `INT` sits.
+    ///
+    /// It is set BEFORE each instruction runs (`cycle_no_interrupt_check_with_budget`
+    /// zeroes it for a fresh first instruction; `run_straight_line` assigns the run
+    /// total before every continuation), so at the `INT` asking it EXCLUDES that
+    /// `INT`'s own charge -- which is why `reflected_call_gate` holds a margin back
+    /// rather than treating this as exact.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn reflected_call_run_core_clocks(&self) -> u64 {
+        self.core_clocks_so_far
+    }
+
+    /// Tear down the lazy arithmetic-flag descriptor WITHOUT settling it into
+    /// `registers.eflags`, for the reflected-call memo's epilogue, which is about to
+    /// assign the whole architectural EFLAGS word from the memo. `materialize_flags`
+    /// would be wrong here: it writes the OLD flags into the base that is about to be
+    /// overwritten, and leaving the descriptor standing would construct a settled base
+    /// with a live descriptor over it -- the state `CpuGsw::settled`'s doc warns is
+    /// produced by no execution path.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn clear_pending_flags(&mut self) {
+        self.pending_flags = PendingFlags::default();
+    }
+
+    /// Restore the recorded CPL as part of the reflected-call memo's epilogue. Rule 1
+    /// already pins the returning CS and SS selectors equal to the entry's, so this is
+    /// an exactness measure rather than a mode change.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn set_current_privilege_level(&mut self, cpl: u8) {
+        self.cpl = cpl;
+    }
+
+    /// Charge an answered reflected call's CORE clocks: the twin of
+    /// `commit_poll_skip_core` above, differing only in where the raw total comes
+    /// from (a recorded trip instead of a projected poll span) and in what it does
+    /// NOT bump (`poll_skip_spans`/`poll_skip_iterations` belong to the poll skip).
+    ///
+    /// The raw total goes through the SAME remainder-carry scaler -- `scaled = raw *
+    /// num + timing_rem`, charge `scaled / den`, keep `scaled % den` -- which is the
+    /// whole reason the memo records RAW clocks rather than a charged delta: the
+    /// carry telescopes, so charging the raw total here leaves `elapsed_clocks` AND
+    /// `timing_rem` exactly where the real trip left them, and the PIT sees the same
+    /// clock stream (slice1 plan section 6, R2.2/R2.15).
+    ///
+    /// `None` on overflow, PROPAGATED as a fall-through by the caller and never
+    /// unwrapped -- `poll_skip_core_projection`'s own `None` contract (R2.15 trap 3).
+    /// Retired-instruction counts are the caller's business: unlike a poll skip, an
+    /// answered trip's instructions are charged to `perf.instructions` by the answer
+    /// itself, because the guest DID advance past them.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn commit_reflected_call_core(&mut self, raw_core: u64) -> Option<u64> {
+        let (num, den) = level_timing(self.persona());
+        let scaled = raw_core
+            .checked_mul(u64::from(num))?
+            .checked_add(self.timing_rem)?;
+        let charged = scaled / u64::from(den);
+        let remainder = scaled % u64::from(den);
+        self.elapsed_clocks = self.elapsed_clocks.checked_add(charged)?;
+        self.timing_rem = remainder;
+        // The same charge, parked for the enclosing run to count toward the BATCH's core
+        // total. See `CpuGsw::reflected_call_pending_core` for why both are needed.
+        self.reflected_call_pending_core = self.reflected_call_pending_core.saturating_add(charged);
+        Some(charged)
+    }
+
+    /// Take the parked charge (see `reflected_call_pending_core`). Called by the run loop
+    /// beside its own `total += outcome.core_clocks`.
+    #[cfg(feature = "reflected-call-memo")]
+    #[inline]
+    pub(crate) fn take_reflected_call_pending_core(&mut self) -> u64 {
+        std::mem::take(&mut self.reflected_call_pending_core)
+    }
+
+    /// The non-mutating half of the above: what `commit_reflected_call_core` WOULD
+    /// charge, for the answer-time clamp, which must know the scaled lump before it
+    /// is allowed to commit anything.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn project_reflected_call_core(&self, raw_core: u64) -> Option<u64> {
+        let (num, den) = level_timing(self.persona());
+        let scaled = raw_core
+            .checked_mul(u64::from(num))?
+            .checked_add(self.timing_rem)?;
+        self.elapsed_clocks.checked_add(scaled / u64::from(den))?;
+        Some(scaled / u64::from(den))
     }
 
     /// TLB-hit-only, non-mutating linear-to-physical PROBE for a data READ

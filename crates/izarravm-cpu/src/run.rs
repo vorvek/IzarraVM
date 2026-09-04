@@ -1125,6 +1125,13 @@ impl CpuGsw {
                 can_take_before = false;
             }
             total += u64::from(outcome.core_clocks);
+            // An answered reflected call charged `elapsed_clocks` from inside this
+            // instruction; the BATCH's core total has to see it too, or the devices never
+            // do. See `CpuGsw::reflected_call_pending_core`.
+            #[cfg(feature = "reflected-call-memo")]
+            {
+                total += self.take_reflected_call_pending_core();
+            }
             // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
             // machine can service an event or interrupt before any further iteration.
             if self.rep_resume_active {
@@ -3657,6 +3664,26 @@ impl CpuGsw {
         // `elapsed_clocks` -- landing in exactly the quantities this slice already declines to pin
         // as equalities, so it would be MISREAD as the timing change the slice admits to.
         let total_dword_stores = exit.ram_dword_writes & u64::from(u32::MAX);
+        // The reflected-call memo's NATIVE-STORE refusal (Fable review 2026-09-05, BLOCKING
+        // F1). A compiled block emits its stores through the store-stub pad and reports them
+        // in bulk right here; none of them passes `write_linear_*`, so none reaches the
+        // journal's `note_write`. A journaled trip whose block stored anything therefore has
+        // an INCOMPLETE write set, and a memo built from it would skip guest writes it never
+        // saw. Refusing is sound by construction -- it needs no argument about which stores
+        // were missed -- and it costs one test on a path that already holds the counts.
+        //
+        // The batch loop's interpreter forcing (`reflected_call_wants_interpreter`) is what
+        // keeps this rare; this is the belt that makes the forcing's timing a HIT-RATE
+        // question rather than a soundness one.
+        #[cfg(feature = "reflected-call-memo")]
+        if crate::reflected_call_memo::native_stores_refuse(
+            self.reflected_call_journal,
+            total_byte_stores,
+            total_word_stores,
+            total_dword_stores,
+        ) {
+            crate::reflected_call_memo::note_native_stores(self);
+        }
         let far_returns = exit.ram_dword_writes >> 32;
         let mode13_byte_writes = exit.mode13_byte_writes & u64::from(u32::MAX);
         let mode13_word_writes = exit.mode13_byte_writes >> 32;

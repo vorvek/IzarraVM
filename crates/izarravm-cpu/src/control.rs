@@ -73,8 +73,19 @@ impl CpuGsw {
         // own state check and the `ARMED` flag itself).
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::on_int_entry(self, bus, vector);
+        // The memo's answer path (slice1 plan section 5). An `Answered` outcome means
+        // the whole trip has ALREADY been applied -- nested acks re-issued, Class W
+        // writes replayed, control effects reproduced, epilogue installed, clocks
+        // charged -- so this returns WITHOUT `deliver_interrupt`, which is what elides
+        // the trip's dispatcher entries. `NotAnswered` (the knob off, no memo, or any
+        // screen missing) leaves guest execution bit-identical to a build without the
+        // feature.
         #[cfg(feature = "reflected-call-memo")]
-        crate::reflected_call_memo::on_int(self, bus, vector);
+        if crate::reflected_call_memo::on_int(self, bus, vector)?
+            == crate::reflected_call_memo::IntOutcome::Answered
+        {
+            return Ok(());
+        }
         if self.is_protected_mode() {
             // `SoftwareInterrupt`, not `External`: this is the one source the
             // gate-DPL check applies to. It used to pass the `is_external =
@@ -111,8 +122,8 @@ impl CpuGsw {
         }
         #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
-            crate::reflected_call_memo::note_read(self, bus, vector_address);
-            crate::reflected_call_memo::note_read(self, bus, vector_address + 2);
+            crate::reflected_call_memo::note_read(self, bus, vector_address, BusWidth::Word);
+            crate::reflected_call_memo::note_read(self, bus, vector_address + 2, BusWidth::Word);
         }
         self.load_segment_real(SegmentIndex::Cs, cs);
         self.set_eip(u32::from(ip));
@@ -948,7 +959,7 @@ impl CpuGsw {
         crate::reflected_call_diag::note_read(self, bus, linear);
         #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
-            crate::reflected_call_memo::note_read(self, bus, linear);
+            crate::reflected_call_memo::note_read(self, bus, linear, width);
         }
         Ok(value)
     }
@@ -976,6 +987,47 @@ impl CpuGsw {
     /// Unconditional invalidation, no same-value elision, for `write_page_walk_entry`'s reason:
     /// the old bytes were consumed before the write and re-reading them to compare would not earn
     /// its cost on a path this cold.
+    /// The reflected-call memo's REPLAY write entry point (slice1 plan Revision 2
+    /// amendments, item 2). Its body is exactly `write_system_linear`'s TAIL, taken
+    /// from an address that is ALREADY PHYSICAL:
+    ///
+    /// ```text
+    /// bus.write_memory(phys, width, value, BusAccessKind::DataWrite)?;
+    /// self.record_write_page(phys);
+    /// self.note_code_write(phys, width.bytes());
+    /// ```
+    ///
+    /// so a replayed write reaches `note_code_write_inner` through `note_code_write`
+    /// (keyed on PHYSICAL) and the device write path through the bus, exactly as the
+    /// original trip's own write did. It reports the write for the same two reasons
+    /// `write_system_linear` does: the 486 prefetch queue must not keep bytes the
+    /// replay just overwrote, and a replayed store landing on a page a compiled block
+    /// covers must invalidate it.
+    ///
+    /// **Why physical, and why re-translating would be worse.** Replay cells are
+    /// pre-resolved to physical at RECORD time, which is what makes them
+    /// CR3-independent. Re-walking a linear address here would use the POST-trip CR3
+    /// (the control-effect replay has already run, or is about to), i.e. a different
+    /// mapping from the one the original write went through -- reopening the very
+    /// hazard the physical representation closes.
+    ///
+    /// It deliberately does NOT journal (`note_write`): a replay is the answer's own
+    /// mutation, not a trip observation, and journaling it would fold the answer's
+    /// writes into a record that must only ever describe real guest execution.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(super) fn write_physical_replay<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        width: BusWidth,
+        value: u32,
+    ) -> ExecResult<()> {
+        bus.write_memory(physical, width, value, BusAccessKind::DataWrite)?;
+        self.record_write_page(physical);
+        self.note_code_write(physical, width.bytes());
+        Ok(())
+    }
+
     fn write_system_linear<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1852,6 +1904,12 @@ impl CpuGsw {
         new_selector: u16,
         kind: TaskSwitchKind,
     ) -> ExecResult<()> {
+        // The reflected-call memo's `task_switch` refusal (slice1 plan section 4.5), at
+        // the one function every task gate, TSS `CALL`/`JMP` and `IRET` back-link return
+        // passes through. A task switch replaces the whole architectural context, and a
+        // memo's epilogue -- registers, segments, CPL -- cannot reproduce a TSS load.
+        #[cfg(feature = "reflected-call-memo")]
+        crate::reflected_call_memo::note_task_switch(self);
         // An IRET task return faults with #TS, not #GP, on every back-link
         // malformation (386 PRM 9.5): a null or out-of-limit selector comes back
         // from `read_transfer_descriptor` as #GP and is re-vectored here.

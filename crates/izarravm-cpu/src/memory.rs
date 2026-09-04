@@ -1270,7 +1270,7 @@ impl CpuGsw {
         crate::reflected_call_diag::note_read(self, bus, linear);
         #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
-            crate::reflected_call_memo::note_read(self, bus, linear);
+            crate::reflected_call_memo::note_read(self, bus, linear, BusWidth::Byte);
         }
         #[cfg(all(
             feature = "jit",
@@ -1573,7 +1573,7 @@ impl CpuGsw {
         if self.reflected_call_journal
             && !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()))
         {
-            crate::reflected_call_memo::note_read(self, bus, linear);
+            crate::reflected_call_memo::note_read(self, bus, linear, width);
         }
         #[cfg(all(
             feature = "jit",
@@ -1775,7 +1775,7 @@ impl CpuGsw {
         crate::reflected_call_diag::note_read(self, bus, linear);
         #[cfg(feature = "reflected-call-memo")]
         if self.reflected_call_journal {
-            crate::reflected_call_memo::note_read(self, bus, linear);
+            crate::reflected_call_memo::note_read(self, bus, linear, BusWidth::Byte);
         }
         #[cfg(all(
             feature = "jit",

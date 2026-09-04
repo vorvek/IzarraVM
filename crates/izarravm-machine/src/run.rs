@@ -1515,7 +1515,28 @@ impl Machine {
                 .timeline
                 .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
                 .max(1);
+            // The reflected-call memo's interpreter forcing (slice1 plan section 4.2: the
+            // batch loop owns this toggle, never the call-out). A learn cycle's two JOURNALED
+            // trips, and any audit trip, must retire through the interpreter's write seams --
+            // a compiled block's stores reach none of them. Read once per batch and acted on
+            // only when the answer CHANGES, so a run with the knob off pays one bool compare.
+            #[cfg(all(feature = "jit", feature = "reflected-call-memo"))]
+            {
+                let want = self.cpu.reflected_call_wants_interpreter();
+                if want != self.reflected_call_interpreter_forced {
+                    self.cpu
+                        .set_native_backend_enabled(!want && self.native_backend_configured);
+                    self.reflected_call_interpreter_forced = want;
+                }
+                if want {
+                    self.cpu.reflected_call_note_learn_batch();
+                }
+            }
             let cap = self.event_batch_cap_cached(remaining);
+            // Published to `MachineBus` below so the reflected-call memo's answer gate
+            // bounds a lump by THIS cap rather than a second, drift-prone derivation;
+            // the bool only names the refusal lane (`DeviceEdge` vs `Cap`).
+            let reflected_call_cap_is_device_edge = self.batch_cap_is_device_edge(cap, remaining);
             // Slice 0b's batch-straddle counter (plan §5, Q6/B6; §14 Q2): one
             // cfg-gated call marking a batch boundary on the reflected-call
             // diagnostic's currently open trip, if any and if armed. The
@@ -1709,6 +1730,9 @@ impl Machine {
                     bus_rem_at_batch_start,
                     bus_num_at_batch_start,
                     bus_den_at_batch_start,
+                    reflected_call_batch_cap: cap,
+                    reflected_call_cap_is_device_edge,
+                    reflected_call_answered: false,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -1863,7 +1887,20 @@ impl Machine {
                                 // A port access read or changed time-dependent device
                                 // state; an HLE INT (pending_soft_int) needs &mut self.
                                 // Stop so the run loop services them at this instant.
-                                if *bus.io_touched || bus.pending_soft_int.is_some() {
+                                // The reflected-call memo's batch-end mitigation (slice1
+                                // plan section 6): an ANSWERED trip ends the batch. A real
+                                // trip contains 6-8 IF-enable batch boundaries and an
+                                // answered one contains none, so without this term an IRQ
+                                // raised during the lump would wait for the batch cap
+                                // instead of being re-checked at the trip's first `IRET`.
+                                // One boundary per answer against 6-8 per real trip is
+                                // strictly FEWER boundaries, and the cap is unchanged, so
+                                // `irq0_edges` cannot move; what it buys is that no
+                                // interrupt is ever deferred across a lump.
+                                if *bus.io_touched
+                                    || bus.pending_soft_int.is_some()
+                                    || std::mem::take(&mut bus.reflected_call_answered)
+                                {
                                     break;
                                 }
                                 if !can_take_before && cpu.can_take_interrupt() {
@@ -1983,6 +2020,17 @@ impl Machine {
                         && let Some(vector) = self.pending_soft_int
                     {
                         serviced = true;
+                        // The reflected-call memo's HLE seam (Fable review 2026-09-05,
+                        // BLOCKING F2). This is the instant a posted software interrupt is
+                        // SERVICED, and the machine writes guest registers and memory here,
+                        // outside every CPU seam. A reflected trip straddles 6-8 batch
+                        // boundaries, so a nested `INT 1Ah`/`INT 10h`/`INT 13h`/`INT 2Fh`
+                        // inside a trip is serviced mid-trip and the flag is cleared at the
+                        // next batch entry -- long before `finish_trip` or the answer screen
+                        // could ask the bus whether one was posted. Refusing the open trip
+                        // HERE is the only place that sees it.
+                        #[cfg(feature = "reflected-call-memo")]
+                        self.cpu.reflected_call_note_soft_int_serviced();
                         match vector {
                             0x10 | 0x42 => self.handle_int10(),
                             0x11 => self.handle_int11(),

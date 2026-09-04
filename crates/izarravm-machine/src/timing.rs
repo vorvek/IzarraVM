@@ -1167,6 +1167,19 @@ impl Machine {
             .min()
     }
 
+    /// Did `cap` (as returned by `event_batch_cap`/`event_batch_cap_cached` for this
+    /// same `remaining`) come from a DEVICE EDGE rather than from the mode-class
+    /// fallback grain? `compose_batch_cap` is `min(fallback, edge_cap, remaining)`, so
+    /// a cap strictly below `min(fallback, remaining)` can only have been produced by
+    /// the optional edge term -- exact, and it costs two integer divisions rather than
+    /// the full uncached device scan `next_device_edge_ticks` is.
+    ///
+    /// Used ONLY to name the reflected-call memo's refusal lane (`DeviceEdge` vs
+    /// `Cap`, the `actuate_ata_poll_skip` split); nothing branches on it.
+    pub(super) fn batch_cap_is_device_edge(&self, cap: u64, remaining: u64) -> bool {
+        cap < self.batch_grain_fallback().max(1).min(remaining.max(1))
+    }
+
     /// The device-free half of the cap: the mode-class fallback grain.
     ///
     /// Split out of `event_batch_cap` so the cached path can keep paying it per

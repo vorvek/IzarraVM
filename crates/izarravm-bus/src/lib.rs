@@ -915,6 +915,49 @@ pub struct CalloutPollSkipOutcome {
     pub now_after: u64,
 }
 
+/// The reflected-call memo's answer-time gate request (slice1 plan section 7.2 /
+/// section 6's edge rule R4.2). Plain `Copy` data across the crate edge, exactly like
+/// `CalloutPollSkipRequest`: `izarravm-bus` can name neither the CPU's memo nor the
+/// machine's timeline, so the CPU supplies the two clock lumps it wants to charge plus
+/// the one term only it knows (the core clocks this RUN has retired so far, which the
+/// machine's own `prior_runs_core_clocks` deliberately excludes), and the machine
+/// answers whether the lump fits inside the batch cap it computed at batch entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReflectedCallGateRequest {
+    /// The SCALED core clocks the answer would charge (the CPU has already run its own
+    /// remainder-carry projection, so this is exact, not an estimate).
+    pub scaled_core_clocks: u64,
+    /// The RAW bus clocks the answer would charge; the machine scales them with the
+    /// batch's own `(num, den)` snapshot, rounding UP, because a gate that rounds down
+    /// can admit a lump that crosses the cap by one clock.
+    pub raw_bus_clocks: u64,
+    /// Core clocks retired by the CURRENT run before the `INT` that is asking. The
+    /// machine's `prior_runs_core_clocks` covers every PRIOR run of this batch and
+    /// nothing of this one, so without this term `spent` is under-counted by however
+    /// far into the run the `INT` sits, and the gate would admit a lump that runs past
+    /// the cap.
+    pub run_core_clocks_so_far: u64,
+}
+
+/// Why `CpuBus::reflected_call_gate` declined, one named counter lane per screen
+/// (the `CalloutPollDecline` shape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReflectedCallDecline {
+    /// The lump does not fit the remaining batch allowance, and the batch cap came
+    /// from the mode-class fallback grain rather than from a device edge.
+    Cap,
+    /// The lump does not fit, and this batch's cap IS a device edge: the lump would
+    /// have crossed a PIT/DSP/WSS/RTC/ATA/serial/LPT/FDC/keyboard/MPU edge.
+    DeviceEdge,
+    /// A Class R range the answer intends to SKIP is visible to something other than
+    /// the CPU (a device window, the framebuffer aperture, an armed DMA region), so
+    /// its intermediate values are observable and the write may not be skipped.
+    DmaVisible,
+    /// The bus has no reflected-call machinery at all (the trait default, and every
+    /// test double): a memo may never answer against it.
+    NotArmed,
+}
+
 pub trait CpuBus {
     fn read_memory(
         &mut self,
@@ -1531,6 +1574,70 @@ pub trait CpuBus {
     /// Defaulted to a no-op: a bus with no lazy time-dependent device state has
     /// nothing to publish to.
     fn publish_core_clocks(&mut self, _now: u64) {}
+
+    /// The reflected-call memo's answer-time clamp (slice1 plan section 6, rule R4.2).
+    /// Answer `Ok(())` only when the whole lump -- scaled core plus scaled bus --
+    /// fits strictly inside `cap - spent`, where `cap` is the batch cap the machine's
+    /// own loop computed from `compose_batch_cap(next_device_edge_ticks(), remaining)`.
+    /// That is what makes "no device edge is ever inside an answered lump" a property
+    /// of the SAME set the batch loop bounds itself by, rather than a second,
+    /// drift-prone scan.
+    ///
+    /// **Defaulted to refuse.** A test double that inherits this can never fake a hit,
+    /// on the `callout_poll_skip` precedent: an answer path whose gate silently passes
+    /// on every bus in the CPU crate's own test suite would make every clamp fixture
+    /// vacuous.
+    fn reflected_call_gate(
+        &self,
+        _req: &ReflectedCallGateRequest,
+    ) -> Result<(), ReflectedCallDecline> {
+        Err(ReflectedCallDecline::NotArmed)
+    }
+
+    /// Commit the BUS half of an answered reflected call: add `raw` RAW bus clocks to
+    /// the bus's own running total, exactly the way `MachineBus::poll_commit_bus`
+    /// commits the poll skip's bus half, and return what was actually added.
+    ///
+    /// Defaulted to a no-op returning 0, so a bus with no bus-clock model charges
+    /// nothing rather than silently pretending it did.
+    fn reflected_call_commit_bus(&mut self, _raw: u64) -> u64 {
+        0
+    }
+
+    /// Answer-time observer test (slice1 plan section 5 step 7, design review A.4):
+    /// is any byte of the inclusive physical range `[lo, hi]` visible to something
+    /// other than the CPU -- a device window, the framebuffer aperture, or an armed
+    /// DMA region? A memo SKIPS its Class R writes, so an intermediate value inside
+    /// such a range would be observed in the real world and not in the answered one.
+    ///
+    /// **Defaulted to `true` (visible, therefore refuse):** the safe answer for a bus
+    /// that cannot tell.
+    fn reflected_call_dma_visible(&self, _lo: u32, _hi: u32) -> bool {
+        true
+    }
+
+    /// Is an HLE software interrupt already POSTED and waiting to be serviced at the next
+    /// batch boundary? The reflected-call memo refuses a trip that has one pending at
+    /// entry, and refuses to LEARN from a trip that acquired one on its way through: the
+    /// posted vector is guest-visible work the memo carries no record of, so an answered
+    /// trip would either skip it or deliver it at the wrong instant.
+    ///
+    /// Non-mutating, and DEFAULTED TO TRUE (posted, therefore refuse) for the same reason
+    /// the gate defaults to refuse: a bus that cannot tell must not be able to admit.
+    fn reflected_call_soft_int_posted(&self) -> bool {
+        true
+    }
+
+    /// Tell the bus an answered reflected call just landed, so the machine's batch
+    /// loop can END THE BATCH at this instant (slice1 plan section 6's batch-end
+    /// mitigation). A real trip contains 6-8 IF-enable batch boundaries and an
+    /// answered one contains none, so without this term an IRQ raised during the lump
+    /// waits for the batch cap instead of the trip's first `IRET`. One boundary per
+    /// answer against 6-8 per real trip is strictly fewer, and the pending-interrupt
+    /// re-check then happens at the first instruction boundary after the lump.
+    ///
+    /// Defaulted to a no-op.
+    fn note_reflected_call_answered(&mut self) {}
 
     /// Certify, binary-search and commit ONE call-out-site device-poll span, entirely
     /// inside `izarravm-machine` (the only crate with the device/timeline state the

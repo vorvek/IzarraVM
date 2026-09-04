@@ -46,6 +46,10 @@ pub(crate) const EFLAGS_ARCH_MASK: u32 = 0x0003_7fd5 | (1 << 18);
 /// byte write as "not restored" merely because the untouched high bytes of
 /// the two 32-bit reads/writes happened to differ (they didn't move; they
 /// were simply never part of this access).
+// Consumed today only by `reflected_call_diag` (feature-gated): the memo module moved to
+// a per-dword byte MASK for both reads and writes (answer-path amendment 3's follow-up),
+// which subsumes width-masking a low-order-justified value.
+#[allow(dead_code)]
 pub(crate) fn mask_to_width(v: u32, width_bytes: u32) -> u32 {
     match width_bytes {
         1 => v & 0xFF,
@@ -67,6 +71,14 @@ pub(crate) struct CachedSegment {
     pub base: u32,
     pub limit: u32,
     pub access: u8,
+    /// The descriptor's D/B bit as the CPU caches it. Part of the closure rule for
+    /// the same reason the base is: `SS.B` decides the stack width every push and pop
+    /// inside the trip uses, and `CS.D` decides the default operand and address size
+    /// of every instruction it executes -- so two entries agreeing on selector, base,
+    /// limit and access but not on this bit are NOT the same architectural state, and
+    /// an epilogue that restores the other five fields and not this one leaves the
+    /// guest running at the wrong width.
+    pub default_size_32: bool,
 }
 
 impl CachedSegment {
@@ -76,6 +88,27 @@ impl CachedSegment {
             base: reg.base,
             limit: reg.limit,
             access: reg.access,
+            default_size_32: reg.default_size_32,
+        }
+    }
+
+    /// Rebuild the `SegmentRegister` this was captured from, for the answer's
+    /// epilogue: every field of `SegmentRegister` is covered, so this is lossless.
+    ///
+    /// Gated on the memo feature because `apply_epilogue` is its only caller, and this
+    /// file is compiled UNCONDITIONALLY (it holds the primitives the diagnostic and the
+    /// memo share). Without the gate, a `--no-default-features --features
+    /// reflected-call-diagnostic` build compiles the method with no user and CI's policy
+    /// self-check fails it as dead code. A `cfg` and not an `allow`: the method really is
+    /// absent from that build rather than present and excused.
+    #[cfg(feature = "reflected-call-memo")]
+    pub(crate) fn to_segment(self) -> SegmentRegister {
+        SegmentRegister {
+            selector: self.selector,
+            base: self.base,
+            limit: self.limit,
+            access: self.access,
+            default_size_32: self.default_size_32,
         }
     }
 }
@@ -145,7 +178,15 @@ impl EntryImage {
             ebp: regs.ebp(),
             esi: regs.esi(),
             edi: regs.edi(),
-            eflags_masked: regs.eflags & EFLAGS_ARCH_MASK,
+            // `cpu.eflags()`, NOT `regs.eflags`: this CPU carries its arithmetic
+            // flags lazily, so `registers.eflags` alone is a REPRESENTATION of the
+            // flags and not the architectural value (`CpuGsw::settled`'s doc says so
+            // in as many words). Capturing the base would let two trips whose
+            // architectural flags genuinely differ -- one with the difference still
+            // living in `pending_flags` -- compare EQUAL here, which is precisely the
+            // closure-rule violation R2.1 exists to close, one level below the
+            // register file.
+            eflags_masked: cpu.eflags() & EFLAGS_ARCH_MASK,
             cs: CachedSegment::capture(regs.segment(SegmentIndex::Cs)),
             ss: CachedSegment::capture(regs.segment(SegmentIndex::Ss)),
             ds: CachedSegment::capture(regs.segment(SegmentIndex::Ds)),
