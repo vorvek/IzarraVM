@@ -178,6 +178,19 @@ pub fn mode_census_json(
                 // nanoseconds every join spent blocked, the direct
                 // read-out of the lever.
                 "async_batches": state.triangles.async_batches,
+                // Slice 2 of the same design (section 8): the LFB-write
+                // entry's coalescing ratio. `lfb_write_run_words /
+                // lfb_write_runs` is how many guest stores each queue entry
+                // carries; a ratio near 1 means the coalescing is not
+                // firing and the burst is back to costing one
+                // RASTER_QUEUE_CAPACITY entry per store, which is a
+                // queue_full drain -- a flush AND a full join -- every ~1024
+                // stores. `lfb_writes_immediate` is the regression
+                // sentinel: writes that could not defer at all and were
+                // applied synchronously after a full drain.
+                "lfb_write_runs": state.triangles.lfb_write_runs,
+                "lfb_write_run_words": state.triangles.lfb_write_run_words,
+                "lfb_writes_immediate": state.triangles.lfb_writes_immediate,
                 "joins_by_cause": {
                     "texture_write": state.triangles.joins_by_cause.texture_write,
                     "lfb_read": state.triangles.joins_by_cause.lfb_read,

@@ -755,3 +755,201 @@ fn raster_owned_is_present_after_every_call_that_could_take_it_with_a_batch_outs
          not just the no-op it joined when nothing could be in flight"
     );
 }
+
+/// Slice 2 of `dev_docs/2026-09-05-distira-async-overlap-design.md` (section
+/// 8), and the stress test
+/// `dev_docs/2026-08-31-distira-raster-followups-handoff.md` asked for when
+/// the queue was first designed: "add a stress test that interleaves
+/// triangles with LFB reads and counter reads".
+///
+/// Guest LFB writes are ordered `QueuedCommand::LfbWrite` entries now, so a
+/// triangle queued BEFORE a write must land under it and one queued AFTER
+/// must land on top of it -- and an LFB READ in the middle must see exactly
+/// what the fully synchronous device would have shown at that instant. This
+/// drives all three against the queue-off reference: two triangles, then a
+/// row of `u16` stores over the pixels they just painted, then a read, then
+/// `u32` stores over the same pixels, six times over, with `lfbMode`'s pixel
+/// pipeline flipped part-way so the coalesced run's snapshot changes
+/// mid-stream. Every read is compared, and so is the whole front buffer at
+/// the end.
+///
+/// Shown RED by deleting `QueuedCommand::LfbWrite(_)` from the run-split
+/// `matches!` in `run_raster_batch`: the writes then apply after every
+/// triangle in the batch instead of between them, and both the read log and
+/// the final buffer diverge from the synchronous arm.
+#[test]
+fn a_stress_test_interleaving_lfb_reads_writes_and_queued_triangles() {
+    /// Like `queue_triangle`, but drawing to the FRONT buffer -- the same
+    /// buffer `LFB_WRITE_FRONT` sends the stores to, so the two really do
+    /// contend for the same pixels. `queue_triangle`'s
+    /// `FBZ_DRAW_BACK | FBZ_DRAW_FRONT` is `FBZ_DRAW_BACK` (front is 0), and
+    /// a triangle in the back buffer would never overlap a front-buffer
+    /// store, which would make the ordering this test exists for
+    /// unobservable.
+    fn queue_front_triangle(distira: &mut Distira, red: u32) {
+        write_reg(distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_FRONT);
+        write_reg(distira, SST_VERTEX_AX, 0 << 4);
+        write_reg(distira, SST_VERTEX_AY, 0 << 4);
+        write_reg(distira, SST_VERTEX_BX, 8 << 4);
+        write_reg(distira, SST_VERTEX_BY, 0 << 4);
+        write_reg(distira, SST_VERTEX_CX, 0 << 4);
+        write_reg(distira, SST_VERTEX_CY, 8 << 4);
+        write_reg(distira, SST_START_R, red << 12);
+        write_reg(distira, SST_START_G, red << 12);
+        write_reg(distira, SST_START_B, red << 12);
+        write_reg(distira, SST_TRIANGLE_CMD, 1);
+    }
+
+    fn run(distira: &mut Distira) -> (Vec<u16>, Vec<u16>) {
+        let mut reads = Vec::new();
+        for step in 0..6u32 {
+            // Two triangles, then stores over the pixels they painted.
+            queue_front_triangle(distira, 0x40 + step * 8);
+            queue_front_triangle(distira, 0x80 + step * 4);
+
+            // Part-way through, turn the LFB pixel pipeline on. `lfbMode`
+            // is deliberately OUTSIDE `raster_snapshot_covers_register`, so
+            // this drains -- and it changes the snapshot a following run
+            // coalesces against.
+            if step == 3 {
+                write_reg(
+                    distira,
+                    SST_LFB_MODE,
+                    LFB_FORMAT_RGB565
+                        | LFB_WRITE_FRONT
+                        | LFB_READ_FRONT
+                        | LFB_ENABLE_PIXEL_PIPELINE,
+                );
+            }
+
+            for x in 0..8u32 {
+                distira.write_lfb_u16((x as usize) * 2, (0x0821 * (step + 1) + x) as u16);
+            }
+
+            // A read between the writes and the next triangle: this is the
+            // join that has to see everything above it and nothing below.
+            reads.push(distira.read_lfb_u16((step as usize % 8) * 2));
+
+            queue_front_triangle(distira, 0xc0 - step * 8);
+
+            for x in 0..4u32 {
+                distira.write_lfb_u32((x as usize) * 4, 0x1234_5678u32.wrapping_add(step * x));
+            }
+
+            reads.push(distira.read_lfb_u16(((step as usize + 3) % 8) * 2));
+            write_reg(distira, SST_SWAPBUFFER_CMD, 0);
+        }
+        write_reg(distira, SST_LFB_MODE, LFB_READ_FRONT);
+        let frame = (0..8 * 8)
+            .map(|index| distira.read_lfb_u16(index * 2))
+            .collect();
+        (reads, frame)
+    }
+
+    let mut sync = Distira::new();
+    sync.set_frame_size(8, 8);
+    sync.set_raster_queue_enabled(false);
+    let (sync_reads, sync_frame) = run(&mut sync);
+
+    let mut queued = Distira::new();
+    queued.set_frame_size(8, 8);
+    let (queued_reads, queued_frame) = run(&mut queued);
+
+    assert!(
+        sync_frame.iter().any(|&pixel| pixel != 0),
+        "the scene must actually paint something, or this test proves nothing"
+    );
+    assert!(
+        sync_reads.iter().any(|&pixel| pixel != 0),
+        "the reads must observe painted pixels, or the interleaving proves nothing"
+    );
+    assert_eq!(
+        sync_reads, queued_reads,
+        "an LFB read between queued triangles and queued LFB writes must \
+         report exactly what the synchronous device reported"
+    );
+    assert_eq!(
+        sync_frame, queued_frame,
+        "queued, coalesced LFB writes interleaved with triangles must leave \
+         the frame store byte-identical to the synchronous path"
+    );
+
+    // ...and the queued arm really did defer them, rather than passing the
+    // whole test on the synchronous fallback.
+    assert!(
+        queued.triangle_census.lfb_write_runs > 0,
+        "the queued arm must have coalesced at least one LFB run"
+    );
+    assert_eq!(
+        queued.triangle_census.lfb_writes_immediate, 0,
+        "no write in this script may fall back to the synchronous arm"
+    );
+    assert_eq!(
+        queued.triangle_census.queue_drain_causes.lfb_write, 0,
+        "J2 must have stopped joining: an LFB write may no longer drain"
+    );
+}
+
+/// Slice 2, the design's second named test. A coalesced run of guest LFB
+/// stores is ONE queue entry and therefore ONE split of the batch, however
+/// many words it carries -- which is the whole reason slice 2 can pay on
+/// `descent2-3dfx-586`. Uncoalesced, Descent II's ~40,830 stores a frame
+/// would be ~40 full `RASTER_QUEUE_CAPACITY` refills, and every refill is a
+/// `queue_full` drain: a flush AND a full join, so the burst would force
+/// MORE joins than the synchronous J2 it replaced (caveat 1 of
+/// `dev_docs/2026-09-05-distira-async-slice1-review.md` section 7).
+///
+/// Shown RED by making `RasterQueue::push_lfb_write` skip its extend branch
+/// and always start a new run: `lfb_write_runs` becomes 4,000 instead of 1,
+/// the queue depth blows past `RASTER_QUEUE_CAPACITY`, and `queue_full`
+/// drains appear.
+#[test]
+fn an_lfb_write_run_costs_one_split_not_one_per_write() {
+    const WORDS: usize = 4000;
+    // The run has to be longer than the queue is deep, or coalescing is not
+    // what is under test. Compile-time, because both sides are constants.
+    const _: () = assert!(WORDS > RASTER_QUEUE_CAPACITY);
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(8, 8);
+    queue_triangle(&mut distira, 0xff);
+    assert_eq!(distira.raster_queue_depth(), 1, "the triangle must defer");
+
+    for index in 0..WORDS {
+        distira.write_lfb_u16((index % 8) * 2, index as u16);
+    }
+
+    assert_eq!(
+        distira.triangle_census.lfb_write_runs, 1,
+        "{WORDS} stores against one unchanged snapshot must coalesce into a \
+         single run"
+    );
+    assert_eq!(
+        distira.triangle_census.lfb_write_run_words, WORDS as u64,
+        "every store must be accounted for in the run"
+    );
+    assert_eq!(
+        distira.raster_queue_depth(),
+        2,
+        "the queue must hold the triangle and exactly one LFB run -- one \
+         split of the batch, not {WORDS} of them"
+    );
+    assert_eq!(
+        distira.triangle_census.queue_drain_causes.queue_full, 0,
+        "a coalesced run must never fill the queue"
+    );
+    assert_eq!(
+        distira.triangle_census.lfb_writes_immediate, 0,
+        "none of these writes may take the synchronous fallback"
+    );
+
+    // And the run really does apply: draining it paints the stores.
+    write_reg(&mut distira, SST_LFB_MODE, LFB_READ_FRONT);
+    let frame: Vec<u16> = (0..8 * 8)
+        .map(|index| distira.read_lfb_u16(index * 2))
+        .collect();
+    assert!(
+        frame.iter().any(|&pixel| pixel != 0),
+        "the coalesced run must actually reach the frame store"
+    );
+}

@@ -41,10 +41,13 @@ fn recycle_keeps_the_allocation_even_when_pending_already_holds_the_next_batch()
 
     // `pending` is non-empty, so the OLD guard would drop `big_batch`'s
     // allocation right here.
-    queue.recycle(big_batch);
+    queue.recycle(RasterBatch {
+        commands: big_batch,
+        lfb_words: Vec::new(),
+    });
 
     let drained = queue.take();
-    assert_eq!(drained.len(), 1);
+    assert_eq!(drained.commands.len(), 1);
     queue.recycle(drained);
 
     assert!(queue.push(texture_write(2000)));
