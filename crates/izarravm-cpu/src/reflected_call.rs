@@ -94,6 +94,14 @@ impl CachedSegment {
 
     /// Rebuild the `SegmentRegister` this was captured from, for the answer's
     /// epilogue: every field of `SegmentRegister` is covered, so this is lossless.
+    ///
+    /// Gated on the memo feature because `apply_epilogue` is its only caller, and this
+    /// file is compiled UNCONDITIONALLY (it holds the primitives the diagnostic and the
+    /// memo share). Without the gate, a `--no-default-features --features
+    /// reflected-call-diagnostic` build compiles the method with no user and CI's policy
+    /// self-check fails it as dead code. A `cfg` and not an `allow`: the method really is
+    /// absent from that build rather than present and excused.
+    #[cfg(feature = "reflected-call-memo")]
     pub(crate) fn to_segment(self) -> SegmentRegister {
         SegmentRegister {
             selector: self.selector,
