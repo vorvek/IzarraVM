@@ -6235,7 +6235,6 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
     }
 }
 
-
 /// Version marker for the guest clock model: bump this whenever a change alters
 /// the number of guest clocks charged per instruction for ANY persona, whether
 /// the change lives in the core per-mode table (`izarravm_core::GSW_MODE_SPECS`),

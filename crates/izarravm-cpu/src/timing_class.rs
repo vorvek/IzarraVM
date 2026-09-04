@@ -894,12 +894,16 @@ const _: () = {
     }
     assert!(interpret_one == crate::INTERPRET_ONE_MAX_CORE_CLOCKS);
 
+    // The PORT term is `MAX_PORT_CORE_CLOCKS`, not this table's `InPort`/`OutPort`
+    // rows, and the difference is the point. Since the port slices (P1-P3) landed,
+    // a port slot's charge is keyed on the live CPL/IOPL column -- which no class
+    // row can carry -- so `MAX_CALL_OUT_CORE_CLOCKS` prices it at the widest
+    // column and the class rows survive only as the poll projection's terms.
+    // Folding the class row in here would assert the two authorities agree, which
+    // they deliberately do not.
     let mut max = interpret_one;
-    if entry(TimingClass::InPort) > max {
-        max = entry(TimingClass::InPort);
-    }
-    if entry(TimingClass::OutPort) > max {
-        max = entry(TimingClass::OutPort);
+    if crate::MAX_PORT_CORE_CLOCKS > max {
+        max = crate::MAX_PORT_CORE_CLOCKS;
     }
     if entry(TimingClass::PushAll) > max {
         max = entry(TimingClass::PushAll);
