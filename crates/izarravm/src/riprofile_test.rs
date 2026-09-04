@@ -434,20 +434,38 @@ fn conservation_check_in_this_process() {
 
 // ===== Item 1: inline-aware resolution (the load-bearing test) =====
 
-/// `SymTagEnum::SymTagInlineSite` in DbgHelp. windows-sys 0.59 does not export
-/// the name; CallSite is 31, InlineSite is 32.
-const SYM_TAG_INLINE_SITE: u32 = 32;
-
-/// The inlined callee this fixture locates by name. `exact_cap_test` is
-/// `#[inline]`, a few lines, and not jit-gated, so a `--no-default-features`
-/// release artifact still carries it. Locating by this symbol (via
-/// `SymEnumSymbolsExW` + `SYMENUM_OPTIONS_INLINE`) rather than by scanning
-/// `run_until_tick`'s extent is what stops ThinLTO of an unrelated hot path
-/// from making the test red.
-const INLINE_CALLEE: &str = "exact_cap_test";
-
-fn names_the_inline_callee(name: &str) -> bool {
-    name == INLINE_CALLEE || name.rsplit("::").next() == Some(INLINE_CALLEE)
+/// Finds `izarravm_machine::Machine::run_until_tick`'s address and code size
+/// in the LOADED module via `SymFromNameW`, by the exact name the PDB records
+/// it under. Rust visibility is irrelevant to dbghelp; it only reads
+/// linker/PDB symbols. This is the scan's extent: the batch loop is the
+/// function everything hot gets inlined into, so it always carries inline
+/// sites, and the test asks only that SOME inlined callee resolves where the
+/// old resolver collapses it -- not that one named callee does.
+///
+/// Locating a NAMED callee's inline sites (`SymEnumSymbolsExW` +
+/// `SYMENUM_OPTIONS_INLINE`) was tried and does not work with the inline-trace
+/// API: for `izarravm_cpu::run::exact_cap_test` the PDB lists three
+/// `SymTagInlineSite` records inside this function, and
+/// `SymAddrIncludeInlineTrace` reports 0 at every one of them and never names
+/// the callee anywhere in the extent (the inlined body carries no line range of
+/// its own, so the trace walk cannot see it). The property under test is the
+/// resolver's, not the inliner's, so the example is found by the same walk the
+/// profiler performs.
+fn find_run_until_tick(process: windows_sys::Win32::Foundation::HANDLE) -> Option<(u64, u32)> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{SYMBOL_INFOW, SymFromNameW};
+    const MAX_NAME: usize = 512;
+    #[repr(C)]
+    struct SymbolBuf {
+        info: SYMBOL_INFOW,
+        _name_tail: [u16; MAX_NAME],
+    }
+    let mut buf: SymbolBuf = unsafe { std::mem::zeroed() };
+    buf.info.SizeOfStruct = std::mem::size_of::<SYMBOL_INFOW>() as u32;
+    buf.info.MaxNameLen = MAX_NAME as u32;
+    let mut name = wide("izarravm_machine::Machine::run_until_tick");
+    name.push(0);
+    let ok = unsafe { SymFromNameW(process, name.as_ptr(), &mut buf.info) };
+    (ok != 0).then_some((buf.info.Address, buf.info.Size))
 }
 
 fn in_ci() -> bool {
@@ -588,41 +606,54 @@ fn inline_chain_check_in_this_process() {
         info.LineNumbers
     );
 
-    let sites = match enum_inline_sites(process, base, INLINE_CALLEE) {
-        Ok(sites) => sites,
-        Err(err) => {
-            unsafe {
-                SymUnloadModule64(process, base);
-                SymCleanup(process);
-            }
-            panic!(
-                "SymEnumSymbolsExW(SYMENUM_OPTIONS_INLINE, *{INLINE_CALLEE}*) failed, \
-                 GetLastError={err}"
-            );
+    let Some((start, size)) = find_run_until_tick(process) else {
+        unsafe {
+            SymUnloadModule64(process, base);
+            SymCleanup(process);
         }
+        panic!(
+            "could not find izarravm_machine::Machine::run_until_tick by name in \
+             {exe_path:?}; the PDB naming assumption this test relies on may have broken"
+        );
     };
+    assert!(
+        size > 0,
+        "run_until_tick has no recorded extent in {exe_path:?}"
+    );
 
+    // Walk the function's whole extent the way the profiler walks a sample:
+    // every address dbghelp reports an inline trace at is resolved through the
+    // NEW chain and the OLD `SymFromAddrW` path. The example is any address
+    // where the chain names a frame the old path does not -- an inlined callee
+    // the old resolver collapsed into its physical parent. Which callee it is
+    // does not matter and is not pinned: ThinLTO of an unrelated hot path may
+    // move or remove any ONE inline site, but it cannot leave the batch loop
+    // with no inlined callee at all without the trace count saying so.
+    use windows_sys::Win32::System::Diagnostics::Debug::SymAddrIncludeInlineTrace;
+    let mut traced = 0usize;
     let mut empty_chain = 0usize;
-    let mut chain_omits_callee = 0usize;
-    let mut named_but_not_collapsed = 0usize;
-    let mut example: Option<(u64, String, Vec<Frame>, Option<String>)> = None;
-    for (addr, site_name) in &sites {
-        let chain = resolve_inline_chain(process, *addr);
+    let mut not_collapsed = 0usize;
+    let mut example: Option<(u64, Vec<Frame>, Option<String>)> = None;
+    for addr in start..start + u64::from(size) {
+        if unsafe { SymAddrIncludeInlineTrace(process, addr) } == 0 {
+            continue;
+        }
+        traced += 1;
+        let chain = resolve_inline_chain(process, addr);
         if chain.is_empty() {
             empty_chain += 1;
             continue;
         }
-        if !chain.iter().any(|f| names_the_inline_callee(&f.name)) {
-            chain_omits_callee += 1;
-            continue;
-        }
-        let old = super::resolve_symbol(process, *addr);
+        let old = super::resolve_symbol(process, addr);
         let old_name = old.as_ref().map(|(name, ..)| name.clone());
-        if old_name.as_deref().is_some_and(names_the_inline_callee) {
-            named_but_not_collapsed += 1;
+        let collapsed = chain
+            .iter()
+            .any(|f| old_name.as_deref() != Some(f.name.as_str()));
+        if !collapsed {
+            not_collapsed += 1;
             continue;
         }
-        example = Some((*addr, site_name.clone(), chain, old_name));
+        example = Some((addr, chain, old_name));
         break;
     }
 
@@ -631,105 +662,41 @@ fn inline_chain_check_in_this_process() {
         SymCleanup(process);
     }
 
-    if sites.is_empty() {
-        panic!(
-            "PDB has no inline-site records for {INLINE_CALLEE} (mask *{INLINE_CALLEE}*, \
-             Tag=SymTagInlineSite). The function is not inlined in this image, or the \
-             PDB name assumption broke. Not a resolver regression."
-        );
-    }
-
-    let (addr, site_name, chain, old_name) = match example {
+    let (addr, chain, old_name) = match example {
         Some(found) => found,
-        None if chain_omits_callee > 0 => panic!(
-            "RESOLVER REGRESSION: PDB recorded {} inline site(s) for {INLINE_CALLEE} \
-             but resolve_inline_chain did not name it at any of them \
-             ({chain_omits_callee} nonempty chain(s) omitted the name, {empty_chain} empty)",
-            sites.len()
+        None if traced == 0 => panic!(
+            "dbghelp reports no inline trace anywhere in run_until_tick's {size:#x}-byte \
+             extent in {exe_path:?}: nothing is inlined into the batch loop in this image, \
+             or the PDB lost its inline records. Not a resolver regression."
         ),
-        None if empty_chain == sites.len() => panic!(
-            "RESOLVER REGRESSION: PDB recorded {} inline site(s) for {INLINE_CALLEE} \
-             but resolve_inline_chain returned empty at all of them",
-            sites.len()
+        None if empty_chain == traced => panic!(
+            "RESOLVER REGRESSION: dbghelp reports an inline trace at {traced} address(es) \
+             in run_until_tick but resolve_inline_chain returned empty at all of them"
         ),
         None => panic!(
-            "{INLINE_CALLEE} is inlined at {} site(s) and resolve_inline_chain names it, \
-             but the old resolver also names it at every site ({named_but_not_collapsed} \
-             hits). No collapsed-into-parent example.",
-            sites.len()
+            "RESOLVER REGRESSION: {traced} traced address(es), {empty_chain} empty chain(s), \
+             and the {not_collapsed} nonempty chain(s) name only what the old resolver \
+             already names: no inlined callee is being revealed"
         ),
     };
 
+    let chain_names: Vec<&str> = chain.iter().map(|f| f.name.as_str()).collect();
     assert!(
-        names_the_inline_callee(&site_name),
-        "enum site name must be {INLINE_CALLEE}, got {site_name:?}"
+        !chain_names.is_empty(),
+        "chain at {addr:#x} must name at least one inlined frame"
     );
+    let revealed: Vec<&str> = chain_names
+        .iter()
+        .copied()
+        .filter(|name| old_name.as_deref() != Some(*name))
+        .collect();
     assert!(
-        chain.iter().any(|f| names_the_inline_callee(&f.name)),
-        "chain at {addr:#x} must name {INLINE_CALLEE}, got {:?}",
-        chain.iter().map(|f| &f.name).collect::<Vec<_>>()
+        !revealed.is_empty(),
+        "old resolver must collapse at least one inlined frame at {addr:#x}: chain \
+         {chain_names:?}, old {old_name:?}"
     );
-    assert!(
-        old_name
-            .as_deref()
-            .is_none_or(|name| !names_the_inline_callee(name)),
-        "old resolver must collapse {INLINE_CALLEE} into a different physical symbol at \
-         {addr:#x}, got {old_name:?}"
+    eprintln!(
+        "inline resolution example at {addr:#x}: old={old_name:?}, chain={chain_names:?}, \
+         revealed={revealed:?} ({traced} traced addresses in run_until_tick)"
     );
-}
-
-/// Enumerate inline-site records whose name matches `*{callee}*`.
-/// `Err` is `GetLastError` after a FALSE return; `Ok(vec![])` is a successful
-/// enum that found nothing.
-fn enum_inline_sites(
-    process: windows_sys::Win32::Foundation::HANDLE,
-    base: u64,
-    callee: &str,
-) -> Result<Vec<(u64, String)>, u32> {
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        SYMENUM_OPTIONS_INLINE, SymEnumSymbolsExW,
-    };
-
-    let mut mask = wide(&format!("*{callee}*"));
-    mask.push(0);
-    let mut sites: Vec<(u64, String)> = Vec::new();
-    let ok = unsafe {
-        SymEnumSymbolsExW(
-            process,
-            base,
-            mask.as_ptr(),
-            Some(collect_inline_sites),
-            std::ptr::from_mut(&mut sites).cast(),
-            SYMENUM_OPTIONS_INLINE,
-        )
-    };
-    if ok == 0 {
-        return Err(unsafe { GetLastError() });
-    }
-    sites.retain(|(_, name)| names_the_inline_callee(name));
-    Ok(sites)
-}
-
-unsafe extern "system" fn collect_inline_sites(
-    psyminfo: *const windows_sys::Win32::System::Diagnostics::Debug::SYMBOL_INFOW,
-    _symbolsize: u32,
-    usercontext: *const core::ffi::c_void,
-) -> i32 {
-    if psyminfo.is_null() || usercontext.is_null() {
-        return 1;
-    }
-    let info = unsafe { &*psyminfo };
-    if info.Tag != SYM_TAG_INLINE_SITE {
-        return 1;
-    }
-    let len = (info.NameLen as usize).min(512);
-    let raw = unsafe { std::slice::from_raw_parts(info.Name.as_ptr(), len) };
-    // The enum callback's NameLen includes the trailing NUL; strip it so
-    // path-segment matching does not see `exact_cap_test\0`.
-    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-    let name = String::from_utf16_lossy(&raw[..end]);
-    let out = unsafe { &mut *usercontext.cast::<Vec<(u64, String)>>().cast_mut() };
-    out.push((info.Address, name));
-    1
 }
