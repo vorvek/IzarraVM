@@ -996,7 +996,7 @@ pub(crate) struct KeyState {
     read_set_offenders: Vec<(u32, u32, u32, u64)>,
     /// The same dump for the AUDIT's write formula: the cell whose predicted final value
     /// disagreed with the observed one, what was predicted, what was found.
-    audit_offenders: Vec<(u32, u32, u32, u64, u32)>,
+    audit_offenders: Vec<AuditOffender>,
     pub write_class_r_pinned: u64,
     pub write_class_r_unpinned: u64,
     pub write_class_d: u64,
@@ -1004,6 +1004,49 @@ pub(crate) struct KeyState {
     pub stability: StabilityAcc,
     pub write_set_size: SizeStats,
     pub read_set_size: SizeStats,
+}
+
+/// One dword the AUDIT's write formula disagreed on, with everything needed to tell the
+/// competing explanations apart WITHOUT re-deriving them from a narrative.
+///
+/// The earlier shape carried only `(phys, predicted, observed, hits, provenance)`, and
+/// `provenance == 2` -- "the trip wrote it, the memo does not replay it" -- was read in
+/// `dev_docs/2026-09-05-reflected-call-slice1-answer-result.md` section 3 as "the memo
+/// classified it Class R". That is an inference, not an observation: a dword can reach
+/// `provenance == 2` from the Class R ranges, from a Class D dword the audit trip's own
+/// (shallower) low-water mark failed to exclude, or from a dword no learn trip ever saw.
+/// The extra fields below decide which, and they cost one struct per DISTINCT offending
+/// address per key (at most `MEMO_READ_SET_OFFENDERS_TRACKED`), never one per audit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AuditOffender {
+    /// Aligned physical dword.
+    phys: u32,
+    /// What the memo's formula said the dword would hold after the trip.
+    predicted: u32,
+    /// What it actually held.
+    observed: u32,
+    /// How many audits of this key disagreed at this address.
+    hits: u64,
+    /// Bit 0: the memo REPLAYS this dword. Bit 1: the audited trip's own journal saw a
+    /// write to it. Bit 2: the dword lies in the memo's CLASS R RANGES, i.e. the memo
+    /// really does claim it unchanged. Bit 3: the audited trip's journal classified the
+    /// write as client- or host-stack. Bit 4: that write was BELOW the audit trip's own
+    /// observed low-water mark (Class D by this trip's reckoning) -- which cannot happen
+    /// while the dead-stack skip is reached, so a set bit means the skip was bypassed.
+    provenance: u32,
+    /// The union of the memo's replay masks at this dword: the bytes an ANSWER writes.
+    /// Zero for a Class R dword, because an answer writes nothing there.
+    claim_mask: u32,
+    /// The mask the audited trip's own journal recorded at this dword, and the dword value
+    /// that journal last saw written. Zero and zero when the trip's journal never saw it --
+    /// which, on a natively executed audit trip, is the common case.
+    journal_mask: u32,
+    journal_value: u32,
+    /// The linear address of the journaled write, and the linear address of the entry
+    /// stack pointer in the same segment. Their difference says whether the cell is stack
+    /// scratch below the entry SP or live data above it. Both zero when unjournaled.
+    journal_linear: u32,
+    entry_sp_linear: u32,
 }
 
 /// How many distinct read-set offenders one key reports (see `read_set_offenders`).
@@ -1016,21 +1059,23 @@ impl KeyState {
     /// 1, the audited trip's own journal saw a write to it (so the trip really does write
     /// it and the memo's classification is what is wrong). Neither bit set means the dword
     /// reached the comparison from the replay set alone with no live write behind it.
-    fn note_audit_offender(
-        &mut self,
-        (phys, predicted, observed): (u32, u32, u32),
-        provenance: u32,
-    ) {
-        if let Some(entry) = self.audit_offenders.iter_mut().find(|e| e.0 == phys) {
-            entry.1 = predicted;
-            entry.2 = observed;
-            entry.3 += 1;
-            entry.4 |= provenance;
+    fn note_audit_offender(&mut self, offender: AuditOffender) {
+        if let Some(entry) = self
+            .audit_offenders
+            .iter_mut()
+            .find(|e| e.phys == offender.phys)
+        {
+            let hits = entry.hits + 1;
+            let provenance = entry.provenance | offender.provenance;
+            *entry = AuditOffender {
+                hits,
+                provenance,
+                ..offender
+            };
             return;
         }
         if self.audit_offenders.len() < MEMO_READ_SET_OFFENDERS_TRACKED {
-            self.audit_offenders
-                .push((phys, predicted, observed, 1, provenance));
+            self.audit_offenders.push(offender);
         }
     }
 
@@ -2867,15 +2912,15 @@ fn finish_audit<B: CpuBus>(
     if audit_write_values_disagree(bus, memo, open, &mut write_offender) {
         mismatches.push(AuditMismatch::WriteValue);
     }
-    if let Some(cell) = write_offender
-        && let Some(key_state) = cpu
+    if let Some(cell) = write_offender {
+        let offender = describe_audit_offender(memo, open, cell);
+        if let Some(key_state) = cpu
             .reflected_call
             .as_mut()
             .and_then(|state| state.keys.get_mut(&key))
-    {
-        let provenance = u32::from(memo.replay.iter().any(|&(a, _, _)| a == cell.0))
-            | (u32::from(open.writes.contains_key(&cell.0)) << 1);
-        key_state.note_audit_offender(cell, provenance);
+        {
+            key_state.note_audit_offender(offender);
+        }
     }
     record_audit(cpu, key, &mismatches, bus_delta);
 }
@@ -2883,6 +2928,62 @@ fn finish_audit<B: CpuBus>(
 /// The write half of the audit formula. Walks the UNION of the observed write set and the
 /// memo's replay set, at aligned-dword granularity, comparing the memo's prediction with
 /// the live post-trip value.
+/// Gather everything an audit's write-value disagreement can say about itself, at the one
+/// instant the memo, the audited trip's journal and the offending cell are all in hand.
+///
+/// This is pure bookkeeping on a cold path (at most `MEMO_READ_SET_OFFENDERS_TRACKED`
+/// distinct addresses per key ever reach the dump) and it exists because the previous
+/// dump's two provenance bits could not distinguish a Class R misclassification from a
+/// Class D dword the audit's own dead-stack test failed to exclude -- and a result document
+/// picked one of the two by narrative. See `AuditOffender`.
+fn describe_audit_offender(
+    memo: &Memo,
+    open: &OpenTrip,
+    (phys, predicted, observed): (u32, u32, u32),
+) -> AuditOffender {
+    let claim_mask = memo
+        .replay
+        .iter()
+        .filter(|&&(a, _, _)| a == phys)
+        .fold(0u32, |acc, &(_, mask, _)| acc | mask);
+    let in_class_r = memo
+        .class_r_ranges
+        .iter()
+        .any(|&(lo, hi)| phys >= (lo & !0x3) && phys <= (hi & !0x3));
+    let obs = open.writes.get(&phys);
+    let is_stack = obs.is_some_and(|o| {
+        matches!(
+            o.class,
+            AddressClass::ClientStack | AddressClass::HostStack
+        )
+    });
+    let is_dead = obs.is_some_and(|o| open.is_dead_stack(o.ss_selector, o.linear));
+    let provenance = u32::from(claim_mask != 0)
+        | (u32::from(obs.is_some()) << 1)
+        | (u32::from(in_class_r) << 2)
+        | (u32::from(is_stack) << 3)
+        | (u32::from(is_dead) << 4);
+    let entry_sp_linear = open
+        .stacks
+        .iter()
+        .flatten()
+        .find(|seg| Some(seg.selector) == obs.map(|o| o.ss_selector))
+        .map(|seg| seg.base.wrapping_add(open.entry_esp))
+        .unwrap_or(0);
+    AuditOffender {
+        phys,
+        predicted,
+        observed,
+        hits: 1,
+        provenance,
+        claim_mask,
+        journal_mask: obs.map(|o| o.mask).unwrap_or(0),
+        journal_value: obs.map(|o| o.latest_dword).unwrap_or(0),
+        journal_linear: obs.map(|o| o.linear).unwrap_or(0),
+        entry_sp_linear,
+    }
+}
+
 fn audit_write_values_disagree<B: CpuBus>(
     bus: &B,
     memo: &Memo,
@@ -3649,13 +3750,23 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
         }
         out.push_str("],\"audit_offenders\":[");
         let mut afirst2 = true;
-        for (phys, predicted, observed, hits, provenance) in &ks.audit_offenders {
+        for o in &ks.audit_offenders {
             if !afirst2 {
                 out.push(',');
             }
             afirst2 = false;
             out.push_str(&format!(
-                "{{\"phys\":{phys},\"predicted\":{predicted},\"observed\":{observed},\"hits\":{hits},\"provenance\":{provenance}}}"
+                "{{\"phys\":{},\"predicted\":{},\"observed\":{},\"hits\":{},\"provenance\":{},\"claim_mask\":{},\"journal_mask\":{},\"journal_value\":{},\"journal_linear\":{},\"entry_sp_linear\":{}}}",
+                o.phys,
+                o.predicted,
+                o.observed,
+                o.hits,
+                o.provenance,
+                o.claim_mask,
+                o.journal_mask,
+                o.journal_value,
+                o.journal_linear,
+                o.entry_sp_linear,
             ));
         }
         out.push_str("]}");
