@@ -2162,15 +2162,45 @@ fn write_hdd_profile_json(
         .sum::<u64>();
     let total_wall_ns = wall.as_nanos().min(u128::from(u64::MAX)) as u64;
     let margo_display = machine.margo_display();
+    let port_accesses_by_class_json = serde_json::Value::Object(
+        izarravm_machine::PORT_BUS_CLASS_LABELS
+            .iter()
+            .zip(machine.port_accesses_by_class())
+            .map(|(label, count)| ((*label).to_string(), json!(count)))
+            .collect(),
+    );
+    let retrace_poll_exits = machine.retrace_poll_exits();
+    let retrace_poll_reads = machine.retrace_poll_reads();
     #[allow(unused_mut)]
     let mut report = json!({
         "schema": "izarravm-hdd-profile-v2",
         "workload": workload.display().to_string(),
         "mode": mode.canonical_name(),
-        // Guest-clock model version (see `izarravm_cpu::TIMING_MODEL_EPOCH`). Bumped whenever
+        // The EFFECTIVE guest-clock model epoch this run used (`Machine::timing_epoch`, set
+        // once at construction from `IZARRAVM_TIMING_EPOCH`) -- not the static
+        // `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal (#843) sees
+        // `2` whenever the knob armed the port-io repricing, not the base `1`. Bumped whenever
         // a change alters guest clocks charged per instruction for any persona; rt numbers
         // recorded under different epochs are not comparable as performance.
-        "timing_model_epoch": izarravm_cpu::TIMING_MODEL_EPOCH,
+        "timing_model_epoch": machine.timing_epoch(),
+        // Port accesses this run, by bus class (`izarravm_machine::PortBusClass`). Counted in
+        // BOTH epochs, so a P1 ladder leg can separate "this row makes fewer port accesses" from
+        // "the same accesses cost more" -- the accounting-closure check the design's section 6
+        // requires on every moved row. Diagnostic only; no emulation decision reads it.
+        "port_accesses_by_class": port_accesses_by_class_json,
+        // F14's `VL_WaitVBL` exit-rate instrument: vertical-retrace bit edges the guest observed
+        // through its OWN 0x3DA/0x3BA reads, i.e. the number of times a retrace poll loop
+        // EXITED. At mode 13h's 70.086 Hz both rows must read ~70.086 per guest second BY
+        // CONSTRUCTION, whatever the polls-per-frame figure is -- which is why this, and not the
+        // poll count, is the port repricing's self-certifying anchor. Diagnostic only.
+        "retrace_poll_exits": {
+            "reads": retrace_poll_reads,
+            "reads_per_rising_exit": retrace_poll_reads as f64 / (retrace_poll_exits.0.max(1)) as f64,
+            "rising": retrace_poll_exits.0,
+            "falling": retrace_poll_exits.1,
+            "rising_per_guest_second": retrace_poll_exits.0 as f64 / guest_seconds.max(f64::MIN_POSITIVE),
+            "falling_per_guest_second": retrace_poll_exits.1 as f64 / guest_seconds.max(f64::MIN_POSITIVE),
+        },
         "cycle_budget": budget,
         "stop": stop_reason_json(stop_reason),
         "wall_seconds": wall_seconds,

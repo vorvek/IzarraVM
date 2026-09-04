@@ -1284,8 +1284,10 @@ impl CpuGsw {
     /// for the DX forms (0xec-0xef) the port comes from the DX register (GPR index 2) at execute
     /// time. The low bit of the opcode selects the I/O direction within each pair (0 = IN, 1 = OUT
     /// only for 0xe4/0xe5 vs 0xe6/0xe7, respectively; 0 = IN, 1 = unused for the 0xec range where
-    /// bit 1 distinguishes direction: see comments per arm). Clocks match the fused arms verbatim
-    /// (12 for IN, 10 for OUT).
+    /// bit 1 distinguishes direction: see comments per arm). Every arm charges through
+    /// `port_io_core_clocks`, which is epoch 1's flat 12-for-IN / 10-for-OUT byte-identically and
+    /// epoch 2's four-column Intel table otherwise -- including the two `0xE5`/`0xED` arms, whose
+    /// bare literal `12` this replaced.
     /// In V86 (or protected mode with CPL > IOPL), `IN`/`OUT` consult the TSS
     /// I/O-permission bitmap: the access is allowed only if every bit for ports
     /// `port..port+width` is 0. A bit at or beyond the TSS limit is treated as set
@@ -1346,7 +1348,7 @@ impl CpuGsw {
                     self.is_ring0_protected(),
                 )? as u8;
                 self.write_gpr8(0, value);
-                Ok(clocks(IN_PORT_CORE_CLOCKS))
+                Ok(clocks(self.port_io_core_clocks(bus, false)))
             }
             0xe5 => {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
@@ -1359,7 +1361,7 @@ impl CpuGsw {
                     self.is_ring0_protected(),
                 )?;
                 self.write_gpr_sized(0, operand_size, value);
-                Ok(clocks(12))
+                Ok(clocks(self.port_io_core_clocks(bus, false)))
             }
             0xe6 => {
                 // OUT imm8, AL: byte port output from AL.
@@ -1372,7 +1374,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(OUT_PORT_CORE_CLOCKS))
+                Ok(clocks(self.port_io_core_clocks(bus, true)))
             }
             0xe7 => {
                 // OUT imm8, AX/EAX: word/dword port output from the accumulator.
@@ -1385,7 +1387,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(OUT_PORT_CORE_CLOCKS))
+                Ok(clocks(self.port_io_core_clocks(bus, true)))
             }
             0xec => {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
@@ -1398,7 +1400,7 @@ impl CpuGsw {
                     self.is_ring0_protected(),
                 )? as u8;
                 self.write_gpr8(0, value);
-                Ok(clocks(IN_PORT_CORE_CLOCKS))
+                Ok(clocks(self.port_io_core_clocks(bus, false)))
             }
             0xed => {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
@@ -1411,7 +1413,7 @@ impl CpuGsw {
                     self.is_ring0_protected(),
                 )?;
                 self.write_gpr_sized(0, operand_size, value);
-                Ok(clocks(12))
+                Ok(clocks(self.port_io_core_clocks(bus, false)))
             }
             0xee => {
                 // OUT DX, AL: byte port output addressed by DX.
@@ -1424,7 +1426,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(OUT_PORT_CORE_CLOCKS))
+                Ok(clocks(self.port_io_core_clocks(bus, true)))
             }
             0xef => {
                 // OUT DX, AX/EAX: word/dword port output addressed by DX.
@@ -1437,7 +1439,7 @@ impl CpuGsw {
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
-                Ok(clocks(OUT_PORT_CORE_CLOCKS))
+                Ok(clocks(self.port_io_core_clocks(bus, true)))
             }
             opcode => unreachable!("port-I/O opcode {opcode:#x}"),
         }

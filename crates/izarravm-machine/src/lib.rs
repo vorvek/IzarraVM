@@ -1489,6 +1489,19 @@ impl ReportedFault {
 
 #[derive(Debug)]
 pub struct Machine {
+    /// `IZARRAVM_TIMING_EPOCH`, read ONCE at construction (`bus::timing_epoch_from_env`) into
+    /// this plain field -- never re-read mid-run, because the JIT caches per-block raw clocks
+    /// that would otherwise go stale under a live epoch flip. `1` (unset, or `""`) is today's
+    /// guest-clock model, byte-identical; `2` is the port-io repricing
+    /// (`dev_docs/2026-09-05-port-io-repricing-design.md`). Reported in the profile JSON as the
+    /// EFFECTIVE epoch via `Machine::timing_epoch`.
+    timing_epoch: u32,
+    /// F14's `VL_WaitVBL` exit-rate instrument (see `RetracePollCensus`).
+    retrace_poll: RetracePollCensus,
+    /// P2's certificate ledger (see `PollSkipCertificateCounters`). Replaced P1's single
+    /// `poll_skip_epoch_refusals`, which P2's admission lane makes structurally unreachable --
+    /// a counter that can never move is a gate that cannot fail.
+    poll_skip_certificate: PollSkipCertificateCounters,
     profile: MachineProfile,
     active_mode: GswMode,
     pending_mode: Option<GswMode>,
@@ -1585,7 +1598,13 @@ pub struct Machine {
     // poll cannot outrun the 80 us OPL timer. See the batch-end use in
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
-    isa_io_batch_clocks: u64,
+    port_bus_batch_clocks: u64,
+    // DIAGNOSTIC ONLY, never read by an emulation decision: how many port accesses this run has
+    // made in each `PortBusClass`, indexed by `PortBusClass::index()`. Counted in BOTH epochs and
+    // whatever the class charge is, which is the point -- the P1 ladder compares the SAME
+    // population across the epoch, and a counter that only existed under epoch 2 could not say
+    // whether a row's accesses moved or only their price did. Never canonical.
+    port_accesses_by_class: [u64; crate::bus::PORT_BUS_CLASS_COUNT],
     // Master-timeline instant until which a PIT counter observer is assumed live,
     // set by any access to the counter data ports or the control port and read by
     // `fine_batch_grain_required`. Counter VALUES no longer depend on it:
@@ -1608,7 +1627,7 @@ pub struct Machine {
     device_edge_scans: u64,
     // Diagnostic-only OPL counters plus an optional access trace; see `OplProbe`.
     // Never read by an emulation decision and never part of canonical state, so
-    // unlike `isa_io_batch_clocks` above it does not gate a canonical capture.
+    // unlike `port_bus_batch_clocks` above it does not gate a canonical capture.
     opl_probe: OplProbe,
     // S1 shadow-tag probe (`dev_docs/2026-09-01-bus-clock-diag.md`): diagnostic
     // ONLY, exactly like `opl_probe` above -- never read by an emulation
@@ -2036,6 +2055,57 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
+/// F14's `VL_WaitVBL` exit-rate instrument: the vertical-retrace bit edges a guest has observed
+/// through its OWN reads of the status-1 register (0x3DA / 0x3BA), since machine construction.
+/// See `MachineBus::note_status1_retrace_edge` for what an edge means and why this is the port
+/// repricing's only self-certifying anchor.
+///
+/// Plain fields behind a `&mut` borrow rather than `Cell`s: the counting site is `&mut self`
+/// (it has just predicted the beam), unlike the certificate ledger's `&self` path.
+#[derive(Debug, Default)]
+pub(crate) struct RetracePollCensus {
+    /// The retrace bit as the guest last read it, or `None` before its first read. The
+    /// comparand -- edges are measured between consecutive GUEST reads, so an elided poll span
+    /// contributes none and the exit read that follows still carries its edge.
+    pub(crate) last_observed: Option<bool>,
+    /// Status-1 reads the instrument saw at all -- the DENOMINATOR. Without it, "polls per
+    /// exit" has to be inferred from the `PciLegacyVga` class total, which also carries every
+    /// other VGA-file access; with it, the ratio is exact and an instrument that is silently
+    /// missing reads can be told apart from a guest that genuinely polls in bursts.
+    pub(crate) reads: u64,
+    /// Reads that saw the retrace bit go 0 -> 1: a `wait until the retrace STARTS` loop's exit.
+    pub(crate) rising_edges: u64,
+    /// Reads that saw it go 1 -> 0: a `wait until the retrace ENDS` loop's exit.
+    pub(crate) falling_edges: u64,
+}
+
+/// Why the io poll skip's own bus certificate was granted or declined, since machine
+/// construction. Slice P2 of the port-io repricing.
+///
+/// `Cell`s because `poll_bus_certificate_from` is `&self` (it is shared with the interpreter's
+/// read-only poll probe) and every lane here is diagnostic: none charges a guest clock and none
+/// gates a decision. They exist because P2 turns two refusals into an admission, and the only
+/// honest way to report that is a counter that says how often the admission fired.
+#[derive(Debug, Default)]
+pub(crate) struct PollSkipCertificateCounters {
+    /// Certificates GRANTED with the epoch at 2 or higher -- i.e. spans the skip elided while
+    /// projecting the repriced per-iteration charge. Zero under epoch 1 by construction.
+    pub(crate) admitted_epoch2: std::cell::Cell<u64>,
+    /// Refused because the polled port is not `POLL_SKIP_IO_PORT` (F9's explicit admission).
+    /// Unreachable today -- both entry points establish the port first -- and that is the
+    /// point: it is the lane a future second-port shape would light up.
+    pub(crate) refused_unpriced_port: std::cell::Cell<u64>,
+    /// Refused because tracing is armed or the lazy port path is off, which is the screen that
+    /// predates the repricing entirely.
+    pub(crate) refused_inactive: std::cell::Cell<u64>,
+}
+
+/// The JSON/report key for each row of `Machine::port_accesses_by_class`, in that array's order.
+/// Re-exported from the private `bus` module so the reporting crate does not carry its own copy of
+/// the class names, and so a new class cannot be added without this list failing to compile.
+pub const PORT_BUS_CLASS_LABELS: [&str; crate::bus::PORT_BUS_CLASS_COUNT] =
+    crate::bus::PortBusClass::LABELS;
+
 impl Machine {
     /// Shared field initialization for the public constructors. They differ only
     /// in the CPU entry state and the ROM image, so each hands those in and
@@ -2068,6 +2138,9 @@ impl Machine {
         let execution_backend = process_execution_backend();
         patch_rom(&mut rom);
         let mut machine = Self {
+            timing_epoch: bus::timing_epoch_from_env(),
+            retrace_poll: RetracePollCensus::default(),
+            poll_skip_certificate: PollSkipCertificateCounters::default(),
             memory,
             ram_lookup,
             profile,
@@ -2100,7 +2173,8 @@ impl Machine {
             ata_poll_skip_slice_too_short: false,
             ata_poll_skip: AtaPollSkipDiagnostics::new(run::ata_poll_skip_diag_default()),
             ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
-            isa_io_batch_clocks: 0,
+            port_bus_batch_clocks: 0,
+            port_accesses_by_class: [0; crate::bus::PORT_BUS_CLASS_COUNT],
             pit_observer_fine_until: 0,
             device_edge_cache: timing::DeviceEdgeCache::Stale,
             device_edge_batches: 0,
@@ -3305,6 +3379,56 @@ impl Machine {
         self.active_mode
     }
 
+    /// The EFFECTIVE guest-clock model epoch this machine was constructed under
+    /// (`IZARRAVM_TIMING_EPOCH`, read once at construction): `1` unless the knob named `2`. The
+    /// profile JSON's `timing_model_epoch` field reports this, not the static
+    /// `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal sees the epoch
+    /// that actually ran.
+    pub fn timing_epoch(&self) -> u32 {
+        self.timing_epoch
+    }
+
+    /// Port accesses this run, by bus class, in `PortBusClass::index()` order --
+    /// `[IsaXBus, PciLegacyVga, PciTarget, ChipsetInternal, Unclaimed]`. Counted in both epochs
+    /// (see the field), so the P1 ladder can separate "the row makes fewer accesses" from "the
+    /// same accesses cost more". Diagnostic only; the profile JSON reports it as
+    /// `port_accesses_by_class`.
+    pub fn port_accesses_by_class(&self) -> [u64; crate::bus::PORT_BUS_CLASS_COUNT] {
+        self.port_accesses_by_class
+    }
+
+    /// F14: `(rising, falling)` vertical-retrace edges the guest has observed through its own
+    /// 0x3DA/0x3BA reads since construction -- the number of times a `VL_WaitVBL`-shaped poll
+    /// loop EXITED. At mode 13h's 70.086 Hz both must read ~70.086 per guest second by
+    /// construction, whatever the polls-per-frame figure is; that is what makes this the port
+    /// repricing's one self-certifying anchor (review F14). Diagnostic only.
+    pub fn retrace_poll_exits(&self) -> (u64, u64) {
+        (
+            self.retrace_poll.rising_edges,
+            self.retrace_poll.falling_edges,
+        )
+    }
+
+    /// F14's denominator: status-1 reads the exit instrument observed. `reads / rising` is
+    /// polls per exit for the retrace-wait loop specifically, without needing the per-site
+    /// call-out attribution feature.
+    pub fn retrace_poll_reads(&self) -> u64 {
+        self.retrace_poll.reads
+    }
+
+    /// P2's poll-skip certificate ledger, since construction: `(admitted_epoch2,
+    /// refused_unpriced_port, refused_inactive)`. Diagnostic only -- no emulation decision
+    /// reads it. `admitted_epoch2` is the counter that says the skip is ALIVE under epoch 2,
+    /// which is the whole point of the slice; the two refusal lanes name why a certificate was
+    /// declined, replacing P1's single structural-epoch refusal.
+    pub fn poll_skip_certificate_counters(&self) -> (u64, u64, u64) {
+        (
+            self.poll_skip_certificate.admitted_epoch2.get(),
+            self.poll_skip_certificate.refused_unpriced_port.get(),
+            self.poll_skip_certificate.refused_inactive.get(),
+        )
+    }
+
     pub fn cache_tier_lookups(&self) -> u64 {
         self.cache_model.lookups()
     }
@@ -3789,6 +3913,23 @@ struct MachineBus<'a> {
     /// deliberate: see `MachineBus::charge_isa_io_wait` for why the Accurate 386
     /// class stays out of it.
     isa_io_wait: bool,
+    /// `Machine::timing_epoch`, copied at bus construction (a plain `u32`, not a reference:
+    /// the epoch never changes mid-run). `1` (unset knob) keeps every port charge
+    /// byte-identical to before this slice; `2` arms the per-class port-bus charge in
+    /// `charge_port_bus` (`dev_docs/2026-09-05-port-io-repricing-design.md`).
+    timing_epoch: u32,
+    /// Points at `Machine::retrace_poll` (F14's instrument).
+    retrace_poll: &'a mut RetracePollCensus,
+    /// P3. Non-zero only for the duration of ONE `INS`/`OUTS` element's port access, carrying
+    /// that element's width in bytes; `charge_port_bus` reads it to price an IDE data-register
+    /// burst at the ATA cycle time instead of the register class's single-access latency. A
+    /// batch-scoped plain field rather than a borrow: it is set and cleared inside a single
+    /// `read_io_string_element` call and never outlives one, so nothing needs to see it across a
+    /// batch boundary.
+    string_port_element_bytes: u8,
+    /// Points at `Machine::poll_skip_certificate`. `&`, not `&mut`: the certificate path this
+    /// counts is `&self` (see the struct's own doc).
+    poll_skip_certificate: &'a PollSkipCertificateCounters,
     /// The Accurate-class (386) extension of the lazy time-derived port reads:
     /// 3DA/3BA/3C2 (VGA status), 0x61 (PIT channel 1/2 OUT), and 0x200-0x207
     /// (the gameport RC one-shots) answer WITHOUT ending the CPU batch.
@@ -3853,8 +3994,10 @@ struct MachineBus<'a> {
     ata_poll_skip: &'a mut AtaPollSkipDiagnostics,
     // Accrues fixed ISA-bus time (CPU clocks) for the OPL status poll in the
     // Approximate class; the run loop folds it into the batch's device advance.
-    // Points at `Machine::isa_io_batch_clocks`.
+    // Points at `Machine::port_bus_batch_clocks`.
     isa_io_clocks: &'a mut u64,
+    // Points at `Machine::port_accesses_by_class`. Diagnostic only; see that field.
+    port_accesses_by_class: &'a mut [u64; crate::bus::PORT_BUS_CLASS_COUNT],
     // Points at `Machine::pit_observer_fine_until`. Armed by any PIT counter or
     // control port access; see that field.
     pit_observer_fine_until: &'a mut u64,

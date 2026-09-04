@@ -804,9 +804,9 @@ impl Machine {
         if self.direct_data_map_changed {
             return Err(MachineCanonicalCaptureError::PendingDirectDataMapChange);
         }
-        if self.isa_io_batch_clocks != 0 {
+        if self.port_bus_batch_clocks != 0 {
             return Err(MachineCanonicalCaptureError::UncommittedBatchTiming {
-                clocks: self.isa_io_batch_clocks,
+                clocks: self.port_bus_batch_clocks,
             });
         }
         let console_total = self.program_output.len();

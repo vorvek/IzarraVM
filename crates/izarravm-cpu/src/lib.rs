@@ -5503,6 +5503,219 @@ pub(crate) const IN_PORT_CORE_CLOCKS: u32 = 12;
 /// each was already a literal 10.
 pub(crate) const OUT_PORT_CORE_CLOCKS: u32 = 10;
 
+/// Which of Intel's four I/O privilege columns an `IN`/`OUT` executes in
+/// (`dev_docs/2026-09-05-port-io-repricing-design.md` §1.2, Appendix F re-anchored against V3
+/// `:32962-32979` / `:35991-35995`). The discriminants are the index into the two epoch-2 tables
+/// below and nothing else reads them, so the order here IS the table order.
+///
+/// The split the two ends of the predicate make is exactly `check_io_permission`'s own: its early
+/// return is `!is_v86_mode() && cpl <= iopl`, which is `Real | ProtectedPrivileged` here, and the
+/// two columns that pay for a bitmap consult are the two it walks. That is not a coincidence to
+/// be maintained by hand -- Intel's `CPL>IOPL` and `vm` counts already INCLUDE the two-byte
+/// bitmap lookup (V3 `:17817-17819`), which is why the design forbids charging those reads
+/// separately once the recalibration zeroes L1-hit data accesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortIoPrivMode {
+    /// CR0.PE clear.
+    Real = 0,
+    /// Protected, not V86, `CPL <= IOPL` -- Intel's `pm=` column.
+    ProtectedPrivileged = 1,
+    /// Protected, not V86, `CPL > IOPL` -- Intel's `**` column, bitmap consult included.
+    ProtectedUnprivileged = 2,
+    /// EFLAGS.VM -- Intel's `vm=` column, bitmap consult included.
+    V86 = 3,
+}
+
+/// Raw core clocks per guest clock at the 486/586 personas: `level_timing` is `(1, 12)` for both,
+/// so a table written in Intel's own guest-clock counts has to be multiplied by this to land in
+/// the raw twelfths every `clocks(..)` charge is denominated in. Named rather than inlined so the
+/// two tables below read as Intel's numbers.
+const PORT_CORE_CLOCK_TWELFTHS: u32 = 12;
+
+/// Epoch-2 `IN` core clocks, indexed by `PortIoPrivMode`: Intel's 7 / 4 / 21 / 19, in raw
+/// twelfths. Any operand width; Intel gives no width row for the port forms.
+pub(crate) const IN_PORT_CORE_CLOCKS_EPOCH2: [u32; 4] = [
+    7 * PORT_CORE_CLOCK_TWELFTHS,
+    4 * PORT_CORE_CLOCK_TWELFTHS,
+    21 * PORT_CORE_CLOCK_TWELFTHS,
+    19 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `OUT` core clocks, indexed by `PortIoPrivMode`: Intel's 12 / 9 / 26 / 24, in raw
+/// twelfths. `OUT >= IN` in every column, which the unposted-write constraint requires
+/// (`241428-004:3332`) and which epoch 1's 10-against-12 inverted.
+pub(crate) const OUT_PORT_CORE_CLOCKS_EPOCH2: [u32; 4] = [
+    12 * PORT_CORE_CLOCK_TWELFTHS,
+    9 * PORT_CORE_CLOCK_TWELFTHS,
+    26 * PORT_CORE_CLOCK_TWELFTHS,
+    24 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `INS` core clocks for the NON-`REP` singleton, indexed by `PortIoPrivMode`: Intel's
+/// 9 / 6 / 24 / 22, in raw twelfths. Appendix F is column-drifted for the string-I/O rows and
+/// every one was re-anchored against the independent Chapter 25 pages (`INS` V3:33066-33070,
+/// `OUTS` :36058-36063, `REP` :36956-36988) --
+/// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 2.1.
+pub(crate) const INS_CORE_CLOCKS_EPOCH2: [u32; 4] = [
+    9 * PORT_CORE_CLOCK_TWELFTHS,
+    6 * PORT_CORE_CLOCK_TWELFTHS,
+    24 * PORT_CORE_CLOCK_TWELFTHS,
+    22 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `OUTS` singleton core clocks: Intel's 13 / 10 / 27 / 25, raw twelfths.
+pub(crate) const OUTS_CORE_CLOCKS_EPOCH2: [u32; 4] = [
+    13 * PORT_CORE_CLOCK_TWELFTHS,
+    10 * PORT_CORE_CLOCK_TWELFTHS,
+    27 * PORT_CORE_CLOCK_TWELFTHS,
+    25 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `REP INS` SETUP core clocks, charged ONCE for the whole repeat: Intel's `11 + 3c` /
+/// `8 + 3c` / `25 + 3c` / `23 + 3c`, raw twelfths, `c` being the element count.
+///
+/// **The setup is what the design's blocker (b) turns on.** Intel's 22/25 are the singleton
+/// forms; charging them per element -- which is what a naive reading of "`INS` costs 22" gives
+/// -- would price a `REP INSW` at seven times its real cost. The per-element figure is 3 (`INS`)
+/// and 4 (`OUTS`), below.
+pub(crate) const REP_INS_SETUP_CLOCKS_EPOCH2: [u32; 4] = [
+    11 * PORT_CORE_CLOCK_TWELFTHS,
+    8 * PORT_CORE_CLOCK_TWELFTHS,
+    25 * PORT_CORE_CLOCK_TWELFTHS,
+    23 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 `REP OUTS` setup core clocks: Intel's 13 / 10 / 27 / 25, raw twelfths.
+pub(crate) const REP_OUTS_SETUP_CLOCKS_EPOCH2: [u32; 4] = [
+    13 * PORT_CORE_CLOCK_TWELFTHS,
+    10 * PORT_CORE_CLOCK_TWELFTHS,
+    27 * PORT_CORE_CLOCK_TWELFTHS,
+    25 * PORT_CORE_CLOCK_TWELFTHS,
+];
+
+/// Epoch-2 per-ELEMENT core clocks for `REP INS` (3) and `REP OUTS` (4), raw twelfths. Mode
+/// independent: Intel's `c` coefficient is the same in all four privilege columns, because the
+/// bitmap consult that separates those columns happens once at setup, not per element.
+pub(crate) const REP_INS_ELEMENT_CLOCKS_EPOCH2: u32 = 3 * PORT_CORE_CLOCK_TWELFTHS;
+pub(crate) const REP_OUTS_ELEMENT_CLOCKS_EPOCH2: u32 = 4 * PORT_CORE_CLOCK_TWELFTHS;
+
+/// The whole-instruction core charge for `INS`/`OUTS`: the singleton's own cost, or a `REP`
+/// form's SETUP. Epoch 1 returns the flat pre-repricing 15 / 14 byte-identically, whatever the
+/// mode and whatever the `REP` prefix, which is exactly what the four `execute_extended` arms
+/// charged before this slice.
+pub(crate) const fn string_port_setup_core_clocks(
+    epoch: u32,
+    is_out: bool,
+    is_rep: bool,
+    mode: PortIoPrivMode,
+) -> u32 {
+    if epoch < 2 {
+        return if is_out {
+            OUTS_CORE_CLOCKS_EPOCH1
+        } else {
+            INS_CORE_CLOCKS_EPOCH1
+        };
+    }
+    let index = mode as usize;
+    match (is_out, is_rep) {
+        (false, false) => INS_CORE_CLOCKS_EPOCH2[index],
+        (true, false) => OUTS_CORE_CLOCKS_EPOCH2[index],
+        (false, true) => REP_INS_SETUP_CLOCKS_EPOCH2[index],
+        (true, true) => REP_OUTS_SETUP_CLOCKS_EPOCH2[index],
+    }
+}
+
+/// The per-ELEMENT core charge for a `REP INS`/`REP OUTS`. **Zero under epoch 1**, where the
+/// whole instruction's cost is the flat 15 / 14 charged once regardless of the element count --
+/// the pre-slice model, kept byte-identical.
+pub(crate) const fn string_port_element_core_clocks(epoch: u32, is_out: bool) -> u32 {
+    if epoch < 2 {
+        return 0;
+    }
+    if is_out {
+        REP_OUTS_ELEMENT_CLOCKS_EPOCH2
+    } else {
+        REP_INS_ELEMENT_CLOCKS_EPOCH2
+    }
+}
+
+/// The flat pre-repricing `INS` / `OUTS` whole-instruction charges (`execute_extended.rs`'s
+/// 0x6C-0x6F arms). Named so epoch 1's identity is a constant a reader can find rather than two
+/// literals in a `match`.
+pub(crate) const INS_CORE_CLOCKS_EPOCH1: u32 = 15;
+pub(crate) const OUTS_CORE_CLOCKS_EPOCH1: u32 = 14;
+
+/// The one function every `IN`/`OUT` charge in the tree goes through, both epochs and all four
+/// privilege columns. Epoch 1 returns the flat pre-repricing constants BYTE-IDENTICALLY, so the
+/// knob-unset build cannot move; epoch 2 indexes the tables above.
+///
+/// FOUR paths must agree on this (up from the three `IN_PORT_CORE_CLOCKS` named): the
+/// interpreter's `execute_port_io_decoded` arms and the JIT's `PortReadAlDx`, `PortReadAlImm8`,
+/// `PortWriteAlImm8` and `PortWriteAlDx` call-out slots. They agree by calling this, not by
+/// carrying a matching literal.
+pub(crate) const fn port_core_clocks(epoch: u32, is_out: bool, mode: PortIoPrivMode) -> u32 {
+    if epoch < 2 {
+        return if is_out {
+            OUT_PORT_CORE_CLOCKS
+        } else {
+            IN_PORT_CORE_CLOCKS
+        };
+    }
+    let index = mode as usize;
+    if is_out {
+        OUT_PORT_CORE_CLOCKS_EPOCH2[index]
+    } else {
+        IN_PORT_CORE_CLOCKS_EPOCH2[index]
+    }
+}
+
+/// The CROSS-MODE, CROSS-EPOCH maximum of `port_core_clocks` -- what every bound that used to be
+/// sized to the flat `IN_PORT_CORE_CLOCKS` (12) must take instead, per review finding F5
+/// (`dev_docs/2026-09-05-port-io-repricing-review.md`). Three of them: `LANE_SAFETY_CEILING`'s
+/// margin (`izarravm-machine`'s `bus.rs`), `IZARRAVM_DIRECT_POLL_MAX_RAW`'s default
+/// (`jit/direct.rs`) and `callout_core_upper`'s port-slot price (`run.rs`). Under epoch 2 that
+/// is `OUT`, `CPL>IOPL`: 26 x 12 = 312, twenty-six times the bound those three were written to.
+///
+/// DERIVED, not written down, for `MAX_CALL_OUT_CORE_CLOCKS`'s reason: a column whose count one
+/// day exceeds this must raise it without anyone remembering to. `pub` (not `pub(crate)`) because
+/// `izarravm-machine` sizes its own lane ceiling on it and a duplicated 312 there would be the
+/// exact drift this constant exists to prevent.
+/// The port-slot term `callout_core_upper` prices a compiled block's `CallOutHelper::Port*` slots
+/// at, for the epoch the bus reports. Epoch 1 is the pre-slice `IN.max(OUT)` EXACTLY, so a
+/// knob-unset build's block admission cannot move; epoch 2 takes the cross-mode maximum, which is
+/// the only bound a compile-time term can carry once the charge depends on the live CPL/IOPL pair
+/// (`CpuGsw::port_io_priv_mode` explains why `jit_mode_key` cannot resolve it).
+pub(crate) const fn port_slot_core_upper(epoch: u32) -> u32 {
+    if epoch < 2 {
+        if IN_PORT_CORE_CLOCKS > OUT_PORT_CORE_CLOCKS {
+            IN_PORT_CORE_CLOCKS
+        } else {
+            OUT_PORT_CORE_CLOCKS
+        }
+    } else {
+        MAX_PORT_CORE_CLOCKS
+    }
+}
+
+pub const MAX_PORT_CORE_CLOCKS: u32 = {
+    let mut max = if IN_PORT_CORE_CLOCKS > OUT_PORT_CORE_CLOCKS {
+        IN_PORT_CORE_CLOCKS
+    } else {
+        OUT_PORT_CORE_CLOCKS
+    };
+    let mut i = 0;
+    while i < 4 {
+        if IN_PORT_CORE_CLOCKS_EPOCH2[i] > max {
+            max = IN_PORT_CORE_CLOCKS_EPOCH2[i];
+        }
+        if OUT_PORT_CORE_CLOCKS_EPOCH2[i] > max {
+            max = OUT_PORT_CORE_CLOCKS_EPOCH2[i];
+        }
+        i += 1;
+    }
+    max
+};
+
 /// What `PUSHA`/`PUSHAD` (0x60) charges, named for the same reason `IN_PORT_CORE_CLOCKS` is: the
 /// interpreter's `execute_decoded` arm and the JIT's `PushAllDword` call-out slot must charge the
 /// same number, and both read this constant rather than a literal of their own.
@@ -5921,15 +6134,12 @@ pub(crate) const INTERPRET_ONE_MAX_DATA_ACCESSES: u64 = 4;
 /// helper with a bigger charge raises it by construction instead of silently under-budgeting the
 /// block that carries it.
 pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
-    // `OUT_PORT_CORE_CLOCKS` (10) cannot be the maximum today -- it is under all three of the
-    // others -- and it is folded in anyway, because the property this constant claims is
-    // "derived, not written down": a port class whose write charge one day exceeds its read charge
-    // must raise this bound without anyone remembering to.
-    let port = if IN_PORT_CORE_CLOCKS > OUT_PORT_CORE_CLOCKS {
-        IN_PORT_CORE_CLOCKS
-    } else {
-        OUT_PORT_CORE_CLOCKS
-    };
+    // `MAX_PORT_CORE_CLOCKS` -- the cross-mode, cross-epoch maximum, not epoch 1's flat 12. Under
+    // epoch 2 a port slot's runtime charge depends on the live privilege column, which this
+    // COMPILE-TIME ceiling cannot see, so it must dominate the widest column (`OUT`, `CPL>IOPL`,
+    // 312 raw). That makes the port class the maximum here for the first time, by a wide margin;
+    // the property this constant claims is unchanged ("derived, not written down").
+    let port = MAX_PORT_CORE_CLOCKS;
     let a = if port > PUSH_ALL_CORE_CLOCKS {
         port
     } else {

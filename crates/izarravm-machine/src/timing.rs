@@ -1627,7 +1627,15 @@ impl MachineBus<'_> {
     /// Returns the predicted byte and the microseconds it was predicted at, so
     /// the OPL trace can record what the read actually saw.
     pub(super) fn predicted_opl_status(&self) -> (u8, u64) {
-        let clocks = self.in_batch_clocks().saturating_add(*self.isa_io_clocks);
+        // F1 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2
+        // `in_batch_clocks` already folds `isa_io_clocks` in (every port access accrues it,
+        // not just OPL polls), so adding it again here would double-count. Epoch 1 keeps the
+        // pre-slice hand-add, byte-identical.
+        let clocks = if self.timing_epoch >= 2 {
+            self.in_batch_clocks()
+        } else {
+            self.in_batch_clocks().saturating_add(*self.isa_io_clocks)
+        };
         let micros = self.timeline_at_batch_start.preview_microseconds(clocks);
         (self.opl.status_after(micros), micros)
     }
@@ -1636,18 +1644,38 @@ impl MachineBus<'_> {
     /// the same quantity `predicted_opl_status` predicts with, exposed for
     /// the SB DSP's reset-settle service (`SbDsp::service_reset_at`).
     pub(super) fn pending_device_micros(&self) -> u64 {
-        let clocks = self.in_batch_clocks().saturating_add(*self.isa_io_clocks);
+        // F1: see `predicted_opl_status`'s matching comment.
+        let clocks = if self.timing_epoch >= 2 {
+            self.in_batch_clocks()
+        } else {
+            self.in_batch_clocks().saturating_add(*self.isa_io_clocks)
+        };
         self.timeline_at_batch_start.preview_microseconds(clocks)
     }
 
     /// Batch-scoped CPU clocks elapsed so far. Beam and PIT predictions share
     /// this conversion so they use the same core total, bus scaling, and carry.
+    ///
+    /// F1 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2 this folds in
+    /// `isa_io_clocks` (by then a general per-port-access accrual, `port_bus_batch_clocks`),
+    /// so `predicted_beam`, `guest_tick_now`, `elapsed_pit_clocks` and
+    /// `poll_project_dot_advance` all see the charge that a batch-end `step` would apply --
+    /// without it, a guest polling a repriced port inside one batch sees the *un-repriced*
+    /// rate, which defeats the whole point of the reprice within the batch it runs in. Epoch 1
+    /// excludes it, byte-identical to before this slice: that accrual was OPL/DSP-poll-only
+    /// there, and the two sites that needed it (`predicted_opl_status`, `pending_device_micros`)
+    /// already hand-add it for epoch 1.
     fn in_batch_clocks(&self) -> u64 {
         let in_batch_bus_clocks = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         let scaled = in_batch_bus_clocks * u64::from(self.bus_num_at_batch_start)
             + self.bus_rem_at_batch_start;
         let scaled_bus_clocks = scaled / u64::from(self.bus_den_at_batch_start);
-        self.prior_runs_core_clocks + self.core_clocks_so_far + scaled_bus_clocks
+        let total = self.prior_runs_core_clocks + self.core_clocks_so_far + scaled_bus_clocks;
+        if self.timing_epoch >= 2 {
+            total.saturating_add(*self.isa_io_clocks)
+        } else {
+            total
+        }
     }
 
     /// Elapsed PIT input clocks at the current point in the batch without

@@ -531,6 +531,11 @@ pub(super) fn try_poll_skip(
         diagnostics.vga_bus_certificate_rejection();
         return None;
     };
+    // P2: the per-iteration RAW core charge, with the shape's baked epoch-1 `IN` term replaced
+    // by the live privilege column under epoch 2 (F8). Read ONCE, before the binary search, so
+    // every projection in this call and the commit that follows price the same iteration --
+    // nothing between here and the commit can change the mode.
+    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll, bus);
     let beam = bus.predicted_beam();
     let status = bus.vega.status1_bits(beam);
     if !poll.fresh_iteration_spins(status) {
@@ -563,7 +568,7 @@ pub(super) fn try_poll_skip(
         let Some(reserved) = iterations.checked_add(1) else {
             return false;
         };
-        let Some(reserved_core) = cpu.project_poll_skip_core(poll, reserved) else {
+        let Some(reserved_core) = cpu.project_poll_skip_core(raw_per_iteration, reserved) else {
             return false;
         };
         let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
@@ -579,7 +584,7 @@ pub(super) fn try_poll_skip(
             return false;
         }
 
-        let Some(skipped_core) = cpu.project_poll_skip_core(poll, iterations) else {
+        let Some(skipped_core) = cpu.project_poll_skip_core(raw_per_iteration, iterations) else {
             return false;
         };
         let Some(skipped_bus) = bus.poll_project_scaled_bus_clocks(certificate, iterations) else {
@@ -612,12 +617,12 @@ pub(super) fn try_poll_skip(
         return None;
     }
 
-    let charged = cpu.project_poll_skip_core(poll, best)?;
+    let charged = cpu.project_poll_skip_core(raw_per_iteration, best)?;
     let charged_u32 = u32::try_from(charged).ok()?;
     bus.poll_project_scaled_bus_clocks(certificate, best)?;
 
     let committed = cpu
-        .commit_poll_skip_core(poll, best)
+        .commit_poll_skip_core(poll, raw_per_iteration, best)
         .expect("projected poll core commit must succeed");
     debug_assert_eq!(committed, charged);
     cpu.poll_skip_backedge_housekeeping();
@@ -657,6 +662,10 @@ fn try_poll_skip_memory(
         diagnostics.memory_translate_or_certificate_rejection();
         return None;
     };
+    // The memory family has no port slot, so this is `poll.raw_core_clocks()` in both epochs
+    // (`poll_skip_raw_core_clocks` returns it unchanged for a non-`Io` family). Taken through
+    // the same function anyway so the two executors cannot drift.
+    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll, bus);
     // R1: read the polled cell through the plain, uncharged backing-store
     // read (never CpuBus::read_memory/read_memory_direct/charge_direct_memory,
     // which all record trace clocks and would break timing identity), then
@@ -689,7 +698,7 @@ fn try_poll_skip_memory(
         let Some(reserved) = iterations.checked_add(1) else {
             return false;
         };
-        let Some(reserved_core) = cpu.project_poll_skip_core(poll, reserved) else {
+        let Some(reserved_core) = cpu.project_poll_skip_core(raw_per_iteration, reserved) else {
             return false;
         };
         let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
@@ -721,12 +730,12 @@ fn try_poll_skip_memory(
         return None;
     }
 
-    let charged = cpu.project_poll_skip_core(poll, best)?;
+    let charged = cpu.project_poll_skip_core(raw_per_iteration, best)?;
     let charged_u32 = u32::try_from(charged).ok()?;
     bus.poll_project_scaled_bus_clocks(certificate, best)?;
 
     let committed = cpu
-        .commit_poll_skip_core(poll, best)
+        .commit_poll_skip_core(poll, raw_per_iteration, best)
         .expect("projected poll core commit must succeed");
     debug_assert_eq!(committed, charged);
     cpu.poll_skip_backedge_housekeeping();
@@ -1452,6 +1461,9 @@ impl Machine {
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
+                    timing_epoch,
+                    poll_skip_certificate,
+                    retrace_poll,
                     profile,
                     active_mode,
                     pending_mode,
@@ -1503,7 +1515,8 @@ impl Machine {
                     exempt_io_touched,
                     ata_poll_skip_armed,
                     ata_poll_skip,
-                    isa_io_batch_clocks,
+                    port_bus_batch_clocks,
+                    port_accesses_by_class,
                     pit_observer_fine_until,
                     opl_probe,
                     shadow_l1,
@@ -1553,6 +1566,10 @@ impl Machine {
                     pending_bios32,
                     last_int_vector,
                     active_mode: *active_mode,
+                    timing_epoch: *timing_epoch,
+                    poll_skip_certificate: &*poll_skip_certificate,
+                    retrace_poll,
+                    string_port_element_bytes: 0,
                     pending_mode,
                     fast_post: *fast_post,
                     booter_inert: *booter_inert,
@@ -1582,7 +1599,8 @@ impl Machine {
                     ata_poll_skip_armed,
                     ata_poll_skip_slice_too_short,
                     ata_poll_skip,
-                    isa_io_clocks: isa_io_batch_clocks,
+                    isa_io_clocks: port_bus_batch_clocks,
+                    port_accesses_by_class,
                     pit_observer_fine_until,
                     opl_probe,
                     shadow_l1,
@@ -1829,7 +1847,7 @@ impl Machine {
                     let scaled_bus_clocks = self.scale_bus(bus_clocks);
                     let step = u64::from(outcome.core_clocks)
                         + scaled_bus_clocks
-                        + std::mem::take(&mut self.isa_io_batch_clocks);
+                        + std::mem::take(&mut self.port_bus_batch_clocks);
                     self.scaled_bus_clocks =
                         self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
                     // Advance the OPL timers so AdLib detection's delay loops see
@@ -1941,10 +1959,20 @@ impl Machine {
                                 //       budget;
                                 //   (b) the batch-entry `service_pending_interrupt`
                                 //       is charged before any cap test runs;
-                                //   (c) `isa_io_batch_clocks` joins the batch-end
-                                //       `step` without ever having been counted
-                                //       against the cap (`spent` is core plus
-                                //       in-batch bus only);
+                                //   (c) under EPOCH 1 `port_bus_batch_clocks` joins
+                                //       the batch-end `step` without ever having
+                                //       been counted against the cap (`spent` is
+                                //       core plus in-batch bus only). Under epoch 2
+                                //       it IS counted: review finding F2 folded the
+                                //       lane into `in_batch_scaled_bus_clocks()`,
+                                //       which is what `spent` is built from, and
+                                //       turned the CPU's per-instruction cap screen
+                                //       off so the exact test runs after every
+                                //       retired instruction. That route's
+                                //       contribution to the overshoot is then one
+                                //       access, not a whole batch's worth -- which
+                                //       matters because epoch 2 charges every port,
+                                //       not seven of them;
                                 //   (d) the grant itself rounds UP --
                                 //       `cpu_clocks_for_master_ticks_ceil(..).max(1)`
                                 //       -- so even a batch that spends exactly what
@@ -1960,7 +1988,9 @@ impl Machine {
                                 // the batch's uncounted ISA charge -- `isa_io_clocks`
                                 // is `clock_hz / 1_000_000`, i.e. 166 clocks per ISA
                                 // access at the 586 persona, so an Approximate-class
-                                // batch can overshoot by hundreds.
+                                // EPOCH-1 batch can overshoot by hundreds. Under
+                                // epoch 2 route (c) contributes one access's class
+                                // charge and no more.
                                 // `next_timer_wake` already clamps the same quantity
                                 // the same way, and it is exactly what returned None
                                 // here.

@@ -1775,9 +1775,46 @@ impl CpuGsw {
         }
     }
 
+    /// The per-iteration RAW core-clock charge an elided iteration of `poll` must project,
+    /// under the bus's live guest-clock model epoch and this CPU's live I/O privilege column.
+    ///
+    /// P2 of the port-io repricing (`dev_docs/2026-09-05-port-io-repricing-design.md` §2, and
+    /// review F8). Every certified `Io`-family shape bakes exactly ONE `IN` slot into its
+    /// `raw_core_clocks` at epoch 1's flat `IN_PORT_CORE_CLOCKS` -- 17 = 12 + `TEST` 2 +
+    /// taken `Jcc` 3 for the 3-slot shape, and the 21 / 28 shapes the same way. Under epoch 2
+    /// that one term becomes Intel's privilege column, so the elided iteration advances the
+    /// guest clock by exactly what the executed `IN` would have charged, and the skip stays a
+    /// host-side elision rather than a guest-visible speed-up.
+    ///
+    /// **Derived from the LIVE mode, never baked** (F8): the poll skip is unavailable in V86
+    /// (`direct.rs`'s `permission.is_none()` decline and `poll_skip_eligible`'s V86 reject), so
+    /// a certified iteration is real-mode or protected `CPL<=IOPL` and the V86 row -- the one
+    /// the design's own §2 arithmetic used -- is exactly the row this path never takes.
+    ///
+    /// The `Memory` family has no port slot and is returned unchanged in both epochs.
     #[cfg(feature = "jit")]
-    fn poll_skip_core_projection(&self, poll: PollLoop, iterations: u64) -> Option<(u64, u64)> {
-        let raw = poll.raw_core_clocks().checked_mul(iterations)?;
+    pub fn poll_skip_raw_core_clocks<B: izarravm_bus::CpuBus>(
+        &self,
+        poll: PollLoop,
+        bus: &B,
+    ) -> u64 {
+        let raw = poll.raw_core_clocks();
+        let epoch = bus.timing_epoch();
+        if epoch < 2 || poll.family() != crate::PollFamily::Io {
+            return raw;
+        }
+        let mode = self.port_io_priv_mode();
+        raw.saturating_sub(u64::from(crate::port_core_clocks(1, false, mode)))
+            .saturating_add(u64::from(crate::port_core_clocks(epoch, false, mode)))
+    }
+
+    #[cfg(feature = "jit")]
+    fn poll_skip_core_projection(
+        &self,
+        raw_per_iteration: u64,
+        iterations: u64,
+    ) -> Option<(u64, u64)> {
+        let raw = raw_per_iteration.checked_mul(iterations)?;
         let (num, den) = level_timing(self.persona());
         let scaled = raw
             .checked_mul(u64::from(num))?
@@ -1787,8 +1824,8 @@ impl CpuGsw {
 
     /// Exact non-mutating core-clock projection for complete poll-loop iterations.
     #[cfg(feature = "jit")]
-    pub fn project_poll_skip_core(&self, poll: PollLoop, iterations: u64) -> Option<u64> {
-        let (charged, _) = self.poll_skip_core_projection(poll, iterations)?;
+    pub fn project_poll_skip_core(&self, raw_per_iteration: u64, iterations: u64) -> Option<u64> {
+        let (charged, _) = self.poll_skip_core_projection(raw_per_iteration, iterations)?;
         self.elapsed_clocks.checked_add(charged)?;
         Some(charged)
     }
@@ -1822,8 +1859,13 @@ impl CpuGsw {
     /// used by normal execution. Retired-instruction and unit-simulator counts stay
     /// unchanged because these instructions did not execute.
     #[cfg(feature = "jit")]
-    pub fn commit_poll_skip_core(&mut self, poll: PollLoop, iterations: u64) -> Option<u64> {
-        let (charged, remainder) = self.poll_skip_core_projection(poll, iterations)?;
+    pub fn commit_poll_skip_core(
+        &mut self,
+        poll: PollLoop,
+        raw_per_iteration: u64,
+        iterations: u64,
+    ) -> Option<u64> {
+        let (charged, remainder) = self.poll_skip_core_projection(raw_per_iteration, iterations)?;
         self.elapsed_clocks = self.elapsed_clocks.checked_add(charged)?;
         self.timing_rem = remainder;
         self.perf.poll_skip_spans = self.perf.poll_skip_spans.saturating_add(1);
@@ -2140,6 +2182,98 @@ impl CpuGsw {
     /// The I/O privilege level (EFLAGS bits 12-13).
     pub(super) fn iopl(&self) -> u8 {
         ((self.registers.eflags >> 12) & 3) as u8
+    }
+
+    /// Which of Intel's four I/O privilege columns the NEXT `IN`/`OUT` executes in
+    /// (`crate::PortIoPrivMode`). Derived live, once per port access, from exactly the three bits
+    /// `check_io_permission` derives its own early return from -- CR0.PE, EFLAGS.VM and
+    /// `cpl <= iopl` -- so the column that pays for a bitmap consult is by construction the
+    /// column that performs one.
+    ///
+    /// NOT resolvable at JIT compile time, which is why every port charge in the tree is applied
+    /// at the call-out and never baked into a block's `raw_clocks`: `jit_mode_key` carries CR0.PE
+    /// and EFLAGS.VM (bits 1 and 2), so it separates `Real` / `V86` / protected -- but it carries
+    /// neither CPL nor IOPL, so a protected block admitted under one mode key spans both
+    /// `ProtectedPrivileged` and `ProtectedUnprivileged` and the two differ by 17 clocks on `OUT`.
+    /// The call-out sites already return their charge as a runtime `i64`, so this costs nothing
+    /// beyond the three loads.
+    pub(crate) fn port_io_priv_mode(&self) -> crate::PortIoPrivMode {
+        if self.is_v86_mode() {
+            crate::PortIoPrivMode::V86
+        } else if !self.is_protected_mode() {
+            crate::PortIoPrivMode::Real
+        } else if self.cpl <= self.iopl() {
+            crate::PortIoPrivMode::ProtectedPrivileged
+        } else {
+            crate::PortIoPrivMode::ProtectedUnprivileged
+        }
+    }
+
+    /// The core-clock charge for one `IN` (`is_out` false) or `OUT` (true) in the CPU's current
+    /// privilege column, under the bus's own guest-clock model epoch. The single seam between
+    /// `crate::port_core_clocks`'s table and every charging site.
+    pub(crate) fn port_io_core_clocks<B: izarravm_bus::CpuBus>(
+        &self,
+        bus: &B,
+        is_out: bool,
+    ) -> u32 {
+        crate::port_core_clocks(bus.timing_epoch(), is_out, self.port_io_priv_mode())
+    }
+
+    /// The whole-instruction core charge for one `INS`/`OUTS` (`is_rep` false) or the SETUP of a
+    /// `REP INS`/`REP OUTS` (`is_rep` true), in the CPU's live privilege column under the bus's
+    /// guest-clock model epoch. The string-I/O twin of `port_io_core_clocks`.
+    pub(crate) fn string_port_setup_core_clocks<B: izarravm_bus::CpuBus>(
+        &self,
+        bus: &B,
+        is_out: bool,
+        is_rep: bool,
+    ) -> u32 {
+        crate::string_port_setup_core_clocks(
+            bus.timing_epoch(),
+            is_out,
+            is_rep,
+            self.port_io_priv_mode(),
+        )
+    }
+
+    /// Charge one `REP INS`/`REP OUTS` ELEMENT's core clocks directly into the CPU's guest clock,
+    /// through the same remainder-carrying scaler ordinary execution uses.
+    ///
+    /// WHY DIRECTLY AND NOT THROUGH `CycleOutcome`. A `REP` string is chunked: it can yield mid
+    /// instruction and resume, and only the FIRST chunk's `CycleOutcome` is ever charged
+    /// (`pause_rep_instruction` charges it; `resume_rep_instruction` maps every later chunk to
+    /// `core_clocks: 0`). Returning `setup + 3 * elements_this_chunk` from the executor arm would
+    /// therefore lose every element after the first chunk. There is no per-element core charge
+    /// anywhere in the string executor today -- `REP MOVS` of a megabyte charges 4 clocks total
+    /// -- so this is the first, and it is deliberately scoped to the two port forms: the rest of
+    /// the string family is the recalibration's business, not the port reprice's.
+    ///
+    /// **Structurally zero under epoch 1** (`string_port_element_core_clocks` returns 0), so a
+    /// knob-unset build cannot move.
+    ///
+    /// `core_clocks_so_far` is deliberately NOT advanced: it is assigned (never incremented) at
+    /// batch-level sites, so a mid-`REP` increment would be overwritten. The budget limiter still
+    /// sees this `REP`'s cost, because its per-element PORT BUS charge -- three to eight times
+    /// larger -- is in `in_batch_scaled_bus_clocks()` under epoch 2 (review F2).
+    pub(crate) fn charge_string_port_element_core<B: izarravm_bus::CpuBus>(
+        &mut self,
+        bus: &B,
+        is_out: bool,
+    ) {
+        let raw = u64::from(crate::string_port_element_core_clocks(
+            bus.timing_epoch(),
+            is_out,
+        ));
+        if raw == 0 {
+            return;
+        }
+        let (num, den) = level_timing(self.persona());
+        let scaled = raw
+            .saturating_mul(u64::from(num))
+            .saturating_add(self.timing_rem);
+        self.elapsed_clocks = self.elapsed_clocks.saturating_add(scaled / u64::from(den));
+        self.timing_rem = scaled % u64::from(den);
     }
 
     /// IOPL-sensitive instructions (CLI, STI, PUSHF/POPF, INT n) fault to the monitor

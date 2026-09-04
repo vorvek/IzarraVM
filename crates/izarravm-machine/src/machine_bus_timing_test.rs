@@ -1848,25 +1848,25 @@ fn opl_status_poll_charges_isa_bus_time_only_in_approximate_class() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine = test_machine();
         machine.set_mode(mode);
-        machine.isa_io_batch_clocks = 0;
+        machine.port_bus_batch_clocks = 0;
         with_bus(&mut machine, |bus| {
             let _ = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
         });
         let expected = (mode.clock_hz() / 1_000_000).max(1);
         assert_eq!(
-            machine.isa_io_batch_clocks, expected,
+            machine.port_bus_batch_clocks, expected,
             "{mode:?}: one OPL status poll charges one ISA bus period"
         );
     }
 
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw386);
-    machine.isa_io_batch_clocks = 0;
+    machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         let _ = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
     });
     assert_eq!(
-        machine.isa_io_batch_clocks, 0,
+        machine.port_bus_batch_clocks, 0,
         "the Accurate class must not charge ISA I/O time (byte-identical cadence)"
     );
 }
@@ -1883,25 +1883,25 @@ fn sb_dsp_status_poll_charges_isa_bus_time_only_in_approximate_class() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine = test_machine();
         machine.set_mode(mode);
-        machine.isa_io_batch_clocks = 0;
+        machine.port_bus_batch_clocks = 0;
         with_bus(&mut machine, |bus| {
             let _ = bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
         });
         let expected = (mode.clock_hz() / 1_000_000).max(1);
         assert_eq!(
-            machine.isa_io_batch_clocks, expected,
+            machine.port_bus_batch_clocks, expected,
             "{mode:?}: one DSP status poll charges one ISA bus period"
         );
     }
 
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw386);
-    machine.isa_io_batch_clocks = 0;
+    machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         let _ = bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
     });
     assert_eq!(
-        machine.isa_io_batch_clocks, 0,
+        machine.port_bus_batch_clocks, 0,
         "the Accurate class must not charge ISA I/O time (byte-identical cadence)"
     );
 }
@@ -1916,7 +1916,7 @@ fn sb_dsp_reset_probe_sees_the_ack_within_a_hundred_polls_at_586() {
     // loop provides on the metal.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
-    machine.isa_io_batch_clocks = 0;
+    machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         let _ = bus.write_io(0x226, BusWidth::Byte, 1, false);
         let _ = bus.write_io(0x226, BusWidth::Byte, 0, false);
@@ -5099,7 +5099,7 @@ fn isa_io_wait_off_leaves_a_pit_access_charging_exactly_as_it_does_today() {
         let (off_bus_clocks, off_isa) = with_isa_io_wait(false, || {
             let mut machine = test_machine();
             machine.set_mode(mode);
-            machine.isa_io_batch_clocks = 0;
+            machine.port_bus_batch_clocks = 0;
             let before = machine.trace.elapsed_clocks();
             with_bus(&mut machine, |bus| {
                 let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
@@ -5107,7 +5107,7 @@ fn isa_io_wait_off_leaves_a_pit_access_charging_exactly_as_it_does_today() {
             });
             (
                 machine.trace.elapsed_clocks() - before,
-                machine.isa_io_batch_clocks,
+                machine.port_bus_batch_clocks,
             )
         });
         assert_eq!(
@@ -5122,7 +5122,7 @@ fn isa_io_wait_off_leaves_a_pit_access_charging_exactly_as_it_does_today() {
         let on_bus_clocks = with_isa_io_wait(true, || {
             let mut machine = test_machine();
             machine.set_mode(mode);
-            machine.isa_io_batch_clocks = 0;
+            machine.port_bus_batch_clocks = 0;
             let before = machine.trace.elapsed_clocks();
             with_bus(&mut machine, |bus| {
                 let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
@@ -5151,14 +5151,14 @@ fn isa_io_wait_charges_a_pit_read_and_a_pit_write_one_isa_period_each() {
             let charged = with_isa_io_wait(true, || {
                 let mut machine = test_machine();
                 machine.set_mode(mode);
-                machine.isa_io_batch_clocks = 0;
+                machine.port_bus_batch_clocks = 0;
                 with_bus(&mut machine, |bus| match write {
                     None => {
                         let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
                     }
                     Some(value) => bus.write_io(port, BusWidth::Byte, value, false).unwrap(),
                 });
-                machine.isa_io_batch_clocks
+                machine.port_bus_batch_clocks
             });
             assert_eq!(
                 charged, expected,
@@ -5247,11 +5247,11 @@ fn isa_io_wait_does_not_double_charge_the_already_charged_opl_and_dsp_reads() {
             let charged = with_isa_io_wait(armed, || {
                 let mut machine = test_machine();
                 machine.set_mode(GswMode::Gsw586);
-                machine.isa_io_batch_clocks = 0;
+                machine.port_bus_batch_clocks = 0;
                 with_bus(&mut machine, |bus| {
                     let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
                 });
-                machine.isa_io_batch_clocks
+                machine.port_bus_batch_clocks
             });
             assert_eq!(
                 charged, period,
@@ -5300,12 +5300,12 @@ fn isa_io_wait_leaves_the_accurate_386_class_byte_identical() {
         let charged = with_isa_io_wait(armed, || {
             let mut machine = test_machine();
             machine.set_mode(GswMode::Gsw386);
-            machine.isa_io_batch_clocks = 0;
+            machine.port_bus_batch_clocks = 0;
             with_bus(&mut machine, |bus| {
                 let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
                 bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
             });
-            machine.isa_io_batch_clocks
+            machine.port_bus_batch_clocks
         });
         assert_eq!(
             charged, 0,

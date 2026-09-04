@@ -1037,6 +1037,20 @@ pub trait CpuBus {
     /// overshoot the next timer edge - the batch cap's PIT terms are guest
     /// clocks, and a real PIT interrupts at every edge. Buses without batch
     /// bus accounting return 0 and use the core-only check.
+    /// Which guest-clock model epoch this machine was constructed under
+    /// (`IZARRAVM_TIMING_EPOCH`, read once at construction; see `izarravm-machine`'s
+    /// `Machine::timing_epoch`). `1` is the pre-repricing model and the default here, so a bus
+    /// with no notion of an epoch -- every test bus, every embedder -- keeps epoch-1 charges
+    /// byte-identically.
+    ///
+    /// The CPU reads this at every port access to pick the `IN`/`OUT` core-clock column
+    /// (`crate::CpuBus` is the only channel the CPU has to a machine-level dial). It MUST be
+    /// constant for the life of the bus: the JIT caches per-block raw clocks, so an epoch that
+    /// changed mid-run would leave already-compiled blocks charging the old model.
+    fn timing_epoch(&self) -> u32 {
+        1
+    }
+
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         0
     }
@@ -1444,6 +1458,41 @@ pub trait CpuBus {
         core_clocks_so_far: u64,
         cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError>;
+
+    /// `read_io` for ONE ELEMENT of a string port read (`INS` / `REP INS`), and its write twin.
+    ///
+    /// The split exists for exactly one charge: a PCI IDE data register moves a string element at
+    /// the ATA PIO **cycle time** (mode 4 `t0` = 120 ns, `ATA-3_X3.298-1997_std.txt:6708`), not at
+    /// the register class's single-access latency. Charging the class latency per element instead
+    /// would price a `REP INSW` transfer at 6.7 MB/s against a real P166's 16.6, and at the
+    /// `IsaXBus` rate 2.0 MB/s -- slower than PIO mode 0, which is the design's blocker (b): every
+    /// HDD and CD read on the board eight times slower than the hardware.
+    ///
+    /// `width` is the ELEMENT width, not a byte cycle's: a bus that splits a word access into two
+    /// byte cycles must divide the element rate between them rather than charging it twice.
+    ///
+    /// Defaulted to the single-access forms, so a bus with no per-class charge (every test bus,
+    /// and the machine bus under epoch 1) needs no override and behaves byte-identically.
+    fn read_io_string_element(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<u32, BusError> {
+        self.read_io(port, width, core_clocks_so_far, cpu_is_ring0_pm)
+    }
+
+    fn write_io_string_element(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        value: u32,
+        core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<(), BusError> {
+        self.write_io(port, width, value, core_clocks_so_far, cpu_is_ring0_pm)
+    }
 
     fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError>;
 

@@ -9,12 +9,29 @@ use izarravm_cpu::PollLoop;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PollBusCertificate {
     raw_clocks_per_iteration: u64,
+    /// P2's third lane (`dev_docs/2026-09-05-port-io-repricing-design.md` §2). The polled
+    /// port's own class bus charge for ONE iteration, in UNSCALED guest clocks -- the exact
+    /// figure `charge_port_bus` would accrue into `port_bus_batch_clocks` for the `IN` an
+    /// elided iteration does not execute, i.e. `port_bus_class(port).clocks()` minus the
+    /// already-scaled generic 4-raw-clock bus cycle, so the two lanes sum to the class figure
+    /// with no double count.
+    ///
+    /// **Zero under epoch 1, and zero for the memory family in every epoch.** It is the unit
+    /// mismatch the old ISA refusal was erected to avoid: this term must NEVER be folded into
+    /// `raw_clocks_per_iteration`, which `poll_project_scaled_bus_clocks` puts through
+    /// `scale_bus` -- dividing a microsecond-denominated charge by the persona's bus scaler is
+    /// the one thing the charge exists to escape.
+    port_bus_clocks_per_iteration: u64,
 }
 
 #[cfg(all(test, feature = "jit"))]
 impl PollBusCertificate {
     pub(super) fn raw_clocks_per_iteration(self) -> u64 {
         self.raw_clocks_per_iteration
+    }
+
+    pub(super) fn port_bus_clocks_per_iteration(self) -> u64 {
+        self.port_bus_clocks_per_iteration
     }
 }
 
@@ -68,6 +85,48 @@ pub(super) fn extended_ram_screen_enabled() -> bool {
             .unwrap_or(true)
     });
     *ENABLED
+}
+
+/// `IZARRAVM_TIMING_EPOCH`: which guest-clock model a freshly constructed `Machine` runs under,
+/// read ONCE into `Machine::timing_epoch` (never re-read mid-run: the JIT caches per-block raw
+/// clocks that would go stale under a live flip). Unset or `""` is epoch `1`, today's model,
+/// byte-identical to before this knob existed -- never `0` as the off-spelling (memory
+/// `parameter-knobs-have-no-off-spelling`: an epoch is a version, not an on/off switch, so `0`
+/// names no epoch and panics like any other unrecognized spelling). `2` is the port-io repricing
+/// (`dev_docs/2026-09-05-port-io-repricing-design.md`); every other spelling panics rather than
+/// silently running epoch 1, the same discipline `IZARRAVM_ISA_IO_WAIT` uses.
+pub(super) fn timing_epoch_from_env() -> u32 {
+    parse_timing_epoch(std::env::var("IZARRAVM_TIMING_EPOCH"))
+}
+
+/// The `IZARRAVM_TIMING_EPOCH` spelling table, lifted out so it is unit-testable without a
+/// process-global env write.
+fn parse_timing_epoch(value: Result<String, std::env::VarError>) -> u32 {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return 1,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_TIMING_EPOCH is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset (epoch 1, today's model) and `2` (the port-io repricing)"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim() {
+        "" => 1,
+        "2" => 2,
+        other => panic!(
+            "IZARRAVM_TIMING_EPOCH={other:?} names no epoch; accepted spellings are unset or \
+             `\"\"` (epoch 1, today's guest-clock model, byte-identical) and `2` (the port-io \
+             repricing, dev_docs/2026-09-05-port-io-repricing-design.md). Refusing to guess: a \
+             mistyped leg that silently ran epoch 1 would be read as the epoch it did not run"
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn parse_timing_epoch_for_test(value: Result<String, std::env::VarError>) -> u32 {
+    parse_timing_epoch(value)
 }
 
 /// Whether a guest port access to a legacy X-bus device is charged its real ISA
@@ -246,6 +305,152 @@ const fn port_is_legacy_isa_io(port: u16) -> bool {
     matches!(port, 0x0040..=0x0043 | 0x0061 | 0x0063 | 0x0070..=0x0071)
 }
 
+/// Test-only mirror of `port_is_legacy_isa_io`, reachable from `machine_port_bus_class_test.rs`
+/// without widening the real predicate's visibility.
+#[cfg(test)]
+pub(super) const fn port_is_legacy_isa_io_for_test(port: u16) -> bool {
+    port_is_legacy_isa_io(port)
+}
+
+/// A static classification of the 64 K port space into the bus family that answers it, for
+/// `IZARRAVM_TIMING_EPOCH=2`'s per-class bus charge
+/// (`dev_docs/2026-09-05-port-io-repricing-design.md` §1.2). Independent of, and NOT a
+/// replacement for, `port_is_legacy_isa_io` above: that predicate stays exactly as it is and
+/// keeps gating the epoch-1 `IZARRAVM_ISA_IO_WAIT` charge, byte-identical, under epoch 1.
+///
+/// Classes only cover STATIC ranges. The BMIDE bus-master BAR4 and Distira's own BARs are
+/// runtime-programmable PCI base addresses (`pci.rs::PciConfig::piix_ide_bm_base`,
+/// `vega.rs`'s LFB/BAR tracking) and are not decidable from a port number alone in a `const
+/// fn`; those accesses already route through their own PCI-target dispatch, which is where a
+/// live-BAR `PciTarget` charge would be applied, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PortBusClass {
+    /// The 8 MHz ISA X-bus: DMA (8237A x2), the 8259A PICs, the 8042 keyboard controller, the
+    /// x87 error-ack latches, the 8254 PIT, PPI port B (0x61/0x63), the RTC/CMOS pair, the
+    /// gameport, the SB/OPL/MPU/WSS legacy-audio blocks, LPT/COM, the FDC, and 0x92 (the one
+    /// port TOKAEMM traps).
+    IsaXBus,
+    /// The legacy VGA register block, 0x3B0-0x3DF (including 0x3DA): a 1997 PCI VGA card
+    /// decoding legacy I/O on-card, priced as an (UNVERIFIED) PCI-target cycle.
+    PciLegacyVga,
+    /// PCI-target register space with a static port: the IDE/ATA command-block and
+    /// control-block registers, and the PCI configuration mechanism (0xCF8-0xCFF).
+    PciTarget,
+    /// This machine's own host-native chipset window, 0xE0-0xE7 (Lotura): no bus round trip,
+    /// nothing on the metal answers there.
+    ChipsetInternal,
+    /// No handler claims the port: 86Box's `io_delay` floor, charged whether or not anything
+    /// drives the data lines.
+    Unclaimed,
+}
+
+/// How many `PortBusClass` variants there are, and therefore how wide the per-class access
+/// histogram is. Written beside the enum, and `PortBusClass::LABELS` below is asserted to be this
+/// long, so a new class cannot land with a histogram that silently drops it.
+pub(crate) const PORT_BUS_CLASS_COUNT: usize = 5;
+
+impl PortBusClass {
+    /// The histogram index for this class -- `Machine::port_accesses_by_class` and the profile
+    /// JSON's `port_accesses_by_class` are both in this order, and `LABELS` names the same rows.
+    pub(super) const fn index(self) -> usize {
+        match self {
+            PortBusClass::IsaXBus => 0,
+            PortBusClass::PciLegacyVga => 1,
+            PortBusClass::PciTarget => 2,
+            PortBusClass::ChipsetInternal => 3,
+            PortBusClass::Unclaimed => 4,
+        }
+    }
+
+    /// The JSON key for each histogram row, in `index()` order. Exported so the reporting crate
+    /// does not carry its own copy of the class names.
+    pub const LABELS: [&'static str; PORT_BUS_CLASS_COUNT] = [
+        "isa_x_bus",
+        "pci_legacy_vga",
+        "pci_target",
+        "chipset_internal",
+        "unclaimed",
+    ];
+
+    /// Unscaled guest clocks at 166.667 MHz, before the `saturating_sub` composition in
+    /// `port_bus_batch_clocks` (design §1.3).
+    pub(super) const fn clocks(self) -> u64 {
+        match self {
+            PortBusClass::IsaXBus => 160,
+            PortBusClass::PciLegacyVga => 56,
+            PortBusClass::PciTarget => 56,
+            PortBusClass::Unclaimed => 56,
+            PortBusClass::ChipsetInternal => 0,
+        }
+    }
+}
+
+/// Classify a 16-bit port address per the table in
+/// `dev_docs/2026-09-05-port-io-repricing-design.md` §1.2. A `const fn` so the class table
+/// itself can be asserted at compile time as well as by the unit-test matrix
+/// (`machine_port_bus_class_test.rs`).
+pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
+    match port {
+        // DMA1, page registers (incl. their 0x90-0x9F aliases -- `dma_page_register_port`
+        // serves every port there except 0x92, which is classed separately below), DMA2.
+        0x0000..=0x000F | 0x0080..=0x009F | 0x00C0..=0x00DF => PortBusClass::IsaXBus,
+        // 8259A PIC 1/2.
+        0x0020..=0x0021 | 0x00A0..=0x00A1 => PortBusClass::IsaXBus,
+        // 8042 keyboard controller.
+        0x0060 | 0x0064 => PortBusClass::IsaXBus,
+        // x87 error-ack latches.
+        0x00F0..=0x00FF => PortBusClass::IsaXBus,
+        // 8254 PIT, PPI port B + mirror, RTC/CMOS (already charged today, unchanged).
+        0x0040..=0x0043 | 0x0061 | 0x0063 | 0x0070..=0x0071 => PortBusClass::IsaXBus,
+        // System Control Port A -- the one port TOKAEMM traps -- is already covered by the
+        // 0x0080-0x009F arm above (`IsaXBus` either way), so it needs no arm of its own here.
+        // Lotura: a host-native device, not an ISA peripheral.
+        0x00E0..=0x00E7 => PortBusClass::ChipsetInternal,
+        // IDE/ATA command-block and control-block registers.
+        0x01F0..=0x01F7 | 0x03F6 | 0x0170..=0x0177 | 0x0376 => PortBusClass::PciTarget,
+        // Gameport; SB + aliases, OPL, MPU, WSS; LPT; COM; FDC.
+        0x0200..=0x0207
+        | 0x0220..=0x022F
+        | 0x0388..=0x038B
+        | 0x0300..=0x0301
+        | 0x0330..=0x0331
+        | 0x0530..=0x0537
+        | 0x0278..=0x027F
+        | 0x0378..=0x037F
+        | 0x02F8..=0x02FF
+        | 0x03F8..=0x03FF
+        | 0x03F0..=0x03F5
+        | 0x03F7 => PortBusClass::IsaXBus,
+        // Legacy VGA register block, including 0x3DA.
+        0x03B0..=0x03DF => PortBusClass::PciLegacyVga,
+        // PCI configuration mechanism.
+        0x0CF8..=0x0CFF => PortBusClass::PciTarget,
+        _ => PortBusClass::Unclaimed,
+    }
+}
+
+/// The ATA PIO mode-4 cycle time `t0`, in guest clocks at 166.667 MHz: **120 ns minimum**
+/// (`dev_docs/reference/ata/ATA-3_X3.298-1997_std.txt:6708`; `:6625` "shall not report a value
+/// less than 120 ns"). Per 16-BIT WORD, which is what an ATA data-register cycle moves.
+///
+/// The one bus constant in this whole repricing that is READ FROM A DOCUMENT rather than
+/// inferred: `IsaXBus` 160 and `PciLegacyVga` 56 are 86Box constants (bracketed and unverified
+/// respectively -- design section 8). It is used only for a STRING element on the IDE/ATAPI data
+/// register, never for a single access: status polling at 0x1F7 and the ATAPI poll skip's own
+/// port keep `PciTarget` 56, because those are single accesses and not a burst.
+///
+/// Resulting rate: 3 (`REP INS` per element) + 20 = 23 clocks per word = 138 ns -> **14.5 MB/s**,
+/// against a real P166's PIO mode 4 **16.6 MB/s** -- 87% of the spec rate, period-correct and
+/// erring slow.
+pub(super) const ATA_STRING_WORD_CLOCKS: u64 = 20;
+
+/// The IDE/ATAPI DATA registers, primary and secondary. The only ports whose string element rate
+/// is the ATA cycle time; every other register in those blocks (status 0x1F7, the control block)
+/// stays at its class latency.
+pub(super) const fn is_ata_data_port(port: u16) -> bool {
+    matches!(port, 0x01f0 | 0x0170)
+}
+
 /// The one port the io-family poll skip can ever certify. Both entry points into
 /// `poll_bus_certificate_from` reach it only after establishing the polled port
 /// is the active colour status-1 register: the interpreter checks
@@ -349,6 +554,10 @@ impl Machine {
             extended_ram_screen: extended_ram_screen_enabled(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             isa_io_wait: isa_io_wait_armed(),
+            timing_epoch: self.timing_epoch,
+            poll_skip_certificate: &self.poll_skip_certificate,
+            retrace_poll: &mut self.retrace_poll,
+            string_port_element_bytes: 0,
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
@@ -356,7 +565,8 @@ impl Machine {
             ata_poll_skip_armed: &mut self.ata_poll_skip_armed,
             ata_poll_skip_slice_too_short: self.ata_poll_skip_slice_too_short,
             ata_poll_skip: &mut self.ata_poll_skip,
-            isa_io_clocks: &mut self.isa_io_batch_clocks,
+            isa_io_clocks: &mut self.port_bus_batch_clocks,
+            port_accesses_by_class: &mut self.port_accesses_by_class,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
             shadow_l1: &mut self.shadow_l1,
@@ -386,7 +596,7 @@ impl Machine {
     /// wait-state charge is disarmed.
     ///
     /// WHY IT HAS TO BE DISARMED, and why clearing the accrual afterwards would be
-    /// the weaker fix. `isa_io_batch_clocks` is an accrual belonging to a live CPU
+    /// the weaker fix. `port_bus_batch_clocks` is an accrual belonging to a live CPU
     /// batch: the run loop folds it into that batch's guest-clock step and zeroes it
     /// (`run_until_tick`), and `canonical_state_capture` refuses a machine holding a
     /// non-zero one precisely because an uncommitted accrual has no batch to belong
@@ -883,31 +1093,42 @@ impl MachineBus<'_> {
         port: u16,
     ) -> Option<PollBusCertificate> {
         if self.trace.tracing_mode() != TracingMode::Off || !self.lazy_port_reads {
+            self.poll_skip_certificate
+                .refused_inactive
+                .set(self.poll_skip_certificate.refused_inactive.get() + 1);
             return None;
         }
-        // THE ISA-CHARGE REFUSAL (`IZARRAVM_ISA_IO_WAIT`). This certificate is
-        // denominated in RAW BUS CLOCKS: `poll_project_scaled_bus_clocks` puts
-        // the whole per-iteration figure through `scale_bus`, and `poll_commit_bus`
-        // commits it into the bus trace. The ISA charge is deliberately NOT in that
-        // unit -- it is unscaled CPU clocks accrued into `isa_io_batch_clocks`
-        // and folded into the batch step outside `scale_bus` (see
-        // `charge_isa_io_wait`) -- so it CANNOT be added to `raw` without being
-        // divided by the persona's bus scaler, which is the whole thing the
-        // charge exists to escape. A certificate that simply omitted it would
-        // under-price every skipped iteration by ~1 us and let the skip machinery
-        // fast-forward a span the guest could not have run, which is the one
-        // correctness interaction the research note names as a blocker.
+        // P2, F9 (`dev_docs/2026-09-05-port-io-repricing-review.md`): AN EXPLICIT ADMISSION,
+        // NOT A DELETED REFUSAL.
         //
-        // So: on a charged port, REFUSE. Poll skip declines and the loop runs its
-        // iterations for real, each paying the charge through `read_io`. This is
-        // conservative rather than free, and today it is also inert: the io-family
-        // poll skip only ever certifies `POLL_SKIP_IO_PORT` (0x3DA), which is
-        // deliberately NOT in the charged set (86Box parity -- see
-        // `port_is_legacy_isa_io`). The guard is here so that a future slice which
-        // widens the charged set -- the DOSBox-X-style flat model over every port,
-        // Shape A in the note -- disables the skip instead of silently
-        // under-pricing it.
-        if self.isa_io_wait && self.lazy_port_reads && port_is_legacy_isa_io(port) {
+        // What stood here before P2 were two refusals. (1) THE ISA-CHARGE REFUSAL: the
+        // certificate was denominated in RAW BUS CLOCKS -- `poll_project_scaled_bus_clocks`
+        // puts the whole per-iteration figure through `scale_bus` -- while the port charge is
+        // unscaled clocks on a different lane, so a charged port could not be priced without
+        // dividing the charge by the persona's bus scaler. (2) F7's structural EPOCH refusal,
+        // which P1 added because classing 0x3DA made every certificate under-priced by the new
+        // charge. `port_bus_clocks_per_iteration` retires BOTH reasons: it is that unscaled
+        // lane, committed outside `scale_bus`, so the certificate now prices a charged port
+        // exactly.
+        //
+        // The refusal is NOT simply deleted, because the ISA one was also a second layer
+        // keeping the skip off ports whose reads are NOT IDEMPOTENT -- the 8254 read-back
+        // latch (0x40-0x43) and the 0x61 refresh toggle, where 0x3DA's read is idempotent and
+        // its one side effect (`status1_side_effects`, the attribute-controller flip-flop) is
+        // replayed once by `poll_commit_bus`. An elided span performs the port's side effects
+        // ONCE, not `iterations` times, which is only sound for a port that has none that
+        // count. The lane prices a port; it cannot express a port's side effects.
+        //
+        // So: admit exactly `POLL_SKIP_IO_PORT`, refuse everything else BY NAME. That is
+        // byte-identical to the pre-P2 behaviour under epoch 1 -- 0x3DA is not in
+        // `port_is_legacy_isa_io`'s set, so the ISA refusal never fired for it, and no other
+        // port can reach here today (both entry points establish the polled port first) -- and
+        // it is the door F9 asked to keep shut: a future shape that certifies a second port
+        // must come here and argue for it rather than inherit an admission.
+        if port != POLL_SKIP_IO_PORT {
+            self.poll_skip_certificate
+                .refused_unpriced_port
+                .set(self.poll_skip_certificate.refused_unpriced_port.get() + 1);
             return None;
         }
         let mut raw = self.poll_fetch_certificate_raw_from(fetches)?;
@@ -915,8 +1136,20 @@ impl MachineBus<'_> {
             BusWidth::Byte,
             self.wait_states.io,
         )))?;
+        // The third lane. Zero under epoch 1, so the whole slice is byte-identical with the
+        // knob unset; under epoch 2 it is the SAME `port_bus_lane_clocks` an executed access
+        // accrues, which is what makes an elided iteration cost exactly a natural one.
+        let port_bus_clocks_per_iteration = if self.timing_epoch >= 2 {
+            self.poll_skip_certificate
+                .admitted_epoch2
+                .set(self.poll_skip_certificate.admitted_epoch2.get() + 1);
+            self.port_bus_lane_clocks(port_bus_class(port))
+        } else {
+            0
+        };
         Some(PollBusCertificate {
             raw_clocks_per_iteration: raw,
+            port_bus_clocks_per_iteration,
         })
     }
 
@@ -937,6 +1170,16 @@ impl MachineBus<'_> {
         }
         // M1: see `poll_fetch_certificate_raw`'s matching comment.
         self.poll_bus_certificate_from(&fetches[..poll.fetch_count().min(6)], port)
+    }
+
+    /// Test-only entry to `poll_bus_certificate_from` with no fetches, reachable without
+    /// constructing a real `PollLoop` -- used by F7's structural-refusal test.
+    #[cfg(all(test, feature = "jit"))]
+    pub(super) fn poll_bus_certificate_from_for_test(
+        &self,
+        port: u16,
+    ) -> Option<PollBusCertificate> {
+        self.poll_bus_certificate_from(&[], port)
     }
 
     /// Certify exact warm-RAM fetch and data-read costs for the classified
@@ -989,9 +1232,20 @@ impl MachineBus<'_> {
         raw = raw.checked_add(self.jit_data_cost_clocks(BusWidth::Dword))?;
         Some(PollBusCertificate {
             raw_clocks_per_iteration: raw,
+            // The memory family never touches a port, in either epoch.
+            port_bus_clocks_per_iteration: 0,
         })
     }
 
+    /// The batch-absolute bus figure `iterations` elided iterations would leave behind, in the
+    /// SAME units and with the same terms as `in_batch_scaled_bus_clocks()` -- which is what
+    /// makes `callout_poll_skip`'s `batch_instant(0) == in_batch_clocks()` and its
+    /// `bus_growth(0) == 0` identities hold in both epochs.
+    ///
+    /// P2: under epoch 2 that means two added terms, both OUTSIDE `scale_bus`. The batch's
+    /// port lane so far (`*self.isa_io_clocks`, which `in_batch_scaled_bus_clocks` folds in
+    /// under F2) and the certificate's own per-iteration port charge times `iterations`. Under
+    /// epoch 1 both are structurally zero and this is the pre-P2 expression byte for byte.
     #[cfg(feature = "jit")]
     pub(super) fn poll_project_scaled_bus_clocks(
         &self,
@@ -1002,7 +1256,15 @@ impl MachineBus<'_> {
             .raw_clocks_per_iteration
             .checked_mul(iterations)?;
         self.trace.elapsed_clocks().checked_add(additional)?;
-        self.jit_projected_batch_scaled_bus_clocks(additional)
+        let scaled = self.jit_projected_batch_scaled_bus_clocks(additional)?;
+        if self.timing_epoch < 2 {
+            return Some(scaled);
+        }
+        scaled.checked_add(*self.isa_io_clocks)?.checked_add(
+            certificate
+                .port_bus_clocks_per_iteration
+                .checked_mul(iterations)?,
+        )
     }
 
     /// Commit the certified aggregate clocks, then replay the idempotent status
@@ -1018,6 +1280,12 @@ impl MachineBus<'_> {
             .checked_add(additional)
             .expect("projected poll bus clock addition must succeed");
         self.trace.add_elapsed_clocks(additional);
+        // P2's third lane, committed where an executed access would have committed it:
+        // `port_bus_batch_clocks`, which `run_until_tick` folds into the batch's guest-clock
+        // step OUTSIDE `scale_bus`. Structurally zero under epoch 1.
+        *self.isa_io_clocks += certificate
+            .port_bus_clocks_per_iteration
+            .saturating_mul(iterations);
         self.vega.status1_side_effects();
     }
 
@@ -1065,7 +1333,7 @@ impl MachineBus<'_> {
     /// THE UNIT. `isa_io_clocks` is CPU clocks at the LIVE mode's clock rate --
     /// 166 at 166 MHz, 100 at 100 MHz -- so what is invariant across personas is
     /// the microsecond, not the clock count, which is what a fixed-frequency bus
-    /// means. It accrues into `isa_io_batch_clocks`, which `run_until_tick` folds
+    /// means. It accrues into `port_bus_batch_clocks`, which `run_until_tick` folds
     /// into the batch's guest-clock step OUTSIDE `scale_bus` (see the comment
     /// above that site): expressing this as bus wait states instead would put it
     /// through the 586's 16/105 bus scaler and shrink a microsecond to 0.15 of
@@ -1077,10 +1345,70 @@ impl MachineBus<'_> {
     /// bar, so it keeps today's cadence whatever this knob says. A conservative
     /// fork: the physical argument for the charge applies to a 386 too, and
     /// arming it there is a separate decision with its own re-pin.
-    fn charge_isa_io_wait(&mut self, port: u16) {
-        if self.isa_io_wait && self.lazy_port_reads && port_is_legacy_isa_io(port) {
+    /// The whole port-bus charge, both epochs. Epoch 1 (the unset knob) is exactly the
+    /// pre-slice `charge_isa_io_wait` predicate, byte-identical. Epoch 2
+    /// (`IZARRAVM_TIMING_EPOCH=2`) instead charges EVERY port access -- no `port_is_legacy_isa_io`
+    /// gate, no `lazy_port_reads`/`isa_io_wait` gate -- `port_bus_class(port).clocks()` minus the
+    /// already-scaled generic 4-raw-clock cycle `read_io`/`write_io` charge through
+    /// `trace.record`, so the two lanes sum to exactly the class figure with no double count
+    /// (design §1.3). `bus_num_at_batch_start`/`bus_den_at_batch_start` are this batch's
+    /// snapshotted `bus_timing(level)` ratio -- while it is still `(16,105)` for I586 (pre
+    /// recalibration slice 2), the subtrahend must be scaled by it too, exactly as the design's
+    /// §7 slice-order note requires.
+    fn charge_port_bus(&mut self, port: u16) {
+        let class = port_bus_class(port);
+        // Counted FIRST and in every epoch, before any charge decision: this is the ladder's
+        // denominator, and a count taken inside the epoch-2 arm could not tell a row that makes
+        // fewer accesses from one whose accesses merely cost more.
+        self.port_accesses_by_class[class.index()] += 1;
+        if self.timing_epoch >= 2 {
+            *self.isa_io_clocks += match self.string_port_element_bytes {
+                0 => self.port_bus_lane_clocks(class),
+                bytes => self.string_element_lane_clocks(port, class, bytes),
+            };
+        } else if self.isa_io_wait && self.lazy_port_reads && port_is_legacy_isa_io(port) {
             *self.isa_io_clocks += isa_io_clocks(self.active_mode);
         }
+    }
+
+    /// The epoch-2 port lane's own per-access figure for one byte cycle of `class`: the class
+    /// charge minus the already-scaled generic bus cycle `read_io`/`write_io` records through
+    /// `trace.record`, so lane + generic cycle == the class figure exactly (design §1.3).
+    ///
+    /// Factored out of `charge_port_bus` because P2's poll-skip certificate needs the SAME
+    /// figure for an iteration it elides: one function, so an elided iteration and an executed
+    /// one can never be priced differently.
+    /// P3. The epoch-2 port lane's per-BYTE-CYCLE figure for one byte cycle of a STRING element
+    /// `bytes` wide.
+    ///
+    /// Every port but the IDE/ATAPI DATA register keeps its class figure: an ISA card driven by
+    /// `REP OUTSB` (a floppy PIO stream) really does pay a full 8 MHz X-bus cycle per byte, and
+    /// Intel's pipelining note for string I/O is a CPU-side statement we claim no bus credit for.
+    ///
+    /// The data register is the exception the design's blocker (b) is about, and it is priced at
+    /// the ATA PIO **cycle time** rather than the `PciTarget` access latency:
+    /// `ATA_STRING_WORD_CLOCKS` per 16-bit word, divided across the byte cycles the element
+    /// decomposes into. A 1-byte element pays a whole word cycle (nothing narrower exists on the
+    /// wire); 2 and 4 pay 10 per byte cycle, i.e. 20 and 40 for the element. Exact for every
+    /// element width the ISA can encode, with no remainder to lose.
+    fn string_element_lane_clocks(&self, port: u16, class: PortBusClass, bytes: u8) -> u64 {
+        if !is_ata_data_port(port) {
+            return self.port_bus_lane_clocks(class);
+        }
+        let bytes = u64::from(bytes.max(1));
+        let words = bytes.div_ceil(2);
+        let element_clocks = words * ATA_STRING_WORD_CLOCKS;
+        let generic_raw = u64::from(BusCycle::clocks_for(BusWidth::Byte, self.wait_states.io));
+        let scaled_generic = (generic_raw * u64::from(self.bus_num_at_batch_start))
+            / u64::from(self.bus_den_at_batch_start);
+        (element_clocks / bytes).saturating_sub(scaled_generic)
+    }
+
+    fn port_bus_lane_clocks(&self, class: PortBusClass) -> u64 {
+        let generic_raw = u64::from(BusCycle::clocks_for(BusWidth::Byte, self.wait_states.io));
+        let scaled_generic = (generic_raw * u64::from(self.bus_num_at_batch_start))
+            / u64::from(self.bus_den_at_batch_start);
+        class.clocks().saturating_sub(scaled_generic)
     }
 
     fn record_pending_device_memory_write(&mut self, physical: u32, width: u32) {
@@ -1177,10 +1505,50 @@ impl MachineBus<'_> {
     ///
     /// `None` means decline and fall through, which is exactly what the inactive status1 alias
     /// does in the non-lazy class. The lazy class answers 0xFF itself rather than declining.
+    /// F14's instrument. Count the retrace-bit EDGES a guest observes through its own reads of
+    /// the status-1 register -- i.e. the instants at which a `VL_WaitVBL`-shaped poll loop
+    /// EXITS.
+    ///
+    /// WHY THIS IS THE DESIGN'S ONE SELF-CERTIFYING ANCHOR (review F14). Every other certifier
+    /// for the port reprice is a band derived from a duty-cycle bracket we do not have a
+    /// document for. This one is fixed by construction: mode 13h retraces at 70.086 Hz, and
+    /// Wolfenstein 3-D's `VL_WaitVBL` is two loops -- `in al,dx / test al,8 / jnz` (spin until
+    /// the retrace ENDS) then `in al,dx / test al,8 / jz` (spin until it STARTS) -- each of
+    /// which exits on exactly one edge per frame. So `rising` and `falling` must both read
+    /// ~70.086 per guest second whatever the polls-per-frame figure is. Below that, the guest
+    /// is no longer reaching the retrace in time and the model has OVER-charged; the poll count
+    /// alone cannot tell that apart from a guest that simply polls less.
+    ///
+    /// EDGES OBSERVED BY THE GUEST, not edges that happened. The comparison is against the last
+    /// value a guest READ, so an elided poll span (which performs no reads at all and replays
+    /// `status1_side_effects` once) contributes nothing, and the exit read that follows it
+    /// carries the edge exactly as an un-elided loop's would. That is what makes the counter
+    /// comparable across the skip's arms as well as across the epoch.
+    ///
+    /// Feature-free: one branch and one compare at a site that has already predicted the beam.
+    /// It counts only reads that the VGA actually answered with status bits -- the inactive
+    /// alias's flat `0xFF` (bit 3 set) is returned by the caller without reaching here, so it
+    /// cannot manufacture an edge. 0x3C2 (status 0) is excluded by the caller for the same
+    /// reason: its bit 3 is not the retrace bit this instrument is about.
+    fn note_status1_retrace_edge(&mut self, port: u16, value: u8) {
+        if port == 0x3C2 {
+            return;
+        }
+        self.retrace_poll.reads += 1;
+        let retrace = value & 0x08 != 0;
+        let previous = self.retrace_poll.last_observed.replace(retrace);
+        match previous {
+            Some(false) if retrace => self.retrace_poll.rising_edges += 1,
+            Some(true) if !retrace => self.retrace_poll.falling_edges += 1,
+            _ => {}
+        }
+    }
+
     fn read_vga_status_port(&mut self, port: u16, skip_io_touched: bool) -> Option<u32> {
         if self.lazy_port_reads || self.lazy_ports_386 {
             let beam = self.predicted_beam();
             if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
+                self.note_status1_retrace_edge(port, value);
                 return Some(u32::from(value));
             }
             // Inactive alias (e.g. 3BA polled in a color setup): no side
@@ -1223,7 +1591,9 @@ impl MachineBus<'_> {
         // where `read_port` declines -- the inactive status1 alias --
         // so the fallthrough at the call site is unchanged.
         let beam = self.predicted_beam();
-        self.vega.read_status_port_lazy(port, beam).map(u32::from)
+        let value = self.vega.read_status_port_lazy(port, beam)?;
+        self.note_status1_retrace_edge(port, value);
+        Some(u32::from(value))
     }
 }
 
@@ -1340,11 +1710,19 @@ impl MachineBus<'_> {
 /// bit, so nothing this may admit may let `raw_core_clocks * iterations` reach it -- whatever a
 /// misconfigured `IZARRAVM_DIRECT_POLL_MAX_RAW` claims. `max_skipped_raw` can still tune the
 /// bound DOWN (a smaller request always wins the `.min`); it can never tune it up past this
-/// ceiling. The 64-clock margin comfortably covers `IN_PORT_CORE_CLOCKS` (12, `izarravm-cpu`,
-/// not visible from this crate) plus any other small additive term the caller folds in on top of
-/// this function's own return.
+/// ceiling. The margin must cover the port charge the caller folds in on top of this function's
+/// own return (`direct.rs`'s `port_read_al_dx`, which adds `port_io_core_clocks` to the skip's
+/// `extra_raw_clocks`) plus any other small additive term.
+///
+/// Review finding F5 (`dev_docs/2026-09-05-port-io-repricing-review.md`): that margin used to be a
+/// literal 64, sized to the flat `IN_PORT_CORE_CLOCKS` of 12. Under `IZARRAVM_TIMING_EPOCH=2` the
+/// same charge reaches 312 raw (`OUT`, `CPL>IOPL`), so 64 was a latent 32-bit lane overflow. It is
+/// now `izarravm_cpu::MAX_PORT_CORE_CLOCKS` -- imported, not copied, so a widened column raises
+/// this bound by construction -- plus the same 64 clocks of slack the original carried for
+/// "any other small additive term".
 #[cfg(feature = "jit")]
-pub(crate) const LANE_SAFETY_CEILING: u64 = u32::MAX as u64 - 64;
+pub(crate) const LANE_SAFETY_CEILING: u64 =
+    u32::MAX as u64 - (izarravm_cpu::MAX_PORT_CORE_CLOCKS as u64 + 64);
 
 #[cfg(feature = "jit")]
 pub(crate) fn poll_skip_upper_bound(
@@ -2212,10 +2590,29 @@ impl CpuBus for MachineBus<'_> {
     /// to its core total against the guest-clock run cap. The same scaled-bus
     /// accounting applies in every CPU mode so a bus-heavy run cannot cross an
     /// earlier master-timeline deadline unnoticed.
+    /// `Machine::timing_epoch`, copied into this bus at construction. The CPU reads it at every
+    /// port access to pick the `IN`/`OUT` privilege column (`CpuGsw::port_io_core_clocks`); it is
+    /// a plain field, so it cannot change mid-run and the JIT's cached per-block raw clocks stay
+    /// valid.
+    fn timing_epoch(&self) -> u32 {
+        self.timing_epoch
+    }
+
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
-        (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
-            / u64::from(self.bus_den_at_batch_start)
+        let scaled = (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
+            / u64::from(self.bus_den_at_batch_start);
+        // F2 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2 the port lane joins
+        // the figure the run loop's `spent` is built from, so the charge is counted AGAINST the cap
+        // instead of only joining the batch-end `step`. See `in_batch_scaled_bus_clocks_screen_scale`
+        // for the other half of the fix -- without it the CPU's per-instruction screen would let a
+        // burst run past the cap unasked. Epoch 1 is byte-identical: the pre-slice lane was
+        // OPL/DSP-poll-only and `run.rs`'s overshoot note (route (c)) still describes it exactly.
+        if self.timing_epoch >= 2 {
+            scaled.saturating_add(*self.isa_io_clocks)
+        } else {
+            scaled
+        }
     }
 
     /// The division-free form of the run-loop cap test. Exactly equivalent to
@@ -2226,6 +2623,17 @@ impl CpuBus for MachineBus<'_> {
     /// tens, and this runs once per retired instruction.
     #[inline]
     fn in_batch_scaled_bus_clocks_at_least(&self, target: u64) -> bool {
+        // Under epoch 2 the figure carries an ADDITIVE unscaled term (the port lane, F2), which
+        // does not survive the multiply-through: `floor(A/den) + p >= t` is not
+        // `A >= (t - p) * den` when `t < p`, and folding `p * den` back in would re-introduce the
+        // very divide this form exists to avoid only to lose exactness at the floor. Ask the value
+        // question instead. It costs one 64-bit divide per retired instruction, which is the 2.99%
+        // of wall this form was written to remove -- accepted, because epoch 2 is not the shipping
+        // configuration and an inexact cap test would be a guest-visible defect rather than a
+        // slow one.
+        if self.timing_epoch >= 2 {
+            return self.in_batch_scaled_bus_clocks() >= target;
+        }
         let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         let scaled = u128::from(raw) * u128::from(self.bus_num_at_batch_start)
             + u128::from(self.bus_rem_at_batch_start);
@@ -2255,6 +2663,20 @@ impl CpuBus for MachineBus<'_> {
     /// run loop to read once per run.
     #[inline]
     fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
+        // F2, second half. `ceil(num/den)` bounds the SCALED figure's growth per raw bus clock, and
+        // under epoch 2 the figure carries a term that is not a function of raw bus clocks at all:
+        // one port access adds up to 160 unscaled clocks for four raw ones. A screen sized to the
+        // bus ratio would then be an INVALID bound -- it would answer "certainly below the cap"
+        // for a burst that had already crossed it, and the run would keep retiring `OUT`s past the
+        // cap unasked. A bound of `40 + ceil(num/den)` would be sound (160 per 4 raw clocks), but
+        // it rests on every port access recording exactly four raw clocks alongside its lane
+        // charge, in that order, at every one of the two call sites -- a coupling no test states.
+        // `0` is the trait's own "this bus offers no bound", which turns the screen off and sends
+        // every ask to the exact test: the pre-screen behaviour, sound by construction, and what
+        // makes the batch's overshoot past the cap exactly one instruction under epoch 2.
+        if self.timing_epoch >= 2 {
+            return 0;
+        }
         let num = u64::from(self.bus_num_at_batch_start);
         let den = u64::from(self.bus_den_at_batch_start);
         num.div_ceil(den).max(1)
@@ -2523,6 +2945,15 @@ impl CpuBus for MachineBus<'_> {
         );
 
         if let Some(value) = self.pci.read_io(port, width, self.vega) {
+            // F4 (`dev_docs/2026-09-05-port-io-repricing-review.md`): this arm claims
+            // 0xCF8-0xCFF above the width split and the general below-the-split charge site,
+            // which would otherwise leave PCI configuration cycles unreached at epoch 2.
+            // `PciTarget` prices a byte cycle, same as every other class, so a wider access
+            // pays once per byte it decomposes into on the real bus, even though `pci.read_io`
+            // itself answers the whole width in one call.
+            for _ in 0..width.bytes() {
+                self.charge_port_bus(port);
+            }
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -2532,6 +2963,11 @@ impl CpuBus for MachineBus<'_> {
         if let Some(base) = self.pci.ide_bus_master_io_base()
             && bmide::BusMasterIde::owns_io(port, width, base)
         {
+            // F4: same reason as the PCI arm above -- the live BMIDE BAR4 block also sits
+            // above the general charge site.
+            for _ in 0..width.bytes() {
+                self.charge_port_bus(port);
+            }
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -2579,7 +3015,7 @@ impl CpuBus for MachineBus<'_> {
         // overlaps the charged set as configured; a guest that relocated BAR4 into
         // the X-bus range would skip the charge on those sixteen ports, which is
         // strictly the conservative direction.
-        self.charge_isa_io_wait(port);
+        self.charge_port_bus(port);
 
         // THE 0x3DA FAST PATH. GP2 reads this one port 2.003 billion times in a run, and in
         // decode order it walks `port_disabled` plus four UART/LPT range checks first, every
@@ -2816,7 +3252,11 @@ impl CpuBus for MachineBus<'_> {
             // cannot outrun the 80 us OPL timer on a fast CPU (folded into the batch
             // device advance in run_until_tick). The 386 modes do not need this
             // charge because their slower clocks already span the window.
-            if self.lazy_port_reads {
+            // F3 (`dev_docs/2026-09-05-port-io-repricing-review.md`): epoch 2's
+            // `charge_port_bus` already prices this same access through the unified class
+            // charge (`IsaXBus` on 0x388-0x38B), so this hand accrual must stay epoch-1-only
+            // or `IN 0x388` double-charges (166 + 156 + 19 instead of 179).
+            if self.lazy_port_reads && self.timing_epoch < 2 {
                 *self.isa_io_clocks += isa_io_clocks(self.active_mode);
             }
             // The chip drives only the status byte on reads; data ports read open-bus.
@@ -2968,7 +3408,12 @@ impl CpuBus for MachineBus<'_> {
             // one hundred times) runs entirely between advances. Gate on the
             // DSP's own ports: the charge must not leak to unrelated ports
             // that merely fall through this arm unclaimed.
-            if self.lazy_port_reads && matches!(port, 0x226 | 0x22A | 0x22C | 0x22E | 0x22F) {
+            // F3: epoch-1-only, same reason as the OPL arm above -- epoch 2's
+            // `charge_port_bus` already prices this port through the unified class charge.
+            if self.lazy_port_reads
+                && self.timing_epoch < 2
+                && matches!(port, 0x226 | 0x22A | 0x22C | 0x22E | 0x22F)
+            {
                 *self.isa_io_clocks += isa_io_clocks(self.active_mode);
                 let pending = self.pending_device_micros();
                 self.sb16.service_reset_at(pending);
@@ -3106,6 +3551,11 @@ impl CpuBus for MachineBus<'_> {
         // which mirrors this post-write block for the HLE path.
         let pci_decode = self.vega.memory_decode_key();
         if self.pci.write_io(port, width, value, self.vega) {
+            // F4: see the matching comment in `read_io` -- 0xCF8-0xCFF sits above the width
+            // split and the general charge site.
+            for _ in 0..width.bytes() {
+                self.charge_port_bus(port);
+            }
             // The only bus-side door onto Distira's PCI command register and BAR, so the only
             // place the extended-RAM floor snapshot can go stale while this view is live. The
             // HLE PCI BIOS arm (`bios.rs handle_pci_bios`) writes through `Machine`, which
@@ -3127,6 +3577,10 @@ impl CpuBus for MachineBus<'_> {
         if let Some(base) = self.pci.ide_bus_master_io_base()
             && bmide::BusMasterIde::owns_io(port, width, base)
         {
+            // F4: see the matching comment in `read_io`.
+            for _ in 0..width.bytes() {
+                self.charge_port_bus(port);
+            }
             if self.pci.ide_io_enabled() {
                 self.bmide
                     .write_io(port, width, value, self.ata.as_mut(), base);
@@ -3161,7 +3615,7 @@ impl CpuBus for MachineBus<'_> {
         // See `read_io`'s matching site: below the width split (one charge per
         // byte cycle), above every device arm, and above `port_disabled` -- an
         // ISA cycle to a listed port happens whether or not the decode answers.
-        self.charge_isa_io_wait(port);
+        self.charge_port_bus(port);
 
         if self.vega.port_disabled(port) {
             return Ok(());
@@ -3685,6 +4139,46 @@ impl CpuBus for MachineBus<'_> {
             committed_raw_bus_clocks,
             now_after,
         })
+    }
+
+    /// P3. One string element's port read, with the element's WIDTH published to
+    /// `charge_port_bus` so an IDE data-register burst is priced at the ATA cycle time rather
+    /// than the register class's single-access latency. The flag is set for the duration of this
+    /// one access and cleared unconditionally afterwards, including on the error path: a leaked
+    /// `true` would misprice every subsequent single access in the batch.
+    fn read_io_string_element(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<u32, BusError> {
+        self.string_port_element_bytes = width.bytes() as u8;
+        let result =
+            <Self as CpuBus>::read_io(self, port, width, core_clocks_so_far, cpu_is_ring0_pm);
+        self.string_port_element_bytes = 0;
+        result
+    }
+
+    fn write_io_string_element(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        value: u32,
+        core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<(), BusError> {
+        self.string_port_element_bytes = width.bytes() as u8;
+        let result = <Self as CpuBus>::write_io(
+            self,
+            port,
+            width,
+            value,
+            core_clocks_so_far,
+            cpu_is_ring0_pm,
+        );
+        self.string_port_element_bytes = 0;
+        result
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {

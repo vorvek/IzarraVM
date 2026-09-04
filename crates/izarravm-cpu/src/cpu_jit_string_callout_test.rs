@@ -1097,12 +1097,18 @@ fn interpret_one_fold_is_unmoved_by_the_string_rows() {
     );
     assert_eq!(
         crate::MAX_CALL_OUT_CORE_CLOCKS,
-        37,
+        26 * 12,
         "MAX_CALL_OUT_CORE_CLOCKS is the GLOBAL ceiling, not a per-class term: its only reader is \
          compute_global_block_upper, which throttles nothing (see this fixture's doc and run.rs). \
-         It reads 37 since the 0xCD INT imm8 row, whose 37-clock charge a dominating ceiling must \
-         cover. If this fails at some OTHER value, check which constant moved: the two \
-         INTERPRET_ONE_* pins below are the ones that would change block admission"
+         It read 37 from the 0xCD INT imm8 row until the port I/O repricing \
+         (dev_docs/2026-09-05-port-io-repricing-design.md) made a port slot's charge a function of \
+         the live privilege column, topping out at MAX_PORT_CORE_CLOCKS (OUT / CPL>IOPL, 26 x 12 \
+         = 312 raw) under IZARRAVM_TIMING_EPOCH=2. A GLOBAL ceiling must dominate every admitted \
+         helper unconditionally, so this one is NOT epoch-keyed even though the per-class port \
+         term in callout_core_upper is: the cost here is slack in a debug assertion, and the cost \
+         there would be guest-visible admission on a knob-unset build. If this fails at some \
+         OTHER value, check which constant moved: the two INTERPRET_ONE_* pins below are the ones \
+         that would change block admission"
     );
     assert_eq!(
         crate::INTERPRET_ONE_MAX_DATA_ACCESSES,

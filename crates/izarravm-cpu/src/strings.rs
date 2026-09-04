@@ -394,26 +394,42 @@ impl CpuGsw {
             }
             StringOp::Ins => {
                 // INS: [ES:DI] <- port[DX]. ES cannot be overridden.
-                let value = bus.read_io(
-                    self.read_gpr16(2),
+                let port = self.read_gpr16(2);
+                // P3, gap 3. String port I/O never consulted the TSS bitmap
+                // (`dev_docs/2026-09-05-v86-port-io-timing-research.md` section 5), so it could
+                // not `#GP` under ANY monitor -- wrong under one trapping a port a driver reaches
+                // with `REP INSW`. Ordered BEFORE the access and before any index adjustment, so
+                // a denied element faults with the string state untouched and `CX` still counting
+                // it, which is what a restartable string instruction requires.
+                self.check_io_permission(bus, port, width)?;
+                let value = bus.read_io_string_element(
+                    port,
                     width,
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
                 self.write_string_dst(bus, address_size, width, value)?;
                 self.adjust_index_register(7, address_size, bytes);
+                if prefixes.rep.is_some() {
+                    self.charge_string_port_element_core(bus, false);
+                }
             }
             StringOp::Outs => {
                 // OUTS: port[DX] <- [DS:SI] (segment overridable).
+                let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, width)?;
                 let value = self.read_string_src(bus, prefixes, address_size, width)?;
-                bus.write_io(
-                    self.read_gpr16(2),
+                bus.write_io_string_element(
+                    port,
                     width,
                     value,
                     self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
                 self.adjust_index_register(6, address_size, bytes);
+                if prefixes.rep.is_some() {
+                    self.charge_string_port_element_core(bus, true);
+                }
             }
         }
         Ok(())
