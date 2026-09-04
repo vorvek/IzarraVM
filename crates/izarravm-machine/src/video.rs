@@ -2433,7 +2433,7 @@ impl Machine {
 
     /// Every frame size the guest gave Distira, against its count. An empty
     /// census means the guest never reached the 3D unit.
-    pub fn distira_census(&self) -> &DistiraCensus {
+    pub fn distira_census(&mut self) -> DistiraCensus {
         self.vega.distira_census()
     }
 
@@ -2442,20 +2442,27 @@ impl Machine {
         self.vega.distira_scanout_state()
     }
 
-    pub fn distira_register_writes(&self) -> Vec<(usize, u64)> {
+    pub fn distira_register_writes(&mut self) -> Vec<(usize, u64)> {
         self.vega.distira_register_writes()
     }
 
-    pub fn distira_register_reads(&self) -> Vec<(usize, u64)> {
+    pub fn distira_register_reads(&mut self) -> Vec<(usize, u64)> {
         self.vega.distira_register_reads()
     }
 
-    pub fn distira_aperture_traffic(&self) -> izarravm_video::DistiraApertureTraffic {
+    pub fn distira_aperture_traffic(&mut self) -> izarravm_video::DistiraApertureTraffic {
         self.vega.distira_aperture_traffic()
     }
 
     pub fn distira_offset_bits_or(&self) -> usize {
         self.vega.distira_offset_bits_or()
+    }
+
+    /// See `izarravm_video::SwapToNextDrainStats`: the fastfill-after-swap
+    /// census from `dev_docs/2026-09-05-distira-async-overlap-review.md`
+    /// section 2.
+    pub fn distira_swap_to_next_drain_stats(&self) -> izarravm_video::SwapToNextDrainStats {
+        self.vega.distira_swap_to_next_drain_stats()
     }
 
     pub fn margo_display(&self) -> Option<crate::MargoDisplay> {

@@ -6,6 +6,7 @@
 //! swaps, ordered dither, triangle setup, texture sampling, and host-color decode.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 mod ncc;
 mod raster_kernel;
@@ -21,6 +22,8 @@ use crate::{DistiraCensus, DistiraCensusKey};
 use ncc::NccState;
 use raster_math::*;
 use raster_pool::{DiagCounter, FrameStore, raster_pool};
+#[cfg(test)]
+use raster_queue::RASTER_QUEUE_CAPACITY;
 use raster_queue::{
     QueuedCommand, QueuedTextureWrite, QueuedTriangle, RasterQueue, ViewMemory, render_band,
 };
@@ -62,6 +65,33 @@ const MIN_ROWS_PER_LANE: usize = 4;
 /// correct on the rare small batch too.
 fn lanes_for_rows(rows: usize, cap: usize) -> usize {
     (rows / MIN_ROWS_PER_LANE).clamp(1, cap.max(1))
+}
+
+/// `IZARRAVM_DISTIRA_ASYNC`, read once and cached for the process --
+/// B2 of `dev_docs/2026-09-05-distira-async-slice1-review.md`: slice 1
+/// landed default-on with no in-binary OFF arm, so the design's own ladder
+/// recipe (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 8:
+/// "`IZARRAVM_DISTIRA_ASYNC` off/on ... interleaved A/B/B/A") could not be
+/// run without comparing two separate builds -- exactly the cross-build
+/// variance the campaign's own measurement discipline rejects.
+///
+/// Same env-null convention as `IZARRAVM_JCC_SHADOW`/`IZARRAVM_PIT_BULK_ADVANCE`
+/// (unset and `""` both mean the default): unset, unparsable, or any value
+/// other than exactly `"0"` keeps slice 1's behaviour (the guest's
+/// `swapbufferCMD` write flushes the queue to the raster pool and returns
+/// without joining, see `write_mmio_u8`'s `SST_SWAPBUFFER_CMD` arm); `"0"`
+/// makes that write fall back to `drain_raster_queue` like every other join
+/// point, i.e. fully synchronous -- flush and its own join are always
+/// adjacent, so `overlap_ns` reads ~0 for the whole run (see
+/// `a_flush_immediately_joined_reports_approximately_zero_overlap`) and
+/// `IZARRAVM_DISTIRA_ASYNC=0` is a true in-binary OFF arm for the ladder.
+fn async_raster_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("IZARRAVM_DISTIRA_ASYNC")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// The triangle-constant inputs of `raster_row`, so a lane needs only
@@ -209,14 +239,98 @@ pub struct DistiraTriangleCensus {
     /// reads, `swapbufferCMD`, `fastfillCMD`, and the queue filling up.
     pub queue_drains: u64,
     /// Of those drains, how many batch was large enough to reach the
-    /// parallel lanes (see `Distira::batch_lanes`).
+    /// parallel lanes (see `batch_lanes`).
     pub queue_drains_parallel: u64,
     /// Slice 0 of the texture-queue lever
     /// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6):
     /// which caller forced each of the `queue_drains` above. Named at the
     /// call site (`DrainCause`, passed to `Distira::drain_raster_queue`), not
     /// inferred after the fact, so it never drifts from the real trigger.
+    ///
+    /// **Widened in slice 0 of the async-overlap review**
+    /// (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2):
+    /// this now counts every CALL to `drain_raster_queue`, including one that
+    /// finds the queue already empty and returns without drawing anything.
+    /// Before this it undercounted by exactly the empty-queue calls, which
+    /// hid the fastfill-after-swap question the review asks: a swap that
+    /// flushes and a fastfill that immediately follows it, finding nothing
+    /// left to draw, used to be invisible here. `queue_drains` above is
+    /// unchanged -- it still counts only the calls that found a non-empty
+    /// queue and actually rasterised.
     pub queue_drain_causes: DistiraDrainCauses,
+
+    /// Slice 1 of the async-overlap review
+    /// (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 8):
+    /// how many of `queue_drains` above were handed to the raster pool
+    /// through `Distira::flush_raster_queue` instead of drawn on the
+    /// calling thread. Under this slice that is every one of them --
+    /// `flush_raster_queue` is the only path that ever takes a non-empty
+    /// queue -- so this tracks `queue_drains` exactly; it exists as its
+    /// own field because a later slice (depth > 1, or a synchronous
+    /// fallback) could make the two diverge, and the whole point of a
+    /// named counter is that it does not have to be re-derived from
+    /// `queue_drains` when that happens.
+    pub async_batches: u64,
+    /// Per-cause breakdown of how many `Distira::join_raster` calls
+    /// actually waited on an in-flight batch (a join that found nothing in
+    /// flight is free and is not counted -- see `Distira::join_raster`'s
+    /// doc comment). Keyed on the cause of the CALL that performed the
+    /// join, not the cause that flushed the batch it waited for: a
+    /// `fastfillCMD` write (`RegisterWriteUncovered`) that joins the
+    /// previous frame's swap-flushed batch is what answers finding 2 of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` -- "does the
+    /// call that follows a swap land microseconds later, or does it find
+    /// the batch already gone?" -- and that answer lives under
+    /// `register_write_uncovered` here, not `swap_or_scanout`.
+    pub joins_by_cause: DistiraDrainCauses,
+    /// **B1 of `dev_docs/2026-09-05-distira-async-slice1-review.md`.** The
+    /// FIRST cut of this field (slice 1 as reviewed) stored
+    /// `flushed_at.elapsed()` measured AFTER `Receiver::recv` returned --
+    /// i.e. the whole flush-to-join-COMPLETE window, which on every join
+    /// point but the swap is the batch's own raster time, not overlap (flush
+    /// and join are adjacent there: see `Distira::drain_raster_queue`). A
+    /// run with zero overlap and a run with perfect overlap both reported a
+    /// large, indistinguishable number.
+    ///
+    /// Fixed: `Distira::join_raster` now takes two independent timings --
+    /// `window_ns` (flush to join-complete, same as before) and `blocked_ns`
+    /// (an `Instant` taken immediately before `recv`, so just the time THIS
+    /// call spent actually waiting). `overlap_ns` is `window_ns - blocked_ns`,
+    /// summed across every join: for a flush immediately followed by its own
+    /// join (every join point but the swap, and the WHOLE run under
+    /// `IZARRAVM_DISTIRA_ASYNC=0`) the two are nearly equal and this reads
+    /// ~0, which is what
+    /// `a_flush_immediately_joined_reports_approximately_zero_overlap` pins.
+    /// Only time the guest spent doing something ELSE while the batch ran on
+    /// the pool -- the actual lever -- accumulates here.
+    pub overlap_ns: u64,
+    /// The `blocked_ns` half of the same split: total wall-clock nanoseconds
+    /// every join spent genuinely inside `Receiver::recv`, whether or not it
+    /// overlapped anything. `overlap_ns + blocked_ns` recovers the OLD
+    /// (wrong) single-number `overlap_ns` this field's sibling replaces.
+    pub blocked_ns: u64,
+    /// Per-cause breakdown of `window_ns` (flush to join-complete) -- see
+    /// `overlap_ns`'s doc comment for what that measures and why B1 asked
+    /// for it broken out per [`DrainCause`], not just as one accumulator:
+    /// "one accumulator cannot distinguish 'the guest gave us a frame' from
+    /// 'the fastfill joined immediately'"
+    /// (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 7).
+    /// Keyed the same way as `joins_by_cause`: the cause of the CALL that
+    /// performed the join, not the cause that flushed the batch it waited
+    /// for.
+    pub window_ns_by_cause: DistiraDrainNanos,
+    /// Per-cause breakdown of `blocked_ns`. Together with
+    /// `window_ns_by_cause`, `window_ns_by_cause[c] - blocked_ns_by_cause[c]`
+    /// is the overlap THAT CAUSE'S joins achieved -- the number that answers
+    /// finding 2 of the prior review directly: a `register_write_uncovered`
+    /// entry (the fastfill) with a window near its blocked time joined
+    /// almost immediately; a large gap between them means real guest work
+    /// ran first.
+    pub blocked_ns_by_cause: DistiraDrainNanos,
+    /// Per-cause breakdown of `overlap_ns` itself
+    /// (`window_ns_by_cause[c] - blocked_ns_by_cause[c]`, precomputed at the
+    /// join so a reader does not have to subtract two histograms by hand).
+    pub overlap_ns_by_cause: DistiraDrainNanos,
 }
 
 /// Per-reason breakdown of [`DistiraTriangleCensus::queue_drains`]. Answers
@@ -295,6 +409,66 @@ impl DistiraDrainCauses {
             DrainCause::Config => self.config += 1,
         }
     }
+}
+
+/// Same field-per-[`DrainCause`] shape as [`DistiraDrainCauses`], but a
+/// nanosecond SUM per cause instead of a call count -- `window_ns_by_cause`,
+/// `blocked_ns_by_cause` and `overlap_ns_by_cause` on
+/// [`DistiraTriangleCensus`] all use this. A separate type rather than
+/// reusing `DistiraDrainCauses` for both: both are `u64` fields, but a count
+/// and a nanosecond sum answer different questions, and giving them the same
+/// type would let a future edit add them together without the compiler
+/// noticing anything wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DistiraDrainNanos {
+    pub texture_write: u64,
+    pub lfb_read: u64,
+    pub lfb_write: u64,
+    pub register_read_stats: u64,
+    pub register_write_uncovered: u64,
+    pub nop_cmd_reset_stats: u64,
+    pub swap_or_scanout: u64,
+    pub queue_full: u64,
+    pub immediate_triangle: u64,
+    pub config: u64,
+}
+
+impl DistiraDrainNanos {
+    fn add(&mut self, cause: DrainCause, nanos: u64) {
+        let field = match cause {
+            DrainCause::LfbRead => &mut self.lfb_read,
+            DrainCause::LfbWrite => &mut self.lfb_write,
+            DrainCause::RegisterReadStats => &mut self.register_read_stats,
+            DrainCause::RegisterWriteUncovered => &mut self.register_write_uncovered,
+            DrainCause::NopCmdResetStats => &mut self.nop_cmd_reset_stats,
+            DrainCause::SwapOrScanout => &mut self.swap_or_scanout,
+            DrainCause::QueueFull => &mut self.queue_full,
+            DrainCause::ImmediateTriangle => &mut self.immediate_triangle,
+            DrainCause::Config => &mut self.config,
+        };
+        *field = field.saturating_add(nanos);
+    }
+}
+
+/// The swap -> next-drain-call wall-clock window, summarised. Answers
+/// the fastfill-after-swap question from
+/// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 2: does the
+/// call that follows a `swapbufferCMD` land microseconds later (the window
+/// an async lever would have to overlap the guest's frame with) or is it
+/// effectively simultaneous (the fastfill finding an already-drained queue,
+/// eating the whole window before any lever can act)? Wall-clock, not guest
+/// cycles -- on the synchronous model the two are the same elapsed interval
+/// on the one thread that runs both, so this is measured directly rather
+/// than derived from a cycle counter Distira does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SwapToNextDrainStats {
+    /// How many swap -> next-call windows were closed (i.e. a swap was
+    /// followed by at least one more `drain_raster_queue` call before the
+    /// run ended).
+    pub count: usize,
+    pub min_ns: u64,
+    pub median_ns: u64,
+    pub max_ns: u64,
 }
 
 /// Traffic through the three non-register apertures. A guest can look idle in
@@ -500,8 +674,14 @@ pub struct Distira {
     /// ever driven it, so this is the first instrument that says whether a
     /// real title reached the 3D unit at all.
     census: DistiraCensus,
-    fb: FrameStore,
-    texture: [Vec<u8>; 2],
+    /// `Arc`, not a plain `FrameStore`: slice 0b of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 3.
+    /// `FrameStore` is ALREADY `Vec<AtomicU8>` (`raster_pool.rs`) -- every
+    /// method takes `&self` and stores through relaxed atomics -- so the
+    /// interior mutability this needs is already there, and `Arc` adds one
+    /// indirection to an access that is already a load, never a `Mutex` or
+    /// `RefCell`. Nothing here is unsafe: `#![forbid(unsafe_code)]` holds.
+    fb: Arc<FrameStore>,
     fifo: VecDeque<DistiraFifoEntry>,
     command_fifo: VecDeque<u32>,
     display: DistiraDisplay,
@@ -676,7 +856,333 @@ pub struct Distira {
     tex_base_addr38: [u32; 2],
     trex_init0: [u32; 2],
     trex_init1: [u32; 2],
+    /// The texture stores and NCC/CLUT tables a raster batch touches, moved
+    /// out for the duration of a batch rather than shared. Slice 0b of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 3: NO
+    /// atomics here, unlike `fb` -- `self.texture` has exactly two `&mut
+    /// self` writers (the drain's serial application of a queued texture
+    /// write, and the queue-off store in `write_texture_u32`) and no `&self`
+    /// reader outside the lane-side view (#840 established that a
+    /// texture-aperture READ never reaches the device), so ownership can
+    /// just move to the batch and back instead of sharing through atomics
+    /// the way `fb` does.
+    ///
+    /// `None` while a batch has the box: from `flush_raster_queue`'s
+    /// `take()` until `join_raster` gets it back over the completion
+    /// channel. Slice 1 of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md`: this used to
+    /// be `None` only for the duration of `drain_raster_queue`'s own call,
+    /// on the calling thread; now the "duration" can span guest
+    /// instructions between the flush and whichever call joins it, which
+    /// is the whole point of the lever. Every access outside a batch goes
+    /// through `raster_owned_mut`, which joins first, so nothing ever
+    /// observes `None` here except the raster worker itself, which owns a
+    /// local `Box<RasterOwned>` moved out of this field, not a borrow of
+    /// it.
+    raster_owned: Option<Box<RasterOwned>>,
+    /// Slice 1 of the async-overlap review: the one batch (depth one) the
+    /// raster pool may be working on right now. `None` whenever nothing is
+    /// outstanding -- which is most of the time a caller looks, since
+    /// `Distira::join_raster` takes it the moment anything needs to
+    /// observe batch-produced state. See `Distira::flush_raster_queue` and
+    /// `Distira::join_raster`.
+    in_flight: Option<InFlight>,
+    /// The instant of the most recent guest `swapbufferCMD` write
+    /// (`SST_SWAPBUFFER_CMD`, byte 3, see `write_mmio_u8`) that has not yet
+    /// been closed off by a following `drain_raster_queue` call. `None` once
+    /// that following call lands -- see `swap_to_next_drain_ns` and slice 0
+    /// of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 2: this
+    /// is the fastfill-after-swap question, measured on the SYNCHRONOUS
+    /// model as a lower bound (the async lever cannot widen a window this
+    /// narrow, only fail to shrink it further).
+    last_swap_instant: Option<std::time::Instant>,
+    /// Every measured swap -> next-call window, in nanoseconds. Read out
+    /// through `swap_to_next_drain_stats`, never compared field-by-field --
+    /// it is wall-clock, so it is in the census "may move" whitelist, not
+    /// graded for identity.
+    swap_to_next_drain_ns: Vec<u64>,
+}
+
+/// The two per-batch memories a raster batch reads and (for `texture`)
+/// writes: moved out of `Distira` for a batch's duration instead of shared.
+/// See `Distira::raster_owned`'s doc comment and slice 0b of
+/// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RasterOwned {
+    texture: [Vec<u8>; 2],
     ncc: NccState,
+}
+
+/// One run of triangles a batch rasterised (a contiguous slice of the
+/// batch's commands with no `TextureWrite` in it) and the per-lane counters
+/// it produced. Sent back from the raster pool so `Distira::join_raster`
+/// can fold them through `merge_pixel_stats` on the JOINING thread --
+/// `dev_docs/2026-09-05-distira-async-overlap-design.md` section 3: "Keep
+/// `merge_pixel_stats` exactly where it is -- on the joining thread, with
+/// the batch's `jobs` slice in hand." `range` indexes into
+/// `RasterBatchResult::commands`, which travels back in the same message.
+struct RasterRunResult {
+    range: std::ops::Range<usize>,
+    lane_stats: Vec<PixelStats>,
+    lanes: usize,
+}
+
+/// What a raster batch hands back through the join channel: the commands
+/// (so the joining thread can recycle the allocation via
+/// `RasterQueue::recycle` and re-derive each run's `jobs` slice for
+/// `merge_pixel_stats`), the `RasterOwned` box (texture stores + NCC,
+/// handed back exactly as the old synchronous `drain_raster_queue` did
+/// before returning), and one `RasterRunResult` per triangle run.
+struct RasterBatchResult {
+    commands: Vec<QueuedCommand>,
+    owned: Box<RasterOwned>,
+    runs: Vec<RasterRunResult>,
+    any_parallel: bool,
+}
+
+/// The one batch `Distira` ever lets be in flight at a time (depth one,
+/// deliberately -- see
+/// `dev_docs/2026-09-05-distira-async-overlap-design.md` section 2). Built
+/// by `Distira::flush_raster_queue`, consumed by `Distira::join_raster`.
+struct InFlight {
+    /// `std::thread::Result` (`Result<RasterBatchResult, Box<dyn Any + Send>>`),
+    /// not a bare `RasterBatchResult`: S1 of
+    /// `dev_docs/2026-09-05-distira-async-slice1-review.md`. `raster_pool()`
+    /// installs no `panic_handler`, and rayon's default aborts the whole
+    /// process on a worker panic with no unwind and no destructors -- before
+    /// slice 1 a raster bug surfaced as an ordinary panic on the emulation
+    /// thread (`raster_pool().install(...)` propagates one out normally);
+    /// moving the raster off that thread silently turned every raster panic
+    /// into a process abort. `run_raster_batch` now runs inside
+    /// `std::panic::catch_unwind` and the payload rides the channel; `Self::join_raster`
+    /// calls `std::panic::resume_unwind` on an `Err`, which restores the old
+    /// behaviour: the panic still surfaces on the emulation thread, at the
+    /// join, instead of killing the process.
+    rx: std::sync::mpsc::Receiver<std::thread::Result<RasterBatchResult>>,
+    /// When this batch was handed to the pool, for `overlap_ns`/`blocked_ns`.
+    flushed_at: std::time::Instant,
+}
+
+/// What one [`Distira::join_raster`] call learned about the batch it just
+/// folded in. See [`DistiraTriangleCensus::overlap_ns`]'s doc comment for
+/// what `window_ns` and `blocked_ns` measure and why B1 of
+/// `dev_docs/2026-09-05-distira-async-slice1-review.md` asked for both.
+struct JoinResult {
+    written: u64,
+    window_ns: u64,
+    blocked_ns: u64,
+}
+
+/// Hand-rolled, in the same spirit as `FrameStore`'s and `RasterQueue`'s
+/// impls just above: `Distira` derives `Debug`/`Clone`/`PartialEq`/`Eq`, but
+/// `mpsc::Receiver` has none of those, and a receiver cannot be duplicated
+/// meaningfully anyway. `in_flight` is ephemeral scheduling state, not
+/// device state -- nothing a queued batch will produce is observable until
+/// `Distira::join_raster` folds it in, and every accessor joins first -- so
+/// two `Distira` values compare and print by PRESENCE only, exactly the way
+/// `RasterQueue::eq` compares by pending count rather than content. Cloning
+/// is different: there is no ephemeral placeholder a clone could hold that
+/// would let it eventually complete a join of its own, so a clone taken
+/// while a batch is genuinely in flight is a bug in the caller (it should
+/// have joined first, the same invariant every other accessor keeps) and
+/// this panics rather than fabricate a receiver that can never resolve.
+impl std::fmt::Debug for InFlight {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "InFlight(..)")
+    }
+}
+
+impl Clone for InFlight {
+    fn clone(&self) -> Self {
+        panic!(
+            "a Distira must not be cloned while a raster batch is in flight; \
+             join_raster first"
+        )
+    }
+}
+
+impl PartialEq for InFlight {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for InFlight {}
+
+/// How many lanes a batch (or one run within it) is worth. Below the pixel
+/// threshold the wake-up cost of the pool beats the win outright and the
+/// calling thread draws the batch (`lanes == 1`); above it, [`lanes_for_rows`]
+/// grants only as many lanes as the batch's row span can fill, up to
+/// `raster_lanes`.
+///
+/// The two measures answer different questions. Pixels are the work, so
+/// they sum over the batch. Rows are the parallelism, and lanes divide
+/// DISTINCT rows, so they take the union span rather than the sum: a stack
+/// of small triangles sitting on top of each other has one triangle's
+/// worth of rows to share out however many triangles it holds.
+///
+/// A free function, not `Distira::batch_lanes`, since slice 1 of
+/// `dev_docs/2026-09-05-distira-async-overlap-review.md` moves the caller
+/// (`raster_run`) onto the raster pool, where there is no `&self` -- only
+/// `raster_lanes`, captured by value in `Distira::flush_raster_queue`.
+fn batch_lanes(jobs: &[QueuedCommand], raster_lanes: usize) -> usize {
+    if raster_lanes < 2 {
+        return 1;
+    }
+    let mut lowest = u32::MAX;
+    let mut highest = 0;
+    let mut pixels = 0usize;
+    for job in jobs {
+        // See `render_band`: every entry in a run is a `Triangle` by
+        // construction.
+        let QueuedCommand::Triangle(job) = job else {
+            continue;
+        };
+        let job_rows = job.context.max_y.saturating_sub(job.context.min_y) as usize;
+        let columns = job.context.max_x.saturating_sub(job.context.min_x) as usize;
+        if job_rows == 0 {
+            continue;
+        }
+        lowest = lowest.min(job.context.min_y);
+        highest = highest.max(job.context.max_y);
+        pixels += job_rows.saturating_mul(columns);
+    }
+    if pixels < PARALLEL_PIXEL_THRESHOLD {
+        return 1;
+    }
+    let rows = highest.saturating_sub(lowest) as usize;
+    lanes_for_rows(rows, raster_lanes)
+}
+
+/// Rasterise one run of triangles with no queued texture write between
+/// them: one fork and one join for the run, entirely on the raster pool.
+/// Lane `i` owns the FRAMEBUFFER rows where `draw_y(y) % lanes == i` and
+/// walks the run in submission order, so overlapping triangles land in the
+/// order the guest sent them. `distira/raster_queue.rs` has why the
+/// framebuffer row is the one that has to partition and not the triangle's
+/// own row. Returns each lane's counters and the lane count, for the
+/// JOINING thread to fold through `Distira::merge_pixel_stats` -- see
+/// `Distira::join_raster`'s doc comment.
+///
+/// A free function (the old `Distira::render_triangle_segment`, minus
+/// `&mut self`): it runs on the worker thread the batch was moved to,
+/// which has no borrow of `Distira` at all, only `fb` and `owned` by
+/// reference and `raster_lanes` by value.
+fn raster_run(
+    jobs: &[QueuedCommand],
+    owned: &RasterOwned,
+    fb: &FrameStore,
+    raster_lanes: usize,
+) -> (Vec<PixelStats>, usize) {
+    let lanes = batch_lanes(jobs, raster_lanes);
+    let mut lane_stats: Vec<PixelStats> = (0..lanes).map(|_| PixelStats::new(0)).collect();
+    let memory = ViewMemory {
+        fb,
+        texture: &owned.texture,
+        ncc: &owned.ncc,
+    };
+    if lanes == 1 {
+        render_band(jobs, memory, 0, 1, &mut lane_stats[0]);
+    } else {
+        let lane_count = lanes as u32;
+        // A lane accumulates into a stack-local `PixelStats` and stores
+        // it once at the end: the `lane_stats` elements share cache
+        // lines, and a per-pixel counter write there makes the lanes
+        // false-share their way back to serial speed.
+        let (worker_stats, install_stats) = lane_stats.split_at_mut(lanes - 1);
+        // `install` moves the whole fork onto the pool: the scope then
+        // spawns into a worker-local queue, which the other workers
+        // steal far faster than an external injection wakes them. The
+        // installed worker rasterises the last lane. This closure already
+        // runs ON a pool thread (the batch driver
+        // `Distira::flush_raster_queue` spawned onto), so `install` here
+        // runs the fork inline on the current worker rather than adding a
+        // thread -- the pool still does exactly `raster_lanes` threads of
+        // work, not `raster_lanes + 1`
+        // (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 7).
+        raster_pool().install(|| {
+            rayon::scope(|scope| {
+                for (lane, stats) in worker_stats.iter_mut().enumerate() {
+                    scope.spawn(move |_| {
+                        render_band(jobs, memory, lane as u32, lane_count, stats);
+                    });
+                }
+                render_band(
+                    jobs,
+                    memory,
+                    lane_count - 1,
+                    lane_count,
+                    &mut install_stats[0],
+                );
+            });
+        });
+    }
+    (lane_stats, lanes)
+}
+
+/// The whole batch, run on the raster pool: split into runs at every
+/// `TextureWrite`, each run forked/joined through [`raster_run`], and
+/// every write applied serially between the two runs it separates -- byte
+/// for byte the body of the old (slice 0b and earlier) synchronous
+/// `Distira::drain_raster_queue`
+/// (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 2, item
+/// 3: "The worker task is byte-for-byte the body of today's
+/// `drain_raster_queue`"), just no longer borrowing `self`.
+///
+/// `merge_pixel_stats` is deliberately NOT called here -- see
+/// `Distira::join_raster`'s doc comment: it runs on the JOINING thread,
+/// with `self` and the batch's `jobs` slice both in hand, never on the
+/// worker.
+fn run_raster_batch(
+    commands: Vec<QueuedCommand>,
+    mut owned: Box<RasterOwned>,
+    fb: &FrameStore,
+    raster_lanes: usize,
+) -> RasterBatchResult {
+    let mut runs = Vec::new();
+    let mut any_parallel = false;
+    // A run of triangles between two `TextureWrite`s (or the batch's
+    // edges) is a CONTIGUOUS subslice of `commands` -- `run_start..index`
+    // tracks it by index instead of copying triangles into a side `Vec`,
+    // which used to memcpy every queued triangle (~600 B each) on every
+    // drain, even the common case with no write in the batch at all.
+    let mut run_start = 0usize;
+    for (index, command) in commands.iter().enumerate() {
+        let QueuedCommand::TextureWrite(write) = *command else {
+            continue;
+        };
+        if index > run_start {
+            let (lane_stats, lanes) =
+                raster_run(&commands[run_start..index], &owned, fb, raster_lanes);
+            any_parallel |= lanes > 1;
+            runs.push(RasterRunResult {
+                range: run_start..index,
+                lane_stats,
+                lanes,
+            });
+        }
+        let mask = DISTIRA_TEX_SIZE - 1;
+        for (byte_index, byte) in write.bytes.into_iter().enumerate() {
+            owned.texture[write.tmu][(write.offset + byte_index) & mask] = byte;
+        }
+        run_start = index + 1;
+    }
+    if run_start < commands.len() {
+        let (lane_stats, lanes) = raster_run(&commands[run_start..], &owned, fb, raster_lanes);
+        any_parallel |= lanes > 1;
+        runs.push(RasterRunResult {
+            range: run_start..commands.len(),
+            lane_stats,
+            lanes,
+        });
+    }
+    RasterBatchResult {
+        commands,
+        owned,
+        runs,
+        any_parallel,
+    }
 }
 
 impl Default for Distira {
@@ -691,8 +1197,7 @@ impl Distira {
         let buffer_stride = display.pitch * display.height;
         let mut distira = Self {
             census: DistiraCensus::default(),
-            fb: FrameStore::new(DISTIRA_FB_SIZE),
-            texture: std::array::from_fn(|_| vec![0; DISTIRA_TEX_SIZE]),
+            fb: Arc::new(FrameStore::new(DISTIRA_FB_SIZE)),
             fifo: VecDeque::new(),
             command_fifo: VecDeque::new(),
             display,
@@ -808,7 +1313,13 @@ impl Distira {
             tex_base_addr38: [0; 2],
             trex_init0: [0; 2],
             trex_init1: [0; 2],
-            ncc: NccState::default(),
+            raster_owned: Some(Box::new(RasterOwned {
+                texture: std::array::from_fn(|_| vec![0; DISTIRA_TEX_SIZE]),
+                ncc: NccState::default(),
+            })),
+            in_flight: None,
+            last_swap_instant: None,
+            swap_to_next_drain_ns: Vec::new(),
         };
         distira.clear_aux_depth();
         distira
@@ -1057,8 +1568,19 @@ impl Distira {
     }
 
     /// Every frame size this guest programmed, against its count.
-    pub fn census(&self) -> &DistiraCensus {
-        &self.census
+    ///
+    /// `&mut self` and an owned return, not `&self` and `&DistiraCensus`:
+    /// slice 0b of `dev_docs/2026-09-05-distira-async-overlap-review.md`
+    /// section 1 closes the `&self`-accessor hole by routing this through
+    /// `join_raster` first. An owned `DistiraCensus` (it derives `Clone`)
+    /// keeps the borrow from `self` from outliving the call, which matters
+    /// once a caller (see `main.rs`'s `--mode-census` dump) reads several of
+    /// these accessors back to back on the same `&mut Machine` -- a borrowed
+    /// return would force them to interleave in a fixed order again, which
+    /// is exactly the "ordering is luck" hazard this slice removes.
+    pub fn census(&mut self) -> DistiraCensus {
+        self.join_raster();
+        self.census.clone()
     }
 
     pub fn display(&self) -> DistiraDisplay {
@@ -1080,7 +1602,11 @@ impl Distira {
     /// A run that reports painted_bytes 0 never rendered; one that reports a
     /// large count with a black picture rendered somewhere nobody is looking.
     /// Diagnostic: `(register index, byte writes)`, busiest first.
-    pub fn register_write_histogram(&self) -> Vec<(usize, u64)> {
+    ///
+    /// `&mut self`: see [`Self::census`]'s doc comment -- same hole, same
+    /// fix.
+    pub fn register_write_histogram(&mut self) -> Vec<(usize, u64)> {
+        self.join_raster();
         let mut rows: Vec<(usize, u64)> = self
             .register_writes
             .iter()
@@ -1093,7 +1619,11 @@ impl Distira {
     }
 
     /// Diagnostic: `(register index, byte reads)`, busiest first.
-    pub fn register_read_histogram(&self) -> Vec<(usize, u64)> {
+    ///
+    /// `&mut self`: see [`Self::census`]'s doc comment -- same hole, same
+    /// fix.
+    pub fn register_read_histogram(&mut self) -> Vec<(usize, u64)> {
+        self.join_raster();
         let mut rows: Vec<(usize, u64)> = self
             .register_reads
             .iter()
@@ -1107,6 +1637,23 @@ impl Distira {
 
     pub fn mmio_offset_bits_or(&self) -> usize {
         self.offset_bits_or
+    }
+
+    /// See [`SwapToNextDrainStats`]. Sorts a clone of the sample vector, so
+    /// it is O(n log n) per call -- fine for an end-of-run census read, not
+    /// meant for a hot loop.
+    pub fn swap_to_next_drain_stats(&self) -> SwapToNextDrainStats {
+        if self.swap_to_next_drain_ns.is_empty() {
+            return SwapToNextDrainStats::default();
+        }
+        let mut samples = self.swap_to_next_drain_ns.clone();
+        samples.sort_unstable();
+        SwapToNextDrainStats {
+            count: samples.len(),
+            min_ns: samples[0],
+            median_ns: samples[samples.len() / 2],
+            max_ns: samples[samples.len() - 1],
+        }
     }
 
     pub fn scanout_state(&mut self) -> DistiraScanoutState {
@@ -1294,16 +1841,27 @@ impl Distira {
     /// The pipeline's view of the device THIS INSTANT. The LFB write path and
     /// the texture-aperture decode use it; a triangle uses the params it was
     /// submitted with instead.
-    fn raster_view(&self) -> RasterView<'_> {
-        self.view_memory().view(self.raster_params())
-    }
-
-    fn view_memory(&self) -> ViewMemory<'_> {
+    ///
+    /// `&mut self`: joins first (see [`Self::join_raster`]), then borrows
+    /// `self.fb`/`self.raster_owned` directly rather than through
+    /// [`Self::raster_owned_mut`] -- that method's `&mut self` receiver would
+    /// keep the whole of `self` borrowed for as long as the returned
+    /// [`RasterView`] lives, which is longer than `self.raster_params()`
+    /// (also `&self`) can tolerate. Reading the fields straight keeps the two
+    /// borrows disjoint.
+    fn raster_view(&mut self) -> RasterView<'_> {
+        self.join_raster();
+        let params = self.raster_params();
+        let owned = self.raster_owned.as_ref().expect(
+            "raster_owned is only None inside drain_raster_queue's own batch, \
+             which never calls back into this accessor",
+        );
         ViewMemory {
-            fb: &self.fb,
-            texture: &self.texture,
-            ncc: &self.ncc,
+            fb: self.fb.as_ref(),
+            texture: &owned.texture,
+            ncc: &owned.ncc,
         }
+        .view(params)
     }
 
     /// Set a triangle up and either queue it or draw it.
@@ -1414,156 +1972,263 @@ impl Distira {
         self.drain_raster_queue(DrainCause::ImmediateTriangle)
     }
 
-    /// Draw every triangle waiting on the queue -- and apply every queued
-    /// texture-aperture write, in submission order -- and return how many
-    /// pixels the triangles stored.
+    /// Wait for an in-flight raster batch, if there is one, before any
+    /// caller observes state a batch could have produced, and fold its
+    /// counters in. Slice 1 of
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 2:
+    /// this used to be a no-op (slice 0b); now it is the JOIN half of
+    /// `Distira::flush_raster_queue`'s flush -- it blocks on the batch's
+    /// completion channel, folds the returned `PixelStats` through
+    /// `merge_pixel_stats` **on this thread** (`RasterBatchResult::runs`
+    /// carries each run's `range`, so `merge_pixel_stats` gets the exact
+    /// `jobs` slice it always has -- see
+    /// `dev_docs/2026-09-05-distira-async-overlap-design.md` section 3),
+    /// and hands `raster_owned` back.
     ///
-    /// `queue_drains`/`queue_drains_parallel` count this call ONCE: the
-    /// certifying counters the texture-queue lever is graded on
-    /// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6)
-    /// name how often the GUEST is made to wait for the raster join, and a
-    /// texture write no longer forces that wait at all -- it rides the same
-    /// queue as the triangles around it and only the eventual real
-    /// synchronisation point (a swap, an LFB access, a full queue, ...)
-    /// pays for a drain.
+    /// Returns what the join learned (see [`JoinResult`]), or `None` if
+    /// nothing was in flight -- "a join on no in-flight batch is free and
+    /// must not be counted" (design section 8). Callers that pass a
+    /// [`DrainCause`] (`Self::flush_raster_queue`, `Self::drain_raster_queue`,
+    /// via `Self::record_join`) use the `Some`/`None` split to decide
+    /// whether to bump `joins_by_cause`; the plain accessor doors
+    /// (`Self::raster_owned_mut`, `Self::census` and friends) just discard
+    /// it -- they only need the join to have happened, not to account for
+    /// it under a cause, because they never flush anything themselves. The
+    /// AGGREGATE `overlap_ns`/`blocked_ns` are updated here unconditionally,
+    /// regardless of caller, so they stay correct even for an accessor-door
+    /// join; only the per-cause breakdowns depend on the caller passing one
+    /// through `Self::record_join`.
+    fn join_raster(&mut self) -> Option<JoinResult> {
+        let in_flight = self.in_flight.take()?;
+        // B1 of `dev_docs/2026-09-05-distira-async-slice1-review.md`: an
+        // `Instant` taken immediately before `recv`, so `blocked_ns` is ONLY
+        // the time this call itself spent waiting -- not the batch's whole
+        // flush-to-join-complete window, which `window_ns` below still
+        // measures for comparison. The old single `overlap_ns` stored
+        // `window_ns` alone, so a join adjacent to its own flush (every join
+        // point but the swap) reported the batch's full raster time as if it
+        // were overlap.
+        let recv_start = std::time::Instant::now();
+        let outcome = in_flight.rx.recv().expect(
+            "the Distira raster worker dropped its sender without a reply -- \
+             it must have panicked, and a worker panic should have arrived \
+             as an Err through the channel instead (see run_raster_batch's \
+             catch_unwind, S1 of the slice 1 review)",
+        );
+        let blocked_ns = recv_start.elapsed().as_nanos() as u64;
+        let window_ns = in_flight.flushed_at.elapsed().as_nanos() as u64;
+        // S1: propagate a worker panic instead of losing it. `run_raster_batch`
+        // ran inside `catch_unwind`, so an `Err` here means the worker
+        // itself panicked; resuming it on THIS (the emulation) thread is
+        // what `raster_pool().install(...)` used to do for free before the
+        // batch moved off this thread.
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        self.triangle_census.blocked_ns =
+            self.triangle_census.blocked_ns.saturating_add(blocked_ns);
+        self.triangle_census.overlap_ns = self
+            .triangle_census
+            .overlap_ns
+            .saturating_add(window_ns.saturating_sub(blocked_ns));
+        let mut written = 0u64;
+        for run in &result.runs {
+            written += self.merge_pixel_stats(
+                &run.lane_stats,
+                &result.commands[run.range.clone()],
+                run.lanes,
+            );
+        }
+        if result.any_parallel {
+            self.triangle_census.queue_drains_parallel += 1;
+        }
+        self.raster_queue.recycle(result.commands);
+        self.raster_owned = Some(result.owned);
+        Some(JoinResult {
+            written,
+            window_ns,
+            blocked_ns,
+        })
+    }
+
+    /// Attribute one join's `window_ns`/`blocked_ns`/`overlap_ns` to `cause`
+    /// -- the per-[`DrainCause`] half of `Self::join_raster`'s bookkeeping,
+    /// factored out because both `Self::flush_raster_queue`'s depth-one
+    /// pre-join and `Self::drain_raster_queue`'s own post-flush join need it
+    /// (N3 of the slice 1 review: one `drain_raster_queue` call can record
+    /// the same cause twice this way, and that is correct -- both are
+    /// genuine waits).
+    fn record_join(&mut self, cause: DrainCause, outcome: &JoinResult) {
+        self.triangle_census.joins_by_cause.record(cause);
+        self.triangle_census
+            .window_ns_by_cause
+            .add(cause, outcome.window_ns);
+        self.triangle_census
+            .blocked_ns_by_cause
+            .add(cause, outcome.blocked_ns);
+        self.triangle_census
+            .overlap_ns_by_cause
+            .add(cause, outcome.window_ns.saturating_sub(outcome.blocked_ns));
+    }
+
+    /// The door onto [`RasterOwned`]: every reader of `self.texture`/
+    /// `self.ncc` outside a batch goes through this, never the fields
+    /// directly. Joins first (see [`Self::join_raster`]), then unwraps --
+    /// the `None` case is a batch in flight on the raster pool, and joining
+    /// clears it, so the `expect` cannot fire: nothing else ever takes
+    /// `raster_owned` and every caller of this method routes through the
+    /// join above first.
+    fn raster_owned_mut(&mut self) -> &mut RasterOwned {
+        self.join_raster();
+        self.raster_owned.as_mut().expect(
+            "raster_owned is only None while a batch is in flight, and \
+             join_raster above always clears that before this unwraps",
+        )
+    }
+
+    /// Take the queue's commands and the [`RasterOwned`] box and move them
+    /// to the raster pool (`raster_pool().spawn`); record one in-flight
+    /// batch. This is the CALL half of the old (slice 0b and earlier)
+    /// `drain_raster_queue` -- it never blocks on the batch it just
+    /// started. [`Self::join_raster`] is the other half.
     ///
-    /// Internally the batch still has to respect the write's ordering: a
-    /// triangle queued before a `TextureWrite` must sample the OLD texel,
-    /// one queued after must sample the NEW one, and a lane's borrow of
-    /// `self.texture` can never overlap the write's `&mut` (see
-    /// `distira/raster_queue.rs`'s module doc). So the batch is split into
-    /// runs of triangles at every `TextureWrite`, each run gets its own
-    /// fork/join through [`Self::render_triangle_segment`], and the write is
-    /// applied serially, on this thread, between the two runs it separates.
-    fn drain_raster_queue(&mut self, cause: DrainCause) -> u64 {
+    /// **Depth one, deliberately**
+    /// (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 2):
+    /// at most one batch is ever in flight. If this call has a NEW,
+    /// non-empty batch to hand to the pool and one is already in flight,
+    /// it joins the old one first -- a flush never has to choose which of
+    /// two outstanding batches to wait for, and the join that does the
+    /// waiting is attributed to `cause`, i.e. to whichever call forced it.
+    /// An empty-queue call -- most calls, since a flush happens on every
+    /// register write's pre-write check -- leaves `in_flight` completely
+    /// alone: it must, or the swap's "flush and return" would only last
+    /// until the very next call to this method, not the whole overlap
+    /// window it exists to open.
+    ///
+    /// Every call site in
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 1
+    /// pairs this with an immediate [`Self::join_raster`] (see
+    /// [`Self::drain_raster_queue`]) **except** the guest's `swapbufferCMD`
+    /// register write (`write_mmio_u8`'s `SST_SWAPBUFFER_CMD` arm), which
+    /// calls this alone and returns -- the guest walks on into the next
+    /// frame's geometry while the batch rasterises, and whichever call
+    /// joins it next (almost always the following register write's own
+    /// pre-write flush, which is where `fastfillCMD` lives) pays for it.
+    ///
+    /// Internally the batch still has to respect a queued texture write's
+    /// ordering: a triangle queued before a `TextureWrite` must sample the
+    /// OLD texel, one queued after must sample the NEW one, and a lane's
+    /// borrow of the batch's texture store can never overlap the write's
+    /// `&mut` (see `distira/raster_queue.rs`'s module doc). So the worker
+    /// (`run_raster_batch`) splits the batch into runs of triangles at
+    /// every `TextureWrite`, each run gets its own fork/join through
+    /// [`raster_run`], and the write is applied serially, on the worker
+    /// thread, between the two runs it separates -- byte for byte the body
+    /// of the old synchronous drain, just moved off this thread.
+    fn flush_raster_queue(&mut self, cause: DrainCause) {
+        // Slice 0 of the async-overlap review
+        // (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2):
+        // record the CALL, not just a non-empty flush. Before this, an
+        // empty-queue call returned above without ever reaching
+        // `queue_drain_causes.record`, so a fastfill that landed after the
+        // queue was already empty (the exact hazard the review names) was
+        // invisible to the census. Every call is now counted, and the
+        // swap -> next-call wall-clock window is measured here too: a
+        // guest `swapbufferCMD` write (`issue_swapbuffer_command`) sets
+        // `last_swap_instant`, and the very next `flush_raster_queue` call
+        // of ANY cause closes the window. That next call is almost always
+        // the following register write's own pre-write flush (see
+        // `write_mmio_u8`), which is where `fastfillCMD` lives -- so this is
+        // measuring exactly the interval the review's finding 2 asks about,
+        // not the rare direct `DrainCause::SwapOrScanout` accessor call
+        // (`scanout_state`/`scanout_argb`/`swap_buffers`), which on these two
+        // rows fires only a handful of times a whole run (diagnostic reads,
+        // not the guest's own per-frame swap).
+        self.triangle_census.queue_drain_causes.record(cause);
+        if let Some(start) = self.last_swap_instant.take() {
+            self.swap_to_next_drain_ns
+                .push(start.elapsed().as_nanos() as u64);
+        }
         if self.raster_queue.is_empty() {
-            return 0;
+            // Nothing new to hand to the pool. Critically, this must NOT
+            // join whatever is already in flight -- an empty-queue flush
+            // (the common case: three of the swap's four byte writes,
+            // every register write between one flush and the next) has to
+            // be a complete no-op on `in_flight`, or the swap's "flush and
+            // return" would only last until the very next call to this
+            // method, which is nothing like a whole frame's overlap
+            // window.
+            return;
+        }
+        // Depth one (`dev_docs/2026-09-05-distira-async-overlap-design.md`
+        // section 2): THIS call has a new batch to hand to the pool, so if
+        // one is already in flight, join it first -- there is only ever
+        // one in-flight slot, and the join that does the waiting is
+        // attributed to `cause`, whichever call forced it.
+        if let Some(outcome) = self.join_raster() {
+            self.record_join(cause, &outcome);
         }
         let commands = self.raster_queue.take();
         self.triangle_census.queue_drains += 1;
-        self.triangle_census.queue_drain_causes.record(cause);
-        let mut written = 0u64;
-        let mut any_parallel = false;
-        // A run of triangles between two `TextureWrite`s (or the batch's
-        // edges) is a CONTIGUOUS subslice of `commands` -- `run_start..index`
-        // tracks it by index instead of copying triangles into a side `Vec`,
-        // which used to memcpy every queued triangle (~600 B each) on every
-        // drain, even the common case with no write in the batch at all.
-        // `commands` is a local, not a borrow of `self`, so slicing it and
-        // then mutating `self.texture` below never conflicts.
-        let mut run_start = 0usize;
-        for (index, command) in commands.iter().enumerate() {
-            let QueuedCommand::TextureWrite(write) = *command else {
-                continue;
-            };
-            if index > run_start {
-                let (segment_written, parallel) =
-                    self.render_triangle_segment(&commands[run_start..index]);
-                written += segment_written;
-                any_parallel |= parallel;
-            }
-            let mask = DISTIRA_TEX_SIZE - 1;
-            for (byte_index, byte) in write.bytes.into_iter().enumerate() {
-                self.texture[write.tmu][(write.offset + byte_index) & mask] = byte;
-            }
-            run_start = index + 1;
-        }
-        if run_start < commands.len() {
-            let (segment_written, parallel) = self.render_triangle_segment(&commands[run_start..]);
-            written += segment_written;
-            any_parallel |= parallel;
-        }
-        if any_parallel {
-            self.triangle_census.queue_drains_parallel += 1;
-        }
-        self.raster_queue.recycle(commands);
-        written
+        self.triangle_census.async_batches += 1;
+        // The batch's memories move to the worker: `join_raster` above
+        // just guaranteed `self.in_flight` is `None`, so this `expect`
+        // cannot fire -- nothing else ever takes `raster_owned` while a
+        // batch is in flight.
+        let owned = self.raster_owned.take().expect(
+            "raster_owned is only None while a batch is in flight, and the \
+             join above just cleared any in-flight batch",
+        );
+        let fb = Arc::clone(&self.fb);
+        let raster_lanes = self.raster_lanes;
+        let (tx, rx) = std::sync::mpsc::channel();
+        raster_pool().spawn(move || {
+            // S1 of `dev_docs/2026-09-05-distira-async-slice1-review.md`:
+            // `raster_pool()` has no `panic_handler`, so an unwound panic
+            // that escaped this closure would abort the whole process
+            // (rayon's documented default) -- no unwind, no destructors, no
+            // error path, a straight-up regression from the old
+            // `raster_pool().install(...)` behaviour on the emulation
+            // thread, which propagated a panic to its caller normally.
+            // `catch_unwind` turns that back into an ordinary `Result` that
+            // rides the channel; `Distira::join_raster` resumes it on the
+            // emulation thread. `AssertUnwindSafe`: `fb` is `&FrameStore`,
+            // backed by `AtomicU8` (unconditionally `RefUnwindSafe`); `owned`
+            // and `commands` are owned, moved-in data with no borrows to
+            // invalidate.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_raster_batch(commands, owned, fb.as_ref(), raster_lanes)
+            }));
+            // The receiver may already be gone (the `Distira` was dropped
+            // mid-batch); the batch still ran to completion (or panicked)
+            // against its own owned memories, so there is nothing to unwind
+            // here regardless -- N5 of the review: this does leave the
+            // thread and the batch's memories alive until the batch (or the
+            // catch_unwind) finishes, which is harmless in practice.
+            let _ = tx.send(outcome);
+        });
+        self.in_flight = Some(InFlight {
+            rx,
+            flushed_at: std::time::Instant::now(),
+        });
     }
 
-    /// Rasterise one run of triangles with no queued texture write between
-    /// them: one fork and one join for the run. Lane `i` owns the
-    /// FRAMEBUFFER rows where `draw_y(y) % lanes == i` and walks the run in
-    /// submission order, so overlapping triangles land in the order the
-    /// guest sent them. `distira/raster_queue.rs` has why the framebuffer
-    /// row is the one that has to partition and not the triangle's own row.
-    /// Returns the pixels stored and whether the run reached the parallel
-    /// lanes.
-    fn render_triangle_segment(&mut self, jobs: &[QueuedCommand]) -> (u64, bool) {
-        let lanes = self.batch_lanes(jobs);
-        let mut lane_stats: Vec<PixelStats> = (0..lanes).map(|_| PixelStats::new(0)).collect();
-        if lanes == 1 {
-            render_band(jobs, self.view_memory(), 0, 1, &mut lane_stats[0]);
-        } else {
-            let memory = self.view_memory();
-            let lane_count = lanes as u32;
-            // A lane accumulates into a stack-local `PixelStats` and stores
-            // it once at the end: the `lane_stats` elements share cache
-            // lines, and a per-pixel counter write there makes the lanes
-            // false-share their way back to serial speed.
-            let (worker_stats, install_stats) = lane_stats.split_at_mut(lanes - 1);
-            // `install` moves the whole fork onto the pool: the scope then
-            // spawns into a worker-local queue, which the other workers
-            // steal far faster than an external injection wakes them. The
-            // installed worker rasterises the last lane.
-            raster_pool().install(|| {
-                rayon::scope(|scope| {
-                    for (lane, stats) in worker_stats.iter_mut().enumerate() {
-                        scope.spawn(move |_| {
-                            render_band(jobs, memory, lane as u32, lane_count, stats);
-                        });
-                    }
-                    render_band(
-                        jobs,
-                        memory,
-                        lane_count - 1,
-                        lane_count,
-                        &mut install_stats[0],
-                    );
-                });
-            });
-        }
-        let written = self.merge_pixel_stats(&lane_stats, jobs, lanes);
-        (written, lanes > 1)
-    }
-
-    /// How many lanes a batch is worth. Below the pixel threshold the
-    /// wake-up cost of the pool beats the win outright and the calling
-    /// thread draws the batch (`lanes == 1`); above it, [`lanes_for_rows`]
-    /// grants only as many lanes as the batch's row span can fill, up to
-    /// `self.raster_lanes`.
-    ///
-    /// The two measures answer different questions. Pixels are the work, so
-    /// they sum over the batch. Rows are the parallelism, and lanes divide
-    /// DISTINCT rows, so they take the union span rather than the sum: a stack
-    /// of small triangles sitting on top of each other has one triangle's
-    /// worth of rows to share out however many triangles it holds.
-    fn batch_lanes(&self, jobs: &[QueuedCommand]) -> usize {
-        if self.raster_lanes < 2 {
-            return 1;
-        }
-        let mut lowest = u32::MAX;
-        let mut highest = 0;
-        let mut pixels = 0usize;
-        for job in jobs {
-            // See `render_band`: every entry in a run is a `Triangle` by
-            // construction.
-            let QueuedCommand::Triangle(job) = job else {
-                continue;
-            };
-            let job_rows = job.context.max_y.saturating_sub(job.context.min_y) as usize;
-            let columns = job.context.max_x.saturating_sub(job.context.min_x) as usize;
-            if job_rows == 0 {
-                continue;
+    /// Flush then join: the old (slice 0b and earlier) `drain_raster_queue`'s
+    /// exact behaviour, and every call site in
+    /// `dev_docs/2026-09-05-distira-async-overlap-review.md` section 1
+    /// still uses it -- **except** the swap, which calls
+    /// [`Self::flush_raster_queue`] alone (see that method's doc comment).
+    fn drain_raster_queue(&mut self, cause: DrainCause) -> u64 {
+        self.flush_raster_queue(cause);
+        match self.join_raster() {
+            Some(outcome) => {
+                let written = outcome.written;
+                self.record_join(cause, &outcome);
+                written
             }
-            lowest = lowest.min(job.context.min_y);
-            highest = highest.max(job.context.max_y);
-            pixels += job_rows.saturating_mul(columns);
+            None => 0,
         }
-        if pixels < PARALLEL_PIXEL_THRESHOLD {
-            return 1;
-        }
-        let rows = highest.saturating_sub(lowest) as usize;
-        lanes_for_rows(rows, self.raster_lanes)
     }
 
     /// Fold a batch's lane counters into the device.
@@ -1711,7 +2376,11 @@ impl Distira {
     }
 
     /// Diagnostic: the aperture counters. See [`DistiraApertureTraffic`].
-    pub fn aperture_traffic(&self) -> DistiraApertureTraffic {
+    ///
+    /// `&mut self`: see [`Self::census`]'s doc comment -- same hole, same
+    /// fix.
+    pub fn aperture_traffic(&mut self) -> DistiraApertureTraffic {
+        self.join_raster();
         DistiraApertureTraffic {
             lfb_reads: self.lfb_reads.get(),
             ..self.aperture_traffic
@@ -2081,10 +2750,45 @@ impl Distira {
         } else if !raster_snapshot_covers_register(register)
             || !raster_snapshot_covers_register(voodoo_reg)
         {
-            self.drain_raster_queue(DrainCause::RegisterWriteUncovered);
+            if register == SST_SWAPBUFFER_CMD && async_raster_enabled() {
+                // Slice 1 of the async-overlap review
+                // (`dev_docs/2026-09-05-distira-async-overlap-review.md`
+                // section 2, `dev_docs/2026-09-05-distira-async-overlap-design.md`
+                // section 2 item 2): the swap is the one uncovered write
+                // that does NOT join. It flushes whatever is queued to the
+                // raster pool and returns, so the guest walks on into the
+                // next frame's geometry while the batch rasterises.
+                // `fastfillCMD`, the other load-bearing uncovered write,
+                // reads and clears the shared depth buffer a still-running
+                // batch may be drawing into, so it stays on the `else`
+                // branch below and joins like every other uncovered write.
+                //
+                // Gated on `async_raster_enabled()` (B2 of
+                // `dev_docs/2026-09-05-distira-async-slice1-review.md`):
+                // `IZARRAVM_DISTIRA_ASYNC=0` falls back to
+                // `drain_raster_queue` here too, so the whole run behaves
+                // exactly as if every join point joined -- the in-binary OFF
+                // arm the ladder needs.
+                self.flush_raster_queue(DrainCause::RegisterWriteUncovered);
+            } else {
+                self.drain_raster_queue(DrainCause::RegisterWriteUncovered);
+            }
         }
         let chip = tmu_chip_mask(offset);
-        if self.ncc.write_register(chip, register, byte, value) {
+        // Slice 1 of the async-overlap review: only join for this if
+        // `register` could actually be an NCC entry -- see
+        // `NccState::touches_register`'s doc comment. Every NCC register is
+        // already uncovered by `raster_snapshot_covers_register`, so a real
+        // NCC write has already joined above; this second check exists so a
+        // write to an UNRELATED register (a vertex, a colour, `triangleCMD`
+        // -- the whole hot path a Glide driver spends most of its time on)
+        // does not join here too.
+        if NccState::touches_register(register)
+            && self
+                .raster_owned_mut()
+                .ncc
+                .write_register(chip, register, byte, value)
+        {
             return;
         }
         if register < DISTIRA_REG_ID
@@ -2275,6 +2979,11 @@ impl Distira {
                 merge_byte(&mut self.swapbuffer_command, byte, value);
                 if byte == 3 {
                     self.issue_swapbuffer_command(self.swapbuffer_command);
+                    // Opens the swap -> next-drain-call window `drain_raster_queue`
+                    // closes. See its doc comment and
+                    // `dev_docs/2026-09-05-distira-async-overlap-review.md`
+                    // section 2.
+                    self.last_swap_instant = Some(std::time::Instant::now());
                 }
             }
             SST_FOG_COLOR => merge_byte(&mut self.fog_color, byte, value),
@@ -2512,8 +3221,9 @@ impl Distira {
             // off there is no ordering to build, only the same store there
             // always was.
             let mask = DISTIRA_TEX_SIZE - 1;
+            let owned = self.raster_owned_mut();
             for (index, byte) in value.to_le_bytes().into_iter().enumerate() {
-                self.texture[tmu][(offset + index) & mask] = byte;
+                owned.texture[tmu][(offset + index) & mask] = byte;
             }
             return;
         }
@@ -2934,7 +3644,7 @@ impl Distira {
         }
     }
 
-    fn lfb_pipeline_depth_test_passes(&self, position: (u32, u32), depth: u16) -> bool {
+    fn lfb_pipeline_depth_test_passes(&mut self, position: (u32, u32), depth: u16) -> bool {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
             return true;
         }
@@ -3306,12 +4016,25 @@ fn nop_cmd_needs_drain(byte: usize, value: u8) -> bool {
 /// `swapbufferCMD` and the framebuffer layout live. A guest that polls status
 /// until idle and then looks will find the work done by the act of looking.
 ///
-/// Reporting busy instead would be worse in both directions. The drain is
-/// synchronous, so nothing clears a busy bit while the guest spins on it: a
-/// guest waiting for idle before it submits more work would wait forever.
-/// And draining on a status poll would put the drain back on the per-triangle
-/// path that this queue exists to get off, since polling status between
-/// triangles is exactly what a Glide driver does.
+/// Reporting busy instead would be worse in both directions. **Updated after
+/// slice 1 of `dev_docs/2026-09-05-distira-async-slice1-review.md` (S4):**
+/// under async a busy bit genuinely COULD clear on its own now that a batch
+/// runs on another thread -- the old "the drain is synchronous, so nothing
+/// clears a busy bit while the guest spins on it" no longer holds as stated,
+/// and reads like the reason this is safe when it is not the real one. The
+/// actual reason is the join set above: `status` is deliberately not gated
+/// by `register_read_needs_raster`, so a guest polling it never forces a
+/// join and never observes a half-drawn batch either way -- it only ever
+/// sees "idle", true under the synchronous model and unchanged under async,
+/// and the pixels it eventually reads are still gated by whichever real
+/// observer path it takes next (an LFB read, a scanout, ...), which always
+/// joins. A guest waiting for idle before it submits more work therefore
+/// still proceeds immediately, same as before -- it just no longer proves
+/// anything about whether raster work is actually done, which slice 3 is the
+/// one that has to make honest (`dev_docs/2026-09-05-distira-async-overlap-design.md`
+/// section 5). And draining on a status poll would put the drain back on
+/// the per-triangle path this queue exists to get off, since polling status
+/// between triangles is exactly what a Glide driver does.
 fn register_read_needs_raster(register: usize) -> bool {
     matches!(
         register,

@@ -115,6 +115,12 @@ pub(super) enum QueuedCommand {
 #[derive(Default)]
 pub(super) struct RasterQueue {
     pending: Vec<QueuedCommand>,
+    /// S2 of `dev_docs/2026-09-05-distira-async-slice1-review.md`: a
+    /// recycled batch allocation parked here when `recycle` ran but
+    /// `pending` was not itself available to adopt it. See `recycle`'s doc
+    /// comment for why that happens under async and did not before.
+    /// `push` claims it the next time `pending` needs to grow from empty.
+    spare: Vec<QueuedCommand>,
 }
 
 impl RasterQueue {
@@ -132,6 +138,13 @@ impl RasterQueue {
         if self.pending.len() >= RASTER_QUEUE_CAPACITY {
             return false;
         }
+        // S2: claim the spare allocation the moment `pending` needs to grow
+        // from empty -- this is the other half of `recycle`'s fix: a batch
+        // parked in `spare` because `pending` was non-empty at the join is
+        // otherwise never seen again.
+        if self.pending.is_empty() && self.spare.capacity() > self.pending.capacity() {
+            self.pending = std::mem::take(&mut self.spare);
+        }
         self.pending.push(command);
         true
     }
@@ -143,10 +156,26 @@ impl RasterQueue {
 
     /// Take the drained batch's allocation back, so a steady render loop
     /// stops allocating after its first frame.
+    ///
+    /// **Widened for S2 of `dev_docs/2026-09-05-distira-async-slice1-review.md`.**
+    /// The OLD guard (`self.pending.is_empty()` alone) silently dropped the
+    /// allocation whenever it did not hold: harmless under the fully
+    /// synchronous model (slice 0b and earlier), where a drain always ran
+    /// with nothing else queued yet. Under async the swap-flushed batch is
+    /// joined at a call where the guest has ALREADY queued the next frame's
+    /// triangles into `pending` -- exactly the case the lever exists to
+    /// create -- so that guard failed on precisely the batch this fix cares
+    /// about, reintroducing the per-frame allocation and memcpy #840's nit D
+    /// removed, on the hot path a change chasing milliseconds should not be
+    /// paying. `spare` is the fallback: when `pending` cannot adopt the
+    /// allocation directly, it waits in `spare` instead of being dropped,
+    /// and `push` above claims it the next time `pending` empties.
     pub(super) fn recycle(&mut self, mut batch: Vec<QueuedCommand>) {
+        batch.clear();
         if self.pending.is_empty() && batch.capacity() > self.pending.capacity() {
-            batch.clear();
             self.pending = batch;
+        } else if batch.capacity() > self.spare.capacity() {
+            self.spare = batch;
         }
     }
 }
@@ -174,8 +203,12 @@ impl Eq for RasterQueue {}
 
 impl Clone for RasterQueue {
     fn clone(&self) -> Self {
+        // `spare` is a scratch allocation, not device state -- like
+        // `pending`'s own capacity, a clone need not carry it, and starting
+        // empty is simpler than deciding whether to clone dead memory too.
         Self {
             pending: self.pending.clone(),
+            spare: Vec::new(),
         }
     }
 }
@@ -259,3 +292,17 @@ impl<'a> ViewMemory<'a> {
         }
     }
 }
+
+#[cfg(test)]
+impl RasterQueue {
+    /// Test-only: `pending`'s allocation size, so a recycle test can prove
+    /// an allocation survived rather than being silently dropped and
+    /// regrown. Not used by any non-test code.
+    fn pending_capacity(&self) -> usize {
+        self.pending.capacity()
+    }
+}
+
+#[cfg(test)]
+#[path = "raster_queue_test.rs"]
+mod tests;

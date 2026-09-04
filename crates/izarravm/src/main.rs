@@ -2009,17 +2009,39 @@ fn run_boot_hdd_folder(
         }
     }
     if let Some(path) = mode_census {
-        // The scanout state is taken first: reading it drains Distira's
-        // triangle queue, so it needs the machine on its own.
+        // Slice 0b of `dev_docs/2026-09-05-distira-async-overlap-review.md`
+        // section 1: this used to read `distira_scanout_state` first
+        // because THAT call happened to drain Distira's triangle queue and
+        // every other accessor below was `&self` and silently read whatever
+        // was left over -- an ordering that worked by luck, not by
+        // construction. `distira_census`/`distira_register_writes`/
+        // `distira_register_reads`/`distira_aperture_traffic` are now
+        // `&mut self` and each joins the raster queue itself
+        // (`Distira::join_raster`), so this call order no longer matters:
+        // every one of them sees the same fully-drained state regardless of
+        // which runs first.
         let scanout_state = machine.distira_scanout_state();
+        // Each accessor is bound to a local before the call: `&mut self`
+        // means each one's borrow of `machine` has to end before the next
+        // starts, and a shared `&ModeCensus`/`&DistiraCensus` held live
+        // across the whole `mode_census_json(...)` argument list (as a
+        // direct method-call argument would be) would conflict with that.
+        let vga_census = machine.mode_census().clone();
+        let distira_census = machine.distira_census();
+        let register_writes = machine.distira_register_writes();
+        let register_reads = machine.distira_register_reads();
+        let aperture_traffic = machine.distira_aperture_traffic();
+        let offset_bits_or = machine.distira_offset_bits_or();
+        let swap_to_next_drain = machine.distira_swap_to_next_drain_stats();
         let mut census = mode_census_json(
-            machine.mode_census(),
-            machine.distira_census(),
+            &vga_census,
+            &distira_census,
             Some(scanout_state),
-            &machine.distira_register_writes(),
-            &machine.distira_register_reads(),
-            machine.distira_aperture_traffic(),
-            machine.distira_offset_bits_or(),
+            &register_writes,
+            &register_reads,
+            aperture_traffic,
+            offset_bits_or,
+            swap_to_next_drain,
         );
         let (vbe_linear, vbe_banked) = machine.vbe_mode_set_window_counts();
         census["margo"] = json!({

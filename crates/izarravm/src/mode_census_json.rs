@@ -8,9 +8,36 @@
 //! went there". The compatibility board grades on that difference, so the
 //! shape must not collapse.
 
-use izarravm_video::{DistiraCensus, DistiraScanoutState, ModeCensus};
+use izarravm_video::{
+    DistiraCensus, DistiraDrainNanos, DistiraScanoutState, ModeCensus, SwapToNextDrainStats,
+};
 use serde_json::{Value, json};
 
+/// One [`DistiraDrainNanos`] (a nanosecond sum per [`DrainCause`]) as JSON,
+/// same field names as the `queue_drain_causes`/`joins_by_cause` histograms
+/// above it. Factored out because slice 1's fix for B1 of
+/// `dev_docs/2026-09-05-distira-async-slice1-review.md` adds three of these
+/// (`window_ns_by_cause`, `blocked_ns_by_cause`, `overlap_ns_by_cause`).
+fn drain_nanos_json(nanos: &DistiraDrainNanos) -> Value {
+    json!({
+        "texture_write": nanos.texture_write,
+        "lfb_read": nanos.lfb_read,
+        "lfb_write": nanos.lfb_write,
+        "register_read_stats": nanos.register_read_stats,
+        "register_write_uncovered": nanos.register_write_uncovered,
+        "nop_cmd_reset_stats": nanos.nop_cmd_reset_stats,
+        "swap_or_scanout": nanos.swap_or_scanout,
+        "queue_full": nanos.queue_full,
+        "immediate_triangle": nanos.immediate_triangle,
+        "config": nanos.config,
+    })
+}
+
+// One parameter per independent census source, mirroring the JSON's own flat
+// section list -- a struct wrapper would just move the eight fields one level
+// out without changing what a caller has to gather. `distira_swap_to_next_drain`
+// is the eighth (slice 0 of the async-overlap review).
+#[allow(clippy::too_many_arguments)]
 pub fn mode_census_json(
     vga: &ModeCensus,
     distira: &DistiraCensus,
@@ -19,6 +46,7 @@ pub fn mode_census_json(
     register_reads: &[(usize, u64)],
     aperture: izarravm_video::DistiraApertureTraffic,
     offset_bits_or: usize,
+    swap_to_next_drain: SwapToNextDrainStats,
 ) -> Value {
     let vga: Vec<Value> = vga
         .entries()
@@ -137,6 +165,58 @@ pub fn mode_census_json(
                         state.triangles.queue_drain_causes.immediate_triangle,
                     "config": state.triangles.queue_drain_causes.config,
                 },
+                // Slice 1 of the async-overlap review
+                // (`dev_docs/2026-09-05-distira-async-overlap-review.md`
+                // section 2, `dev_docs/2026-09-05-distira-async-overlap-design.md`
+                // section 8): the async-lever win metrics. `async_batches`
+                // is how many batches were handed to the raster pool
+                // instead of drawn on the calling thread; `joins_by_cause`
+                // is how many of THOSE joins actually waited, broken down
+                // by which call forced the wait -- a `register_write_uncovered`
+                // entry here answers finding 2's fastfill-after-swap
+                // question directly; `overlap_ns` is the summed wall-clock
+                // nanoseconds every join spent blocked, the direct
+                // read-out of the lever.
+                "async_batches": state.triangles.async_batches,
+                "joins_by_cause": {
+                    "texture_write": state.triangles.joins_by_cause.texture_write,
+                    "lfb_read": state.triangles.joins_by_cause.lfb_read,
+                    "lfb_write": state.triangles.joins_by_cause.lfb_write,
+                    "register_read_stats": state.triangles.joins_by_cause.register_read_stats,
+                    "register_write_uncovered":
+                        state.triangles.joins_by_cause.register_write_uncovered,
+                    "nop_cmd_reset_stats": state.triangles.joins_by_cause.nop_cmd_reset_stats,
+                    "swap_or_scanout": state.triangles.joins_by_cause.swap_or_scanout,
+                    "queue_full": state.triangles.joins_by_cause.queue_full,
+                    "immediate_triangle": state.triangles.joins_by_cause.immediate_triangle,
+                    "config": state.triangles.joins_by_cause.config,
+                },
+                // **Fixed per B1 of `dev_docs/2026-09-05-distira-async-slice1-review.md`.**
+                // The first cut of `overlap_ns` measured flush-to-join-COMPLETE
+                // elapsed on every join, which on every join point but the
+                // swap (flush and join adjacent) is the batch's own raster
+                // time, not overlap -- a run with zero overlap and one with
+                // perfect overlap both reported a large number. `overlap_ns`
+                // is now `window_ns - blocked_ns` summed across every join
+                // (`blocked_ns` is a fresh `Instant` taken immediately before
+                // `Receiver::recv`, so it is ONLY the time that call spent
+                // waiting); `blocked_ns` is the same split's other half.
+                // `window_ns_by_cause`/`blocked_ns_by_cause`/`overlap_ns_by_cause`
+                // break the same three numbers out per `DrainCause` -- keyed
+                // on the cause of the CALL that performed the join, same as
+                // `joins_by_cause` -- because "one accumulator cannot
+                // distinguish 'the guest gave us a frame' from 'the fastfill
+                // joined immediately'"
+                // (`dev_docs/2026-09-05-distira-async-overlap-review.md`
+                // section 7): a `register_write_uncovered` entry here (the
+                // fastfill) with `overlap_ns_by_cause` near zero joined
+                // almost immediately; a large value means real guest work
+                // ran first.
+                "overlap_ns": state.triangles.overlap_ns,
+                "blocked_ns": state.triangles.blocked_ns,
+                "window_ns_by_cause": drain_nanos_json(&state.triangles.window_ns_by_cause),
+                "blocked_ns_by_cause": drain_nanos_json(&state.triangles.blocked_ns_by_cause),
+                "overlap_ns_by_cause": drain_nanos_json(&state.triangles.overlap_ns_by_cause),
             },
             "retrace_count": state.retrace_count,
             "painted_bytes": state.painted_bytes,
@@ -196,6 +276,18 @@ pub fn mode_census_json(
         },
         "distira_offset_bits_or": offset_bits_or,
         "distira_raster_lanes": distira_raster_lanes,
+        // Slice 0 of the async-overlap review
+        // (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2):
+        // the swap -> next-drain-call wall-clock window, whole run. Answers
+        // whether the fastfill that follows a swap lands microseconds later
+        // (a real overlap window an async lever could fill) or effectively
+        // at once (the window is already spent before any lever can act).
+        "distira_swap_to_next_drain_ns": {
+            "count": swap_to_next_drain.count,
+            "min": swap_to_next_drain.min_ns,
+            "median": swap_to_next_drain.median_ns,
+            "max": swap_to_next_drain.max_ns,
+        },
     })
 }
 
