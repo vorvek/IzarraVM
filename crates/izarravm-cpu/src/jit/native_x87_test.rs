@@ -968,6 +968,47 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
     }
 }
 
+#[test]
+fn real_divide_forms_route_to_their_distinct_classes() {
+    let cases = [
+        (insn(0xd8, 0, 6, 1), TimingClass::X87MemDiv32),
+        (insn(0xd8, 0, 7, 1), TimingClass::X87MemDiv32),
+        (insn(0xdc, 0, 6, 1), TimingClass::X87MemDiv64),
+        (insn(0xdc, 0, 7, 1), TimingClass::X87MemDiv64),
+        (insn(0xd8, 3, 6, 1), TimingClass::X87RegDiv),
+        (insn(0xd8, 3, 7, 1), TimingClass::X87RegDiv),
+        (insn(0xdc, 3, 6, 1), TimingClass::X87RegDiv),
+        (insn(0xdc, 3, 7, 1), TimingClass::X87RegDiv),
+        (insn(0xde, 3, 6, 1), TimingClass::X87RegDiv),
+        (insn(0xde, 3, 7, 1), TimingClass::X87RegDiv),
+    ];
+    for (decoded, class) in cases {
+        let native = NativeX87Insn::classify(&decoded).expect("divide form lowers");
+        assert_eq!(native.timing_class(), class, "{decoded:?}");
+    }
+
+    for decoded in [
+        insn(0xd8, 0, 0, 1),
+        insn(0xdc, 0, 1, 1),
+        insn(0xd8, 3, 0, 1),
+        insn(0xdc, 3, 1, 1),
+        insn(0xde, 3, 0, 1),
+    ] {
+        let native = NativeX87Insn::classify(&decoded).expect("nondivide form lowers");
+        assert_ne!(native.timing_class(), TimingClass::X87RegDiv, "{decoded:?}");
+        assert_ne!(
+            native.timing_class(),
+            TimingClass::X87MemDiv32,
+            "{decoded:?}"
+        );
+        assert_ne!(
+            native.timing_class(),
+            TimingClass::X87MemDiv64,
+            "{decoded:?}"
+        );
+    }
+}
+
 /// Neither control-word form moves TOP, pushes or pops. That is what lets the pair join an
 /// otherwise integer block, and it is also why such a block ends up TOP-pinned for no
 /// architectural reason (`jit_direct_reject_x87_top`).

@@ -2640,10 +2640,11 @@ fn scale_clocks_batches_exactly() {
     // exact long division with a remainder carry. Verified across every mode, several clock
     // sequences, and a non-zero starting remainder. A regression here silently breaks the
     // JIT's cyc/iter identity, so this guards the property.
-    let seqs: [&[u32]; 3] = [
+    let seqs: [&[u32]; 4] = [
         &[3, 5, 1, 1, 61, 2, 7, 4, 9, 2],
         &[1; 32],
         &[255, 1, 100, 3, 17, 61, 61, 2],
+        &[468, 2, 36, 2],
     ];
     for mode in [
         GswMode::Gsw386Slow,
@@ -2651,7 +2652,7 @@ fn scale_clocks_batches_exactly() {
         GswMode::Gsw486,
         GswMode::Gsw586,
     ] {
-        for start_rem in [0u64, 1, 7, 100] {
+        for start_rem in 0..=11 {
             for seq in seqs {
                 let mut indiv = CpuGsw::default();
                 indiv.set_mode(mode);
@@ -2689,7 +2690,7 @@ fn scale_clocks_batches_exactly() {
 #[test]
 fn scale_fp_clocks_batches_exactly() {
     use FpOpClass::{F32Mem, F64Mem, IntConvert16, IntConvert32, Register, Wait};
-    let seqs: [&[(u32, FpOpClass)]; 3] = [
+    let seqs: [&[(u32, FpOpClass)]; 4] = [
         &[
             (4, IntConvert32),
             (1, Register),
@@ -2706,43 +2707,47 @@ fn scale_fp_clocks_batches_exactly() {
             (5, IntConvert16),
             (3, F64Mem),
         ],
+        &[(468, Register), (2, F32Mem), (36, Register), (2, Register)],
     ];
-    for mode in [
-        GswMode::Gsw386Slow,
-        GswMode::Gsw386,
-        GswMode::Gsw486,
-        GswMode::Gsw586,
-    ] {
-        for start_rem in [0u64, 1, 5, 7] {
-            for seq in seqs {
-                let mut indiv = CpuGsw::default();
-                indiv.set_mode(mode);
-                indiv.fp_rem = start_rem;
-                let sum_individual: u64 = seq
-                    .iter()
-                    .map(|&(c, cl)| u64::from(indiv.scale_fp_clocks(c, cl)))
-                    .sum();
+    for epoch in [1, 2] {
+        for mode in [
+            GswMode::Gsw386Slow,
+            GswMode::Gsw386,
+            GswMode::Gsw486,
+            GswMode::Gsw586,
+        ] {
+            for start_rem in 0..=7 {
+                for seq in seqs {
+                    let mut indiv = CpuGsw::default();
+                    indiv.set_timing_epoch(epoch);
+                    indiv.set_mode(mode);
+                    indiv.fp_rem = start_rem;
+                    let sum_individual: u64 = seq
+                        .iter()
+                        .map(|&(c, cl)| u64::from(indiv.scale_fp_clocks(c, cl)))
+                        .sum();
 
-                // Closed-form batched value: sum the per-op class-weighted numerators, then one
-                // exact division with the single carried remainder.
-                let weighted: u64 = seq
-                    .iter()
-                    .map(|&(c, cl)| {
-                        u64::from(c) * u64::from(fp_timing_class(mode.persona(), cl, 1))
-                    })
-                    .sum();
-                let scaled = weighted + start_rem;
-                let batched = scaled / u64::from(FP_TIMING_DEN);
-                let final_rem = scaled % u64::from(FP_TIMING_DEN);
+                    // Closed-form batched value: sum the per-op class-weighted numerators, then one
+                    // exact division with the single carried remainder.
+                    let weighted: u64 = seq
+                        .iter()
+                        .map(|&(c, cl)| {
+                            u64::from(c) * u64::from(fp_timing_class(mode.persona(), cl, epoch))
+                        })
+                        .sum();
+                    let scaled = weighted + start_rem;
+                    let batched = scaled / u64::from(FP_TIMING_DEN);
+                    let final_rem = scaled % u64::from(FP_TIMING_DEN);
 
-                assert_eq!(
-                    sum_individual, batched,
-                    "mode {mode:?} rem {start_rem}: per-op FP sum != batched"
-                );
-                assert_eq!(
-                    indiv.fp_rem, final_rem,
-                    "mode {mode:?} rem {start_rem}: fp_rem carry diverged"
-                );
+                    assert_eq!(
+                        sum_individual, batched,
+                        "epoch {epoch} mode {mode:?} rem {start_rem}: per-op FP sum != batched"
+                    );
+                    assert_eq!(
+                        indiv.fp_rem, final_rem,
+                        "epoch {epoch} mode {mode:?} rem {start_rem}: fp_rem carry diverged"
+                    );
+                }
             }
         }
     }

@@ -583,8 +583,13 @@ impl NativeX87Insn {
     /// and a class is a routing fact rather than a timing effect.
     pub(crate) const fn timing_class(self) -> TimingClass {
         match self {
-            // 0xd8 memory: FADD/FSUB/FMUL/FDIV/FCOM m32real.
-            Self::BinaryMemory { .. } => TimingClass::X87MemArith32,
+            // 0xd8 memory: real m32 arithmetic, with FDIV/FDIVR split out.
+            Self::BinaryMemory { op, .. } => match op {
+                NativeX87BinaryOp::Divide | NativeX87BinaryOp::DivideReverse => {
+                    TimingClass::X87MemDiv32
+                }
+                _ => TimingClass::X87MemArith32,
+            },
             // 0xda memory: integer m32 arithmetic. `FIDIV`/`FIDIVR` (/6, /7)
             // splits out exactly as `fpu_exec.rs`'s 0xda arm splits it -- 42 P5
             // clocks against the rest of the family's 7-8. Both classes carry
@@ -595,12 +600,24 @@ impl NativeX87Insn {
                 }
                 _ => TimingClass::X87MemArithInt32,
             },
-            // 0xdc memory: the same family with an m64real operand.
-            Self::BinaryMemoryF64 { .. } => TimingClass::X87MemArith64,
+            // 0xdc memory: real m64 arithmetic, with FDIV/FDIVR split out.
+            Self::BinaryMemoryF64 { op, .. } => match op {
+                NativeX87BinaryOp::Divide | NativeX87BinaryOp::DivideReverse => {
+                    TimingClass::X87MemDiv64
+                }
+                _ => TimingClass::X87MemArith64,
+            },
             // Every register-form arithmetic shape: 0xd8/0xdc/0xde mod=3.
-            Self::BinaryRegister { .. }
-            | Self::BinaryRegisterDest { .. }
-            | Self::PopBinary { .. } => TimingClass::X87RegArith,
+            Self::BinaryRegister { op, .. } => match op {
+                NativeX87BinaryOp::Divide | NativeX87BinaryOp::DivideReverse => {
+                    TimingClass::X87RegDiv
+                }
+                _ => TimingClass::X87RegArith,
+            },
+            Self::BinaryRegisterDest { op, .. } | Self::PopBinary { op, .. } => match op {
+                NativeX87StiOp::Divide | NativeX87StiOp::DivideReverse => TimingClass::X87RegDiv,
+                _ => TimingClass::X87RegArith,
+            },
             Self::LoadF32 { .. } => TimingClass::X87LoadReal32,
             Self::StoreF32 { .. } => TimingClass::X87StoreReal32,
             Self::LoadF64 { .. } => TimingClass::X87LoadReal64,

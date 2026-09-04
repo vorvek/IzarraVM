@@ -167,6 +167,302 @@ fn assert_program_matches_exact_insns(
     )
 }
 
+fn assert_program_matches_at_epoch_exact_insns(
+    mode: GswMode,
+    epoch: u32,
+    memory: Vec<u8>,
+    control: u16,
+    expected_insns: u64,
+) -> (CpuGsw, TestBus) {
+    let mut direct = x87_cpu(mode);
+    let mut interpreter = x87_cpu(mode);
+    direct.set_timing_epoch(epoch);
+    interpreter.set_timing_epoch(epoch);
+    let mut direct_bus = direct_memory(memory.clone());
+    let mut interpreter_bus = direct_memory(memory.clone());
+    direct_bus.timing_epoch_two = epoch >= 2;
+    interpreter_bus.timing_epoch_two = epoch >= 2;
+
+    arm(&mut direct, control);
+    run_to_halt(&mut direct, &mut direct_bus);
+    arm(&mut interpreter, control);
+    run_to_halt(&mut interpreter, &mut interpreter_bus);
+
+    direct.set_jit_auto_admit(true);
+    arm(&mut direct, control);
+    direct_bus.memory.copy_from_slice(&memory);
+    direct_bus.trace = BusTrace::default();
+    run_to_halt(&mut direct, &mut direct_bus);
+
+    arm(&mut direct, control);
+    arm(&mut interpreter, control);
+    direct_bus.memory.copy_from_slice(&memory);
+    direct_bus.trace = BusTrace::default();
+    interpreter_bus.memory.copy_from_slice(&memory);
+    interpreter_bus.trace = BusTrace::default();
+    let before = direct.perf_counters().jit_direct_insns;
+    let direct_outcomes = run_to_halt(&mut direct, &mut direct_bus);
+    let interpreter_outcomes = run_to_halt(&mut interpreter, &mut interpreter_bus);
+
+    assert_eq!(
+        direct_outcomes, interpreter_outcomes,
+        "epoch {epoch}: run timing differs"
+    );
+    assert_eq!(
+        crate::tests::settled_registers(&direct),
+        crate::tests::settled_registers(&interpreter)
+    );
+    assert_eq!(direct.fpu, interpreter.fpu);
+    assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(direct.timing_rem, interpreter.timing_rem);
+    assert_eq!(direct.fp_rem, interpreter.fp_rem);
+    assert_eq!(direct_bus.memory, interpreter_bus.memory);
+    assert_eq!(
+        direct_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(
+        direct.perf_counters().jit_direct_insns - before,
+        expected_insns,
+        "epoch {epoch}: a required x87 instruction did not retire natively"
+    );
+    (direct, direct_bus)
+}
+
+fn fadd_or_fdiv_m32_program(extension: u8) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9,
+        0x05,
+        0x00,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x200]
+        0xd8,
+        0x05 | (extension << 3),
+        0x04,
+        0x02,
+        0x00,
+        0x00, // fadd/fdiv dword [0x204]
+        0x89,
+        0xc0, // mov eax,eax
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&8.0f32.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+    memory
+}
+
+fn fdiv_register_program(extension: u8) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9,
+        0x05,
+        0x00,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x200]
+        0xd9,
+        0x05,
+        0x04,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x204]
+        0xd8,
+        0xc1 | (extension << 3), // fdiv/fdivr st(0),st(1)
+        0x89,
+        0xc0, // mov eax,eax
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&8.0f32.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn native_real_fdiv_charges_the_epoch_two_i586_delta_without_changing_other_columns() {
+    let mut results = Vec::new();
+    for (mode, epoch) in [
+        (GswMode::Gsw486, 1),
+        (GswMode::Gsw486, 2),
+        (GswMode::Gsw586, 1),
+        (GswMode::Gsw586, 2),
+    ] {
+        let (add, add_bus) = assert_program_matches_at_epoch_exact_insns(
+            mode,
+            epoch,
+            fadd_or_fdiv_m32_program(0),
+            0x037f,
+            3,
+        );
+        let (divide, divide_bus) = assert_program_matches_at_epoch_exact_insns(
+            mode,
+            epoch,
+            fadd_or_fdiv_m32_program(6),
+            0x037f,
+            3,
+        );
+        assert_eq!(
+            add_bus.trace.elapsed_clocks(),
+            divide_bus.trace.elapsed_clocks()
+        );
+        results.push((mode, epoch, divide.elapsed_clocks - add.elapsed_clocks));
+    }
+    assert_eq!(results[0].2, 0, "epoch 1 I486 stays byte-identical");
+    assert_eq!(
+        results[1].2, 0,
+        "epoch 2 I486 keeps the old real-arithmetic charge"
+    );
+    assert_eq!(results[2].2, 0, "epoch 1 I586 stays byte-identical");
+    assert_eq!(
+        results[3].2, 36,
+        "epoch 2 I586 charges 432 raw clocks at a 1/12 core scale"
+    );
+}
+
+#[test]
+fn epoch_two_native_real_divide_forms_retire_without_a_fallback() {
+    for (label, expected_insns, memory) in [
+        ("m32 divide", 3, fadd_or_fdiv_m32_program(6)),
+        ("m32 reverse divide", 3, fadd_or_fdiv_m32_program(7)),
+        ("register divide", 4, fdiv_register_program(6)),
+        ("register reverse divide", 4, fdiv_register_program(7)),
+        ("DC destination reverse divide", 5, dc_sti_program(6)),
+        ("DC destination divide", 5, dc_sti_program(7)),
+        ("DE pop reverse divide", 6, de_pop_program(6)),
+        ("DE pop divide", 6, de_pop_program(7)),
+        ("m64 divide", 8, m64_arith_program()),
+        ("m64 reverse divide", 8, {
+            let mut memory = m64_arith_program();
+            let modrm = memory
+                .windows(2)
+                .position(|bytes| bytes == [0xdc, 0x35])
+                .expect("m64 divide opcode");
+            memory[modrm + 1] = 0x3d;
+            memory
+        }),
+    ] {
+        let (cpu, _) = assert_program_matches_at_epoch_exact_insns(
+            GswMode::Gsw586,
+            2,
+            memory,
+            0x037f,
+            expected_insns,
+        );
+        assert_eq!(cpu.perf_counters().jit_direct_side_exits, 0, "{label}");
+    }
+}
+
+#[test]
+fn completed_real_divide_prefix_is_charged_once_before_a_memory_read_fault() {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]
+        0xd9, 0x05, 0x04, 0x02, 0x00, 0x00, // fld dword [0x204]
+        0xd8, 0xf1, // fdiv st(0),st(1), completes natively
+        0xd8, 0x35, 0x08, 0x02, 0x00, 0x00, // fdiv dword [0x208], faults on DS limit
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&8.0f32.to_bits().to_le_bytes());
+    memory[DATA + 8..DATA + 12].copy_from_slice(&4.0f32.to_bits().to_le_bytes());
+
+    let mut direct = x87_cpu(GswMode::Gsw586);
+    let mut interpreter = x87_cpu(GswMode::Gsw586);
+    for cpu in [&mut direct, &mut interpreter] {
+        cpu.set_timing_epoch(2);
+    }
+    let mut direct_bus = direct_memory(memory.clone());
+    let mut interpreter_bus = direct_memory(memory);
+    direct_bus.timing_epoch_two = true;
+    interpreter_bus.timing_epoch_two = true;
+    // Prime the decoded slots while DS is flat. The finite limit is installed before compiling so
+    // the native block carries the real operand-read guard rather than declining the block.
+    arm(&mut direct, 0x037f);
+    run_to_halt(&mut direct, &mut direct_bus);
+    arm(&mut interpreter, 0x037f);
+    run_to_halt(&mut interpreter, &mut interpreter_bus);
+
+    for cpu in [&mut direct, &mut interpreter] {
+        let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+        ds.limit = (DATA + 9) as u32;
+        cpu.registers.set_segment(SegmentIndex::Ds, ds);
+        arm(cpu, 0x037f);
+        cpu.registers.eip = ENTRY;
+    }
+    direct_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+
+    let key = jit::direct::key_for(&direct, ENTRY, true).expect("native block key");
+    let _ = direct.jit_direct.probe(key);
+    let compilation = jit::direct::compile(&mut direct, ENTRY, true).expect("native FDIV block");
+    assert_eq!(compilation.span.instructions, 4);
+    let id = direct
+        .jit_direct
+        .install(&compilation)
+        .expect("native FDIV block installs");
+    let block = direct
+        .jit_direct
+        .block(id)
+        .expect("installed native FDIV block");
+    let before = direct.perf_counters().jit_direct_insns;
+    let side_exits = direct.perf_counters().jit_direct_side_exits;
+    let limit_exits = direct.direct_stall_snapshot().side_exit_segment_limit;
+    assert!(
+        direct
+            .try_run_direct_block_for_test(&mut direct_bus, block)
+            .unwrap(),
+        "the completed divide prefix must retire natively"
+    );
+    assert_eq!(
+        direct.perf_counters().jit_direct_insns - before,
+        3,
+        "only the two loads and completed register divide retire before the faulting read"
+    );
+    assert_eq!(direct.registers.eip, ENTRY + 14);
+    assert_eq!(direct.perf_counters().jit_direct_side_exits - side_exits, 1);
+    assert_eq!(
+        direct.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
+        1
+    );
+
+    for _ in 0..3 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+    assert_eq!(interpreter.registers.eip, ENTRY + 14);
+    let native_decoded = direct.decode_cache.get(ENTRY + 14, true).unwrap();
+    let interpreter_decoded = interpreter.decode_cache.get(ENTRY + 14, true).unwrap();
+    let native_fault = direct.execute_decoded(&native_decoded, &mut direct_bus);
+    let interpreter_fault = interpreter.execute_decoded(&interpreter_decoded, &mut interpreter_bus);
+    for fault in [native_fault, interpreter_fault] {
+        assert!(matches!(
+            fault,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            })
+        ));
+    }
+    assert_eq!(
+        crate::tests::settled_registers(&direct),
+        crate::tests::settled_registers(&interpreter)
+    );
+    assert_eq!(direct.fpu, interpreter.fpu);
+    assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(direct.timing_rem, interpreter.timing_rem);
+    assert_eq!(direct.fp_rem, interpreter.fp_rem);
+    assert_eq!(
+        direct_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+}
+
 fn quake_hot_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     let code = [

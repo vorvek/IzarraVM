@@ -616,10 +616,14 @@ timing_classes! {
     // absorber in slice 4, not now).
     /// `WAIT`/`FWAIT` (`0x9b`) with no pending unmasked exception.
     X87Wait = (6, 72, 12, "F5 (FWAIT 1 latency) / T10.3 via the shipped literal (WAIT 1-3)"),
-    /// `FADD`/`FSUB`/`FMUL`/`FDIV`/`FCOM` with an m32 real operand (`0xd8`).
+    /// `FADD`/`FSUB`/`FMUL`/`FCOM` with an m32 real operand (`0xd8`).
     X87MemArith32 = (20, 240, 36, "F5 (FADD m32 3 latency) / T10.3 via the shipped literal (FADD 20, high end)"),
-    /// The same family with an m64 real operand (`0xdc`).
+    /// The same family with an m64 real operand (`0xdc`), excluding FDIV/FDIVR.
     X87MemArith64 = (20, 240, 36, "F5 (FADD m64 3 latency) / T10.3 via the shipped literal"),
+    /// `FDIV`/`FDIVR m32real` (`0xd8 /6`, `/7`).
+    X87MemDiv32 = (20, 240, 468, "F5 (FDIV m32 39 latency); I486 preserved"),
+    /// `FDIV`/`FDIVR m64real` (`0xdc /6`, `/7`).
+    X87MemDiv64 = (20, 240, 468, "F5 (FDIV m64 39 latency); I486 preserved"),
     /// `FIADD`/`FIMUL`/... with an m32 integer operand (`0xda`).
     X87MemArithInt32 = (20, 240, 96, "F5 (FIADD/FISUB/FIMUL 7, FICOM 8 latency -- FIDIV split out) / T10.3 via the shipped literal"),
     /// The same family with an m16 integer operand (`0xde`).
@@ -678,15 +682,15 @@ timing_classes! {
     X87LoadBcd = (75, 900, 696, "F5 (FBLD 48-58, slow end) / T10.3 (FBLD 75, Intel's own average)"),
     /// `FBSTP` (`0xdf /6`).
     X87StoreBcd = (160, 1920, 1848, "F5 (FBSTP 148-154, slow end) / T10.3 via the shipped literal"),
-    /// Register-form `FADD`/`FSUB`/`FMUL`/`FDIV` and their `P`/`R` variants.
+    /// Register-form `FADD`/`FSUB`/`FMUL` and their `P`/`R` variants.
     ///
     /// One class for the whole arithmetic family, which is what the interpreter
     /// site gives: `fpu_reg_arith_st0`/`_sti` charge one number for all of them.
-    /// Design §3.2 wants `FDIV` at 468 and `FSQRT` at 840 separately, and R7
-    /// makes the `FDIV` ladder slice 4's problem; splitting the family needs the
-    /// sub-opcode at the charge site and is a later sub-slice. This entry takes
-    /// `FADD`'s 3-clock latency, an under-charge for `FDIV` recorded here.
-    X87RegArith = (20, 240, 36, "cmp §3 row 19 (FADD 3 clk); FDIV/FSQRT split deferred"),
+    /// This entry takes `FADD`'s 3-clock latency. FDIV/FDIVR and FSQRT have
+    /// their own sourced classes.
+    X87RegArith = (20, 240, 36, "cmp §3 row 19 (FADD 3 clk)"),
+    /// Register-form `FDIV`/`FDIVR` and their `P`/`R` variants.
+    X87RegDiv = (20, 240, 468, "F5 (FDIV register/pop 39 latency); I486 preserved"),
     /// `FUCOM`/`FUCOMP` (`0xdd /4`, `/5`).
     X87RegCompare = (4, 48, 48, "F5 (FUCOM ST(i) 4 latency) / T10.3 via the shipped literal"),
     /// `FLD ST(i)` and `FXCH` (`0xd9 c0..cf`, `0xd9 d0`).

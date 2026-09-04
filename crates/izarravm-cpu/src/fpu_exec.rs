@@ -129,12 +129,20 @@ impl CpuGsw {
             0xd8 => {
                 let operand = self.read_real32(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(self.charge(TimingClass::X87MemArith32))
+                Ok(self.charge(if reg >= 6 {
+                    TimingClass::X87MemDiv32
+                } else {
+                    TimingClass::X87MemArith32
+                }))
             }
             0xdc => {
                 let operand = self.read_real64(bus, mem)?;
                 self.fpu_mem_arith(reg, operand);
-                Ok(self.charge(TimingClass::X87MemArith64))
+                Ok(self.charge(if reg >= 6 {
+                    TimingClass::X87MemDiv64
+                } else {
+                    TimingClass::X87MemArith64
+                }))
             }
             0xd9 => match reg {
                 0 => {
@@ -399,7 +407,11 @@ impl CpuGsw {
                 self.fpu.set(0, r);
             }
         }
-        Ok(self.charge(TimingClass::X87RegArith))
+        Ok(self.charge(if reg >= 6 {
+            TimingClass::X87RegDiv
+        } else {
+            TimingClass::X87RegArith
+        }))
     }
 
     /// Set the IE (invalid) and ZE (divide-by-zero) status flags after an arithmetic
@@ -439,7 +451,11 @@ impl CpuGsw {
         if pop {
             self.fpu.pop();
         }
-        Ok(self.charge(TimingClass::X87RegArith))
+        Ok(self.charge(if reg >= 6 {
+            TimingClass::X87RegDiv
+        } else {
+            TimingClass::X87RegArith
+        }))
     }
 
     fn fpu_d9_register(&mut self, byte: u8, i: u8) -> ExecResult<CycleOutcome> {
