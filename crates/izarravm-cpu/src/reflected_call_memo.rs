@@ -492,6 +492,10 @@ struct WriteObs {
     latest_dword: u32,
     mask: u32,
     class: AddressClass,
+    /// The BASE of the stack segment in force at that first write, beside its selector.
+    /// One selector value can name two descriptors inside a single reflected trip, so the
+    /// selector alone does not identify the stack a dead-stack question is about.
+    ss_base: u32,
 }
 
 impl WriteObs {
@@ -784,10 +788,19 @@ impl OpenTrip {
         None
     }
 
+    /// A stack track is keyed by SELECTOR **and BASE**, not by the selector alone.
+    ///
+    /// A reflected DPMI trip reloads `SS` with the same selector VALUE under a different
+    /// descriptor (measured on `tyrian-specs-586`: selector `0x18` appears with the
+    /// client's base `0x0009d3e0` and with a second, unrelated one). Keying on the selector
+    /// merged the two into ONE track, so `low_water_esp` became the minimum of two
+    /// unrelated offset spaces -- on that title `0x00000f64` against an entry ESP of
+    /// `0x0ff9fb34` -- and every dead-stack question about the client stack was then
+    /// answered from the other stack's depth.
     fn touch_stack(&mut self, ss: SegmentRegister, esp: u32) {
         for slot in self.stacks.iter_mut() {
             match slot {
-                Some(seg) if seg.selector == ss.selector => {
+                Some(seg) if seg.selector == ss.selector && seg.base == ss.base => {
                     seg.low_water_esp = seg.low_water_esp.min(esp);
                     seg.last_esp = esp;
                     return;
@@ -810,14 +823,27 @@ impl OpenTrip {
 
     /// Class D (plan section 4.3): below this trip's own observed low-water
     /// mark for the stack segment the write fell in.
-    fn is_dead_stack(&self, seg_selector: u16, linear: u32) -> bool {
+    ///
+    /// **Both sides of the comparison are OFFSETS FROM THE SEGMENT BASE.** `low_water_esp`
+    /// is an `ESP`, which is already such an offset (`OpenTrip::start` seeds it from
+    /// `regs.esp()` and `touch_stack` only ever `min`s it with another `esp`); the linear
+    /// address has to have the base taken off it to reach the same space, and that is the
+    /// only subtraction this test may make. Taking the base off the ESP as well -- which
+    /// this function did until 2026-09-04 -- is a unit error that is INVISIBLE whenever the
+    /// base is zero, which is every flat descriptor and every synthetic fixture in this
+    /// module. On `tyrian-specs-586` the DPMI client stack has base `0x0009d3e0`, the
+    /// second subtraction wrapped to `0xfff63b84`, and the test returned true for every
+    /// address in the segment: the dominant key's whole stack write set (~100 dwords per
+    /// trip) was classified Class D, "recorded nowhere", and an answer replayed none of it.
+    /// The runtime audit then graded those dwords from its own partial journal and reported
+    /// `write_value` on 27 of 27 audits -- the learn's blindness and the audit's complaint
+    /// were one bug seen from two sides.
+    fn is_dead_stack(&self, seg_selector: u16, seg_base: u32, linear: u32) -> bool {
         for seg in self.stacks.iter().flatten() {
-            if seg.selector != seg_selector {
+            if seg.selector != seg_selector || seg.base != seg_base {
                 continue;
             }
-            let addr_from_base = linear.wrapping_sub(seg.base);
-            let low_from_base = seg.low_water_esp.wrapping_sub(seg.base);
-            return addr_from_base < low_from_base;
+            return linear.wrapping_sub(seg.base) < seg.low_water_esp;
         }
         false
     }
@@ -1047,6 +1073,22 @@ struct AuditOffender {
     /// scratch below the entry SP or live data above it. Both zero when unjournaled.
     journal_linear: u32,
     entry_sp_linear: u32,
+    /// `AddressClass::name()` of the journaled write, so the dead-stack skip's CLASS gate
+    /// can be read off the dump instead of inferred. `"none"` when unjournaled.
+    journal_class: &'static str,
+    /// The stack track the dead-stack test used for this write: its selector, its base and
+    /// its observed low-water ESP. Zero when no track matched (the test then returns false
+    /// and the skip cannot fire whatever the class says).
+    track_selector: u32,
+    track_base: u32,
+    track_low_water: u32,
+    /// WHERE the audit's baseline came from: 2 = `audit_open_pre`, the value peeked at the
+    /// trip's entry; 1 = `WriteObs::pre_dword`, the value before the trip's FIRST JOURNALED
+    /// write, which is a MID-TRIP instant and not what an answer leaves; 0 = the live value,
+    /// which cannot mismatch. This is the field that separates "the memo is wrong about a
+    /// cell it claims" from "the audit graded a cell the memo never modelled against an
+    /// instant the memo never named".
+    baseline_source: u32,
 }
 
 /// How many distinct read-set offenders one key reports (see `read_set_offenders`).
@@ -2511,6 +2553,7 @@ pub(crate) fn note_write<B: CpuBus>(
             let mut rec = WriteObs {
                 linear,
                 ss_selector: ss.selector,
+                ss_base: ss.base,
                 pre_dword,
                 latest_dword: pre_dword.unwrap_or(0),
                 mask: 0,
@@ -2957,19 +3000,35 @@ fn describe_audit_offender(
             AddressClass::ClientStack | AddressClass::HostStack
         )
     });
-    let is_dead = obs.is_some_and(|o| open.is_dead_stack(o.ss_selector, o.linear));
+    let is_dead = obs.is_some_and(|o| open.is_dead_stack(o.ss_selector, o.ss_base, o.linear));
     let provenance = u32::from(claim_mask != 0)
         | (u32::from(obs.is_some()) << 1)
         | (u32::from(in_class_r) << 2)
         | (u32::from(is_stack) << 3)
         | (u32::from(is_dead) << 4);
+    let track = open
+        .stacks
+        .iter()
+        .flatten()
+        .find(|seg| Some((seg.selector, seg.base)) == obs.map(|o| (o.ss_selector, o.ss_base)));
     let entry_sp_linear = open
         .stacks
         .iter()
         .flatten()
-        .find(|seg| Some(seg.selector) == obs.map(|o| o.ss_selector))
+        .next()
         .map(|seg| seg.base.wrapping_add(open.entry_esp))
         .unwrap_or(0);
+    let baseline_source = if open
+        .audit_open_pre
+        .binary_search_by_key(&phys, |&(d, _)| d)
+        .is_ok()
+    {
+        2
+    } else if obs.and_then(|o| o.pre_dword).is_some() {
+        1
+    } else {
+        0
+    };
     AuditOffender {
         phys,
         predicted,
@@ -2981,6 +3040,11 @@ fn describe_audit_offender(
         journal_value: obs.map(|o| o.latest_dword).unwrap_or(0),
         journal_linear: obs.map(|o| o.linear).unwrap_or(0),
         entry_sp_linear,
+        journal_class: obs.map(|o| o.class.name()).unwrap_or("none"),
+        track_selector: track.map(|t| u32::from(t.selector)).unwrap_or(0),
+        track_base: track.map(|t| t.base).unwrap_or(0),
+        track_low_water: track.map(|t| t.low_water_esp).unwrap_or(0),
+        baseline_source,
     }
 }
 
@@ -3026,7 +3090,7 @@ fn audit_write_values_disagree<B: CpuBus>(
                 obs.class,
                 AddressClass::ClientStack | AddressClass::HostStack
             )
-            && open.is_dead_stack(obs.ss_selector, obs.linear)
+            && open.is_dead_stack(obs.ss_selector, obs.ss_base, obs.linear)
         {
             continue;
         }
@@ -3380,7 +3444,7 @@ fn build_confirmed<B: CpuBus>(
         if matches!(
             obs.class,
             AddressClass::ClientStack | AddressClass::HostStack
-        ) && open.is_dead_stack(obs.ss_selector, obs.linear)
+        ) && open.is_dead_stack(obs.ss_selector, obs.ss_base, obs.linear)
         {
             continue; // Class D: skip, recorded nowhere.
         }
@@ -3502,7 +3566,7 @@ fn tally_write_classes(key_state: &mut KeyState, open: &OpenTrip, writes: &HashM
         if matches!(
             obs.class,
             AddressClass::ClientStack | AddressClass::HostStack
-        ) && open.is_dead_stack(obs.ss_selector, obs.linear)
+        ) && open.is_dead_stack(obs.ss_selector, obs.ss_base, obs.linear)
         {
             key_state.write_class_d += 1;
             continue;
@@ -3756,7 +3820,7 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
             }
             afirst2 = false;
             out.push_str(&format!(
-                "{{\"phys\":{},\"predicted\":{},\"observed\":{},\"hits\":{},\"provenance\":{},\"claim_mask\":{},\"journal_mask\":{},\"journal_value\":{},\"journal_linear\":{},\"entry_sp_linear\":{}}}",
+                "{{\"phys\":{},\"predicted\":{},\"observed\":{},\"hits\":{},\"provenance\":{},\"claim_mask\":{},\"journal_mask\":{},\"journal_value\":{},\"journal_linear\":{},\"entry_sp_linear\":{},\"journal_class\":\"{}\",\"track_selector\":{},\"track_base\":{},\"track_low_water\":{},\"baseline_source\":{}}}",
                 o.phys,
                 o.predicted,
                 o.observed,
@@ -3767,6 +3831,11 @@ pub fn reflected_call_memo_json(cpu: &CpuGsw) -> String {
                 o.journal_value,
                 o.journal_linear,
                 o.entry_sp_linear,
+                o.journal_class,
+                o.track_selector,
+                o.track_base,
+                o.track_low_water,
+                o.baseline_source,
             ));
         }
         out.push_str("]}");

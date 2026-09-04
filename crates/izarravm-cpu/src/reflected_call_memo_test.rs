@@ -533,6 +533,7 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
                 pre_dword: None,
                 linear: addr,
                 ss_selector: DATA_SELECTOR,
+                ss_base: 0,
                 latest_dword: 1,
                 mask: u32::MAX,
                 class: AddressClass::Other,
@@ -548,6 +549,7 @@ fn a_write_whose_post_value_varies_between_trips_two_and_three_is_class_n() {
             pre_dword: None,
             linear: addr,
             ss_selector: DATA_SELECTOR,
+            ss_base: 0,
             latest_dword: 2, // differs from trip A's 1
             mask: u32::MAX,
             class: AddressClass::Other,
@@ -586,6 +588,7 @@ fn a_write_of_a_constant_the_trip_never_read_is_class_w_not_class_r() {
             pre_dword: Some(0),
             linear: 0x9000,
             ss_selector: DATA_SELECTOR,
+            ss_base: 0,
             // A perfect restoration -- but the trip never READ the address, and
             // `open.reads` is empty, so it is not pinned and must not count as R.
             latest_dword: 0,
@@ -904,8 +907,11 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
         selector: HOST_SS_SELECTOR,
         base: 0x9000,
         limit: 0xffff,
-        low_water_esp: 0x9100,
-        last_esp: 0x9200,
+        // OFFSETS from `base`, which is what `OpenTrip::start` and `touch_stack` store
+        // (both take `regs.esp()`). Spelling them as linear addresses here is what let the
+        // unit bug in `is_dead_stack` -- a second subtraction of the base -- go unseen.
+        low_water_esp: 0x100,
+        last_esp: 0x200,
     });
     let mut key_state = KeyState::default();
     let mut writes = HashMap::new();
@@ -915,6 +921,7 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
             pre_dword: None,
             linear: 0x9080,
             ss_selector: HOST_SS_SELECTOR,
+            ss_base: 0x9000,
             latest_dword: 0xdead_beef,
             mask: u32::MAX,
             class: AddressClass::HostStack,
@@ -930,6 +937,93 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
     let _ = &mut open;
 }
 
+/// The Class D rule against a stack segment with a **NON-ZERO BASE**, which is the only
+/// shape in which the unit bug this test names is visible.
+///
+/// `StackTrack::low_water_esp` is an ESP -- an offset from the segment base -- because
+/// that is what `OpenTrip::start` (`regs.esp()`) and `touch_stack` put there. The linear
+/// address of a write has to have the base taken off it to reach that space, and that is
+/// the ONLY subtraction the test may make.
+///
+/// **Mutation bite**: restore the second subtraction,
+/// `let low_from_base = seg.low_water_esp.wrapping_sub(seg.base);`, and this test fails on
+/// its live assertion. With the DPMI client stack's measured base `0x0009_d3e0` against a
+/// low-water ESP well below it, that subtraction wraps to `0xfff6_3c20` and EVERY address
+/// in the segment answers "dead" -- which is what classified the dominant key's whole
+/// stack write set (~100 dwords per trip) as Class D, "recorded nowhere", on
+/// `tyrian-specs-586`, and what the runtime audit then reported as `write_value` on 27 of
+/// 27 audits from the other side.
+#[test]
+fn class_d_compares_offsets_against_a_segment_whose_base_exceeds_the_low_water_esp() {
+    const DPMI_SS: u16 = 0x18;
+    const DPMI_BASE: u32 = 0x0009_d3e0;
+    const LOW_WATER: u32 = 0x0000_1000;
+    let (cpu, _bus) = synthetic_reflected_client();
+    let mut open = test_open_trip(&cpu);
+    open.stacks[1] = Some(StackTrack {
+        selector: DPMI_SS,
+        base: DPMI_BASE,
+        limit: 0x000f_ffff,
+        low_water_esp: LOW_WATER,
+        last_esp: LOW_WATER + 0x40,
+    });
+    // ABOVE the low-water mark: the trip's live frame, which an answer MUST replay.
+    assert!(
+        !open.is_dead_stack(DPMI_SS, DPMI_BASE, DPMI_BASE + 0x2000),
+        "a write 0x2000 into a segment whose low-water ESP is 0x1000 is LIVE; calling it          dead makes the answer skip a cell the trip really wrote"
+    );
+    // BELOW it: genuinely unobservable scratch, and still so.
+    assert!(open.is_dead_stack(DPMI_SS, DPMI_BASE, DPMI_BASE + 0x800));
+    // And an address outside the segment's own base is not this segment's business.
+    assert!(!open.is_dead_stack(DPMI_SS, DPMI_BASE, 0x10));
+}
+
+/// One SELECTOR VALUE can name two descriptors inside a single reflected trip -- measured
+/// on `tyrian-specs-586`, where `0x18` appears with the client stack's base `0x0009d3e0`
+/// and with a second, unrelated one whose ESPs live four orders of magnitude away.
+///
+/// **Mutation bite**: key `touch_stack` and `is_dead_stack` on the selector alone (drop
+/// `&& seg.base == ss.base` / `|| seg.base != seg_base`). The two descriptors collapse into
+/// one track, `low_water_esp` becomes the minimum over two unrelated offset spaces, and the
+/// live assertion below flips: the client stack's frame is declared dead because the OTHER
+/// stack once had a small ESP.
+#[test]
+fn two_descriptors_sharing_a_selector_do_not_share_a_stack_track() {
+    const SHARED: u16 = 0x18;
+    let (cpu, _bus) = synthetic_reflected_client();
+    let mut open = test_open_trip(&cpu);
+    let client = SegmentRegister {
+        selector: SHARED,
+        base: 0x0009_d3e0,
+        limit: 0x0fff_ffff,
+        access: 0x93,
+        default_size_32: true,
+    };
+    let other = SegmentRegister {
+        base: 0x0002_0000,
+        ..client
+    };
+    open.touch_stack(client, 0x0ff9_fb00);
+    open.touch_stack(other, 0x0000_0f64);
+
+    let tracks: Vec<_> = open
+        .stacks
+        .iter()
+        .flatten()
+        .filter(|t| t.selector == SHARED)
+        .collect();
+    assert_eq!(
+        tracks.len(),
+        2,
+        "one selector with two bases must occupy two tracks: {tracks:?}"
+    );
+    assert!(
+        !open.is_dead_stack(SHARED, client.base, client.base + 0x0ff9_fb34),
+        "the client stack's own live frame must not be judged against the other          descriptor's low-water ESP"
+    );
+    assert!(open.is_dead_stack(SHARED, other.base, other.base + 0x100));
+}
+
 #[test]
 fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
     let (cpu, _bus) = synthetic_reflected_client();
@@ -938,8 +1032,11 @@ fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
         selector: HOST_SS_SELECTOR,
         base: 0x9000,
         limit: 0xffff,
-        low_water_esp: 0x9100,
-        last_esp: 0x9200,
+        // OFFSETS from `base`, which is what `OpenTrip::start` and `touch_stack` store
+        // (both take `regs.esp()`). Spelling them as linear addresses here is what let the
+        // unit bug in `is_dead_stack` -- a second subtraction of the base -- go unseen.
+        low_water_esp: 0x100,
+        last_esp: 0x200,
     });
     let mut key_state = KeyState::default();
     let mut writes = HashMap::new();
@@ -949,6 +1046,7 @@ fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
             pre_dword: None,
             linear: 0x9150,
             ss_selector: HOST_SS_SELECTOR,
+            ss_base: 0x9000,
             latest_dword: 0x1234,
             mask: u32::MAX,
             class: AddressClass::HostStack,

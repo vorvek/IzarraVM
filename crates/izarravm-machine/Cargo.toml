@@ -29,8 +29,11 @@ reflected-call-diagnostic = ["izarravm-cpu/reflected-call-diagnostic"]
 # see shadow_cache.rs (the off-feature module, verbatim pre-S1a) vs
 # shadow_cache_probe.rs (the on-feature module) in lib.rs's cfg'd `mod` pair.
 shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-bus/shadow-cache-probe"]
-# Passthrough only (izarravm-machine has no hook of its own for slice 1, unlike
-# reflected-call-diagnostic's batch-straddle counter); kept for CI symmetry.
+# NOT a passthrough: this crate owns two of slice 1's seams, and both were added after
+# the comment this replaces was written. `run.rs`'s batch loop reads
+# `reflected_call_wants_interpreter` and forces the interpreter for a journaled trip (F1),
+# and its HLE soft-int SERVICE site refuses an open trip (F2). A build of `izarravm` that
+# enables the memo without enabling this feature gets the module and neither fix.
 reflected-call-memo = ["izarravm-cpu/reflected-call-memo"]
 
 # Passthrough for the per-class retire histogram; see izarravm-cpu. The machine has no hook of

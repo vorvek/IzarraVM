@@ -17,6 +17,17 @@ use izarravm_core::{
     CpuPersona, GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard,
     WAVETABLE_MPU_BASE, WssConfig,
 };
+/// Are this crate's two reflected-call-memo seams compiled in?
+///
+/// The batch loop's interpreter forcing (Fable review F1) and the HLE soft-int SERVICE
+/// refusal (F2) both live in `run.rs` behind this crate's own `reflected-call-memo`
+/// feature. A build of the `izarravm` binary that enables `izarravm-cpu`'s arm without
+/// enabling this one gets the memo module and NEITHER fix, and says nothing about it: the
+/// journal is incomplete on every compiled block, so every learn attempt refuses with
+/// `native_store` and no key ever answers. `izarravm` asserts this constant at COMPILE
+/// time so that hole cannot be reopened by editing one feature list.
+pub const REFLECTED_CALL_MEMO_SEAMS_WIRED: bool = cfg!(feature = "reflected-call-memo");
+
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
 #[cfg(test)]

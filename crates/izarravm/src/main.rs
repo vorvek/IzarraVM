@@ -2382,6 +2382,15 @@ fn write_hdd_profile_json(
     // build carries neither the key nor the module.
     #[cfg(feature = "reflected-call-memo")]
     {
+        // The feature list that reaches here must also have reached `izarravm-machine`,
+        // whose `run.rs` owns the interpreter forcing (F1) and the soft-int service
+        // refusal (F2). Asserted rather than commented: the list at
+        // `crates/izarravm/Cargo.toml` named only `izarravm-cpu/reflected-call-memo` for
+        // five commits, and a binary built from it learned nothing at all.
+        const _: () = assert!(
+            izarravm_machine::REFLECTED_CALL_MEMO_SEAMS_WIRED,
+            "izarravm/Cargo.toml's `reflected-call-memo` must also enable              `izarravm-machine/reflected-call-memo`: the batch loop's interpreter forcing              and the HLE soft-int service refusal live there"
+        );
         let raw = izarravm_cpu::reflected_call_memo_json(machine.cpu());
         report["reflected_call_memo"] =
             serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
