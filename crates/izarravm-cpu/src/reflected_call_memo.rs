@@ -1455,6 +1455,22 @@ pub(crate) struct Memo {
     /// Class R ranges, coalesced, for the answer-time observer test (plan 5.7 / review A.4):
     /// (physical_lo, physical_hi_inclusive).
     pub(crate) class_r_ranges: Box<[(u32, u32)]>,
+    /// The CLASS D cells: dwords the learned trip wrote below its own observed stack
+    /// low-water mark, "recorded nowhere" and skipped at answer time.
+    ///
+    /// Recorded rather than re-derived, because the two derivations do not agree. The
+    /// learn's journal trips are FORCED onto the interpreter, so their write set -- and
+    /// with it the low-water mark the Class D rule rests on -- is complete; an AUDIT trip
+    /// deliberately runs NATIVE (its clock triple is graded against a memo learned from
+    /// native samples), so its own journal sees only the interpreted subset and its
+    /// low-water mark is shallower. Asking the audit to re-derive deadness from that
+    /// partial record made it grade cells the memo had deliberately excluded, against
+    /// `WriteObs::pre_dword` -- a MID-TRIP instant -- and report a divergence that says
+    /// nothing about the memo. Measured on `tyrian-specs-586` 2026-09-04: the last
+    /// `write_value` offender on both dominant keys was physical `0x17ac`, class
+    /// `host_stack`, `claim_mask` 0, not in `class_r_ranges`, the audit trip's own
+    /// dead-stack verdict FALSE.
+    pub(crate) class_d_ranges: Box<[(u32, u32)]>,
     pub(crate) raw_core_clocks: u64,
     pub(crate) raw_bus_clocks: u64,
     pub(crate) insns: u64,
@@ -2867,6 +2883,7 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
                             return_eip: c.return_eip,
                             replay: replay.into_boxed_slice(),
                             class_r_ranges: class_r_ranges.into_boxed_slice(),
+                            class_d_ranges: c.class_d_ranges.into_boxed_slice(),
                             raw_core_clocks: raw_core,
                             raw_bus_clocks: raw_bus,
                             insns,
@@ -3078,20 +3095,22 @@ fn audit_write_values_disagree<B: CpuBus>(
     dwords.dedup();
     for dword in dwords {
         // Class D is excluded, and that is the formula's meaning rather than a hole in it.
-        // A dead-stack write lies below this trip's OWN observed low-water mark for the
+        // A dead-stack write lies below the LEARNED trip's observed low-water mark for the
         // segment it fell in: nothing reads it again, which is exactly why the memo skips
         // it. Grading the memo on it asks the answer to reproduce bytes no guest can
         // observe, and on this title's dominant key that is 128 stack dwords per trip --
         // measured 2026-09-03, `audit_mismatch[write_value]` fired on 14,510 of 14,510
         // audited trips while the epilogue, the core clocks and the instruction count all
         // agreed exactly, and every one of them was this.
-        if let Some(obs) = open.writes.get(&dword)
-            && matches!(
-                obs.class,
-                AddressClass::ClientStack | AddressClass::HostStack
-            )
-            && open.is_dead_stack(obs.ss_selector, obs.ss_base, obs.linear)
-        {
+        //
+        // The set is the MEMO'S OWN, not one re-derived from this trip. A journal trip is
+        // forced onto the interpreter and sees every store; an audit trip runs native and
+        // sees only the interpreted subset, so its low-water mark is shallower and its
+        // dead-stack verdict disagrees with the one the memo was built on. Re-deriving it
+        // here made the audit grade cells the memo had deliberately excluded, against
+        // `WriteObs::pre_dword` -- a mid-trip instant -- on 26 of 27 audits (physical
+        // `0x17ac`, class `host_stack`, measured 2026-09-04).
+        if ranges_contain(&memo.class_d_ranges, dword) {
             continue;
         }
         let Some(observed_now) = bus.peek_direct_ram(dword, BusWidth::Dword) else {
@@ -3295,19 +3314,32 @@ fn derive_replay_and_ranges(write_check: &[WriteCheck]) -> (ReplaySet, ClassRRan
         }
     }
     replay.sort_unstable_by_key(|&(addr, _, _)| addr);
-    class_r_dwords.sort_unstable();
-    class_r_dwords.dedup();
-    let mut class_r_ranges: ClassRRanges = Vec::new();
-    for dword in class_r_dwords {
-        if let Some((_, hi)) = class_r_ranges.last_mut()
+    (replay, coalesce_dwords(class_r_dwords))
+}
+
+/// Coalesce aligned dwords into inclusive ranges. Only EXACTLY adjacent dwords merge
+/// (`dword <= hi + 1`, and `hi` is the previous dword plus 3), so a range never covers an
+/// address that was not in the list -- which is what lets a caller walk a range back into
+/// its dwords and get the same set out.
+fn coalesce_dwords(mut dwords: Vec<u32>) -> ClassRRanges {
+    dwords.sort_unstable();
+    dwords.dedup();
+    let mut ranges: ClassRRanges = Vec::new();
+    for dword in dwords {
+        if let Some((_, hi)) = ranges.last_mut()
             && dword <= hi.wrapping_add(1)
         {
             *hi = dword + 3;
             continue;
         }
-        class_r_ranges.push((dword, dword + 3));
+        ranges.push((dword, dword + 3));
     }
-    (replay, class_r_ranges)
+    ranges
+}
+
+/// Is this aligned dword inside one of the coalesced ranges?
+fn ranges_contain(ranges: &[(u32, u32)], dword: u32) -> bool {
+    ranges.iter().any(|&(lo, hi)| dword >= lo && dword <= hi)
 }
 
 /// One address of the WRITE CHECK SET: the union of Class W and Class R, which is what the
@@ -3350,6 +3382,9 @@ struct ConfirmedTrip {
     return_eip: u32,
     replay: Vec<(u32, u32, u32)>,
     class_r_ranges: Vec<(u32, u32)>,
+    /// The Class D dwords this trip wrote and the answer skips. See `Memo::class_d_ranges`
+    /// for why this is RECORDED rather than re-derived by whoever needs it next.
+    class_d_ranges: Vec<(u32, u32)>,
     nested_acks: Vec<(u8, u16)>,
     control_effects: Vec<ControlEffect>,
     /// Has `sample_read_set_at_open` taken its first live sample yet, and did any later
@@ -3437,6 +3472,7 @@ fn build_confirmed<B: CpuBus>(
     // are derived from it, here and again after the natural samples have had their say, so
     // a demotion cannot leave the two descriptions disagreeing.
     let mut write_check: Vec<WriteCheck> = Vec::new();
+    let mut class_d_dwords: Vec<u32> = Vec::new();
     for (&dword, obs) in &open.writes {
         if obs.class.never_restored() {
             return Err(LearnRefused::WriteClassN);
@@ -3446,7 +3482,11 @@ fn build_confirmed<B: CpuBus>(
             AddressClass::ClientStack | AddressClass::HostStack
         ) && open.is_dead_stack(obs.ss_selector, obs.ss_base, obs.linear)
         {
-            continue; // Class D: skip, recorded nowhere.
+            // Class D: skipped at answer time, and recorded HERE so the runtime audit
+            // can skip exactly the same set rather than re-deriving it from its own
+            // (native, partial) journal. "Recorded nowhere" was the hole.
+            class_d_dwords.push(dword);
+            continue;
         }
         // Class R (restored): every byte written must be covered by the read set (see
         // `write_is_pinned`) AND must hold what it held before. `note_read` already
@@ -3542,6 +3582,7 @@ fn build_confirmed<B: CpuBus>(
         return_eip: open.return_eip,
         replay,
         class_r_ranges,
+        class_d_ranges: coalesce_dwords(class_d_dwords),
         nested_acks: open.nested_acks.clone(),
         control_effects: open.control_effects.clone(),
         read_set_pinned: false,

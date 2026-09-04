@@ -1274,6 +1274,7 @@ fn fake_memo() -> Arc<Memo> {
         return_eip: CLIENT_RETURN_EIP,
         replay: Box::new([]),
         class_r_ranges: Box::new([]),
+        class_d_ranges: Box::new([]),
         raw_core_clocks: 1,
         raw_bus_clocks: 1,
         insns: 1,
@@ -1475,6 +1476,7 @@ fn a_poisoned_read_cell_falls_through_with_zero_state_change() {
         return_eip: CLIENT_RETURN_EIP,
         replay: Box::new([]),
         class_r_ranges: Box::new([]),
+        class_d_ranges: Box::new([]),
         raw_core_clocks: 42,
         raw_bus_clocks: 7,
         insns: 3,
@@ -1515,6 +1517,7 @@ fn on_int_screening_never_mutates_state_on_a_poisoned_cell() {
         return_eip: CLIENT_RETURN_EIP,
         replay: Box::new([]),
         class_r_ranges: Box::new([]),
+        class_d_ranges: Box::new([]),
         raw_core_clocks: 1,
         raw_bus_clocks: 1,
         insns: 1,
@@ -1587,6 +1590,7 @@ fn distinguishable_memo(cpu: &CpuGsw, replay_addr: u32, cr3_after: u32) -> Memo 
         return_eip: CLIENT_RETURN_EIP + 2,
         replay: Box::new([(replay_addr, 0x0000_FFFF, 0xBEEF)]),
         class_r_ranges: Box::new([(0x7000, 0x7003)]),
+        class_d_ranges: Box::new([]),
         // 1,000 is NOT a multiple of `den` (12) on this persona, so a committer that
         // fed a PRE-SCALED delta back through the scaler would leave a different
         // `timing_rem` and this fixture would see it (R2.11's test for finding 2).
@@ -2120,6 +2124,7 @@ fn matching_memo(cpu: &CpuGsw, bus: &FlatMemBus, write_value: u32) -> Memo {
         return_eip: CLIENT_RETURN_EIP,
         replay: Box::new([(CLASS_W_ADDR, u32::MAX, write_value)]),
         class_r_ranges: Box::new([]),
+        class_d_ranges: Box::new([]),
         raw_core_clocks: 100 * u64::from(den) / u64::from(num),
         raw_bus_clocks: 50,
         insns: 7,
@@ -2651,6 +2656,7 @@ fn a_byte_read_pins_one_byte_not_the_whole_dword() {
         return_eip: CLIENT_RETURN_EIP,
         replay: Box::new([]),
         class_r_ranges: Box::new([]),
+        class_d_ranges: Box::new([]),
         raw_core_clocks: 1,
         raw_bus_clocks: 1,
         insns: 1,
@@ -3116,7 +3122,113 @@ fn the_new_refusal_lane_is_in_learn_refused_all_and_the_array_is_sized_for_it() 
     }
 }
 
-/// The audit's formula is stated over "the value the address held at trip ENTRY" (R2.18),
+/// The audit must skip the memo's OWN Class D set, not one re-derived from the audited
+/// trip's journal.
+///
+/// A learn cycle's journal trips are forced onto the interpreter and see every store, so
+/// the low-water mark their Class D rule rests on is complete. An audit trip deliberately
+/// runs NATIVE -- its clock triple is graded against a memo learned from native samples --
+/// so its own journal holds only the interpreted subset and its low-water mark is
+/// shallower. This fixture is that asymmetry in miniature: the audited trip journals ONE
+/// write, deep in its stack, with no earlier push to pull the low-water mark down, so its
+/// own dead-stack test says "live" about a cell the memo recorded as Class D.
+///
+/// **Mutation bite**: delete the `ranges_contain(&memo.class_d_ranges, dword)` skip from
+/// `audit_write_values_disagree` (or restore the re-derivation,
+/// `open.is_dead_stack(obs.ss_selector, obs.ss_base, obs.linear)`). The audit grades the
+/// dword against `WriteObs::pre_dword` -- a mid-trip instant -- and reports a divergence
+/// about a cell the memo deliberately excluded and the answer never touches. On
+/// `tyrian-specs-586` that was physical `0x17ac`, class `host_stack`, on 26 of 27 audits.
+#[test]
+fn the_audit_skips_the_memos_own_class_d_set_not_one_it_re_derives() {
+    const DEAD: u32 = STACK_TOP - 0x40;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+
+    let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    memo.replay = Box::new([]);
+    memo.class_r_ranges = Box::new([]);
+    // What a COMPLETE journal saw: this dword is below the learned trip's low-water mark.
+    memo.class_d_ranges = Box::new([(DEAD, DEAD + 3)]);
+    install_memo(&mut cpu, key, memo);
+    set_audit_period(&mut cpu, 1);
+    bus.gate_allowance = Some(1_000_000);
+
+    bus.write_raw(DEAD, BusWidth::Dword, 0x1111_1111);
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered,
+        "AUDIT=1 audits instead of answering"
+    );
+
+    // The audit trip pushes PAST the cell before writing it, so its OWN low-water mark
+    // sits below the cell and its own `is_dead_stack` answers "live" -- the disagreement
+    // this test exists to make harmless.
+    cpu.registers.set_esp(STACK_TOP - 0x80);
+    note_write(&mut cpu, &bus, DEAD, BusWidth::Dword, 0x2222_2222, false, None);
+    bus.write_raw(DEAD, BusWidth::Dword, 0x2222_2222);
+
+    cpu.elapsed_clocks += 100;
+    cpu.perf.instructions += 7;
+    bus.bus_clock += 50;
+    cpu.registers.set_esp(STACK_TOP - 2);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    on_far_return(&mut cpu, &bus);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.audited, 1);
+    assert_eq!(
+        state.audit_mismatch[AuditMismatch::WriteValue.index()],
+        0,
+        "a dword the MEMO recorded as Class D is unobservable by construction; the audit          may not grade it because its own partial journal reaches a different verdict"
+    );
+}
+
+/// The mirror of the test above: a dword the memo did NOT record as Class D is still
+/// graded, so the skip above is an exclusion of a named set and not a hole.
+///
+/// **Mutation bite**: skip every dword the audited trip wrote that the memo has no opinion
+/// about. The mismatch below disappears, and with it the audit's ability to catch a trip
+/// whose shape has changed since the memo was learned.
+#[test]
+fn a_written_dword_outside_the_memos_class_d_set_is_still_graded() {
+    const LIVE: u32 = STACK_TOP - 0x40;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+
+    let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    memo.replay = Box::new([]);
+    memo.class_r_ranges = Box::new([]);
+    memo.class_d_ranges = Box::new([(LIVE + 0x100, LIVE + 0x103)]); // a DIFFERENT dword
+    install_memo(&mut cpu, key, memo);
+    set_audit_period(&mut cpu, 1);
+    bus.gate_allowance = Some(1_000_000);
+
+    bus.write_raw(LIVE, BusWidth::Dword, 0x1111_1111);
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    let _ = on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault");
+    note_write(&mut cpu, &bus, LIVE, BusWidth::Dword, 0x2222_2222, false, None);
+    bus.write_raw(LIVE, BusWidth::Dword, 0x2222_2222);
+    cpu.elapsed_clocks += 100;
+    cpu.perf.instructions += 7;
+    bus.bus_clock += 50;
+    cpu.registers.set_esp(STACK_TOP - 2);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    on_far_return(&mut cpu, &bus);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.audited, 1);
+    assert_eq!(
+        state.audit_mismatch[AuditMismatch::WriteValue.index()],
+        1,
+        "the memo skips this dword and the trip changes it: that IS a divergence"
+    );
+}/// The audit's formula is stated over "the value the address held at trip ENTRY" (R2.18),
 /// and that is not the same instant as `WriteObs::pre_dword`, which is the value before
 /// the trip's first JOURNALED write to the dword. The two differ whenever anything else
 /// moved the cell earlier in the same trip.
