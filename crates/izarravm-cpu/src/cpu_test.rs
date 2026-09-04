@@ -2727,7 +2727,9 @@ fn scale_fp_clocks_batches_exactly() {
                 // exact division with the single carried remainder.
                 let weighted: u64 = seq
                     .iter()
-                    .map(|&(c, cl)| u64::from(c) * u64::from(fp_timing_class(mode.persona(), cl)))
+                    .map(|&(c, cl)| {
+                        u64::from(c) * u64::from(fp_timing_class(mode.persona(), cl, 1))
+                    })
                     .sum();
                 let scaled = weighted + start_rem;
                 let batched = scaled / u64::from(FP_TIMING_DEN);

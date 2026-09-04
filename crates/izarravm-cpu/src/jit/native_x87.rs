@@ -7,6 +7,7 @@ use super::super::{
     AddrMode, CR0_EM, CR0_NE, CR0_TS, CpuPersona, DecodeGroup, DecodedInsn, DecodedOperand,
     FP_TIMING_DEN, FpOpClass, fp_timing_class,
 };
+use crate::timing_class::{ClassTable, TimingClass};
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -347,8 +348,29 @@ pub(crate) struct NativeX87Metadata {
 }
 
 impl NativeX87Metadata {
-    pub(crate) const fn weighted_fp_clocks(self, persona: CpuPersona) -> u64 {
-        self.raw_clocks as u64 * fp_timing_class(persona, self.fp_class) as u64
+    /// This shape's cost under one `(persona, epoch)` charge table, times its
+    /// FP-dial numerator; the caller divides by [`FP_TIMING_DEN`] through
+    /// `scale_weighted_fp_clocks`, carrying the remainder.
+    ///
+    /// `class` is [`NativeX87Insn::timing_class`]. At epoch 1
+    /// `table.raw(class)` IS `self.raw_clocks` -- every class's epoch-1 column
+    /// is the literal the interpreter site carried, and
+    /// `every_native_x87_shape_charges_its_epoch_1_literal` asserts that shape
+    /// by shape -- and `fp_timing_class` is the shipped dial, so epoch 1 is the
+    /// pre-slice expression byte for byte. At epoch 2 the dial is IDENTITY
+    /// (design section 4 deletes it) and the table carries the honest Appendix
+    /// F count, which is what puts the native leg and the interpreter leg on
+    /// the same number: before slice 4 `fpu_exec.rs` charged
+    /// `X87StoreInt32 = 72` under epoch 2 while this table charged the epoch-1
+    /// literal 14, a 5x leg divergence.
+    pub(crate) const fn weighted_fp_clocks(
+        self,
+        persona: CpuPersona,
+        class: TimingClass,
+        table: &ClassTable,
+        epoch: u32,
+    ) -> u64 {
+        table.raw(class) as u64 * fp_timing_class(persona, self.fp_class, epoch) as u64
     }
 }
 
@@ -543,6 +565,73 @@ impl NativeX87Insn {
             }),
             (0xdf, 4, 0) => Some(Self::StoreStatusAx),
             _ => None,
+        }
+    }
+
+    /// The charge CLASS this shape carries -- the sibling of
+    /// [`NativeX87Metadata::raw_clocks`], and what an epoch-2 run charges
+    /// instead of it.
+    ///
+    /// Slice 4. `metadata()`'s `raw_clocks` is the epoch-1 literal the
+    /// interpreter site carried; the interpreter has charged
+    /// `table.raw(class)` since slice 1a (`fpu_exec.rs`'s 69 routed sites),
+    /// and this is what lets the NATIVE leg read the same table. The mapping
+    /// mirrors `fpu_exec.rs` opcode for opcode, and every class named here has
+    /// the shape's `raw_clocks` as its epoch-1 column, so epoch 1 cannot move.
+    /// Kept OFF `NativeX87Metadata` deliberately: that struct is pinned field
+    /// by field by `metadata_matches_interpreter_timing_and_memory_effects`,
+    /// and a class is a routing fact rather than a timing effect.
+    pub(crate) const fn timing_class(self) -> TimingClass {
+        match self {
+            // 0xd8 memory: FADD/FSUB/FMUL/FDIV/FCOM m32real.
+            Self::BinaryMemory { .. } => TimingClass::X87MemArith32,
+            // 0xda memory: integer m32 arithmetic. `FIDIV`/`FIDIVR` (/6, /7)
+            // splits out exactly as `fpu_exec.rs`'s 0xda arm splits it -- 42 P5
+            // clocks against the rest of the family's 7-8. Both classes carry
+            // the SAME epoch-1 literal (20), so the split cannot move epoch 1.
+            Self::IntBinaryMemory { op, .. } => match op {
+                NativeX87BinaryOp::Divide | NativeX87BinaryOp::DivideReverse => {
+                    TimingClass::X87MemArithIntDiv32
+                }
+                _ => TimingClass::X87MemArithInt32,
+            },
+            // 0xdc memory: the same family with an m64real operand.
+            Self::BinaryMemoryF64 { .. } => TimingClass::X87MemArith64,
+            // Every register-form arithmetic shape: 0xd8/0xdc/0xde mod=3.
+            Self::BinaryRegister { .. }
+            | Self::BinaryRegisterDest { .. }
+            | Self::PopBinary { .. } => TimingClass::X87RegArith,
+            Self::LoadF32 { .. } => TimingClass::X87LoadReal32,
+            Self::StoreF32 { .. } => TimingClass::X87StoreReal32,
+            Self::LoadF64 { .. } => TimingClass::X87LoadReal64,
+            Self::StoreF64 { .. } => TimingClass::X87StoreReal64,
+            Self::LoadI32 { .. } => TimingClass::X87LoadInt32,
+            Self::StoreI32 { .. } => TimingClass::X87StoreInt32,
+            Self::LoadI64 { .. } => TimingClass::X87LoadInt64,
+            Self::StoreI64 { .. } => TimingClass::X87StoreInt64,
+            Self::StoreExtended80 { .. } => TimingClass::X87StoreExtended80,
+            // SPLIT here, where epoch 1 gave all four `clocks(4)`: Appendix F
+            // prices `FLD ST(i)`/`FXCH` at the design's raw 12 and `FLD1`/`FLDZ`
+            // at 2 latency = raw 24. Both classes carry 4 as their epoch-1
+            // column, so the split is invisible at epoch 1.
+            Self::LoadRegister { .. } | Self::Exchange { .. } => TimingClass::X87RegExchange,
+            Self::LoadOne | Self::LoadZero => TimingClass::X87RegConstCheap,
+            // `FTST` shares `X87RegConstCheap` with FLD1/FLDZ, as it does in
+            // `timing_class.rs`: the three register-form ops that charge 4.
+            Self::TestZero => TimingClass::X87RegConstCheap,
+            Self::StoreRegister { .. } => TimingClass::X87RegStore,
+            Self::SignOp { .. } => TimingClass::X87RegSign,
+            // `FXAM` is 21 P5 clocks where the five constant loads it used to
+            // share a literal with are 5; `timing_class.rs` split it out.
+            Self::Examine => TimingClass::X87Xam,
+            Self::SquareRoot => TimingClass::X87Sqrt,
+            Self::RoundToInt => TimingClass::X87RoundInt,
+            Self::Wait => TimingClass::X87Wait,
+            Self::UnorderedCompare { .. } => TimingClass::X87RegCompare,
+            Self::ComparePopPop => TimingClass::X87ComparePop,
+            Self::StoreStatusAx => TimingClass::X87StatusReg,
+            Self::LoadControlWord { .. } => TimingClass::X87LoadControl,
+            Self::StoreControlWord { .. } => TimingClass::X87StoreControl,
         }
     }
 

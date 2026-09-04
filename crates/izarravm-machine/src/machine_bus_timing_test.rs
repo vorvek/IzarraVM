@@ -3086,10 +3086,44 @@ fn a_misaligned_access_costs_the_same_split_natively_and_interpreted() {
 
 #[test]
 fn approximate_video_wait_states_keep_the_doom_calibration() {
-    assert_eq!(video_wait_states_approx(CpuPersona::I486), 45);
+    assert_eq!(video_wait_states_approx(CpuPersona::I486, 1), 45);
     // 586: jointly solved with `bus_timing` 16/105 for the 166 MHz / PC100
     // spec so doom-586 holds ~1001 realtics; see video_wait_states_approx.
-    assert_eq!(video_wait_states_approx(CpuPersona::I586), 147);
+    assert_eq!(video_wait_states_approx(CpuPersona::I586, 1), 147);
+}
+
+/// EPOCH 2, slice 4: the mode-13h absorber is spent, and the value that replaces
+/// it stays INSIDE its pre-registered hardware range.
+///
+/// The ranges are declared in `video_wait_states_approx`'s own comment and in
+/// `dev_docs/2026-09-05-586-recalibration-design.md` sections 4 and 5, and were
+/// written down before the ladder ran. This test is the guard that no later
+/// slice quietly walks the constant out of the range to make a row pass -- which
+/// is the exact pattern the campaign exists to remove.
+#[test]
+fn epoch_2_video_wait_states_stay_inside_their_pre_registered_range() {
+    let i586 = video_wait_states_approx(CpuPersona::I586, 2);
+    let i486 = video_wait_states_approx(CpuPersona::I486, 2);
+
+    // I586, a 1997 PCI VGA: a posted PCI write at ~30 ns per byte access is
+    // ws 3 at 166 MHz; an ISA-timed VGA write at ~375 ns is ws ~60.
+    assert!(
+        (3..=60).contains(&i586),
+        "the epoch-2 I586 mode-13h wait state is {i586}, outside the pre-registered 3..=60"
+    );
+    // I486, a 1993 VLB/ISA VGA. Less headroom: the epoch-1 45 already sat at
+    // the ISA end, so the ladder is 5 / 12 / 20.
+    assert!(
+        (5..=20).contains(&i486),
+        "the epoch-2 I486 mode-13h wait state is {i486}, outside the pre-registered 5..=20"
+    );
+
+    // Both epoch-1 values are untouched. This is the merge bar in miniature.
+    assert_eq!(video_wait_states_approx(CpuPersona::I486, 1), 45);
+    assert_eq!(video_wait_states_approx(CpuPersona::I586, 1), 147);
+    // The 386 is out of the recalibration's scope under both epochs.
+    assert_eq!(video_wait_states_approx(CpuPersona::I386, 1), 1);
+    assert_eq!(video_wait_states_approx(CpuPersona::I386, 2), 1);
 }
 
 #[test]

@@ -180,6 +180,19 @@ param(
     # the board summary, so a leg can be audited afterwards and nobody has to
     # take it on trust that the knob was actually set.
     [string[]]$Knobs = @(),
+    # The epoch-2 guest-cycle budget multiplier (recalibration design section
+    # 9.7). Applied ONLY when -Knobs actually requests epoch 2; an epoch-1 run
+    # gets its recorded budget back untouched whatever this says. See
+    # Get-EpochScaledCycles for why the default is 4 and why it is margin rather
+    # than a fit.
+    #
+    # `1` runs the epoch-2 rows on the fixture's OWN budgets, which is the
+    # apples-to-apples arm for a class-band comparison against an earlier slice's
+    # table: a row whose demo finishes early spends the rest of a scaled budget
+    # in an idle loop, and that idle loop's instruction mix dilutes every
+    # per-instruction term. Use 1 to grade the band, the default to grade an
+    # anchor that has to reach the end of a demo.
+    [uint64]$EpochCycleBudgetScale = 4,
     [switch]$RecordInvariants,
     [switch]$Force,
     [switch]$ListFixtures,
@@ -563,6 +576,19 @@ function Invoke-ScoreboardSelfTest {
     if ($epochMismatch.note -notmatch "not comparable across timing-model epochs") {
         throw "epoch mismatch note did not explain the refusal: $($epochMismatch.note)"
     }
+
+    # The epoch-2 guest-cycle budget re-scale (design section 9.7). The load-bearing
+    # half is the NEGATIVE case: a knob-unset run must get its budget back
+    # untouched, or the identity merge bar would be graded on a different amount
+    # of guest work.
+    Assert-ScoreboardSelfTestEqual (Get-EpochScaledCycles ([uint64]6200000000) @()) `
+        ([uint64]6200000000) "an epoch-1 (knob-unset) row keeps its recorded budget"
+    Assert-ScoreboardSelfTestEqual `
+        (Get-EpochScaledCycles ([uint64]6200000000) @("IZARRAVM_TIMING_EPOCH=2")) `
+        ([uint64]24800000000) "an epoch-2 row's budget is scaled by the pre-registered 4x"
+    Assert-ScoreboardSelfTestEqual `
+        (Get-EpochScaledCycles ([uint64]4000000000) @("IZARRAVM_SEGMENT_RETIRE_GOVERNOR=off")) `
+        ([uint64]4000000000) "an unrelated knob does not scale the budget"
 
     $noJit = Get-CoverageMetrics (New-CoverageSelfTestProfile 100 0 0 0 0)
     Assert-ScoreboardSelfTestEqual $noJit.interpreted_insns 100 "no-JIT instructions"
@@ -2522,6 +2548,57 @@ function Resolve-FixtureSelection([string[]]$Specification, [string[]]$KnownName
     return ,$selected
 }
 
+# THE EPOCH-2 GUEST-CYCLE BUDGET RE-SCALE (recalibration design section 9.7).
+#
+# Every row's `cycles` is a fixed GUEST-CYCLE budget, and the demo-completion
+# invariants -- quake-586's 969 frames, doom-586's realtics -- are only gradeable
+# if the demo FINISHES inside it. The recalibration makes the guest slower in
+# guest-clock terms on purpose: slice 2 measured whole-bill ratios of 1.34x to
+# 6.20x across the board rows, and at epoch 2 both anchors stopped on
+# `cycle_limit` with no timedemo line at all. That is design section 9.7's own
+# predicted non-defect -- "a slower guest will not finish the demo inside 6.2 G,
+# breaking it for a non-defect" -- and the fix it asks for is to scale the budget
+# with the epoch, not to bend the model.
+#
+# PRE-REGISTERED, before slice 4's ladder ran: **4x, one multiplier, every row.**
+# The reasoning, stated so it can be checked rather than fitted:
+#
+#  * The requirement is a budget large enough for the demo to complete with
+#    margin, NOT a per-row fit. A per-row multiplier would be an absorber wearing
+#    a scope -- the exact pattern the owner's line-82 ruling struck out.
+#  * 4x dominates the largest ANCHOR-row ratio slice 2 measured (doom-586,
+#    3.824x) and every non-anchor row except tyrian-586 (6.199x). Slice 4 only
+#    ever REDUCES the bill on those rows -- it deletes the x87 absorber and cuts
+#    the mode-13h aperture term, which was 78% of doom-586's bill and 39% of
+#    tyrian's -- so every ratio falls under it. tyrian-586's residual risk is
+#    recorded in the slice-4 result doc rather than papered over with a fifth
+#    knob.
+#  * It is a POWER OF TWO chosen for margin, not a solved value. Nothing is
+#    graded on it: it decides only how much guest time a row is given, and a row
+#    that still fails to complete inside it is a finding.
+#
+# EPOCH 1 DOES NOT MOVE. The multiplier applies only when the caller's -Knobs
+# passthrough actually asks for epoch 2, which is the only way to reach epoch 2
+# (`IZARRAVM_TIMING_EPOCH=1` panics by design; the epoch-1 arm is the variable
+# unset). A knob-unset run gets `$Cycles` back unchanged, byte for byte, so the
+# identity merge bar is untouched.
+function Get-EpochScaledCycles([uint64]$Cycles, [string[]]$KnobSpecification = $Knobs) {
+    $boardOwned = Get-BoardOwnedEnvironment
+    $knobValues = Resolve-KnobPassthrough $KnobSpecification @($boardOwned.Keys)
+    if (-not $knobValues.Contains("IZARRAVM_TIMING_EPOCH")) { return $Cycles }
+    $requested = 0
+    if (-not [uint32]::TryParse([string]$knobValues["IZARRAVM_TIMING_EPOCH"], [ref]$requested)) {
+        return $Cycles
+    }
+    if ($requested -lt 2) { return $Cycles }
+    return [uint64]($Cycles * $EpochTwoCycleBudgetScale)
+}
+
+# The multiplier in force, from the -EpochCycleBudgetScale parameter. Named so
+# the self-test and the result doc quote one number. See Get-EpochScaledCycles
+# for why the default is 4 and why it is not a fit.
+$script:EpochTwoCycleBudgetScale = $EpochCycleBudgetScale
+
 # The child environment for one row: scrub, then the board's own table, then the
 # caller's explicit -Knobs passthrough.
 #
@@ -2966,7 +3043,7 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         }
     }
 
-    $arguments = Get-FixtureArguments $Fixture $workingCopy $Fixture.cycles `
+    $arguments = Get-FixtureArguments $Fixture $workingCopy (Get-EpochScaledCycles $Fixture.cycles) `
         $profilePath $(if ($Fixture.resultPpm) { $ppmPath } else { $null })
     $environment = Get-RowEnvironment
 
@@ -3223,9 +3300,9 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
                 if ($profile.stop.kind -ne "cycle_limit") {
                     $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
                         "'cycle_limit' -- the guest did not run the whole budget")
-                } elseif ([uint64]$profile.cycle_budget -ne $Fixture.cycles) {
+                } elseif ([uint64]$profile.cycle_budget -ne (Get-EpochScaledCycles $Fixture.cycles)) {
                     $failures += ("the run was given a budget of $($profile.cycle_budget) " +
-                        "cycles, expected the fixture's $($Fixture.cycles)")
+                        "cycles, expected the fixture's $(Get-EpochScaledCycles $Fixture.cycles)")
                 } elseif ([uint64]$profile.elapsed_budget_clocks -lt
                     [uint64]$profile.cycle_budget) {
                     $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
@@ -3338,9 +3415,9 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         if ($profile.stop.kind -ne "cycle_limit") {
             $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
                 "'cycle_limit' -- the guest did not run the whole budget")
-        } elseif ([uint64]$profile.cycle_budget -ne $Fixture.cycles) {
+        } elseif ([uint64]$profile.cycle_budget -ne (Get-EpochScaledCycles $Fixture.cycles)) {
             $failures += ("the run was given a budget of $($profile.cycle_budget) " +
-                "cycles, expected the fixture's $($Fixture.cycles)")
+                "cycles, expected the fixture's $(Get-EpochScaledCycles $Fixture.cycles)")
         } elseif ([uint64]$profile.elapsed_budget_clocks -lt [uint64]$profile.cycle_budget) {
             $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
                 "$($profile.cycle_budget) cycle budget -- it ended early")

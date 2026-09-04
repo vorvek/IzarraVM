@@ -6380,7 +6380,17 @@ const FP_TIMING_DEN: u32 = 8;
 /// effective stall surcharge (see FpOpClass::IntConvert). CALIBRATION
 /// CONSTRAINTS: Whetstone 586 = 34.5 MFLOPS and 486 = 6.5 stay era-exact;
 /// Dhrystone/Sieve run no x87 and stay bit-identical; 386 frozen.
-const fn fp_timing_class(persona: CpuPersona, class: FpOpClass) -> u32 {
+const fn fp_timing_class(persona: CpuPersona, class: FpOpClass, epoch: u32) -> u32 {
+    // EPOCH 2, design section 4: the dial is DELETED, not re-solved. Every I586
+    // FP class becomes identity (8/8) and the honest per-form Appendix F counts
+    // are charged by the class table instead (`timing_class.rs`'s x87 block,
+    // sourced row by row in `dev_docs/2026-09-05-class-table-sources.md`).
+    // `IntConvert32 = 272` (x34) was the absorber: its own comment called it
+    // "empirically walked against the two era anchors", and it priced
+    // `FISTP m32` at 39.67 guest clocks against Intel's 6.
+    if epoch >= 2 {
+        return FP_TIMING_DEN;
+    }
     match persona {
         CpuPersona::I386 | CpuPersona::I486 => FP_TIMING_DEN,
         CpuPersona::I586 => match class {

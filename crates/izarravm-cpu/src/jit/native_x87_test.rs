@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use crate::jit::direct::{MAX_X87_BLOCK_CORE_CLOCKS, MAX_X87_BLOCK_INSTRUCTIONS, MAX_X87_SLOTS};
+use crate::jit::direct::{MAX_X87_BLOCK_INSTRUCTIONS, MAX_X87_SLOTS, max_x87_block_core_clocks};
+use crate::timing_class::class_table;
 use crate::{AddressSize, DecodedOperand, OperandSize, Prefixes, RepKind, SegmentIndex};
 
 fn addr() -> AddrMode {
@@ -1116,17 +1117,24 @@ fn weighted_timing_batches_exactly() {
         NativeX87Insn::classify(&insn(0xdf, 3, 4, 0)).unwrap(),
     ];
     for persona in [CpuPersona::I486, CpuPersona::I586] {
+        let table = class_table(persona, 1);
         let weighted = sequence
             .iter()
-            .map(|op| op.metadata().weighted_fp_clocks(persona))
+            .map(|op| {
+                op.metadata()
+                    .weighted_fp_clocks(persona, op.timing_class(), table, 1)
+            })
             .sum::<u64>();
         let aggregate = scale_weighted_fp_clocks(weighted, 3);
 
         let mut individual_clocks = 0;
         let mut remainder = 3;
         for op in sequence {
-            let step =
-                scale_weighted_fp_clocks(op.metadata().weighted_fp_clocks(persona), remainder);
+            let step = scale_weighted_fp_clocks(
+                op.metadata()
+                    .weighted_fp_clocks(persona, op.timing_class(), table, 1),
+                remainder,
+            );
             individual_clocks += step.clocks;
             remainder = step.remainder;
         }
@@ -1276,40 +1284,104 @@ fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
     let shapes = every_x87_shape();
     assert!(shapes.iter().copied().all(shape_is_enumerated));
 
-    // Ceil per slot, then sum, which is at least ceil(sum / den) and is how the bound was built.
-    let worst_fp_slot = shapes
-        .iter()
-        .map(|insn| {
-            insn.metadata()
-                .weighted_fp_clocks(CpuPersona::I586)
-                .div_ceil(u64::from(FP_TIMING_DEN))
-        })
-        .max()
-        .expect("at least one x87 shape");
+    // BOTH epochs, and both fast personas within each. Slice 4 routes this table onto the class
+    // table, so epoch 2's worst slot is a different shape at a different cost from epoch 1's
+    // (FSQRT at raw 840, where epoch 1's worst is 0xDA m32int through the x32 IntConvert16 dial)
+    // and each epoch's bound must dominate its own.
+    for epoch in [1, 2] {
+        let bound = max_x87_block_core_clocks(epoch);
+        // Ceil per slot, then sum, which is at least ceil(sum / den) and is how the bound was
+        // built.
+        let worst_fp_slot = shapes
+            .iter()
+            .flat_map(|insn| {
+                [CpuPersona::I486, CpuPersona::I586].map(|persona| {
+                    insn.metadata()
+                        .weighted_fp_clocks(
+                            persona,
+                            insn.timing_class(),
+                            class_table(persona, epoch),
+                            epoch,
+                        )
+                        .div_ceil(u64::from(FP_TIMING_DEN))
+                })
+            })
+            .max()
+            .expect("at least one x87 shape");
 
-    // `DirectKind::X87` charges 0 raw clocks, so the raw term comes from the NON-x87 instructions
-    // sharing the block. A block with any x87 slot holds at most MAX_X87_BLOCK_INSTRUCTIONS of
-    // them, and no kind with a constant charge exceeds the 10 a near RET costs.
-    const WORST_CONSTANT_RAW_CLOCKS: u64 = 10;
-    let derived = MAX_X87_SLOTS as u64 * worst_fp_slot
-        + MAX_X87_BLOCK_INSTRUCTIONS as u64 * WORST_CONSTANT_RAW_CLOCKS;
+        // `DirectKind::X87` charges 0 raw clocks, so the raw term comes from the NON-x87
+        // instructions sharing the block. A block with any x87 slot holds at most
+        // MAX_X87_BLOCK_INSTRUCTIONS of them, and no kind with a constant charge exceeds the 10 a
+        // near RET costs.
+        const WORST_CONSTANT_RAW_CLOCKS: u64 = 10;
+        let derived = MAX_X87_SLOTS as u64 * worst_fp_slot
+            + MAX_X87_BLOCK_INSTRUCTIONS as u64 * WORST_CONSTANT_RAW_CLOCKS;
 
-    assert!(
-        derived <= MAX_X87_BLOCK_CORE_CLOCKS,
-        "MAX_X87_BLOCK_CORE_CLOCKS is {MAX_X87_BLOCK_CORE_CLOCKS} but the metadata table now \
-         allows a block costing {derived} ({MAX_X87_SLOTS} slots x {worst_fp_slot} core clocks \
-         plus {MAX_X87_BLOCK_INSTRUCTIONS} x {WORST_CONSTANT_RAW_CLOCKS} raw). Raise the constant \
-         and re-measure: it feeds the chain quota, so widening it changes when devices advance."
-    );
-    // The bound is TIGHT as of this slice (0xDA m32int, `FpOpClass::IntConvert16`, is the worst
-    // admissible slot and its cost was what `MAX_X87_BLOCK_CORE_CLOCKS` was pre-raised for). A
-    // future ahead-of-time raise of the constant, or a costlier shape joining the table, must
-    // adjust both sides of this equality together; without it, mutations that undercharge the new
-    // shape (a wrong `fp_class` or `raw_clocks`) would pass the `<=` above trivially by falling
-    // back under the old IntConvert32 worst case, and this assertion is what catches that.
+        // The bound is TIGHT in both epochs, and the equality is what makes a mutation that
+        // UNDERCHARGES a shape (a wrong class, `fp_class` or `raw_clocks`) fail here rather than
+        // pass a `<=` trivially by falling back under the old worst case.
+        assert_eq!(
+            derived, bound,
+            "epoch {epoch}: the bound is {bound} but the metadata table derives {derived} \
+             ({MAX_X87_SLOTS} slots x {worst_fp_slot} core clocks plus \
+             {MAX_X87_BLOCK_INSTRUCTIONS} x {WORST_CONSTANT_RAW_CLOCKS} raw). Both sides of this \
+             pin must move together: it feeds the chain quota, so widening it changes when \
+             devices advance."
+        );
+    }
+}
+
+/// EPOCH 1 IS BYTE-IDENTICAL BY CONSTRUCTION, shape by shape.
+///
+/// Slice 4's native-leg routing is safe only because every class
+/// [`NativeX87Insn::timing_class`] names carries, as its epoch-1 column, exactly the literal the
+/// shape's `raw_clocks` already held. This asserts it for every shape the compiler can build, on
+/// both fast personas -- so a routing mistake (the realistic error: reaching for a neighbouring
+/// class because two shapes look alike, as `FLD1` and `FXCH` did while they shared one arm) is
+/// caught here rather than as a moved epoch-1 pin on a game row.
+#[test]
+fn every_native_x87_shape_charges_its_epoch_1_literal() {
+    for insn in every_x87_shape() {
+        for persona in [CpuPersona::I486, CpuPersona::I586] {
+            assert_eq!(
+                class_table(persona, 1).raw(insn.timing_class()),
+                u32::from(insn.metadata().raw_clocks),
+                "{insn:?} on {persona:?} routes to {:?}, whose epoch-1 column is not the shape's \
+                 own literal",
+                insn.timing_class()
+            );
+        }
+    }
+}
+
+/// The other half: at epoch 2 the native leg charges what the INTERPRETER charges.
+///
+/// Before this slice `FISTP m32` cost raw 14 natively and raw 72 interpreted -- a 5x leg
+/// divergence, hidden because the `fp_timing_class` absorber multiplied both by 34. Slice 4
+/// deletes the dial (design section 4) and routes the native leg onto the same class.
+#[test]
+fn epoch_2_deletes_the_fp_dial_and_charges_the_class_table() {
+    let fistp = NativeX87Insn::classify(&insn(0xdb, 0, 3, 1)).expect("FISTP m32 lowers");
+    assert_eq!(fistp.timing_class(), TimingClass::X87StoreInt32);
+
+    // Epoch 1: the shipped literal 14 times the x34 `IntConvert32` absorber.
     assert_eq!(
-        derived, MAX_X87_BLOCK_CORE_CLOCKS,
-        "the derived bound no longer matches MAX_X87_BLOCK_CORE_CLOCKS exactly; both sides of \
-         this pin must move together"
+        fistp.metadata().weighted_fp_clocks(
+            CpuPersona::I586,
+            fistp.timing_class(),
+            class_table(CpuPersona::I586, 1),
+            1
+        ),
+        14 * 272,
+    );
+    // Epoch 2: Intel's 6 clocks (raw 72), with the dial at identity.
+    assert_eq!(
+        fistp.metadata().weighted_fp_clocks(
+            CpuPersona::I586,
+            fistp.timing_class(),
+            class_table(CpuPersona::I586, 2),
+            2
+        ),
+        72 * u64::from(FP_TIMING_DEN),
     );
 }
