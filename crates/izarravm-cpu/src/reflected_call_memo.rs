@@ -3011,12 +3011,8 @@ fn describe_audit_offender(
         .iter()
         .any(|&(lo, hi)| phys >= (lo & !0x3) && phys <= (hi & !0x3));
     let obs = open.writes.get(&phys);
-    let is_stack = obs.is_some_and(|o| {
-        matches!(
-            o.class,
-            AddressClass::ClientStack | AddressClass::HostStack
-        )
-    });
+    let is_stack =
+        obs.is_some_and(|o| matches!(o.class, AddressClass::ClientStack | AddressClass::HostStack));
     let is_dead = obs.is_some_and(|o| open.is_dead_stack(o.ss_selector, o.ss_base, o.linear));
     let provenance = u32::from(claim_mask != 0)
         | (u32::from(obs.is_some()) << 1)

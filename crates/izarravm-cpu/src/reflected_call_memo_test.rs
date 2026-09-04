@@ -3168,7 +3168,15 @@ fn the_audit_skips_the_memos_own_class_d_set_not_one_it_re_derives() {
     // sits below the cell and its own `is_dead_stack` answers "live" -- the disagreement
     // this test exists to make harmless.
     cpu.registers.set_esp(STACK_TOP - 0x80);
-    note_write(&mut cpu, &bus, DEAD, BusWidth::Dword, 0x2222_2222, false, None);
+    note_write(
+        &mut cpu,
+        &bus,
+        DEAD,
+        BusWidth::Dword,
+        0x2222_2222,
+        false,
+        None,
+    );
     bus.write_raw(DEAD, BusWidth::Dword, 0x2222_2222);
 
     cpu.elapsed_clocks += 100;
@@ -3212,7 +3220,15 @@ fn a_written_dword_outside_the_memos_class_d_set_is_still_graded() {
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
     let _ = on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault");
-    note_write(&mut cpu, &bus, LIVE, BusWidth::Dword, 0x2222_2222, false, None);
+    note_write(
+        &mut cpu,
+        &bus,
+        LIVE,
+        BusWidth::Dword,
+        0x2222_2222,
+        false,
+        None,
+    );
     bus.write_raw(LIVE, BusWidth::Dword, 0x2222_2222);
     cpu.elapsed_clocks += 100;
     cpu.perf.instructions += 7;
@@ -3228,7 +3244,8 @@ fn a_written_dword_outside_the_memos_class_d_set_is_still_graded() {
         1,
         "the memo skips this dword and the trip changes it: that IS a divergence"
     );
-}/// The audit's formula is stated over "the value the address held at trip ENTRY" (R2.18),
+}
+/// The audit's formula is stated over "the value the address held at trip ENTRY" (R2.18),
 /// and that is not the same instant as `WriteObs::pre_dword`, which is the value before
 /// the trip's first JOURNALED write to the dword. The two differ whenever anything else
 /// moved the cell earlier in the same trip.
