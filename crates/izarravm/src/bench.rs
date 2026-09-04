@@ -1372,16 +1372,19 @@ pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Er
                 izarravm_firmware::neurketa_image(),
             )?;
             machine.set_mode(mode);
+            let epoch = machine.timing_epoch();
             let sample = machine.measure_read_bandwidth(0x10_0000, block, TOTAL);
             let mb_per_sec = if sample.clocks > 0 {
                 sample.bytes as f64 / mode.clock_rate().seconds_for_clocks(sample.clocks) / 1.0e6
             } else {
                 0.0
             };
-            let tag = bandwidth_band_tag(mode, block, mb_per_sec);
-            if bench_reference::band_for(bandwidth_tier(mode, block), mode).is_some_and(|band| {
-                band.verdict(mb_per_sec) != bench_reference::BandVerdict::InBand
-            }) {
+            let tag = bandwidth_band_tag(mode, block, mb_per_sec, epoch);
+            if bench_reference::band_for_epoch(bandwidth_tier(mode, block), mode, epoch)
+                .is_some_and(|band| {
+                    band.verdict(mb_per_sec) != bench_reference::BandVerdict::InBand
+                })
+            {
                 out_of_band = true;
             }
             println!("{:>7}K {:>12.1} {:>16}", block / 1024, mb_per_sec, tag,);
@@ -1407,10 +1410,10 @@ fn bandwidth_tier(mode: GswMode, block: u32) -> &'static str {
 }
 
 /// Tag a bandwidth row against the band for its active cache tier.
-fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64) -> String {
+fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64, epoch: u32) -> String {
     use bench_reference::BandVerdict;
     let tier = bandwidth_tier(mode, block);
-    let Some(band) = bench_reference::band_for(tier, mode) else {
+    let Some(band) = bench_reference::band_for_epoch(tier, mode, epoch) else {
         return String::new();
     };
     let label = tier.trim_start_matches("bandwidth-");

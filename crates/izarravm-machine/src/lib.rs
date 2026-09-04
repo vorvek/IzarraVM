@@ -495,7 +495,7 @@ enum Tier {
 ///
 /// Wired into `read_memory`/`write_memory`: every data access warms the modeled
 /// cache, and the resolved tier already DRIVES the charged data-access cost via
-/// `data_wait_states` -> `tier_cost` (L1/L2/RAM each have their own calibrated
+/// `data_tier_and_wait_states` -> `tier_cost` (L1/L2/RAM each have their own calibrated
 /// per-mode wait-state).
 #[derive(Debug)]
 struct CacheModel {
@@ -504,31 +504,44 @@ struct CacheModel {
     config: CacheLevelConfig,
     cost: TierCost,
     code_fetch_ws: u8,
+    /// `IZARRAVM_TIMING_EPOCH`, copied in once from `Machine::timing_epoch` at
+    /// construction. The geometry (line size, and therefore the masks) and the
+    /// tier costs are both epoch-keyed from slice 2 on, so the model has to carry
+    /// the epoch to answer `set_mode` later without re-reading the environment.
+    epoch: u32,
     lookups: u64,
 }
 
 /// Sentinel tag that cannot be a valid line number, so a freshly filled array is
-/// all-miss. `line = phys >> 6`; with a 32-bit phys the top line number is
-/// `0xFFFF_FFFF >> 6 < u32::MAX`, so `u32::MAX` is never a real tag.
+/// all-miss. `line = phys >> config.line_shift`, and the smallest line any epoch
+/// models is 16 bytes; with a 32-bit phys the top line number is
+/// `0xFFFF_FFFF >> 4 < u32::MAX`, so `u32::MAX` is never a real tag.
 const CACHE_EMPTY_TAG: u32 = u32::MAX;
 
 impl CacheModel {
-    fn new(mode: GswMode) -> Self {
+    fn new(mode: GswMode, epoch: u32) -> Self {
         Self {
             l1_tags: vec![CACHE_EMPTY_TAG; CACHE_L1_MAX_LINES].into_boxed_slice(),
             l2_tags: vec![CACHE_EMPTY_TAG; CACHE_L2_MAX_LINES].into_boxed_slice(),
-            config: cache_level_config(mode),
-            cost: tier_cost(mode),
+            config: cache_level_config(mode, epoch),
+            cost: tier_cost(mode, epoch),
             code_fetch_ws: code_fetch_ws(mode),
+            epoch,
             lookups: 0,
         }
     }
 
     fn set_mode(&mut self, mode: GswMode) {
-        self.config = cache_level_config(mode);
-        self.cost = tier_cost(mode);
+        self.config = cache_level_config(mode, self.epoch);
+        self.cost = tier_cost(mode, self.epoch);
         self.code_fetch_ws = code_fetch_ws(mode);
         self.reset();
+    }
+
+    /// The epoch this model was built under, so the canonical projection can
+    /// re-derive the SAME geometry and costs it is checking.
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
     }
 
     /// Resolve a DATA access at `phys` to a tier for the live `level`, installing the
@@ -537,13 +550,13 @@ impl CacheModel {
     ///
     #[cfg(test)]
     fn data_tier(&mut self, mode: GswMode, phys: u32) -> Tier {
-        self.data_tier_with_config(cache_level_config(mode), phys)
+        self.data_tier_with_config(cache_level_config(mode, self.epoch), phys)
     }
 
     #[inline(always)]
     fn data_tier_with_config(&mut self, config: CacheLevelConfig, phys: u32) -> Tier {
         self.lookups += 1;
-        let line = phys >> 6;
+        let line = phys >> config.line_shift;
         if config.l1_mask != CACHE_TIER_DISABLED_MASK {
             let idx = (line & config.l1_mask) as usize;
             if self.l1_tags[idx] == line {
@@ -578,21 +591,30 @@ impl CacheModel {
         }
     }
 
-    /// Wait-states to charge for a DATA access at `phys`. Warms the modeled cache
-    /// (so tier state is live) and returns the per-tier cost for the resolved tier.
-    /// `_width` is accepted for a future wide-access straddle model but does not
-    /// affect the current single-line model. The RAM cost is `tier_cost(level).ram`,
-    /// not the device `memory_wait_states`: the device-window gate in
-    /// `data_access_wait_states` already routed ROM/MMIO accesses to
-    /// `memory_wait_states` before reaching here, so this only ever sees cacheable
-    /// RAM.
+    /// The resolved TIER and the wait-states to charge for a DATA access at
+    /// `phys`. Warms the modeled cache (so tier state is live) and returns the
+    /// per-tier cost for the resolved tier. `_width` is accepted for a future
+    /// wide-access straddle model but does not affect the current single-line
+    /// model. The RAM cost is `tier_cost(level).ram`, not the device
+    /// `memory_wait_states`: the device-window gate in `data_access_wait_states`
+    /// already routed ROM/MMIO accesses to `memory_wait_states` before reaching
+    /// here, so this only ever sees cacheable RAM.
+    ///
+    /// The tier travels WITH the cost because the caller treats one tier
+    /// differently (epoch 2 folds the L1 hit into the instruction class count)
+    /// and resolving it MUTATES the tag arrays -- asking a second time would be
+    /// neither free nor idempotent.
     #[inline(always)]
-    fn data_wait_states(&mut self, phys: u32, _width: BusWidth) -> u8 {
-        match self.data_tier_with_config(self.config, phys) {
-            Tier::L1 => self.cost.l1,
-            Tier::L2 => self.cost.l2,
-            Tier::Ram => self.cost.ram,
-        }
+    fn data_tier_and_wait_states(&mut self, phys: u32, _width: BusWidth) -> (Tier, u8) {
+        let tier = self.data_tier_with_config(self.config, phys);
+        (
+            tier,
+            match tier {
+                Tier::L1 => self.cost.l1,
+                Tier::L2 => self.cost.l2,
+                Tier::Ram => self.cost.ram,
+            },
+        )
     }
 
     /// Wait-states for a code fetch: code is assumed L1-resident, so this is a
@@ -2270,7 +2292,7 @@ impl Machine {
             reported_fault_sites: Vec::new(),
             last_fault_line: None,
             cpu,
-            cache_model: CacheModel::new(active_mode),
+            cache_model: CacheModel::new(active_mode, timing_epoch),
             bus_rem: 0,
             scaled_bus_clocks: 0,
             #[cfg(feature = "jit")]
@@ -3525,6 +3547,10 @@ impl Machine {
     pub(crate) fn set_timing_epoch_for_test(&mut self, epoch: u32) {
         self.timing_epoch = epoch;
         self.cpu.set_timing_epoch(epoch);
+        // The cache model's geometry and tier costs are epoch-keyed too (slice 2),
+        // so rebuild it rather than leaving a model that disagrees with the epoch
+        // the rest of the machine now runs under.
+        self.cache_model = CacheModel::new(self.active_mode, epoch);
     }
 
     pub fn timing_epoch(&self) -> u32 {
@@ -3619,6 +3645,11 @@ impl Machine {
             // diagnostic, not guest-perceived time), so it always tiers even in the
             // Approximate class.
             bus.flat_data_cost = false;
+            // For the same reason, the epoch-2 whole-bill fold is off here. The fold
+            // exists because Intel's per-instruction class counts already contain the
+            // L1 access; this sweep issues no instructions and is measuring the BUS,
+            // so folding would report an L1 tier that costs literally nothing.
+            bus.l1_charges_folded = false;
             let start = bus.trace.elapsed_clocks();
             for _ in 0..passes {
                 for off in (0..block).step_by(4) {
@@ -4001,6 +4032,24 @@ struct MachineBus<'a> {
     // warms it via data_access_wait_states, and the resolved tier's calibrated cost
     // is the charged wait-state.
     cache: &'a mut CacheModel,
+    /// EPOCH 2's whole-bill fold (slice 2), I486 and I586 only: an L1-hit data
+    /// access and a CACHED-RAM instruction fetch charge NOTHING on the bus,
+    /// because Intel's per-instruction class counts -- the epoch-2 table the CPU
+    /// now charges from -- already contain both. Charging them here as well is a
+    /// double-count worth 0.3048 guest clocks of fetch per instruction plus
+    /// 0.3048 per data access (2 raw at `bus_timing(I586) = (16,105)`), which is
+    /// what would push every row above its band.
+    ///
+    /// SCOPED, deliberately: only the cached-RAM routes fold. ROM, UMB, shadow
+    /// and device-window fetches keep their route cost, and so does every
+    /// aperture/MMIO data access and every port cycle -- else BIOS and option
+    /// ROMs would run free (design section 9.5: the first draft's rule was "too
+    /// broad"). An L2 or RAM MISS is outside the fold in principle; on these two
+    /// personas `flat_data_cost` means no miss is ever resolved, which is the
+    /// recorded under-charge, not a claim that misses are free.
+    ///
+    /// Epoch 1 leaves this `false` for every persona, so nothing here moves.
+    l1_charges_folded: bool,
     /// The clocks ONE cacheable-RAM instruction fetch costs: `clocks_for(Byte,
     /// cache.code_fetch_wait_states())`, resolved once per batch instead of per
     /// instruction. Code is assumed I-cache-resident, so this is a per-persona

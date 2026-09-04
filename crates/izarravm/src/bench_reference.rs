@@ -78,6 +78,92 @@ pub fn band_for(payload: &str, mode: GswMode) -> Option<&'static BenchBand> {
         .find(|entry| entry.payload == payload && entry.mode == mode)
 }
 
+/// `band_for`, keyed by the guest-clock model epoch the measuring machine ran
+/// under (`Machine::timing_epoch`).
+///
+/// Epoch 2's whole-bill fold (slice 2) re-solves `tier_cost` on both fast
+/// personas and takes `bus_timing` to `(1, 1)`, so a tier's cost in guest clocks
+/// changes and the memory-bandwidth rows the old bands describe no longer exist.
+/// A band that describes a model the tree no longer runs is worse than no band,
+/// so the six affected rows have an epoch-2 twin here; every other payload falls
+/// through to `BENCH_BANDS`.
+pub fn band_for_epoch(payload: &str, mode: GswMode, epoch: u32) -> Option<&'static BenchBand> {
+    if epoch >= 2
+        && let Some(entry) = EPOCH2_BENCH_BANDS
+            .iter()
+            .find(|entry| entry.payload == payload && entry.mode == mode)
+    {
+        return Some(entry);
+    }
+    band_for(payload, mode)
+}
+
+/// The epoch-2 memory-bandwidth bands, DERIVED from the model rather than fitted
+/// to a game: the sweep reads one dword per bus access, an access costs
+/// `2 + tier_cost(mode, 2).<tier>` raw clocks (`BusCycle::clocks_for`), and
+/// `bus_timing(persona, 2) = (1, 1)` makes a raw clock a guest clock. A tier
+/// below L1 is reached once per LINE, not once per dword: the resolution installs
+/// the line into L1, so a 32-byte 586 line is one L2/RAM access plus seven L1
+/// hits and the per-dword cost is `(2 + ws + 7 * 2) / 8`. Each target below is
+/// that arithmetic; where a tier's block sizes spread (the cold first pass costs
+/// more on a bigger block), the target centres the spread so every block in the
+/// tier sits inside the same 0.98-1.05 window.
+///
+/// RECORDED FINDING, not a fit: these sit BELOW the SpeedSys-era figures the
+/// epoch-1 bands carry -- the 586 goes 2160 / 299.5 / 242.9 -> 332 / 188 / 116
+/// MB/s, and the 486 198 / 50.0 / 40.5 -> 132 / 81 / 52.8 (the 486's lower tiers
+/// go UP, because its epoch-1 `tier_cost` priced a miss at 191/250 wait states).
+/// The L1 shortfall is structural and predates this slice: the model charges one
+/// non-burst 2-clock bus cycle per dword and has no line fill, so L1 bandwidth
+/// cannot exceed `2 * clock_hz` bytes/s whatever the wait state is. Epoch 1 hid
+/// that behind `bus_timing`'s 0.152 multiplier -- exactly the dial the fold
+/// removes. Restoring era L1 bandwidth needs a burst/line-fill model, which is
+/// nobody's slice yet.
+pub const EPOCH2_BENCH_BANDS: &[BenchBand] = &[
+    band(
+        "bandwidth-l1",
+        GswMode::Gsw486,
+        132.0,
+        "MB/s",
+        "Epoch 2, derived: 4 bytes per (2 + 0) clocks at 66 MHz -- the bus-cycle floor, since the 486 L1 wait state is 0 under the whole-bill fold",
+    ),
+    band(
+        "bandwidth-l2",
+        GswMode::Gsw486,
+        80.9,
+        "MB/s",
+        "Epoch 2, derived: a 16-byte line is one L2 access (2 + 5) plus three L1 hits, 13 clocks per 16 bytes at 66 MHz = 81.2 steady state; 80.9 centres the tier's cold-pass spread",
+    ),
+    band(
+        "bandwidth-ram",
+        GswMode::Gsw486,
+        52.8,
+        "MB/s",
+        "Epoch 2, derived: a 16-byte line is one RAM access (2 + 12) plus three L1 hits, 20 clocks per 16 bytes at 66 MHz",
+    ),
+    band(
+        "bandwidth-l1",
+        GswMode::Gsw586,
+        332.0,
+        "MB/s",
+        "Epoch 2, derived: 4 bytes per (2 + 0) clocks at 166 MHz -- the 2-clock bus-cycle floor, not an L1 figure; see the module note",
+    ),
+    band(
+        "bandwidth-l2",
+        GswMode::Gsw586,
+        187.9,
+        "MB/s",
+        "Epoch 2, derived: a 32-byte line is one L2 access (2 + 12) plus seven L1 hits, 28 clocks per 32 bytes at 166 MHz = 189.7 steady state; 187.9 centres the tier's cold-pass spread",
+    ),
+    band(
+        "bandwidth-ram",
+        GswMode::Gsw586,
+        115.5,
+        "MB/s",
+        "Epoch 2, derived: a 32-byte line is one RAM access (2 + 30) plus seven L1 hits, 46 clocks per 32 bytes at 166 MHz",
+    ),
+];
+
 pub const BENCH_BANDS: &[BenchBand] = &[
     band(
         "dhrystone",
