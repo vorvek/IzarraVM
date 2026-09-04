@@ -361,7 +361,18 @@ fn conservation_mismatch_catches_a_beyond_extent_disagreement() {
 fn spawn_riprofile_child(test_name: &str, env_var: &str) -> std::process::Output {
     let exe = std::env::current_exe().expect("test exe path");
     std::process::Command::new(exe)
-        .args([test_name, "--exact", "--test-threads=1", "--nocapture"])
+        // `--include-ignored`, not a bare filter: one of the two callers is itself
+        // `#[ignore]`d (issue #851), and without this the child would select ZERO
+        // tests, exit 0, and make the parent's `output.status.success()` assert pass
+        // vacuously -- a gate that cannot fail. `--include-ignored` still runs the
+        // non-ignored caller, so both keep meaning what they say.
+        .args([
+            test_name,
+            "--exact",
+            "--include-ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
         .env(env_var, "1")
         .output()
         .expect("spawn riprofile child")
@@ -450,6 +461,7 @@ fn find_run_until_tick(process: windows_sys::Win32::Foundation::HANDLE) -> Optio
 }
 
 #[test]
+#[ignore = "issue #851: asserts a rustc inlining property of the release PDB; see the issue"]
 fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapses() {
     if std::env::var_os("IZARRAVM_RIPROFILE_INLINE_CHILD").is_some() {
         inline_chain_check_in_this_process();
