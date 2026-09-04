@@ -361,11 +361,9 @@ fn conservation_mismatch_catches_a_beyond_extent_disagreement() {
 fn spawn_riprofile_child(test_name: &str, env_var: &str) -> std::process::Output {
     let exe = std::env::current_exe().expect("test exe path");
     std::process::Command::new(exe)
-        // `--include-ignored`, not a bare filter: one of the two callers is itself
-        // `#[ignore]`d (issue #851), and without this the child would select ZERO
-        // tests, exit 0, and make the parent's `output.status.success()` assert pass
-        // vacuously -- a gate that cannot fail. `--include-ignored` still runs the
-        // non-ignored caller, so both keep meaning what they say.
+        // `--include-ignored` is harmless for a live test and keeps the child
+        // from selecting zero tests (exit 0, parent vacuously green) if this
+        // helper is pointed at an ignored name again.
         .args([
             test_name,
             "--exact",
@@ -437,11 +435,22 @@ fn conservation_check_in_this_process() {
 // ===== Item 1: inline-aware resolution (the load-bearing test) =====
 
 /// Finds `izarravm_machine::Machine::run_until_tick`'s address and code size
-/// in THIS process via `SymFromNameW`, by the exact name the PDB records it
-/// under (confirmed against `target/release/izarravm.pdb` with
-/// `llvm-pdbutil dump --symbols`). Rust's visibility (`run_until_tick` is a
-/// private method) is irrelevant to dbghelp; it only reads linker/PDB
-/// symbols.
+/// in the LOADED module via `SymFromNameW`, by the exact name the PDB records
+/// it under. Rust visibility is irrelevant to dbghelp; it only reads
+/// linker/PDB symbols. This is the scan's extent: the batch loop is the
+/// function everything hot gets inlined into, so it always carries inline
+/// sites, and the test asks only that SOME inlined callee resolves where the
+/// old resolver collapses it -- not that one named callee does.
+///
+/// Locating a NAMED callee's inline sites (`SymEnumSymbolsExW` +
+/// `SYMENUM_OPTIONS_INLINE`) was tried and does not work with the inline-trace
+/// API: for `izarravm_cpu::run::exact_cap_test` the PDB lists three
+/// `SymTagInlineSite` records inside this function, and
+/// `SymAddrIncludeInlineTrace` reports 0 at every one of them and never names
+/// the callee anywhere in the extent (the inlined body carries no line range of
+/// its own, so the trace walk cannot see it). The property under test is the
+/// resolver's, not the inliner's, so the example is found by the same walk the
+/// profiler performs.
 fn find_run_until_tick(process: windows_sys::Win32::Foundation::HANDLE) -> Option<(u64, u32)> {
     use windows_sys::Win32::System::Diagnostics::Debug::{SYMBOL_INFOW, SymFromNameW};
     const MAX_NAME: usize = 512;
@@ -453,22 +462,55 @@ fn find_run_until_tick(process: windows_sys::Win32::Foundation::HANDLE) -> Optio
     let mut buf: SymbolBuf = unsafe { std::mem::zeroed() };
     buf.info.SizeOfStruct = std::mem::size_of::<SYMBOL_INFOW>() as u32;
     buf.info.MaxNameLen = MAX_NAME as u32;
-    let name = wide("izarravm_machine::Machine::run_until_tick");
-    let mut name0 = name.clone();
-    name0.push(0);
-    let ok = unsafe { SymFromNameW(process, name0.as_ptr(), &mut buf.info) };
+    let mut name = wide("izarravm_machine::Machine::run_until_tick");
+    name.push(0);
+    let ok = unsafe { SymFromNameW(process, name.as_ptr(), &mut buf.info) };
     (ok != 0).then_some((buf.info.Address, buf.info.Size))
 }
 
+fn in_ci() -> bool {
+    std::env::var_os("CI").is_some() || std::env::var_os("GITHUB_ACTIONS").is_some()
+}
+
+/// The shipped `izarravm.exe` this check loads as a separate module.
+///
+/// `CARGO_TARGET_DIR`, when set, wins even if the file is missing: falling
+/// through to the main tree's `target/release` from a worktree would load a
+/// foreign image/PDB pair. With the env var unset, walk up from the test
+/// harness (`target/<profile>/deps/<harness>.exe`) so a config.toml
+/// `build.target-dir` still works, then `CARGO_MANIFEST_DIR/../../target`.
+fn release_exe_path() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        return std::path::PathBuf::from(dir)
+            .join("release")
+            .join("izarravm.exe");
+    }
+    if let Ok(harness) = std::env::current_exe() {
+        let profile_dir = harness.parent().and_then(|p| {
+            if p.file_name().is_some_and(|n| n == "deps") {
+                p.parent()
+            } else {
+                Some(p)
+            }
+        });
+        if let Some(target_dir) = profile_dir.and_then(|p| p.parent()) {
+            let candidate = target_dir.join("release").join("izarravm.exe");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/izarravm.exe")
+}
+
 #[test]
-#[ignore = "issue #851: asserts a rustc inlining property of the release PDB; see the issue"]
-fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapses() {
+fn inline_resolution_names_an_inlined_callee_the_old_resolver_collapses() {
     if std::env::var_os("IZARRAVM_RIPROFILE_INLINE_CHILD").is_some() {
         inline_chain_check_in_this_process();
         return;
     }
     let output = spawn_riprofile_child(
-        "riprofile::tests::inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapses",
+        "riprofile::tests::inline_resolution_names_an_inlined_callee_the_old_resolver_collapses",
         "IZARRAVM_RIPROFILE_INLINE_CHILD",
     );
     assert!(
@@ -481,59 +523,52 @@ fn inline_resolution_reveals_run_budgeted_where_the_old_resolver_collapses() {
 
 fn inline_chain_check_in_this_process() {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Diagnostics::Debug::{
         SYMOPT_LOAD_LINES, SYMOPT_UNDNAME, SymCleanup, SymInitializeW, SymLoadModuleExW,
         SymSetOptions, SymUnloadModule64,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    // NOTE ON BUILD-PROFILE INDEPENDENCE: this check does NOT depend on the
-    // calling process's own optimization level. It never probes this TEST
-    // binary's own code -- it loads and probes `target/release/izarravm.exe`
-    // as a SEPARATE module below, via `SymLoadModuleExW`. That module's
-    // inlining decisions are fixed at the time `--profile release` built it,
-    // regardless of whether the test harness driving this check was built
-    // `dev` or `release`. An earlier version of this function DID probe the
-    // calling process's own code (before the switch to `SymLoadModuleExW`)
-    // and genuinely needed a skip for dev/test builds (verified: a dev-profile
-    // scan of the test binary's OWN `run_until_tick` found 1,325 addresses
-    // with nonzero inline traces and none of them were
-    // `run_budgeted`/`run_budgeted_inner`, because a dev/test harness binary
-    // never performs the cross-crate heuristic inlining that reaches them).
-    // That justification no longer applies to what this function does today,
-    // so there is NO SKIP here: if `target/release/izarravm.exe` is missing,
-    // the `.expect(...)` below fails loudly rather than passing silently, and
-    // `cargo test --workspace` -- the house gate -- exercises this for real.
-    //
-    // Resolve against the actual shipped artifact
-    // (`target/release/izarravm.exe`, virtually loaded at an arbitrary base
-    // via `SymLoadModuleExW`), not this TEST binary's own code: a `--test`
-    // harness binary links an extra crate (the harness itself) into the same
-    // link step, which can and does change LLVM's inlining decisions for
-    // functions near the harness's own inlining budget. This is exactly the
-    // scenario `llvm-pdbutil dump --symbols --modi=92
-    // target/release/izarravm.pdb` was used to confirm during design review:
-    // `run_budgeted_inner` genuinely nests under `run_budgeted` in the
-    // SHIPPED binary. `fInvadeProcess = 0` below means this test's own
-    // process modules are never auto-registered, so there is no ambiguity
-    // between two same-named functions in two different binaries.
+    // Loads the shipped `izarravm.exe` as a separate module (`SymLoadModuleExW`,
+    // `fInvadeProcess = 0`). The test harness binary is a different link and
+    // LLVM inlines it differently; this check is against the artifact the
+    // profiler actually symbolizes. Build profile of the harness does not
+    // matter. Missing exe skips locally (worktrees without a release build)
+    // and panics under CI, where `.github/workflows/ci.yml` builds release
+    // before `cargo test --workspace`. A present exe with a bad/missing PDB
+    // is always a hard fail: that is a broken artifact, not "I did not build
+    // release."
+    let exe_path = release_exe_path();
+    if !exe_path.exists() {
+        let msg = format!(
+            "release exe not found at {exe_path:?}; build it with \
+             `cargo build --profile release -p izarravm`"
+        );
+        if in_ci() {
+            panic!("{msg}");
+        }
+        eprintln!("riprofile inline test: {msg} (skipped)");
+        return;
+    }
+    let exe_path = exe_path.canonicalize().unwrap_or(exe_path);
+
     let process = unsafe { GetCurrentProcess() };
     unsafe { SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME) };
-    assert_ne!(
-        unsafe { SymInitializeW(process, std::ptr::null(), 0) },
-        0,
-        "SymInitializeW failed"
-    );
-
-    let exe_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/release/izarravm.exe")
-        .canonicalize()
-        .expect(
-            "target/release/izarravm.exe must exist -- build it first \
-             (`cargo build --profile release -p izarravm`)",
-        );
     let mut wide_path: Vec<u16> = exe_path.as_os_str().encode_wide().collect();
     wide_path.push(0);
+    // Search path is the exe's directory so dbghelp finds the sibling PDB.
+    // Keep `exe_dir` alive across the `SymInitializeW` call; the pointer is
+    // into that Vec.
+    let exe_dir =
+        exe_directory(&wide_path[..wide_path.len() - 1]).expect("release exe has a directory");
+    assert_ne!(
+        unsafe { SymInitializeW(process, exe_dir.as_ptr(), 0) },
+        0,
+        "SymInitializeW failed, GetLastError={}",
+        unsafe { GetLastError() }
+    );
+
     let base = unsafe {
         SymLoadModuleExW(
             process,
@@ -550,7 +585,7 @@ fn inline_chain_check_in_this_process() {
         base,
         0,
         "SymLoadModuleExW failed to load {exe_path:?}, GetLastError={}",
-        unsafe { windows_sys::Win32::Foundation::GetLastError() }
+        unsafe { GetLastError() }
     );
 
     let mut info: windows_sys::Win32::System::Diagnostics::Debug::IMAGEHLP_MODULEW64 =
@@ -561,150 +596,107 @@ fn inline_chain_check_in_this_process() {
     assert_ne!(
         unsafe { super::SymGetModuleInfoW64(process, base, &mut info) },
         0,
-        "SymGetModuleInfoW64 failed for the loaded release exe"
+        "SymGetModuleInfoW64 failed for the loaded release exe, GetLastError={}",
+        unsafe { GetLastError() }
     );
     assert!(
         symbols_are_trustworthy(info.SymType, info.LineNumbers),
-        "target/release/izarravm.exe loaded degraded symbols (SymType={}, lines={}); \
-         rebuild it",
+        "{exe_path:?} loaded degraded symbols (SymType={}, lines={}); rebuild it",
         info.SymType,
         info.LineNumbers
     );
 
     let Some((start, size)) = find_run_until_tick(process) else {
-        unsafe { SymCleanup(process) };
+        unsafe {
+            SymUnloadModule64(process, base);
+            SymCleanup(process);
+        }
         panic!(
             "could not find izarravm_machine::Machine::run_until_tick by name in \
-             target/release/izarravm.exe; the PDB naming assumption this test relies on \
-             (confirmed via `llvm-pdbutil dump --symbols`) may have broken"
+             {exe_path:?}; the PDB naming assumption this test relies on may have broken"
         );
     };
+    assert!(
+        size > 0,
+        "run_until_tick has no recorded extent in {exe_path:?}"
+    );
 
-    // Scan the function's own recorded extent for an address where the OLD
-    // resolver collapses to `run_until_tick` @ machine/src/run.rs inside
-    // OLD_COLLAPSE_SPAN (the budgeted-run statement group around the
-    // `cpu.run_budgeted(&mut bus, run_budget)` call site; the EXACT line is
-    // dbghelp/codegen-environment-dependent -- this box says 1715, the
-    // 2026-08-30 CI runner said otherwise and failed the exact pin --
-    // the specific defect example this instrument exists to
-    // fix — 1677 -> 1683 as the IzarraCD doorbell and claim fields joined run.rs
-    // above it, then 1683 -> 1693 as the 16-bit poll slice's I-D1b assertion
-    // joined `try_poll_skip`, then 1693 -> 1694 as the extended-RAM screen's
-    // bool joined the `MachineBus` literal, then 1694 -> 1710 as the fault
-    // trace grew an IDTR/GDTR line while a Zone 66 crash was diagnosed, then
-    // 1710 -> 1715 as the ISA I/O wait-state slice added the `isa_io_wait`
-    // bool to the `MachineBus` literal and a five-line note to the poll-skip
-    // certification site. That last re-pin is +5, not the +6 the source moved:
-    // the address the OLD resolver collapses at is attributed to the
-    // `let run_budget = remaining;` statement immediately above the call, not
-    // to the `match` line itself, and the two drifted apart by one. The pin is
-    // whatever the resolver ACTUALLY reports -- it was measured, by scanning the
-    // extent and printing every machine-side line that reproduced the defect
-    // shape, not derived by adding the diff's line count. Do that again rather
-    // than arithmetic: the compiler chooses the attributed line. THIS PIN DRIFTS WITH
-    // `machine/src/run.rs`'s line
-    // count, by construction: it names a call site by line, so any edit ABOVE
-    // that call moves it and this test is what says so. Re-pin it, do not skip
-    // it.) and the NEW resolver's innermost frame names something else, with
-    // a real `izarravm-cpu` `run.rs` line. A stride of 8 keeps this well
-    // under a second even over a ~55KB function.
-    //
-    // This does NOT assert `run_budgeted_inner` specifically, and that is a
-    // deliberate, evidence-based departure from the brief: an exhaustive
-    // stride-8 scan of every one of the function's 6,920 addresses in this
-    // exact binary never produces a chain containing `run_budgeted_inner`,
-    // even though the PDB's static `S_INLINEES` list nominally records it as
-    // nested under `run_budgeted`'s inline site. `run_budgeted` itself DOES
-    // resolve correctly and reproducibly (three distinct lines: 623, 627,
-    // 635, matching `cpu/src/run.rs`'s `run_budgeted` wrapper body exactly),
-    // which is real, verified proof the resolver defeats the collapse this
-    // change targets. (Re-measured on the ISA I/O wait-state re-pin: the same
-    // scan now reports `run_budgeted` at cpu/src/run.rs 623, 629, 634 and 642 --
-    // still the wrapper body, still four-for-four inside it, the exact lines
-    // having moved with that file.) See the implementation notes for the full evidence,
-    // including a separately confirmed 8-level chain elsewhere in this same
-    // function (`next_timer_wake` down to `div_ceil`) that establishes
-    // dbghelp's context order is INNERMOST-first, not outermost-first as the
-    // design assumed -- a real correctness fix this test's existence found.
-    // WHICH inlined callee carries the example is NOT pinned any more, and neither is the line it
-    // collapses onto. Both were, twice: first as an exact line, then (after the 2026-08-30 CI
-    // runner attributed the same collapse to a neighbouring line, #776's first CI run) as the
-    // 1700..=1730 budgeted-run statement group with `run_budgeted` named as its owner. Both pins
-    // are hostage to an inlining size heuristic in a function nobody is editing. The 2026-09-02
-    // CPU micro-cost batch moved `run_budgeted_inner`'s size, LLVM stopped inlining the
-    // `run_budgeted` wrapper into `run_until_tick` at all, and this fixture went red with
-    // nothing wrong with the resolver. `#[inline]` on the wrapper did not bring the frame back
-    // either, so it is not a decision this repository can hold still.
-    //
-    // The claim the fixture exists to carry survives all of that: SOMEWHERE in `run_until_tick`
-    // there is an address the old resolver reports as an izarravm-machine `run.rs` line while
-    // the new one names the izarravm-cpu frame actually inlined there. That is what is asserted
-    // now, with the structural halves kept that can still fail: the physical symbol is never its
-    // own inline frame, the revealed frame names an izarravm-cpu `run.rs` line, and a resolver
-    // that produced no chain at all still fails here, which is the regression this watches for.
-    //
-    // A fourth assertion used to sit at the end of this list, that the revealed frame does not
-    // itself collapse into the machine run loop. It was dropped rather than kept: the selection
-    // loop already requires the revealed site to start with `crates\izarravm-cpu` and the collapse
-    // predicate requires `crates\izarravm-machine`, so no string can satisfy both and no mutation
-    // of the resolver could ever have turned it red. A guard that cannot fail is worse than no
-    // guard, because it reads as coverage.
-    fn collapses_into_the_machine_run_loop(site: &str) -> bool {
-        site.starts_with("crates\\izarravm-machine") && site.contains("run.rs:")
-    }
-    const STRIDE: u64 = 8;
-    let mut best: Option<(u64, Frame, String)> = None;
-    let mut offset = 0u64;
-    while offset < u64::from(size) {
-        let addr = start + offset;
-        offset += STRIDE;
-        let Some(old_line) = super::resolve_line(process, addr) else {
-            continue;
-        };
-        if !collapses_into_the_machine_run_loop(&old_line) {
+    // Walk the function's whole extent the way the profiler walks a sample:
+    // every address dbghelp reports an inline trace at is resolved through the
+    // NEW chain and the OLD `SymFromAddrW` path. The example is any address
+    // where the chain names a frame the old path does not -- an inlined callee
+    // the old resolver collapsed into its physical parent. Which callee it is
+    // does not matter and is not pinned: ThinLTO of an unrelated hot path may
+    // move or remove any ONE inline site, but it cannot leave the batch loop
+    // with no inlined callee at all without the trace count saying so.
+    use windows_sys::Win32::System::Diagnostics::Debug::SymAddrIncludeInlineTrace;
+    let mut traced = 0usize;
+    let mut empty_chain = 0usize;
+    let mut not_collapsed = 0usize;
+    let mut example: Option<(u64, Vec<Frame>, Option<String>)> = None;
+    for addr in start..start + u64::from(size) {
+        if unsafe { SymAddrIncludeInlineTrace(process, addr) } == 0 {
             continue;
         }
+        traced += 1;
         let chain = resolve_inline_chain(process, addr);
-        let Some(innermost) = chain.first() else {
+        if chain.is_empty() {
+            empty_chain += 1;
             continue;
-        };
-        if !innermost.name.contains("run_until_tick")
-            && innermost.site.starts_with("crates\\izarravm-cpu")
-            && innermost.site.contains("run.rs")
-        {
-            best = Some((addr, innermost.clone(), old_line));
-            break;
         }
+        let old = super::resolve_symbol(process, addr);
+        let old_name = old.as_ref().map(|(name, ..)| name.clone());
+        let collapsed = chain
+            .iter()
+            .any(|f| old_name.as_deref() != Some(f.name.as_str()));
+        if !collapsed {
+            not_collapsed += 1;
+            continue;
+        }
+        example = Some((addr, chain, old_name));
+        break;
     }
+
     unsafe {
         SymUnloadModule64(process, base);
         SymCleanup(process);
     }
 
-    let (addr, innermost, old_line) = best.unwrap_or_else(|| {
-        panic!(
-            "no address in run_until_tick's {size:#x}-byte extent reproduced the \
-             defect example: OLD resolver collapsing into an izarravm-machine \
-             run.rs line while NEW resolver names the izarravm-cpu run.rs frame \
-             inlined there. Either nothing from izarravm-cpu is inlined into this \
-             function any more (recheck the claim in the module doc) or the NEW \
-             resolver regressed."
-        )
-    });
+    let (addr, chain, old_name) = match example {
+        Some(found) => found,
+        None if traced == 0 => panic!(
+            "dbghelp reports no inline trace anywhere in run_until_tick's {size:#x}-byte \
+             extent in {exe_path:?}: nothing is inlined into the batch loop in this image, \
+             or the PDB lost its inline records. Not a resolver regression."
+        ),
+        None if empty_chain == traced => panic!(
+            "RESOLVER REGRESSION: dbghelp reports an inline trace at {traced} address(es) \
+             in run_until_tick but resolve_inline_chain returned empty at all of them"
+        ),
+        None => panic!(
+            "RESOLVER REGRESSION: {traced} traced address(es), {empty_chain} empty chain(s), \
+             and the {not_collapsed} nonempty chain(s) name only what the old resolver \
+             already names: no inlined callee is being revealed"
+        ),
+    };
 
+    let chain_names: Vec<&str> = chain.iter().map(|f| f.name.as_str()).collect();
     assert!(
-        collapses_into_the_machine_run_loop(&old_line),
-        "the defect's OLD side must be an izarravm-machine run.rs line, got {old_line:?}"
+        !chain_names.is_empty(),
+        "chain at {addr:#x} must name at least one inlined frame"
     );
-    // The physical symbol itself is NEVER a member of the inline chain (a
-    // reviewer rejected a guard that assumed otherwise).
+    let revealed: Vec<&str> = chain_names
+        .iter()
+        .copied()
+        .filter(|name| old_name.as_deref() != Some(*name))
+        .collect();
     assert!(
-        !innermost.name.contains("run_until_tick"),
-        "run_until_tick must not appear inside its own inline chain at {addr:#x}"
+        !revealed.is_empty(),
+        "old resolver must collapse at least one inlined frame at {addr:#x}: chain \
+         {chain_names:?}, old {old_name:?}"
     );
-    assert!(
-        innermost.site.starts_with("crates\\izarravm-cpu") && innermost.site.contains("run.rs"),
-        "the revealed frame's site must be an izarravm-cpu run.rs line, got {:?}",
-        innermost.site
+    eprintln!(
+        "inline resolution example at {addr:#x}: old={old_name:?}, chain={chain_names:?}, \
+         revealed={revealed:?} ({traced} traced addresses in run_until_tick)"
     );
 }
