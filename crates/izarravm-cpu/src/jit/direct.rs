@@ -257,6 +257,24 @@ const MAX_MEMORY_ALU_SLOTS: u8 = 3;
 /// all six anchors byte-identical, the chain quota shrinks (a chain hop is assumed costlier,
 /// so chains return to the dispatcher earlier), entries up about 136,000, roughly 8 ms of wall.
 pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
+/// The same bound, per epoch. Epoch 1 is the constant above, unchanged and
+/// unchangeable (it is a live admission input and moving it moves epoch 1).
+///
+/// Slice 4 routes the native x87 metadata onto the class table, so at epoch 2 a
+/// slot's weighted cost is `table.raw(class)` with an IDENTITY FP dial rather
+/// than the epoch-1 literal times `fp_timing_class`. The worst shape the
+/// compiler can build there is `FIDIV m32int` on the I486 (`X87MemArithIntDiv32`,
+/// raw 1,026 -- Table 10.3's own 85.5-clock average), so the bound is
+/// `MAX_X87_SLOTS * 1026 + MAX_X87_BLOCK_INSTRUCTIONS * 10`.
+/// `max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table`
+/// re-derives BOTH epochs from the metadata table, over both fast personas, and
+/// fails the build if a costlier shape ever joins it.
+pub(crate) const fn max_x87_block_core_clocks(epoch: u32) -> u64 {
+    if epoch >= 2 {
+        return 8_328;
+    }
+    MAX_X87_BLOCK_CORE_CLOCKS
+}
 /// Mutable imm32 lanes per block. One lane-admitted `0x81 /r` slot claims one lane; slots past
 /// this cap keep their baked immediate, which is a missed optimisation and never a correctness
 /// question. Four covered Doom's paired patch sites; duke3d's Build-engine patch bursts rewrite
@@ -6183,10 +6201,15 @@ impl DirectKind {
         }
     }
 
-    fn weighted_fp_clocks(self, persona: CpuPersona) -> u32 {
+    fn weighted_fp_clocks(self, persona: CpuPersona, table: &ClassTable, epoch: u32) -> u32 {
         match self {
-            Self::X87 { insn, .. } => u32::try_from(insn.metadata().weighted_fp_clocks(persona))
-                .expect("one x87 instruction's weighted clocks fit u32"),
+            Self::X87 { insn, .. } => u32::try_from(insn.metadata().weighted_fp_clocks(
+                persona,
+                insn.timing_class(),
+                table,
+                epoch,
+            ))
+            .expect("one x87 instruction's weighted clocks fit u32"),
             _ => 0,
         }
     }
@@ -8889,7 +8912,8 @@ fn compile_with_budget(
             stop = CompileStop::Boundary;
             break;
         }
-        let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.persona());
+        let slot_weighted_fp_clocks =
+            kind.weighted_fp_clocks(cpu.persona(), cpu.class_table(), cpu.timing_epoch());
         let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks(cpu.class_table()))
         else {
             stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);

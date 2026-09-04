@@ -474,7 +474,41 @@ pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 /// Interpreter, direct-page, REP, and native VGA paths all use this table. The
 /// Accurate 386 class keeps the frozen `WaitStateProfile.video` path. Recalibrate
 /// these values if `bus_timing` changes.
-const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
+/// EPOCH 2 (slice 4, design section 4 and section 5): the absorber is SPENT and
+/// re-solved inside a hardware-plausible range, not fitted to a game.
+///
+/// Slice 2's fold set `bus_timing` to `(1, 1)`, which multiplied this term by
+/// 6.56x on the 586 and 3x on the 486 and made a mode-13h byte access cost 149
+/// guest clocks (897 ns) -- slice 2's escalated finding F1, and 78% of
+/// doom-586's whole bill. Under epoch 2 a wait state IS a guest clock, so the
+/// count is read straight off the part:
+///
+/// * **I586, range ws 3..=60.** A 1997 PCI VGA card behind a posted-write
+///   buffer sustains roughly one non-burstable PCI transaction per ~3 PCI
+///   clocks at 33 MHz -- ~90 ns per dword, ~30 ns per byte access, ws 3 at
+///   166 MHz -- while an ISA-timed VGA write at ~375 ns is ws ~60. Both
+///   emulator references charge ZERO, which is the floor of the estimate; we
+///   model no write buffer, so the sustained figure is charged. Laddered 3 / 8 /
+///   15 against doom-586's re-derived realtics window; **the chosen rung is in
+///   `dev_docs/2026-09-05-recalibration-slice4-result.md`**.
+/// * **I486, range ws 5..=20**, a 1993 VLB/ISA VGA. The 486 has LESS absorber
+///   headroom: 45 already sits at the ISA end. Laddered 5 / 12 / 20.
+///
+/// The epoch-1 values below are UNCHANGED and must stay so.
+///
+/// FINDING for slice 4b, recorded rather than fixed here: the census scores this
+/// constant 2.2x OVER on writes and 6-9x UNDER on reads. One constant per
+/// persona cannot be both; the per-direction table is 4b's.
+const fn video_wait_states_approx(persona: CpuPersona, epoch: u32) -> u8 {
+    if epoch >= 2 {
+        return match persona {
+            // Out of the recalibration's scope; the Accurate class takes the
+            // profile path anyway.
+            CpuPersona::I386 => 1,
+            CpuPersona::I486 => VIDEO_WAIT_STATES_EPOCH2_I486,
+            CpuPersona::I586 => VIDEO_WAIT_STATES_EPOCH2_I586,
+        };
+    }
     match persona {
         // Unreachable in practice because the Accurate class takes the profile path.
         CpuPersona::I386 => 1,
@@ -487,6 +521,43 @@ const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
         CpuPersona::I586 => 147,
     }
 }
+
+/// The CHOSEN epoch-2 mode-13h rung, I586: **ws 8**, inside the pre-registered
+/// 3..=60, and the middle rung of the design's 3 / 8 / 15 ladder.
+///
+/// Picked on doom-586's re-derived realtics window `[972, 1074]` (1023 +- 5%,
+/// from the ~73 fps era anchor and the fixture's own 2134 gametics; the
+/// arithmetic is in `dev_docs/2026-09-05-recalibration-slice4-result.md`
+/// section 0.1, written before the ladder ran). Measured, all three rungs, one
+/// scoreboard run each:
+///
+/// | ws | doom-586 realtics | verdict |
+/// |---:|---:|---|
+/// | 3 | 913 | **outside, FAST side** -- a hard failure: the model would claim a P166 ran doom faster than a P166 did |
+/// | **8** | **1052** | **IN**, on the slow side of the 1023 centre, which is the direction the ruling requires |
+/// | 15 | 1241 | outside, slow side |
+///
+/// A byte access costs `2 + 8 = 10` guest clocks = **60 ns** at 166 MHz, against
+/// epoch 1's 149 clocks / 897 ns. That is 2x the isolated posted-PCI-write
+/// estimate and a sixth of an ISA-timed write: a sustained mode-13h fill on a
+/// card with no write buffer modelled, which is what section 5 says to charge.
+pub(crate) const VIDEO_WAIT_STATES_EPOCH2_I586: u8 = 8;
+/// The CHOSEN epoch-2 mode-13h rung, I486: **ws 5**, inside the pre-registered
+/// 5..=20, and the first rung of the design's 5 / 12 / 20 ladder.
+///
+/// The 486 has LESS absorber headroom -- design section 9.9 says so, and the
+/// ladder confirms it. Measured against the fixture's own recorded doom-486
+/// anchor `[2814, 2964]`, the only 486 anchor the tree carries:
+///
+/// | ws | doom-486 realtics | verdict |
+/// |---:|---:|---|
+/// | **5** | **2847** | **IN**, 1.5% under the band's centre |
+/// | 12 | 3332 | outside, slow side, +12% |
+/// | 20 | 3883 | outside, slow side, +31% |
+///
+/// A byte access costs `2 + 5 = 7` guest clocks = **106 ns** at 66 MHz, against
+/// epoch 1's 47 clocks / 712 ns.
+pub(crate) const VIDEO_WAIT_STATES_EPOCH2_I486: u8 = 5;
 
 /// Which modeled cache tier a data access resolves to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

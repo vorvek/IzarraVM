@@ -2354,7 +2354,7 @@ impl CpuGsw {
         // The x87 class needs no call-out term: x87 and call-out slots never share a block
         // (the compile walk refuses the mix in either order), so an x87 block's `callout_slots`
         // is zero by construction.
-        let x87_core = scale_core(jit::direct::MAX_X87_BLOCK_CORE_CLOCKS);
+        let x87_core = scale_core(jit::direct::max_x87_block_core_clocks(bus.timing_epoch()));
         let max_core = if has_x87 { x87_core } else { integer_core };
         let max_read = bus
             .jit_data_cost_clocks(BusWidth::Dword)

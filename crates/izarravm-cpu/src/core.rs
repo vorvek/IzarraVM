@@ -1664,7 +1664,7 @@ impl CpuGsw {
     /// remainder stays exact across ops of different classes. With an identity factor
     /// this returns `clocks` unchanged.
     pub(super) fn scale_fp_clocks(&mut self, clocks: u32, class: FpOpClass) -> u32 {
-        let num = fp_timing_class(self.persona(), class);
+        let num = fp_timing_class(self.persona(), class, self.timing_epoch);
         let scaled = u64::from(clocks) * u64::from(num) + self.fp_rem;
         self.fp_rem = scaled % u64::from(FP_TIMING_DEN);
         (scaled / u64::from(FP_TIMING_DEN)).min(u64::from(u32::MAX)) as u32

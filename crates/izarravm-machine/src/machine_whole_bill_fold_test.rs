@@ -88,10 +88,23 @@ fn epoch_2_leaves_rom_and_device_window_fetches_charged() {
                 "{mode:?} {address:#x}: an uncached fetch must never be folded -- BIOS and \
                  option ROMs would run free"
             );
-            assert_eq!(
-                one, two,
-                "{mode:?} {address:#x}: the uncached fetch route must not move across the epoch"
-            );
+            if address == ROM_ADDRESS {
+                assert_eq!(
+                    one, two,
+                    "{mode:?} {address:#x}: the ROM fetch route must not move across the epoch"
+                );
+            } else {
+                // The APERTURE route does move, as of slice 4: the mode-13h wait
+                // state is that slice's absorber and it is spent. What this row
+                // still asserts is the half slice 2 owns -- an uncached fetch is
+                // never FOLDED -- plus the direction of the move, which is what
+                // spending an absorber means.
+                assert!(
+                    two < one,
+                    "{mode:?} {address:#x}: slice 4 spends the mode-13h absorber, so the \
+                     epoch-2 aperture fetch ({two}) must cost less than epoch 1's ({one})"
+                );
+            }
         }
     }
 }
@@ -131,10 +144,16 @@ fn epoch_2_leaves_the_aperture_data_access_charged() {
             two > 0,
             "{mode:?}: an aperture access is not inside anyone's instruction count"
         );
-        assert_eq!(
-            one, two,
-            "{mode:?}: the aperture route's RAW charge must not move across the epoch (the \
-             mode-13h wait state is slice 4's, not this one's)"
+        // SLICE 4 MOVED THIS, deliberately. Slice 2 asserted equality here with
+        // the note "the mode-13h wait state is slice 4's, not this one's"; slice 4
+        // is now that slice, and the absorber is spent -- ws 147 -> 8 on the 586
+        // and 45 -> 5 on the 486, both inside their pre-registered hardware
+        // ranges. What survives is the DIRECTION, and the fact that the aperture
+        // is still charged at all.
+        assert!(
+            two < one,
+            "{mode:?}: slice 4 spends the mode-13h absorber, so the epoch-2 aperture access \
+             ({two}) must cost less than epoch 1's ({one})"
         );
     }
 }
