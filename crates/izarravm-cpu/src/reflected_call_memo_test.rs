@@ -376,6 +376,7 @@ fn a_retf_return_leaving_the_flags_word_closes_as_a_return_match() {
         control_effects: Vec::new(),
         control_effects_over_cap: false,
         audit: None,
+        audit_open_pre: Vec::new(),
         hw_interrupt_seen: false,
         entry_tail: None,
     };
@@ -449,6 +450,7 @@ fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
         control_effects: Vec::new(),
         control_effects_over_cap: false,
         audit: None,
+        audit_open_pre: Vec::new(),
         hw_interrupt_seen: false,
         entry_tail: None,
     }
@@ -3011,4 +3013,132 @@ fn the_new_refusal_lane_is_in_learn_refused_all_and_the_array_is_sized_for_it() 
     for (i, lane) in LEARN_REFUSED_ALL.iter().enumerate() {
         assert_eq!(lane.index(), i, "lane {i} must report its own position");
     }
+}
+
+/// The audit's formula is stated over "the value the address held at trip ENTRY" (R2.18),
+/// and that is not the same instant as `WriteObs::pre_dword`, which is the value before
+/// the trip's first JOURNALED write to the dword. The two differ whenever anything else
+/// moved the cell earlier in the same trip.
+///
+/// The shape here is the measured one: a Class R cell that is `0` at trip entry, is moved
+/// to `0x1a` mid-trip by something the journal does not see, is written back to `0` by the
+/// trip, and is `0` again at exit. The memo SKIPS it, and skipping is CORRECT -- an
+/// answered trip leaves it at `0`, exactly as the real trip does.
+///
+/// **Mutation bite**: prefer `pre_dword` over the trip-entry snapshot. The audit then
+/// reports a divergence on a cell the memo handles correctly -- 60,243 of 60,243 audits of
+/// the dominant key on `tyrian-specs-586` (`0x127150`, predicted `0x1a`, observed `0x0`),
+/// which retires and re-learns the memo forever and collapses the answer rate.
+#[test]
+fn the_audit_compares_against_the_value_at_trip_entry_not_before_the_first_write() {
+    const CELL: u32 = 0x7B00;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+
+    // A memo that SKIPS the cell (Class R range, nothing in `replay`).
+    let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    memo.replay = Box::new([]);
+    memo.class_r_ranges = Box::new([(CELL, CELL + 3)]);
+    install_memo(&mut cpu, key, memo);
+    set_audit_period(&mut cpu, 1);
+    bus.gate_allowance = Some(1_000_000);
+
+    bus.write_raw(CELL, BusWidth::Dword, 0); // the value at TRIP ENTRY
+    cpu.registers.set_esp(STACK_TOP);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    assert_eq!(
+        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        IntOutcome::NotAnswered,
+        "AUDIT=1 audits instead of answering"
+    );
+
+    // Mid-trip, something the journal never sees moves the cell...
+    bus.write_raw(CELL, BusWidth::Dword, 0x1a);
+    // ...and then the trip writes it back to 0 through a journaled seam, so `pre_dword`
+    // records the mid-trip 0x1a.
+    note_write(&mut cpu, &bus, CELL, BusWidth::Dword, 0, false, None);
+    bus.write_raw(CELL, BusWidth::Dword, 0);
+
+    cpu.elapsed_clocks += 100;
+    cpu.perf.instructions += 7;
+    bus.bus_clock += 50;
+    cpu.registers.set_esp(STACK_TOP - 2);
+    cpu.set_eip(CLIENT_RETURN_EIP);
+    on_far_return(&mut cpu, &bus);
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(state.audited, 1);
+    assert_eq!(
+        state.audit_mismatch[AuditMismatch::WriteValue.index()],
+        0,
+        "entry 0 -> exit 0 with the memo skipping the cell is a CORRECT model, not a divergence"
+    );
+}
+
+/// An answered trip writes the bytes its model claims and touches nothing else, so what it
+/// leaves behind is `(entry & !mask) | (value & mask)` -- the WHOLE dword. A real trip that
+/// moves a byte OUTSIDE the claimed mask therefore diverges from the answer just as surely
+/// as one that moves a byte inside it, and the natural-sample confirmation has to compare
+/// the whole dword to see it.
+///
+/// **Mutation bite**: compare under `check.mask` instead of the full dword. The
+/// confirmation then passes a trip whose unclaimed bytes move, and the runtime audit --
+/// which does compare the whole dword -- rejects it later. Measured on `tyrian-specs-586`:
+/// the DPMI host's register block at `0xd058`, where each key's memo carried the OTHER
+/// interleaved key's byte in a position JournalB never recorded a write to, passed eight
+/// natural samples and then failed 22 of 24 audits.
+#[test]
+fn a_byte_moving_outside_the_claimed_mask_widens_the_claim_and_is_confirmed() {
+    const CELL: u32 = 0x7C00;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    let key = key_for(&cpu, VECTOR, 0);
+
+    for trip in 1..=11u32 {
+        cpu.registers.set_esp(STACK_TOP);
+        cpu.set_eip(CLIENT_RETURN_EIP);
+        let _ = on_int(&mut cpu, &mut bus, VECTOR);
+        // The trip journals a WORD write to the high half only...
+        note_write(
+            &mut cpu,
+            &bus,
+            CELL + 2,
+            BusWidth::Word,
+            0xBEEF,
+            false,
+            None,
+        );
+        bus.write_raw(CELL + 2, BusWidth::Word, 0xBEEF);
+        // ...and moves the low half through a path the journal never sees. From trip 4 on
+        // (the natural samples) it settles on a constant, which is what the widened claim
+        // must capture.
+        let low = if trip <= 3 { 0x1111u32 } else { 0x2222 };
+        bus.write_raw(CELL, BusWidth::Word, low);
+        cpu.elapsed_clocks += 100;
+        cpu.perf.instructions += 7;
+        bus.bus_clock += 50;
+        cpu.registers.set_esp(STACK_TOP - 2);
+        cpu.set_eip(CLIENT_RETURN_EIP);
+        on_far_return(&mut cpu, &bus);
+    }
+
+    let state = cpu.reflected_call.as_ref().unwrap();
+    assert_eq!(
+        state.keys[&key].learned, 1,
+        "the widened claim is provisional and the remaining samples confirmed it"
+    );
+    let memo = &state.memos[&key][0];
+    let entry = memo
+        .replay
+        .iter()
+        .find(|&&(addr, _, _)| addr == CELL)
+        .expect("the dword must be replayed");
+    assert_eq!(
+        entry.1,
+        u32::MAX,
+        "the claim must widen to the bytes that actually moved, not stay at the journaled word"
+    );
+    assert_eq!(entry.2 & 0xFFFF, 0x2222, "and carry the observed low half");
+    assert_eq!(entry.2 >> 16, 0xBEEF, "alongside the journaled high half");
 }

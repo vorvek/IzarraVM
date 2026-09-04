@@ -608,6 +608,17 @@ struct OpenTrip {
     control_effects_over_cap: bool,
     /// The memo this trip is auditing (`Slot::Audit` only).
     audit: Option<Arc<Memo>>,
+    /// (aligned dword, value AT TRIP ENTRY) for every cell the audited memo has an opinion
+    /// about -- its replay set and its Class R ranges. `Slot::Audit` only.
+    ///
+    /// The audit's formula is stated over "the value the address held at trip ENTRY"
+    /// (R2.18), and `WriteObs::pre_dword` is NOT that: it is the value just before the
+    /// trip's first JOURNALED write to the dword, which is a mid-trip instant. The two
+    /// differ whenever anything else moved the cell earlier in the same trip, and on
+    /// `tyrian-specs-586` that gap was a false positive on 60,243 of 60,243 audits of the
+    /// dominant key (`0x127150`: 0 at entry, 0 at exit, and the memo correctly skipping
+    /// it -- while the formula compared against a mid-trip `0x1a` and called it wrong).
+    audit_open_pre: Vec<(u32, u32)>,
     hw_interrupt_seen: bool,
     /// Plan 4.4, the live stack tail: the physical address and WORD value at
     /// `[entry_esp - 2, entry_esp)` sampled at trip OPEN, before the `INT`'s own push --
@@ -710,6 +721,7 @@ impl OpenTrip {
             control_effects: Vec::new(),
             control_effects_over_cap: false,
             audit: None,
+            audit_open_pre: Vec::new(),
             hw_interrupt_seen: false,
             entry_tail,
         }
@@ -1626,18 +1638,42 @@ fn confirm_write_model_at_close<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoK
             confirmed.write_model_unstable = true;
             return;
         };
+        // The WHOLE dword, not merely the masked bytes -- because that is what an answer
+        // leaves behind. An answered trip writes the masked bytes and touches nothing else,
+        // so its result is exactly `predicted`; a real trip that moves a byte OUTSIDE the
+        // mask diverges from the answer just as surely as one that moves a byte inside it.
+        //
+        // Comparing under the mask instead hides exactly that case, and on
+        // `tyrian-specs-586` it hid a live one: the DPMI host's register block at `0xd058`,
+        // where each key's memo carried the OTHER key's byte in a position JournalB never
+        // recorded a write to. E passed it eight times and the runtime audit -- which does
+        // compare the whole dword -- then rejected 22 of 24 audits.
         let predicted = if check.is_class_r {
             pre
         } else {
             (pre & !check.mask) | (check.value & check.mask)
         };
-        if (predicted ^ now) & check.mask == 0 {
+        if predicted == now {
             continue;
         }
         if check.retaken {
             confirmed.write_model_unstable = true;
             return;
         }
+        // WIDEN the claim to cover every byte that actually moved, and take the observed
+        // dword. This is sound because it is provisional: the remaining natural samples
+        // must agree with the widened model, and a second disagreement refuses the learn.
+        // It is what lets a trip whose writes the journal only partly saw still be
+        // memoised -- the alternative is to refuse every such key, and the DPMI register
+        // block is written by every reflected call this mechanism exists for.
+        let mut moved = 0u32;
+        for byte in 0..4u32 {
+            let byte_mask = 0xFFu32 << (byte * 8);
+            if (predicted ^ now) & byte_mask != 0 {
+                moved |= byte_mask;
+            }
+        }
+        check.mask |= moved;
         check.value = now;
         check.is_class_r = false;
         check.retaken = true;
@@ -1804,6 +1840,30 @@ pub(crate) fn half_irq0_edge_clocks(clock_hz: u64) -> u64 {
 fn open_audit_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoKey, memo: Arc<Memo>) {
     cpu.reflected_call_journal = true;
     let mut open = OpenTrip::start(cpu, bus, key, Slot::Audit);
+    // The TRIP-ENTRY values of every cell the memo has an opinion about, peeked here and
+    // nowhere else: this is the only instant at which "what the address held at trip entry"
+    // is observable, and `peek_direct_ram` takes `&self` so taking it costs no clock.
+    let mut entry_pre: Vec<(u32, u32)> = Vec::new();
+    for &(dword, _, _) in memo.replay.iter() {
+        if let Some(v) = bus.peek_direct_ram(dword, BusWidth::Dword) {
+            entry_pre.push((dword, v));
+        }
+    }
+    for &(lo, hi) in memo.class_r_ranges.iter() {
+        let mut dword = lo & !0x3;
+        loop {
+            if let Some(v) = bus.peek_direct_ram(dword, BusWidth::Dword) {
+                entry_pre.push((dword, v));
+            }
+            if dword >= (hi & !0x3) {
+                break;
+            }
+            dword += 4;
+        }
+    }
+    entry_pre.sort_unstable_by_key(|&(d, _)| d);
+    entry_pre.dedup_by_key(|e| e.0);
+    open.audit_open_pre = entry_pre;
     open.audit = Some(memo);
     let state = cpu.reflected_call.as_mut().expect("caller checked");
     state.open = Some(open);
@@ -2710,13 +2770,18 @@ fn audit_write_values_disagree<B: CpuBus>(
             // disagreement, not an excuse.
             return true;
         };
-        // "The value the address held at trip entry": the peek `note_write` took before
-        // this trip's FIRST write to the dword. An address the trip never wrote still
-        // holds its entry value now, so the live read is that value.
+        // "The value the address held at trip ENTRY" (R2.18), taken from the snapshot
+        // `open_audit_trip` peeked at the open. `WriteObs::pre_dword` is the fallback and
+        // NOT the primary: it is the value before the trip's first JOURNALED write, a
+        // mid-trip instant, and preferring it turned a correctly-skipped Class R cell into
+        // a divergence on every audit of the dominant key. An address the trip never wrote
+        // still holds its entry value now, so the live read is the last resort.
         let entry = open
-            .writes
-            .get(&dword)
-            .and_then(|obs| obs.pre_dword)
+            .audit_open_pre
+            .binary_search_by_key(&dword, |&(d, _)| d)
+            .ok()
+            .map(|i| open.audit_open_pre[i].1)
+            .or_else(|| open.writes.get(&dword).and_then(|obs| obs.pre_dword))
             .unwrap_or(observed_now);
         let mut predicted = entry;
         for &(addr, mask, value) in memo.replay.iter() {
