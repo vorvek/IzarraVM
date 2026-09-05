@@ -13,7 +13,8 @@ fn deliver_exception_from_v86_builds_the_v86_frame_on_ring0_stack() {
     cpu.load_segment_real(SegmentIndex::Gs, 0x4444);
     let saved_eflags = cpu.registers.eflags;
 
-    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+    cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
     assert_eq!(cpu.registers.cs().selector, R0_CS);
@@ -55,7 +56,8 @@ fn deliver_exception_onto_a_16bit_ring0_stack_wraps_sp_and_preserves_high_esp() 
     put32(&mut bus.memory, TSS + 4, 0x0001_0010);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+    cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(!cpu.stack_is_32bit(), "the loaded SS0 must carry B=0");
     assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
@@ -86,7 +88,8 @@ fn deliver_exception_onto_a_16bit_ring0_stack_preserves_interrupted_esp_high_wor
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
     cpu.registers.set_esp(0xbeef_1000);
 
-    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+    cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(!cpu.stack_is_32bit(), "the loaded SS0 must carry B=0");
     assert_eq!(
@@ -106,7 +109,8 @@ fn v86_external_interrupt_on_vector_8_pushes_no_error_code() {
     int_gate(&mut bus.memory, 8, MON_CODE);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    cpu.deliver_exception(&mut bus, 8, None, true).unwrap();
+    cpu.deliver_exception(&mut bus, 8, None, true, &mut CommittedCore::default())
+        .unwrap();
 
     // In the monitor: the top of the ring-0 stack is the V86 EIP, not an error
     // code (the frame is EIP, CS, EFLAGS, ... with no error code beneath EIP).
@@ -135,7 +139,8 @@ fn iret_into_v86_restores_the_task() {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
 
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(cpu.is_v86_mode(), "IRET with popped VM=1 must re-enter V86");
     assert_eq!(cpu.registers.eip, 0x0010);
@@ -185,7 +190,7 @@ fn iret_into_v86_with_dirty_high_word_eip_faults_before_committing_v86_state() {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
 
-    let result = cpu.iret(&mut bus, OperandSize::Dword);
+    let result = cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -234,7 +239,8 @@ fn iret_inter_privilege_return_to_ring3() {
     for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
     assert!(!cpu.is_v86_mode());
     assert_eq!(cpu.registers.eip, 0x1234);
@@ -270,7 +276,8 @@ fn iret_to_outer_ring_nulls_data_segments_inaccessible_at_the_new_cpl() {
     for v in [0x2Bu32, 0x2000, 0x2, 0x23, 0x1234] {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(cpu.current_privilege_level(), 3);
     let sel = |cpu: &CpuGsw, s| cpu.registers.segment(s).selector;
     assert_eq!(sel(&cpu, SegmentIndex::Ds), 0, "ring-0 DS nulled");
@@ -314,7 +321,8 @@ fn iret_inter_privilege_return_to_a_16bit_stack_wraps_sp_and_preserves_high_esp(
     for v in [u32::from(r3_ss), 0x0002_0010, 0x2, u32::from(r3_cs), 0x1234] {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
     assert!(!cpu.stack_is_32bit(), "the loaded outer SS must carry B=0");
     assert_eq!(cpu.registers.eip, 0x1234);
@@ -354,7 +362,8 @@ fn iret_word_inter_privilege_return_pops_ss_sp_and_nulls_ring0_data_segments() {
         cpu.push(&mut bus, v, OperandSize::Word).unwrap();
     }
 
-    cpu.iret(&mut bus, OperandSize::Word).unwrap();
+    cpu.iret(&mut bus, OperandSize::Word, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
     assert!(!cpu.is_v86_mode());
@@ -390,7 +399,8 @@ fn iret_word_same_privilege_return_stays_on_the_current_stack() {
         cpu.push(&mut bus, v, OperandSize::Word).unwrap();
     }
 
-    cpu.iret(&mut bus, OperandSize::Word).unwrap();
+    cpu.iret(&mut bus, OperandSize::Word, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(cpu.current_privilege_level(), 0);
     assert_eq!(cpu.registers.eip, 0x1234);
@@ -430,12 +440,19 @@ fn deliver_exception_through_a_16bit_interrupt_gate_pushes_a_word_frame() {
     for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(cpu.current_privilege_level(), 3);
     cpu.set_flag(FLAG_IF, true);
 
-    cpu.deliver_exception(&mut bus, 13, Some(0x18), false)
-        .unwrap();
+    cpu.deliver_exception(
+        &mut bus,
+        13,
+        Some(0x18),
+        false,
+        &mut CommittedCore::default(),
+    )
+    .unwrap();
 
     assert_eq!(cpu.current_privilege_level(), 0);
     assert_eq!(cpu.registers.cs().selector, R0_CS);
@@ -510,10 +527,12 @@ fn deliver_exception_reads_the_ring0_stack_from_a_286_tss() {
     for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(cpu.current_privilege_level(), 3);
 
-    cpu.deliver_exception(&mut bus, 0x21, None, true).unwrap();
+    cpu.deliver_exception(&mut bus, 0x21, None, true, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(cpu.current_privilege_level(), 0);
     assert_eq!(
@@ -549,12 +568,13 @@ fn a_delivery_that_faults_midway_restores_the_interrupted_cpl() {
     for v in [0x2Bu32, 0x2000, 0x2, 0x23, 0x1234] {
         cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
     }
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(cpu.current_privilege_level(), 3);
     // Poison SS0: the inner-stack switch must fault on the null selector.
     put16(&mut bus.memory, TSS + 8, 0);
 
-    let result = cpu.deliver_exception(&mut bus, 0x21, None, true);
+    let result = cpu.deliver_exception(&mut bus, 0x21, None, true, &mut CommittedCore::default());
 
     assert!(
         result.is_err(),
@@ -661,7 +681,7 @@ fn iret_word_to_a_not_present_code_segment_restores_sp_for_the_restart() {
     }
     let esp_before = cpu.registers.esp();
 
-    let result = cpu.iret(&mut bus, OperandSize::Word);
+    let result = cpu.iret(&mut bus, OperandSize::Word, &mut CommittedCore::default());
 
     assert!(result.is_err(), "P=0 target CS must fault: {result:?}");
     assert_eq!(
@@ -685,7 +705,13 @@ fn far_call_to_a_not_present_code_segment_faults_before_pushing() {
     cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
     cpu.registers.set_esp(0x6800);
 
-    let result = cpu.far_call(&mut bus, 0x30, 0x10, OperandSize::Word);
+    let result = cpu.far_call(
+        &mut bus,
+        0x30,
+        0x10,
+        OperandSize::Word,
+        &mut CommittedCore::default(),
+    );
 
     assert!(
         matches!(
@@ -719,7 +745,8 @@ fn enter_ring3(cpu: &mut CpuGsw, bus: &mut TestBus) {
     for v in [0x2Bu32, 0x2000, 0x2, 0x23, 0x1234] {
         cpu.push(bus, v, OperandSize::Dword).unwrap();
     }
-    cpu.iret(bus, OperandSize::Dword).unwrap();
+    cpu.iret(bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(cpu.current_privilege_level(), 3);
 }
 
@@ -753,7 +780,8 @@ fn iret_word_inter_privilege_to_a_16bit_stack_takes_sp_only_and_keeps_high_esp()
         cpu.push(&mut bus, v, OperandSize::Word).unwrap();
     }
 
-    cpu.iret(&mut bus, OperandSize::Word).unwrap();
+    cpu.iret(&mut bus, OperandSize::Word, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(cpu.current_privilege_level(), 3);
     assert!(!cpu.stack_is_32bit(), "the loaded outer SS must carry B=0");
@@ -783,7 +811,7 @@ fn iret_word_inter_privilege_with_mismatched_ss_rpl_faults_gp() {
         cpu.push(&mut bus, v, OperandSize::Word).unwrap();
     }
 
-    let result = cpu.iret(&mut bus, OperandSize::Word);
+    let result = cpu.iret(&mut bus, OperandSize::Word, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -847,7 +875,8 @@ fn a_16bit_trap_gate_delivers_a_word_frame_without_clearing_if() {
     enter_ring3(&mut cpu, &mut bus);
     cpu.set_flag(FLAG_IF, true);
 
-    cpu.deliver_exception(&mut bus, 0x21, None, true).unwrap();
+    cpu.deliver_exception(&mut bus, 0x21, None, true, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(cpu.current_privilege_level(), 0);
     assert_eq!(cpu.registers.eip, MON_CODE);
@@ -872,7 +901,8 @@ fn a_v86_source_through_a_16bit_gate_still_builds_the_dword_frame() {
     gate16(&mut bus.memory, 13, MON_CODE as u16, 0xe6);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+    cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(!cpu.is_v86_mode());
     assert_eq!(cpu.registers.eip, MON_CODE);
@@ -895,7 +925,8 @@ fn an_uninitialized_tr_access_byte_keeps_the_386_tss_read() {
     cpu.tr.access = 0;
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+    cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, R0_SS);
     assert_eq!(
@@ -922,7 +953,7 @@ fn a_delivery_that_faults_after_the_stack_switch_restores_ss_esp() {
     enter_ring3(&mut cpu, &mut bus);
     let esp_before = cpu.registers.esp();
 
-    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default());
 
     assert!(result.is_err(), "the frame push must fault: {result:?}");
     assert_eq!(cpu.current_privilege_level(), 3);
@@ -943,7 +974,7 @@ fn a_v86_delivery_that_faults_on_the_cs_load_restores_the_v86_state() {
     bus.memory[(GDT + 0x08 + 5) as usize] = 0x1b; // R0_CS: present bit off
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default());
 
     assert!(result.is_err(), "the CS load must fault: {result:?}");
     assert!(cpu.is_v86_mode(), "VM must be restored");
@@ -1061,7 +1092,8 @@ fn v86_monitor_round_trip_go_no_go() {
             };
             bus.memory[esp as usize..esp as usize + 4]
                 .copy_from_slice(&(guest_eip + len).to_le_bytes());
-            cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+            cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+                .unwrap();
             continue;
         }
     }
@@ -1134,7 +1166,7 @@ fn deliver_exception_from_v86_with_cs_rpl3_does_not_fault_the_monitors_own_pushe
     // legal V86 state, just an unusual selector value (0xFFFF, the HMA stub).
     cpu.load_segment_real(SegmentIndex::Cs, 0xffff);
 
-    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+    let result = cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default());
 
     assert!(
         result.is_ok(),
@@ -1164,7 +1196,7 @@ fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
     put32(&mut bus.memory, 0x2000 + 6 * 4, 0x6000 | 0x6);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    let outer = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+    let outer = cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default());
     let inner_fault = outer.expect_err("the not-present ESP0 push must nest a fault");
     let InternalFault::Exception {
         vector: nested_vector,
@@ -1205,12 +1237,12 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
     let start_eip = cpu.registers.eip;
     let start_cs = cpu.registers.cs().selector;
-    let result: Result<CpuCycleOutcome, CpuError> = cpu.finish_instruction(
+    let result = cpu.finish_instruction(
         &mut bus,
-        Err(InternalFault::Exception {
+        InstructionExecution::new(Err(InternalFault::Exception {
             vector: 13,
             error_code: Some(0),
-        }),
+        })),
         start_eip,
         start_cs,
         0,
@@ -1219,9 +1251,12 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     );
     assert_eq!(
         result,
-        Err(CpuError::TripleFault {
-            original_vector: 13,
-            nested_vector: 11,
+        Err(CpuRunError {
+            error: CpuError::TripleFault {
+                original_vector: 13,
+                nested_vector: 11,
+            },
+            consumed_core_clocks: 0,
         }),
         "{result:?}"
     );
@@ -1290,12 +1325,12 @@ fn deliver_through_finish_instruction(
     bus: &mut TestBus,
     vector: u8,
     error_code: Option<u32>,
-) -> (Result<CpuCycleOutcome, CpuError>, u32, u16) {
+) -> (Result<CpuCycleOutcome, CpuRunError>, u32, u16) {
     let start_eip = cpu.registers.eip;
     let start_cs = cpu.registers.cs().selector;
     let result = cpu.finish_instruction(
         bus,
-        Err(InternalFault::Exception { vector, error_code }),
+        InstructionExecution::new(Err(InternalFault::Exception { vector, error_code })),
         start_eip,
         start_cs,
         0,
@@ -1488,9 +1523,12 @@ fn a_fault_while_calling_the_double_fault_handler_stops_the_machine() {
 
     assert_eq!(
         result,
-        Err(CpuError::TripleFault {
-            original_vector: 14,
-            nested_vector: 11,
+        Err(CpuRunError {
+            error: CpuError::TripleFault {
+                original_vector: 14,
+                nested_vector: 11,
+            },
+            consumed_core_clocks: 0,
         }),
         "{result:?}"
     );
@@ -1551,7 +1589,13 @@ fn a_non_external_vector_8_delivery_that_faults_shuts_down_immediately() {
     unmap_page(&mut bus.memory, 12);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    let result = cpu.deliver_exception_escalating(&mut bus, 8, Some(0), false);
+    let result = cpu.deliver_exception_escalating(
+        &mut bus,
+        8,
+        Some(0),
+        false,
+        &mut CommittedCore::default(),
+    );
 
     assert_eq!(
         result,
@@ -1569,7 +1613,8 @@ fn deliver_exception_from_v86_reads_esp0_ss0_through_a_non_identity_tss_mapping(
     alias_tss_through_second_pde(&mut bus, &mut cpu);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
 
-    cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+    cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default())
+        .unwrap();
 
     // ESP0/SS0 came from the TSS at its aliased linear address, not from
     // unmapped physical memory at ALIAS_BASE + TSS + 4/+8 (which is zeroed).
@@ -1680,7 +1725,13 @@ fn a_fatal_fault_delivering_an_irq_reports_the_boundary_it_was_taken_at() {
     // fault-site assertions below are what this test exists for and they are
     // unchanged.
     assert!(
-        matches!(result, Err(CpuError::TripleFault { .. })),
+        matches!(
+            result,
+            Err(CpuRunError {
+                error: CpuError::TripleFault { .. },
+                ..
+            })
+        ),
         "{result:?}"
     );
     let site = cpu
@@ -1948,7 +1999,7 @@ fn v86_software_int_through_a_dpl0_gate_general_protection_faults() {
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
     assert_eq!(cpu.current_privilege_level(), 3, "a V86 task is CPL 3");
 
-    let result = cpu.software_interrupt(&mut bus, 0x21);
+    let result = cpu.software_interrupt(&mut bus, 0x21, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -1979,7 +2030,8 @@ fn v86_software_int_through_a_dpl3_gate_dispatches() {
     set_gate_access(&mut bus.memory, 0x21, 0xee);
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
 
-    cpu.software_interrupt(&mut bus, 0x21).unwrap();
+    cpu.software_interrupt(&mut bus, 0x21, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(!cpu.is_v86_mode(), "delivery out of V86 enters the monitor");
     assert_eq!(cpu.registers.cs().selector, R0_CS);
@@ -1995,7 +2047,8 @@ fn v86_hardware_interrupt_through_a_dpl0_gate_dispatches() {
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
 
-    cpu.hardware_interrupt(&mut bus, 0x21).unwrap();
+    cpu.hardware_interrupt(&mut bus, 0x21, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(!cpu.is_v86_mode(), "the IRQ is delivered into the monitor");
     assert_eq!(cpu.registers.cs().selector, R0_CS);
@@ -2011,7 +2064,7 @@ fn v86_software_int_through_a_not_present_gate_raises_np() {
     set_gate_access(&mut bus.memory, 0x21, 0x6e); // DPL 3, P = 0
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
 
-    let result = cpu.software_interrupt(&mut bus, 0x21);
+    let result = cpu.software_interrupt(&mut bus, 0x21, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -2036,7 +2089,7 @@ fn v86_hardware_interrupt_through_a_not_present_gate_raises_np_with_ext_set() {
     set_gate_access(&mut bus.memory, 0x21, 0x6e); // DPL 3, P = 0
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
 
-    let result = cpu.hardware_interrupt(&mut bus, 0x21);
+    let result = cpu.hardware_interrupt(&mut bus, 0x21, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -2060,7 +2113,7 @@ fn v86_software_int_through_a_not_present_dpl0_gate_takes_gp_not_np() {
     set_gate_access(&mut bus.memory, 0x21, 0x0e); // DPL 0, P = 0
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
 
-    let result = cpu.software_interrupt(&mut bus, 0x21);
+    let result = cpu.software_interrupt(&mut bus, 0x21, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -2084,7 +2137,7 @@ fn v86_int3_through_a_dpl0_gate_general_protection_faults() {
     int_gate(&mut bus.memory, 3, MON_CODE); // present, DPL 0
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
 
-    let result = cpu.software_interrupt(&mut bus, 3);
+    let result = cpu.software_interrupt(&mut bus, 3, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -2155,7 +2208,13 @@ fn an_out_of_limit_vector_whose_gp_gate_is_also_missing_ends_in_a_triple_fault()
     let result = cpu.run_budgeted(&mut bus, 10_000);
 
     assert!(
-        matches!(result, Err(CpuError::TripleFault { .. })),
+        matches!(
+            result,
+            Err(CpuRunError {
+                error: CpuError::TripleFault { .. },
+                ..
+            })
+        ),
         "{result:?}"
     );
 }

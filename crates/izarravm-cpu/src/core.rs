@@ -2109,8 +2109,8 @@ impl CpuGsw {
     /// `INT`'s own charge -- which is why `reflected_call_gate` holds a margin back
     /// rather than treating this as exact.
     #[cfg(feature = "reflected-call-memo")]
-    pub(crate) fn reflected_call_run_core_clocks(&self) -> u64 {
-        self.core_clocks_so_far
+    pub(crate) fn reflected_call_run_core_clocks(&self, committed: &CommittedCore) -> u64 {
+        committed.projected_after(self.core_clocks_so_far)
     }
 
     /// Tear down the lazy arithmetic-flag descriptor WITHOUT settling it into
@@ -2151,7 +2151,11 @@ impl CpuGsw {
     /// answered trip's instructions are charged to `perf.instructions` by the answer
     /// itself, because the guest DID advance past them.
     #[cfg(feature = "reflected-call-memo")]
-    pub(crate) fn commit_reflected_call_core(&mut self, raw_core: u64) -> Option<u64> {
+    pub(crate) fn commit_reflected_call_core(
+        &mut self,
+        raw_core: u64,
+        committed: &mut CommittedCore,
+    ) -> Option<u64> {
         let (num, den) = level_timing(self.persona());
         let scaled = raw_core
             .checked_mul(u64::from(num))?
@@ -2160,18 +2164,8 @@ impl CpuGsw {
         let remainder = scaled % u64::from(den);
         self.elapsed_clocks = self.elapsed_clocks.checked_add(charged)?;
         self.timing_rem = remainder;
-        // The same charge, parked for the enclosing run to count toward the BATCH's core
-        // total. See `CpuGsw::reflected_call_pending_core` for why both are needed.
-        self.reflected_call_pending_core = self.reflected_call_pending_core.saturating_add(charged);
+        committed.add(charged);
         Some(charged)
-    }
-
-    /// Take the parked charge (see `reflected_call_pending_core`). Called by the run loop
-    /// beside its own `total += outcome.core_clocks`.
-    #[cfg(feature = "reflected-call-memo")]
-    #[inline]
-    pub(crate) fn take_reflected_call_pending_core(&mut self) -> u64 {
-        std::mem::take(&mut self.reflected_call_pending_core)
     }
 
     /// The non-mutating half of the above: what `commit_reflected_call_core` WOULD
@@ -2561,14 +2555,15 @@ impl CpuGsw {
     /// **Structurally zero under epoch 1** (`string_port_element_core_clocks` returns 0), so a
     /// knob-unset build cannot move.
     ///
-    /// `core_clocks_so_far` is deliberately NOT advanced: it is assigned (never incremented) at
-    /// batch-level sites, so a mid-`REP` increment would be overwritten. The budget limiter still
-    /// sees this `REP`'s cost, because its per-element PORT BUS charge -- three to eight times
-    /// larger -- is in `in_batch_scaled_bus_clocks()` under epoch 2 (review F2).
+    /// `core_clocks_so_far` is deliberately NOT advanced: batch-level sites assign it, so a
+    /// mid-`REP` increment would be overwritten. The committed owner carries the element's core
+    /// projection, while the budget limiter independently projects each port transaction from
+    /// the current in-batch bus state.
     pub(crate) fn charge_string_port_element_core<B: izarravm_bus::CpuBus>(
         &mut self,
         bus: &B,
         is_out: bool,
+        committed: &mut CommittedCore,
     ) {
         let raw = u64::from(crate::string_port_element_core_clocks(
             bus.timing_epoch(),
@@ -2581,8 +2576,10 @@ impl CpuGsw {
         let scaled = raw
             .saturating_mul(u64::from(num))
             .saturating_add(self.timing_rem);
-        self.elapsed_clocks = self.elapsed_clocks.saturating_add(scaled / u64::from(den));
+        let charged = scaled / u64::from(den);
+        self.elapsed_clocks = self.elapsed_clocks.saturating_add(charged);
         self.timing_rem = scaled % u64::from(den);
+        committed.add(charged);
     }
 
     /// IOPL-sensitive instructions (CLI, STI, PUSHF/POPF, INT n) fault to the monitor

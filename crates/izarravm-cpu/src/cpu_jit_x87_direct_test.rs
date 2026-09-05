@@ -500,8 +500,16 @@ fn completed_real_divide_prefix_is_charged_once_before_a_memory_read_fault() {
     assert_eq!(interpreter.registers.eip, ENTRY + 14);
     let native_decoded = direct.decode_cache.get(ENTRY + 14, true).unwrap();
     let interpreter_decoded = interpreter.decode_cache.get(ENTRY + 14, true).unwrap();
-    let native_fault = direct.execute_decoded(&native_decoded, &mut direct_bus);
-    let interpreter_fault = interpreter.execute_decoded(&interpreter_decoded, &mut interpreter_bus);
+    let native_fault = direct.execute_decoded(
+        &native_decoded,
+        &mut direct_bus,
+        &mut CommittedCore::default(),
+    );
+    let interpreter_fault = interpreter.execute_decoded(
+        &interpreter_decoded,
+        &mut interpreter_bus,
+        &mut CommittedCore::default(),
+    );
     for fault in [native_fault, interpreter_fault] {
         assert!(matches!(
             fault,

@@ -230,6 +230,8 @@ fn interpreter_direct_pages_skip_fast_map_when_native_admission_is_disabled() {
 #[test]
 fn direct_runtime_admission_tracks_backend_policy_and_clones_cold() {
     let mut cpu = CpuGsw::default();
+    assert_eq!(cpu.jit_direct.native_successful_helper_core, 0);
+    assert_eq!(cpu.jit_direct.native_fatal_helper_core, 0);
     let assert_synchronized = |cpu: &CpuGsw| {
         assert_eq!(
             cpu.direct_runtime.admission_active,
@@ -241,9 +243,13 @@ fn direct_runtime_admission_tracks_backend_policy_and_clones_cold() {
     cpu.set_jit_auto_admit(true);
     assert_synchronized(&cpu);
 
+    cpu.jit_direct.native_successful_helper_core = 17;
+    cpu.jit_direct.native_fatal_helper_core = 19;
     let clone = cpu.clone();
     assert!(!clone.direct_runtime.admission_active);
     assert_synchronized(&clone);
+    assert_eq!(clone.jit_direct.native_successful_helper_core, 0);
+    assert_eq!(clone.jit_direct.native_fatal_helper_core, 0);
 
     cpu.set_native_backend_enabled(false);
     assert_synchronized(&cpu);
@@ -257,6 +263,8 @@ fn direct_runtime_admission_tracks_backend_policy_and_clones_cold() {
     cpu.reset();
     assert!(!cpu.direct_runtime.admission_active);
     assert_synchronized(&cpu);
+    assert_eq!(cpu.jit_direct.native_successful_helper_core, 0);
+    assert_eq!(cpu.jit_direct.native_fatal_helper_core, 0);
 }
 
 #[cfg(feature = "jit")]
@@ -2884,7 +2892,7 @@ fn a_bus_decode_change_still_drops_ram_and_vga_direct_pages() {
 }
 
 #[derive(Default)]
-struct TestBus {
+pub(crate) struct TestBus {
     // Aligned like the production `Memory` backing, and for the same reason: `direct_page`
     // below hands `memory.as_mut_ptr()` pages to the fast map, and an unaligned backing would
     // silently poison every store-bias entry — the whole one-lookup fixture suite would pass
@@ -2966,6 +2974,8 @@ struct TestBus {
     non_direct_read_pages: Vec<u32>,
     // G4: deny direct pages under InstructionPrefetch only, modeling a non-RAM code page.
     deny_instruction_prefetch_direct_page: bool,
+    fail_instruction_prefetch_direct_page: bool,
+    instruction_prefetch_direct_page_requests: u64,
     uniform_native_fetches: bool,
     // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
     // timing-free, so keep that default and let direct-memory differential tests request clocks.
@@ -3019,7 +3029,7 @@ struct TestBus {
     // `IZARRAVM_TIMING_EPOCH=2` without an env write: `CpuBus::timing_epoch` reports 2 when set.
     // A bool rather than a `u32` so `#[derive(Default)]` still lands on epoch 1, which is what
     // every fixture written before the port repricing expects.
-    timing_epoch_two: bool,
+    pub(crate) timing_epoch_two: bool,
 }
 
 impl TestBus {
@@ -3049,6 +3059,8 @@ impl TestBus {
             direct_write_denied_page: None,
             non_direct_read_pages: Vec::new(),
             deny_instruction_prefetch_direct_page: false,
+            fail_instruction_prefetch_direct_page: false,
+            instruction_prefetch_direct_page_requests: 0,
             uniform_native_fetches: false,
             direct_page_clocks: false,
             flat_direct_page_clocks: false,
@@ -3546,8 +3558,15 @@ impl CpuBus for TestBus {
         address: u32,
         kind: BusAccessKind,
     ) -> Result<Option<DirectPage>, BusError> {
+        if kind == BusAccessKind::InstructionPrefetch {
+            self.instruction_prefetch_direct_page_requests += 1;
+        }
         if !self.direct_pages_enabled {
             return Ok(None);
+        }
+        if self.fail_instruction_prefetch_direct_page && kind == BusAccessKind::InstructionPrefetch
+        {
+            return Err(BusError::UnmappedMemory { address });
         }
         if self.deny_instruction_prefetch_direct_page && kind == BusAccessKind::InstructionPrefetch
         {
@@ -3759,7 +3778,7 @@ fn cpl3_code(code: &[u8]) -> (CpuGsw, TestBus) {
 fn exec_one_split<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> ExecResult<CycleOutcome> {
     cpu.begin_instruction();
     let insn = cpu.decode(bus)?;
-    cpu.execute_decoded(&insn, bus)
+    cpu.execute_decoded(&insn, bus, &mut CommittedCore::default())
 }
 
 fn real_mode_cpu(code: &[u8], mem_len: usize) -> (CpuGsw, Vec<u8>) {

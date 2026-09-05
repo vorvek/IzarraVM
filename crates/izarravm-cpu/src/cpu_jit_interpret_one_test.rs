@@ -1151,12 +1151,26 @@ fn interpret_one_window_stays_open_across_fault_delivery() {
     arm_tiny_model(&mut native, &mut native_bus);
     assert_eq!(native.jit_direct.len(), 1);
     let deferred_before = native.direct_stall_snapshot().callout_deferred_code_writes;
+    let elapsed_before = native.elapsed_clocks;
+    let retired_before = native.perf_counters().jit_direct_insns;
 
+    let outcome = native
+        .run_direct_block_accounted_for_test(&mut native_bus, block, u64::MAX)
+        .expect("a delivery onto the block's own page must not stop the machine")
+        .expect("the installed block must execute natively");
+    assert_eq!(
+        native.perf_counters().jit_direct_insns - retired_before,
+        1,
+        "the real native prefix retires before the helper-delivered fault"
+    );
     assert!(
-        native
-            .try_run_direct_block_for_test(&mut native_bus, block)
-            .expect("a delivery onto the block's own page must not stop the machine"),
-        "the block must run"
+        outcome.core_clocks > 0,
+        "a helper-delivered fault must retain both the native prefix and delivery work"
+    );
+    assert_eq!(
+        outcome.core_clocks,
+        native.elapsed_clocks - elapsed_before,
+        "the successful native return carries the helper-delivered fault's committed core work"
     );
 
     let stalls = native.direct_stall_snapshot();
@@ -5481,7 +5495,9 @@ fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
     program[ENTRY as usize..ENTRY as usize + CODE_ES.len()].copy_from_slice(CODE_ES);
     seed_protected_tables(&mut program);
     let mut bus = sixteen_bit_bus(program);
+    bus.timing_epoch_two = true;
     let mut cpu = protected_cpu();
+    cpu.set_timing_epoch(2);
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
     for offset in STARTS_ES {
         let linear = ENTRY + offset;
@@ -5523,9 +5539,33 @@ fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
     // empty IDT gives that #GP nowhere to go.
     arm(&mut cpu, &mut bus, SEL_BAD);
     cpu.idtr.limit = 0;
+    let elapsed_before = cpu.elapsed_clocks;
+    let retired_before = cpu.perf_counters().jit_direct_insns;
+    let error = cpu
+        .run_direct_block_accounted_for_test(&mut bus, block, u64::MAX)
+        .expect_err("the fixture must actually reach the machine-stopping path");
     assert!(
-        cpu.try_run_direct_block_for_test(&mut bus, block).is_err(),
-        "the fixture must actually reach the machine-stopping path"
+        matches!(error.error, CpuError::TripleFault { .. }),
+        "the helper's failed delivery must preserve its stopping error: {error:?}"
+    );
+    assert_eq!(
+        cpu.registers.eax(),
+        0x1111,
+        "the native MOV prefix must retire before the helper faults"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns - retired_before,
+        1,
+        "the native entry must contain the MOV prefix and no retired faulting helper"
+    );
+    assert!(
+        error.consumed_core_clocks > 0,
+        "the fatal direct return must retain its committed native-prefix debt"
+    );
+    assert_eq!(
+        error.consumed_core_clocks,
+        cpu.elapsed_clocks - elapsed_before,
+        "the fatal direct return carries exactly the entry's committed core work"
     );
     assert_eq!(
         cpu.direct_stall_snapshot().callout_interpret_one_demoted,
@@ -5550,10 +5590,16 @@ fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
     // prologue and took an abnormal exit, once per execution, for ever.
     cpu.idtr.limit = 0xff;
     arm(&mut cpu, &mut bus, SEL_OTHER);
+    let elapsed_before_decline = cpu.elapsed_clocks;
     assert!(
-        !cpu.try_run_direct_block_for_test(&mut bus, block)
-            .expect("a retired block is declined, not a machine stop"),
+        cpu.run_direct_block_accounted_for_test(&mut bus, block, u64::MAX)
+            .expect("a retired block is declined, not a machine stop")
+            .is_none(),
         "the retired block must not be re-entered through a handle taken before it"
+    );
+    assert_eq!(
+        cpu.elapsed_clocks, elapsed_before_decline,
+        "the next declined entry must not inherit fatal helper debt"
     );
     assert!(
         cpu.jit_direct.take_callout_retire_pending().is_none(),

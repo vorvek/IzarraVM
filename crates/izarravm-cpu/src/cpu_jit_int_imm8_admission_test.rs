@@ -826,13 +826,22 @@ fn a_handler_at_the_fall_through_address_still_resyncs() {
     arm_int_fixture(&mut native, &mut native_bus);
     let cs_before = native.registers.cs();
     let before = native.perf_counters().jit_direct_insns;
-    assert!(
-        native
-            .try_run_direct_block_for_test(&mut native_bus, block)
-            .expect("the fixture block must not stop the machine"),
-        "the installed block must actually run natively"
-    );
+    let elapsed_before = native.elapsed_clocks;
+    let outcome = native
+        .run_direct_block_accounted_for_test(&mut native_bus, block, u64::MAX)
+        .expect("the fixture block must not stop the machine")
+        .expect("the installed terminal INT block must actually run natively");
     let native_insns = native.perf_counters().jit_direct_insns - before;
+
+    assert!(
+        outcome.core_clocks > 0,
+        "the terminal native INT entry must retain nonzero committed core work"
+    );
+    assert_eq!(
+        outcome.core_clocks,
+        native.elapsed_clocks - elapsed_before,
+        "the terminal native INT return carries its prefix and delivered-interrupt core work"
+    );
 
     // R1's two halves, read off the machine rather than argued. This is the assertion that makes
     // the fixture NON-VACUOUS: a delivery landing anywhere else would fail R1 and the gate would

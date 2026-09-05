@@ -224,6 +224,13 @@ pub(crate) struct JitState {
     /// (watched-page-bit design D4). Non-empty only between the acquiring call and its
     /// `CpuGsw::sweep_block_watch_edges` drain; `install`/`reject` assert that.
     pub(crate) pending_watch_edges: Vec<u32>,
+    /// Interpreted call-out work that retired successfully while a native entry owns the raw ABI
+    /// result. It joins that entry's scaled outcome exactly once after native return.
+    pub(crate) native_successful_helper_core: u64,
+    /// Interpreted call-out work consumed by a machine-stopping helper. It remains outside the
+    /// cache so a task switch, fault, or retirement cannot erase the live debt before the native
+    /// entry reconstructs its `CpuRunError`.
+    pub(crate) native_fatal_helper_core: u64,
     #[cfg(feature = "direct-callout-attribution")]
     pub(crate) direct_callout_attribution: Option<Box<direct::CallOutAttribution>>,
     /// The last native entry's `SideExitReason`, or `None` when the block completed. TEST-ONLY;
@@ -287,6 +294,8 @@ impl JitState {
             code_watch: Box::default(),
             fast_map_audit: Box::default(),
             pending_watch_edges: Vec::new(),
+            native_successful_helper_core: 0,
+            native_fatal_helper_core: 0,
             #[cfg(feature = "direct-callout-attribution")]
             direct_callout_attribution: direct::direct_callout_attribution_default(),
             #[cfg(test)]
@@ -333,6 +342,8 @@ impl Clone for JitState {
             code_watch: Box::default(),
             fast_map_audit: Box::default(),
             pending_watch_edges: Vec::new(),
+            native_successful_helper_core: 0,
+            native_fatal_helper_core: 0,
             #[cfg(feature = "direct-callout-attribution")]
             direct_callout_attribution: None,
             #[cfg(test)]

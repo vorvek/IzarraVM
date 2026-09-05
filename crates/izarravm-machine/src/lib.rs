@@ -29,7 +29,9 @@ use izarravm_core::{
 pub const REFLECTED_CALL_MEMO_SEAMS_WIRED: bool = cfg!(feature = "reflected-call-memo");
 
 pub use izarravm_cpu::PerfCounters;
-use izarravm_cpu::{CpuCycleOutcome, CpuError, CpuGsw, SegmentIndex, SegmentRegister, bus_timing};
+use izarravm_cpu::{
+    CpuCycleOutcome, CpuError, CpuGsw, CpuRunError, SegmentIndex, SegmentRegister, bus_timing,
+};
 #[cfg(test)]
 use izarravm_video::HGC_FB_SIZE;
 use izarravm_video::{
@@ -2098,6 +2100,22 @@ pub struct Machine {
     // within the total that later fed advance_devices.
     #[cfg(test)]
     test_batch_core_totals: Vec<u64>,
+    // Test-only one-shot cap and its effective value. This chooses an existing
+    // batch boundary; the ordinary loop, CPU, bus and settlement stay in use.
+    #[cfg(test)]
+    test_next_batch_cap: Option<u64>,
+    #[cfg(test)]
+    test_effective_batch_caps: Vec<u64>,
+    #[cfg(test)]
+    test_batch_steps: Vec<u64>,
+    #[cfg(test)]
+    test_batch_isa_clocks: Vec<u64>,
+    #[cfg(test)]
+    test_batch_registers: Vec<(u32, u32, u32)>,
+    #[cfg(test)]
+    test_string_port_observations: Option<Vec<TestStringPortObservation>>,
+    #[cfg(test)]
+    test_batch_observations: Vec<TestBatchObservation>,
     // Test-only: how many times the halt fast-forward's remaining-ticks clamp
     // actually clamped, i.e. a batch ended on a HLT with `now_ticks()` already
     // PAST `deadline_ticks`. Its only job is to keep
@@ -2519,6 +2537,20 @@ impl Machine {
             test_prior_core_pushes: Vec::new(),
             #[cfg(test)]
             test_batch_core_totals: Vec::new(),
+            #[cfg(test)]
+            test_next_batch_cap: None,
+            #[cfg(test)]
+            test_effective_batch_caps: Vec::new(),
+            #[cfg(test)]
+            test_batch_steps: Vec::new(),
+            #[cfg(test)]
+            test_batch_isa_clocks: Vec::new(),
+            #[cfg(test)]
+            test_batch_registers: Vec::new(),
+            #[cfg(test)]
+            test_string_port_observations: None,
+            #[cfg(test)]
+            test_batch_observations: Vec::new(),
             #[cfg(test)]
             test_halt_deadline_clamps: 0,
         };
@@ -4050,6 +4082,46 @@ impl Machine {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestStringPortObservation {
+    pub(crate) write: bool,
+    pub(crate) port: u16,
+    pub(crate) width: BusWidth,
+    pub(crate) value: u32,
+    pub(crate) success: bool,
+    pub(crate) prior_runs_core_clocks: u64,
+    pub(crate) core_clocks_so_far: u64,
+    pub(crate) trace_elapsed: u64,
+    pub(crate) trace_elapsed_at_batch_start: u64,
+    pub(crate) bus_rem_at_batch_start: u64,
+    pub(crate) bus_num_at_batch_start: u64,
+    pub(crate) bus_den_at_batch_start: u64,
+    pub(crate) isa_io_clocks: u64,
+    pub(crate) master_ticks_at_batch_start: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestBatchObservation {
+    pub(crate) raw_bus_clocks: u64,
+    pub(crate) scaled_bus_clocks: u64,
+    pub(crate) core_clocks: u64,
+    pub(crate) isa_clocks: u64,
+    pub(crate) step: u64,
+    pub(crate) bus_rem_at_entry: u64,
+    pub(crate) bus_rem_at_exit: u64,
+    pub(crate) timeline_ticks_at_entry: u64,
+    pub(crate) timeline_ticks_at_exit: u64,
+    pub(crate) elapsed_at_entry: u64,
+    pub(crate) elapsed_at_exit: u64,
+    pub(crate) effective_cap: u64,
+    pub(crate) fatal: bool,
+    pub(crate) device_wrote_memory_before_reconcile: bool,
+    pub(crate) direct_map_changed_before_reconcile: bool,
+    pub(crate) direct_data_map_changed_before_reconcile: bool,
+}
+
 struct MachineBus<'a> {
     memory: &'a mut Memory,
     ram_lookup: &'a mut RamPageLookup,
@@ -4210,6 +4282,8 @@ struct MachineBus<'a> {
     /// `read_io_string_element` call and never outlives one, so nothing needs to see it across a
     /// batch boundary.
     string_port_element_bytes: u8,
+    #[cfg(test)]
+    test_string_port_observations: &'a mut Option<Vec<TestStringPortObservation>>,
     /// Points at `Machine::poll_skip_certificate`. `&`, not `&mut`: the certificate path this
     /// counts is `&self` (see the struct's own doc).
     poll_skip_certificate: &'a PollSkipCertificateCounters,

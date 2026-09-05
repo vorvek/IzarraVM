@@ -4281,8 +4281,10 @@ fn finite_cs_ret_limit_exit_case(stack_physical: u32) {
         .decode_cache
         .get(QUAKE_SEGMENT_BASE + RET, true)
         .unwrap();
-    let native_fault = native.execute_decoded(&native_ret, &mut native_bus);
-    let interp_fault = interp.execute_decoded(&interp_ret, &mut interp_bus);
+    let native_fault =
+        native.execute_decoded(&native_ret, &mut native_bus, &mut CommittedCore::default());
+    let interp_fault =
+        interp.execute_decoded(&interp_ret, &mut interp_bus, &mut CommittedCore::default());
     for fault in [native_fault, interp_fault] {
         assert!(matches!(
             fault,
@@ -4386,8 +4388,16 @@ fn nonflat_segment_limit_and_permission_fallbacks_are_transactional() {
 
         let native_decoded = native.decode_cache.get(STORE, true).unwrap();
         let interp_decoded = interp.decode_cache.get(STORE, true).unwrap();
-        let native_fault = native.execute_decoded(&native_decoded, &mut native_bus);
-        let interp_fault = interp.execute_decoded(&interp_decoded, &mut interp_bus);
+        let native_fault = native.execute_decoded(
+            &native_decoded,
+            &mut native_bus,
+            &mut CommittedCore::default(),
+        );
+        let interp_fault = interp.execute_decoded(
+            &interp_decoded,
+            &mut interp_bus,
+            &mut CommittedCore::default(),
+        );
         for fault in [native_fault, interp_fault] {
             assert!(matches!(
                 fault,
@@ -5729,10 +5739,10 @@ fn finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_pr
         .get(QUAKE_SEGMENT_BASE + JMP, true)
         .unwrap();
     native
-        .execute_decoded(&native_jmp, &mut native_bus)
+        .execute_decoded(&native_jmp, &mut native_bus, &mut CommittedCore::default())
         .unwrap();
     interp
-        .execute_decoded(&interp_jmp, &mut interp_bus)
+        .execute_decoded(&interp_jmp, &mut interp_bus, &mut CommittedCore::default())
         .unwrap();
     assert_eq!(native.registers.eip, QUAKE_CS_LIMIT + 1);
     assert_eq!(interp.registers.eip, QUAKE_CS_LIMIT + 1);

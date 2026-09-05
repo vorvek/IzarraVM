@@ -332,6 +332,34 @@ fn call_out_matches_the_interpreter_mid_block() {
 }
 
 #[test]
+fn accounted_direct_result_retains_the_real_native_block_charge() {
+    let (mut fixture, _interpreter, _interpreter_bus) = slot_block(|bus| {
+        bus.lazy_io_reads = true;
+        bus.io_read_value = Some(0x5a);
+    });
+    let elapsed_before = fixture.cpu.elapsed_clocks;
+    let retired_before = fixture.cpu.perf_counters().jit_direct_insns;
+
+    let outcome = fixture
+        .cpu
+        .run_direct_block_accounted_for_test(&mut fixture.bus, fixture.block, u64::MAX)
+        .expect("the real native entry must not fault")
+        .expect("the installed block must execute natively");
+
+    assert_eq!(
+        fixture.cpu.perf_counters().jit_direct_insns - retired_before,
+        3,
+        "the returned result belongs to a real three-slot native entry"
+    );
+    assert!(outcome.core_clocks > 0, "native work must be nonzero");
+    assert_eq!(
+        outcome.core_clocks,
+        fixture.cpu.elapsed_clocks - elapsed_before,
+        "the direct result retains the entry's charged core total"
+    );
+}
+
+#[test]
 fn a_step_breaking_port_ends_the_native_run_after_the_call_out() {
     // A non-lazy read touches time-dependent device state, so the run must end at the boundary
     // AFTER the IN -- the same boundary `run_straight_line`'s post-instruction check produces.
@@ -4851,15 +4879,41 @@ fn a_v86_rep_string_port_form_traps_on_its_first_element() {
     for (opcode, is_out) in [(0x6du8, false), (0x6f, true)] {
         for epoch_two in [false, true] {
             let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86, epoch_two);
+            cpu.set_timing_epoch(if epoch_two { 2 } else { 1 });
+            cpu.timing_rem = 0;
+            cpu.idtr.limit = 0;
             cpu.tr.limit = 0;
             cpu.registers.set_edi(0x6000);
             cpu.registers.set_esi(0x6000);
             cpu.registers.set_ecx(4);
             bus.memory[PORT_COLUMN_ENTRY as usize] = 0xf3;
             bus.memory[PORT_COLUMN_ENTRY as usize + 1] = opcode;
-            bus.memory[PORT_COLUMN_ENTRY as usize + 2] = 0xf4;
+            bus.memory[PORT_COLUMN_ENTRY as usize + 2..PORT_COLUMN_ENTRY as usize + 4]
+                .copy_from_slice(&[0xb0, 0x5a]);
             cpu.set_eip(PORT_COLUMN_ENTRY);
-            let _ = cpu.cycle(&mut bus);
+            let elapsed = cpu.elapsed_clocks;
+            let carry = cpu.timing_rem;
+            assert_eq!(carry, 0, "the denied row starts without carry");
+            let retired = cpu.perf_counters().instructions;
+            let destination = bus.memory[0x6000..0x6008].to_vec();
+            let result = cpu.cycle(&mut bus);
+            assert!(matches!(
+                result,
+                Err(CpuRunError {
+                    error: CpuError::TripleFault { .. },
+                    consumed_core_clocks: 0,
+                })
+            ));
+            assert_eq!(cpu.elapsed_clocks, elapsed);
+            assert_eq!(cpu.timing_rem, carry);
+            assert_eq!(cpu.perf_counters().instructions, retired);
+            assert_eq!(cpu.registers.esi(), 0x6000);
+            assert_eq!(cpu.registers.edi(), 0x6000);
+            assert_eq!(&bus.memory[0x6000..0x6008], destination.as_slice());
+            assert_eq!(
+                cpu.fault_site().expect("the denied REP fault site").eip,
+                PORT_COLUMN_ENTRY
+            );
             assert!(
                 bus.io_reads.is_empty() && bus.io_writes.is_empty(),
                 "{opcode:#04x} epoch2={epoch_two}/out={is_out}: a bitmap-denied string element \
@@ -4870,6 +4924,20 @@ fn a_v86_rep_string_port_form_traps_on_its_first_element() {
                 4,
                 "{opcode:#04x} epoch2={epoch_two}: the trap must leave every element to count"
             );
+            assert!(cpu.rep_execution.resume.is_none());
+            cpu.set_eip(PORT_COLUMN_ENTRY + 2);
+            let later_elapsed = cpu.elapsed_clocks;
+            let later_retired = cpu.perf_counters().instructions;
+            let later = cpu.cycle(&mut bus).unwrap();
+            assert_eq!(later.core_clocks, if epoch_two { 1 } else { 0 });
+            assert_eq!(
+                cpu.elapsed_clocks - later_elapsed,
+                if epoch_two { 1 } else { 0 }
+            );
+            assert_eq!(cpu.timing_rem, if epoch_two { 0 } else { 2 });
+            assert_eq!(cpu.perf_counters().instructions - later_retired, 1);
+            assert_eq!(cpu.registers.eip, PORT_COLUMN_ENTRY + 4);
+            assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
         }
     }
 }

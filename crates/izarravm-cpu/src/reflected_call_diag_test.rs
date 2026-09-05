@@ -253,10 +253,11 @@ fn a_synthetic_reflected_trip_is_journaled_with_the_expected_write_class_and_res
     on_int_entry_on(&mut state, &mut cpu, &bus, VECTOR);
     assert!(state.open.is_some(), "the outer predicate must open a trip");
 
-    cpu.software_interrupt(&mut bus, VECTOR).expect(
-        "delivery must succeed: DPL 0 gate, DPL 0 target, CPL 0, no privilege \
+    cpu.software_interrupt(&mut bus, VECTOR, &mut CommittedCore::default())
+        .expect(
+            "delivery must succeed: DPL 0 gate, DPL 0 target, CPL 0, no privilege \
          crossing, paging off",
-    );
+        );
     assert_eq!(cpu.registers.cs().selector, CODE_SELECTOR);
     assert_eq!(
         cpu.registers.eip, HANDLER_EIP,
@@ -287,7 +288,7 @@ fn a_synthetic_reflected_trip_is_journaled_with_the_expected_write_class_and_res
     );
     note_read_on(&mut state, &mut cpu, &bus, push_addr);
 
-    cpu.iret(&mut bus, OperandSize::Dword)
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
         .expect("the matching IRET must succeed");
     assert_eq!(cpu.registers.cs().selector, CODE_SELECTOR);
     assert_eq!(

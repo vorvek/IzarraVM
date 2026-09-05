@@ -1532,6 +1532,7 @@ pub(crate) fn on_int<B: CpuBus>(
     cpu: &mut CpuGsw,
     bus: &mut B,
     vector: u8,
+    committed: &mut CommittedCore,
 ) -> ExecResult<IntOutcome> {
     if cpu.reflected_call.is_none() {
         return Ok(IntOutcome::NotAnswered);
@@ -1582,7 +1583,7 @@ pub(crate) fn on_int<B: CpuBus>(
     // The answer path (plan section 5). Every screen precedes every mutation, and a
     // miss at any screen is a FALL-THROUGH: nothing written, no register moved, the
     // guest runs the real trip.
-    if try_answer(cpu, bus, key)?.is_some() {
+    if try_answer(cpu, bus, key, committed)?.is_some() {
         return Ok(IntOutcome::Answered);
     }
     // An AUDIT fall-through has already opened its own trip in place of the answer
@@ -1828,7 +1829,12 @@ fn confirm_write_model_at_close<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, key: MemoK
 /// anywhere -- registers, memory, clocks and counters other than the fall-through lane
 /// itself. `Err` can only come from a replayed nested ack, and is the fault the real
 /// trip would have taken at its first nested `INT`.
-fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecResult<Option<()>> {
+fn try_answer<B: CpuBus>(
+    cpu: &mut CpuGsw,
+    bus: &mut B,
+    key: MemoKey,
+    committed: &mut CommittedCore,
+) -> ExecResult<Option<()>> {
     // Screen 0: the code watch's wholesale half (plan R2.4). One `u64` compare.
     sync_code_mark_epoch(cpu);
     // Screen 2/3/6: bucket lookup, the 43-field entry-image compare, then the
@@ -1886,7 +1892,7 @@ fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecRes
     let gate = bus.reflected_call_gate(&ReflectedCallGateRequest {
         scaled_core_clocks: scaled_core,
         raw_bus_clocks: memo.raw_bus_clocks,
-        run_core_clocks_so_far: cpu.reflected_call_run_core_clocks(),
+        run_core_clocks_so_far: cpu.reflected_call_run_core_clocks(committed),
     });
     if let Err(decline) = gate {
         note_fell_through(
@@ -1924,7 +1930,7 @@ fn try_answer<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B, key: MemoKey) -> ExecRes
         return Ok(None);
     }
 
-    apply_answer(cpu, bus, &memo, scaled_core)?;
+    apply_answer(cpu, bus, &memo, scaled_core, committed)?;
     note_answer_for_audit(cpu, key);
     Ok(Some(()))
 }
@@ -2080,6 +2086,7 @@ fn apply_answer<B: CpuBus>(
     bus: &mut B,
     memo: &Memo,
     scaled_core: u64,
+    committed: &mut CommittedCore,
 ) -> ExecResult<()> {
     // Sampled BEFORE the first mutation: everything the answer itself charges to the
     // bus between here and the commit below is subtracted from the memo's recorded
@@ -2132,7 +2139,7 @@ fn apply_answer<B: CpuBus>(
     let bus_charged =
         bus.reflected_call_commit_bus(memo.raw_bus_clocks.saturating_sub(self_charged));
     let core_charged = cpu
-        .commit_reflected_call_core(memo.raw_core_clocks)
+        .commit_reflected_call_core(memo.raw_core_clocks, committed)
         .unwrap_or(0);
     debug_assert_eq!(
         core_charged, scaled_core,

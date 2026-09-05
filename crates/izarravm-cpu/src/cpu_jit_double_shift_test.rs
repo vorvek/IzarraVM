@@ -552,9 +552,16 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
         native.jit_fast_map.invalidate_page(target);
         let native_decoded = native.decode_cache.get(ENTRY, true).unwrap();
         let interpreter_decoded = interpreter.decode_cache.get(ENTRY, true).unwrap();
-        let native_result = native.execute_decoded(&native_decoded, &mut native_bus);
-        let interpreter_result =
-            interpreter.execute_decoded(&interpreter_decoded, &mut interpreter_bus);
+        let native_result = native.execute_decoded(
+            &native_decoded,
+            &mut native_bus,
+            &mut CommittedCore::default(),
+        );
+        let interpreter_result = interpreter.execute_decoded(
+            &interpreter_decoded,
+            &mut interpreter_bus,
+            &mut CommittedCore::default(),
+        );
         assert_eq!(
             result_signature(native_result),
             result_signature(interpreter_result),
@@ -593,12 +600,16 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
 
     let native_decoded = fixture.native.decode_cache.get(ENTRY, true).unwrap();
     let interpreter_decoded = fixture.interpreter.decode_cache.get(ENTRY, true).unwrap();
-    let native_result = fixture
-        .native
-        .execute_decoded(&native_decoded, &mut fixture.native_bus);
-    let interpreter_result = fixture
-        .interpreter
-        .execute_decoded(&interpreter_decoded, &mut fixture.interpreter_bus);
+    let native_result = fixture.native.execute_decoded(
+        &native_decoded,
+        &mut fixture.native_bus,
+        &mut CommittedCore::default(),
+    );
+    let interpreter_result = fixture.interpreter.execute_decoded(
+        &interpreter_decoded,
+        &mut fixture.interpreter_bus,
+        &mut CommittedCore::default(),
+    );
     let native_result = result_signature(native_result);
     let interpreter_result = result_signature(interpreter_result);
     assert_eq!(native_result, interpreter_result);

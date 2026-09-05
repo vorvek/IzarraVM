@@ -59,6 +59,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         vector: u8,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
         // Slice 0b of the reflected-call HLE design's trip-shape instrument
@@ -81,7 +82,7 @@ impl CpuGsw {
         // screen missing) leaves guest execution bit-identical to a build without the
         // feature.
         #[cfg(feature = "reflected-call-memo")]
-        if crate::reflected_call_memo::on_int(self, bus, vector)?
+        if crate::reflected_call_memo::on_int(self, bus, vector, committed)?
             == crate::reflected_call_memo::IntOutcome::Answered
         {
             return Ok(());
@@ -91,7 +92,13 @@ impl CpuGsw {
             // gate-DPL check applies to. It used to pass the `is_external =
             // true` bool, which carries the right error-code behaviour but
             // cannot express the PRM's software/external split.
-            self.deliver_interrupt(bus, vector, None, DeliverySource::SoftwareInterrupt)
+            self.deliver_interrupt(
+                bus,
+                vector,
+                None,
+                DeliverySource::SoftwareInterrupt,
+                committed,
+            )
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -137,6 +144,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         vector: u8,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         // A device edge landed; if a reflected trip is open, count it (design
         // section 8 item 5 / review B6).
@@ -145,7 +153,7 @@ impl CpuGsw {
         #[cfg(feature = "reflected-call-memo")]
         crate::reflected_call_memo::on_hardware_interrupt(self);
         if self.is_protected_mode() {
-            self.deliver_interrupt(bus, vector, None, DeliverySource::External)
+            self.deliver_interrupt(bus, vector, None, DeliverySource::External, committed)
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -347,9 +355,10 @@ impl CpuGsw {
         vector: u8,
         error_code: Option<u32>,
         is_external: bool,
+        committed: &mut CommittedCore,
     ) -> Result<(), CpuError> {
-        let attempt = self.deliver_exception(bus, vector, error_code, is_external);
-        self.escalate_delivery(bus, attempt, vector, is_external)
+        let attempt = self.deliver_exception(bus, vector, error_code, is_external, committed);
+        self.escalate_delivery(bus, attempt, vector, is_external, committed)
     }
 
     /// `hardware_interrupt` with the same escalation as
@@ -360,9 +369,10 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         vector: u8,
+        committed: &mut CommittedCore,
     ) -> Result<(), CpuError> {
-        let attempt = self.hardware_interrupt(bus, vector);
-        self.escalate_delivery(bus, attempt, vector, true)
+        let attempt = self.hardware_interrupt(bus, vector, committed);
+        self.escalate_delivery(bus, attempt, vector, true, committed)
     }
 
     /// The escalation loop shared by the two entry points above. `attempt` is the
@@ -413,6 +423,7 @@ impl CpuGsw {
         attempt: ExecResult<()>,
         original_vector: u8,
         original_is_external: bool,
+        committed: &mut CommittedCore,
     ) -> Result<(), CpuError> {
         let mut attempt = attempt;
         let mut vector = original_vector;
@@ -477,7 +488,7 @@ impl CpuGsw {
                 }
             };
             class = fault_class(vector, false);
-            attempt = self.deliver_exception(bus, vector, error_code, false);
+            attempt = self.deliver_exception(bus, vector, error_code, false, committed);
         }
     }
 
@@ -494,13 +505,14 @@ impl CpuGsw {
         // even on a vector that a CPU exception would carry one for (e.g. IRQ0 remapped
         // to vector 8, #DF). Only a genuine CPU exception pushes one.
         is_external: bool,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         let source = if is_external {
             DeliverySource::External
         } else {
             DeliverySource::Exception
         };
-        self.deliver_interrupt(bus, vector, error_code, source)
+        self.deliver_interrupt(bus, vector, error_code, source, committed)
     }
 
     fn deliver_interrupt<B: CpuBus>(
@@ -509,6 +521,7 @@ impl CpuGsw {
         vector: u8,
         error_code: Option<u32>,
         source: DeliverySource,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         // #GP/#PF traps taken while a reflected trip is open (design's
         // `task_switch`-adjacent refusal population; review section 3 item
@@ -532,10 +545,10 @@ impl CpuGsw {
             self.trace_fault_if_enabled(bus, vector, error_code);
         }
         if !self.is_protected_mode() {
-            return self.software_interrupt(bus, vector);
+            return self.software_interrupt(bus, vector, committed);
         }
 
-        self.deliver_exception_inner(bus, vector, error_code, source)
+        self.deliver_exception_inner(bus, vector, error_code, source, committed)
     }
 
     /// Guard around the delivery body: a fault raised while the frame is being
@@ -551,6 +564,7 @@ impl CpuGsw {
         vector: u8,
         error_code: Option<u32>,
         source: DeliverySource,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         // Snapshot everything the body mutates before its final CS:EIP commit:
         // CPL, EFLAGS (VM drop, NT/TF/IF clears), the inner SS:ESP installed by
@@ -573,7 +587,7 @@ impl CpuGsw {
             SegmentIndex::Gs,
         ]
         .map(|segment| (segment, self.registers.segment(segment)));
-        let result = self.deliver_exception_body(bus, vector, error_code, source);
+        let result = self.deliver_exception_body(bus, vector, error_code, source, committed);
         // A committed task switch is the one failure this restore must NOT run
         // for. By then the incoming task's CR3, LDTR, TR, CS:EIP and GPRs are
         // live, and putting five fields of the OUTGOING task back would assemble
@@ -618,6 +632,7 @@ impl CpuGsw {
         vector: u8,
         error_code: Option<u32>,
         source: DeliverySource,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         let gate_address = self.idtr.base + u32::from(vector) * 8;
         if u32::from(self.idtr.limit) < u32::from(vector) * 8 + 7 {
@@ -746,7 +761,7 @@ impl CpuGsw {
         // V86 drop below. Only the error code lands on the NEW task's stack.
         // DOS/4GW 1.97 points #PF at one of these.
         if (gate_high >> 8) & 0x1f == 0x05 {
-            self.task_switch(bus, selector, TaskSwitchKind::Call)?;
+            self.task_switch(bus, selector, TaskSwitchKind::Call, committed)?;
             if source.pushes_error_code() && vector_pushes_error_code(vector) {
                 // The switch has committed, and this push lands on the NEW task's
                 // stack, so a fault here is terminal for the same reason it is
@@ -1125,9 +1140,10 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         operand_size: OperandSize,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         let esp_before = self.registers.esp();
-        let result = self.iret_body(bus, operand_size);
+        let result = self.iret_body(bus, operand_size, committed);
         if result.is_err() {
             self.registers.set_esp(esp_before);
         }
@@ -1142,7 +1158,12 @@ impl CpuGsw {
         result
     }
 
-    fn iret_body<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<()> {
+    fn iret_body<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand_size: OperandSize,
+        committed: &mut CommittedCore,
+    ) -> ExecResult<()> {
         // NT set in protected mode: this IRET ends a nested TASK, not an
         // interrupt frame (386 PRM 9.5). Return through the current TSS's
         // back-link; nothing is popped. The outgoing image is saved with NT=0
@@ -1153,7 +1174,7 @@ impl CpuGsw {
             let back_link = self.read_system_linear(bus, self.tr.base, BusWidth::Word)? as u16;
             // NT is cleared inside `task_switch`, after the back-link validates:
             // a #TS on a bad back-link must leave NT set for restartability.
-            return self.task_switch(bus, back_link, TaskSwitchKind::Return);
+            return self.task_switch(bus, back_link, TaskSwitchKind::Return, committed);
         }
         match operand_size {
             OperandSize::Word => {
@@ -1354,6 +1375,7 @@ impl CpuGsw {
         selector: u16,
         offset: u32,
         operand_size: OperandSize,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         // A protected-mode far call to a system descriptor goes through a call gate,
         // which supplies its own CS:offset (the instruction's offset is ignored).
@@ -1362,7 +1384,7 @@ impl CpuGsw {
         if self.is_protected_mode() && !self.is_v86_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
-                return self.far_system_transfer(bus, selector, low, high, true);
+                return self.far_system_transfer(bus, selector, low, high, true, committed);
             }
             // 386 PRM CALL: the target descriptor's present bit is checked
             // (#NP(selector)) BEFORE the return address is pushed. Borland RTM
@@ -1560,12 +1582,13 @@ impl CpuGsw {
         selector: u16,
         offset: u32,
         operand_size: OperandSize,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         // As in `far_call`: a V86 task's far jump is 8086-style, not a descriptor load.
         if self.is_protected_mode() && !self.is_v86_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
-                return self.far_system_transfer(bus, selector, low, high, false);
+                return self.far_system_transfer(bus, selector, low, high, false, committed);
             }
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
@@ -1592,6 +1615,7 @@ impl CpuGsw {
         low: u32,
         high: u32,
         is_call: bool,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         let kind = if is_call {
             TaskSwitchKind::Call
@@ -1615,11 +1639,11 @@ impl CpuGsw {
             0x04 | 0x0c if is_call => self.far_call_gate(bus, selector, low, high),
             0x04 | 0x0c => self.far_jump_gate(bus, selector, low, high),
             // Available 386 TSS: a direct task switch.
-            0x09 => self.task_switch(bus, selector, kind),
+            0x09 => self.task_switch(bus, selector, kind, committed),
             // Task gate: switch to the TSS the gate names.
             0x05 => {
                 let tss_selector = ((low >> 16) & 0xffff) as u16;
-                self.task_switch(bus, tss_selector, kind)
+                self.task_switch(bus, tss_selector, kind, committed)
             }
             _ => Err(InternalFault::Exception {
                 vector: 13,
@@ -1903,6 +1927,7 @@ impl CpuGsw {
         bus: &mut B,
         new_selector: u16,
         kind: TaskSwitchKind,
+        committed: &mut CommittedCore,
     ) -> ExecResult<()> {
         // The reflected-call memo's `task_switch` refusal (slice1 plan section 4.5), at
         // the one function every task gate, TSS `CALL`/`JMP` and `IRET` back-link return
@@ -1983,8 +2008,8 @@ impl CpuGsw {
         // is reported as terminal instead of being handed to a caller that would
         // retry (exception delivery's escalation) or rewind (an instruction's own
         // fault path) from a state belonging to no task.
-        let committed = self.commit_task_switch(bus, kind, new_tss, old_selector, new_selector);
-        if committed.is_ok() {
+        let switch_result = self.commit_task_switch(bus, kind, new_tss, old_selector, new_selector);
+        if switch_result.is_ok() {
             // THE TERM THAT DID NOT EXIST. A task switch rode whichever of the
             // far-transfer, IRET or interrupt charges delivered it, which the
             // census scores as under by 100x or more. It is charged HERE rather
@@ -2004,9 +2029,10 @@ impl CpuGsw {
             if raw != 0 {
                 let charged = self.scale_clocks(raw);
                 self.elapsed_clocks += charged;
+                committed.add(charged);
             }
         }
-        committed.map_err(fault_after_task_switch_commit)
+        switch_result.map_err(fault_after_task_switch_commit)
     }
 
     /// The committing tail of `task_switch`. See the comment at its only call

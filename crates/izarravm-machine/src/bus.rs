@@ -592,6 +592,8 @@ impl Machine {
             poll_skip_certificate: &self.poll_skip_certificate,
             retrace_poll: &mut self.retrace_poll,
             string_port_element_bytes: 0,
+            #[cfg(test)]
+            test_string_port_observations: &mut self.test_string_port_observations,
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
             io_touched: &mut self.io_touched,
             exempt_io_touched: &mut self.exempt_io_touched,
@@ -1055,6 +1057,36 @@ fn vega_census_token(identity: (u8, Option<u32>)) -> u8 {
 }
 
 impl MachineBus<'_> {
+    #[cfg(test)]
+    fn record_string_port_observation(
+        &mut self,
+        write: bool,
+        port: u16,
+        width: BusWidth,
+        value: Option<u32>,
+        core_clocks_so_far: u64,
+    ) {
+        let observation = TestStringPortObservation {
+            write,
+            port,
+            width,
+            value: value.unwrap_or_default(),
+            success: value.is_some(),
+            prior_runs_core_clocks: self.prior_runs_core_clocks,
+            core_clocks_so_far,
+            trace_elapsed: self.trace.elapsed_clocks(),
+            trace_elapsed_at_batch_start: self.trace_elapsed_at_batch_start,
+            bus_rem_at_batch_start: self.bus_rem_at_batch_start,
+            bus_num_at_batch_start: u64::from(self.bus_num_at_batch_start),
+            bus_den_at_batch_start: u64::from(self.bus_den_at_batch_start),
+            isa_io_clocks: *self.isa_io_clocks,
+            master_ticks_at_batch_start: self.master_ticks_at_batch_start,
+        };
+        if let Some(log) = self.test_string_port_observations.as_mut() {
+            log.push(observation);
+        }
+    }
+
     /// The fetch-byte certification loop shared by every poll shape family:
     /// certify each slot's warm-RAM fetch range (rejecting a BIOS-stub overlay
     /// alias or any device-window byte) and sum the per-byte fetch cost.
@@ -4318,6 +4350,14 @@ impl CpuBus for MachineBus<'_> {
         let result =
             <Self as CpuBus>::read_io(self, port, width, core_clocks_so_far, cpu_is_ring0_pm);
         self.string_port_element_bytes = 0;
+        #[cfg(test)]
+        self.record_string_port_observation(
+            false,
+            port,
+            width,
+            result.as_ref().ok().copied(),
+            core_clocks_so_far,
+        );
         result
     }
 
@@ -4339,6 +4379,14 @@ impl CpuBus for MachineBus<'_> {
             cpu_is_ring0_pm,
         );
         self.string_port_element_bytes = 0;
+        #[cfg(test)]
+        self.record_string_port_observation(
+            true,
+            port,
+            width,
+            result.as_ref().ok().map(|()| value),
+            core_clocks_so_far,
+        );
         result
     }
 

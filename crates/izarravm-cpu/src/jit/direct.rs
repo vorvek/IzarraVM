@@ -24,6 +24,7 @@ use std::{
 
 use izarravm_core::{CpuPersona, GswMode};
 
+use crate::InstructionExecution;
 #[cfg(feature = "timing-class-histogram")]
 use crate::timing_class::NativeClassMetadata;
 use crate::timing_class::{ClassTable, TimingClass};
@@ -31929,59 +31930,87 @@ fn interpret_one_step<B: CpuBus>(
     let end_eip = start_eip.wrapping_add(u32::from(view.insn.len));
     cpu.registers.eip = end_eip;
     cpu.deferred_code_writes.open();
-    let result = cpu.execute_hot_cached_or_decoded(&view.insn, bus);
+    let execution = cpu.execute_hot_cached_or_decoded(&view.insn, bus);
 
-    let Ok(outcome) = result else {
-        // STEP 7. The fault arm. `finish_instruction` is the run loop's own tail: it rewinds EIP
-        // and CS onto the faulting instruction, delivers the exception, charges the architectural
-        // 59 clocks into `elapsed_clocks` and counts the instruction in `perf.instructions`. All
-        // of that is DONE by the time it returns, which is why this arm reports "not retired" and
-        // returns zero clocks: the block must count neither again.
-        //
-        // THE WINDOW IS STILL OPEN ACROSS THE DELIVERY, and that is the whole of this arm's
-        // hazard. `deliver_exception` pushes three to five words onto the guest stack and, under
-        // paging, can write accessed bits during the walks that reach them. A tiny-model guest --
-        // which is exactly what the loader is -- puts SS on the same page as CS, so those pushes
-        // can land on the running block's own bytes. Closing the window before this call let them
-        // reach `invalidate_physical_range` with the block's native frame still on the host stack,
-        // which retires the block the helper has to RETURN THROUGH. Closing it after is the fix
-        // and there is nothing else to it; the drain then replays them.
-        //
-        // A `CpuError` is a machine stop rather than a guest fault, and the helper cannot return
-        // one through an `i64`. It is parked and `run_direct_block` propagates it after the native
-        // return, which is the same boundary the run loop would have propagated it from. The close
-        // below is AFTER the `if let`, so it covers that branch too.
-        if let Err(error) = cpu.finish_instruction(bus, result, start_eip, start_cs, 0, None, None)
-        {
-            cpu.direct_runtime.callout_error = Some(error);
+    let (outcome, committed) = match execution {
+        InstructionExecution {
+            result: Ok(outcome),
+            committed,
+        } => (outcome, committed),
+        execution => {
+            // STEP 7. The fault arm. `finish_instruction` is the run loop's own tail: it rewinds EIP
+            // and CS onto the faulting instruction, delivers the exception, charges the architectural
+            // 59 clocks into `elapsed_clocks` and counts the instruction in `perf.instructions`. All
+            // of that is DONE by the time it returns, which is why this arm reports "not retired" and
+            // returns zero clocks: the block must count neither again.
+            //
+            // THE WINDOW IS STILL OPEN ACROSS THE DELIVERY, and that is the whole of this arm's
+            // hazard. `deliver_exception` pushes three to five words onto the guest stack and, under
+            // paging, can write accessed bits during the walks that reach them. A tiny-model guest --
+            // which is exactly what the loader is -- puts SS on the same page as CS, so those pushes
+            // can land on the running block's own bytes. Closing the window before this call let them
+            // reach `invalidate_physical_range` with the block's native frame still on the host stack,
+            // which retires the block the helper has to RETURN THROUGH. Closing it after is the fix
+            // and there is nothing else to it; the drain then replays them.
+            //
+            // A `CpuError` is a machine stop rather than a guest fault, and the helper cannot return
+            // one through an `i64`. It is parked and `run_direct_block` propagates it after the native
+            // return, which is the same boundary the run loop would have propagated it from. The close
+            // below is AFTER the `if let`, so it covers that branch too.
+            match cpu.finish_instruction(bus, execution, start_eip, start_cs, 0, None, None) {
+                Ok(outcome) => {
+                    cpu.jit_direct.native_successful_helper_core = cpu
+                        .jit_direct
+                        .native_successful_helper_core
+                        .checked_add(outcome.core_clocks)
+                        .expect("native helper core exceeded u64");
+                }
+                Err(error) => {
+                    cpu.jit_direct.native_fatal_helper_core = cpu
+                        .jit_direct
+                        .native_fatal_helper_core
+                        .checked_add(error.consumed_core_clocks)
+                        .expect("native fatal helper core exceeded u64");
+                    cpu.direct_runtime.callout_error = Some(error.error);
+                }
+            }
+            cpu.deferred_code_writes.close();
+            // The instruction fetch the block will not charge, because this arm reports the prefix
+            // only. It cannot fault: the line is resident, and `DecodeCache::put` refuses any line
+            // that straddles a page, so the crossing arm is unreachable from here.
+            let charged = cpu.charge_cached_fetch_at_without_advance(
+                bus,
+                lin,
+                view.insn.len,
+                view.phys_start,
+            );
+            debug_assert!(
+                charged.is_ok(),
+                "a resident decode line's fetch charge cannot fault"
+            );
+            cpu.settle_write_record();
+            publish_flags(cpu);
+            if cell.note_execution(true) {
+                note_demotion(cpu, cell);
+            }
+            cpu.jit_direct.note_interpret_one_resync_fault(cell.row());
+            // RESYNC-FAULT is `Continued` on the attribution axis, and the axis is the reason: these
+            // three outcomes name WHICH SIDE-EXIT STUB the emitted slot left through, because that is
+            // the only thing the two runtime counters the snapshot closes against can see. This arm
+            // leaves through the `resync_fault` stub, which is neither `CallOutAbnormal` nor
+            // `CallOutStepBreak`, so it belongs in the residual bucket with every other continuation.
+            // The resync split itself is not lost -- `callout_interpret_one_rows` carries `resync`,
+            // `resync_fault`, `demoted` and `resume_refused_prefix_use` per row, ungated.
+            #[cfg(feature = "direct-callout-attribution")]
+            note_interpret_one_attribution(cpu, cell, CallOutOutcome::Continued);
+            return 1i64 << STATUS_RESYNC_FAULT_BIT;
         }
-        cpu.deferred_code_writes.close();
-        // The instruction fetch the block will not charge, because this arm reports the prefix
-        // only. It cannot fault: the line is resident, and `DecodeCache::put` refuses any line
-        // that straddles a page, so the crossing arm is unreachable from here.
-        let charged =
-            cpu.charge_cached_fetch_at_without_advance(bus, lin, view.insn.len, view.phys_start);
-        debug_assert!(
-            charged.is_ok(),
-            "a resident decode line's fetch charge cannot fault"
-        );
-        cpu.settle_write_record();
-        publish_flags(cpu);
-        if cell.note_execution(true) {
-            note_demotion(cpu, cell);
-        }
-        cpu.jit_direct.note_interpret_one_resync_fault(cell.row());
-        // RESYNC-FAULT is `Continued` on the attribution axis, and the axis is the reason: these
-        // three outcomes name WHICH SIDE-EXIT STUB the emitted slot left through, because that is
-        // the only thing the two runtime counters the snapshot closes against can see. This arm
-        // leaves through the `resync_fault` stub, which is neither `CallOutAbnormal` nor
-        // `CallOutStepBreak`, so it belongs in the residual bucket with every other continuation.
-        // The resync split itself is not lost -- `callout_interpret_one_rows` carries `resync`,
-        // `resync_fault`, `demoted` and `resume_refused_prefix_use` per row, ungated.
-        #[cfg(feature = "direct-callout-attribution")]
-        note_interpret_one_attribution(cpu, cell, CallOutOutcome::Continued);
-        return 1i64 << STATUS_RESYNC_FAULT_BIT;
     };
+    cpu.jit_direct.native_successful_helper_core = cpu
+        .jit_direct
+        .native_successful_helper_core
+        .checked_add(committed.into_inner())
+        .expect("native helper core exceeded u64");
     cpu.deferred_code_writes.close();
 
     // The `begin_instruction` half this step owes the slot after it, which is native and will

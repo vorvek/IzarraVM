@@ -1135,12 +1135,16 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
         fixture.native.jit_fast_map.invalidate_page(target);
         let native_decoded = fixture.native.decode_cache.get(ENTRY, true).unwrap();
         let interpreter_decoded = fixture.interpreter.decode_cache.get(ENTRY, true).unwrap();
-        let native_result = fixture
-            .native
-            .execute_decoded(&native_decoded, &mut fixture.native_bus);
-        let interpreter_result = fixture
-            .interpreter
-            .execute_decoded(&interpreter_decoded, &mut fixture.interpreter_bus);
+        let native_result = fixture.native.execute_decoded(
+            &native_decoded,
+            &mut fixture.native_bus,
+            &mut CommittedCore::default(),
+        );
+        let interpreter_result = fixture.interpreter.execute_decoded(
+            &interpreter_decoded,
+            &mut fixture.interpreter_bus,
+            &mut CommittedCore::default(),
+        );
         assert_eq!(
             result_signature(native_result),
             result_signature(interpreter_result),
