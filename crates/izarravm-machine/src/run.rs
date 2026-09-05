@@ -1838,13 +1838,9 @@ impl Machine {
                         // top and see a batch-total that is monotone across run
                         // boundaries. See MachineBus::prior_runs_core_clocks.
                         bus.prior_runs_core_clocks = batch_core;
+                        bus.core_clocks_so_far = 0;
                         #[cfg(feature = "jit")]
                         let align_poll_head = if poll_skip_enabled {
-                            // The CPU resets its run-scoped offset before the first
-                            // real instruction. Poll projection happens before that
-                            // public call, so canonicalize the matching bus scratch
-                            // only inside the poll-skip-enabled path.
-                            bus.core_clocks_so_far = 0;
                             let poll = classify_poll_skip_boundary(cpu, poll_skip_diagnostics);
                             let align = poll.is_some_and(|poll| !poll.at_head());
                             if !align

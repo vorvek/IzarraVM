@@ -1733,10 +1733,8 @@ impl MachineBus<'_> {
     /// STATUS.BUSY clearing a nanosecond early or late against a real
     /// `advance_devices` of the same clocks.
     ///
-    /// `isa_io_clocks` is deliberately NOT folded in: that accrual is charged
-    /// only on OPL polls, so `predicted_opl_status` includes it and the beam and
-    /// PIT peeks exclude it. A Margo MMIO read is a memory access, not a port
-    /// access, and accrues no I/O stall of its own.
+    /// Epoch 2 includes earlier port charges in this batch. The Margo MMIO
+    /// access accrues no port charge of its own.
     ///
     /// Two callers, both in `MachineBus`: the STATUS read (`read_phys`) and the
     /// arm-time drain credit (`write_memory_byte_recorded`). They must agree,

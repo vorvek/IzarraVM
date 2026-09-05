@@ -4154,7 +4154,6 @@ impl CpuBus for MachineBus<'_> {
     /// diagnostic pair, 2026-08-26): C1 conservation held to 1.1 ppb while the frame hash
     /// moved -- the charges were right and a prediction INPUT was wrong, which is exactly
     /// this signature.
-    #[cfg(feature = "jit")]
     fn publish_core_clocks(&mut self, now: u64) {
         self.core_clocks_so_far = now;
     }

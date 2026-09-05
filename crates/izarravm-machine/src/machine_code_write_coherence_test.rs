@@ -17,10 +17,14 @@ const PATCH_PROGRAM: [u8; 23] = [
     0x89, 0xc3, // mov ebx,eax
     0xf4, // hlt
 ];
+#[cfg(feature = "jit")]
 const PATCH_ENTRY: u32 = 0x100;
+#[cfg(feature = "jit")]
 const PATCH_PHYSICAL: u32 = DOS_LOAD_SEGMENT as u32 * 16 + PATCH_ENTRY;
+#[cfg(feature = "jit")]
 const PATCH_IMMEDIATE: u32 = PATCH_PHYSICAL + 6;
 
+#[cfg(feature = "jit")]
 fn patch_machine() -> Machine {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PATCH_PROGRAM)
@@ -46,10 +50,12 @@ fn execute_patch_program_at(machine: &mut Machine, entry: u32) {
     assert!(machine.cpu.halted, "patch program did not halt");
 }
 
+#[cfg(feature = "jit")]
 fn execute_patch_program(machine: &mut Machine) {
     execute_patch_program_at(machine, PATCH_ENTRY);
 }
 
+#[cfg(feature = "jit")]
 fn warm_patch_program_at(machine: &mut Machine, entry: u32) {
     let installed = machine.cpu.perf_counters().jit_direct_blocks_installed;
     for _ in 0..4 {
@@ -66,11 +72,13 @@ fn warm_patch_program_at(machine: &mut Machine, entry: u32) {
     );
 }
 
+#[cfg(feature = "jit")]
 fn warm_patch_program(machine: &mut Machine) {
     warm_patch_program_at(machine, PATCH_ENTRY);
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg(feature = "jit")]
 enum PatchWriter {
     PublicByte,
     PublicWord,
@@ -81,6 +89,7 @@ enum PatchWriter {
     HleBlockSameValue,
 }
 
+#[cfg(feature = "jit")]
 fn apply_patch_writer(machine: &mut Machine, writer: PatchWriter) -> u32 {
     match writer {
         PatchWriter::PublicByte => {
@@ -119,6 +128,7 @@ fn apply_patch_writer(machine: &mut Machine, writer: PatchWriter) -> u32 {
 }
 
 #[test]
+#[cfg(feature = "jit")]
 fn every_machine_ram_writer_retires_native_code_before_reentry() {
     for writer in [
         PatchWriter::PublicByte,
@@ -153,6 +163,7 @@ fn every_machine_ram_writer_retires_native_code_before_reentry() {
 }
 
 #[test]
+#[cfg(feature = "jit")]
 fn precise_host_patch_keeps_an_adjacent_native_block_live() {
     const ADJACENT_ENTRY: u32 = 0x200;
     const ADJACENT_PHYSICAL: usize = (DOS_LOAD_SEGMENT as usize * 16) + ADJACENT_ENTRY as usize;

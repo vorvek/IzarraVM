@@ -665,31 +665,35 @@ fn the_widest_epoch_two_charges_survive_every_stage() {
     // Stage 2: a full block of the widest class the JIT can lower natively.
     // `CompiledBlock::raw_clocks` is still a `u16` and still refuses rather than
     // truncating, so the worst native block has to fit it.
-    let worst_native = EPOCH2_I586.raw(TimingClass::Idiv32);
-    let worst_block = worst_native * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u32;
-    assert!(
-        worst_block <= u32::from(u16::MAX),
-        "a full block of the widest native class ({worst_native} raw x \
+    #[cfg(feature = "jit")]
+    {
+        let worst_native = EPOCH2_I586.raw(TimingClass::Idiv32);
+        let worst_block = worst_native * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u32;
+        assert!(
+            worst_block <= u32::from(u16::MAX),
+            "a full block of the widest native class ({worst_native} raw x \
          {} slots = {worst_block}) no longer fits the block sum's u16; either the sum widens \
          or the install refusal becomes reachable on ordinary code",
-        crate::jit::direct::MAX_BLOCK_INSTRUCTIONS
-    );
+            crate::jit::direct::MAX_BLOCK_INSTRUCTIONS
+        );
 
-    // Stage 3: the static accounting accumulator, now u32. The widest entry in
-    // the table is `WBINVD`'s printed floor, which is not a native slot but is
-    // the number the accumulator has to be safe against if one ever is.
-    let widest = EPOCH2_I586.max_raw();
-    assert_eq!(widest, EPOCH2_I586.raw(TimingClass::Wbinvd));
-    let worst_accumulation = u64::from(widest) * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u64;
-    assert!(
-        worst_accumulation <= u64::from(u32::MAX),
-        "the static accounting accumulator would saturate at {worst_accumulation}"
-    );
-    assert!(
-        worst_accumulation > u64::from(u16::MAX),
-        "the u16 this accumulator used to be would have WRAPPED at {worst_accumulation}, which \
+        // Stage 3: the static accounting accumulator, now u32. The widest entry in
+        // the table is `WBINVD`'s printed floor, which is not a native slot but is
+        // the number the accumulator has to be safe against if one ever is.
+        let widest = EPOCH2_I586.max_raw();
+        assert_eq!(widest, EPOCH2_I586.raw(TimingClass::Wbinvd));
+        let worst_accumulation =
+            u64::from(widest) * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u64;
+        assert!(
+            worst_accumulation <= u64::from(u32::MAX),
+            "the static accounting accumulator would saturate at {worst_accumulation}"
+        );
+        assert!(
+            worst_accumulation > u64::from(u16::MAX),
+            "the u16 this accumulator used to be would have WRAPPED at {worst_accumulation}, which \
          is the defect slice 1d fixed; if this stops being true the test is no longer a proof"
-    );
+        );
+    }
 }
 
 /// Native entries form an exact diagnostic partition without assigning a

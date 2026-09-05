@@ -1593,7 +1593,6 @@ impl CpuGsw {
     /// u64 raw input because a region batch can exceed u32. Equal to summing per-instruction
     /// `scale_clocks` results over the same charges (the remainder-carry identity pinned by
     /// `scale_clocks_batches_exactly`).
-    #[cfg(feature = "jit")]
     pub(super) fn scale_clocks_batch(&mut self, clocks: u64) -> u64 {
         let persona = self.persona();
         let (num, den) = level_timing(persona);
@@ -1620,13 +1619,8 @@ impl CpuGsw {
     /// `scale_clocks_batch` WITHOUT the side effect: the same long division over the same
     /// `timing_rem` carry, but the new remainder is discarded instead of stored.
     ///
-    /// Exists for exactly one caller, the JIT's interpreter call-out slot
-    /// (`jit/direct/callout.rs`), which needs the scaled value of a block prefix that the block
-    /// has NOT retired yet. The prefix is charged once, later, by `run_direct_block`'s single
-    /// batch call; consuming the carry here would move that charge and make the batch inexact.
-    /// Reading it without consuming it is what lets a mid-block port read hand the device the
-    /// same guest-time offset an interpreted continuation would.
-    #[cfg(feature = "jit")]
+    /// Native call-outs and REP memory accesses publish pending work before its
+    /// owner settles it. Previewing must not consume that owner's fractional carry.
     pub(super) fn preview_scale_clocks(&self, clocks: u64) -> u64 {
         let persona = self.persona();
         let scaled = clocks.saturating_mul(u64::from(level_timing(persona).0)) + self.timing_rem;

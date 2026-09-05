@@ -409,7 +409,13 @@ impl CpuGsw {
         };
         if self.rep_execution.yielded {
             let insn = decoded.expect("only a decoded REP instruction can yield");
-            return Ok(self.pause_rep_instruction(insn, start_eip, start_cs_register, execution));
+            return Ok(self.pause_rep_instruction(
+                bus,
+                insn,
+                start_eip,
+                start_cs_register,
+                execution,
+            ));
         }
         // Observe the retired instruction (this is the FIRST-instruction / standalone retire path;
         // continuations retire through the run_one_cached fast tails). `finish_instruction`
@@ -438,14 +444,17 @@ impl CpuGsw {
         )
     }
 
-    fn pause_rep_instruction(
+    fn pause_rep_instruction<B: CpuBus>(
         &mut self,
+        bus: &mut B,
         insn: DecodedInsn,
         start_eip: u32,
         cs: SegmentRegister,
         mut execution: InstructionExecution,
     ) -> CpuCycleOutcome {
-        let price_history = Self::prepare_rep_settlement(&mut execution);
+        let sourced = execution.work.sourced_rep();
+        let settlement = self.prepare_rep_settlement(bus, &mut execution);
+        let price_history = settlement.map(|paid| paid.history);
         let outcome = execution
             .result
             .expect("a faulting REP chunk cannot also yield");
@@ -471,11 +480,19 @@ impl CpuGsw {
             start_eip,
             post_eip,
             cs,
-            precharged_core: charged,
+            precharged_core: checked_run_core_total(
+                charged,
+                settlement.map_or(0, |paid| paid.paid_core),
+            ),
             price_history,
         });
         self.rep_resume_active = true;
         self.rep_execution.yielded = false;
+        self.publish_rep_handoff(
+            bus,
+            sourced,
+            checked_run_core_total(charged, committed_total),
+        );
         CpuCycleOutcome {
             core_clocks: checked_run_core_total(charged, committed_total),
             halted: false,
@@ -511,8 +528,10 @@ impl CpuGsw {
             rep_budget,
             resume.price_history,
         );
-        let price_history = Self::prepare_rep_settlement(&mut execution);
         if self.rep_execution.yielded {
+            let sourced = execution.work.sourced_rep();
+            let settlement = self.prepare_rep_settlement(bus, &mut execution);
+            let price_history = settlement.map(|paid| paid.history);
             let outcome = execution
                 .result
                 .expect("a faulting REP chunk cannot also yield");
@@ -528,9 +547,13 @@ impl CpuGsw {
                 start_eip: resume.start_eip,
                 post_eip: resume.post_eip,
                 cs: resume.cs,
-                precharged_core: resume.precharged_core,
+                precharged_core: checked_run_core_total(
+                    resume.precharged_core,
+                    settlement.map_or(0, |paid| paid.paid_core),
+                ),
                 price_history,
             });
+            self.publish_rep_handoff(bus, sourced, committed_total);
             return Ok(CpuCycleOutcome {
                 core_clocks: committed_total,
                 halted: false,
@@ -538,7 +561,7 @@ impl CpuGsw {
         }
 
         self.rep_resume_active = false;
-        if price_history.is_none() {
+        if execution.work.rep.is_none() {
             execution.result = execution.result.map(|outcome| CycleOutcome {
                 core_clocks: 0,
                 halted: outcome.halted,
@@ -576,11 +599,7 @@ impl CpuGsw {
     ) -> InstructionExecution {
         let mut work = InstructionWork {
             committed: CommittedCore::default(),
-            rep: history.map(|history| RepInvocation {
-                history,
-                completed: 0,
-                raw_due: 0,
-            }),
+            rep: history.map(RepInvocation::new),
         };
         let result = self.execute_decoded_budgeted_inner(insn, bus, rep_budget, &mut work);
         InstructionExecution { result, work }
@@ -601,8 +620,32 @@ impl CpuGsw {
         result
     }
 
-    fn prepare_rep_settlement(execution: &mut InstructionExecution) -> Option<RepPriceHistory> {
+    fn prepare_rep_settlement<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        execution: &mut InstructionExecution,
+    ) -> Option<RepSettlement> {
         let mut invoice = execution.work.rep.take()?;
+        if invoice.plan.is_some() {
+            let paid_core = self.scale_clocks_batch(invoice.raw_due);
+            self.elapsed_clocks = self
+                .elapsed_clocks
+                .checked_add(paid_core)
+                .expect("REP elapsed exceeded u64");
+            execution.work.committed.add(paid_core);
+            if self.is_ring0_protected() {
+                self.perf.monitor_resident_core_clocks += paid_core;
+            }
+            if let Ok(outcome) = execution.result.as_ref() {
+                assert_eq!(outcome.core_clocks, 0, "REP charge has two owners");
+            }
+            invoice.history.startup_paid = true;
+            self.publish_rep_handoff(bus, true, execution.work.committed.total());
+            return Some(RepSettlement {
+                history: invoice.history,
+                paid_core,
+            });
+        }
         match execution.result.as_mut() {
             Ok(outcome) => {
                 assert_eq!(outcome.core_clocks, 0, "REP charge has two owners");
@@ -611,7 +654,16 @@ impl CpuGsw {
             }
             Err(_) => assert_eq!(invoice.raw_due, 0, "legacy fault earned REP work"),
         }
-        Some(invoice.history)
+        Some(RepSettlement {
+            history: invoice.history,
+            paid_core: 0,
+        })
+    }
+
+    fn publish_rep_handoff<B: CpuBus>(&self, bus: &mut B, sourced: bool, core: u64) {
+        if sourced {
+            bus.publish_core_clocks(checked_run_core_total(self.core_clocks_so_far, core));
+        }
     }
 
     /// Emit one differential-oracle trace line for the instruction that just retired at
@@ -705,7 +757,10 @@ impl CpuGsw {
         profile_key: Option<(DecodeGroup, u16, CpuProfileOperandForm)>,
         profile_start: Option<std::time::Instant>,
     ) -> CpuExecutionResult<CpuCycleOutcome> {
-        Self::prepare_rep_settlement(&mut execution);
+        let sourced = execution.work.sourced_rep();
+        let paid_core = self
+            .prepare_rep_settlement(bus, &mut execution)
+            .map_or(0, |paid| paid.paid_core);
         let mut committed = execution.work.committed;
         let outcome = match execution.result {
             Ok(outcome) => outcome,
@@ -750,6 +805,7 @@ impl CpuGsw {
                     &mut committed,
                 ) {
                     self.record_fault_site(start_eip, cs_was_moved);
+                    self.publish_rep_handoff(bus, sourced, committed.total());
                     return Err(CpuRunError {
                         error,
                         consumed_core_clocks: committed.into_inner(),
@@ -797,6 +853,7 @@ impl CpuGsw {
                 // past it.
                 let cs_moved = self.registers.cs().selector != start_cs;
                 self.record_fault_site(start_eip, cs_moved);
+                self.publish_rep_handoff(bus, sourced, committed.total());
                 return Err(CpuRunError {
                     error,
                     consumed_core_clocks: committed.into_inner(),
@@ -831,7 +888,9 @@ impl CpuGsw {
                 group,
                 opcode,
                 form,
-                precharged_core.saturating_add(charged),
+                precharged_core
+                    .saturating_add(paid_core)
+                    .saturating_add(charged),
                 profile_start,
                 lin,
             );
@@ -839,6 +898,11 @@ impl CpuGsw {
         if self.retire_gates.diff_trace {
             self.emit_diff_trace_line(start_cs, start_eip);
         }
+        self.publish_rep_handoff(
+            bus,
+            sourced,
+            checked_run_core_total(charged, committed.total()),
+        );
         Ok(CpuCycleOutcome {
             core_clocks: checked_run_core_total(charged, committed.into_inner()),
             halted: outcome.halted,
@@ -4365,7 +4429,10 @@ impl CpuGsw {
                     Ok(()) => self.execute_hot_cached_or_decoded(insn, bus),
                     Err(fault) => InstructionExecution::new(Err(fault)),
                 };
-            Self::prepare_rep_settlement(&mut execution);
+            let sourced = execution.work.sourced_rep();
+            if execution.result.is_ok() {
+                self.prepare_rep_settlement(bus, &mut execution);
+            }
             return match execution {
                 InstructionExecution {
                     result: Ok(outcome),
@@ -4400,6 +4467,11 @@ impl CpuGsw {
                     if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
+                    self.publish_rep_handoff(
+                        bus,
+                        sourced,
+                        checked_run_core_total(charged, work.committed.total()),
+                    );
                     Ok(CpuCycleOutcome {
                         core_clocks: checked_run_core_total(charged, work.committed.into_inner()),
                         halted: outcome.halted,
@@ -4469,13 +4541,17 @@ impl CpuGsw {
                 };
             if self.rep_execution.yielded {
                 return Ok(self.pause_rep_instruction(
+                    bus,
                     *insn,
                     start_eip,
                     start_cs_register,
                     execution,
                 ));
             }
-            Self::prepare_rep_settlement(&mut execution);
+            let sourced = execution.work.sourced_rep();
+            if execution.result.is_ok() {
+                self.prepare_rep_settlement(bus, &mut execution);
+            }
             return match execution {
                 InstructionExecution {
                     result: Ok(outcome),
@@ -4511,6 +4587,11 @@ impl CpuGsw {
                     if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
+                    self.publish_rep_handoff(
+                        bus,
+                        sourced,
+                        checked_run_core_total(charged, work.committed.total()),
+                    );
                     Ok(CpuCycleOutcome {
                         core_clocks: checked_run_core_total(charged, work.committed.into_inner()),
                         halted: outcome.halted,
@@ -4527,7 +4608,13 @@ impl CpuGsw {
             Err(fault) => InstructionExecution::new(Err(fault)),
         };
         if self.rep_execution.yielded {
-            return Ok(self.pause_rep_instruction(*insn, start_eip, start_cs_register, execution));
+            return Ok(self.pause_rep_instruction(
+                bus,
+                *insn,
+                start_eip,
+                start_cs_register,
+                execution,
+            ));
         }
         // Profiling path: past the yield check, an Ok result retires through finish_instruction;
         // observe the same Ok retirements so the count stays exact when profiling is enabled.

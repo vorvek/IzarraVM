@@ -3759,6 +3759,259 @@ fn program_large_margo_fill(machine: &mut Machine) {
     write_mmio_reg(machine, 0x130, 0); // FLAGS: none
 }
 
+fn rep_margo_machine(mode: GswMode, program: &[u8]) -> Machine {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(2, VideoCard::Vega), program).unwrap();
+    machine.set_mode(mode);
+    machine.set_timing_epoch_for_test(2);
+    machine.cpu.registers.eflags &= !0x600;
+    let mut cs = machine.cpu.registers.cs();
+    cs.default_size_32 = true;
+    cs.limit = u32::MAX;
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    for segment in [SegmentIndex::Ds, SegmentIndex::Es] {
+        machine
+            .cpu
+            .registers
+            .set_segment(segment, SegmentRegister::flat(0, 0x93));
+    }
+    machine.set_jit_auto_admit(true);
+    #[cfg(feature = "jit")]
+    {
+        machine.cpu.set_native_backend_enabled(true);
+        machine.poll_skip_enabled = false;
+    }
+    machine.cpu.registers.set_esi(0x7000);
+    machine.cpu.registers.set_edi(0x8000);
+    machine.memory.as_mut_slice()[0x7000..0x7020].fill(0x5a);
+    machine
+}
+
+fn warm_margo_instruction_decode(machine: &mut Machine, eip: u32) {
+    let mut cpu = machine.cpu.clone();
+    let registers = cpu.registers.clone();
+    let elapsed = cpu.elapsed_clocks;
+    cpu.registers.eip = eip;
+    cpu.registers.set_ecx(0);
+    with_bus(machine, |bus| cpu.cycle(bus).unwrap());
+    cpu.registers = registers;
+    cpu.elapsed_clocks = elapsed;
+    cpu.reset_perf_counters();
+    machine.cpu = cpu;
+}
+
+#[test]
+fn rep_price_margo_second_status_read_sees_the_completed_element() {
+    for (mode, arm_prior, raw_mmio, published, returned, element) in [
+        (GswMode::Gsw486, 52, 7, 15, 19, 3),
+        (GswMode::Gsw586, 25, 10, 14, 16, 1),
+    ] {
+        // Carry 5 is an injected additive stress. Epoch 2's 1:1 bus ratio
+        // normally leaves carry 0, which is tested separately.
+        for carry in [0, 5] {
+            let mut machine = rep_margo_machine(mode, &[0x90, 0xf3, 0xa4, 0xf4]);
+            warm_margo_instruction_decode(&mut machine, 0x101);
+            machine.cpu.registers.set_ecx(2);
+            machine.cpu.registers.set_esi(MARGO_MMIO_BASE + 7);
+            program_small_margo_fill(&mut machine);
+            machine.io_touched = false;
+            machine.bus_rem = carry;
+            machine.port_bus_batch_clocks = 11;
+            let timeline = machine.timeline;
+            let arm = arm_prior + 4 * raw_mmio + carry + 11;
+            let good = 64 + 1 + published + 2 * raw_mmio + carry + 11;
+            let stale = good - element;
+            let arm_ns = timeline.preview_margo_nanoseconds(arm);
+            assert!(timeline.preview_margo_nanoseconds(stale) < arm_ns + 200);
+            assert!(timeline.preview_margo_nanoseconds(good) >= arm_ns + 200);
+            assert_eq!(arm_margo_fill_at(&mut machine, arm_prior, 1), arm_ns);
+            let mut cpu = std::mem::take(&mut machine.cpu);
+            let start = cpu.elapsed_clocks;
+            let ticks = machine.master_ticks();
+            let (outcome, raw, published_at_exit) = with_bus(&mut machine, |bus| {
+                bus.prior_runs_core_clocks = 64;
+                let before = bus.trace.elapsed_clocks();
+                let outcome = cpu.run_budgeted(bus, 1000).unwrap();
+                assert!(!*bus.io_touched);
+                (
+                    outcome,
+                    bus.trace.elapsed_clocks() - before,
+                    bus.core_clocks_so_far,
+                )
+            });
+            assert_eq!(outcome.consumed_core_clocks, returned);
+            assert_eq!(published_at_exit, returned);
+            assert_eq!(cpu.elapsed_clocks - start, returned);
+            assert_eq!(raw, 2 * raw_mmio);
+            assert_eq!(cpu.registers.ecx(), 0);
+            assert_eq!(cpu.registers.edi(), 0x8002);
+            assert_eq!(machine.memory.read_u8(0x8001).unwrap() & 1, 0);
+            assert_eq!(machine.master_ticks(), ticks);
+            assert_eq!(cpu.perf_counters().jit_direct_insns, 0);
+        }
+    }
+}
+
+#[test]
+fn rep_price_margo_command_arms_after_startup_before_the_element_charge() {
+    for (mode, raw_mmio, startup, returned, before_edge, after_edge) in [
+        (GswMode::Gsw486, 7, 7, 12, 12, 14),
+        (GswMode::Gsw586, 10, 9, 11, 33, 34),
+    ] {
+        for carry in [0, 5] {
+            let mut machine = rep_margo_machine(mode, &[0x90, 0xf3, 0xab, 0xf4]);
+            warm_margo_instruction_decode(&mut machine, 0x101);
+            machine.cpu.registers.set_ecx(1);
+            machine.cpu.registers.set_eax(1);
+            machine.cpu.registers.set_edi(MARGO_MMIO_BASE + 0x150);
+            program_small_margo_fill(&mut machine);
+            machine.io_touched = false;
+            machine.bus_rem = carry;
+            machine.port_bus_batch_clocks = 11;
+            let timeline = machine.timeline;
+            let arm = 64 + 1 + startup + raw_mmio + carry + 11;
+            let arm_ns = timeline.preview_margo_nanoseconds(arm);
+            let mut cpu = std::mem::take(&mut machine.cpu);
+            let (outcome, raw) = with_bus(&mut machine, |bus| {
+                bus.prior_runs_core_clocks = 64;
+                let before = bus.trace.elapsed_clocks();
+                let outcome = cpu.run_budgeted(bus, 1000).unwrap();
+                assert!(!*bus.io_touched);
+                (outcome, bus.trace.elapsed_clocks() - before)
+            });
+            assert_eq!(outcome.consumed_core_clocks, returned);
+            assert_eq!(raw, raw_mmio);
+            assert_eq!(cpu.registers.ecx(), 0);
+            assert_eq!(machine.vega.blitter_busy_ns(), 200);
+            assert_eq!(
+                machine
+                    .vega
+                    .margo()
+                    .busy_ns_after(timeline.preview_margo_nanoseconds(arm + 1)),
+                200 - (timeline.preview_margo_nanoseconds(arm + 1) - arm_ns)
+            );
+            assert!(
+                machine
+                    .vega
+                    .margo()
+                    .status_busy_after(timeline.preview_margo_nanoseconds(arm + before_edge))
+            );
+            assert!(
+                !machine
+                    .vega
+                    .margo()
+                    .status_busy_after(timeline.preview_margo_nanoseconds(arm + after_edge))
+            );
+            assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 3), 0xab);
+        }
+    }
+}
+
+#[test]
+fn rep_price_machine_resets_the_origin_before_a_cold_mmio_instruction() {
+    for (mode, rep_core, raw_mmio, arm_prior) in
+        [(GswMode::Gsw486, 108, 7, 82), (GswMode::Gsw586, 45, 10, 0)]
+    {
+        for warm_tail in [false, true] {
+            for command in [false, true] {
+                let mut program = vec![0x90, 0xf3, 0xa4];
+                if warm_tail {
+                    program.push(0x90);
+                }
+                program.push(if command { 0xa3 } else { 0xa0 });
+                program.extend_from_slice(
+                    &(MARGO_MMIO_BASE + if command { 0x150 } else { 8 }).to_le_bytes(),
+                );
+                program.push(0xf4);
+                let mut machine = rep_margo_machine(mode, &program);
+                if warm_tail {
+                    warm_margo_instruction_decode(&mut machine, 0x103);
+                }
+                machine.cpu.registers.set_ecx(32);
+                machine
+                    .cpu
+                    .registers
+                    .set_eax(if command { 1 } else { 0xa5 });
+                program_small_margo_fill(&mut machine);
+                machine.io_touched = false;
+                machine.port_bus_batch_clocks = 0;
+                let timeline = machine.timeline;
+                let prior = 1 + rep_core + u64::from(warm_tail);
+                let access = prior + raw_mmio;
+                let access_ns = timeline.preview_margo_nanoseconds(access);
+                if !command {
+                    let arm = arm_prior + 4 * raw_mmio;
+                    let arm_ns = timeline.preview_margo_nanoseconds(arm);
+                    assert!(access_ns < arm_ns + 200);
+                    assert!(timeline.preview_margo_nanoseconds(access + rep_core) >= arm_ns + 200);
+                    assert_eq!(arm_margo_fill_at(&mut machine, arm_prior, 1), arm_ns);
+                }
+                let start = machine.cpu.elapsed_clocks;
+                let stop = machine.run_until_halt_or_cycles(1000).unwrap();
+                assert!(
+                    machine.cpu.halted,
+                    "{mode:?} {warm_tail} {command}: {stop:?}"
+                );
+                assert_eq!(machine.test_batch_observations.len(), 1);
+                assert_eq!(&machine.test_prior_core_pushes[0][..3], &[0, 1, prior]);
+                let observation = &machine.test_batch_observations[0];
+                assert_eq!(observation.core_clocks, prior + 1);
+                assert_eq!(observation.raw_bus_clocks, raw_mmio);
+                assert_eq!(observation.scaled_bus_clocks, raw_mmio);
+                assert_eq!(observation.isa_clocks, 0);
+                assert_eq!(observation.step, access + 1);
+                assert_eq!(machine.cpu.elapsed_clocks - start, prior + 1);
+                #[cfg(feature = "jit")]
+                assert_eq!(machine.cpu.poll_skip_timing_remainder(), 5);
+                assert_eq!(&machine.memory.as_slice()[0x8000..0x8020], &[0x5a; 32]);
+                assert_eq!(machine.cpu.perf_counters().jit_direct_insns, 0);
+                if command {
+                    let remaining =
+                        200 - (timeline.preview_margo_nanoseconds(access + 1) - access_ns);
+                    assert!(remaining > 0 && remaining < 200);
+                    assert_eq!(machine.vega.blitter_busy_ns(), remaining);
+                    assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 3), 0xab);
+                } else {
+                    assert_eq!(machine.cpu.registers.eax() & 1, 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn non_rep_port_publication_does_not_shift_a_later_margo_command() {
+    for (mode, raw_mmio) in [(GswMode::Gsw486, 7), (GswMode::Gsw586, 10)] {
+        let mut program = vec![0x90, 0x90, 0xec, 0xb0, 1, 0xa3];
+        program.extend_from_slice(&(MARGO_MMIO_BASE + 0x150).to_le_bytes());
+        program.push(0xf4);
+        let mut machine = rep_margo_machine(mode, &program);
+        machine.cpu.registers.set_edx(0x3da);
+        machine.cpu.registers.set_eax(0);
+        warm_margo_instruction_decode(&mut machine, 0x102);
+        program_small_margo_fill(&mut machine);
+        machine.port_bus_batch_clocks = 0;
+        machine.io_touched = false;
+        let timeline = machine.timeline;
+        let arm = 66 + raw_mmio;
+        let remaining = 200
+            - (timeline.preview_margo_nanoseconds(arm + 1)
+                - timeline.preview_margo_nanoseconds(arm));
+        assert!(remaining > 0 && remaining < 200);
+        machine.run_until_halt_or_cycles(1000).unwrap();
+        assert!(machine.cpu.halted);
+        assert_eq!(machine.test_batch_observations.len(), 1);
+        assert_eq!(machine.test_prior_core_pushes[0], [0, 1, 9, 10, 11]);
+        let observation = &machine.test_batch_observations[0];
+        assert_eq!(observation.core_clocks, 11);
+        assert_eq!(observation.raw_bus_clocks, 4 + raw_mmio);
+        assert_eq!(observation.isa_clocks, 52);
+        assert_eq!(observation.step, arm + 1);
+        assert_eq!(machine.vega.blitter_busy_ns(), remaining);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 3), 0xab);
+    }
+}
+
 /// The same, sized like a glyph blit: 20 pixels is 100 + 20*5 = 200 ns, about
 /// 4.4 clocks at the 386 tier.
 fn program_small_margo_fill(machine: &mut Machine) {

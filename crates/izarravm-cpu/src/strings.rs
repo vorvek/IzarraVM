@@ -44,7 +44,13 @@ enum RepLimitPlan {
 }
 
 impl RepLimitPlan {
-    fn compute<B: CpuBus>(cpu: &CpuGsw, bus: &B, op: StringOp, width: BusWidth) -> Self {
+    fn compute<B: CpuBus>(
+        cpu: &CpuGsw,
+        bus: &B,
+        op: StringOp,
+        width: BusWidth,
+        work: &InstructionWork,
+    ) -> Self {
         if cpu.rep_execution.budget.is_none() {
             return Self::Unbounded;
         }
@@ -53,19 +59,17 @@ impl RepLimitPlan {
         // admission bound even though the aligned bulk path normally charges one wide cycle.
         let access_upper = byte_cost.saturating_mul(u64::from(width.bytes()));
         let bus_per_iteration = access_upper.saturating_mul(CpuGsw::rep_memory_accesses(op));
-        // THE PER-ELEMENT CORE TERM (review B4.3). `per_iteration` excluded core work.
-        // so a chunk could over-admit by `MAX_BUDGETED_REP_ITERATIONS` times the
-        // whole core cost of an element. At epoch 1 that cost is
-        // `StringElem`'s 4 raw -- a third of a guest clock at the 1/12 personas,
-        // swamped by the bus terms -- and adding it would move `rep_chunk_limit`
-        // on every fixture, which the knob-unset byte-identity merge bar forbids.
-        // At epoch 2 it is 48 raw, four whole clocks per element, and the
-        // omission is material. So the term is charged UNDER EPOCH 2 ONLY, and
-        // the epoch-1 over-admission is recorded here as a pre-existing defect
-        // that slice 7's default flip resolves rather than one this slice
-        // introduces.
+        // Preserve epoch 1 admission. Selected epoch 2 startup is already pending;
+        // only its element term belongs in this next-element bound.
         let per_iteration = if cpu.timing_epoch() >= 2 {
-            let raw = u64::from(cpu.class_table().raw(TimingClass::StringElem));
+            let raw = work
+                .rep
+                .as_ref()
+                .and_then(|invoice| invoice.plan)
+                .map_or_else(
+                    || u64::from(cpu.class_table().raw(TimingClass::StringElem)),
+                    |plan| plan.element_raw,
+                );
             let (num, den) = crate::level_timing(cpu.persona());
             let core = raw
                 .saturating_mul(u64::from(num))
@@ -95,6 +99,90 @@ impl RepLimitPlan {
 
 impl CpuGsw {
     const MAX_BUDGETED_REP_ITERATIONS: u32 = 4_096;
+
+    pub(super) fn price_rep_invocation(
+        &self,
+        work: &mut InstructionWork,
+        op: StringOp,
+        address_size: AddressSize,
+    ) {
+        if self.timing_epoch() < 2 {
+            return;
+        }
+        let Some(invoice) = work.rep.as_mut() else {
+            return;
+        };
+        let (plan, startup) = RepChargePlan::new(
+            self.persona(),
+            op,
+            invoice.history,
+            self.string_count(address_size),
+        );
+        assert!(self.timing_rem < 12, "invalid REP timing carry");
+        plan.max_raw
+            .checked_add(self.timing_rem)
+            .expect("REP numerator exceeded u64");
+        let new_core = self.preview_scale_clocks(plan.max_raw);
+        // A memory fault can earn one task switch before its error-code push fails.
+        let table = self.class_table();
+        let delivery = u64::from(table.raw(TimingClass::TaskSwitch))
+            + u64::from(
+                table
+                    .raw(TimingClass::ExceptionDelivery)
+                    .max(table.raw(TimingClass::ExceptionDeliveryV86)),
+            );
+        let reserve = delivery.div_ceil(12);
+        // Fetch may precede this assertion. This bounds the selected memory work,
+        // not arbitrary CPU or Machine lifetime exhaustion.
+        Self::check_rep_headroom(
+            self.elapsed_clocks,
+            self.core_clocks_so_far,
+            work.committed.total(),
+            new_core,
+            reserve,
+        );
+        invoice.raw_due = startup;
+        invoice.plan = Some(plan);
+    }
+
+    pub(super) fn check_rep_headroom(
+        elapsed: u64,
+        prefix: u64,
+        owner: u64,
+        new_core: u64,
+        delivery: u64,
+    ) {
+        let maximum = new_core
+            .checked_add(delivery)
+            .expect("REP reserve exceeded u64");
+        elapsed
+            .checked_add(maximum)
+            .expect("REP elapsed headroom exhausted");
+        let owned = owner
+            .checked_add(maximum)
+            .expect("REP owner headroom exhausted");
+        prefix
+            .checked_add(owned)
+            .expect("REP run headroom exhausted");
+    }
+
+    fn rep_projected_core(&self, work: &InstructionWork) -> u64 {
+        let owned = work.committed.projected_after(self.core_clocks_so_far);
+        let pending = work
+            .rep
+            .as_ref()
+            .filter(|invoice| invoice.plan.is_some())
+            .map_or(0, |invoice| self.preview_scale_clocks(invoice.raw_due));
+        owned
+            .checked_add(pending)
+            .expect("REP projected core exceeded u64")
+    }
+
+    pub(super) fn publish_rep_core<B: CpuBus>(&self, bus: &mut B, work: &InstructionWork) {
+        if work.sourced_rep() {
+            bus.publish_core_clocks(self.rep_projected_core(work));
+        }
+    }
 
     fn index_offset(&self, index: u8, address_size: AddressSize) -> u32 {
         match address_size {
@@ -188,7 +276,7 @@ impl CpuGsw {
         bus: &B,
         op: StringOp,
         width: BusWidth,
-        committed: &CommittedCore,
+        work: &InstructionWork,
     ) -> Option<u32> {
         let budget = self.rep_execution.budget?;
         // Recomputes the whole plan from scratch on every call (once per fast chunk, once
@@ -201,7 +289,7 @@ impl CpuGsw {
         // expected, not a regression to bisect.
         debug_assert_eq!(
             plan,
-            RepLimitPlan::compute(self, bus, op, width),
+            RepLimitPlan::compute(self, bus, op, width, work),
             "REP limit plan went stale mid-loop: a bus cost dial or the paging mode moved \
              inside one REP, which rep_data_byte_cost_upper's and rep_page_walk_cost_upper's \
              doc comments both say must not happen"
@@ -225,10 +313,12 @@ impl CpuGsw {
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
-        let used = committed
-            .projected_after(self.core_clocks_so_far)
-            .saturating_add(bus_growth);
-        let core_upper = self.rep_core_upper(bus, op);
+        let used = self.rep_projected_core(work).saturating_add(bus_growth);
+        let core_upper = if work.sourced_rep() {
+            0
+        } else {
+            self.rep_core_upper(bus, op)
+        };
         let available = budget
             .cap
             .saturating_sub(used)
@@ -245,7 +335,7 @@ impl CpuGsw {
         &self,
         bus: &B,
         op: StringOp,
-        committed: &CommittedCore,
+        work: &InstructionWork,
     ) -> bool {
         let Some(budget) = self.rep_execution.budget else {
             return false;
@@ -253,9 +343,12 @@ impl CpuGsw {
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
-        let core_upper = self.rep_core_upper(bus, op);
-        committed
-            .projected_after(self.core_clocks_so_far)
+        let core_upper = if work.sourced_rep() {
+            0
+        } else {
+            self.rep_core_upper(bus, op)
+        };
+        self.rep_projected_core(work)
             .saturating_add(bus_growth)
             .saturating_add(core_upper)
             >= budget.cap
@@ -838,8 +931,8 @@ impl CpuGsw {
                 let mut chunk_iterations = 0u32;
                 // Priced once for the whole REP: see RepLimitPlan's doc for why per_iteration
                 // and the paging setup cost cannot change across this loop's iterations.
-                let plan = RepLimitPlan::compute(self, bus, op, width);
-                let mut allowance = self.rep_chunk_limit(plan, bus, op, width, &work.committed);
+                let plan = RepLimitPlan::compute(self, bus, op, width, work);
+                let mut allowance = self.rep_chunk_limit(plan, bus, op, width, work);
                 loop {
                     if self.string_count(address_size) == 0 {
                         break;
@@ -861,6 +954,7 @@ impl CpuGsw {
                         self.rep_execution.yielded = true;
                         break;
                     }
+                    self.publish_rep_core(bus, work);
                     if let Some(fast) = self.try_run_string_fast(
                         bus,
                         op,
@@ -882,9 +976,7 @@ impl CpuGsw {
                         if fast.stop {
                             break;
                         }
-                        if let Some(refreshed) =
-                            self.rep_chunk_limit(plan, bus, op, width, &work.committed)
-                        {
+                        if let Some(refreshed) = self.rep_chunk_limit(plan, bus, op, width, work) {
                             allowance = Some(
                                 allowance.map_or(refreshed, |available| available.min(refreshed)),
                             );
@@ -894,13 +986,14 @@ impl CpuGsw {
                             && (allowance == Some(0)
                                 || chunk_iterations >= Self::MAX_BUDGETED_REP_ITERATIONS
                                 || bus.requires_step_break()
-                                || self.rep_budget_exhausted(bus, op, &work.committed))
+                                || self.rep_budget_exhausted(bus, op, work))
                         {
                             self.rep_execution.yielded = true;
                             break;
                         }
                         continue;
                     }
+                    self.publish_rep_core(bus, work);
                     self.string_step(bus, &mut work.committed, op, width, prefixes, address_size)?;
                     if let Some(invoice) = work.rep.as_mut() {
                         invoice.complete(1);
@@ -923,9 +1016,7 @@ impl CpuGsw {
                             break;
                         }
                     }
-                    if let Some(refreshed) =
-                        self.rep_chunk_limit(plan, bus, op, width, &work.committed)
-                    {
+                    if let Some(refreshed) = self.rep_chunk_limit(plan, bus, op, width, work) {
                         allowance =
                             Some(allowance.map_or(refreshed, |available| available.min(refreshed)));
                     }
@@ -934,7 +1025,7 @@ impl CpuGsw {
                         && (allowance == Some(0)
                             || chunk_iterations >= Self::MAX_BUDGETED_REP_ITERATIONS
                             || bus.requires_step_break()
-                            || self.rep_budget_exhausted(bus, op, &work.committed))
+                            || self.rep_budget_exhausted(bus, op, work))
                     {
                         self.rep_execution.yielded = true;
                         break;

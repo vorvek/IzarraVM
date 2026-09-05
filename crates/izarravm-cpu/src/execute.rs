@@ -1288,16 +1288,16 @@ impl CpuGsw {
             && matches!(op, StringOp::Movs | StringOp::Stos)
             && matches!(self.persona(), CpuPersona::I486 | CpuPersona::I586)
         {
-            work.rep = Some(RepInvocation {
-                history: RepPriceHistory {
-                    initial_count: self.string_count(address_size),
-                    startup_paid: false,
-                },
-                completed: 0,
-                raw_due: 0,
-            });
+            work.rep = Some(RepInvocation::new(RepPriceHistory {
+                initial_count: self.string_count(address_size),
+                startup_paid: false,
+            }));
         }
+        self.price_rep_invocation(work, op, address_size);
         self.run_string(bus, work, op, width, prefixes, address_size)?;
+        if work.sourced_rep() {
+            return Ok(clocks(0));
+        }
         let mut outcome = self.charge(TimingClass::StringElem);
         if let Some(invoice) = work.rep.as_mut() {
             invoice.legacy_payment(outcome.core_clocks);

@@ -1648,6 +1648,7 @@ fn drive_native_fetch_loop(cpu: &mut CpuGsw, machine: &mut Machine) -> Vec<CpuCy
 }
 
 #[test]
+#[cfg(feature = "jit")]
 fn direct_large_self_loop_bulk_fetch_uses_physical_paging_alias_timing() {
     const ITERATIONS: u32 = 1_000;
     const PROGRAM: [u8; 16] = [

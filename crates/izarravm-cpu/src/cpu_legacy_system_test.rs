@@ -2219,6 +2219,109 @@ fn public_bad_selector_exception_through_a_task_gate_has_its_delivery_and_switch
 }
 
 #[test]
+fn rep_price_fault_through_task_gate_keeps_rep_switch_and_delivery_owners() {
+    for (mode, startup, element, switch, delivery) in [
+        (GswMode::Gsw486, 12, 3, 199, 69),
+        (GswMode::Gsw586, 13, 1, 173, 40),
+    ] {
+        for fatal_push in [false, true] {
+            for completed in [0u64, 1] {
+                for carry in 0..12 {
+                    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+                        &[0xb0, 0x21, 0xf3, 0xa4],
+                        &[
+                            RING0_CODE,
+                            (0x10, 0x0000_ffff, 0x00cf_9300),
+                            (0x18, 0x0380_0067, 0x0000_8900),
+                            (0x20, 0x0300_0067, 0x0000_8b00),
+                            (0x28, 0x0000_00ff, 0x0040_9300),
+                        ],
+                    );
+                    cpu.set_mode(mode);
+                    cpu.set_timing_epoch(2);
+                    cpu.tr = SegmentRegister {
+                        selector: 0x20,
+                        base: 0x300,
+                        limit: 0x67,
+                        access: 0x8b,
+                        default_size_32: false,
+                    };
+                    cpu.idtr = DescriptorTable {
+                        base: 0x200,
+                        limit: 0xff,
+                    };
+                    cpu.registers.set_esp(0x1234);
+                    cpu.registers.set_ecx(2);
+                    cpu.registers.set_esi(0x800);
+                    cpu.registers
+                        .set_edi(if completed == 0 { 0x901 } else { 0x900 });
+                    let mut es = cpu.registers.segment(SegmentIndex::Es);
+                    es.base = 0;
+                    es.limit = 0x900;
+                    cpu.registers.set_segment(SegmentIndex::Es, es);
+                    let put32 = |m: &mut [u8], offset: usize, value: u32| {
+                        m[offset..offset + 4].copy_from_slice(&value.to_le_bytes())
+                    };
+                    let put16 = |m: &mut [u8], offset: usize, value: u16| {
+                        m[offset..offset + 2].copy_from_slice(&value.to_le_bytes())
+                    };
+                    put32(&mut memory, 0x268, 0x0018_0000);
+                    put32(&mut memory, 0x26c, 0x0000_8500);
+                    put32(&mut memory, 0x380 + 32, 0x90);
+                    put32(&mut memory, 0x380 + 36, 2);
+                    put32(&mut memory, 0x380 + 56, if fatal_push { 0 } else { 0xf0 });
+                    put16(&mut memory, 0x380 + 72, 0x10);
+                    put16(&mut memory, 0x380 + 76, 0x08);
+                    put16(
+                        &mut memory,
+                        0x380 + 80,
+                        if fatal_push { 0x28 } else { 0x10 },
+                    );
+                    put16(&mut memory, 0x380 + 84, 0x10);
+                    memory[0x90..0x92].copy_from_slice(&[0xb0, 0x5a]);
+                    memory.resize(0x1000, 0);
+                    memory[0x800] = 0x7b;
+                    let mut bus = TestBus::with_memory(memory);
+                    bus.timing_epoch_two = true;
+                    cpu.begin_instruction();
+                    cpu.fetch_decoded(&mut bus, 0).unwrap();
+                    cpu.set_eip(2);
+                    cpu.begin_instruction();
+                    cpu.fetch_decoded(&mut bus, 2).unwrap();
+                    cpu.set_eip(0);
+                    cpu.timing_rem = carry;
+                    let before = cpu.elapsed_clocks;
+                    let result = cpu.run_budgeted(&mut bus, u64::MAX);
+                    let earned = 1 + startup + completed * element + switch;
+                    if fatal_push {
+                        let error = result.unwrap_err();
+                        assert_eq!(
+                            error.error,
+                            CpuError::FaultAfterTaskSwitchCommit { nested_vector: 12 }
+                        );
+                        assert_eq!(error.consumed_core_clocks, earned);
+                        assert_eq!(cpu.elapsed_clocks - before, earned);
+                    } else {
+                        assert_eq!(result.unwrap().consumed_core_clocks, earned + delivery);
+                        assert_eq!(cpu.elapsed_clocks - before, earned + delivery);
+                        assert_eq!(&bus.memory[0xec..0xf0], &[0; 4]);
+                    }
+                    assert_eq!(cpu.timing_rem, carry);
+                    assert_eq!(cpu.tr.selector, 0x18);
+                    assert_eq!(bus.memory[0x900], if completed == 0 { 0 } else { 0x7b });
+                    assert!(cpu.rep_execution.resume.is_none());
+                    assert_eq!(cpu.registers.eip, 0x90);
+                    let later = cpu.cycle(&mut bus).unwrap();
+                    assert_eq!(later.core_clocks, 1);
+                    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+                    assert_eq!(cpu.timing_rem, carry);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn public_fault_after_a_task_gate_switch_commits_keeps_the_run_prefix() {
     // A task switch commits the WHOLE incoming task inside `load_task_state`:
     // CR3, LDTR, TR, CS:EIP, every GPR. `deliver_exception_inner`'s unwind can
