@@ -1190,6 +1190,30 @@ fn a_sixteen_bit_poll_loop_commits_a_span_with_the_knob_on() {
     );
 }
 
+#[cfg(feature = "jit")]
+#[test]
+fn epoch_two_direct_sixteen_bit_poll_charges_the_live_in_price() {
+    for (mode, raw_per_iteration) in [(GswMode::Gsw486, 132), (GswMode::Gsw586, 112)] {
+        for (program, ax) in [
+            (&[0xec, 0xa8, 0x08, 0x75, 0xfb][..], 0),
+            (&[0xec, 0x84, 0xe0, 0x75, 0xfb][..], 0x0800),
+        ] {
+            let mut machine = sixteen_bit_spin_machine(program, ax, true);
+            machine.set_mode(mode);
+            machine.set_timing_epoch_for_test(2);
+            machine.run_cycles(mode.clock_hz() / 30).unwrap();
+            let snapshot = machine.cpu.direct_stall_snapshot();
+            let iterations: u64 = snapshot.poll_skip_iterations.iter().sum();
+            assert!(iterations > 1, "mode={mode:?} ax={ax}");
+            assert!(machine.cpu.perf_counters().jit_direct_insns > 0);
+            assert_eq!(
+                snapshot.poll_skip_raw_core_clocks,
+                raw_per_iteration * iterations
+            );
+        }
+    }
+}
+
 /// **T-D5, the D1b half.** The same, for the register-mask form `IN AL,DX / TEST AL,AH /
 /// JNZ` with `MOV AH,8`'s effect preloaded into AH. This is the shape that carries 81.68%
 /// of tyrian's declines and the single hottest site.

@@ -184,6 +184,45 @@ fn class_clocks_match_the_design_table() {
 }
 
 #[test]
+fn construction_port_writes_preserve_devices_without_charging_guest_time() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut profile = MachineProfile::gsw_386(4, VideoCard::Vega);
+        profile.cpu = mode;
+        let mut seed = Machine::new_raw_program(profile.clone(), &[0xf4]).unwrap();
+        let mut ordinary = Machine::new_raw_program(profile.clone(), &[0xf4]).unwrap();
+        for machine in [&mut seed, &mut ordinary] {
+            machine.set_timing_epoch_for_test(2);
+            assert_eq!(machine.port_bus_batch_clocks, 0);
+        }
+        seed.make_construction_bus()
+            .write_io(0x43, BusWidth::Byte, 0x34, false)
+            .unwrap();
+        ordinary
+            .make_bus()
+            .write_io(0x43, BusWidth::Byte, 0x34, false)
+            .unwrap();
+        assert_eq!(seed.pit, ordinary.pit);
+        assert_eq!(seed.pic, ordinary.pic);
+        assert_eq!(seed.trace.elapsed_clocks(), ordinary.trace.elapsed_clocks());
+        assert_eq!(seed.port_accesses_by_class, ordinary.port_accesses_by_class);
+        assert_eq!(seed.port_bus_batch_clocks, 0);
+        assert_eq!(ordinary.port_bus_batch_clocks, 156);
+
+        let mut guest = Machine::new_raw_program(profile, &[0xe6, 0x43, 0xf4]).unwrap();
+        guest.set_timing_epoch_for_test(2);
+        guest.cpu.registers.set_eax(0x34);
+        assert!(guest.canonical_state_capture().is_ok());
+        let raw_before = guest.raw_bus_clocks();
+        let stop = guest.run_until_halt_or_cycles(10_000).unwrap();
+        assert_eq!(stop, StopReason::Halted);
+        assert_eq!(guest.test_batch_isa_clocks.iter().sum::<u64>(), 156);
+        assert_eq!(guest.raw_bus_clocks() - raw_before, 4);
+        assert_eq!(guest.port_bus_batch_clocks, 0);
+        assert!(guest.canonical_state_capture().is_ok());
+    }
+}
+
+#[test]
 fn legacy_isa_predicate_is_unchanged_by_the_new_classifier() {
     // `port_is_legacy_isa_io` keeps gating epoch 1's `IZARRAVM_ISA_IO_WAIT` charge exactly as
     // it did before this slice; it is a narrower, independent set from `IsaXBus`.

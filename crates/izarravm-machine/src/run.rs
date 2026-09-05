@@ -1727,6 +1727,7 @@ impl Machine {
                     extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
                     lazy_port_reads: active_mode.uses_approximate_timing(),
                     isa_io_wait: crate::bus::isa_io_wait_armed(),
+                    charge_port_timing: true,
                     lazy_ports_386: crate::bus::lazy_ports_386_for(*active_mode),
                     io_touched,
                     exempt_io_touched,

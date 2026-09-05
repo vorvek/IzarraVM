@@ -1932,13 +1932,9 @@ impl CpuGsw {
     /// The per-iteration RAW core-clock charge an elided iteration of `poll` must project,
     /// under the bus's live guest-clock model epoch and this CPU's live I/O privilege column.
     ///
-    /// P2 of the port-io repricing (`dev_docs/2026-09-05-port-io-repricing-design.md` §2, and
-    /// review F8). Every certified `Io`-family shape bakes exactly ONE `IN` slot into its
-    /// `raw_core_clocks` at epoch 1's flat `IN_PORT_CORE_CLOCKS` -- 17 = 12 + `TEST` 2 +
-    /// taken `Jcc` 3 for the 3-slot shape, and the 21 / 28 shapes the same way. Under epoch 2
-    /// that one term becomes Intel's privilege column, so the elided iteration advances the
-    /// guest clock by exactly what the executed `IN` would have charged, and the skip stays a
-    /// host-side elision rather than a guest-visible speed-up.
+    /// Every certified I/O shape includes one `InPort` charge from the current class
+    /// table. Replace that term with the live privilege-column price, as an executed
+    /// `IN` does. Subtracting an older table's price would leave part of the charge twice.
     ///
     /// **Derived from the LIVE mode, never baked** (F8): the poll skip is unavailable in V86
     /// (`direct.rs`'s `permission.is_none()` decline and `poll_skip_eligible`'s V86 reject), so
@@ -1958,8 +1954,11 @@ impl CpuGsw {
             return raw;
         }
         let mode = self.port_io_priv_mode();
-        raw.saturating_sub(u64::from(crate::port_core_clocks(1, false, mode)))
-            .saturating_add(u64::from(crate::port_core_clocks(epoch, false, mode)))
+        raw.saturating_sub(u64::from(
+            self.class_table()
+                .raw(crate::timing_class::TimingClass::InPort),
+        ))
+        .saturating_add(u64::from(crate::port_core_clocks(epoch, false, mode)))
     }
 
     #[cfg(feature = "jit")]

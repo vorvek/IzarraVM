@@ -588,6 +588,7 @@ impl Machine {
             extended_ram_screen: extended_ram_screen_enabled(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
             isa_io_wait: isa_io_wait_armed(),
+            charge_port_timing: true,
             timing_epoch: self.timing_epoch,
             poll_skip_certificate: &self.poll_skip_certificate,
             retrace_poll: &mut self.retrace_poll,
@@ -632,29 +633,12 @@ impl Machine {
         }
     }
 
-    /// A bus for CONSTRUCTION-TIME device programming -- the seed writes a machine
-    /// performs before any guest instruction runs (`new_raw_program`'s PIT seed and
-    /// 8259 pair setup in `dos.rs`). Identical to `make_bus` except that the ISA
-    /// wait-state charge is disarmed.
-    ///
-    /// WHY IT HAS TO BE DISARMED, and why clearing the accrual afterwards would be
-    /// the weaker fix. `port_bus_batch_clocks` is an accrual belonging to a live CPU
-    /// batch: the run loop folds it into that batch's guest-clock step and zeroes it
-    /// (`run_until_tick`), and `canonical_state_capture` refuses a machine holding a
-    /// non-zero one precisely because an uncommitted accrual has no batch to belong
-    /// to (`MachineCanonicalCaptureError::UncommittedBatchTiming`). A construction
-    /// write happens outside every batch, so a charge taken there is not "pending",
-    /// it is SPURIOUS -- it would be paid by whichever batch happened to run first,
-    /// and until then the machine cannot be captured at all. The seed writes model
-    /// what the BIOS POST already did before the guest was loaded; that time is not
-    /// the guest's to pay.
-    ///
-    /// Found by adversarial review of the `IZARRAVM_ISA_IO_WAIT` slice: armed, a
-    /// freshly constructed `new_raw_program` machine held three PIT periods of
-    /// accrual and refused canonical capture before executing an instruction.
+    /// Seed device registers before the first guest instruction. The writes retain
+    /// their device and trace effects, but no guest batch owns their port-time lane.
     pub(super) fn make_construction_bus(&mut self) -> MachineBus<'_> {
         let mut bus = self.make_bus();
         bus.isa_io_wait = false;
+        bus.charge_port_timing = false;
         bus
     }
 
@@ -1432,6 +1416,9 @@ impl MachineBus<'_> {
         // denominator, and a count taken inside the epoch-2 arm could not tell a row that makes
         // fewer accesses from one whose accesses merely cost more.
         self.port_accesses_by_class[class.index()] += 1;
+        if !self.charge_port_timing {
+            return;
+        }
         if self.timing_epoch >= 2 {
             *self.isa_io_clocks += match self.string_port_element_bytes {
                 0 => self.port_bus_lane_clocks(class),

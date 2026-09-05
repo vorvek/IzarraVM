@@ -30,6 +30,7 @@ fn poll_skip_test_machine_at_epoch(
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = mode;
     let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    machine.set_timing_epoch_for_test(epoch);
     let mut cs = machine.cpu.registers.cs();
     cs.default_size_32 = true;
     machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
@@ -39,8 +40,55 @@ fn poll_skip_test_machine_at_epoch(
     machine.cpu.set_native_backend_enabled(false);
     machine.poll_skip_enabled = enabled;
     machine.trace.set_tracing_mode(tracing);
-    machine.timing_epoch = epoch;
     machine
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn epoch_two_poll_skip_matches_executed_iterations() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for protected in [false, true] {
+            for mask in [0x01, 0x08] {
+                let mut baseline =
+                    poll_skip_test_machine_at_epoch(false, TracingMode::Off, mode, mask, 2);
+                let mut skipped =
+                    poll_skip_test_machine_at_epoch(false, TracingMode::Off, mode, mask, 2);
+                for machine in [&mut baseline, &mut skipped] {
+                    if protected {
+                        machine.cpu.control.cr0 |= 1;
+                    }
+                    machine.run_cycles(10_000).unwrap();
+                    machine.cpu.registers.eip = 0x108;
+                    machine.cpu.poll_skip_backedge_housekeeping();
+                    let poll = machine.cpu.poll_loop().expect("warm epoch 2 poll");
+                    // Seed a valid fractional core carry without changing the loop's price.
+                    machine.cpu.commit_poll_skip_core(poll, 1, 1).unwrap();
+                    machine.bus_rem = 0;
+                    machine.cpu.reset_perf_counters();
+                }
+                skipped.poll_skip_enabled = true;
+                let window = mode.clock_hz() / 30;
+                let baseline_stop = baseline.run_cycles(window).unwrap();
+                let skipped_stop = skipped.run_cycles(window).unwrap();
+                assert_eq!(skipped_stop, baseline_stop);
+                let skipped_iterations = skipped.cpu.perf_counters().poll_skip_iterations;
+                assert!(
+                    skipped_iterations > 1,
+                    "mode={mode:?} mask={mask} eip={:#x} eligible={} spans={} instructions={}",
+                    skipped.cpu.registers.eip,
+                    skipped.cpu.poll_skip_eligible(),
+                    skipped.cpu.perf_counters().poll_skip_spans,
+                    skipped.cpu.perf_counters().instructions,
+                );
+                assert_eq!(
+                    skipped.cpu.perf_counters().instructions + 3 * skipped_iterations,
+                    baseline.cpu.perf_counters().instructions,
+                    "mode={mode:?} mask={mask}",
+                );
+                assert_poll_machine_boundary_eq(&skipped, &baseline);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "jit")]
@@ -119,23 +167,29 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
                     machine.cpu.poll_skip_backedge_housekeeping();
                     let poll = machine.cpu.poll_loop().expect("warm direct poll loop");
                     for _ in 0..2 {
+                        let raw = if epoch == 2 {
+                            1
+                        } else {
+                            poll.raw_core_clocks()
+                        };
                         machine
                             .cpu
-                            .commit_poll_skip_core(poll, poll.raw_core_clocks(), 1)
+                            .commit_poll_skip_core(poll, raw, 1)
                             .expect("one iteration advances the CPU timing remainder");
                         if machine.cpu.poll_skip_timing_remainder() != 0 {
                             break;
                         }
                     }
                     machine.cpu.reset_perf_counters();
-                    machine.bus_rem = 2;
+                    machine.bus_rem = if epoch == 2 { 0 } else { 2 };
                     assert_ne!(machine.cpu.poll_skip_timing_remainder(), 0);
-                    assert_ne!(machine.bus_rem, 0);
+                    assert!(machine.bus_rem < u64::from(bus_timing(mode.persona(), epoch).1));
                 }
                 skipped.poll_skip_enabled = true;
 
-                let baseline_stop = baseline.run_cycles(100_000).unwrap();
-                let skipped_stop = skipped.run_cycles(100_000).unwrap();
+                let window = mode.clock_hz() / 30;
+                let baseline_stop = baseline.run_cycles(window).unwrap();
+                let skipped_stop = skipped.run_cycles(window).unwrap();
                 assert_eq!(
                     skipped_stop, baseline_stop,
                     "epoch={epoch} mode={mode:?} mask={mask:#04x}"

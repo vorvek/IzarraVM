@@ -4268,6 +4268,8 @@ struct MachineBus<'a> {
     /// deliberate: see `MachineBus::charge_isa_io_wait` for why the Accurate 386
     /// class stays out of it.
     isa_io_wait: bool,
+    /// Construction seeds devices without charging a guest instruction batch.
+    charge_port_timing: bool,
     /// `Machine::timing_epoch`, copied at bus construction (a plain `u32`, not a reference:
     /// the epoch never changes mid-run). `1` (unset knob) keeps every port charge
     /// byte-identical to before this slice; `2` arms the per-class port-bus charge in

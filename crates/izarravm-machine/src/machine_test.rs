@@ -432,6 +432,7 @@ pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus)
         extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
         isa_io_wait: crate::bus::isa_io_wait_armed(),
+        charge_port_timing: true,
         timing_epoch: machine.timing_epoch,
         poll_skip_certificate: &machine.poll_skip_certificate,
         retrace_poll: &mut machine.retrace_poll,
