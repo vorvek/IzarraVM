@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::tests::TestBus;
 
 // The three `level_timing` literal tripwires used to live here, #[cfg(test)]-only. Moved to
 // strings.rs beside rep_core_upper (review N2) so a release build breaks too, not only a test
@@ -34,6 +35,7 @@ const ALL_PERSONAS: [(GswMode, CpuPersona); 3] = [
 /// call exactly.
 #[test]
 fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
+    let bus = TestBus::default();
     for &(mode, persona) in &ALL_PERSONAS {
         let (num, den) = level_timing_for_test(persona);
         for &op in &ALL_STRING_OPS {
@@ -53,7 +55,7 @@ fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
                         / u64::from(den)
                 };
                 assert_eq!(
-                    cpu.rep_core_upper(op),
+                    cpu.rep_core_upper(&bus, op),
                     oracle,
                     "{persona:?} {op:?} resume_active={resume_active}"
                 );
@@ -68,17 +70,39 @@ fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
 /// mutation coverage.
 #[test]
 fn rep_core_upper_collapses_to_zero_exactly_when_resuming() {
+    let bus = TestBus::default();
     for &(mode, _persona) in &ALL_PERSONAS {
         for &op in &ALL_STRING_OPS {
             let mut cpu = CpuGsw::default();
             cpu.set_mode(mode);
             cpu.rep_resume_active = true;
             assert_eq!(
-                cpu.rep_core_upper(op),
+                cpu.rep_core_upper(&bus, op),
                 0,
                 "resume_active must zero core_upper"
             );
         }
+    }
+}
+
+#[test]
+fn rep_core_upper_uses_the_live_epoch_two_port_setup_tariff() {
+    let mut bus = TestBus::default();
+    bus.timing_epoch_two = true;
+
+    for (mode, ins, outs) in [
+        (GswMode::Gsw386, 53, 63),
+        (GswMode::Gsw486, 11, 13),
+        (GswMode::Gsw586, 11, 13),
+    ] {
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(mode);
+        assert_eq!(cpu.rep_core_upper(&bus, StringOp::Ins), ins, "{mode:?} INS");
+        assert_eq!(
+            cpu.rep_core_upper(&bus, StringOp::Outs),
+            outs,
+            "{mode:?} OUTS"
+        );
     }
 }
 

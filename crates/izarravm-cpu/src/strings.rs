@@ -53,7 +53,7 @@ impl RepLimitPlan {
         // admission bound even though the aligned bulk path normally charges one wide cycle.
         let access_upper = byte_cost.saturating_mul(u64::from(width.bytes()));
         let bus_per_iteration = access_upper.saturating_mul(CpuGsw::rep_memory_accesses(op));
-        // THE PER-ELEMENT CORE TERM (review B4.3). `per_iteration` was BUS-ONLY,
+        // THE PER-ELEMENT CORE TERM (review B4.3). `per_iteration` excluded core work.
         // so a chunk could over-admit by `MAX_BUDGETED_REP_ITERATIONS` times the
         // whole core cost of an element. At epoch 1 that cost is
         // `StringElem`'s 4 raw -- a third of a guest clock at the 1/12 personas,
@@ -150,11 +150,18 @@ impl CpuGsw {
     /// `rep_resume_active` state `rep_chunk_limit` and `rep_budget_exhausted` can reach.
     /// `rep_resume_active` collapses this to 0 regardless of persona, checked BEFORE the match so
     /// neither arm has to encode it.
-    fn rep_core_upper(&self, op: StringOp) -> u64 {
+    fn rep_core_upper<B: CpuBus>(&self, bus: &B, op: StringOp) -> u64 {
         if self.rep_resume_active {
             return 0;
         }
-        let raw = u64::from(Self::rep_core_clocks(op));
+        let raw = match op {
+            StringOp::Ins | StringOp::Outs => u64::from(self.string_port_setup_core_clocks(
+                bus,
+                matches!(op, StringOp::Outs),
+                true,
+            )),
+            _ => u64::from(Self::rep_core_clocks(op)),
+        };
         match self.persona() {
             CpuPersona::I386 => raw.saturating_mul(2).saturating_add(4) / 5,
             CpuPersona::I486 | CpuPersona::I586 => raw.saturating_add(11) / 12,
@@ -181,6 +188,7 @@ impl CpuGsw {
         bus: &B,
         op: StringOp,
         width: BusWidth,
+        committed: &CommittedCore,
     ) -> Option<u32> {
         let budget = self.rep_execution.budget?;
         // Recomputes the whole plan from scratch on every call (once per fast chunk, once
@@ -217,8 +225,10 @@ impl CpuGsw {
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
-        let used = self.core_clocks_so_far.saturating_add(bus_growth);
-        let core_upper = self.rep_core_upper(op);
+        let used = committed
+            .projected_after(self.core_clocks_so_far)
+            .saturating_add(bus_growth);
+        let core_upper = self.rep_core_upper(bus, op);
         let available = budget
             .cap
             .saturating_sub(used)
@@ -231,15 +241,21 @@ impl CpuGsw {
         Some(limit)
     }
 
-    fn rep_budget_exhausted<B: CpuBus>(&self, bus: &B, op: StringOp) -> bool {
+    fn rep_budget_exhausted<B: CpuBus>(
+        &self,
+        bus: &B,
+        op: StringOp,
+        committed: &CommittedCore,
+    ) -> bool {
         let Some(budget) = self.rep_execution.budget else {
             return false;
         };
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
-        let core_upper = self.rep_core_upper(op);
-        self.core_clocks_so_far
+        let core_upper = self.rep_core_upper(bus, op);
+        committed
+            .projected_after(self.core_clocks_so_far)
             .saturating_add(bus_growth)
             .saturating_add(core_upper)
             >= budget.cap
@@ -379,6 +395,7 @@ impl CpuGsw {
     fn string_step<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        committed: &mut CommittedCore,
         op: StringOp,
         width: BusWidth,
         prefixes: Prefixes,
@@ -428,13 +445,13 @@ impl CpuGsw {
                 let value = bus.read_io_string_element(
                     port,
                     width,
-                    self.core_clocks_so_far,
+                    committed.projected_after(self.core_clocks_so_far),
                     self.is_ring0_protected(),
                 )?;
                 self.write_string_dst(bus, address_size, width, value)?;
                 self.adjust_index_register(7, address_size, bytes);
                 if prefixes.rep.is_some() {
-                    self.charge_string_port_element_core(bus, false);
+                    self.charge_string_port_element_core(bus, false, committed);
                 }
             }
             StringOp::Outs => {
@@ -446,12 +463,12 @@ impl CpuGsw {
                     port,
                     width,
                     value,
-                    self.core_clocks_so_far,
+                    committed.projected_after(self.core_clocks_so_far),
                     self.is_ring0_protected(),
                 )?;
                 self.adjust_index_register(6, address_size, bytes);
                 if prefixes.rep.is_some() {
-                    self.charge_string_port_element_core(bus, true);
+                    self.charge_string_port_element_core(bus, true, committed);
                 }
             }
         }
@@ -807,19 +824,20 @@ impl CpuGsw {
     pub(super) fn run_string<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        committed: &mut CommittedCore,
         op: StringOp,
         width: BusWidth,
         prefixes: Prefixes,
         address_size: AddressSize,
     ) -> ExecResult<()> {
         match prefixes.rep {
-            None => self.string_step(bus, op, width, prefixes, address_size)?,
+            None => self.string_step(bus, committed, op, width, prefixes, address_size)?,
             Some(kind) => {
                 let mut chunk_iterations = 0u32;
                 // Priced once for the whole REP: see RepLimitPlan's doc for why per_iteration
                 // and the paging setup cost cannot change across this loop's iterations.
                 let plan = RepLimitPlan::compute(self, bus, op, width);
-                let mut allowance = self.rep_chunk_limit(plan, bus, op, width);
+                let mut allowance = self.rep_chunk_limit(plan, bus, op, width, committed);
                 loop {
                     if self.string_count(address_size) == 0 {
                         break;
@@ -859,7 +877,9 @@ impl CpuGsw {
                         if fast.stop {
                             break;
                         }
-                        if let Some(refreshed) = self.rep_chunk_limit(plan, bus, op, width) {
+                        if let Some(refreshed) =
+                            self.rep_chunk_limit(plan, bus, op, width, committed)
+                        {
                             allowance = Some(
                                 allowance.map_or(refreshed, |available| available.min(refreshed)),
                             );
@@ -869,14 +889,14 @@ impl CpuGsw {
                             && (allowance == Some(0)
                                 || chunk_iterations >= Self::MAX_BUDGETED_REP_ITERATIONS
                                 || bus.requires_step_break()
-                                || self.rep_budget_exhausted(bus, op))
+                                || self.rep_budget_exhausted(bus, op, committed))
                         {
                             self.rep_execution.yielded = true;
                             break;
                         }
                         continue;
                     }
-                    self.string_step(bus, op, width, prefixes, address_size)?;
+                    self.string_step(bus, committed, op, width, prefixes, address_size)?;
                     self.perf.rep_string_iterations += 1;
                     chunk_iterations += 1;
                     if let Some(available) = allowance.as_mut() {
@@ -895,7 +915,7 @@ impl CpuGsw {
                             break;
                         }
                     }
-                    if let Some(refreshed) = self.rep_chunk_limit(plan, bus, op, width) {
+                    if let Some(refreshed) = self.rep_chunk_limit(plan, bus, op, width, committed) {
                         allowance =
                             Some(allowance.map_or(refreshed, |available| available.min(refreshed)));
                     }
@@ -904,7 +924,7 @@ impl CpuGsw {
                         && (allowance == Some(0)
                             || chunk_iterations >= Self::MAX_BUDGETED_REP_ITERATIONS
                             || bus.requires_step_break()
-                            || self.rep_budget_exhausted(bus, op))
+                            || self.rep_budget_exhausted(bus, op, committed))
                     {
                         self.rep_execution.yielded = true;
                         break;

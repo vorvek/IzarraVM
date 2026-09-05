@@ -401,6 +401,62 @@ pub enum CpuError {
     FaultAfterTaskSwitchCommit { nested_vector: u8 },
 }
 
+/// A CPU stop together with scaled core work committed by the same public call.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CpuRunError {
+    pub error: CpuError,
+    pub consumed_core_clocks: u64,
+}
+
+type CpuExecutionResult<T> = Result<T, CpuRunError>;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CommittedCore(u64);
+
+impl CommittedCore {
+    fn add(&mut self, clocks: u64) {
+        self.0 = self
+            .0
+            .checked_add(clocks)
+            .expect("committed core exceeded u64");
+    }
+
+    fn into_inner(self) -> u64 {
+        self.0
+    }
+
+    fn total(&self) -> u64 {
+        self.0
+    }
+
+    fn projected_after(&self, prior_core_clocks: u64) -> u64 {
+        prior_core_clocks
+            .checked_add(self.0)
+            .expect("projected core clocks exceeded u64")
+    }
+
+    fn absorb(&mut self, other: Self) {
+        self.add(other.0);
+    }
+}
+
+/// Raw instruction execution paired with scaled work committed by producers
+/// that cannot express that work in the raw ABI result.
+#[derive(Debug)]
+struct InstructionExecution {
+    result: ExecResult<CycleOutcome>,
+    committed: CommittedCore,
+}
+
+impl InstructionExecution {
+    fn new(result: ExecResult<CycleOutcome>) -> Self {
+        Self {
+            result,
+            committed: CommittedCore::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reg16 {
     Ax,
@@ -3139,25 +3195,6 @@ pub struct CpuGsw {
     /// pointer of growth"). `cfg`-gated as of the Fable review above.
     #[cfg(feature = "reflected-call-memo")]
     pub(crate) reflected_call: Option<Box<crate::reflected_call_memo::ReflectedCallMemoState>>,
-    /// SCALED core clocks an answered reflected call charged that the enclosing RUN has
-    /// not yet counted.
-    ///
-    /// `commit_reflected_call_core` puts the charge into `elapsed_clocks`, which is the
-    /// CPU's own clock. It is NOT the clock the machine advances its devices by: the batch
-    /// loop sums `CpuCycleOutcome::core_clocks` from each `run_budgeted` call into
-    /// `batch_core`, and `advance_cpu_work` derives the PIT stream from THAT plus the
-    /// scaled bus total. A charge that lands only in `elapsed_clocks` is therefore invisible
-    /// to every device -- the guest gets the instructions for free and runs further inside
-    /// the same budget. Measured on `tyrian-specs-586` (2026-09-03): with 1,115,196 answers
-    /// the dwell iterated 901,091 times against the OFF arm's 726,134, and
-    /// `perf.instructions` came out 17.6% high.
-    ///
-    /// The poll skip has the same split and solves it the same way -- its caller adds
-    /// `skipped_core` to `batch_core` explicitly (`izarravm-machine`'s `run.rs`). An
-    /// answered call cannot, because it happens deep inside an instruction, so it parks
-    /// the charge here and the run loop takes it beside the instruction's own.
-    #[cfg(feature = "reflected-call-memo")]
-    pub(crate) reflected_call_pending_core: u64,
     /// The hoisted per-retire diagnostic gates; see `RetireGates`. At the `CpuGsw` tail for the
     /// layout reason every field around it carries: it must not move `pending_flags` off its
     /// pinned offset.
@@ -3279,8 +3316,6 @@ impl Default for CpuGsw {
             slot_census_enabled: slot_census_default(),
             #[cfg(feature = "reflected-call-memo")]
             reflected_call_journal: false,
-            #[cfg(feature = "reflected-call-memo")]
-            reflected_call_pending_core: 0,
             #[cfg(feature = "reflected-call-memo")]
             reflected_call: crate::reflected_call_memo::armed_at_construction()
                 .then(|| Box::new(crate::reflected_call_memo::ReflectedCallMemoState::default())),
@@ -3940,7 +3975,7 @@ struct RepBudget {
     cap: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RepResume {
     insn: DecodedInsn,
     start_eip: u32,

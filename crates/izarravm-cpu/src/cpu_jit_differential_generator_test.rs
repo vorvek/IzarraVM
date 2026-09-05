@@ -315,7 +315,7 @@ fn run_to_halt<B: CpuBus>(
     cpu: &mut CpuGsw,
     bus: &mut B,
     case: &GeneratedCase,
-) -> Result<Vec<BudgetedRunOutcome>, CpuError> {
+) -> Result<Vec<BudgetedRunOutcome>, CpuRunError> {
     let mut outcomes = Vec::new();
     for _ in 0..64 {
         let outcome = cpu.run_budgeted(bus, case.cap)?;
@@ -1209,7 +1209,7 @@ fn run_to_error(
     cpu: &mut CpuGsw,
     bus: &mut TestBus,
     case: &GeneratedCase,
-) -> (Vec<BudgetedRunOutcome>, CpuError) {
+) -> (Vec<BudgetedRunOutcome>, CpuRunError) {
     let mut outcomes = Vec::new();
     for _ in 0..64 {
         match cpu.run_budgeted(bus, case.cap) {

@@ -308,6 +308,7 @@ impl CpuGsw {
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
+        _committed: &mut CommittedCore,
     ) -> ExecResult<CycleOutcome> {
         let operand_size = insn.operand_size;
         match insn.opcode {
@@ -877,6 +878,7 @@ impl CpuGsw {
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
+        committed: &mut CommittedCore,
     ) -> ExecResult<CycleOutcome> {
         let operand_size = insn.operand_size;
         let address_size = insn.address_size;
@@ -887,7 +889,7 @@ impl CpuGsw {
                 // `imm2`); reconstruct it and deliver through the unchanged far-call helper.
                 let offset = insn.imm;
                 let selector = insn.imm2 as u16;
-                self.far_call(bus, selector, offset, operand_size)?;
+                self.far_call(bus, selector, offset, operand_size, committed)?;
                 #[cfg(feature = "reflected-call-diagnostic")]
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 #[cfg(feature = "reflected-call-memo")]
@@ -901,7 +903,7 @@ impl CpuGsw {
                 // JMP far direct. Same far-pointer reconstruction, via the far-jump helper.
                 let offset = insn.imm;
                 let selector = insn.imm2 as u16;
-                self.far_jump(bus, selector, offset, operand_size)?;
+                self.far_jump(bus, selector, offset, operand_size, committed)?;
                 #[cfg(feature = "reflected-call-diagnostic")]
                 crate::reflected_call_diag::on_far_transfer_boundary(self, bus);
                 #[cfg(feature = "reflected-call-memo")]
@@ -949,7 +951,7 @@ impl CpuGsw {
             }
             0xcc => {
                 // INT 3: one-byte breakpoint trap to vector 3, via the shared delivery path.
-                self.software_interrupt(bus, 3)?;
+                self.software_interrupt(bus, 3, committed)?;
                 Ok(self.charge(TimingClass::Int3))
             }
             0xcd => {
@@ -982,13 +984,13 @@ impl CpuGsw {
                 // CS and can leave V86, and Intel prices the gate by the mode the
                 // INSTRUCTION executed in.
                 let mode = int_n_class(self.control.cr0 & CR0_PE != 0, self.is_v86_mode());
-                self.software_interrupt(bus, vector)?;
+                self.software_interrupt(bus, vector, committed)?;
                 Ok(self.charge(mode))
             }
             0xce => {
                 // INTO: trap to vector 4 only when OF is set; otherwise a no-op.
                 if self.flag(FLAG_OF) {
-                    self.software_interrupt(bus, 4)?;
+                    self.software_interrupt(bus, 4, committed)?;
                     Ok(self.charge(TimingClass::IntO))
                 } else {
                     Ok(self.charge(TimingClass::IntONotTaken))
@@ -1007,7 +1009,7 @@ impl CpuGsw {
                 let from_v86 = self.is_v86_mode();
                 let from_cpl = self.current_privilege_level();
                 let protected = self.control.cr0 & CR0_PE != 0;
-                self.iret(bus, operand_size)?;
+                self.iret(bus, operand_size, committed)?;
                 Ok(self.charge(iret_class(
                     protected,
                     from_v86,
@@ -1085,9 +1087,9 @@ impl CpuGsw {
                             BusAccessKind::DataRead,
                         )? as u16;
                         if modrm.reg == 3 {
-                            self.far_call(bus, selector, offset, operand_size)?;
+                            self.far_call(bus, selector, offset, operand_size, committed)?;
                         } else {
-                            self.far_jump(bus, selector, offset, operand_size)?;
+                            self.far_jump(bus, selector, offset, operand_size, committed)?;
                         }
                         // `FF /3` and `FF /5`, the indirect far forms review N3 named:
                         // a DPMI host's return through a saved far pointer is exactly
@@ -1408,6 +1410,7 @@ impl CpuGsw {
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
+        committed: &mut CommittedCore,
     ) -> ExecResult<CycleOutcome> {
         let operand_size = insn.operand_size;
         let address_size = insn.address_size;
@@ -1507,6 +1510,7 @@ impl CpuGsw {
             0x6c => {
                 self.run_string(
                     bus,
+                    committed,
                     StringOp::Ins,
                     BusWidth::Byte,
                     insn.prefixes,
@@ -1524,6 +1528,7 @@ impl CpuGsw {
             0x6d => {
                 self.run_string(
                     bus,
+                    committed,
                     StringOp::Ins,
                     operand_size.bus_width(),
                     insn.prefixes,
@@ -1541,6 +1546,7 @@ impl CpuGsw {
             0x6e => {
                 self.run_string(
                     bus,
+                    committed,
                     StringOp::Outs,
                     BusWidth::Byte,
                     insn.prefixes,
@@ -1558,6 +1564,7 @@ impl CpuGsw {
             0x6f => {
                 self.run_string(
                     bus,
+                    committed,
                     StringOp::Outs,
                     operand_size.bus_width(),
                     insn.prefixes,

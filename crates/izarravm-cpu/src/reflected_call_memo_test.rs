@@ -156,6 +156,33 @@ impl CpuBus for FlatMemBus {
         Some(self.read_raw(address, width))
     }
 
+    fn direct_page(
+        &mut self,
+        address: u32,
+        _kind: BusAccessKind,
+    ) -> Result<Option<izarravm_bus::DirectPage>, izarravm_bus::BusError> {
+        let physical_page = address & !0x0fff;
+        let start = physical_page as usize;
+        if start.saturating_add(0x1000) > self.mem.len() {
+            return Ok(None);
+        }
+        Ok(Some(izarravm_bus::DirectPage {
+            physical_page,
+            ptr: unsafe { self.mem.as_mut_ptr().add(start) },
+            len: 0x1000,
+            writable: true,
+            mapping_epoch: 1,
+        }))
+    }
+
+    fn native_fetches_are_uniform(&self) -> bool {
+        true
+    }
+
+    fn native_aggregate_accounting_allowed(&self) -> bool {
+        true
+    }
+
     fn prefetch_memory(
         &mut self,
         address: u32,
@@ -496,7 +523,7 @@ fn frame_gone_and_re_entry_never_produce_a_memo() {
     let open2 = test_open_trip(&cpu2);
     cpu2.reflected_call.as_mut().unwrap().open = Some(open2);
     cpu2.registers.set_esp(STACK_TOP); // back at entry: re-entry shape
-    let _ = on_int(&mut cpu2, &mut bus, VECTOR);
+    let _ = on_int(&mut cpu2, &mut bus, VECTOR, &mut CommittedCore::default());
     let ks2 = cpu2
         .reflected_call
         .as_ref()
@@ -765,7 +792,7 @@ fn the_off_arm_is_bit_identical() {
     );
     assert!(!cpu.reflected_call_journal);
 
-    cpu.software_interrupt(&mut bus, VECTOR)
+    cpu.software_interrupt(&mut bus, VECTOR, &mut CommittedCore::default())
         .expect("delivery must succeed");
     assert!(
         cpu.reflected_call.is_none(),
@@ -773,7 +800,7 @@ fn the_off_arm_is_bit_identical() {
     );
     assert!(!cpu.reflected_call_journal);
 
-    cpu.iret(&mut bus, OperandSize::Dword)
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
         .expect("IRET must succeed");
     assert!(cpu.reflected_call.is_none());
     assert!(!cpu.reflected_call_journal);
@@ -1105,7 +1132,7 @@ fn disarmed_key_still_counts_trips_seen_and_disarmed_returns() {
         let state = cpu.reflected_call.as_mut().unwrap();
         state.keys.entry(key).or_default().disarmed = true;
     }
-    let _ = on_int(&mut cpu, &mut bus, VECTOR);
+    let _ = on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default());
     let state = cpu.reflected_call.as_ref().unwrap();
     let ks = state.keys.get(&key).expect("recorded");
     assert_eq!(ks.trips_seen, 1);
@@ -1201,7 +1228,7 @@ fn on_int_rearms_a_disarmed_key_through_the_real_hook() {
             "test setup: four consecutive failures must disarm"
         );
     }
-    let _ = on_int(&mut cpu, &mut bus, VECTOR); // trips_seen -> 1,000,001: still far short of the window
+    let _ = on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()); // trips_seen -> 1,000,001: still far short of the window
     {
         let ks = cpu.reflected_call.as_ref().unwrap().keys.get(&key).unwrap();
         assert!(
@@ -1215,7 +1242,7 @@ fn on_int_rearms_a_disarmed_key_through_the_real_hook() {
         let ks = state.keys.get_mut(&key).unwrap();
         ks.trips_seen = 1_000_001 + MEMO_REARM_TRIPS_SEEN;
     }
-    let _ = on_int(&mut cpu, &mut bus, VECTOR);
+    let _ = on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default());
     let ks = cpu.reflected_call.as_ref().unwrap().keys.get(&key).unwrap();
     assert!(
         !ks.disarmed,
@@ -1383,7 +1410,7 @@ const CLASS_W_ADDR: u32 = 0x7000;
 fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u32) {
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
-    let _ = on_int(cpu, bus, VECTOR);
+    let _ = on_int(cpu, bus, VECTOR, &mut CommittedCore::default());
     // `note_write` BEFORE the store commits, which is the production seam order
     // (`write_system_linear`: "Hooked BEFORE the write below ... `note_write` needs the
     // pre-write value, which this function's own doc says is gone once the write below
@@ -1529,7 +1556,7 @@ fn on_int_screening_never_mutates_state_on_a_poisoned_cell() {
 
     let regs_before = cpu.registers.clone();
     let mem_before = bus.mem.clone();
-    let _ = on_int(&mut cpu, &mut bus, VECTOR);
+    let _ = on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default());
     assert_eq!(
         cpu.registers, regs_before,
         "on_int must not move any register on a screen miss"
@@ -1612,6 +1639,249 @@ fn install_memo(cpu: &mut CpuGsw, key: MemoKey, memo: Memo) {
     state.memos.insert(key, vec![Arc::new(memo)]);
 }
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn map_flat_direct_page(cpu: &mut CpuGsw, bus: &mut FlatMemBus, page: u32) {
+    let permissions = jit::fast_map::PagePermissions::UNPAGED;
+    let read = bus
+        .direct_page(page, BusAccessKind::DataRead)
+        .expect("FlatMemBus direct read page")
+        .expect("fixture page is mapped");
+    assert!(cpu.jit_fast_map.populate_read(
+        page,
+        page,
+        read,
+        permissions,
+        cpu.physical_page_watched(page)
+    ));
+    let write = bus
+        .direct_page(page, BusAccessKind::DataWrite)
+        .expect("FlatMemBus direct write page")
+        .expect("fixture page is mapped");
+    assert!(cpu.jit_fast_map.populate_write(
+        page,
+        page,
+        write,
+        permissions,
+        cpu.physical_page_watched(page)
+    ));
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn native_terminal_reflected_int_returns_its_answer_once_without_running_the_suffix() {
+    const NATIVE_ENTRY: u32 = 0x500;
+    const PREFIX_MARKER: u32 = 0x1357_9bdf;
+    const SUFFIX_MARKER: u32 = 0x2468_ace0;
+
+    struct IntRowsGuard;
+    impl Drop for IntRowsGuard {
+        fn drop(&mut self) {
+            jit::direct::set_int_imm8_rows_for_test(None);
+        }
+    }
+
+    jit::direct::set_int_imm8_rows_for_test(Some(true));
+    let _int_rows = IntRowsGuard;
+    let (mut cpu, mut bus) = synthetic_reflected_client();
+    arm(&mut cpu);
+    cpu.set_timing_epoch(2);
+    bus.gate_allowance = Some(1_000_000);
+    bus.mem[NATIVE_ENTRY as usize..NATIVE_ENTRY as usize + 12].copy_from_slice(&[
+        0xbb, 0xdf, 0x9b, 0x57, 0x13, // MOV EBX, prefix marker
+        0xcd, VECTOR, // INT 21h
+        0xb8, 0xe0, 0xac, 0x68, 0x24, // MOV EAX, suffix marker
+    ]);
+
+    // `on_int` keys by the already-advanced EIP, exactly as the decoded INT does.
+    cpu.set_eip(NATIVE_ENTRY + 7);
+    let ebx_before_native_prefix = cpu.registers.ebx();
+    assert_ne!(ebx_before_native_prefix, PREFIX_MARKER);
+    // The guard is sampled at the INT entry, after the native MOV has written EBX.
+    cpu.registers.set_ebx(PREFIX_MARKER);
+    let key = key_for(&cpu, VECTOR, 0);
+    let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+    memo.return_eip = NATIVE_ENTRY + 7;
+    memo.epilogue.ebx = PREFIX_MARKER;
+    memo.raw_core_clocks = 1_000;
+    let raw_answer = memo.raw_core_clocks;
+    install_memo(&mut cpu, key, memo);
+    cpu.registers.set_ebx(ebx_before_native_prefix);
+
+    cpu.set_eip(NATIVE_ENTRY);
+    cpu.set_fast_map_enabled_for_test(true);
+    map_flat_direct_page(&mut cpu, &mut bus, 0);
+    for start in [NATIVE_ENTRY, NATIVE_ENTRY + 5] {
+        cpu.set_eip(start);
+        cpu.begin_instruction();
+        cpu.fetch_decoded(&mut bus, start)
+            .expect("the native reflected slots decode");
+    }
+    cpu.set_eip(NATIVE_ENTRY);
+    let compilation = jit::direct::compile(&mut cpu, NATIVE_ENTRY, true)
+        .expect("MOV; INT 21h must compile as the terminal native shape");
+    assert_eq!(compilation.span.instructions, 2);
+    assert_eq!(compilation.callout_int_imm8_slots, 1);
+    let block_key = jit::direct::key_for(&cpu, NATIVE_ENTRY, true).expect("native block key");
+    assert!(matches!(
+        cpu.jit_direct.probe(block_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install reflected terminal block");
+    let block = cpu.jit_direct.block(id).expect("installed block");
+
+    let entries = cpu.perf_counters().jit_direct_entries;
+    let retired = cpu.perf_counters().jit_direct_insns;
+    let elapsed = cpu.elapsed_clocks;
+    let remainder = cpu.reflected_call_timing_rem();
+    let outcome = cpu
+        .run_direct_block_accounted_for_test(&mut bus, block, u64::MAX)
+        .expect("the answered INT must not stop the CPU")
+        .expect("the installed reflected block must enter natively");
+
+    assert_eq!(cpu.perf_counters().jit_direct_entries - entries, 1);
+    assert_eq!(cpu.perf_counters().jit_direct_insns - retired, 2);
+    assert_eq!(cpu.registers.ebx(), PREFIX_MARKER);
+    assert_eq!(cpu.registers.eip, NATIVE_ENTRY + 7);
+    assert_ne!(
+        cpu.registers.eax(),
+        SUFFIX_MARKER,
+        "the suffix remains unexecuted"
+    );
+    assert!(
+        bus.answered_flag,
+        "the actual reflected answer reached the bus observer"
+    );
+    assert_eq!(cpu.reflected_call.as_ref().unwrap().answered, 1);
+    assert_eq!(
+        outcome.core_clocks, 124,
+        "one native MOV, the I586 protected INT helper, and the raw memo answer each settle once"
+    );
+    assert_eq!(cpu.elapsed_clocks - elapsed, outcome.core_clocks);
+    assert_eq!(raw_answer, 1_000);
+    assert_eq!(remainder, 0);
+    assert_eq!(cpu.reflected_call_timing_rem(), 4);
+    assert!(cpu.direct_runtime.callout_error.is_none());
+    assert_eq!(cpu.jit_direct.native_successful_helper_core, 0);
+    assert_eq!(cpu.jit_direct.native_fatal_helper_core, 0);
+    assert!(cpu.jit_direct.take_callout_retire_pending().is_none());
+
+    let later_elapsed = cpu.elapsed_clocks;
+    let later = cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        later.core_clocks, 1,
+        "later suffix has no reflected sidecar debt"
+    );
+    assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
+    assert_eq!(cpu.registers.eax(), SUFFIX_MARKER);
+}
+
+#[test]
+fn public_reflected_int_answers_once_from_cycle_and_cached_head() {
+    const ENTRY: u32 = 0x500;
+    for cached_head in [false, true] {
+        let (mut cpu, mut bus) = synthetic_reflected_client();
+        arm(&mut cpu);
+        cpu.set_mode(GswMode::Gsw586);
+        cpu.set_timing_epoch(2);
+        bus.gate_allowance = Some(1_000_000);
+        bus.mem[ENTRY as usize..ENTRY as usize + 4].copy_from_slice(&[0xcd, VECTOR, 0xb0, 0x5a]);
+
+        cpu.set_eip(ENTRY + 2);
+        let key = key_for(&cpu, VECTOR, 0);
+        let mut memo = distinguishable_memo(&cpu, 0x7200, cpu.control.cr3);
+        memo.return_eip = ENTRY + 2;
+        memo.raw_core_clocks = 1_000;
+        let expected_epilogue = memo.epilogue;
+        install_memo(&mut cpu, key, memo);
+        cpu.set_eip(ENTRY);
+        if cached_head {
+            cpu.begin_instruction();
+            cpu.fetch_decoded(&mut bus, ENTRY)
+                .expect("the cached INT head decodes");
+            cpu.set_eip(ENTRY);
+        }
+        cpu.set_jit_auto_admit(false);
+        let elapsed = cpu.elapsed_clocks;
+        let dispatches = cpu.perf_counters().instructions;
+        let native_entries = cpu.perf_counters().jit_direct_entries;
+        let committed_bus = bus.committed_bus;
+        let core_clocks = if cached_head {
+            cpu.run_budgeted(&mut bus, 123)
+                .unwrap()
+                .consumed_core_clocks
+        } else {
+            cpu.cycle(&mut bus).unwrap().core_clocks
+        };
+        assert_eq!(core_clocks, 123);
+        assert_eq!(cpu.elapsed_clocks - elapsed, 123);
+        assert_eq!(cpu.perf_counters().instructions - dispatches, 1_580);
+        assert_eq!(cpu.perf_counters().jit_direct_entries - native_entries, 0);
+        assert_eq!(bus.committed_bus - committed_bus, 500);
+        assert!(bus.answered_flag);
+        assert_eq!(cpu.reflected_call.as_ref().unwrap().answered, 1);
+        assert_eq!(cpu.registers.eip, ENTRY + 2);
+        assert_eq!(cpu.registers.eax(), expected_epilogue.eax);
+        assert_eq!(cpu.registers.ebx(), expected_epilogue.ebx);
+        assert_eq!(cpu.registers.ecx(), expected_epilogue.ecx);
+        assert_eq!(cpu.registers.edx(), expected_epilogue.edx);
+        assert_eq!(cpu.registers.ebp(), expected_epilogue.ebp);
+        assert_eq!(cpu.registers.esi(), expected_epilogue.esi);
+        assert_eq!(cpu.registers.edi(), expected_epilogue.edi);
+        assert_eq!(cpu.registers.esp(), expected_epilogue.esp);
+        assert_eq!(
+            cpu.eflags() & EFLAGS_ARCH_MASK,
+            expected_epilogue.eflags_masked
+        );
+        for (index, want) in [
+            (SegmentIndex::Cs, expected_epilogue.cs),
+            (SegmentIndex::Ss, expected_epilogue.ss),
+            (SegmentIndex::Ds, expected_epilogue.ds),
+            (SegmentIndex::Es, expected_epilogue.es),
+            (SegmentIndex::Fs, expected_epilogue.fs),
+            (SegmentIndex::Gs, expected_epilogue.gs),
+        ] {
+            let live = cpu.registers.segment(index);
+            assert_eq!(live.selector, want.selector, "{index:?} selector");
+            assert_eq!(live.base, want.base, "{index:?} base");
+            assert_eq!(live.limit, want.limit, "{index:?} limit");
+            assert_eq!(live.access, want.access, "{index:?} access");
+            assert_eq!(live.default_size_32, want.default_size_32, "{index:?} D/B");
+        }
+        assert_ne!(cpu.registers.eax() & 0xff, 0x5a);
+        assert_eq!(bus.mem[0x7200], 0xef);
+        assert_eq!(cpu.timing_rem, 4);
+
+        let later_elapsed = cpu.elapsed_clocks;
+        let later_dispatches = cpu.perf_counters().instructions;
+        let later_native_entries = cpu.perf_counters().jit_direct_entries;
+        let later_bus = bus.committed_bus;
+        let later = cpu.cycle(&mut bus).unwrap();
+        assert_eq!(later.core_clocks, 1);
+        assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
+        assert_eq!(cpu.perf_counters().instructions - later_dispatches, 1);
+        assert_eq!(
+            cpu.perf_counters().jit_direct_entries - later_native_entries,
+            0
+        );
+        assert_eq!(bus.committed_bus, later_bus);
+        assert_eq!(cpu.timing_rem, 4);
+        assert_eq!(cpu.registers.eip, ENTRY + 4);
+        assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+        assert_eq!(cpu.reflected_call.as_ref().unwrap().answered, 1);
+    }
+}
+
 /// **Mutation bites, four, each verified red on its own**: (a) drop the epilogue's
 /// segment restore -- DS keeps the caller's selector and the next reflected call runs
 /// the DOS half against the wrong data segment (BLOCKING finding 1's shape); (b) drop
@@ -1629,7 +1899,8 @@ fn the_answer_reproduces_the_epilogue_registers_flags_segments_and_sp() {
     let expected = memo.epilogue;
     install_memo(&mut cpu, key, memo);
 
-    let outcome = on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault");
+    let outcome =
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault");
     assert_eq!(outcome, IntOutcome::Answered);
 
     let regs = &cpu.registers;
@@ -1690,8 +1961,9 @@ fn nested_acks_are_re_issued_in_trip_order() {
     install_memo(&mut cpu, key, memo);
     bus.acks.clear();
 
+    let mut committed = CommittedCore::default();
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut committed).expect("no bus fault"),
         IntOutcome::Answered
     );
     assert_eq!(
@@ -1717,7 +1989,7 @@ fn a_class_w_write_is_replayed_at_its_own_address_and_width() {
     install_memo(&mut cpu, key, memo);
 
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::Answered
     );
     assert_eq!(bus.read_raw(0x7200, BusWidth::Word), 0xBEEF);
@@ -1745,7 +2017,7 @@ fn an_answered_trip_replays_the_cr3_writes() {
     install_memo(&mut cpu, key, memo);
 
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::Answered
     );
     assert_eq!(
@@ -1782,13 +2054,19 @@ fn the_answer_charges_raw_core_clocks_through_the_carry_scaler() {
     let bus_before = bus.bus_clock;
     let insns_before = cpu.perf.instructions;
 
+    let mut committed = CommittedCore::default();
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut committed).expect("no bus fault"),
         IntOutcome::Answered
     );
 
     let scaled = raw_core * num + rem_before;
     assert_eq!(cpu.elapsed_clocks - elapsed_before, scaled / den);
+    assert_eq!(
+        committed.total(),
+        scaled / den,
+        "the direct answer result owns the same committed scaled core work"
+    );
     assert_eq!(cpu.reflected_call_timing_rem(), scaled % den);
     assert_ne!(
         scaled % den,
@@ -1828,7 +2106,7 @@ fn a_lump_that_does_not_fit_the_remaining_allowance_falls_through() {
     let rem_before = cpu.reflected_call_timing_rem();
 
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered
     );
     assert_eq!(cpu.registers, regs_before);
@@ -1865,7 +2143,7 @@ fn a_class_r_range_a_device_can_observe_falls_through_at_answer_time() {
     let regs_before = cpu.registers.clone();
     let mem_before = bus.mem.clone();
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered
     );
     assert_eq!(cpu.registers, regs_before);
@@ -1908,7 +2186,7 @@ fn a_poisoned_read_cell_leaves_every_register_memory_clock_and_counter_untouched
     let cr3_before = cpu.control.cr3;
 
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered
     );
     assert_eq!(cpu.registers, regs_before, "no register may move");
@@ -1951,7 +2229,7 @@ fn an_unarmed_test_double_can_never_fake_a_hit() {
 
     let regs_before = cpu.registers.clone();
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered
     );
     assert_eq!(cpu.registers, regs_before);
@@ -1978,7 +2256,7 @@ fn a_nested_int_outside_the_opening_window_is_still_recorded_as_an_ack() {
     cpu.reflected_call.as_mut().unwrap().open = Some(open);
     cpu.registers.set_eax(0x1234);
 
-    let _ = on_int(&mut cpu, &mut bus, 0x60);
+    let _ = on_int(&mut cpu, &mut bus, 0x60, &mut CommittedCore::default());
     let acks = &cpu
         .reflected_call
         .as_ref()
@@ -2066,7 +2344,7 @@ fn a_wholesale_decode_mark_clear_retires_every_memo() {
 
     let regs_before = cpu.registers.clone();
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered,
         "a memo whose code marks were cleared wholesale may not answer"
     );
@@ -2155,7 +2433,7 @@ fn an_audit_refuses_the_answer_and_runs_the_real_trip() {
     install_memo(&mut cpu, key, memo);
 
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered,
         "at AUDIT=1 nothing is answered"
     );
@@ -2330,7 +2608,7 @@ fn audit_period_zero_turns_the_audit_off() {
     install_memo(&mut cpu, key, memo);
 
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::Answered
     );
     let state = cpu.reflected_call.as_ref().unwrap();
@@ -2373,7 +2651,7 @@ fn accumulated_bus_drift_forces_an_audit_before_half_an_edge_is_lost() {
 
     // Answer once, so the key exists with a zero accumulator.
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::Answered
     );
     assert_eq!(
@@ -2395,7 +2673,7 @@ fn accumulated_bus_drift_forces_an_audit_before_half_an_edge_is_lost() {
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered,
         "the accumulator forces the next trip to run naturally"
     );
@@ -2425,7 +2703,7 @@ fn a_posted_soft_int_refuses_the_answer() {
 
     let regs_before = cpu.registers.clone();
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered
     );
     assert_eq!(cpu.registers, regs_before);
@@ -2481,7 +2759,7 @@ fn a_task_switch_inside_a_trip_refuses_the_memo() {
     // proved, and a fault on the way out cannot un-record the refusal.
     cpu.registers.eflags |= FLAG_NT;
     cpu.tr.base = 0x3000;
-    let _ = cpu.iret(&mut bus, OperandSize::Dword);
+    let _ = cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default());
     cpu.registers.eflags &= !FLAG_NT;
 
     on_far_return(&mut cpu, &bus);
@@ -2707,7 +2985,7 @@ fn a_cell_read_then_written_is_pinned_at_its_post_trip_value() {
     for _ in 0..11 {
         cpu.registers.set_esp(STACK_TOP);
         cpu.set_eip(CLIENT_RETURN_EIP);
-        let _ = on_int(&mut cpu, &mut bus, VECTOR);
+        let _ = on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default());
         note_read(&mut cpu, &bus, CELL, BusWidth::Dword);
         note_write(&mut cpu, &bus, CELL, BusWidth::Dword, 0x2222, false, None);
         bus.write_raw(CELL, BusWidth::Dword, 0x2222);
@@ -2838,7 +3116,7 @@ fn a_write_whose_bytes_the_trip_never_read_is_not_pinned() {
 fn run_trip_writing(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u32, also: &[(u32, u32)]) {
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
-    let _ = on_int(cpu, bus, VECTOR);
+    let _ = on_int(cpu, bus, VECTOR, &mut CommittedCore::default());
     note_write(
         cpu,
         bus,
@@ -2959,7 +3237,7 @@ fn a_class_r_write_whose_pre_value_alternates_is_demoted_to_class_w() {
         bus.write_raw(CELL, BusWidth::Dword, pre);
         cpu.registers.set_esp(STACK_TOP);
         cpu.set_eip(CLIENT_RETURN_EIP);
-        let _ = on_int(&mut cpu, &mut bus, VECTOR);
+        let _ = on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default());
         // Read before writing, so the write is PINNED and Class R is reachable at all.
         note_read(&mut cpu, &bus, CELL, BusWidth::Dword);
         note_write(&mut cpu, &bus, CELL, BusWidth::Dword, 0, false, None);
@@ -3159,7 +3437,7 @@ fn the_audit_skips_the_memos_own_class_d_set_not_one_it_re_derives() {
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered,
         "AUDIT=1 audits instead of answering"
     );
@@ -3219,7 +3497,8 @@ fn a_written_dword_outside_the_memos_class_d_set_is_still_graded() {
     bus.write_raw(LIVE, BusWidth::Dword, 0x1111_1111);
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
-    let _ = on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault");
+    let _ =
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault");
     note_write(
         &mut cpu,
         &bus,
@@ -3278,7 +3557,7 @@ fn the_audit_compares_against_the_value_at_trip_entry_not_before_the_first_write
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
     assert_eq!(
-        on_int(&mut cpu, &mut bus, VECTOR).expect("no bus fault"),
+        on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default()).expect("no bus fault"),
         IntOutcome::NotAnswered,
         "AUDIT=1 audits instead of answering"
     );
@@ -3328,7 +3607,7 @@ fn a_byte_moving_outside_the_claimed_mask_widens_the_claim_and_is_confirmed() {
     for trip in 1..=11u32 {
         cpu.registers.set_esp(STACK_TOP);
         cpu.set_eip(CLIENT_RETURN_EIP);
-        let _ = on_int(&mut cpu, &mut bus, VECTOR);
+        let _ = on_int(&mut cpu, &mut bus, VECTOR, &mut CommittedCore::default());
         // The trip journals a WORD write to the high half only...
         note_write(
             &mut cpu,

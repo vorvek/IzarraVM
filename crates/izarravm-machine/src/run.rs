@@ -1483,6 +1483,8 @@ impl Machine {
                 < self.ata_poll_floor_ticks;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
+            #[cfg(test)]
+            let elapsed_at_batch_start = self.elapsed_clocks;
             // Capture live timing state before the fields move into MachineBus.
             let timeline_at_batch_start = self.timeline;
             let master_ticks_at_batch_start = self.timeline.now_ticks();
@@ -1539,6 +1541,13 @@ impl Machine {
                 }
             }
             let cap = self.event_batch_cap_cached(remaining);
+            #[cfg(test)]
+            let cap = self
+                .test_next_batch_cap
+                .take()
+                .map_or(cap, |requested| requested.min(cap));
+            #[cfg(test)]
+            self.test_effective_batch_caps.push(cap);
             // Published to `MachineBus` below so the reflected-call memo's answer gate
             // bounds a lump by THIS cap rather than a second, drift-prone derivation;
             // the bool only names the refusal lane (`DeviceEdge` vs `Cap`).
@@ -1641,6 +1650,8 @@ impl Machine {
                     poll_skip_diagnostics,
                     #[cfg(test)]
                     test_prior_core_pushes,
+                    #[cfg(test)]
+                    test_string_port_observations,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -1684,6 +1695,8 @@ impl Machine {
                     poll_skip_certificate: &*poll_skip_certificate,
                     retrace_poll,
                     string_port_element_bytes: 0,
+                    #[cfg(test)]
+                    test_string_port_observations,
                     pending_mode,
                     fast_post: *fast_post,
                     booter_inert: *booter_inert,
@@ -1935,7 +1948,13 @@ impl Machine {
                                 }
                             }
                             Err(e) => {
-                                fault = Some(e);
+                                fault = Some(CpuRunError {
+                                    error: e.error,
+                                    consumed_core_clocks: checked_batch_core_sum(
+                                        batch_core,
+                                        e.consumed_core_clocks,
+                                    ),
+                                });
                                 break;
                             }
                         }
@@ -1953,13 +1972,58 @@ impl Machine {
             self.host_profile
                 .record(MachineProfilePhaseKind::CpuBatch, cpu_batch_start);
 
+            let settled_core = match &outcome {
+                Ok(outcome) => outcome.core_clocks,
+                Err(error) => error.consumed_core_clocks,
+            };
+            let bus_clocks = self.trace.elapsed_clocks() - trace_before;
+            let scaled_bus_clocks = self.scale_bus(bus_clocks);
+            let isa_clocks = std::mem::take(&mut self.port_bus_batch_clocks);
+            let step = settled_core
+                .checked_add(scaled_bus_clocks)
+                .and_then(|total| total.checked_add(isa_clocks))
+                .expect("machine batch step exceeded u64");
+            self.scaled_bus_clocks = self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
+            let advance_start = self.host_profile.start();
+            self.advance_cpu_work(step, settled_core);
+            self.host_profile
+                .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
+
+            // The same settlement owner serves a completed batch and a fatal
+            // return. Keep the observation at that common boundary so tests do
+            // not have to infer fatal core from device time.
+            #[cfg(test)]
+            {
+                self.test_batch_observations.push(TestBatchObservation {
+                    raw_bus_clocks: bus_clocks,
+                    scaled_bus_clocks,
+                    core_clocks: settled_core,
+                    isa_clocks,
+                    step,
+                    bus_rem_at_entry: bus_rem_at_batch_start,
+                    bus_rem_at_exit: self.bus_rem,
+                    timeline_ticks_at_entry: master_ticks_at_batch_start,
+                    timeline_ticks_at_exit: self.timeline.now_ticks(),
+                    elapsed_at_entry: elapsed_at_batch_start,
+                    elapsed_at_exit: self.elapsed_clocks,
+                    effective_cap: cap,
+                    fatal: outcome.is_err(),
+                    device_wrote_memory_before_reconcile: self.device_wrote_memory,
+                    direct_map_changed_before_reconcile: self.direct_map_changed,
+                    direct_data_map_changed_before_reconcile: self.direct_data_map_changed,
+                });
+                self.test_batch_core_totals.push(settled_core);
+                self.test_batch_steps.push(step);
+                self.test_batch_isa_clocks.push(isa_clocks);
+                self.test_batch_registers.push((
+                    self.cpu.registers.eip,
+                    self.cpu.registers.ecx(),
+                    self.cpu.registers.edi(),
+                ));
+            }
+
             match outcome {
                 Ok(outcome) => {
-                    // Test seam: the final core total the batch-end step consumes,
-                    // parallel to this batch's test_prior_core_pushes entry.
-                    #[cfg(test)]
-                    self.test_batch_core_totals.push(outcome.core_clocks);
-                    let bus_clocks = self.trace.elapsed_clocks() - trace_before;
                     // Scale the bus portion per mode (B-T10). core_clocks is already
                     // scaled by the CPU's level_timing; this applies the third lever
                     // to the fetch + data-access bus clocks so a fast part pulls away
@@ -1982,23 +2046,6 @@ impl Machine {
                     // would miss exactly the case that fails. The Accurate class
                     // (386) never accumulates this (see read_io), so it stays
                     // byte-identical; its slower clock already spans the 80 us window.
-                    let scaled_bus_clocks = self.scale_bus(bus_clocks);
-                    let step = outcome
-                        .core_clocks
-                        .checked_add(scaled_bus_clocks)
-                        .and_then(|total| {
-                            total.checked_add(std::mem::take(&mut self.port_bus_batch_clocks))
-                        })
-                        .expect("machine batch step exceeded u64");
-                    self.scaled_bus_clocks =
-                        self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
-                    // Advance the OPL timers so AdLib detection's delay loops see
-                    // the overflow flag (the synthesis clock is driven separately
-                    // by `render_audio`).
-                    let advance_start = self.host_profile.start();
-                    self.advance_cpu_work(step, outcome.core_clocks);
-                    self.host_profile
-                        .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
                     let service_start = self.host_profile.start();
                     let mut serviced = false;
                     let mut service_stop = None;
@@ -2221,7 +2268,24 @@ impl Machine {
                         self.direct_data_map_changed = false;
                     }
                 }
-                Err(error) => {
+                Err(fatal) => {
+                    let error = fatal.error;
+                    self.invalidate_device_edge_cache();
+                    if self.keyboard.a20_enabled() != a20_before {
+                        self.cpu.note_a20_changed();
+                    }
+                    if std::mem::take(&mut self.device_wrote_memory) {
+                        self.cpu.note_device_memory_write();
+                    }
+                    if self.direct_map_changed {
+                        self.cpu.note_direct_map_changed();
+                        self.direct_map_changed = false;
+                        self.direct_data_map_changed = false;
+                    } else if self.direct_data_map_changed {
+                        self.note_vga_wipe_apply();
+                        self.cpu.note_direct_data_map_changed();
+                        self.direct_data_map_changed = false;
+                    }
                     self.report_fatal_fault(&error);
                     if fault_trace_enabled() {
                         self.log_fault_trace(&error);

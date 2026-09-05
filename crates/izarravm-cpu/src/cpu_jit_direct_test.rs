@@ -3507,6 +3507,14 @@ mod interpret_one;
 #[path = "cpu_jit_int_imm8_admission_test.rs"]
 mod int_imm8_admission;
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_task_gate_ledger_test.rs"]
+mod task_gate_ledger;
+
 #[path = "cpu_jit_direct_timing_test.rs"]
 mod timing;
 
@@ -4618,10 +4626,10 @@ fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faul
     let native_call = native.decode_cache.get(CALL, true).unwrap();
     let interp_call = interp.decode_cache.get(CALL, true).unwrap();
     native
-        .execute_decoded(&native_call, &mut native_bus)
+        .execute_decoded(&native_call, &mut native_bus, &mut CommittedCore::default())
         .unwrap();
     interp
-        .execute_decoded(&interp_call, &mut interp_bus)
+        .execute_decoded(&interp_call, &mut interp_bus, &mut CommittedCore::default())
         .unwrap();
     assert_eq!(native.registers.eip, TARGET);
     assert_eq!(interp.registers.eip, TARGET);
@@ -5095,10 +5103,10 @@ fn finite_cs_call_through_memory_limit_exit_preserves_restart_state_and_faults_p
     let native_call = native.decode_cache.get(CALL, true).unwrap();
     let interp_call = interp.decode_cache.get(CALL, true).unwrap();
     native
-        .execute_decoded(&native_call, &mut native_bus)
+        .execute_decoded(&native_call, &mut native_bus, &mut CommittedCore::default())
         .unwrap();
     interp
-        .execute_decoded(&interp_call, &mut interp_bus)
+        .execute_decoded(&interp_call, &mut interp_bus, &mut CommittedCore::default())
         .unwrap();
     assert_eq!(native.registers.eip, TARGET);
     assert_eq!(interp.registers.eip, TARGET);

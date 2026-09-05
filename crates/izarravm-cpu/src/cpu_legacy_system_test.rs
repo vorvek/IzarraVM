@@ -48,7 +48,9 @@ fn decode_then_execute_matches_golden_for_add_rm_reg() {
     let insn = split.decode(&mut split_bus).unwrap();
     assert_eq!(insn.opcode, 0x01);
     assert_eq!(insn.operand, Some(DecodedOperand::Reg(0))); // r/m = AX
-    let split_outcome = split.execute_decoded(&insn, &mut split_bus).unwrap();
+    let split_outcome = split
+        .execute_decoded(&insn, &mut split_bus, &mut CommittedCore::default())
+        .unwrap();
 
     // 0x1234 + 0x1111 = 0x2345: no carry/zero/sign/overflow/aux, low byte 0x45 has odd parity
     // (PF clear), so only the always-set reserved bit 1 remains.
@@ -87,7 +89,8 @@ fn decoded_add_rm_reg_recomputes_ea_from_live_registers() {
 
     // Move the pointer before executing.
     cpu.write_reg16(Reg16::Bx, 0x0030);
-    cpu.execute_decoded(&insn, &mut bus).unwrap();
+    cpu.execute_decoded(&insn, &mut bus, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(bus.memory[0x20], 0x01, "old target must be untouched");
     assert_eq!(bus.memory[0x30], 0x11, "new target (BX=0x30) gets AX added");
@@ -110,13 +113,15 @@ fn alu_split_recomputes_effective_address() {
 
     // First run with BX = 0x40: the byte at [0x40] gains AL.
     cpu.write_reg16(Reg16::Bx, 0x0040);
-    cpu.execute_decoded(&insn, &mut bus).unwrap();
+    cpu.execute_decoded(&insn, &mut bus, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(bus.memory[0x40], 0x11, "[BX=0x40] must get AL added");
     assert_eq!(bus.memory[0x50], 0x02, "[0x50] untouched on the first run");
 
     // Re-execute the SAME decoded instruction with BX = 0x50: the EA must follow BX.
     cpu.write_reg16(Reg16::Bx, 0x0050);
-    cpu.execute_decoded(&insn, &mut bus).unwrap();
+    cpu.execute_decoded(&insn, &mut bus, &mut CommittedCore::default())
+        .unwrap();
     assert_eq!(bus.memory[0x40], 0x11, "[0x40] untouched on the second run");
     assert_eq!(bus.memory[0x50], 0x12, "[BX=0x50] must get AL added");
 }
@@ -1681,7 +1686,8 @@ fn cpl_transition_iret_into_v86_forces_cpl_3() {
     write(28, 0x3333); // FS
     write(32, 0x4444); // GS
 
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(cpu.is_v86_mode(), "returned into V86");
     assert_eq!(
@@ -1717,8 +1723,7 @@ fn cpl_transition_pe_clear_resets_cpl_to_zero() {
 
 // ---- Hardware task switch ----
 
-#[test]
-fn jmp_to_tss_performs_a_task_switch() {
+fn direct_tss_jmp_fixture(mode: GswMode, epoch: u32, carry: u64) -> (CpuGsw, TestBus) {
     // New 386 TSS at 0x380 (selector 0x18), old busy TSS at 0x300 (selector 0x20).
     let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
     let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
@@ -1727,6 +1732,9 @@ fn jmp_to_tss_performs_a_task_switch() {
         &[0xea, 0x00, 0x00, 0x18, 0x00],
         &[RING0_CODE, ring0_data, new_tss, old_tss],
     );
+    cpu.set_mode(mode);
+    cpu.set_timing_epoch(epoch);
+    cpu.timing_rem = carry;
     cpu.tr = SegmentRegister {
         selector: 0x20,
         base: 0x300,
@@ -1746,9 +1754,21 @@ fn jmp_to_tss_performs_a_task_switch() {
     put16(&mut memory, 0x380 + 76, 0x08); // CS
     put16(&mut memory, 0x380 + 80, 0x10); // SS
     put16(&mut memory, 0x380 + 84, 0x10); // DS
+    memory[0x200..0x202].copy_from_slice(&[0xb0, 0x5a]); // later clean MOV AL, 0x5a
     let mut bus = TestBus::with_memory(memory);
+    bus.timing_epoch_two = epoch == 2;
+    (cpu, bus)
+}
 
-    cpu.cycle(&mut bus).unwrap();
+#[test]
+fn jmp_to_tss_performs_a_task_switch() {
+    let (mut cpu, mut bus) = direct_tss_jmp_fixture(GswMode::Gsw486, 2, 0);
+
+    let elapsed_before = cpu.elapsed_clocks;
+    let outcome = cpu.cycle(&mut bus).unwrap();
+    assert_eq!(outcome.core_clocks, 398, "199 outer + 199 TaskSwitch");
+    assert_eq!(cpu.elapsed_clocks - elapsed_before, 398);
+    assert_eq!(cpu.timing_rem, 0, "both epoch-2 task terms divide exactly");
 
     assert_eq!(cpu.registers.cs().selector, 0x08, "loaded new task CS");
     assert_eq!(cpu.registers.eip, 0x200);
@@ -1763,6 +1783,216 @@ fn jmp_to_tss_performs_a_task_switch() {
     );
     // JMP clears the old TSS busy bit in its GDT descriptor (0x8b -> 0x89).
     assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x89);
+    let later = cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        later.core_clocks, 1,
+        "later MOV must not receive old task debt"
+    );
+    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+    assert_eq!(cpu.timing_rem, 0);
+}
+
+#[test]
+fn direct_call_to_tss_keeps_the_old_task_busy_and_the_backlink() {
+    for (mode, expected) in [(GswMode::Gsw486, 398), (GswMode::Gsw586, 346)] {
+        let (mut cpu, mut bus) = direct_tss_jmp_fixture(mode, 2, 0);
+        bus.memory[..5].copy_from_slice(&[0x9a, 0x00, 0x00, 0x18, 0x00]);
+        let elapsed = cpu.elapsed_clocks;
+
+        let outcome = cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(outcome.core_clocks, expected, "{mode:?} direct CALL total");
+        assert_eq!(cpu.elapsed_clocks - elapsed, expected);
+        assert_eq!(cpu.timing_rem, 0);
+        assert_eq!(cpu.tr.selector, 0x18);
+        assert_eq!(
+            bus.memory[0x100 + 0x20 + 5],
+            0x8b,
+            "CALL keeps old TSS busy"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x380..0x382].try_into().unwrap()),
+            0x20,
+            "CALL writes the old-task backlink"
+        );
+        assert_eq!(cpu.cycle(&mut bus).unwrap().core_clocks, 1);
+    }
+}
+
+#[test]
+fn public_tss_save_failure_before_commit_earns_no_task_switch_debt() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (mut cpu, mut bus) = direct_tss_jmp_fixture(mode, 2, 7);
+        bus.memory[0x100 + 0x20..0x100 + 0x28]
+            .copy_from_slice(&[0x67, 0x00, 0x00, 0x10, 0x00, 0x8b, 0x00, 0x00]);
+        bus.memory[5..7].copy_from_slice(&[0xb0, 0x5a]);
+        cpu.tr.base = 0x1000;
+        let before = cpu.clone();
+        let memory_before = bus.memory.clone();
+        let trace_before = bus.trace.cycles().len();
+
+        let error = cpu.cycle(&mut bus).unwrap_err();
+
+        assert!(matches!(
+            error.error,
+            CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 0x1020 })
+        ));
+        assert_eq!(
+            error.consumed_core_clocks, 0,
+            "{mode:?} failed save earns zero"
+        );
+        assert_eq!(cpu.elapsed_clocks, before.elapsed_clocks);
+        assert_eq!(cpu.timing_rem, 7);
+        assert_eq!(cpu.tr, before.tr);
+        assert_eq!(
+            [
+                cpu.registers.eax(),
+                cpu.registers.ecx(),
+                cpu.registers.edx(),
+                cpu.registers.ebx(),
+                cpu.registers.esp(),
+                cpu.registers.ebp(),
+                cpu.registers.esi(),
+                cpu.registers.edi(),
+            ],
+            [
+                before.registers.eax(),
+                before.registers.ecx(),
+                before.registers.edx(),
+                before.registers.ebx(),
+                before.registers.esp(),
+                before.registers.ebp(),
+                before.registers.esi(),
+                before.registers.edi(),
+            ]
+        );
+        for segment in [
+            SegmentIndex::Cs,
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Fs,
+            SegmentIndex::Gs,
+            SegmentIndex::Ss,
+        ] {
+            assert_eq!(
+                cpu.registers.segment(segment),
+                before.registers.segment(segment)
+            );
+        }
+        assert_eq!(cpu.registers.eflags, before.registers.eflags);
+        assert_eq!(cpu.control, before.control);
+        assert_eq!(bus.memory, memory_before);
+        assert_eq!(cpu.registers.eip, 5, "the attempted JMP is the fault site");
+        assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x8b, "old TSS remains busy");
+        assert_eq!(
+            bus.memory[0x100 + 0x18 + 5],
+            0x89,
+            "new TSS remains available"
+        );
+        assert_eq!(
+            bus.trace
+                .cycles()
+                .iter()
+                .skip(trace_before)
+                .filter(|cycle| cycle.kind == BusAccessKind::DataRead)
+                .map(|cycle| cycle.address)
+                .collect::<Vec<_>>(),
+            vec![0x118, 0x11c, 0x118, 0x11c]
+        );
+        assert_eq!(
+            bus.trace
+                .cycles()
+                .iter()
+                .skip(trace_before)
+                .filter(|cycle| cycle.kind == BusAccessKind::DataWrite)
+                .map(|cycle| cycle.address)
+                .collect::<Vec<_>>(),
+            vec![0x1020]
+        );
+
+        let later_elapsed = cpu.elapsed_clocks;
+        assert_eq!(cpu.cycle(&mut bus).unwrap().core_clocks, 1);
+        assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
+        assert_eq!(cpu.timing_rem, 7);
+        assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+        assert_eq!(cpu.registers.eip, 7);
+    }
+}
+
+#[test]
+fn direct_tss_jmp_keeps_its_i586_and_epoch_one_tariffs_separate() {
+    let (mut i586, mut i586_bus) = direct_tss_jmp_fixture(GswMode::Gsw586, 2, 0);
+    let i586_elapsed = i586.elapsed_clocks;
+    let i586_outcome = i586.cycle(&mut i586_bus).unwrap();
+    assert_eq!(i586_outcome.core_clocks, 346, "173 outer + 173 TaskSwitch");
+    assert_eq!(i586.elapsed_clocks - i586_elapsed, 346);
+    assert_eq!(i586.timing_rem, 0);
+    assert_eq!(i586.cycle(&mut i586_bus).unwrap().core_clocks, 1);
+    assert_eq!(i586.registers.eax() & 0xff, 0x5a);
+    assert_eq!(i586.timing_rem, 0);
+
+    let (mut epoch_one, mut epoch_one_bus) = direct_tss_jmp_fixture(GswMode::Gsw486, 1, 0);
+    let epoch_one_elapsed = epoch_one.elapsed_clocks;
+    let epoch_one_outcome = epoch_one.cycle(&mut epoch_one_bus).unwrap();
+    assert_eq!(
+        epoch_one_outcome.core_clocks, 1,
+        "epoch one has only the raw-17 outer term"
+    );
+    assert_eq!(epoch_one.elapsed_clocks - epoch_one_elapsed, 1);
+    assert_eq!(epoch_one.timing_rem, 5, "17 raw clocks leave carry five");
+    assert_eq!(
+        epoch_one.cycle(&mut epoch_one_bus).unwrap().core_clocks,
+        0,
+        "the later epoch-one MOV is independently below a full core clock"
+    );
+    assert_eq!(epoch_one.registers.eax() & 0xff, 0x5a);
+    assert_eq!(
+        epoch_one.timing_rem, 7,
+        "the later MOV advances only its own carry"
+    );
+
+    let (mut carried, mut carried_bus) = direct_tss_jmp_fixture(GswMode::Gsw486, 1, 7);
+    assert_eq!(
+        carried.cycle(&mut carried_bus).unwrap().core_clocks,
+        2,
+        "raw17 plus entry carry7 crosses two epoch-one core clocks"
+    );
+    assert_eq!(
+        carried.timing_rem, 0,
+        "the exact epoch-one quotient consumes carry7"
+    );
+}
+
+#[test]
+fn indirect_tss_transfers_keep_their_far_memory_outer_tariff() {
+    for (mode, expected) in [(GswMode::Gsw486, 217), (GswMode::Gsw586, 178)] {
+        for (modrm, kind) in [(0x1e, "CALL"), (0x2e, "JMP")] {
+            let (mut cpu, mut bus) = direct_tss_jmp_fixture(mode, 2, 0);
+            bus.memory[0..4].copy_from_slice(&[0xff, modrm, 0x80, 0x00]);
+            bus.memory[0x80..0x84].copy_from_slice(&[0, 0, 0x18, 0]);
+            let elapsed_before = cpu.elapsed_clocks;
+
+            let outcome = cpu.cycle(&mut bus).unwrap();
+
+            assert_eq!(
+                outcome.core_clocks, expected,
+                "{kind} must retain CallJmpFarMem plus TaskSwitch for {mode:?}"
+            );
+            assert_eq!(cpu.elapsed_clocks - elapsed_before, expected);
+            assert_eq!(cpu.timing_rem, 0);
+            assert_eq!(cpu.tr.selector, 0x18, "{kind} must switch to the named TSS");
+            assert_eq!(
+                u32::from_le_bytes(bus.memory[0x320..0x324].try_into().unwrap()),
+                4,
+                "{kind} saves the four-byte indirect instruction extent"
+            );
+            assert_eq!(
+                cpu.cycle(&mut bus).unwrap().core_clocks,
+                1,
+                "the later clean MOV must not receive {kind} debt"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1809,8 +2039,14 @@ fn exception_through_an_idt_task_gate_switches_tasks_and_pushes_the_error_code()
     let mut bus = TestBus::with_memory(memory);
     cpu.registers.eip = 0x1234;
 
-    cpu.deliver_exception(&mut bus, 14, Some(0x4), false)
-        .unwrap();
+    cpu.deliver_exception(
+        &mut bus,
+        14,
+        Some(0x4),
+        false,
+        &mut CommittedCore::default(),
+    )
+    .unwrap();
 
     assert_eq!(cpu.tr.selector, 0x18, "task register points at the new TSS");
     assert_eq!(cpu.registers.cs().selector, 0x08);
@@ -1851,6 +2087,9 @@ fn hardware_interrupt_through_a_task_gate_pushes_no_error_code() {
     let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
     let (mut cpu, mut memory) =
         protected_cpu_with_gdt(&[0xf4], &[RING0_CODE, ring0_data, new_tss, old_tss]);
+    cpu.set_mode(GswMode::Gsw486);
+    cpu.set_timing_epoch(2);
+    cpu.timing_rem = 0;
     cpu.tr = SegmentRegister {
         selector: 0x20,
         base: 0x300,
@@ -1876,8 +2115,26 @@ fn hardware_interrupt_through_a_task_gate_pushes_no_error_code() {
     put16(&mut memory, 0x380 + 80, 0x10); // SS
     put16(&mut memory, 0x380 + 84, 0x10); // DS
     let mut bus = TestBus::with_memory(memory);
+    bus.timing_epoch_two = true;
+    bus.pending_irq = Some(14);
+    cpu.registers.eflags |= FLAG_IF;
+    cpu.interrupt_shadow = false;
+    let elapsed_before = cpu.elapsed_clocks;
+    let retired_before = cpu.perf_counters().instructions;
 
-    cpu.deliver_exception(&mut bus, 14, None, true).unwrap();
+    let outcome = cpu
+        .service_pending_interrupt(&mut bus)
+        .unwrap()
+        .expect("the pending task-gate IRQ must be delivered");
+    assert_eq!(outcome.core_clocks, 230, "31 outer + 199 TaskSwitch");
+    assert_eq!(cpu.elapsed_clocks - elapsed_before, 230);
+    assert_eq!(cpu.timing_rem, 0);
+    assert_eq!(bus.pending_irq, None, "the IRQ must be acknowledged once");
+    assert_eq!(
+        cpu.perf_counters().instructions,
+        retired_before,
+        "hardware service does not retire a guest instruction"
+    );
 
     assert_eq!(cpu.tr.selector, 0x18, "task switch still happens");
     assert_eq!(
@@ -1888,7 +2145,81 @@ fn hardware_interrupt_through_a_task_gate_pushes_no_error_code() {
 }
 
 #[test]
-fn a_fault_after_a_task_gate_switch_commits_is_terminal_not_escalated() {
+fn public_bad_selector_exception_through_a_task_gate_has_its_delivery_and_switch_debt() {
+    let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+    let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+    let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(
+        &[0x8e, 0xc2], // MOV ES, DX, with DX naming an absent selector
+        &[RING0_CODE, ring0_data, new_tss, old_tss],
+    );
+    cpu.set_mode(GswMode::Gsw486);
+    cpu.set_timing_epoch(2);
+    cpu.timing_rem = 0;
+    cpu.tr = SegmentRegister {
+        selector: 0x20,
+        base: 0x300,
+        limit: 0x67,
+        access: 0x8b,
+        default_size_32: false,
+    };
+    cpu.idtr = DescriptorTable {
+        base: 0x200,
+        limit: 0xff,
+    };
+    let put32 =
+        |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put16 =
+        |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    put32(&mut memory, 0x268, 0x0018_0000); // #GP task gate -> TSS 0x18
+    put32(&mut memory, 0x26c, 0x0000_8500);
+    put32(&mut memory, 0x380 + 32, 0x90); // EIP
+    put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS
+    put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+    put16(&mut memory, 0x380 + 72, 0x10); // ES
+    put16(&mut memory, 0x380 + 76, 0x08); // CS
+    put16(&mut memory, 0x380 + 80, 0x10); // SS
+    put16(&mut memory, 0x380 + 84, 0x10); // DS
+    memory[0x90..0x92].copy_from_slice(&[0xb0, 0x5a]); // later clean MOV AL, 0x5a
+    let mut bus = TestBus::with_memory(memory);
+    bus.timing_epoch_two = true;
+    cpu.registers.set_edx(0x30);
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 0).unwrap();
+    assert_eq!(cpu.registers.eip, 2, "the cached MOV ES, DX advances EIP");
+    assert_eq!(&bus.memory[..2], &[0x8e, 0xc2]);
+    assert_eq!(cpu.registers.edx(), 0x30);
+    cpu.set_eip(0);
+    let retired_before = cpu.perf_counters().instructions;
+    let elapsed_before = cpu.elapsed_clocks;
+
+    let outcome = cpu.cycle(&mut bus).unwrap();
+
+    assert_eq!(
+        outcome.core_clocks, 268,
+        "69 completed delivery + 199 TaskSwitch"
+    );
+    assert_eq!(cpu.elapsed_clocks - elapsed_before, 268);
+    assert_eq!(cpu.timing_rem, 0);
+    assert_eq!(cpu.tr.selector, 0x18);
+    assert_eq!(cpu.registers.cs().selector, 0x08);
+    assert_eq!(cpu.registers.eip, 0x90);
+    assert_eq!(cpu.registers.esp(), 0xec, "the #GP code lands on new stack");
+    assert_eq!(
+        u32::from_le_bytes(bus.memory[0xec..0xf0].try_into().unwrap()),
+        0x30
+    );
+    assert_eq!(cpu.perf_counters().instructions - retired_before, 1);
+    let later = cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        later.core_clocks, 1,
+        "later MOV must not receive delivery debt"
+    );
+    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+}
+
+#[test]
+fn public_fault_after_a_task_gate_switch_commits_keeps_the_run_prefix() {
     // A task switch commits the WHOLE incoming task inside `load_task_state`:
     // CR3, LDTR, TR, CS:EIP, every GPR. `deliver_exception_inner`'s unwind can
     // only put back five fields of the OUTGOING task, so a fault after that
@@ -1904,9 +2235,12 @@ fn a_fault_after_a_task_gate_switch_commits_is_terminal_not_escalated() {
     // zero and lands outside it.
     let tiny_stack = (0x28u16, 0x0000_00ff, 0x0040_9300);
     let (mut cpu, mut memory) = protected_cpu_with_gdt(
-        &[0xf4],
+        &[0xba, 0x30, 0x00, 0x8e, 0xc2], // MOV DX, 0x30; MOV ES, DX -> #GP(0x30)
         &[RING0_CODE, ring0_data, new_tss, old_tss, tiny_stack],
     );
+    cpu.set_mode(GswMode::Gsw486);
+    cpu.set_timing_epoch(2);
+    cpu.timing_rem = 0;
     cpu.tr = SegmentRegister {
         selector: 0x20,
         base: 0x300,
@@ -1933,15 +2267,34 @@ fn a_fault_after_a_task_gate_switch_commits_is_terminal_not_escalated() {
     put16(&mut memory, 0x380 + 76, 0x08); // CS
     put16(&mut memory, 0x380 + 80, 0x28); // SS: the 0xff-limit segment
     put16(&mut memory, 0x380 + 84, 0x10); // DS
+    memory[0x90..0x92].copy_from_slice(&[0xb0, 0x5a]); // later clean MOV AL, 0x5a
     let mut bus = TestBus::with_memory(memory);
-
-    let result = cpu.deliver_exception_escalating(&mut bus, 13, Some(0), false);
+    bus.timing_epoch_two = true;
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 0).unwrap();
+    cpu.set_eip(3);
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 3).unwrap();
+    cpu.set_eip(0);
+    let elapsed_before = cpu.elapsed_clocks;
+    let result = cpu.run_budgeted(&mut bus, u64::MAX);
 
     assert_eq!(
         result,
-        Err(CpuError::FaultAfterTaskSwitchCommit { nested_vector: 12 }),
+        Err(CpuRunError {
+            error: CpuError::FaultAfterTaskSwitchCommit { nested_vector: 12 },
+            consumed_core_clocks: 200,
+        }),
         "{result:?}"
     );
+    assert_eq!(cpu.elapsed_clocks - elapsed_before, 200);
+    assert_eq!(cpu.timing_rem, 0);
+    assert_eq!(
+        u32::from_le_bytes(bus.memory[0x330..0x334].try_into().unwrap()),
+        0x30,
+        "the prefix retired into the outgoing task image"
+    );
+    assert_eq!(cpu.perf_counters().instructions, 1);
     assert_eq!(
         cpu.tr.selector, 0x18,
         "the switch committed; it must not be half-unwound"
@@ -1955,6 +2308,13 @@ fn a_fault_after_a_task_gate_switch_commits_is_terminal_not_escalated() {
         0x1234,
         "the outgoing task's ESP must NOT be restored over the committed task"
     );
+    let later = cpu.cycle(&mut bus).unwrap();
+    assert_eq!(
+        later.core_clocks, 1,
+        "later MOV must not receive fatal debt"
+    );
+    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+    assert_eq!(cpu.timing_rem, 0);
 }
 
 #[test]
@@ -1990,7 +2350,13 @@ fn a_task_gate_fault_before_the_switch_commits_still_escalates() {
     put32(&mut memory, 0x244, 0x0000_8e00);
     let mut bus = TestBus::with_memory(memory);
 
-    let result = cpu.deliver_exception_escalating(&mut bus, 13, Some(0), false);
+    let result = cpu.deliver_exception_escalating(
+        &mut bus,
+        13,
+        Some(0),
+        false,
+        &mut CommittedCore::default(),
+    );
 
     assert!(result.is_ok(), "the #DF must be delivered: {result:?}");
     assert_eq!(cpu.registers.eip, 0x1234, "the #DF handler runs");
@@ -2019,7 +2385,9 @@ fn iret_with_nt_and_a_non_busy_backlink_raises_ts_and_keeps_nt() {
     memory[0x380..0x382].copy_from_slice(&0x20u16.to_le_bytes()); // back-link
     let mut bus = TestBus::with_memory(memory);
 
-    let fault = cpu.iret(&mut bus, OperandSize::Dword).unwrap_err();
+    let fault = cpu
+        .iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap_err();
 
     assert!(
         matches!(
@@ -2080,8 +2448,14 @@ fn task_gate_delivery_from_v86_saves_vm_in_the_outgoing_eflags_image() {
     cpu.load_segment_real(SegmentIndex::Ss, 0x200);
     cpu.cpl = 3;
 
-    cpu.deliver_exception(&mut bus, 14, Some(0x4), false)
-        .unwrap();
+    cpu.deliver_exception(
+        &mut bus,
+        14,
+        Some(0x4),
+        false,
+        &mut CommittedCore::default(),
+    )
+    .unwrap();
 
     assert_eq!(cpu.tr.selector, 0x18);
     assert!(
@@ -2104,9 +2478,12 @@ fn iret_with_nt_set_returns_to_the_backlink_task() {
     let back_tss = (0x20u16, 0x0300_0067, 0x0000_8b00); // interrupted, busy
     let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
     let (mut cpu, mut memory) = protected_cpu_with_gdt(
-        &[0xcf], // IRET (16-bit form unused; iret() is called directly below)
+        &[0xcf], // IRET reaches the NT task-return path through cycle
         &[RING0_CODE, ring0_data, handler_tss, back_tss],
     );
+    cpu.set_mode(GswMode::Gsw486);
+    cpu.set_timing_epoch(2);
+    cpu.timing_rem = 0;
     cpu.tr = SegmentRegister {
         selector: 0x18,
         base: 0x380,
@@ -2127,9 +2504,15 @@ fn iret_with_nt_set_returns_to_the_backlink_task() {
     put16(&mut memory, 0x300 + 76, 0x08); // CS
     put16(&mut memory, 0x300 + 80, 0x10); // SS
     put16(&mut memory, 0x300 + 84, 0x10); // DS
+    memory[0x60..0x62].copy_from_slice(&[0xb0, 0x5a]); // later clean MOV AL, 0x5a
     let mut bus = TestBus::with_memory(memory);
+    bus.timing_epoch_two = true;
+    let elapsed_before = cpu.elapsed_clocks;
 
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    let outcome = cpu.cycle(&mut bus).unwrap();
+    assert_eq!(outcome.core_clocks, 235, "36 outer + 199 TaskSwitch");
+    assert_eq!(cpu.elapsed_clocks - elapsed_before, 235);
+    assert_eq!(cpu.timing_rem, 0);
 
     assert_eq!(cpu.tr.selector, 0x20, "returned to the back-link task");
     assert_eq!(cpu.registers.cs().selector, 0x08);
@@ -2144,6 +2527,12 @@ fn iret_with_nt_set_returns_to_the_backlink_task() {
         u32::from_le_bytes(bus.memory[0x380 + 36..0x380 + 40].try_into().unwrap()) & FLAG_NT,
         0
     );
+    assert_eq!(
+        cpu.cycle(&mut bus).unwrap().core_clocks,
+        1,
+        "later MOV must not receive IRET task-return debt"
+    );
+    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
 }
 
 // ---- BOUND and INS/OUTS ----
@@ -2791,7 +3180,7 @@ fn ring3_software_int_through_a_dpl0_gate_general_protection_faults() {
     let mut bus = TestBus::with_memory(memory);
     descend_to_ring3(&mut cpu);
 
-    let result = cpu.software_interrupt(&mut bus, 0x20);
+    let result = cpu.software_interrupt(&mut bus, 0x20, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -2817,7 +3206,7 @@ fn ring3_into_through_a_dpl0_gate_general_protection_faults() {
     let mut bus = TestBus::with_memory(memory);
     descend_to_ring3(&mut cpu);
 
-    let result = cpu.software_interrupt(&mut bus, 4);
+    let result = cpu.software_interrupt(&mut bus, 4, &mut CommittedCore::default());
 
     assert!(
         matches!(
@@ -2840,7 +3229,8 @@ fn ring0_software_int_through_a_dpl0_gate_dispatches() {
     let mut bus = TestBus::with_memory(memory);
     assert_eq!(cpu.current_privilege_level(), 0);
 
-    cpu.software_interrupt(&mut bus, 0x20).unwrap();
+    cpu.software_interrupt(&mut bus, 0x20, &mut CommittedCore::default())
+        .unwrap();
 
     assert_eq!(
         cpu.registers.cs().selector,

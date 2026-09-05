@@ -52,6 +52,12 @@ pub(crate) fn checked_run_core_total(total: u64, added: u64) -> u64 {
         .expect("CPU run total exceeded u64")
 }
 
+#[inline]
+fn with_run_prefix(mut error: CpuRunError, prefix: u64) -> CpuRunError {
+    error.consumed_core_clocks = checked_run_core_total(prefix, error.consumed_core_clocks);
+    error
+}
+
 /// Whether an opcode is a port-I/O instruction (IN / OUT / INS / OUTS), for the unit simulator's
 /// `touches_io` fact. IN (0xE4/0xE5 imm, 0xEC/0xED DX) and the string forms INS (0x6C/0x6D) / OUTS
 /// (0x6E/0x6F) plus OUT (0xE6/0xE7 imm, 0xEE/0xEF DX). OUT/INS/OUTS are also non-continuable, so the
@@ -231,7 +237,7 @@ impl CallOutBudgetTerms {
 }
 
 impl CpuGsw {
-    pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CpuCycleOutcome, CpuError> {
+    pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> CpuExecutionResult<CpuCycleOutcome> {
         // `cycle` is the per-instruction prologue (halt-wake + hardware interrupt
         // service) followed by one instruction. The two halves are split so the
         // machine batch loop can run the prologue once per batch and then run a
@@ -258,7 +264,7 @@ impl CpuGsw {
     pub fn service_pending_interrupt<B: CpuBus>(
         &mut self,
         bus: &mut B,
-    ) -> Result<Option<CpuCycleOutcome>, CpuError> {
+    ) -> CpuExecutionResult<Option<CpuCycleOutcome>> {
         // Wake from HLT only when a maskable interrupt can actually be taken. The 386
         // exits HLT on an enabled interrupt; a masked or IF-disabled request leaves it
         // halted. NMI and the other non-maskable wake sources are out of scope.
@@ -288,6 +294,7 @@ impl CpuGsw {
             && bus.interrupt_pending()
             && let Some(vector) = bus.acknowledge_interrupt()
         {
+            let mut committed = CommittedCore::default();
             // The interrupt frame sees the paused REP's start EIP. Once delivery begins, the
             // saved host continuation is stale; IRET restarts from guest code and refetches.
             self.rep_resume_active = false;
@@ -301,11 +308,14 @@ impl CpuGsw {
             // `hardware_interrupt_escalating`): the guest gets the nested vector
             // or #DF, and only a fault during the double-fault handler's call
             // stops the machine.
-            if let Err(error) = self.hardware_interrupt_escalating(bus, vector) {
+            if let Err(error) = self.hardware_interrupt_escalating(bus, vector, &mut committed) {
                 // cs_moved is false by construction: an IRQ is taken at a
                 // boundary, so no instruction was mid-flight to move CS.
                 self.record_fault_site(boundary_eip, false);
-                return Err(error);
+                return Err(CpuRunError {
+                    error,
+                    consumed_core_clocks: committed.into_inner(),
+                });
             }
             // Was a bare `61`. The INTA cycles the 8259A drives are still not
             // modelled anywhere -- the census lists them as missing entirely --
@@ -323,7 +333,7 @@ impl CpuGsw {
                 crate::reflected_call_diag::on_clock_charge();
             }
             return Ok(Some(CpuCycleOutcome {
-                core_clocks: charged,
+                core_clocks: checked_run_core_total(charged, committed.into_inner()),
                 halted: false,
             }));
         }
@@ -340,7 +350,7 @@ impl CpuGsw {
     pub fn cycle_no_interrupt_check<B: CpuBus>(
         &mut self,
         bus: &mut B,
-    ) -> Result<CpuCycleOutcome, CpuError> {
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         self.cycle_no_interrupt_check_with_budget(bus, None)
     }
 
@@ -348,7 +358,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
-    ) -> Result<CpuCycleOutcome, CpuError> {
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         self.interrupt_shadow = false;
         // This is always either a standalone single-step (no prior instructions in
         // "this run") or run_straight_line's FIRST instruction (total == 0 at that
@@ -383,7 +393,7 @@ impl CpuGsw {
         let mut profile_key = None;
         let mut decoded = None;
         self.rep_execution.yielded = false;
-        let result = match self.fetch_decoded(bus, lin) {
+        let execution = match self.fetch_decoded(bus, lin) {
             Ok(insn) => {
                 decoded = Some(insn);
                 if profiling {
@@ -395,12 +405,20 @@ impl CpuGsw {
                 }
                 self.execute_decoded_with_rep_budget(&insn, bus, rep_budget)
             }
-            Err(fault) => Err(fault),
+            Err(fault) => InstructionExecution::new(Err(fault)),
         };
         if self.rep_execution.yielded {
             let insn = decoded.expect("only a decoded REP instruction can yield");
-            let outcome = result.expect("a faulting REP chunk cannot also yield");
-            return Ok(self.pause_rep_instruction(insn, start_eip, start_cs_register, outcome));
+            let outcome = execution
+                .result
+                .expect("a faulting REP chunk cannot also yield");
+            return Ok(self.pause_rep_instruction(
+                insn,
+                start_eip,
+                start_cs_register,
+                outcome,
+                execution.committed,
+            ));
         }
         // Observe the retired instruction (this is the FIRST-instruction / standalone retire path;
         // continuations retire through the run_one_cached fast tails). `finish_instruction`
@@ -408,7 +426,7 @@ impl CpuGsw {
         // measures fault-free hot code, so observe only the Ok retirements (a decode miss leaves
         // `decoded` None and never observes). `d` is the pre-execution decode key.
         #[cfg(feature = "jit")]
-        if result.is_ok()
+        if execution.result.is_ok()
             && let Some(insn) = &decoded
         {
             self.unit_sim_observe(
@@ -420,7 +438,7 @@ impl CpuGsw {
         }
         self.finish_instruction(
             bus,
-            result,
+            execution,
             start_eip,
             start_cs,
             0,
@@ -435,6 +453,7 @@ impl CpuGsw {
         start_eip: u32,
         cs: SegmentRegister,
         outcome: CycleOutcome,
+        committed: CommittedCore,
     ) -> CpuCycleOutcome {
         debug_assert!(insn.prefixes.rep.is_some());
         debug_assert!(!outcome.halted);
@@ -448,6 +467,7 @@ impl CpuGsw {
         if self.is_ring0_protected() {
             self.perf.monitor_resident_core_clocks += charged;
         }
+        let committed_total = committed.total();
         // Do not call set_eip here. A budget yield is not guest control flow and must retain the
         // instruction's prefetch snapshot for the no-interrupt continuation.
         self.registers.eip = start_eip;
@@ -461,7 +481,7 @@ impl CpuGsw {
         self.rep_resume_active = true;
         self.rep_execution.yielded = false;
         CpuCycleOutcome {
-            core_clocks: charged,
+            core_clocks: checked_run_core_total(charged, committed_total),
             halted: false,
         }
     }
@@ -470,14 +490,14 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
-    ) -> Result<CpuCycleOutcome, CpuError> {
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         let resume = self
             .rep_execution
             .resume
+            .take()
             .expect("resume path requires REP state");
         if self.registers.eip != resume.start_eip || self.registers.cs() != resume.cs {
             self.rep_resume_active = false;
-            self.rep_execution.resume = None;
             return self.cycle_no_interrupt_check_with_budget(bus, rep_budget);
         }
 
@@ -489,21 +509,30 @@ impl CpuGsw {
         } else {
             None
         };
-        let result = self.execute_decoded_with_rep_budget(&resume.insn, bus, rep_budget);
+        let mut execution = self.execute_decoded_with_rep_budget(&resume.insn, bus, rep_budget);
         if self.rep_execution.yielded {
-            let outcome = result.expect("a faulting REP chunk cannot also yield");
+            let outcome = execution
+                .result
+                .expect("a faulting REP chunk cannot also yield");
             debug_assert!(!outcome.halted);
             self.registers.eip = resume.start_eip;
             self.rep_execution.yielded = false;
+            let committed_total = execution.committed.total();
+            self.rep_execution.resume = Some(RepResume {
+                insn: resume.insn,
+                start_eip: resume.start_eip,
+                post_eip: resume.post_eip,
+                cs: resume.cs,
+                precharged_core: resume.precharged_core,
+            });
             return Ok(CpuCycleOutcome {
-                core_clocks: 0,
+                core_clocks: committed_total,
                 halted: false,
             });
         }
 
         self.rep_resume_active = false;
-        self.rep_execution.resume = None;
-        let result = result.map(|outcome| CycleOutcome {
+        execution.result = execution.result.map(|outcome| CycleOutcome {
             core_clocks: 0,
             halted: outcome.halted,
         });
@@ -511,13 +540,13 @@ impl CpuGsw {
         // yielded without retiring). `.map` above preserves the Ok/Err split, so the same
         // Ok-only rule as the other retire sites holds.
         #[cfg(feature = "jit")]
-        if result.is_ok() {
+        if execution.result.is_ok() {
             let lin = resume.cs.base.wrapping_add(resume.start_eip);
             self.unit_sim_observe(&resume.insn, lin, resume.cs.default_size_32, resume.cs.base);
         }
         self.finish_instruction(
             bus,
-            result,
+            execution,
             resume.start_eip,
             resume.cs.selector,
             resume.precharged_core,
@@ -535,14 +564,18 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
-    ) -> ExecResult<CycleOutcome> {
+    ) -> InstructionExecution {
+        let mut committed = CommittedCore::default();
         if insn.prefixes.rep.is_none() || rep_budget.is_none() {
-            return self.execute_decoded(insn, bus);
+            return InstructionExecution {
+                result: self.execute_decoded(insn, bus, &mut committed),
+                committed,
+            };
         }
         self.rep_execution.budget = rep_budget;
-        let result = self.execute_decoded(insn, bus);
+        let result = self.execute_decoded(insn, bus, &mut committed);
         self.rep_execution.budget = None;
-        result
+        InstructionExecution { result, committed }
     }
 
     /// Emit one differential-oracle trace line for the instruction that just retired at
@@ -629,14 +662,15 @@ impl CpuGsw {
     pub(super) fn finish_instruction<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        result: ExecResult<CycleOutcome>,
+        execution: InstructionExecution,
         start_eip: u32,
         start_cs: u16,
         precharged_core: u64,
         profile_key: Option<(DecodeGroup, u16, CpuProfileOperandForm)>,
         profile_start: Option<std::time::Instant>,
-    ) -> Result<CpuCycleOutcome, CpuError> {
-        let outcome = match result {
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
+        let mut committed = execution.committed;
+        let outcome = match execution.result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
                 // Both reads are INSIDE the arm, so the success path pays for
@@ -671,11 +705,18 @@ impl CpuGsw {
                 // per the PRM's contributory-fault table, so the guest sees the
                 // nested vector or #DF; only a fault during the double-fault
                 // handler's call reaches the caller as a stop.
-                if let Err(error) =
-                    self.deliver_exception_escalating(bus, vector, error_code, false)
-                {
+                if let Err(error) = self.deliver_exception_escalating(
+                    bus,
+                    vector,
+                    error_code,
+                    false,
+                    &mut committed,
+                ) {
                     self.record_fault_site(start_eip, cs_was_moved);
-                    return Err(error);
+                    return Err(CpuRunError {
+                        error,
+                        consumed_core_clocks: committed.into_inner(),
+                    });
                 }
                 // Census row 7, the worst in its group: a flat 59 for every
                 // mode, **16.7x under** on the V86 monitor trip, and it REPLACED
@@ -719,7 +760,10 @@ impl CpuGsw {
                 // past it.
                 let cs_moved = self.registers.cs().selector != start_cs;
                 self.record_fault_site(start_eip, cs_moved);
-                return Err(error);
+                return Err(CpuRunError {
+                    error,
+                    consumed_core_clocks: committed.into_inner(),
+                });
             }
         };
 
@@ -759,7 +803,7 @@ impl CpuGsw {
             self.emit_diff_trace_line(start_cs, start_eip);
         }
         Ok(CpuCycleOutcome {
-            core_clocks: charged,
+            core_clocks: checked_run_core_total(charged, committed.into_inner()),
             halted: outcome.halted,
         })
     }
@@ -789,7 +833,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         cap: u64,
-    ) -> Result<BudgetedRunOutcome, CpuError> {
+    ) -> CpuExecutionResult<BudgetedRunOutcome> {
         let result = self.run_budgeted_inner(bus, cap);
         // The seventh run-end reason: a propagated hard `CpuError` skips every `brk_*` fold
         // inside the loop (see `straight_line_runs`' identity comment), so it is counted here
@@ -818,7 +862,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         cap: u64,
-    ) -> Result<BudgetedRunOutcome, CpuError> {
+    ) -> CpuExecutionResult<BudgetedRunOutcome> {
         let mut total = 0u64;
         let mut first = true;
         // The call-out window is opened and closed inside one helper call, which is itself inside
@@ -914,7 +958,8 @@ impl CpuGsw {
             let mut can_take_before = self.can_take_interrupt();
             let outcome = if first {
                 first = false;
-                self.cycle_no_interrupt_check_with_budget(bus, Some(rep_budget))?
+                self.cycle_no_interrupt_check_with_budget(bus, Some(rep_budget))
+                    .map_err(|error| with_run_prefix(error, total))?
             } else {
                 let lin = self.linear_eip();
                 let cs = self.registers.cs();
@@ -958,85 +1003,95 @@ impl CpuGsw {
                     (view, view.map(|view| view.screen()))
                 };
                 #[cfg_attr(not(feature = "jit"), allow(unused_variables))]
-                let screen = match screened {
-                    Some(screen) => {
-                        if !screen.continuable {
-                            self.perf.brk_decode_or_branch += 1;
-                            self.perf.brk_cont_not_continuable += 1;
-                            // Let the Direct dispatcher SEE this address before the run ends.
-                            // Admission only; nothing is entered, and the break below is
-                            // unchanged. See `probe_admit_at_break`.
-                            //
-                            // Gated in two steps, cheap one first.
-                            //
-                            // Step one is the decode-pack bit, which answers out of the 16-byte
-                            // entry the screen above already read. It carries the PROBE POLICY set
-                            // (`non_continuable_break_probe_candidate`), not the walk's capability
-                            // set: the far-transfer family and nothing else. That is where the
-                            // common case ends and it touches no extra memory. Without a gate the
-                            // probe would recur forever at every non-continuable address: on
-                            // 15-move-hole-puzzle that is 116 M visits to ten `CALL FAR` sites that
-                            // cannot lower, measured at about 4% of the wall, and on duke3d-586
-                            // 2.79 M visits to IMUL, LES/LDS and OUT sites that bought 92 blocks
-                            // and cost 5.7% of the row. The policy set's own documentation carries
-                            // both measurements and the residue argument behind them.
-                            //
-                            // Step two takes the line, because the rest of the question is about
-                            // the operand size, the prefixes and the CPU's mode. On the packed arm
-                            // this is the only place that line is faulted in, and the bit is what
-                            // keeps that rare.
-                            #[cfg(feature = "jit")]
-                            if screen.noncont_break_probe {
-                                match held_view
-                                    .or_else(|| self.decode_cache.get_view(lin, cs.default_size_32))
-                                {
-                                    Some(view) => {
-                                        if jit::direct::walk_admits_non_continuable_entry(
-                                            self,
-                                            &view.insn,
-                                            cs.default_size_32,
-                                        ) {
-                                            self.probe_admit_at_break(
-                                                bus,
-                                                native_continuations_active,
-                                                screen,
-                                                lin,
+                let screen =
+                    match screened {
+                        Some(screen) => {
+                            if !screen.continuable {
+                                self.perf.brk_decode_or_branch += 1;
+                                self.perf.brk_cont_not_continuable += 1;
+                                // Let the Direct dispatcher SEE this address before the run ends.
+                                // Admission only; nothing is entered, and the break below is
+                                // unchanged. See `probe_admit_at_break`.
+                                //
+                                // Gated in two steps, cheap one first.
+                                //
+                                // Step one is the decode-pack bit, which answers out of the 16-byte
+                                // entry the screen above already read. It carries the PROBE POLICY set
+                                // (`non_continuable_break_probe_candidate`), not the walk's capability
+                                // set: the far-transfer family and nothing else. That is where the
+                                // common case ends and it touches no extra memory. Without a gate the
+                                // probe would recur forever at every non-continuable address: on
+                                // 15-move-hole-puzzle that is 116 M visits to ten `CALL FAR` sites that
+                                // cannot lower, measured at about 4% of the wall, and on duke3d-586
+                                // 2.79 M visits to IMUL, LES/LDS and OUT sites that bought 92 blocks
+                                // and cost 5.7% of the row. The policy set's own documentation carries
+                                // both measurements and the residue argument behind them.
+                                //
+                                // Step two takes the line, because the rest of the question is about
+                                // the operand size, the prefixes and the CPU's mode. On the packed arm
+                                // this is the only place that line is faulted in, and the bit is what
+                                // keeps that rare.
+                                #[cfg(feature = "jit")]
+                                if screen.noncont_break_probe {
+                                    match held_view.or_else(|| {
+                                        self.decode_cache.get_view(lin, cs.default_size_32)
+                                    }) {
+                                        Some(view) => {
+                                            if jit::direct::walk_admits_non_continuable_entry(
+                                                self,
+                                                &view.insn,
                                                 cs.default_size_32,
-                                            )?;
+                                            ) {
+                                                self.probe_admit_at_break(
+                                                    bus,
+                                                    native_continuations_active,
+                                                    screen,
+                                                    lin,
+                                                    cs.default_size_32,
+                                                )
+                                                .map_err(|error| {
+                                                    with_run_prefix(
+                                                        CpuRunError {
+                                                            error,
+                                                            consumed_core_clocks: 0,
+                                                        },
+                                                        total,
+                                                    )
+                                                })?;
+                                            }
                                         }
+                                        // The screen passed and the line is gone: the same
+                                        // impossible-by-construction miss the interpreted arm counts,
+                                        // counted the same way rather than swallowed. Admission only
+                                        // READS the decode cache, so nothing between the screen and
+                                        // here can retire the slot; a non-zero reading means that
+                                        // argument is wrong. Skipping the probe is the sound response
+                                        // either way, since the run is ending regardless.
+                                        None => self.jit_direct.note_decode_pack_late_view_miss(),
                                     }
-                                    // The screen passed and the line is gone: the same
-                                    // impossible-by-construction miss the interpreted arm counts,
-                                    // counted the same way rather than swallowed. Admission only
-                                    // READS the decode cache, so nothing between the screen and
-                                    // here can retire the slot; a non-zero reading means that
-                                    // argument is wrong. Skipping the probe is the sound response
-                                    // either way, since the run is ending regardless.
-                                    None => self.jit_direct.note_decode_pack_late_view_miss(),
                                 }
+                                break;
                             }
-                            break;
+                            // NO PAGE-CROSS SCREEN. `DecodeCache::put` rejects any line whose
+                            // instruction straddles a 4 KiB boundary, under the identical predicate,
+                            // so a cached line can never answer this one yes and `brk_cont_page_cross`
+                            // is identically zero. The counter stays in `PerfCounters`, permanently
+                            // zero, so the report's field set does not move; what came out is an add,
+                            // a compare and a branch per continuation, plus `screen.len`'s live range
+                            // across them.
+                            if !Self::fetch_within_limit(self.registers.eip, screen.len, cs.limit) {
+                                self.perf.brk_decode_or_branch += 1;
+                                self.perf.brk_cont_not_continuable += 1;
+                                break;
+                            }
+                            screen
                         }
-                        // NO PAGE-CROSS SCREEN. `DecodeCache::put` rejects any line whose
-                        // instruction straddles a 4 KiB boundary, under the identical predicate,
-                        // so a cached line can never answer this one yes and `brk_cont_page_cross`
-                        // is identically zero. The counter stays in `PerfCounters`, permanently
-                        // zero, so the report's field set does not move; what came out is an add,
-                        // a compare and a branch per continuation, plus `screen.len`'s live range
-                        // across them.
-                        if !Self::fetch_within_limit(self.registers.eip, screen.len, cs.limit) {
+                        None => {
                             self.perf.brk_decode_or_branch += 1;
-                            self.perf.brk_cont_not_continuable += 1;
+                            self.perf.brk_cont_decode_miss += 1;
                             break;
                         }
-                        screen
-                    }
-                    None => {
-                        self.perf.brk_decode_or_branch += 1;
-                        self.perf.brk_cont_decode_miss += 1;
-                        break;
-                    }
-                };
+                    };
                 // JIT admission: a compiled Direct block covering this line runs natively instead
                 // of the interpreted continuation, occupying one loop iteration; the loop's own
                 // break checks below then fire at exactly the boundary the block stopped at.
@@ -1045,18 +1100,21 @@ impl CpuGsw {
                 // the traversal, accumulating nothing, so the inter-entry gap never lands in P0.
                 ea_begin!(cs.default_size_32, self.is_v86_mode());
                 #[cfg(feature = "jit")]
-                let direct_outcome = match self.dispatch_continuation(
-                    bus,
-                    native_continuations_active,
-                    screen,
-                    lin,
-                    cs.default_size_32,
-                    ContinuationBudget {
-                        total,
-                        bus_at_entry,
-                        cap,
-                    },
-                )? {
+                let direct_outcome = match self
+                    .dispatch_continuation(
+                        bus,
+                        native_continuations_active,
+                        screen,
+                        lin,
+                        cs.default_size_32,
+                        ContinuationBudget {
+                            total,
+                            bus_at_entry,
+                            cap,
+                        },
+                    )
+                    .map_err(|error| with_run_prefix(error, total))?
+                {
                     ContinuationDispatch::Native(outcome) => Some(outcome),
                     ContinuationDispatch::Declined => {
                         seam_declines += 1;
@@ -1098,9 +1156,11 @@ impl CpuGsw {
                         // including the continuation about to execute.
                         self.core_clocks_so_far = total;
                         let ea_outcome = if view.insn.prefixes.rep.is_some() {
-                            self.run_one_cached_budgeted(bus, &view, lin, rep_budget)?
+                            self.run_one_cached_budgeted(bus, &view, lin, rep_budget)
+                                .map_err(|error| with_run_prefix(error, total))?
                         } else {
-                            self.run_one_cached(bus, &view, lin)?
+                            self.run_one_cached(bus, &view, lin)
+                                .map_err(|error| with_run_prefix(error, total))?
                         };
                         // H3-R: the `None` arm is reached by `Declined` AND `Skipped`, and
                         // both fall into this same block, so this is the traversal's only
@@ -1140,13 +1200,6 @@ impl CpuGsw {
                 can_take_before = false;
             }
             total = checked_run_core_total(total, outcome.core_clocks);
-            // An answered reflected call charged `elapsed_clocks` from inside this
-            // instruction; the BATCH's core total has to see it too, or the devices never
-            // do. See `CpuGsw::reflected_call_pending_core`.
-            #[cfg(feature = "reflected-call-memo")]
-            {
-                total = checked_run_core_total(total, self.take_reflected_call_pending_core());
-            }
             // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
             // machine can service an event or interrupt before any further iteration.
             if self.rep_resume_active {
@@ -1269,7 +1322,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         cap: u64,
-    ) -> Result<CpuCycleOutcome, CpuError> {
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         let outcome = self.run_budgeted(bus, cap)?;
         Ok(CpuCycleOutcome {
             core_clocks: outcome.consumed_core_clocks,
@@ -1513,7 +1566,7 @@ impl CpuGsw {
         lin: u32,
         d: bool,
         budget: ContinuationBudget,
-    ) -> Result<ContinuationDispatch, CpuError> {
+    ) -> CpuExecutionResult<ContinuationDispatch> {
         // Hoisted by the caller and passed in: it is run-invariant, and re-reading it per
         // continuation is exactly the per-iteration cost this task is removing.
         if !native_continuations_active {
@@ -2112,8 +2165,14 @@ impl CpuGsw {
         lin: u32,
         d: bool,
         budget: ContinuationBudget,
-    ) -> Result<DirectContinuation, CpuError> {
-        let Some(block) = self.try_admit_direct_block(bus, screen, lin, d, false)? else {
+    ) -> CpuExecutionResult<DirectContinuation> {
+        let Some(block) = self
+            .try_admit_direct_block(bus, screen, lin, d, false)
+            .map_err(|error| CpuRunError {
+                error,
+                consumed_core_clocks: 0,
+            })?
+        else {
             return Ok(DirectContinuation::Interpret);
         };
         // A hidden short block must pass the canonical decode scan above before it becomes a link
@@ -2208,7 +2267,7 @@ impl CpuGsw {
         bus: &mut B,
         lin: u32,
         d: bool,
-    ) -> Result<(), CpuError> {
+    ) -> CpuExecutionResult<()> {
         // The fixtures drive a decoded, live line; a miss here would have reached `key_for`'s
         // `line_phys_start` and returned `Interpret`, which this helper discards either way.
         let Some(view) = self.decode_cache.get_view(lin, d) else {
@@ -2241,7 +2300,7 @@ impl CpuGsw {
         lin: u32,
         d: bool,
         native_continuations_active: bool,
-    ) -> Result<ContinuationDispatch, CpuError> {
+    ) -> CpuExecutionResult<ContinuationDispatch> {
         let view = self
             .decode_cache
             .get_view(lin, d)
@@ -2869,7 +2928,7 @@ impl CpuGsw {
         total: u64,
         bus_at_entry: u64,
         cap: u64,
-    ) -> Result<DirectBlockOutcome, CpuError> {
+    ) -> CpuExecutionResult<DirectBlockOutcome> {
         // INV-W backstop drain (watched-page-bit design D4): no native code runs while strict
         // watch edges are pending their fast-map sweep. The production chokes drain inline
         // (install/reject and every decode insert), so both sweeps are no-op reads here; any
@@ -3459,6 +3518,9 @@ impl CpuGsw {
         // sealed it executable, and the current generational lookup keeps that arena entry live.
         let entry: jit::direct::DirectEntryFn =
             unsafe { std::mem::transmute(current_block_entry_ptr) };
+        debug_assert!(self.direct_runtime.callout_error.is_none());
+        debug_assert_eq!(self.jit_direct.native_successful_helper_core, 0);
+        debug_assert_eq!(self.jit_direct.native_fatal_helper_core, 0);
         // The call-out window: two stores in, two out, so the erased `*mut B` is never reachable
         // outside the call that owns the borrow. `publish::<B>` also picks the helper
         // instantiations for THIS bus type, which is what makes the erasure sound; see
@@ -4032,7 +4094,7 @@ impl CpuGsw {
         if self.is_ring0_protected() {
             self.perf.monitor_resident_core_clocks += charged;
         }
-        let outcome = CpuCycleOutcome {
+        let mut outcome = CpuCycleOutcome {
             core_clocks: charged,
             halted: false,
         };
@@ -4069,6 +4131,12 @@ impl CpuGsw {
         if let Some(key) = retire {
             self.jit_direct.retire_key_for_recompile(key);
         }
+        outcome.core_clocks = outcome
+            .core_clocks
+            .checked_add(std::mem::take(
+                &mut self.jit_direct.native_successful_helper_core,
+            ))
+            .expect("native outcome core exceeded u64");
         // A machine-stopping error an `InterpretOne` slot's fault delivery produced. The helper
         // returns an `i64` and cannot carry one, so it parks it and this is the boundary that
         // propagates it -- the same boundary `run_budgeted_inner` would have propagated it from
@@ -4078,7 +4146,13 @@ impl CpuGsw {
         if let Some(error) = self.direct_runtime.callout_error.take() {
             ea_mark!(Phase::TailClocks);
             ea_end!(Population::Entered);
-            return Err(error);
+            return Err(CpuRunError {
+                error,
+                consumed_core_clocks: checked_run_core_total(
+                    outcome.core_clocks,
+                    std::mem::take(&mut self.jit_direct.native_fatal_helper_core),
+                ),
+            });
         }
         // The `Prefix` (3068) and `Complete` (3070) returns are the two arms of the `if` below
         // and take the same terminal mark, so it is written once above them.
@@ -4182,7 +4256,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         block: jit::direct::CompiledBlock,
-    ) -> Result<bool, CpuError> {
+    ) -> CpuExecutionResult<bool> {
         self.try_run_direct_block_with_cap_for_test(bus, block, u64::MAX)
     }
 
@@ -4199,13 +4273,31 @@ impl CpuGsw {
         bus: &mut B,
         block: jit::direct::CompiledBlock,
         cap: u64,
-    ) -> Result<bool, CpuError> {
+    ) -> CpuExecutionResult<bool> {
         let bus_at_entry = bus.in_batch_scaled_bus_clocks();
         let outcome = self.run_direct_block(bus, block, 0, bus_at_entry, cap)?;
         // This helper bypasses `run_budgeted`, which is where the per-batch flush now lives, so a
         // fixture that entered a block here would never see the cache's stats reach `perf`.
         self.flush_direct_cache_stats();
         Ok(!matches!(outcome, DirectBlockOutcome::NotRun))
+    }
+
+    #[cfg(all(feature = "jit", test))]
+    pub(crate) fn run_direct_block_accounted_for_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        block: jit::direct::CompiledBlock,
+        cap: u64,
+    ) -> CpuExecutionResult<Option<CpuCycleOutcome>> {
+        let bus_at_entry = bus.in_batch_scaled_bus_clocks();
+        let outcome = self.run_direct_block(bus, block, 0, bus_at_entry, cap)?;
+        self.flush_direct_cache_stats();
+        Ok(match outcome {
+            DirectBlockOutcome::NotRun => None,
+            DirectBlockOutcome::Complete(outcome) | DirectBlockOutcome::Prefix(outcome) => {
+                Some(outcome)
+            }
+        })
     }
 
     /// Execute one already-decoded cached instruction as a straight-line continuation. Consumes the
@@ -4219,7 +4311,7 @@ impl CpuGsw {
         bus: &mut B,
         view: &DecodeLineView,
         lin: u32,
-    ) -> Result<CpuCycleOutcome, CpuError> {
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         let insn = &view.insn;
         self.interrupt_shadow = false;
         self.begin_instruction();
@@ -4231,11 +4323,15 @@ impl CpuGsw {
         let start_cs = start_cs_register.selector;
         let profiling = self.profile.enabled;
         if !profiling {
-            return match self
-                .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
-                .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus))
-            {
-                Ok(outcome) => {
+            let execution = match self.charge_cached_fetch_at(bus, lin, insn.len, view.phys_start) {
+                Ok(()) => self.execute_hot_cached_or_decoded(insn, bus),
+                Err(fault) => InstructionExecution::new(Err(fault)),
+            };
+            return match execution {
+                InstructionExecution {
+                    result: Ok(outcome),
+                    committed,
+                } => {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     #[cfg(feature = "reflected-call-diagnostic")]
@@ -4266,23 +4362,24 @@ impl CpuGsw {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
                     Ok(CpuCycleOutcome {
-                        core_clocks: charged,
+                        core_clocks: checked_run_core_total(charged, committed.into_inner()),
                         halted: outcome.halted,
                     })
                 }
-                Err(fault) => {
-                    self.finish_instruction(bus, Err(fault), start_eip, start_cs, 0, None, None)
+                execution => {
+                    self.finish_instruction(bus, execution, start_eip, start_cs, 0, None, None)
                 }
             };
         }
         let profile_start = self.profile.sample_start();
-        let result = self
-            .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
-            .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus));
+        let execution = match self.charge_cached_fetch_at(bus, lin, insn.len, view.phys_start) {
+            Ok(()) => self.execute_hot_cached_or_decoded(insn, bus),
+            Err(fault) => InstructionExecution::new(Err(fault)),
+        };
         // Profiling path: finish_instruction retires (increments perf.instructions) on Ok; observe
         // the same Ok retirements here so the count stays exact when profiling is enabled.
         #[cfg(feature = "jit")]
-        if result.is_ok() {
+        if execution.result.is_ok() {
             if self.retire_gates.barrier_census {
                 self.jit_direct.note_barrier_census_interpreted(insn);
             }
@@ -4295,7 +4392,7 @@ impl CpuGsw {
         }
         self.finish_instruction(
             bus,
-            result,
+            execution,
             start_eip,
             start_cs,
             0,
@@ -4315,7 +4412,7 @@ impl CpuGsw {
         view: &DecodeLineView,
         lin: u32,
         rep_budget: RepBudget,
-    ) -> Result<CpuCycleOutcome, CpuError> {
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         let insn = &view.insn;
         debug_assert!(insn.prefixes.rep.is_some());
         self.interrupt_shadow = false;
@@ -4326,14 +4423,25 @@ impl CpuGsw {
         let profiling = self.profile.enabled;
         self.rep_execution.yielded = false;
         if !profiling {
-            return match self
-                .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
-                .and_then(|()| self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget))
-            {
-                Ok(outcome) if self.rep_execution.yielded => {
-                    Ok(self.pause_rep_instruction(*insn, start_eip, start_cs_register, outcome))
-                }
-                Ok(outcome) => {
+            let execution = match self.charge_cached_fetch_at(bus, lin, insn.len, view.phys_start) {
+                Ok(()) => self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget),
+                Err(fault) => InstructionExecution::new(Err(fault)),
+            };
+            return match execution {
+                InstructionExecution {
+                    result: Ok(outcome),
+                    committed,
+                } if self.rep_execution.yielded => Ok(self.pause_rep_instruction(
+                    *insn,
+                    start_eip,
+                    start_cs_register,
+                    outcome,
+                    committed,
+                )),
+                InstructionExecution {
+                    result: Ok(outcome),
+                    committed,
+                } => {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     #[cfg(feature = "reflected-call-diagnostic")]
@@ -4365,27 +4473,36 @@ impl CpuGsw {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
                     Ok(CpuCycleOutcome {
-                        core_clocks: charged,
+                        core_clocks: checked_run_core_total(charged, committed.into_inner()),
                         halted: outcome.halted,
                     })
                 }
-                Err(fault) => {
-                    self.finish_instruction(bus, Err(fault), start_eip, start_cs, 0, None, None)
+                execution => {
+                    self.finish_instruction(bus, execution, start_eip, start_cs, 0, None, None)
                 }
             };
         }
         let profile_start = self.profile.sample_start();
-        let result = self
-            .charge_cached_fetch_at(bus, lin, insn.len, view.phys_start)
-            .and_then(|()| self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget));
+        let execution = match self.charge_cached_fetch_at(bus, lin, insn.len, view.phys_start) {
+            Ok(()) => self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget),
+            Err(fault) => InstructionExecution::new(Err(fault)),
+        };
         if self.rep_execution.yielded {
-            let outcome = result.expect("a faulting REP chunk cannot also yield");
-            return Ok(self.pause_rep_instruction(*insn, start_eip, start_cs_register, outcome));
+            let outcome = execution
+                .result
+                .expect("a faulting REP chunk cannot also yield");
+            return Ok(self.pause_rep_instruction(
+                *insn,
+                start_eip,
+                start_cs_register,
+                outcome,
+                execution.committed,
+            ));
         }
         // Profiling path: past the yield check, an Ok result retires through finish_instruction;
         // observe the same Ok retirements so the count stays exact when profiling is enabled.
         #[cfg(feature = "jit")]
-        if result.is_ok() {
+        if execution.result.is_ok() {
             self.unit_sim_observe(
                 insn,
                 lin,
@@ -4395,7 +4512,7 @@ impl CpuGsw {
         }
         self.finish_instruction(
             bus,
-            result,
+            execution,
             start_eip,
             start_cs,
             0,
@@ -4413,8 +4530,11 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
         rep_budget: RepBudget,
-    ) -> ExecResult<CycleOutcome> {
-        self.execute_hot_cached_or_decoded_inner(insn, bus, Some(rep_budget))
+    ) -> InstructionExecution {
+        let mut committed = CommittedCore::default();
+        let result =
+            self.execute_hot_cached_or_decoded_inner(insn, bus, Some(rep_budget), &mut committed);
+        InstructionExecution { result, committed }
     }
 
     #[inline]
@@ -4423,8 +4543,10 @@ impl CpuGsw {
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
-    ) -> ExecResult<CycleOutcome> {
-        self.execute_hot_cached_or_decoded_inner(insn, bus, None)
+    ) -> InstructionExecution {
+        let mut committed = CommittedCore::default();
+        let result = self.execute_hot_cached_or_decoded_inner(insn, bus, None, &mut committed);
+        InstructionExecution { result, committed }
     }
 
     #[inline]
@@ -4433,6 +4555,7 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
+        committed: &mut CommittedCore,
     ) -> ExecResult<CycleOutcome> {
         if let Some(outcome) = self.execute_hot_cached_decoded(insn) {
             return Ok(outcome);
@@ -4471,8 +4594,12 @@ impl CpuGsw {
             _ => {}
         }
         match rep_budget {
-            Some(rep_budget) => self.execute_decoded_with_rep_budget(insn, bus, Some(rep_budget)),
-            None => self.execute_decoded(insn, bus),
+            Some(rep_budget) => {
+                let execution = self.execute_decoded_with_rep_budget(insn, bus, Some(rep_budget));
+                committed.absorb(execution.committed);
+                execution.result
+            }
+            None => self.execute_decoded(insn, bus, committed),
         }
     }
 

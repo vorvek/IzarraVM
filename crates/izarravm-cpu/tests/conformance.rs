@@ -548,10 +548,10 @@ fn run_test(test: &CpuTest) -> Outcome {
                 if let Some(expected) = expected_vector {
                     return Outcome::VectorMismatch {
                         expected,
-                        got: error.to_string(),
+                        got: error.error.to_string(),
                     };
                 }
-                return Outcome::Errored(error.to_string());
+                return Outcome::Errored(error.error.to_string());
             }
         }
         guard += 1;

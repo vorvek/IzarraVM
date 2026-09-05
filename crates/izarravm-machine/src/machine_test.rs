@@ -352,7 +352,7 @@ fn load_asymmetric_stereo(machine: &mut Machine, frames: u32) {
 }
 
 // Run one closure against a freshly-borrowed bus over the whole machine.
-fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
+pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
     // Captured before the struct literal below since VEGA and trace are also
     // mutably borrowed by other fields in that same literal.
     // `scanout_beam_dots`, not `vega.beam_dots()`: this helper is a hand copy of
@@ -436,6 +436,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         poll_skip_certificate: &machine.poll_skip_certificate,
         retrace_poll: &mut machine.retrace_poll,
         string_port_element_bytes: 0,
+        test_string_port_observations: &mut machine.test_string_port_observations,
         lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),
         io_touched: &mut machine.io_touched,
         exempt_io_touched: &mut machine.exempt_io_touched,
@@ -686,6 +687,8 @@ mod native_bus_timing;
 #[cfg(test)]
 #[path = "machine_port_bus_class_test.rs"]
 mod port_bus_class;
+#[path = "machine_rep_accounted_test.rs"]
+mod rep_accounted;
 #[cfg(test)]
 #[path = "machine_storage_test.rs"]
 mod storage;

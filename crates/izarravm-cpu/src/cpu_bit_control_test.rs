@@ -2112,7 +2112,8 @@ fn v86_guest_hlt_resumes_after_the_f4_byte_under_monitor_emulation() {
     let guest_eip = u32::from_le_bytes(cpu_mem(&bus, esp));
     assert_eq!(guest_eip, 0, "faulted at the guest's HLT");
     bus.memory[esp as usize..esp as usize + 4].copy_from_slice(&(guest_eip + 1).to_le_bytes());
-    cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
 
     assert!(cpu.is_v86_mode(), "IRET must return the guest to V86");
     assert_eq!(cpu.registers.eip, 1, "guest resumes past the HLT byte");

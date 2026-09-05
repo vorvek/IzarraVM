@@ -99,10 +99,13 @@ fn brk_rep_resume_counts_budgeted_chunk_yields() {
 /// out of `run_budgeted` itself.
 #[test]
 fn brk_fatal_counts_a_propagated_hard_cpu_error() {
-    let mut memory = vec![0u8; 16];
-    memory[0] = 0xf6;
-    memory[1] = 0xf3; // DIV BL
+    let mut memory = vec![0u8; 0x100];
+    memory[0..2].copy_from_slice(&[0xb0, 0x7f]); // MOV AL, 0x7f
+    memory[2] = 0xf6;
+    memory[3] = 0xf3; // DIV BL
+    memory[0x80..0x82].copy_from_slice(&[0xb0, 0x5a]);
     let mut cpu = CpuGsw::default();
+    cpu.set_timing_epoch(2);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers
         .set_segment(SegmentIndex::Cs, flat_pm_segment(0x08, 0x9b));
@@ -116,6 +119,16 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
     // of reading a gate.
     cpu.idtr.limit = 0;
     let mut bus = TestBus::with_memory(memory);
+    bus.timing_epoch_two = true;
+    // Populate both lines before the run so its cached continuation executes the
+    // successful MOV and the fatal DIV in one public call.
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 0).unwrap();
+    cpu.set_eip(2);
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 2).unwrap();
+    cpu.set_eip(0);
+    let elapsed_before = cpu.elapsed_clocks;
 
     let result = cpu.run_budgeted(&mut bus, 10_000);
 
@@ -126,8 +139,34 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
     // propagates out of run_budgeted and brk_fatal counts it -- only the way the
     // fixture reaches one is now the architectural chain.
     assert!(
-        matches!(result, Err(CpuError::TripleFault { .. })),
+        matches!(
+            &result,
+            Err(CpuRunError {
+                error: CpuError::TripleFault { .. },
+                ..
+            })
+        ),
         "{result:?}"
+    );
+    let error = result.expect_err("the decoded DIV must still stop");
+    assert_eq!(cpu.registers.eax() & 0xff, 0x7f, "the prefix retired once");
+    assert_eq!(
+        cpu.perf_counters().instructions,
+        1,
+        "only the successful MOV prefix retires before fatal delivery fails"
+    );
+    assert!(
+        error.consumed_core_clocks > 0,
+        "the fatal return carries the committed MOV work"
+    );
+    assert_eq!(
+        error.consumed_core_clocks, 1,
+        "epoch-2 MOV AL,imm earns one core clock"
+    );
+    assert_eq!(
+        error.consumed_core_clocks,
+        cpu.elapsed_clocks - elapsed_before,
+        "the returned fatal core matches the committed CPU clock delta"
     );
     let p = cpu.perf_counters();
     assert_eq!(
@@ -140,6 +179,305 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
         0,
         "a single fatal run: brk_fatal alone must account for it: got {p:#?}"
     );
+
+    let later_elapsed = cpu.elapsed_clocks;
+    let later_carry = cpu.timing_rem;
+    let retired_before = cpu.perf_counters().instructions;
+    cpu.set_eip(0x80);
+    assert_eq!(cpu.cycle(&mut bus).unwrap().core_clocks, 1);
+    assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
+    assert_eq!(cpu.timing_rem, later_carry);
+    assert_eq!(cpu.registers.eip, 0x82);
+    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+    assert_eq!(cpu.perf_counters().instructions - retired_before, 1);
+}
+
+#[test]
+fn first_fetch_page_walk_fault_returns_no_core_and_leaves_a_clean_next_entry() {
+    fn fixture() -> (CpuGsw, TestBus) {
+        let mut memory = vec![0u8; 0x1000];
+        memory[..2].copy_from_slice(&[0xb0, 0x5a]);
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(GswMode::Gsw486);
+        cpu.set_timing_epoch(2);
+        cpu.timing_rem = 7;
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, flat_pm_segment(0x08, 0x9b));
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        bus.timing_epoch_two = true;
+        (cpu, bus)
+    }
+
+    for public_run in [false, true] {
+        let (mut cpu, mut bus) = fixture();
+        let trace_before = bus.trace.cycles().len();
+        let result = if public_run {
+            cpu.run_budgeted(&mut bus, u64::MAX).map(|_| ())
+        } else {
+            cpu.cycle(&mut bus).map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(CpuRunError {
+                error: CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 0x1000 }),
+                consumed_core_clocks: 0,
+            })
+        ));
+        assert_eq!(cpu.elapsed_clocks, 0);
+        assert_eq!(cpu.timing_rem, 7);
+        assert_eq!(cpu.registers.eip, 0);
+        assert_eq!(cpu.perf_counters().instructions, 0);
+        let walks = bus
+            .trace
+            .cycles()
+            .iter()
+            .skip(trace_before)
+            .filter(|cycle| cycle.kind == BusAccessKind::PageWalkRead)
+            .collect::<Vec<_>>();
+        assert_eq!(walks.len(), 1);
+        assert_eq!(walks[0].address, 0x1000);
+        assert_eq!(walks[0].width, BusWidth::Dword);
+        assert_eq!(walks[0].clocks, 2, "one wait-zero page walk is raw two");
+
+        let old_cr0 = cpu.control.cr0;
+        let new_cr0 = old_cr0 & !CR0_PG;
+        cpu.control.cr0 = new_cr0;
+        cpu.flush_tlb_for_cr0_write(old_cr0, new_cr0);
+        cpu.set_eip(0);
+        let later_elapsed = cpu.elapsed_clocks;
+        let later_dispatches = cpu.perf_counters().instructions;
+        assert_eq!(cpu.cycle(&mut bus).unwrap().core_clocks, 1);
+        assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
+        assert_eq!(cpu.perf_counters().instructions - later_dispatches, 1);
+        assert_eq!(cpu.timing_rem, 7);
+        assert_eq!(cpu.registers.eip, 2);
+        assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+    }
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn break_admission_error_keeps_successful_run_prefix() {
+    struct ResetRetfArm;
+
+    impl Drop for ResetRetfArm {
+        fn drop(&mut self) {
+            jit::direct::set_direct_retf_v86_for_test(None);
+        }
+    }
+
+    let _reset_retf_arm = ResetRetfArm;
+    let mut memory = vec![0u8; 0x1000];
+    memory[0..2].copy_from_slice(&[0xb0, 0x7f]); // MOV AL, 0x7f
+    memory[2..7].copy_from_slice(&[0x9a, 0x00, 0x04, 0x20, 0x00]); // CALL FAR 0020:0400
+    memory[0x80..0x82].copy_from_slice(&[0xb0, 0x5a]);
+    let mut cpu = CpuGsw::default();
+    cpu.set_timing_epoch(2);
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.set_sixteen_bit_admission_level(1);
+    for segment in [SegmentIndex::Cs, SegmentIndex::Ds, SegmentIndex::Ss] {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.control.cr0 |= CR0_PE;
+    cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+    cpu.cpl = 3;
+    assert!(cpu.is_v86_mode(), "CALL FAR admission requires the V86 arm");
+    cpu.registers.eip = 0;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.timing_epoch_two = true;
+    cpu.set_fast_map_enabled_for_test(true);
+    let permissions = jit::fast_map::PagePermissions::UNPAGED;
+    let read = bus
+        .direct_page(0, BusAccessKind::DataRead)
+        .unwrap()
+        .expect("the fixture RAM page must be directly readable");
+    assert!(
+        cpu.jit_fast_map
+            .populate_read(0, 0, read, permissions, cpu.physical_page_watched(0))
+    );
+    let write = bus
+        .direct_page(0, BusAccessKind::DataWrite)
+        .unwrap()
+        .expect("the fixture RAM page must be directly writable");
+    assert!(cpu.jit_fast_map.populate_write(
+        0,
+        0,
+        write,
+        permissions,
+        cpu.physical_page_watched(0)
+    ));
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(1);
+    cpu.jit_direct.set_defer_short_for_test(false);
+    jit::direct::set_direct_retf_v86_for_test(Some(jit::direct::RetfArm::V86));
+    assert!(
+        cpu.direct_runtime.admission_active,
+        "the fixture must activate native continuation admission"
+    );
+    cpu.set_skip_direct_once_for_test(false);
+
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 0).unwrap();
+    cpu.set_eip(2);
+    cpu.begin_instruction();
+    cpu.fetch_decoded(&mut bus, 2).unwrap();
+    cpu.set_eip(0);
+    let view = cpu
+        .decode_cache
+        .get_view(2, false)
+        .expect("the CALL FAR must stay cached for the break probe");
+    assert!(view.screen().noncont_break_probe);
+    assert!(!view.screen().continuable);
+    assert!(jit::direct::walk_admits_non_continuable_entry(
+        &cpu, &view.insn, false
+    ));
+    let slot = view.screen().slot;
+    let _ = view;
+    let mut hot = false;
+    for _ in 0..2 {
+        hot |= cpu
+            .decode_cache
+            .direct_hot_at(slot, cpu.jit_direct.admission_heat());
+    }
+    assert!(
+        hot,
+        "the measured break probe must pass the Direct heat gate"
+    );
+    let key =
+        jit::direct::key_for(&cpu, 2, false).expect("the cached CALL FAR must have a Direct key");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    assert_eq!(
+        cpu.jit_direct.len(),
+        0,
+        "the measured CPU starts with no block"
+    );
+    let mut preflight = cpu.clone();
+    let mut preflight_bus = TestBus::with_memory(bus.memory.to_vec());
+    preflight_bus.direct_pages_enabled = true;
+    preflight.set_fast_map_enabled_for_test(true);
+    let read = preflight_bus
+        .direct_page(0, BusAccessKind::DataRead)
+        .unwrap()
+        .expect("the preflight RAM page must be directly readable");
+    assert!(preflight.jit_fast_map.populate_read(
+        0,
+        0,
+        read,
+        permissions,
+        preflight.physical_page_watched(0)
+    ));
+    let write = preflight_bus
+        .direct_page(0, BusAccessKind::DataWrite)
+        .unwrap()
+        .expect("the preflight RAM page must be directly writable");
+    assert!(preflight.jit_fast_map.populate_write(
+        0,
+        0,
+        write,
+        permissions,
+        preflight.physical_page_watched(0)
+    ));
+    preflight.set_eip(2);
+    preflight.begin_instruction();
+    preflight.fetch_decoded(&mut preflight_bus, 2).unwrap();
+    let preflight_outcome = jit::direct::compile(&mut preflight, 2, false);
+    match preflight_outcome {
+        jit::direct::CompileOutcome::Compiled(_) => {}
+        jit::direct::CompileOutcome::StructuralReject(_) => {
+            panic!("the copied CALL FAR was structurally rejected before bus injection")
+        }
+        jit::direct::CompileOutcome::Retry(cause) => {
+            panic!("the copied CALL FAR retried before bus injection: {cause:?}")
+        }
+    }
+    let elapsed_before = cpu.elapsed_clocks;
+    let requests_before = bus.instruction_prefetch_direct_page_requests;
+    let compile_attempts_before = cpu.perf_counters().jit_direct_compile_attempts;
+    let installs_before = cpu.perf_counters().jit_direct_blocks_installed;
+    bus.fail_instruction_prefetch_direct_page = true;
+
+    let result = cpu.run_budgeted(&mut bus, u64::MAX);
+    assert!(
+        matches!(
+            &result,
+            Err(CpuRunError {
+                error: CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 2 }),
+                ..
+            })
+        ),
+        "the break-site admission probe must expose its direct-page failure: {result:?}, perf={:#?}",
+        cpu.perf_counters()
+    );
+    let error = result.expect_err("the checked admission error must be retained");
+
+    assert!(matches!(
+        error.error,
+        CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 2 })
+    ));
+    assert_eq!(cpu.registers.eax() & 0xff, 0x7f);
+    assert_eq!(
+        cpu.registers.eip, 2,
+        "the probed CALL FAR must remain unexecuted"
+    );
+    assert_eq!(cpu.perf_counters().instructions, 1);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_entries,
+        0,
+        "admission fails before any native block can enter"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_insns,
+        0,
+        "admission fails before any native guest instruction can retire"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_compile_attempts,
+        compile_attempts_before + 1,
+        "the public CALL FAR break probe must make one real compile attempt"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installs_before,
+        "the failing direct-page request must prevent installation"
+    );
+    assert_eq!(
+        bus.instruction_prefetch_direct_page_requests,
+        requests_before + 1,
+        "the failure must come from one actual break-site admission direct-page request"
+    );
+    assert_eq!(
+        error.consumed_core_clocks, 1,
+        "the public error must retain exactly the epoch-2 MOV prefix"
+    );
+    assert_eq!(
+        error.consumed_core_clocks,
+        cpu.elapsed_clocks - elapsed_before,
+        "the admission failure owns no core beyond the successful local prefix"
+    );
+    assert_eq!(cpu.timing_rem, 0, "the one-core prefix leaves no carry");
+
+    bus.fail_instruction_prefetch_direct_page = false;
+    let later_elapsed = cpu.elapsed_clocks;
+    let later_carry = cpu.timing_rem;
+    let retired_before = cpu.perf_counters().instructions;
+    cpu.set_eip(0x80);
+    assert_eq!(cpu.cycle(&mut bus).unwrap().core_clocks, 1);
+    assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
+    assert_eq!(cpu.timing_rem, later_carry);
+    assert_eq!(cpu.registers.eip, 0x82);
+    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+    assert_eq!(cpu.perf_counters().instructions - retired_before, 1);
 }
 
 /// The real deliverable: the run-end ledger's identity, asserted EXACTLY, on one CPU driven

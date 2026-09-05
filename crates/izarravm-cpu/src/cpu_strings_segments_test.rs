@@ -195,6 +195,592 @@ fn budgeted_rep_stosb_limits_each_dirty_chunk() {
 }
 
 #[test]
+fn resumed_rep_port_returns_only_its_new_port_core_debt() {
+    const ORIGIN: usize = 0x40;
+    const FIRST_CHUNK_ELEMENTS: usize = 4096;
+    let values = (0..=FIRST_CHUNK_ELEMENTS)
+        .map(|index| ((index * 73 + 0x19) & 0xff) as u8)
+        .collect::<Vec<_>>();
+
+    for (mode, opcode, setup, element) in [
+        (GswMode::Gsw486, 0x6c, 11, 3),
+        (GswMode::Gsw586, 0x6c, 11, 3),
+        (GswMode::Gsw486, 0x6e, 13, 4),
+        (GswMode::Gsw586, 0x6e, 13, 4),
+    ] {
+        let is_ins = opcode == 0x6c;
+        let mut memory = vec![0; 0x3000];
+        memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0xf3, opcode]);
+        if !is_ins {
+            memory[0x200..0x200 + values.len()].copy_from_slice(&values);
+        }
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(mode);
+        cpu.set_timing_epoch(2);
+        for segment in [
+            SegmentIndex::Cs,
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Ss,
+        ] {
+            cpu.load_segment_real(segment, 0);
+        }
+        cpu.registers.eip = ORIGIN as u32;
+        cpu.registers.set_edx(0x03da);
+        cpu.registers.set_esi(0x200);
+        cpu.registers.set_edi(0x200);
+        cpu.registers.set_ecx((FIRST_CHUNK_ELEMENTS + 1) as u32);
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_page_clocks = true;
+        bus.report_batch_clocks = true;
+        bus.timing_epoch_two = true;
+        bus.lazy_io_reads = true;
+        bus.lazy_io_writes = true;
+        bus.io_read_sequence = values.iter().map(|value| u32::from(*value)).collect();
+
+        let first_elapsed = cpu.elapsed_clocks;
+        let first = cpu.run_budgeted(&mut bus, u64::MAX).unwrap();
+        assert_eq!(
+            first.consumed_core_clocks,
+            setup + FIRST_CHUNK_ELEMENTS as u64 * element,
+            "{mode:?} first return has one REP setup and 4096 completed port elements"
+        );
+        assert_eq!(cpu.registers.eip, ORIGIN as u32);
+        assert_eq!(cpu.registers.ecx(), 1);
+        assert_eq!(
+            first.consumed_core_clocks,
+            cpu.elapsed_clocks - first_elapsed
+        );
+
+        if is_ins {
+            assert_eq!(
+                bus.io_reads
+                    .iter()
+                    .map(|(port, _)| *port)
+                    .collect::<Vec<_>>(),
+                vec![0x03da; FIRST_CHUNK_ELEMENTS]
+            );
+            assert_eq!(
+                &bus.memory[0x200..0x200 + FIRST_CHUNK_ELEMENTS],
+                &values[..FIRST_CHUNK_ELEMENTS]
+            );
+            assert_eq!(cpu.registers.edi(), 0x200 + FIRST_CHUNK_ELEMENTS as u32);
+        } else {
+            assert_eq!(
+                bus.io_writes
+                    .iter()
+                    .map(|(port, value, _)| (*port, *value))
+                    .collect::<Vec<_>>(),
+                values[..FIRST_CHUNK_ELEMENTS]
+                    .iter()
+                    .map(|value| (0x03da, u32::from(*value)))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(cpu.registers.esi(), 0x200 + FIRST_CHUNK_ELEMENTS as u32);
+        }
+
+        let resumed_elapsed = cpu.elapsed_clocks;
+        let resumed = cpu.run_budgeted(&mut bus, u64::MAX).unwrap();
+        assert_eq!(resumed.consumed_core_clocks, element);
+        assert_eq!(
+            resumed.consumed_core_clocks,
+            cpu.elapsed_clocks - resumed_elapsed
+        );
+        assert_eq!(cpu.registers.ecx(), 0);
+        assert_eq!(cpu.registers.eip, (ORIGIN + 2) as u32);
+        if is_ins {
+            assert_eq!(
+                bus.io_reads
+                    .iter()
+                    .map(|(port, _)| *port)
+                    .collect::<Vec<_>>(),
+                vec![0x03da; FIRST_CHUNK_ELEMENTS + 1]
+            );
+            assert_eq!(&bus.memory[0x200..0x200 + values.len()], values.as_slice());
+            assert_eq!(cpu.registers.edi(), 0x200 + values.len() as u32);
+        } else {
+            assert_eq!(
+                bus.io_writes
+                    .iter()
+                    .map(|(port, value, _)| (*port, *value))
+                    .collect::<Vec<_>>(),
+                values
+                    .iter()
+                    .map(|value| (0x03da, u32::from(*value)))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(cpu.registers.esi(), 0x200 + values.len() as u32);
+        }
+        assert_eq!(cpu.timing_rem, 0);
+    }
+}
+
+#[test]
+fn epoch_two_rep_port_boundaries_keep_setup_pause_forced_progress_and_resume_separate() {
+    struct Case {
+        opcode: u8,
+        setup: u64,
+        element: u64,
+        port_entries: fn(&TestBus) -> usize,
+        assert_effects: fn(&CpuGsw, &TestBus, usize),
+    }
+
+    fn reads(bus: &TestBus) -> usize {
+        bus.io_reads.len()
+    }
+
+    fn writes(bus: &TestBus) -> usize {
+        bus.io_writes.len()
+    }
+
+    fn assert_insb_effects(cpu: &CpuGsw, bus: &TestBus, elements: usize) {
+        assert_eq!(
+            bus.io_reads
+                .iter()
+                .map(|(port, _)| *port)
+                .collect::<Vec<_>>(),
+            vec![0x03da; elements]
+        );
+        assert_eq!(
+            bus.memory[0x300..0x300 + elements].to_vec(),
+            vec![0xa5; elements]
+        );
+        assert_eq!(cpu.registers.edi(), 0x300 + elements as u32);
+    }
+
+    fn assert_outsb_effects(cpu: &CpuGsw, bus: &TestBus, elements: usize) {
+        let values = [0x66, 0x77];
+        assert_eq!(
+            bus.io_writes
+                .iter()
+                .map(|(port, value, _)| (*port, *value))
+                .collect::<Vec<_>>(),
+            values[..elements]
+                .iter()
+                .map(|value| (0x03da, u32::from(*value)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(&bus.memory[0x200..0x202], &values);
+        assert_eq!(cpu.registers.esi(), 0x200 + elements as u32);
+    }
+
+    let cases = [
+        Case {
+            opcode: 0x6c,
+            setup: 11,
+            element: 3,
+            port_entries: reads,
+            assert_effects: assert_insb_effects,
+        },
+        Case {
+            opcode: 0x6e,
+            setup: 13,
+            element: 4,
+            port_entries: writes,
+            assert_effects: assert_outsb_effects,
+        },
+    ];
+
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for case in &cases {
+            let fixture = |count: u32, carry: u64| {
+                let mut memory = vec![0u8; 0x1000];
+                memory[0x40..0x44].copy_from_slice(&[0xf3, case.opcode, 0xb0, 0x5a]);
+                memory[0x200] = 0x66;
+                memory[0x201] = 0x77;
+                let mut cpu = CpuGsw::default();
+                cpu.set_mode(mode);
+                cpu.set_timing_epoch(2);
+                cpu.timing_rem = carry;
+                for segment in [
+                    SegmentIndex::Cs,
+                    SegmentIndex::Ds,
+                    SegmentIndex::Es,
+                    SegmentIndex::Ss,
+                ] {
+                    cpu.load_segment_real(segment, 0);
+                }
+                cpu.registers.eip = 0x40;
+                cpu.registers.set_edx(0x03da);
+                cpu.registers.set_esi(0x200);
+                cpu.registers.set_edi(0x300);
+                cpu.registers.set_ecx(count);
+                let mut bus = TestBus::with_memory(memory);
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                bus.timing_epoch_two = true;
+                bus.lazy_io_reads = true;
+                bus.io_read_value = Some(0xa5);
+                (cpu, bus)
+            };
+
+            // Count zero still owns the instruction's setup, but no element or port transaction.
+            let (mut zero, mut zero_bus) = fixture(0, 7);
+            let zero_elapsed = zero.elapsed_clocks;
+            let zero_result = zero.run_budgeted(&mut zero_bus, case.setup).unwrap();
+            assert_eq!(zero_result.consumed_core_clocks, case.setup);
+            assert_eq!(zero.elapsed_clocks - zero_elapsed, case.setup);
+            assert_eq!((case.port_entries)(&zero_bus), 0);
+            assert_eq!(zero.registers.ecx(), 0);
+            assert_eq!(zero.registers.eip, 0x42);
+            assert_eq!(zero.timing_rem, 7, "setup is an exact epoch-2 whole clock");
+            (case.assert_effects)(&zero, &zero_bus, 0);
+
+            // Count one completes normally under a finite program budget: setup and element
+            // appear once in the public return. Its reservation includes bus work beyond core.
+            let (mut one, mut one_bus) = fixture(1, 0);
+            let one_elapsed = one.elapsed_clocks;
+            let one_result = one.run_budgeted(&mut one_bus, u64::MAX).unwrap();
+            assert_eq!(one_result.consumed_core_clocks, case.setup + case.element);
+            assert_eq!(one.elapsed_clocks - one_elapsed, case.setup + case.element);
+            assert_eq!((case.port_entries)(&one_bus), 1);
+            assert_eq!(one.registers.ecx(), 0);
+            assert_eq!(one.registers.eip, 0x42);
+            (case.assert_effects)(&one, &one_bus, 1);
+
+            // This cap is U+12 for INS and U+14 for OUTS. It pauses before the first element,
+            // retaining only setup and a restartable EIP. The next exhausted cap takes the real
+            // forced-one-element arm; a third call completes the remaining element normally.
+            let (mut two, mut two_bus) = fixture(2, 0);
+            let paused_elapsed = two.elapsed_clocks;
+            let paused = two.run_budgeted(&mut two_bus, case.setup + 1).unwrap();
+            assert_eq!(paused.consumed_core_clocks, case.setup);
+            assert_eq!(two.elapsed_clocks - paused_elapsed, case.setup);
+            assert_eq!((case.port_entries)(&two_bus), 0);
+            assert_eq!(two.registers.ecx(), 2);
+            assert_eq!(two.registers.eip, 0x40);
+            assert!(two.rep_execution.resume.is_some());
+            (case.assert_effects)(&two, &two_bus, 0);
+
+            let forced_elapsed = two.elapsed_clocks;
+            let forced = two.run_budgeted(&mut two_bus, 0).unwrap();
+            assert_eq!(forced.consumed_core_clocks, case.element);
+            assert_eq!(two.elapsed_clocks - forced_elapsed, case.element);
+            assert_eq!((case.port_entries)(&two_bus), 1);
+            assert_eq!(two.registers.ecx(), 1);
+            assert_eq!(two.registers.eip, 0x40);
+            assert!(two.rep_execution.resume.is_some());
+            (case.assert_effects)(&two, &two_bus, 1);
+
+            let resumed_elapsed = two.elapsed_clocks;
+            let resumed = two.run_budgeted(&mut two_bus, u64::MAX).unwrap();
+            assert_eq!(resumed.consumed_core_clocks, case.element);
+            assert_eq!(two.elapsed_clocks - resumed_elapsed, case.element);
+            assert_eq!((case.port_entries)(&two_bus), 2);
+            assert_eq!(two.registers.ecx(), 0);
+            assert_eq!(two.registers.eip, 0x42);
+            assert!(two.rep_execution.resume.is_none());
+            (case.assert_effects)(&two, &two_bus, 2);
+
+            let later_elapsed = two.elapsed_clocks;
+            let later = two.cycle(&mut two_bus).unwrap();
+            assert_eq!(later.core_clocks, 1, "later MOV has no REP sidecar debt");
+            assert_eq!(two.elapsed_clocks - later_elapsed, 1);
+            assert_eq!(two.registers.eax() & 0xff, 0x5a);
+        }
+    }
+}
+
+#[test]
+fn i386_epoch_one_rep_ports_keep_first_and_resumed_owners() {
+    for (opcode, is_out, first_core, first_carry, later_core, later_carry, resume_cap) in [
+        (0x6c, false, 6, 0, 0, 4, 0),
+        (0x6c, false, 6, 0, 0, 4, u64::MAX),
+        (0x6e, true, 5, 3, 1, 2, 0),
+        (0x6e, true, 5, 3, 1, 2, u64::MAX),
+    ] {
+        let mut memory = vec![0u8; 0x1000];
+        memory[0x40..0x44].copy_from_slice(&[0xf3, opcode, 0xb0, 0x5a]);
+        if is_out {
+            memory[0x200..0x202].copy_from_slice(&[0x11, 0x22]);
+        }
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(GswMode::Gsw386);
+        cpu.set_timing_epoch(1);
+        cpu.timing_rem = 0;
+        for segment in [
+            SegmentIndex::Cs,
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Ss,
+        ] {
+            cpu.load_segment_real(segment, 0);
+        }
+        cpu.set_flag(FLAG_IF, false);
+        cpu.set_flag(FLAG_DF, false);
+        cpu.registers.eip = 0x40;
+        cpu.registers.set_ecx(2);
+        cpu.registers.set_esi(0x200);
+        cpu.registers.set_edi(0x200);
+        cpu.registers.set_edx(0x03da);
+        let mut bus = TestBus::with_memory(memory);
+        bus.report_batch_clocks = true;
+        bus.batch_bus_scale = (1, 1);
+        bus.lazy_io_reads = true;
+        bus.lazy_io_writes = true;
+        bus.io_read_sequence = vec![0x11, 0x22];
+
+        let first_trace_start = bus.trace.cycles().len();
+        let first_elapsed = cpu.elapsed_clocks;
+        let first = cpu.run_budgeted(&mut bus, 1).unwrap();
+        assert_eq!(first.consumed_core_clocks, first_core);
+        assert_eq!(cpu.elapsed_clocks - first_elapsed, first_core);
+        assert_eq!(cpu.timing_rem, first_carry);
+        assert_eq!(cpu.registers.ecx(), 1);
+        assert_eq!(cpu.registers.eip, 0x40);
+        assert!(cpu.rep_execution.resume.is_some());
+        assert_eq!(bus.trace.elapsed_clocks(), 10);
+        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 10);
+        assert_eq!(cpu.perf_counters().instructions, 0);
+        assert_eq!(cpu.perf_counters().rep_string_iterations, 1);
+        let fetches = bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|cycle| cycle.kind == BusAccessKind::InstructionPrefetch)
+            .map(|cycle| cycle.address)
+            .collect::<Vec<_>>();
+        assert_eq!(fetches, vec![0x40, 0x41, 0x41]);
+        assert_eq!(
+            bus.trace
+                .cycles()
+                .iter()
+                .skip(first_trace_start)
+                .map(|cycle| (cycle.kind, cycle.address))
+                .collect::<Vec<_>>(),
+            if is_out {
+                vec![
+                    (BusAccessKind::InstructionPrefetch, 0x40),
+                    (BusAccessKind::InstructionPrefetch, 0x41),
+                    (BusAccessKind::InstructionPrefetch, 0x41),
+                    (BusAccessKind::DataRead, 0x200),
+                    (BusAccessKind::IoWrite, 0x03da),
+                ]
+            } else {
+                vec![
+                    (BusAccessKind::InstructionPrefetch, 0x40),
+                    (BusAccessKind::InstructionPrefetch, 0x41),
+                    (BusAccessKind::InstructionPrefetch, 0x41),
+                    (BusAccessKind::IoRead, 0x03da),
+                    (BusAccessKind::DataWrite, 0x200),
+                ]
+            }
+        );
+        if is_out {
+            assert_eq!(cpu.registers.esi(), 0x201);
+            assert_eq!(cpu.registers.edi(), 0x200);
+            assert!(bus.io_reads.is_empty());
+            assert_eq!(bus.io_writes, vec![(0x03da, 0x11, 0)]);
+            assert_eq!(&bus.memory[0x200..0x202], &[0x11, 0x22]);
+        } else {
+            assert_eq!(cpu.registers.esi(), 0x200);
+            assert_eq!(cpu.registers.edi(), 0x201);
+            assert_eq!(bus.io_reads, vec![(0x03da, 0)]);
+            assert!(bus.io_writes.is_empty());
+            assert_eq!(&bus.memory[0x200..0x202], &[0x11, 0x00]);
+        }
+
+        let resumed_trace_start = bus.trace.cycles().len();
+        let resumed_elapsed = cpu.elapsed_clocks;
+        let resumed = cpu.run_budgeted(&mut bus, resume_cap).unwrap();
+        assert_eq!(resumed.consumed_core_clocks, 0);
+        assert_eq!(cpu.elapsed_clocks - resumed_elapsed, 0);
+        assert_eq!(cpu.timing_rem, first_carry);
+        assert_eq!(cpu.registers.ecx(), 0);
+        assert_eq!(cpu.registers.eip, 0x42);
+        assert!(cpu.rep_execution.resume.is_none());
+        assert_eq!(bus.trace.elapsed_clocks(), 14);
+        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 14);
+        assert_eq!(cpu.perf_counters().instructions, 1);
+        assert_eq!(cpu.perf_counters().rep_string_iterations, 2);
+        assert_eq!(
+            bus.trace
+                .cycles()
+                .iter()
+                .skip(resumed_trace_start)
+                .map(|cycle| (cycle.kind, cycle.address))
+                .collect::<Vec<_>>(),
+            if is_out {
+                vec![
+                    (BusAccessKind::DataRead, 0x201),
+                    (BusAccessKind::IoWrite, 0x03da),
+                ]
+            } else {
+                vec![
+                    (BusAccessKind::IoRead, 0x03da),
+                    (BusAccessKind::DataWrite, 0x201),
+                ]
+            }
+        );
+        if is_out {
+            assert_eq!(cpu.registers.esi(), 0x202);
+            assert_eq!(cpu.registers.edi(), 0x200);
+            assert!(bus.io_reads.is_empty());
+            assert_eq!(bus.io_writes, vec![(0x03da, 0x11, 0), (0x03da, 0x22, 0)]);
+            assert_eq!(&bus.memory[0x200..0x202], &[0x11, 0x22]);
+        } else {
+            assert_eq!(cpu.registers.esi(), 0x200);
+            assert_eq!(cpu.registers.edi(), 0x202);
+            assert_eq!(bus.io_reads, vec![(0x03da, 0), (0x03da, 0)]);
+            assert!(bus.io_writes.is_empty());
+            assert_eq!(&bus.memory[0x200..0x202], &[0x11, 0x22]);
+        }
+
+        let later_trace_start = bus.trace.cycles().len();
+        let later_elapsed = cpu.elapsed_clocks;
+        let later_bus = bus.trace.elapsed_clocks();
+        let later = cpu.cycle(&mut bus).unwrap();
+        assert_eq!(later.core_clocks, later_core);
+        assert_eq!(cpu.elapsed_clocks - later_elapsed, later_core);
+        assert_eq!(cpu.timing_rem, later_carry);
+        assert_eq!(bus.trace.elapsed_clocks() - later_bus, 6);
+        assert_eq!(bus.trace.elapsed_clocks(), 20);
+        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 20);
+        assert_eq!(
+            bus.trace
+                .cycles()
+                .iter()
+                .skip(later_trace_start)
+                .map(|cycle| (cycle.kind, cycle.address))
+                .collect::<Vec<_>>(),
+            vec![
+                (BusAccessKind::InstructionPrefetch, 0x42),
+                (BusAccessKind::InstructionPrefetch, 0x42),
+                (BusAccessKind::InstructionPrefetch, 0x43),
+            ]
+        );
+        assert_eq!(cpu.registers.eip, 0x44);
+        assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+        assert_eq!(cpu.perf_counters().instructions, 2);
+        assert_eq!(cpu.perf_counters().rep_string_iterations, 2);
+    }
+}
+
+#[test]
+fn rep_port_faults_keep_only_completed_element_debt_and_never_resume() {
+    const ORIGIN: usize = 0x40;
+
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut out_memory = vec![0; 0x1000];
+        out_memory[ORIGIN..ORIGIN + 4].copy_from_slice(&[0xf3, 0x6e, 0xb0, 0x5a]);
+        out_memory[0x0fff] = 0x66;
+        let mut out_cpu = CpuGsw::default();
+        out_cpu.set_mode(mode);
+        out_cpu.set_timing_epoch(2);
+        out_cpu.timing_rem = 7;
+        for segment in [
+            SegmentIndex::Cs,
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Ss,
+        ] {
+            out_cpu.load_segment_real(segment, 0);
+        }
+        out_cpu.registers.eip = ORIGIN as u32;
+        out_cpu.registers.set_edx(0x03da);
+        out_cpu.registers.set_esi(0x0fff);
+        out_cpu.registers.set_ecx(2);
+        out_cpu.set_flag(FLAG_IF, false);
+        out_cpu.set_flag(FLAG_DF, false);
+        let mut out_bus = TestBus::with_memory(out_memory);
+        out_bus.timing_epoch_two = true;
+        out_bus.lazy_io_reads = true;
+        out_bus.lazy_io_writes = true;
+
+        let out_elapsed = out_cpu.elapsed_clocks;
+        let out_error = out_cpu.run_budgeted(&mut out_bus, u64::MAX).unwrap_err();
+        assert!(matches!(
+            out_error.error,
+            CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 0x1000 })
+        ));
+        assert_eq!(
+            out_error.consumed_core_clocks, 4,
+            "{mode:?} OUTS first element only"
+        );
+        assert_eq!(out_cpu.elapsed_clocks - out_elapsed, 4);
+        assert_eq!(out_cpu.timing_rem, 7);
+        assert_eq!(out_cpu.registers.ecx(), 1);
+        assert_eq!(out_cpu.registers.esi(), 0x1000);
+        assert_eq!(out_cpu.registers.eip, ORIGIN as u32 + 2);
+        assert!(out_cpu.rep_execution.resume.is_none());
+        assert_eq!(out_cpu.perf_counters().instructions, 0);
+        assert_eq!(out_bus.io_writes, vec![(0x03da, 0x66, 0)]);
+        assert_eq!(
+            out_bus
+                .trace
+                .cycles()
+                .iter()
+                .filter(|cycle| cycle.kind == BusAccessKind::DataRead)
+                .map(|cycle| cycle.address)
+                .collect::<Vec<_>>(),
+            vec![0x0fff, 0x1000]
+        );
+        assert_eq!(out_cpu.cycle(&mut out_bus).unwrap().core_clocks, 1);
+        assert_eq!(out_cpu.registers.eax() & 0xff, 0x5a);
+        assert_eq!(out_cpu.timing_rem, 7);
+
+        let mut ins_memory = vec![0; 0x1000];
+        ins_memory[ORIGIN..ORIGIN + 4].copy_from_slice(&[0xf3, 0x6c, 0xb0, 0x5a]);
+        let mut ins_cpu = CpuGsw::default();
+        ins_cpu.set_mode(mode);
+        ins_cpu.set_timing_epoch(2);
+        ins_cpu.timing_rem = 7;
+        for segment in [
+            SegmentIndex::Cs,
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Ss,
+        ] {
+            ins_cpu.load_segment_real(segment, 0);
+        }
+        ins_cpu.registers.eip = ORIGIN as u32;
+        ins_cpu.registers.set_edx(0x03da);
+        ins_cpu.registers.set_edi(0x0fff);
+        ins_cpu.registers.set_ecx(2);
+        ins_cpu.set_flag(FLAG_IF, false);
+        ins_cpu.set_flag(FLAG_DF, false);
+        let mut ins_bus = TestBus::with_memory(ins_memory);
+        ins_bus.timing_epoch_two = true;
+        ins_bus.lazy_io_reads = true;
+        ins_bus.lazy_io_writes = true;
+        ins_bus.io_read_sequence = vec![0xa5, 0xb6];
+
+        let ins_elapsed = ins_cpu.elapsed_clocks;
+        let ins_error = ins_cpu.run_budgeted(&mut ins_bus, u64::MAX).unwrap_err();
+        assert!(matches!(
+            ins_error.error,
+            CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 0x1000 })
+        ));
+        assert_eq!(
+            ins_error.consumed_core_clocks, 3,
+            "{mode:?} INS first element only"
+        );
+        assert_eq!(ins_cpu.elapsed_clocks - ins_elapsed, 3);
+        assert_eq!(ins_cpu.timing_rem, 7);
+        assert_eq!(ins_cpu.registers.ecx(), 1);
+        assert_eq!(ins_cpu.registers.edi(), 0x1000);
+        assert_eq!(ins_cpu.registers.eip, ORIGIN as u32 + 2);
+        assert!(ins_cpu.rep_execution.resume.is_none());
+        assert_eq!(ins_cpu.perf_counters().instructions, 0);
+        assert_eq!(ins_bus.io_reads, vec![(0x03da, 0), (0x03da, 3)]);
+        assert_eq!(ins_bus.memory[0x0fff], 0xa5);
+        assert_eq!(
+            ins_bus
+                .trace
+                .cycles()
+                .iter()
+                .filter(|cycle| cycle.kind == BusAccessKind::DataWrite)
+                .map(|cycle| cycle.address)
+                .collect::<Vec<_>>(),
+            vec![0x0fff, 0x1000]
+        );
+        assert_eq!(ins_cpu.cycle(&mut ins_bus).unwrap().core_clocks, 1);
+        assert_eq!(ins_cpu.registers.eax() & 0xff, 0x5a);
+        assert_eq!(ins_cpu.timing_rem, 7);
+    }
+}
+
+#[test]
 fn interrupt_between_rep_chunks_pushes_the_rep_start_eip() {
     const ORIGIN: usize = 0x40;
     let mut memory = vec![0; 0x1000];
@@ -534,6 +1120,7 @@ fn paged_rep_movsb_bulk_translates_each_page_once_and_keeps_noncontiguous_frames
 
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Movs,
         BusWidth::Byte,
         Prefixes {
@@ -582,6 +1169,7 @@ fn paged_rep_movsb_bulk_fault_keeps_completed_chunk_progress() {
     let fault = cpu
         .run_string(
             &mut bus,
+            &mut CommittedCore::default(),
             StringOp::Movs,
             BusWidth::Byte,
             Prefixes {
@@ -637,6 +1225,7 @@ fn paged_movs_and_cmps_read_source_before_a_destination_page_fault() {
         let fault = cpu
             .run_string(
                 &mut bus,
+                &mut CommittedCore::default(),
                 op,
                 BusWidth::Byte,
                 Prefixes {
@@ -819,6 +1408,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(4);
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Stos,
         BusWidth::Byte,
         Prefixes {
@@ -837,6 +1427,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(3);
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Lods,
         BusWidth::Byte,
         Prefixes {
@@ -857,6 +1448,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(3);
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Cmps,
         BusWidth::Byte,
         Prefixes {
@@ -877,6 +1469,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(3);
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Scas,
         BusWidth::Byte,
         Prefixes {
@@ -912,6 +1505,7 @@ fn bulk_scratch_residue_never_reaches_the_guest() {
     cpu.registers.set_ecx(8);
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Movs,
         BusWidth::Byte,
         Prefixes {
@@ -940,6 +1534,7 @@ fn bulk_scratch_residue_never_reaches_the_guest() {
     cpu.registers.set_ecx(6);
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Stos,
         BusWidth::Byte,
         Prefixes {
@@ -960,6 +1555,7 @@ fn bulk_scratch_residue_never_reaches_the_guest() {
     cpu.registers.set_ecx(5);
     cpu.run_string(
         &mut bus,
+        &mut CommittedCore::default(),
         StringOp::Lods,
         BusWidth::Byte,
         Prefixes {
@@ -1019,6 +1615,7 @@ fn df_and_overlap_bails_never_reach_the_bulk_path() {
         cpu.registers.set_ecx(4);
         cpu.run_string(
             &mut bus,
+            &mut CommittedCore::default(),
             StringOp::Stos,
             BusWidth::Byte,
             Prefixes {
@@ -1062,6 +1659,7 @@ fn df_and_overlap_bails_never_reach_the_bulk_path() {
         cpu.registers.set_ecx(4);
         cpu.run_string(
             &mut bus,
+            &mut CommittedCore::default(),
             StringOp::Movs,
             BusWidth::Byte,
             Prefixes {

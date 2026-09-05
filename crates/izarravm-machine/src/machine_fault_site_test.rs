@@ -2,6 +2,302 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::tests::with_bus;
+use izarravm_cpu::DescriptorTable;
+
+fn fatal_sb8_dma_machine() -> Machine {
+    // mov dx,2010h; in al,dx; jmp short back to the IN. The failed IN is
+    // real device work: its settlement must still advance the armed SB8 DMA.
+    const PROG: &[u8] = &[0xba, 0x10, 0x20, 0xec, 0xeb, 0xfd];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    machine.set_mode(GswMode::Gsw486);
+    machine.set_timing_epoch_for_test(2);
+    machine.cpu.registers.eflags &= !0x200;
+    machine.set_fatal_ports(&[0x2010]);
+    for index in 0..16u32 {
+        machine.write_physical_u8(0x1_0000 + index, if index == 0 { 0x40 } else { 0x10 });
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0b, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x0f, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0a, BusWidth::Byte, 0x01, false).unwrap();
+        for byte in [0x41u8, 0x2b, 0x11, 0xc0, 0x00, 0x0f, 0x00] {
+            bus.write_io(0x22c, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    machine.port_bus_batch_clocks = 0;
+    machine
+}
+
+#[test]
+fn a_fatal_settlement_advances_one_due_sb8_dma_sample_once() {
+    // This is not the synchronous 8237 software-copy path. SB8 consumption is
+    // clock-driven by advance_devices, so the fatal return has to own it.
+    const FATAL_STEP: u64 = 57; // MOV DX (1) + failed byte IN raw (4) + ISA (52)
+    let mut candidate = fatal_sb8_dma_machine();
+    let mut reference = fatal_sb8_dma_machine();
+    let first_sample = candidate
+        .timeline
+        .cpu_clocks_until(
+            crate::timeline::DeviceClock::Dsp,
+            1,
+            u64::from(candidate.sb16.test_output_frame_rate()),
+        )
+        .unwrap();
+    assert!(first_sample > FATAL_STEP);
+    for machine in [&mut candidate, &mut reference] {
+        assert_eq!(machine.dma.master.channels[1].transfer_cycles, 0);
+        assert_eq!(machine.dma.master.channels[1].cur_addr, 0);
+        assert_eq!(machine.dma.master.channels[1].cur_count, 15);
+        machine.advance_devices(first_sample - FATAL_STEP);
+    }
+
+    let batch = candidate.test_batch_observations.len();
+    let stop = candidate.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert!(matches!(stop, StopReason::CpuError(_)));
+    let observation = &candidate.test_batch_observations[batch];
+    assert!(observation.fatal);
+    assert_eq!(observation.core_clocks, 1);
+    assert_eq!(observation.isa_clocks, 52);
+    assert_eq!(observation.step, FATAL_STEP);
+
+    reference.advance_cpu_work(FATAL_STEP, 1);
+    assert_eq!(
+        candidate.dma.master.channels[1], reference.dma.master.channels[1],
+        "fatal settlement and the independent device reference must own the same DMA cycle"
+    );
+    assert_eq!(candidate.dma.master.channels[1].transfer_cycles, 1);
+    assert_eq!(candidate.dma.master.channels[1].cur_addr, 1);
+    assert_eq!(candidate.dma.master.channels[1].cur_count, 14);
+    let candidate_frame = candidate.sb16.test_drain_frame();
+    let reference_frame = reference.sb16.test_drain_frame();
+    assert!(candidate_frame.is_some());
+    assert_eq!(candidate_frame, reference_frame);
+
+    let transfers = candidate.dma.master.channels[1].transfer_cycles;
+    let resumed = candidate.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert!(matches!(resumed, StopReason::CpuError(_)));
+    assert_eq!(candidate.dma.master.channels[1].transfer_cycles, transfers);
+}
+
+fn ring0_software_dma_copy_machine(mem_to_mem_enabled: bool) -> Machine {
+    // Ring-0 I486 leaves this DMA request in the exempt I/O lane, so the
+    // synchronous copy and the fatal IN share one Machine batch.
+    const PROG: &[u8] = &[
+        0xb0, 0x04, // mov al,4: software DREQ on channel 0
+        0x66, 0xba, 0x09, 0x00, // mov dx,9
+        0xee, // out dx,al
+        0x66, 0xba, 0x10, 0x20, // mov dx,2010h
+        0xec, // in al,dx
+    ];
+    const SRC: u32 = 0x1000;
+    const DST: u32 = 0x1100;
+    const GDT: u32 = 0x3000;
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    machine.set_mode(GswMode::Gsw486);
+    machine.set_timing_epoch_for_test(2);
+    machine.write_physical_u32(GDT + 0x08, 0x0000_ffff);
+    machine.write_physical_u32(GDT + 0x0c, 0x00cf_9b00);
+    machine.write_physical_u32(GDT + 0x10, 0x0000_ffff);
+    machine.write_physical_u32(GDT + 0x14, 0x00cf_9300);
+    machine.cpu.gdtr = DescriptorTable {
+        base: GDT,
+        limit: 0x17,
+    };
+    machine.cpu.control.cr0 |= 1;
+    let code = SegmentRegister::flat(0x08, 0x9b);
+    let data = SegmentRegister::flat(0x10, 0x93);
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, code);
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Es,
+        SegmentIndex::Ss,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        machine.cpu.registers.set_segment(segment, data);
+    }
+    for (offset, byte) in PROG.iter().copied().enumerate() {
+        machine.write_physical_u8(0x100 + offset as u32, byte);
+    }
+    machine.cpu.registers.eip = 0x100;
+    machine.cpu.registers.eflags &= !0x200;
+    machine.set_fatal_ports(&[0x2010]);
+    for (offset, byte) in [0xb0, 0xa5, 0xf4, 0x90].into_iter().enumerate() {
+        machine.write_physical_u8(DST + offset as u32, byte);
+    }
+    let source = [0xb0, 0x5a, 0xf4, 0x90];
+    for (offset, byte) in source.into_iter().enumerate() {
+        machine.write_physical_u8(SRC + offset as u32, byte);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x10, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x11, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x03, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x0a, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x08, BusWidth::Byte, mem_to_mem_enabled as u32, false)
+            .unwrap();
+    });
+    machine.port_bus_batch_clocks = 0;
+    machine
+}
+
+#[test]
+fn a_ring0_software_dma_copy_is_reconciled_by_the_same_fatal_return() {
+    const DST: u32 = 0x1100;
+    for mem_to_mem_enabled in [true, false] {
+        let mut machine = ring0_software_dma_copy_machine(mem_to_mem_enabled);
+        machine.cpu.registers.eip = DST;
+        let warm = machine.run_until_halt_or_cycles(1).unwrap();
+        assert!(matches!(warm, StopReason::CycleLimit { requested: 1 }));
+        assert_eq!(machine.cpu.registers.eip, DST + 2);
+        assert_eq!(machine.cpu.registers.eax() as u8, 0xa5);
+
+        // Repositioning EIP preserves the warmed destination's decode state. The
+        // guest's MOV AL,4 restores the request value before its OUT 09.
+        machine.cpu.registers.eip = 0x100;
+        let resets = machine.cpu.perf_counters().device_write_coarse_resets;
+        let batch = machine.test_batch_observations.len();
+        let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert!(matches!(stop, StopReason::CpuError(_)));
+        let observation = &machine.test_batch_observations[batch];
+        assert!(observation.fatal);
+        assert_eq!(
+            observation.device_wrote_memory_before_reconcile,
+            mem_to_mem_enabled
+        );
+        assert!(!machine.device_wrote_memory);
+        assert_eq!(
+            machine.cpu.perf_counters().device_write_coarse_resets,
+            resets + if mem_to_mem_enabled { 1 } else { 0 }
+        );
+        for (offset, byte) in [0xb0, 0x5a, 0xf4, 0x90].into_iter().enumerate() {
+            assert_eq!(
+                machine.read_physical_u8(DST + offset as u32),
+                if mem_to_mem_enabled {
+                    byte
+                } else {
+                    [0xb0, 0xa5, 0xf4, 0x90][offset]
+                }
+            );
+        }
+
+        machine.cpu.registers.eip = DST;
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(
+            machine.cpu.registers.eax() as u8,
+            if mem_to_mem_enabled { 0x5a } else { 0xa5 }
+        );
+    }
+}
+
+#[test]
+fn a_split_vga_word_out_reconciles_its_data_map_before_a_later_fatal() {
+    // The word OUT changes GC6 through 03cf and its passive 03d0 neighbour in
+    // one ordinary batch. The later IN is independently fatal, proving it
+    // cannot re-consume the completed data-map invalidation.
+    const PROG: &[u8] = &[
+        0xbb, 0x11, 0x11, // mov bx,1111h
+        0xba, 0xcf, 0x03, // mov dx,03cfh
+        0xb8, 0x00, 0x00, // mov ax,0000h
+        0xef, // out dx,ax
+        0xba, 0x10, 0x20, // mov dx,2010h
+        0xec, // in al,dx
+        0xb0, 0x5a, // mov al,5ah
+        0xf4, // hlt
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    machine.set_mode(GswMode::Gsw486);
+    machine.set_timing_epoch_for_test(2);
+    assert!(machine.set_vga_mode(0x13));
+    assert_eq!(machine.vega.direct_write_token(), 1);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x3ce, BusWidth::Byte, 0x06, false).unwrap();
+        *bus.direct_map_changed = false;
+        *bus.direct_data_map_changed = false;
+        *bus.io_touched = false;
+    });
+    machine.set_fatal_ports(&[0x2010]);
+    let code_generation = machine.cpu.decode_cache_generation();
+    let audit_before = machine.cpu.fast_map_audit_counters();
+    let batch = machine.test_batch_observations.len();
+    let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert!(
+        matches!(&stop, StopReason::CpuError(text) if text.contains("0x2010")),
+        "the separate IN must reach the configured fatal open port: {stop:?}"
+    );
+    let observations = &machine.test_batch_observations[batch..];
+    let remap_index = observations
+        .iter()
+        .position(|observation| observation.direct_data_map_changed_before_reconcile)
+        .expect("the real GC6 data write must reach ordinary reconciliation");
+    let remap = &observations[remap_index];
+    assert!(!remap.fatal);
+    assert!(!remap.direct_map_changed_before_reconcile);
+    let fatal_index = observations
+        .iter()
+        .position(|observation| observation.fatal)
+        .expect("the later IN must have its own fatal batch");
+    assert!(
+        remap_index < fatal_index,
+        "the ordinary GC6 remap must settle before the separate fatal IN"
+    );
+    let fatal = &observations[fatal_index];
+    assert!(!fatal.direct_map_changed_before_reconcile);
+    assert!(!fatal.direct_data_map_changed_before_reconcile);
+    assert_eq!(machine.vega.direct_write_token(), 0);
+    assert!(!machine.direct_map_changed);
+    assert!(!machine.direct_data_map_changed);
+    assert_eq!(machine.cpu.decode_cache_generation(), code_generation);
+    let audit_after = machine.cpu.fast_map_audit_counters();
+    assert_eq!(audit_after.wipes_direct_map, audit_before.wipes_direct_map);
+    assert_eq!(
+        audit_after.wipes_direct_data_map,
+        audit_before.wipes_direct_data_map + 1
+    );
+
+    let resumed = machine.test_batch_core_totals.len();
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(
+        machine.test_batch_core_totals[resumed..]
+            .iter()
+            .sum::<u64>(),
+        1,
+        "the later MOV AL,5ah must retire its one-clock work without fatal debt"
+    );
+    assert_eq!(machine.cpu.registers.eax() as u8, 0x5a);
+    assert_eq!(machine.vega.direct_write_token(), 0);
+    assert!(!machine.direct_map_changed);
+    assert!(!machine.direct_data_map_changed);
+    let audit_after_resume = machine.cpu.fast_map_audit_counters();
+    assert_eq!(
+        audit_after_resume.wipes_direct_map,
+        audit_after.wipes_direct_map
+    );
+    assert_eq!(
+        audit_after_resume.wipes_direct_data_map,
+        audit_after.wipes_direct_data_map
+    );
+}
 
 /// An access to an undecoded port USED TO BE fatal by default. It is not any
 /// more -- real hardware floats an unclaimed read and swallows an unclaimed
@@ -36,6 +332,11 @@ fn a_fatal_port_fault_names_the_faulting_instruction_not_the_next_one() {
     // Opt 0x2010 back onto the fatal path; open bus does not stop, and a stop is
     // what carries the fault site this test is about.
     machine.set_fatal_ports(&[0x2010]);
+    let elapsed_before = machine.elapsed_clocks();
+    let ticks_before = machine.master_ticks();
+    let raw_bus_before = machine.raw_bus_clocks();
+    let scaled_bus_before = machine.scaled_bus_clocks();
+    let batch_before = machine.test_batch_core_totals.len();
     let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
     assert!(
@@ -53,6 +354,204 @@ fn a_fatal_port_fault_names_the_faulting_instruction_not_the_next_one() {
     assert!(
         !site.cs_moved,
         "IN cannot change CS, so the recorded segment must be trustworthy"
+    );
+    assert!(machine.elapsed_clocks() > elapsed_before);
+    assert!(machine.master_ticks() > ticks_before);
+    assert!(machine.raw_bus_clocks() > raw_bus_before);
+    assert!(machine.scaled_bus_clocks() > scaled_bus_before);
+    let fatal_core = *machine
+        .test_batch_core_totals
+        .get(batch_before)
+        .expect("the fatal batch must expose its settled core once");
+    assert_eq!(
+        fatal_core, 0,
+        "I386's first raw-2 MOV leaves carry 4, not a clock"
+    );
+}
+
+#[test]
+fn a_fatal_settlement_advances_an_armed_pit_without_acknowledging_it() {
+    // Keep IF clear. The PIT edge raised while the fatal batch settles must be
+    // left for a later batch, not acknowledged by fatal handling.
+    const PROG: &[u8] = &[
+        0xb8, 0x01, 0x00, 0xbb, 0x02, 0x00, 0xb9, 0x03, 0x00, 0xba, 0x10, 0x20, 0xec, 0xeb, 0xfd,
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    machine.set_fatal_ports(&[0x2010]);
+    machine.cpu.registers.eflags &= !0x200;
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x02, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+    });
+    let mut reference =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    reference.cpu.registers.eflags &= !0x200;
+    with_bus(&mut reference, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x02, false).unwrap();
+        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+    });
+    // This is a valid I386 scaler remainder. The expected bus lane below is
+    // calculated from the actual raw trace, never from the settled step.
+    machine.bus_rem = 7;
+    reference.bus_rem = 7;
+    const FATAL_INTERVAL: u64 = 32;
+    let next_irq_deadline = machine.event_batch_cap(u64::MAX);
+    assert!(next_irq_deadline >= FATAL_INTERVAL);
+    reference.advance_devices(next_irq_deadline - FATAL_INTERVAL);
+    machine.advance_devices(next_irq_deadline - FATAL_INTERVAL);
+    // Raw-program construction has already seeded channel 0. Clear that
+    // setup-era edge before arming the measured interval; this direct PIC
+    // normalization is outside a Machine run and precedes the INTA baseline.
+    for candidate in [&mut machine, &mut reference] {
+        with_bus(candidate, |bus| {
+            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
+        });
+    }
+    assert!(
+        !machine.pic.irr_bit(0),
+        "the short PIT interval starts unraised"
+    );
+    assert_eq!(machine.event_batch_cap(u64::MAX), FATAL_INTERVAL);
+    let acknowledges = machine.inta_diag.acknowledge_count;
+    let elapsed = machine.elapsed_clocks();
+    let raw_bus = machine.raw_bus_clocks();
+    let scaled_bus = machine.scaled_bus_clocks();
+    let batches = machine.test_batch_core_totals.len();
+
+    let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    assert!(matches!(stop, StopReason::CpuError(_)));
+    assert!(machine.elapsed_clocks() > elapsed);
+    let settled_core = machine.test_batch_core_totals[batches];
+    let observation = &machine.test_batch_observations[batches];
+    let settled_step = machine.test_batch_steps[batches];
+    let settled_isa = machine.test_batch_isa_clocks[batches];
+    let settled_scaled_bus = machine.scaled_bus_clocks() - scaled_bus;
+    assert_eq!(machine.raw_bus_clocks() - raw_bus, 40);
+    assert_eq!(observation.raw_bus_clocks, 40);
+    assert_eq!(observation.bus_rem_at_entry, 7);
+    assert!(observation.fatal);
+    assert_eq!(observation.isa_clocks, 0, "I386 epoch one has no ISA lane");
+    let scaled_from_raw = ((u128::from(observation.raw_bus_clocks) * 23 + 7) / 31) as u64;
+    let remainder_from_raw = ((u128::from(observation.raw_bus_clocks) * 23 + 7) % 31) as u64;
+    let independent_step = 3 + scaled_from_raw;
+    assert_eq!(settled_core, 3);
+    #[cfg(feature = "jit")]
+    assert_eq!(machine.cpu.poll_skip_timing_remainder(), 1);
+    assert_eq!(settled_scaled_bus, 29);
+    assert_eq!(settled_isa, 0);
+    assert_eq!(settled_step, FATAL_INTERVAL);
+    assert_eq!(independent_step, FATAL_INTERVAL);
+    assert_eq!(observation.step, FATAL_INTERVAL);
+    assert_eq!(remainder_from_raw, 28);
+    assert_eq!(machine.bus_rem, 28);
+    assert_eq!(machine.elapsed_clocks() - elapsed, FATAL_INTERVAL);
+    reference.advance_cpu_work(FATAL_INTERVAL, 3);
+    assert_eq!(machine.pit, reference.pit);
+    assert_eq!(machine.timeline, reference.timeline);
+    assert!(
+        machine.pic.irr_bit(0),
+        "the fatal settlement must advance the armed PIT through an IRQ0 edge; step={} raw={} core={}",
+        independent_step,
+        observation.raw_bus_clocks,
+        settled_core
+    );
+    assert_eq!(machine.pic.irr_bit(0), reference.pic.irr_bit(0));
+    assert_eq!(
+        machine.inta_diag.acknowledge_count, acknowledges,
+        "fatal settlement must not service or acknowledge the newly pending IRQ0"
+    );
+    assert_eq!(
+        settled_core, 3,
+        "four state-changing raw-2 MOVs scale to three I386 clocks with carry 0"
+    );
+
+    assert_eq!(
+        machine.device_edge_cache,
+        crate::timing::DeviceEdgeCache::Stale
+    );
+    let cached_cap = machine.event_batch_cap_cached(u64::MAX);
+    let fresh_cap = machine.event_batch_cap(u64::MAX);
+    assert_eq!(cached_cap, fresh_cap);
+
+    let resumed_elapsed = machine.elapsed_clocks();
+    let resumed_raw_bus = machine.raw_bus_clocks();
+    let resumed_scaled_bus = machine.scaled_bus_clocks();
+    let resumed_batches = machine.test_batch_core_totals.len();
+    let resumed = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert!(matches!(resumed, StopReason::CpuError(_)));
+    assert!(machine.elapsed_clocks() > resumed_elapsed);
+    assert!(machine.raw_bus_clocks() > resumed_raw_bus);
+    let resumed_observation = &machine.test_batch_observations[resumed_batches];
+    let resumed_raw = machine.raw_bus_clocks() - resumed_raw_bus;
+    let resumed_scaled = ((u128::from(resumed_observation.raw_bus_clocks) * 23
+        + u128::from(resumed_observation.bus_rem_at_entry))
+        / 31) as u64;
+    let resumed_remainder = ((u128::from(resumed_observation.raw_bus_clocks) * 23
+        + u128::from(resumed_observation.bus_rem_at_entry))
+        % 31) as u64;
+    assert!(resumed_observation.fatal);
+    assert_eq!(resumed_observation.raw_bus_clocks, resumed_raw);
+    assert_eq!(resumed_observation.bus_rem_at_entry, 28);
+    assert_eq!(machine.test_batch_core_totals[resumed_batches], 3);
+    #[cfg(feature = "jit")]
+    assert_eq!(machine.cpu.poll_skip_timing_remainder(), 0);
+    assert_eq!(resumed_observation.scaled_bus_clocks, resumed_scaled);
+    assert_eq!(
+        machine.scaled_bus_clocks() - resumed_scaled_bus,
+        resumed_scaled
+    );
+    let resumed_step = 3 + resumed_scaled;
+    assert_eq!(resumed_observation.step, resumed_step);
+    assert_eq!(machine.bus_rem, resumed_remainder);
+    assert_eq!(machine.elapsed_clocks() - resumed_elapsed, resumed_step);
+    reference.advance_cpu_work(resumed_step, 3);
+    assert_eq!(machine.pit, reference.pit);
+    assert_eq!(machine.timeline, reference.timeline);
+    assert_eq!(
+        machine.inta_diag.acknowledge_count, acknowledges,
+        "the IF-clear GUI-style resume must not pay the prior stop by servicing IRQ0"
+    );
+    assert_eq!(
+        machine.device_edge_cache,
+        crate::timing::DeviceEdgeCache::Stale
+    );
+    let cached_cap = machine.event_batch_cap_cached(u64::MAX);
+    let fresh_cap = machine.event_batch_cap(u64::MAX);
+    assert_eq!(cached_cap, fresh_cap);
+}
+
+#[test]
+fn an_i486_fatal_port_keeps_its_attempted_isa_lane_once() {
+    // Four MOVs retire before the failed IN. Epoch two prices the actual
+    // unclaimed byte port attempt on ISA even though the IN contributes no
+    // completed core clocks.
+    const PROG: &[u8] = &[
+        0xb8, 0x01, 0x00, 0xbb, 0x02, 0x00, 0xb9, 0x03, 0x00, 0xba, 0x10, 0x20, 0xec,
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
+    machine.set_mode(GswMode::Gsw486);
+    machine.set_timing_epoch_for_test(2);
+    machine.set_fatal_ports(&[0x2010]);
+    let batch = machine.test_batch_observations.len();
+    let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert!(matches!(stop, StopReason::CpuError(_)));
+    let observation = &machine.test_batch_observations[batch];
+    assert!(observation.fatal);
+    assert_eq!(observation.core_clocks, 4);
+    assert_eq!(observation.isa_clocks, 52);
+    assert_eq!(observation.bus_rem_at_entry, 0);
+    assert_eq!(observation.bus_rem_at_exit, 0);
+    assert_eq!(
+        observation.step,
+        observation.core_clocks + observation.scaled_bus_clocks + observation.isa_clocks
     );
 }
 
@@ -221,7 +720,20 @@ fn the_fault_report_latches_per_site_not_per_run() {
     let mut spinner =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), SPIN).unwrap();
     spinner.set_fatal_ports(&[0x2010]);
+    let first_elapsed = spinner.elapsed_clocks();
+    let first_ticks = spinner.master_ticks();
+    let first_raw_bus = spinner.raw_bus_clocks();
+    let first_scaled_bus = spinner.scaled_bus_clocks();
+    let first_batch = spinner.test_batch_core_totals.len();
     spinner.run_until_halt_or_cycles(1_000_000).unwrap();
+    let first_settled_core = spinner.test_batch_core_totals[first_batch];
+    let first_elapsed = spinner.elapsed_clocks() - first_elapsed;
+    let first_ticks = spinner.master_ticks() - first_ticks;
+    let first_raw_bus = spinner.raw_bus_clocks() - first_raw_bus;
+    let first_scaled_bus = spinner.scaled_bus_clocks() - first_scaled_bus;
+    assert_eq!(first_settled_core, 0);
+    assert!(first_elapsed > 0 && first_ticks > 0);
+    assert!(first_raw_bus > 0 && first_scaled_bus > 0);
     let first = spinner
         .last_fault_line()
         .expect("first fault reports")
@@ -234,12 +746,29 @@ fn the_fault_report_latches_per_site_not_per_run() {
     // first makes a re-report visible, and also catches a fixture whose second
     // run silently never faulted.
     spinner.last_fault_line = None;
+    let second_elapsed = spinner.elapsed_clocks();
+    let second_ticks = spinner.master_ticks();
+    let second_raw_bus = spinner.raw_bus_clocks();
+    let second_scaled_bus = spinner.scaled_bus_clocks();
+    let second_batch = spinner.test_batch_core_totals.len();
     spinner.run_until_halt_or_cycles(1_000_000).unwrap();
+    let second_settled_core = spinner.test_batch_core_totals[second_batch];
+    let second_elapsed = spinner.elapsed_clocks() - second_elapsed;
+    let second_ticks = spinner.master_ticks() - second_ticks;
+    let second_raw_bus = spinner.raw_bus_clocks() - second_raw_bus;
+    let second_scaled_bus = spinner.scaled_bus_clocks() - second_scaled_bus;
     assert_eq!(
         spinner.last_fault_line(),
         None,
         "a repeat at the same site must not re-report, or a spinning guest \
          floods stderr for as long as it runs"
+    );
+    assert_eq!(second_settled_core, 3);
+    assert!(second_elapsed > 0 && second_ticks > 0);
+    assert!(second_raw_bus > 0 && second_scaled_bus > 0);
+    assert_eq!(
+        second_settled_core, 3,
+        "the resumed JMP consumes the first call's carry but no prior return debt"
     );
 
     // TWO bad ports back to back. The second run faults one byte further on,
