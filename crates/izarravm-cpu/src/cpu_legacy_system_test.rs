@@ -49,7 +49,7 @@ fn decode_then_execute_matches_golden_for_add_rm_reg() {
     assert_eq!(insn.opcode, 0x01);
     assert_eq!(insn.operand, Some(DecodedOperand::Reg(0))); // r/m = AX
     let split_outcome = split
-        .execute_decoded(&insn, &mut split_bus, &mut CommittedCore::default())
+        .execute_decoded(&insn, &mut split_bus, &mut InstructionWork::default())
         .unwrap();
 
     // 0x1234 + 0x1111 = 0x2345: no carry/zero/sign/overflow/aux, low byte 0x45 has odd parity
@@ -89,7 +89,7 @@ fn decoded_add_rm_reg_recomputes_ea_from_live_registers() {
 
     // Move the pointer before executing.
     cpu.write_reg16(Reg16::Bx, 0x0030);
-    cpu.execute_decoded(&insn, &mut bus, &mut CommittedCore::default())
+    cpu.execute_decoded(&insn, &mut bus, &mut InstructionWork::default())
         .unwrap();
 
     assert_eq!(bus.memory[0x20], 0x01, "old target must be untouched");
@@ -113,14 +113,14 @@ fn alu_split_recomputes_effective_address() {
 
     // First run with BX = 0x40: the byte at [0x40] gains AL.
     cpu.write_reg16(Reg16::Bx, 0x0040);
-    cpu.execute_decoded(&insn, &mut bus, &mut CommittedCore::default())
+    cpu.execute_decoded(&insn, &mut bus, &mut InstructionWork::default())
         .unwrap();
     assert_eq!(bus.memory[0x40], 0x11, "[BX=0x40] must get AL added");
     assert_eq!(bus.memory[0x50], 0x02, "[0x50] untouched on the first run");
 
     // Re-execute the SAME decoded instruction with BX = 0x50: the EA must follow BX.
     cpu.write_reg16(Reg16::Bx, 0x0050);
-    cpu.execute_decoded(&insn, &mut bus, &mut CommittedCore::default())
+    cpu.execute_decoded(&insn, &mut bus, &mut InstructionWork::default())
         .unwrap();
     assert_eq!(bus.memory[0x40], 0x11, "[0x40] untouched on the second run");
     assert_eq!(bus.memory[0x50], 0x12, "[BX=0x50] must get AL added");

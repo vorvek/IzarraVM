@@ -31935,8 +31935,14 @@ fn interpret_one_step<B: CpuBus>(
     let (outcome, committed) = match execution {
         InstructionExecution {
             result: Ok(outcome),
-            committed,
-        } => (outcome, committed),
+            work,
+        } => {
+            assert!(
+                work.rep.is_none(),
+                "native helper admitted a repeated memory string"
+            );
+            (outcome, work.committed)
+        }
         execution => {
             // STEP 7. The fault arm. `finish_instruction` is the run loop's own tail: it rewinds EIP
             // and CS onto the faulting instruction, delivers the exception, charges the architectural

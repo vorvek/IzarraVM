@@ -1138,12 +1138,12 @@ fn paging_permission_and_cross_page_exits_precede_flags_and_operand_changes() {
         let native_result = fixture.native.execute_decoded(
             &native_decoded,
             &mut fixture.native_bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
         );
         let interpreter_result = fixture.interpreter.execute_decoded(
             &interpreter_decoded,
             &mut fixture.interpreter_bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
         );
         assert_eq!(
             result_signature(native_result),

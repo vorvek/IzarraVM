@@ -1410,7 +1410,7 @@ impl CpuGsw {
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
-        committed: &mut CommittedCore,
+        work: &mut InstructionWork,
     ) -> ExecResult<CycleOutcome> {
         let operand_size = insn.operand_size;
         let address_size = insn.address_size;
@@ -1510,7 +1510,7 @@ impl CpuGsw {
             0x6c => {
                 self.run_string(
                     bus,
-                    committed,
+                    work,
                     StringOp::Ins,
                     BusWidth::Byte,
                     insn.prefixes,
@@ -1528,7 +1528,7 @@ impl CpuGsw {
             0x6d => {
                 self.run_string(
                     bus,
-                    committed,
+                    work,
                     StringOp::Ins,
                     operand_size.bus_width(),
                     insn.prefixes,
@@ -1546,7 +1546,7 @@ impl CpuGsw {
             0x6e => {
                 self.run_string(
                     bus,
-                    committed,
+                    work,
                     StringOp::Outs,
                     BusWidth::Byte,
                     insn.prefixes,
@@ -1564,7 +1564,7 @@ impl CpuGsw {
             0x6f => {
                 self.run_string(
                     bus,
-                    committed,
+                    work,
                     StringOp::Outs,
                     operand_size.bus_width(),
                     insn.prefixes,

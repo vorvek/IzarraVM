@@ -4281,10 +4281,16 @@ fn finite_cs_ret_limit_exit_case(stack_physical: u32) {
         .decode_cache
         .get(QUAKE_SEGMENT_BASE + RET, true)
         .unwrap();
-    let native_fault =
-        native.execute_decoded(&native_ret, &mut native_bus, &mut CommittedCore::default());
-    let interp_fault =
-        interp.execute_decoded(&interp_ret, &mut interp_bus, &mut CommittedCore::default());
+    let native_fault = native.execute_decoded(
+        &native_ret,
+        &mut native_bus,
+        &mut InstructionWork::default(),
+    );
+    let interp_fault = interp.execute_decoded(
+        &interp_ret,
+        &mut interp_bus,
+        &mut InstructionWork::default(),
+    );
     for fault in [native_fault, interp_fault] {
         assert!(matches!(
             fault,
@@ -4391,12 +4397,12 @@ fn nonflat_segment_limit_and_permission_fallbacks_are_transactional() {
         let native_fault = native.execute_decoded(
             &native_decoded,
             &mut native_bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
         );
         let interp_fault = interp.execute_decoded(
             &interp_decoded,
             &mut interp_bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
         );
         for fault in [native_fault, interp_fault] {
             assert!(matches!(
@@ -5739,10 +5745,18 @@ fn finite_cs_jmp_through_memory_limit_exit_preserves_restart_state_and_faults_pr
         .get(QUAKE_SEGMENT_BASE + JMP, true)
         .unwrap();
     native
-        .execute_decoded(&native_jmp, &mut native_bus, &mut CommittedCore::default())
+        .execute_decoded(
+            &native_jmp,
+            &mut native_bus,
+            &mut InstructionWork::default(),
+        )
         .unwrap();
     interp
-        .execute_decoded(&interp_jmp, &mut interp_bus, &mut CommittedCore::default())
+        .execute_decoded(
+            &interp_jmp,
+            &mut interp_bus,
+            &mut InstructionWork::default(),
+        )
         .unwrap();
     assert_eq!(native.registers.eip, QUAKE_CS_LIMIT + 1);
     assert_eq!(interp.registers.eip, QUAKE_CS_LIMIT + 1);
@@ -6326,5 +6340,82 @@ fn fild_m64_above_2_32_and_2_53_matches_the_interpreter_mid_block() {
             "{label}: bus clocks"
         );
         assert_eq!(native.fpu.get(0), value as f64, "{label}: FILD result");
+    }
+}
+
+#[test]
+fn rep_legacy_native_prefix_and_interpreted_invoice_conserve_each_return() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            let mut native = fresh();
+            let mut interp = fresh();
+            for cpu in [&mut native, &mut interp] {
+                cpu.set_mode(mode);
+                cpu.set_timing_epoch(epoch);
+                cpu.registers.set_ecx(2);
+                cpu.registers.set_esi(0x2000);
+                cpu.registers.set_edi(0x3000);
+            }
+            let mut memory = vec![0; 0x4000];
+            memory[0x100..0x10a]
+                .copy_from_slice(&[0x90, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0xf3, 0xa4, 0xf4]);
+            memory[0x2000..0x2002].copy_from_slice(&[0x41, 0x52]);
+            let mut native_bus = TestBus::with_memory(memory.clone());
+            let mut interp_bus = TestBus::with_memory(memory);
+            for (cpu, bus) in [
+                (&mut native, &mut native_bus),
+                (&mut interp, &mut interp_bus),
+            ] {
+                bus.uniform_native_fetches = true;
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+                bus.report_batch_clocks = true;
+                decode_fixture(
+                    cpu,
+                    bus,
+                    &[
+                        0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106, 0x107, 0x109,
+                    ],
+                );
+                cpu.registers.eip = 0x100;
+            }
+            native.set_jit_auto_admit(true);
+            let block = install_fixture_block(&mut native, 0x101);
+            assert_eq!(block.span().instructions, 6);
+            interp.set_native_backend_enabled(false);
+            let mut returned = [0, 0];
+            for (index, cpu, bus) in [
+                (0, &mut native, &mut native_bus),
+                (1, &mut interp, &mut interp_bus),
+            ] {
+                while cpu.registers.eip < 0x109 {
+                    let before = cpu.elapsed_clocks;
+                    let result = cpu.run_budgeted(bus, u64::MAX).unwrap();
+                    assert_eq!(cpu.elapsed_clocks - before, result.consumed_core_clocks);
+                    returned[index] += result.consumed_core_clocks;
+                }
+                assert_eq!(cpu.registers.ecx(), 0);
+                assert_eq!(cpu.registers.ebx(), 6);
+                assert_eq!(&bus.memory[0x3000..0x3002], &[0x41, 0x52]);
+                assert_eq!(cpu.perf.rep_string_iterations, 2);
+                assert!(cpu.rep_execution.resume.is_none());
+            }
+            assert!(
+                native.perf.jit_direct_insns >= 6,
+                "{mode:?} E{epoch} {:?}",
+                native.perf_counters()
+            );
+            assert_eq!(interp.perf.jit_direct_insns, 0);
+            assert_eq!(returned[0], returned[1]);
+            assert_eq!(native.timing_rem, interp.timing_rem);
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp)
+            );
+            assert_eq!(
+                native_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks()
+            );
+        }
     }
 }

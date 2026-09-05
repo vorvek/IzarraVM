@@ -434,10 +434,6 @@ impl CommittedCore {
             .checked_add(self.0)
             .expect("projected core clocks exceeded u64")
     }
-
-    fn absorb(&mut self, other: Self) {
-        self.add(other.0);
-    }
 }
 
 /// Raw instruction execution paired with scaled work committed by producers
@@ -445,14 +441,52 @@ impl CommittedCore {
 #[derive(Debug)]
 struct InstructionExecution {
     result: ExecResult<CycleOutcome>,
-    committed: CommittedCore,
+    work: InstructionWork,
 }
 
 impl InstructionExecution {
     fn new(result: ExecResult<CycleOutcome>) -> Self {
         Self {
             result,
-            committed: CommittedCore::default(),
+            work: InstructionWork::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct InstructionWork {
+    committed: CommittedCore,
+    rep: Option<RepInvocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepPriceHistory {
+    initial_count: u32,
+    startup_paid: bool,
+}
+
+#[derive(Debug)]
+struct RepInvocation {
+    history: RepPriceHistory,
+    completed: u32,
+    raw_due: u64,
+}
+
+impl RepInvocation {
+    fn complete(&mut self, count: u32) {
+        self.completed = self
+            .completed
+            .checked_add(count)
+            .expect("REP count exceeded u32");
+    }
+
+    fn legacy_raw(&self) -> u32 {
+        u32::try_from(self.raw_due).expect("legacy REP raw charge exceeded u32")
+    }
+
+    fn legacy_payment(&mut self, raw: u32) {
+        if !self.history.startup_paid {
+            self.raw_due = u64::from(raw);
         }
     }
 }
@@ -3982,6 +4016,7 @@ struct RepResume {
     post_eip: u32,
     cs: SegmentRegister,
     precharged_core: u64,
+    price_history: Option<RepPriceHistory>,
 }
 
 const REP_BULK_BYTES: usize = 4096;

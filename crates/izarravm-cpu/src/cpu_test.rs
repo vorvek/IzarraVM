@@ -3778,7 +3778,7 @@ fn cpl3_code(code: &[u8]) -> (CpuGsw, TestBus) {
 fn exec_one_split<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> ExecResult<CycleOutcome> {
     cpu.begin_instruction();
     let insn = cpu.decode(bus)?;
-    cpu.execute_decoded(&insn, bus, &mut CommittedCore::default())
+    cpu.execute_decoded(&insn, bus, &mut InstructionWork::default())
 }
 
 fn real_mode_cpu(code: &[u8], mem_len: usize) -> (CpuGsw, Vec<u8>) {

@@ -1120,7 +1120,7 @@ fn paged_rep_movsb_bulk_translates_each_page_once_and_keeps_noncontiguous_frames
 
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Movs,
         BusWidth::Byte,
         Prefixes {
@@ -1169,7 +1169,7 @@ fn paged_rep_movsb_bulk_fault_keeps_completed_chunk_progress() {
     let fault = cpu
         .run_string(
             &mut bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
             StringOp::Movs,
             BusWidth::Byte,
             Prefixes {
@@ -1225,7 +1225,7 @@ fn paged_movs_and_cmps_read_source_before_a_destination_page_fault() {
         let fault = cpu
             .run_string(
                 &mut bus,
-                &mut CommittedCore::default(),
+                &mut InstructionWork::default(),
                 op,
                 BusWidth::Byte,
                 Prefixes {
@@ -1408,7 +1408,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(4);
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Stos,
         BusWidth::Byte,
         Prefixes {
@@ -1427,7 +1427,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(3);
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Lods,
         BusWidth::Byte,
         Prefixes {
@@ -1448,7 +1448,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(3);
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Cmps,
         BusWidth::Byte,
         Prefixes {
@@ -1469,7 +1469,7 @@ fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     cpu.registers.set_ecx(3);
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Scas,
         BusWidth::Byte,
         Prefixes {
@@ -1505,7 +1505,7 @@ fn bulk_scratch_residue_never_reaches_the_guest() {
     cpu.registers.set_ecx(8);
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Movs,
         BusWidth::Byte,
         Prefixes {
@@ -1534,7 +1534,7 @@ fn bulk_scratch_residue_never_reaches_the_guest() {
     cpu.registers.set_ecx(6);
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Stos,
         BusWidth::Byte,
         Prefixes {
@@ -1555,7 +1555,7 @@ fn bulk_scratch_residue_never_reaches_the_guest() {
     cpu.registers.set_ecx(5);
     cpu.run_string(
         &mut bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
         StringOp::Lods,
         BusWidth::Byte,
         Prefixes {
@@ -1615,7 +1615,7 @@ fn df_and_overlap_bails_never_reach_the_bulk_path() {
         cpu.registers.set_ecx(4);
         cpu.run_string(
             &mut bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
             StringOp::Stos,
             BusWidth::Byte,
             Prefixes {
@@ -1659,7 +1659,7 @@ fn df_and_overlap_bails_never_reach_the_bulk_path() {
         cpu.registers.set_ecx(4);
         cpu.run_string(
             &mut bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
             StringOp::Movs,
             BusWidth::Byte,
             Prefixes {
@@ -3259,4 +3259,519 @@ fn retf_32bit_pops_full_eip_and_preserves_high_esp() {
     assert_eq!(cpu.registers.eip, 0x0001_2345);
     // sp 0x0100 -> +8 (two dword pops) = 0x0108, high half preserved
     assert_eq!(cpu.registers.esp(), 0xcafe_0108);
+}
+
+#[test]
+fn rep_legacy_invoice_preserves_returns_and_effects() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            for opcode in [0xa4, 0xa5, 0xaa, 0xab] {
+                for dword in [false, true] {
+                    for address32 in [false, true] {
+                        for backwards in [false, true] {
+                            for count in [0u32, 1, 2, 4097] {
+                                let mut code = vec![0xf3];
+                                if dword {
+                                    code.push(0x66);
+                                }
+                                if address32 {
+                                    code.push(0x67);
+                                }
+                                code.push(opcode);
+                                let (mut cpu, mut memory) = real_mode_cpu(&code, 0x10000);
+                                cpu.set_mode(mode);
+                                cpu.set_timing_epoch(epoch);
+                                cpu.load_segment_real(SegmentIndex::Es, 0);
+                                cpu.registers.set_eax(0x5a5a5a5a);
+                                cpu.registers.set_ecx(count);
+                                let width = if opcode & 1 == 0 {
+                                    1
+                                } else if dword {
+                                    4
+                                } else {
+                                    2
+                                };
+                                let bytes = count as usize * width;
+                                memory[0x2000..0x2000 + bytes].fill(0x5a);
+                                let offset = if backwards {
+                                    bytes.saturating_sub(width)
+                                } else {
+                                    0
+                                } as u32;
+                                cpu.registers.set_esi(0x2000 + offset);
+                                cpu.registers.set_edi(0x8000 + offset);
+                                cpu.set_flag(FLAG_DF, backwards);
+                                let mut atomic = cpu.clone();
+                                let mut bus = TestBus::with_memory(memory.clone());
+                                bus.direct_page_clocks = true;
+                                bus.report_batch_clocks = true;
+                                let mut atomic_bus = TestBus::with_memory(memory);
+                                atomic_bus.direct_page_clocks = true;
+                                atomic_bus.report_batch_clocks = true;
+                                let start = cpu.elapsed_clocks;
+                                let first = cpu.run_budgeted(&mut bus, 0).unwrap();
+                                let raw = if epoch == 1 { 4 } else { 48 };
+                                assert_eq!(first.consumed_core_clocks, raw / 12);
+                                assert_eq!(cpu.timing_rem, raw % 12);
+                                assert_eq!(cpu.registers.ecx(), count);
+                                let mut total = first.consumed_core_clocks;
+                                let mut chunks = 0;
+                                while cpu.rep_resume_active {
+                                    let before = cpu.elapsed_clocks;
+                                    let result = cpu.run_budgeted(&mut bus, 0).unwrap();
+                                    assert_eq!(
+                                        result.consumed_core_clocks, 0,
+                                        "mode={mode:?} epoch={epoch} opcode={opcode:x}"
+                                    );
+                                    assert_eq!(cpu.elapsed_clocks, before);
+                                    assert_eq!(cpu.timing_rem, raw % 12);
+                                    total += result.consumed_core_clocks;
+                                    chunks += 1;
+                                    assert!(chunks <= count);
+                                }
+                                let atomic_result = atomic.cycle(&mut atomic_bus).unwrap();
+                                assert_eq!(total, atomic_result.core_clocks);
+                                assert_eq!(cpu.elapsed_clocks - start, total);
+                                assert_eq!(cpu.registers, atomic.registers);
+                                assert_eq!(bus.memory, atomic_bus.memory);
+                                assert_eq!(&bus.memory[0x8000..0x8000 + bytes], vec![0x5a; bytes]);
+                                assert_eq!(
+                                    bus.trace.elapsed_clocks(),
+                                    atomic_bus.trace.elapsed_clocks()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rep_legacy_history_keeps_initial_count_after_a_zero_quotient_payment() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (mut cpu, memory) = real_mode_cpu(&[0xf3, 0xa4], 0x1000);
+        cpu.set_mode(mode);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.set_ecx(2);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_page_clocks = true;
+        bus.report_batch_clocks = true;
+        let first = cpu.run_budgeted(&mut bus, 0).unwrap();
+        assert_eq!(first.consumed_core_clocks, 0);
+        assert_eq!(cpu.timing_rem, 4);
+        assert_eq!(
+            cpu.rep_execution.resume.as_ref().unwrap().price_history,
+            Some(RepPriceHistory {
+                initial_count: 2,
+                startup_paid: true
+            })
+        );
+        let next = cpu.run_budgeted(&mut bus, 0).unwrap();
+        assert_eq!(next.consumed_core_clocks, 0);
+        assert_eq!(cpu.registers.ecx(), 1);
+        assert_eq!(
+            cpu.rep_execution.resume.as_ref().unwrap().price_history,
+            Some(RepPriceHistory {
+                initial_count: 2,
+                startup_paid: true
+            })
+        );
+        assert_eq!(cpu.timing_rem, 4);
+    }
+}
+
+#[test]
+fn rep_legacy_partial_fault_invoice_counts_only_completed_elements() {
+    for destination_fault in [false, true] {
+        let (mut cpu, mut memory) = real_mode_cpu(&[0xf3, 0xa4], 0x1000);
+        cpu.set_mode(GswMode::Gsw586);
+        cpu.set_timing_epoch(2);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        memory[0x100..0x103].copy_from_slice(&[0x31, 0x42, 0x53]);
+        cpu.registers.set_ecx(3);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        let segment = if destination_fault {
+            SegmentIndex::Es
+        } else {
+            SegmentIndex::Ds
+        };
+        let mut descriptor = cpu.registers.segment(segment);
+        descriptor.limit = if destination_fault { 0x201 } else { 0x101 };
+        cpu.registers.set_segment(segment, descriptor);
+        let mut bus = TestBus::with_memory(memory);
+        let insn = cpu.decode(&mut bus).unwrap();
+        let mut work = InstructionWork::default();
+        let result = cpu.execute_decoded(&insn, &mut bus, &mut work);
+        assert!(matches!(
+            result,
+            Err(InternalFault::Exception { vector: 13, .. })
+        ));
+        let invoice = work.rep.unwrap();
+        assert_eq!(invoice.completed, 2);
+        assert_eq!(invoice.raw_due, 0);
+        assert!(!invoice.history.startup_paid);
+        assert_eq!(invoice.history.initial_count, 3);
+        assert_eq!(cpu.registers.ecx(), 1);
+        assert_eq!(&bus.memory[0x200..0x203], &[0x31, 0x42, 0]);
+        assert_eq!(work.committed.total(), 0);
+    }
+}
+
+#[test]
+#[should_panic(expected = "REP resume has unpaid startup")]
+fn rep_legacy_resumed_yield_rejects_a_lost_payment() {
+    let (mut cpu, memory) = real_mode_cpu(&[0xf3, 0xa4], 0x1000);
+    cpu.load_segment_real(SegmentIndex::Es, 0);
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.registers.set_ecx(2);
+    cpu.registers.set_esi(0x100);
+    cpu.registers.set_edi(0x200);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+    cpu.run_budgeted(&mut bus, 0).unwrap();
+    cpu.rep_execution
+        .resume
+        .as_mut()
+        .unwrap()
+        .price_history
+        .as_mut()
+        .unwrap()
+        .startup_paid = false;
+    cpu.run_budgeted(&mut bus, 0).unwrap();
+}
+
+fn rep_legacy_fixture(mode: GswMode, epoch: u32, prefix: u8, count: u32) -> (CpuGsw, TestBus) {
+    let (mut cpu, mut memory) = real_mode_cpu(&[0x90, prefix, 0xa4, 0xb0, 0x5a], 0x10000);
+    cpu.set_mode(mode);
+    cpu.set_timing_epoch(epoch);
+    cpu.load_segment_real(SegmentIndex::Es, 0);
+    cpu.registers.eip = 1;
+    cpu.registers.set_ecx(count);
+    cpu.registers.set_esi(0x2000);
+    cpu.registers.set_edi(0x8000);
+    cpu.registers.set_esp(0x1000);
+    memory[0x2000..0x2000 + count as usize].fill(0x6d);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+    (cpu, bus)
+}
+
+#[test]
+fn rep_legacy_full_chunk_and_cloned_resume_keep_one_startup() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            let (mut cpu, mut bus) = rep_legacy_fixture(mode, epoch, 0xf3, 4097);
+            let first = cpu.run_budgeted(&mut bus, u64::MAX).unwrap();
+            assert_eq!(cpu.registers.ecx(), 1);
+            assert_eq!(cpu.perf.rep_string_iterations, 4096);
+            assert_eq!(&bus.memory[0x8000..0x9000], &[0x6d; 4096]);
+            let history = cpu
+                .rep_execution
+                .resume
+                .as_ref()
+                .unwrap()
+                .price_history
+                .unwrap();
+            assert_eq!(history.initial_count, 4097);
+            assert!(history.startup_paid);
+            let mut clone = cpu.clone();
+            let mut clone_bus = TestBus::with_memory(bus.memory.to_vec());
+            clone_bus.direct_page_clocks = true;
+            clone_bus.report_batch_clocks = true;
+            assert_eq!(clone.rep_execution.resume, cpu.rep_execution.resume);
+            assert_eq!(
+                clone.canonical_execution_capture().err(),
+                Some(CpuCanonicalCaptureError::ActiveRepContinuation)
+            );
+            let last = cpu.run_budgeted(&mut bus, 0).unwrap();
+            let cloned_last = clone.run_budgeted(&mut clone_bus, 0).unwrap();
+            assert_eq!(last, cloned_last);
+            assert_eq!(last.consumed_core_clocks, 0);
+            assert_eq!(cpu.elapsed_clocks, first.consumed_core_clocks);
+            assert_eq!(cpu.registers.ecx(), 0);
+            assert_eq!(cpu.perf.instructions, 1);
+            assert_eq!(cpu.registers, clone.registers);
+            assert_eq!(bus.memory, clone_bus.memory);
+            assert_eq!(cpu.timing_rem, clone.timing_rem);
+        }
+    }
+}
+
+#[test]
+fn rep_legacy_cached_and_profiled_entries_keep_the_invoice() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            for prefix in [0xf2, 0xf3] {
+                for profiling in [false, true] {
+                    let (mut cpu, mut bus) = rep_legacy_fixture(mode, epoch, prefix, 2);
+                    cpu.registers.eip = 0;
+                    cpu.cycle(&mut bus).unwrap();
+                    cpu.cycle(&mut bus).unwrap();
+                    cpu.registers.eip = 0;
+                    cpu.registers.set_ecx(2);
+                    cpu.registers.set_esi(0x2000);
+                    cpu.registers.set_edi(0x8000);
+                    cpu.timing_rem = 0;
+                    cpu.elapsed_clocks = 0;
+                    cpu.reset_perf_counters();
+                    cpu.profile.enabled = profiling;
+                    #[cfg(feature = "timing-class-histogram")]
+                    {
+                        cpu.class_histogram = Box::default();
+                    }
+                    // The warmed ordinary prefix reaches the cached REP tail in this run.
+                    let first = cpu.run_budgeted(&mut bus, 21).unwrap();
+                    assert_eq!(cpu.registers.eip, 1);
+                    assert!(
+                        cpu.rep_resume_active,
+                        "{mode:?} E{epoch} profile={profiling}"
+                    );
+                    assert_eq!(
+                        cpu.rep_execution.resume.as_ref().unwrap().price_history,
+                        Some(RepPriceHistory {
+                            initial_count: 2,
+                            startup_paid: true
+                        })
+                    );
+                    let carry = cpu.timing_rem;
+                    let before = cpu.elapsed_clocks;
+                    let mut invocations = 1;
+                    while cpu.rep_resume_active {
+                        invocations += 1;
+                        assert_eq!(
+                            cpu.run_budgeted(&mut bus, 0).unwrap().consumed_core_clocks,
+                            0
+                        );
+                    }
+                    assert_eq!(cpu.elapsed_clocks, before);
+                    assert_eq!(cpu.timing_rem, carry);
+                    assert_eq!(cpu.elapsed_clocks, first.consumed_core_clocks);
+                    assert_eq!(cpu.perf.instructions, 2);
+                    #[cfg(feature = "timing-class-histogram")]
+                    assert_eq!(
+                        cpu.class_histogram
+                            .rows()
+                            .into_iter()
+                            .find(|(name, _)| *name
+                                == crate::timing_class::TimingClass::StringElem.name())
+                            .unwrap()
+                            .1,
+                        invocations
+                    );
+                    assert!(invocations > 1);
+                    assert_eq!(&bus.memory[0x8000..0x8002], &[0x6d; 2]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rep_legacy_interrupt_iret_refetch_earns_a_fresh_startup() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            let (mut cpu, mut bus) = rep_legacy_fixture(mode, epoch, 0xf3, 2);
+            bus.memory[8 * 4..8 * 4 + 4].copy_from_slice(&[0x00, 0x03, 0, 0]);
+            bus.memory[0x300] = 0xcf;
+            cpu.run_budgeted(&mut bus, 0).unwrap();
+            cpu.run_budgeted(&mut bus, 0).unwrap();
+            assert_eq!(cpu.registers.ecx(), 1);
+            cpu.set_flag(FLAG_IF, true);
+            bus.pending_irq = Some(8);
+            let before = cpu.elapsed_clocks;
+            let interrupt = cpu.service_pending_interrupt(&mut bus).unwrap().unwrap();
+            assert_eq!(cpu.elapsed_clocks - before, interrupt.core_clocks);
+            assert_eq!(cpu.registers.eip, 0x300);
+            assert!(cpu.rep_execution.resume.is_none());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(cpu.registers.eip, 1);
+            let carry = cpu.timing_rem;
+            let before = cpu.elapsed_clocks;
+            let raw = if epoch == 1 { 4 } else { 48 };
+            let restarted = cpu.run_budgeted(&mut bus, 0).unwrap();
+            assert_eq!(restarted.consumed_core_clocks, (raw + carry) / 12);
+            assert_eq!(cpu.timing_rem, (raw + carry) % 12);
+            assert_eq!(cpu.elapsed_clocks - before, restarted.consumed_core_clocks);
+            assert_eq!(
+                cpu.rep_execution.resume.as_ref().unwrap().price_history,
+                Some(RepPriceHistory {
+                    initial_count: 1,
+                    startup_paid: true
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn rep_legacy_public_fatal_retains_only_this_entry_and_recovers_cleanly() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            for paused in [false, true] {
+                for destination_fault in [false, true] {
+                    let (mut cpu, mut bus) = rep_legacy_fixture(mode, epoch, 0xf3, 2);
+                    bus = TestBus::with_memory(bus.memory[..0x1000].to_vec());
+                    bus.direct_page_clocks = true;
+                    bus.report_batch_clocks = true;
+                    bus.memory[0x100] = 0x6d;
+                    bus.memory[0xfff] = 0x6d;
+                    cpu.registers
+                        .set_esi(if destination_fault { 0x100 } else { 0xfff });
+                    cpu.registers
+                        .set_edi(if destination_fault { 0xfff } else { 0x200 });
+                    cpu.timing_rem = 7;
+                    if paused {
+                        cpu.run_budgeted(&mut bus, 0).unwrap();
+                        assert!(
+                            cpu.rep_execution
+                                .resume
+                                .as_ref()
+                                .unwrap()
+                                .price_history
+                                .unwrap()
+                                .startup_paid
+                        );
+                    }
+                    let before = cpu.elapsed_clocks;
+                    let carry = cpu.timing_rem;
+                    let error = cpu.run_budgeted(&mut bus, u64::MAX).unwrap_err();
+                    assert!(matches!(
+                        error.error,
+                        CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 0x1000 })
+                    ));
+                    assert_eq!(error.consumed_core_clocks, 0);
+                    assert_eq!(cpu.elapsed_clocks, before);
+                    assert_eq!(cpu.timing_rem, carry);
+                    assert_eq!(cpu.registers.ecx(), 1);
+                    assert!(cpu.rep_execution.resume.is_none());
+                    let written = if destination_fault { 0xfff } else { 0x200 };
+                    assert_eq!(bus.memory[written], 0x6d);
+                    cpu.registers.eip = 3;
+                    let next = cpu.cycle(&mut bus).unwrap();
+                    let raw = if epoch == 1 { 2 } else { 12 };
+                    assert_eq!(next.core_clocks, (raw + carry) / 12);
+                    assert_eq!(cpu.timing_rem, (raw + carry) % 12);
+                    assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rep_legacy_delivered_and_triple_faults_settle_after_paid_resumes() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            for paused in [false, true] {
+                for fatal in [false, true] {
+                    let (mut cpu, mut bus) = rep_legacy_fixture(mode, epoch, 0xf3, 2);
+                    bus.memory[13 * 4..13 * 4 + 4].copy_from_slice(&[0, 3, 0, 0]);
+                    let mut es = cpu.registers.segment(SegmentIndex::Es);
+                    es.limit = 0x8000;
+                    cpu.registers.set_segment(SegmentIndex::Es, es);
+                    cpu.timing_rem = 7;
+                    if fatal {
+                        cpu.control.cr0 |= CR0_PE;
+                        cpu.idtr.limit = 0;
+                    }
+                    if paused {
+                        cpu.run_budgeted(&mut bus, 0).unwrap();
+                    }
+                    let before = cpu.elapsed_clocks;
+                    let carry = cpu.timing_rem;
+                    let result = cpu.run_budgeted(&mut bus, u64::MAX);
+                    assert_eq!(cpu.registers.ecx(), 1);
+                    assert_eq!(&bus.memory[0x8000..0x8002], &[0x6d, 0]);
+                    assert!(cpu.rep_execution.resume.is_none());
+                    if fatal {
+                        let error = result.unwrap_err();
+                        assert!(matches!(error.error, CpuError::TripleFault { .. }));
+                        assert_eq!(error.consumed_core_clocks, 0);
+                        assert_eq!(cpu.elapsed_clocks, before);
+                        assert_eq!(cpu.timing_rem, carry);
+                    } else {
+                        let raw = cpu
+                            .class_table()
+                            .raw(crate::timing_class::TimingClass::ExceptionDelivery)
+                            as u64;
+                        assert_eq!(result.unwrap().consumed_core_clocks, (raw + carry) / 12);
+                        assert_eq!(cpu.elapsed_clocks - before, (raw + carry) / 12);
+                        assert_eq!(cpu.timing_rem, (raw + carry) % 12);
+                        assert_eq!(cpu.registers.eip, 0x300);
+                        assert_eq!(
+                            u16::from_le_bytes([bus.memory[0xffa], bus.memory[0xffb]]),
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rep_legacy_invalidation_discards_only_paid_history() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for epoch in [1, 2] {
+            for action in 0..4 {
+                let (mut cpu, mut bus) = rep_legacy_fixture(mode, epoch, 0xf3, 2);
+                let first = cpu.run_budgeted(&mut bus, 0).unwrap();
+                assert!(
+                    cpu.rep_execution
+                        .resume
+                        .as_ref()
+                        .unwrap()
+                        .price_history
+                        .unwrap()
+                        .startup_paid
+                );
+                let elapsed = cpu.elapsed_clocks;
+                let carry = cpu.timing_rem;
+                match action {
+                    0 => cpu.set_eip(3),
+                    1 => cpu.load_segment_real(SegmentIndex::Cs, 1),
+                    2 => cpu.set_mode(if mode == GswMode::Gsw486 {
+                        GswMode::Gsw586
+                    } else {
+                        GswMode::Gsw486
+                    }),
+                    _ => cpu.reset(),
+                }
+                assert!(cpu.rep_execution.resume.is_none());
+                assert!(!cpu.rep_resume_active);
+                assert_eq!(elapsed, first.consumed_core_clocks);
+                if action < 2 {
+                    assert_eq!(cpu.elapsed_clocks, elapsed);
+                    assert_eq!(cpu.timing_rem, carry);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rep_legacy_checked_invoice_bounds_reject_unrepresentable_work() {
+    let mut invoice = RepInvocation {
+        history: RepPriceHistory {
+            initial_count: u32::MAX,
+            startup_paid: false,
+        },
+        completed: 0,
+        raw_due: u32::MAX as u64,
+    };
+    invoice.complete(u32::MAX);
+    assert_eq!(invoice.completed, u32::MAX);
+    assert_eq!(invoice.legacy_raw(), u32::MAX);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoice.complete(1))).is_err()
+    );
+    invoice.raw_due += 1;
+    assert!(std::panic::catch_unwind(|| invoice.legacy_raw()).is_err());
 }

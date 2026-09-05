@@ -4626,10 +4626,18 @@ fn finite_cs_call_through_a_register_limit_exit_preserves_restart_state_and_faul
     let native_call = native.decode_cache.get(CALL, true).unwrap();
     let interp_call = interp.decode_cache.get(CALL, true).unwrap();
     native
-        .execute_decoded(&native_call, &mut native_bus, &mut CommittedCore::default())
+        .execute_decoded(
+            &native_call,
+            &mut native_bus,
+            &mut InstructionWork::default(),
+        )
         .unwrap();
     interp
-        .execute_decoded(&interp_call, &mut interp_bus, &mut CommittedCore::default())
+        .execute_decoded(
+            &interp_call,
+            &mut interp_bus,
+            &mut InstructionWork::default(),
+        )
         .unwrap();
     assert_eq!(native.registers.eip, TARGET);
     assert_eq!(interp.registers.eip, TARGET);
@@ -5103,10 +5111,18 @@ fn finite_cs_call_through_memory_limit_exit_preserves_restart_state_and_faults_p
     let native_call = native.decode_cache.get(CALL, true).unwrap();
     let interp_call = interp.decode_cache.get(CALL, true).unwrap();
     native
-        .execute_decoded(&native_call, &mut native_bus, &mut CommittedCore::default())
+        .execute_decoded(
+            &native_call,
+            &mut native_bus,
+            &mut InstructionWork::default(),
+        )
         .unwrap();
     interp
-        .execute_decoded(&interp_call, &mut interp_bus, &mut CommittedCore::default())
+        .execute_decoded(
+            &interp_call,
+            &mut interp_bus,
+            &mut InstructionWork::default(),
+        )
         .unwrap();
     assert_eq!(native.registers.eip, TARGET);
     assert_eq!(interp.registers.eip, TARGET);

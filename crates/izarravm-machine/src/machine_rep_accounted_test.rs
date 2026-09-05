@@ -752,3 +752,65 @@ fn machine_fatal_keeps_staged_success_only_commands_pending() {
         assert_eq!(machine.active_mode, GswMode::Gsw386);
     }
 }
+
+#[test]
+fn machinebus_rep_legacy_pause_and_resume_conserve_ram_work_and_pit() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for opcode in [0xa4, 0xaa] {
+            let fixture = || {
+                let mut machine = rep_port_machine(opcode, 0);
+                machine.set_mode(mode);
+                machine.cpu.registers.set_eax(0x11);
+                arm_fast_channel2(&mut machine);
+                machine.port_bus_batch_clocks = 0;
+                machine
+            };
+            let mut paused = fixture();
+            let mut normal = fixture();
+            let batch = run_one_capped_batch(&mut paused, 1);
+            assert_rep_port_batch(
+                &paused,
+                &paused.test_batch_observations[batch],
+                (4, 0, 0, 0, 4, 0, 0),
+            );
+            assert_eq!(paused.cpu.registers.ecx() as u16, 2);
+            assert_eq!(paused.cpu.registers.eip, 0x100);
+            assert_eq!(paused.read_physical_u8(0x2300), 0);
+            assert_eq!(
+                paused.run_until_halt_or_cycles(1_000_000).unwrap(),
+                StopReason::Halted
+            );
+            assert_eq!(
+                normal.run_until_halt_or_cycles(1_000_000).unwrap(),
+                StopReason::Halted
+            );
+            assert_eq!(paused.cpu.registers.ecx() as u16, 0);
+            assert_eq!(paused.cpu.registers, normal.cpu.registers);
+            assert_eq!(paused.elapsed_clocks, normal.elapsed_clocks);
+            assert_eq!(paused.cpu.elapsed_clocks, normal.cpu.elapsed_clocks);
+            assert_eq!(paused.timeline.now_ticks(), normal.timeline.now_ticks());
+            assert_eq!(paused.pit, normal.pit);
+            assert_eq!(paused.bus_rem, normal.bus_rem);
+            for address in [0x2300, 0x2301] {
+                assert_eq!(
+                    paused.read_physical_u8(address),
+                    normal.read_physical_u8(address)
+                );
+            }
+            for observation in &paused.test_batch_observations {
+                assert_eq!(
+                    observation.step,
+                    observation.core_clocks
+                        + observation.scaled_bus_clocks
+                        + observation.isa_clocks
+                );
+                assert_eq!(
+                    observation.elapsed_at_exit - observation.elapsed_at_entry,
+                    observation.step
+                );
+                assert_eq!(observation.isa_clocks, 0);
+                assert!(!observation.fatal);
+            }
+        }
+    }
+}
