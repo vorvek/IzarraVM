@@ -1652,106 +1652,255 @@ fn direct_cross_page_push_exits_before_esp_commit() {
 }
 
 #[test]
-fn direct_user_stack_permission_exit_preserves_fault_restart_state() {
-    const ENTRY: u32 = 0x201;
-    const PUSH: u32 = 0x208;
-    const INITIAL_ESP: u32 = 0x8804;
-    let mut pristine = vec![0; 0xa000];
-    pristine[ENTRY as usize..0x20a].copy_from_slice(&[
-        0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
-        0x89, 0xc1, // mov ecx,eax
-        0x50, // push eax
-        0xf4,
-    ]);
-    pristine[0x3000..0x3004].copy_from_slice(&0x4007u32.to_le_bytes());
-    pristine[0x4000..0x4004].copy_from_slice(&0x0007u32.to_le_bytes());
-    pristine[0x4020..0x4024].copy_from_slice(&0x8003u32.to_le_bytes());
-
-    let user_cpu = || {
-        let mut cpu = flat_stack_cpu(ENTRY);
-        cpu.control.cr0 |= CR0_PG | CR0_WP;
-        cpu.control.cr3 = 0x3000;
-        cpu.cpl = 3;
-        cpu.registers
-            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x0b, 0xfb));
-        for segment in [
-            SegmentIndex::Ds,
-            SegmentIndex::Ss,
-            SegmentIndex::Es,
-            SegmentIndex::Fs,
-            SegmentIndex::Gs,
-        ] {
-            cpu.registers
-                .set_segment(segment, SegmentRegister::flat(0x13, 0xf3));
+fn mixed_stack_side_exits_preserve_access_extent_and_restart_state() {
+    for (pop, word, stack32, esp, limit, mapped) in [
+        (false, false, false, 0xabcd_0002, 0xffff, true),
+        (false, false, false, 0xabcd_0002, u32::MAX, true),
+        (true, false, false, 0xabcd_fffe, 0xffff, true),
+        (true, false, false, 0xabcd_fffe, u32::MAX, true),
+        (false, true, true, 0x2_0001, u32::MAX, true),
+        (true, true, true, 0x1_ffff, u32::MAX, true),
+        (false, false, false, 0xabcd_8004, u32::MAX, false),
+        (true, false, false, 0xabcd_8000, u32::MAX, false),
+        (false, true, true, 0x8002, u32::MAX, false),
+        (true, true, true, 0x8000, u32::MAX, false),
+        (false, false, false, 0xabcd_020b, u32::MAX, true),
+        (false, true, true, 0x020a, u32::MAX, true),
+    ] {
+        const ENTRY: u32 = 0x201;
+        const ACCESS: u32 = 0x208;
+        let mut pristine = vec![0x6d; 0x3_0000];
+        let mut code = vec![0xb8, 0x44, 0x33, 0x22, 0x11, 0x89, 0xc1];
+        if word {
+            code.push(0x66);
         }
-        cpu
-    };
-    let mut native = user_cpu();
-    let mut interp = user_cpu();
-    let mut native_bus = TestBus::with_memory(pristine.clone());
-    let mut interp_bus = TestBus::with_memory(pristine.clone());
-    for bus in [&mut native_bus, &mut interp_bus] {
-        bus.direct_pages_enabled = true;
-        bus.direct_page_clocks = true;
+        code.extend_from_slice(&[if pop { 0x58 } else { 0x50 }, 0xf4]);
+        pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut native = flat_stack_cpu(ENTRY);
+        let mut interp = flat_stack_cpu(ENTRY);
+        for cpu in [&mut native, &mut interp] {
+            let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+            ss.default_size_32 = stack32;
+            ss.limit = limit;
+            cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        }
+        let mut native_bus = TestBus::with_memory(pristine.clone());
+        let mut interp_bus = TestBus::with_memory(pristine.clone());
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+        decode_fixture(&mut native, &mut native_bus, &[ENTRY, ENTRY + 5, ACCESS]);
+        decode_fixture(&mut interp, &mut interp_bus, &[ENTRY, ENTRY + 5, ACCESS]);
+        map_direct_page(
+            &mut native,
+            &mut native_bus,
+            0,
+            0,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+        if mapped {
+            for page in [0, 0xf000, 0x1_0000, 0x1_f000, 0x2_0000] {
+                map_direct_page(
+                    &mut native,
+                    &mut native_bus,
+                    page,
+                    page,
+                    jit::fast_map::PagePermissions::UNPAGED,
+                    true,
+                    true,
+                );
+            }
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        assert_eq!(block.span().instructions, 3);
+        arm_stack_fixture(&mut native, ENTRY, esp);
+        arm_stack_fixture(&mut interp, ENTRY, esp);
+        native_bus.memory.copy_from_slice(&pristine);
+        interp_bus.memory.copy_from_slice(&pristine);
+        native_bus.trace = BusTrace::default();
+        interp_bus.trace = BusTrace::default();
+        let before = native.perf_counters().jit_direct_insns;
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap()
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - before,
+            2,
+            "pop={pop} word={word} stack32={stack32} esp={esp:x} limit={limit:x} mapped={mapped}"
+        );
+        interp.cycle(&mut interp_bus).unwrap();
+        interp.cycle(&mut interp_bus).unwrap();
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
+        assert_eq!(native.registers.eip, ACCESS);
+        assert_eq!(native.registers.esp(), esp);
+        assert_eq!(&native_bus.memory[..], &pristine[..]);
+        let size = if word {
+            OperandSize::Word
+        } else {
+            OperandSize::Dword
+        };
+        let access = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+            if pop {
+                cpu.pop(bus, size)
+            } else {
+                cpu.push(bus, cpu.registers.eax(), size).map(|()| 0)
+            }
+            .map_err(|fault| match fault {
+                InternalFault::Exception { vector, error_code } => (vector, error_code),
+                other => panic!("unexpected stack fault: {other:?}"),
+            })
+        };
+        let native_result = access(&mut native, &mut native_bus);
+        assert_eq!(native_result, access(&mut interp, &mut interp_bus));
+        if limit == 0xffff {
+            assert_eq!(native_result, Err((12, Some(0))));
+            assert_eq!(native.registers.esp(), esp);
+        } else {
+            assert!(native_result.is_ok());
+        }
+        if !pop && !word && esp == 0xabcd_0002 && limit == u32::MAX {
+            assert_eq!(
+                &native_bus.memory[0xfffe..0x1_0002],
+                &0x1122_3344u32.to_le_bytes()
+            );
+            assert_eq!(&native_bus.memory[..2], &pristine[..2]);
+        }
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
+        assert_eq!(native_bus.memory, interp_bus.memory);
+        assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(native.core_clocks_so_far, interp.core_clocks_so_far);
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
     }
-    decode_fixture(&mut native, &mut native_bus, &[ENTRY, 0x206, PUSH]);
-    decode_fixture(&mut interp, &mut interp_bus, &[ENTRY, 0x206, PUSH]);
-    map_direct_page(
-        &mut native,
-        &mut native_bus,
-        0x8000,
-        0x8000,
-        jit::fast_map::PagePermissions {
-            writable: true,
-            user: false,
-        },
-        false,
-        true,
-    );
-    let block = install_fixture_block(&mut native, ENTRY);
-    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
-    arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
-    native_bus.memory.copy_from_slice(&pristine);
-    interp_bus.memory.copy_from_slice(&pristine);
-    native_bus.trace = BusTrace::default();
-    interp_bus.trace = BusTrace::default();
-    let exits = native.perf_counters().jit_direct_exit_permission;
+}
 
-    assert!(
-        native
-            .try_run_direct_block_for_test(&mut native_bus, block)
-            .unwrap()
-    );
-    interp.cycle(&mut interp_bus).unwrap();
-    interp.cycle(&mut interp_bus).unwrap();
-    assert_eq!(
-        crate::tests::settled_registers(&native),
-        crate::tests::settled_registers(&interp)
-    );
-    assert_eq!(native.registers.eip, PUSH);
-    assert_eq!(native.registers.esp(), INITIAL_ESP);
-    assert_eq!(native.perf_counters().jit_direct_exit_permission - exits, 1);
+#[test]
+fn direct_user_stack_permission_exit_preserves_fault_restart_state() {
+    for stack32 in [false, true] {
+        for word in [false, true] {
+            const ENTRY: u32 = 0x201;
+            const PUSH: u32 = 0x208;
+            let initial_esp = if stack32 { 0x8804 } else { 0xabcd_8804 };
+            let operand_size = if word {
+                OperandSize::Word
+            } else {
+                OperandSize::Dword
+            };
+            let mut pristine = vec![0; 0xa000];
+            let mut code = vec![
+                0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+                0x89, 0xc1, // mov ecx,eax
+            ];
+            if word {
+                code.push(0x66);
+            }
+            code.extend_from_slice(&[0x50, 0xf4]);
+            pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+            pristine[0x3000..0x3004].copy_from_slice(&0x4007u32.to_le_bytes());
+            pristine[0x4000..0x4004].copy_from_slice(&0x0007u32.to_le_bytes());
+            pristine[0x4020..0x4024].copy_from_slice(&0x8003u32.to_le_bytes());
 
-    let native_fault = native.push(&mut native_bus, native.registers.eax(), OperandSize::Dword);
-    let interp_fault = interp.push(&mut interp_bus, interp.registers.eax(), OperandSize::Dword);
-    let fault_code = |fault| match fault {
-        Err(InternalFault::Exception {
-            vector: 14,
-            error_code: Some(code),
-        }) => code,
-        other => panic!("expected page fault, got {other:?}"),
-    };
-    assert_eq!(fault_code(native_fault), fault_code(interp_fault));
-    assert_eq!(native.registers.esp(), INITIAL_ESP);
-    assert_eq!(interp.registers.esp(), INITIAL_ESP);
-    assert_eq!(
-        &native_bus.memory[0x8800..0x8804],
-        &pristine[0x8800..0x8804]
-    );
-    assert_eq!(
-        &interp_bus.memory[0x8800..0x8804],
-        &pristine[0x8800..0x8804]
-    );
+            let user_cpu = || {
+                let mut cpu = flat_stack_cpu(ENTRY);
+                cpu.control.cr0 |= CR0_PG | CR0_WP;
+                cpu.control.cr3 = 0x3000;
+                cpu.cpl = 3;
+                cpu.registers
+                    .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x0b, 0xfb));
+                for segment in [
+                    SegmentIndex::Ds,
+                    SegmentIndex::Ss,
+                    SegmentIndex::Es,
+                    SegmentIndex::Fs,
+                    SegmentIndex::Gs,
+                ] {
+                    cpu.registers
+                        .set_segment(segment, SegmentRegister::flat(0x13, 0xf3));
+                }
+                cpu.registers.segments[SegmentIndex::Ss as usize].default_size_32 = stack32;
+                cpu
+            };
+            let mut native = user_cpu();
+            let mut interp = user_cpu();
+            let mut native_bus = TestBus::with_memory(pristine.clone());
+            let mut interp_bus = TestBus::with_memory(pristine.clone());
+            for bus in [&mut native_bus, &mut interp_bus] {
+                bus.direct_pages_enabled = true;
+                bus.direct_page_clocks = true;
+            }
+            decode_fixture(&mut native, &mut native_bus, &[ENTRY, 0x206, PUSH]);
+            decode_fixture(&mut interp, &mut interp_bus, &[ENTRY, 0x206, PUSH]);
+            map_direct_page(
+                &mut native,
+                &mut native_bus,
+                0x8000,
+                0x8000,
+                jit::fast_map::PagePermissions {
+                    writable: true,
+                    user: false,
+                },
+                false,
+                true,
+            );
+            let block = install_fixture_block(&mut native, ENTRY);
+            arm_stack_fixture(&mut native, ENTRY, initial_esp);
+            arm_stack_fixture(&mut interp, ENTRY, initial_esp);
+            native_bus.memory.copy_from_slice(&pristine);
+            interp_bus.memory.copy_from_slice(&pristine);
+            native_bus.trace = BusTrace::default();
+            interp_bus.trace = BusTrace::default();
+            let exits = native.perf_counters().jit_direct_exit_permission;
+
+            assert!(
+                native
+                    .try_run_direct_block_for_test(&mut native_bus, block)
+                    .unwrap()
+            );
+            interp.cycle(&mut interp_bus).unwrap();
+            interp.cycle(&mut interp_bus).unwrap();
+            assert_eq!(
+                crate::tests::settled_registers(&native),
+                crate::tests::settled_registers(&interp)
+            );
+            assert_eq!(native.registers.eip, PUSH);
+            assert_eq!(native.registers.esp(), initial_esp);
+            assert_eq!(native.perf_counters().jit_direct_exit_permission - exits, 1);
+
+            let native_fault = native.push(&mut native_bus, native.registers.eax(), operand_size);
+            let interp_fault = interp.push(&mut interp_bus, interp.registers.eax(), operand_size);
+            let fault_code = |fault| match fault {
+                Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(code),
+                }) => code,
+                other => panic!("expected page fault, got {other:?}"),
+            };
+            assert_eq!(fault_code(native_fault), fault_code(interp_fault));
+            assert_eq!(native.registers.esp(), initial_esp);
+            assert_eq!(interp.registers.esp(), initial_esp);
+            assert_eq!(
+                &native_bus.memory[0x8800..0x8804],
+                &pristine[0x8800..0x8804]
+            );
+            assert_eq!(
+                &interp_bus.memory[0x8800..0x8804],
+                &pristine[0x8800..0x8804]
+            );
+        }
+    }
 }
 
 const ALU_MEM_ENTRY: u32 = 0x501;

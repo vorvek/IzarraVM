@@ -236,11 +236,11 @@ impl Machine {
 /// A fixture: the same bytes run wholly interpreted and again with the leading block installed and
 /// entered natively, then compared on the WHOLE CPU (registers, EIP, EFLAGS, clocks) and on guest
 /// RAM.
-struct WidthCase {
+struct WidthCase<'a> {
     machine: Machine,
-    code: &'static [u8],
+    code: &'a [u8],
     /// Instruction START offsets from `ENTRY`, which is what the decode cache must be warmed over.
-    starts: &'static [u32],
+    starts: &'a [u32],
     /// Instructions the compiled block must cover. Asserted, because a block that stopped early
     /// would leave the row under test to the interpreter and every state assertion would pass.
     instructions: u8,
@@ -271,14 +271,18 @@ fn run_width_case(case: &WidthCase) -> WidthOutcome {
     program[ENTRY as usize..ENTRY as usize + case.code.len()].copy_from_slice(case.code);
 
     let mut interp_bus = sixteen_bit_bus(program.clone());
+    interp_bus.direct_page_clocks = true;
     let mut interp = case.machine.cpu(ENTRY);
+    arm_native_sixteen_bit(&mut interp, &mut interp_bus, case.pages);
+    let starts: Vec<u32> = case.starts.iter().map(|offset| ENTRY + offset).collect();
+    warm_sixteen_bit(&mut interp, &mut interp_bus, &starts);
     (case.arm)(&mut interp, &mut interp_bus);
     drive(&mut interp, &mut interp_bus);
 
     let mut native_bus = sixteen_bit_bus(program);
+    native_bus.direct_page_clocks = true;
     let mut native = case.machine.cpu(ENTRY);
     arm_native_sixteen_bit(&mut native, &mut native_bus, case.pages);
-    let starts: Vec<u32> = case.starts.iter().map(|offset| ENTRY + offset).collect();
     warm_sixteen_bit(&mut native, &mut native_bus, &starts);
 
     let d = case.machine.d();
@@ -1050,6 +1054,166 @@ fn arm_push_ss32(cpu: &mut CpuGsw, bus: &mut TestBus) {
 /// ESP to 0x1233_FFFE and write four bytes at a different page.
 fn arm_push_ss_wrap(cpu: &mut CpuGsw, bus: &mut TestBus) {
     arm_push_ss(cpu, bus, 0x1234_0000);
+}
+
+fn arm_mixed_stack(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    let esp = if cpu.stack_is_32bit() {
+        0x1_2340
+    } else {
+        0xabcd_2340
+    };
+    arm_push_ss(cpu, bus, esp);
+    for reg in [0, 1, 2, 3, 5, 6, 7] {
+        cpu.registers.gpr[reg] = 0x7654_3010 + reg as u32 * 0x0101_0101;
+    }
+}
+
+#[test]
+fn mixed_stack_register_push_pop_matches_interpreter() {
+    for (machine, code32) in [
+        (Machine::Code16Stack16, false),
+        (Machine::Code16Stack32, false),
+        (Machine::Code32Stack16, true),
+        (Machine::Code32Stack32, true),
+    ] {
+        for operand32 in [false, true] {
+            for (source, destination) in [(0, 1), (4, 2), (3, 4), (4, 4), (6, 7)] {
+                let mut code = Vec::new();
+                let mut starts = Vec::new();
+                for opcode in [0x50 + source, 0x58 + destination] {
+                    starts.push(code.len() as u32);
+                    if operand32 != code32 {
+                        code.push(0x66);
+                    }
+                    code.push(opcode);
+                }
+                starts.push(code.len() as u32);
+                code.extend_from_slice(&[0x40, 0xf4]);
+                let outcome = run_width_case(&WidthCase {
+                    machine,
+                    code: &code,
+                    starts: &starts,
+                    instructions: 3,
+                    raw_clocks: 8,
+                    pages: &[0, 0x2000, 0x1_2000],
+                    memory_len: 0x2_0000,
+                    arm: arm_mixed_stack,
+                });
+                assert_same_state(&outcome);
+                assert_eq!(
+                    outcome.native.core_clocks_so_far,
+                    outcome.interp.core_clocks_so_far
+                );
+                assert_eq!(
+                    outcome.native_bus.trace.elapsed_clocks(),
+                    outcome.interp_bus.trace.elapsed_clocks()
+                );
+            }
+        }
+    }
+}
+
+fn arm_mixed_wrap(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    arm_push_ss(cpu, bus, 0xabcd_0000);
+    cpu.registers.set_eax(0x9876_5432);
+}
+
+fn arm_mixed_pop_sp_carry(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    arm_push_ss(cpu, bus, 0x1_fffe);
+    bus.memory[0x1_fffe..0x2_0000].copy_from_slice(&0x3456u16.to_le_bytes());
+}
+
+#[test]
+fn mixed_stack_wrap_and_pop_sp_carry_match_interpreter() {
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code32Stack16,
+        code: &[0x50, 0x59, 0x40, 0xf4],
+        starts: &[0, 1, 2],
+        instructions: 3,
+        raw_clocks: 8,
+        pages: &[0, 0xf000],
+        memory_len: 0x1_0000,
+        arm: arm_mixed_wrap,
+    });
+    assert_same_state(&outcome);
+    assert_eq!(outcome.native.registers.esp(), 0xabcd_0000);
+    assert_eq!(
+        &outcome.native_bus.memory[0xfffc..0x1_0000],
+        &0x9876_5432u32.to_le_bytes()
+    );
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code32Stack32,
+        code: &[0x66, 0x5c, 0x40, 0x41, 0xf4],
+        starts: &[0, 2, 3],
+        instructions: 3,
+        raw_clocks: 8,
+        pages: &[0, 0x1_f000],
+        memory_len: 0x2_0000,
+        arm: arm_mixed_pop_sp_carry,
+    });
+    assert_same_state(&outcome);
+    assert_eq!(outcome.native.registers.esp(), 0x2_3456);
+}
+
+#[test]
+fn mixed_stack_immediate_and_selector_sources_match_interpreter() {
+    for (machine, word) in [
+        (Machine::Code32Stack16Ss, false),
+        (Machine::Code32Stack32Ss, true),
+    ] {
+        for (push, pop_offset) in [(&[0x6a, 0x80][..], 2), (&[0x16][..], 1), (&[0x0e][..], 1)] {
+            let mut code = Vec::new();
+            if word {
+                code.push(0x66);
+            }
+            code.extend_from_slice(push);
+            let pop = pop_offset + u32::from(word);
+            if word {
+                code.push(0x66);
+            }
+            code.extend_from_slice(&[0x58, 0x41, 0xf4]);
+            let outcome = run_width_case(&WidthCase {
+                machine,
+                code: &code,
+                starts: &[0, pop, pop + 1 + u32::from(word)],
+                instructions: 3,
+                raw_clocks: 8,
+                pages: &[0, 0x2000, 0x1_2000],
+                memory_len: 0x2_0000,
+                arm: arm_mixed_stack,
+            });
+            assert_same_state(&outcome);
+        }
+    }
+}
+
+#[test]
+fn mixed_stack_pushfd_stores_settled_flags() {
+    fn arm(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        arm_mixed_stack(cpu, bus);
+        cpu.registers.eflags = 0x0025_0a02;
+    }
+    let outcome = run_width_case(&WidthCase {
+        machine: Machine::Code32Stack16Ss,
+        code: &[0x40, 0x9c, 0x5a, 0xf4], // inc eax; pushfd; pop edx
+        starts: &[0, 1, 2],
+        instructions: 3,
+        raw_clocks: 9,
+        pages: &[0, 0x2000],
+        memory_len: 0x4000,
+        arm,
+    });
+    assert_same_state(&outcome);
+    assert_eq!(
+        outcome.native.registers.edx() & 0x0001_0000,
+        0,
+        "RF is not pushed"
+    );
+    assert_eq!(
+        outcome.native.registers.edx() & 0x0024_0000,
+        0x0024_0000,
+        "AC and ID survive"
+    );
 }
 
 /// PUSH SS unprefixed in a 16-bit code segment on a 16-bit stack: the loader's own shape.

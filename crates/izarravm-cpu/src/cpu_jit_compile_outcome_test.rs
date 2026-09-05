@@ -2500,16 +2500,11 @@ fn a_word_jcc_above_the_wrap_is_refused_while_the_same_block_below_it_compiles()
     assert_eq!(high_perf.jit_direct_word_control_refused, 1);
 }
 
-/// The §2(H) instrument, first producer: `stack_width_kind`'s own matrix. `PUSH EAX` (0x50) has
-/// no prefix at all, so the operand size comes straight from CS.D (32-bit here, so Dword), and
-/// SS.B is forced to 0 (16-bit stack) after the fixture's default 32-bit setup -- exactly the
-/// DOS/4GW shape the design note's own prediction names: a 32-bit client on a 16-bit kernel
-/// stack. That is cell A, `PushDwordSs16`, and it has no emitter, so the walk must decline it and
-/// the census must name the reason `push_dword_ss16`.
+/// A 486 dword selector push on SS16 still declines because its store width differs from Pentium.
 #[cfg(feature = "direct-admission-census")]
 #[test]
-fn push_dword_on_a_16bit_stack_declines_the_matrix_cell_by_name() {
-    let (mut cpu, mut bus) = fixture(&[0x50]); // PUSH EAX
+fn push_dword_selector_on_a_486_16bit_stack_declines_the_matrix_cell_by_name() {
+    let (mut cpu, mut bus) = fixture_in_mode(&[0x16], GswMode::Gsw486); // PUSH SS
     let mut ss = cpu.registers.segment(SegmentIndex::Ss);
     ss.default_size_32 = false;
     cpu.registers.set_segment(SegmentIndex::Ss, ss);
@@ -2602,13 +2597,13 @@ fn invalid_segment_descriptor_declines_via_the_second_producer() {
 /// the total multiplies with the search depth instead of counting real compile attempts.
 ///
 /// Drives `compile_with_instruction_limit` directly at both a short and the full limit, on a
-/// fixture (`PUSH EAX` on a 16-bit stack) that declines on its very first instruction regardless
+/// fixture (486 dword `PUSH SS` on a 16-bit stack) that declines on its very first instruction regardless
 /// of the limit -- so the SAME refusal is reachable at every limit, and only the gate keeps the
 /// short pass from counting.
 #[cfg(feature = "direct-admission-census")]
 #[test]
 fn stack_width_decline_is_not_counted_below_the_full_length_pass() {
-    let (mut cpu, mut bus) = fixture(&[0x50]); // PUSH EAX
+    let (mut cpu, mut bus) = fixture_in_mode(&[0x16], GswMode::Gsw486); // PUSH SS
     let mut ss = cpu.registers.segment(SegmentIndex::Ss);
     ss.default_size_32 = false;
     cpu.registers.set_segment(SegmentIndex::Ss, ss);
@@ -2726,54 +2721,32 @@ fn a_word_push_on_a_sixteen_bit_stack_enters_the_block() {
     assert_eq!(compilation.dword_stores, 0);
 }
 
-/// Matrix row 2: a Word push on a THIRTY-TWO bit stack must not be admitted, because the
-/// shipped `Push` kind would write four bytes and decrement four where the guest moves two.
-/// Reachable today through a 66-prefixed push in 32-bit code.
-///
-/// The 16-bit-stack control beside it is what makes the negative attributable: without it the
-/// assertion would also hold if the push simply failed to classify.
 #[test]
-fn a_word_push_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit_one() {
-    // inc eax; inc ecx; inc edx; 66 50 (push ax at Word operand size).
-    const CODE: [u8; 5] = [0x40, 0x41, 0x42, 0x66, 0x50];
-    const WARM: [u32; 4] = [ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3];
-
-    // 32-bit stack: the three fillers compile, the push does not.
-    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
-    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
-    ss.default_size_32 = true;
-    cpu.registers.set_segment(SegmentIndex::Ss, ss);
-    warm(&mut cpu, &mut bus, &WARM);
-    let wide = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-    assert_eq!(
-        wide.span.instructions, 3,
-        "a two-byte push must not be lowered by the four-byte kind"
-    );
-    assert_eq!(wide.span.guest_len, 3);
-
-    // 16-bit stack, same bytes: the push IS admitted.
-    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
-    warm(&mut cpu, &mut bus, &WARM);
-    let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-    assert_eq!(narrow.span.instructions, 4, "control: the push must lower");
-    assert_eq!(narrow.span.guest_len, 5);
-}
-
-/// Matrix row 4: a Dword push on a 16-bit stack stays refused. Four bytes on a 16-bit stack
-/// pointer is a form this slice does not build, and it must not fall through to either kind.
-#[test]
-fn a_dword_push_on_a_sixteen_bit_stack_is_still_refused() {
-    // inc eax; inc ecx; inc edx; 50 (push eax at Dword operand size).
-    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &[0x40, 0x41, 0x42, 0x50]);
-    warm(
-        &mut cpu,
-        &mut bus,
-        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
-    );
-
-    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-    assert_eq!(compilation.span.instructions, 3);
-    assert_eq!(compilation.span.guest_len, 3);
+fn scalar_push_bus_width_follows_operand_size_on_both_stack_widths() {
+    for stack32 in [false, true] {
+        for word in [false, true] {
+            let code: &[u8] = if word {
+                &[0x40, 0x41, 0x42, 0x66, 0x50]
+            } else {
+                &[0x40, 0x41, 0x42, 0x50]
+            };
+            let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, code);
+            let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+            ss.default_size_32 = stack32;
+            cpu.registers.set_segment(SegmentIndex::Ss, ss);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(compilation.span.instructions, 4);
+            assert_eq!(compilation.span.guest_len, code.len() as u16);
+            assert_eq!(compilation.word_stores, u8::from(word));
+            assert_eq!(compilation.dword_stores, u8::from(!word));
+            assert_eq!(compilation.raw_clocks, 8);
+        }
+    }
 }
 
 /// The anti-vacuity gate for the 16-bit POP, the same shape as the push one above.
@@ -2806,28 +2779,32 @@ fn a_word_pop_on_a_sixteen_bit_stack_enters_the_block() {
     assert_eq!(compilation.raw_clocks, 8);
 }
 
-/// Matrix row 2 for the pop: a Word pop on a THIRTY-TWO bit stack is not admitted, because the
-/// shipped kind would read four bytes, advance four, and replace the whole destination.
 #[test]
-fn a_word_pop_on_a_thirty_two_bit_stack_is_refused_but_admitted_on_a_sixteen_bit_one() {
-    // inc eax; inc ecx; inc edx; 66 58 (pop ax at Word operand size).
-    const CODE: [u8; 5] = [0x40, 0x41, 0x42, 0x66, 0x58];
-    const WARM: [u32; 4] = [ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3];
-
-    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
-    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
-    ss.default_size_32 = true;
-    cpu.registers.set_segment(SegmentIndex::Ss, ss);
-    warm(&mut cpu, &mut bus, &WARM);
-    let wide = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-    assert_eq!(wide.span.instructions, 3);
-    assert_eq!(wide.span.guest_len, 3);
-
-    let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, &CODE);
-    warm(&mut cpu, &mut bus, &WARM);
-    let narrow = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-    assert_eq!(narrow.span.instructions, 4, "control: the pop must lower");
-    assert_eq!(narrow.span.guest_len, 5);
+fn scalar_pop_bus_width_follows_operand_size_on_both_stack_widths() {
+    for stack32 in [false, true] {
+        for word in [false, true] {
+            let code: &[u8] = if word {
+                &[0x40, 0x41, 0x42, 0x66, 0x58]
+            } else {
+                &[0x40, 0x41, 0x42, 0x58]
+            };
+            let (mut cpu, mut bus) = sixteen_bit_stack_fixture(ENTRY, code);
+            let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+            ss.default_size_32 = stack32;
+            cpu.registers.set_segment(SegmentIndex::Ss, ss);
+            warm(
+                &mut cpu,
+                &mut bus,
+                &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+            );
+            let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+            assert_eq!(compilation.span.instructions, 4);
+            assert_eq!(compilation.span.guest_len, code.len() as u16);
+            assert_eq!(compilation.word_reads, u8::from(word));
+            assert_eq!(compilation.dword_reads, u8::from(!word));
+            assert_eq!(compilation.raw_clocks, 10);
+        }
+    }
 }
 
 /// The two immediate pushes ride the already-merged `Push16` arm, so this slice adds them to

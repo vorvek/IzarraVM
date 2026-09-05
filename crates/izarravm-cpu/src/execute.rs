@@ -531,11 +531,19 @@ impl CpuGsw {
                 )?;
                 Ok(self.charge(TimingClass::PushSeg))
             }
-            0x07 => {
-                // POP ES. 386 PRM: a 32-bit operand size pops a full dword and loads the
-                // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
+            0x07 | 0x1f => {
+                let segment = if opcode == 0x07 {
+                    SegmentIndex::Es
+                } else {
+                    SegmentIndex::Ds
+                };
+                let esp = self.registers.esp();
                 let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Es, value)?;
+                if let Err(fault) = self.load_segment(bus, segment, value) {
+                    // Pentium Vol. 3, section 14.2: a faulting stack read restores SP/ESP.
+                    self.registers.set_esp(esp);
+                    return Err(fault);
+                }
                 Ok(self.charge(TimingClass::PopSeg))
             }
             0x0e => {
@@ -582,12 +590,6 @@ impl CpuGsw {
                     operand_size,
                 )?;
                 Ok(self.charge(TimingClass::PushSeg))
-            }
-            0x1f => {
-                // POP DS. Same 386 PRM operand-size rule as POP ES above.
-                let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Ds, value)?;
-                Ok(self.charge(TimingClass::PopSeg))
             }
             0x50..=0x57 => {
                 let index = opcode - 0x50;

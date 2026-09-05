@@ -4,6 +4,88 @@
 use super::*;
 
 #[test]
+fn mixed_stack_self_loop_respects_the_tight_native_deadline() {
+    const ENTRY: u32 = 0x101;
+    for stack32 in [false, true] {
+        let code: &[u8] = if stack32 {
+            &[0x66, 0x50, 0x66, 0x5a, 0x49, 0x75, 0xf9, 0xf4]
+        } else {
+            &[0x50, 0x5a, 0x49, 0x75, 0xfb, 0xf4]
+        };
+        let starts: &[u32] = if stack32 {
+            &[0, 2, 4, 5]
+        } else {
+            &[0, 1, 2, 3]
+        };
+        let mut memory = vec![0; 0x4000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(code);
+        let mut native = flat_stack_cpu(ENTRY);
+        native.registers.segments[SegmentIndex::Ss as usize].default_size_32 = stack32;
+        let mut interp = native.clone();
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        let linears: Vec<u32> = starts.iter().map(|offset| ENTRY + offset).collect();
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            bus.uniform_native_fetches = true;
+            decode_fixture(cpu, bus, &linears);
+            map_direct_page(
+                cpu,
+                bus,
+                0x2000,
+                0x2000,
+                jit::fast_map::PagePermissions::UNPAGED,
+                true,
+                true,
+            );
+            arm_stack_fixture(cpu, ENTRY, if stack32 { 0x2800 } else { 0xabcd_2800 });
+            cpu.registers.set_ecx(2);
+            cpu.registers.set_eax(0x1234_5678);
+            bus.trace = BusTrace::default();
+        }
+        let block = install_fixture_block(&mut native, ENTRY);
+        assert!(block.is_self_loop());
+        assert_eq!(block.word_reads(), u8::from(stack32));
+        assert_eq!(block.dword_reads(), u8::from(!stack32));
+        let upper = native.recompute_iteration_upper_for_test(&native_bus, &block);
+        let registers = native.registers.clone();
+        assert!(
+            !native
+                .try_run_direct_block_with_cap_for_test(&mut native_bus, block, upper)
+                .unwrap()
+        );
+        assert_eq!(native.registers, registers);
+        assert_eq!(native_bus.trace.elapsed_clocks(), 0);
+        let before = native.perf_counters().jit_direct_insns;
+        assert!(
+            native
+                .try_run_direct_block_with_cap_for_test(&mut native_bus, block, upper + 1)
+                .unwrap()
+        );
+        for _ in 0..4 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+        assert_eq!(native.perf_counters().jit_direct_insns - before, 4);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
+        assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+        assert_eq!(native_bus.memory, interp_bus.memory);
+        assert!(native.elapsed_clocks + native_bus.trace.elapsed_clocks() < upper + 1);
+    }
+}
+
+#[test]
 fn mode13_read_self_loop_respects_the_tight_native_deadline() {
     const ENTRY: u32 = 0x101;
     const MODE13: u32 = 0x000a_0000;

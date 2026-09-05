@@ -9,6 +9,70 @@ use izarravm_cpu::CpuCycleOutcome;
 use izarravm_cpu::TLB_ENTRIES;
 
 #[cfg(feature = "jit")]
+#[test]
+fn mixed_stack_native_loop_preserves_device_time_and_pending_interrupt_delivery() {
+    let program = [
+        0xb9, 0xff, 0xff, // mov cx,ffff
+        0x66, 0x50, 0x66, 0x5a, 0x43, 0x49, 0x75,
+        0xf8, // push eax; pop edx; inc bx; dec cx; jnz
+        0xf4,
+    ];
+    let make = |native| {
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        profile.cpu = GswMode::Gsw586;
+        let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+        machine.cpu.set_native_backend_enabled(native);
+        machine.cpu.set_jit_auto_admit(native);
+        machine.poll_skip_enabled = false;
+        machine.trace.set_tracing_mode(TracingMode::Off);
+        machine.cpu.registers.set_esp(0xabcd_8000);
+        machine.cpu.registers.set_eax(0x1234_5678);
+        machine.write_physical_u16(8 * 4, 0x300);
+        machine.write_physical_u16(8 * 4 + 2, 0);
+        machine.write_physical_u8(0x300, 0xf4);
+        machine.pic.write_port(0x20, 0x11);
+        machine.pic.write_port(0x21, 0x08);
+        machine.pic.write_port(0x21, 0x04);
+        machine.pic.write_port(0x21, 0x01);
+        machine.pit.write_port(0x43, 0x34);
+        machine.pit.write_port(0x40, 0x00);
+        machine.pit.write_port(0x40, 0x04);
+        machine.cpu.registers.eflags &= !0x0200;
+        machine
+    };
+    let mut baseline = make(false);
+    let mut native = make(true);
+    assert_eq!(
+        baseline.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(
+        native.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(native.cpu.registers.eip, 0x10c);
+    assert!(native.cpu.perf_counters().jit_direct_insns > 100);
+    assert_eq!(native.cpu.eflags(), baseline.cpu.eflags());
+    native.cpu = native.cpu.settled();
+    baseline.cpu = baseline.cpu.settled();
+    assert_poll_machine_boundary_eq(&native, &baseline);
+    for machine in [&mut baseline, &mut native] {
+        machine.cpu.halted = false;
+        machine.cpu.registers.eflags |= 0x0200;
+    }
+    assert_eq!(
+        baseline.run_until_halt_or_cycles(10_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(
+        native.run_until_halt_or_cycles(10_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(native.cpu.registers.eip, 0x301);
+    assert_poll_machine_boundary_eq(&native, &baseline);
+}
+
+#[cfg(feature = "jit")]
 fn poll_skip_test_machine(enabled: bool, tracing: TracingMode, mode: GswMode, mask: u8) -> Machine {
     poll_skip_test_machine_at_epoch(enabled, tracing, mode, mask, 1)
 }

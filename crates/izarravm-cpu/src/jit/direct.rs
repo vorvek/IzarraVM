@@ -5301,29 +5301,21 @@ pub(crate) enum DirectKind {
     },
     Push {
         source: StoreSource,
+        stack32: bool,
     },
-    /// PUSH on a 16-bit stack (SS.B = 0) at Word operand size: two bytes written at
-    /// `(SP - 2) & 0xFFFF`, and only SP advances, preserving ESP[31:16].
-    ///
-    /// A SEPARATE variant rather than a width field on `Push`, because `Push`'s emitter
-    /// hard-codes `MemoryWidth::Dword` and `iadd_imm(esp, -4)`. The two widths it stands for are
-    /// ORTHOGONAL: SS.B picks the stack-pointer width and `operand_size` picks how many bytes
-    /// move (386 PRM 16.2, restated in the interpreter's `push` in `memory.rs`). This variant is the (SS.B = 0, Word)
-    /// cell only; the compile loop refuses the other two new cells.
+    /// Word transfer; SS.B independently selects the stack pointer width.
     Push16 {
         source: StoreSource,
+        stack32: bool,
     },
     Pop {
         dst: u8,
+        stack32: bool,
     },
-    /// POP on a 16-bit stack (SS.B = 0) at Word operand size: two bytes read at `SP & 0xFFFF`,
-    /// only SP advances (preserving ESP[31:16]), and the destination is MERGED into rather than
-    /// replaced, exactly as `write_gpr_sized(index, Word, ..)` does.
-    ///
-    /// Separate variant for the same reason as `Push16`: `Pop`'s emitter hard-codes the 32-bit
-    /// width, the +4 advance AND a full 32-bit destination write.
+    /// Word transfer and destination merge, on either stack pointer width.
     Pop16 {
         dst: u8,
+        stack32: bool,
     },
     /// LEAVE (0xC9) at DWORD operand size on a 32-bit stack: `ESP <- EBP` then `POP EBP`.
     /// Fieldless because the instruction has no operands and this variant stands for one cell of
@@ -6129,27 +6121,35 @@ impl DirectKind {
             // operand shape is what separates them.
             Self::Push {
                 source: StoreSource::Flags { .. },
+                ..
             }
             | Self::Push16 {
                 source: StoreSource::Flags { .. },
+                ..
             } => TimingClass::PushFlags,
             Self::Push {
                 source: StoreSource::Selector(..),
+                ..
             }
             | Self::Push16 {
                 source: StoreSource::Selector(..),
+                ..
             } => TimingClass::PushSeg,
             Self::Push {
                 source: StoreSource::Imm(..) | StoreSource::EipDelta(..),
+                ..
             }
             | Self::Push16 {
                 source: StoreSource::Imm(..) | StoreSource::EipDelta(..),
+                ..
             } => TimingClass::PushImm,
             Self::Push {
                 source: StoreSource::Reg(..) | StoreSource::ParkedByte,
+                ..
             }
             | Self::Push16 {
                 source: StoreSource::Reg(..) | StoreSource::ParkedByte,
+                ..
             } => TimingClass::PushReg,
             Self::PushMem { .. } => TimingClass::PushMem,
             Self::Pop { .. } | Self::Pop16 { .. } => TimingClass::PopReg,
@@ -6583,9 +6583,11 @@ impl DirectKind {
             // `bakes_cs_selector` instead, as `BAKES_CS_BIT`.
             Self::Push {
                 source: StoreSource::Selector(segment),
+                ..
             }
             | Self::Push16 {
                 source: StoreSource::Selector(segment),
+                ..
             } if segment != SegmentIndex::Cs => Some(segment),
             _ => None,
         }
@@ -6610,8 +6612,10 @@ impl DirectKind {
             self,
             Self::Push {
                 source: StoreSource::Selector(SegmentIndex::Cs),
+                ..
             } | Self::Push16 {
                 source: StoreSource::Selector(SegmentIndex::Cs),
+                ..
             } | Self::MovSegToReg {
                 segment: SegmentIndex::Cs,
                 ..
@@ -7514,6 +7518,7 @@ fn stack_width_kind(
     let kind = match kind {
         DirectKind::Push {
             source: StoreSource::Flags { .. },
+            stack32,
         } => {
             if cpu.is_v86_mode() {
                 return Err(StackWidthDecline::Other);
@@ -7522,6 +7527,7 @@ fn stack_width_kind(
                 source: StoreSource::Flags {
                     mask: pushf_mask(cpu.persona()),
                 },
+                stack32,
             }
         }
         // The segment load is emitted as `base = selector << 4` with no descriptor fetch, which is
@@ -7656,11 +7662,26 @@ fn stack_width_kind(
         // builds that. A silent fallthrough is the same answer for as long as no arm below
         // happens to match `Leave`, which is a property of the arm order rather than a decision.
         (DirectKind::Leave, false, OperandSize::Dword) => Err(StackWidthDecline::LeaveDwordSs16),
-        (kind, true, OperandSize::Dword) => Ok(kind),
-        (DirectKind::Push { source }, false, OperandSize::Word) => {
-            Ok(DirectKind::Push16 { source })
+        (DirectKind::Push { source, .. }, stack32, OperandSize::Word) => {
+            Ok(DirectKind::Push16 { source, stack32 })
         }
-        (DirectKind::Pop { dst }, false, OperandSize::Word) => Ok(DirectKind::Pop16 { dst }),
+        (DirectKind::Push { source, .. }, stack32, OperandSize::Dword) => {
+            // Pentium Vol. 3, section 23.2.19.3: 486 selector pushes have different store widths.
+            if !stack32
+                && matches!(source, StoreSource::Selector(_))
+                && cpu.persona() != CpuPersona::I586
+            {
+                return Err(StackWidthDecline::PushDwordSs16);
+            }
+            Ok(DirectKind::Push { source, stack32 })
+        }
+        (DirectKind::Pop { dst, .. }, stack32, OperandSize::Word) => {
+            Ok(DirectKind::Pop16 { dst, stack32 })
+        }
+        (DirectKind::Pop { dst, .. }, stack32, OperandSize::Dword) => {
+            Ok(DirectKind::Pop { dst, stack32 })
+        }
+        (kind, true, OperandSize::Dword) => Ok(kind),
         (DirectKind::Ret { release }, false, OperandSize::Word) => {
             Ok(DirectKind::Ret16 { release })
         }
@@ -7675,13 +7696,7 @@ fn stack_width_kind(
             return_delta,
             target_delta,
         }),
-        // The residue: every stack-touching kind not named above, at the (SS.B, operand size)
-        // cross the explicit arms did not cover. Four of these ARE the missing cells the design
-        // note's §2(H) instrument exists to attribute (a Dword push/pop/ret/call on a 16-bit
-        // stack, a Word push/pop/ret/call on a 32-bit stack); everything else -- `PushMem`,
-        // `CallReg`, `CallMem`, or a combination none of the arms above name -- falls to `Other`,
-        // spelled out rather than silently folded into a named cell so a non-zero reading there
-        // is visible on its own.
+        // Keep the diagnostic labels stable for the remaining unsupported cells.
         (kind, stack32, size) => Err(match (kind, stack32, size) {
             (DirectKind::Push { .. }, false, OperandSize::Dword) => {
                 StackWidthDecline::PushDwordSs16
@@ -8636,31 +8651,9 @@ fn compile_with_budget(
                 break;
             }
         };
-        // The stack-width admission matrix, and it is FIRST on purpose: everything below this
-        // point reads the kind, and the access accessors in particular give different answers
-        // for `Push` and `Push16` (a dword store against a word store). Anything that read the
-        // pre-mapping kind would silently account the wrong width.
-        //
-        // SS.B picks the STACK POINTER width and `operand_size` picks how many bytes move; the
-        // two are orthogonal (386 PRM 16.2, restated in the interpreter's `push` in `memory.rs`). Four cells:
-        //
-        //   SS.B=1 + Dword  admit as `Push`   the shipped 32-bit form
-        //   SS.B=1 + Word   STOP              a 2-byte push with a 32-bit SP. `Push` would move
-        //                                     four bytes and decrement four, so admitting it
-        //                                     here is a miscompile, not a missed lowering.
-        //                                     Reachable TODAY through a 66-prefixed push in
-        //                                     32-bit code, which the prefix gate accepts.
-        //   SS.B=0 + Word   admit as `Push16` the new form
-        //   SS.B=0 + Dword  STOP              four bytes on a 16-bit SP, not built yet
-        //
-        // This REPLACES the old `uses_stack() && !stack_is_32bit()` stop rather than joining it.
-        // Left in place, that stop would have refused every `Push16`, because they exist only
-        // when the stack is 16-bit. The slice would have done nothing and a counter-identity
-        // gate would have passed while certifying the mechanism's own absence.
-        //
-        // `classify` cannot make this decision: it has no `cpu`, and SS.B is CPU state. Deciding
-        // it here is safe against block reuse because `jit_mode_key` already carries SS.B, so a
-        // block compiled for one stack width can never be entered with the other.
+        // Resolve widths before access accounting. Operand size chooses the transfer width
+        // (Push/Push16 and Pop/Pop16); SS.B independently chooses the pointer width.
+        // The mode key includes SS.B, so blocks cannot be reused with a different stack width.
         let kind = match stack_width_kind(cpu, kind, insn.operand_size) {
             Ok(kind) => kind,
             Err(reason) => {
@@ -16946,10 +16939,14 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             0x50..=0x57 => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Reg(opcode - 0x50),
+                    stack32: true,
                 });
             }
             0x58..=0x5f => {
-                return Some(DirectKind::Pop { dst: opcode - 0x58 });
+                return Some(DirectKind::Pop {
+                    dst: opcode - 0x58,
+                    stack32: true,
+                });
             }
             // LEAVE is classified at the 0xc9 arm below and its (operand size x SS.B) cell is
             // chosen by the stack-width matrix, not here. Three of the four cells are built as of
@@ -17360,6 +17357,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             0x9c => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Flags { mask: u32::MAX },
+                    stack32: true,
                 });
             }
             // POPF, WORD form only, N2. No `classify` arm existed for this opcode at any width
@@ -17466,6 +17464,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         0x1e => SegmentIndex::Ds,
                         _ => SegmentIndex::Es,
                     }),
+                    stack32: true,
                 });
             }
             // POP ES (0x07) and POP DS (0x1f), the read half's mirror: a word off the stack loaded
@@ -17532,11 +17531,13 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             0x68 => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Imm(insn.imm),
+                    stack32: true,
                 });
             }
             0x6a => {
                 return Some(DirectKind::Push {
                     source: StoreSource::Imm(crate::sign_extend_u8(insn.imm as u8)),
+                    stack32: true,
                 });
             }
             // THREE-operand IMUL, register source only: `IMUL r32, r/m32, imm32` (0x69) and
@@ -20275,110 +20276,67 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // its pre-instruction value.
                 e.alu_r32_imm32(5, home(4), 4);
             }
-            DirectKind::Push { source } => {
-                // PUSHFD's `materialize_flags()`, in the interpreter's order: settle the lazy
-                // descriptor BEFORE the store, so a stack fault leaves the same CPU state the
-                // interpreter would. RBP already holds the settled value; what is missing is
-                // publishing it and tearing the descriptor down.
+            DirectKind::Push { source, stack32 } | DirectKind::Push16 { source, stack32 } => {
+                let width = if matches!(slot.kind, DirectKind::Push16 { .. }) {
+                    MemoryWidth::Word
+                } else {
+                    MemoryWidth::Dword
+                };
+                let bytes = width.bytes();
+                let wrap = if stack32 {
+                    AddressWrap::None
+                } else {
+                    AddressWrap::Word
+                };
+                // Settle PUSHFD flags before a faulting store, as the interpreter does.
                 if matches!(source, StoreSource::Flags { .. }) {
                     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RBP);
                     emit_clear_pending(&mut e);
                 }
                 let side = e.label();
-                let reasons =
-                    MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(4))));
-                emit_store(
-                    &mut e,
-                    source,
-                    MemoryWidth::Dword,
-                    stack_addr(0u32.wrapping_sub(4)),
-                    memory,
-                    reasons,
-                    AddressWrap::None,
-                );
+                let addr = stack_addr(0u32.wrapping_sub(bytes));
+                let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
+                emit_store(&mut e, source, width, addr, memory, reasons, wrap);
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                e.alu_r32_imm32(5, home(4), 4);
+                // Commit the pointer only after the store succeeds.
+                if stack32 {
+                    e.alu_r32_imm32(5, home(4), bytes);
+                } else {
+                    e.alu_r16_imm16(5, home(4), bytes as u16);
+                }
             }
-            // PUSH on a 16-bit stack: two bytes at `(SP - 2) & 0xFFFF`, then SP alone advances.
-            //
-            // Three things differ from the 32-bit arm above and each one is load-bearing. The
-            // displacement is -2 rather than -4 and the width is Word, so the slot matches the
-            // interpreter's `operand_size.bytes()`. The address wraps at 64K, applied inside
-            // `emit_store` before the segment limit compare. And the pointer update is a 16-bit
-            // register operation, which on x86-64 preserves bits 31 to 16 rather than
-            // zero-extending, exactly reproducing `write_gpr16(4, sp)`.
-            //
-            // The store still PRECEDES the pointer update, which is the invariant the 32-bit arm
-            // already carries: a faulting push must leave SP at its pre-instruction value, or a
-            // lazy-commit host that retries the instruction double-decrements it (see the
-            // interpreter's `push` in `memory.rs`, traced to a real Quake crt1 crash). The side
-            // exit is
-            // published between the two for the same reason.
-            DirectKind::Push16 { source } => {
-                let side = e.label();
-                let reasons =
-                    MemorySideExits::new(&mut e, memory, Some(stack_addr(0u32.wrapping_sub(2))));
-                emit_store(
-                    &mut e,
-                    source,
-                    MemoryWidth::Word,
-                    stack_addr(0u32.wrapping_sub(2)),
-                    memory,
-                    reasons,
-                    AddressWrap::Word,
-                );
-                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
-                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                e.alu_r16_imm16(5, home(4), 2);
-            }
-            DirectKind::Pop { dst } => {
+            DirectKind::Pop { dst, stack32 } | DirectKind::Pop16 { dst, stack32 } => {
+                let word = matches!(slot.kind, DirectKind::Pop16 { .. });
+                let width = if word {
+                    MemoryWidth::Word
+                } else {
+                    MemoryWidth::Dword
+                };
+                let wrap = if stack32 {
+                    AddressWrap::None
+                } else {
+                    AddressWrap::Word
+                };
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
-                emit_ram_read_pointer(
-                    &mut e,
-                    MemoryWidth::Dword,
-                    stack_addr(0),
-                    memory,
-                    reasons,
-                    AddressWrap::None,
-                );
-                e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
-                e.add_r32_imm32(home(4), 4);
-                e.mov_r32_r32(home(dst), Reg::RDX);
-                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
-                side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-            }
-            // POP on a 16-bit stack: two bytes read at `SP & 0xFFFF`, SP alone advances, and the
-            // destination is MERGED into rather than replaced.
-            //
-            // Three things differ from the 32-bit arm above, and each is load-bearing. The read
-            // is Word and its address wraps at 64K, which the read path only gained a parameter
-            // for with this slice; the pointer advance is a 16-bit register op, preserving bits
-            // 31 to 16; and the destination write is `mov r16, r16`, which merges into the low
-            // half exactly as `write_gpr_sized(index, Word, ..)` does, where a 32-bit move would
-            // clobber the high half.
-            //
-            // THE ORDER OF THE LAST TWO IS THE POP SP CASE. When `dst` is 4 the destination IS
-            // the stack pointer, and the interpreter advances first and assigns second
-            // (`memory.rs` advances inside `pop`, `execute.rs` assigns after it returns), so the
-            // final SP is the LOADED WORD, not the advanced pointer. The 32-bit arm above
-            // already has this order and the Dword case is pinned on both backends; reversing
-            // it here would leave POP SP holding loaded + 2.
-            DirectKind::Pop16 { dst } => {
-                let side = e.label();
-                let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
-                emit_ram_read_pointer(
-                    &mut e,
-                    MemoryWidth::Word,
-                    stack_addr(0),
-                    memory,
-                    reasons,
-                    AddressWrap::Word,
-                );
-                e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
-                e.alu_r16_imm16(0, home(4), 2);
-                emit_write_gpr16(&mut e, dst, Reg::RDX);
+                emit_ram_read_pointer(&mut e, width, stack_addr(0), memory, reasons, wrap);
+                if word {
+                    e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+                } else {
+                    e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
+                }
+                // POP SP/ESP assigns the loaded value after advancing the pointer.
+                if stack32 {
+                    e.add_r32_imm32(home(4), width.bytes());
+                } else {
+                    e.alu_r16_imm16(0, home(4), width.bytes() as u16);
+                }
+                if word {
+                    emit_write_gpr16(&mut e, dst, Reg::RDX);
+                } else {
+                    e.mov_r32_r32(home(dst), Reg::RDX);
+                }
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }

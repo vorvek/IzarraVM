@@ -28,6 +28,87 @@ use super::sixteen_bit::{
 };
 use super::*;
 
+#[test]
+fn pop_data_segment_fault_restores_the_original_stack_pointer() {
+    for opcode in [0x07, 0x1f] {
+        for stack32 in [false, true] {
+            for operand32 in [false, true] {
+                for (selector, paging, pte, vector, error) in [
+                    (SEL_BAD, false, 0u32, 13, u32::from(SEL_BAD)),
+                    (SEL_NOT_PRESENT, false, 0, 11, u32::from(SEL_NOT_PRESENT)),
+                    (SEL_DATA, true, 0, 14, 0),
+                    (SEL_UNACCESSED, true, 0x5001, 14, 3),
+                ] {
+                    let mut cpu = protected_cpu();
+                    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+                    ss.default_size_32 = stack32;
+                    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+                    let esp = if stack32 {
+                        STACK_TOP
+                    } else {
+                        0xabcd_0000 | STACK_TOP
+                    };
+                    cpu.registers.set_esp(esp);
+                    let mut memory = vec![0; 0x6000];
+                    seed_protected_tables(&mut memory);
+                    memory[STACK_TOP as usize..STACK_TOP as usize + 4]
+                        .copy_from_slice(&u32::from(selector).to_le_bytes());
+                    let code = if operand32 {
+                        vec![opcode]
+                    } else {
+                        vec![0x66, opcode]
+                    };
+                    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+                    if paging {
+                        memory.copy_within(0x1200..0x1240, 0x5000);
+                        cpu.gdtr.base = 0x5000;
+                        cpu.control.cr0 |= CR0_PG | CR0_WP;
+                        cpu.control.cr3 = 0x3000;
+                        memory[0x3000..0x3004].copy_from_slice(&0x4003u32.to_le_bytes());
+                        memory[0x4000..0x4004].copy_from_slice(&3u32.to_le_bytes());
+                        memory[0x4004..0x4008].copy_from_slice(&0x1003u32.to_le_bytes());
+                        memory[0x4014..0x4018].copy_from_slice(&pte.to_le_bytes());
+                    }
+                    let mut bus = TestBus::with_memory(memory);
+                    cpu.begin_instruction();
+                    let insn = cpu.fetch_decoded(&mut bus, ENTRY).unwrap();
+                    let segments = cpu.registers.segments;
+                    let clocks = bus.trace.elapsed_clocks();
+                    let result =
+                        cpu.execute_decoded(&insn, &mut bus, &mut CommittedCore::default());
+                    assert!(
+                        matches!(result, Err(InternalFault::Exception { vector: v, error_code: Some(e) }) if v == vector && e == error),
+                        "{result:?}"
+                    );
+                    assert_eq!(
+                        cpu.registers.esp(),
+                        esp,
+                        "opcode {opcode:02x}, SS.B={stack32}, operand32={operand32}"
+                    );
+                    assert_eq!(cpu.registers.segments, segments);
+                    assert!(bus.trace.elapsed_clocks() > clocks);
+                    if paging {
+                        assert_eq!(
+                            cpu.control.cr2,
+                            0x5000 + u32::from(selector) + if pte == 0 { 0 } else { 5 }
+                        );
+                        let stack_pte =
+                            u32::from_le_bytes(bus.memory[0x4004..0x4008].try_into().unwrap());
+                        assert_eq!(
+                            stack_pte & 0x60,
+                            0x20,
+                            "stack read keeps Accessed, without Dirty"
+                        );
+                        let descriptor_pte =
+                            u32::from_le_bytes(bus.memory[0x4014..0x4018].try_into().unwrap());
+                        assert_eq!(descriptor_pte & 0x60, if pte == 0 { 0 } else { 0x20 });
+                    }
+                }
+            }
+        }
+    }
+}
+
 const ENTRY: u32 = 0x100;
 /// A page the block's code is not on, for the stack and for the POP's destination.
 const DATA_PAGE: u32 = 0x1000;

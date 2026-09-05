@@ -2843,7 +2843,10 @@ fn word_size_control_targets_are_refused_above_the_sixteen_bit_wrap() {
 
     // A kind with no control target is unaffected in either width.
     assert!(static_control_target_within_limit(
-        DirectKind::Pop { dst: 0 },
+        DirectKind::Pop {
+            dst: 0,
+            stack32: true
+        },
         0x1_0100,
         word
     ));
