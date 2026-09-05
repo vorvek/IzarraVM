@@ -216,7 +216,7 @@ fn enable_dispatch(roles: &mut Roles) {
 }
 
 /// One capped run of the run loop on both roles.
-fn run_loop_once(roles: &mut Roles, cap: u64) -> (CycleOutcome, CycleOutcome) {
+fn run_loop_once(roles: &mut Roles, cap: u64) -> (CpuCycleOutcome, CpuCycleOutcome) {
     let native = roles
         .native
         .run_straight_line(&mut roles.native_bus, cap)

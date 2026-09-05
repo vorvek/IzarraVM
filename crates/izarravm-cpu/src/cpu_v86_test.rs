@@ -1205,7 +1205,7 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
     let start_eip = cpu.registers.eip;
     let start_cs = cpu.registers.cs().selector;
-    let result: Result<CycleOutcome, CpuError> = cpu.finish_instruction(
+    let result: Result<CpuCycleOutcome, CpuError> = cpu.finish_instruction(
         &mut bus,
         Err(InternalFault::Exception {
             vector: 13,
@@ -1290,7 +1290,7 @@ fn deliver_through_finish_instruction(
     bus: &mut TestBus,
     vector: u8,
     error_code: Option<u32>,
-) -> (Result<CycleOutcome, CpuError>, u32, u16) {
+) -> (Result<CpuCycleOutcome, CpuError>, u32, u16) {
     let start_eip = cpu.registers.eip;
     let start_cs = cpu.registers.cs().selector;
     let result = cpu.finish_instruction(

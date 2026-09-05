@@ -39,6 +39,21 @@ fn budgeted_run_matches_the_compatibility_wrapper() {
 }
 
 #[test]
+fn budgeted_run_fold_keeps_wide_normal_and_halt_totals() {
+    let normal_total = crate::run::checked_run_core_total(29, u64::from(u32::MAX) - 11);
+    let total = crate::run::checked_run_core_total(normal_total, u64::from(u32::MAX) + 17);
+    let normal = crate::run::budgeted_run_outcome(total, false);
+    let halted = crate::run::budgeted_run_outcome(total, true);
+
+    assert!(normal_total > u64::from(u32::MAX));
+    assert!(total > u64::from(u32::MAX));
+    assert_eq!(normal.consumed_core_clocks, total);
+    assert!(!normal.halted);
+    assert_eq!(halted.consumed_core_clocks, total);
+    assert!(halted.halted);
+}
+
+#[test]
 fn straight_line_hot_loop_matches_per_instruction_result() {
     // MOV CX,5 ; loop: INC AX ; INC AX ; LOOP loop ; HLT. Once the loop body is cached, the
     // relative LOOP can run as a continuation too, so one hot run can chain several iterations.

@@ -114,7 +114,7 @@ fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approxima
     let eight_incs_total = {
         let mut solo = cpu.clone();
         let mut solo_bus = TestBus::with_memory(vec![0x40; 8]);
-        let mut total = 0u32;
+        let mut total = 0u64;
         for _ in 0..8 {
             total += solo.cycle(&mut solo_bus).unwrap().core_clocks;
         }
@@ -137,7 +137,7 @@ fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approxima
     );
     assert_eq!(
         bus.last_read_io_core_clocks_so_far,
-        Some(eight_incs_total.into()),
+        Some(eight_incs_total),
         "the IN reached as the run's ninth instruction (a continuation) must \
              see core_clocks_so_far equal to the eight INCs' combined charge, not 0"
     );
@@ -201,7 +201,7 @@ fn poll_loop_with_test_imm_chains_end_to_end_in_the_approximate_class() {
              (nonzero) core-clock total, proving the INs chained mid-run"
     );
     assert!(
-        u64::from(outcome.core_clocks) >= 1_000,
+        outcome.core_clocks >= 1_000,
         "the chained run must have consumed the whole cap"
     );
 }
@@ -352,7 +352,7 @@ fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation()
     // core_clocks_so_far was set to `total` right before the run's LAST
     // continuation (the third INC) dispatched, so it must equal exactly the
     // first two INCs' combined charge, independently measured above.
-    assert_eq!(cpu.core_clocks_so_far, u64::from(two_incs_total));
+    assert_eq!(cpu.core_clocks_so_far, two_incs_total);
     assert_eq!(outcome.core_clocks, three_incs_total);
 }
 
@@ -2507,7 +2507,7 @@ fn cap_boundary_probe(scale: (u64, u64), cap: u64) -> (u64, u64, u64) {
     (
         p.instructions,
         p.brk_cap,
-        u64::from(outcome.core_clocks) + (scaled_at_exit - scaled_at_entry),
+        outcome.core_clocks + (scaled_at_exit - scaled_at_entry),
     )
 }
 

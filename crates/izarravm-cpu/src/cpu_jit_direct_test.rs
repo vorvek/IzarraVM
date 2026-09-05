@@ -54,7 +54,7 @@ fn fresh_real16() -> CpuGsw {
     cpu
 }
 
-pub(super) fn drive(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
+pub(super) fn drive(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u64, u32, bool)> {
     let mut outcomes = Vec::new();
     for _ in 0..64 {
         let outcome = cpu.run_straight_line(bus, u64::MAX).unwrap();
@@ -2554,11 +2554,11 @@ fn immediate_ram_store_watch_and_map_miss_side_exits_are_precise() {
             assert_eq!(
                 native_outcomes
                     .iter()
-                    .map(|(clocks, _, _)| u64::from(*clocks))
+                    .map(|(clocks, _, _)| *clocks)
                     .sum::<u64>(),
                 interp_outcomes
                     .iter()
-                    .map(|(clocks, _, _)| u64::from(*clocks))
+                    .map(|(clocks, _, _)| *clocks)
                     .sum::<u64>(),
                 "{name} aggregate raw clocks"
             );
@@ -3301,14 +3301,8 @@ fn direct_mode13_reads_match_values_and_video_bus_timing() {
     let native_outcomes = drive(&mut native, &mut native_bus);
 
     assert_eq!(
-        native_outcomes
-            .iter()
-            .map(|outcome| u64::from(outcome.0))
-            .sum::<u64>(),
-        interp_outcomes
-            .iter()
-            .map(|outcome| u64::from(outcome.0))
-            .sum::<u64>(),
+        native_outcomes.iter().map(|outcome| outcome.0).sum::<u64>(),
+        interp_outcomes.iter().map(|outcome| outcome.0).sum::<u64>(),
     );
     assert_eq!(
         crate::tests::settled_state(&native),

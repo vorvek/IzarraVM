@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_cpu::CpuCycleOutcome;
 // Both uses sit inside `#[cfg(feature = "jit")]` items, so the import has to be gated too or a
 // no-default-features build of the test targets trips unused_imports.
 #[cfg(feature = "jit")]
@@ -538,7 +539,7 @@ fn prepare_setup_poll_head(
 }
 
 #[cfg(feature = "jit")]
-fn projected_poll_total(machine: &mut Machine, iterations: u64, batch_core: u32) -> u64 {
+fn projected_poll_total(machine: &mut Machine, iterations: u64, batch_core: u64) -> u64 {
     with_cpu_and_bus(machine, |cpu, bus| {
         let poll = cpu.poll_loop().expect("warm poll descriptor");
         let certificate = bus
@@ -550,12 +551,12 @@ fn projected_poll_total(machine: &mut Machine, iterations: u64, batch_core: u32)
         let scaled_bus = bus
             .poll_project_scaled_bus_clocks(certificate, iterations)
             .expect("poll bus projection");
-        u64::from(batch_core) + core + scaled_bus
+        batch_core + core + scaled_bus
     })
 }
 
 #[cfg(feature = "jit")]
-fn projected_poll_dots(machine: &mut Machine, iterations: u64, batch_core: u32) -> u64 {
+fn projected_poll_dots(machine: &mut Machine, iterations: u64, batch_core: u64) -> u64 {
     with_cpu_and_bus(machine, |cpu, bus| {
         let poll = cpu.poll_loop().expect("warm poll descriptor");
         let certificate = bus
@@ -567,16 +568,16 @@ fn projected_poll_dots(machine: &mut Machine, iterations: u64, batch_core: u32) 
         let scaled_bus = bus
             .poll_project_scaled_bus_clocks(certificate, iterations)
             .expect("poll bus projection");
-        bus.poll_project_dot_advance(u64::from(batch_core) + core + scaled_bus)
+        bus.poll_project_dot_advance(batch_core + core + scaled_bus)
             .expect("poll dot projection")
     })
 }
 
 #[cfg(feature = "jit")]
-fn attempt_poll_skip(machine: &mut Machine, batch_core: u32, cap: u64) -> Option<u32> {
+fn attempt_poll_skip(machine: &mut Machine, batch_core: u64, cap: u64) -> Option<u64> {
     let mut diagnostics = run::PollSkipDiagnostics::default();
     with_cpu_and_bus(machine, |cpu, bus| {
-        bus.prior_runs_core_clocks = u64::from(batch_core);
+        bus.prior_runs_core_clocks = batch_core;
         bus.core_clocks_so_far = 0;
         let poll = run::classify_poll_skip_boundary(cpu, &mut diagnostics)?;
         run::try_poll_skip(cpu, bus, &mut diagnostics, poll, batch_core, cap)
@@ -731,7 +732,7 @@ fn setup_poll_source_mismatch_and_tiny_cap_never_bulk_charge_prefix_state() {
 #[cfg(feature = "jit")]
 #[test]
 fn poll_skip_reserves_k_plus_one_at_the_exact_cap_with_fractional_carries() {
-    const BATCH_CORE: u32 = 7;
+    const BATCH_CORE: u64 = 7;
     const K: u64 = 2;
     for at_cap in [false, true] {
         let mut machine =
@@ -760,6 +761,165 @@ fn poll_skip_reserves_k_plus_one_at_the_exact_cap_with_fractional_carries() {
             assert_eq!(machine.cpu.perf_counters().poll_skip_iterations, 0);
         }
     }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn memory_poll_skip_returns_a_wide_epoch_two_charge_after_precommit() {
+    const ITERATIONS: u64 = 1_500_000_000;
+
+    fn prepared_machine() -> Machine {
+        let mut machine = memory_poll_machine(
+            true,
+            false,
+            MEMORY_POLL_CELL_DISP,
+            MEMORY_POLL_COMPARAND ^ 0x55aa,
+        );
+        machine.set_timing_epoch_for_test(2);
+        with_cpu_and_bus(&mut machine, |cpu, bus| {
+            for _ in 0..8 {
+                cpu.run_budgeted(bus, 500).expect("warm memory poll spin");
+            }
+        });
+        machine.cpu.registers.eip = MEMORY_POLL_HEAD_EIP;
+        machine.cpu.poll_skip_backedge_housekeeping();
+        assert!(machine.cpu.poll_skip_eligible());
+        assert_eq!(
+            machine.cpu.poll_loop().expect("warm memory poll").family(),
+            izarravm_cpu::PollFamily::Memory
+        );
+        machine.cpu.reset_perf_counters();
+        machine
+    }
+
+    fn memory_projection(machine: &mut Machine, iterations: u64) -> (u64, u64, u64, u64) {
+        with_cpu_and_bus(machine, |cpu, bus| {
+            let poll = cpu.poll_loop().expect("warm memory poll descriptor");
+            let linear = poll.memory_cell_linear().expect("memory poll cell");
+            let physical = cpu
+                .probe_linear_read_physical(linear)
+                .expect("identity-mapped memory poll cell");
+            let certificate = bus
+                .poll_memory_bus_certificate(poll, physical)
+                .expect("plain RAM memory poll certificate");
+            let raw_core = cpu.poll_skip_raw_core_clocks(poll, bus);
+            let core = cpu
+                .project_poll_skip_core(raw_core, iterations)
+                .expect("memory poll core projection");
+            let bus_total = bus
+                .poll_project_scaled_bus_clocks(certificate, iterations)
+                .expect("memory poll bus projection");
+            (
+                raw_core,
+                certificate.raw_clocks_per_iteration(),
+                core,
+                bus_total,
+            )
+        })
+    }
+
+    let mut admitted = prepared_machine();
+    let (raw_core, raw_bus, expected_core, expected_bus) =
+        memory_projection(&mut admitted, ITERATIONS);
+    assert_eq!(raw_core, 40, "epoch-2 I586 memory poll raw core shape");
+    let (_, _, reserved_core, reserved_bus) = memory_projection(&mut admitted, ITERATIONS + 1);
+    let reserved_total = reserved_core + reserved_bus;
+    let elapsed_before = admitted.cpu.elapsed_clocks;
+    let remainder_before = admitted.cpu.poll_skip_timing_remainder();
+    let trace_before = admitted.trace.elapsed_clocks();
+    let cap = reserved_total;
+    let charged = attempt_poll_skip(&mut admitted, 0, cap)
+        .expect("the full N+1 memory reservation admits N complete iterations");
+    assert_eq!(charged, expected_core);
+    assert!(charged > u64::from(u32::MAX));
+    assert_eq!(admitted.cpu.elapsed_clocks, elapsed_before + expected_core);
+    let (num, den) = izarravm_cpu::level_timing_for_test(admitted.cpu.persona());
+    assert_eq!(
+        expected_core,
+        (raw_core * ITERATIONS * u64::from(num) + remainder_before) / u64::from(den)
+    );
+    let expected_remainder =
+        (raw_core * ITERATIONS * u64::from(num) + remainder_before) % u64::from(den);
+    assert_eq!(
+        admitted.cpu.poll_skip_timing_remainder(),
+        expected_remainder
+    );
+    assert_eq!(
+        admitted.trace.elapsed_clocks(),
+        trace_before + raw_bus * ITERATIONS
+    );
+    assert_eq!(
+        admitted.port_bus_batch_clocks, 0,
+        "memory poll has no ISA lane"
+    );
+    assert_eq!(
+        admitted.cpu.perf_counters().poll_skip_iterations,
+        ITERATIONS
+    );
+    assert_eq!(admitted.cpu.poll_skip_memory().iterations, ITERATIONS);
+    assert_eq!(run::checked_batch_core_sum(0, charged), charged);
+    assert_eq!(bus_timing(admitted.cpu.persona(), 2), (1, 1));
+    assert_eq!(
+        expected_bus,
+        raw_bus * ITERATIONS,
+        "epoch-2 I586 bus projection retains the certified raw memory lane"
+    );
+
+    let smaller_cap = cap - 1;
+    let mut smaller = prepared_machine();
+    let smaller_charged = attempt_poll_skip(&mut smaller, 0, smaller_cap)
+        .expect("a lower cap may still admit a smaller complete memory span");
+    let smaller_iterations = smaller.cpu.perf_counters().poll_skip_iterations;
+    assert!(smaller_iterations < ITERATIONS);
+    let mut smaller_projection = prepared_machine();
+    let (_, _, smaller_core, smaller_bus) =
+        memory_projection(&mut smaller_projection, smaller_iterations + 1);
+    assert_eq!(
+        smaller_charged,
+        memory_projection(&mut smaller_projection, smaller_iterations).2
+    );
+    assert!(smaller_core + smaller_bus <= smaller_cap);
+
+    let mut minimum = prepared_machine();
+    let minimum_cap =
+        memory_projection(&mut minimum, 3).2 + memory_projection(&mut minimum, 3).3 - 1;
+    let registers_before = minimum.cpu.registers.clone();
+    let elapsed_before = minimum.cpu.elapsed_clocks;
+    let remainder_before = minimum.cpu.poll_skip_timing_remainder();
+    let trace_before = minimum.trace.elapsed_clocks();
+    let port_before = minimum.port_bus_batch_clocks;
+    assert!(attempt_poll_skip(&mut minimum, 0, minimum_cap).is_none());
+    assert_eq!(minimum.cpu.registers, registers_before);
+    assert_eq!(minimum.cpu.elapsed_clocks, elapsed_before);
+    assert_eq!(minimum.cpu.poll_skip_timing_remainder(), remainder_before);
+    assert_eq!(minimum.trace.elapsed_clocks(), trace_before);
+    assert_eq!(minimum.port_bus_batch_clocks, port_before);
+    assert_eq!(minimum.cpu.perf_counters().poll_skip_spans, 0);
+    assert_eq!(minimum.cpu.perf_counters().poll_skip_iterations, 0);
+}
+
+#[test]
+fn machine_batch_fold_keeps_wide_normal_and_halt_outcomes() {
+    let wide = u64::from(u32::MAX) + 29;
+    let normal = CpuCycleOutcome {
+        core_clocks: wide,
+        halted: false,
+    };
+    let halted = CpuCycleOutcome {
+        core_clocks: wide,
+        halted: true,
+    };
+
+    assert_eq!(
+        run::checked_batch_core_sum(11, normal.core_clocks),
+        wide + 11
+    );
+    assert_eq!(
+        run::checked_batch_core_sum(13, halted.core_clocks),
+        wide + 13
+    );
+    assert!(!normal.halted);
+    assert!(halted.halted);
 }
 
 #[cfg(feature = "jit")]
@@ -808,9 +968,9 @@ fn poll_skip_edge_is_strict_and_the_reserved_final_iteration_runs_real() {
             let spent_bus = bus
                 .poll_project_scaled_bus_clocks(certificate, 0)
                 .expect("committed bus projection");
-            let spent = u64::from(batch_core) + spent_bus;
+            let spent = batch_core + spent_bus;
             let remaining = cap.checked_sub(spent).expect("K+1 reserved tail");
-            bus.prior_runs_core_clocks = u64::from(batch_core);
+            bus.prior_runs_core_clocks = batch_core;
             let outcome = cpu
                 .run_budgeted(bus, remaining)
                 .expect("reserved real iteration run");
@@ -1475,7 +1635,7 @@ fn arm_native_fetch_loop(cpu: &mut CpuGsw) {
     cpu.registers.set_segment(SegmentIndex::Cs, cs);
 }
 
-fn drive_native_fetch_loop(cpu: &mut CpuGsw, machine: &mut Machine) -> Vec<CycleOutcome> {
+fn drive_native_fetch_loop(cpu: &mut CpuGsw, machine: &mut Machine) -> Vec<CpuCycleOutcome> {
     let mut outcomes = Vec::new();
     for _ in 0..64 {
         let outcome = with_bus(machine, |bus| cpu.run_straight_line(bus, u64::MAX).unwrap());

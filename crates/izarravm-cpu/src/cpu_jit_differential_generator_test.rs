@@ -624,13 +624,13 @@ fn assert_measured_pair_with_split(
             .as_ref()
             .expect("fallback case must halt")
             .iter()
-            .map(|outcome| u64::from(outcome.consumed_core_clocks))
+            .map(|outcome| outcome.consumed_core_clocks)
             .sum();
         let native_clocks: u64 = native
             .as_ref()
             .expect("fallback case must halt")
             .iter()
-            .map(|outcome| u64::from(outcome.consumed_core_clocks))
+            .map(|outcome| outcome.consumed_core_clocks)
             .sum();
         assert_eq!(
             native_clocks, interpreted_clocks,
@@ -710,13 +710,13 @@ fn assert_measured_pair_ignoring_translation_watch_split(
         .as_ref()
         .expect("fallback case must halt")
         .iter()
-        .map(|outcome| u64::from(outcome.consumed_core_clocks))
+        .map(|outcome| outcome.consumed_core_clocks)
         .sum();
     let native_clocks: u64 = native
         .as_ref()
         .expect("fallback case must halt")
         .iter()
-        .map(|outcome| u64::from(outcome.consumed_core_clocks))
+        .map(|outcome| outcome.consumed_core_clocks)
         .sum();
     assert_eq!(
         native_clocks, interpreted_clocks,

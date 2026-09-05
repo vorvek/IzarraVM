@@ -486,9 +486,9 @@ pub(super) fn try_poll_skip(
     bus: &mut MachineBus<'_>,
     diagnostics: &mut PollSkipDiagnostics,
     poll: PollLoop,
-    batch_core: u32,
+    batch_core: u64,
     cap: u64,
-) -> Option<u32> {
+) -> Option<u64> {
     // I-D1b clause 2: no register-mask (D1b) shape can reach the interpreter. It is true by
     // double gating -- `build_poll_loop` passes `sixteen_bit_ok: false` at every interpreter
     // call site, and `poll_head_possible` still refuses a 16-bit head -- and it is load-bearing
@@ -554,7 +554,7 @@ pub(super) fn try_poll_skip(
     };
 
     let current_bus = bus.poll_project_scaled_bus_clocks(certificate, 0)?;
-    let spent = u64::from(batch_core).checked_add(current_bus)?;
+    let spent = batch_core.checked_add(current_bus)?;
     let upper = cap
         .checked_sub(spent)?
         .min(u64::from(u32::MAX))
@@ -574,7 +574,7 @@ pub(super) fn try_poll_skip(
         let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
             return false;
         };
-        let Some(reserved_total) = u64::from(batch_core)
+        let Some(reserved_total) = batch_core
             .checked_add(reserved_core)
             .and_then(|total| total.checked_add(reserved_bus))
         else {
@@ -590,7 +590,7 @@ pub(super) fn try_poll_skip(
         let Some(skipped_bus) = bus.poll_project_scaled_bus_clocks(certificate, iterations) else {
             return false;
         };
-        let Some(candidate_total) = u64::from(batch_core)
+        let Some(candidate_total) = batch_core
             .checked_add(skipped_core)
             .and_then(|total| total.checked_add(skipped_bus))
         else {
@@ -618,7 +618,6 @@ pub(super) fn try_poll_skip(
     }
 
     let charged = cpu.project_poll_skip_core(raw_per_iteration, best)?;
-    let charged_u32 = u32::try_from(charged).ok()?;
     bus.poll_project_scaled_bus_clocks(certificate, best)?;
 
     let committed = cpu
@@ -628,7 +627,14 @@ pub(super) fn try_poll_skip(
     cpu.poll_skip_backedge_housekeeping();
     bus.poll_commit_bus(certificate, best);
     diagnostics.committed(best);
-    Some(charged_u32)
+    Some(charged)
+}
+
+#[inline]
+pub(crate) fn checked_batch_core_sum(total: u64, added: u64) -> u64 {
+    total
+        .checked_add(added)
+        .expect("machine batch core total exceeded u64")
 }
 
 /// The memory-family poll-skip executor (R4): certifies the polled cell's
@@ -646,9 +652,9 @@ fn try_poll_skip_memory(
     bus: &mut MachineBus<'_>,
     diagnostics: &mut PollSkipDiagnostics,
     poll: PollLoop,
-    batch_core: u32,
+    batch_core: u64,
     cap: u64,
-) -> Option<u32> {
+) -> Option<u64> {
     diagnostics.memory_structural_hit();
     if !poll.at_head() {
         return None;
@@ -681,7 +687,7 @@ fn try_poll_skip_memory(
     }
 
     let current_bus = bus.poll_project_scaled_bus_clocks(certificate, 0)?;
-    let spent = u64::from(batch_core).checked_add(current_bus)?;
+    let spent = batch_core.checked_add(current_bus)?;
     let upper = cap
         .checked_sub(spent)?
         .min(u64::from(u32::MAX))
@@ -704,7 +710,7 @@ fn try_poll_skip_memory(
         let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
             return false;
         };
-        let Some(reserved_total) = u64::from(batch_core)
+        let Some(reserved_total) = batch_core
             .checked_add(reserved_core)
             .and_then(|total| total.checked_add(reserved_bus))
         else {
@@ -731,7 +737,6 @@ fn try_poll_skip_memory(
     }
 
     let charged = cpu.project_poll_skip_core(raw_per_iteration, best)?;
-    let charged_u32 = u32::try_from(charged).ok()?;
     bus.poll_project_scaled_bus_clocks(certificate, best)?;
 
     let committed = cpu
@@ -741,7 +746,7 @@ fn try_poll_skip_memory(
     cpu.poll_skip_backedge_housekeeping();
     bus.poll_commit_memory_bus(certificate, best);
     diagnostics.committed(best);
-    Some(charged_u32)
+    Some(charged)
 }
 
 impl Machine {
@@ -1743,14 +1748,12 @@ impl Machine {
                     reflected_call_cap_is_device_edge,
                     reflected_call_answered: false,
                 };
-                // Collapse the batch into one CycleOutcome so every downstream
+                // Collapse the batch into one CpuCycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
                 // unittester, console flush, HLT fast-forward) is unchanged:
                 // core_clocks is the batch sum, halted is set iff the batch ended
-                // on a HLT. core_clocks can't overflow u32 (the cap is at most
-                // ~1 ms of guest clocks in the Approximate class, a few hundred
-                // thousand at 586).
-                let mut batch_core = 0u32;
+                // on a HLT.
+                let mut batch_core = 0u64;
                 let mut halted = false;
                 let mut fault = None;
                 // Service a pending interrupt / halt-wake ONCE per batch.
@@ -1761,7 +1764,7 @@ impl Machine {
                 // honored per instruction inside cycle_no_interrupt_check.
                 match cpu.service_pending_interrupt(&mut bus) {
                     Ok(Some(o)) => {
-                        batch_core = batch_core.saturating_add(o.core_clocks);
+                        batch_core = checked_batch_core_sum(batch_core, o.core_clocks);
                         if o.halted {
                             halted = true;
                         }
@@ -1798,7 +1801,9 @@ impl Machine {
                         // realistic rate). Count the in-batch SCALED bus clocks
                         // toward the cap in every mode. Check at loop top so an
                         // over-budget batch does not enter one more run.
-                        let spent = u64::from(batch_core) + bus.in_batch_scaled_bus_clocks();
+                        let spent = batch_core
+                            .checked_add(bus.in_batch_scaled_bus_clocks())
+                            .expect("machine batch spent total exceeded u64");
                         if spent >= cap {
                             break;
                         }
@@ -1819,7 +1824,7 @@ impl Machine {
                         // coming run can add the RUN-scoped core_clocks_so_far on
                         // top and see a batch-total that is monotone across run
                         // boundaries. See MachineBus::prior_runs_core_clocks.
-                        bus.prior_runs_core_clocks = u64::from(batch_core);
+                        bus.prior_runs_core_clocks = batch_core;
                         #[cfg(feature = "jit")]
                         let align_poll_head = if poll_skip_enabled {
                             // The CPU resets its run-scoped offset before the first
@@ -1840,12 +1845,11 @@ impl Machine {
                                     cap,
                                 )
                             {
-                                batch_core = batch_core
-                                    .checked_add(skipped_core)
-                                    .expect("poll projection bounded the batch core total");
-                                bus.prior_runs_core_clocks = u64::from(batch_core);
-                                let spent = u64::from(batch_core)
-                                    .saturating_add(bus.in_batch_scaled_bus_clocks());
+                                batch_core = checked_batch_core_sum(batch_core, skipped_core);
+                                bus.prior_runs_core_clocks = batch_core;
+                                let spent = batch_core
+                                    .checked_add(bus.in_batch_scaled_bus_clocks())
+                                    .expect("machine poll batch spent total exceeded u64");
                                 remaining = cap.saturating_sub(spent);
                             }
                             align
@@ -1888,7 +1892,8 @@ impl Machine {
                         let run_budget = remaining;
                         match cpu.run_budgeted(&mut bus, run_budget) {
                             Ok(o) => {
-                                batch_core = batch_core.saturating_add(o.consumed_core_clocks);
+                                batch_core =
+                                    checked_batch_core_sum(batch_core, o.consumed_core_clocks);
                                 if o.halted {
                                     halted = true;
                                     break;
@@ -1925,7 +1930,7 @@ impl Machine {
                                 // A core-only fast exit avoids another loop when
                                 // this run consumed the full budget. Bus-heavy
                                 // runs are caught by the combined check above.
-                                if u64::from(batch_core) >= cap {
+                                if batch_core >= cap {
                                     break;
                                 }
                             }
@@ -1938,7 +1943,7 @@ impl Machine {
                 }
                 match fault {
                     Some(e) => Err(e),
-                    None => Ok(CycleOutcome {
+                    None => Ok(CpuCycleOutcome {
                         core_clocks: batch_core,
                         halted,
                     }),
@@ -1953,8 +1958,7 @@ impl Machine {
                     // Test seam: the final core total the batch-end step consumes,
                     // parallel to this batch's test_prior_core_pushes entry.
                     #[cfg(test)]
-                    self.test_batch_core_totals
-                        .push(u64::from(outcome.core_clocks));
+                    self.test_batch_core_totals.push(outcome.core_clocks);
                     let bus_clocks = self.trace.elapsed_clocks() - trace_before;
                     // Scale the bus portion per mode (B-T10). core_clocks is already
                     // scaled by the CPU's level_timing; this applies the third lever
@@ -1979,16 +1983,20 @@ impl Machine {
                     // (386) never accumulates this (see read_io), so it stays
                     // byte-identical; its slower clock already spans the 80 us window.
                     let scaled_bus_clocks = self.scale_bus(bus_clocks);
-                    let step = u64::from(outcome.core_clocks)
-                        + scaled_bus_clocks
-                        + std::mem::take(&mut self.port_bus_batch_clocks);
+                    let step = outcome
+                        .core_clocks
+                        .checked_add(scaled_bus_clocks)
+                        .and_then(|total| {
+                            total.checked_add(std::mem::take(&mut self.port_bus_batch_clocks))
+                        })
+                        .expect("machine batch step exceeded u64");
                     self.scaled_bus_clocks =
                         self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
                     // Advance the OPL timers so AdLib detection's delay loops see
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     let advance_start = self.host_profile.start();
-                    self.advance_cpu_work(step, u64::from(outcome.core_clocks));
+                    self.advance_cpu_work(step, outcome.core_clocks);
                     self.host_profile
                         .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
                     let service_start = self.host_profile.start();
