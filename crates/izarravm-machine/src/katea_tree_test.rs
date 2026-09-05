@@ -784,6 +784,297 @@ fn reconcile_makes_a_subdir_and_a_file_inside_it() {
 }
 
 #[test]
+fn a_settled_save_does_not_reconcile_again_for_a_fat_only_write() {
+    let (mut vol, root) = fresh_vol("save_then_fat");
+    let first = next_free_for_test(&vol);
+    stamp_file(&mut vol, ROOT_CLUSTER, "SAVE.DAT", 0x20, first, b"save one");
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(fs::read(root.join("SAVE.DAT")).unwrap(), b"save one");
+    let before = vol.storage_counters().metadata_projection_passes;
+
+    set_fat(&mut vol, first, crate::fat32::FAT32_EOC);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(vol.storage_counters().metadata_projection_passes, before);
+    assert!(!vol.metadata_reconcile_pending);
+    assert_eq!(fs::read(root.join("SAVE.DAT")).unwrap(), b"save one");
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_protected_host_file_is_only_pending_after_its_entry_disappears() {
+    let root = scratch("protected_host_pending");
+    let sub = root.join("TOOLS");
+    fs::create_dir(&sub).unwrap();
+    let path = sub.join("MORE.EXE");
+    fs::write(&path, b"host tool").unwrap();
+    let payload = crate::katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+    let mut vol = KateaTreeVolume::new(&payload.mbr, &payload.vbr, &root, &payload.files).unwrap();
+    let first = first_cluster_of(&vol, &path);
+    let key = *vol
+        .mirrored
+        .iter()
+        .find(|(_, mirror)| mirror.host_path == path)
+        .unwrap()
+        .0;
+    assert!(vol.system_names.contains(&key.1));
+    assert!(!vol.metadata_projection_pending());
+
+    delete_entry(&mut vol, key.0, "MORE.EXE");
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(vol.metadata_reconcile_pending);
+    assert_eq!(fs::read(&path).unwrap(), b"host tool");
+    free_chain(&mut vol, first);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(!path.exists());
+    assert!(!vol.metadata_reconcile_pending);
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_real_dos_directory_still_keeps_its_held_deletion_pending() {
+    for with_system in [false, true] {
+        let root = scratch(&format!("real_dos_pending_{with_system}"));
+        let host_dos = root.join("DOS");
+        fs::create_dir(&host_dos).unwrap();
+        let mut vol = mount(&root);
+        if !with_system {
+            vol = KateaTreeVolume::new(&vol.mbr, &vol.vbr, &root, &[]).unwrap();
+        }
+        let key = *vol
+            .mirrored
+            .iter()
+            .find(|(key, mirror)| {
+                mirror.is_dir
+                    && mirror.host_path == host_dos
+                    && (!with_system || key.1 != *b"DOS        ")
+            })
+            .unwrap()
+            .0;
+        assert_eq!(key.1 == *b"DOS        ", !with_system);
+        assert!(!vol.metadata_projection_pending());
+
+        delete_entry(
+            &mut vol,
+            ROOT_CLUSTER,
+            &crate::katea_volume::decode_83(&key.1),
+        );
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+        assert!(vol.metadata_reconcile_pending);
+        assert!(host_dos.is_dir());
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[test]
+fn saving_a_small_file_does_not_scan_unchanged_projection_clusters() {
+    let root = scratch("save_unchanged_projections");
+    fs::write(root.join("A_PAD.BIN"), vec![0; 128 * 1024]).unwrap();
+    fs::write(root.join("LARGE.BIN"), vec![0x4b; 512 * 1024]).unwrap();
+    fs::write(root.join("PAD.BIN"), vec![0; 128 * 1024]).unwrap();
+    let save = root.join("SAVE.DAT");
+    fs::write(&save, b"old save").unwrap();
+    let mut vol = mount(&root);
+    let first = first_cluster_of(&vol, &save);
+
+    for payload in [b"save one", b"save two", b"save end"] {
+        vol.projection_cluster_checks.set(0);
+        vol.file_projection_checks.clear();
+        rewrite_single_cluster_file(&mut vol, ROOT_CLUSTER, "SAVE.DAT", first, payload);
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+        assert_eq!(fs::read(&save).unwrap(), payload);
+        assert_eq!(vol.projection_cluster_checks.get(), 0);
+        assert!(
+            !vol.file_projection_checks
+                .contains(&(ROOT_CLUSTER, *b"LARGE   BIN"))
+        );
+        assert!(
+            vol.file_projection_checks
+                .contains(&(ROOT_CLUSTER, *b"SAVE    DAT"))
+        );
+    }
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn pending_metadata_revalidates_stale_and_missing_chain_memos() {
+    let root = scratch("pending_chain_memo");
+    let path = root.join("FILE.BIN");
+    fs::write(&path, vec![0x56; 8192]).unwrap();
+    let mut vol = mount(&root);
+    let first = first_cluster_of(&vol, &path);
+    let chain = vol.chain_of(first).unwrap();
+    assert!(chain.len() > 1);
+    assert!(!vol.metadata_projection_pending());
+
+    set_fat(&mut vol, first, crate::fat32::FAT32_EOC);
+    assert!(vol.metadata_projection_pending());
+    set_fat(&mut vol, first, chain[1]);
+    assert!(!vol.metadata_projection_pending());
+    vol.clear_chain_memo();
+    assert!(!vol.metadata_projection_pending());
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn projection_ownership_changes_are_detected_even_when_the_chain_is_unchanged() {
+    let root = scratch("projection_ownership_changes");
+    let path = root.join("FIRST.BIN");
+    fs::write(&path, b"first").unwrap();
+    fs::write(root.join("SECOND.BIN"), b"second").unwrap();
+    let mut vol = mount(&root);
+    let first = (ROOT_CLUSTER, *b"FIRST   BIN");
+    let second = (ROOT_CLUSTER, *b"SECOND  BIN");
+    let chain = vol.projected_files[&first].chain.clone();
+    assert!(!vol.chain_shifts_projection(first, &chain));
+
+    vol.install_projection(second, root.join("SECOND.BIN"), 5, chain.clone(), false);
+    assert!(vol.chain_shifts_projection(first, &chain));
+    vol.remove_projection(second);
+    assert!(!vol.chain_shifts_projection(first, &chain));
+
+    let duplicate = vec![chain[0], chain[0]];
+    vol.install_projection(first, path, 5, duplicate.clone(), false);
+    assert!(vol.chain_shifts_projection(first, &duplicate));
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn saving_in_an_existing_directory_does_not_attempt_to_recreate_the_tree() {
+    let root = scratch("save_existing_directories");
+    let saves = root.join("GAMES/SAVES");
+    fs::create_dir_all(&saves).unwrap();
+    for index in 0..8 {
+        fs::create_dir_all(root.join(format!("ARCH{index}/NESTED"))).unwrap();
+    }
+    let long_dir = root.join("Archive Long Name/NestedCase");
+    fs::create_dir_all(&long_dir).unwrap();
+    let save = saves.join("SAVE.DAT");
+    fs::write(&save, b"old save").unwrap();
+    let mut vol = mount(&root);
+    let first = first_cluster_of(&vol, &save);
+    let directory = *vol
+        .dir_paths
+        .iter()
+        .find(|(_, path)| *path == &saves)
+        .unwrap()
+        .0;
+
+    for payload in [b"save one", b"save two", b"save end"] {
+        vol.directory_validation_calls = 0;
+        rewrite_single_cluster_file(&mut vol, directory, "SAVE.DAT", first, payload);
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+        assert_eq!(fs::read(&save).unwrap(), payload);
+        assert_eq!(
+            vol.directory_create_calls, 0,
+            "a save must not attempt to recreate unchanged host directories"
+        );
+        assert_eq!(vol.directory_validation_calls, 1);
+    }
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_written_child_directory_is_validated_without_a_parent_write() {
+    let root = scratch("written_child_directory");
+    let sub = root.join("PARENT/SUB");
+    fs::create_dir_all(&sub).unwrap();
+    let mut vol = mount(&root);
+    let first = *vol
+        .dir_paths
+        .iter()
+        .find(|(_, path)| **path == sub)
+        .unwrap()
+        .0;
+    let lba = vol.cluster_to_lba(first);
+    let directory = vol.read_sector(lba);
+    fs::remove_dir(&sub).unwrap();
+    vol.write_sector(lba, &directory);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(sub.is_dir());
+    assert_eq!(vol.directory_create_calls, 1);
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_directory_rename_keeps_descendant_validation_on_later_saves() {
+    let root = scratch("renamed_directory_validation");
+    fs::create_dir_all(root.join("OLD/CHILD/DEEP")).unwrap();
+    let saves = root.join("SAVES");
+    fs::create_dir(&saves).unwrap();
+    let save = saves.join("SAVE.DAT");
+    fs::write(&save, b"old save").unwrap();
+    let mut vol = mount(&root);
+    let first = first_cluster_of(&vol, &save);
+    let directory = *vol
+        .dir_paths
+        .iter()
+        .find(|(_, path)| **path == saves)
+        .unwrap()
+        .0;
+    rewrite_single_cluster_file(&mut vol, directory, "SAVE.DAT", first, b"save one");
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(vol.directory_validation_calls, 1);
+
+    rename_entry(&mut vol, ROOT_CLUSTER, "OLD", "NEW");
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    vol.directory_validation_calls = 0;
+    rewrite_single_cluster_file(&mut vol, directory, "SAVE.DAT", first, b"save two");
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert_eq!(vol.directory_validation_calls, 4);
+    assert_eq!(fs::read(&save).unwrap(), b"save two");
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn directory_projection_still_recreates_a_missing_host_directory() {
+    let root = scratch("recreate_missing_directory");
+    let sub = root.join("SUB");
+    fs::create_dir(&sub).unwrap();
+    let mut vol = mount(&root);
+    let lba = vol.cluster_to_lba(ROOT_CLUSTER);
+    let directory = vol.read_sector(lba);
+    fs::remove_dir(&sub).unwrap();
+    vol.write_sector(lba, &directory);
+    vol.commit_guest_write_batch(GuestWriteRoute::Int13);
+    assert!(sub.is_dir());
+    assert_eq!(vol.directory_create_calls, 1);
+
+    fs::remove_dir(&sub).unwrap();
+    vol.flush_guest_writes();
+    assert!(sub.is_dir());
+    assert_eq!(vol.directory_create_calls, 2);
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn directory_projection_retries_a_file_collision_and_reaches_new_children() {
+    let (mut vol, root) = fresh_vol("directory_collision_retry");
+    let sub = make_subdir(&mut vol, ROOT_CLUSTER, "SUB");
+    let first = next_free_for_test(&vol);
+    stamp_file(&mut vol, sub, "SAVE.DAT", 0x20, first, b"new save");
+    let path = root.join("SUB");
+    fs::write(&path, b"blocking file").unwrap();
+    assert_eq!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::HostIoFailure
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"blocking file");
+    assert!(!vol.dir_paths.contains_key(&sub));
+
+    fs::remove_file(&path).unwrap();
+    let lba = vol.cluster_to_lba(ROOT_CLUSTER);
+    let directory = vol.read_sector(lba);
+    vol.write_sector(lba, &directory);
+    assert_eq!(
+        vol.commit_guest_write_batch(GuestWriteRoute::Int13),
+        CommitGuestWriteResult::Projected
+    );
+    assert!(path.is_dir());
+    assert_eq!(fs::read(path.join("SAVE.DAT")).unwrap(), b"new save");
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn reconcile_holds_an_incomplete_chain_and_skips_system_files() {
     let (mut vol, root) = fresh_vol("rec_hold");
     let free = vol.next_free;
@@ -2812,6 +3103,55 @@ fn mount(root: &std::path::Path) -> KateaTreeVolume {
     let mut vbr = [0u8; 512];
     vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
     KateaTreeVolume::new(&mbr, &vbr, root, &sys).unwrap()
+}
+
+#[test]
+fn host_folder_boot_records_select_fat_zero_without_changing_geometry() {
+    let root = scratch("active_fat_bpb");
+    let vol = mount(&root);
+    let primary = vol.read_sector(vol.geo.part_start);
+    let backup = vol.read_sector(vol.geo.part_start + u32::from(BACKUP_BOOT_SECTOR));
+    assert_eq!(primary, backup);
+    assert_eq!(&primary[0x28..0x2a], &0x0080u16.to_le_bytes());
+    assert_eq!(primary[0x10], 2);
+
+    let mut mirrored = primary;
+    stamp_fat32_bpb(
+        &mut mirrored,
+        vol.geo.spc,
+        vol.geo.fatsz,
+        vol.geo.part_start,
+        vol.geo.part_sectors,
+    );
+    assert_eq!(&mirrored[0x28..0x2a], &[0, 0]);
+    mirrored[0x28..0x2a].copy_from_slice(&0x0080u16.to_le_bytes());
+    assert_eq!(primary, mirrored);
+
+    let image = izarravm_firmware::tokados_hdd_img();
+    assert_eq!(&image[2048 * SECTOR + 0x28..2048 * SECTOR + 0x2a], &[0, 0]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn raw_writes_to_either_fat_remain_independently_readable() {
+    let root = scratch("active_fat_raw_writes");
+    let mut vol = mount(&root);
+    let fat_zero = vol.geo.part_start + u32::from(RESERVED_SECTORS);
+    let fat_one = fat_zero + vol.geo.fatsz;
+    let original = vol.read_sector(fat_zero);
+    assert_eq!(original, vol.read_sector(fat_one));
+    let mut first = original;
+    first[508..512].copy_from_slice(&crate::fat32::FAT32_EOC.to_le_bytes());
+    vol.write_sector(fat_zero, &first);
+    assert_eq!(vol.read_sector(fat_zero), first);
+    assert_eq!(vol.read_sector(fat_one), original);
+
+    let mut second = original;
+    second[504..508].copy_from_slice(&crate::fat32::FAT32_EOC.to_le_bytes());
+    vol.write_sector(fat_one, &second);
+    assert_eq!(vol.read_sector(fat_zero), first);
+    assert_eq!(vol.read_sector(fat_one), second);
+    fs::remove_dir_all(root).unwrap();
 }
 
 /// The guest cluster a mounted host file starts at, found by its host path.
