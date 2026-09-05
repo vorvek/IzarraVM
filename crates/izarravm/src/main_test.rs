@@ -526,6 +526,13 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     assert!(report["perf"]["jit_direct_insns"].as_u64().is_some());
     assert!(report["perf"]["jit_direct_side_exits"].as_u64().is_some());
     assert!(report["direct_barrier_census"].is_null());
+    #[cfg(feature = "timing-class-histogram")]
+    assert_eq!(
+        report["timing_class_histogram"]["schema_version"], 2,
+        "the feature emits schema 2"
+    );
+    #[cfg(not(feature = "timing-class-histogram"))]
+    assert!(report.get("timing_class_histogram").is_none());
     #[cfg(feature = "direct-link-refusal-census")]
     assert_eq!(
         report.get("direct_link_refusal_census"),
@@ -601,6 +608,96 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     }
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn timing_class_histogram_schema_two_keeps_populations_and_signed_residuals_distinct() {
+    let report = timing_class_histogram_json(
+        2,
+        izarravm_cpu::TimingClassHistogramSnapshot {
+            instruction_counter: 4,
+            interpreter_charge_counts: vec![("Jcc", 2)],
+            interpreter_unknown_class_events: 3,
+            interpreter_modeled_raw_clocks: 88,
+            system_event_counts: vec![("ExceptionDelivery", 1)],
+            system_event_modeled_raw_clocks: 59,
+            native_entries: 4,
+            native_instructions: 7,
+            native_known_class_counts: vec![("Reg", 2), ("X87RegDiv", 1)],
+            native_unresolved_instructions: izarravm_cpu::NativeUnresolvedCounts {
+                linked_entry: 1,
+                repeated_unlinked_entry: 1,
+                missing_vector: 0,
+                invalid_vector: 0,
+                callout_slot: 1,
+                unknown_slot: 1,
+            },
+            native_unresolved_entries: izarravm_cpu::NativeUnresolvedEntryCounts {
+                linked_entry: 1,
+                repeated_unlinked_entry: 1,
+                missing_vector: 1,
+                invalid_vector: 1,
+            },
+            native_observed_raw_core: 71,
+            native_observed_weighted_fp: 9,
+            native_partition_residual: 0,
+            instruction_minus_native: -3,
+        },
+    );
+
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["epoch"], 2);
+    assert_eq!(report["instruction_counter"], 4);
+    assert_eq!(report["coverage"]["instruction_minus_native"], -3);
+    assert_eq!(report["coverage"]["native_partition_residual"], 0);
+    assert_eq!(report["coverage"]["whole_row_gradeable"], false);
+    assert_eq!(report["interpreter_charge_events"]["counts"]["Jcc"], 2);
+    assert_eq!(
+        report["interpreter_charge_events"]["unknown_class_events"],
+        3
+    );
+    assert_eq!(
+        report["interpreter_charge_events"]["modeled_raw_clocks"],
+        88
+    );
+    assert_eq!(report["system_events"]["modeled_raw_clocks"], 59);
+    assert_eq!(report["native"]["observed_raw_core"], 71);
+    assert_eq!(report["native"]["observed_weighted_fp"], 9);
+    assert_eq!(
+        report["native"]["unresolved_instructions"]["callout_slot"],
+        1
+    );
+    assert_eq!(
+        report["native"]["unresolved_instructions"]["unknown_slot"],
+        1
+    );
+    let entries = report["native"]["unresolved_entries"]
+        .as_object()
+        .expect("whole-entry buckets are an object");
+    assert_eq!(entries.len(), 4);
+    for key in [
+        "linked_entry",
+        "repeated_unlinked_entry",
+        "missing_vector",
+        "invalid_vector",
+    ] {
+        assert!(entries.contains_key(key), "missing {key}");
+    }
+    assert!(!entries.contains_key("callout_slot"));
+    assert!(!entries.contains_key("unknown_slot"));
+    for old_key in [
+        "attributed_retires",
+        "unattributed_retires",
+        "class_clocks",
+        "counts",
+        "system_event_clocks",
+    ] {
+        assert!(
+            !report.as_object().unwrap().contains_key(old_key),
+            "removed {old_key}"
+        );
+    }
 }
 
 #[cfg(feature = "direct-admission-census")]

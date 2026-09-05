@@ -2157,6 +2157,66 @@ fn katea_counters_json(k: &izarravm_machine::KateaStorageCounters) -> serde_json
     })
 }
 
+#[cfg(feature = "timing-class-histogram")]
+fn timing_class_histogram_json(
+    epoch: u32,
+    histogram: izarravm_cpu::TimingClassHistogramSnapshot,
+) -> serde_json::Value {
+    let to_json_counts = |rows: Vec<(&'static str, u64)>| {
+        serde_json::Value::Object(
+            rows.into_iter()
+                .map(|(name, count)| (name.to_string(), json!(count)))
+                .collect(),
+        )
+    };
+    let unresolved = |counts: izarravm_cpu::NativeUnresolvedCounts| {
+        json!({
+            "linked_entry": counts.linked_entry,
+            "repeated_unlinked_entry": counts.repeated_unlinked_entry,
+            "missing_vector": counts.missing_vector,
+            "invalid_vector": counts.invalid_vector,
+            "callout_slot": counts.callout_slot,
+            "unknown_slot": counts.unknown_slot,
+        })
+    };
+    let unresolved_entries = |counts: izarravm_cpu::NativeUnresolvedEntryCounts| {
+        json!({
+            "linked_entry": counts.linked_entry,
+            "repeated_unlinked_entry": counts.repeated_unlinked_entry,
+            "missing_vector": counts.missing_vector,
+            "invalid_vector": counts.invalid_vector,
+        })
+    };
+    json!({
+        "schema_version": 2,
+        "epoch": epoch,
+        "instruction_counter": histogram.instruction_counter,
+        "interpreter_charge_events": {
+            "counts": to_json_counts(histogram.interpreter_charge_counts),
+            "unknown_class_events": histogram.interpreter_unknown_class_events,
+            "modeled_raw_clocks": histogram.interpreter_modeled_raw_clocks,
+        },
+        "system_events": {
+            "counts": to_json_counts(histogram.system_event_counts),
+            "modeled_raw_clocks": histogram.system_event_modeled_raw_clocks,
+        },
+        "native": {
+            "entries": histogram.native_entries,
+            "instructions": histogram.native_instructions,
+            "known_class_counts": to_json_counts(histogram.native_known_class_counts),
+            "unresolved_instructions": unresolved(histogram.native_unresolved_instructions),
+            "unresolved_entries": unresolved_entries(histogram.native_unresolved_entries),
+            "observed_raw_core": histogram.native_observed_raw_core,
+            "observed_weighted_fp": histogram.native_observed_weighted_fp,
+        },
+        "coverage": {
+            "native_partition_residual": histogram.native_partition_residual,
+            "instruction_minus_native": histogram.instruction_minus_native,
+            "whole_row_gradeable": false,
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_hdd_profile_json(
     path: &Path,
@@ -2325,45 +2385,14 @@ fn write_hdd_profile_json(
             None,
         ),
     });
-    // The per-class retire histogram (design section 9.1; review R5, which makes
-    // it the load-bearing falsifier now that Dhrystone is demoted). Sparse: only
-    // classes with a nonzero count appear, since 157 rows of mostly zeros is
-    // noise and the reader wants the shares.
-    //
-    // `class_clocks` is review R5(i)'s SERIAL, pre-pairing class term -- the sum
-    // of `count x table[class]` over the attributed population. It is not the
-    // whole guest bill (no bus, no x87 dial, no call-out runtime charges) and it
-    // is not comparable to `executed_cpu_core_clocks`; `attributed` and
-    // `unattributed` are printed beside it so a share can be read as a share of
-    // what was actually placed.
+    // Schema 2 keeps interpreter charge events apart from native instruction
+    // partitions. Neither population is a whole-row instruction census.
     #[cfg(feature = "timing-class-histogram")]
     {
-        let (class_clocks, attributed, unattributed) = machine.cpu().class_histogram_totals();
-        let system_event_clocks = machine.cpu().class_histogram_system_event_clocks();
-        let mut events = serde_json::Map::new();
-        for (name, count) in machine.cpu().class_histogram_system_event_rows() {
-            events.insert(name.to_string(), json!(count));
-        }
-        let mut rows = serde_json::Map::new();
-        for (name, count) in machine.cpu().class_histogram_rows() {
-            rows.insert(name.to_string(), json!(count));
-        }
-        report["timing_class_histogram"] = json!({
-            "epoch": machine.timing_epoch(),
-            "class_clocks": class_clocks,
-            "attributed_retires": attributed,
-            "unattributed_retires": unattributed,
-            "class_clocks_per_attributed_retire":
-                class_clocks as f64 / (attributed as f64).max(1.0),
-            "counts": serde_json::Value::Object(rows),
-            // Slice 8's system events, counted APART from retires: an exception
-            // delivery charges clocks without retiring an instruction and a task
-            // switch charges them from inside `control.rs`, so folding either
-            // into `counts` would stop `class_clocks / attributed_retires`
-            // meaning clocks per retired instruction.
-            "system_event_clocks": system_event_clocks,
-            "system_events": serde_json::Value::Object(events),
-        });
+        report["timing_class_histogram"] = timing_class_histogram_json(
+            machine.timing_epoch(),
+            machine.cpu().timing_class_histogram_snapshot(),
+        );
     }
     #[cfg(feature = "direct-link-refusal-census")]
     {

@@ -1475,32 +1475,11 @@ impl CpuGsw {
         }
     }
 
-    /// The per-class retire histogram, for the profile JSON.
+    /// The feature-gated timing-class diagnostic snapshot for profile JSON.
     #[cfg(feature = "timing-class-histogram")]
-    pub fn class_histogram_rows(&self) -> Vec<(&'static str, u64)> {
-        self.class_histogram.rows()
-    }
-
-    /// Slice 8's system events that fired, by class.
-    #[cfg(feature = "timing-class-histogram")]
-    pub fn class_histogram_system_event_rows(&self) -> Vec<(&'static str, u64)> {
-        self.class_histogram.system_event_rows()
-    }
-
-    /// The clocks those system events cost under the running table.
-    #[cfg(feature = "timing-class-histogram")]
-    pub fn class_histogram_system_event_clocks(&self) -> u64 {
-        self.class_histogram.system_event_clocks(self.class_table)
-    }
-
-    /// `(class clocks, attributed retires, unattributed retires)`.
-    #[cfg(feature = "timing-class-histogram")]
-    pub fn class_histogram_totals(&self) -> (u64, u64, u64) {
-        (
-            self.class_histogram.class_clocks(self.class_table),
-            self.class_histogram.attributed(),
-            self.class_histogram.unattributed(),
-        )
+    pub fn timing_class_histogram_snapshot(&self) -> crate::TimingClassHistogramSnapshot {
+        self.class_histogram
+            .snapshot(self.class_table, self.perf.instructions)
     }
 
     /// The active GSW compatibility mode.

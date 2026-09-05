@@ -924,57 +924,91 @@ const _: () = {
     assert!(max == crate::MAX_CALL_OUT_CORE_CLOCKS);
 };
 
-/// Per-class retire counts, plus the one honesty counter that keeps them
-/// readable (design section 9.1, and review R5, which makes this the load-bearing
-/// falsifier now that Dhrystone is demoted).
+/// Feature-gated charge and native-return diagnostics.
 ///
-/// # What it counts, and what it cannot
-///
-/// The interpreter increments exactly once per retire, in `CpuGsw::charge`. The
-/// JIT cannot: a compiled block's instructions retire inside emitted code that
-/// never calls `charge`, so a native ENTRY adds its block's compile-time class
-/// vector instead -- design section 9.1's "sparse list", walked once per entry
-/// rather than once per instruction.
-///
-/// That attribution is exact for an entry that runs one block, and for a
-/// self-loop, whose retires are that same vector repeated. It is NOT exact for a
-/// CHAINED entry: `NativeExit::instructions` counts the whole chain from its
-/// head, and only the head block's vector is in hand. Those instructions are
-/// counted in [`TimingHistogram::unattributed`] rather than spread over the head
-/// block's classes, so a share read off this table is a share of the
-/// ATTRIBUTED population and the reader can see how much is missing. Anything
-/// else would invent a distribution.
-///
-/// Slots whose charge arrives at run time -- x87 (through `weighted_fp_clocks`)
-/// and call-outs (through the helper's return value) -- carry no class and are
-/// absent from a block's vector, so they are unattributed too.
-/// The marker a block's class vector carries for a slot with no class -- an x87
-/// or call-out slot, whose charge arrives at run time. `N_CLASSES` is 157, so
-/// `u8::MAX` can never collide with a real index; a static assertion below says
-/// so rather than leaving it to arithmetic.
-pub(crate) const UNCLASSED_SLOT: u8 = u8::MAX;
+/// Interpreter calls are charge events, not an architectural retire census.
+/// Native entries are partitioned into known classes and explicit unresolved
+/// states only when the saved vector proves a single-block prefix.
+/// The diagnostic vector marker for an interpreter call-out slot. Its helper
+/// may record separate interpreter charge events, so the native partition does
+/// not assign it a timing class.
+pub(crate) const CALL_OUT_SLOT: u8 = u8::MAX;
+
+/// The diagnostic vector marker for a native slot with no timing class.
+pub(crate) const UNKNOWN_SLOT: u8 = u8::MAX - 1;
 
 const _: () = assert!(
-    N_CLASSES < UNCLASSED_SLOT as usize,
-    "a class index would collide with UNCLASSED_SLOT; the vector needs a wider element"
+    N_CLASSES < UNKNOWN_SLOT as usize,
+    "a class index would collide with a diagnostic vector marker; the vector needs a wider element"
 );
+
+#[derive(Clone, Copy, Default)]
+pub struct NativeUnresolvedCounts {
+    pub linked_entry: u64,
+    pub repeated_unlinked_entry: u64,
+    pub missing_vector: u64,
+    pub invalid_vector: u64,
+    pub callout_slot: u64,
+    pub unknown_slot: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct NativeUnresolvedEntryCounts {
+    pub linked_entry: u64,
+    pub repeated_unlinked_entry: u64,
+    pub missing_vector: u64,
+    pub invalid_vector: u64,
+}
+
+#[derive(Clone, Copy)]
+enum WholeUnresolved {
+    LinkedEntry,
+    RepeatedUnlinkedEntry,
+    MissingVector,
+    InvalidVector,
+}
+
+#[derive(Clone)]
+pub struct TimingClassHistogramSnapshot {
+    pub instruction_counter: u64,
+    pub interpreter_charge_counts: Vec<(&'static str, u64)>,
+    pub interpreter_unknown_class_events: u64,
+    pub interpreter_modeled_raw_clocks: u64,
+    pub system_event_counts: Vec<(&'static str, u64)>,
+    pub system_event_modeled_raw_clocks: u64,
+    pub native_entries: u64,
+    pub native_instructions: u64,
+    pub native_known_class_counts: Vec<(&'static str, u64)>,
+    pub native_unresolved_instructions: NativeUnresolvedCounts,
+    pub native_unresolved_entries: NativeUnresolvedEntryCounts,
+    pub native_observed_raw_core: u64,
+    pub native_observed_weighted_fp: u64,
+    pub native_partition_residual: i128,
+    pub instruction_minus_native: i128,
+}
 
 #[derive(Clone)]
 pub(crate) struct TimingHistogram {
-    counts: [u64; N_CLASSES],
+    interpreter_charge_counts: [u64; N_CLASSES],
+    interpreter_unknown_class_events: u64,
     /// Slice 8's system events, counted apart from retires. See
     /// `record_system_event`.
     system_events: Box<[u64; N_CLASSES]>,
-    unattributed: u64,
+    native_known_class_counts: [u64; N_CLASSES],
+    native_unresolved_instructions: NativeUnresolvedCounts,
+    native_unresolved_entries: NativeUnresolvedEntryCounts,
+    native_entries: u64,
+    native_instructions: u64,
+    native_observed_raw_core: u64,
+    native_observed_weighted_fp: u64,
 }
 
 /// ALWAYS EQUAL, on the `FarCallLedger` precedent (`lib.rs`), and for its exact
 /// reason: `CpuGsw` derives `PartialEq` and the differential tests compare whole
 /// CPUs, so a diagnostic counter that compared by value would make the native
 /// and interpreted legs of every sweep unequal on a field no guest instruction
-/// can observe. The two legs' histograms differ legitimately -- the interpreter
-/// attributes per retire and the JIT per block entry, and a chained entry lands
-/// in `unattributed` on one side only.
+/// can observe. The two legs' diagnostics differ legitimately because
+/// interpreter charge events and native-return partitions are separate samples.
 impl PartialEq for TimingHistogram {
     fn eq(&self, _other: &Self) -> bool {
         true
@@ -988,9 +1022,9 @@ impl std::fmt::Debug for TimingHistogram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "TimingHistogram {{ {} attributed, {} unattributed }}",
-            self.attributed(),
-            self.unattributed
+            "TimingHistogram {{ {} interpreter charge events, {} native instructions }}",
+            self.interpreter_charge_events(),
+            self.native_instructions
         )
     }
 }
@@ -998,60 +1032,109 @@ impl std::fmt::Debug for TimingHistogram {
 impl Default for TimingHistogram {
     fn default() -> Self {
         Self {
-            counts: [0; N_CLASSES],
+            interpreter_charge_counts: [0; N_CLASSES],
+            interpreter_unknown_class_events: 0,
             system_events: Box::new([0; N_CLASSES]),
-            unattributed: 0,
+            native_known_class_counts: [0; N_CLASSES],
+            native_unresolved_instructions: NativeUnresolvedCounts::default(),
+            native_unresolved_entries: NativeUnresolvedEntryCounts::default(),
+            native_entries: 0,
+            native_instructions: 0,
+            native_observed_raw_core: 0,
+            native_observed_weighted_fp: 0,
         }
     }
 }
 
 impl TimingHistogram {
-    /// One interpreter retire.
+    /// One interpreter charge event.
     #[inline]
     pub(crate) fn record(&mut self, class: TimingClass) {
         match class {
             // A `Legacy` site has no class row, so it cannot be attributed. It
             // is one site (ARPL) and it is counted honestly rather than folded
             // into a neighbour.
-            TimingClass::Legacy(_) => self.unattributed += 1,
-            other => self.counts[other.index()] += 1,
+            TimingClass::Legacy(_) => self.interpreter_unknown_class_events += 1,
+            other => self.interpreter_charge_counts[other.index()] += 1,
         }
     }
 
-    /// One compiled-block entry: `passes` complete traversals of `vector` plus a
-    /// `remainder`-long prefix of it, which is exactly how a block's slots
-    /// retire on a completed run, a self-loop and a mid-block side exit alike.
-    ///
-    /// `vector` carries ONE ENTRY PER SLOT, with [`UNCLASSED_SLOT`] for the x87
-    /// and call-out slots whose charge arrives at run time. Those retires go to
-    /// `unattributed`: they did happen, and they have no class to hold them.
-    pub(crate) fn record_block(&mut self, vector: &[u8], passes: u64, remainder: usize) {
-        for (position, index) in vector.iter().enumerate() {
-            let times = passes + u64::from(position < remainder);
-            if times == 0 {
-                continue;
-            }
-            if *index == UNCLASSED_SLOT {
-                self.unattributed += times;
-            } else {
-                self.counts[usize::from(*index)] += times;
+    pub(crate) fn record_native_entry(
+        &mut self,
+        instructions: u64,
+        raw_core: u64,
+        weighted_fp: u64,
+        linked_transfers: u32,
+        span_instructions: usize,
+        vector: Option<&[u8]>,
+    ) {
+        self.native_entries += 1;
+        self.native_instructions += instructions;
+        self.native_observed_raw_core += raw_core;
+        self.native_observed_weighted_fp += weighted_fp;
+
+        if linked_transfers != 0 {
+            self.record_whole_unresolved(instructions, WholeUnresolved::LinkedEntry);
+            self.assert_native_partition();
+            return;
+        }
+        let Some(vector) = vector else {
+            self.record_whole_unresolved(instructions, WholeUnresolved::MissingVector);
+            self.assert_native_partition();
+            return;
+        };
+        if vector.is_empty()
+            || vector.len() != span_instructions
+            || vector.iter().any(|index| {
+                usize::from(*index) >= N_CLASSES
+                    && *index != CALL_OUT_SLOT
+                    && *index != UNKNOWN_SLOT
+            })
+        {
+            self.record_whole_unresolved(instructions, WholeUnresolved::InvalidVector);
+            self.assert_native_partition();
+            return;
+        }
+        if instructions > vector.len() as u64 {
+            self.record_whole_unresolved(instructions, WholeUnresolved::RepeatedUnlinkedEntry);
+            self.assert_native_partition();
+            return;
+        }
+        for &index in vector.iter().take(instructions as usize) {
+            match index {
+                CALL_OUT_SLOT => self.native_unresolved_instructions.callout_slot += 1,
+                UNKNOWN_SLOT => self.native_unresolved_instructions.unknown_slot += 1,
+                class => self.native_known_class_counts[usize::from(class)] += 1,
             }
         }
+        self.assert_native_partition();
     }
 
-    /// Instructions this histogram knows retired but cannot place in a class.
-    pub(crate) fn record_unattributed(&mut self, instructions: u64) {
-        self.unattributed += instructions;
+    fn record_whole_unresolved(&mut self, instructions: u64, bucket: WholeUnresolved) {
+        match bucket {
+            WholeUnresolved::LinkedEntry => {
+                self.native_unresolved_instructions.linked_entry += instructions;
+                self.native_unresolved_entries.linked_entry += 1;
+            }
+            WholeUnresolved::RepeatedUnlinkedEntry => {
+                self.native_unresolved_instructions.repeated_unlinked_entry += instructions;
+                self.native_unresolved_entries.repeated_unlinked_entry += 1;
+            }
+            WholeUnresolved::MissingVector => {
+                self.native_unresolved_instructions.missing_vector += instructions;
+                self.native_unresolved_entries.missing_vector += 1;
+            }
+            WholeUnresolved::InvalidVector => {
+                self.native_unresolved_instructions.invalid_vector += instructions;
+                self.native_unresolved_entries.invalid_vector += 1;
+            }
+        }
     }
 
     /// One SYSTEM EVENT: a delivery, a task switch, a mode-keyed far transfer.
     ///
-    /// Kept apart from the retire counts on purpose. A system event is not a
-    /// retire -- an exception delivery charges clocks without retiring an
-    /// instruction, and a task switch charges them from inside `control.rs` --
-    /// so folding either into `counts` would make `class_clocks / attributed`
-    /// stop meaning clocks per retired instruction. Slice 8 is the slice that
-    /// makes these numbers move, and this is how their contribution is read.
+    /// Kept apart from interpreter charge events and native instruction
+    /// partitions. A system event charges clocks without being either one.
     pub(crate) fn record_system_event(&mut self, class: TimingClass) {
         if let TimingClass::Legacy(_) = class {
             return;
@@ -1076,31 +1159,83 @@ impl TimingHistogram {
             .sum()
     }
 
-    /// `(class name, count)` for every class with a nonzero count, plus the
-    /// unattributed total. Sparse on purpose: 157 rows of mostly zeros in a
-    /// profile JSON is noise, and the reader needs the shares.
+    /// `(class name, count)` for every nonzero interpreter charge-event class.
     pub(crate) fn rows(&self) -> Vec<(&'static str, u64)> {
         TimingClass::ALL
             .iter()
-            .filter(|class| self.counts[class.index()] != 0)
-            .map(|class| (class.name(), self.counts[class.index()]))
+            .filter(|class| self.interpreter_charge_counts[class.index()] != 0)
+            .map(|class| (class.name(), self.interpreter_charge_counts[class.index()]))
             .collect()
     }
 
-    /// The class clocks these retires cost under `table` -- the numerator of
-    /// review R5(i)'s serial, pre-pairing class term.
+    /// The modeled raw clocks for interpreter charge events under `table`.
     pub(crate) fn class_clocks(&self, table: &ClassTable) -> u64 {
         TimingClass::ALL
             .iter()
-            .map(|class| u64::from(table.raw(*class)) * self.counts[class.index()])
+            .map(|class| {
+                u64::from(table.raw(*class)) * self.interpreter_charge_counts[class.index()]
+            })
             .sum()
     }
 
-    pub(crate) fn attributed(&self) -> u64 {
-        self.counts.iter().sum()
+    fn interpreter_charge_events(&self) -> u64 {
+        self.interpreter_charge_counts.iter().sum::<u64>() + self.interpreter_unknown_class_events
     }
 
-    pub(crate) fn unattributed(&self) -> u64 {
-        self.unattributed
+    fn native_partition_residual(&self) -> i128 {
+        let known = self
+            .native_known_class_counts
+            .iter()
+            .map(|&count| count as i128)
+            .sum::<i128>();
+        let unresolved = [
+            self.native_unresolved_instructions.linked_entry,
+            self.native_unresolved_instructions.repeated_unlinked_entry,
+            self.native_unresolved_instructions.missing_vector,
+            self.native_unresolved_instructions.invalid_vector,
+            self.native_unresolved_instructions.callout_slot,
+            self.native_unresolved_instructions.unknown_slot,
+        ]
+        .into_iter()
+        .map(i128::from)
+        .sum::<i128>();
+        self.native_instructions as i128 - known - unresolved
+    }
+
+    fn assert_native_partition(&self) {
+        debug_assert_eq!(
+            self.native_partition_residual(),
+            0,
+            "native timing-class partition must account for every native instruction"
+        );
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        table: &ClassTable,
+        instruction_counter: u64,
+    ) -> TimingClassHistogramSnapshot {
+        TimingClassHistogramSnapshot {
+            instruction_counter,
+            interpreter_charge_counts: self.rows(),
+            interpreter_unknown_class_events: self.interpreter_unknown_class_events,
+            interpreter_modeled_raw_clocks: self.class_clocks(table),
+            system_event_counts: self.system_event_rows(),
+            system_event_modeled_raw_clocks: self.system_event_clocks(table),
+            native_entries: self.native_entries,
+            native_instructions: self.native_instructions,
+            native_known_class_counts: TimingClass::ALL
+                .iter()
+                .filter(|class| self.native_known_class_counts[class.index()] != 0)
+                .map(|class| (class.name(), self.native_known_class_counts[class.index()]))
+                .collect(),
+            native_unresolved_instructions: self.native_unresolved_instructions,
+            native_unresolved_entries: self.native_unresolved_entries,
+            native_observed_raw_core: self.native_observed_raw_core,
+            native_observed_weighted_fp: self.native_observed_weighted_fp,
+            native_partition_residual: self.native_partition_residual(),
+            instruction_minus_native: instruction_counter as i128
+                - self.native_instructions as i128,
+        }
     }
 }

@@ -357,6 +357,33 @@ fn epoch_two_native_real_divide_forms_retire_without_a_fallback() {
     }
 }
 
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn native_x87_classes_cover_actual_add_and_divide_retires() {
+    let cases = [
+        ("m32 add", fadd_or_fdiv_m32_program(0), "X87MemArith32"),
+        ("m32 divide", fadd_or_fdiv_m32_program(6), "X87MemDiv32"),
+        ("register divide", fdiv_register_program(6), "X87RegDiv"),
+    ];
+    for (label, memory, expected_class) in cases {
+        let (cpu, _) = assert_program_matches_at_epoch_exact_insns(
+            GswMode::Gsw586,
+            2,
+            memory,
+            0x037f,
+            if label == "register divide" { 4 } else { 3 },
+        );
+        let snapshot = cpu.timing_class_histogram_snapshot();
+        let known: std::collections::HashMap<_, _> =
+            snapshot.native_known_class_counts.into_iter().collect();
+        assert!(
+            known.get(expected_class).copied().unwrap_or(0) >= 1,
+            "{label} must retire natively into its diagnostic x87 class"
+        );
+        assert_eq!(snapshot.native_partition_residual, 0, "{label}");
+    }
+}
+
 #[test]
 fn completed_real_divide_prefix_is_charged_once_before_a_memory_read_fault() {
     let mut memory = vec![0; 0x1000];
@@ -414,6 +441,8 @@ fn completed_real_divide_prefix_is_charged_once_before_a_memory_read_fault() {
     let before = direct.perf_counters().jit_direct_insns;
     let side_exits = direct.perf_counters().jit_direct_side_exits;
     let limit_exits = direct.direct_stall_snapshot().side_exit_segment_limit;
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = direct.timing_class_histogram_snapshot();
     assert!(
         direct
             .try_run_direct_block_for_test(&mut direct_bus, block)
@@ -431,6 +460,39 @@ fn completed_real_divide_prefix_is_charged_once_before_a_memory_read_fault() {
         direct.direct_stall_snapshot().side_exit_segment_limit - limit_exits,
         1
     );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = direct.timing_class_histogram_snapshot();
+        let before_rows: std::collections::HashMap<_, _> = histogram_before
+            .native_known_class_counts
+            .into_iter()
+            .collect();
+        let after_rows: std::collections::HashMap<_, _> = histogram_after
+            .native_known_class_counts
+            .into_iter()
+            .collect();
+        assert_eq!(
+            histogram_after.native_instructions - histogram_before.native_instructions,
+            3
+        );
+        assert_eq!(
+            after_rows.get("X87LoadReal32").copied().unwrap_or(0)
+                - before_rows.get("X87LoadReal32").copied().unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            after_rows.get("X87RegDiv").copied().unwrap_or(0)
+                - before_rows.get("X87RegDiv").copied().unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            after_rows.get("X87MemDiv32").copied().unwrap_or(0)
+                - before_rows.get("X87MemDiv32").copied().unwrap_or(0),
+            0,
+            "the faulting memory divide must not enter the successful native prefix"
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+    }
 
     for _ in 0..3 {
         interpreter.cycle(&mut interpreter_bus).unwrap();

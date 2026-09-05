@@ -68,6 +68,10 @@ mod smc_trace;
 mod strings;
 mod timing_class;
 pub use fpu::X87;
+#[cfg(feature = "timing-class-histogram")]
+pub use timing_class::{
+    NativeUnresolvedCounts, NativeUnresolvedEntryCounts, TimingClassHistogramSnapshot,
+};
 
 /// Whether this build contains the native x64 execution backend.
 ///
@@ -2878,7 +2882,7 @@ pub struct CpuGsw {
     // position is load-bearing only through `offset_of!`, which computes it.
     #[cfg(feature = "jit")]
     pub(crate) native_callout: jit::direct::CallOutTable,
-    /// Per-class retire counts (design section 9.1). Boxed because it is
+    /// Feature-gated charge and native-return diagnostics. Boxed because it is
     /// `N_CLASSES` `u64`s and `CpuGsw` is already large; feature-gated because
     /// the campaign's own rule forbids a default-off instrument that taxes the
     /// hot path, so there is no env knob and a plain build has no field.
