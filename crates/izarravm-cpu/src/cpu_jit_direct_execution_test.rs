@@ -619,11 +619,11 @@ fn direct_self_loop_reports_a_later_iteration_memory_side_exit() {
     assert_eq!(
         native_outcomes
             .iter()
-            .map(|(clocks, _, _)| u64::from(*clocks))
+            .map(|(clocks, _, _)| *clocks)
             .sum::<u64>(),
         interp_outcomes
             .iter()
-            .map(|(clocks, _, _)| u64::from(*clocks))
+            .map(|(clocks, _, _)| *clocks)
             .sum::<u64>()
     );
     assert!(native_outcomes.last().is_some_and(|outcome| outcome.2));

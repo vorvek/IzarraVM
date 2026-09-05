@@ -3144,7 +3144,7 @@ pub struct CpuGsw {
     ///
     /// `commit_reflected_call_core` puts the charge into `elapsed_clocks`, which is the
     /// CPU's own clock. It is NOT the clock the machine advances its devices by: the batch
-    /// loop sums `CycleOutcome::core_clocks` from each `run_budgeted` call into
+    /// loop sums `CpuCycleOutcome::core_clocks` from each `run_budgeted` call into
     /// `batch_core`, and `advance_cpu_work` derives the PIT stream from THAT plus the
     /// scaled bus total. A charge that lands only in `elapsed_clocks` is therefore invisible
     /// to every device -- the guest gets the instructions for free and runs further inside
@@ -3354,14 +3354,22 @@ impl std::fmt::Debug for UnitSimSlot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleOutcome {
+    /// Raw executor clocks, before the CPU timing scaler.
     pub core_clocks: u32,
+    pub halted: bool,
+}
+
+/// Result of a CPU execution path after timing scaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuCycleOutcome {
+    pub core_clocks: u64,
     pub halted: bool,
 }
 
 /// Result of an event-capped CPU run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetedRunOutcome {
-    pub consumed_core_clocks: u32,
+    pub consumed_core_clocks: u64,
     pub halted: bool,
 }
 

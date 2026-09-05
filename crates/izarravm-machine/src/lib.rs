@@ -29,7 +29,7 @@ use izarravm_core::{
 pub const REFLECTED_CALL_MEMO_SEAMS_WIRED: bool = cfg!(feature = "reflected-call-memo");
 
 pub use izarravm_cpu::PerfCounters;
-use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
+use izarravm_cpu::{CpuCycleOutcome, CpuError, CpuGsw, SegmentIndex, SegmentRegister, bus_timing};
 #[cfg(test)]
 use izarravm_video::HGC_FB_SIZE;
 use izarravm_video::{

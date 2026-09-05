@@ -43,7 +43,7 @@ pub(super) fn arm(cpu: &mut CpuGsw, control: u16) {
     cpu.interrupt_shadow = false;
 }
 
-pub(super) fn run_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u32, u32, bool)> {
+pub(super) fn run_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus) -> Vec<(u64, u32, bool)> {
     let mut outcomes = Vec::new();
     for _ in 0..32 {
         let outcome = cpu.run_straight_line(bus, u64::MAX).unwrap();

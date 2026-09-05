@@ -37,6 +37,21 @@ fn exact_cap_test<B: CpuBus>(bus: &mut B, bus_at_entry: u64, cap: u64, total: u6
     }
 }
 
+#[inline]
+pub(crate) fn budgeted_run_outcome(total: u64, halted: bool) -> BudgetedRunOutcome {
+    BudgetedRunOutcome {
+        consumed_core_clocks: total,
+        halted,
+    }
+}
+
+#[inline]
+pub(crate) fn checked_run_core_total(total: u64, added: u64) -> u64 {
+    total
+        .checked_add(added)
+        .expect("CPU run total exceeded u64")
+}
+
 /// Whether an opcode is a port-I/O instruction (IN / OUT / INS / OUTS), for the unit simulator's
 /// `touches_io` fact. IN (0xE4/0xE5 imm, 0xEC/0xED DX) and the string forms INS (0x6C/0x6D) / OUTS
 /// (0x6E/0x6F) plus OUT (0xE6/0xE7 imm, 0xEE/0xEF DX). OUT/INS/OUTS are also non-continuable, so the
@@ -83,8 +98,8 @@ fn io_hist_requested() -> bool {
 
 #[cfg(feature = "jit")]
 enum DirectContinuation {
-    Run(CycleOutcome),
-    Prefix(CycleOutcome),
+    Run(CpuCycleOutcome),
+    Prefix(CpuCycleOutcome),
     Interpret,
 }
 
@@ -95,7 +110,7 @@ enum DirectContinuation {
 #[cfg(feature = "jit")]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(crate) enum ContinuationDispatch {
-    Native(CycleOutcome),
+    Native(CpuCycleOutcome),
     Declined,
     Skipped,
 }
@@ -103,8 +118,8 @@ pub(crate) enum ContinuationDispatch {
 #[cfg(feature = "jit")]
 enum DirectBlockOutcome {
     NotRun,
-    Complete(CycleOutcome),
-    Prefix(CycleOutcome),
+    Complete(CpuCycleOutcome),
+    Prefix(CpuCycleOutcome),
 }
 
 #[cfg(feature = "jit")]
@@ -216,7 +231,7 @@ impl CallOutBudgetTerms {
 }
 
 impl CpuGsw {
-    pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CycleOutcome, CpuError> {
+    pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CpuCycleOutcome, CpuError> {
         // `cycle` is the per-instruction prologue (halt-wake + hardware interrupt
         // service) followed by one instruction. The two halves are split so the
         // machine batch loop can run the prologue once per batch and then run a
@@ -243,7 +258,7 @@ impl CpuGsw {
     pub fn service_pending_interrupt<B: CpuBus>(
         &mut self,
         bus: &mut B,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
+    ) -> Result<Option<CpuCycleOutcome>, CpuError> {
         // Wake from HLT only when a maskable interrupt can actually be taken. The 386
         // exits HLT on an enabled interrupt; a masked or IF-disabled request leaves it
         // halted. NMI and the other non-maskable wake sources are out of scope.
@@ -251,7 +266,7 @@ impl CpuGsw {
             if self.flag(FLAG_IF) && bus.interrupt_pending() {
                 self.halted = false;
             } else {
-                return Ok(Some(CycleOutcome {
+                return Ok(Some(CpuCycleOutcome {
                     core_clocks: 1,
                     halted: true,
                 }));
@@ -307,8 +322,8 @@ impl CpuGsw {
             if self.retire_gates.reflected_call_diag_armed {
                 crate::reflected_call_diag::on_clock_charge();
             }
-            return Ok(Some(CycleOutcome {
-                core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+            return Ok(Some(CpuCycleOutcome {
+                core_clocks: charged,
                 halted: false,
             }));
         }
@@ -325,7 +340,7 @@ impl CpuGsw {
     pub fn cycle_no_interrupt_check<B: CpuBus>(
         &mut self,
         bus: &mut B,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<CpuCycleOutcome, CpuError> {
         self.cycle_no_interrupt_check_with_budget(bus, None)
     }
 
@@ -333,7 +348,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<CpuCycleOutcome, CpuError> {
         self.interrupt_shadow = false;
         // This is always either a standalone single-step (no prior instructions in
         // "this run") or run_straight_line's FIRST instruction (total == 0 at that
@@ -420,7 +435,7 @@ impl CpuGsw {
         start_eip: u32,
         cs: SegmentRegister,
         outcome: CycleOutcome,
-    ) -> CycleOutcome {
+    ) -> CpuCycleOutcome {
         debug_assert!(insn.prefixes.rep.is_some());
         debug_assert!(!outcome.halted);
         let post_eip = self.registers.eip;
@@ -445,8 +460,8 @@ impl CpuGsw {
         });
         self.rep_resume_active = true;
         self.rep_execution.yielded = false;
-        CycleOutcome {
-            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+        CpuCycleOutcome {
+            core_clocks: charged,
             halted: false,
         }
     }
@@ -455,7 +470,7 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<CpuCycleOutcome, CpuError> {
         let resume = self
             .rep_execution
             .resume
@@ -480,7 +495,7 @@ impl CpuGsw {
             debug_assert!(!outcome.halted);
             self.registers.eip = resume.start_eip;
             self.rep_execution.yielded = false;
-            return Ok(CycleOutcome {
+            return Ok(CpuCycleOutcome {
                 core_clocks: 0,
                 halted: false,
             });
@@ -620,7 +635,7 @@ impl CpuGsw {
         precharged_core: u64,
         profile_key: Option<(DecodeGroup, u16, CpuProfileOperandForm)>,
         profile_start: Option<std::time::Instant>,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<CpuCycleOutcome, CpuError> {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
@@ -743,8 +758,8 @@ impl CpuGsw {
         if self.retire_gates.diff_trace {
             self.emit_diff_trace_line(start_cs, start_eip);
         }
-        Ok(CycleOutcome {
-            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+        Ok(CpuCycleOutcome {
+            core_clocks: charged,
             halted: outcome.halted,
         })
     }
@@ -1054,7 +1069,7 @@ impl CpuGsw {
                     }
                 };
                 #[cfg(not(feature = "jit"))]
-                let direct_outcome: Option<CycleOutcome> = None;
+                let direct_outcome: Option<CpuCycleOutcome> = None;
                 match direct_outcome {
                     Some(outcome) => outcome,
                     None => {
@@ -1124,13 +1139,13 @@ impl CpuGsw {
             if self.jit_direct.take_interrupt_shadow_consumed() {
                 can_take_before = false;
             }
-            total += u64::from(outcome.core_clocks);
+            total = checked_run_core_total(total, outcome.core_clocks);
             // An answered reflected call charged `elapsed_clocks` from inside this
             // instruction; the BATCH's core total has to see it too, or the devices never
             // do. See `CpuGsw::reflected_call_pending_core`.
             #[cfg(feature = "reflected-call-memo")]
             {
-                total += self.take_reflected_call_pending_core();
+                total = checked_run_core_total(total, self.take_reflected_call_pending_core());
             }
             // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
             // machine can service an event or interrupt before any further iteration.
@@ -1148,10 +1163,7 @@ impl CpuGsw {
                 // ends in HLT does not lose its seam counts.
                 self.perf.decode_probes += seam_probes;
                 self.perf.jit_direct_dispatch_declines += seam_declines;
-                return Ok(BudgetedRunOutcome {
-                    consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
-                    halted: true,
-                });
+                return Ok(budgeted_run_outcome(total, true));
             }
             // A port access touched time-dependent device state, or an HLE software interrupt is
             // pending (e.g. an INT n, or an x87 #MF routed to vector 0x10). End the run so the machine
@@ -1249,10 +1261,7 @@ impl CpuGsw {
         // and no gate run produces one.
         self.perf.decode_probes += seam_probes;
         self.perf.jit_direct_dispatch_declines += seam_declines;
-        Ok(BudgetedRunOutcome {
-            consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
-            halted: false,
-        })
+        Ok(budgeted_run_outcome(total, false))
     }
 
     /// Compatibility wrapper for callers that still consume a single-cycle outcome.
@@ -1260,9 +1269,9 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         cap: u64,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<CpuCycleOutcome, CpuError> {
         let outcome = self.run_budgeted(bus, cap)?;
-        Ok(CycleOutcome {
+        Ok(CpuCycleOutcome {
             core_clocks: outcome.consumed_core_clocks,
             halted: outcome.halted,
         })
@@ -4023,8 +4032,8 @@ impl CpuGsw {
         if self.is_ring0_protected() {
             self.perf.monitor_resident_core_clocks += charged;
         }
-        let outcome = CycleOutcome {
-            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+        let outcome = CpuCycleOutcome {
+            core_clocks: charged,
             halted: false,
         };
         // The governor demoted a slot in a block this entry ran. Retiring that block's key makes
@@ -4210,7 +4219,7 @@ impl CpuGsw {
         bus: &mut B,
         view: &DecodeLineView,
         lin: u32,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<CpuCycleOutcome, CpuError> {
         let insn = &view.insn;
         self.interrupt_shadow = false;
         self.begin_instruction();
@@ -4256,8 +4265,8 @@ impl CpuGsw {
                     if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
-                    Ok(CycleOutcome {
-                        core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+                    Ok(CpuCycleOutcome {
+                        core_clocks: charged,
                         halted: outcome.halted,
                     })
                 }
@@ -4306,7 +4315,7 @@ impl CpuGsw {
         view: &DecodeLineView,
         lin: u32,
         rep_budget: RepBudget,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<CpuCycleOutcome, CpuError> {
         let insn = &view.insn;
         debug_assert!(insn.prefixes.rep.is_some());
         self.interrupt_shadow = false;
@@ -4355,8 +4364,8 @@ impl CpuGsw {
                     if self.retire_gates.diff_trace {
                         self.emit_diff_trace_line(start_cs, start_eip);
                     }
-                    Ok(CycleOutcome {
-                        core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+                    Ok(CpuCycleOutcome {
+                        core_clocks: charged,
                         halted: outcome.halted,
                     })
                 }

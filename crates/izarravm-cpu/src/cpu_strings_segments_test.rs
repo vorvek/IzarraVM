@@ -109,7 +109,7 @@ fn budgeted_rep_movsb_yields_at_restart_eip_and_matches_atomic_timing() {
     let before_bus = budgeted_bus.trace.elapsed_clocks();
     let first = budgeted.run_budgeted(&mut budgeted_bus, 31).unwrap();
     assert!(
-        u64::from(first.consumed_core_clocks)
+        first.consumed_core_clocks
             + budgeted_bus
                 .trace
                 .elapsed_clocks()
@@ -131,7 +131,7 @@ fn budgeted_rep_movsb_yields_at_restart_eip_and_matches_atomic_timing() {
         let before_bus = budgeted_bus.trace.elapsed_clocks();
         let outcome = budgeted.run_budgeted(&mut budgeted_bus, 31).unwrap();
         assert!(
-            u64::from(outcome.consumed_core_clocks)
+            outcome.consumed_core_clocks
                 + budgeted_bus
                     .trace
                     .elapsed_clocks()
@@ -379,8 +379,8 @@ fn budgeted_paged_rep_reserves_the_next_four_mib_page_walk() {
 
     let before_bus = bus.trace.elapsed_clocks();
     let outcome = cpu.run_budgeted(&mut bus, 100).unwrap();
-    let charged = u64::from(outcome.consumed_core_clocks)
-        + bus.trace.elapsed_clocks().saturating_sub(before_bus);
+    let charged =
+        outcome.consumed_core_clocks + bus.trace.elapsed_clocks().saturating_sub(before_bus);
 
     assert!(charged <= 100, "charged {charged} clocks");
     assert_eq!(cpu.registers.eip, BUDGETED_PAGED_REP_ORIGIN);
