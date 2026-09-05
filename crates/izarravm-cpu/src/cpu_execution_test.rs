@@ -50,14 +50,14 @@ fn out_and_outs_forward_the_live_run_offset_without_a_side_commit() {
     let mut out_bus = TestBus::with_memory(out_memory);
     let out = out_cpu.decode(&mut out_bus).unwrap();
     out_cpu.core_clocks_so_far = 123;
-    let mut out_committed = CommittedCore::default();
+    let mut out_committed = InstructionWork::default();
     out_cpu
         .execute_decoded(&out, &mut out_bus, &mut out_committed)
         .unwrap();
     assert_eq!(out_bus.last_write_io_core_clocks_so_far, Some(123));
     assert_eq!(out_bus.io_writes, vec![(0x300, 0, 123)]);
     assert_eq!(
-        out_committed.total(),
+        out_committed.committed.total(),
         0,
         "ordinary OUT has no E side commit"
     );
@@ -69,14 +69,14 @@ fn out_and_outs_forward_the_live_run_offset_without_a_side_commit() {
     let mut outs_bus = TestBus::with_memory(outs_memory);
     let outs = outs_cpu.decode(&mut outs_bus).unwrap();
     outs_cpu.core_clocks_so_far = 456;
-    let mut outs_committed = CommittedCore::default();
+    let mut outs_committed = InstructionWork::default();
     outs_cpu
         .execute_decoded(&outs, &mut outs_bus, &mut outs_committed)
         .unwrap();
     assert_eq!(outs_bus.last_write_io_core_clocks_so_far, Some(456));
     assert_eq!(outs_bus.io_writes, vec![(0x300, 0x5a, 456)]);
     assert_eq!(
-        outs_committed.total(),
+        outs_committed.committed.total(),
         0,
         "a singleton OUTS forwards its bus timestamp without a side commit"
     );

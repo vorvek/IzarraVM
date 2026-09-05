@@ -434,10 +434,6 @@ impl CommittedCore {
             .checked_add(self.0)
             .expect("projected core clocks exceeded u64")
     }
-
-    fn absorb(&mut self, other: Self) {
-        self.add(other.0);
-    }
 }
 
 /// Raw instruction execution paired with scaled work committed by producers
@@ -445,16 +441,140 @@ impl CommittedCore {
 #[derive(Debug)]
 struct InstructionExecution {
     result: ExecResult<CycleOutcome>,
-    committed: CommittedCore,
+    work: InstructionWork,
 }
 
 impl InstructionExecution {
     fn new(result: ExecResult<CycleOutcome>) -> Self {
         Self {
             result,
-            committed: CommittedCore::default(),
+            work: InstructionWork::default(),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct InstructionWork {
+    committed: CommittedCore,
+    rep: Option<RepInvocation>,
+}
+
+impl InstructionWork {
+    fn sourced_rep(&self) -> bool {
+        self.rep
+            .as_ref()
+            .is_some_and(|invoice| invoice.plan.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepPriceHistory {
+    initial_count: u32,
+    startup_paid: bool,
+}
+
+#[derive(Debug)]
+struct RepInvocation {
+    history: RepPriceHistory,
+    completed: u32,
+    raw_due: u64,
+    plan: Option<RepChargePlan>,
+}
+
+impl RepInvocation {
+    fn new(history: RepPriceHistory) -> Self {
+        Self {
+            history,
+            completed: 0,
+            raw_due: 0,
+            plan: None,
+        }
+    }
+
+    fn complete(&mut self, count: u32) {
+        self.completed = self
+            .completed
+            .checked_add(count)
+            .expect("REP count exceeded u32");
+        if let Some(plan) = self.plan {
+            assert!(
+                self.completed <= plan.entry_count,
+                "REP exceeded its entry count"
+            );
+            self.raw_due = self
+                .raw_due
+                .checked_add(
+                    plan.element_raw
+                        .checked_mul(u64::from(count))
+                        .expect("REP product exceeded u64"),
+                )
+                .expect("REP invoice exceeded u64");
+            assert!(
+                self.raw_due <= plan.max_raw,
+                "REP exceeded its entry price bound"
+            );
+        }
+    }
+
+    fn legacy_raw(&self) -> u32 {
+        u32::try_from(self.raw_due).expect("legacy REP raw charge exceeded u32")
+    }
+
+    fn legacy_payment(&mut self, raw: u32) {
+        if !self.history.startup_paid {
+            self.raw_due = u64::from(raw);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RepChargePlan {
+    element_raw: u64,
+    entry_count: u32,
+    max_raw: u64,
+}
+
+impl RepChargePlan {
+    fn new(
+        persona: CpuPersona,
+        op: StringOp,
+        history: RepPriceHistory,
+        remaining: u32,
+    ) -> (Self, u64) {
+        // Intel486 DX2 table 10.1; Pentium 241430-004 pp. 25-267/268.
+        let (startup, element_raw): (u64, u64) = match (persona, op, history.initial_count) {
+            (CpuPersona::I486, StringOp::Movs | StringOp::Stos, 0) => (60, 0),
+            (CpuPersona::I586, StringOp::Movs | StringOp::Stos, 0) => (72, 0),
+            (CpuPersona::I486 | CpuPersona::I586, StringOp::Movs, 1) => (156, 0),
+            (CpuPersona::I486, StringOp::Movs, _) => (144, 36),
+            (CpuPersona::I486, StringOp::Stos, _) => (84, 48),
+            (CpuPersona::I586, StringOp::Movs, _) => (156, 12),
+            (CpuPersona::I586, StringOp::Stos, _) => (108, 12),
+            _ => unreachable!("unselected REP pricing"),
+        };
+        let startup: u64 = if history.startup_paid { 0 } else { startup };
+        let max_raw = startup
+            .checked_add(
+                element_raw
+                    .checked_mul(u64::from(remaining))
+                    .expect("REP maximum product exceeded u64"),
+            )
+            .expect("REP maximum exceeded u64");
+        (
+            Self {
+                element_raw,
+                entry_count: remaining,
+                max_raw,
+            },
+            startup,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RepSettlement {
+    history: RepPriceHistory,
+    paid_core: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3982,6 +4102,7 @@ struct RepResume {
     post_eip: u32,
     cs: SegmentRegister,
     precharged_core: u64,
+    price_history: Option<RepPriceHistory>,
 }
 
 const REP_BULK_BYTES: usize = 4096;

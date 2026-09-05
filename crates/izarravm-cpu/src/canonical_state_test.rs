@@ -92,6 +92,7 @@ fn dummy_rep_resume() -> RepResume {
         post_eip: 0x101,
         cs: SegmentRegister::default(),
         precharged_core: 1,
+        price_history: None,
     }
 }
 

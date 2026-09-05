@@ -2209,7 +2209,7 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
 
         let decoded = interp.decode_cache.get(ALU_MEM_ENTRY, true).unwrap();
         let interp_fault =
-            interp.execute_decoded(&decoded, &mut interp_bus, &mut CommittedCore::default());
+            interp.execute_decoded(&decoded, &mut interp_bus, &mut InstructionWork::default());
         // `map_direct_page` is a native-emission fixture and seeds a mapping without performing
         // the architectural page walk that normally precedes a FastMap fill. Remove that synthetic
         // entry before comparing the precise interpreter fallback and its A/D writes.
@@ -2218,7 +2218,7 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
         let native_fault = native.execute_decoded(
             &native_decoded,
             &mut native_bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
         );
         let page_fault = |fault| match fault {
             Err(InternalFault::Exception {

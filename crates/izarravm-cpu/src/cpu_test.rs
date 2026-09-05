@@ -2891,8 +2891,16 @@ fn a_bus_decode_change_still_drops_ram_and_vga_direct_pages() {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TestCoreEvent {
+    Publish(u64),
+    Memory(u32, BusAccessKind, u64),
+}
+
 #[derive(Default)]
 pub(crate) struct TestBus {
+    published_core: u64,
+    core_events: Option<Vec<TestCoreEvent>>,
     // Aligned like the production `Memory` backing, and for the same reason: `direct_page`
     // below hands `memory.as_mut_ptr()` pages to the fast map, and an unaligned backing would
     // silently poison every store-bias entry — the whole one-lookup fixture suite would pass
@@ -2972,6 +2980,7 @@ pub(crate) struct TestBus {
     // there), which is the situation the slow-read page histogram exists to take apart. Without it
     // TestBus has no readable-but-not-direct region at all: every in-range `DataRead` is direct.
     non_direct_read_pages: Vec<u32>,
+    decline_bulk_write: bool,
     // G4: deny direct pages under InstructionPrefetch only, modeling a non-RAM code page.
     deny_instruction_prefetch_direct_page: bool,
     fail_instruction_prefetch_direct_page: bool,
@@ -3038,6 +3047,9 @@ impl TestBus {
             memory: memory.into(),
             trace: BusTrace::default(),
             timing_epoch_two: false,
+            published_core: 0,
+            core_events: None,
+            decline_bulk_write: false,
             pending_irq: None,
             io_touched: false,
             lazy_io_reads: false,
@@ -3122,12 +3134,22 @@ impl TestBus {
 }
 
 impl CpuBus for TestBus {
+    fn publish_core_clocks(&mut self, now: u64) {
+        self.published_core = now;
+        if let Some(events) = self.core_events.as_mut() {
+            events.push(TestCoreEvent::Publish(now));
+        }
+    }
+
     fn read_memory(
         &mut self,
         address: u32,
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<u32, BusError> {
+        if let Some(events) = self.core_events.as_mut() {
+            events.push(TestCoreEvent::Memory(address, kind, self.published_core));
+        }
         self.trace.push(BusCycle::new(kind, address, width, 0));
         let start = address as usize;
         let end = start
@@ -3158,6 +3180,9 @@ impl CpuBus for TestBus {
         value: u32,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
+        if let Some(events) = self.core_events.as_mut() {
+            events.push(TestCoreEvent::Memory(address, kind, self.published_core));
+        }
         self.trace.push(BusCycle::new(kind, address, width, 0));
         if self.fail_write_address == Some(address) {
             return Err(BusError::UnmappedMemory { address });
@@ -3267,6 +3292,13 @@ impl CpuBus for TestBus {
         }
         let access = width.bytes() as usize;
         for offset in (0..out.len()).step_by(access) {
+            if let Some(events) = &mut self.core_events {
+                events.push(TestCoreEvent::Memory(
+                    address + offset as u32,
+                    kind,
+                    self.published_core,
+                ));
+            }
             self.trace
                 .push(BusCycle::new(kind, address + offset as u32, width, 0));
         }
@@ -3286,6 +3318,9 @@ impl CpuBus for TestBus {
             return Ok(0);
         }
         if self.direct_memory_bytes(address, data.len(), width, kind) != data.len() {
+            return Ok(0);
+        }
+        if self.decline_bulk_write {
             return Ok(0);
         }
         let access = width.bytes() as usize;
@@ -3778,7 +3813,7 @@ fn cpl3_code(code: &[u8]) -> (CpuGsw, TestBus) {
 fn exec_one_split<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> ExecResult<CycleOutcome> {
     cpu.begin_instruction();
     let insn = cpu.decode(bus)?;
-    cpu.execute_decoded(&insn, bus, &mut CommittedCore::default())
+    cpu.execute_decoded(&insn, bus, &mut InstructionWork::default())
 }
 
 fn real_mode_cpu(code: &[u8], mem_len: usize) -> (CpuGsw, Vec<u8>) {
@@ -4392,6 +4427,7 @@ fn decoded_insn_size_is_pinned_after_the_operand_length_pair() {
 // `u16`, or a new `u16` added) falls through to the byte-rotate `write` fallback, a different
 // and much slower algorithm. A hand-rolled sequence would keep passing while the map itself
 // quietly stopped using the fast path.
+#[cfg(feature = "jit")]
 fn pod_key_hash(linear: u32, physical: u32, mode_key: u32) -> u64 {
     use std::hash::BuildHasher;
     crate::PodKeyBuildHasher::default().hash_one(crate::jit::direct::BlockKey::new(
@@ -4400,6 +4436,7 @@ fn pod_key_hash(linear: u32, physical: u32, mode_key: u32) -> u64 {
 }
 
 #[test]
+#[cfg(feature = "jit")]
 fn pod_key_hasher_folds_every_field_and_does_not_overwrite() {
     let base = pod_key_hash(1, 2, 3);
     // Each field alone must move the hash. Overwriting semantics would make the first two
@@ -4412,6 +4449,7 @@ fn pod_key_hasher_folds_every_field_and_does_not_overwrite() {
 }
 
 #[test]
+#[cfg(feature = "jit")]
 fn pod_key_hasher_spreads_the_low_bits_hashbrown_indexes_with() {
     // A Fibonacci multiply concentrates entropy high; hashbrown picks its bucket from the low
     // bits. Without the xor-shift finalizer a realistic key population lands in very few

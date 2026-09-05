@@ -13,7 +13,7 @@ impl CpuGsw {
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
-        committed: &mut CommittedCore,
+        work: &mut InstructionWork,
     ) -> ExecResult<CycleOutcome> {
         // Dispatch on the group `decode` already resolved and stored, so the parse side and the
         // execute side can never drift out of sync and `route_group` runs only once per instruction.
@@ -38,7 +38,9 @@ impl CpuGsw {
             // executor, consuming the far-pointer/imm16/imm8 `decode` pre-parsed (for 0x9a/0xea/0xc2/
             // 0xca/0xcd) or the pre-parsed ModRM/descriptor (for 0xff), and reusing the existing
             // far-call/far-jump/ret/retf/interrupt/IRET/inc_dec/push helpers verbatim.
-            DecodeGroup::ControlFlow => self.execute_control_flow_decoded(insn, bus, committed),
+            DecodeGroup::ControlFlow => {
+                self.execute_control_flow_decoded(insn, bus, &mut work.committed)
+            }
             // The flags + misc register block (TEST r/m,reg, INC/DEC reg, CBW/CWD, SAHF/LAHF, and
             // the single flag-bit ops) runs through its split executor, consuming the pre-parsed
             // ModRM/operand for TEST and running the same flag/register logic as the fused path.
@@ -47,7 +49,7 @@ impl CpuGsw {
             // its split executor, a thin call to the existing `run_string` helper with the pre-decoded
             // `insn.prefixes` (REP/REPNE + segment override) passed through — the REP loop, ZF
             // termination, DF direction, and per-iteration clocks all stay in `run_string` unchanged.
-            DecodeGroup::StringOps => self.execute_string_decoded(insn, bus, committed),
+            DecodeGroup::StringOps => self.execute_string_decoded(insn, bus, work),
             // The port I/O block (IN AL/AX/EAX, OUT AL/AX/EAX, both imm8-port and DX-port forms)
             // runs through its split executor, which calls `bus.read_io`/`bus.write_io` on the same
             // port-dispatch path as the fused arms — so `io_touched` is set exactly as before.
@@ -65,7 +67,9 @@ impl CpuGsw {
             // LES/LDS) runs through its split executor, consuming the pre-decoded ModRM/operand and
             // reusing the existing CR/segment/descriptor leaf helpers verbatim so the TLB and
             // code-cache invalidation hooks fire exactly as before.
-            DecodeGroup::SystemSeg => self.execute_system_seg_decoded(insn, bus, committed),
+            DecodeGroup::SystemSeg => {
+                self.execute_system_seg_decoded(insn, bus, &mut work.committed)
+            }
             // The x87 FPU block (0xD8-0xDF) + WAIT/FWAIT (0x9B) runs through its split executor: a
             // thin wrapper that reproduces the fused pending-#MF gate, then resolves the pre-decoded
             // ModRM/operand (for the memory forms) and calls the existing `execute_fpu_register` /
@@ -77,7 +81,7 @@ impl CpuGsw {
             // and CMPXCHG8B) runs through its split executor, consuming the pre-decoded
             // ModRM/operand/immediate and reusing the existing BCD/`imul_truncated`/`run_string`/
             // CPUID/RDTSC/halt leaf logic verbatim.
-            DecodeGroup::Misc => self.execute_misc_decoded(insn, bus, committed),
+            DecodeGroup::Misc => self.execute_misc_decoded(insn, bus, work),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -1261,7 +1265,7 @@ impl CpuGsw {
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
-        committed: &mut CommittedCore,
+        work: &mut InstructionWork,
     ) -> ExecResult<CycleOutcome> {
         let prefixes = insn.prefixes;
         let address_size = insn.address_size;
@@ -1279,8 +1283,27 @@ impl CpuGsw {
             0xae | 0xaf => StringOp::Scas,
             opcode => unreachable!("string opcode {opcode:#x}"),
         };
-        self.run_string(bus, committed, op, width, prefixes, address_size)?;
-        Ok(self.charge(TimingClass::StringElem))
+        if work.rep.is_none()
+            && prefixes.rep.is_some()
+            && matches!(op, StringOp::Movs | StringOp::Stos)
+            && matches!(self.persona(), CpuPersona::I486 | CpuPersona::I586)
+        {
+            work.rep = Some(RepInvocation::new(RepPriceHistory {
+                initial_count: self.string_count(address_size),
+                startup_paid: false,
+            }));
+        }
+        self.price_rep_invocation(work, op, address_size);
+        self.run_string(bus, work, op, width, prefixes, address_size)?;
+        if work.sourced_rep() {
+            return Ok(clocks(0));
+        }
+        let mut outcome = self.charge(TimingClass::StringElem);
+        if let Some(invoice) = work.rep.as_mut() {
+            invoice.legacy_payment(outcome.core_clocks);
+            outcome.core_clocks = 0;
+        }
+        Ok(outcome)
     }
 
     /// The port I/O block through the decode/execute split (task A9). Calls `bus.read_io` /

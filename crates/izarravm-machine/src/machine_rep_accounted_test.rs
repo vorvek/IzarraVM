@@ -752,3 +752,169 @@ fn machine_fatal_keeps_staged_success_only_commands_pending() {
         assert_eq!(machine.active_mode, GswMode::Gsw386);
     }
 }
+
+#[test]
+fn machinebus_rep_price_pause_and_resume_conserve_ram_work_and_pit() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for opcode in [0xa4, 0xaa] {
+            let fixture = || {
+                let mut machine = rep_port_machine(opcode, 0);
+                machine.set_mode(mode);
+                machine.cpu.registers.set_eax(0x11);
+                arm_fast_channel2(&mut machine);
+                machine.port_bus_batch_clocks = 0;
+                machine
+            };
+            let mut paused = fixture();
+            let mut normal = fixture();
+            let batch = run_one_capped_batch(&mut paused, 1);
+            let startup = match (mode, opcode) {
+                (GswMode::Gsw486, 0xa4) => 12,
+                (GswMode::Gsw486, _) => 7,
+                (_, 0xa4) => 13,
+                _ => 9,
+            };
+            assert_rep_port_batch(
+                &paused,
+                &paused.test_batch_observations[batch],
+                (startup, 0, 0, 0, startup, 0, 0),
+            );
+            assert_eq!(paused.cpu.registers.ecx() as u16, 2);
+            assert_eq!(paused.cpu.registers.eip, 0x100);
+            assert_eq!(paused.read_physical_u8(0x2300), 0);
+            assert_eq!(
+                paused.run_until_halt_or_cycles(1_000_000).unwrap(),
+                StopReason::Halted
+            );
+            assert_eq!(
+                normal.run_until_halt_or_cycles(1_000_000).unwrap(),
+                StopReason::Halted
+            );
+            assert_eq!(paused.cpu.registers.ecx() as u16, 0);
+            assert_eq!(paused.read_physical_u8(0x2300), 0x11);
+            assert_eq!(
+                paused.read_physical_u8(0x2301),
+                if opcode == 0xa4 { 0x22 } else { 0x11 }
+            );
+            assert_eq!(paused.cpu.registers, normal.cpu.registers);
+            assert_eq!(paused.elapsed_clocks, normal.elapsed_clocks);
+            assert_eq!(paused.cpu.elapsed_clocks, normal.cpu.elapsed_clocks);
+            assert_eq!(paused.timeline.now_ticks(), normal.timeline.now_ticks());
+            assert_eq!(paused.pit, normal.pit);
+            assert_eq!(paused.bus_rem, normal.bus_rem);
+            for address in [0x2300, 0x2301] {
+                assert_eq!(
+                    paused.read_physical_u8(address),
+                    normal.read_physical_u8(address)
+                );
+            }
+            for observation in &paused.test_batch_observations {
+                assert_eq!(
+                    observation.step,
+                    observation.core_clocks
+                        + observation.scaled_bus_clocks
+                        + observation.isa_clocks
+                );
+                assert_eq!(
+                    observation.elapsed_at_exit - observation.elapsed_at_entry,
+                    observation.step
+                );
+                assert_eq!(observation.isa_clocks, 0);
+                assert!(!observation.fatal);
+            }
+        }
+    }
+}
+
+#[test]
+fn machinebus_rep_prices_fold_aligned_fetch_and_ram_once() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (opcode, width, operand32) in [
+            (0xa4, 1, false),
+            (0xa5, 2, false),
+            (0xa5, 4, true),
+            (0xaa, 1, false),
+            (0xab, 2, false),
+            (0xab, 4, true),
+        ] {
+            for address32 in [false, true] {
+                for backwards in [false, true] {
+                    for count in [0u32, 1, 2, 4097] {
+                        let mut code = vec![0xf3];
+                        if operand32 {
+                            code.push(0x66);
+                        }
+                        if address32 {
+                            code.push(0x67);
+                        }
+                        code.extend_from_slice(&[opcode, 0xf4]);
+                        let mut machine = Machine::new_raw_program(
+                            MachineProfile::gsw_386(2, VideoCard::Vega),
+                            &code,
+                        )
+                        .unwrap();
+                        machine.set_mode(mode);
+                        machine.set_timing_epoch_for_test(2);
+                        machine.cpu.registers.eflags &= !0x200;
+                        if backwards {
+                            machine.cpu.registers.eflags |= 0x400;
+                        }
+                        machine.cpu.registers.set_ecx(count);
+                        machine.cpu.registers.set_eax(0x5a5a5a5a);
+                        let offset = if backwards && count > 0 {
+                            (count - 1) * width
+                        } else {
+                            0
+                        };
+                        machine.cpu.registers.set_esi(0x2000 + offset);
+                        machine.cpu.registers.set_edi(0x8000 + offset);
+                        for i in 0..count * width {
+                            machine.write_physical_u8(DOS_LOAD_BASE + 0x2000 + i, 0x5a);
+                        }
+                        let mut cpu = machine.cpu.clone();
+                        let before = cpu.elapsed_clocks;
+                        let (result, raw_bus, scaled_bus, isa) = with_bus(&mut machine, |bus| {
+                            let raw_before = bus.trace.elapsed_clocks();
+                            let result = cpu.cycle(bus).unwrap();
+                            (
+                                result,
+                                bus.trace.elapsed_clocks() - raw_before,
+                                bus.in_batch_scaled_bus_clocks(),
+                                *bus.isa_io_clocks,
+                            )
+                        });
+                        let stos = opcode == 0xaa || opcode == 0xab;
+                        let expected = match (mode, stos, count) {
+                            (GswMode::Gsw486, _, 0) => 5,
+                            (GswMode::Gsw586, _, 0) => 6,
+                            (_, false, 1) => 13,
+                            (GswMode::Gsw486, false, _) => 12 + 3 * u64::from(count),
+                            (GswMode::Gsw586, false, _) => 13 + u64::from(count),
+                            (GswMode::Gsw486, true, _) => 7 + 4 * u64::from(count),
+                            (GswMode::Gsw586, true, _) => 9 + u64::from(count),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            result.core_clocks, expected,
+                            "{mode:?} {opcode:x} width={width} address32={address32} DF={backwards} C={count}"
+                        );
+                        assert_eq!(cpu.elapsed_clocks - before, expected);
+                        assert_eq!((raw_bus, scaled_bus, isa), (0, 0, 0));
+                        assert_eq!(cpu.registers.ecx(), 0);
+                        assert_eq!(cpu.perf_counters().rep_string_iterations, u64::from(count));
+                        if count > 0 {
+                            if backwards {
+                                assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 0);
+                            } else {
+                                assert!(cpu.perf_counters().rep_string_fast_iterations > 0);
+                            }
+                        }
+                        for i in 0..count * width {
+                            assert_eq!(machine.read_physical_u8(DOS_LOAD_BASE + 0x8000 + i), 0x5a);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -555,12 +555,12 @@ fn paging_permission_alignment_and_cross_page_exits_are_transactional() {
         let native_result = native.execute_decoded(
             &native_decoded,
             &mut native_bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
         );
         let interpreter_result = interpreter.execute_decoded(
             &interpreter_decoded,
             &mut interpreter_bus,
-            &mut CommittedCore::default(),
+            &mut InstructionWork::default(),
         );
         assert_eq!(
             result_signature(native_result),
@@ -603,12 +603,12 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
     let native_result = fixture.native.execute_decoded(
         &native_decoded,
         &mut fixture.native_bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
     );
     let interpreter_result = fixture.interpreter.execute_decoded(
         &interpreter_decoded,
         &mut fixture.interpreter_bus,
-        &mut CommittedCore::default(),
+        &mut InstructionWork::default(),
     );
     let native_result = result_signature(native_result);
     let interpreter_result = result_signature(interpreter_result);

@@ -82,7 +82,12 @@ impl CpuGsw {
     /// reading the mirror (which is the point -- the serve gate should be established once), and
     /// it surfaced as a JIT block failing to compile because no FastMap entry was ever published.
     /// Bundling the two here means a test cannot arm the map into a stale-mirror state at all.
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
     pub(crate) fn set_fast_map_enabled_for_test(&mut self, enabled: bool) {
         self.jit_direct
             .set_fast_map_enabled_for_test_without_mirror_refresh(enabled);
