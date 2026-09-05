@@ -474,6 +474,42 @@ fn direct_large_self_loop_keeps_the_generic_fetch_fallback_exact() {
             histogram_after.native_instructions - histogram_before.native_instructions,
             4_000
         );
+        let known_before = histogram_before
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let known_after = histogram_after
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        assert_eq!(known_after - known_before, 4_000);
+        let jcc_before = histogram_before
+            .native_known_class_counts
+            .iter()
+            .find(|(name, _)| *name == "Jcc")
+            .map_or(0, |(_, count)| *count);
+        let jcc_after = histogram_after
+            .native_known_class_counts
+            .iter()
+            .find(|(name, _)| *name == "Jcc")
+            .map_or(0, |(_, count)| *count);
+        assert_eq!(
+            jcc_after - jcc_before,
+            u64::from(ITERATIONS),
+            "the guest EAX marker proves the loop completed this many terminal branches"
+        );
+        assert_eq!(
+            histogram_after.self_loop_recovered_instructions
+                - histogram_before.self_loop_recovered_instructions,
+            4_000
+        );
+        assert_eq!(
+            histogram_after.self_loop_recovered_entries
+                - histogram_before.self_loop_recovered_entries,
+            1
+        );
         assert_eq!(
             histogram_after
                 .native_unresolved_instructions
@@ -481,16 +517,7 @@ fn direct_large_self_loop_keeps_the_generic_fetch_fallback_exact() {
                 - histogram_before
                     .native_unresolved_instructions
                     .repeated_unlinked_entry,
-            4_000
-        );
-        assert_eq!(
-            histogram_after
-                .native_unresolved_entries
-                .repeated_unlinked_entry
-                - histogram_before
-                    .native_unresolved_entries
-                    .repeated_unlinked_entry,
-            1
+            0
         );
         assert_eq!(histogram_after.native_partition_residual, 0);
     }
@@ -583,6 +610,8 @@ fn direct_self_loop_reports_a_later_iteration_memory_side_exit() {
     let direct_entries = native.perf_counters().jit_direct_entries;
     let direct_exits = native.perf_counters().jit_direct_side_exits;
     let direct_stores = native.perf_counters().jit_native_store_hits;
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = native.timing_class_histogram_snapshot();
 
     let interp_outcomes = drive(&mut interp, &mut interp_bus);
     let native_outcomes = drive(&mut native, &mut native_bus);
@@ -620,6 +649,184 @@ fn direct_self_loop_reports_a_later_iteration_memory_side_exit() {
         native.perf_counters().jit_native_store_hits - direct_stores,
         1
     );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = native.timing_class_histogram_snapshot();
+        assert_eq!(
+            histogram_after.self_loop_recovered_entries
+                - histogram_before.self_loop_recovered_entries,
+            0,
+            "the two native entries do not form one repeated self-loop return"
+        );
+        assert_eq!(
+            histogram_after.self_loop_recovered_instructions
+                - histogram_before.self_loop_recovered_instructions,
+            0,
+            "the refused first slot has no successful prefix to recover"
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+    }
+}
+
+#[cfg(feature = "timing-class-histogram")]
+fn marker_before_store_exit_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x3000];
+    memory[(STORE_ENTRY - 1) as usize] = 0x90;
+    memory[STORE_ENTRY as usize..STORE_ENTRY as usize + 10].copy_from_slice(&[
+        0x42, // inc edx, an independently visible loop marker
+        0x88, 0x03, // mov [ebx],al
+        0x83, 0xc3, 0x01, // add ebx,1
+        0x39, 0xfb, // cmp ebx,edi
+        0x7c, 0xf6, // jl 0x1101
+    ]);
+    memory[STORE_ENTRY as usize + 10] = 0xf4;
+    memory[WATCHED_TARGET] = 0x88;
+    memory
+}
+
+/// A store guard after the marker returns one full five-slot traversal plus a
+/// one-slot successful prefix. The interpreter twin is the traversal oracle.
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn direct_self_loop_recovers_a_later_guard_prefix_from_guest_markers() {
+    let memory = marker_before_store_exit_program();
+    let mut interpreter = fresh();
+    let mut native = fresh();
+    let mut interpreter_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    interpreter_bus.direct_pages_enabled = true;
+    native_bus.direct_pages_enabled = true;
+    interpreter_bus.direct_page_clocks = true;
+    native_bus.direct_page_clocks = true;
+
+    native.set_jit_auto_admit(true);
+    for _ in 0..5 {
+        native_bus.memory[WATCHED_TARGET] = 0x88;
+        arm_later_store_exit(
+            &mut native,
+            WATCHED_TARGET as u32,
+            WATCHED_TARGET as u32 + 1,
+        );
+        drive(&mut native, &mut native_bus);
+    }
+    arm_later_store_exit(
+        &mut interpreter,
+        WATCHED_TARGET as u32,
+        WATCHED_TARGET as u32 + 1,
+    );
+    drive(&mut interpreter, &mut interpreter_bus);
+    let key = jit::direct::key_for(&native, STORE_ENTRY, true).expect("marker loop key");
+    let jit::direct::BlockProbe::Ready(id) = native.jit_direct.probe(key) else {
+        panic!("marker loop was not admitted")
+    };
+    let block = native.jit_direct.block(id).expect("marker loop block");
+    assert_eq!(block.span().instructions, 5);
+    assert!(block.is_self_loop());
+    for linear in [
+        STORE_ENTRY,
+        STORE_ENTRY + 1,
+        STORE_ENTRY + 3,
+        STORE_ENTRY + 6,
+        STORE_ENTRY + 8,
+    ] {
+        assert!(
+            interpreter.decode_cache.get(linear, true).is_some(),
+            "interpreter did not warm loop instruction at {linear:#x}"
+        );
+        assert!(
+            native.decode_cache.get(linear, true).is_some(),
+            "native did not warm loop instruction at {linear:#x}"
+        );
+    }
+
+    for bus in [&mut interpreter_bus, &mut native_bus] {
+        bus.memory[LATER_STORE_TARGET] = 0;
+        bus.memory[LATER_STORE_TARGET + 1] = 0x90;
+        bus.trace = BusTrace::default();
+    }
+    for cpu in [&mut interpreter, &mut native] {
+        arm_later_store_exit(
+            cpu,
+            LATER_STORE_TARGET as u32,
+            LATER_STORE_TARGET as u32 + 2,
+        );
+        cpu.registers.eip = STORE_ENTRY;
+        cpu.registers.set_eax(0x5a);
+        cpu.registers.set_edx(0);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+
+    for _ in 0..6 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+    let direct_entries = native.perf_counters().jit_direct_entries;
+    let direct_insns = native.perf_counters().jit_direct_insns;
+    let direct_exits = native.perf_counters().jit_direct_side_exits;
+    let histogram_before = native.timing_class_histogram_snapshot();
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap(),
+        "the marker loop must enter natively before the guarded store refusal"
+    );
+
+    assert_eq!(native.registers.edx(), 2, "two guest markers retired");
+    assert_eq!(native.registers.eip, STORE_ENTRY + 1);
+    assert_eq!(native_bus.memory[LATER_STORE_TARGET], 0x5a);
+    assert_eq!(native_bus.memory[LATER_STORE_TARGET + 1], 0x90);
+    assert_eq!(
+        native.perf_counters().jit_direct_entries - direct_entries,
+        1
+    );
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_insns, 6);
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits - direct_exits,
+        1
+    );
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interpreter)
+    );
+    assert_eq!(native_bus.memory, interpreter_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+
+    let histogram_after = native.timing_class_histogram_snapshot();
+    let before_rows: std::collections::HashMap<_, _> = histogram_before
+        .native_known_class_counts
+        .into_iter()
+        .collect();
+    let after_rows: std::collections::HashMap<_, _> = histogram_after
+        .native_known_class_counts
+        .into_iter()
+        .collect();
+    assert_eq!(
+        after_rows.get("Reg").copied().unwrap_or(0) - before_rows.get("Reg").copied().unwrap_or(0),
+        4
+    );
+    assert_eq!(
+        after_rows.get("MovMemReg").copied().unwrap_or(0)
+            - before_rows.get("MovMemReg").copied().unwrap_or(0),
+        1
+    );
+    assert_eq!(
+        after_rows.get("Jcc").copied().unwrap_or(0) - before_rows.get("Jcc").copied().unwrap_or(0),
+        1
+    );
+    assert_eq!(
+        histogram_after.self_loop_recovered_entries - histogram_before.self_loop_recovered_entries,
+        1
+    );
+    assert_eq!(
+        histogram_after.self_loop_recovered_instructions
+            - histogram_before.self_loop_recovered_instructions,
+        6
+    );
+    assert_eq!(histogram_after.native_partition_residual, 0);
 }
 
 fn mode13_loop_program() -> Vec<u8> {

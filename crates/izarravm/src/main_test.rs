@@ -641,6 +641,8 @@ fn timing_class_histogram_schema_two_keeps_populations_and_signed_residuals_dist
             },
             native_observed_raw_core: 71,
             native_observed_weighted_fp: 9,
+            self_loop_recovered_entries: 2,
+            self_loop_recovered_instructions: 4,
             native_partition_residual: 0,
             instruction_minus_native: -3,
         },
@@ -651,6 +653,8 @@ fn timing_class_histogram_schema_two_keeps_populations_and_signed_residuals_dist
     assert_eq!(report["instruction_counter"], 4);
     assert_eq!(report["coverage"]["instruction_minus_native"], -3);
     assert_eq!(report["coverage"]["native_partition_residual"], 0);
+    assert_eq!(report["coverage"]["self_loop_recovered_entries"], 2);
+    assert_eq!(report["coverage"]["self_loop_recovered_instructions"], 4);
     assert_eq!(report["coverage"]["whole_row_gradeable"], false);
     assert_eq!(report["interpreter_charge_events"]["counts"]["Jcc"], 2);
     assert_eq!(

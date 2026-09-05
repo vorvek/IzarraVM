@@ -3864,8 +3864,7 @@ impl CpuGsw {
             exit.raw_clocks,
             exit.weighted_fp_clocks,
             exit.linked_transfers,
-            usize::from(block.span().instructions),
-            self.jit_direct.class_vector(block.id()),
+            self.jit_direct.native_class_metadata(block.id()),
         );
         // The CS.D = 0 split of the two lines above. Mode-key bit 0 is CS.D, so a clear bit is a
         // 16-bit code segment. Branchless because this is the hottest path in the backend: the
