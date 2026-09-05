@@ -1028,7 +1028,10 @@ impl CpuGsw {
                         let value = self.read_operand_sized(bus, operand, operand_size)?;
                         let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
                         self.write_operand_sized(bus, operand, operand_size, result)?;
-                        Ok(self.charge(TimingClass::IncDecRm))
+                        Ok(self.charge(match operand {
+                            RmOperand::Register(_) => TimingClass::Reg,
+                            RmOperand::Memory(_) => TimingClass::IncDecRm,
+                        }))
                     }
                     2 => {
                         let target = self.read_operand_sized(bus, operand, operand_size)?;

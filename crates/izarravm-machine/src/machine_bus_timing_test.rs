@@ -5648,3 +5648,88 @@ fn isa_io_wait_charges_a_rep_outsb_run_per_element() {
          uncharged {off} in the same guest-clock budget"
     );
 }
+
+#[test]
+fn dsp_reset_settle_tracks_the_write_inside_a_pending_batch() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_timing_epoch_for_test(2);
+        machine.set_mode(mode);
+        machine.port_bus_batch_clocks = 0;
+        with_bus(&mut machine, |bus| {
+            bus.core_clocks_so_far = mode.clock_hz() / 1_000;
+            bus.write_io(0x226, BusWidth::Byte, 1, false).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0, false).unwrap();
+            let deadline = bus.pending_device_micros() + 20;
+            assert!(deadline >= 1_020);
+            for (micros, ready) in [(deadline - 1, false), (deadline, true)] {
+                let mut low = bus.core_clocks_so_far;
+                let mut high = mode.clock_hz();
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    bus.core_clocks_so_far = middle;
+                    if bus.pending_device_micros() < micros {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                bus.core_clocks_so_far = low - 160;
+                let raw = bus.trace.elapsed_clocks();
+                let port = *bus.isa_io_clocks;
+                let status = bus
+                    .read_io(0x22e, BusWidth::Byte, bus.core_clocks_so_far, false)
+                    .unwrap();
+                assert_eq!(bus.pending_device_micros(), micros);
+                assert_eq!(status & 0x80 != 0, ready, "{mode:?} at {micros} us");
+                assert_eq!(bus.trace.elapsed_clocks() - raw, 4);
+                assert_eq!(*bus.isa_io_clocks - port, 156);
+            }
+            assert_eq!(
+                bus.read_io(0x22a, BusWidth::Byte, bus.core_clocks_so_far, false)
+                    .unwrap(),
+                0xaa
+            );
+            assert_eq!(bus.sb16.read_port(0x22e).unwrap() & 0x80, 0);
+        });
+        machine.advance_devices_clocks(mode.clock_hz());
+        assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0);
+    }
+}
+
+#[test]
+fn dsp_lazy_settle_does_not_service_unrelated_ports_or_accurate_reads() {
+    for mode in [
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let mut machine = test_machine();
+        machine.set_timing_epoch_for_test(2);
+        machine.set_mode(mode);
+        machine.port_bus_batch_clocks = 0;
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x226, BusWidth::Byte, 1, false).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0, false).unwrap();
+            bus.core_clocks_so_far = mode.clock_hz() / 1_000;
+            bus.read_io(0x80, BusWidth::Byte, bus.core_clocks_so_far, false)
+                .unwrap();
+            assert_eq!(bus.sb16.read_port(0x22e).unwrap() & 0x80, 0);
+            if matches!(mode, GswMode::Gsw386 | GswMode::Gsw386Slow) {
+                let before = *bus.isa_io_clocks;
+                assert_eq!(
+                    bus.read_io(0x22e, BusWidth::Byte, bus.core_clocks_so_far, false)
+                        .unwrap()
+                        & 0x80,
+                    0
+                );
+                assert_eq!(*bus.isa_io_clocks - before, 158);
+            }
+        });
+        machine.advance_devices_clocks(mode.clock_hz() / 1_000);
+        assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0x80);
+        assert_eq!(machine.sb16.read_port(0x22a), Some(0xaa));
+        assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0);
+    }
+}

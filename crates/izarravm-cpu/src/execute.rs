@@ -967,7 +967,10 @@ impl CpuGsw {
                         self.write_operand_u8(bus, operand, result)?;
                         // Named because the MEMORY form is an `InterpretOne` call-out row: its
                         // budget bound and this arm must charge the same number.
-                        Ok(self.charge(TimingClass::IncDecRm))
+                        Ok(self.charge(match operand {
+                            RmOperand::Register(_) => TimingClass::Reg,
+                            RmOperand::Memory(_) => TimingClass::IncDecRm,
+                        }))
                     }
                     _extension => Err(undefined_opcode()),
                 }

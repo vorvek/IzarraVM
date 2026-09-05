@@ -3559,22 +3559,10 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(self.fdc.read_port(port).unwrap_or(0xff)));
         }
         if !matches!(port, 0x224 | 0x225) {
-            // An ISA port read costs about a microsecond of bus time on the
-            // metal. Charge it in the fast modes for the same reason the OPL
-            // polls charge it above, then service the reset-settle countdown
-            // at the predicted point in the batch (the DSP analogue of
-            // `predicted_opl_status`): the countdown otherwise moves only on
-            // a device advance, and a tight probe loop (OuterRid polls 0x22E
-            // one hundred times) runs entirely between advances. Gate on the
-            // DSP's own ports: the charge must not leak to unrelated ports
-            // that merely fall through this arm unclaimed.
-            // F3: epoch-1-only, same reason as the OPL arm above -- epoch 2's
-            // `charge_port_bus` already prices this port through the unified class charge.
-            if self.lazy_port_reads
-                && self.timing_epoch < 2
-                && matches!(port, 0x226 | 0x22A | 0x22C | 0x22E | 0x22F)
-            {
-                *self.isa_io_clocks += isa_io_clocks(self.active_mode);
+            if self.lazy_port_reads && matches!(port, 0x226 | 0x22A | 0x22C | 0x22E | 0x22F) {
+                if self.timing_epoch < 2 {
+                    *self.isa_io_clocks += isa_io_clocks(self.active_mode);
+                }
                 let pending = self.pending_device_micros();
                 self.sb16.service_reset_at(pending);
             }

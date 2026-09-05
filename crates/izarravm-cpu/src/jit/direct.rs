@@ -45,8 +45,8 @@ use super::x87_avx2_emit::{
 use crate::{
     AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, DirectBarrierCensusRow,
     DirectBarrierCensusSnapshot, FLAG_IF, FLAG_TF, FLAG_VM, MAX_PORT_CORE_CLOCKS, OperandSize,
-    POP_ALL_CORE_CLOCKS, PUSH_ALL_CORE_CLOCKS, PendingFlags, PodKeyBuildHasher, PollFamily,
-    Prefixes, Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
+    PendingFlags, PodKeyBuildHasher, PollFamily, Prefixes, Registers, SegmentIndex,
+    SegmentRegister, U32BuildHasher,
 };
 
 use super::block::{PollScanOutcome, build_poll_loop_from};
@@ -31258,9 +31258,7 @@ unsafe extern "C" fn push_all_dword<B: CpuBus>(
         return STATUS_ABNORMAL;
     }
 
-    // The SAME constant the interpreter's `0x60` arm charges, and the same step-break question
-    // `run_straight_line` asks after every interpreted instruction. Both are shared rather than
-    // restated so the exact-clocks claim cannot drift out from under this call-out path.
+    // Return raw clocks; the caller settles them with the block prefix.
     #[cfg(feature = "direct-callout-attribution")]
     {
         let step_break = bus.requires_step_break();
@@ -31273,11 +31271,12 @@ unsafe extern "C" fn push_all_dword<B: CpuBus>(
                 CallOutOutcome::Continued
             },
         );
-        i64::from(PUSH_ALL_CORE_CLOCKS) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+        i64::from(cpu.class_table().raw(TimingClass::PushAll))
+            | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
     }
     #[cfg(not(feature = "direct-callout-attribution"))]
     {
-        i64::from(PUSH_ALL_CORE_CLOCKS)
+        i64::from(cpu.class_table().raw(TimingClass::PushAll))
             | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
     }
 }
@@ -31351,11 +31350,12 @@ unsafe extern "C" fn pop_all_dword<B: CpuBus>(
                 CallOutOutcome::Continued
             },
         );
-        i64::from(POP_ALL_CORE_CLOCKS) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+        i64::from(cpu.class_table().raw(TimingClass::PopAll))
+            | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
     }
     #[cfg(not(feature = "direct-callout-attribution"))]
     {
-        i64::from(POP_ALL_CORE_CLOCKS)
+        i64::from(cpu.class_table().raw(TimingClass::PopAll))
             | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
     }
 }

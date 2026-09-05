@@ -421,6 +421,12 @@ impl Timeline {
         )
     }
 
+    pub(crate) fn master_ticks_until_microseconds(self, micros: u64) -> u64 {
+        self.microseconds
+            .ticks_until(micros, MICROSECOND_HZ)
+            .unwrap()
+    }
+
     /// Microseconds a `cpu_clocks` advance WOULD produce, without performing it.
     ///
     /// Same arithmetic as the `microseconds` field of `advance_master_ticks`,

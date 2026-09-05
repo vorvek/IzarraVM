@@ -3301,3 +3301,94 @@ fn pause_dac_holds_dma_across_the_batch_that_ends_at_its_deadline() {
         "output resumes after the pause"
     );
 }
+
+#[test]
+fn dsp_pause_deadline_preserves_fractional_time_and_cached_edges() {
+    let ticks_per_us = izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for phase in [0, 1, ticks_per_us / 2, ticks_per_us - 1] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            machine.cpu.registers.eflags |= 0x0200;
+            machine.advance_devices_ticks(phase);
+            {
+                let mut bus = machine.make_construction_bus();
+                for (port, value) in [
+                    (0x20, 0x11),
+                    (0x21, 0x08),
+                    (0x21, 0x04),
+                    (0x21, 0x01),
+                    (0xa0, 0x11),
+                    (0xa1, 0x70),
+                    (0xa1, 0x02),
+                    (0xa1, 0x01),
+                    (0x21, 0x7f),
+                    (0xa1, 0xff),
+                ] {
+                    bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+                }
+                for byte in [0x41, 0xc3, 0x50, 0x80, 0x00, 0x00] {
+                    bus.write_io(0x22c, BusWidth::Byte, byte, false).unwrap();
+                }
+            }
+            let micros = machine.sb16.test_pause_micros_remaining().unwrap();
+            let ticks = micros * ticks_per_us - phase;
+            let expected = machine
+                .timeline
+                .cpu_clocks_for_master_ticks_ceil(ticks)
+                .max(1);
+            assert_eq!(
+                machine.next_timer_wake(machine.master_ticks() + ticks * 4),
+                Some(expected)
+            );
+            machine.invalidate_device_edge_cache();
+            assert_eq!(machine.event_batch_cap_cached(u64::MAX), expected);
+            let quiet = ticks_per_us / 2;
+            machine.advance_devices_ticks(quiet);
+            assert_eq!(
+                machine.event_batch_cap_cached(u64::MAX),
+                machine.event_batch_cap(u64::MAX)
+            );
+            assert_eq!(
+                machine.event_batch_cap_cached(u64::MAX),
+                machine
+                    .timeline
+                    .cpu_clocks_for_master_ticks_ceil(ticks - quiet)
+                    .max(1)
+            );
+            if phase == 1 {
+                machine.set_mode(if mode == GswMode::Gsw586 {
+                    GswMode::Gsw386
+                } else {
+                    GswMode::Gsw586
+                });
+                assert_eq!(
+                    machine.event_batch_cap_cached(u64::MAX),
+                    machine.event_batch_cap(u64::MAX)
+                );
+                assert_eq!(
+                    machine.event_batch_cap_cached(u64::MAX),
+                    machine
+                        .timeline
+                        .cpu_clocks_for_master_ticks_ceil(ticks - quiet)
+                        .max(1)
+                );
+            }
+            machine.advance_devices_ticks(ticks - quiet - 1);
+            assert!(
+                !machine.pic.irr_bit(7),
+                "{mode:?}, phase {phase}: early pause IRQ"
+            );
+            machine.advance_devices_ticks(1);
+            assert!(
+                machine.pic.irr_bit(7),
+                "{mode:?}, phase {phase}: missing pause IRQ"
+            );
+        }
+    }
+}
