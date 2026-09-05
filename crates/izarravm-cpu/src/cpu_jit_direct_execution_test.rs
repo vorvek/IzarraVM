@@ -442,6 +442,8 @@ fn direct_large_self_loop_keeps_the_generic_fetch_fallback_exact() {
     assert_eq!(native_bus.trace.elapsed_clocks(), 0);
     let direct_insns = native.perf_counters().jit_direct_insns;
     let direct_entries = native.perf_counters().jit_direct_entries;
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = native.timing_class_histogram_snapshot();
 
     let interp_outcomes = drive(&mut interp, &mut interp_bus);
     let native_outcomes = drive(&mut native, &mut native_bus);
@@ -461,6 +463,37 @@ fn direct_large_self_loop_keeps_the_generic_fetch_fallback_exact() {
         native.perf_counters().jit_direct_entries - direct_entries,
         1
     );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = native.timing_class_histogram_snapshot();
+        assert_eq!(
+            histogram_after.native_entries - histogram_before.native_entries,
+            1
+        );
+        assert_eq!(
+            histogram_after.native_instructions - histogram_before.native_instructions,
+            4_000
+        );
+        assert_eq!(
+            histogram_after
+                .native_unresolved_instructions
+                .repeated_unlinked_entry
+                - histogram_before
+                    .native_unresolved_instructions
+                    .repeated_unlinked_entry,
+            4_000
+        );
+        assert_eq!(
+            histogram_after
+                .native_unresolved_entries
+                .repeated_unlinked_entry
+                - histogram_before
+                    .native_unresolved_entries
+                    .repeated_unlinked_entry,
+            1
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+    }
 }
 
 fn later_store_exit_program() -> Vec<u8> {
@@ -700,6 +733,8 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
     let registers = crate::tests::settled_registers(&cpu);
     let pending = cpu.pending_flags;
     let pending_eflags = cpu.eflags();
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = cpu.timing_class_histogram_snapshot();
 
     let observer_rejects = cpu.perf_counters().jit_direct_reject_observer;
     cpu.profile.enabled = true;
@@ -790,6 +825,18 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
         cpu.perf_counters().jit_direct_reject_cs_layout - cs_rejects,
         1
     );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = cpu.timing_class_histogram_snapshot();
+        assert_eq!(
+            histogram_after.native_entries,
+            histogram_before.native_entries
+        );
+        assert_eq!(
+            histogram_after.native_instructions,
+            histogram_before.native_instructions
+        );
+    }
 }
 
 #[test]
@@ -922,6 +969,10 @@ fn direct_stack_call_jump_and_return_chain_matches_interpreter() {
     interp_bus.trace = BusTrace::default();
     let entries = native.perf_counters().jit_direct_entries;
     let transfers = native.perf_counters().jit_direct_linked_transfers;
+    #[cfg(feature = "timing-class-histogram")]
+    let direct_insns = native.perf_counters().jit_direct_insns;
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = native.timing_class_histogram_snapshot();
 
     assert!(
         native
@@ -949,6 +1000,45 @@ fn direct_stack_call_jump_and_return_chain_matches_interpreter() {
         native.perf_counters().jit_direct_linked_transfers - transfers,
         4
     );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = native.timing_class_histogram_snapshot();
+        let known_before = histogram_before
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let known_after = histogram_after
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let native_instruction_delta = native.perf_counters().jit_direct_insns - direct_insns;
+        assert_eq!(
+            histogram_after.native_entries - histogram_before.native_entries,
+            1
+        );
+        assert_eq!(
+            histogram_after.native_instructions - histogram_before.native_instructions,
+            native_instruction_delta
+        );
+        assert_eq!(
+            known_after - known_before,
+            0,
+            "linked work must not use the head vector"
+        );
+        assert_eq!(
+            histogram_after.native_unresolved_instructions.linked_entry
+                - histogram_before.native_unresolved_instructions.linked_entry,
+            native_instruction_delta
+        );
+        assert_eq!(
+            histogram_after.native_unresolved_entries.linked_entry
+                - histogram_before.native_unresolved_entries.linked_entry,
+            1
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+    }
 }
 
 #[test]
@@ -1858,6 +1948,8 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
             .jit_direct_exit_cross_page_or_alignment;
         let permission_exits = native.perf_counters().jit_direct_exit_permission;
         let unavailable_exits = native.perf_counters().jit_direct_exit_unavailable_or_kind;
+        #[cfg(feature = "timing-class-histogram")]
+        let histogram_before = native.timing_class_histogram_snapshot();
 
         assert!(
             native
@@ -1882,6 +1974,31 @@ fn direct_memory_alu_paging_and_cross_page_exits_precede_flags_and_memory_mutati
             native.perf_counters().jit_direct_exit_unavailable_or_kind - unavailable_exits,
             u64::from(expected_unavailable)
         );
+        #[cfg(feature = "timing-class-histogram")]
+        {
+            let histogram_after = native.timing_class_histogram_snapshot();
+            let known_before = histogram_before
+                .native_known_class_counts
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<u64>();
+            let known_after = histogram_after
+                .native_known_class_counts
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<u64>();
+            assert_eq!(
+                histogram_after.native_entries - histogram_before.native_entries,
+                1
+            );
+            assert_eq!(
+                histogram_after.native_instructions - histogram_before.native_instructions,
+                0,
+                "the first-slot memory refusal entered native code but retired no slot"
+            );
+            assert_eq!(known_after - known_before, 0);
+            assert_eq!(histogram_after.native_partition_residual, 0);
+        }
 
         let decoded = interp.decode_cache.get(ALU_MEM_ENTRY, true).unwrap();
         let interp_fault = interp.execute_decoded(&decoded, &mut interp_bus);
@@ -2856,6 +2973,74 @@ pub(super) fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
         1,
         "the successor must be reached natively, or this row proves nothing about chains"
     );
+
+    // Keep the linked edge live but remove the successor's native data mapping.
+    // The source completes, the transfer is native, and the successor refuses
+    // its first memory slot without advancing EIP.
+    native.jit_fast_map.invalidate_page(BAKED);
+    native.set_eip(ENTRY);
+    native.registers.set_edx(0);
+    let before = native.perf_counters().clone();
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = native.timing_class_histogram_snapshot();
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, entry_block)
+            .unwrap()
+    );
+    assert_eq!(native.registers.eip, SECOND);
+    assert_eq!(native.registers.edx(), 0);
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        1
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_insns - before.jit_direct_insns,
+        2,
+        "only the source block completes before the successor memory refusal"
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits - before.jit_direct_side_exits,
+        1
+    );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = native.timing_class_histogram_snapshot();
+        let known_before = histogram_before
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let known_after = histogram_after
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        assert_eq!(
+            histogram_after.native_entries - histogram_before.native_entries,
+            1
+        );
+        assert_eq!(
+            histogram_after.native_instructions - histogram_before.native_instructions,
+            2
+        );
+        assert_eq!(
+            known_after - known_before,
+            0,
+            "linked work has no head-vector classes"
+        );
+        assert_eq!(
+            histogram_after.native_unresolved_instructions.linked_entry
+                - histogram_before.native_unresolved_instructions.linked_entry,
+            2
+        );
+        assert_eq!(
+            histogram_after.native_unresolved_entries.linked_entry
+                - histogram_before.native_unresolved_entries.linked_entry,
+            1
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+    }
 
     // Now move ES's BASE. The root pins nothing, so only the strict six-descriptor check stands
     // between the chain and a read through the stale base.

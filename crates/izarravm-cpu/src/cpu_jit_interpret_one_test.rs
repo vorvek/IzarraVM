@@ -88,6 +88,10 @@ struct Legs {
     exit_reason: Option<u32>,
     /// Instructions the block reported retiring natively on the entry under test.
     native_insns: u64,
+    #[cfg(feature = "timing-class-histogram")]
+    native_histogram_before_entry: crate::TimingClassHistogramSnapshot,
+    #[cfg(feature = "timing-class-histogram")]
+    native_histogram_after_entry: crate::TimingClassHistogramSnapshot,
 }
 
 /// Build the two CPUs and the installed block without entering it yet, so a caller can perturb
@@ -171,6 +175,8 @@ fn run_both(code: &[u8], starts: &[u32], perturb: fn(&mut CpuGsw, &mut TestBus))
 
     let before = native.perf_counters().jit_direct_insns;
     let entries = native.perf_counters().jit_direct_entries;
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_before_entry = native.timing_class_histogram_snapshot();
     assert!(
         native
             .try_run_direct_block_for_test(&mut native_bus, block)
@@ -180,6 +186,8 @@ fn run_both(code: &[u8], starts: &[u32], perturb: fn(&mut CpuGsw, &mut TestBus))
     assert_eq!(native.perf_counters().jit_direct_entries - entries, 1);
     let native_insns = native.perf_counters().jit_direct_insns - before;
     let exit_reason = native.jit_direct.last_side_exit_reason_for_test();
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_after_entry = native.timing_class_histogram_snapshot();
     // The tail past the block is interpreted on both legs, so the two CPUs end at the same
     // architectural point and the whole-struct comparison below is exact.
     drive(&mut native, &mut native_bus);
@@ -191,6 +199,10 @@ fn run_both(code: &[u8], starts: &[u32], perturb: fn(&mut CpuGsw, &mut TestBus))
         native_bus,
         exit_reason,
         native_insns,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_before_entry,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_after_entry,
     }
 }
 
@@ -757,6 +769,66 @@ fn interpret_one_resync_fault_reports_prefix_only() {
     let stalls = legs.native.direct_stall_snapshot();
     assert_eq!(stalls.callout_interpret_one_resync_fault, 1);
     assert_eq!(stalls.callout_interpret_one_resync, 0);
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let before = &legs.native_histogram_before_entry;
+        let after = &legs.native_histogram_after_entry;
+        let known_before = before
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let known_after = after
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let events_before = before
+            .interpreter_charge_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+            + before.interpreter_unknown_class_events;
+        let events_after = after
+            .interpreter_charge_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+            + after.interpreter_unknown_class_events;
+        let system_before = before
+            .system_event_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let system_after = after
+            .system_event_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        assert_eq!(after.native_instructions - before.native_instructions, 1);
+        assert_eq!(
+            after.instruction_counter - before.instruction_counter,
+            2,
+            "the native prefix and delivered fault retain their existing global accounting"
+        );
+        assert_eq!(known_after - known_before, 1, "the native prefix is known");
+        assert_eq!(
+            after.native_unresolved_instructions.callout_slot
+                - before.native_unresolved_instructions.callout_slot,
+            0,
+            "the faulting helper is outside NativeExit::instructions"
+        );
+        assert_eq!(
+            events_after, events_before,
+            "the faulting helper does not produce an interpreter charge event"
+        );
+        assert_eq!(
+            system_after - system_before,
+            1,
+            "the fault delivery remains a separate system event"
+        );
+        assert_eq!(after.native_partition_residual, 0);
+    }
     assert_legs_agree(&mut legs);
 }
 
@@ -3365,6 +3437,46 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
     let stalls = legs.native.direct_stall_snapshot();
     assert_eq!(stalls.callout_interpret_one_resync, 1);
     assert_eq!(stalls.callout_interpret_one_resync_fault, 0);
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let before = &legs.native_histogram_before_entry;
+        let after = &legs.native_histogram_after_entry;
+        let known_before = before
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let known_after = after
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let events_before = before
+            .interpreter_charge_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+            + before.interpreter_unknown_class_events;
+        let events_after = after
+            .interpreter_charge_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+            + after.interpreter_unknown_class_events;
+        assert_eq!(after.native_instructions - before.native_instructions, 2);
+        assert_eq!(known_after - known_before, 1, "one native prefix slot");
+        assert_eq!(
+            after.native_unresolved_instructions.callout_slot
+                - before.native_unresolved_instructions.callout_slot,
+            1,
+            "the completed helper occupies one native slot"
+        );
+        assert!(
+            events_after > events_before,
+            "the helper charge is a separate event"
+        );
+        assert_eq!(after.native_partition_residual, 0);
+    }
     assert_legs_agree(&mut legs);
     assert_eq!(
         legs.native.registers.segment(SegmentIndex::Fs).selector,
@@ -3987,6 +4099,8 @@ fn run_both_protected_program(
     perturb(&mut native, &mut native_bus);
 
     let before = native.perf_counters().jit_direct_insns;
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_before_entry = native.timing_class_histogram_snapshot();
     assert!(
         native
             .try_run_direct_block_for_test(&mut native_bus, block)
@@ -3995,6 +4109,8 @@ fn run_both_protected_program(
     );
     let native_insns = native.perf_counters().jit_direct_insns - before;
     let exit_reason = native.jit_direct.last_side_exit_reason_for_test();
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_after_entry = native.timing_class_histogram_snapshot();
     drive(&mut native, &mut native_bus);
 
     Legs {
@@ -4004,6 +4120,10 @@ fn run_both_protected_program(
         native_bus,
         exit_reason,
         native_insns,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_before_entry,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_after_entry,
     }
 }
 
@@ -7017,6 +7137,8 @@ fn run_both_lar_lsl(code: &[u8], starts: &[u32], selector: u16) -> Legs {
     arm_lar_lsl(&mut native, &mut native_bus, selector);
 
     let before = native.perf_counters().jit_direct_insns;
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_before_entry = native.timing_class_histogram_snapshot();
     assert!(
         native
             .try_run_direct_block_for_test(&mut native_bus, block)
@@ -7025,6 +7147,8 @@ fn run_both_lar_lsl(code: &[u8], starts: &[u32], selector: u16) -> Legs {
     );
     let native_insns = native.perf_counters().jit_direct_insns - before;
     let exit_reason = native.jit_direct.last_side_exit_reason_for_test();
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_after_entry = native.timing_class_histogram_snapshot();
     drive(&mut native, &mut native_bus);
 
     Legs {
@@ -7034,6 +7158,10 @@ fn run_both_lar_lsl(code: &[u8], starts: &[u32], selector: u16) -> Legs {
         native_bus,
         exit_reason,
         native_insns,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_before_entry,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_after_entry,
     }
 }
 
@@ -7170,6 +7298,8 @@ fn run_both_lar_lsl_memory_limit_fault(code: &[u8], starts: &[u32]) -> Legs {
     small_es(&mut native);
 
     let before = native.perf_counters().jit_direct_insns;
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_before_entry = native.timing_class_histogram_snapshot();
     assert!(
         native
             .try_run_direct_block_for_test(&mut native_bus, block)
@@ -7178,6 +7308,8 @@ fn run_both_lar_lsl_memory_limit_fault(code: &[u8], starts: &[u32]) -> Legs {
     );
     let native_insns = native.perf_counters().jit_direct_insns - before;
     let exit_reason = native.jit_direct.last_side_exit_reason_for_test();
+    #[cfg(feature = "timing-class-histogram")]
+    let native_histogram_after_entry = native.timing_class_histogram_snapshot();
     drive(&mut native, &mut native_bus);
 
     Legs {
@@ -7187,6 +7319,10 @@ fn run_both_lar_lsl_memory_limit_fault(code: &[u8], starts: &[u32]) -> Legs {
         native_bus,
         exit_reason,
         native_insns,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_before_entry,
+        #[cfg(feature = "timing-class-histogram")]
+        native_histogram_after_entry,
     }
 }
 

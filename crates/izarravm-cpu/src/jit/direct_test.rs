@@ -1091,6 +1091,46 @@ fn invalidated_metadata_slot_reuse_rejects_its_stale_generation() {
     );
 }
 
+/// The timing diagnostic must not read a replacement vector through a retired
+/// block ID, even when the slot index and vector length are unchanged.
+#[cfg(all(
+    feature = "timing-class-histogram",
+    any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )
+))]
+#[test]
+fn class_vector_requires_the_active_block_generation() {
+    let mut cache = BlockCache::default();
+    let old_key = key(0x1700);
+    let mut old = trivial_compilation(BlockSpan::new(old_key, 1, 1).expect("old span"));
+    old.class_vector = vec![TimingClass::Reg.index() as u8].into_boxed_slice();
+    assert!(matches!(cache.probe(old_key), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(old_key), BlockProbe::Compile));
+    let old_id = cache.install(&old).expect("old install");
+    assert_eq!(
+        cache.class_vector(old_id),
+        Some(&[TimingClass::Reg.index() as u8][..])
+    );
+
+    assert_eq!(cache.retire_physical_range_for_test(old_key.physical, 1), 1);
+    let new_key = key(0x1800);
+    let mut replacement =
+        trivial_compilation(BlockSpan::new(new_key, 1, 1).expect("replacement span"));
+    replacement.class_vector = vec![TimingClass::Jcc.index() as u8].into_boxed_slice();
+    assert!(matches!(cache.probe(new_key), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(new_key), BlockProbe::Compile));
+    let replacement_id = cache.install(&replacement).expect("replacement install");
+    assert_eq!(replacement_id.index(), old_id.index());
+    assert_ne!(replacement_id, old_id);
+    assert_eq!(cache.class_vector(old_id), None);
+    assert_eq!(
+        cache.class_vector(replacement_id),
+        Some(&[TimingClass::Jcc.index() as u8][..])
+    );
+}
+
 #[cfg(any(
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")

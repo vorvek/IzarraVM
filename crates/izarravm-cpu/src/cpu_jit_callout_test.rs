@@ -341,6 +341,8 @@ fn a_step_breaking_port_ends_the_native_run_after_the_call_out() {
     });
 
     let retired = fixture.cpu.perf_counters().jit_direct_insns;
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = fixture.cpu.timing_class_histogram_snapshot();
     assert!(
         fixture
             .cpu
@@ -356,6 +358,52 @@ fn a_step_breaking_port_ends_the_native_run_after_the_call_out() {
         2,
         "the call-out and its prefix retire natively, the tail does not"
     );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = fixture.cpu.timing_class_histogram_snapshot();
+        let known_before = histogram_before
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let known_after = histogram_after
+            .native_known_class_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>();
+        let events_before = histogram_before
+            .interpreter_charge_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+            + histogram_before.interpreter_unknown_class_events;
+        let events_after = histogram_after
+            .interpreter_charge_counts
+            .iter()
+            .map(|(_, count)| count)
+            .sum::<u64>()
+            + histogram_after.interpreter_unknown_class_events;
+        assert_eq!(
+            histogram_after.native_instructions - histogram_before.native_instructions,
+            2
+        );
+        assert_eq!(
+            known_after - known_before,
+            1,
+            "the prefix is the only known slot"
+        );
+        assert_eq!(
+            histogram_after.native_unresolved_instructions.callout_slot
+                - histogram_before.native_unresolved_instructions.callout_slot,
+            1
+        );
+        assert_eq!(
+            events_after - events_before,
+            0,
+            "the port helper returns runtime clocks without a CpuGsw::charge event"
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+    }
     assert_eq!(
         fixture.cpu.registers.eip, interpreter.registers.eip,
         "EIP must sit AFTER the call-out"

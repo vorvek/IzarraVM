@@ -3646,28 +3646,23 @@ impl BlockCache {
         }
     }
 
+    /// The block's diagnostic slot classes. A stale or reused ID returns none.
+    #[cfg(feature = "timing-class-histogram")]
+    pub(crate) fn class_vector(&self, id: BlockId) -> Option<&[u8]> {
+        self.active_index(id)
+            .and_then(|index| self.class_vectors.get(index))
+            .map(|vector| vector.as_ref())
+    }
+
     /// The block's compile-time segment snapshot, which no longer rides the `CompiledBlock`
     /// copy. Returned by value: the three descriptor checks in `run_direct_block` sit between
     /// `&mut self.jit_direct` uses (`retire_key_for_recompile`), so a borrow cannot span them.
     /// One 116-byte copy per entry replaces four.
     ///
-    /// Indexed WITHOUT `active_index`, deliberately. Callers reach this holding a possibly
-    /// stale `CompiledBlock` copy, and back when the layout was a field of that copy the
-    /// descriptor checks still ran (and still attributed their reject counters) against a
-    /// retired block's own snapshot. Adding a liveness gate here would move retirement
-    /// detection ahead of those counters and silently change reject attribution.
-    ///
-    /// Reading a reused slot's newer layout is harmless: it can only pick a different reject
-    /// counter, never admit a stale block. Entry is gated separately by the generational
-    /// re-resolve in `run_direct_block`, which fails for both a retired and a reused id.
-    /// `None` means the whole cache was reset out from under the copy, which that re-resolve
-    /// would have refused a few lines later anyway.
-    /// The block's slot classes, for the class histogram. See `class_vectors`.
-    #[cfg(feature = "timing-class-histogram")]
-    pub(crate) fn class_vector(&self, id: BlockId) -> Option<&[u8]> {
-        self.class_vectors.get(id.index()).map(|v| v.as_ref())
-    }
-
+    /// Indexed without `active_index` deliberately. Callers can hold a stale `CompiledBlock`
+    /// copy, and its own snapshot still drives the reject attribution before entry is refused.
+    /// A reused slot's newer layout can alter only that diagnostic counter, never admit a stale
+    /// block. Entry is gated separately by the generational re-resolve in `run_direct_block`.
     pub(crate) fn segment_layout(&self, id: BlockId) -> Option<SegmentLayout> {
         self.segment_layouts.get(id.index()).copied()
     }
@@ -5998,23 +5993,21 @@ pub(crate) struct DirectAddr {
     pub(crate) disp_lane: Option<ImmLane>,
 }
 
-/// One block's slot classes as dense indices, in slot order, ONE ENTRY PER SLOT.
+/// One block's diagnostic classes in slot order, one entry per slot.
 ///
-/// Slots whose charge arrives at run time (`X87`, `CallOut`) have no class --
-/// an x87 slot's cost comes through `weighted_fp_clocks` and a call-out's
-/// through the helper's return value, so attributing either to a class would
-/// double-count it in the histogram's own terms. They are marked with
-/// `UNCLASSED_SLOT` rather than dropped, because the vector's LENGTH is the
-/// divisor `record_block` uses to turn a retire count into passes: dropping a
-/// slot would shorten the block and smear that slot's retires across its
-/// classed neighbours.
+/// Native x87 slots carry their diagnostic timing class. Call-outs remain
+/// separate because the helper can record interpreter charge events.
 #[cfg(feature = "timing-class-histogram")]
 fn class_vector(slots: &[DirectInsn]) -> Box<[u8]> {
     slots
         .iter()
-        .map(|slot| match slot.kind.timing_class() {
-            Some(class) => class.index() as u8,
-            None => crate::timing_class::UNCLASSED_SLOT,
+        .map(|slot| match slot.kind {
+            DirectKind::X87 { insn, .. } => insn.timing_class().index() as u8,
+            DirectKind::CallOut { .. } => crate::timing_class::CALL_OUT_SLOT,
+            kind => match kind.timing_class() {
+                Some(class) => class.index() as u8,
+                None => crate::timing_class::UNKNOWN_SLOT,
+            },
         })
         .collect()
 }

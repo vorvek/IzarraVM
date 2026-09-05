@@ -3856,24 +3856,17 @@ impl CpuGsw {
         self.perf.instructions += instructions;
         self.perf.jit_direct_entries += 1;
         self.perf.jit_direct_insns += instructions;
-        // The class histogram's native half: design section 9.1's sparse list,
-        // walked once per ENTRY rather than once per instruction. See
-        // `TimingHistogram` for why a chained entry lands in `unattributed`
-        // instead of being spread over the head block's classes.
+        // Reconcile one native return. The diagnostic owns every reported
+        // instruction exactly once, but only attributes a proven unlinked prefix.
         #[cfg(feature = "timing-class-histogram")]
-        {
-            match self.jit_direct.class_vector(block.id()) {
-                Some(vector) if !vector.is_empty() => {
-                    let slots = vector.len() as u64;
-                    let passes = instructions / slots;
-                    let remainder = (instructions % slots) as usize;
-                    let vector: Vec<u8> = vector.to_vec();
-                    self.class_histogram
-                        .record_block(&vector, passes, remainder);
-                }
-                _ => self.class_histogram.record_unattributed(instructions),
-            }
-        }
+        self.class_histogram.record_native_entry(
+            instructions,
+            exit.raw_clocks,
+            exit.weighted_fp_clocks,
+            exit.linked_transfers,
+            usize::from(block.span().instructions),
+            self.jit_direct.class_vector(block.id()),
+        );
         // The CS.D = 0 split of the two lines above. Mode-key bit 0 is CS.D, so a clear bit is a
         // 16-bit code segment. Branchless because this is the hottest path in the backend: the
         // predicate is a compare into a flag and the add is unconditional, so a 32-bit block

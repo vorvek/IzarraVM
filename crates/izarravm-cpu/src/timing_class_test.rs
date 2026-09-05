@@ -692,81 +692,101 @@ fn the_widest_epoch_two_charges_survive_every_stage() {
     );
 }
 
-/// The histogram's arithmetic, including the one thing it must never do:
-/// invent a distribution for retires it cannot place.
+/// Native entries form an exact diagnostic partition without assigning a
+/// repeated or linked entry to a guessed block vector.
 #[cfg(feature = "timing-class-histogram")]
 #[test]
-fn the_histogram_attributes_a_block_exactly_and_never_guesses() {
+fn native_histogram_partitions_only_a_proven_single_block_prefix() {
     let mut hist = TimingHistogram::default();
-    // A three-slot block: Reg, AluRegMem, Jcc.
     let vector = [
         TimingClass::Reg.index() as u8,
         TimingClass::AluRegMem.index() as u8,
         TimingClass::Jcc.index() as u8,
     ];
-    // Ten complete passes plus a two-slot prefix -- 32 retires, which is what a
-    // self-loop that stopped mid-iteration actually did.
-    hist.record_block(&vector, 10, 2);
-    assert_eq!(hist.attributed(), 32);
-    assert_eq!(hist.unattributed(), 0);
-    let rows: std::collections::HashMap<_, _> = hist.rows().into_iter().collect();
-    assert_eq!(rows["Reg"], 11);
-    assert_eq!(rows["AluRegMem"], 11);
-    assert_eq!(rows["Jcc"], 10);
+    hist.record_native_entry(2, 30, 7, 0, vector.len(), Some(&vector));
+    let snapshot = hist.snapshot(&EPOCH1, 11);
+    let known: std::collections::HashMap<_, _> =
+        snapshot.native_known_class_counts.into_iter().collect();
+    assert_eq!(known["Reg"], 1);
+    assert_eq!(known["AluRegMem"], 1);
+    assert!(!known.contains_key("Jcc"));
+    assert_eq!(snapshot.native_entries, 1);
+    assert_eq!(snapshot.native_instructions, 2);
+    assert_eq!(snapshot.native_observed_raw_core, 30);
+    assert_eq!(snapshot.native_observed_weighted_fp, 7);
+    assert_eq!(snapshot.native_partition_residual, 0);
+    assert_eq!(snapshot.instruction_minus_native, 9);
+
+    hist.record_native_entry(3, 0, 0, 1, vector.len(), Some(&vector));
+    hist.record_native_entry(4, 0, 0, 0, vector.len(), Some(&vector));
+    let snapshot = hist.snapshot(&EPOCH1, 11);
+    assert_eq!(snapshot.native_unresolved_instructions.linked_entry, 3);
+    assert_eq!(snapshot.native_unresolved_entries.linked_entry, 1);
     assert_eq!(
-        rows.len(),
-        3,
-        "no class the block does not carry may appear"
-    );
-
-    // The class-clock term is the serial, pre-pairing sum review R5(i) wants.
-    assert_eq!(
-        hist.class_clocks(&EPOCH1),
-        11 * 2 + 11 * 2 + 10 * 3,
-        "epoch 1: Reg 2, AluRegMem 2, Jcc 3"
+        snapshot
+            .native_unresolved_instructions
+            .repeated_unlinked_entry,
+        4
     );
     assert_eq!(
-        hist.class_clocks(&EPOCH2_I586),
-        11 * 12 + 11 * 24 + 10 * 16,
-        "epoch 2 on the 586: Reg 12, AluRegMem 24, Jcc 16"
+        snapshot.native_unresolved_entries.repeated_unlinked_entry,
+        1
     );
+    assert_eq!(snapshot.native_partition_residual, 0);
+}
 
-    // An interpreter retire lands in its class; a `Legacy` site has no class row
-    // and is counted honestly rather than folded into a neighbour.
-    hist.record(TimingClass::Reg);
-    assert_eq!(hist.attributed(), 33);
-    hist.record(TimingClass::Legacy(9));
-    assert_eq!(hist.attributed(), 33, "Legacy must not enter a class row");
-    assert_eq!(hist.unattributed(), 1);
-
-    // A chained native entry hands over instructions the head block's vector
-    // cannot place. They are counted, not spread.
-    hist.record_unattributed(500);
-    assert_eq!(hist.unattributed(), 501);
-    assert_eq!(hist.attributed(), 33);
-
-    // AND the divisor is the SLOT count, not the classed-slot count. A block
-    // with an x87 or call-out slot carries `UNCLASSED_SLOT` in its place, so its
-    // retires land in `unattributed` and its neighbours do not absorb them --
-    // the bias that made an x87-heavy row's class term read high before this was
-    // fixed.
-    let mut mixed = TimingHistogram::default();
-    let with_gap = [
+/// Call-outs and unknown slots remain visible and do not join interpreter charge
+/// events or native class counts.
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn native_histogram_keeps_helper_and_unknown_slots_unresolved() {
+    let mut hist = TimingHistogram::default();
+    let vector = [
         TimingClass::Reg.index() as u8,
-        crate::timing_class::UNCLASSED_SLOT,
-        TimingClass::Jcc.index() as u8,
+        CALL_OUT_SLOT,
+        UNKNOWN_SLOT,
+        TimingClass::X87RegArith.index() as u8,
     ];
-    mixed.record_block(&with_gap, 4, 0);
-    assert_eq!(mixed.attributed(), 8, "two classed slots, four passes");
-    assert_eq!(
-        mixed.unattributed(),
-        4,
-        "the x87 slot retired four times too"
-    );
-    let rows: std::collections::HashMap<_, _> = mixed.rows().into_iter().collect();
-    assert_eq!(rows["Reg"], 4);
-    assert_eq!(rows["Jcc"], 4);
-    assert_eq!(rows.len(), 2);
+    hist.record_native_entry(4, 0, 0, 0, vector.len(), Some(&vector));
+    hist.record(TimingClass::Reg);
+    hist.record(TimingClass::Legacy(9));
+    let snapshot = hist.snapshot(&EPOCH2_I586, 5);
+    let known: std::collections::HashMap<_, _> =
+        snapshot.native_known_class_counts.into_iter().collect();
+    assert_eq!(known["Reg"], 1);
+    assert_eq!(known["X87RegArith"], 1);
+    assert_eq!(snapshot.native_unresolved_instructions.callout_slot, 1);
+    assert_eq!(snapshot.native_unresolved_instructions.unknown_slot, 1);
+    assert_eq!(snapshot.interpreter_unknown_class_events, 1);
+    assert_eq!(snapshot.instruction_minus_native, 1);
+    assert_eq!(snapshot.native_partition_residual, 0);
+}
+
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn native_histogram_marks_missing_and_invalid_vectors_without_panicking() {
+    let mut hist = TimingHistogram::default();
+    hist.record_native_entry(0, 0, 0, 0, 1, None);
+    hist.record_native_entry(3, 0, 0, 0, 3, Some(&[TimingClass::Reg.index() as u8]));
+    hist.record_native_entry(2, 0, 0, 0, 2, Some(&[0xfe, 0xfd]));
+    let snapshot = hist.snapshot(&EPOCH1, 5);
+    assert_eq!(snapshot.native_unresolved_entries.missing_vector, 1);
+    assert_eq!(snapshot.native_unresolved_instructions.missing_vector, 0);
+    assert_eq!(snapshot.native_unresolved_instructions.invalid_vector, 5);
+    assert_eq!(snapshot.native_unresolved_entries.invalid_vector, 2);
+    assert_eq!(snapshot.native_partition_residual, 0);
+}
+
+#[cfg(feature = "timing-class-histogram")]
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "native timing-class partition")]
+fn native_histogram_partition_assertion_rejects_a_dropped_slot() {
+    let hist = TimingHistogram {
+        native_instructions: 1,
+        ..Default::default()
+    };
+    hist.assert_native_partition();
 }
 
 /// Slice 8's mode-keyed system rows. Every one of them was a single flat
@@ -856,8 +876,7 @@ fn the_task_switch_term_is_new_and_free_at_epoch_one() {
     assert_eq!(zeros, vec!["TaskSwitch"]);
 }
 
-/// System events are counted APART from retires, so `class_clocks / attributed`
-/// keeps meaning clocks per retired instruction.
+/// System events remain outside interpreter charge events and native entries.
 #[cfg(feature = "timing-class-histogram")]
 #[test]
 fn system_events_do_not_enter_the_retire_counts() {
@@ -867,17 +886,23 @@ fn system_events_do_not_enter_the_retire_counts() {
     hist.record_system_event(TimingClass::ExceptionDeliveryV86);
     hist.record_system_event(TimingClass::TaskSwitch);
 
-    assert_eq!(hist.attributed(), 1, "a delivery retires no instruction");
+    let snapshot = hist.snapshot(&EPOCH2_I586, 1);
+    assert_eq!(
+        snapshot.interpreter_charge_counts,
+        vec![("Reg", 1)],
+        "a delivery is not an interpreter charge event"
+    );
     assert_eq!(
         hist.class_clocks(&EPOCH2_I586),
         12,
         "one Reg, and nothing else"
     );
-    let events: std::collections::HashMap<_, _> = hist.system_event_rows().into_iter().collect();
+    let events: std::collections::HashMap<_, _> =
+        snapshot.system_event_counts.into_iter().collect();
     assert_eq!(events["ExceptionDeliveryV86"], 2);
     assert_eq!(events["TaskSwitch"], 1);
     assert_eq!(
-        hist.system_event_clocks(&EPOCH2_I586),
+        snapshot.system_event_modeled_raw_clocks,
         2 * 792 + 2076,
         "two V86 trips and a task switch"
     );
