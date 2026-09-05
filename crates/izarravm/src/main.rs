@@ -2210,6 +2210,8 @@ fn timing_class_histogram_json(
             "observed_weighted_fp": histogram.native_observed_weighted_fp,
         },
         "coverage": {
+            "self_loop_recovered_entries": histogram.self_loop_recovered_entries,
+            "self_loop_recovered_instructions": histogram.self_loop_recovered_instructions,
             "native_partition_residual": histogram.native_partition_residual,
             "instruction_minus_native": histogram.instruction_minus_native,
             "whole_row_gradeable": false,

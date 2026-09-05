@@ -24,6 +24,8 @@ use std::{
 
 use izarravm_core::{CpuPersona, GswMode};
 
+#[cfg(feature = "timing-class-histogram")]
+use crate::timing_class::NativeClassMetadata;
 use crate::timing_class::{ClassTable, TimingClass};
 
 use super::code_watch::NativeCodeWatch;
@@ -3646,12 +3648,17 @@ impl BlockCache {
         }
     }
 
-    /// The block's diagnostic slot classes. A stale or reused ID returns none.
+    /// The block's exact-generation diagnostic metadata. A stale or reused ID returns none.
     #[cfg(feature = "timing-class-histogram")]
-    pub(crate) fn class_vector(&self, id: BlockId) -> Option<&[u8]> {
-        self.active_index(id)
-            .and_then(|index| self.class_vectors.get(index))
-            .map(|vector| vector.as_ref())
+    pub(crate) fn native_class_metadata(&self, id: BlockId) -> Option<NativeClassMetadata<'_>> {
+        let index = self.active_index(id)?;
+        let block = self.blocks.get(index)?;
+        let vector = self.class_vectors.get(index)?;
+        Some(NativeClassMetadata {
+            self_loop: block.is_self_loop(),
+            span_instructions: usize::from(block.span().instructions),
+            vector,
+        })
     }
 
     /// The block's compile-time segment snapshot, which no longer rides the `CompiledBlock`

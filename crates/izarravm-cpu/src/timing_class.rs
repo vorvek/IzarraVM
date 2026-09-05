@@ -937,6 +937,14 @@ pub(crate) const CALL_OUT_SLOT: u8 = u8::MAX;
 /// The diagnostic vector marker for a native slot with no timing class.
 pub(crate) const UNKNOWN_SLOT: u8 = u8::MAX - 1;
 
+/// Exact-generation metadata for one native exit's diagnostic class vector.
+pub(crate) struct NativeClassMetadata<'a> {
+    #[cfg(feature = "timing-class-histogram")]
+    pub(crate) self_loop: bool,
+    pub(crate) span_instructions: usize,
+    pub(crate) vector: &'a [u8],
+}
+
 const _: () = assert!(
     N_CLASSES < UNKNOWN_SLOT as usize,
     "a class index would collide with a diagnostic vector marker; the vector needs a wider element"
@@ -983,6 +991,10 @@ pub struct TimingClassHistogramSnapshot {
     pub native_unresolved_entries: NativeUnresolvedEntryCounts,
     pub native_observed_raw_core: u64,
     pub native_observed_weighted_fp: u64,
+    #[cfg(feature = "timing-class-histogram")]
+    pub self_loop_recovered_entries: u64,
+    #[cfg(feature = "timing-class-histogram")]
+    pub self_loop_recovered_instructions: u64,
     pub native_partition_residual: i128,
     pub instruction_minus_native: i128,
 }
@@ -1001,6 +1013,10 @@ pub(crate) struct TimingHistogram {
     native_instructions: u64,
     native_observed_raw_core: u64,
     native_observed_weighted_fp: u64,
+    #[cfg(feature = "timing-class-histogram")]
+    self_loop_recovered_entries: u64,
+    #[cfg(feature = "timing-class-histogram")]
+    self_loop_recovered_instructions: u64,
 }
 
 /// ALWAYS EQUAL, on the `FarCallLedger` precedent (`lib.rs`), and for its exact
@@ -1042,6 +1058,10 @@ impl Default for TimingHistogram {
             native_instructions: 0,
             native_observed_raw_core: 0,
             native_observed_weighted_fp: 0,
+            #[cfg(feature = "timing-class-histogram")]
+            self_loop_recovered_entries: 0,
+            #[cfg(feature = "timing-class-histogram")]
+            self_loop_recovered_instructions: 0,
         }
     }
 }
@@ -1065,8 +1085,7 @@ impl TimingHistogram {
         raw_core: u64,
         weighted_fp: u64,
         linked_transfers: u32,
-        span_instructions: usize,
-        vector: Option<&[u8]>,
+        metadata: Option<NativeClassMetadata<'_>>,
     ) {
         self.native_entries += 1;
         self.native_instructions += instructions;
@@ -1078,13 +1097,14 @@ impl TimingHistogram {
             self.assert_native_partition();
             return;
         }
-        let Some(vector) = vector else {
+        let Some(metadata) = metadata else {
             self.record_whole_unresolved(instructions, WholeUnresolved::MissingVector);
             self.assert_native_partition();
             return;
         };
+        let vector = metadata.vector;
         if vector.is_empty()
-            || vector.len() != span_instructions
+            || vector.len() != metadata.span_instructions
             || vector.iter().any(|index| {
                 usize::from(*index) >= N_CLASSES
                     && *index != CALL_OUT_SLOT
@@ -1096,18 +1116,34 @@ impl TimingHistogram {
             return;
         }
         if instructions > vector.len() as u64 {
+            #[cfg(feature = "timing-class-histogram")]
+            if metadata.self_loop {
+                self.self_loop_recovered_entries += 1;
+                self.self_loop_recovered_instructions += instructions;
+                let complete = instructions / vector.len() as u64;
+                let prefix = instructions % vector.len() as u64;
+                for (slot, &index) in vector.iter().enumerate() {
+                    self.record_native_slot(index, complete + u64::from(slot < prefix as usize));
+                }
+                self.assert_native_partition();
+                return;
+            }
             self.record_whole_unresolved(instructions, WholeUnresolved::RepeatedUnlinkedEntry);
             self.assert_native_partition();
             return;
         }
         for &index in vector.iter().take(instructions as usize) {
-            match index {
-                CALL_OUT_SLOT => self.native_unresolved_instructions.callout_slot += 1,
-                UNKNOWN_SLOT => self.native_unresolved_instructions.unknown_slot += 1,
-                class => self.native_known_class_counts[usize::from(class)] += 1,
-            }
+            self.record_native_slot(index, 1);
         }
         self.assert_native_partition();
+    }
+
+    fn record_native_slot(&mut self, index: u8, occurrences: u64) {
+        match index {
+            CALL_OUT_SLOT => self.native_unresolved_instructions.callout_slot += occurrences,
+            UNKNOWN_SLOT => self.native_unresolved_instructions.unknown_slot += occurrences,
+            class => self.native_known_class_counts[usize::from(class)] += occurrences,
+        }
     }
 
     fn record_whole_unresolved(&mut self, instructions: u64, bucket: WholeUnresolved) {
@@ -1233,6 +1269,10 @@ impl TimingHistogram {
             native_unresolved_entries: self.native_unresolved_entries,
             native_observed_raw_core: self.native_observed_raw_core,
             native_observed_weighted_fp: self.native_observed_weighted_fp,
+            #[cfg(feature = "timing-class-histogram")]
+            self_loop_recovered_entries: self.self_loop_recovered_entries,
+            #[cfg(feature = "timing-class-histogram")]
+            self_loop_recovered_instructions: self.self_loop_recovered_instructions,
             native_partition_residual: self.native_partition_residual(),
             instruction_minus_native: instruction_counter as i128
                 - self.native_instructions as i128,

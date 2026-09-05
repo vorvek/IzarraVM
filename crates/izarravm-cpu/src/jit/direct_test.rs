@@ -1105,14 +1105,15 @@ fn class_vector_requires_the_active_block_generation() {
     let mut cache = BlockCache::default();
     let old_key = key(0x1700);
     let mut old = trivial_compilation(BlockSpan::new(old_key, 1, 1).expect("old span"));
+    old.self_loop = true;
     old.class_vector = vec![TimingClass::Reg.index() as u8].into_boxed_slice();
     assert!(matches!(cache.probe(old_key), BlockProbe::Interpret));
     assert!(matches!(cache.probe(old_key), BlockProbe::Compile));
     let old_id = cache.install(&old).expect("old install");
-    assert_eq!(
-        cache.class_vector(old_id),
-        Some(&[TimingClass::Reg.index() as u8][..])
-    );
+    let old_metadata = cache.native_class_metadata(old_id).expect("old metadata");
+    assert!(old_metadata.self_loop);
+    assert_eq!(old_metadata.span_instructions, 1);
+    assert_eq!(old_metadata.vector, &[TimingClass::Reg.index() as u8]);
 
     assert_eq!(cache.retire_physical_range_for_test(old_key.physical, 1), 1);
     let new_key = key(0x1800);
@@ -1124,11 +1125,13 @@ fn class_vector_requires_the_active_block_generation() {
     let replacement_id = cache.install(&replacement).expect("replacement install");
     assert_eq!(replacement_id.index(), old_id.index());
     assert_ne!(replacement_id, old_id);
-    assert_eq!(cache.class_vector(old_id), None);
-    assert_eq!(
-        cache.class_vector(replacement_id),
-        Some(&[TimingClass::Jcc.index() as u8][..])
-    );
+    assert!(cache.native_class_metadata(old_id).is_none());
+    let metadata = cache
+        .native_class_metadata(replacement_id)
+        .expect("replacement metadata");
+    assert!(!metadata.self_loop);
+    assert_eq!(metadata.span_instructions, 1);
+    assert_eq!(metadata.vector, &[TimingClass::Jcc.index() as u8]);
 }
 
 #[cfg(any(

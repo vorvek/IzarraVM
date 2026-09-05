@@ -2679,6 +2679,8 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     let before_registers = direct.registers.clone();
     let before_fpu = direct.fpu.clone();
     let before_fp_rem = direct.fp_rem;
+    #[cfg(feature = "timing-class-histogram")]
+    let histogram_before = direct.timing_class_histogram_snapshot();
     direct_bus.memory.copy_from_slice(&memory);
     direct_bus.trace = BusTrace::default();
     assert!(
@@ -2701,6 +2703,46 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
             .try_run_direct_block_with_cap_for_test(&mut direct_bus, block, 81)
             .unwrap()
     );
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_after = direct.timing_class_histogram_snapshot();
+        let before_rows: std::collections::HashMap<_, _> = histogram_before
+            .native_known_class_counts
+            .into_iter()
+            .collect();
+        let after_rows: std::collections::HashMap<_, _> = histogram_after
+            .native_known_class_counts
+            .into_iter()
+            .collect();
+        assert_eq!(
+            histogram_after.native_instructions - histogram_before.native_instructions,
+            4
+        );
+        assert_eq!(
+            histogram_after.self_loop_recovered_instructions
+                - histogram_before.self_loop_recovered_instructions,
+            0
+        );
+        assert_eq!(
+            histogram_after.self_loop_recovered_entries
+                - histogram_before.self_loop_recovered_entries,
+            0
+        );
+        assert_eq!(
+            after_rows.get("X87LoadInt32").copied().unwrap_or(0)
+                - before_rows.get("X87LoadInt32").copied().unwrap_or(0),
+            1,
+            "the cap permits one native FILD traversal"
+        );
+        assert_eq!(
+            after_rows.get("X87StoreInt32").copied().unwrap_or(0)
+                - before_rows.get("X87StoreInt32").copied().unwrap_or(0),
+            1,
+            "the cap permits one native FISTP traversal"
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+    }
+    assert_eq!(direct.registers.ecx(), 2);
     for _ in 0..4 {
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
@@ -2713,6 +2755,69 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     assert_eq!(direct.timing_rem, interpreter.timing_rem);
     assert_eq!(direct.fp_rem, interpreter.fp_rem);
     assert_eq!(direct_bus.memory, interpreter_bus.memory);
+
+    #[cfg(feature = "timing-class-histogram")]
+    {
+        let histogram_before = direct.timing_class_histogram_snapshot();
+        let direct_entries = direct.perf_counters().jit_direct_entries;
+        let direct_instructions = direct.perf_counters().jit_direct_insns;
+        assert!(
+            direct
+                .try_run_direct_block_with_cap_for_test(&mut direct_bus, block, u64::MAX)
+                .unwrap()
+        );
+        for _ in 0..8 {
+            interpreter.cycle(&mut interpreter_bus).unwrap();
+        }
+        let histogram_after = direct.timing_class_histogram_snapshot();
+        let before_rows: std::collections::HashMap<_, _> = histogram_before
+            .native_known_class_counts
+            .into_iter()
+            .collect();
+        let after_rows: std::collections::HashMap<_, _> = histogram_after
+            .native_known_class_counts
+            .into_iter()
+            .collect();
+        assert_eq!(direct.registers.ecx(), 0);
+        assert_eq!(
+            direct.perf_counters().jit_direct_entries - direct_entries,
+            1
+        );
+        assert_eq!(
+            direct.perf_counters().jit_direct_insns - direct_instructions,
+            8
+        );
+        assert_eq!(
+            after_rows.get("X87LoadInt32").copied().unwrap_or(0)
+                - before_rows.get("X87LoadInt32").copied().unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            after_rows.get("X87StoreInt32").copied().unwrap_or(0)
+                - before_rows.get("X87StoreInt32").copied().unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            histogram_after.self_loop_recovered_entries
+                - histogram_before.self_loop_recovered_entries,
+            1
+        );
+        assert_eq!(
+            histogram_after.self_loop_recovered_instructions
+                - histogram_before.self_loop_recovered_instructions,
+            8
+        );
+        assert_eq!(histogram_after.native_partition_residual, 0);
+        assert_eq!(
+            crate::tests::settled_registers(&direct),
+            crate::tests::settled_registers(&interpreter)
+        );
+        assert_eq!(direct.fpu, interpreter.fpu);
+        assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
+        assert_eq!(direct.timing_rem, interpreter.timing_rem);
+        assert_eq!(direct.fp_rem, interpreter.fp_rem);
+        assert_eq!(direct_bus.memory, interpreter_bus.memory);
+    }
 }
 
 // Slice 38: 0xDA m32int arithmetic (`NativeX87Insn::IntBinaryMemory`). Every fixture below places

@@ -695,6 +695,19 @@ fn the_widest_epoch_two_charges_survive_every_stage() {
 /// Native entries form an exact diagnostic partition without assigning a
 /// repeated or linked entry to a guessed block vector.
 #[cfg(feature = "timing-class-histogram")]
+fn native_metadata(
+    vector: &[u8],
+    span_instructions: usize,
+    self_loop: bool,
+) -> NativeClassMetadata<'_> {
+    NativeClassMetadata {
+        self_loop,
+        span_instructions,
+        vector,
+    }
+}
+
+#[cfg(feature = "timing-class-histogram")]
 #[test]
 fn native_histogram_partitions_only_a_proven_single_block_prefix() {
     let mut hist = TimingHistogram::default();
@@ -703,7 +716,13 @@ fn native_histogram_partitions_only_a_proven_single_block_prefix() {
         TimingClass::AluRegMem.index() as u8,
         TimingClass::Jcc.index() as u8,
     ];
-    hist.record_native_entry(2, 30, 7, 0, vector.len(), Some(&vector));
+    hist.record_native_entry(
+        2,
+        30,
+        7,
+        0,
+        Some(native_metadata(&vector, vector.len(), false)),
+    );
     let snapshot = hist.snapshot(&EPOCH1, 11);
     let known: std::collections::HashMap<_, _> =
         snapshot.native_known_class_counts.into_iter().collect();
@@ -717,8 +736,20 @@ fn native_histogram_partitions_only_a_proven_single_block_prefix() {
     assert_eq!(snapshot.native_partition_residual, 0);
     assert_eq!(snapshot.instruction_minus_native, 9);
 
-    hist.record_native_entry(3, 0, 0, 1, vector.len(), Some(&vector));
-    hist.record_native_entry(4, 0, 0, 0, vector.len(), Some(&vector));
+    hist.record_native_entry(
+        3,
+        0,
+        0,
+        1,
+        Some(native_metadata(&vector, vector.len(), true)),
+    );
+    hist.record_native_entry(
+        4,
+        0,
+        0,
+        0,
+        Some(native_metadata(&vector, vector.len(), false)),
+    );
     let snapshot = hist.snapshot(&EPOCH1, 11);
     assert_eq!(snapshot.native_unresolved_instructions.linked_entry, 3);
     assert_eq!(snapshot.native_unresolved_entries.linked_entry, 1);
@@ -735,6 +766,82 @@ fn native_histogram_partitions_only_a_proven_single_block_prefix() {
     assert_eq!(snapshot.native_partition_residual, 0);
 }
 
+/// Recovered self-loop counts overlap the partition that already owns the same instructions.
+#[cfg(feature = "timing-class-histogram")]
+#[test]
+fn native_histogram_recovers_only_proven_self_loop_multiplicities() {
+    let mut hist = TimingHistogram::default();
+    let vector = [
+        TimingClass::Reg.index() as u8,
+        TimingClass::AluRegMem.index() as u8,
+        TimingClass::Jcc.index() as u8,
+    ];
+    hist.record_native_entry(
+        8,
+        0,
+        0,
+        0,
+        Some(native_metadata(&vector, vector.len(), true)),
+    );
+    let snapshot = hist.snapshot(&EPOCH1, 8);
+    let known: std::collections::HashMap<_, _> =
+        snapshot.native_known_class_counts.iter().copied().collect();
+    assert_eq!(known["Reg"], 3);
+    assert_eq!(known["AluRegMem"], 3);
+    assert_eq!(known["Jcc"], 2);
+    assert_eq!(snapshot.self_loop_recovered_entries, 1);
+    assert_eq!(snapshot.self_loop_recovered_instructions, 8);
+    assert_eq!(
+        snapshot
+            .native_unresolved_instructions
+            .repeated_unlinked_entry,
+        0
+    );
+    assert_eq!(snapshot.native_partition_residual, 0);
+    assert_eq!(
+        snapshot.native_instructions + snapshot.self_loop_recovered_instructions,
+        16,
+        "recovered coverage overlaps native partition instructions and must not be summed into it"
+    );
+
+    let mut non_loop = TimingHistogram::default();
+    non_loop.record_native_entry(
+        8,
+        0,
+        0,
+        0,
+        Some(native_metadata(&vector, vector.len(), false)),
+    );
+    let non_loop_snapshot = non_loop.snapshot(&EPOCH1, 8);
+    assert_eq!(
+        non_loop_snapshot
+            .native_unresolved_instructions
+            .repeated_unlinked_entry,
+        8
+    );
+    assert_eq!(non_loop_snapshot.self_loop_recovered_entries, 0);
+
+    let mut short_or_zero = TimingHistogram::default();
+    short_or_zero.record_native_entry(
+        0,
+        0,
+        0,
+        0,
+        Some(native_metadata(&vector, vector.len(), true)),
+    );
+    short_or_zero.record_native_entry(
+        2,
+        0,
+        0,
+        0,
+        Some(native_metadata(&vector, vector.len(), true)),
+    );
+    let short_or_zero_snapshot = short_or_zero.snapshot(&EPOCH1, 2);
+    assert_eq!(short_or_zero_snapshot.self_loop_recovered_entries, 0);
+    assert_eq!(short_or_zero_snapshot.self_loop_recovered_instructions, 0);
+    assert_eq!(short_or_zero_snapshot.native_partition_residual, 0);
+}
+
 /// Call-outs and unknown slots remain visible and do not join interpreter charge
 /// events or native class counts.
 #[cfg(feature = "timing-class-histogram")]
@@ -747,7 +854,13 @@ fn native_histogram_keeps_helper_and_unknown_slots_unresolved() {
         UNKNOWN_SLOT,
         TimingClass::X87RegArith.index() as u8,
     ];
-    hist.record_native_entry(4, 0, 0, 0, vector.len(), Some(&vector));
+    hist.record_native_entry(
+        4,
+        0,
+        0,
+        0,
+        Some(native_metadata(&vector, vector.len(), false)),
+    );
     hist.record(TimingClass::Reg);
     hist.record(TimingClass::Legacy(9));
     let snapshot = hist.snapshot(&EPOCH2_I586, 5);
@@ -766,9 +879,17 @@ fn native_histogram_keeps_helper_and_unknown_slots_unresolved() {
 #[test]
 fn native_histogram_marks_missing_and_invalid_vectors_without_panicking() {
     let mut hist = TimingHistogram::default();
-    hist.record_native_entry(0, 0, 0, 0, 1, None);
-    hist.record_native_entry(3, 0, 0, 0, 3, Some(&[TimingClass::Reg.index() as u8]));
-    hist.record_native_entry(2, 0, 0, 0, 2, Some(&[0xfe, 0xfd]));
+    hist.record_native_entry(0, 0, 0, 0, None);
+    let short = [TimingClass::Reg.index() as u8];
+    hist.record_native_entry(3, 0, 0, 0, Some(native_metadata(&short, 3, false)));
+    let invalid = [0xfe, 0xfd];
+    hist.record_native_entry(
+        2,
+        0,
+        0,
+        0,
+        Some(native_metadata(&invalid, invalid.len(), false)),
+    );
     let snapshot = hist.snapshot(&EPOCH1, 5);
     assert_eq!(snapshot.native_unresolved_entries.missing_vector, 1);
     assert_eq!(snapshot.native_unresolved_instructions.missing_vector, 0);
