@@ -1,93 +1,12 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The per-instruction charge CLASS and the three persona class tables.
+//! Instruction charges by CPU persona. Fast-persona raw charges use twelfths
+//! of a core clock; the 386 retains its existing charge units.
 //!
-//! Slice 1a of the timing recalibration
-//! (`dev_docs/2026-09-05-586-recalibration-design.md` §3.2, §9.4, §9.9; the
-//! review's "Revision 2 re-review" item 1). Today every charge site in the
-//! interpreter and the JIT carries a bare integer literal -- `Ok(clocks(2))`,
-//! `DirectKind::raw_clocks`'s `_ => 2` -- and that literal is the SAME number
-//! for all three personas, scaled afterwards by `level_timing`'s single dial.
-//! This module replaces the literal with a NAME (`TimingClass`) plus a
-//! per-persona, per-epoch lookup (`ClassTable`), so a persona can charge a
-//! Pentium's count for `DIV r/m32` where the 386 charges the i386's.
-//!
-//! # The two epochs, and why epoch 1 is bit-identical BY CONSTRUCTION
-//!
-//! `IZARRAVM_TIMING_EPOCH` (read once at `Machine` construction; unset = 1) is
-//! the only selector. Epoch 1 resolves to [`EPOCH1`] for **every** persona, and
-//! every entry in [`EPOCH1`] is the literal the site used to carry. So an
-//! epoch-1 run cannot differ from the pre-slice tree unless a routing mistake
-//! maps a site to the wrong class -- which is exactly what
-//! `timing_class_test.rs`'s epoch-1 fixture catches, literal by literal.
-//!
-//! Epoch 2's unit is the design's: `level_timing` stays `(1, 12)` and **one raw
-//! clock is one twelfth of a core clock**, so every Intel count appears here
-//! multiplied by 12 and is exact.
-//!
-//! # Provenance
-//!
-//! Every class carries a `provenance` string naming the document and row it
-//! came from, and **every class is sourced** -- the `UNSOURCED x12` default the
-//! table shipped with is gone, by the count asserted in
-//! `the_unsourced_and_placeholder_census_is_pinned`. The spellings:
-//!
-//! * `F2 p.N` / `F3` / `F5` -- Intel's Pentium Tables F-2 (integer), F-3 (I/O)
-//!   and F-5 (floating point), Appendix F of 241430-004. `INT` is the interrupt
-//!   clock-count table.
-//! * `T10.1` / `T10.2` / `T10.3` -- the i486 DX2 Data Book's Tables 10.1
-//!   (integer), 10.2 (I/O) and 10.3 (floating point). The persona is a
-//!   **DX2-66**, so the DX2 book is the primary 486 column wherever it differs
-//!   from the base-i486 datasheet; each such row says so.
-//! * `A1` / `3.6.2.1` -- the Optimization Manual's pairing table and rules.
-//!   Table F-2's own `Pairing` column is column-drifted in the extraction and
-//!   is never read positionally.
-//! * `cmp §3 row N` -- `dev_docs/2026-09-05-86box-pentium-timing-comparison.md`
-//!   §3, which is Appendix F read for the same rows.
-//! * `486 §5` -- `dev_docs/2026-09-05-486-timing-audit.md` §5's I486 column.
-//!
-//! Conventions, all from `dev_docs/2026-09-05-class-table-sources.md`: a true
-//! min/max range takes the SLOW end (the owner's 12:15 ruling -- "a miss on the
-//! slow side is a soft finding; a miss on the fast side is a hard failure"); a
-//! DATA-dependent MN/MX range takes a typical and records the range, following
-//! `RclRcrCl`'s precedent; a mode split takes the real-mode row, as `IntN` and
-//! `MovSregReg` already did; and an x87 latency/throughput pair takes the
-//! LATENCY, which is what a non-overlapped retire actually costs and is the slow
-//! side.
-//!
-//! **The I486 x87 column is the shipped literal times twelve, deliberately.**
-//! `dev_docs/2026-09-05-k6-fpu-provenance.md` found that our x87 literals ARE
-//! i486 DX2 Table 10.3 counts (FBLD 75, FLDENV 44, FSTENV 56, FCHS 6, FXCH 4,
-//! FFREE 3, FADD 20 at the high end, FSAVE 150, with F2XM1 200 and the
-//! transcendentals 300 as round stand-ins inside the 486's ranges), so the 486
-//! arm was accidentally right all along and only the I586 column moved onto the
-//! Pentium counts. The three classes SPLIT out during the sourcing
-//! (`X87MemArithIntDiv32`/`16`, `X87Xam`) have no shipped literal of their own
-//! and take Table 10.3 directly.
-//!
-//! # EPOCH 2 IS NOT YET COHERENT. Do not measure it.
-//!
-//! Slice 1a routes the INTERPRETER's `execute.rs` and `run.rs` charge sites onto
-//! the table (131 of the 274). Three things are still on their literals:
-//! `execute_extended.rs` and `fpu_exec.rs` (142 sites, disjoint opcodes -- they
-//! simply under-charge under epoch 2), and, importantly, the JIT's
-//! `DirectKind::raw_clocks`, which mirrors the SAME opcodes `execute.rs` serves.
-//! So under epoch 2 a natively compiled block and an interpreted one charge
-//! DIFFERENT numbers for the same instruction. That is fixed by slice 1 item 2
-//! (the class index in the slot), which is the next sub-slice; until it lands,
-//! `IZARRAVM_TIMING_EPOCH=2` is a development knob and no epoch-2 rate is a
-//! measurement.
-//!
-//! Epoch 1 is unaffected by all of it: every routed site charges the literal it
-//! carried before, which is what the tree's several hundred exact-clock
-//! assertions check.
-//!
-//! # What this slice does NOT do
-//!
-//! The slot-index migration, the budget path, the four width sites, the class
-//! histogram and the Dhrystone reconciliation are items 2-6 of slice 1 and are
-//! later sub-slices. Nothing here changes a charge under epoch 1.
+//! Row provenance names Intel Pentium Appendix F tables F-2, F-3 and F-5,
+//! i486 DX2 Data Book tables 10.1 through 10.3, and the pairing audit.
+//! Data-dependent ranges record their chosen estimate beside the row.
 
 // `name`, `provenance`, `ALL` and `N_CLASSES` are consumed by the tests today and
 // by the class histogram (design section 9.1) when it lands in a later sub-slice;
@@ -98,37 +17,16 @@
 
 use izarravm_core::CpuPersona;
 
-/// Declare the class enum, its dense index, and the three persona columns from
-/// ONE list, so a new class cannot be added to the enum and forgotten in a
-/// table (the failure mode `DirectKind::raw_clocks`'s `_ => 2` default has
-/// shipped twice this campaign).
-///
-/// Columns are `(epoch-1 literal, I486 epoch 2, I586 epoch 2, provenance)`.
-/// There is no I386 epoch-2 column on purpose: the 386 is out of the
-/// recalibration's scope (design §9.9), so `class_table(I386, _)` is [`EPOCH1`]
-/// under both epochs and the 386 stays byte-identical forever.
+/// Declare the class enum, dense indices and I386/I486/I586 persona columns
+/// from one list. The I386 entries retain their original instruction literals.
 macro_rules! timing_classes {
-    ($( $(#[$meta:meta])* $name:ident = ($e1:expr, $i486:expr, $i586:expr, $prov:expr) ),+ $(,)?) => {
-        /// One variant per distinct charge shape the decoder produces.
-        ///
-        /// "Distinct" is decided by the pair (semantic family, epoch-1
-        /// literal): two sites that charge the same literal today but are
-        /// different instructions on a real part -- `PUSH r` at 2 and `LEA` at
-        /// 2, say -- are different classes, because epoch 2 must be free to
-        /// separate them. Two sites that are the same instruction at two
-        /// operand widths and charge the same on both references share one.
+    ($( $(#[$meta:meta])* $name:ident = ($i386:expr, $i486:expr, $i586:expr, $prov:expr) ),+ $(,)?) => {
+        /// One variant per semantic instruction charge shape. Different instructions
+        /// can have different persona prices even when their original literals agree.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub(crate) enum TimingClass {
             $( $(#[$meta])* $name, )+
-            /// The escape hatch: a charge site not yet classified, carrying its
-            /// own epoch-1 literal.
-            ///
-            /// It charges that literal unchanged under EVERY epoch and persona,
-            /// which is correct for epoch 1 and a recorded under-charge for
-            /// epoch 2. It exists so routing can proceed site by site instead
-            /// of as one 274-site commit; a `Legacy` site is not a table row and
-            /// is deliberately invisible to [`TimingClass::ALL`]. Later
-            /// sub-slices empty it out.
+            /// An unclassified site's explicit raw literal, outside the persona tables.
             Legacy(u16),
         }
 
@@ -196,7 +94,7 @@ macro_rules! timing_classes {
             pub(crate) const fn provenance(self) -> &'static str {
                 match self {
                     $( TimingClass::$name => $prov, )+
-                    TimingClass::Legacy(_) => "unclassified site; charges its epoch-1 literal",
+                    TimingClass::Legacy(_) => "unclassified site; uses its explicit raw literal",
                 }
             }
         }
@@ -204,27 +102,26 @@ macro_rules! timing_classes {
         /// How many table-backed classes exist.
         pub(crate) const N_CLASSES: usize = TimingClass::ALL.len();
 
-        /// The epoch-1 column: today's literal for every class, for every
-        /// persona. This array IS the byte-identity proof -- see the module docs.
-        pub(crate) static EPOCH1: ClassTable = EPOCH1_CONST;
+        /// The retained I386 persona column.
+        pub(crate) static I386: ClassTable = I386_CONST;
 
-        /// A `const` twin of [`EPOCH1`], for compile-time tripwires.
+        /// A `const` twin of [`I386`], for compile-time tripwires.
         ///
-        /// Callers that need a stable ADDRESS take `&EPOCH1`; callers that need
+        /// Callers that need a stable ADDRESS take `&I386`; callers that need
         /// to evaluate at compile time take this, because a `const` may not read
         /// a `static`. The two are the same array by construction.
-        pub(crate) const EPOCH1_CONST: ClassTable = ClassTable(EPOCH1_ENTRIES);
+        pub(crate) const I386_CONST: ClassTable = ClassTable(I386_ENTRIES);
 
-        /// `EPOCH1`'s array as a `const`, so the tripwire block below it can be
+        /// `I386`'s array as a `const`, so the tripwire block below it can be
         /// evaluated at compile time: a `const` may not read a `static`, and
-        /// `EPOCH1` has to be a `static` for its address to be stable.
-        const EPOCH1_ENTRIES: [u16; N_CLASSES] = [ $( $e1, )+ ];
+        /// `I386` has to be a `static` for its address to be stable.
+        const I386_ENTRIES: [u16; N_CLASSES] = [ $( $i386, )+ ];
 
         /// The I486 epoch-2 column (`dev_docs/2026-09-05-486-timing-audit.md` §5).
-        pub(crate) static EPOCH2_I486: ClassTable = ClassTable([ $( $i486, )+ ]);
+        pub(crate) static I486: ClassTable = ClassTable([ $( $i486, )+ ]);
 
         /// The I586 epoch-2 column (design §3.2 as amended by §9).
-        pub(crate) static EPOCH2_I586: ClassTable = ClassTable([ $( $i586, )+ ]);
+        pub(crate) static I586: ClassTable = ClassTable([ $( $i586, )+ ]);
     };
 }
 
@@ -345,15 +242,8 @@ timing_classes! {
     JmpFar = (17, 204, 48, "F2 (JMP far indirect 4 real) / T10.1 (17 real)"),
     /// `RETF` (`0xca`/`0xcb`), both operand sizes.
     RetFar = (17, 168, 48, "F2 (RETF 4 real) / T10.1 (14 real, imm form)"),
-    /// Far `CALL` (`0xff /3`) and far `JMP` (`0xff /5`) THROUGH MEMORY, which
-    /// charge 11 where the direct `0x9a`/`0xea` forms charge 17. A separate
-    /// class rather than a shared one because the two literals differ today, and
-    /// a class may hold only one epoch-1 value.
-    /// Far `CALL`/`JMP` through memory take the same real-mode counts as their
-    /// direct forms (`CallFar`/`JmpFar`); they are a separate class only because
-    /// their epoch-1 literals differ (11 against 17), and a class holds one
-    /// epoch-1 value. The epoch-2 entries take the slower of the two families,
-    /// `CallFar`, per the 12:15 ruling.
+    /// Far CALL/JMP through memory retain the I386 literal 11, versus 17 for
+    /// direct forms. Fast personas use the slower real-mode CALL count for both.
     CallJmpFarMem = (11, 216, 60, "F2 (CALL far indirect 5 real) / T10.1 (18 real)"),
     /// A far `CALL`/`JMP`/`RETF` to a protected-mode CODE SEGMENT at the same
     /// privilege level -- no gate, no stack switch. The one flat 17 covered
@@ -378,6 +268,7 @@ timing_classes! {
     Jcxz = (9, 96, 66, "486 §5 (8 clk taken) / design §3.2 (5.5 clk)"),
     /// `NOP` (`0x90`), which is `XCHG eAX, eAX` and charges its own number.
     Nop = (3, 12, 12, "cmp §3 row 1 (1 clk)"),
+    Hlt = (5, 48, 60, "386 inherited5; 486 table10.1 entry4; P5 modeled entry5, residency charged separately"),
     /// `INT imm8` (`0xcd`), today's `INT_IMM8_CORE_CLOCKS`.
     ///
     /// Real mode. The V86 row (design §3.2: 720) needs the mode at the charge
@@ -599,15 +490,8 @@ timing_classes! {
     /// The INTA cycles the PIC drives are NOT in this number and are not
     /// modelled anywhere -- the census lists 8259A INTA as missing entirely.
     HardwareInterrupt = (61, 372, 192, "F2 INT table, real mode 11 + external INTA / T10.1 (31 clk)"),
-    /// A TASK SWITCH: `JMP`/`CALL` through a TSS or task gate, an interrupt
-    /// through a task gate, and `IRET` with NT set.
-    ///
-    /// **This term did not exist.** The switch rode whichever of 17 / 22 / 37 /
-    /// 59 delivered it, which the census scores as under by 100x or more. Its
-    /// epoch-1 entry is ZERO for exactly that reason -- there was no literal to
-    /// preserve, and charging one at epoch 1 would break the knob-unset
-    /// identity bar. It is the one class whose epoch-1 value is not a literal
-    /// it replaced, and the only class exempt from the non-zero test.
+    /// Hardware task-switch work, separate from the invoking instruction.
+    /// The I386 column retains zero; the fast tables carry the documented term.
     TaskSwitch = (0, 2388, 2076, "F2 (task switch 173+) / T10.1 (199 clk); NEW, no epoch-1 term existed"),
 
     // --- x87 -----------------------------------------------------------------
@@ -792,33 +676,12 @@ impl ClassTable {
     }
 }
 
-/// The charge table for one persona under one epoch, resolved ONCE at machine
-/// construction (design §9.9; `dev_docs/2026-09-05-port-io-repricing-design.md`
-/// §4: "the epoch may never change mid-run, because the JIT caches per-block raw
-/// clocks").
-///
-/// Epoch 1 -- and I386 under every epoch -- is [`EPOCH1`], whose entries are the
-/// literals the charge sites used to carry. That is the byte-identity proof: not
-/// a test result, a property of the array.
-///
-/// An epoch above 2 resolves like epoch 2 rather than refusing: the knob parser
-/// (`izarravm-machine`'s `parse_timing_epoch`) is the one place that rejects a
-/// spelling, and duplicating the refusal here would put two answers in the tree.
-///
-/// The three tables are `static`, not `const`, so the returned reference has a
-/// stable address: a `const` is inlined per use site, and two `&EPOCH1`s from
-/// two call sites need not be the same pointer. The tests compare identity, and
-/// the CPU caches the reference across a whole run.
-pub(crate) fn class_table(persona: CpuPersona, epoch: u32) -> &'static ClassTable {
-    if epoch < 2 {
-        return &EPOCH1;
-    }
+/// Resolve the stable charge table for the active persona.
+pub(crate) fn class_table(persona: CpuPersona) -> &'static ClassTable {
     match persona {
-        // The 386 is out of the recalibration's scope (design §9.9): no epoch-2
-        // column exists for it and it stays byte-identical under both epochs.
-        CpuPersona::I386 => &EPOCH1,
-        CpuPersona::I486 => &EPOCH2_I486,
-        CpuPersona::I586 => &EPOCH2_I586,
+        CpuPersona::I386 => &I386,
+        CpuPersona::I486 => &I486,
+        CpuPersona::I586 => &I586,
     }
 }
 
@@ -826,31 +689,18 @@ pub(crate) fn class_table(persona: CpuPersona, epoch: u32) -> &'static ClassTabl
 #[path = "timing_class_test.rs"]
 mod tests;
 
-/// THE EPOCH-1 TRIPWIRES, checked at compile time.
-///
-/// `lib.rs`'s per-opcode `*_CORE_CLOCKS` constants no longer feed anything: the
-/// charge sites read the class table and, since slice 1c, so does the budget
-/// path. They stay because the review asked for them as tripwires, and this
-/// block is what makes them one rather than dead code -- each is asserted equal
-/// to its class's epoch-1 entry, so a table edit that moves an epoch-1 value
-/// fails the BUILD rather than a test.
-///
-/// `INTERPRET_ONE_MAX_CORE_CLOCKS` and `MAX_CALL_OUT_CORE_CLOCKS` are folds of
-/// the others and are asserted against the same folds taken over the table, so
-/// the allowlist in `run.rs`'s `INTERPRET_ONE_CLASSES` cannot silently stop
-/// covering a row the const covers.
+/// Compile-time checks of retained I386 instruction literals against their
+/// original opcode constants.
 const _: () = {
     const fn entry(class: TimingClass) -> u32 {
-        EPOCH1_ENTRIES[class.index()] as u32
+        I386_ENTRIES[class.index()] as u32
     }
     assert!(entry(TimingClass::PopMem) == crate::POP_RM_CORE_CLOCKS);
     assert!(entry(TimingClass::MovRegSreg) == crate::MOV_RM_SREG_CORE_CLOCKS);
     assert!(entry(TimingClass::Xchg) == crate::XCHG_CORE_CLOCKS);
     assert!(entry(TimingClass::BitTest) == crate::BIT_STRING_CORE_CLOCKS);
     assert!(entry(TimingClass::BitTestModify) == crate::BIT_STRING_CORE_CLOCKS);
-    // Group 3's thirteen classes all replaced ONE `clocks(GROUP3_CORE_CLOCKS)`,
-    // so all thirteen carry its literal at epoch 1. That is the whole reason the
-    // split is invisible under the knob-unset identity fixture.
+    // The thirteen group-3 classes retain the original I386 literal.
     assert!(entry(TimingClass::TestImmReg) == crate::GROUP3_CORE_CLOCKS);
     assert!(entry(TimingClass::TestImmMem) == crate::GROUP3_CORE_CLOCKS);
     assert!(entry(TimingClass::NotNegReg) == crate::GROUP3_CORE_CLOCKS);
@@ -882,11 +732,8 @@ const _: () = {
     assert!(entry(TimingClass::Lar) == crate::LAR_LSL_CORE_CLOCKS);
     assert!(entry(TimingClass::Lsl) == crate::LAR_LSL_CORE_CLOCKS);
 
-    // The two folds. `INTERPRET_ONE_MAX_CORE_CLOCKS` is the maximum over the
-    // allowlist; the budget path takes the same maximum over
-    // `run.rs`'s `INTERPRET_ONE_CLASSES`, and this asserts the two agree at
-    // epoch 1 -- which is the only epoch at which they can, since the const
-    // cannot be persona-keyed.
+    // The constant allowlist maximum must match the I386 class fold.
+    // Runtime bounds take this maximum from the selected persona table.
     let mut interpret_one = 0u32;
     let mut i = 0;
     while i < crate::run::INTERPRET_ONE_CLASSES.len() {

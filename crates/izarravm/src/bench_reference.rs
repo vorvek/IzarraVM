@@ -1,17 +1,9 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Reference targets for the Neurketa CPU and memory benchmarks.
-//!
-//! Every target uses the same hard acceptance window: 0.98 through 1.05 of
-//! the reference value. The asymmetric window keeps the accepted center a
-//! little fast, as requested for guest timing.
-//!
-//! Dhrystone and Whetstone carry the project reference values for the three
-//! hardware classes. The 386-slow row is the 22 MHz 386 result divided by
-//! three because it has the same ISA, operation costs, and 64 KiB external
-//! cache at exactly one-third the clock. Sieve, fp-Mandelbrot, and the cache
-//! tiers are deterministic calibration probes rather than period standards.
+//! Historical Neurketa CPU and memory references. These numbers describe
+//! earlier timing and board models. They are retained for comparison, not
+//! acceptance of the current fixed-board model.
 
 use izarravm_core::GswMode;
 
@@ -27,7 +19,9 @@ pub struct BenchBand {
     pub payload: &'static str,
     pub mode: GswMode,
     pub target: f64,
+    #[allow(dead_code)]
     pub lo: f64,
+    #[allow(dead_code)]
     pub hi: f64,
     #[allow(dead_code)]
     pub unit: &'static str,
@@ -35,6 +29,7 @@ pub struct BenchBand {
     pub cite: &'static str,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BandVerdict {
     InBand,
@@ -42,6 +37,7 @@ pub enum BandVerdict {
     High,
 }
 
+#[cfg(test)]
 impl BenchBand {
     pub fn verdict(&self, measured: f64) -> BandVerdict {
         if measured < self.lo {
@@ -78,30 +74,19 @@ pub fn band_for(payload: &str, mode: GswMode) -> Option<&'static BenchBand> {
         .find(|entry| entry.payload == payload && entry.mode == mode)
 }
 
-/// `band_for`, keyed by the guest-clock model epoch the measuring machine ran
-/// under (`Machine::timing_epoch`).
-///
-/// Epoch 2's whole-bill fold (slice 2) re-solves `tier_cost` on both fast
-/// personas and takes `bus_timing` to `(1, 1)`, so a tier's cost in guest clocks
-/// changes and the memory-bandwidth rows the old bands describe no longer exist.
-/// A band that describes a model the tree no longer runs is worse than no band,
-/// so the six affected rows have an epoch-2 twin here; every other payload falls
-/// through to `BENCH_BANDS`.
-pub fn band_for_epoch(payload: &str, mode: GswMode, epoch: u32) -> Option<&'static BenchBand> {
-    if epoch >= 2
-        && let Some(entry) = EPOCH2_BENCH_BANDS
-            .iter()
-            .find(|entry| entry.payload == payload && entry.mode == mode)
-    {
-        return Some(entry);
-    }
-    band_for(payload, mode)
+/// Prefer the latest recorded reference while retaining the older fallback.
+/// Neither set is calibrated for the current fixed motherboard.
+pub fn historical_band_for(payload: &str, mode: GswMode) -> Option<&'static BenchBand> {
+    EPOCH2_BENCH_BANDS
+        .iter()
+        .find(|entry| entry.payload == payload && entry.mode == mode)
+        .or_else(|| band_for(payload, mode))
 }
 
 /// The epoch-2 memory-bandwidth bands, DERIVED from the model rather than fitted
 /// to a game: the sweep reads one dword per bus access, an access costs
-/// `2 + tier_cost(mode, 2).<tier>` raw clocks (`BusCycle::clocks_for`), and
-/// `bus_timing(persona, 2) = (1, 1)` makes a raw clock a guest clock. A tier
+/// `2 + tier_cost(mode).<tier>` raw clocks (`BusCycle::clocks_for`), and
+/// `bus_timing(persona) = (1, 1)` makes a raw clock a guest clock. A tier
 /// below L1 is reached once per LINE, not once per dword: the resolution installs
 /// the line into L1, so a 32-byte 586 line is one L2/RAM access plus seven L1
 /// hits and the per-dword cost is `(2 + ws + 7 * 2) / 8`. Each target below is

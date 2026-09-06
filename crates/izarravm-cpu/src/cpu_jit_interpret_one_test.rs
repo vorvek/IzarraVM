@@ -27,6 +27,7 @@ use super::sixteen_bit::{
     arm_native_sixteen_bit, sixteen_bit_bus, sixteen_bit_code_cpu, warm_sixteen_bit,
 };
 use super::*;
+use crate::timing_class::TimingClass;
 
 const ENTRY: u32 = 0x100;
 /// A page the block's code is not on, for the stack and for the POP's destination.
@@ -1434,7 +1435,7 @@ fn pop_rm_core_clocks_is_what_the_interpreter_charges() {
     let mut expected = 0u64;
     for _ in 0..REPEATS {
         cpu.cycle(&mut bus).expect("the POP must execute");
-        expected += oracle.scale_clocks(crate::POP_RM_CORE_CLOCKS);
+        expected += oracle.scale_clocks(crate::timing_class::I586.raw(TimingClass::PopMem));
     }
     assert!(
         expected > 0,
@@ -2231,7 +2232,11 @@ fn xchg_eax_eax_stays_a_native_nop() {
 #[test]
 fn xchg_core_clocks_is_what_the_interpreter_charges() {
     for row in [&[0x87u8, 0xC3][..], &[0x87, 0x07], &[0x91]] {
-        assert_row_charges(row, crate::XCHG_CORE_CLOCKS, |_, _| {});
+        assert_row_charges(
+            row,
+            crate::timing_class::I586.raw(TimingClass::Xchg),
+            |_, _| {},
+        );
     }
 }
 
@@ -2368,7 +2373,11 @@ fn bit_string_core_clocks_is_what_the_interpreter_charges() {
         &[0x0F, 0xA3, 0xC3],
         &[0x0F, 0xA3, 0x07],
     ] {
-        assert_row_charges(row, crate::BIT_STRING_CORE_CLOCKS, |_, _| {});
+        assert_row_charges(
+            row,
+            crate::timing_class::I586.raw(TimingClass::BitTest),
+            |_, _| {},
+        );
     }
 }
 
@@ -2590,18 +2599,16 @@ fn interpret_one_divide_by_zero_takes_the_fault_stub() {
 /// forms.
 #[test]
 fn group3_core_clocks_is_what_the_interpreter_charges() {
-    for row in [
-        &[0xF7u8, 0xD3][..],
-        &[0xF7, 0xE3],
-        &[0xF7, 0x17],
-        &[0xF7, 0x07, 0x34, 0x12],
-        // F6 execute charges a literal clocks(2), not the named constant. If those drift,
-        // Group3's fold term lies about the byte form.
-        &[0xF6, 0xDF],
-        &[0xF6, 0xE7],
-        &[0xF6, 0x1F],
+    for (row, class) in [
+        (&[0xf7, 0xd3][..], TimingClass::NotNegReg),
+        (&[0xf7, 0xe3][..], TimingClass::Mul16),
+        (&[0xf7, 0x17][..], TimingClass::NotNegMem),
+        (&[0xf7, 0x07, 0x34, 0x12][..], TimingClass::TestImmMem),
+        (&[0xf6, 0xdf][..], TimingClass::NotNegReg),
+        (&[0xf6, 0xe7][..], TimingClass::Mul8),
+        (&[0xf6, 0x1f][..], TimingClass::NotNegMem),
     ] {
-        assert_row_charges(row, crate::GROUP3_CORE_CLOCKS, |cpu, _| {
+        assert_row_charges(row, crate::timing_class::I586.raw(class), |cpu, _| {
             cpu.registers.set_edx(0);
         });
     }
@@ -2670,7 +2677,15 @@ fn inc_dec_byte_splits_native_register_from_call_out_memory() {
 #[test]
 fn inc_dec_rm8_core_clocks_is_what_the_interpreter_charges() {
     for row in [&[0xFEu8, 0x07][..], &[0xFE, 0xC3]] {
-        assert_row_charges(row, crate::INC_DEC_RM8_CORE_CLOCKS, |_, _| {});
+        assert_row_charges(
+            row,
+            crate::timing_class::I586.raw(if row[1] & 0xc0 == 0xc0 {
+                TimingClass::Reg
+            } else {
+                TimingClass::IncDecRm
+            }),
+            |_, _| {},
+        );
     }
 }
 
@@ -2739,7 +2754,11 @@ fn push_rm_memory_takes_the_call_out_at_word_size_only() {
 /// `PUSH_RM_CORE_CLOCKS` is what the interpreter charges.
 #[test]
 fn push_rm_core_clocks_is_what_the_interpreter_charges() {
-    assert_row_charges(&[0xFF, 0x37], crate::PUSH_RM_CORE_CLOCKS, |_, _| {});
+    assert_row_charges(
+        &[0xFF, 0x37],
+        crate::timing_class::I586.raw(TimingClass::PushMem),
+        |_, _| {},
+    );
 }
 
 /// Row 7: CLI, on both of the edges it can take.
@@ -2814,7 +2833,11 @@ fn sti_joins_the_block_beside_the_admitted_cli() {
 /// `CLI_CORE_CLOCKS` is what the interpreter charges.
 #[test]
 fn cli_core_clocks_is_what_the_interpreter_charges() {
-    assert_row_charges(&[0xFA], crate::CLI_CORE_CLOCKS, |_, _| {});
+    assert_row_charges(
+        &[0xFA],
+        crate::timing_class::I586.raw(TimingClass::Cli),
+        |_, _| {},
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2996,7 +3019,11 @@ fn interpret_one_popf_resumes_and_matches_the_interpreter() {
 /// `cli_core_clocks_is_what_the_interpreter_charges`.
 #[test]
 fn pushf_core_clocks_is_what_the_interpreter_charges() {
-    assert_row_charges(&[0x9C], crate::PUSHF_CORE_CLOCKS, |_, _| {});
+    assert_row_charges(
+        &[0x9C],
+        crate::timing_class::I586.raw(TimingClass::PushFlags),
+        |_, _| {},
+    );
 }
 
 /// `POPF_CORE_CLOCKS` is what the interpreter charges. `assert_row_charges` drives the pure
@@ -3005,7 +3032,11 @@ fn pushf_core_clocks_is_what_the_interpreter_charges() {
 /// is needed -- the same no-op every other charge fixture in this file uses.
 #[test]
 fn popf_core_clocks_is_what_the_interpreter_charges() {
-    assert_row_charges(&[0x9D], crate::POPF_CORE_CLOCKS, |_, _| {});
+    assert_row_charges(
+        &[0x9D],
+        crate::timing_class::I586.raw(TimingClass::PopFlags),
+        |_, _| {},
+    );
 }
 
 /// POPF setting TF resyncs, end to end. Before N2 no admitted row could write EFLAGS at all, so
@@ -3765,9 +3796,13 @@ fn mov_sreg_keeps_the_real_mode_register_lowering() {
 #[test]
 fn mov_sreg_core_clocks_is_what_the_interpreter_charges() {
     for row in [&[0x8Eu8, 0xE2][..], &[0x8E, 0x07]] {
-        assert_row_charges(row, crate::MOV_SREG_CORE_CLOCKS, |cpu, _| {
-            cpu.registers.set_edx(0);
-        });
+        assert_row_charges(
+            row,
+            crate::timing_class::I586.raw(TimingClass::MovSregReg),
+            |cpu, _| {
+                cpu.registers.set_edx(0);
+            },
+        );
     }
 }
 
@@ -5495,9 +5530,7 @@ fn a_demotion_on_a_stopping_entry_does_not_leak_its_retire_to_the_next_one() {
     program[ENTRY as usize..ENTRY as usize + CODE_ES.len()].copy_from_slice(CODE_ES);
     seed_protected_tables(&mut program);
     let mut bus = sixteen_bit_bus(program);
-    bus.timing_epoch_two = true;
     let mut cpu = protected_cpu();
-    cpu.set_timing_epoch(2);
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0x0000, DATA_PAGE]);
     for offset in STARTS_ES {
         let linear = ENTRY + offset;
@@ -5944,7 +5977,11 @@ fn only_the_arming_rows_may_resume_with_a_step_armed_shadow() {
 /// `STI_CORE_CLOCKS` is what the interpreter charges.
 #[test]
 fn sti_core_clocks_is_what_the_interpreter_charges() {
-    assert_row_charges(&[0xFB], crate::STI_CORE_CLOCKS, |_, _| {});
+    assert_row_charges(
+        &[0xFB],
+        crate::timing_class::I586.raw(TimingClass::Sti),
+        |_, _| {},
+    );
 }
 
 /// The IF 0-to-1 relaxation is NARROWER than the arming set, and the two must not be merged.
@@ -6347,8 +6384,16 @@ fn the_ss_rows_charge_what_the_interpreter_charges() {
     fn quiet_stack(cpu: &mut CpuGsw, _: &mut TestBus) {
         cpu.registers.set_esp(0x1900);
     }
-    assert_row_charges(&[0x17], crate::POP_SS_CORE_CLOCKS, quiet_stack);
-    assert_row_charges(MOV_SS_SAME, crate::MOV_SREG_CORE_CLOCKS, |_, _| {});
+    assert_row_charges(
+        &[0x17],
+        crate::timing_class::I586.raw(TimingClass::PopSs),
+        quiet_stack,
+    );
+    assert_row_charges(
+        MOV_SS_SAME,
+        crate::timing_class::I586.raw(TimingClass::MovSregReg),
+        |_, _| {},
+    );
 }
 
 // The protected-mode half. A real-mode SS load is `base = selector << 4`; a protected-mode one is

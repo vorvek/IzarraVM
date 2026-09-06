@@ -1073,27 +1073,6 @@ pub trait CpuBus {
     /// Implementations must not fail after returning a window from `begin`.
     fn finish_compiled_window(&mut self, _window: CompiledBusWindow, _delta: CompiledBusDelta) {}
 
-    /// Scaled bus clocks this batch has accumulated so far, in GUEST clocks.
-    /// The straight-line run loop adds the growth of this figure to its core
-    /// total when checking the run cap, so a bus-heavy run (a framebuffer
-    /// blit) cannot exhaust a guest-clock budget expressed in core clocks and
-    /// overshoot the next timer edge - the batch cap's PIT terms are guest
-    /// clocks, and a real PIT interrupts at every edge. Buses without batch
-    /// bus accounting return 0 and use the core-only check.
-    /// Which guest-clock model epoch this machine was constructed under
-    /// (`IZARRAVM_TIMING_EPOCH`, read once at construction; see `izarravm-machine`'s
-    /// `Machine::timing_epoch`). `1` is the pre-repricing model and the default here, so a bus
-    /// with no notion of an epoch -- every test bus, every embedder -- keeps epoch-1 charges
-    /// byte-identically.
-    ///
-    /// The CPU reads this at every port access to pick the `IN`/`OUT` core-clock column
-    /// (`crate::CpuBus` is the only channel the CPU has to a machine-level dial). It MUST be
-    /// constant for the life of the bus: the JIT caches per-block raw clocks, so an epoch that
-    /// changed mid-run would leave already-compiled blocks charging the old model.
-    fn timing_epoch(&self) -> u32 {
-        1
-    }
-
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         0
     }
@@ -1389,6 +1368,12 @@ pub trait CpuBus {
     /// that varies its answer per access silently moves the yield boundary the loop-invariant hoist
     /// computed, and does so only in release builds, where the hoist's `debug_assert_eq!` staleness
     /// check is compiled out.
+    /// CPU-clock upper bound for one string I/O element's complete port transaction.
+    /// Must remain conservative throughout the instruction, including device reprogramming.
+    fn rep_io_cost_upper(&self, _port: u16, width: BusWidth) -> u64 {
+        self.jit_scale_bus_cost_upper(self.jit_io_cost_clocks(width))
+    }
+
     fn rep_data_byte_cost_upper(&self) -> u64 {
         self.jit_data_cost_clocks(BusWidth::Byte)
             .max(self.jit_mode13_data_cost_clocks(BusWidth::Byte))
@@ -1502,20 +1487,8 @@ pub trait CpuBus {
         cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError>;
 
-    /// `read_io` for ONE ELEMENT of a string port read (`INS` / `REP INS`), and its write twin.
-    ///
-    /// The split exists for exactly one charge: a PCI IDE data register moves a string element at
-    /// the ATA PIO **cycle time** (mode 4 `t0` = 120 ns, `ATA-3_X3.298-1997_std.txt:6708`), not at
-    /// the register class's single-access latency. Charging the class latency per element instead
-    /// would price a `REP INSW` transfer at 6.7 MB/s against a real P166's 16.6, and at the
-    /// `IsaXBus` rate 2.0 MB/s -- slower than PIO mode 0, which is the design's blocker (b): every
-    /// HDD and CD read on the board eight times slower than the hardware.
-    ///
-    /// `width` is the ELEMENT width, not a byte cycle's: a bus that splits a word access into two
-    /// byte cycles must divide the element rate between them rather than charging it twice.
-    ///
-    /// Defaulted to the single-access forms, so a bus with no per-class charge (every test bus,
-    /// and the machine bus under epoch 1) needs no override and behaves byte-identically.
+    /// Default string-port cost forwards the generic byte transaction estimate.
+    /// MachineBus specializes it for the complete physical port transaction.
     fn read_io_string_element(
         &mut self,
         port: u16,

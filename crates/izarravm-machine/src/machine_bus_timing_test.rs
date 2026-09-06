@@ -296,16 +296,15 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
                 // clocks), bus_clocks is what the trace recorded since batch
                 // entry (mirrored here by raw_bus_clocks), scaled through
                 // scale_bus's exact carry arithmetic.
-                let step = prior_runs_core_clocks
-                    + core_clocks_so_far
-                    + real_machine.scale_bus(raw_bus_clocks);
+                let step =
+                    (prior_runs_core_clocks + core_clocks_so_far) * 249 + raw_bus_clocks * 33;
                 // Compute whether this step wraps the frame, from the same
                 // pure formula, BEFORE the mutating advance: the prediction
                 // only claims position, but the wrap cases must be shown to
                 // really wrap (frames_completed bumps) or the coverage claim
                 // above is hollow.
                 let frames_before = real_machine.video().frames_completed();
-                real_machine.advance_devices(step);
+                real_machine.advance_devices_ticks(step);
                 let wraps = real_machine.video().frames_completed() > frames_before;
 
                 assert_eq!(
@@ -505,8 +504,8 @@ fn predicted_beam_survives_a_mid_batch_handover_of_the_display() {
 
     // The real machine takes the same handover and then really advances.
     with_bus(&mut real_machine, enable_distira_display);
-    let step = STEP + real_machine.scale_bus(raw_bus_clocks);
-    real_machine.advance_devices(step);
+    let step = STEP * 249 + raw_bus_clocks * 33;
+    real_machine.advance_devices_ticks(step);
 
     assert_eq!(
         predicted,
@@ -537,7 +536,8 @@ fn predicted_beam_survives_a_mid_batch_handover_of_the_display() {
 fn distira_handover_machine() -> Machine {
     let mut machine = test_machine();
     machine.run_cycles(5_000).unwrap();
-    with_bus(&mut machine, |bus| {
+    {
+        let mut bus = machine.make_construction_bus();
         // PCI config 0x40 = initEnable, the write-protect on the FBIINIT
         // registers. Without it the FBIINIT0 write below is silently dropped.
         let address = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | 0x40;
@@ -545,7 +545,8 @@ fn distira_handover_machine() -> Machine {
             .unwrap();
         bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, 1, false)
             .unwrap();
-    });
+    }
+    assert_eq!(machine.port_bus_batch_clocks, 0);
     assert!(machine.vega.set_vbe_mode(0x0105));
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
     machine.advance_devices_clocks(9_999);
@@ -1238,35 +1239,26 @@ fn lazy_61_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurat
 }
 
 #[test]
-fn lazy_61_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
-    // At batch start (zero in-batch clocks, predicted_pit_out degenerates to
-    // the batch-entry live channel_out exactly, the PIT counterpart of
-    // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy 0x61
-    // byte must be byte-identical to what a non-lazy read would return for the
-    // same live PIT/speaker state.
+fn lazy_61_read_observes_the_end_of_its_board_transaction() {
     let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+    machine.set_mode(GswMode::Gsw486);
     machine.run_cycles(5_000).unwrap();
-
-    let expected = (machine.speaker.control_bits() & 0x03)
-        | (u8::from(machine.pit.channel_out(1)) << 4)
-        | (u8::from(machine.pit.channel_out(2)) << 5);
-
-    let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
-        let value = bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap();
-        (value, *bus.io_touched)
+    let initial = machine.pit.channel_out(1);
+    let mut reference = test_machine();
+    reference.set_mode(GswMode::Gsw486);
+    reference.run_cycles(5_000).unwrap();
+    reference.advance_devices_ticks(160 * 33);
+    let expected = (reference.speaker.control_bits() & 3)
+        | (u8::from(reference.pit.channel_out(1)) << 4)
+        | (u8::from(reference.pit.channel_out(2)) << 5);
+    assert_ne!(initial, reference.pit.channel_out(1));
+    with_bus(&mut machine, |bus| {
+        assert_eq!(
+            bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap(),
+            u32::from(expected)
+        );
+        assert!(!*bus.io_touched);
     });
-
-    assert!(
-        !io_touched,
-        "sanity: this is the lazy path (Approximate class)"
-    );
-    assert_eq!(
-        lazy_value,
-        u32::from(expected),
-        "the lazy 0x61 byte must equal the non-lazy read at batch start \
-             (zero in-batch clocks)"
-    );
 }
 
 #[test]
@@ -1402,8 +1394,10 @@ fn a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks()
                 let (predicted, raw_bus_clocks) =
                     latch_and_read_channel0(&mut predicted_machine, prior, core);
 
-                let step = prior + core + real_machine.scale_bus(raw_bus_clocks);
-                real_machine.advance_devices(step);
+                assert_eq!(raw_bus_clocks, 4);
+                assert_eq!(predicted_machine.port_bus_batch_clocks, 468);
+                let step = (prior + core) * u64::from(bus_timing(mode).1);
+                real_machine.advance_devices_ticks(step);
                 let (real, _) = latch_and_read_channel0(&mut real_machine, 0, 0);
 
                 assert_eq!(
@@ -1838,72 +1832,25 @@ fn adlib_detection_idiom_ends_the_batch_on_status_reads() {
 }
 
 #[test]
-fn opl_status_poll_charges_isa_bus_time_only_in_approximate_class() {
-    // A fast CPU retires a tight IN loop so quickly that the 80 us OPL timer
-    // AdLib detection waits on never overflows, so Doom disables FM music. The
-    // fix charges each OPL status read one ISA bus period (~1 us), folded into
-    // the batch's device advance, so the poll cannot outrun the timer. The
-    // The 486/586 modes accrue it. The slower 386 modes already span the
-    // window and do not need the extra charge.
-    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        let mut machine = test_machine();
-        machine.set_mode(mode);
-        machine.port_bus_batch_clocks = 0;
-        with_bus(&mut machine, |bus| {
-            let _ = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
-        });
-        let expected = (mode.clock_hz() / 1_000_000).max(1);
-        assert_eq!(
-            machine.port_bus_batch_clocks, expected,
-            "{mode:?}: one OPL status poll charges one ISA bus period"
-        );
+fn sound_status_polls_charge_the_same_board_period_in_every_cpu_mode() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for port in [0x388, 0x22e] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            with_bus(&mut machine, |bus| {
+                let before = bus.trace.elapsed_clocks();
+                bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+                assert_eq!(bus.trace.elapsed_clocks() - before, 4);
+                assert_eq!(*bus.isa_io_clocks, 156);
+                assert_eq!(bus.in_batch_master_ticks(), 160 * 33);
+            });
+        }
     }
-
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw386);
-    machine.port_bus_batch_clocks = 0;
-    with_bus(&mut machine, |bus| {
-        let _ = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
-    });
-    assert_eq!(
-        machine.port_bus_batch_clocks, 0,
-        "the Accurate class must not charge ISA I/O time (byte-identical cadence)"
-    );
-}
-
-#[test]
-fn sb_dsp_status_poll_charges_isa_bus_time_only_in_approximate_class() {
-    // The SB DSP reset probe is the same idiom as AdLib detection: arm the
-    // reset, then poll the read-status port a bounded number of times for
-    // the 0xAA acknowledge. OuterRid polls 0x22E one hundred times; at 586
-    // an uncharged iteration costs ~60 ns, so the whole loop spans ~6 us
-    // against the 100 us settle and the probe fails where hardware
-    // succeeds. Each DSP port read must charge one ISA bus period in the
-    // Approximate class, exactly as the OPL status poll does above.
-    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        let mut machine = test_machine();
-        machine.set_mode(mode);
-        machine.port_bus_batch_clocks = 0;
-        with_bus(&mut machine, |bus| {
-            let _ = bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
-        });
-        let expected = (mode.clock_hz() / 1_000_000).max(1);
-        assert_eq!(
-            machine.port_bus_batch_clocks, expected,
-            "{mode:?}: one DSP status poll charges one ISA bus period"
-        );
-    }
-
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw386);
-    machine.port_bus_batch_clocks = 0;
-    with_bus(&mut machine, |bus| {
-        let _ = bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
-    });
-    assert_eq!(
-        machine.port_bus_batch_clocks, 0,
-        "the Accurate class must not charge ISA I/O time (byte-identical cadence)"
-    );
 }
 
 #[test]
@@ -3085,45 +3032,38 @@ fn a_misaligned_access_costs_the_same_split_natively_and_interpreted() {
 }
 
 #[test]
-fn approximate_video_wait_states_keep_the_doom_calibration() {
-    assert_eq!(video_wait_states_approx(CpuPersona::I486, 1), 45);
-    // 586: jointly solved with `bus_timing` 16/105 for the 166 MHz / PC100
-    // spec so doom-586 holds ~1001 realtics; see video_wait_states_approx.
-    assert_eq!(video_wait_states_approx(CpuPersona::I586, 1), 147);
-}
-
-/// EPOCH 2, slice 4: the mode-13h absorber is spent, and the value that replaces
-/// it stays INSIDE its pre-registered hardware range.
-///
-/// The ranges are declared in `video_wait_states_approx`'s own comment and in
-/// `dev_docs/2026-09-05-586-recalibration-design.md` sections 4 and 5, and were
-/// written down before the ladder ran. This test is the guard that no later
-/// slice quietly walks the constant out of the range to make a row pass -- which
-/// is the exact pattern the campaign exists to remove.
-#[test]
-fn epoch_2_video_wait_states_stay_inside_their_pre_registered_range() {
-    let i586 = video_wait_states_approx(CpuPersona::I586, 2);
-    let i486 = video_wait_states_approx(CpuPersona::I486, 2);
-
-    // I586, a 1997 PCI VGA: a posted PCI write at ~30 ns per byte access is
-    // ws 3 at 166 MHz; an ISA-timed VGA write at ~375 ns is ws ~60.
-    assert!(
-        (3..=60).contains(&i586),
-        "the epoch-2 I586 mode-13h wait state is {i586}, outside the pre-registered 3..=60"
-    );
-    // I486, a 1993 VLB/ISA VGA. Less headroom: the epoch-1 45 already sat at
-    // the ISA end, so the ladder is 5 / 12 / 20.
-    assert!(
-        (5..=20).contains(&i486),
-        "the epoch-2 I486 mode-13h wait state is {i486}, outside the pre-registered 5..=20"
-    );
-
-    // Both epoch-1 values are untouched. This is the merge bar in miniature.
-    assert_eq!(video_wait_states_approx(CpuPersona::I486, 1), 45);
-    assert_eq!(video_wait_states_approx(CpuPersona::I586, 1), 147);
-    // The 386 is out of the recalibration's scope under both epochs.
-    assert_eq!(video_wait_states_approx(CpuPersona::I386, 1), 1);
-    assert_eq!(video_wait_states_approx(CpuPersona::I386, 2), 1);
+fn video_board_wait_states_honor_the_profile_in_every_cpu_mode() {
+    assert_eq!(WaitStateProfile::default().video, 8);
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for wait_states in [0, 1, 8, 123] {
+            let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+            profile.cpu = mode;
+            profile.wait_states.video = wait_states;
+            let mut machine = Machine::new(profile, vec![0; BIOS_ROM_SIZE]).unwrap();
+            assert!(machine.set_vga_mode(0x13));
+            with_bus(&mut machine, |bus| {
+                let before = bus.trace.elapsed_clocks();
+                bus.read_memory(0xa1200, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap();
+                let expected = 2 + u64::from(wait_states);
+                assert_eq!(bus.trace.elapsed_clocks() - before, expected);
+                let before = bus.trace.elapsed_clocks();
+                bus.charge_direct_memory(0xa1200, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap();
+                assert_eq!(bus.trace.elapsed_clocks() - before, expected);
+                assert!(
+                    bus.jit_direct_memory_max_clocks(BusWidth::Byte, BusAccessKind::DataRead)
+                        .unwrap()
+                        >= expected
+                );
+            });
+        }
+    }
 }
 
 #[test]
@@ -3663,8 +3603,8 @@ fn the_386_lazy_switch_leaves_the_opl_charging_rules_alone() {
     });
     assert!(touched, "an OPL status poll stays batch-ending on 386");
     assert_eq!(
-        isa_clocks, 0,
-        "the Approximate-class ISA-I/O charge must not appear on the 386 class"
+        isa_clocks, 156,
+        "the 386 uses the same physical ISA transaction"
     );
 }
 
@@ -3763,7 +3703,6 @@ fn rep_margo_machine(mode: GswMode, program: &[u8]) -> Machine {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(2, VideoCard::Vega), program).unwrap();
     machine.set_mode(mode);
-    machine.set_timing_epoch_for_test(2);
     machine.cpu.registers.eflags &= !0x600;
     let mut cs = machine.cpu.registers.cs();
     cs.default_size_32 = true;
@@ -3803,27 +3742,27 @@ fn warm_margo_instruction_decode(machine: &mut Machine, eip: u32) {
 #[test]
 fn rep_price_margo_second_status_read_sees_the_completed_element() {
     for (mode, arm_prior, raw_mmio, published, returned, element) in [
-        (GswMode::Gsw486, 52, 7, 15, 19, 3),
+        (GswMode::Gsw486, 58, 10, 15, 19, 3),
         (GswMode::Gsw586, 25, 10, 14, 16, 1),
     ] {
-        // Carry 5 is an injected additive stress. Epoch 2's 1:1 bus ratio
-        // normally leaves carry 0, which is tested separately.
-        for carry in [0, 5] {
+        for phase in [0, 5] {
             let mut machine = rep_margo_machine(mode, &[0x90, 0xf3, 0xa4, 0xf4]);
             warm_margo_instruction_decode(&mut machine, 0x101);
             machine.cpu.registers.set_ecx(2);
             machine.cpu.registers.set_esi(MARGO_MMIO_BASE + 7);
             program_small_margo_fill(&mut machine);
             machine.io_touched = false;
-            machine.bus_rem = carry;
+            machine.advance_devices_ticks(phase);
+            assert_eq!(machine.bus_rem, 0);
             machine.port_bus_batch_clocks = 11;
             let timeline = machine.timeline;
-            let arm = arm_prior + 4 * raw_mmio + carry + 11;
-            let good = 64 + 1 + published + 2 * raw_mmio + carry + 11;
-            let stale = good - element;
-            let arm_ns = timeline.preview_margo_nanoseconds(arm);
-            assert!(timeline.preview_margo_nanoseconds(stale) < arm_ns + 200);
-            assert!(timeline.preview_margo_nanoseconds(good) >= arm_ns + 200);
+            let quantum = timeline.ticks_per_cpu_clock();
+            let arm = arm_prior * quantum + (4 * raw_mmio + 11) * 33;
+            let good = (64 + 1 + published) * quantum + (2 * raw_mmio + 11) * 33;
+            let stale = good - element * quantum;
+            let arm_ns = timeline.preview_margo_nanoseconds_at_ticks(arm);
+            assert!(timeline.preview_margo_nanoseconds_at_ticks(stale) < arm_ns + 200);
+            assert!(timeline.preview_margo_nanoseconds_at_ticks(good) >= arm_ns + 200);
             assert_eq!(arm_margo_fill_at(&mut machine, arm_prior, 1), arm_ns);
             let mut cpu = std::mem::take(&mut machine.cpu);
             let start = cpu.elapsed_clocks;
@@ -3840,6 +3779,9 @@ fn rep_price_margo_second_status_read_sees_the_completed_element() {
                 )
             });
             assert_eq!(outcome.consumed_core_clocks, returned);
+            assert_eq!(cpu.registers.eip, 0x103);
+            assert!(!outcome.halted);
+            assert!(!cpu.halted);
             assert_eq!(published_at_exit, returned);
             assert_eq!(cpu.elapsed_clocks - start, returned);
             assert_eq!(raw, 2 * raw_mmio);
@@ -3855,10 +3797,10 @@ fn rep_price_margo_second_status_read_sees_the_completed_element() {
 #[test]
 fn rep_price_margo_command_arms_after_startup_before_the_element_charge() {
     for (mode, raw_mmio, startup, returned, before_edge, after_edge) in [
-        (GswMode::Gsw486, 7, 7, 12, 12, 14),
+        (GswMode::Gsw486, 10, 7, 12, 12, 14),
         (GswMode::Gsw586, 10, 9, 11, 33, 34),
     ] {
-        for carry in [0, 5] {
+        for phase in [0, 5] {
             let mut machine = rep_margo_machine(mode, &[0x90, 0xf3, 0xab, 0xf4]);
             warm_margo_instruction_decode(&mut machine, 0x101);
             machine.cpu.registers.set_ecx(1);
@@ -3866,11 +3808,13 @@ fn rep_price_margo_command_arms_after_startup_before_the_element_charge() {
             machine.cpu.registers.set_edi(MARGO_MMIO_BASE + 0x150);
             program_small_margo_fill(&mut machine);
             machine.io_touched = false;
-            machine.bus_rem = carry;
+            machine.advance_devices_ticks(phase);
+            assert_eq!(machine.bus_rem, 0);
             machine.port_bus_batch_clocks = 11;
             let timeline = machine.timeline;
-            let arm = 64 + 1 + startup + raw_mmio + carry + 11;
-            let arm_ns = timeline.preview_margo_nanoseconds(arm);
+            let quantum = timeline.ticks_per_cpu_clock();
+            let arm = (64 + 1 + startup) * quantum + (raw_mmio + 11) * 33;
+            let arm_ns = timeline.preview_margo_nanoseconds_at_ticks(arm);
             let mut cpu = std::mem::take(&mut machine.cpu);
             let (outcome, raw) = with_bus(&mut machine, |bus| {
                 bus.prior_runs_core_clocks = 64;
@@ -3880,6 +3824,9 @@ fn rep_price_margo_command_arms_after_startup_before_the_element_charge() {
                 (outcome, bus.trace.elapsed_clocks() - before)
             });
             assert_eq!(outcome.consumed_core_clocks, returned);
+            assert_eq!(cpu.registers.eip, 0x103);
+            assert!(!outcome.halted);
+            assert!(!cpu.halted);
             assert_eq!(raw, raw_mmio);
             assert_eq!(cpu.registers.ecx(), 0);
             assert_eq!(machine.vega.blitter_busy_ns(), 200);
@@ -3887,21 +3834,15 @@ fn rep_price_margo_command_arms_after_startup_before_the_element_charge() {
                 machine
                     .vega
                     .margo()
-                    .busy_ns_after(timeline.preview_margo_nanoseconds(arm + 1)),
-                200 - (timeline.preview_margo_nanoseconds(arm + 1) - arm_ns)
+                    .busy_ns_after(timeline.preview_margo_nanoseconds_at_ticks(arm + quantum)),
+                200 - (timeline.preview_margo_nanoseconds_at_ticks(arm + quantum) - arm_ns)
             );
-            assert!(
-                machine
-                    .vega
-                    .margo()
-                    .status_busy_after(timeline.preview_margo_nanoseconds(arm + before_edge))
-            );
-            assert!(
-                !machine
-                    .vega
-                    .margo()
-                    .status_busy_after(timeline.preview_margo_nanoseconds(arm + after_edge))
-            );
+            assert!(machine.vega.margo().status_busy_after(
+                timeline.preview_margo_nanoseconds_at_ticks(arm + before_edge * quantum)
+            ));
+            assert!(!machine.vega.margo().status_busy_after(
+                timeline.preview_margo_nanoseconds_at_ticks(arm + after_edge * quantum)
+            ));
             assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 3), 0xab);
         }
     }
@@ -3910,7 +3851,7 @@ fn rep_price_margo_command_arms_after_startup_before_the_element_charge() {
 #[test]
 fn rep_price_machine_resets_the_origin_before_a_cold_mmio_instruction() {
     for (mode, rep_core, raw_mmio, arm_prior) in
-        [(GswMode::Gsw486, 108, 7, 82), (GswMode::Gsw586, 45, 10, 0)]
+        [(GswMode::Gsw486, 108, 10, 85), (GswMode::Gsw586, 45, 10, 0)]
     {
         for warm_tail in [false, true] {
             for command in [false, true] {
@@ -3936,14 +3877,22 @@ fn rep_price_machine_resets_the_origin_before_a_cold_mmio_instruction() {
                 machine.io_touched = false;
                 machine.port_bus_batch_clocks = 0;
                 let timeline = machine.timeline;
+                let quantum = timeline.ticks_per_cpu_clock();
                 let prior = 1 + rep_core + u64::from(warm_tail);
-                let access = prior + raw_mmio;
-                let access_ns = timeline.preview_margo_nanoseconds(access);
+                let access = prior * quantum + raw_mmio * 33;
+                let halt = if mode == GswMode::Gsw486 { 4 } else { 5 };
+                let core = prior + 1 + halt;
+                let physical = core * quantum + raw_mmio * 33;
+                let step = physical / quantum;
+                let access_ns = timeline.preview_margo_nanoseconds_at_ticks(access);
                 if !command {
-                    let arm = arm_prior + 4 * raw_mmio;
-                    let arm_ns = timeline.preview_margo_nanoseconds(arm);
+                    let arm = arm_prior * quantum + 4 * raw_mmio * 33;
+                    let arm_ns = timeline.preview_margo_nanoseconds_at_ticks(arm);
                     assert!(access_ns < arm_ns + 200);
-                    assert!(timeline.preview_margo_nanoseconds(access + rep_core) >= arm_ns + 200);
+                    assert!(
+                        timeline.preview_margo_nanoseconds_at_ticks(access + rep_core * quantum)
+                            >= arm_ns + 200
+                    );
                     assert_eq!(arm_margo_fill_at(&mut machine, arm_prior, 1), arm_ns);
                 }
                 let start = machine.cpu.elapsed_clocks;
@@ -3955,19 +3904,19 @@ fn rep_price_machine_resets_the_origin_before_a_cold_mmio_instruction() {
                 assert_eq!(machine.test_batch_observations.len(), 1);
                 assert_eq!(&machine.test_prior_core_pushes[0][..3], &[0, 1, prior]);
                 let observation = &machine.test_batch_observations[0];
-                assert_eq!(observation.core_clocks, prior + 1);
+                assert_eq!(observation.core_clocks, core);
                 assert_eq!(observation.raw_bus_clocks, raw_mmio);
-                assert_eq!(observation.scaled_bus_clocks, raw_mmio);
+                assert_eq!(observation.scaled_bus_clocks, step - core);
                 assert_eq!(observation.isa_clocks, 0);
-                assert_eq!(observation.step, access + 1);
-                assert_eq!(machine.cpu.elapsed_clocks - start, prior + 1);
+                assert_eq!(observation.step, step);
+                assert_eq!(machine.cpu.elapsed_clocks - start, core);
                 #[cfg(feature = "jit")]
-                assert_eq!(machine.cpu.poll_skip_timing_remainder(), 5);
+                assert_eq!(machine.cpu.poll_skip_timing_remainder(), 0);
                 assert_eq!(&machine.memory.as_slice()[0x8000..0x8020], &[0x5a; 32]);
                 assert_eq!(machine.cpu.perf_counters().jit_direct_insns, 0);
                 if command {
                     let remaining =
-                        200 - (timeline.preview_margo_nanoseconds(access + 1) - access_ns);
+                        200 - (timeline.preview_margo_nanoseconds_at_ticks(physical) - access_ns);
                     assert!(remaining > 0 && remaining < 200);
                     assert_eq!(machine.vega.blitter_busy_ns(), remaining);
                     assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 3), 0xab);
@@ -3981,7 +3930,7 @@ fn rep_price_machine_resets_the_origin_before_a_cold_mmio_instruction() {
 
 #[test]
 fn non_rep_port_publication_does_not_shift_a_later_margo_command() {
-    for (mode, raw_mmio) in [(GswMode::Gsw486, 7), (GswMode::Gsw586, 10)] {
+    for (mode, raw_mmio) in [(GswMode::Gsw486, 10), (GswMode::Gsw586, 10)] {
         let mut program = vec![0x90, 0x90, 0xec, 0xb0, 1, 0xa3];
         program.extend_from_slice(&(MARGO_MMIO_BASE + 0x150).to_le_bytes());
         program.push(0xf4);
@@ -3993,20 +3942,24 @@ fn non_rep_port_publication_does_not_shift_a_later_margo_command() {
         machine.port_bus_batch_clocks = 0;
         machine.io_touched = false;
         let timeline = machine.timeline;
-        let arm = 66 + raw_mmio;
+        let quantum = timeline.ticks_per_cpu_clock();
+        let halt = if mode == GswMode::Gsw486 { 4 } else { 5 };
+        let core = 11 + halt;
+        let arm = 10 * quantum + 66 * 33;
+        let physical = arm + (1 + halt) * quantum;
         let remaining = 200
-            - (timeline.preview_margo_nanoseconds(arm + 1)
-                - timeline.preview_margo_nanoseconds(arm));
+            - (timeline.preview_margo_nanoseconds_at_ticks(physical)
+                - timeline.preview_margo_nanoseconds_at_ticks(arm));
         assert!(remaining > 0 && remaining < 200);
         machine.run_until_halt_or_cycles(1000).unwrap();
         assert!(machine.cpu.halted);
         assert_eq!(machine.test_batch_observations.len(), 1);
         assert_eq!(machine.test_prior_core_pushes[0], [0, 1, 9, 10, 11]);
         let observation = &machine.test_batch_observations[0];
-        assert_eq!(observation.core_clocks, 11);
+        assert_eq!(observation.core_clocks, core);
         assert_eq!(observation.raw_bus_clocks, 4 + raw_mmio);
         assert_eq!(observation.isa_clocks, 52);
-        assert_eq!(observation.step, arm + 1);
+        assert_eq!(observation.step, physical / quantum);
         assert_eq!(machine.vega.blitter_busy_ns(), remaining);
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 3), 0xab);
     }
@@ -4417,10 +4370,14 @@ fn cached_icache_fetch_cost_matches_the_live_model_in_every_persona() {
     ] {
         let mut machine = test_machine();
         machine.set_mode(mode);
-        let expected = u64::from(BusCycle::clocks_for(
-            BusWidth::Byte,
-            machine.cache_model.code_fetch_wait_states(),
-        ));
+        let expected = if mode.uses_approximate_timing() {
+            0
+        } else {
+            u64::from(BusCycle::clocks_for(
+                BusWidth::Byte,
+                machine.cache_model.code_fetch_wait_states(),
+            ))
+        };
 
         for tracing in [TracingMode::Off, TracingMode::Counts, TracingMode::Full] {
             machine.trace.set_tracing_mode(tracing);
@@ -4539,7 +4496,10 @@ fn charge_direct_ram_split_is_bit_identical_to_the_byte_splitting_loop() {
                     }
                     assert_eq!(got_cycles.len(), ref_cycles.len(), "{case}: cycle count");
                     // A split really did happen -- otherwise every equality above is vacuous.
-                    if tracing == TracingMode::Full {
+                    if mode.uses_approximate_timing() {
+                        assert_eq!((ref_clocks, ref_accesses), (0, 0));
+                        assert!(ref_cycles.is_empty());
+                    } else if tracing == TracingMode::Full {
                         assert_eq!(
                             ref_cycles.len(),
                             width.bytes() as usize,
@@ -4661,11 +4621,7 @@ fn a_word_read_of_the_status_port_still_decomposes_into_two_byte_cycles() {
         word & 0xfe,
         "the low byte must still be the status port (bit 0 is beam-dependent and excluded)"
     );
-    assert!(
-        word_clocks > byte_clocks,
-        "a word read records its own outer access on top of the two byte cycles \
-         (word {word_clocks}, two bytes {byte_clocks})"
-    );
+    assert_eq!((word_clocks, byte_clocks), (8, 8));
 }
 
 /// The IDE bus-master block keeps precedence at 0x3DA when a guest points BAR4 at it.
@@ -5327,324 +5283,128 @@ fn may_own_memory_agrees_with_the_extended_floor() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// IZARRAVM_ISA_IO_WAIT -- bus-realistic ISA time for legacy X-bus port access.
-// Design basis: dev_docs/isa-io-waitstate-research-2026-08-30.md section 5.2,
-// Shape C.
-// ---------------------------------------------------------------------------
-
-/// Run `body` with the `IZARRAVM_ISA_IO_WAIT` arm forced on this thread, then restore the
-/// ambient reading. The shipped knob is a process-wide `OnceLock`, so both arms can only be
-/// exercised in one process through the per-thread override.
-fn with_isa_io_wait<R>(armed: bool, body: impl FnOnce() -> R) -> R {
-    crate::bus::set_isa_io_wait_for_test(Some(armed));
-    let result = body();
-    crate::bus::set_isa_io_wait_for_test(None);
-    result
-}
-
+/// Scalar I/O pays its class charge in both directions on every persona.
 #[test]
-fn isa_io_wait_knob_names_exactly_two_arms_and_refuses_to_guess() {
-    use crate::bus::parse_isa_io_wait_arm_for_test as parse;
-    // Unset and empty name the SAME arm -- the shipped default, ON since the 2026-08-30 flip
-    // (gp2 1.7818 / descent2 1.1019 / wolf3d 0.9991 null control; the flip commit carries the
-    // evidence). A default moved back without a ladder of that grade would ship silently.
-    assert!(parse(Err(std::env::VarError::NotPresent)));
-    assert!(parse(Ok(String::new())));
-    assert!(parse(Ok("   ".to_string())));
-    for off in ["0", "off", "OFF", " Off "] {
-        assert!(
-            !parse(Ok(off.to_string())),
-            "{off:?} must name the base arm"
-        );
-    }
-    for on in ["1", "on", "ON", " On "] {
-        assert!(parse(Ok(on.to_string())), "{on:?} must name the charge");
-    }
-    for garbage in ["true", "yes", "2", "isa", "-1"] {
-        assert!(
-            std::panic::catch_unwind(|| parse(Ok(garbage.to_string()))).is_err(),
-            "{garbage:?} names no arm and must panic rather than silently run the default"
-        );
-    }
-    assert!(
-        std::panic::catch_unwind(|| parse(Err(std::env::VarError::NotUnicode(
-            std::ffi::OsString::from("x")
-        ))))
-        .is_err(),
-        "a non-UTF-8 setting must panic rather than fall back to the default"
-    );
-}
-
-#[test]
-fn isa_io_wait_off_leaves_a_pit_access_charging_exactly_as_it_does_today() {
-    // The OFF arm is the pre-slice tree, and "byte-identical" is the claim: no ISA accrual at
-    // all, and the recorded bus cycle untouched. The recorded-cycle half is asserted against
-    // the ON arm below rather than against a literal, so it stays true if `wait_states.io`
-    // ever moves.
-    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        let (off_bus_clocks, off_isa) = with_isa_io_wait(false, || {
-            let mut machine = test_machine();
-            machine.set_mode(mode);
-            machine.port_bus_batch_clocks = 0;
-            let before = machine.trace.elapsed_clocks();
-            with_bus(&mut machine, |bus| {
-                let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
-                bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
-            });
-            (
-                machine.trace.elapsed_clocks() - before,
-                machine.port_bus_batch_clocks,
-            )
-        });
-        assert_eq!(
-            off_isa, 0,
-            "{mode:?}: knob OFF must accrue no ISA time on the PIT"
-        );
-        assert!(
-            off_bus_clocks > 0,
-            "{mode:?}: sanity -- the two accesses must still record bus cycles"
-        );
-
-        let on_bus_clocks = with_isa_io_wait(true, || {
-            let mut machine = test_machine();
-            machine.set_mode(mode);
-            machine.port_bus_batch_clocks = 0;
-            let before = machine.trace.elapsed_clocks();
-            with_bus(&mut machine, |bus| {
-                let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
-                bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
-            });
-            machine.trace.elapsed_clocks() - before
-        });
-        assert_eq!(
-            on_bus_clocks, off_bus_clocks,
-            "{mode:?}: the charge is ADDITIVE -- it must not move the recorded bus cycle, \
-             which is what would put it through scale_bus"
-        );
-    }
-}
-
-#[test]
-fn isa_io_wait_charges_a_pit_read_and_a_pit_write_one_isa_period_each() {
-    // 86Box charges ISA_CYCLES(8) = 160 CPU cycles on the PIT in BOTH directions
-    // (pit_fast.c:423 write, :563 read), and a Pentium machine always selects that PIT.
-    // `OUT` is not cheaper than `IN`: Pentium I/O writes are not posted (Vol 1 :3332,
-    // :3403-3416). Both personas charge the same MICROSECOND, which is what a
-    // fixed-frequency bus means -- the clock count follows the mode's clock.
-    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        let expected = (mode.clock_hz() / 1_000_000).max(1);
-        for (port, write) in [(0x40u16, None), (0x43u16, Some(0x34u32))] {
-            let charged = with_isa_io_wait(true, || {
+fn scalar_port_accesses_charge_one_class_lane() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for port in [
+            0x40, 0x43, 0x61, 0x70, 0x201, 0x388, 0x22e, 0x3da, 0xcf8, 0xe4,
+        ] {
+            for write in [false, true] {
                 let mut machine = test_machine();
                 machine.set_mode(mode);
                 machine.port_bus_batch_clocks = 0;
-                with_bus(&mut machine, |bus| match write {
-                    None => {
-                        let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
-                    }
-                    Some(value) => bus.write_io(port, BusWidth::Byte, value, false).unwrap(),
-                });
-                machine.port_bus_batch_clocks
-            });
-            assert_eq!(
-                charged, expected,
-                "{mode:?}: one 8-bit access to {port:#04x} (write={write:?}) must charge one \
-                 ISA bus period"
-            );
-        }
-    }
-
-    // A word access decomposes into two byte cycles and pays for exactly two.
-    let word = with_isa_io_wait(true, || {
-        let mut machine = test_machine();
-        machine.set_mode(GswMode::Gsw586);
-        with_bus(&mut machine, |bus| {
-            *bus.isa_io_clocks = 0;
-            let _ = bus.read_io(0x40, BusWidth::Word, 0, false);
-            *bus.isa_io_clocks
-        })
-    });
-    assert_eq!(
-        word,
-        2 * (GswMode::Gsw586.clock_hz() / 1_000_000).max(1),
-        "a word access decomposes into two byte cycles and pays for exactly two"
-    );
-}
-
-#[test]
-fn isa_io_wait_charges_exactly_the_ports_86box_charges_and_no_others() {
-    // THE PARITY PIN. Under owner-ruling-86box-accuracy-parity the charged set is 86Box's
-    // set, port for port: the PIT (pit_fast.c:423/:563), the PPI port B and its 0x63 mirror
-    // (port_6x.c:58/:91/:105, is486-gated and so live on 486/586), and the RTC/CMOS pair
-    // (nvr_at.c:670/:722). 86Box charges NOTHING on the PIC, the keyboard controller, either
-    // DMA controller, the page registers or the x87 latch strobes -- the research note's
-    // Shape C proposed those, and they were cut, because charging where 86Box is accurate is
-    // inventing rather than matching, and the biggest term would land on the V86 monitor's
-    // PIC OCW3 probes. Re-adding any of the UNCHARGED rows below must fail here.
-    let period = (GswMode::Gsw586.clock_hz() / 1_000_000).max(1);
-    let charged: &[u16] = &[0x40, 0x41, 0x42, 0x43, 0x61, 0x63, 0x70, 0x71];
-    let uncharged: &[u16] = &[
-        0x00, 0x0f, // DMA 1
-        0x20, 0x21, // PIC 1 -- the V86 monitor's OCW3 probe lives here
-        0x60, 0x64, // keyboard controller
-        0x62, 0x6f, // PPI neighbours: only 0x61 and its 0x63 mirror are charged
-        0x72, 0x80, 0x84, 0x8f, // extended CMOS index, DMA page + POST
-        0xa0, 0xa1, // PIC 2
-        0xc0, 0xdf, // DMA 2
-        0xf0, 0xf1, // x87 latch strobes
-    ];
-    let seen = with_isa_io_wait(true, || {
-        let mut machine = test_machine();
-        machine.set_mode(GswMode::Gsw586);
-        let mut seen = Vec::new();
-        with_bus(&mut machine, |bus| {
-            for port in charged.iter().chain(uncharged).copied() {
-                *bus.isa_io_clocks = 0;
-                let _ = bus.read_io(port, BusWidth::Byte, 0, false);
-                let read = *bus.isa_io_clocks;
-                *bus.isa_io_clocks = 0;
-                let _ = bus.write_io(port, BusWidth::Byte, 0, false);
-                seen.push((port, read, *bus.isa_io_clocks));
-            }
-            seen
-        })
-    });
-    for (port, read, write) in seen {
-        let expected = if charged.contains(&port) { period } else { 0 };
-        assert_eq!(
-            read, expected,
-            "read {port:#04x}: the charged set is 86Box's set, port for port"
-        );
-        assert_eq!(
-            write, expected,
-            "write {port:#04x}: the charged set is 86Box's set, port for port"
-        );
-    }
-}
-
-#[test]
-fn isa_io_wait_does_not_double_charge_the_already_charged_opl_and_dsp_reads() {
-    // The OPL ports and the SB16 DSP read ports already take `isa_io_clocks` on the read
-    // side, default-on in the Approximate class. Listing them in the X-bus set would charge
-    // those reads TWICE; they are excluded, so arming the knob must not move them at all.
-    let period = (GswMode::Gsw586.clock_hz() / 1_000_000).max(1);
-    for port in [0x0388u16, 0x0389, 0x0220, 0x22E, 0x226] {
-        for armed in [false, true] {
-            let charged = with_isa_io_wait(armed, || {
-                let mut machine = test_machine();
-                machine.set_mode(GswMode::Gsw586);
-                machine.port_bus_batch_clocks = 0;
+                let before = machine.trace.elapsed_clocks();
                 with_bus(&mut machine, |bus| {
-                    let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+                    if write {
+                        bus.write_io(port, BusWidth::Byte, 0, false).unwrap();
+                    } else {
+                        bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+                    }
                 });
-                machine.port_bus_batch_clocks
-            });
-            assert_eq!(
-                charged, period,
-                "{port:#06x} read: armed={armed} must charge exactly ONE period, not two"
-            );
+                let generic = 4;
+                let class = crate::bus::port_bus_class(port).clocks();
+                assert_eq!(machine.trace.elapsed_clocks() - before, 4);
+                assert_eq!(
+                    machine.port_bus_batch_clocks,
+                    class.saturating_sub(generic),
+                    "{mode:?} {port:#x} write={write}"
+                );
+            }
         }
     }
 }
 
 #[test]
-fn isa_io_wait_leaves_the_vga_status_ports_uncharged_by_86box_parity() {
-    // 86Box charges 0x3DA nothing: its per-card timing feeds `svga_read_common` (the video
-    // MEMORY path, vid_svga.c:2039), while `svga_in`'s `case 0x3da:` (:622-634) adds no
-    // cycles. Under owner-ruling-86box-accuracy-parity, being inaccurate the same way 86Box
-    // is inaccurate can merge -- so the whole 0x3B0-0x3DF range stays cheap here, which also
-    // keeps the largest counts on the board (gp2's 2.003 G reads of 0x3DA) out of this slice.
-    // 0x00E7 rides along as the Lotura chipset's own port: a host-native device, never ISA.
-    let uncharged = with_isa_io_wait(true, || {
+fn dsp_reset_settle_tracks_the_write_inside_a_pending_batch() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine = test_machine();
-        machine.set_mode(GswMode::Gsw586);
-        let mut seen = Vec::new();
+        machine.set_mode(mode);
+        machine.port_bus_batch_clocks = 0;
         with_bus(&mut machine, |bus| {
-            for port in [0x03dau16, 0x03ba, 0x03c2, 0x03c4, 0x03ce, 0x03d4, 0x00e7] {
-                *bus.isa_io_clocks = 0;
-                let _ = bus.read_io(port, BusWidth::Byte, 0, false);
-                let read = *bus.isa_io_clocks;
-                *bus.isa_io_clocks = 0;
-                let _ = bus.write_io(port, BusWidth::Byte, 0, false);
-                seen.push((port, read, *bus.isa_io_clocks));
+            bus.core_clocks_so_far = mode.clock_hz() / 1_000;
+            bus.write_io(0x226, BusWidth::Byte, 1, false).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0, false).unwrap();
+            let deadline = bus.pending_device_micros() + 20;
+            assert!(deadline >= 1_020);
+            for (micros, ready) in [(deadline - 1, false), (deadline, true)] {
+                let mut low = bus.core_clocks_so_far;
+                let mut high = mode.clock_hz();
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    bus.core_clocks_so_far = middle;
+                    if bus
+                        .timeline_at_batch_start
+                        .preview_microseconds_at_ticks(bus.in_batch_master_ticks() + 5_280)
+                        < micros
+                    {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                bus.core_clocks_so_far = low;
+                let raw = bus.trace.elapsed_clocks();
+                let port = *bus.isa_io_clocks;
+                let status = bus
+                    .read_io(0x22e, BusWidth::Byte, bus.core_clocks_so_far, false)
+                    .unwrap();
+                assert_eq!(bus.pending_device_micros(), micros);
+                assert_eq!(status & 0x80 != 0, ready, "{mode:?} at {micros} us");
+                assert_eq!(bus.trace.elapsed_clocks() - raw, 4);
+                assert_eq!(*bus.isa_io_clocks - port, 156);
             }
-            seen
-        })
-    });
-    for (port, read, write) in uncharged {
-        assert_eq!(read, 0, "{port:#06x} read must stay uncharged");
-        assert_eq!(write, 0, "{port:#06x} write must stay uncharged");
-    }
-}
-
-#[test]
-fn isa_io_wait_leaves_the_accurate_386_class_byte_identical() {
-    // Composed with `lazy_port_reads` at the charge site, like both existing `isa_io_clocks`
-    // sites: the Accurate class advances devices per instruction and is the class whose clock
-    // bit-identity is still a merge bar, so it keeps today's cadence whatever the knob says.
-    for armed in [false, true] {
-        let charged = with_isa_io_wait(armed, || {
-            let mut machine = test_machine();
-            machine.set_mode(GswMode::Gsw386);
-            machine.port_bus_batch_clocks = 0;
-            with_bus(&mut machine, |bus| {
-                let _ = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap();
-                bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
-            });
-            machine.port_bus_batch_clocks
+            assert_eq!(
+                bus.read_io(0x22a, BusWidth::Byte, bus.core_clocks_so_far, false)
+                    .unwrap(),
+                0xaa
+            );
+            assert_eq!(bus.sb16.read_port(0x22e).unwrap() & 0x80, 0);
         });
-        assert_eq!(
-            charged, 0,
-            "386, armed={armed}: no ISA charge in this class"
-        );
+        machine.advance_devices_clocks(mode.clock_hz());
+        assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0);
     }
 }
 
 #[test]
-fn isa_io_wait_charges_a_rep_outsb_run_per_element() {
-    // The charge lands on the BUS, so every CPU path inherits it -- including REP OUTS, which
-    // calls `write_io` once per element. This is the end-to-end statement of that: the same
-    // guest, the same guest-clock budget, sixteen `OUT`s per REP to a charged port (0x61, the
-    // PPI port B -- 86Box charges it via `cycles_sub` in `port_6x.c`, and writing speaker-gate
-    // bits has no effect this test depends on). With the charge on, each REP costs ~16 us instead of ~16
-    // instruction-times, so far fewer REPs fit in the budget. If the charge reached only the
-    // discrete IN/OUT paths the two arms would be indistinguishable.
-    let code = [
-        0x31, 0xC0, // 0: xor ax, ax
-        0x8E, 0xD8, // 2: mov ds, ax
-        0xC7, 0x06, 0x00, 0x70, 0x00, 0x00, // 4: mov word [0x7000], 0
-        // loop (10):
-        0xBE, 0x00, 0x80, // 10: mov si, 0x8000
-        0xB9, 0x10, 0x00, // 13: mov cx, 16
-        0xBA, 0x61, 0x00, // 16: mov dx, 0x0061
-        0xF3, 0x6E, // 19: rep outsb
-        0xFF, 0x06, 0x00, 0x70, // 21: inc word [0x7000]
-        0xEB, 0xEF, // 25: jmp loop (-17 from 27)
-    ];
-    let mut counts = Vec::new();
-    for armed in [false, true] {
-        counts.push(with_isa_io_wait(armed, || {
-            let mut machine = Machine::new(
-                MachineProfile::gsw_386(4, VideoCard::Vega),
-                rom_with_code(&code),
-            )
-            .unwrap();
-            machine.set_mode(GswMode::Gsw586);
-            let budget = machine.active_mode().clock_hz() / 200;
-            machine.run_cycles(budget).unwrap();
-            machine.memory.read_u16(0x7000).unwrap()
-        }));
+fn dsp_lazy_settle_does_not_service_unrelated_ports_or_accurate_reads() {
+    for mode in [
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        machine.port_bus_batch_clocks = 0;
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x226, BusWidth::Byte, 1, false).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0, false).unwrap();
+            bus.core_clocks_so_far = mode.clock_hz() / 1_000;
+            bus.read_io(0x80, BusWidth::Byte, bus.core_clocks_so_far, false)
+                .unwrap();
+            assert_eq!(bus.sb16.read_port(0x22e).unwrap() & 0x80, 0);
+            if matches!(mode, GswMode::Gsw386 | GswMode::Gsw386Slow) {
+                let before = *bus.isa_io_clocks;
+                let raw = bus.trace.elapsed_clocks();
+                assert_eq!(
+                    bus.read_io(0x22e, BusWidth::Byte, bus.core_clocks_so_far, false)
+                        .unwrap()
+                        & 0x80,
+                    0
+                );
+                assert_eq!(*bus.isa_io_clocks - before, 156);
+                assert_eq!(bus.trace.elapsed_clocks() - raw, 4);
+            }
+        });
+        machine.advance_devices_clocks(mode.clock_hz() / 1_000);
+        assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0x80);
+        assert_eq!(machine.sb16.read_port(0x22a), Some(0xaa));
+        assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0);
     }
-    let (off, on) = (counts[0], counts[1]);
-    assert!(
-        off > 100,
-        "sanity: the uncharged arm must retire many REP OUTSB runs, saw {off}"
-    );
-    assert!(on > 0, "the charged arm must still make progress, saw {on}");
-    assert!(
-        u32::from(on) * 10 < u32::from(off),
-        "REP OUTSB must pay the ISA charge per ELEMENT: charged {on} runs against \
-         uncharged {off} in the same guest-clock budget"
-    );
 }

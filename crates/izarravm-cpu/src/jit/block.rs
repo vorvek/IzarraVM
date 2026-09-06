@@ -98,11 +98,11 @@ mod poll_clocks {
 /// matching a really-run span, so the equality is asserted at build time rather
 /// than left to a test that a `#[cfg]` could skip.
 const _: () = {
-    use crate::timing_class::EPOCH1_CONST;
-    assert!(poll_clocks::io_three_slot(&EPOCH1_CONST) == 17);
-    assert!(poll_clocks::io_five_slot(&EPOCH1_CONST) == 21);
-    assert!(poll_clocks::io_six_slot(&EPOCH1_CONST) == 28);
-    assert!(poll_clocks::memory(&EPOCH1_CONST) == MEMORY_POLL_RAW_CORE_CLOCKS);
+    use crate::timing_class::I386_CONST;
+    assert!(poll_clocks::io_three_slot(&I386_CONST) == 17);
+    assert!(poll_clocks::io_five_slot(&I386_CONST) == 21);
+    assert!(poll_clocks::io_six_slot(&I386_CONST) == 28);
+    assert!(poll_clocks::memory(&I386_CONST) == MEMORY_POLL_RAW_CORE_CLOCKS);
 };
 
 /// Cap on a built block's slot count, to bound the scan. A block that reaches the cap ends

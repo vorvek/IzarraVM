@@ -12,13 +12,13 @@ fn fatal_sb8_dma_machine() -> Machine {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
     machine.set_mode(GswMode::Gsw486);
-    machine.set_timing_epoch_for_test(2);
     machine.cpu.registers.eflags &= !0x200;
     machine.set_fatal_ports(&[0x2010]);
     for index in 0..16u32 {
         machine.write_physical_u8(0x1_0000 + index, if index == 0 { 0x40 } else { 0x10 });
     }
-    with_bus(&mut machine, |bus| {
+    {
+        let mut bus = machine.make_construction_bus();
         bus.write_io(0x0b, BusWidth::Byte, 0x49, false).unwrap();
         bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
@@ -30,8 +30,8 @@ fn fatal_sb8_dma_machine() -> Machine {
             bus.write_io(0x22c, BusWidth::Byte, u32::from(byte), false)
                 .unwrap();
         }
-    });
-    machine.port_bus_batch_clocks = 0;
+    }
+    assert_eq!(machine.port_bus_batch_clocks, 0);
     machine
 }
 
@@ -39,25 +39,28 @@ fn fatal_sb8_dma_machine() -> Machine {
 fn a_fatal_settlement_advances_one_due_sb8_dma_sample_once() {
     // This is not the synchronous 8237 software-copy path. SB8 consumption is
     // clock-driven by advance_devices, so the fatal return has to own it.
-    const FATAL_STEP: u64 = 57; // MOV DX (1) + failed byte IN raw (4) + ISA (52)
+    const FATAL_TICKS: u64 = 83 + (4 + 52) * 33;
     let mut candidate = fatal_sb8_dma_machine();
     let mut reference = fatal_sb8_dma_machine();
     let first_sample = candidate
         .timeline
-        .cpu_clocks_until(
+        .master_ticks_until(
             crate::timeline::DeviceClock::Dsp,
             1,
             u64::from(candidate.sb16.test_output_frame_rate()),
         )
         .unwrap();
-    assert!(first_sample > FATAL_STEP);
+    assert!(first_sample > FATAL_TICKS);
     for machine in [&mut candidate, &mut reference] {
         assert_eq!(machine.dma.master.channels[1].transfer_cycles, 0);
         assert_eq!(machine.dma.master.channels[1].cur_addr, 0);
         assert_eq!(machine.dma.master.channels[1].cur_count, 15);
-        machine.advance_devices(first_sample - FATAL_STEP);
+        machine.advance_devices_ticks(first_sample - FATAL_TICKS);
     }
 
+    let before_ticks = candidate.master_ticks();
+    let acknowledges = candidate.inta_diag.acknowledge_count;
+    let expected_step = first_sample / 83 - before_ticks / 83;
     let batch = candidate.test_batch_observations.len();
     let stop = candidate.run_until_halt_or_cycles(1_000_000).unwrap();
     assert!(matches!(stop, StopReason::CpuError(_)));
@@ -65,9 +68,13 @@ fn a_fatal_settlement_advances_one_due_sb8_dma_sample_once() {
     assert!(observation.fatal);
     assert_eq!(observation.core_clocks, 1);
     assert_eq!(observation.isa_clocks, 52);
-    assert_eq!(observation.step, FATAL_STEP);
+    assert_eq!(observation.raw_bus_clocks, 4);
+    assert_eq!(observation.step, expected_step);
+    assert_eq!(candidate.master_ticks() - before_ticks, FATAL_TICKS);
+    assert_eq!(candidate.inta_diag.acknowledge_count, acknowledges);
 
-    reference.advance_cpu_work(FATAL_STEP, 1);
+    reference.cpu.elapsed_clocks += 1;
+    reference.advance_cpu_work(FATAL_TICKS, 1);
     assert_eq!(
         candidate.dma.master.channels[1], reference.dma.master.channels[1],
         "fatal settlement and the independent device reference must own the same DMA cycle"
@@ -102,7 +109,6 @@ fn ring0_software_dma_copy_machine(mem_to_mem_enabled: bool) -> Machine {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
     machine.set_mode(GswMode::Gsw486);
-    machine.set_timing_epoch_for_test(2);
     machine.write_physical_u32(GDT + 0x08, 0x0000_ffff);
     machine.write_physical_u32(GDT + 0x0c, 0x00cf_9b00);
     machine.write_physical_u32(GDT + 0x10, 0x0000_ffff);
@@ -224,7 +230,6 @@ fn a_split_vga_word_out_reconciles_its_data_map_before_a_later_fatal() {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
     machine.set_mode(GswMode::Gsw486);
-    machine.set_timing_epoch_for_test(2);
     assert!(machine.set_vga_mode(0x13));
     assert_eq!(machine.vega.direct_write_token(), 1);
     with_bus(&mut machine, |bus| {
@@ -269,7 +274,7 @@ fn a_split_vga_word_out_reconciles_its_data_map_before_a_later_fatal() {
     assert_eq!(audit_after.wipes_direct_map, audit_before.wipes_direct_map);
     assert_eq!(
         audit_after.wipes_direct_data_map,
-        audit_before.wipes_direct_data_map + 1
+        audit_before.wipes_direct_data_map + u64::from(cfg!(feature = "jit"))
     );
 
     let resumed = machine.test_batch_core_totals.len();
@@ -281,8 +286,8 @@ fn a_split_vga_word_out_reconciles_its_data_map_before_a_later_fatal() {
         machine.test_batch_core_totals[resumed..]
             .iter()
             .sum::<u64>(),
-        1,
-        "the later MOV AL,5ah must retire its one-clock work without fatal debt"
+        5,
+        "MOV AL,5ah and HLT retire without repeated fatal debt"
     );
     assert_eq!(machine.cpu.registers.eax() as u8, 0x5a);
     assert_eq!(machine.vega.direct_write_token(), 0);
@@ -371,160 +376,103 @@ fn a_fatal_port_fault_names_the_faulting_instruction_not_the_next_one() {
 
 #[test]
 fn a_fatal_settlement_advances_an_armed_pit_without_acknowledging_it() {
-    // Keep IF clear. The PIT edge raised while the fatal batch settles must be
-    // left for a later batch, not acknowledged by fatal handling.
-    const PROG: &[u8] = &[
+    const PROGRAM: &[u8] = &[
         0xb8, 0x01, 0x00, 0xbb, 0x02, 0x00, 0xb9, 0x03, 0x00, 0xba, 0x10, 0x20, 0xec, 0xeb, 0xfd,
     ];
-    let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
-    machine.set_fatal_ports(&[0x2010]);
-    machine.cpu.registers.eflags &= !0x200;
-    with_bus(&mut machine, |bus| {
-        bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
-        bus.write_io(0x40, BusWidth::Byte, 0x02, false).unwrap();
-        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
-    });
-    let mut reference =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
-    reference.cpu.registers.eflags &= !0x200;
-    with_bus(&mut reference, |bus| {
-        bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
-        bus.write_io(0x40, BusWidth::Byte, 0x02, false).unwrap();
-        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
-    });
-    // This is a valid I386 scaler remainder. The expected bus lane below is
-    // calculated from the actual raw trace, never from the settled step.
-    machine.bus_rem = 7;
-    reference.bus_rem = 7;
-    const FATAL_INTERVAL: u64 = 32;
-    let next_irq_deadline = machine.event_batch_cap(u64::MAX);
-    assert!(next_irq_deadline >= FATAL_INTERVAL);
-    reference.advance_devices(next_irq_deadline - FATAL_INTERVAL);
-    machine.advance_devices(next_irq_deadline - FATAL_INTERVAL);
-    // Raw-program construction has already seeded channel 0. Clear that
-    // setup-era edge before arming the measured interval; this direct PIC
-    // normalization is outside a Machine run and precedes the INTA baseline.
-    for candidate in [&mut machine, &mut reference] {
-        with_bus(candidate, |bus| {
-            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
-        });
+    const FATAL_TICKS: u64 = 4 * 83 + 56 * 33;
+    let make = || {
+        let mut machine =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROGRAM)
+                .unwrap();
+        machine.set_mode(GswMode::Gsw486);
+        machine.set_fatal_ports(&[0x2010]);
+        machine.cpu.registers.eflags &= !0x200;
+        {
+            let mut bus = machine.make_construction_bus();
+            for (port, value) in [
+                (0x43, 0x34),
+                (0x40, 2),
+                (0x40, 0),
+                (0x20, 0x11),
+                (0x21, 8),
+                (0x21, 4),
+                (0x21, 1),
+            ] {
+                bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+            }
+        }
+        let edge = machine
+            .timeline
+            .master_ticks_until(
+                crate::timeline::DeviceClock::Pit,
+                machine.pit.clocks_until_out_rise(0).unwrap(),
+                u64::from(PIT_INPUT_HZ),
+            )
+            .unwrap();
+        assert!(edge > FATAL_TICKS);
+        machine.advance_devices_ticks(edge - FATAL_TICKS);
+        assert_eq!(machine.port_bus_batch_clocks, 0);
+        assert!(!machine.pic.irr_bit(0));
+        assert_eq!(machine.event_batch_cap(u64::MAX), 27);
+        assert_eq!(machine.event_batch_cap_cached(u64::MAX), 27);
+        machine
+    };
+    let mut machine = make();
+    let mut reference = make();
+    for (ticks, rises) in [(FATAL_TICKS - 1, 0), (FATAL_TICKS, 1)] {
+        let mut pit = machine.pit.clone();
+        let clocks = machine.timeline.preview_master_ticks(ticks, 0).0;
+        assert_eq!(
+            pit.tick_arm(clocks, false, &mut PitBulkAdvanceCounters::default()),
+            rises
+        );
     }
-    assert!(
-        !machine.pic.irr_bit(0),
-        "the short PIT interval starts unraised"
-    );
-    assert_eq!(machine.event_batch_cap(u64::MAX), FATAL_INTERVAL);
     let acknowledges = machine.inta_diag.acknowledge_count;
-    let elapsed = machine.elapsed_clocks();
-    let raw_bus = machine.raw_bus_clocks();
-    let scaled_bus = machine.scaled_bus_clocks();
-    let batches = machine.test_batch_core_totals.len();
-
-    let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
-
-    assert!(matches!(stop, StopReason::CpuError(_)));
-    assert!(machine.elapsed_clocks() > elapsed);
-    let settled_core = machine.test_batch_core_totals[batches];
-    let observation = &machine.test_batch_observations[batches];
-    let settled_step = machine.test_batch_steps[batches];
-    let settled_isa = machine.test_batch_isa_clocks[batches];
-    let settled_scaled_bus = machine.scaled_bus_clocks() - scaled_bus;
-    assert_eq!(machine.raw_bus_clocks() - raw_bus, 40);
-    assert_eq!(observation.raw_bus_clocks, 40);
-    assert_eq!(observation.bus_rem_at_entry, 7);
-    assert!(observation.fatal);
-    assert_eq!(observation.isa_clocks, 0, "I386 epoch one has no ISA lane");
-    let scaled_from_raw = ((u128::from(observation.raw_bus_clocks) * 23 + 7) / 31) as u64;
-    let remainder_from_raw = ((u128::from(observation.raw_bus_clocks) * 23 + 7) % 31) as u64;
-    let independent_step = 3 + scaled_from_raw;
-    assert_eq!(settled_core, 3);
-    #[cfg(feature = "jit")]
-    assert_eq!(machine.cpu.poll_skip_timing_remainder(), 1);
-    assert_eq!(settled_scaled_bus, 29);
-    assert_eq!(settled_isa, 0);
-    assert_eq!(settled_step, FATAL_INTERVAL);
-    assert_eq!(independent_step, FATAL_INTERVAL);
-    assert_eq!(observation.step, FATAL_INTERVAL);
-    assert_eq!(remainder_from_raw, 28);
-    assert_eq!(machine.bus_rem, 28);
-    assert_eq!(machine.elapsed_clocks() - elapsed, FATAL_INTERVAL);
-    reference.advance_cpu_work(FATAL_INTERVAL, 3);
-    assert_eq!(machine.pit, reference.pit);
-    assert_eq!(machine.timeline, reference.timeline);
-    assert!(
-        machine.pic.irr_bit(0),
-        "the fatal settlement must advance the armed PIT through an IRQ0 edge; step={} raw={} core={}",
-        independent_step,
-        observation.raw_bus_clocks,
-        settled_core
-    );
-    assert_eq!(machine.pic.irr_bit(0), reference.pic.irr_bit(0));
-    assert_eq!(
-        machine.inta_diag.acknowledge_count, acknowledges,
-        "fatal settlement must not service or acknowledge the newly pending IRQ0"
-    );
-    assert_eq!(
-        settled_core, 3,
-        "four state-changing raw-2 MOVs scale to three I386 clocks with carry 0"
-    );
-
-    assert_eq!(
-        machine.device_edge_cache,
-        crate::timing::DeviceEdgeCache::Stale
-    );
-    let cached_cap = machine.event_batch_cap_cached(u64::MAX);
-    let fresh_cap = machine.event_batch_cap(u64::MAX);
-    assert_eq!(cached_cap, fresh_cap);
-
-    let resumed_elapsed = machine.elapsed_clocks();
-    let resumed_raw_bus = machine.raw_bus_clocks();
-    let resumed_scaled_bus = machine.scaled_bus_clocks();
-    let resumed_batches = machine.test_batch_core_totals.len();
-    let resumed = machine.run_until_halt_or_cycles(1_000_000).unwrap();
-    assert!(matches!(resumed, StopReason::CpuError(_)));
-    assert!(machine.elapsed_clocks() > resumed_elapsed);
-    assert!(machine.raw_bus_clocks() > resumed_raw_bus);
-    let resumed_observation = &machine.test_batch_observations[resumed_batches];
-    let resumed_raw = machine.raw_bus_clocks() - resumed_raw_bus;
-    let resumed_scaled = ((u128::from(resumed_observation.raw_bus_clocks) * 23
-        + u128::from(resumed_observation.bus_rem_at_entry))
-        / 31) as u64;
-    let resumed_remainder = ((u128::from(resumed_observation.raw_bus_clocks) * 23
-        + u128::from(resumed_observation.bus_rem_at_entry))
-        % 31) as u64;
-    assert!(resumed_observation.fatal);
-    assert_eq!(resumed_observation.raw_bus_clocks, resumed_raw);
-    assert_eq!(resumed_observation.bus_rem_at_entry, 28);
-    assert_eq!(machine.test_batch_core_totals[resumed_batches], 3);
-    #[cfg(feature = "jit")]
-    assert_eq!(machine.cpu.poll_skip_timing_remainder(), 0);
-    assert_eq!(resumed_observation.scaled_bus_clocks, resumed_scaled);
-    assert_eq!(
-        machine.scaled_bus_clocks() - resumed_scaled_bus,
-        resumed_scaled
-    );
-    let resumed_step = 3 + resumed_scaled;
-    assert_eq!(resumed_observation.step, resumed_step);
-    assert_eq!(machine.bus_rem, resumed_remainder);
-    assert_eq!(machine.elapsed_clocks() - resumed_elapsed, resumed_step);
-    reference.advance_cpu_work(resumed_step, 3);
-    assert_eq!(machine.pit, reference.pit);
-    assert_eq!(machine.timeline, reference.timeline);
-    assert_eq!(
-        machine.inta_diag.acknowledge_count, acknowledges,
-        "the IF-clear GUI-style resume must not pay the prior stop by servicing IRQ0"
-    );
-    assert_eq!(
-        machine.device_edge_cache,
-        crate::timing::DeviceEdgeCache::Stale
-    );
-    let cached_cap = machine.event_batch_cap_cached(u64::MAX);
-    let fresh_cap = machine.event_batch_cap(u64::MAX);
-    assert_eq!(cached_cap, fresh_cap);
+    for (core, ticks) in [(4, FATAL_TICKS), (3, 3 * 83 + 56 * 33)] {
+        let start_ticks = machine.master_ticks();
+        let elapsed = machine.elapsed_clocks();
+        let cpu_elapsed = machine.cpu.elapsed_clocks;
+        let scaled = machine.scaled_bus_clocks();
+        let batches = machine.test_batch_observations.len();
+        let step = (start_ticks % 83 + ticks) / 83;
+        let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert!(matches!(stop, StopReason::CpuError(_)));
+        assert_eq!(machine.test_batch_observations.len(), batches + 1);
+        let observation = &machine.test_batch_observations[batches];
+        assert!(observation.fatal);
+        assert_eq!(observation.core_clocks, core);
+        assert_eq!(observation.raw_bus_clocks, 4);
+        assert_eq!(observation.isa_clocks, 52);
+        assert_eq!(observation.step, step);
+        assert_eq!(observation.scaled_bus_clocks, step - core);
+        assert_eq!(observation.bus_rem_at_entry, 0);
+        assert_eq!(observation.bus_rem_at_exit, 0);
+        assert_eq!(machine.master_ticks() - start_ticks, ticks);
+        assert_eq!(machine.elapsed_clocks() - elapsed, step);
+        assert_eq!(machine.cpu.elapsed_clocks - cpu_elapsed, core);
+        assert_eq!(machine.scaled_bus_clocks() - scaled, step - core);
+        assert_eq!(machine.cpu.registers.eip, 0x10d);
+        assert_eq!(machine.cpu.registers.eax() as u16, 1);
+        assert_eq!(machine.cpu.registers.ebx() as u16, 2);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 3);
+        assert_eq!(machine.cpu.registers.edx() as u16, 0x2010);
+        assert_eq!(machine.cpu.fault_site().unwrap().eip, 0x10c);
+        reference.cpu.elapsed_clocks += core;
+        reference.advance_cpu_work(ticks, core);
+        assert_eq!(machine.pit, reference.pit);
+        assert_eq!(machine.timeline, reference.timeline);
+        assert!(machine.pic.irr_bit(0));
+        assert_eq!(machine.pic.irr_bit(0), reference.pic.irr_bit(0));
+        assert_eq!(machine.inta_diag.acknowledge_count, acknowledges);
+        assert_eq!(
+            machine.device_edge_cache,
+            crate::timing::DeviceEdgeCache::Stale
+        );
+        assert_eq!(
+            machine.event_batch_cap_cached(u64::MAX),
+            machine.event_batch_cap(u64::MAX)
+        );
+    }
 }
 
 #[test]
@@ -538,20 +486,24 @@ fn an_i486_fatal_port_keeps_its_attempted_isa_lane_once() {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
     machine.set_mode(GswMode::Gsw486);
-    machine.set_timing_epoch_for_test(2);
     machine.set_fatal_ports(&[0x2010]);
+    let ticks = machine.master_ticks();
     let batch = machine.test_batch_observations.len();
     let stop = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert!(matches!(stop, StopReason::CpuError(_)));
     let observation = &machine.test_batch_observations[batch];
     assert!(observation.fatal);
     assert_eq!(observation.core_clocks, 4);
+    assert_eq!(observation.raw_bus_clocks, 4);
+    assert_eq!(observation.scaled_bus_clocks, 22);
+    assert_eq!(observation.step, 26);
+    assert_eq!(machine.master_ticks() - ticks, 4 * 83 + 56 * 33);
     assert_eq!(observation.isa_clocks, 52);
     assert_eq!(observation.bus_rem_at_entry, 0);
     assert_eq!(observation.bus_rem_at_exit, 0);
     assert_eq!(
         observation.step,
-        observation.core_clocks + observation.scaled_bus_clocks + observation.isa_clocks
+        observation.core_clocks + observation.scaled_bus_clocks
     );
 }
 

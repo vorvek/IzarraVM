@@ -83,10 +83,17 @@ fn run_bench_one_profiled(
     let started = std::time::Instant::now();
     let stop = machine.run_until_halt_or_cycles(budget)?;
     let wall = started.elapsed();
-    if !matches!(stop, StopReason::TestExit { .. }) {
+    let baseline = matches!(source, BenchSource::BootSelector(0));
+    let owned_payload = !matches!(source, BenchSource::DosExe(_));
+    if !matches!(stop, StopReason::TestExit { code: 0 })
+        || (owned_payload
+            && (machine.bench_status() != 1 || (!baseline && machine.bench_iterations() == 0)))
+    {
         return Err(format!(
-            "bench {} {source:?} did not exit cleanly: {stop:?}",
-            mode.canonical_name()
+            "bench {} {source:?} has invalid completion: {stop:?}, status={}, iterations={}",
+            mode.canonical_name(),
+            machine.bench_status(),
+            machine.bench_iterations(),
         )
         .into());
     }
@@ -143,9 +150,7 @@ const BENCHES: &[Bench] = &[
         min_mode: GswMode::Gsw386Slow,
         flops_per_iter: None,
     },
-    // Whetstone: the FP oracle (486+). `flops_per_iter` is the per-sweep FLOP weight,
-    // anchored so the era-calibrated 486 lands at ~6.5 MFLOPS (Roy Longbottom); the
-    // 586 is then tuned to ~34.5 MFLOPS via fp_timing(I586).
+    // Whetstone uses the retained reporting weight below, without timing calibration.
     Bench {
         name: "whetstone",
         source: BenchSource::LocalDosExe(".bench/whetstone.exe"),
@@ -154,10 +159,8 @@ const BENCHES: &[Bench] = &[
     },
 ];
 
-/// FLOP weight per Whetstone sweep (the value reported as one iteration). Anchored
-/// to the era 486DX2-66 Whetstone figure (~6.5 MFLOPS): the measured 486 throughput
-/// (250.0 sweeps/sec, era-calibrated 486 timing) times this over 1e6 == 6.5. A pure
-/// units constant; the physical 586/486 ratio lives in fp_timing(I586).
+/// Retained reporting weight per Whetstone sweep. The original reference used
+/// 250 sweeps/sec and 6.5 MFLOPS; this is not new fixed-board calibration.
 const WHETSTONE_FLOPS_PER_SWEEP: f64 = 26000.0;
 
 /// Small real-mode polling and memory loops used for host-performance diagnosis.
@@ -416,9 +419,8 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
         PerfCounters,
         izarravm_cpu::FastMapProbeCounters,
     )> = Vec::new();
-    let mut out_of_band = false;
     for bench in BENCHES {
-        let mut slow_row: Option<(u64, f64)> = None;
+        let mut slow_row: Option<(u32, u32)> = None;
         for mode in modes {
             if mode_rank(mode) < mode_rank(bench.min_mode) {
                 continue;
@@ -438,7 +440,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 BenchSource::LocalDosExe(_) | BenchSource::DosExe(_) => 0,
             };
             let work = run.clocks.saturating_sub(baseline_clocks);
-            let iters = u64::from(run.iterations.max(1));
+            let iters = u64::from(run.iterations);
             let cyc_per_iter = work as f64 / iters as f64;
             let guest_secs = mode.clock_rate().seconds_for_clocks(work);
             let iters_per_sec = if guest_secs > 0.0 {
@@ -461,25 +463,15 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 }
                 None => (iters_per_sec, String::new()),
             };
+            let result = (run.iterations, run.aux);
             match mode {
-                GswMode::Gsw386Slow => slow_row = Some((work, band_value)),
+                GswMode::Gsw386Slow => slow_row = Some(result),
                 GswMode::Gsw386 => {
-                    if let Some((slow_work, slow_value)) = slow_row {
-                        if slow_work != work {
-                            return Err(format!(
-                                "{} retired different architectural work in 386-slow ({slow_work}) and 386 ({work})",
-                                bench.name
-                            )
-                            .into());
-                        }
-                        let ratio = slow_value * 3.0 / band_value;
-                        if (ratio - 1.0).abs() > 0.005 {
-                            return Err(format!(
-                                "{} 386-slow throughput is {:.4} of the exact one-third target",
-                                bench.name, ratio
-                            )
-                            .into());
-                        }
+                    if slow_row.is_some_and(|slow| slow != result) {
+                        return Err(format!(
+                            "{} reports different guest results in 386-slow {slow_row:?} and 386 {result:?}",
+                            bench.name
+                        ).into());
                     }
                 }
                 GswMode::Gsw486 | GswMode::Gsw586 => {}
@@ -496,11 +488,6 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 wall_secs * 1000.0,
                 rt,
             );
-            if bench_reference::band_for(bench.name, mode).is_some_and(|band| {
-                band.verdict(band_value) != bench_reference::BandVerdict::InBand
-            }) {
-                out_of_band = true;
-            }
             println!(
                 "{}{}",
                 mflops_suffix,
@@ -561,12 +548,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.jit_paged_tlb_successes,
         );
     }
-    if out_of_band {
-        return Err("a CPU benchmark row is outside its hard reference band"
-            .to_string()
-            .into());
-    }
-    Ok(())
+    Err("CPU benchmark calibration is unavailable for the current fixed-board timing model".into())
 }
 
 pub(super) fn run_bench_exe(path: &Path, hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
@@ -1295,19 +1277,15 @@ pub(super) fn print_perf_counter_row(
     );
 }
 
-/// Compare a measured `iters/sec` to the matching era reference band and return
-/// a tag to append to the row: ` [in band]`, ` [LOW <ratio>]`, ` [HIGH <ratio>]`,
-/// or empty when no band is encoded for this payload/mode.
-fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
-    use bench_reference::BandVerdict;
-    let Some(band) = bench_reference::band_for(payload, mode) else {
-        return String::new();
+/// Show the historical reference without grading the current timing model.
+fn band_tag(payload: &str, mode: GswMode, measured: f64) -> String {
+    let Some(band) = bench_reference::historical_band_for(payload, mode) else {
+        return " [unqualified: no historical reference]".to_string();
     };
-    match band.verdict(iters_per_sec) {
-        BandVerdict::InBand => " [in band]".to_string(),
-        BandVerdict::Low => format!(" [LOW {:.2}]", iters_per_sec / band.target),
-        BandVerdict::High => format!(" [HIGH {:.2}]", iters_per_sec / band.target),
-    }
+    format!(
+        " [unqualified historical ratio={:.2}]",
+        measured / band.target
+    )
 }
 
 /// Block sizes swept by --headless-bandwidth, powers of two from 4 KB to 4 MB.
@@ -1333,8 +1311,8 @@ const BANDWIDTH_BLOCKS: &[u32] = &[
 /// physical address) over a range of block sizes and prints MB/s per block, so a
 /// human can see the L1/L2/RAM cache tiers as steps in the curve.
 ///
-/// Every row is checked against the same hard reference window as the CPU
-/// payloads. The curve must step down at each cache boundary.
+/// Historical ratios are unqualified. Print the full sweep before reporting
+/// that the current timing model has no calibrated acceptance bands.
 pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     // A fixed total budget per block: small blocks do many passes, large blocks a
     // few. 16 MB amortizes the cold first pass so the steady state dominates.
@@ -1352,9 +1330,8 @@ pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Er
         TOTAL / (1024 * 1024),
         0x10_0000u32,
     );
-    println!("(tier costs calibrated: the curve steps down at each cache boundary)");
+    println!("(current fixed-board measurements; historical references are unqualified)");
 
-    let mut out_of_band = false;
     for mode in modes {
         println!();
         println!(
@@ -1372,29 +1349,20 @@ pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Er
                 izarravm_firmware::neurketa_image(),
             )?;
             machine.set_mode(mode);
-            let epoch = machine.timing_epoch();
             let sample = machine.measure_read_bandwidth(0x10_0000, block, TOTAL);
             let mb_per_sec = if sample.clocks > 0 {
                 sample.bytes as f64 / mode.clock_rate().seconds_for_clocks(sample.clocks) / 1.0e6
             } else {
                 0.0
             };
-            let tag = bandwidth_band_tag(mode, block, mb_per_sec, epoch);
-            if bench_reference::band_for_epoch(bandwidth_tier(mode, block), mode, epoch)
-                .is_some_and(|band| {
-                    band.verdict(mb_per_sec) != bench_reference::BandVerdict::InBand
-                })
-            {
-                out_of_band = true;
-            }
+            let tag = bandwidth_band_tag(mode, block, mb_per_sec);
             println!("{:>7}K {:>12.1} {:>16}", block / 1024, mb_per_sec, tag,);
         }
     }
-    if out_of_band {
-        Err("a memory-bandwidth row is outside its hard reference band".into())
-    } else {
-        Ok(())
-    }
+    Err(
+        "Memory-bandwidth calibration is unavailable for the current fixed-board timing model"
+            .into(),
+    )
 }
 
 fn bandwidth_tier(mode: GswMode, block: u32) -> &'static str {
@@ -1409,17 +1377,16 @@ fn bandwidth_tier(mode: GswMode, block: u32) -> &'static str {
     }
 }
 
-/// Tag a bandwidth row against the band for its active cache tier.
-fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64, epoch: u32) -> String {
-    use bench_reference::BandVerdict;
+/// Label the measured tier and its unqualified historical reference.
+fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64) -> String {
     let tier = bandwidth_tier(mode, block);
-    let Some(band) = bench_reference::band_for_epoch(tier, mode, epoch) else {
-        return String::new();
-    };
-    let label = tier.trim_start_matches("bandwidth-");
-    match band.verdict(mb_per_sec) {
-        BandVerdict::InBand => format!("{label} [in band]"),
-        BandVerdict::Low => format!("{label} [LOW {:.2}]", mb_per_sec / band.target),
-        BandVerdict::High => format!("{label} [HIGH {:.2}]", mb_per_sec / band.target),
-    }
+    format!(
+        "{}{}",
+        tier.trim_start_matches("bandwidth-"),
+        band_tag(tier, mode, mb_per_sec)
+    )
 }
+
+#[cfg(test)]
+#[path = "bench_test.rs"]
+mod tests;

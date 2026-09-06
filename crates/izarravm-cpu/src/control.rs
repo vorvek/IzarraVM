@@ -2010,16 +2010,8 @@ impl CpuGsw {
         // fault path) from a state belonging to no task.
         let switch_result = self.commit_task_switch(bus, kind, new_tss, old_selector, new_selector);
         if switch_result.is_ok() {
-            // THE TERM THAT DID NOT EXIST. A task switch rode whichever of the
-            // far-transfer, IRET or interrupt charges delivered it, which the
-            // census scores as under by 100x or more. It is charged HERE rather
-            // than at a call site because the three paths that reach a switch --
-            // `JMP`/`CALL` through a TSS or task gate, `IRET` with NT set, and
-            // an interrupt through a task gate -- do not share one.
-            //
-            // At epoch 1 `TaskSwitch` is ZERO, so this adds nothing and the
-            // knob-unset identity bar holds; it is the one class whose epoch-1
-            // entry is not a literal it replaced, because there was none.
+            // Task-switch work is charged separately from the instruction that invokes it.
+            // The retained I386 table has no extra task-switch term.
             #[cfg(feature = "timing-class-histogram")]
             self.class_histogram
                 .record_system_event(crate::timing_class::TimingClass::TaskSwitch);

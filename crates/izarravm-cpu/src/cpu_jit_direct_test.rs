@@ -3325,55 +3325,76 @@ fn deadline_program() -> Vec<u8> {
         0x89, 0xc3, // mov ebx,eax
         0x89, 0xc1, // mov ecx,eax
         0x89, 0xc2, // mov edx,eax
-        0x89, 0xc6, // mov esi,eax: reaches cap=1
-        0x89, 0xc7, // mov edi,eax: zero-scaled suffix
-        0x89, 0xc5, // mov ebp,eax: zero-scaled suffix
+        0x89, 0xc6, // mov esi,eax: reaches cap=6
+        0x89, 0xc7, // mov edi,eax: beyond cap=6
+        0x89, 0xc5, // mov ebp,eax: ends the seven-clock block
         0xf4,
     ]);
     memory
 }
 
 #[test]
-fn direct_block_equal_to_deadline_falls_back_before_zero_scaled_suffix() {
+fn direct_block_at_the_deadline_falls_back_without_running_past_the_cap() {
     let memory = deadline_program();
     let mut interp = fresh();
     let mut native = fresh();
+    interp.set_jit_auto_admit(false);
     let mut interp_bus = TestBus::with_memory(memory.clone());
     let mut native_bus = TestBus::with_memory(memory);
     drive(&mut interp, &mut interp_bus);
     drive(&mut native, &mut native_bus);
+    let block = install_fixture_block(&mut native, 0x101);
     native.set_jit_auto_admit(true);
-    for _ in 0..3 {
-        native.halted = false;
-        native.registers.eip = 0x100;
-        drive(&mut native, &mut native_bus);
+    assert_eq!(block.span().instructions, 7);
+    assert_eq!(block.raw_clocks(), 84);
+    for (cap, eip, tail, enters) in [
+        (6, 0x10e, 0, false),
+        (8, 0x112, 1, false),
+        (9, 0x112, 1, true),
+    ] {
+        for cpu in [&mut interp, &mut native] {
+            cpu.halted = false;
+            cpu.registers.eip = 0x100;
+            cpu.registers.gpr.fill(0);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.trace = BusTrace::default();
+        }
+        let before = (
+            native.perf_counters().jit_direct_entries,
+            native.perf_counters().jit_direct_reject_zero_budget,
+        );
+        let interp_outcome = interp.run_straight_line(&mut interp_bus, cap).unwrap();
+        let native_outcome = native.run_straight_line(&mut native_bus, cap).unwrap();
+        assert_eq!(native_outcome, interp_outcome);
+        let mut native_state = crate::tests::settled_state(&native);
+        let mut interp_state = crate::tests::settled_state(&interp);
+        if enters {
+            assert_eq!(native.core_clocks_so_far, 1);
+            assert_eq!(interp.core_clocks_so_far, 7);
+        } else {
+            assert_eq!(native.core_clocks_so_far, interp.core_clocks_so_far);
+        }
+        native_state.core_clocks_so_far = 0;
+        interp_state.core_clocks_so_far = 0;
+        assert_eq!(native_state, interp_state);
+        assert_eq!(native_bus.memory, interp_bus.memory);
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+        assert_eq!(native.registers.eip, eip);
+        assert_eq!(native.registers.edi(), tail);
+        assert_eq!(native.registers.ebp(), tail);
+        let after = native.perf_counters();
+        assert_eq!(after.jit_direct_entries > before.0, enters);
+        if cap == 8 {
+            assert!(after.jit_direct_reject_zero_budget > before.1);
+        }
     }
-
-    for cpu in [&mut interp, &mut native] {
-        cpu.halted = false;
-        cpu.registers.eip = 0x100;
-        cpu.registers.gpr.fill(0);
-        cpu.elapsed_clocks = 0;
-        cpu.timing_rem = 0;
-        cpu.core_clocks_so_far = 0;
-    }
-    for bus in [&mut interp_bus, &mut native_bus] {
-        bus.trace = BusTrace::default();
-    }
-    let direct_entries = native.perf_counters().jit_direct_entries;
-
-    let interp_outcome = interp.run_straight_line(&mut interp_bus, 1).unwrap();
-    let native_outcome = native.run_straight_line(&mut native_bus, 1).unwrap();
-
-    assert_eq!(native_outcome, interp_outcome);
-    assert_eq!(
-        crate::tests::settled_state(&native),
-        crate::tests::settled_state(&interp)
-    );
-    assert_eq!(native.registers.eip, 0x10e);
-    assert_eq!(native.registers.edi(), 0);
-    assert_eq!(native.registers.ebp(), 0);
-    assert_eq!(native.perf_counters().jit_direct_entries, direct_entries);
 }
 
 pub(super) fn make_data_segments_flat(cpu: &mut CpuGsw) {

@@ -13,9 +13,11 @@ use izarravm_bus::{
     DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, ReflectedCallDecline,
     ReflectedCallGateRequest, TracingMode, scale_core_clocks,
 };
+#[cfg(test)]
+use izarravm_core::CpuPersona;
 use izarravm_core::{
-    CpuPersona, GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard,
-    WAVETABLE_MPU_BASE, WssConfig,
+    GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard, WAVETABLE_MPU_BASE,
+    WssConfig,
 };
 /// Are this crate's two reflected-call-memo seams compiled in?
 ///
@@ -29,9 +31,7 @@ use izarravm_core::{
 pub const REFLECTED_CALL_MEMO_SEAMS_WIRED: bool = cfg!(feature = "reflected-call-memo");
 
 pub use izarravm_cpu::PerfCounters;
-use izarravm_cpu::{
-    CpuCycleOutcome, CpuError, CpuGsw, CpuRunError, SegmentIndex, SegmentRegister, bus_timing,
-};
+use izarravm_cpu::{CpuCycleOutcome, CpuError, CpuGsw, CpuRunError, SegmentIndex, SegmentRegister};
 #[cfg(test)]
 use izarravm_video::HGC_FB_SIZE;
 use izarravm_video::{
@@ -87,7 +87,9 @@ mod vga_wipe_census;
 mod video;
 mod video_params;
 
-use timeline::{DeviceAdvance, DeviceRates, RatePhase, Timeline};
+use timeline::{
+    BUS_CLOCK_MASTER_TICKS, DeviceAdvance, DeviceRates, RatePhase, Timeline, bus_timing,
+};
 use vega::{Vega, VideoWrite};
 
 use sb16_path::{Ct1745Mix, Sb16Path, Sb16RenderWindow};
@@ -301,7 +303,7 @@ impl Default for WaitStateProfile {
         Self {
             ram: 0,
             rom: 1,
-            video: 1,
+            video: 8,
             io: 2,
         }
     }
@@ -456,111 +458,6 @@ impl VideoHostMetricsSnapshot {
 /// wall second, so a guest that never polls pays ~140k clocks/s (~0.2 percent).
 pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 
-/// Per-mode video-window wait states for the Approximate class (486/586).
-/// A real VGA card sits across an expansion bus whose access latency does not
-/// scale with CPU speed. The flat `WaitStateProfile.video = 1` rode `scale_bus`
-/// (486 x1/3, 586 x7/30), which priced VRAM far below VLB and PCI latency. Doom
-/// issues about 131 million VGA accesses in the max-detail demo3 timedemo, so it
-/// exposes this error while the synthetic CPU benchmarks do not.
-///
-/// Narrow SMC invalidation removed an accidental cold-decode timing tax. The 586
-/// value was recalibrated at that point, but the 486 value was left stale. The
-/// current values are measured after that change and after `scale_bus`:
-///
-/// - 486 ws=45: 2980 realtics, 25.1 fps (target about 3000 realtics)
-/// - 586 ws=75 at 200 MHz with `bus_timing` 7/30: 833 realtics, 89.7 fps
-///   (target 820 to 850 realtics); re-seated 2026-08-08 for the 166 MHz /
-///   PC100 spec as ws=147 with `bus_timing` 16/105, jointly solved so doom-586
-///   holds ~1001 realtics (74.6 fps) while quake reaches ~41.2 fps.
-///
-/// Interpreter, direct-page, REP, and native VGA paths all use this table. The
-/// Accurate 386 class keeps the frozen `WaitStateProfile.video` path. Recalibrate
-/// these values if `bus_timing` changes.
-/// EPOCH 2 (slice 4, design section 4 and section 5): the absorber is SPENT and
-/// re-solved inside a hardware-plausible range, not fitted to a game.
-///
-/// Slice 2's fold set `bus_timing` to `(1, 1)`, which multiplied this term by
-/// 6.56x on the 586 and 3x on the 486 and made a mode-13h byte access cost 149
-/// guest clocks (897 ns) -- slice 2's escalated finding F1, and 78% of
-/// doom-586's whole bill. Under epoch 2 a wait state IS a guest clock, so the
-/// count is read straight off the part:
-///
-/// * **I586, range ws 3..=60.** A 1997 PCI VGA card behind a posted-write
-///   buffer sustains roughly one non-burstable PCI transaction per ~3 PCI
-///   clocks at 33 MHz -- ~90 ns per dword, ~30 ns per byte access, ws 3 at
-///   166 MHz -- while an ISA-timed VGA write at ~375 ns is ws ~60. Both
-///   emulator references charge ZERO, which is the floor of the estimate; we
-///   model no write buffer, so the sustained figure is charged. Laddered 3 / 8 /
-///   15 against doom-586's re-derived realtics window; **the chosen rung is in
-///   `dev_docs/2026-09-05-recalibration-slice4-result.md`**.
-/// * **I486, range ws 5..=20**, a 1993 VLB/ISA VGA. The 486 has LESS absorber
-///   headroom: 45 already sits at the ISA end. Laddered 5 / 12 / 20.
-///
-/// The epoch-1 values below are UNCHANGED and must stay so.
-///
-/// FINDING for slice 4b, recorded rather than fixed here: the census scores this
-/// constant 2.2x OVER on writes and 6-9x UNDER on reads. One constant per
-/// persona cannot be both; the per-direction table is 4b's.
-const fn video_wait_states_approx(persona: CpuPersona, epoch: u32) -> u8 {
-    if epoch >= 2 {
-        return match persona {
-            // Out of the recalibration's scope; the Accurate class takes the
-            // profile path anyway.
-            CpuPersona::I386 => 1,
-            CpuPersona::I486 => VIDEO_WAIT_STATES_EPOCH2_I486,
-            CpuPersona::I586 => VIDEO_WAIT_STATES_EPOCH2_I586,
-        };
-    }
-    match persona {
-        // Unreachable in practice because the Accurate class takes the profile path.
-        CpuPersona::I386 => 1,
-        // (2 + 45) * 1/3 clocks at 66 MHz is about 237 ns per access.
-        CpuPersona::I486 => 45,
-        // (2 + 147) * 16/105 clocks at 166 MHz is about 137 ns per access. The
-        // count rises with the `bus_timing` cut so the VGA product lands where
-        // the doom-586 anchor (~1001 realtics / 74.6 fps) needs it; see the
-        // joint solve note on `bus_timing`.
-        CpuPersona::I586 => 147,
-    }
-}
-
-/// The CHOSEN epoch-2 mode-13h rung, I586: **ws 8**, inside the pre-registered
-/// 3..=60, and the middle rung of the design's 3 / 8 / 15 ladder.
-///
-/// Picked on doom-586's re-derived realtics window `[972, 1074]` (1023 +- 5%,
-/// from the ~73 fps era anchor and the fixture's own 2134 gametics; the
-/// arithmetic is in `dev_docs/2026-09-05-recalibration-slice4-result.md`
-/// section 0.1, written before the ladder ran). Measured, all three rungs, one
-/// scoreboard run each:
-///
-/// | ws | doom-586 realtics | verdict |
-/// |---:|---:|---|
-/// | 3 | 913 | **outside, FAST side** -- a hard failure: the model would claim a P166 ran doom faster than a P166 did |
-/// | **8** | **1052** | **IN**, on the slow side of the 1023 centre, which is the direction the ruling requires |
-/// | 15 | 1241 | outside, slow side |
-///
-/// A byte access costs `2 + 8 = 10` guest clocks = **60 ns** at 166 MHz, against
-/// epoch 1's 149 clocks / 897 ns. That is 2x the isolated posted-PCI-write
-/// estimate and a sixth of an ISA-timed write: a sustained mode-13h fill on a
-/// card with no write buffer modelled, which is what section 5 says to charge.
-pub(crate) const VIDEO_WAIT_STATES_EPOCH2_I586: u8 = 8;
-/// The CHOSEN epoch-2 mode-13h rung, I486: **ws 5**, inside the pre-registered
-/// 5..=20, and the first rung of the design's 5 / 12 / 20 ladder.
-///
-/// The 486 has LESS absorber headroom -- design section 9.9 says so, and the
-/// ladder confirms it. Measured against the fixture's own recorded doom-486
-/// anchor `[2814, 2964]`, the only 486 anchor the tree carries:
-///
-/// | ws | doom-486 realtics | verdict |
-/// |---:|---:|---|
-/// | **5** | **2847** | **IN**, 1.5% under the band's centre |
-/// | 12 | 3332 | outside, slow side, +12% |
-/// | 20 | 3883 | outside, slow side, +31% |
-///
-/// A byte access costs `2 + 5 = 7` guest clocks = **106 ns** at 66 MHz, against
-/// epoch 1's 47 clocks / 712 ns.
-pub(crate) const VIDEO_WAIT_STATES_EPOCH2_I486: u8 = 5;
-
 /// Which modeled cache tier a data access resolves to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tier {
@@ -588,11 +485,6 @@ struct CacheModel {
     config: CacheLevelConfig,
     cost: TierCost,
     code_fetch_ws: u8,
-    /// `IZARRAVM_TIMING_EPOCH`, copied in once from `Machine::timing_epoch` at
-    /// construction. The geometry (line size, and therefore the masks) and the
-    /// tier costs are both epoch-keyed from slice 2 on, so the model has to carry
-    /// the epoch to answer `set_mode` later without re-reading the environment.
-    epoch: u32,
     lookups: u64,
 }
 
@@ -603,29 +495,22 @@ struct CacheModel {
 const CACHE_EMPTY_TAG: u32 = u32::MAX;
 
 impl CacheModel {
-    fn new(mode: GswMode, epoch: u32) -> Self {
+    fn new(mode: GswMode) -> Self {
         Self {
             l1_tags: vec![CACHE_EMPTY_TAG; CACHE_L1_MAX_LINES].into_boxed_slice(),
             l2_tags: vec![CACHE_EMPTY_TAG; CACHE_L2_MAX_LINES].into_boxed_slice(),
-            config: cache_level_config(mode, epoch),
-            cost: tier_cost(mode, epoch),
+            config: cache_level_config(mode),
+            cost: tier_cost(mode),
             code_fetch_ws: code_fetch_ws(mode),
-            epoch,
             lookups: 0,
         }
     }
 
     fn set_mode(&mut self, mode: GswMode) {
-        self.config = cache_level_config(mode, self.epoch);
-        self.cost = tier_cost(mode, self.epoch);
+        self.config = cache_level_config(mode);
+        self.cost = tier_cost(mode);
         self.code_fetch_ws = code_fetch_ws(mode);
-        self.reset();
-    }
-
-    /// The epoch this model was built under, so the canonical projection can
-    /// re-derive the SAME geometry and costs it is checking.
-    pub(crate) fn epoch(&self) -> u32 {
-        self.epoch
+        self.l1_tags.fill(CACHE_EMPTY_TAG);
     }
 
     /// Resolve a DATA access at `phys` to a tier for the live `level`, installing the
@@ -634,7 +519,7 @@ impl CacheModel {
     ///
     #[cfg(test)]
     fn data_tier(&mut self, mode: GswMode, phys: u32) -> Tier {
-        self.data_tier_with_config(cache_level_config(mode, self.epoch), phys)
+        self.data_tier_with_config(cache_level_config(mode), phys)
     }
 
     #[inline(always)]
@@ -647,9 +532,10 @@ impl CacheModel {
                 return Tier::L1;
             }
         }
+        let l2_line = phys >> 5;
         if config.l2_mask != CACHE_TIER_DISABLED_MASK {
-            let idx = (line & config.l2_mask) as usize;
-            if self.l2_tags[idx] == line {
+            let idx = (l2_line & config.l2_mask) as usize;
+            if self.l2_tags[idx] == l2_line {
                 // L2 hit: pull the line up into L1 (if L1 exists) for next time.
                 self.install_l1(config, line);
                 return Tier::L2;
@@ -657,7 +543,7 @@ impl CacheModel {
         }
         // Miss in both: serve from RAM and fill the existing tiers.
         self.install_l1(config, line);
-        self.install_l2(config, line);
+        self.install_l2(config, l2_line);
         Tier::Ram
     }
 
@@ -1673,13 +1559,6 @@ impl ReportedFault {
 
 #[derive(Debug)]
 pub struct Machine {
-    /// `IZARRAVM_TIMING_EPOCH`, read ONCE at construction (`bus::timing_epoch_from_env`) into
-    /// this plain field -- never re-read mid-run, because the JIT caches per-block raw clocks
-    /// that would otherwise go stale under a live epoch flip. `1` (unset, or `""`) is today's
-    /// guest-clock model, byte-identical; `2` is the port-io repricing
-    /// (`dev_docs/2026-09-05-port-io-repricing-design.md`). Reported in the profile JSON as the
-    /// EFFECTIVE epoch via `Machine::timing_epoch`.
-    timing_epoch: u32,
     /// F14's `VL_WaitVBL` exit-rate instrument (see `RetracePollCensus`).
     retrace_poll: RetracePollCensus,
     /// P2's certificate ledger (see `PollSkipCertificateCounters`). Replaced P1's single
@@ -1945,6 +1824,7 @@ pub struct Machine {
     // READ/WRITE DATA move sector bytes over DMA channel 2 against `floppy`.
     fdc: fdc::Fdc,
     opl: OplChip,
+    opl_timer_advance_credit_us: u64,
     resampler: Resampler,
     sb16: Sb16Path,
     last_audio_ticks: u64,
@@ -2320,8 +2200,7 @@ pub(crate) struct RetracePollCensus {
 /// honest way to report that is a counter that says how often the admission fired.
 #[derive(Debug, Default)]
 pub(crate) struct PollSkipCertificateCounters {
-    /// Certificates GRANTED with the epoch at 2 or higher -- i.e. spans the skip elided while
-    /// projecting the repriced per-iteration charge. Zero under epoch 1 by construction.
+    /// Certified status-port poll admissions with the current per-iteration tariff.
     pub(crate) admitted_epoch2: std::cell::Cell<u64>,
     /// Refused because the polled port is not `POLL_SKIP_IO_PORT` (F9's explicit admission).
     /// Unreachable today -- both entry points establish the port first -- and that is the
@@ -2362,12 +2241,6 @@ impl Machine {
             dma: profile.wss.dma.channel() as u8,
         });
         let active_mode = profile.cpu;
-        let timing_epoch = bus::timing_epoch_from_env();
-        // The CPU resolves its own persona-keyed charge table from the epoch, so
-        // it has to learn the epoch BEFORE `set_mode` picks the persona -- and
-        // this is the only place either is installed. `set_mode` re-resolves the
-        // table itself, so the order is belt and braces rather than load-bearing.
-        cpu.set_timing_epoch(timing_epoch);
         cpu.set_mode(active_mode);
         let vega = Vega::default();
         let pci = PciConfig::new();
@@ -2376,10 +2249,6 @@ impl Machine {
         let execution_backend = process_execution_backend();
         patch_rom(&mut rom);
         let mut machine = Self {
-            // The local, not a second `timing_epoch_from_env()` call: the CPU
-            // is handed the SAME value a few lines above, so one read of the
-            // knob configures both halves and they cannot disagree.
-            timing_epoch,
             retrace_poll: RetracePollCensus::default(),
             poll_skip_certificate: PollSkipCertificateCounters::default(),
             memory,
@@ -2392,7 +2261,7 @@ impl Machine {
             reported_fault_sites: Vec::new(),
             last_fault_line: None,
             cpu,
-            cache_model: CacheModel::new(active_mode, timing_epoch),
+            cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
             scaled_bus_clocks: 0,
             #[cfg(feature = "jit")]
@@ -2476,6 +2345,7 @@ impl Machine {
             dma: dma::DmaController::default(),
             fdc: fdc::Fdc::default(),
             opl: OplChip::default(),
+            opl_timer_advance_credit_us: 0,
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             sb16,
             last_audio_ticks: 0,
@@ -3526,7 +3396,7 @@ impl Machine {
             }
             let _ = self.write_guest_ram_u16(0x410, equipment);
         }
-        // The modeled cache contents are per-mode, so a mode switch starts cold.
+        // A CPU mode switch clears L1 and retains the motherboard L2.
         self.cache_model.set_mode(mode);
         // The shadow L1 probe's array is likewise per-mode state on real silicon
         // (a persona change is a different part); start it cold too. The probe
@@ -3644,31 +3514,9 @@ impl Machine {
         self.active_mode
     }
 
-    /// The EFFECTIVE guest-clock model epoch this machine was constructed under
-    /// (`IZARRAVM_TIMING_EPOCH`, read once at construction): `1` unless the knob named `2`. The
-    /// profile JSON's `timing_model_epoch` field reports this, not the static
-    /// `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal sees the epoch
-    /// that actually ran.
-    /// Move a constructed machine onto another epoch, for tests that must not
-    /// write a process-global environment variable.
-    ///
-    /// It exists because `Machine::timing_epoch` alone is HALF the epoch: the
-    /// CPU carries its own copy and resolves its charge table from it, so a test
-    /// that assigns the field directly would leave the bus on epoch 2 and every
-    /// instruction charge on epoch 1. Production has one writer -- `Machine::new`
-    /// -- and this is the only other one.
-    #[cfg(test)]
-    pub(crate) fn set_timing_epoch_for_test(&mut self, epoch: u32) {
-        self.timing_epoch = epoch;
-        self.cpu.set_timing_epoch(epoch);
-        // The cache model's geometry and tier costs are epoch-keyed too (slice 2),
-        // so rebuild it rather than leaving a model that disagrees with the epoch
-        // the rest of the machine now runs under.
-        self.cache_model = CacheModel::new(self.active_mode, epoch);
-    }
-
+    /// Identity of the guest timing model used by this build.
     pub fn timing_epoch(&self) -> u32 {
-        self.timing_epoch
+        izarravm_cpu::TIMING_MODEL_EPOCH
     }
 
     /// Port accesses this run, by bus class, in `PortBusClass::index()` order --
@@ -4152,6 +4000,7 @@ struct MachineBus<'a> {
     inta_diag: &'a mut InterruptEntryDiagnostics,
     fdc: &'a mut fdc::Fdc,
     opl: &'a mut OplChip,
+    opl_timer_advance_credit_us: &'a mut u64,
     sb16: &'a mut Sb16Path,
     wavetable_mpu: &'a mut Mpu401,
     midi_mpu: &'a mut Mpu401,
@@ -4186,23 +4035,9 @@ struct MachineBus<'a> {
     // warms it via data_access_wait_states, and the resolved tier's calibrated cost
     // is the charged wait-state.
     cache: &'a mut CacheModel,
-    /// EPOCH 2's whole-bill fold (slice 2), I486 and I586 only: an L1-hit data
-    /// access and a CACHED-RAM instruction fetch charge NOTHING on the bus,
-    /// because Intel's per-instruction class counts -- the epoch-2 table the CPU
-    /// now charges from -- already contain both. Charging them here as well is a
-    /// double-count worth 0.3048 guest clocks of fetch per instruction plus
-    /// 0.3048 per data access (2 raw at `bus_timing(I586) = (16,105)`), which is
-    /// what would push every row above its band.
-    ///
-    /// SCOPED, deliberately: only the cached-RAM routes fold. ROM, UMB, shadow
-    /// and device-window fetches keep their route cost, and so does every
-    /// aperture/MMIO data access and every port cycle -- else BIOS and option
-    /// ROMs would run free (design section 9.5: the first draft's rule was "too
-    /// broad"). An L2 or RAM MISS is outside the fold in principle; on these two
-    /// personas `flat_data_cost` means no miss is ever resolved, which is the
-    /// recorded under-charge, not a claim that misses are free.
-    ///
-    /// Epoch 1 leaves this `false` for every persona, so nothing here moves.
+    /// Fast-persona instruction prices include cached-RAM fetch and L1 data work.
+    /// ROM, shadow and device routes retain their separate board charges. The flat
+    /// fast data path does not resolve cache misses; that approximation is unchanged.
     l1_charges_folded: bool,
     /// The clocks ONE cacheable-RAM instruction fetch costs: `clocks_for(Byte,
     /// cache.code_fetch_wait_states())`, resolved once per batch instead of per
@@ -4259,20 +4094,8 @@ struct MachineBus<'a> {
     /// per-port landing plus a bool test, never a per-access classification --
     /// not a single reader.
     lazy_port_reads: bool,
-    /// Whether a legacy X-bus port access is charged its real ISA bus time in
-    /// BOTH directions. `IZARRAVM_ISA_IO_WAIT`, DEFAULT OFF; resolved once per
-    /// process and cached here at bus construction so the per-access cost when
-    /// it is off is a single bool test on an already-hot cache line.
-    ///
-    /// Composed with `lazy_port_reads` at the charge site, not here, and that is
-    /// deliberate: see `MachineBus::charge_isa_io_wait` for why the Accurate 386
-    /// class stays out of it.
-    isa_io_wait: bool,
-    /// `Machine::timing_epoch`, copied at bus construction (a plain `u32`, not a reference:
-    /// the epoch never changes mid-run). `1` (unset knob) keeps every port charge
-    /// byte-identical to before this slice; `2` arms the per-class port-bus charge in
-    /// `charge_port_bus` (`dev_docs/2026-09-05-port-io-repricing-design.md`).
-    timing_epoch: u32,
+    /// Construction seeds devices without charging a guest instruction batch.
+    charge_port_timing: bool,
     /// Points at `Machine::retrace_poll` (F14's instrument).
     retrace_poll: &'a mut RetracePollCensus,
     /// P3. Non-zero only for the duration of ONE `INS`/`OUTS` element's port access, carrying
@@ -4281,7 +4104,7 @@ struct MachineBus<'a> {
     /// batch-scoped plain field rather than a borrow: it is set and cleared inside a single
     /// `read_io_string_element` call and never outlives one, so nothing needs to see it across a
     /// batch boundary.
-    string_port_element_bytes: u8,
+    port_transaction_active: bool,
     #[cfg(test)]
     test_string_port_observations: &'a mut Option<Vec<TestStringPortObservation>>,
     /// Points at `Machine::poll_skip_certificate`. `&`, not `&mut`: the certificate path this
@@ -4408,6 +4231,7 @@ struct MachineBus<'a> {
     // MARGO anchor for the rest of such a batch. See `scanout_beam_dots`.
     margo_scanout_at_batch_start: bool,
     trace_elapsed_at_batch_start: u64,
+    #[cfg(test)]
     bus_rem_at_batch_start: u64,
     // bus_timing(cpu.level())'s (num, den) ratio, copied at bus construction from
     // the same authoritative CPU mode `scale_bus` reads. `predicted_beam` must
@@ -4494,15 +4318,6 @@ fn icdex_iso_name_and_version(record: &[u8]) -> (Vec<u8>, u16) {
     } else {
         (raw.into_bytes(), 1)
     }
-}
-
-/// CPU clocks for one 8-bit ISA I/O bus cycle at the live mode's clock. The ISA
-/// bus runs at a fixed ~8 MHz, so an access costs roughly a microsecond of wall
-/// time no matter how fast the CPU is; charging that keeps a fast-CPU device poll
-/// from outrunning the hardware it polls (chiefly the 80 us OPL timer that AdLib
-/// detection waits on). At least one clock so it always makes progress.
-fn isa_io_clocks(mode: GswMode) -> u64 {
-    (mode.clock_hz() / 1_000_000).max(1)
 }
 
 /// Map a CPU I/O port to the OPL register port (0x388-0x38B) it addresses, or

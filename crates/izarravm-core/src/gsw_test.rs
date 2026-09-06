@@ -20,7 +20,7 @@ fn table_has_the_exact_four_profiles_in_rank_order() {
             persona: CpuPersona::I386,
             cache: CacheGeometry {
                 l1: L1Cache::None,
-                external_kib: 64,
+                external_kib: 512,
             },
         },
         GswModeSpec {
@@ -32,7 +32,7 @@ fn table_has_the_exact_four_profiles_in_rank_order() {
             persona: CpuPersona::I386,
             cache: CacheGeometry {
                 l1: L1Cache::None,
-                external_kib: 64,
+                external_kib: 512,
             },
         },
         GswModeSpec {
@@ -44,7 +44,7 @@ fn table_has_the_exact_four_profiles_in_rank_order() {
             persona: CpuPersona::I486,
             cache: CacheGeometry {
                 l1: L1Cache::Unified { kib: 8 },
-                external_kib: 256,
+                external_kib: 512,
             },
         },
         GswModeSpec {

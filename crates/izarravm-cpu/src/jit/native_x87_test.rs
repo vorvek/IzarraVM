@@ -523,7 +523,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd8, 0, 3, 0),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::F32Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 4,
@@ -536,7 +535,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd8, 3, 1, 2),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -549,7 +547,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xda, 0, 0, 0),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::IntConvert16,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 4,
@@ -564,7 +561,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xda, 0, 3, 0),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::IntConvert16,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 4,
@@ -577,7 +573,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 0, 0, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F32Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 4,
@@ -590,7 +585,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 0, 2, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F32Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 4,
@@ -603,7 +597,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 0, 3, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F32Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 4,
@@ -616,7 +609,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 3, 1, 1),
             NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -629,7 +621,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 0, 5, 0),
             NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::F32Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 2,
@@ -643,7 +634,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 0, 7, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F32Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 2,
@@ -656,7 +646,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdb, 0, 0, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert32,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 4,
@@ -669,7 +658,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdb, 0, 3, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert32,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 4,
@@ -682,7 +670,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xde, 3, 0, 1),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
                 terminates_block: false,
@@ -692,7 +679,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdd, 3, 3, 1),
             NativeX87Metadata {
                 raw_clocks: 3,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
                 terminates_block: false,
@@ -702,7 +688,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 3, 5, 0),
             NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -716,7 +701,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdc, 3, 7, 1),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -726,7 +710,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xde, 3, 7, 1),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
                 terminates_block: false,
@@ -736,7 +719,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xde, 3, 3, 1),
             NativeX87Metadata {
                 raw_clocks: 5,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
                 terminates_block: false,
@@ -746,7 +728,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdf, 3, 4, 0),
             NativeX87Metadata {
                 raw_clocks: 3,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -758,7 +739,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdd, 0, 0, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F64Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 8,
@@ -772,7 +752,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdd, 0, 2, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F64Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 8,
@@ -786,7 +765,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdd, 0, 3, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F64Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 8,
@@ -801,7 +779,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdc, 0, 0, 0),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::F64Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 8,
@@ -817,7 +794,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdc, 0, 3, 0),
             NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::F64Mem,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 8,
@@ -832,7 +808,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdf, 0, 5, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert16,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Read,
                     width: 8,
@@ -848,7 +823,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 3, 4, 0),
             NativeX87Metadata {
                 raw_clocks: 6,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -858,7 +832,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 3, 4, 4),
             NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -868,7 +841,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 3, 4, 5),
             NativeX87Metadata {
                 raw_clocks: 8,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -881,7 +853,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xd9, 3, 7, 2),
             NativeX87Metadata {
                 raw_clocks: 70,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -895,7 +866,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdb, 0, 2, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert32,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 4,
@@ -912,7 +882,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdb, 0, 7, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert32,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 10,
@@ -929,7 +898,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdf, 0, 7, 0),
             NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert16,
                 memory: Some(NativeX87MemoryAccess {
                     direction: NativeX87MemoryDirection::Write,
                     width: 8,
@@ -946,7 +914,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdd, 3, 4, 2),
             NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -956,7 +923,6 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
             insn(0xdd, 3, 5, 2),
             NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
                 terminates_block: false,
@@ -1158,13 +1124,10 @@ fn weighted_timing_batches_exactly() {
         NativeX87Insn::classify(&insn(0xdf, 3, 4, 0)).unwrap(),
     ];
     for persona in [CpuPersona::I486, CpuPersona::I586] {
-        let table = class_table(persona, 1);
+        let table = class_table(persona);
         let weighted = sequence
             .iter()
-            .map(|op| {
-                op.metadata()
-                    .weighted_fp_clocks(persona, op.timing_class(), table, 1)
-            })
+            .map(|op| op.metadata().weighted_fp_clocks(op.timing_class(), table))
             .sum::<u64>();
         let aggregate = scale_weighted_fp_clocks(weighted, 3);
 
@@ -1172,8 +1135,7 @@ fn weighted_timing_batches_exactly() {
         let mut remainder = 3;
         for op in sequence {
             let step = scale_weighted_fp_clocks(
-                op.metadata()
-                    .weighted_fp_clocks(persona, op.timing_class(), table, 1),
+                op.metadata().weighted_fp_clocks(op.timing_class(), table),
                 remainder,
             );
             individual_clocks += step.clocks;
@@ -1325,12 +1287,9 @@ fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
     let shapes = every_x87_shape();
     assert!(shapes.iter().copied().all(shape_is_enumerated));
 
-    // BOTH epochs, and both fast personas within each. Slice 4 routes this table onto the class
-    // table, so epoch 2's worst slot is a different shape at a different cost from epoch 1's
-    // (FSQRT at raw 840, where epoch 1's worst is 0xDA m32int through the x32 IntConvert16 dial)
-    // and each epoch's bound must dominate its own.
-    for epoch in [1, 2] {
-        let bound = max_x87_block_core_clocks(epoch);
+    // The bound must cover every native x87 shape in both fast persona tables.
+    {
+        let bound = max_x87_block_core_clocks();
         // Ceil per slot, then sum, which is at least ceil(sum / den) and is how the bound was
         // built.
         let worst_fp_slot = shapes
@@ -1338,12 +1297,7 @@ fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
             .flat_map(|insn| {
                 [CpuPersona::I486, CpuPersona::I586].map(|persona| {
                     insn.metadata()
-                        .weighted_fp_clocks(
-                            persona,
-                            insn.timing_class(),
-                            class_table(persona, epoch),
-                            epoch,
-                        )
+                        .weighted_fp_clocks(insn.timing_class(), class_table(persona))
                         .div_ceil(u64::from(FP_TIMING_DEN))
                 })
             })
@@ -1363,7 +1317,7 @@ fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
         // pass a `<=` trivially by falling back under the old worst case.
         assert_eq!(
             derived, bound,
-            "epoch {epoch}: the bound is {bound} but the metadata table derives {derived} \
+            "the bound is {bound} but the metadata table derives {derived} \
              ({MAX_X87_SLOTS} slots x {worst_fp_slot} core clocks plus \
              {MAX_X87_BLOCK_INSTRUCTIONS} x {WORST_CONSTANT_RAW_CLOCKS} raw). Both sides of this \
              pin must move together: it feeds the chain quota, so widening it changes when \
@@ -1372,22 +1326,16 @@ fn max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table() {
     }
 }
 
-/// EPOCH 1 IS BYTE-IDENTICAL BY CONSTRUCTION, shape by shape.
-///
-/// Slice 4's native-leg routing is safe only because every class
-/// [`NativeX87Insn::timing_class`] names carries, as its epoch-1 column, exactly the literal the
-/// shape's `raw_clocks` already held. This asserts it for every shape the compiler can build, on
-/// both fast personas -- so a routing mistake (the realistic error: reaching for a neighbouring
-/// class because two shapes look alike, as `FLD1` and `FXCH` did while they shared one arm) is
-/// caught here rather than as a moved epoch-1 pin on a game row.
+/// Every native x87 shape must route to its retained I386 literal.
 #[test]
-fn every_native_x87_shape_charges_its_epoch_1_literal() {
+fn native_x87_base_literals_match_the_386_class_column() {
     for insn in every_x87_shape() {
-        for persona in [CpuPersona::I486, CpuPersona::I586] {
+        {
+            let persona = CpuPersona::I386;
             assert_eq!(
-                class_table(persona, 1).raw(insn.timing_class()),
+                class_table(persona).raw(insn.timing_class()),
                 u32::from(insn.metadata().raw_clocks),
-                "{insn:?} on {persona:?} routes to {:?}, whose epoch-1 column is not the shape's \
+                "{insn:?} on {persona:?} routes to {:?}, whose I386 column is not the shape's \
                  own literal",
                 insn.timing_class()
             );
@@ -1395,34 +1343,17 @@ fn every_native_x87_shape_charges_its_epoch_1_literal() {
     }
 }
 
-/// The other half: at epoch 2 the native leg charges what the INTERPRETER charges.
-///
-/// Before this slice `FISTP m32` cost raw 14 natively and raw 72 interpreted -- a 5x leg
-/// divergence, hidden because the `fp_timing_class` absorber multiplied both by 34. Slice 4
-/// deletes the dial (design section 4) and routes the native leg onto the same class.
+/// Native x87 settlement uses the class table without an extra multiplier.
 #[test]
-fn epoch_2_deletes_the_fp_dial_and_charges_the_class_table() {
+fn native_x87_charges_the_class_table_without_an_extra_multiplier() {
     let fistp = NativeX87Insn::classify(&insn(0xdb, 0, 3, 1)).expect("FISTP m32 lowers");
     assert_eq!(fistp.timing_class(), TimingClass::X87StoreInt32);
 
-    // Epoch 1: the shipped literal 14 times the x34 `IntConvert32` absorber.
-    assert_eq!(
-        fistp.metadata().weighted_fp_clocks(
-            CpuPersona::I586,
-            fistp.timing_class(),
-            class_table(CpuPersona::I586, 1),
-            1
-        ),
-        14 * 272,
-    );
     // Epoch 2: Intel's 6 clocks (raw 72), with the dial at identity.
     assert_eq!(
-        fistp.metadata().weighted_fp_clocks(
-            CpuPersona::I586,
-            fistp.timing_class(),
-            class_table(CpuPersona::I586, 2),
-            2
-        ),
+        fistp
+            .metadata()
+            .weighted_fp_clocks(fistp.timing_class(), class_table(CpuPersona::I586)),
         72 * u64::from(FP_TIMING_DEN),
     );
 }

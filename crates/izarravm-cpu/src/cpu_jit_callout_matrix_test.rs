@@ -1560,3 +1560,134 @@ fn the_prologue_family_lands_in_one_block() {
     );
     compare_state(&roles, "prologue family");
 }
+
+#[test]
+fn current_model_inc_dec_register_and_memory_prices_match_native_execution() {
+    let bodies: &[(&[u8], bool)] = &[
+        (&[0xfe, 0xc0], false),
+        (&[0xfe, 0xcc], false),
+        (&[0xff, 0xc0], false),
+        (&[0xff, 0xc8], false),
+        (&[0x66, 0xff, 0xc0], false),
+        (&[0x66, 0xff, 0xc8], false),
+        (&[0xfe, 0x03], true),
+        (&[0xfe, 0x0b], true),
+    ];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for &(body, memory) in bodies {
+            for carry in [0, 1, 11] {
+                let (code, starts) = program(&[body]);
+                let mut roles = build(
+                    &code,
+                    &starts,
+                    |_| {},
+                    |cpu| {
+                        cpu.set_mode(mode);
+                        cpu.registers.set_ebx(STACK_TOP - 4);
+                    },
+                );
+                warm_stack_frame_pages(&mut roles);
+                for cpu in [&mut roles.native, &mut roles.interp] {
+                    cpu.registers.set_eax(0x7fff_7fff);
+                    cpu.registers.set_ebx(STACK_TOP - 4);
+                    cpu.registers.eflags = 0x203;
+                    cpu.timing_rem = carry;
+                }
+                for bus in [&mut roles.native_bus, &mut roles.interp_bus] {
+                    bus.memory[(STACK_TOP - 4) as usize..STACK_TOP as usize]
+                        .copy_from_slice(&0x7fff_7fffu32.to_le_bytes());
+                }
+                assert!(run_block(&mut roles, 3), "{mode:?} {body:x?}");
+                assert_eq!(roles.native.perf_counters().jit_direct_insns, 3);
+                let raw = 24 + if memory { 36 } else { 12 };
+                assert_eq!(roles.native.elapsed_clocks, (raw + carry) / 12);
+                assert_eq!(roles.native.timing_rem, (raw + carry) % 12);
+                assert_eq!(roles.interp.timing_rem, roles.native.timing_rem);
+                assert_eq!(roles.native.eflags() & FLAG_CF, FLAG_CF);
+                compare_state(&roles, "INC/DEC price and effects");
+            }
+        }
+    }
+}
+
+#[test]
+fn current_model_pushad_popad_prices_match_native_execution() {
+    for (mode, push_raw, pop_raw) in [(GswMode::Gsw486, 132, 108), (GswMode::Gsw586, 60, 60)] {
+        for (opcode, raw) in [(PUSHAD, push_raw), (POPAD, pop_raw)] {
+            for carry in [0, 1, 11] {
+                let (code, starts) = program(&[&[opcode]]);
+                let mut roles = build(
+                    &code,
+                    &starts,
+                    |_| {},
+                    |cpu| {
+                        cpu.set_mode(mode);
+                    },
+                );
+                warm_stack_frame_pages(&mut roles);
+                seed_registers(&mut roles, STACK_TOP - 32);
+                for cpu in [&mut roles.native, &mut roles.interp] {
+                    cpu.timing_rem = carry;
+                }
+                let executed = roles.native.direct_stall_snapshot().callout_executed;
+                assert!(run_block(&mut roles, 3));
+                assert_eq!(
+                    roles.native.direct_stall_snapshot().callout_executed - executed,
+                    1
+                );
+                assert_eq!(roles.native.perf_counters().jit_direct_insns, 3);
+                assert_eq!(roles.native.elapsed_clocks, (24 + raw + carry) / 12);
+                assert_eq!(roles.native.timing_rem, (24 + raw + carry) % 12);
+                assert_eq!(roles.interp.timing_rem, roles.native.timing_rem);
+                compare_state(&roles, "PUSHAD/POPAD price and effects");
+            }
+        }
+    }
+}
+
+#[test]
+fn inc_dec_memory_keeps_its_class_at_both_operand_widths() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let slow = matches!(mode, GswMode::Gsw386Slow | GswMode::Gsw386);
+        let (raw, num, den) = if slow { (2, 2, 5) } else { (36, 1, 12) };
+        for (body, word, decrement) in [
+            (&[0xff, 0x03][..], false, false),
+            (&[0xff, 0x0b][..], false, true),
+            (&[0x66, 0xff, 0x03][..], true, false),
+            (&[0x66, 0xff, 0x0b][..], true, true),
+        ] {
+            for carry in 0..den {
+                let mut cpu = flat_cpu();
+                cpu.set_mode(mode);
+                cpu.set_eip(ENTRY);
+                cpu.registers.set_ebx(STACK_TOP - 4);
+                cpu.registers.eflags = 0x203;
+                cpu.timing_rem = carry;
+                let mut bus = TestBus::with_memory(vec![0; 0x5000]);
+                bus.memory[ENTRY as usize..ENTRY as usize + body.len()].copy_from_slice(body);
+                bus.memory[(STACK_TOP - 4) as usize..STACK_TOP as usize]
+                    .copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
+                cpu.cycle(&mut bus).unwrap();
+                assert_eq!(cpu.elapsed_clocks, (raw * num + carry) / den);
+                assert_eq!(cpu.timing_rem, (raw * num + carry) % den);
+                assert_eq!(cpu.eflags() & FLAG_CF, FLAG_CF);
+                let expected: u32 = if decrement {
+                    0x7fff_fffe
+                } else if word {
+                    0x7fff_0000
+                } else {
+                    0x8000_0000
+                };
+                assert_eq!(
+                    &bus.memory[(STACK_TOP - 4) as usize..STACK_TOP as usize],
+                    &expected.to_le_bytes()
+                );
+            }
+        }
+    }
+}

@@ -3076,17 +3076,7 @@ pub struct CpuGsw {
     /// only place the descriptor type is known, and taken by the `0x9a` /
     /// `0xea` / `0xca` / `0xcb` charge sites. `None` means a real-mode transfer.
     pending_transfer_class: Option<timing_class::TimingClass>,
-    // The guest-clock model epoch (`IZARRAVM_TIMING_EPOCH`), copied in ONCE from
-    // `Machine::timing_epoch` at construction via `set_timing_epoch`. Unset = 1.
-    // It may never change mid-run -- the JIT caches per-block raw clocks
-    // (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4) -- so nothing
-    // reads the environment here and nothing on the hot path branches on it.
-    timing_epoch: u32,
-    // The resolved charge table for (persona, epoch), the ONE thing every charge
-    // site reads. Refreshed by `set_timing_epoch` and by `set_mode` (which can
-    // move the persona), never per instruction. Under epoch 1 this is
-    // `timing_class::EPOCH1` for every persona, which is what makes a knob-unset
-    // run byte-identical to the pre-slice tree by construction.
+    // Cached persona table, refreshed when the CPU mode changes.
     class_table: &'static timing_class::ClassTable,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
@@ -3375,8 +3365,7 @@ impl Default for CpuGsw {
             pending_transfer_class: None,
             #[cfg(feature = "timing-class-histogram")]
             class_histogram: Box::default(),
-            timing_epoch: 1,
-            class_table: &timing_class::EPOCH1,
+            class_table: &timing_class::I586,
             timing_rem: 0,
             fp_rem: 0,
             halted: false,
@@ -5819,29 +5808,18 @@ pub(crate) const REP_OUTS_SETUP_CLOCKS_EPOCH2: [u32; 4] = [
     25 * PORT_CORE_CLOCK_TWELFTHS,
 ];
 
-/// Epoch-2 per-ELEMENT core clocks for `REP INS` (3) and `REP OUTS` (4), raw twelfths. Mode
-/// independent: Intel's `c` coefficient is the same in all four privilege columns, because the
-/// bitmap consult that separates those columns happens once at setup, not per element.
+/// REP INS/OUTS element coefficients in raw twelfths, common to all privilege
+/// columns. Permission checks and their bus work still occur for each element.
 pub(crate) const REP_INS_ELEMENT_CLOCKS_EPOCH2: u32 = 3 * PORT_CORE_CLOCK_TWELFTHS;
 pub(crate) const REP_OUTS_ELEMENT_CLOCKS_EPOCH2: u32 = 4 * PORT_CORE_CLOCK_TWELFTHS;
 
-/// The whole-instruction core charge for `INS`/`OUTS`: the singleton's own cost, or a `REP`
-/// form's SETUP. Epoch 1 returns the flat pre-repricing 15 / 14 byte-identically, whatever the
-/// mode and whatever the `REP` prefix, which is exactly what the four `execute_extended` arms
-/// charged before this slice.
+/// Select the live privilege column for singleton INS/OUTS or REP setup.
+/// REP element work is charged separately.
 pub(crate) const fn string_port_setup_core_clocks(
-    epoch: u32,
     is_out: bool,
     is_rep: bool,
     mode: PortIoPrivMode,
 ) -> u32 {
-    if epoch < 2 {
-        return if is_out {
-            OUTS_CORE_CLOCKS_EPOCH1
-        } else {
-            INS_CORE_CLOCKS_EPOCH1
-        };
-    }
     let index = mode as usize;
     match (is_out, is_rep) {
         (false, false) => INS_CORE_CLOCKS_EPOCH2[index],
@@ -5851,13 +5829,9 @@ pub(crate) const fn string_port_setup_core_clocks(
     }
 }
 
-/// The per-ELEMENT core charge for a `REP INS`/`REP OUTS`. **Zero under epoch 1**, where the
-/// whole instruction's cost is the flat 15 / 14 charged once regardless of the element count --
-/// the pre-slice model, kept byte-identical.
-pub(crate) const fn string_port_element_core_clocks(epoch: u32, is_out: bool) -> u32 {
-    if epoch < 2 {
-        return 0;
-    }
+/// Per-element REP port work: three/four CPU clocks in the fast-persona
+/// raw convention, independent of operand width and privilege column.
+pub(crate) const fn string_port_element_core_clocks(is_out: bool) -> u32 {
     if is_out {
         REP_OUTS_ELEMENT_CLOCKS_EPOCH2
     } else {
@@ -5865,28 +5839,8 @@ pub(crate) const fn string_port_element_core_clocks(epoch: u32, is_out: bool) ->
     }
 }
 
-/// The flat pre-repricing `INS` / `OUTS` whole-instruction charges (`execute_extended.rs`'s
-/// 0x6C-0x6F arms). Named so epoch 1's identity is a constant a reader can find rather than two
-/// literals in a `match`.
-pub(crate) const INS_CORE_CLOCKS_EPOCH1: u32 = 15;
-pub(crate) const OUTS_CORE_CLOCKS_EPOCH1: u32 = 14;
-
-/// The one function every `IN`/`OUT` charge in the tree goes through, both epochs and all four
-/// privilege columns. Epoch 1 returns the flat pre-repricing constants BYTE-IDENTICALLY, so the
-/// knob-unset build cannot move; epoch 2 indexes the tables above.
-///
-/// FOUR paths must agree on this (up from the three `IN_PORT_CORE_CLOCKS` named): the
-/// interpreter's `execute_port_io_decoded` arms and the JIT's `PortReadAlDx`, `PortReadAlImm8`,
-/// `PortWriteAlImm8` and `PortWriteAlDx` call-out slots. They agree by calling this, not by
-/// carrying a matching literal.
-pub(crate) const fn port_core_clocks(epoch: u32, is_out: bool, mode: PortIoPrivMode) -> u32 {
-    if epoch < 2 {
-        return if is_out {
-            OUT_PORT_CORE_CLOCKS
-        } else {
-            IN_PORT_CORE_CLOCKS
-        };
-    }
+/// Shared live-privilege core pricing for interpreter and native IN/OUT paths.
+pub(crate) const fn port_core_clocks(is_out: bool, mode: PortIoPrivMode) -> u32 {
     let index = mode as usize;
     if is_out {
         OUT_PORT_CORE_CLOCKS_EPOCH2[index]
@@ -5895,32 +5849,9 @@ pub(crate) const fn port_core_clocks(epoch: u32, is_out: bool, mode: PortIoPrivM
     }
 }
 
-/// The CROSS-MODE, CROSS-EPOCH maximum of `port_core_clocks` -- what every bound that used to be
-/// sized to the flat `IN_PORT_CORE_CLOCKS` (12) must take instead, per review finding F5
-/// (`dev_docs/2026-09-05-port-io-repricing-review.md`). Three of them: `LANE_SAFETY_CEILING`'s
-/// margin (`izarravm-machine`'s `bus.rs`), `IZARRAVM_DIRECT_POLL_MAX_RAW`'s default
-/// (`jit/direct.rs`) and `callout_core_upper`'s port-slot price (`run.rs`). Under epoch 2 that
-/// is `OUT`, `CPL>IOPL`: 26 x 12 = 312, twenty-six times the bound those three were written to.
-///
-/// DERIVED, not written down, for `MAX_CALL_OUT_CORE_CLOCKS`'s reason: a column whose count one
-/// day exceeds this must raise it without anyone remembering to. `pub` (not `pub(crate)`) because
-/// `izarravm-machine` sizes its own lane ceiling on it and a duplicated 312 there would be the
-/// exact drift this constant exists to prevent.
-/// The port-slot term `callout_core_upper` prices a compiled block's `CallOutHelper::Port*` slots
-/// at, for the epoch the bus reports. Epoch 1 is the pre-slice `IN.max(OUT)` EXACTLY, so a
-/// knob-unset build's block admission cannot move; epoch 2 takes the cross-mode maximum, which is
-/// the only bound a compile-time term can carry once the charge depends on the live CPL/IOPL pair
-/// (`CpuGsw::port_io_priv_mode` explains why `jit_mode_key` cannot resolve it).
-pub(crate) const fn port_slot_core_upper(epoch: u32) -> u32 {
-    if epoch < 2 {
-        if IN_PORT_CORE_CLOCKS > OUT_PORT_CORE_CLOCKS {
-            IN_PORT_CORE_CLOCKS
-        } else {
-            OUT_PORT_CORE_CLOCKS
-        }
-    } else {
-        MAX_PORT_CORE_CLOCKS
-    }
+/// Privilege-independent upper bound for a native port callout.
+pub(crate) const fn port_slot_core_upper() -> u32 {
+    MAX_PORT_CORE_CLOCKS
 }
 
 pub const MAX_PORT_CORE_CLOCKS: u32 = {
@@ -6411,7 +6342,7 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
 /// `CpuGsw::charge(TimingClass)`, and this function was deleted with them. It
 /// comes back for the twelve port and string-port arms the port slices (P1-P3)
 /// own: those compute their charge at RUN TIME from
-/// `port_core_clocks(epoch, is_out, priv_mode)`, which is keyed on a privilege
+/// `port_core_clocks(is_out, priv_mode)`, which is keyed on a privilege
 /// column the class table has no row for, so they cannot go through a class.
 ///
 /// **Every argument here is a computed value.** A bare integer at a call site is
@@ -6424,59 +6355,14 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
     }
 }
 
-/// Version marker for the guest clock model: bump this whenever a change alters
-/// the number of guest clocks charged per instruction for ANY persona, whether
-/// the change lives in the core per-mode table (`izarravm_core::GSW_MODE_SPECS`),
-/// `level_timing`, `bus_timing`, or an absorber that scales clocks on top of them
-/// (e.g. the x87 `IntConvert32` multiplier, the mode-13h wait state). Consumers
-/// (the profile-json report, the fixture scoreboard, the realtime gate) stamp
-/// this value alongside recorded runtimes.
-///
-/// Runtime (`rt`) numbers recorded under different epochs are NOT comparable as
-/// performance: an rt change across an epoch bump can mean the guest is doing a
-/// different amount of work per guest second, not that the emulator got faster
-/// or slower. Compare rt only within one epoch; treat a cross-epoch rt delta as
-/// uninterpreted until the underlying instruction/bus counts are checked too.
-pub const TIMING_MODEL_EPOCH: u32 = 1;
+/// Identity of the guest timing model, recorded with runtime observations.
+/// Changes to instruction or board pricing can change guest work per second.
+/// Cross-model runtime differences therefore need guest-work attribution.
+pub const TIMING_MODEL_EPOCH: u32 = 2;
 
-/// Per-level instruction-clock scaling as (numerator, denominator), CALIBRATED
-/// (B-T10) against the Neurketa compute benchmarks. A retired op's base clocks are
-/// scaled by num/den (with a fractional remainder carry in `scale_clocks`), so
-/// num/den < 1 runs the mode faster.
-///
-/// This is the COMPUTE dial. Since B-T10 a second per-mode dial (`bus_timing`)
-/// scales the whole bus portion (fetch + data access), so every guest clock is
-/// `scale_clocks(instruction) + scale_bus(bus)`. The bus dial carries the absolute
-/// per-mode magnitude (it lets a fast part pull away from the old flat per-access
-/// floor), so this dial only trims the compute share. Dhrystone is a fetch+data
-/// mix split roughly compute/bus; these values plus `bus_timing` seat all four
-/// modes' Dhrystones/sec on the era references (386 ~9,200, 486 ~61,000,
-/// 586 ~337,200 at 166 MHz) to within ~0.3%.
-///
-/// **DHRYSTONE IS NOT A TARGET** (owner ruling of 2026-09-03, 12:10, recorded in
-/// `dev_docs/2026-09-05-586-recalibration-review.md`). It ranked behind quake's
-/// 969-frame demo time and doom's realtics window and was then demoted
-/// entirely: a synthetic loop at IPC ~1.5 is not the code the personas exist to
-/// run, and the recalibration's class tables break the very fit these two dials
-/// came from -- on BOTH the 486 and the 586 -- which is expected and is not a
-/// regression. The figures above are recorded because they say where the dials
-/// came from, not because anything is graded on them.
-///
-/// The 586 figure is **337,200**, one number, taken from
-/// `izarravm/src/bench_reference.rs`'s band, which is the single authority.
-/// This comment carried ~250,000 until slice 1f; that value matched nothing --
-/// not the band, not the ~337,000 the era reference and the recalibration
-/// design both cite for a Pentium 166 at ~190 DMIPS. It was stale text, not a
-/// second measurement.
-///
-/// fp-mandel TRADE-OFF: fp-mandel is x87-compute-bound (~7280 instruction clocks
-/// vs ~6247 bus per pixel), so it rides this dial. Dhrystone pinned to its owner
-/// target forces the compute dial small on the fast modes, which makes fp-mandel
-/// run well above its ratio-anchored band and at a 586/486 ratio of ~8x (the model
-/// floor with Dhrystone pinned is ~7.8x; see bench_reference.rs). Matching both the
-/// fp-mandel ratio AND the Dhrystone target needs a separate x87 latency dial (a
-/// deferred Whetstone-payload follow-up); Dhrystone anchored the dials, so fp-mandel's band
-/// is recentered on the achieved value and the ratio gap recorded.
+/// Convert class-table raw work into CPU clocks. Fast persona tables use twelfths;
+/// the 386 retains its 2/5 conversion. The CPU carries fractional work between
+/// instructions. Board reference clocks convert to master ticks separately.
 pub(crate) const fn level_timing(persona: CpuPersona) -> (u32, u32) {
     match persona {
         CpuPersona::I386 => (2, 5),
@@ -6495,145 +6381,8 @@ pub const fn level_timing_for_test(persona: CpuPersona) -> (u32, u32) {
     level_timing(persona)
 }
 
-/// x87 op classes for the per-class FP-timing dial. The class is derived at the
-/// FPU dispatch tail from (escape opcode, ModRM), so the classifier sees exactly
-/// what the census profiler's opcode rows see:
-/// - `IntConvert`: the int<->fp boundary — every DB/DF/DA MEMORY form (FILD,
-///   FIST(P), FBLD/FBSTP, integer-operand arithmetic). On a real P55C, FIST is
-///   unpairable and drains the FP pipe, exposing the full latency of the chain
-///   that produced the value; a sequential interpreter charges issue cost only,
-///   so this class carries an effective stall surcharge (the Quake span
-///   rasterizer's fixed-point boundary is exactly this traffic).
-/// - `F32Mem` / `F64Mem`: D8/D9 and DC/DD memory forms (f32/f64 load, store,
-///   memory-operand arithmetic).
-/// - `Register`: every mode==3 form — register arithmetic, FXCH, compares,
-///   constants, transcendentals, control ops. P5 pairing and the 1-clock
-///   FADD/FMUL issue rate make this class CHEAPER than the raw 387 clocks.
-/// - `Wait`: the 9B WAIT opcode (Whetstone-era code is full of FWAITs; real P5
-///   treats them as ~free once no exception is pending).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FpOpClass {
-    /// DB memory forms: 32-bit FILD/FIST(P) (+f80 loads/stores) - the class the
-    /// Quake span rasterizer's fixed-point boundary lives in.
-    IntConvert32,
-    /// DF/DA/DE memory forms: the era-compiler conversion families - DF int16
-    /// loads/stores (+m64 FILD/FISTP under /5 //7, +BCD), DE int16 arith, DA
-    /// int32 arith. Grouped as one calibration knob; the width in the name
-    /// records the dominant DF-int16 shape, not every member's encoding.
-    IntConvert16,
-    F32Mem,
-    F64Mem,
-    Register,
-    Wait,
-}
-
-/// Common denominator for every `fp_timing_class` ratio: sharing one denominator
-/// keeps the single carried remainder (`fp_rem`) exact across ops of different
-/// classes (a per-op numerator over a fixed base, tunable in 1/8 steps).
+/// Fixed denominator retained for the serialized FP remainder.
 const FP_TIMING_DEN: u32 = 8;
-
-/// Per-mode, per-class FP-op-clock numerator over `FP_TIMING_DEN` — a SEPARATE
-/// dial from `level_timing` so the P55C's x87 pipeline can be modeled at I586
-/// without touching the integer-instruction compute ratio. Identity (8/8) for
-/// 386/486: their FP rides `level_timing` alone, keeping the frozen-class
-/// bench bytes and the 486 Whetstone anchor (6.5 MFLOPS) untouched.
-///
-/// The I586 values replace the old flat (31/34) scalar with separate classes.
-/// Quake demo1's FP
-/// clocks are conversion/traffic-shaped (FILD/FIST + f32/f64 memory ops) while
-/// Whetstone's are register-arithmetic/transcendental-shaped, and the era
-/// anchors pull those classes in OPPOSITE directions (real P55C-200: Quake
-/// ~42 fps, Whetstone 34.5 MFLOPS). Register-class ops get CHEAPER than raw 387
-/// clocks (U/V pairing, 1-clock FADD/FMUL issue); the int<->fp boundary pays an
-/// effective stall surcharge (see FpOpClass::IntConvert). CALIBRATION
-/// CONSTRAINTS: Whetstone 586 = 34.5 MFLOPS and 486 = 6.5 stay era-exact;
-/// Dhrystone/Sieve run no x87 and stay bit-identical; 386 frozen.
-const fn fp_timing_class(persona: CpuPersona, class: FpOpClass, epoch: u32) -> u32 {
-    // EPOCH 2, design section 4: the dial is DELETED, not re-solved. Every I586
-    // FP class becomes identity (8/8) and the honest per-form Appendix F counts
-    // are charged by the class table instead (`timing_class.rs`'s x87 block,
-    // sourced row by row in `dev_docs/2026-09-05-class-table-sources.md`).
-    // `IntConvert32 = 272` (x34) was the absorber: its own comment called it
-    // "empirically walked against the two era anchors", and it priced
-    // `FISTP m32` at 39.67 guest clocks against Intel's 6.
-    if epoch >= 2 {
-        return FP_TIMING_DEN;
-    }
-    match persona {
-        CpuPersona::I386 | CpuPersona::I486 => FP_TIMING_DEN,
-        CpuPersona::I586 => match class {
-            // Census-guided, empirically walked against the two era anchors
-            // (Whetstone 586 = 34.5 MFLOPS, Quake demo1 ~42 fps).
-            FpOpClass::IntConvert32 => 272, // x34: conversion drains the FP pipe
-            FpOpClass::IntConvert16 => 256, // x32: FIST16 drains the pipe too, a touch less
-            FpOpClass::F32Mem => 8,         // x1
-            FpOpClass::F64Mem => 8,         // x1
-            FpOpClass::Register => 2,       // x0.25: pairing/issue-rate honesty
-            FpOpClass::Wait => 1,           // x0.125: FWAIT is ~free on a P5
-        },
-    }
-}
-
-/// Per-level BUS-clock scaling as (numerator, denominator), CALIBRATED (B-T10).
-/// This is the THIRD timing lever (after `level_timing` and the cache `tier_cost`
-/// wait-states): it scales the ENTIRE bus portion of a step (instruction fetch +
-/// every tiered data access) by num/den, with a fractional-remainder carry in the
-/// machine's `scale_bus` so a cheap access is not rounded to zero.
-///
-/// Why it exists: the bus portion is `2 + wait_states` clocks per access and the
-/// `2` base is mode-INDEPENDENT, so before this dial a fast part could not pull
-/// away from a flat per-access floor and 486/586 Dhrystone/Sieve floored far below
-/// their era absolutes. Scaling the whole bus portion per mode supplies the
-/// absolute magnitude the fast modes need (num/den < 1 makes the bus effectively
-/// faster, lifting iters/sec), while the relative L1<L2<RAM structure stays in the
-/// `tier_cost` wait-states. The slow modes keep num/den ~ 1 (their flat-floor bus
-/// was already near band); the fast modes use a smaller ratio to reach their
-/// targets (486 ~0.33, 586 ~0.18). These values, with `level_timing`, seat all four
-/// Dhrystone modes on their era references. Those are references and not targets;
-/// see `level_timing`'s note on the 12:10 demotion.
-///
-/// BANDWIDTH coupling (see bench_reference.rs): the bandwidth tool now reports the
-/// SCALED bus delta, so a tier's MB/s is `4 * clock_hz / ((2 + ws) * (num/den)) /
-/// 1e6`. A smaller num/den (needed for fast-mode Dhrystone) multiplies bandwidth UP
-/// by den/num, so the fast-mode L1 bandwidth lands ABOVE the SpeedSys era figures
-/// and cannot be pulled back without re-slowing Dhrystone (Dhrystone is ~30% L1
-/// data, so the L1 wait-state is shared). The L2/RAM tiers are decoupled (the
-/// benchmarks fit L1/L2 and never miss), so their large `tier_cost` miss penalties
-/// pull those tiers down to SpeedSys on the 486; on the 586 the u8 wait-state cap
-/// (255) over a 16-dword line floors L2/RAM above SpeedSys. Era anchors and the gap
-/// are recorded in each bandwidth `cite`.
-///
-/// EPOCH 2 (`IZARRAVM_TIMING_EPOCH=2`, slice 2's whole-bill fold): both fast
-/// personas become `(1, 1)`. Every guest clock is a real clock and no dial
-/// survives anywhere in the 486/586 bus path -- which is the whole point of the
-/// fold: it is what makes our bill directly comparable to 86Box's and
-/// DOSBox-X's. `(1,1)` is a 6.56x multiplier on the 586's surviving bus terms
-/// (`(16,105) = 0.152381`) and a 3x one on the 486's, so `tier_cost` is
-/// re-solved in the SAME commit and the L1 fetch/data terms the class counts
-/// already contain are folded out on the same gate. The 386 is out of the
-/// recalibration's scope and keeps `(23, 31)` under both epochs.
-pub const fn bus_timing(persona: CpuPersona, epoch: u32) -> (u32, u32) {
-    if epoch >= 2 {
-        return match persona {
-            CpuPersona::I386 => (23, 31),
-            CpuPersona::I486 | CpuPersona::I586 => (1, 1),
-        };
-    }
-    match persona {
-        CpuPersona::I386 => (23, 31),
-        CpuPersona::I486 => (1, 3),
-        // Recalibrated for the 166 MHz / 64 MB PC100 SDRAM spec (2026-08-08):
-        // 7/30 was seated on the 200 MHz Dhrystone target; the PC100 memory
-        // subsystem cheapens the whole bus portion so Quake demo1 lands on the
-        // ~41 fps anchor at the lower clock. Solved jointly with the mode 13h
-        // video wait-state (75 -> 147) against the two-game linear model
-        // fitted from three measured configs on 2026-08-08 (guest-time shares:
-        // doom = 0.17 compute + 0.33 nonvideo-bus + 0.50 VGA; quake = 0.535 +
-        // 0.400 + 0.064), landing doom-586 on ~1001 realtics (74.6 fps) and
-        // quake demo1 on ~41.2 fps.
-        CpuPersona::I586 => (16, 105),
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IsaGeneration {

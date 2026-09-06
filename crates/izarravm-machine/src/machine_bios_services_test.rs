@@ -2848,13 +2848,13 @@ fn profile_construction_and_set_mode_drive_cpu_and_cache_table() {
     .unwrap();
     assert_eq!(machine.cpu.mode(), GswMode::Gsw386);
     assert_eq!(machine.cpu.persona(), CpuPersona::I386);
-    assert_eq!(machine.cache_config(), (0, 64));
+    assert_eq!(machine.cache_config(), (0, 512));
 
     let generation = machine.cpu.decode_cache_generation();
     machine.set_mode(GswMode::Gsw386Slow);
     assert_eq!(machine.cpu.mode(), GswMode::Gsw386Slow);
     assert_eq!(machine.cpu.persona(), CpuPersona::I386);
-    assert_eq!(machine.cache_config(), (0, 64));
+    assert_eq!(machine.cache_config(), (0, 512));
     assert_eq!(
         machine.cpu.decode_cache_generation(),
         generation.wrapping_add(1)
@@ -2863,12 +2863,12 @@ fn profile_construction_and_set_mode_drive_cpu_and_cache_table() {
     machine.set_mode(GswMode::Gsw386);
     assert_eq!(machine.cpu.mode(), GswMode::Gsw386);
     assert_eq!(machine.cpu.persona(), CpuPersona::I386);
-    assert_eq!(machine.cache_config(), (0, 64));
+    assert_eq!(machine.cache_config(), (0, 512));
 
     machine.set_mode(GswMode::Gsw486);
     assert_eq!(machine.cpu.mode(), GswMode::Gsw486);
     assert_eq!(machine.cpu.persona(), CpuPersona::I486);
-    assert_eq!(machine.cache_config(), (8, 256));
+    assert_eq!(machine.cache_config(), (8, 512));
 
     machine.set_mode(GswMode::Gsw586);
     assert_eq!(machine.cpu.mode(), GswMode::Gsw586);

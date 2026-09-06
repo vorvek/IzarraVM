@@ -2332,3 +2332,99 @@ fn int19_disarms_the_hdd_map_registration() {
         "disarm forgets the registration, same as a never-registered kernel"
     );
 }
+
+#[test]
+fn deferred_cd_audio_commands_conserve_the_span_after_completion() {
+    use izarravm_core::MASTER_CLOCK_HZ;
+    fn pending(mode: GswMode, operation: u8, early_fdc: bool) -> (Machine, u64) {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        machine.mount_cd(audio_cd(40));
+        machine.ide.device_mut().execute(&[0; 12]);
+        let mut play = [0; 12];
+        play[0] = 0x45;
+        play[5] = 1;
+        play[8] = 30;
+        if operation != 0x45 {
+            machine.ide.device_mut().execute(&play);
+            machine.advance_devices_ticks(MASTER_CLOCK_HZ / 225);
+            if operation == 1 {
+                let mut pause = [0; 12];
+                pause[0] = 0x4b;
+                machine.ide.device_mut().execute(&pause);
+            }
+        }
+        let now = machine.master_ticks();
+        machine.fdc.write_port_at(0x3f2, 0x0c, now);
+        machine.fdc.write_port_at(0x3f5, 0x08, now);
+        while machine.fdc.read_port(0x3f4).unwrap() & 0x40 != 0 {
+            machine.fdc.read_port(0x3f5);
+        }
+        for value in [0x03, 0xf0, 0, 0x0f, 0, 1] {
+            machine.fdc.write_port_at(0x3f5, value, now);
+        }
+        if early_fdc {
+            machine.advance_devices_ticks(MASTER_CLOCK_HZ * 9 / 10_000);
+        }
+        machine.ide.write_port(0x177, 0xa0);
+        machine.advance_devices_ticks(MASTER_CLOCK_HZ / 20_000);
+        machine.ide.read_port(0x177);
+        let mut command = play;
+        if operation != 0x45 {
+            command = [0; 12];
+            command[0] = if operation == 1 { 0x4b } else { operation };
+            command[8] = u8::from(operation == 1);
+        }
+        let prefix = with_bus(&mut machine, |bus| {
+            bus.prior_runs_core_clocks = 5_000;
+            for byte in command {
+                CpuBus::write_io(bus, 0x170, BusWidth::Byte, u32::from(byte), 17, false).unwrap();
+            }
+            bus.in_batch_master_ticks()
+        });
+        let deadline = prefix + MASTER_CLOCK_HZ / 10_000;
+        assert_eq!(machine.ide.ticks_until_completion(), Some(deadline));
+        let fdc = machine
+            .fdc
+            .ticks_until_event(machine.master_ticks())
+            .unwrap();
+        assert_eq!(fdc < deadline, early_fdc);
+        (machine, deadline)
+    }
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for operation in [0x45, 0x4b, 1, 0x4e] {
+            for early_fdc in [false, true] {
+                let (mut whole, deadline) = pending(mode, operation, early_fdc);
+                let (mut split, other_deadline) = pending(mode, operation, early_fdc);
+                assert_eq!(deadline, other_deadline);
+                let suffix = MASTER_CLOCK_HZ * 2 / 75;
+                whole.advance_devices_ticks(deadline + suffix);
+                split.advance_devices_ticks(deadline);
+                split.advance_devices_ticks(suffix);
+                assert_eq!(
+                    whole.ide.device().playback(),
+                    split.ide.device().playback(),
+                    "{mode:?} op={operation:x} early_fdc={early_fdc}"
+                );
+                assert_eq!(
+                    whole.ide.device().playback().current_lba,
+                    if operation == 0x45 || operation == 1 {
+                        3
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(whole.timeline, split.timeline);
+                assert_eq!(whole.pic, split.pic);
+                assert_eq!(whole.ide.ticks_until_completion(), None);
+                assert_eq!(whole.fdc.ticks_until_event(whole.master_ticks()), None);
+                assert_eq!(whole.ide.read_port(0x177), split.ide.read_port(0x177));
+            }
+        }
+    }
+}

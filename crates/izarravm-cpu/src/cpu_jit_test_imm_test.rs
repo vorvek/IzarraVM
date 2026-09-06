@@ -3164,7 +3164,7 @@ fn exact_current_dx_poll_shapes_cover_masks_and_branch_senses() {
             let (mut cpu, _) = warm_exact_poll(&code, ENTRY, &[0, 1, 3], 0, 0, 0xaaaa_03da);
             let poll = cpu.poll_loop().expect("exact CurrentDx poll");
             assert_eq!(poll.diagnostic_class(), 0);
-            assert_eq!(poll.raw_core_clocks(), 17);
+            assert_eq!(poll.raw_core_clocks(), 196);
             assert_eq!(poll.fetch_count(), 3);
             assert_eq!(poll.resolved_port(&cpu), 0x03da);
             assert_eq!(poll.status_mask(), mask);
@@ -3188,7 +3188,7 @@ fn exact_setup_poll_shapes_cover_sources_senses_and_every_phase() {
                         warm_exact_poll(&code, ENTRY, starts, ebx, ecx_value, 0xaaaa_03da);
                     let poll = cpu.poll_loop().expect("exact setup poll");
                     assert_eq!(poll.diagnostic_class(), if paired { 2 } else { 1 });
-                    assert_eq!(poll.raw_core_clocks(), if paired { 28 } else { 21 });
+                    assert_eq!(poll.raw_core_clocks(), if paired { 232 } else { 220 });
                     assert_eq!(poll.fetch_count(), starts.len());
                     assert_eq!(poll.status_mask(), mask);
                     assert_eq!(

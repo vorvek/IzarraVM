@@ -3195,7 +3195,8 @@ fn a_stray_zero_to_the_wavetable_registers_attenuates_rather_than_muting() {
 /// `test_machine`) unmasked.
 fn enable_sb16_irq_wake(machine: &mut Machine) {
     machine.cpu.registers.eflags |= 0x0200;
-    with_bus(machine, |bus| {
+    {
+        let mut bus = machine.make_construction_bus();
         for (port, value) in [
             (0x20u16, 0x11u32),
             (0x21, 0x08),
@@ -3210,27 +3211,26 @@ fn enable_sb16_irq_wake(machine: &mut Machine) {
         ] {
             bus.write_io(port, BusWidth::Byte, value, false).unwrap();
         }
-    });
+    }
 }
 
 #[test]
 fn halted_cpu_wakes_for_a_pending_dsp_pause_interrupt() {
     // A guest that sends 0x80 and then STI; HLT must be woken at the pause
-    // deadline, not at the next unrelated edge (Codex review on #733).
+    // deadline.
     let mut machine = test_machine();
     enable_sb16_irq_wake(&mut machine);
-    with_bus(&mut machine, |bus| {
-        for &b in &[0x41u8, 0x27, 0x10, 0x80, 0x09, 0x00] {
+    {
+        let mut bus = machine.make_construction_bus();
+        for &b in &[0x41u8, 0x27, 0x10, 0x80, 0x04, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
                 .unwrap();
         }
-    });
+    }
     let micros = machine.sb16.test_pause_micros_remaining().unwrap();
-    assert!(
-        micros >= 1_000,
-        "10 periods at 10 kHz, plus any folded span"
-    );
-    let ticks = micros * izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    assert_eq!(micros, 500);
+    assert_eq!(machine.port_bus_batch_clocks, 0);
+    let ticks = machine.timeline.master_ticks_until_microseconds(micros);
     let expected = machine
         .timeline
         .cpu_clocks_for_master_ticks_ceil(ticks)
@@ -3240,7 +3240,7 @@ fn halted_cpu_wakes_for_a_pending_dsp_pause_interrupt() {
         Some(expected)
     );
     assert!(machine.event_batch_cap(u64::MAX) <= expected);
-    // Nothing else is armed, so the cap is the pause itself.
+    // The 500-us pause precedes the 1-ms fallback.
     assert_eq!(machine.event_batch_cap(u64::MAX), expected);
 }
 
@@ -3248,13 +3248,14 @@ fn halted_cpu_wakes_for_a_pending_dsp_pause_interrupt() {
 fn masked_sb16_line_does_not_offer_the_pause_wake() {
     let mut machine = test_machine();
     enable_sb16_irq_wake(&mut machine);
-    with_bus(&mut machine, |bus| {
+    {
+        let mut bus = machine.make_construction_bus();
         bus.write_io(0x21, BusWidth::Byte, 0xff, false).unwrap();
         for &b in &[0x41u8, 0x27, 0x10, 0x80, 0x09, 0x00] {
             bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
                 .unwrap();
         }
-    });
+    }
     let ticks = 1_000 * izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
     assert_eq!(
         machine.next_timer_wake(machine.master_ticks() + ticks * 4),
@@ -3300,4 +3301,375 @@ fn pause_dac_holds_dma_across_the_batch_that_ends_at_its_deadline() {
         machine.sb16.test_block_remaining() < 8,
         "output resumes after the pause"
     );
+}
+
+#[test]
+fn dsp_pause_deadline_preserves_fractional_time_and_cached_edges() {
+    let ticks_per_us = izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for phase in [0, 1, ticks_per_us / 2, ticks_per_us - 1] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            machine.cpu.registers.eflags |= 0x0200;
+            machine.advance_devices_ticks(phase);
+            {
+                let mut bus = machine.make_construction_bus();
+                for (port, value) in [
+                    (0x20, 0x11),
+                    (0x21, 0x08),
+                    (0x21, 0x04),
+                    (0x21, 0x01),
+                    (0xa0, 0x11),
+                    (0xa1, 0x70),
+                    (0xa1, 0x02),
+                    (0xa1, 0x01),
+                    (0x21, 0x7f),
+                    (0xa1, 0xff),
+                ] {
+                    bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+                }
+                for byte in [0x41, 0xc3, 0x50, 0x80, 0x00, 0x00] {
+                    bus.write_io(0x22c, BusWidth::Byte, byte, false).unwrap();
+                }
+            }
+            let micros = machine.sb16.test_pause_micros_remaining().unwrap();
+            let ticks = micros * ticks_per_us - phase;
+            let expected = machine
+                .timeline
+                .cpu_clocks_for_master_ticks_ceil(ticks)
+                .max(1);
+            assert_eq!(
+                machine.next_timer_wake(machine.master_ticks() + ticks * 4),
+                Some(expected)
+            );
+            machine.invalidate_device_edge_cache();
+            assert_eq!(machine.event_batch_cap_cached(u64::MAX), expected);
+            let quiet = ticks_per_us / 2;
+            machine.advance_devices_ticks(quiet);
+            assert_eq!(
+                machine.event_batch_cap_cached(u64::MAX),
+                machine.event_batch_cap(u64::MAX)
+            );
+            assert_eq!(
+                machine.event_batch_cap_cached(u64::MAX),
+                machine
+                    .timeline
+                    .cpu_clocks_for_master_ticks_ceil(ticks - quiet)
+                    .max(1)
+            );
+            if phase == 1 {
+                machine.set_mode(if mode == GswMode::Gsw586 {
+                    GswMode::Gsw386
+                } else {
+                    GswMode::Gsw586
+                });
+                assert_eq!(
+                    machine.event_batch_cap_cached(u64::MAX),
+                    machine.event_batch_cap(u64::MAX)
+                );
+                assert_eq!(
+                    machine.event_batch_cap_cached(u64::MAX),
+                    machine
+                        .timeline
+                        .cpu_clocks_for_master_ticks_ceil(ticks - quiet)
+                        .max(1)
+                );
+            }
+            machine.advance_devices_ticks(ticks - quiet - 1);
+            assert!(
+                !machine.pic.irr_bit(7),
+                "{mode:?}, phase {phase}: early pause IRQ"
+            );
+            machine.advance_devices_ticks(1);
+            assert!(
+                machine.pic.irr_bit(7),
+                "{mode:?}, phase {phase}: missing pause IRQ"
+            );
+        }
+    }
+}
+
+fn pcm_origin_machine(mode: GswMode, wss: bool) -> Machine {
+    let mut machine = test_machine();
+    machine.set_mode(mode);
+    for i in 0..64 {
+        machine.write_physical_u8(0x10000 + i, (i * 3) as u8);
+    }
+    {
+        let mut bus = machine.make_construction_bus();
+        let channel = u16::from(!wss);
+        for (port, value) in [
+            (0x0c, 0),
+            (0x0b, 0x48 + u32::from(channel)),
+            (2 * channel, 0),
+            (2 * channel, 0),
+            (2 * channel + 1, 63),
+            (2 * channel + 1, 0),
+            (if wss { 0x87 } else { 0x83 }, 1),
+            (0x0a, u32::from(channel)),
+        ] {
+            bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+        }
+        if wss {
+            for (port, value) in [(0x534, 0x48), (0x535, 0), (0x534, 8)] {
+                bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+            }
+        } else {
+            for value in [0x41, 0x27, 0x10, 0xc0, 0, 63] {
+                bus.write_io(0x22c, BusWidth::Byte, value, false).unwrap();
+            }
+        }
+    }
+    if wss {
+        machine.advance_devices_ticks(128 * (izarravm_core::MASTER_CLOCK_HZ / 8000));
+        {
+            let mut bus = machine.make_construction_bus();
+            for (index, value) in [(10, 2), (15, 63), (14, 0), (9, 8)] {
+                bus.write_io(0x534, BusWidth::Byte, index, false).unwrap();
+                bus.write_io(0x535, BusWidth::Byte, value, false).unwrap();
+            }
+        }
+        assert!(machine.wss_enabled);
+        assert_eq!(machine.wss.dma(), 0);
+        assert_eq!(machine.wss.output_frame_rate(), 8000);
+        assert!(!machine.wss.is_playing());
+        assert!(!machine.wss.autocal_active());
+        assert_eq!(machine.wss.current_count(), 63);
+    } else {
+        assert_eq!(machine.sb16.test_output_frame_rate(), 10_000);
+        assert!(!machine.sb16.test_is_playing());
+    }
+    let channel = usize::from(!wss);
+    assert_eq!(machine.dma.master.channels[channel].cur_addr, 0);
+    assert_eq!(machine.dma.master.channels[channel].cur_count, 63);
+    assert_eq!(machine.dma.master.channels[channel].transfer_cycles, 0);
+    assert_eq!(machine.port_bus_batch_clocks, 0);
+    machine
+}
+
+fn arm_audio_at_pending_prefix(machine: &mut Machine, port: u16, value: u32) -> u64 {
+    const CORE_TICKS: u64 = 4_108_500;
+    let quantum = machine.timeline.ticks_per_cpu_clock();
+    assert_eq!(CORE_TICKS % quantum, 0);
+    let raw = machine.raw_bus_clocks();
+    assert_eq!(machine.port_bus_batch_clocks, 0);
+    let prefix = with_bus(machine, |bus| {
+        bus.prior_runs_core_clocks = CORE_TICKS / quantum - 17;
+        CpuBus::write_io(bus, port, BusWidth::Byte, value, 17, false).unwrap();
+        bus.in_batch_master_ticks()
+    });
+    assert_eq!(prefix, CORE_TICKS + 160 * 33);
+    assert_eq!(machine.raw_bus_clocks() - raw, 4);
+    assert_eq!(std::mem::take(&mut machine.port_bus_batch_clocks), 156);
+    prefix
+}
+
+#[test]
+#[ignore = "PCM startup currently consumes the prewrite batch prefix"]
+fn pcm_startup_owns_only_the_postwrite_span() {
+    let suffix = izarravm_core::MASTER_CLOCK_HZ / 100_000;
+    let mut observations = Vec::new();
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for wss in [false, true] {
+            let mut candidate = pcm_origin_machine(mode, wss);
+            let mut reference = pcm_origin_machine(mode, wss);
+            let (port, value) = if wss { (0x535, 9) } else { (0x22c, 0) };
+            let prefix = arm_audio_at_pending_prefix(&mut candidate, port, value);
+            reference.advance_devices_ticks(prefix);
+            reference
+                .make_construction_bus()
+                .write_io(port, BusWidth::Byte, value, false)
+                .unwrap();
+            candidate.advance_devices_ticks(prefix + suffix);
+            reference.advance_devices_ticks(suffix);
+            let channel = usize::from(!wss);
+            let actual = candidate.dma.master.channels[channel];
+            let expected = reference.dma.master.channels[channel];
+            assert_eq!(expected.transfer_cycles, 0);
+            assert_eq!(expected.cur_addr, 0);
+            assert_eq!(expected.cur_count, 63);
+            let remaining = if wss {
+                candidate.wss.current_count()
+            } else {
+                candidate.sb16.test_block_remaining()
+            };
+            println!(
+                "pcm_origin mode={mode:?} wss={wss} candidate_transfers={} reference_transfers={} remaining={remaining}",
+                actual.transfer_cycles, expected.transfer_cycles
+            );
+            observations.push((actual, expected));
+        }
+    }
+    assert!(
+        observations
+            .iter()
+            .all(|(actual, expected)| actual == expected)
+    );
+}
+
+fn wss_calibration_machine(mode: GswMode, invalid_rate: bool) -> Machine {
+    let mut machine = test_machine();
+    machine.set_mode(mode);
+    {
+        let mut bus = machine.make_construction_bus();
+        bus.write_io(0x534, BusWidth::Byte, 0x48, false).unwrap();
+        bus.write_io(
+            0x535,
+            BusWidth::Byte,
+            if invalid_rate { 8 } else { 0 },
+            false,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        machine.wss.output_frame_rate(),
+        if invalid_rate { 0 } else { 8000 }
+    );
+    assert!(!machine.wss.autocal_active());
+    assert!(!machine.wss.is_playing());
+    assert_eq!(machine.port_bus_batch_clocks, 0);
+    machine
+}
+
+#[test]
+#[ignore = "WSS autocalibration currently consumes the prewrite batch prefix"]
+fn wss_calibration_starts_at_the_mce_clear_write() {
+    let duration = 128 * (izarravm_core::MASTER_CLOCK_HZ / 8000);
+    let suffix = izarravm_core::MASTER_CLOCK_HZ / 100_000;
+    let mut observations = Vec::new();
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for invalid_rate in [false, true] {
+            let mut candidate = wss_calibration_machine(mode, invalid_rate);
+            let mut reference = wss_calibration_machine(mode, invalid_rate);
+            let prefix = arm_audio_at_pending_prefix(&mut candidate, 0x534, 8);
+            reference.advance_devices_ticks(prefix);
+            reference
+                .make_construction_bus()
+                .write_io(0x534, BusWidth::Byte, 8, false)
+                .unwrap();
+            candidate.advance_devices_ticks(prefix + suffix);
+            reference.advance_devices_ticks(suffix);
+            for machine in [&mut candidate, &mut reference] {
+                assert!(machine.wss.autocal_active());
+                machine.advance_devices_ticks(duration - suffix - 1);
+            }
+            let actual = candidate.wss.autocal_active();
+            let expected = reference.wss.autocal_active();
+            println!(
+                "wss_aci_origin mode={mode:?} invalid={invalid_rate} candidate_before={actual} reference_before={expected}"
+            );
+            assert!(expected);
+            observations.push(actual == expected);
+            for machine in [&mut candidate, &mut reference] {
+                machine.advance_devices_ticks(1);
+                assert!(!machine.wss.autocal_active());
+                assert_eq!(machine.dma.master.channels[0].transfer_cycles, 0);
+            }
+        }
+    }
+    assert!(observations.into_iter().all(|equal| equal));
+}
+
+#[test]
+fn armed_audio_clocks_survive_cpu_mode_changes_and_split_advances() {
+    let duration = izarravm_core::MASTER_CLOCK_HZ / 500;
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for wss in [false, true] {
+            let mut whole = pcm_origin_machine(mode, wss);
+            let mut split = pcm_origin_machine(mode, wss);
+            for machine in [&mut whole, &mut split] {
+                let (port, value) = if wss { (0x535, 9) } else { (0x22c, 0) };
+                machine
+                    .make_construction_bus()
+                    .write_io(port, BusWidth::Byte, value, false)
+                    .unwrap();
+                assert_eq!(machine.port_bus_batch_clocks, 0);
+            }
+            whole.advance_devices_ticks(duration);
+            split.advance_devices_ticks(1);
+            split.set_mode(if mode == GswMode::Gsw586 {
+                GswMode::Gsw386Slow
+            } else {
+                GswMode::Gsw586
+            });
+            split.advance_devices_ticks(duration / 3);
+            split.advance_devices_ticks(duration - duration / 3 - 1);
+            let channel = usize::from(!wss);
+            let count = if wss { 16 } else { 20 };
+            assert_eq!(
+                whole.dma.master.channels[channel],
+                split.dma.master.channels[channel]
+            );
+            for machine in [&mut whole, &mut split] {
+                let dma = &machine.dma.master.channels[channel];
+                assert_eq!(dma.transfer_cycles, count);
+                assert_eq!(u64::from(dma.cur_addr), count);
+                assert_eq!(u64::from(dma.cur_count), 63 - count);
+                assert!(!dma.reached_tc);
+                if wss {
+                    assert_eq!(u64::from(machine.wss.current_count()), 63 - count);
+                    assert!(!machine.wss.take_irq());
+                } else {
+                    assert_eq!(u64::from(machine.sb16.test_block_remaining()), 64 - count);
+                    assert!(!machine.sb16.test_take_irq());
+                }
+                let clock = if wss {
+                    timeline::DeviceClock::Wss
+                } else {
+                    timeline::DeviceClock::Dsp
+                };
+                let rate = if wss { 8000 } else { 10_000 };
+                assert_eq!(
+                    machine.timeline.master_ticks_until(clock, 1, rate),
+                    Some(izarravm_core::MASTER_CLOCK_HZ / rate)
+                );
+            }
+        }
+        for invalid_rate in [false, true] {
+            let duration = 128 * (izarravm_core::MASTER_CLOCK_HZ / 8000);
+            let mut whole = wss_calibration_machine(mode, invalid_rate);
+            let mut split = wss_calibration_machine(mode, invalid_rate);
+            for machine in [&mut whole, &mut split] {
+                machine
+                    .make_construction_bus()
+                    .write_io(0x534, BusWidth::Byte, 8, false)
+                    .unwrap();
+            }
+            whole.advance_devices_ticks(duration - 1);
+            split.advance_devices_ticks(1);
+            split.set_mode(if mode == GswMode::Gsw586 {
+                GswMode::Gsw386Slow
+            } else {
+                GswMode::Gsw586
+            });
+            split.advance_devices_ticks(duration / 3);
+            split.advance_devices_ticks(duration - duration / 3 - 2);
+            for machine in [&mut whole, &mut split] {
+                assert!(machine.wss.autocal_active());
+                machine.advance_devices_ticks(1);
+                assert!(!machine.wss.autocal_active());
+                assert_eq!(machine.dma.master.channels[0].transfer_cycles, 0);
+            }
+        }
+    }
 }

@@ -10,17 +10,6 @@ use izarravm_cpu::TLB_ENTRIES;
 
 #[cfg(feature = "jit")]
 fn poll_skip_test_machine(enabled: bool, tracing: TracingMode, mode: GswMode, mask: u8) -> Machine {
-    poll_skip_test_machine_at_epoch(enabled, tracing, mode, mask, 1)
-}
-
-#[cfg(feature = "jit")]
-fn poll_skip_test_machine_at_epoch(
-    enabled: bool,
-    tracing: TracingMode,
-    mode: GswMode,
-    mask: u8,
-    epoch: u32,
-) -> Machine {
     let program = [
         0xba, 0xda, 0x03, // mov dx,3DAh
         0xec, 0xa8, mask, 0x75, 0xfb, // wait while the status bit is set
@@ -39,8 +28,53 @@ fn poll_skip_test_machine_at_epoch(
     machine.cpu.set_native_backend_enabled(false);
     machine.poll_skip_enabled = enabled;
     machine.trace.set_tracing_mode(tracing);
-    machine.timing_epoch = epoch;
     machine
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn epoch_two_poll_skip_matches_executed_iterations() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for protected in [false, true] {
+            for mask in [0x01, 0x08] {
+                let mut baseline = poll_skip_test_machine(false, TracingMode::Off, mode, mask);
+                let mut skipped = poll_skip_test_machine(false, TracingMode::Off, mode, mask);
+                for machine in [&mut baseline, &mut skipped] {
+                    if protected {
+                        machine.cpu.control.cr0 |= 1;
+                    }
+                    machine.run_cycles(10_000).unwrap();
+                    machine.cpu.registers.eip = 0x108;
+                    machine.cpu.poll_skip_backedge_housekeeping();
+                    let poll = machine.cpu.poll_loop().expect("warm epoch 2 poll");
+                    // Seed a valid fractional core carry without changing the loop's price.
+                    machine.cpu.commit_poll_skip_core(poll, 1, 1).unwrap();
+                    machine.bus_rem = 0;
+                    machine.cpu.reset_perf_counters();
+                }
+                skipped.poll_skip_enabled = true;
+                let window = mode.clock_hz() / 30;
+                let baseline_stop = baseline.run_cycles(window).unwrap();
+                let skipped_stop = skipped.run_cycles(window).unwrap();
+                assert_eq!(skipped_stop, baseline_stop);
+                let skipped_iterations = skipped.cpu.perf_counters().poll_skip_iterations;
+                assert!(
+                    skipped_iterations > 1,
+                    "mode={mode:?} mask={mask} eip={:#x} eligible={} spans={} instructions={}",
+                    skipped.cpu.registers.eip,
+                    skipped.cpu.poll_skip_eligible(),
+                    skipped.cpu.perf_counters().poll_skip_spans,
+                    skipped.cpu.perf_counters().instructions,
+                );
+                assert_eq!(
+                    skipped.cpu.perf_counters().instructions + 3 * skipped_iterations,
+                    baseline.cpu.perf_counters().instructions,
+                    "mode={mode:?} mask={mask}",
+                );
+                assert_poll_machine_boundary_eq(&skipped, &baseline);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "jit")]
@@ -102,13 +136,11 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
     // two privilege columns the skip can actually take (F8: V86 is structurally refused, see
     // `poll_skip_is_refused_in_v86_but_would_price_the_v86_column`), and the epoch-2 leg fails
     // on any per-iteration term that is wrong by a single clock.
-    for epoch in [1, 2] {
+    {
         for mode in [GswMode::Gsw486, GswMode::Gsw586] {
             for mask in [0x01, 0x08] {
-                let mut baseline =
-                    poll_skip_test_machine_at_epoch(false, TracingMode::Off, mode, mask, epoch);
-                let mut skipped =
-                    poll_skip_test_machine_at_epoch(true, TracingMode::Off, mode, mask, epoch);
+                let mut baseline = poll_skip_test_machine(false, TracingMode::Off, mode, mask);
+                let mut skipped = poll_skip_test_machine(true, TracingMode::Off, mode, mask);
 
                 skipped.poll_skip_enabled = false;
                 baseline.run_cycles(1_000).unwrap();
@@ -119,26 +151,28 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
                     machine.cpu.poll_skip_backedge_housekeeping();
                     let poll = machine.cpu.poll_loop().expect("warm direct poll loop");
                     for _ in 0..2 {
+                        let raw = 1;
                         machine
                             .cpu
-                            .commit_poll_skip_core(poll, poll.raw_core_clocks(), 1)
+                            .commit_poll_skip_core(poll, raw, 1)
                             .expect("one iteration advances the CPU timing remainder");
                         if machine.cpu.poll_skip_timing_remainder() != 0 {
                             break;
                         }
                     }
                     machine.cpu.reset_perf_counters();
-                    machine.bus_rem = 2;
+                    machine.bus_rem = 0;
                     assert_ne!(machine.cpu.poll_skip_timing_remainder(), 0);
-                    assert_ne!(machine.bus_rem, 0);
+                    assert!(machine.bus_rem < u64::from(bus_timing(mode).1));
                 }
                 skipped.poll_skip_enabled = true;
 
-                let baseline_stop = baseline.run_cycles(100_000).unwrap();
-                let skipped_stop = skipped.run_cycles(100_000).unwrap();
+                let window = mode.clock_hz() / 30;
+                let baseline_stop = baseline.run_cycles(window).unwrap();
+                let skipped_stop = skipped.run_cycles(window).unwrap();
                 assert_eq!(
                     skipped_stop, baseline_stop,
-                    "epoch={epoch} mode={mode:?} mask={mask:#04x}"
+                    "mode={mode:?} mask={mask:#04x}"
                 );
                 // poll_loop now borrows &mut, so materialize the diagnostic before the
                 // assert rather than inside its format args (which hold the other &self
@@ -147,7 +181,7 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
                 let loop_diag = skipped.cpu.poll_loop();
                 assert!(
                     skipped.cpu.perf_counters().poll_skip_spans > 0,
-                    "epoch={epoch} mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={loop_diag:?}",
+                    "mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={loop_diag:?}",
                     skipped.cpu.registers.eip,
                     skipped.cpu.linear_eip(),
                     skipped.cpu.registers.edx() as u16,
@@ -180,7 +214,6 @@ fn an_elided_span_charges_exactly_n_times_one_iteration_on_every_lane() {
     let mut machine =
         setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
     prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
-    machine.timing_epoch = 2;
     machine.port_bus_batch_clocks = 0;
 
     let (raw_per_iteration, port_lane, raw_bus_per_iteration) =
@@ -190,14 +223,14 @@ fn an_elided_span_charges_exactly_n_times_one_iteration_on_every_lane() {
                 .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
                 .expect("0x3DA is admitted under epoch 2");
             (
-                cpu.poll_skip_raw_core_clocks(poll, bus),
+                cpu.poll_skip_raw_core_clocks(poll),
                 certificate.port_bus_clocks_per_iteration(),
                 certificate.raw_clocks_per_iteration(),
             )
         });
     assert_eq!(
         raw_per_iteration,
-        21 - 12 + 84,
+        52 + 84,
         "the core lane must swap the shape's baked epoch-1 IN (12 raw) for Intel's real-mode          column (7 x 12 = 84 raw), leaving the 5-slot shape's other four slots (21 - 12 = 9          raw) alone -- the rest of the core class table is the recalibration's slice 1, not          this one's"
     );
     assert_eq!(
@@ -252,14 +285,13 @@ fn the_poll_skip_prices_the_real_mode_column_because_v86_can_never_reach_it() {
     let mut machine =
         setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
     prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
-    machine.timing_epoch = 2;
     assert!(!machine.cpu.is_v86_mode(), "the fixture runs in real mode");
     assert!(machine.cpu.poll_skip_eligible());
     let poll = machine.cpu.poll_loop().expect("warm poll descriptor");
-    let raw = with_cpu_and_bus(&mut machine, |cpu, bus| {
-        cpu.poll_skip_raw_core_clocks(poll, bus)
+    let raw = with_cpu_and_bus(&mut machine, |cpu, _bus| {
+        cpu.poll_skip_raw_core_clocks(poll)
     });
-    assert_eq!(raw, 21 - 12 + 84, "real mode: Intel's IN 7 x 12 = 84 raw");
+    assert_eq!(raw, 52 + 84, "real mode: Intel's IN 7 x 12 = 84 raw");
 }
 
 /// F14's instrument, as a RATE. The fixture is the `VL_WaitVBL` shape itself -- spin while the
@@ -282,9 +314,8 @@ fn the_poll_skip_prices_the_real_mode_column_because_v86_can_never_reach_it() {
 #[cfg(feature = "jit")]
 #[test]
 fn retrace_poll_exits_track_frames_not_polls() {
-    for (epoch, skip) in [(1, false), (1, true), (2, false), (2, true)] {
-        let mut machine =
-            poll_skip_test_machine_at_epoch(skip, TracingMode::Off, GswMode::Gsw586, 0x08, epoch);
+    for skip in [false, true] {
+        let mut machine = poll_skip_test_machine(skip, TracingMode::Off, GswMode::Gsw586, 0x08);
         machine.run_cycles(1_000).unwrap();
         let frames_before = machine.vega.frame_sequence();
         let (rising_before, falling_before) = machine.retrace_poll_exits();
@@ -292,14 +323,11 @@ fn retrace_poll_exits_track_frames_not_polls() {
         let frames = machine.vega.frame_sequence() - frames_before;
         let (rising, falling) = machine.retrace_poll_exits();
         let (rising, falling) = (rising - rising_before, falling - falling_before);
-        assert!(
-            frames > 2,
-            "epoch {epoch} skip={skip}: the fixture must cross frames"
-        );
+        assert!(frames > 2, "skip={skip}: the fixture must cross frames");
         // One exit per edge per frame, +/- the partial frame at each end of the window.
         assert!(
             rising.abs_diff(frames) <= 1 && falling.abs_diff(frames) <= 1,
-            "epoch {epoch} skip={skip}: exits must track frames -- frames={frames}              rising={rising} falling={falling}"
+            "skip={skip}: exits must track frames -- frames={frames}              rising={rising} falling={falling}"
         );
     }
 }
@@ -380,29 +408,25 @@ fn poll_bus_certificate_admits_only_the_one_port_it_prices() {
     let mut machine =
         setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
     prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
-    for epoch in [1, 2] {
-        machine.timing_epoch = epoch;
+    {
         // The arm has to be set BEFORE `with_cpu_and_bus`: the bus caches the resolved knob at
         // construction (one bool test per access instead of a lazy-static touch), which is also
         // the production shape -- the environment is read once per process.
         for armed in [false, true] {
-            crate::bus::set_isa_io_wait_for_test(Some(armed));
             with_cpu_and_bus(&mut machine, |cpu, bus| {
                 let poll = cpu.poll_loop().expect("warm poll descriptor");
                 assert!(
                     bus.poll_bus_certificate(poll, 0x0040).is_none(),
-                    "epoch={epoch} armed={armed}: a port the admission does not name must                      refuse, whatever the ISA knob and whatever the epoch"
+                    "armed={armed}: a port the admission does not name must                      refuse, whatever the ISA knob and whatever the epoch"
                 );
                 assert!(
                     bus.poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
                         .is_some(),
-                    "epoch={epoch} armed={armed}: 0x3DA is the admitted port in BOTH epochs --                      under epoch 2 it is priced by the third lane, not refused"
+                    "armed={armed}: 0x3DA is the admitted port in BOTH epochs --                      under epoch 2 it is priced by the third lane, not refused"
                 );
             });
         }
     }
-    machine.timing_epoch = 1;
-    crate::bus::set_isa_io_wait_for_test(None);
 }
 
 #[cfg(feature = "jit")]
@@ -506,6 +530,7 @@ fn prepare_setup_poll_head(
         &[0, 2, 4, 5, 7]
     };
     with_cpu_and_bus(machine, |cpu, bus| {
+        bus.charge_port_timing = false;
         let initial_eflags = cpu.registers.eflags | 1;
         cpu.registers.set_eax(0xdead_beef);
         cpu.registers
@@ -546,7 +571,7 @@ fn projected_poll_total(machine: &mut Machine, iterations: u64, batch_core: u64)
             .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("RAM poll bus certificate");
         let core = cpu
-            .project_poll_skip_core(cpu.poll_skip_raw_core_clocks(poll, bus), iterations)
+            .project_poll_skip_core(cpu.poll_skip_raw_core_clocks(poll), iterations)
             .expect("poll core projection");
         let scaled_bus = bus
             .poll_project_scaled_bus_clocks(certificate, iterations)
@@ -563,12 +588,21 @@ fn projected_poll_dots(machine: &mut Machine, iterations: u64, batch_core: u64) 
             .poll_bus_certificate(poll, crate::bus::POLL_SKIP_IO_PORT)
             .expect("RAM poll bus certificate");
         let core = cpu
-            .project_poll_skip_core(cpu.poll_skip_raw_core_clocks(poll, bus), iterations)
+            .project_poll_skip_core(cpu.poll_skip_raw_core_clocks(poll), iterations)
             .expect("poll core projection");
-        let scaled_bus = bus
-            .poll_project_scaled_bus_clocks(certificate, iterations)
-            .expect("poll bus projection");
-        bus.poll_project_dot_advance(batch_core + core + scaled_bus)
+        let ticks = bus
+            .poll_project_master_ticks(certificate, iterations, batch_core + core)
+            .expect("poll master-tick projection");
+        assert_eq!(
+            ticks,
+            (batch_core + core) * u64::from(bus.bus_den_at_batch_start)
+                + (bus.in_batch_reference_bus_clocks()
+                    + iterations
+                        * (certificate.raw_clocks_per_iteration()
+                            + certificate.port_bus_clocks_per_iteration()))
+                    * 33
+        );
+        bus.poll_project_dot_advance(ticks)
             .expect("poll dot projection")
     })
 }
@@ -738,7 +772,7 @@ fn poll_skip_reserves_k_plus_one_at_the_exact_cap_with_fractional_carries() {
         let mut machine =
             setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
         prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
-        machine.bus_rem = 2;
+        machine.advance_devices_ticks(2);
         with_cpu_and_bus(&mut machine, |cpu, _| {
             let poll = cpu.poll_loop().expect("warm direct setup poll");
             cpu.commit_poll_skip_core(poll, poll.raw_core_clocks(), 1)
@@ -746,7 +780,8 @@ fn poll_skip_reserves_k_plus_one_at_the_exact_cap_with_fractional_carries() {
             assert_ne!(cpu.poll_skip_timing_remainder(), 0);
             cpu.reset_perf_counters();
         });
-        assert_ne!(machine.bus_rem, 0);
+        assert_eq!(machine.bus_rem, 0);
+        assert_eq!(machine.master_ticks() % 33, 2);
 
         let exact_cap = projected_poll_total(&mut machine, K + 1, BATCH_CORE);
         let cap = if at_cap { exact_cap } else { exact_cap - 1 };
@@ -775,7 +810,6 @@ fn memory_poll_skip_returns_a_wide_epoch_two_charge_after_precommit() {
             MEMORY_POLL_CELL_DISP,
             MEMORY_POLL_COMPARAND ^ 0x55aa,
         );
-        machine.set_timing_epoch_for_test(2);
         with_cpu_and_bus(&mut machine, |cpu, bus| {
             for _ in 0..8 {
                 cpu.run_budgeted(bus, 500).expect("warm memory poll spin");
@@ -802,7 +836,7 @@ fn memory_poll_skip_returns_a_wide_epoch_two_charge_after_precommit() {
             let certificate = bus
                 .poll_memory_bus_certificate(poll, physical)
                 .expect("plain RAM memory poll certificate");
-            let raw_core = cpu.poll_skip_raw_core_clocks(poll, bus);
+            let raw_core = cpu.poll_skip_raw_core_clocks(poll);
             let core = cpu
                 .project_poll_skip_core(raw_core, iterations)
                 .expect("memory poll core projection");
@@ -858,7 +892,7 @@ fn memory_poll_skip_returns_a_wide_epoch_two_charge_after_precommit() {
     );
     assert_eq!(admitted.cpu.poll_skip_memory().iterations, ITERATIONS);
     assert_eq!(run::checked_batch_core_sum(0, charged), charged);
-    assert_eq!(bus_timing(admitted.cpu.persona(), 2), (1, 1));
+    assert_eq!(bus_timing(admitted.cpu.mode()), (33, 33));
     assert_eq!(
         expected_bus,
         raw_bus * ITERATIONS,
@@ -1558,7 +1592,7 @@ fn native_deadline_bound_uses_the_same_bus_scale_as_batch_accounting() {
 
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
         machine.set_mode(mode);
-        let (num, den) = bus_timing(mode.persona(), machine.timing_epoch);
+        let (num, den) = bus_timing(mode);
         let expected = RAW_CLOCKS
             .saturating_mul(u64::from(num))
             .saturating_add(u64::from(den) - 1)
@@ -1887,17 +1921,19 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
         (&mut interp_cpu, &mut interp_machine),
         (&mut native_cpu, &mut native_machine),
     ] {
+        for pte in [PTE_A, PTE_B] {
+            assert_eq!(machine.memory.read_u32(pte as usize).unwrap() & 0x20, 0);
+        }
+        let walks = cpu.perf_counters().tlb_walks;
         arm(cpu, WARM_CODE_LINEAR);
         let outcomes = drive_native_fetch_loop(cpu, machine);
         assert!(outcomes.last().is_some_and(|outcome| outcome.halted));
         for pte in [PTE_A, PTE_B] {
-            assert!(
-                machine.trace.cycles().iter().any(|cycle| {
-                    cycle.kind == BusAccessKind::PageWalkRead && cycle.address == pte
-                }),
-                "the cold warmup must walk PTE {pte:#x}"
-            );
+            assert_ne!(machine.memory.read_u32(pte as usize).unwrap() & 0x20, 0);
         }
+        assert!(cpu.perf_counters().tlb_walks - walks >= 3);
+        assert_eq!(cpu.probe_linear_read_physical(LINEAR_A), None);
+        assert_eq!(cpu.probe_linear_read_physical(LINEAR_B), Some(FRAME_B));
     }
 
     interp_machine.trace = BusTrace::default();
@@ -1926,19 +1962,13 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     ] {
         machine.trace = BusTrace::default();
         machine.trace.set_tracing_mode(TracingMode::Full);
+        let walks = cpu.perf_counters().tlb_walks;
         arm(cpu, WARM_CODE_LINEAR);
         let outcomes = drive_native_fetch_loop(cpu, machine);
         assert!(outcomes.last().is_some_and(|outcome| outcome.halted));
-        let data_walks: Vec<_> = machine
-            .trace
-            .cycles()
-            .iter()
-            .filter(|cycle| {
-                cycle.kind == BusAccessKind::PageWalkRead && matches!(cycle.address, PTE_A | PTE_B)
-            })
-            .collect();
-        assert!(!data_walks.is_empty());
-        assert_eq!(data_walks.last().unwrap().address, PTE_B);
+        assert!(cpu.perf_counters().tlb_walks > walks);
+        assert_eq!(cpu.probe_linear_read_physical(LINEAR_A), None);
+        assert_eq!(cpu.probe_linear_read_physical(LINEAR_B), Some(FRAME_B));
         machine
             .memory
             .write_u32(PAGE_DIRECTORY as usize, PAGE_TABLE | 7)
@@ -1953,8 +1983,8 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     interp_machine.trace.set_tracing_mode(TracingMode::Off);
     native_machine.trace = BusTrace::default();
     native_machine.trace.set_tracing_mode(TracingMode::Off);
-    interp_machine.bus_rem = 2;
-    native_machine.bus_rem = 2;
+    interp_machine.bus_rem = 0;
+    native_machine.bus_rem = 0;
     arm(&mut interp_cpu, MEASURE_CODE_LINEAR);
     arm(&mut native_cpu, MEASURE_CODE_LINEAR);
     interp_cpu.elapsed_clocks = 0;
@@ -2020,11 +2050,7 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     let native_scaled = native_machine.scale_bus(native_raw);
     assert_eq!(native_scaled, interp_scaled);
     assert_eq!(native_machine.bus_rem, interp_machine.bus_rem);
-    assert_eq!(
-        native_scaled,
-        (native_raw * u64::from(bus_timing(GswMode::Gsw486.persona(), 1).0) + 2)
-            / u64::from(bus_timing(GswMode::Gsw486.persona(), 1).1)
-    );
+    assert_eq!(native_scaled, (native_raw * 33).div_ceil(83));
     assert_eq!(
         interp_machine
             .memory

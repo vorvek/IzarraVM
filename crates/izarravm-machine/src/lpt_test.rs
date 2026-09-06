@@ -111,3 +111,68 @@ fn irq_enable_is_sampled_at_the_ack_edge() {
     lpt.advance_master_ticks(BUSY_TICKS);
     assert!(lpt.take_irq());
 }
+
+#[test]
+fn access_catchup_matches_settlement_across_printer_events() {
+    for base in [LPT1_BASE, LPT2_BASE] {
+        for enabled in [false, true] {
+            let mut initial = if base == LPT1_BASE {
+                Lpt::default()
+            } else {
+                Lpt::lpt2()
+            };
+            initial.write_port(base, b'A');
+            initial.write_port(
+                base + 2,
+                CONTROL_STROBE | if enabled { CONTROL_IRQ_ENABLE } else { 0 },
+            );
+            for offset in [
+                BUSY_TICKS - 1,
+                BUSY_TICKS,
+                BUSY_TICKS + 1,
+                BUSY_TICKS + ACK_TICKS - 1,
+                BUSY_TICKS + ACK_TICKS,
+                BUSY_TICKS + ACK_TICKS + 1,
+            ] {
+                for value in [0, CONTROL_IRQ_ENABLE] {
+                    let mut split = initial.clone();
+                    let mut whole = initial.clone();
+                    split.advance_master_ticks(offset);
+                    assert_eq!(
+                        whole.read_port_at(base + 1, offset),
+                        split.read_port(base + 1)
+                    );
+                    for (port, data) in [
+                        (base + 2, value),
+                        (base, b'B'),
+                        (base + 2, value | CONTROL_STROBE),
+                        (base, b'C'),
+                    ] {
+                        split.write_port(port, data);
+                        whole.write_port_at(port, data, offset);
+                    }
+                    let span = offset + BUSY_TICKS + ACK_TICKS;
+                    whole.advance_master_ticks(offset / 2);
+                    assert_eq!(whole.advance_credit_ticks(), offset - offset / 2);
+                    whole.advance_master_ticks(span - offset / 2);
+                    split.advance_master_ticks(span - offset);
+                    assert_eq!(whole, split);
+                    let expected: &[u8] = if offset >= BUSY_TICKS + ACK_TICKS {
+                        b"AB"
+                    } else {
+                        b"A"
+                    };
+                    assert_eq!(whole.output(), expected);
+                    assert_eq!(
+                        whole.take_irq(),
+                        if offset < BUSY_TICKS {
+                            value != 0
+                        } else {
+                            enabled || (expected.len() == 2 && value != 0)
+                        }
+                    );
+                }
+            }
+        }
+    }
+}

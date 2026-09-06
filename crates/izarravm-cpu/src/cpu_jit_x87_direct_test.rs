@@ -167,21 +167,16 @@ fn assert_program_matches_exact_insns(
     )
 }
 
-fn assert_program_matches_at_epoch_exact_insns(
+fn assert_program_matches_with_installed_block(
     mode: GswMode,
-    epoch: u32,
     memory: Vec<u8>,
     control: u16,
     expected_insns: u64,
 ) -> (CpuGsw, TestBus) {
     let mut direct = x87_cpu(mode);
     let mut interpreter = x87_cpu(mode);
-    direct.set_timing_epoch(epoch);
-    interpreter.set_timing_epoch(epoch);
     let mut direct_bus = direct_memory(memory.clone());
     let mut interpreter_bus = direct_memory(memory.clone());
-    direct_bus.timing_epoch_two = epoch >= 2;
-    interpreter_bus.timing_epoch_two = epoch >= 2;
 
     arm(&mut direct, control);
     run_to_halt(&mut direct, &mut direct_bus);
@@ -204,10 +199,7 @@ fn assert_program_matches_at_epoch_exact_insns(
     let direct_outcomes = run_to_halt(&mut direct, &mut direct_bus);
     let interpreter_outcomes = run_to_halt(&mut interpreter, &mut interpreter_bus);
 
-    assert_eq!(
-        direct_outcomes, interpreter_outcomes,
-        "epoch {epoch}: run timing differs"
-    );
+    assert_eq!(direct_outcomes, interpreter_outcomes, "run timing differs");
     assert_eq!(
         crate::tests::settled_registers(&direct),
         crate::tests::settled_registers(&interpreter)
@@ -224,7 +216,7 @@ fn assert_program_matches_at_epoch_exact_insns(
     assert_eq!(
         direct.perf_counters().jit_direct_insns - before,
         expected_insns,
-        "epoch {epoch}: a required x87 instruction did not retire natively"
+        "a required x87 instruction did not retire natively"
     );
     (direct, direct_bus)
 }
@@ -284,24 +276,16 @@ fn fdiv_register_program(extension: u8) -> Vec<u8> {
 }
 
 #[test]
-fn native_real_fdiv_charges_the_epoch_two_i586_delta_without_changing_other_columns() {
-    let mut results = Vec::new();
-    for (mode, epoch) in [
-        (GswMode::Gsw486, 1),
-        (GswMode::Gsw486, 2),
-        (GswMode::Gsw586, 1),
-        (GswMode::Gsw586, 2),
-    ] {
-        let (add, add_bus) = assert_program_matches_at_epoch_exact_insns(
+fn native_real_fdiv_uses_each_personas_sourced_tariff() {
+    for (mode, expected_delta) in [(GswMode::Gsw486, 0), (GswMode::Gsw586, 36)] {
+        let (add, add_bus) = assert_program_matches_with_installed_block(
             mode,
-            epoch,
             fadd_or_fdiv_m32_program(0),
             0x037f,
             3,
         );
-        let (divide, divide_bus) = assert_program_matches_at_epoch_exact_insns(
+        let (divide, divide_bus) = assert_program_matches_with_installed_block(
             mode,
-            epoch,
             fadd_or_fdiv_m32_program(6),
             0x037f,
             3,
@@ -310,18 +294,8 @@ fn native_real_fdiv_charges_the_epoch_two_i586_delta_without_changing_other_colu
             add_bus.trace.elapsed_clocks(),
             divide_bus.trace.elapsed_clocks()
         );
-        results.push((mode, epoch, divide.elapsed_clocks - add.elapsed_clocks));
+        assert_eq!(divide.elapsed_clocks - add.elapsed_clocks, expected_delta);
     }
-    assert_eq!(results[0].2, 0, "epoch 1 I486 stays byte-identical");
-    assert_eq!(
-        results[1].2, 0,
-        "epoch 2 I486 keeps the old real-arithmetic charge"
-    );
-    assert_eq!(results[2].2, 0, "epoch 1 I586 stays byte-identical");
-    assert_eq!(
-        results[3].2, 36,
-        "epoch 2 I586 charges 432 raw clocks at a 1/12 core scale"
-    );
 }
 
 #[test]
@@ -346,9 +320,8 @@ fn epoch_two_native_real_divide_forms_retire_without_a_fallback() {
             memory
         }),
     ] {
-        let (cpu, _) = assert_program_matches_at_epoch_exact_insns(
+        let (cpu, _) = assert_program_matches_with_installed_block(
             GswMode::Gsw586,
-            2,
             memory,
             0x037f,
             expected_insns,
@@ -366,9 +339,8 @@ fn native_x87_classes_cover_actual_add_and_divide_retires() {
         ("register divide", fdiv_register_program(6), "X87RegDiv"),
     ];
     for (label, memory, expected_class) in cases {
-        let (cpu, _) = assert_program_matches_at_epoch_exact_insns(
+        let (cpu, _) = assert_program_matches_with_installed_block(
             GswMode::Gsw586,
-            2,
             memory,
             0x037f,
             if label == "register divide" { 4 } else { 3 },
@@ -402,13 +374,9 @@ fn completed_real_divide_prefix_is_charged_once_before_a_memory_read_fault() {
 
     let mut direct = x87_cpu(GswMode::Gsw586);
     let mut interpreter = x87_cpu(GswMode::Gsw586);
-    for cpu in [&mut direct, &mut interpreter] {
-        cpu.set_timing_epoch(2);
-    }
+
     let mut direct_bus = direct_memory(memory.clone());
     let mut interpreter_bus = direct_memory(memory);
-    direct_bus.timing_epoch_two = true;
-    interpreter_bus.timing_epoch_two = true;
     // Prime the decoded slots while DS is flat. The finite limit is installed before compiling so
     // the native block carries the real operand-read guard rather than declining the block.
     arm(&mut direct, 0x037f);
@@ -2693,7 +2661,7 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     direct_bus.trace = BusTrace::default();
     assert!(
         !direct
-            .try_run_direct_block_with_cap_for_test(&mut direct_bus, block, 10)
+            .try_run_direct_block_with_cap_for_test(&mut direct_bus, block, 12)
             .unwrap()
     );
     assert_eq!(direct.registers, before_registers);
@@ -2708,7 +2676,7 @@ fn x87_conversion_self_loop_respects_a_tight_event_cap() {
     let mut interpreter_bus = direct_memory(memory);
     assert!(
         direct
-            .try_run_direct_block_with_cap_for_test(&mut direct_bus, block, 81)
+            .try_run_direct_block_with_cap_for_test(&mut direct_bus, block, 13)
             .unwrap()
     );
     #[cfg(feature = "timing-class-histogram")]

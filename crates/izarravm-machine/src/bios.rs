@@ -1190,6 +1190,7 @@ impl Machine {
                             self.pci.ide_bus_master_enabled(),
                             &self.memory,
                             disk,
+                            0,
                         );
                     }
                 }

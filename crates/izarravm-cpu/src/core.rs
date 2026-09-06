@@ -1427,34 +1427,12 @@ impl CpuGsw {
         key | (u32::from(self.mode.rank()) << 8)
     }
 
-    /// Install the guest-clock model epoch, ONCE, at machine construction.
-    ///
-    /// `izarravm-machine` reads `IZARRAVM_TIMING_EPOCH` into `Machine::timing_epoch`
-    /// and hands it here; nothing else may call this. The epoch may not change
-    /// mid-run: the JIT caches a block's raw clock sum at compile time, so a
-    /// live change would leave already-compiled blocks charging the old epoch
-    /// while the interpreter charged the new one
-    /// (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4).
-    pub fn set_timing_epoch(&mut self, epoch: u32) {
-        self.timing_epoch = epoch;
-        self.refresh_class_table();
-    }
-
-    /// The epoch this CPU is charging under. `1` unless the knob named `2`.
-    pub fn timing_epoch(&self) -> u32 {
-        self.timing_epoch
-    }
-
-    /// Re-resolve the `(persona, epoch)` charge table. The two callers are the
-    /// two things that can move either input: `set_timing_epoch` and `set_mode`.
+    /// Refresh the cached instruction table after a CPU mode change.
     fn refresh_class_table(&mut self) {
-        self.class_table = crate::timing_class::class_table(self.persona(), self.timing_epoch);
+        self.class_table = crate::timing_class::class_table(self.persona());
     }
 
-    /// The resolved `(persona, epoch)` charge table, for the JIT's compile-time
-    /// walk and its emitter: both must read the SAME table the interpreter
-    /// charges from, or a compiled block and an interpreted one price the same
-    /// instruction differently.
+    /// The resolved persona table shared by interpreter pricing and native emission.
     pub(crate) fn class_table(&self) -> &'static crate::timing_class::ClassTable {
         self.class_table
     }
@@ -1502,10 +1480,7 @@ impl CpuGsw {
     /// that share the 386 persona.
     pub fn set_mode(&mut self, mode: GswMode) {
         self.mode = mode;
-        // The persona just moved, and the charge table is persona-keyed. Under
-        // epoch 1 this re-resolves to the same table for every persona, so a
-        // mode switch cannot move a charge; under epoch 2 it is what lets a
-        // 486-mode guest charge the 486 column.
+        // Refresh the instruction table with the active persona.
         self.refresh_class_table();
         self.timing_rem = 0;
         self.fp_rem = 0;
@@ -1636,8 +1611,8 @@ impl CpuGsw {
     /// every class ratio shares the same denominator (FP_TIMING_DEN), so the carried
     /// remainder stays exact across ops of different classes. With an identity factor
     /// this returns `clocks` unchanged.
-    pub(super) fn scale_fp_clocks(&mut self, clocks: u32, class: FpOpClass) -> u32 {
-        let num = fp_timing_class(self.persona(), class, self.timing_epoch);
+    pub(super) fn scale_fp_clocks(&mut self, clocks: u32) -> u32 {
+        let num = FP_TIMING_DEN;
         let scaled = u64::from(clocks) * u64::from(num) + self.fp_rem;
         self.fp_rem = scaled % u64::from(FP_TIMING_DEN);
         (scaled / u64::from(FP_TIMING_DEN)).min(u64::from(u32::MAX)) as u32
@@ -1932,13 +1907,9 @@ impl CpuGsw {
     /// The per-iteration RAW core-clock charge an elided iteration of `poll` must project,
     /// under the bus's live guest-clock model epoch and this CPU's live I/O privilege column.
     ///
-    /// P2 of the port-io repricing (`dev_docs/2026-09-05-port-io-repricing-design.md` §2, and
-    /// review F8). Every certified `Io`-family shape bakes exactly ONE `IN` slot into its
-    /// `raw_core_clocks` at epoch 1's flat `IN_PORT_CORE_CLOCKS` -- 17 = 12 + `TEST` 2 +
-    /// taken `Jcc` 3 for the 3-slot shape, and the 21 / 28 shapes the same way. Under epoch 2
-    /// that one term becomes Intel's privilege column, so the elided iteration advances the
-    /// guest clock by exactly what the executed `IN` would have charged, and the skip stays a
-    /// host-side elision rather than a guest-visible speed-up.
+    /// Every certified I/O shape includes one `InPort` charge from the current class
+    /// table. Replace that term with the live privilege-column price, as an executed
+    /// `IN` does. Subtracting an older table's price would leave part of the charge twice.
     ///
     /// **Derived from the LIVE mode, never baked** (F8): the poll skip is unavailable in V86
     /// (`direct.rs`'s `permission.is_none()` decline and `poll_skip_eligible`'s V86 reject), so
@@ -1947,19 +1918,17 @@ impl CpuGsw {
     ///
     /// The `Memory` family has no port slot and is returned unchanged in both epochs.
     #[cfg(feature = "jit")]
-    pub fn poll_skip_raw_core_clocks<B: izarravm_bus::CpuBus>(
-        &self,
-        poll: PollLoop,
-        bus: &B,
-    ) -> u64 {
+    pub fn poll_skip_raw_core_clocks(&self, poll: PollLoop) -> u64 {
         let raw = poll.raw_core_clocks();
-        let epoch = bus.timing_epoch();
-        if epoch < 2 || poll.family() != crate::PollFamily::Io {
+        if poll.family() != crate::PollFamily::Io {
             return raw;
         }
         let mode = self.port_io_priv_mode();
-        raw.saturating_sub(u64::from(crate::port_core_clocks(1, false, mode)))
-            .saturating_add(u64::from(crate::port_core_clocks(epoch, false, mode)))
+        raw.saturating_sub(u64::from(
+            self.class_table()
+                .raw(crate::timing_class::TimingClass::InPort),
+        ))
+        .saturating_add(u64::from(crate::port_core_clocks(false, mode)))
     }
 
     #[cfg(feature = "jit")]
@@ -2509,60 +2478,27 @@ impl CpuGsw {
     /// The core-clock charge for one `IN` (`is_out` false) or `OUT` (true) in the CPU's current
     /// privilege column, under the bus's own guest-clock model epoch. The single seam between
     /// `crate::port_core_clocks`'s table and every charging site.
-    pub(crate) fn port_io_core_clocks<B: izarravm_bus::CpuBus>(
-        &self,
-        bus: &B,
-        is_out: bool,
-    ) -> u32 {
-        crate::port_core_clocks(bus.timing_epoch(), is_out, self.port_io_priv_mode())
+    pub(crate) fn port_io_core_clocks(&self, is_out: bool) -> u32 {
+        crate::port_core_clocks(is_out, self.port_io_priv_mode())
     }
 
     /// The whole-instruction core charge for one `INS`/`OUTS` (`is_rep` false) or the SETUP of a
     /// `REP INS`/`REP OUTS` (`is_rep` true), in the CPU's live privilege column under the bus's
     /// guest-clock model epoch. The string-I/O twin of `port_io_core_clocks`.
-    pub(crate) fn string_port_setup_core_clocks<B: izarravm_bus::CpuBus>(
-        &self,
-        bus: &B,
-        is_out: bool,
-        is_rep: bool,
-    ) -> u32 {
-        crate::string_port_setup_core_clocks(
-            bus.timing_epoch(),
-            is_out,
-            is_rep,
-            self.port_io_priv_mode(),
-        )
+    pub(crate) fn string_port_setup_core_clocks(&self, is_out: bool, is_rep: bool) -> u32 {
+        crate::string_port_setup_core_clocks(is_out, is_rep, self.port_io_priv_mode())
     }
 
-    /// Charge one `REP INS`/`REP OUTS` ELEMENT's core clocks directly into the CPU's guest clock,
-    /// through the same remainder-carrying scaler ordinary execution uses.
-    ///
-    /// WHY DIRECTLY AND NOT THROUGH `CycleOutcome`. A `REP` string is chunked: it can yield mid
-    /// instruction and resume, and only the FIRST chunk's `CycleOutcome` is ever charged
-    /// (`pause_rep_instruction` charges it; `resume_rep_instruction` maps every later chunk to
-    /// `core_clocks: 0`). Returning `setup + 3 * elements_this_chunk` from the executor arm would
-    /// therefore lose every element after the first chunk. There is no per-element core charge
-    /// anywhere in the string executor today -- `REP MOVS` of a megabyte charges 4 clocks total
-    /// -- so this is the first, and it is deliberately scoped to the two port forms: the rest of
-    /// the string family is the recalibration's business, not the port reprice's.
-    ///
-    /// **Structurally zero under epoch 1** (`string_port_element_core_clocks` returns 0), so a
-    /// knob-unset build cannot move.
-    ///
-    /// `core_clocks_so_far` is deliberately NOT advanced: batch-level sites assign it, so a
-    /// mid-`REP` increment would be overwritten. The committed owner carries the element's core
-    /// projection, while the budget limiter independently projects each port transaction from
-    /// the current in-batch bus state.
-    pub(crate) fn charge_string_port_element_core<B: izarravm_bus::CpuBus>(
+    /// Publish each REP port element through the committed core owner and the CPU
+    /// fractional carry. Setup is charged once; resumed elements retain their work.
+    /// Batch-level core_clocks_so_far stays run-relative and is published by its
+    /// caller. The bus limiter projects each port transaction separately.
+    pub(crate) fn charge_string_port_element_core(
         &mut self,
-        bus: &B,
         is_out: bool,
         committed: &mut CommittedCore,
     ) {
-        let raw = u64::from(crate::string_port_element_core_clocks(
-            bus.timing_epoch(),
-            is_out,
-        ));
+        let raw = u64::from(crate::string_port_element_core_clocks(is_out));
         if raw == 0 {
             return;
         }

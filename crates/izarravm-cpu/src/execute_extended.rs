@@ -705,15 +705,8 @@ impl CpuGsw {
                     self.write_operand_sized(bus, operand, OperandSize::Word, u32::from(selector))?;
                 }
                 self.set_flag(FLAG_ZF, adjusted);
-                // ARPL is the ONE charge site in the tree that was already
-                // persona-keyed before the class table existed, so it cannot be a
-                // class: a class holds one epoch-1 value for all three personas
-                // and this arm holds three. It takes the `Legacy` escape, which
-                // charges the literal handed to it under every epoch -- exactly
-                // today's behaviour, and an epoch-2 under-charge recorded here
-                // rather than guessed at. Folding it in needs a per-persona
-                // epoch-1 column, which is a table shape change, not a routing
-                // one.
+                // ARPL retains its original persona-specific raw literal outside the table;
+                // its fast-persona pricing remains an approximation.
                 let clocks_used: u16 = match self.persona() {
                     CpuPersona::I386 => 20,
                     CpuPersona::I486 => 9,
@@ -1028,7 +1021,10 @@ impl CpuGsw {
                         let value = self.read_operand_sized(bus, operand, operand_size)?;
                         let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
                         self.write_operand_sized(bus, operand, operand_size, result)?;
-                        Ok(self.charge(TimingClass::IncDecRm))
+                        Ok(self.charge(match operand {
+                            RmOperand::Register(_) => TimingClass::Reg,
+                            RmOperand::Memory(_) => TimingClass::IncDecRm,
+                        }))
                     }
                     2 => {
                         let target = self.read_operand_sized(bus, operand, operand_size)?;
@@ -1518,9 +1514,8 @@ impl CpuGsw {
                 )?;
                 // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
                 // charged inside `string_step` (see `charge_string_port_element_core` for why it
-                // cannot ride this return value); epoch 1 returns the flat 15 unchanged.
+                // cannot ride this return value).
                 Ok(clocks(self.string_port_setup_core_clocks(
-                    bus,
                     false,
                     insn.prefixes.rep.is_some(),
                 )))
@@ -1536,9 +1531,8 @@ impl CpuGsw {
                 )?;
                 // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
                 // charged inside `string_step` (see `charge_string_port_element_core` for why it
-                // cannot ride this return value); epoch 1 returns the flat 15 unchanged.
+                // cannot ride this return value).
                 Ok(clocks(self.string_port_setup_core_clocks(
-                    bus,
                     false,
                     insn.prefixes.rep.is_some(),
                 )))
@@ -1554,9 +1548,8 @@ impl CpuGsw {
                 )?;
                 // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
                 // charged inside `string_step` (see `charge_string_port_element_core` for why it
-                // cannot ride this return value); epoch 1 returns the flat 14 unchanged.
+                // cannot ride this return value).
                 Ok(clocks(self.string_port_setup_core_clocks(
-                    bus,
                     true,
                     insn.prefixes.rep.is_some(),
                 )))
@@ -1572,9 +1565,8 @@ impl CpuGsw {
                 )?;
                 // P3: the SETUP charge only. Under epoch 2 a `REP` form's per-element cost is
                 // charged inside `string_step` (see `charge_string_port_element_core` for why it
-                // cannot ride this return value); epoch 1 returns the flat 14 unchanged.
+                // cannot ride this return value).
                 Ok(clocks(self.string_port_setup_core_clocks(
-                    bus,
                     true,
                     insn.prefixes.rep.is_some(),
                 )))
@@ -1642,10 +1634,9 @@ impl CpuGsw {
                 // emulating the guest's halt semantics on the resulting #GP.
                 self.require_cpl0()?;
                 self.halted = true;
-                Ok(CycleOutcome {
-                    core_clocks: 5,
-                    halted: true,
-                })
+                let mut outcome = self.charge(TimingClass::Hlt);
+                outcome.halted = true;
+                Ok(outcome)
             }
             // CMPXCHG8B (0F C7 /1): the ModRM was pre-parsed; resolve the m64 operand here and reuse
             // the same compare/store/load-and-set-ZF logic as the former fused arm. The register

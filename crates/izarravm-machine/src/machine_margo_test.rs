@@ -104,6 +104,16 @@ fn vbe_current_mode_returns_the_set_mode() {
     assert_eq!(machine.cpu().registers.ebx() as u16, 0x4101);
 }
 
+fn sample_status1(machine: &mut Machine) -> u8 {
+    assert_eq!(machine.port_bus_batch_clocks, 0);
+    let raw = machine.raw_bus_clocks();
+    let value = machine.read_io_port_u8(0x3da);
+    assert_eq!(machine.raw_bus_clocks() - raw, 4);
+    assert_eq!(std::mem::take(&mut machine.port_bus_batch_clocks), 52);
+    machine.advance_devices_ticks(56 * 33);
+    value
+}
+
 /// Sample 0x3DA through the real port path every `sample_ticks` of machine time
 /// for `window_ticks`, and report the mean master-tick period between rising
 /// edges of bit 3 (vertical retrace), plus the number of edges seen.
@@ -115,13 +125,16 @@ fn vretrace_period_ticks(
     sample_ticks: u64,
     window_ticks: u64,
 ) -> (u64, u32) {
-    let mut previous = machine.read_io_port_u8(0x3da) & 0x08 != 0;
+    let mut previous = sample_status1(machine) & 0x08 != 0;
     let (mut first, mut last, mut edges) = (None, 0u64, 0u32);
-    let mut elapsed = 0u64;
-    while elapsed < window_ticks {
-        machine.advance_devices_ticks(sample_ticks);
-        elapsed += sample_ticks;
-        let now = machine.read_io_port_u8(0x3da) & 0x08 != 0;
+    assert!(sample_ticks >= 56 * 33);
+    let origin = machine.master_ticks();
+    while machine.master_ticks() - origin < window_ticks {
+        let target = machine.master_ticks() + sample_ticks;
+        machine.advance_devices_ticks(sample_ticks - 56 * 33);
+        let now = sample_status1(machine) & 0x08 != 0;
+        assert_eq!(machine.master_ticks(), target);
+        let elapsed = machine.master_ticks() - origin;
         if now && !previous {
             edges += 1;
             first.get_or_insert(elapsed);
@@ -210,12 +223,14 @@ fn margo_display_start_latches_inside_the_blanking_the_guest_polled_for() {
 
     // Advance to the first rising edge of the retrace bit, exactly as a guest
     // pacing on 0x3DA would.
-    let mut previous = machine.read_io_port_u8(0x3da) & 0x08 != 0;
-    let mut waited = 0u64;
+    let mut previous = sample_status1(&mut machine) & 0x08 != 0;
+    let origin = machine.master_ticks();
     loop {
-        machine.advance_devices_ticks(SAMPLE_TICKS);
-        waited += SAMPLE_TICKS;
-        let now = machine.read_io_port_u8(0x3da) & 0x08 != 0;
+        let target = machine.master_ticks() + SAMPLE_TICKS;
+        machine.advance_devices_ticks(SAMPLE_TICKS - 56 * 33);
+        let now = sample_status1(&mut machine) & 0x08 != 0;
+        assert_eq!(machine.master_ticks(), target);
+        let waited = machine.master_ticks() - origin;
         if now && !previous {
             break;
         }

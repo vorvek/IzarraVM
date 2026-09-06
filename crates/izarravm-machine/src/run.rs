@@ -531,11 +531,9 @@ pub(super) fn try_poll_skip(
         diagnostics.vga_bus_certificate_rejection();
         return None;
     };
-    // P2: the per-iteration RAW core charge, with the shape's baked epoch-1 `IN` term replaced
-    // by the live privilege column under epoch 2 (F8). Read ONCE, before the binary search, so
-    // every projection in this call and the commit that follows price the same iteration --
-    // nothing between here and the commit can change the mode.
-    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll, bus);
+    // Per-iteration raw core work with the current table's IN entry replaced by
+    // the live privilege-column charge.
+    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll);
     let beam = bus.predicted_beam();
     let status = bus.vega.status1_bits(beam);
     if !poll.fresh_iteration_spins(status) {
@@ -587,12 +585,9 @@ pub(super) fn try_poll_skip(
         let Some(skipped_core) = cpu.project_poll_skip_core(raw_per_iteration, iterations) else {
             return false;
         };
-        let Some(skipped_bus) = bus.poll_project_scaled_bus_clocks(certificate, iterations) else {
-            return false;
-        };
         let Some(candidate_total) = batch_core
             .checked_add(skipped_core)
-            .and_then(|total| total.checked_add(skipped_bus))
+            .and_then(|core| bus.poll_project_master_ticks(certificate, iterations, core))
         else {
             return false;
         };
@@ -671,7 +666,7 @@ fn try_poll_skip_memory(
     // The memory family has no port slot, so this is `poll.raw_core_clocks()` in both epochs
     // (`poll_skip_raw_core_clocks` returns it unchanged for a non-`Io` family). Taken through
     // the same function anyway so the two executors cannot drift.
-    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll, bus);
+    let raw_per_iteration = cpu.poll_skip_raw_core_clocks(poll);
     // R1: read the polled cell through the plain, uncharged backing-store
     // read (never CpuBus::read_memory/read_memory_direct/charge_direct_memory,
     // which all record trace clocks and would break timing identity), then
@@ -864,7 +859,7 @@ impl Machine {
                                 &mut self.ata_poll_skip.counters.declines_deadline_clamped;
                             *clamped = clamped.saturating_add(1);
                         } else {
-                            // The same primitive `stall_for_hdd_sectors_cached`
+                            // The same primitive `stall_for_hdd_sectors`
                             // uses for the INT 13h path: it advances
                             // the master timeline with the full
                             // device fan-out, charges
@@ -912,7 +907,7 @@ impl Machine {
     /// by the primary channel cannot outrun the secondary's boundary or a DMA
     /// transfer's, exactly as the ATAPI skip cannot outrun the primary's.
     /// Reuses `stall_for_master_ticks` to commit: the same whole-machine
-    /// advance `stall_for_hdd_sectors_cached` uses for the INT 13h path, so
+    /// advance `stall_for_hdd_sectors` uses for the INT 13h path, so
     /// every device -- including `self.ata` itself -- advances in lockstep
     /// with the master clock the skip moves.
     ///
@@ -1491,12 +1486,12 @@ impl Machine {
             let beam_at_batch_start = self.scanout_beam_dots();
             let margo_scanout_at_batch_start = self.vega.margo_scanout().is_some();
             let trace_elapsed_at_batch_start = trace_before;
+            #[cfg(test)]
             let bus_rem_at_batch_start = self.bus_rem;
             // bus_timing's (num, den), read from the same authoritative CPU mode
             // that scale_bus uses. Machine's active_mode copy exists for Lotura
             // register readback and is updated in the same set_mode call.
-            let (bus_num_at_batch_start, bus_den_at_batch_start) =
-                bus_timing(self.cpu.level(), self.timing_epoch);
+            let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.active_mode);
             // Test seam: open this batch's per-run prior_runs_core_clocks push log.
             #[cfg(test)]
             self.test_prior_core_pushes.push(Vec::new());
@@ -1580,7 +1575,6 @@ impl Machine {
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
-                    timing_epoch,
                     poll_skip_certificate,
                     retrace_poll,
                     profile,
@@ -1608,6 +1602,7 @@ impl Machine {
                     inta_diag,
                     fdc,
                     opl,
+                    opl_timer_advance_credit_us,
                     sb16,
                     wavetable_mpu,
                     midi_mpu,
@@ -1677,6 +1672,7 @@ impl Machine {
                     inta_diag,
                     fdc,
                     opl,
+                    opl_timer_advance_credit_us,
                     sb16,
                     wavetable_mpu,
                     midi_mpu,
@@ -1691,10 +1687,9 @@ impl Machine {
                     pending_bios32,
                     last_int_vector,
                     active_mode: *active_mode,
-                    timing_epoch: *timing_epoch,
                     poll_skip_certificate: &*poll_skip_certificate,
                     retrace_poll,
-                    string_port_element_bytes: 0,
+                    port_transaction_active: false,
                     #[cfg(test)]
                     test_string_port_observations,
                     pending_mode,
@@ -1708,10 +1703,7 @@ impl Machine {
                     cd_redirector_armed: cd_redirector_dos_ds.is_some(),
                     unittester,
                     wait_states: profile.wait_states,
-                    icache_fetch_clocks: if crate::bus::l1_charges_folded(
-                        *active_mode,
-                        *timing_epoch,
-                    ) {
+                    icache_fetch_clocks: if crate::bus::l1_charges_folded(*active_mode) {
                         0
                     } else {
                         u64::from(izarravm_bus::BusCycle::clocks_for(
@@ -1720,13 +1712,13 @@ impl Machine {
                         ))
                     },
                     cache: cache_model,
-                    l1_charges_folded: crate::bus::l1_charges_folded(*active_mode, *timing_epoch),
+                    l1_charges_folded: crate::bus::l1_charges_folded(*active_mode),
                     flat_data_cost: active_mode.uses_approximate_timing(),
                     a20_open,
                     device_free_extended_floor,
                     extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
                     lazy_port_reads: active_mode.uses_approximate_timing(),
-                    isa_io_wait: crate::bus::isa_io_wait_armed(),
+                    charge_port_timing: true,
                     lazy_ports_386: crate::bus::lazy_ports_386_for(*active_mode),
                     io_touched,
                     exempt_io_touched,
@@ -1754,6 +1746,7 @@ impl Machine {
                     beam_at_batch_start,
                     margo_scanout_at_batch_start,
                     trace_elapsed_at_batch_start,
+                    #[cfg(test)]
                     bus_rem_at_batch_start,
                     bus_num_at_batch_start,
                     bus_den_at_batch_start,
@@ -1973,15 +1966,30 @@ impl Machine {
                 Err(error) => error.consumed_core_clocks,
             };
             let bus_clocks = self.trace.elapsed_clocks() - trace_before;
-            let scaled_bus_clocks = self.scale_bus(bus_clocks);
             let isa_clocks = std::mem::take(&mut self.port_bus_batch_clocks);
-            let step = settled_core
-                .checked_add(scaled_bus_clocks)
-                .and_then(|total| total.checked_add(isa_clocks))
-                .expect("machine batch step exceeded u64");
-            self.scaled_bus_clocks = self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
+            let reference_bus = bus_clocks
+                .checked_add(isa_clocks)
+                .expect("bus bill exceeded u64");
+            let master_ticks = self
+                .timeline
+                .master_ticks_for_cpu_clocks(settled_core)
+                .checked_add(
+                    reference_bus
+                        .checked_mul(BUS_CLOCK_MASTER_TICKS)
+                        .expect("bus time exceeded u64"),
+                )
+                .expect("machine batch time exceeded u64");
+            let elapsed_before = self.elapsed_clocks;
             let advance_start = self.host_profile.start();
-            self.advance_cpu_work(step, settled_core);
+            self.advance_cpu_work(master_ticks, settled_core);
+            debug_assert_eq!(self.opl_timer_advance_credit_us, 0);
+            debug_assert_eq!(self.serial.advance_credit_ticks(), 0);
+            debug_assert_eq!(self.serial2.advance_credit_ticks(), 0);
+            debug_assert_eq!(self.lpt.advance_credit_ticks(), 0);
+            debug_assert_eq!(self.lpt2.advance_credit_ticks(), 0);
+            let step = self.elapsed_clocks.saturating_sub(elapsed_before);
+            let scaled_bus_clocks = step.saturating_sub(settled_core);
+            self.scaled_bus_clocks = self.scaled_bus_clocks.saturating_add(scaled_bus_clocks);
             self.host_profile
                 .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
 
@@ -2144,62 +2152,8 @@ impl Machine {
                                 self.advance_halted_cpu_clocks(wake_step);
                             }
                             None => {
-                                // Saturating because a batch can end PAST the
-                                // deadline, so `now > deadline` is a normal state
-                                // here, not a broken invariant. The batch was
-                                // granted `remaining_ticks` worth of clocks at
-                                // loop top, and four separate routes carry the
-                                // timeline beyond that grant:
-                                //   (a) `run_budgeted` always retires at least one
-                                //       instruction, so the last one straddles the
-                                //       budget;
-                                //   (b) the batch-entry `service_pending_interrupt`
-                                //       is charged before any cap test runs;
-                                //   (c) under EPOCH 1 `port_bus_batch_clocks` joins
-                                //       the batch-end `step` without ever having
-                                //       been counted against the cap (`spent` is
-                                //       core plus in-batch bus only). Under epoch 2
-                                //       it IS counted: review finding F2 folded the
-                                //       lane into `in_batch_scaled_bus_clocks()`,
-                                //       which is what `spent` is built from, and
-                                //       turned the CPU's per-instruction cap screen
-                                //       off so the exact test runs after every
-                                //       retired instruction. That route's
-                                //       contribution to the overshoot is then one
-                                //       access, not a whole batch's worth -- which
-                                //       matters because epoch 2 charges every port,
-                                //       not seven of them;
-                                //   (d) the grant itself rounds UP --
-                                //       `cpu_clocks_for_master_ticks_ceil(..).max(1)`
-                                //       -- so even a batch that spends exactly what
-                                //       it was granted lands up to
-                                //       `ticks_per_cpu_clock - 1` master ticks past
-                                //       the deadline (249 at the 386 quantum), with
-                                //       no instruction-level explanation at all.
-                                // The overshoot is small but NOT bounded by a
-                                // handful of clocks: measured at 3 clocks on the
-                                // 386 fixture (`tokaemm_v86_iopl_is_always_three_
-                                // across_a_boot` hits it once per boot), while the
-                                // true bound is one instruction's core clocks plus
-                                // the batch's uncounted ISA charge -- `isa_io_clocks`
-                                // is `clock_hz / 1_000_000`, i.e. 166 clocks per ISA
-                                // access at the 586 persona, so an Approximate-class
-                                // EPOCH-1 batch can overshoot by hundreds. Under
-                                // epoch 2 route (c) contributes one access's class
-                                // charge and no more.
-                                // `next_timer_wake` already clamps the same quantity
-                                // the same way, and it is exactly what returned None
-                                // here.
-                                //
-                                // Clamping to zero IS the semantic: `remaining`
-                                // exists only to stop the halted fast-forward
-                                // from running past the caller's deadline, and a
-                                // deadline already reached leaves zero halted
-                                // time to grant. `advance_halted_ticks(0)` is the
-                                // same no-op the exact-landing case already takes,
-                                // and the loop condition then ends the run. The
-                                // pending device edge is not lost -- the next run
-                                // call re-derives it.
+                                // An instruction, interrupt entry or rounded CPU grant can cross the deadline.
+                                // Clamp the remaining halted time to zero; the next run rechecks device edges.
                                 #[cfg(test)]
                                 if self.timeline.now_ticks() > deadline_ticks {
                                     self.test_halt_deadline_clamps += 1;

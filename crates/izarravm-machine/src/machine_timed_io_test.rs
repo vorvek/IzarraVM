@@ -19,10 +19,11 @@ const ALL_MODES: [GswMode; 4] = [
 ];
 
 fn out(machine: &mut Machine, port: u16, value: u8) {
-    with_bus(machine, |bus| {
+    {
+        let mut bus = machine.make_construction_bus();
         bus.write_io(port, BusWidth::Byte, u32::from(value), false)
             .unwrap();
-    });
+    }
 }
 
 fn initialize_pic(machine: &mut Machine, master_mask: u8, slave_mask: u8) {

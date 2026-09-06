@@ -149,8 +149,10 @@ fn absolute_tsc_origin_cannot_change_machine_or_cpu_continuation() {
 
     left.set_mode(GswMode::Gsw586);
     right.set_mode(GswMode::Gsw586);
-    left.advance_cpu_work(7, 3);
-    right.advance_cpu_work(7, 3);
+    left.cpu.elapsed_clocks += 3;
+    left.advance_cpu_work(7 * 33, 3);
+    right.cpu.elapsed_clocks += 3;
+    right.advance_cpu_work(7 * 33, 3);
     left.stall_for_master_ticks(101);
     right.stall_for_master_ticks(101);
     left.advance_halted_cpu_clocks(3);

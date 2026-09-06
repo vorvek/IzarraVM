@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::timing_class::TimingClass;
 
 const GAME_LOOP_ENTRY: u32 = 0x101;
 
@@ -2412,8 +2413,8 @@ fn bt_and_byte_inc_dec_charge_the_interpreter_clocks() {
     assert_eq!(block.span().instructions, 3);
     assert_eq!(
         block.raw_clocks(),
-        10,
-        "two 2-clock moves plus a 6-clock BT; the `_ => 2` default undercharges BT by 4"
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::BitTest)
     );
 
     // mov eax,imm32 (2) ; mov ebx,imm32 (2) ; inc al (2) = 6. The byte form deliberately has NO
@@ -2433,8 +2434,7 @@ fn bt_and_byte_inc_dec_charge_the_interpreter_clocks() {
     assert_eq!(block.span().instructions, 3);
     assert_eq!(
         block.raw_clocks(),
-        6,
-        "0xFE INC/DEC r8 charges 2, like 0xFF"
+        3 * crate::timing_class::I586.raw(TimingClass::Reg)
     );
 }
 

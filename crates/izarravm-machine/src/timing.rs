@@ -166,7 +166,7 @@ impl Machine {
         self.io_stall_clocks
     }
 
-    /// Monotonic global guest time in fixed 6.6 GHz master ticks. Unlike
+    /// Monotonic global guest time in fixed-rate master ticks. Unlike
     /// `elapsed_clocks`, this value keeps one unit across live CPU-mode changes.
     pub fn master_ticks(&self) -> u64 {
         self.timeline.now_ticks()
@@ -205,24 +205,15 @@ impl Machine {
         self.pit_bulk_advance = enabled;
     }
 
-    /// Scale a step's raw bus clocks by the active level's `bus_timing` factor,
-    /// carrying the fractional remainder so a cheap access in a fast mode is not
-    /// rounded to zero. This is the THIRD timing lever (B-T10): it scales the whole
-    /// bus portion (instruction fetch + every tiered data access already summed into
-    /// `raw`) per mode, supplying the absolute per-mode magnitude that lets a fast
-    /// part pull away from the flat per-access floor. The relative L1<L2<RAM tier
-    /// structure stays in the `tier_cost` wait-states; this only sets the overall
-    /// scale. Cheap by construction: one multiply + a modulo per call, not per
-    /// access. Mirrors the CPU's `scale_clocks` for instruction clocks.
     pub(super) fn scale_bus(&mut self, raw: u64) -> u64 {
-        let (num, den) = bus_timing(self.cpu.level(), self.timing_epoch);
-        let scaled = raw * u64::from(num) + self.bus_rem;
-        self.bus_rem = scaled % u64::from(den);
-        scaled / u64::from(den)
+        self.timeline
+            .cpu_clocks_for_master_ticks_ceil(raw.saturating_mul(BUS_CLOCK_MASTER_TICKS))
     }
 
     fn apply_device_advance(&mut self, advance: DeviceAdvance) {
-        self.opl.advance_micros(advance.microseconds);
+        let opl_credit = advance.microseconds.min(self.opl_timer_advance_credit_us);
+        self.opl_timer_advance_credit_us -= opl_credit;
+        self.opl.advance_micros(advance.microseconds - opl_credit);
         let sb16_irq = {
             let Machine {
                 sb16, dma, memory, ..
@@ -327,7 +318,7 @@ impl Machine {
             }
         }
 
-        // Advance Red Book CD audio at 44.1 kHz from guest elapsed time.
+        // Advance Red Book playback at 75 sectors per guest second.
         // Drive the playback LBA from guest elapsed time so position is accurate
         // independent of when the mixer drains samples. Pull in render_audio
         // consumes from the advanced position (frac for sub-frame continuity).
@@ -601,7 +592,9 @@ impl Machine {
             let step = self
                 .fdc
                 .ticks_until_event(self.timeline.now_ticks())
-                .map_or(remaining, |deadline| remaining.min(deadline));
+                .into_iter()
+                .chain(self.ide.ticks_until_completion())
+                .fold(remaining, u64::min);
             let rates = self.device_rates();
             let advance = if io_stall {
                 self.timeline.advance_io_stall_ticks(step, rates)
@@ -614,27 +607,17 @@ impl Machine {
         self.finish_tsc_advance(tsc_before, executed_clocks);
     }
 
-    pub(super) fn advance_cpu_work(&mut self, clocks: u64, executed_clocks: u64) {
-        let master_ticks = self.timeline.master_ticks_for_cpu_clocks(clocks);
-        let crosses_fdc_deadline = self
-            .fdc
-            .ticks_until_event(self.timeline.now_ticks())
-            .is_some_and(|deadline| deadline <= master_ticks);
-        if crosses_fdc_deadline {
-            self.advance_master_time(master_ticks, false, executed_clocks);
-        } else {
-            let tsc_before = self.timeline.tsc_clocks();
-            let rates = self.device_rates();
-            let advance = self.timeline.advance_cpu_clocks(clocks, rates);
-            self.apply_device_advance(advance);
-            self.finish_tsc_advance(tsc_before, executed_clocks);
-        }
-        self.elapsed_clocks = self.elapsed_clocks.saturating_add(clocks);
+    pub(super) fn advance_cpu_work(&mut self, master_ticks: u64, executed_clocks: u64) {
+        let tsc_before = self.timeline.tsc_clocks();
+        self.advance_master_time(master_ticks, false, executed_clocks);
+        self.elapsed_clocks = self
+            .elapsed_clocks
+            .saturating_add(self.timeline.tsc_clocks().wrapping_sub(tsc_before));
     }
 
     pub(super) fn advance_halted_cpu_clocks(&mut self, clocks: u64) {
         let before = self.timeline.now_ticks();
-        self.advance_cpu_work(clocks, 0);
+        self.advance_cpu_work(self.timeline.master_ticks_for_cpu_clocks(clocks), 0);
         self.halted_ticks = self
             .halted_ticks
             .saturating_add(self.timeline.now_ticks().saturating_sub(before));
@@ -841,11 +824,15 @@ impl Machine {
         });
         // A 0x80 "pause DAC" countdown raises the 8-bit interrupt on the same
         // line; it counts microseconds, so it is a separate term.
-        let dsp_pause_wake = self.sb16.pause_irq_deadline().and_then(|(line, ticks)| {
-            self.pic
-                .deliverable(line)
-                .then(|| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
-        });
+        let dsp_pause_wake = self
+            .sb16
+            .pause_irq_deadline_micros()
+            .and_then(|(line, micros)| {
+                let ticks = self.timeline.master_ticks_until_microseconds(micros);
+                self.pic
+                    .deliverable(line)
+                    .then(|| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
+            });
         // The AD1848 / WSS terminal-count wake, on the codec's own (config) IRQ
         // line. The codec drains one Current Count per output frame, so its IRQ
         // estimator is fed the frame rate directly (no byte/word-counter scaling
@@ -1376,7 +1363,10 @@ impl Machine {
         } else {
             None
         };
-        let dsp_pause = self.sb16.pause_irq_deadline().map(|(_, ticks)| ticks);
+        let dsp_pause = self
+            .sb16
+            .pause_irq_deadline_micros()
+            .map(|(_, micros)| self.timeline.master_ticks_until_microseconds(micros).max(1));
         pit.chain(dsp)
             .chain(dsp_pause)
             .chain(wss)
@@ -1541,10 +1531,8 @@ pub(crate) enum DeviceEdgeCache {
 
 impl MachineBus<'_> {
     pub(super) fn guest_tick_now(&self) -> u64 {
-        self.master_ticks_at_batch_start.saturating_add(
-            self.timeline_at_batch_start
-                .master_ticks_for_cpu_clocks(self.in_batch_clocks()),
-        )
+        self.master_ticks_at_batch_start
+            .saturating_add(self.in_batch_master_ticks())
     }
 
     /// Predict the VGA beam position at the current point in a CPU batch without
@@ -1557,14 +1545,14 @@ impl MachineBus<'_> {
     /// batch total. Only beam position is predicted. Frame-boundary effects stay
     /// in `advance_devices` at batch end.
     pub(super) fn predicted_beam(&self) -> u64 {
-        let in_batch_clocks = self.in_batch_clocks();
+        let in_batch_clocks = self.in_batch_master_ticks();
         // Margo's beam is a position in its frame phase, not an offset from a
         // device-held beam, so this arm needs no `beam_at_batch_start` term at
         // all: the phase accumulator already carries where the frame started.
         if let Some(scan) = self.vega.margo_scanout() {
             return self
                 .timeline_at_batch_start
-                .preview_margo_scanout(in_batch_clocks, scan.frame_dots())
+                .preview_margo_scanout_at_ticks(in_batch_clocks, scan.frame_dots())
                 .beam;
         }
         // The anchor is only usable if it is a VGA dot, and it is a MARGO dot
@@ -1583,7 +1571,7 @@ impl MachineBus<'_> {
         };
         let (_, whole_dots) = self
             .timeline_at_batch_start
-            .preview_cpu_clocks(in_batch_clocks, self.vega.dot_clock_hz());
+            .preview_master_ticks(in_batch_clocks, self.vega.dot_clock_hz());
         let frame = self.vega.frame_dots();
         if frame == 0 {
             return anchor; // guard: un-programmed CRTC, mirrors Vga::advance
@@ -1595,7 +1583,7 @@ impl MachineBus<'_> {
     /// absolute in-batch clock total.
     #[cfg(feature = "jit")]
     pub(super) fn poll_project_dot_advance(&self, candidate_clocks: u64) -> Option<u64> {
-        let current_clocks = self.in_batch_clocks();
+        let current_clocks = self.in_batch_master_ticks();
         if candidate_clocks < current_clocks {
             return None;
         }
@@ -1607,57 +1595,34 @@ impl MachineBus<'_> {
             let frame_dots = scan.frame_dots();
             let current = self
                 .timeline_at_batch_start
-                .preview_margo_scanout(current_clocks, frame_dots);
+                .preview_margo_scanout_at_ticks(current_clocks, frame_dots);
             let candidate = self
                 .timeline_at_batch_start
-                .preview_margo_scanout(candidate_clocks, frame_dots);
+                .preview_margo_scanout_at_ticks(candidate_clocks, frame_dots);
             return candidate.dots.checked_sub(current.dots);
         }
         let (_, current_dots) = self
             .timeline_at_batch_start
-            .preview_cpu_clocks(current_clocks, self.vega.dot_clock_hz());
+            .preview_master_ticks(current_clocks, self.vega.dot_clock_hz());
         let (_, candidate_dots) = self
             .timeline_at_batch_start
-            .preview_cpu_clocks(candidate_clocks, self.vega.dot_clock_hz());
+            .preview_master_ticks(candidate_clocks, self.vega.dot_clock_hz());
         candidate_dots.checked_sub(current_dots)
     }
 
-    /// The OPL status byte at the current point in the batch, without stepping
-    /// the chip. The lazy-path analogue of `predicted_beam`, and it exists for
-    /// the same reason: in the Approximate class devices only advance at batch
-    /// end, so a status read taken mid-batch would otherwise report the state
-    /// the chip had when the batch STARTED.
-    ///
-    /// That is not a nicety. AdLib detection starts timer 1 (one 80 us step),
-    /// runs a fixed delay loop, then reads status ONCE. The delay loop is pure
-    /// computation, so it never ends the batch, and the read used to see the
-    /// pre-delay flags and conclude no card was present -- which is why AdLib
-    /// music was silent on 486 and 586 while the exact-timing 386 modes, whose
-    /// devices advance per instruction, played it fine.
-    ///
-    /// Unlike `predicted_beam` this folds in `isa_io_clocks`. The batch-end
-    /// advance adds that accrual to the batch total, and it is charged ONLY on
-    /// OPL polls, so including it here is what makes the peek agree with the
-    /// advance that follows -- and excluding it from the beam peek stays right
-    /// for the same reason.
-    ///
-    /// With nothing pending this is exactly `OplChip::status()`: `expired_after`
-    /// with a zero elapsed reduces to the live `expired` flag, because `advance`
-    /// leaves `accumulated_us` below one step.
-    /// Returns the predicted byte and the microseconds it was predicted at, so
-    /// the OPL trace can record what the read actually saw.
+    /// Predict OPL status at the current batch timestamp without stepping the chip.
+    /// Use the complete pending master-tick bill, less time already credited to OPL.
+    /// Return the status and predicted microseconds for the diagnostic trace.
     pub(super) fn predicted_opl_status(&self) -> (u8, u64) {
-        // F1 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2
-        // `in_batch_clocks` already folds `isa_io_clocks` in (every port access accrues it,
-        // not just OPL polls), so adding it again here would double-count. Epoch 1 keeps the
-        // pre-slice hand-add, byte-identical.
-        let clocks = if self.timing_epoch >= 2 {
-            self.in_batch_clocks()
-        } else {
-            self.in_batch_clocks().saturating_add(*self.isa_io_clocks)
-        };
-        let micros = self.timeline_at_batch_start.preview_microseconds(clocks);
-        (self.opl.status_after(micros), micros)
+        // The pending bill already contains every port transaction.
+        let clocks = self.in_batch_master_ticks();
+        let micros = self
+            .timeline_at_batch_start
+            .preview_microseconds_at_ticks(clocks);
+        let remaining = micros
+            .checked_sub(*self.opl_timer_advance_credit_us)
+            .expect("OPL timer preview moved backward");
+        (self.opl.status_after(remaining), micros)
     }
 
     /// The un-applied batch time at the current instant, in microseconds —
@@ -1665,37 +1630,22 @@ impl MachineBus<'_> {
     /// the SB DSP's reset-settle service (`SbDsp::service_reset_at`).
     pub(super) fn pending_device_micros(&self) -> u64 {
         // F1: see `predicted_opl_status`'s matching comment.
-        let clocks = if self.timing_epoch >= 2 {
-            self.in_batch_clocks()
-        } else {
-            self.in_batch_clocks().saturating_add(*self.isa_io_clocks)
-        };
-        self.timeline_at_batch_start.preview_microseconds(clocks)
+        let clocks = self.in_batch_master_ticks();
+        self.timeline_at_batch_start
+            .preview_microseconds_at_ticks(clocks)
     }
 
-    /// Batch-scoped CPU clocks elapsed so far. Beam and PIT predictions share
-    /// this conversion so they use the same core total, bus scaling, and carry.
-    ///
-    /// F1 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2 this folds in
-    /// `isa_io_clocks` (by then a general per-port-access accrual, `port_bus_batch_clocks`),
-    /// so `predicted_beam`, `guest_tick_now`, `elapsed_pit_clocks` and
-    /// `poll_project_dot_advance` all see the charge that a batch-end `step` would apply --
-    /// without it, a guest polling a repriced port inside one batch sees the *un-repriced*
-    /// rate, which defeats the whole point of the reprice within the batch it runs in. Epoch 1
-    /// excludes it, byte-identical to before this slice: that accrual was OPL/DSP-poll-only
-    /// there, and the two sites that needed it (`predicted_opl_status`, `pending_device_micros`)
-    /// already hand-add it for epoch 1.
-    fn in_batch_clocks(&self) -> u64 {
-        let in_batch_bus_clocks = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
-        let scaled = in_batch_bus_clocks * u64::from(self.bus_num_at_batch_start)
-            + self.bus_rem_at_batch_start;
-        let scaled_bus_clocks = scaled / u64::from(self.bus_den_at_batch_start);
-        let total = self.prior_runs_core_clocks + self.core_clocks_so_far + scaled_bus_clocks;
-        if self.timing_epoch >= 2 {
-            total.saturating_add(*self.isa_io_clocks)
-        } else {
-            total
-        }
+    /// Exact physical duration so far, independent of CPU-budget rounding.
+    pub(super) fn in_batch_master_ticks(&self) -> u64 {
+        let core = self
+            .prior_runs_core_clocks
+            .saturating_add(self.core_clocks_so_far);
+        self.timeline_at_batch_start
+            .master_ticks_for_cpu_clocks(core)
+            .saturating_add(
+                self.in_batch_reference_bus_clocks()
+                    .saturating_mul(BUS_CLOCK_MASTER_TICKS),
+            )
     }
 
     /// Elapsed PIT input clocks at the current point in the batch without
@@ -1718,7 +1668,7 @@ impl MachineBus<'_> {
     /// followed by a read would produce.
     pub(super) fn elapsed_pit_clocks(&self) -> u64 {
         self.timeline_at_batch_start
-            .preview_cpu_clocks(self.in_batch_clocks(), self.vega.dot_clock_hz())
+            .preview_master_ticks(self.in_batch_master_ticks(), self.vega.dot_clock_hz())
             .0
     }
 
@@ -1741,7 +1691,7 @@ impl MachineBus<'_> {
     /// since the credit is the origin the read measures from.
     pub(super) fn elapsed_margo_ns(&self) -> u64 {
         self.timeline_at_batch_start
-            .preview_margo_nanoseconds(self.in_batch_clocks())
+            .preview_margo_nanoseconds_at_ticks(self.in_batch_master_ticks())
     }
 
     /// Record that the guest just touched a PIT counter, so the Accurate class

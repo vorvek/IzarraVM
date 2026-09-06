@@ -87,6 +87,7 @@ $ErrorActionPreference = "Stop"
 # than silently gating on a stale ratchet. A profile JSON with no `timing_model_epoch` field
 # predates the marker and is treated as epoch 1. Whoever bumps TIMING_MODEL_EPOCH and
 # re-derives the floors updates this alongside them.
+# Historical calibration only; current sole-model captures are refused.
 $expectedTimingModelEpoch = 1
 $acceptedBaselineTree = "5aabe720c492cbcf5f31c776c5c58d33d89cd6c8"
 $highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"

@@ -184,49 +184,40 @@ fn class_clocks_match_the_design_table() {
 }
 
 #[test]
-fn legacy_isa_predicate_is_unchanged_by_the_new_classifier() {
-    // `port_is_legacy_isa_io` keeps gating epoch 1's `IZARRAVM_ISA_IO_WAIT` charge exactly as
-    // it did before this slice; it is a narrower, independent set from `IsaXBus`.
-    use crate::bus::port_is_legacy_isa_io_for_test;
-    for port in 0u32..=0xFFFF {
-        let port = port as u16;
-        let legacy = port_is_legacy_isa_io_for_test(port);
-        if legacy {
-            // Every port the epoch-1 predicate covers is a subset of the epoch-2 `IsaXBus`
-            // class -- the seven-port table did not move.
-            assert_eq!(
-                port_bus_class(port),
-                PortBusClass::IsaXBus,
-                "port {port:#06x} is legacy-ISA under epoch 1 but not IsaXBus under epoch 2"
-            );
+fn construction_port_writes_preserve_devices_without_charging_guest_time() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut profile = MachineProfile::gsw_386(4, VideoCard::Vega);
+        profile.cpu = mode;
+        let mut seed = Machine::new_raw_program(profile.clone(), &[0xf4]).unwrap();
+        let mut ordinary = Machine::new_raw_program(profile.clone(), &[0xf4]).unwrap();
+        for machine in [&mut seed, &mut ordinary] {
+            assert_eq!(machine.port_bus_batch_clocks, 0);
         }
+        seed.make_construction_bus()
+            .write_io(0x43, BusWidth::Byte, 0x34, false)
+            .unwrap();
+        ordinary
+            .make_bus()
+            .write_io(0x43, BusWidth::Byte, 0x34, false)
+            .unwrap();
+        assert_eq!(seed.pit, ordinary.pit);
+        assert_eq!(seed.pic, ordinary.pic);
+        assert_eq!(seed.trace.elapsed_clocks(), ordinary.trace.elapsed_clocks());
+        assert_eq!(seed.port_accesses_by_class, ordinary.port_accesses_by_class);
+        assert_eq!(seed.port_bus_batch_clocks, 0);
+        assert_eq!(ordinary.port_bus_batch_clocks, 156);
+
+        let mut guest = Machine::new_raw_program(profile, &[0xe6, 0x43, 0xf4]).unwrap();
+        guest.cpu.registers.set_eax(0x34);
+        assert!(guest.canonical_state_capture().is_ok());
+        let raw_before = guest.raw_bus_clocks();
+        let stop = guest.run_until_halt_or_cycles(10_000).unwrap();
+        assert_eq!(stop, StopReason::Halted);
+        assert_eq!(guest.test_batch_isa_clocks.iter().sum::<u64>(), 156);
+        assert_eq!(guest.raw_bus_clocks() - raw_before, 4);
+        assert_eq!(guest.port_bus_batch_clocks, 0);
+        assert!(guest.canonical_state_capture().is_ok());
     }
-    // And the predicate is still exactly the seven-port set the design cites, not the wider
-    // epoch-2 IsaXBus class.
-    assert!(port_is_legacy_isa_io_for_test(0x0040));
-    assert!(!port_is_legacy_isa_io_for_test(0x0020)); // PIC1: IsaXBus under epoch 2, not legacy today
-    assert!(!port_is_legacy_isa_io_for_test(0x0092)); // 0x92: IsaXBus under epoch 2, not legacy today
-}
-
-#[test]
-fn timing_epoch_spelling_table() {
-    use crate::bus::parse_timing_epoch_for_test;
-    assert_eq!(
-        parse_timing_epoch_for_test(Err(std::env::VarError::NotPresent)),
-        1
-    );
-    assert_eq!(parse_timing_epoch_for_test(Ok(String::new())), 1);
-    assert_eq!(parse_timing_epoch_for_test(Ok("2".to_string())), 2);
-}
-
-#[test]
-#[should_panic(expected = "IZARRAVM_TIMING_EPOCH")]
-fn timing_epoch_rejects_zero_as_an_off_spelling() {
-    // memory `parameter-knobs-have-no-off-spelling`: an epoch names a version, not an on/off
-    // state, so `0` must panic like any other unrecognized spelling, never silently mean
-    // epoch 1.
-    use crate::bus::parse_timing_epoch_for_test;
-    parse_timing_epoch_for_test(Ok("0".to_string()));
 }
 
 /// T2-lite: the epoch-2 per-class charge for one byte cycle, on an I586 machine (so
@@ -238,24 +229,12 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
 
-    // Epoch 1 (unset): a gameport read charges through the pre-slice predicate only, which
-    // does not cover 0x201 -- no port-bus accrual at all.
-    machine.port_bus_batch_clocks = 0;
-    with_bus(&mut machine, |bus| {
-        bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap();
-    });
-    assert_eq!(
-        machine.port_bus_batch_clocks, 0,
-        "epoch 1 must not charge a gameport read (not in the seven-port legacy set)"
-    );
-
     // Epoch 2: every port charges its class figure. IsaXBus (gameport 0x201) = 160
     // clocks, of which the generic byte cycle `read_io` records through `trace.record`
     // now carries 4 -- slice 2 took `bus_timing(I586)` to `(1, 1)`, so the scaled
     // subtrahend that used to floor to 0 is the whole 4 raw. Lane 156 + cycle 4 = 160,
     // the same class figure by the same composition (design section 9.6 pre-registered
     // exactly this re-derivation: "156 / 52 / 52 / 0 once bus_timing is (1,1)").
-    machine.set_timing_epoch_for_test(2);
     machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap();
@@ -295,7 +274,6 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
 fn epoch_2_does_not_double_charge_the_opl_status_read() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
-    machine.set_timing_epoch_for_test(2);
     machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
         bus.read_io(0x0388, BusWidth::Byte, 0, false).unwrap();
@@ -315,7 +293,6 @@ fn epoch_2_does_not_double_charge_the_opl_status_read() {
 fn epoch_2_admits_the_poll_skip_certificate_with_the_port_lane() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
-    machine.set_timing_epoch_for_test(2);
     // `test_machine()` arms detailed bus tracing, which is its own certificate refusal
     // (`trace.tracing_mode() != TracingMode::Off`) -- turn it off so this test exercises the
     // admission specifically.
@@ -347,10 +324,9 @@ fn epoch_2_admits_the_poll_skip_certificate_with_the_port_lane() {
 #[test]
 #[cfg(feature = "jit")]
 fn a_port_other_than_3da_is_refused_by_name_in_both_epochs() {
-    for epoch in [1, 2] {
+    {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
-        machine.timing_epoch = epoch;
         machine.trace.set_tracing_mode(TracingMode::Off);
         let (_, refused_before, _) = machine.poll_skip_certificate_counters();
         let refused = with_bus(&mut machine, |bus| {
@@ -358,36 +334,15 @@ fn a_port_other_than_3da_is_refused_by_name_in_both_epochs() {
         });
         assert!(
             refused,
-            "epoch {epoch}: the certificate must refuse a port it is not admitted for"
+            "the certificate must refuse a port it is not admitted for"
         );
         let (_, refused_after, _) = machine.poll_skip_certificate_counters();
         assert_eq!(
             refused_after,
             refused_before + 1,
-            "epoch {epoch}: the named refusal must be counted"
+            "the named refusal must be counted"
         );
     }
-}
-
-/// Epoch 1 keeps the pre-P2 certificate byte for byte: 0x3DA is admitted, and its third lane is
-/// structurally zero, so nothing about the elided iteration's price moves on a knob-unset build.
-#[test]
-#[cfg(feature = "jit")]
-fn epoch_1_admits_3da_with_a_zero_port_lane() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
-    machine.timing_epoch = 1;
-    machine.trace.set_tracing_mode(TracingMode::Off);
-    let lane = with_bus(&mut machine, |bus| {
-        bus.poll_bus_certificate_from_for_test(0x03da)
-            .map(|certificate| certificate.port_bus_clocks_per_iteration())
-    });
-    assert_eq!(lane, Some(0));
-    let (admitted, _, _) = machine.poll_skip_certificate_counters();
-    assert_eq!(
-        admitted, 0,
-        "the epoch-2 admission counter must stay zero under epoch 1"
-    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -431,71 +386,58 @@ fn epoch_2_counts_the_port_lane_against_the_batch_cap() {
     // less the generic 4-raw cycle, which slice 2's `(1, 1)` bus ratio no longer scales away.
     const PER_ACCESS: u64 = 52;
 
-    for epoch in [1u32, 2] {
+    {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
-        machine.timing_epoch = epoch;
         machine.port_bus_batch_clocks = 0;
         let before = with_bus(&mut machine, |bus| bus.in_batch_scaled_bus_clocks());
         burst_of_palette_writes(&mut machine, BURST);
         let lane = machine.port_bus_batch_clocks;
         let after = with_bus(&mut machine, |bus| bus.in_batch_scaled_bus_clocks());
 
-        if epoch == 1 {
-            assert_eq!(
-                lane, 0,
-                "epoch 1 must not charge the VGA palette port at all (86Box parity)"
-            );
-            assert_eq!(
-                after, before,
-                "epoch 1's cap accounting must be byte-identical to the pre-slice figure"
-            );
-        } else {
-            assert_eq!(
-                lane,
-                u64::from(BURST) * PER_ACCESS,
-                "epoch 2 must charge every write in the burst"
-            );
-            assert_eq!(
-                after - before,
-                lane,
-                "the whole port lane must be visible to the cap accounting; the burst is the \
+        assert_eq!(
+            lane,
+            u64::from(BURST) * PER_ACCESS,
+            "epoch 2 must charge every write in the burst"
+        );
+        assert_eq!(
+            after - before,
+            lane,
+            "the whole port lane must be visible to the cap accounting; the burst is the \
                  review's own example and the difference here is exactly the overshoot F2 names"
-            );
-        }
+        );
     }
 }
 
 #[test]
-fn the_division_free_cap_test_agrees_with_the_value_form_under_both_epochs() {
+fn the_cap_test_agrees_with_the_value_form() {
     // The run loop asks `in_batch_scaled_bus_clocks_at_least(target)` once per retired
     // instruction and takes its answer as EXACTLY `in_batch_scaled_bus_clocks() >= target`. Epoch
     // 2 adds an unscaled additive term to the value form that does not survive the u128
     // multiply-through, so the two forms had to stop sharing an implementation -- and a
     // divergence between them would move run boundaries with nothing to notice.
-    for epoch in [1u32, 2] {
+    {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
-        machine.timing_epoch = epoch;
         machine.port_bus_batch_clocks = 0;
         burst_of_palette_writes(&mut machine, 7);
         with_bus(&mut machine, |bus| {
             let value = bus.in_batch_scaled_bus_clocks();
             assert!(
-                epoch == 1 || value > 0,
+                value > 0,
                 "epoch 2's burst must have moved the figure, or the sweep below proves nothing"
             );
             for target in 0..=value + 8 {
                 assert_eq!(
                     bus.in_batch_scaled_bus_clocks_at_least(target),
                     value >= target,
-                    "epoch {epoch}: the two cap-test forms disagreed at target {target} \
+                    "the two cap-test forms disagreed at target {target} \
                      (value {value})"
                 );
             }
             assert!(
                 !bus.in_batch_scaled_bus_clocks_at_least(u64::MAX),
-                "epoch {epoch}: an unreachable target must answer 'not at the cap'"
+                "an unreachable target must answer 'not at the cap'"
             );
         });
     }
@@ -513,18 +455,7 @@ fn epoch_2_turns_the_per_instruction_cap_screen_off() {
     // arithmetic showing why that F fails is asserted rather than described.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
-
-    machine.timing_epoch = 1;
-    let epoch_1_screen = with_bus(&mut machine, |bus| {
-        bus.in_batch_scaled_bus_clocks_screen_scale()
-    });
-    assert_eq!(
-        epoch_1_screen, 1,
-        "I586's (16, 105) bus ratio gives ceil(num/den).max(1) = 1; if this moved, the \
-         arithmetic below is stale"
-    );
-
-    machine.timing_epoch = 2;
+    let raw_only_bound = 1;
     assert_eq!(
         with_bus(&mut machine, |bus| bus
             .in_batch_scaled_bus_clocks_screen_scale()),
@@ -546,9 +477,9 @@ fn epoch_2_turns_the_per_instruction_cap_screen_off() {
         )
     });
     assert!(
-        scaled_growth > raw_growth * epoch_1_screen,
+        scaled_growth > raw_growth * raw_only_bound,
         "one epoch-2 port access grew the scaled figure by {scaled_growth} over {raw_growth} raw \
-         clocks, which the epoch-1 screen bound of {epoch_1_screen} per raw clock does NOT cover \
+         clocks, which the epoch-1 screen bound of {raw_only_bound} per raw clock does NOT cover \
          -- this is the arithmetic that makes the screen unsound under epoch 2, and if it ever \
          stops holding the screen could be re-armed with a widened bound instead of turned off"
     );
@@ -563,7 +494,6 @@ fn epoch_2_turns_the_per_instruction_cap_screen_off() {
 fn the_monitors_own_0x92_access_pays_the_isa_class_charge_once() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
-    machine.timing_epoch = 2;
 
     machine.port_bus_batch_clocks = 0;
     with_bus(&mut machine, |bus| {
@@ -592,7 +522,7 @@ fn the_monitors_own_0x92_access_pays_the_isa_class_charge_once() {
 /// returning the megabytes per guest second the GUEST sees. Real mode, 16-bit operand and address
 /// size, `ES` pointed well above the program so the transfer cannot overwrite its own code.
 #[cfg(feature = "jit")]
-fn rep_insw_megabytes_per_guest_second(port: u16, epoch: u32) -> f64 {
+fn rep_insw_megabytes_per_guest_second(port: u16) -> f64 {
     const WORDS: u16 = 0x8000;
     let program = [
         0xba,
@@ -611,7 +541,6 @@ fn rep_insw_megabytes_per_guest_second(port: u16, epoch: u32) -> f64 {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &program).unwrap();
     machine.set_mode(GswMode::Gsw586);
-    machine.timing_epoch = epoch;
     machine
         .cpu
         .registers
@@ -648,7 +577,7 @@ fn rep_insw_megabytes_per_guest_second(port: u16, epoch: u32) -> f64 {
 #[test]
 #[cfg(feature = "jit")]
 fn a_rep_insw_from_the_ide_data_register_runs_at_the_ata_cycle_time() {
-    let rate = rep_insw_megabytes_per_guest_second(0x01f0, 2);
+    let rate = rep_insw_megabytes_per_guest_second(0x01f0);
     assert!(
         (11.0..=16.6).contains(&rate),
         "REP INSW from 0x1F0 must land near the ATA PIO mode-4 rate and under the spec's 16.6 \
@@ -656,7 +585,7 @@ fn a_rep_insw_from_the_ide_data_register_runs_at_the_ata_cycle_time() {
     );
     // The secondary channel is the same register file and takes the same treatment (review F11):
     // ATAPI on 0x170 is where the CD rows live.
-    let atapi = rep_insw_megabytes_per_guest_second(0x0170, 2);
+    let atapi = rep_insw_megabytes_per_guest_second(0x0170);
     assert!(
         (rate - atapi).abs() < 0.5,
         "0x170 (ATAPI) must take the same element rate as 0x1F0: {rate:.2} vs {atapi:.2} MB/s"
@@ -676,8 +605,8 @@ fn a_rep_insw_from_an_isa_port_keeps_the_class_rate() {
     // 0x3F5 (`IsaXBus` 160) and 0x3F6 (the IDE control block, `PciTarget` 56) and lands at 1.53
     // MB/s rather than the flat-ISA 1.03. That is correct -- the charge follows the port on the
     // wire -- but it makes 0x3F5 a bad fixture for "the ISA rate". Both LPT bytes are `IsaXBus`.
-    let isa = rep_insw_megabytes_per_guest_second(0x0378, 2);
-    let ata = rep_insw_megabytes_per_guest_second(0x01f0, 2);
+    let isa = rep_insw_megabytes_per_guest_second(0x0378);
+    let ata = rep_insw_megabytes_per_guest_second(0x01f0);
     assert!(
         isa < 1.2,
         "an ISA-class string element must still pay 160 a byte cycle -- 2 x 160 + 3 = 323 clocks          a word, about 1.03 MB/s; got {isa:.2} MB/s"
@@ -686,19 +615,4 @@ fn a_rep_insw_from_an_isa_port_keeps_the_class_rate() {
         ata / isa > 8.0,
         "the ATA data register must be the exception, not the rule: {ata:.2} vs {isa:.2} MB/s"
     );
-}
-
-/// The knob-unset merge bar for P3's bus half: under epoch 1 the transfer rate must be exactly
-/// what it was before the slice, on both the ATA and the ISA port -- no class charge at all.
-#[test]
-#[cfg(feature = "jit")]
-fn epoch_1_string_port_throughput_is_untouched() {
-    for port in [0x01f0u16, 0x03f5] {
-        let rate = rep_insw_megabytes_per_guest_second(port, 1);
-        assert!(
-            rate > 30.0,
-            "port {port:#06x}: epoch 1 charges no class rate at all, so the transfer must stay \
-             far above any repriced figure; got {rate:.2} MB/s"
-        );
-    }
 }

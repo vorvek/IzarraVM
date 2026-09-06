@@ -61,6 +61,7 @@ const FIFO_SIZE: usize = 16;
 /// reset value and read/write side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uart16450 {
+    advance_credit_ticks: u64,
     base: u16,    // first I/O port (0x3F8 for COM1, 0x2F8 for COM2)
     ier: u8,      // interrupt enable
     fcr: u8,      // FIFO control (write side of offset 2)
@@ -88,6 +89,7 @@ pub struct Uart16450 {
 impl Default for Uart16450 {
     fn default() -> Self {
         Self {
+            advance_credit_ticks: 0,
             base: COM1_BASE,
             ier: 0,
             fcr: 0,
@@ -140,6 +142,34 @@ impl Uart16450 {
     }
 
     /// Read a UART register, applying read side effects. None if not our port.
+    pub(crate) fn advance_credit_ticks(&self) -> u64 {
+        self.advance_credit_ticks
+    }
+
+    fn catch_up(&mut self, prefix_ticks: u64) {
+        let elapsed = prefix_ticks
+            .checked_sub(self.advance_credit_ticks)
+            .expect("peripheral access cannot precede its last access");
+        self.advance_elapsed_ticks(elapsed);
+        self.advance_credit_ticks = prefix_ticks;
+    }
+
+    pub(crate) fn read_port_at(&mut self, port: u16, prefix_ticks: u64) -> Option<u8> {
+        if !(self.map_offset(port).is_some()) {
+            return None;
+        }
+        self.catch_up(prefix_ticks);
+        self.read_port(port)
+    }
+
+    pub(crate) fn write_port_at(&mut self, port: u16, value: u8, prefix_ticks: u64) -> bool {
+        if !(self.map_offset(port).is_some()) {
+            return false;
+        }
+        self.catch_up(prefix_ticks);
+        self.write_port(port, value)
+    }
+
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         let offset = self.map_offset(port)?;
         let value = match offset {
@@ -262,7 +292,13 @@ impl Uart16450 {
 
     /// Advance baud and FIFO deadlines. Splitting a master-tick span does not
     /// change the bytes delivered or the interrupt state.
-    pub fn advance_master_ticks(&mut self, mut ticks: u64) {
+    pub fn advance_master_ticks(&mut self, ticks: u64) {
+        let credit = ticks.min(self.advance_credit_ticks);
+        self.advance_credit_ticks -= credit;
+        self.advance_elapsed_ticks(ticks - credit);
+    }
+
+    fn advance_elapsed_ticks(&mut self, mut ticks: u64) {
         while ticks > 0 {
             let Some(next) = self.ticks_until_event() else {
                 break;

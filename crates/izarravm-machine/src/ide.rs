@@ -497,7 +497,12 @@ impl IdeChannel {
 
     /// Read one byte from a channel port. The data register (0x170) returns the
     /// next data-in byte; the rest return their task-file values.
+    #[cfg(test)]
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
+        self.read_port_at(port, 0)
+    }
+
+    pub fn read_port_at(&mut self, port: u16, prefix_ticks: u64) -> Option<u8> {
         if port == SECONDARY_CTRL {
             // Alt status: the status register without clearing the IRQ.
             return Some(self.status);
@@ -519,7 +524,7 @@ impl IdeChannel {
         self.reset_alt_status_run();
         let reg = port - SECONDARY_CMD_BASE;
         let value = match reg {
-            0 => self.read_data_byte(),
+            0 => self.read_data_byte(prefix_ticks),
             1 => self.error,
             2 => self.sector_count,
             3 => self.lba_low,
@@ -539,7 +544,12 @@ impl IdeChannel {
 
     /// Write one byte to a channel port. Word writes to the data register split
     /// into two byte writes at the bus layer, so the packet/data path is byte-fed.
+    #[cfg(test)]
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
+        self.write_port_at(port, value, 0)
+    }
+
+    pub fn write_port_at(&mut self, port: u16, value: u8, prefix_ticks: u64) -> bool {
         // GUARD 1 for the ring-0 SRST hazard, and the general "a write is not a
         // poll" rule. A write to the control port can trigger SRST, which clears
         // `pending_command` mid-batch; and the write-side ring-0 carve-out at
@@ -575,14 +585,14 @@ impl IdeChannel {
             return true;
         }
         match reg {
-            0 => self.write_data_byte(value),
+            0 => self.write_data_byte(value, prefix_ticks),
             1 => self.features = value,
             2 => self.sector_count = value,
             3 => self.lba_low = value,
             4 => self.lba_mid = value,
             5 => self.lba_high = value,
             6 => self.drive_select = value,
-            7 => self.write_command(value),
+            7 => self.write_command(value, prefix_ticks),
             _ => {}
         }
         true
@@ -619,27 +629,51 @@ impl IdeChannel {
         self.lba_high = 0xEB;
     }
 
-    fn write_command(&mut self, command: u8) {
+    fn write_command(&mut self, command: u8, prefix_ticks: u64) {
         if self.pending_command.is_some() || self.phase != Phase::Idle {
             return;
         }
         if !self.master_selected() {
-            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
+            self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks);
             return;
         }
         match command {
             0xA0 if self.test_stall_packet => {}
-            0xA0 => self.schedule(PendingAction::AcceptPacket, PACKET_ACCEPT_TICKS),
-            0xA1 => self.schedule(PendingAction::PrepareIdentify, COMMAND_LATENCY_TICKS),
-            0x08 => self.schedule(PendingAction::DeviceReset, COMMAND_LATENCY_TICKS),
-            0xEC => self.schedule(PendingAction::IdentifyNak, COMMAND_LATENCY_TICKS),
-            0x90 => self.schedule(PendingAction::Diagnostic, COMMAND_LATENCY_TICKS),
+            0xA0 => self.schedule_at(
+                PendingAction::AcceptPacket,
+                PACKET_ACCEPT_TICKS,
+                prefix_ticks,
+            ),
+            0xA1 => self.schedule_at(
+                PendingAction::PrepareIdentify,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
+            0x08 => self.schedule_at(
+                PendingAction::DeviceReset,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
+            0xEC => self.schedule_at(
+                PendingAction::IdentifyNak,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
+            0x90 => self.schedule_at(
+                PendingAction::Diagnostic,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
             // NOP and unsupported commands abort after command latency.
-            _ => self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS),
+            _ => self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks),
         }
     }
 
     fn schedule(&mut self, action: PendingAction, ticks: u64) {
+        self.schedule_at(action, ticks, 0);
+    }
+
+    fn schedule_at(&mut self, action: PendingAction, ticks: u64, prefix_ticks: u64) {
         // A NEW pending command gets a fresh chance at the skip. This is what
         // bounds the once-per-decline latch to one wasted batch break per
         // command, and it is why each of TOKACD's three per-sector phases
@@ -651,7 +685,7 @@ impl IdeChannel {
         self.error = 0;
         self.irq_pending = false;
         self.pending_command = Some(PendingCommand {
-            ticks_remaining: ticks.max(1),
+            ticks_remaining: prefix_ticks.saturating_add(ticks.max(1)),
             action,
         });
     }
@@ -751,7 +785,7 @@ impl IdeChannel {
         self.raise_irq();
     }
 
-    fn read_data_byte(&mut self) -> u8 {
+    fn read_data_byte(&mut self, prefix_ticks: u64) -> u8 {
         if self.phase != Phase::DataIn {
             return 0;
         }
@@ -771,7 +805,11 @@ impl IdeChannel {
         } else if self.data_in_pos >= self.data_in_ready_end {
             // The ready sector drained. Keep later sectors busy until their own
             // transfer deadlines instead of exposing the whole HLE buffer.
-            self.schedule(PendingAction::PresentReadSector, sector_transfer_ticks());
+            self.schedule_at(
+                PendingAction::PresentReadSector,
+                sector_transfer_ticks(),
+                prefix_ticks,
+            );
         } else if self.data_in_pos >= self.data_in_block_end {
             // The host byte-count block drained inside the ready sector.
             self.present_data_block();
@@ -780,7 +818,7 @@ impl IdeChannel {
         byte
     }
 
-    fn write_data_byte(&mut self, value: u8) {
+    fn write_data_byte(&mut self, value: u8, prefix_ticks: u64) {
         match self.phase {
             Phase::AwaitPacket => {
                 if self.packet_filled < self.packet.len() {
@@ -789,13 +827,21 @@ impl IdeChannel {
                 }
                 if self.packet_filled == self.packet.len() {
                     let cdb = self.packet;
-                    self.schedule(PendingAction::ExecutePacket(cdb), COMMAND_LATENCY_TICKS);
+                    self.schedule_at(
+                        PendingAction::ExecutePacket(cdb),
+                        COMMAND_LATENCY_TICKS,
+                        prefix_ticks,
+                    );
                 }
             }
             Phase::DataOut => {
                 self.data_out.push(value);
                 if self.data_out.len() >= self.data_out_expected {
-                    self.schedule(PendingAction::CompleteDataOut, COMMAND_LATENCY_TICKS);
+                    self.schedule_at(
+                        PendingAction::CompleteDataOut,
+                        COMMAND_LATENCY_TICKS,
+                        prefix_ticks,
+                    );
                 } else if self.data_out.len() >= self.data_out_block_end {
                     self.present_data_out_block();
                     self.raise_irq();

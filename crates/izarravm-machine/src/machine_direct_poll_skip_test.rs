@@ -48,7 +48,7 @@
 //! callout-poll-skip and BLOCKER-1/2 fixtures above never exercise a program shape with two
 //! converging back-edges, so this is NOT known to be caused by anything this slice touches, and it
 //! was not root-caused within the session that found it. `callout_poll_skip_commits_a_span_
-//! through_the_real_bus`'s exact `skipped_raw_core_clocks == 17 * iterations` assertion, and the
+//! through_the_real_bus`'s exact `skipped_raw_core_clocks == 112 * iterations` assertion, and the
 //! BLOCKER 1/2 differential fixtures above, are the identity evidence this file actually ships;
 //! they pin the seam's arithmetic directly rather than comparing two native end-to-end runs.
 
@@ -147,7 +147,7 @@ fn request_for_with_bus_baseline(
         fetch_count: poll.fetch_count() as u8,
         status_mask: poll.status_mask(),
         spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
-        raw_core_clocks: poll.raw_core_clocks(),
+        raw_core_clocks: cpu.poll_skip_raw_core_clocks(poll),
         core_clocks_at_block_entry: cpu.core_clocks_so_far_for_test(),
         prefix_raw: 0,
         core_num,
@@ -296,7 +296,7 @@ fn callout_poll_skip_commits_a_span_through_the_real_bus() {
         );
         assert_eq!(
             outcome.skipped_raw_core_clocks,
-            17 * outcome.iterations,
+            (if mode == GswMode::Gsw486 { 132 } else { 112 }) * outcome.iterations,
             "mode={mode:?}: the 3-slot shape's raw core charge must be exactly 17 per iteration"
         );
     }
@@ -376,12 +376,12 @@ fn five_and_six_slot_shapes_engage_with_the_correct_spin_sense() {
     );
     assert_eq!(
         outcome5.skipped_raw_core_clocks,
-        21 * outcome5.iterations,
+        136 * outcome5.iterations,
         "the 5-slot shape's raw core charge must be exactly 21 per iteration"
     );
     assert_eq!(
         outcome6.skipped_raw_core_clocks,
-        28 * outcome6.iterations,
+        148 * outcome6.iterations,
         "the 6-slot shape's raw core charge must be exactly 28 per iteration"
     );
 }
@@ -1134,7 +1134,7 @@ fn sixteen_bit_spin_machine_for_mask(
 /// **T-D5, the D1 half.** A 16-bit certified 3-slot loop with the new knob ON commits a
 /// span through the REAL bus, from the EMITTED call-out: `poll_skip_spans.sum() > 0`,
 /// `poll_skip_last_head` equal to the shape's own head linear, and
-/// `skipped_raw_core_clocks == 17 * iterations` -- the same arithmetic identity the
+/// `skipped_raw_core_clocks == 112 * iterations` -- the same arithmetic identity the
 /// 32-bit slice shipped with.
 ///
 /// It also pins round-2 MINOR-6: with knob-first ordering the 16-bit screen's condition is
@@ -1179,7 +1179,7 @@ fn a_sixteen_bit_poll_loop_commits_a_span_with_the_knob_on() {
     let iterations: u64 = snapshot.poll_skip_iterations.iter().sum();
     assert_eq!(
         snapshot.poll_skip_raw_core_clocks,
-        17 * iterations,
+        112 * iterations,
         "the 3-slot shape's raw core charge must be exactly 17 per iteration in 16-bit \
          code, the same constant the 32-bit arm charges"
     );
@@ -1188,6 +1188,29 @@ fn a_sixteen_bit_poll_loop_commits_a_span_with_the_knob_on() {
         0,
         "the interpreter's own poll-skip commit must stay zero on a Direct row"
     );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn epoch_two_direct_sixteen_bit_poll_charges_the_live_in_price() {
+    for (mode, raw_per_iteration) in [(GswMode::Gsw486, 132), (GswMode::Gsw586, 112)] {
+        for (program, ax) in [
+            (&[0xec, 0xa8, 0x08, 0x75, 0xfb][..], 0),
+            (&[0xec, 0x84, 0xe0, 0x75, 0xfb][..], 0x0800),
+        ] {
+            let mut machine = sixteen_bit_spin_machine(program, ax, true);
+            machine.set_mode(mode);
+            machine.run_cycles(mode.clock_hz() / 30).unwrap();
+            let snapshot = machine.cpu.direct_stall_snapshot();
+            let iterations: u64 = snapshot.poll_skip_iterations.iter().sum();
+            assert!(iterations > 1, "mode={mode:?} ax={ax}");
+            assert!(machine.cpu.perf_counters().jit_direct_insns > 0);
+            assert_eq!(
+                snapshot.poll_skip_raw_core_clocks,
+                raw_per_iteration * iterations
+            );
+        }
+    }
 }
 
 /// **T-D5, the D1b half.** The same, for the register-mask form `IN AL,DX / TEST AL,AH /
@@ -1219,7 +1242,7 @@ fn a_sixteen_bit_register_mask_poll_loop_commits_a_span_with_the_knob_on() {
     let iterations: u64 = snapshot.poll_skip_iterations.iter().sum();
     assert_eq!(
         snapshot.poll_skip_raw_core_clocks,
-        17 * iterations,
+        112 * iterations,
         "D1b shares the 3-slot constant unchanged: 0x84 charges clocks(2) exactly as 0xA8 \
          does, so raw_core_clocks stays 17"
     );

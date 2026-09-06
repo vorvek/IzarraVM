@@ -107,12 +107,23 @@ fn outcome_name(outcome: &PollScanOutcome) -> &'static str {
 /// `warm_exact_poll` does. The segment is installed BEFORE the warm walk, so every
 /// cached line is keyed on this `d` (`DecodeCache`'s liveness test includes `line.d`).
 fn warm_poll_code(code: &[u8], starts: &[u32], d: bool, limit: u32, ah: u8) -> (CpuGsw, TestBus) {
+    warm_poll_code_for_mode(code, starts, d, limit, ah, GswMode::Gsw586)
+}
+
+fn warm_poll_code_for_mode(
+    code: &[u8],
+    starts: &[u32],
+    d: bool,
+    limit: u32,
+    ah: u8,
+    mode: GswMode,
+) -> (CpuGsw, TestBus) {
     let mut memory = vec![0xf4; 0x3000];
     let at = POLL16_ENTRY as usize;
     memory[at..at + code.len()].copy_from_slice(code);
     let mut cpu = CpuGsw::default();
     cpu.set_fast_map_enabled_for_test(true);
-    cpu.set_mode(GswMode::Gsw586);
+    cpu.set_mode(mode);
     cpu.control.cr0 |= CR0_PE;
     // `poll_skip_eligible` (the interpreter's own gate) requires the Direct backend OFF,
     // so the rows that go through `poll_loop()` need this explicitly.
@@ -151,6 +162,50 @@ const D1_CODE: &[u8] = &[0xec, 0xa8, 0x08, 0x75, 0xfb];
 const D1B_CODE: &[u8] = &[0xec, 0x84, 0xe0, 0x75, 0xfb];
 const POLL3_STARTS: &[u32] = &[0, 1, 3];
 
+#[test]
+fn epoch_two_poll_shapes_replace_their_actual_in_price() {
+    let shapes: [(&[u8], &[u32]); 3] = [
+        (D1_CODE, POLL3_STARTS),
+        (
+            &[0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x75, 0xf7],
+            &[0, 2, 4, 5, 7],
+        ),
+        (
+            &[
+                0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0x02, 0xeb, 0xf5,
+            ],
+            &[0, 2, 4, 5, 7, 9],
+        ),
+    ];
+    for (mode, non_port) in [
+        (GswMode::Gsw486, [48, 72, 108]),
+        (GswMode::Gsw586, [28, 52, 64]),
+    ] {
+        for (shape, (code, starts)) in shapes.iter().enumerate() {
+            let (mut cpu, _bus) = warm_poll_code_for_mode(code, starts, true, u32::MAX, 0, mode);
+            let PollScanOutcome::Found(poll) = build_poll_loop_from(&cpu, POLL16_ENTRY, false)
+            else {
+                panic!("mode={mode:?} shape={shape} must certify");
+            };
+            for (protected, v86, cpl, iopl, port_raw) in [
+                (false, false, 0, 0, 84),
+                (true, false, 0, 3, 48),
+                (true, false, 3, 0, 252),
+                (true, true, 3, 3, 228),
+            ] {
+                cpu.control.cr0 = if protected { CR0_PE } else { 0 };
+                cpu.registers.eflags = 2 | (iopl << 12) | if v86 { FLAG_VM } else { 0 };
+                cpu.cpl = cpl;
+                assert_eq!(
+                    cpu.poll_skip_raw_core_clocks(poll),
+                    non_port[shape] + port_raw,
+                    "mode={mode:?} shape={shape} protected={protected} v86={v86} cpl={cpl}",
+                );
+            }
+        }
+    }
+}
+
 /// **T-D1.** The textbook 3-slot shape in a real-mode-shaped 16-bit code segment
 /// certifies at the call-out's `sixteen_bit_ok`, with the SAME descriptor a 32-bit
 /// segment produces: `Io` family, `raw_core_clocks == 17`, three fetches. None of the
@@ -168,7 +223,7 @@ fn a_sixteen_bit_three_slot_poll_shape_certifies_at_the_callout() {
         );
     };
     assert_eq!(poll.family(), PollFamily::Io);
-    assert_eq!(poll.raw_core_clocks(), 17);
+    assert_eq!(poll.raw_core_clocks(), 196);
     assert_eq!(poll.fetch_count(), 3);
     assert_eq!(poll.status_mask(), 0x08);
     assert_eq!(poll.resolved_port(&cpu), 0x03da);
@@ -335,7 +390,7 @@ fn the_register_mask_poll_shape_certifies_with_a_symbolic_mask() {
         );
     };
     assert_eq!(poll.family(), PollFamily::Io);
-    assert_eq!(poll.raw_core_clocks(), 17);
+    assert_eq!(poll.raw_core_clocks(), 196);
     assert_eq!(poll.fetch_count(), 3);
     assert_eq!(poll.mask_source(), PollMaskSource::Ah);
     assert!(
@@ -610,11 +665,11 @@ fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
 /// knob-unset merge bar.
 #[test]
 fn poll_skip_raw_core_clocks_reads_the_live_privilege_column() {
-    let (mut cpu, mut bus) = warm_poll_code(D1_CODE, POLL3_STARTS, true, 0xffff_ffff, 0);
+    let (mut cpu, _bus) = warm_poll_code(D1_CODE, POLL3_STARTS, true, 0xffff_ffff, 0);
     let PollScanOutcome::Found(poll) = build_poll_loop_from(&cpu, POLL16_ENTRY, false) else {
         panic!("the 3-slot shape must certify");
     };
-    assert_eq!(poll.raw_core_clocks(), 17, "12 + TEST 2 + taken Jcc 3");
+    assert_eq!(poll.raw_core_clocks(), 196, "12 + TEST 2 + taken Jcc 3");
 
     // (set-up closure, expected epoch-2 raw): real, protected CPL<=IOPL, protected CPL>IOPL, V86.
     type Column = (fn(&mut CpuGsw), u64);
@@ -625,7 +680,7 @@ fn poll_skip_raw_core_clocks_reads_the_live_privilege_column() {
                 cpu.registers.eflags &= !FLAG_VM;
                 cpu.cpl = 0;
             },
-            17 - 12 + 84,
+            28 + 84,
         ),
         (
             |cpu| {
@@ -634,7 +689,7 @@ fn poll_skip_raw_core_clocks_reads_the_live_privilege_column() {
                 cpu.registers.eflags |= 3 << 12;
                 cpu.cpl = 0;
             },
-            17 - 12 + 48,
+            28 + 48,
         ),
         (
             |cpu| {
@@ -643,7 +698,7 @@ fn poll_skip_raw_core_clocks_reads_the_live_privilege_column() {
                 cpu.registers.eflags &= !(3 << 12);
                 cpu.cpl = 3;
             },
-            17 - 12 + 252,
+            28 + 252,
         ),
         (
             |cpu| {
@@ -651,20 +706,13 @@ fn poll_skip_raw_core_clocks_reads_the_live_privilege_column() {
                 cpu.registers.eflags |= FLAG_VM | (3 << 12);
                 cpu.cpl = 3;
             },
-            17 - 12 + 228,
+            28 + 228,
         ),
     ];
     for (index, (setup, expected)) in columns.into_iter().enumerate() {
         setup(&mut cpu);
-        bus.timing_epoch_two = false;
         assert_eq!(
-            cpu.poll_skip_raw_core_clocks(poll, &bus),
-            17,
-            "column {index}: epoch 1 must return the shape's own baked figure, byte-identically"
-        );
-        bus.timing_epoch_two = true;
-        assert_eq!(
-            cpu.poll_skip_raw_core_clocks(poll, &bus),
+            cpu.poll_skip_raw_core_clocks(poll),
             expected,
             "column {index}: epoch 2 must swap the baked IN for Intel's own column"
         );
