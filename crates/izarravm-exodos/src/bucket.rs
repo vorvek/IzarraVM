@@ -108,11 +108,9 @@ pub const BOOT_BANNER_ROWS: usize = 160;
 
 /// FNV-1a of the banner crop's RGB bytes.
 ///
-/// Provenance and the corpus cross-check are in
-/// `the_banner_reference_digest_is_the_measured_one` and
-/// `the_banner_reference_still_matches_the_archive`. This is measured data, not
-/// a tunable: a Toka-DOS image rebuild can invalidate it, and the archive test
-/// is the alarm that says so.
+/// Historical reference from main `7ca814ee`, measured on 2026-08-17 with
+/// 200 ms screen dumps. All 44 boot samples shared this crop; 29 frames in
+/// 14 archived games matched it. A changed logo requires a fresh measurement.
 pub const BOOT_BANNER_DIGEST: u64 = 0x9b44_c208_87b4_8025;
 
 /// Pixels a decoded frame must carry before it counts as evidence.

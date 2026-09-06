@@ -1063,11 +1063,12 @@ fn warming_never_reaches_past_the_next_track() {
 }
 
 #[test]
-fn warming_the_last_track_is_not_an_error() {
-    let (img, _second) = two_track_disc(1000);
-    // Inside the final track, and past the end of the disc entirely.
-    img.warm_upcoming(1999);
-    img.warm_upcoming(5000);
+fn warming_at_the_end_of_the_disc_does_not_restart_the_last_track() {
+    let (img, second) = two_track_disc(1000);
+    for lba in [1999, 5000] {
+        img.warm_upcoming(lba);
+        assert!(!second.was_touched(), "last track warmed at LBA {lba}");
+    }
 }
 
 #[test]

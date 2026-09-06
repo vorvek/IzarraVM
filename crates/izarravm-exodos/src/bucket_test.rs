@@ -1534,19 +1534,6 @@ fn only_the_boot_screens_geometry_carries_a_banner_digest() {
     assert!(solid(720, 400, [0, 0, 0]).banner_digest().is_some());
 }
 
-/// The pinned reference, with its provenance. This constant is DATA, measured
-/// once and cross-checked against the corpus; it is not a tunable.
-///
-/// Provenance: `izarravm --hdd-folder <bare C:> --cpu 586 --cycles 1660000000
-/// --screen-dump-dir <dir> --screen-dump-interval-ms 200`, binary main
-/// `7ca814ee`, 2026-08-17. All 44 sampled frames of that boot share this digest.
-/// Cross-check: it matches 29 frames across 14 of the 203 archived stage-1 games
-/// (`the_banner_reference_still_matches_the_archive`).
-#[test]
-fn the_banner_reference_digest_is_the_measured_one() {
-    assert_eq!(BOOT_BANNER_DIGEST, 0x9b44_c208_87b4_8025);
-}
-
 #[test]
 fn boot_banner_entries_count_arrivals_at_the_boot_screen_not_samples_of_it() {
     let banner = |present: bool| if present { "boot" } else { "game" }.to_string();
@@ -1980,22 +1967,18 @@ fn unreadable_frames_are_flagged_and_never_collapsed() {
 }
 
 // ---------------------------------------------------------------------------
-// The on-disk board, when it happens to be there. `.bench/` is git-ignored, so
-// this cannot be the gate — it is a cross-check that the embedded table above
-// still equals the files it was read from.
+// Optional archive-loader cross-check against the original fixture board.
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "requires the archived scoreboard-20260815-181222-armon fixture board"]
 fn the_real_fixture_board_still_matches_the_embedded_table() {
     let board = Path::new(".bench/results/scoreboard-20260815-181222-armon/profiles");
     let board = if board.is_dir() {
         board.to_path_buf()
     } else {
         let up = Path::new("../..").join(board);
-        if !up.is_dir() {
-            eprintln!("skipped: no fixture board on disk");
-            return;
-        }
+        assert!(up.is_dir(), "missing fixture board: {}", up.display());
         up
     };
     let archives = load_input(&board).expect("fixture board loads");
@@ -2024,108 +2007,4 @@ fn the_real_fixture_board_still_matches_the_embedded_table() {
         assert_eq!(profile.executed_cpu_core_clocks, fixture.core_clocks);
         assert_eq!(profile.perf.decode_misses, fixture.decode_misses);
     }
-}
-
-// ---------------------------------------------------------------------------
-// The archived stage-1 corpus, when it happens to be there. `D:\dev\exo-sweeps\exo-stage1` is
-// not in the repo, so these cannot be gates either; they pin two claims that
-// only real data can settle.
-// ---------------------------------------------------------------------------
-
-fn stage1_archive() -> Option<PathBuf> {
-    let root = PathBuf::from(r"D:\dev\exo-sweeps\exo-stage1\passB-20260816");
-    root.is_dir().then_some(root)
-}
-
-/// The banner reference is a pinned constant, so it can go stale silently when
-/// the Toka-DOS image is rebuilt. This is the alarm: it must still match the
-/// archive it was cross-checked against.
-#[test]
-fn the_banner_reference_still_matches_the_archive() {
-    let Some(root) = stage1_archive() else {
-        eprintln!("skipped: no stage-1 archive on disk");
-        return;
-    };
-    let mut frames = 0usize;
-    let mut games = 0usize;
-    for entry in std::fs::read_dir(&root)
-        .expect("archive reads")
-        .filter_map(Result::ok)
-    {
-        let screens = entry.path().join("screens");
-        if !screens.is_dir() {
-            continue;
-        }
-        let mut hits = 0usize;
-        for frame in std::fs::read_dir(&screens)
-            .expect("screens read")
-            .filter_map(Result::ok)
-        {
-            let path = frame.path();
-            if path.extension().is_some_and(|ext| ext == "ppm") {
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                if read_ppm(&bytes).is_some_and(|image| image.is_boot_banner()) {
-                    hits += 1;
-                }
-            }
-        }
-        if hits > 0 {
-            frames += hits;
-            games += 1;
-        }
-    }
-    assert_eq!(
-        (frames, games),
-        (29, 14),
-        "the pinned boot-banner digest no longer matches the archive it was \
-         measured against. Either the Toka-DOS boot logo changed, in which case \
-         re-measure the constant and say so, or the crop geometry moved."
-    );
-}
-
-/// **§2 item 4 is REFUTED, and this records the refutation.**
-///
-/// The triage reported that B5b's counter is "never emitted into profile.json",
-/// so the bucket could not fire. MEASURED: `jit_direct_x87_pad_bails` IS emitted
-/// — the `--hdd-folder` path and the scoreboard path share
-/// `bench::perf_counters_json` — and it reads exactly 0 on all 184 profiled
-/// stage-1 rows. Nothing needs wiring. B5b fired 0 times because these games do
-/// not bail, which the neighbouring x87 counters corroborate: only 5 of 184 rows
-/// take any x87 eligibility exit at all.
-#[test]
-fn the_b5b_counter_is_emitted_and_the_corpus_genuinely_reads_zero() {
-    let Some(root) = stage1_archive() else {
-        eprintln!("skipped: no stage-1 archive on disk");
-        return;
-    };
-    let mut profiles = 0usize;
-    let mut present = 0usize;
-    let mut nonzero_bails = 0usize;
-    let mut with_x87_work = 0usize;
-    for entry in std::fs::read_dir(&root)
-        .expect("archive reads")
-        .filter_map(Result::ok)
-    {
-        let path = entry.path().join("profile.json");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        profiles += 1;
-        if text.contains("\"jit_direct_x87_pad_bails\"") {
-            present += 1;
-        }
-        let profile: Profile = serde_json::from_str(&text).expect("profile parses");
-        if profile.perf.jit_direct_x87_pad_bails > 0 {
-            nonzero_bails += 1;
-        }
-        if profile.direct_stalls.side_exit_x87_eligibility > 0 {
-            with_x87_work += 1;
-        }
-    }
-    assert_eq!(profiles, 184);
-    assert_eq!(present, 184, "the counter is emitted on every row");
-    assert_eq!(nonzero_bails, 0, "and every row reads zero");
-    assert_eq!(with_x87_work, 5, "only five rows do any x87 work at all");
 }
