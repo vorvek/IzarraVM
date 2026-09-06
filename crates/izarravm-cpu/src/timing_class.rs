@@ -36,8 +36,7 @@ macro_rules! timing_classes {
         /// compile-time constants rather than a linear scan: `TimingClass`
         /// carries a payload in `Legacy`, so `self as usize` is not available
         /// on it, and `index` is called once per retired instruction. A match
-        /// onto constants lowers to a single byte-table load; a scan over 138
-        /// `matches!` would not.
+        /// onto constants lets constant callers fold away the conversion.
         #[repr(u16)]
         #[allow(dead_code)]
         enum ClassOrdinal { $( $name, )+ }
@@ -52,6 +51,7 @@ macro_rules! timing_classes {
             /// # Panics
             /// On [`TimingClass::Legacy`], which has no table row. Callers go
             /// through [`ClassTable::raw`], which handles it.
+            #[inline]
             pub(crate) const fn index(self) -> usize {
                 match self {
                     $( TimingClass::$name => ClassOrdinal::$name as usize, )+

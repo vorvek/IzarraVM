@@ -261,9 +261,16 @@ fn class_indices_are_a_dense_permutation() {
         let index = class.index();
         assert!(index < N_CLASSES, "{} is out of range", class.name());
         assert!(!seen[index], "{} collides at index {index}", class.name());
+        assert_eq!(TimingClass::from_index(index as u8), *class);
         seen[index] = true;
     }
     assert!(seen.iter().all(|hit| *hit));
+}
+
+#[test]
+#[should_panic(expected = "TimingClass::Legacy carries its own literal and has no table index")]
+fn legacy_has_no_table_index() {
+    TimingClass::Legacy(std::hint::black_box(37)).index();
 }
 
 /// Names are unique, so the class histogram (design section 9.1) and every
