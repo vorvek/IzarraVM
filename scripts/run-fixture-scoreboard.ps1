@@ -8,11 +8,9 @@ One pass over every game fixture, reporting real-time factor and the JIT
 counters beside each fixture's correctness invariant.
 
 .DESCRIPTION
-The formal gate (run-realtime-gate.ps1) compares a candidate against a pinned
-baseline over three workloads and takes the better part of an hour. This is the
-other instrument: one run per fixture, no pairing, no baseline, about half an
-hour for the whole set. It answers "where does every workload sit right now",
-which the gate cannot, because the gate only knows Doom and Quake.
+One current-model capture per fixture, with runtime validity checked separately
+from context-qualified historical pins. The realtime gate retains historical
+calibration and refuses the current sole timing model.
 
 Each fixture is invoked with the EXACT arguments recorded for it in
 .bench/PROTOCOL.md. That is not a style choice: the framebuffer hashes below
@@ -180,19 +178,6 @@ param(
     # the board summary, so a leg can be audited afterwards and nobody has to
     # take it on trust that the knob was actually set.
     [string[]]$Knobs = @(),
-    # The epoch-2 guest-cycle budget multiplier (recalibration design section
-    # 9.7). Applied ONLY when -Knobs actually requests epoch 2; an epoch-1 run
-    # gets its recorded budget back untouched whatever this says. See
-    # Get-EpochScaledCycles for why the default is 4 and why it is margin rather
-    # than a fit.
-    #
-    # `1` runs the epoch-2 rows on the fixture's OWN budgets, which is the
-    # apples-to-apples arm for a class-band comparison against an earlier slice's
-    # table: a row whose demo finishes early spends the rest of a scaled budget
-    # in an idle loop, and that idle loop's instruction mix dilutes every
-    # per-instruction term. Use 1 to grade the band, the default to grade an
-    # anchor that has to reach the end of a demo.
-    [uint64]$EpochCycleBudgetScale = 4,
     [switch]$RecordInvariants,
     [switch]$Force,
     [switch]$ListFixtures,
@@ -233,7 +218,7 @@ function Resolve-BenchRoot([string]$RepositoryRoot) {
 }
 $benchRoot = Resolve-BenchRoot $repositoryRoot
 $invariantPath = Join-Path $PSScriptRoot "fixture-scoreboard-invariants.json"
-$scoreboardSchema = "izarravm-fixture-scoreboard-v2"
+$scoreboardSchema = "izarravm-fixture-scoreboard-v3"
 
 function Get-RequiredUInt64Property($InputObject, [string]$Name, [string]$Path) {
     if ($null -eq $InputObject) {
@@ -536,6 +521,220 @@ function New-CoverageSelfTestProfile([UInt64]$Total, [UInt64]$Direct,
     }
 }
 
+function Assert-ScoreboardQualificationSelfTest {
+    $table = @(Get-FixtureTable)
+    Assert-ScoreboardSelfTestEqual $table.Count 21 'full board row count'
+    foreach ($pair in @(@('doom-486', 32000000000), @('doom-586', 26560000000),
+        @('quake-586', 24800000000), @('tyrian-setup-486', 4700000000), @('tombraid-loader-586', 500000000))) {
+        Assert-ScoreboardSelfTestEqual (@($table | Where-Object name -eq $pair[0])[0].cycles) $pair[1] 'literal fixture window'
+    }
+    Assert-ScoreboardSelfTestEqual (Get-FrameContract (@($table | Where-Object name -eq 'tombraid-586')[0])).anchorCycles 500000000 'unchanged anchor window'
+    $directory = Join-Path ([IO.Path]::GetTempPath()) ('izarravm-pin-selftest-' + [Guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $directory
+    $previousBench = $script:benchRoot
+    $previousKnobs = $script:Knobs
+    $previousEpoch = [Environment]::GetEnvironmentVariable('IZARRAVM_TIMING_EPOCH')
+    try {
+        $script:benchRoot = $directory
+        $hdd = Join-Path $directory 'hdd'
+        $null = New-Item -ItemType Directory -Path $hdd
+        [IO.File]::WriteAllText((Join-Path $hdd 'AUTOEXEC.BAT'), 'GAME.EXE')
+        [IO.File]::WriteAllText((Join-Path $hdd '.hidden'), 'hidden input')
+        [IO.File]::SetAttributes((Join-Path $hdd '.hidden'), [IO.FileAttributes]::Hidden)
+        [IO.File]::WriteAllText((Join-Path $directory 'disc.cue'), 'FILE "track.bin" BINARY')
+        [IO.File]::WriteAllBytes((Join-Path $directory 'track.bin'), [byte[]]@(1,2,3))
+        $fixture = [pscustomobject]@{
+            name = 'synthetic'; folder = 'hdd'; arguments = @('--cpu','586','--memory-mib','64','--video','vega')
+            cycles = [uint64]100; injection = @('--inject-key-at', '10:1c'); resultPpm = $true
+            qconsole = $false; gametics = $null; dukemark = $null; cdImage = 'disc.cue'
+            frameContract = New-FrameContract -AnchorCycles 20 -AnchorDisplay VgaRaster
+        }
+        $descriptor = Get-FixtureDescriptor $fixture $hdd
+        Assert-ScoreboardSelfTestEqual $descriptor.hdd_files.Count 2 'hidden fixture bytes included'
+        Assert-ScoreboardSelfTestEqual $descriptor.cd_files.Count 2 'CUE and track included'
+        $context = New-PinContext $fixture $descriptor
+        $pins = @{ pin_context = $context; qualified_axes = @('frame') }
+        $script:Knobs = @('IZARRAVM_DEVICE_TIMING=ata')
+        $alternate = New-PinContext $fixture (Get-FixtureDescriptor $fixture $hdd)
+        Assert-ScoreboardSelfTestEqual (Test-PinContext $pins $alternate) $false 'disk timing policy changes pin context'
+        $script:Knobs = $previousKnobs
+        $row = [ordered]@{ pin_context = $context; invariant = 'pass'; notes = @(); refused_axes = @() }
+        Assert-ScoreboardSelfTestEqual (Test-RowPin $pins $row 'frame') $true 'exact qualified context'
+        Assert-ScoreboardSelfTestEqual (Test-RowPin $pins $row 'profile_bands') $false 'axis is independently qualified'
+        Assert-ScoreboardSelfTestEqual (Test-PinContext @{} $context) $false 'historical context absent'
+        foreach ($key in @('timing_model_epoch', 'cycle_budget', 'anchor_cycle_budget', 'fixture_contract_sha256')) {
+            $changed = $context | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable
+            $changed[$key] = if ($key -eq 'fixture_contract_sha256') { 'different' } else { 999 }
+            Assert-ScoreboardSelfTestEqual (Test-PinContext @{ pin_context = $changed } $context) $false "changed $key"
+            $changed.Remove($key)
+            Assert-ScoreboardSelfTestEqual (Test-PinContext @{ pin_context = $changed } $context) $false "missing $key"
+        }
+        foreach ($mutation in @('hdd', 'track', 'arguments', 'injection')) {
+            switch ($mutation) {
+                hdd { [IO.File]::WriteAllText((Join-Path $hdd 'AUTOEXEC.BAT'), 'OTHER.EXE') }
+                track { [IO.File]::WriteAllBytes((Join-Path $directory 'track.bin'), [byte[]]@(3,2,1)) }
+                arguments { $fixture.arguments[1] = '486' }
+                injection { $fixture.injection[1] = '11:1c' }
+            }
+            $changed = New-PinContext $fixture (Get-FixtureDescriptor $fixture $hdd)
+            Assert-ScoreboardSelfTestEqual (Test-PinContext $pins $changed) $false "input mutation $mutation"
+            [IO.File]::WriteAllText((Join-Path $hdd 'AUTOEXEC.BAT'), 'GAME.EXE')
+            [IO.File]::WriteAllBytes((Join-Path $directory 'track.bin'), [byte[]]@(1,2,3))
+            $fixture.arguments[1] = '586'; $fixture.injection[1] = '10:1c'
+        }
+        Assert-ScoreboardSelfTestThrows { Get-ContainedPath $hdd '../escape' } 'Invalid fixture path' 'parent traversal'
+        $junction = Join-Path $directory 'linked'
+        $null = New-Item -ItemType Junction -Path $junction -Target $hdd
+        try {
+            Assert-ScoreboardSelfTestThrows {
+                Get-FixtureFileIdentities $directory @('linked/AUTOEXEC.BAT')
+            } 'reparse point' 'selected track cannot traverse a junction'
+            Assert-ScoreboardSelfTestThrows {
+                Get-FixtureFileIdentities $junction @('AUTOEXEC.BAT')
+            } 'reparse point' 'selected input root cannot be a junction'
+        } finally { Remove-Item -LiteralPath $junction -Force }
+        $fixture.PSObject.Properties.Remove('frameContract')
+        $context = New-PinContext $fixture (Get-FixtureDescriptor $fixture $hdd)
+        $invariants = [ordered]@{ synthetic = @{ frame_sha256 = 'old'; final_nonblack_percent_min = 80
+            pin_context = @{ schema = 'obsolete' }; qualified_axes = @('content_bands') } }
+        $observation = [ordered]@{ pin_context = $context; invariant = 'pass'; notes = @(); refused_axes = @(); frame_sha256 = 'new' }
+        Complete-RowPins $fixture $observation $invariants $true $true
+        Assert-ScoreboardSelfTestEqual (@($invariants.synthetic.qualified_axes) -join ',') 'frame' 'recording does not qualify old sibling bands'
+        Complete-RowPins $fixture $observation $invariants $true $true
+        $roundTrip = $invariants | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable
+        Assert-ScoreboardSelfTestEqual (Test-PinContext $roundTrip.synthetic $context) $true 'pin context JSON round trip'
+        Assert-ScoreboardSelfTestEqual (@($roundTrip.synthetic.qualified_axes) -join ',') 'frame' 'repeated recording does not launder siblings'
+        $invalid = [ordered]@{ pin_context = $context; invariant = 'FAIL'; notes = @('bad anchor'); refused_axes = @() }
+        Complete-RowPins $fixture $invalid @{}
+        Assert-ScoreboardSelfTestEqual $invalid.invariant 'FAIL' 'failed capture remains failed without pins'
+        Assert-ScoreboardSelfTestThrows { Complete-RowPins $fixture $invalid @{} $true $true } 'Cannot record invalid capture' 'failed anchor cannot qualify pins'
+        $profile = [pscustomobject]@{
+            schema = 'izarravm-hdd-profile-v2'
+            timing_model_epoch = 2; mode = '586'; cycle_budget = 100; elapsed_budget_clocks = 100
+            real_time_factor = 1.0; guest_seconds = 1.0; wall_seconds = 1.0
+            stop = [pscustomobject]@{ kind = 'cycle_limit'; requested = 7 }
+        }
+        Assert-FixtureCapture $fixture $profile 0 100
+        $profile.schema = 'wrong'
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'profile schema' 'wrong schema'
+        $profile.schema = 'izarravm-hdd-profile-v2'
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 1 100 } 'Host exit code' 'host failure'
+        $profile.mode = '486'
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'Effective CPU' 'CMOS override'
+        $profile.mode = '586'; $profile.timing_model_epoch = 1
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'explicitly report timing model 2' 'old model'
+        $profile.PSObject.Properties.Remove('timing_model_epoch')
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'missing profile.timing_model_epoch' 'missing current model'
+        $profile | Add-Member timing_model_epoch 2
+        $profile.elapsed_budget_clocks = 99
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'full cycle window' 'truncated window'
+        $profile.elapsed_budget_clocks = 100; $profile.real_time_factor = [double]::NaN
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'Invalid real_time_factor' 'NaN capture'
+        $nanBand = Test-ProfileBands $profile @(@{ path = 'real_time_factor'; min = 0; max = 10 }) $false
+        Assert-ScoreboardSelfTestEqual $nanBand.failures.Count 1 'unqualified bands still reject malformed fields'
+        $quake = Join-Path $directory 'qconsole.log'
+        [IO.File]::WriteAllText($quake, '969 frames 24.3 seconds 39.9 fps')
+        $null = Read-ScoreboardQuakeResult $quake
+        foreach ($bad in @('968 frames 24.3 seconds 39.9 fps', '969 frames 0 seconds 39.9 fps',
+            '969 frames 24.3 seconds 100 fps', "969 frames 24.3 seconds 39.9 fps`n969 frames 24.3 seconds 39.9 fps")) {
+            [IO.File]::WriteAllText($quake, $bad)
+            Assert-ScoreboardSelfTestThrows { Read-ScoreboardQuakeResult $quake } 'QCONSOLE' 'invalid timedemo'
+        }
+        [Environment]::SetEnvironmentVariable('IZARRAVM_TIMING_EPOCH', '2')
+        $child = Get-ChildEnvironmentSnapshot (Get-RowEnvironment)
+        Assert-ScoreboardSelfTestEqual $child.ContainsKey('IZARRAVM_TIMING_EPOCH') $false 'actual child drops inherited selector'
+        Assert-ScoreboardSelfTestThrows {
+            Resolve-KnobPassthrough @('IZARRAVM_TIMING_EPOCH=2') @((Get-BoardOwnedEnvironment).Keys)
+        } 'which this board sets itself' 'selector override refused'
+        $board = @'
+Info for Voodoo board # 0:
+=====================================================
+Virtual Base Address:                       0x10400000
+Physical Base Address:                      0xe1000000
+PCI Device Number:                          0x10
+Vendor ID:                                  0x121a
+Device ID:                                  0x1
+FBI Revision:                               2
+FBI Memory:                                 4 MB
+FBI PowerOn Sense:                          0x6
+TMU PowerOn Sense:                          0xc1
+FBI DAC Output Color Format:                24BPP
+Scan-Line Interleaved?                      No
+TMU Revision:                               1
+Number TMUs:                                2
+TMU 0 RAM:                                  4 MB
+TMU 1 RAM:                                  4 MB
+'@
+        $registers = @'
+  Register Name      Data  Address
+---------------  -------- --------
+         status: 0ffff03f        0
+		       3f : pci fifo free space (63)
+			0 : vertical retrace
+			0 : fbi busy
+			0 : tmu busy
+			0 : sst busy
+			0 : displayed buffer
+		     ffff : mem fifo free space (65535)
+			0 : swap buffers pending
+   fbzColorPath: 00000000      104
+        fogMode: 00000000      108
+      alphaMode: 00000000      10c
+        fbzMode: 00000000      110
+		          : zfunction
+			0 : drawbuffer (0=front, 1=back)
+        lfbMode: 00000000      114
+		      565 : lfb format
+			0 : writebuffer (0=front, 1=back, 2=aux)
+			0 : readbuffer (0=front, 1=back, 2=aux)
+		     ARGB : rgba lanes
+  clipLeftRight: 00000000      118
+  clipBottomTop: 00000000      11c
+        stipple: 00000000      140
+             c0: 00000000      144
+             c1: 00000000      148
+    fbiPixelsIn: 00000000      14c
+  fbiChromaFail: 00000000      150
+   fbiZfuncFail: 00000000      154
+   fbiAfuncFail: 00000000      158
+   fbiPixelsOut: 00000000      15c
+       fbiInit4: 00000003      200
+       vRetrace: 00000206      204
+      backPorch: 00000000      208
+videoDimensions: 00000000      20c
+       fbiInit0: 00001c10      210
+       fbiInit1: 002011a8      214
+       fbiInit2: 1824b0e0      218
+       fbiInit3: 00110601      21c
+'@
+        Assert-MojoReports $board $registers
+        foreach ($bad in @($board.Replace('0x121a', '0x1234'), $board.Replace('4 MB', '2 MB'),
+            $board.Replace('Number TMUs:', 'Missing TMUs:'), "$board`nNumber TMUs: 1",
+            "$board`nNo Voodoo boards found", "$board`nInfo for Voodoo board # 0:",
+            $board.Replace('Info for Voodoo board # 0:', ''))) {
+            Assert-ScoreboardSelfTestThrows { Assert-MojoReports $bad $registers } 'MOJO' 'invalid board identity'
+        }
+        foreach ($bad in @('', ($registers -split "`n" | Select-Object -First 10) -join "`n",
+            "$registers`nstatus: 00000000 0", $registers.Replace('fbzColorPath:', 'missing:'),
+            ($registers -replace '(?m)^(\s*status:)\s+\S+', '$1 invalid!'),
+            ($registers -replace '(?m)^(\s*fbzColorPath:\s+\S+\s+)104', '${1}105'))) {
+            Assert-ScoreboardSelfTestThrows { Assert-MojoReports $board $bad } 'MOJO' 'invalid register report'
+        }
+        $dynamic = $registers -replace '(?m)^(\s*(?:status|vRetrace):)\s+\S+', '$1 12345678'
+        Assert-MojoReports $board $dynamic
+    } finally {
+        $script:benchRoot = $previousBench
+        $script:Knobs = $previousKnobs
+        [Environment]::SetEnvironmentVariable('IZARRAVM_TIMING_EPOCH', $previousEpoch)
+        $resolved = [IO.Path]::GetFullPath($directory)
+        if (-not $resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Self-test cleanup left the temporary root'
+        }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+}
+
+
 function Invoke-ScoreboardSelfTest {
     # The profile-band grader must be provable RED: a gate that cannot fail is
     # systemic. One in-range band, one below the floor, one missing path.
@@ -560,35 +759,7 @@ function Invoke-ScoreboardSelfTest {
         @{ path = "mpu.wavetable"; min = 1; max = 2 })
     Assert-ScoreboardSelfTestEqual $bandObject.failures.Count 1 "a non-numeric target goes RED"
 
-    # The stored final-instruction pin must refuse a comparison across a timing-model epoch
-    # bump: the same cycle_budget legitimately retires a different instruction count once
-    # izarravm_cpu::TIMING_MODEL_EPOCH changes, so a silent drift grade would be meaningless.
-    $epochMatch = Test-InstructionPinTimingEpoch @{ timing_model_epoch = 1 } ([uint32]1)
-    Assert-ScoreboardSelfTestEqual $epochMatch.refused $false "same epoch is not refused"
-    $epochMissingRecorded = Test-InstructionPinTimingEpoch @{} ([uint32]1)
-    Assert-ScoreboardSelfTestEqual $epochMissingRecorded.refused $false `
-        "a missing recorded epoch is treated as epoch 1"
-    $epochMismatch = Test-InstructionPinTimingEpoch @{ timing_model_epoch = 1 } ([uint32]2)
-    Assert-ScoreboardSelfTestEqual $epochMismatch.refused $true `
-        "a mismatched epoch is refused"
-    Assert-ScoreboardSelfTestEqual $epochMismatch.recorded_epoch ([uint32]1) `
-        "the refusal reports the recorded epoch"
-    if ($epochMismatch.note -notmatch "not comparable across timing-model epochs") {
-        throw "epoch mismatch note did not explain the refusal: $($epochMismatch.note)"
-    }
-
-    # The epoch-2 guest-cycle budget re-scale (design section 9.7). The load-bearing
-    # half is the NEGATIVE case: a knob-unset run must get its budget back
-    # untouched, or the identity merge bar would be graded on a different amount
-    # of guest work.
-    Assert-ScoreboardSelfTestEqual (Get-EpochScaledCycles ([uint64]6200000000) @()) `
-        ([uint64]6200000000) "an epoch-1 (knob-unset) row keeps its recorded budget"
-    Assert-ScoreboardSelfTestEqual `
-        (Get-EpochScaledCycles ([uint64]6200000000) @("IZARRAVM_TIMING_EPOCH=2")) `
-        ([uint64]24800000000) "an epoch-2 row's budget is scaled by the pre-registered 4x"
-    Assert-ScoreboardSelfTestEqual `
-        (Get-EpochScaledCycles ([uint64]4000000000) @("IZARRAVM_SEGMENT_RETIRE_GOVERNOR=off")) `
-        ([uint64]4000000000) "an unrelated knob does not scale the budget"
+    Assert-ScoreboardQualificationSelfTest
 
     $noJit = Get-CoverageMetrics (New-CoverageSelfTestProfile 100 0 0 0 0)
     Assert-ScoreboardSelfTestEqual $noJit.interpreted_insns 100 "no-JIT instructions"
@@ -1108,7 +1279,7 @@ function New-FrameContract {
 # Grade one profile against a row's `profileBands` (see the Tyrian rows).
 # Returns @{ values = <ordered name->number>; failures = <string[]> }. Pure so
 # the self-test can drive it red and green without an emulator run.
-function Test-ProfileBands($Profile, $Bands) {
+function Test-ProfileBands($Profile, $Bands, [bool]$CompareCalibration = $true) {
     $values = [ordered]@{}
     $failures = @()
     foreach ($band in $Bands) {
@@ -1132,8 +1303,12 @@ function Test-ProfileBands($Profile, $Bands) {
             $failures += "profile band '$($band.path)': the value is not numeric"
             continue
         }
+        if ($null -eq $value -or $value -is [string] -or $value -is [bool] -or -not [double]::IsFinite($number)) {
+            $failures += "profile band '$($band.path)': the value is not a finite number"
+            continue
+        }
         $values["band_" + ($band.path -replace '\.', '_')] = $number
-        if ($number -lt $band.min -or $number -gt $band.max) {
+        if ($CompareCalibration -and ($number -lt $band.min -or $number -gt $band.max)) {
             $failures += ("profile band '$($band.path)' is {0}, outside [{1}, {2}]" -f
                 $number, $band.min, $band.max)
         }
@@ -1146,7 +1321,7 @@ function Get-FixtureTable {
         [pscustomobject]@{
             name = "doom-486"; folder = "jemmex_doom_c"
             arguments = @("--cpu", "486", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]8000000000
+            cycles = [uint64]32000000000
             # Guest-reported, so robust to host noise. LOWER realtics is faster.
             # Shifted down 86 tics on 2026-08-10 with the storage-charge changes,
             # keeping the band's width and its margins around the measurement.
@@ -1160,7 +1335,7 @@ function Get-FixtureTable {
         [pscustomobject]@{
             name = "doom-586"; folder = "jemmex_doom_c"
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]6640000000
+            cycles = [uint64]26560000000
             # Shifted down 19 tics on 2026-08-10 for the same reason as the 486
             # row, band width and margins preserved.
             realticsMinimum = 951; realticsMaximum = 1021; gametics = 2134
@@ -1169,7 +1344,7 @@ function Get-FixtureTable {
         [pscustomobject]@{
             name = "quake-586"; folder = "quake_c"
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            cycles = [uint64]6200000000
+            cycles = [uint64]24800000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             # QCONSOLE.LOG is the invariant. perf.instructions is NOT one: the
             # demo finishes before the budget and the run stops in an idle tail
@@ -1898,6 +2073,7 @@ function Copy-Fixture([string]$SourcePath, [string]$DestinationPath) {
     if (Test-Path -LiteralPath $DestinationPath) {
         throw "A scoreboard fixture path was reused: $DestinationPath"
     }
+    $null = Get-FixtureFilePaths $SourcePath
     $robocopy = Get-Command robocopy.exe -CommandType Application -ErrorAction Stop
     $output = @(& $robocopy.Source $SourcePath $DestinationPath /E /COPY:DAT /DCOPY:DAT `
         /R:1 /W:1 /NFL /NDL /NJH /NJS /NP 2>&1)
@@ -2012,12 +2188,13 @@ function Get-PpmFrameStats([string]$Path) {
     if ($tokens.Count -lt 4 -or $tokens[0] -ne "P6") { return $null }
     $cursor++  # the single whitespace byte that terminates the maxval token
 
-    $width = [int]$tokens[1]
-    $height = [int]$tokens[2]
-    $maxValue = [int]$tokens[3]
+    $width = 0; $height = 0; $maxValue = 0
+    if (-not [int]::TryParse($tokens[1], [ref]$width) -or
+        -not [int]::TryParse($tokens[2], [ref]$height) -or
+        -not [int]::TryParse($tokens[3], [ref]$maxValue)) { return $null }
     if ($width -le 0 -or $height -le 0 -or $maxValue -ne 255) { return $null }
-    $pixels = $width * $height
-    if ($bytes.Length - $cursor -lt $pixels * 3) { return $null }
+    $pixels = [int64]$width * $height
+    if ($bytes.Length - $cursor -ne $pixels * 3) { return $null }
 
     $distinct = [Collections.Generic.HashSet[int]]::new()
     $nonBlack = 0
@@ -2237,32 +2414,361 @@ function Write-TextLf([string]$Path, [string]$Text) {
     [IO.File]::WriteAllText($Path, $normalised, (New-Object Text.UTF8Encoding $false))
 }
 
-# A fixed cycle_budget retires a different instruction count under a different guest-clock
-# model (izarravm_cpu::TIMING_MODEL_EPOCH), so a recorded `final_instructions` pin is only
-# valid within the epoch it was recorded under. Pulled out as its own function so the
-# self-test can exercise the refusal without driving the whole per-fixture grading loop. A
-# sidecar entry with no `timing_model_epoch` predates the marker and is epoch 1.
-function Test-InstructionPinTimingEpoch($Recorded, [uint32]$RowEpoch) {
-    $recordedEpoch = if ($null -ne $Recorded -and $Recorded.Contains("timing_model_epoch")) {
-        [uint32]$Recorded.timing_model_epoch
-    } else {
-        [uint32]1
+function Get-FixtureOption($Fixture, [string]$Name) {
+    $property = $Fixture.PSObject.Properties[$Name]
+    if ($null -ne $property) { return $property.Value }
+    return $null
+}
+
+function Get-ContainedPath([string]$Root, [string]$Relative) {
+    if ([IO.Path]::IsPathRooted($Relative) -or $Relative -match '[\x00-\x1f:]' -or
+        @($Relative -split '[/\\]' | Where-Object { $_ -in @('', '.', '..') -or $_ -match '[. ]$' }).Count) {
+        throw "Invalid fixture path: '$Relative'"
     }
-    if ($recordedEpoch -ne $RowEpoch) {
-        return [pscustomobject][ordered]@{
-            refused        = $true
-            recorded_epoch = $recordedEpoch
-            note           = ("final instruction pin was recorded under timing_model_epoch " +
-                "$recordedEpoch but this run is epoch $RowEpoch -- rt and instruction counts " +
-                "are not comparable across timing-model epochs; refusing the comparison")
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $path = [IO.Path]::GetFullPath((Join-Path $rootPath $Relative))
+    if (-not $path.StartsWith($rootPath + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase)) { throw "Path leaves fixture root: $path" }
+    return $path
+}
+
+function Get-FixtureFilePaths([string]$Root, [string[]]$RelativeFiles = @()) {
+    $rootPath = [IO.Path]::GetFullPath($Root)
+    $paths = [Collections.Generic.List[string]]::new()
+    $pending = [Collections.Generic.Stack[string]]::new()
+    if ($RelativeFiles.Count) {
+        foreach ($relative in $RelativeFiles) {
+            $path = Get-ContainedPath $rootPath $relative
+            Assert-RegularFixturePath $rootPath $relative
+            if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::Directory) {
+                throw "Expected an input file: $path"
+            }
+            $pending.Push($path)
+        }
+    } else { $pending.Push($rootPath) }
+    while ($pending.Count) {
+        $path = $pending.Pop()
+        $attributes = [IO.File]::GetAttributes($path)
+        if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Fixture contains a reparse point: $path" }
+        if ($attributes -band [IO.FileAttributes]::Directory) {
+            foreach ($child in [IO.Directory]::GetFileSystemEntries($path)) { $pending.Push($child) }
+        } else {
+            $relative = [IO.Path]::GetRelativePath($rootPath, $path).Replace('\', '/')
+            $null = Get-ContainedPath $rootPath $relative
+            $paths.Add($relative)
         }
     }
-    return [pscustomobject][ordered]@{
-        refused        = $false
-        recorded_epoch = $recordedEpoch
-        note           = $null
+    $paths.Sort([StringComparer]::Ordinal)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($relative in $paths) {
+        if (-not $seen.Add($relative)) { throw "Colliding fixture path: $relative" }
+        $relative
     }
 }
+
+function Get-FixtureFileIdentities([string]$Root, [string[]]$RelativeFiles = @()) {
+    foreach ($relative in @(Get-FixtureFilePaths $Root $RelativeFiles)) {
+        $path = Get-ContainedPath $Root $relative
+        [ordered]@{ path = $relative; length = (Get-Item -LiteralPath $path -Force).Length
+            sha256 = Get-FileSha256 $path }
+    }
+}
+
+function Assert-RegularFixturePath([string]$Root, [string]$Relative) {
+    $null = Get-ContainedPath $Root $Relative
+    $path = [IO.Path]::GetFullPath($Root)
+    foreach ($component in @('') + @($Relative -split '[/\\]')) {
+        if ($component) { $path = Join-Path $path $component }
+        if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) {
+            throw "Fixture contains a reparse point: $path"
+        }
+    }
+}
+
+function Get-FixtureCdIdentity($Fixture) {
+    $image = Get-FixtureOption $Fixture 'cdImage'
+    if (-not $image) { return @() }
+    $path = Get-ContainedPath $benchRoot $image
+    Assert-RegularFixturePath $benchRoot $image
+    $root = [IO.Path]::GetDirectoryName($path)
+    $files = @([IO.Path]::GetFileName($path))
+    if ([IO.Path]::GetExtension($path) -ieq '.cue') {
+        foreach ($line in [IO.File]::ReadAllLines($path)) {
+            if ($line -notmatch '^\s*FILE\s') { continue }
+            if ($line -notmatch '^\s*FILE\s+(?:"(?<quoted>[^"]+)"|(?<bare>\S+))\s+\S+\s*$') {
+                throw "Malformed CUE FILE entry: $line"
+            }
+            $files += if ($Matches.quoted) { $Matches.quoted } else { $Matches.bare }
+        }
+        if ($files.Count -eq 1) { throw "CUE contains no tracks: $path" }
+    }
+    return @(Get-FixtureFileIdentities $root @($files | Select-Object -Unique))
+}
+
+function Clear-FixtureOutputs($Fixture, [string]$WorkingCopy) {
+    $files = @('QUAKE/ID1/QCONSOLE.LOG')
+    if ($Fixture.dukemark) { $files += $Fixture.dukemark.resultFile }
+    $text = Get-FixtureOption $Fixture 'textResults'
+    if ($text) { $files += $text.files }
+    foreach ($file in $files) {
+        $path = Get-ContainedPath $WorkingCopy $file
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+}
+
+function Get-FixtureDescriptor($Fixture, [string]$WorkingCopy) {
+    $knobValues = Resolve-KnobPassthrough $Knobs @((Get-BoardOwnedEnvironment).Keys)
+    $knobNames = [string[]]@($knobValues.Keys)
+    [Array]::Sort($knobNames, [StringComparer]::Ordinal)
+    $orderedKnobs = [ordered]@{}
+    foreach ($name in $knobNames) { $orderedKnobs[$name] = $knobValues[$name] }
+    return [ordered]@{
+        schema = 'fixture-inputs-v1'; name = $Fixture.name
+        hdd_files = @(Get-FixtureFileIdentities $WorkingCopy)
+        arguments = @($Fixture.arguments); injection = @($Fixture.injection)
+        knobs = $orderedKnobs
+        frame_kind = $(if (-not $Fixture.resultPpm) { 'none' }
+            elseif (Get-FixtureOption $Fixture 'gradePresentedFrame') { 'presented' } else { 'result' })
+        cd_files = @(Get-FixtureCdIdentity $Fixture)
+    }
+}
+
+function Get-DescriptorSha256($Descriptor) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($Descriptor | ConvertTo-Json -Depth 16 -Compress))
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function New-PinContext($Fixture, $Descriptor) {
+    $contract = Get-FrameContract $Fixture
+    return [ordered]@{
+        schema = 'fixture-pin-context-v1'; timing_model_epoch = 2
+        cycle_budget = [uint64]$Fixture.cycles
+        anchor_cycle_budget = $(if ($contract) { [uint64]$contract.anchorCycles } else { $null })
+        fixture_contract_sha256 = Get-DescriptorSha256 $Descriptor
+    }
+}
+
+function Test-PinContext($Recorded, $Context) {
+    if ($null -eq $Recorded -or -not $Recorded.Contains('pin_context')) { return $false }
+    $pin = $Recorded.pin_context
+    if ($null -eq $pin -or $pin.Count -ne $Context.Count) { return $false }
+    foreach ($key in $Context.Keys) {
+        if (-not $pin.Contains($key) -or $pin[$key] -cne $Context[$key]) { return $false }
+    }
+    return $true
+}
+
+function Test-RowPin($Recorded, $Row, [string]$Axis) {
+    $qualified = (Test-PinContext $Recorded $Row.pin_context) -and
+        $Recorded.Contains('qualified_axes') -and @($Recorded.qualified_axes) -ccontains $Axis
+    if (-not $qualified -and $Row.refused_axes -notcontains $Axis) {
+        $Row.refused_axes += $Axis
+        $Row.notes += "$Axis pin is unqualified for this fixture, configuration and timing window"
+    }
+    return $qualified
+}
+
+function Get-RequiredPositiveNumber($Object, [string]$Name) {
+    $value = Get-FixtureOption $Object $Name
+    if ($null -eq $value -or $value -is [string] -or $value -is [bool]) { throw "Missing or nonnumeric $Name" }
+    try { $number = [double]$value } catch { throw "Nonnumeric $Name" }
+    if (-not [double]::IsFinite($number) -or $number -le 0) { throw "Invalid ${Name}: $value" }
+    return $number
+}
+
+function Assert-FixtureCapture($Fixture, $Profile, [int]$ExitCode, [uint64]$Budget, [bool]$Anchor = $false) {
+    if ((Get-FixtureOption $Profile 'schema') -cne 'izarravm-hdd-profile-v2') {
+        throw 'Capture has no supported HDD profile schema'
+    }
+    if ((Get-RequiredUInt64Property $Profile 'timing_model_epoch' 'profile') -ne 2) {
+        throw 'The capture must explicitly report timing model 2'
+    }
+    $cpuAt = [Array]::IndexOf([string[]]$Fixture.arguments, '--cpu')
+    if ($cpuAt -lt 0 -or $Profile.mode -cne $Fixture.arguments[$cpuAt + 1]) {
+        throw "Effective CPU '$($Profile.mode)' differs from the fixture's requested CPU"
+    }
+    if ((Get-RequiredUInt64Property $Profile 'cycle_budget' 'profile') -ne $Budget) {
+        throw "Capture cycle_budget differs from the declared $Budget"
+    }
+    foreach ($name in @('real_time_factor', 'guest_seconds', 'wall_seconds')) {
+        $null = Get-RequiredPositiveNumber $Profile $name
+    }
+    $text = Get-FixtureOption $Fixture 'textResults'
+    $completion = -not $Anchor -and ($null -ne $Fixture.gametics -or $Fixture.dukemark -or $text)
+    $code = if ($completion -and $Fixture.dukemark) { $Fixture.dukemark.exitCode }
+        elseif ($completion -and $text) { $text.exitCode } else { 0 }
+    if ($ExitCode -ne $code) { throw "Host exit code $ExitCode, expected $code" }
+    if ($completion) {
+        if ($Profile.stop.kind -ne 'test_exit' -or
+            (Get-RequiredUInt64Property $Profile.stop 'code' 'profile.stop') -ne $code) {
+            throw "Guest did not complete through test_exit code $code"
+        }
+    } elseif ($Profile.stop.kind -ne 'cycle_limit' -or
+        (Get-RequiredUInt64Property $Profile 'elapsed_budget_clocks' 'profile') -lt $Budget) {
+        throw 'Guest did not complete the declared full cycle window'
+    }
+}
+
+function Read-ScoreboardQuakeResult([string]$Path) {
+    $lines = @([IO.File]::ReadAllLines($Path) | Where-Object { $_ -match '\d+\s+frames' })
+    if ($lines.Count -ne 1 -or $lines[0] -notmatch
+        '^\s*(?<frames>\d+)\s+frames\s+(?<seconds>\d+(?:\.\d+)?)\s+seconds\s+(?<fps>\d+(?:\.\d+)?)\s+fps\s*$') {
+        throw 'QCONSOLE must contain exactly one valid timedemo result'
+    }
+    $frames = [uint64]$Matches.frames
+    $seconds = [double]::Parse($Matches.seconds, [Globalization.CultureInfo]::InvariantCulture)
+    $fps = [double]::Parse($Matches.fps, [Globalization.CultureInfo]::InvariantCulture)
+    if ($frames -ne 969 -or -not [double]::IsFinite($seconds) -or $seconds -le 0 -or
+        -not [double]::IsFinite($fps) -or $fps -le 0 -or [Math]::Abs($frames / $seconds - $fps) -gt 0.2) {
+        throw 'QCONSOLE timedemo identity is incomplete or inconsistent'
+    }
+    return $lines[0].Trim()
+}
+
+function Assert-MojoReports([string]$Board, [string]$Registers) {
+    foreach ($report in @($Board, $Registers)) {
+        if ($report -match "No Voodoo boards found|Couldn't get info for Voodoo|Bogus number of TMUs") {
+            throw 'MOJO reported a diagnostic failure'
+        }
+    }
+    if ([regex]::Matches($Board, '(?m)^\s*Info for Voodoo board #').Count -ne 1 -or
+        $Board -notmatch '(?m)^\s*Info for Voodoo board #\s*0:\s*$') { throw 'Invalid MOJO board header' }
+    $facts = [ordered]@{
+        'Vendor ID:' = '0x121a'; 'Device ID:' = '0x1'; 'FBI Revision:' = '2'; 'FBI Memory:' = '4 MB'
+        'FBI PowerOn Sense:' = '0x6'; 'TMU PowerOn Sense:' = '0xc1'
+        'FBI DAC Output Color Format:' = '24BPP'; 'Scan-Line Interleaved?' = 'No'
+        'TMU Revision:' = '1'; 'Number TMUs:' = '2'; 'TMU 0 RAM:' = '4 MB'; 'TMU 1 RAM:' = '4 MB'
+    }
+    foreach ($label in $facts.Keys) {
+        $pattern = '(?m)^\s*' + [regex]::Escape($label)
+        $rows = [regex]::Matches($Board, $pattern + '[^\r\n]*')
+        if ($rows.Count -ne 1 -or $rows[0].Value -notmatch
+            ($pattern + '\s*' + [regex]::Escape($facts[$label]) + '\s*$')) { throw "Invalid MOJO fact: $label" }
+    }
+    foreach ($label in @('Virtual Base Address:', 'Physical Base Address:', 'PCI Device Number:')) {
+        $rows = [regex]::Matches($Board, '(?m)^\s*' + [regex]::Escape($label) + '[^\r\n]*')
+        if ($rows.Count -ne 1 -or $rows[0].Value -notmatch '0x[0-9a-fA-F]+\s*$') { throw "Invalid MOJO location: $label" }
+    }
+    if ([regex]::Matches($Registers, '(?m)^\s*Register Name\s+Data\s+Address\s*$').Count -ne 1) { throw 'Invalid MOJO register header' }
+    $addresses = [ordered]@{
+        status = 0x000; fbzColorPath = 0x104; fogMode = 0x108; alphaMode = 0x10c
+        fbzMode = 0x110; lfbMode = 0x114; clipLeftRight = 0x118; clipBottomTop = 0x11c
+        stipple = 0x140; c0 = 0x144; c1 = 0x148; fbiPixelsIn = 0x14c; fbiChromaFail = 0x150
+        fbiZfuncFail = 0x154; fbiAfuncFail = 0x158; fbiPixelsOut = 0x15c; fbiInit4 = 0x200
+        vRetrace = 0x204; backPorch = 0x208; videoDimensions = 0x20c; fbiInit0 = 0x210
+        fbiInit1 = 0x214; fbiInit2 = 0x218; fbiInit3 = 0x21c
+    }
+    foreach ($name in $addresses.Keys) {
+        $rows = [regex]::Matches($Registers, '(?m)^\s*' + $name + ':[^\r\n]*')
+        if ($rows.Count -ne 1 -or $rows[0].Value -notmatch ':\s+([0-9a-fA-F]{8})\s+([0-9a-fA-F]+)\s*$' -or
+            [Convert]::ToUInt32($Matches[2], 16) -ne $addresses[$name]) { throw "Invalid MOJO register row: $name" }
+    }
+}
+
+function Preserve-FixtureArtifacts($Fixture, [string]$ScratchRoot, [string]$Stamp,
+    [string]$WorkingCopy, [string]$Archive, [string]$Suffix = '') {
+    $stem = "$($Fixture.name)$Suffix"
+    foreach ($extension in @('json', 'ppm', 'out', 'err', 'inputs.json')) {
+        $source = Join-Path $ScratchRoot "$stem-$Stamp.$extension"
+        if (Test-Path -LiteralPath $source) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $Archive "$stem.$extension") -Force
+        }
+    }
+    $files = @('QUAKE/ID1/QCONSOLE.LOG')
+    if ($Fixture.dukemark) { $files += $Fixture.dukemark.resultFile }
+    $text = Get-FixtureOption $Fixture 'textResults'
+    if ($text) { $files += $text.files }
+    foreach ($file in $files) {
+        $source = Get-ContainedPath $WorkingCopy $file
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination `
+                (Join-Path $Archive "$stem.$($file.Replace('/', '_').Replace('\', '_'))") -Force
+        }
+    }
+}
+
+function Complete-RowPins($Fixture, $Row, $Invariants, [bool]$Record = $false, [bool]$Overwrite = $false) {
+    if ($Row.invariant -eq 'FAIL') {
+        if ($Record) { throw "Cannot record invalid capture: $($Fixture.name)" }
+        return
+    }
+    $recorded = if ($Invariants.Contains($Fixture.name)) { $Invariants[$Fixture.name] } else { @{} }
+    $sameContext = Test-PinContext $recorded $Row.pin_context
+    if ($Record) {
+        if (-not $sameContext) { $recorded.qualified_axes = @() }
+        $recorded.pin_context = $Row.pin_context
+        if (-not $recorded.Contains('qualified_axes')) { $recorded.qualified_axes = @() }
+    }
+    $specs = @()
+    if ($Row.Contains('frame_sha256') -and -not (Get-FixtureOption $Fixture 'frame_sha256_allowed')) {
+        $specs += @{ axis = 'frame'; key = 'frame_sha256'; value = $Row.frame_sha256; tolerance = 0 }
+    }
+    if ($Row.Contains('text_result_sha256')) {
+        $specs += @{ axis = 'text_reports'; key = 'text_result_sha256'; value = $Row.text_result_sha256; tolerance = 0 }
+    }
+    if ($Row.Contains('dukemark_samples') -and $null -ne $Row.dukemark_samples) {
+        $specs += @{ axis = 'dukemark_samples'; key = 'dukemark_samples'; value = $Row.dukemark_samples
+            tolerance = $dukemarkSampleTolerance }
+    }
+    if (Get-FrameContract $Fixture) {
+        if ($Row.Contains('anchor_frame_sha256')) {
+            $specs += @{ axis = 'anchor_frame'; key = 'anchor_frame_sha256'; value = $Row.anchor_frame_sha256; tolerance = 0 }
+        }
+        $specs += @{ axis = 'final_instructions'; key = 'final_instructions'; value = $Row.instructions
+            tolerance = $frameInstructionTolerance }
+    }
+    foreach ($spec in $specs) {
+        $key = $spec.key
+        $hasPin = $recorded.Contains($key)
+        $expected = if ($hasPin) { $recorded[$key] } else { $null }
+        $toleranceKey = $key + '_tolerance'
+        $tolerance = if ($recorded.Contains($toleranceKey)) { $recorded[$toleranceKey] } else { $spec.tolerance }
+        $matches = $false
+        if ($hasPin) {
+            if ($spec.axis -eq 'anchor_frame') { $matches = @($expected) -contains $spec.value }
+            elseif ($spec.axis -eq 'text_reports') {
+                $matches = $expected.Count -eq $spec.value.Count
+                foreach ($name in $spec.value.Keys) {
+                    $matches = $matches -and $expected.Contains($name) -and $expected[$name] -ceq $spec.value[$name]
+                }
+            } elseif ($spec.tolerance -gt 0) {
+                $matches = [double]$expected -gt 0 -and
+                    [Math]::Abs([double]$spec.value - [double]$expected) -le
+                    [Math]::Max(1, [double]$expected * $tolerance)
+            } else { $matches = $expected -ceq $spec.value }
+        }
+        if ($Record) {
+            if ($hasPin -and -not $matches -and -not $Overwrite) { throw "Recording $key would replace a pin; use -Force after reviewing the change" }
+            if ($spec.axis -eq 'anchor_frame') {
+                $anchors = if ($sameContext -and $hasPin) { @($expected) } else { @() }
+                if ($anchors -notcontains $spec.value) {
+                    if ($anchors.Count -ge (Get-FrameContract $Fixture).anchorPhases) { throw 'Anchor phase limit exceeded' }
+                    $anchors += $spec.value
+                }
+                $recorded[$key] = @($anchors)
+            } else { $recorded[$key] = $spec.value }
+            if ($spec.tolerance -gt 0) { $recorded[$toleranceKey] = $tolerance }
+            if ($recorded.qualified_axes -notcontains $spec.axis) { $recorded.qualified_axes += $spec.axis }
+        } elseif (Test-RowPin $recorded $Row $spec.axis) {
+            if (-not $matches) { $Row.invariant = 'FAIL'; $Row.notes += "$key differs from the qualified pin" }
+        }
+    }
+    if (Get-FrameContract $Fixture) {
+        if (Test-RowPin $recorded $Row 'content_bands') {
+            foreach ($band in @(
+                @{ value = 'final_nonblack_pct'; low = 'final_nonblack_percent_min'; high = 'final_nonblack_percent_max' },
+                @{ value = 'final_distinct_colors'; low = 'final_distinct_colors_min'; high = 'final_distinct_colors_max' })) {
+                if (-not $recorded.Contains($band.low) -or -not $recorded.Contains($band.high) -or
+                    $Row[$band.value] -lt $recorded[$band.low] -or $Row[$band.value] -gt $recorded[$band.high]) {
+                    $Row.invariant = 'FAIL'; $Row.notes += "$($band.value) differs from the qualified content band"
+                }
+            }
+        }
+    }
+    if ($Record) { $Invariants[$Fixture.name] = $recorded }
+    if ($Row.invariant -ne 'FAIL' -and $Row.refused_axes.Count) { $Row.invariant = 'unpinned' }
+}
+
 
 function Write-Invariants($Table) {
     $json = $Table.GetEnumerator() |
@@ -2270,7 +2776,7 @@ function Write-Invariants($Table) {
         ForEach-Object -Begin { $ordered = [ordered]@{} } `
             -Process { $ordered[$_.Key] = $_.Value } `
             -End { $ordered } |
-        ConvertTo-Json -Depth 6
+        ConvertTo-Json -Depth 16
     Write-TextLf $invariantPath $json
 
     # The invariants json is LICENSE_MANIFEST-covered, and a re-record without the
@@ -2389,6 +2895,7 @@ function Get-BoardOwnedEnvironment {
         # every board row. Removal is also the only value safe for EVERY binary
         # era: a pre-C1 exe reads an empty IZARRAVM_AUDIO_WAV as a real path and
         # aborts every row (measured 2026-08-14, eight FAILs).
+        "IZARRAVM_TIMING_EPOCH"          = $null
         "IZARRAVM_CPU_PROFILE"           = $null
         "IZARRAVM_MACHINE_PROFILE"       = $null
         "IZARRAVM_RIP_PROFILE"           = $null
@@ -2547,57 +3054,6 @@ function Resolve-FixtureSelection([string[]]$Specification, [string[]]$KnownName
     }
     return ,$selected
 }
-
-# THE EPOCH-2 GUEST-CYCLE BUDGET RE-SCALE (recalibration design section 9.7).
-#
-# Every row's `cycles` is a fixed GUEST-CYCLE budget, and the demo-completion
-# invariants -- quake-586's 969 frames, doom-586's realtics -- are only gradeable
-# if the demo FINISHES inside it. The recalibration makes the guest slower in
-# guest-clock terms on purpose: slice 2 measured whole-bill ratios of 1.34x to
-# 6.20x across the board rows, and at epoch 2 both anchors stopped on
-# `cycle_limit` with no timedemo line at all. That is design section 9.7's own
-# predicted non-defect -- "a slower guest will not finish the demo inside 6.2 G,
-# breaking it for a non-defect" -- and the fix it asks for is to scale the budget
-# with the epoch, not to bend the model.
-#
-# PRE-REGISTERED, before slice 4's ladder ran: **4x, one multiplier, every row.**
-# The reasoning, stated so it can be checked rather than fitted:
-#
-#  * The requirement is a budget large enough for the demo to complete with
-#    margin, NOT a per-row fit. A per-row multiplier would be an absorber wearing
-#    a scope -- the exact pattern the owner's line-82 ruling struck out.
-#  * 4x dominates the largest ANCHOR-row ratio slice 2 measured (doom-586,
-#    3.824x) and every non-anchor row except tyrian-586 (6.199x). Slice 4 only
-#    ever REDUCES the bill on those rows -- it deletes the x87 absorber and cuts
-#    the mode-13h aperture term, which was 78% of doom-586's bill and 39% of
-#    tyrian's -- so every ratio falls under it. tyrian-586's residual risk is
-#    recorded in the slice-4 result doc rather than papered over with a fifth
-#    knob.
-#  * It is a POWER OF TWO chosen for margin, not a solved value. Nothing is
-#    graded on it: it decides only how much guest time a row is given, and a row
-#    that still fails to complete inside it is a finding.
-#
-# EPOCH 1 DOES NOT MOVE. The multiplier applies only when the caller's -Knobs
-# passthrough actually asks for epoch 2, which is the only way to reach epoch 2
-# (`IZARRAVM_TIMING_EPOCH=1` panics by design; the epoch-1 arm is the variable
-# unset). A knob-unset run gets `$Cycles` back unchanged, byte for byte, so the
-# identity merge bar is untouched.
-function Get-EpochScaledCycles([uint64]$Cycles, [string[]]$KnobSpecification = $Knobs) {
-    $boardOwned = Get-BoardOwnedEnvironment
-    $knobValues = Resolve-KnobPassthrough $KnobSpecification @($boardOwned.Keys)
-    if (-not $knobValues.Contains("IZARRAVM_TIMING_EPOCH")) { return $Cycles }
-    $requested = 0
-    if (-not [uint32]::TryParse([string]$knobValues["IZARRAVM_TIMING_EPOCH"], [ref]$requested)) {
-        return $Cycles
-    }
-    if ($requested -lt 2) { return $Cycles }
-    return [uint64]($Cycles * $EpochTwoCycleBudgetScale)
-}
-
-# The multiplier in force, from the -EpochCycleBudgetScale parameter. Named so
-# the self-test and the result doc quote one number. See Get-EpochScaledCycles
-# for why the default is 4 and why it is not a fit.
-$script:EpochTwoCycleBudgetScale = $EpochCycleBudgetScale
 
 # The child environment for one row: scrub, then the board's own table, then the
 # caller's explicit -Knobs passthrough.
@@ -2944,500 +3400,191 @@ It is cheap relative to what it protects: 7 s against tombraid-586's ~250 s,
 Nothing here is timed. The anchor run contributes NO wall, NO real-time factor
 and NO coverage counters to the row -- only a frame hash.
 #>
-function Invoke-AnchorRun($Fixture, [string]$ExecutablePath, [string]$ScratchRoot) {
+function Invoke-AnchorRun($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
+    [string]$Archive, [string]$InputSha256) {
     $contract = Get-FrameContract $Fixture
-    $stamp = [Guid]::NewGuid().ToString("N").Substring(0, 8)
-    $workingCopy = Join-Path $ScratchRoot "$($Fixture.name)-anchor-$stamp"
-    $profilePath = Join-Path $ScratchRoot "$($Fixture.name)-anchor-$stamp.json"
-    $ppmPath = Join-Path $ScratchRoot "$($Fixture.name)-anchor-$stamp.ppm"
-
+    $stamp = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $stem = "$($Fixture.name)-anchor-$stamp"
+    $workingCopy = Join-Path $ScratchRoot $stem
+    $profilePath = Join-Path $ScratchRoot "$stem.json"
+    $ppmPath = Join-Path $ScratchRoot "$stem.ppm"
     $result = @{ sha256 = $null; display = $null; wall_s = 0.0; failure = $null }
-    Copy-Fixture (Join-Path $benchRoot $Fixture.folder) $workingCopy
     try {
+        Copy-Fixture (Join-Path $benchRoot $Fixture.folder) $workingCopy
+        Clear-FixtureOutputs $Fixture $workingCopy
+        $descriptor = Get-FixtureDescriptor $Fixture $workingCopy
+        $descriptor | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath `
+            (Join-Path $ScratchRoot "$stem.inputs.json") -Encoding utf8
+        if ((Get-DescriptorSha256 $descriptor) -cne $InputSha256) { throw 'Anchor prelaunch inputs differ from the main run' }
         $start = @{
-            FilePath               = $ExecutablePath
-            ArgumentList           = (Get-FixtureArguments $Fixture $workingCopy `
-                    $contract.anchorCycles $profilePath $ppmPath)
-            NoNewWindow            = $true
-            PassThru               = $true
-            RedirectStandardOutput = (Join-Path $ScratchRoot "$($Fixture.name)-anchor-$stamp.out")
-            RedirectStandardError  = (Join-Path $ScratchRoot "$($Fixture.name)-anchor-$stamp.err")
-            Environment            = Get-RowEnvironment
+            FilePath = $ExecutablePath
+            ArgumentList = Get-FixtureArguments $Fixture $workingCopy $contract.anchorCycles $profilePath $ppmPath
+            NoNewWindow = $true; PassThru = $true; Environment = Get-RowEnvironment
+            RedirectStandardOutput = Join-Path $ScratchRoot "$stem.out"
+            RedirectStandardError = Join-Path $ScratchRoot "$stem.err"
         }
         $wall = [Diagnostics.Stopwatch]::StartNew()
         $process = Start-Process @start
-        if ($ProcessorIndex -ge 0) {
-            try { $process.ProcessorAffinity = [IntPtr]([int64]1 -shl $ProcessorIndex) } catch { }
-        }
+        if ($ProcessorIndex -ge 0) { $process.ProcessorAffinity = [IntPtr]([int64]1 -shl $ProcessorIndex) }
         if (-not $process.WaitForExit($HostTimeoutSeconds * 1000)) {
-            try { $process.Kill($true) } catch { }
-            $result.failure = "the anchor run exceeded $HostTimeoutSeconds seconds"
-            return $result
+            $process.Kill($true); $process.WaitForExit()
+            throw "Anchor exceeded $HostTimeoutSeconds seconds"
         }
         $wall.Stop()
-        $result.wall_s = [math]::Round($wall.Elapsed.TotalSeconds, 3)
-
+        $result.wall_s = [Math]::Round($wall.Elapsed.TotalSeconds, 3)
+        $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+        Assert-FixtureCapture $Fixture $profile $process.ExitCode $contract.anchorCycles $true
+        Assert-CaptureStderr $start.RedirectStandardError
+        if ($null -eq (Get-PpmFrameStats $ppmPath)) { throw 'Anchor PPM is missing or malformed' }
         $result.sha256 = Get-FileSha256 $ppmPath
-        if ($null -eq $result.sha256) {
-            $result.failure = ("the anchor run wrote no PPM at " +
-                "$($contract.anchorCycles) cycles (the emulator crashed, or never started)")
-            return $result
-        }
-        # The display PATH at the anchor is part of the contract: tombraid's
-        # anchor is a VGA text page and nascar's is a Margo LFB frame, and a row
-        # that produced the right bytes through the wrong path has still changed.
-        if (Test-Path -LiteralPath $profilePath) {
-            try {
-                $anchorProfile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-                $result.display = $anchorProfile.active_display
-            } catch { }
-        }
-    } finally {
-        Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
+        $result.display = $profile.active_display
+        if ([string]::IsNullOrWhiteSpace($result.display)) { throw 'Missing anchor active_display' }
+        $result.profile = $profile
+    } catch { $result.failure = "Anchor: $($_.Exception.Message)" }
+    finally {
+        Preserve-FixtureArtifacts $Fixture $ScratchRoot $stamp $workingCopy $Archive '-anchor'
+        if (Test-Path -LiteralPath $workingCopy) { Remove-Item -LiteralPath $workingCopy -Recurse -Force }
     }
     return $result
 }
 
+function Assert-CaptureStderr([string]$Path) {
+    $offending = @(Get-Content -LiteralPath $Path | Where-Object { $_ -notmatch '^open-bus: ' -and $_ -notmatch '^\s*$' })
+    if ($offending.Count) { throw "Capture wrote diagnostics to stderr: $(($offending | Select-Object -First 3) -join '; ')" }
+}
+
 function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
-    [string]$KeepProfilesIn) {
-    $fixtureSource = Join-Path $benchRoot $Fixture.folder
-    if (-not (Test-Path -LiteralPath $fixtureSource -PathType Container)) {
-        throw "Fixture folder is missing: $fixtureSource"
-    }
-
-    $stamp = [Guid]::NewGuid().ToString("N").Substring(0, 8)
-    $workingCopy = Join-Path $ScratchRoot "$($Fixture.name)-$stamp"
-    $profilePath = Join-Path $ScratchRoot "$($Fixture.name)-$stamp.json"
-    $ppmPath = Join-Path $ScratchRoot "$($Fixture.name)-$stamp.ppm"
-
-    Copy-Fixture $fixtureSource $workingCopy
-
-    # Quake appends to this and the oracle is its LAST line, so a stale file
-    # from the source tree would be read as this run's result.
-    $staleQuakeLog = Join-Path $workingCopy "QUAKE\ID1\QCONSOLE.LOG"
-    if (Test-Path -LiteralPath $staleQuakeLog) {
-        Remove-Item -LiteralPath $staleQuakeLog -Force
-    }
-
-    # Same hazard for DUKEMARK's redirected report: if a copy ever ends up in the
-    # source fixture, a run that produced nothing would be graded on it.
-    $dukemarkResultPath = $null
-    if ($null -ne $Fixture.dukemark) {
-        $dukemarkResultPath = Join-Path $workingCopy $Fixture.dukemark.resultFile
-        if (Test-Path -LiteralPath $dukemarkResultPath) {
-            Remove-Item -LiteralPath $dukemarkResultPath -Force
-        }
-    }
-
-    # ...and for a `textResults` row, which grades files the guest redirected to
-    # disk rather than a framebuffer. Identical hazard, identical repair: a stale
-    # copy in the SOURCE tree would be hashed and pass while the run produced
-    # nothing at all.
-    $textResultsProperty = $Fixture.PSObject.Properties['textResults']
-    $textResultPaths = [ordered]@{}
-    if ($null -ne $textResultsProperty -and $textResultsProperty.Value) {
-        foreach ($file in $textResultsProperty.Value.files) {
-            $path = Join-Path $workingCopy $file
-            $textResultPaths[$file] = $path
-            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-        }
-    }
-
-    $arguments = Get-FixtureArguments $Fixture $workingCopy (Get-EpochScaledCycles $Fixture.cycles) `
-        $profilePath $(if ($Fixture.resultPpm) { $ppmPath } else { $null })
-    $environment = Get-RowEnvironment
-
-    $stdoutPath = Join-Path $ScratchRoot "$($Fixture.name)-$stamp.out"
-    $start = @{
-        FilePath               = $ExecutablePath
-        ArgumentList           = $arguments
-        NoNewWindow            = $true
-        PassThru               = $true
-        RedirectStandardOutput = $stdoutPath
-        RedirectStandardError  = (Join-Path $ScratchRoot "$($Fixture.name)-$stamp.err")
-        Environment            = $environment
-    }
-
-    $wallStart = [Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process @start
-    if ($ProcessorIndex -ge 0) {
-        try {
-            $process.ProcessorAffinity = [IntPtr]([int64]1 -shl $ProcessorIndex)
-        } catch {
-            Write-Warning "Could not pin $($Fixture.name) to processor ${ProcessorIndex}: $_"
-        }
-    }
-    $waited = Wait-WithLoadSampling $process $HostTimeoutSeconds
-    if ($waited.timedOut) {
-        try { $process.Kill($true) } catch { }
-        throw "$($Fixture.name) exceeded $HostTimeoutSeconds seconds."
-    }
-    $wallStart.Stop()
-    $exitCode = $process.ExitCode
-
-    $backgroundLoad = [math]::Round((Get-Median ([double[]]$waited.samples)), 2)
-    $peakLoad = if ($waited.samples.Count -gt 0) {
-        [math]::Round((($waited.samples | Measure-Object -Maximum).Maximum), 2)
-    } else { 0.0 }
-
+    [string]$KeepProfilesIn, $Recorded) {
+    $stamp = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $stem = "$($Fixture.name)-$stamp"
+    $workingCopy = Join-Path $ScratchRoot $stem
+    $profilePath = Join-Path $ScratchRoot "$stem.json"
+    $ppmPath = Join-Path $ScratchRoot "$stem.ppm"
+    $stdoutPath = Join-Path $ScratchRoot "$stem.out"
     $result = [ordered]@{
-        name             = $Fixture.name
-        arm              = $Arm
-        one_lookup_store = $OneLookupStore
-        one_lookup_load  = $OneLookupLoad
-        # The -Knobs passthrough exactly as it was armed for THIS row, resolved
-        # rather than raw, so a leg can be audited after the fact instead of
-        # taken on trust. `{}` means nothing was passed through. A knob armed to
-        # the empty string appears as `"NAME": ""` and one that was never named
-        # is absent from the object -- the same distinction the child sees.
-        knobs            = (Resolve-KnobPassthrough $Knobs `
-                                @((Get-BoardOwnedEnvironment).Keys))
-        exit_code        = $exitCode
-        host_wall_s      = [math]::Round($wallStart.Elapsed.TotalSeconds, 3)
-        background_load  = $backgroundLoad
-        background_peak  = $peakLoad
-        load_samples     = $waited.samples.Count
-        contaminated     = $false
-        invariant        = "unchecked"
-        notes            = @()
+        name = $Fixture.name; arm = $Arm; one_lookup_store = $OneLookupStore; one_lookup_load = $OneLookupLoad
+        knobs = Resolve-KnobPassthrough $Knobs @((Get-BoardOwnedEnvironment).Keys)
+        exit_code = $null; host_wall_s = 0.0; background_load = 0.0; background_peak = 0.0
+        load_samples = 0; contaminated = $false; invariant = 'FAIL'; notes = @(); refused_axes = @()
     }
-
-    # A board row must run with NO instrument armed. Every instrument announces
-    # itself on stderr (e.g. "riprofile: sampling armed"), so any stderr output
-    # at all fails the row loudly instead of silently taxing the measurement.
-    # This is the regression guard for the 2026-08-15 empty-env-string incident:
-    # an empty IZARRAVM_RIP_PROFILE armed the sampler on every row.
-    #
-    # One exception, shared with the corpus sweep's policy: open-bus port
-    # diagnostics are DATA, not failures. A guest probing for hardware
-    # touches unclaimed ports as a matter of course, and the emulator's
-    # answer (float, log) is the hardware answer. First seen on a board row
-    # 2026-08-17: the DSP settle fix let Prince of Persia detect the Sound
-    # Blaster, and its sound init strobes 0x8E00-0x8E03.
-    $stderrPath = $start.RedirectStandardError
-    if (Test-Path -LiteralPath $stderrPath) {
-        $offending = @(Get-Content -LiteralPath $stderrPath |
-            Where-Object { $_ -notmatch '^open-bus: ' -and $_ -notmatch '^\s*$' })
-        if ($offending.Count -gt 0) {
-            $stderrHead = ($offending | Select-Object -First 3) -join "; "
-            $result.invariant = "FAIL"
-            $result.notes += ("row wrote to stderr (an instrument armed, or the emulator " +
-                "complained): $stderrHead")
-            Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
-            return $result
-        }
-    }
-
-    # A run that wrote no profile, or wrote one that will not parse, is a run
-    # that told us NOTHING -- an emulator that crashed on start looks exactly
-    # like this. It used to report a third word, `no-profile`, which the exit
-    # check at the bottom did not count, so a sweep whose fixtures all crashed
-    # exited 0 and read as a clean sweep. It is a FAIL; the note is what says
-    # which kind of fail it is.
-    if (-not (Test-Path -LiteralPath $profilePath)) {
-        $result.invariant = "FAIL"
-        $result.notes += ("no profile JSON was written (the emulator crashed, or never " +
-            "started); exit code $exitCode")
-        Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
-        return $result
-    }
-
-    $profile = $null
     try {
+        Copy-Fixture (Join-Path $benchRoot $Fixture.folder) $workingCopy
+        Clear-FixtureOutputs $Fixture $workingCopy
+        $descriptor = Get-FixtureDescriptor $Fixture $workingCopy
+        $descriptor | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath `
+            (Join-Path $ScratchRoot "$stem.inputs.json") -Encoding utf8
+        $result.pin_context = New-PinContext $Fixture $descriptor
+        $arguments = Get-FixtureArguments $Fixture $workingCopy $Fixture.cycles $profilePath `
+            $(if ($Fixture.resultPpm) { $ppmPath } else { $null })
+        $start = @{
+            FilePath = $ExecutablePath; ArgumentList = $arguments
+            NoNewWindow = $true; PassThru = $true; Environment = Get-RowEnvironment
+            RedirectStandardOutput = $stdoutPath
+            RedirectStandardError = Join-Path $ScratchRoot "$stem.err"
+        }
+        $wall = [Diagnostics.Stopwatch]::StartNew()
+        $process = Start-Process @start
+        if ($ProcessorIndex -ge 0) { $process.ProcessorAffinity = [IntPtr]([int64]1 -shl $ProcessorIndex) }
+        $waited = Wait-WithLoadSampling $process $HostTimeoutSeconds
+        if ($waited.timedOut) {
+            $process.Kill($true); $process.WaitForExit()
+            throw "Capture exceeded $HostTimeoutSeconds seconds"
+        }
+        $wall.Stop()
+        $result.exit_code = $process.ExitCode
+        $result.host_wall_s = [Math]::Round($wall.Elapsed.TotalSeconds, 3)
+        $result.background_load = [Math]::Round((Get-Median ([double[]]$waited.samples)), 2)
+        $result.background_peak = if ($waited.samples.Count) {
+            [Math]::Round(($waited.samples | Measure-Object -Maximum).Maximum, 2)
+        } else { 0.0 }
+        $result.load_samples = $waited.samples.Count
+        $result.contaminated = $result.background_load -ge $maximumBackgroundLoadPercent
+        if ($result.contaminated) { $result.notes += "Background load exceeded $maximumBackgroundLoadPercent%" }
         $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-    } catch {
-        $profile = $null
-    }
-    if ($null -eq $profile -or $null -eq $profile.PSObject.Properties["perf"]) {
-        $result.invariant = "FAIL"
-        $result.notes += ("the profile JSON did not parse or carries no perf block " +
-            "(truncated by a crash mid-write?); exit code $exitCode")
-        Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
-        return $result
-    }
-
-    # Preserve the raw profile before validating the derived scoreboard fields. If a new or
-    # inconsistent counter contract fails below, the row fails but the evidence remains available.
-    if (-not [string]::IsNullOrWhiteSpace($KeepProfilesIn)) {
-        Copy-Item -LiteralPath $profilePath `
-            -Destination (Join-Path $KeepProfilesIn "$($Fixture.name).json") -Force
-    }
-
-    $result.real_time_factor = [math]::Round($profile.real_time_factor, 4)
-    $result.guest_seconds = [math]::Round($profile.guest_seconds, 3)
-    $result.wall_seconds = [math]::Round($profile.wall_seconds, 3)
-    # The guest-clock model epoch this row's rt/instruction counts were measured under (see
-    # izarravm_cpu::TIMING_MODEL_EPOCH). A profile JSON with no field predates the marker and
-    # is epoch 1. rt and final-instruction numbers are not comparable across epochs.
-    $epochProperty = $profile.PSObject.Properties["timing_model_epoch"]
-    $result.timing_model_epoch = if ($null -ne $epochProperty) {
-        [uint32]$epochProperty.Value
-    } else {
-        [uint32]1
-    }
-    $coverageFailure = $null
-    try {
+        Assert-FixtureCapture $Fixture $profile $process.ExitCode $Fixture.cycles
+        Assert-CaptureStderr $start.RedirectStandardError
+        $result.real_time_factor = [Math]::Round($profile.real_time_factor, 4)
+        $result.guest_seconds = [Math]::Round($profile.guest_seconds, 3)
+        $result.wall_seconds = [Math]::Round($profile.wall_seconds, 3)
+        $result.timing_model_epoch = $profile.timing_model_epoch
+        $result.stop = $profile.stop
         $null = Add-CoverageMetrics $result $profile
-    } catch {
-        $coverageFailure = $_.Exception.Message
-    }
-    $result.stop = $profile.stop
-
-    if ($backgroundLoad -ge $maximumBackgroundLoadPercent) {
-        $result.contaminated = $true
-        $result.notes += ("background load median {0}% over {1} samples, peak {2}%, threshold {3}%" -f
-            $backgroundLoad, $waited.samples.Count, $peakLoad, $maximumBackgroundLoadPercent)
-    }
-
-    # --- invariants -------------------------------------------------------
-    $failures = @()
-    if ($null -ne $coverageFailure) {
-        $failures += $coverageFailure
-    }
-
-    if ($null -ne $Fixture.realticsMinimum) {
-        if ($null -eq $profile.timedemo) {
-            $failures += "no timedemo line was produced"
-        } else {
-            $realtics = [int]$profile.timedemo.realtics
-            $gametics = [int]$profile.timedemo.gametics
-            $result.realtics = $realtics
-            $result.gametics = $gametics
-            if ($realtics -lt $Fixture.realticsMinimum -or
-                $realtics -gt $Fixture.realticsMaximum) {
-                $failures += ("realtics {0} outside [{1}, {2}]" -f
-                    $realtics, $Fixture.realticsMinimum, $Fixture.realticsMaximum)
-            }
-            if ($null -ne $Fixture.gametics -and $gametics -ne $Fixture.gametics) {
-                $failures += "gametics $gametics is not $($Fixture.gametics)"
-            }
-        }
-    }
-
-    if ($Fixture.qconsole) {
-        $logPath = Join-Path $workingCopy "QUAKE\ID1\QCONSOLE.LOG"
-        if (-not (Test-Path -LiteralPath $logPath)) {
-            $failures += "QCONSOLE.LOG was never written"
-        } else {
-            $lines = @(Get-Content -LiteralPath $logPath |
-                Where-Object { $_ -match "\d+\s+frames" })
-            if ($lines.Count -eq 0) {
-                $failures += "QCONSOLE.LOG has no timedemo result line"
-            } else {
-                $result.qconsole = $lines[-1].Trim()
-                if ($result.qconsole -notmatch "^969 frames") {
-                    $failures += "QCONSOLE result is '$($result.qconsole)', expected 969 frames"
+        $failures = @()
+        if ($null -ne $Fixture.gametics) {
+            $realtics = Get-RequiredUInt64Property $profile.timedemo 'realtics' 'profile.timedemo'
+            $gametics = Get-RequiredUInt64Property $profile.timedemo 'gametics' 'profile.timedemo'
+            $result.realtics = $realtics; $result.gametics = $gametics
+            if ($realtics -eq 0 -or $gametics -ne $Fixture.gametics) { $failures += 'Timedemo did not complete the declared gametics with positive realtics' }
+            if (Test-RowPin $Recorded $result 'realtics') {
+                if ($realtics -lt $Fixture.realticsMinimum -or $realtics -gt $Fixture.realticsMaximum) {
+                    $failures += 'Realtics differs from the qualified range'
                 }
             }
         }
-    }
-
-    $contract = Get-FrameContract $Fixture
-    if ($Fixture.resultPpm -and $null -eq $contract) {
-        $hash = Get-FileSha256 $ppmPath
-        if ($null -eq $hash) {
-            $failures += "no result PPM was written"
-        } else {
-            $result.frame_sha256 = $hash
+        if ($Fixture.qconsole) {
+            $result.qconsole = Read-ScoreboardQuakeResult (Join-Path $workingCopy 'QUAKE/ID1/QCONSOLE.LOG')
         }
-
-        $allowedProperty = $Fixture.PSObject.Properties['frame_sha256_allowed']
-        if ($null -ne $allowedProperty) {
-            $allowed = @($allowedProperty.Value)
-            $result.frame_sha256_allowed = $allowed
-            if ($exitCode -ne 0) { $failures += "emulator exit code is $exitCode, expected 0" }
-            if ($null -ne $hash -and -not (Test-Sha256Allowed $allowed $hash)) {
-                $failures += "frame hash $hash is not in the allowed set"
-            }
-
+        $contract = Get-FrameContract $Fixture
+        $allowed = Get-FixtureOption $Fixture 'frame_sha256_allowed'
+        if ($Fixture.resultPpm) {
             $stats = Get-PpmFrameStats $ppmPath
-            if ($null -eq $stats) {
-                $failures += "the result PPM did not parse as a P6 frame"
-            } else {
-                $result.final_frame_width = $stats.width
-                $result.final_frame_height = $stats.height
-                if ($stats.width -ne $Fixture.expected_width -or
-                    $stats.height -ne $Fixture.expected_height) {
-                    $failures += ("the final frame is {0}x{1}, expected {2}x{3}" -f
-                        $stats.width, $stats.height, $Fixture.expected_width,
-                        $Fixture.expected_height)
-                }
-            }
-
+            if ($null -eq $stats) { throw 'Result PPM is missing or malformed' }
+            $hash = Get-FileSha256 $ppmPath
+            $result.final_frame_width = $stats.width; $result.final_frame_height = $stats.height
             $result.final_display = $profile.active_display
-            $result.final_video_mode = $profile.legacy_video_mode
-            if ($profile.active_display -ne $Fixture.expected_display) {
-                $failures += ("the final display is '$($profile.active_display)', expected " +
-                    "'$($Fixture.expected_display)'")
+            if ([string]::IsNullOrWhiteSpace($result.final_display)) { throw 'Missing active_display' }
+            if ($contract) {
+                $result.final_frame_sha256 = $hash
+                $result.final_nonblack_pct = $stats.non_black_pct
+                $result.final_distinct_colors = $stats.distinct_colors
+            } else { $result.frame_sha256 = $hash }
+            if ($contract -or $allowed) {
+                $geometry = Test-RowPin $Recorded $result 'geometry'
+                $expectedWidth = if ($contract) { $contract.width } else { $Fixture.expected_width }
+                $expectedHeight = if ($contract) { $contract.height } else { $Fixture.expected_height }
+                $expectedDisplay = if ($contract) { $contract.display } else { $Fixture.expected_display }
+                $expectedMode = if ($contract) { $contract.mode } else { $Fixture.expected_video_mode }
+                if ($geometry -and ($stats.width -ne $expectedWidth -or $stats.height -ne $expectedHeight -or
+                    $profile.active_display -ne $expectedDisplay)) { $failures += 'Final geometry differs from the qualified phase' }
+                if ($profile.active_display -eq 'MargoLfb') {
+                    $result.final_bpp = Get-RequiredPositiveNumber $profile.margo_display 'bpp'
+                    $result.final_mode = $profile.margo_display.mode
+                    if ($geometry -and $contract -and $result.final_bpp -ne $contract.bpp) { $failures += 'Final bpp differs from the qualified phase' }
+                } else { $result.final_mode = $profile.legacy_video_mode }
+                if ([string]::IsNullOrWhiteSpace($result.final_mode)) { throw 'Missing final video mode' }
+                if ($geometry -and $result.final_mode -ne $expectedMode) { $failures += 'Final video mode differs from the qualified phase' }
             }
-            if ($profile.legacy_video_mode -ne $Fixture.expected_video_mode) {
-                $failures += ("the final video mode is '$($profile.legacy_video_mode)', " +
-                    "expected '$($Fixture.expected_video_mode)'")
-            }
-            # `stop.requested` is the wrong field for a row with an INPUT
-            # SCHEDULE: an injection schedule slices the run into one
-            # `run_until_halt_or_cycles` call per scancode/mouse packet plus
-            # one final call for the remainder, so `stop.requested` holds only
-            # the LAST slice's budget rather than the fixture's total
-            # `--cycles` (see the frame-contract block's own comment above
-            # `Invoke-AnchorRun` for the tombraid3d-586 case that first found
-            # this). `tyrian-specs-586` is the first row on THIS grading path
-            # to carry a schedule, and it gets the frame-contract block's own
-            # fix, not a weaker one: that block does not skip the check, it
-            # SUBSTITUTES `cycle_budget` / `elapsed_budget_clocks` for
-            # `stop.requested`, and the pair is strictly stronger -- it
-            # catches a wrong budget AND a run that ended early. Skipping the
-            # check outright would have been unsafe on exactly this row: the
-            # Ship Specs picture is static for the whole 10.5-guest-second
-            # tail of the budget, so a truncated `cycles` would still hash
-            # correctly and grade green while under-reporting the dwell's
-            # instruction and entry rates, which is the only thing this row
-            # exists to carry.
-            $probedInjection = $Fixture.PSObject.Properties['injection']
-            $hasSchedule = ($null -ne $probedInjection -and
-                @($probedInjection.Value).Count -gt 0)
-            if ($hasSchedule) {
-                if ($profile.stop.kind -ne "cycle_limit") {
-                    $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
-                        "'cycle_limit' -- the guest did not run the whole budget")
-                } elseif ([uint64]$profile.cycle_budget -ne (Get-EpochScaledCycles $Fixture.cycles)) {
-                    $failures += ("the run was given a budget of $($profile.cycle_budget) " +
-                        "cycles, expected the fixture's $(Get-EpochScaledCycles $Fixture.cycles)")
-                } elseif ([uint64]$profile.elapsed_budget_clocks -lt
-                    [uint64]$profile.cycle_budget) {
-                    $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
-                        "$($profile.cycle_budget) cycle budget -- it ended early")
-                }
-            } elseif ($profile.stop.kind -ne "cycle_limit" -or
-                [uint64]$profile.stop.requested -ne $Fixture.cycles) {
-                $failures += ("the run stopped as '$($profile.stop.kind)' at " +
-                    "$($profile.stop.requested), expected cycle_limit at $($Fixture.cycles)")
-            }
-            $stdout = if (Test-Path -LiteralPath $stdoutPath) {
-                Get-Content -LiteralPath $stdoutPath -Raw
-            } else { "" }
-            if ($stdout -notlike "*$($Fixture.stdout_contains)*") {
-                $failures += "stdout did not contain '$($Fixture.stdout_contains)'"
-            }
-        }
-    }
-
-    # FRAME CONTRACT rows. See New-FrameContract for the whole argument; the
-    # short version is that the end-of-budget frame hash is GONE and what
-    # replaces it is a cadence-stable anchor hash plus content bands.
-    #
-    # Everything measured here is graded in the driver against the sidecar,
-    # except the display class and the stop reason, which are fixture constants
-    # and are graded right here.
-    if ($null -ne $contract) {
-        $hash = Get-FileSha256 $ppmPath
-        if ($null -eq $hash) {
-            $failures += "no result PPM was written"
-        } else {
-            # A MEASUREMENT, never asserted. It is what an attribution cycle
-            # starts from when a band does move, and it is what makes the
-            # scoreboard.json of two builds diffable by eye -- but grading it is
-            # exactly the treadmill this row was rewritten to escape.
-            $result.final_frame_sha256 = $hash
-        }
-
-        $stats = Get-PpmFrameStats $ppmPath
-        if ($null -eq $stats) {
-            $failures += "the result PPM did not parse as a P6 frame"
-        } else {
-            $result.final_nonblack_pct = $stats.non_black_pct
-            $result.final_distinct_colors = $stats.distinct_colors
-            $result.final_frame_width = $stats.width
-            $result.final_frame_height = $stats.height
-            if ($stats.width -ne $contract.width -or $stats.height -ne $contract.height) {
-                $failures += ("the final frame is $($stats.width)x$($stats.height), " +
-                    "expected $($contract.width)x$($contract.height)")
-            }
-        }
-
-        # The display CLASS: which path painted the frame, at what depth and in
-        # what mode. Cadence cannot move any of it, and it is what separates
-        # "the game is rendering" from "the guest fell back to a text page" --
-        # a distinction the pixel bands alone do not draw, because a DOS screen
-        # full of error text is neither black nor single-coloured.
-        $result.final_display = $profile.active_display
-        if ($profile.active_display -ne $contract.display) {
-            $failures += ("the final frame came from display path " +
-                "'$($profile.active_display)', expected '$($contract.display)'")
-        }
-        # Depth and mode come from a different profile block per display path.
-        # Margo publishes a `margo_display` block; the legacy VGA scanout has no
-        # such block and reports `legacy_video_mode` instead, so demanding
-        # margo_display of every contract row locked this mechanism to Margo.
-        # psycho-486 is the first legacy-VGA contract row.
-        if ($contract.display -ne "MargoLfb") {
-            $legacy = $profile.PSObject.Properties['legacy_video_mode']
-            if ($null -eq $legacy -or $null -eq $legacy.Value) {
-                $failures += "the profile carries no legacy_video_mode for the final frame"
-            } else {
-                $result.final_mode = $legacy.Value
-                if ($legacy.Value -ne $contract.mode) {
-                    $failures += ("the final frame is legacy video mode " +
-                        "'$($legacy.Value)', expected '$($contract.mode)'")
+            if ($allowed) {
+                $result.frame_sha256_allowed = @($allowed)
+                if ((Test-RowPin $Recorded $result 'allowed_frames') -and -not (Test-Sha256Allowed $allowed $hash)) {
+                    $failures += 'Final frame is outside the qualified allowed set'
                 }
             }
-        } elseif ($null -eq ($margo = $profile.PSObject.Properties['margo_display']) -or
-            $null -eq $margo.Value) {
-            $failures += "the profile carries no margo_display block for the final frame"
-        } else {
-            $result.final_bpp = $margo.Value.bpp
-            $result.final_mode = $margo.Value.mode
-            if ([int]$margo.Value.bpp -ne $contract.bpp -or
-                $margo.Value.mode -ne $contract.mode) {
-                $failures += ("the final frame is bpp $($margo.Value.bpp) mode " +
-                    "$($margo.Value.mode), expected bpp $($contract.bpp) mode " +
-                    "$($contract.mode)")
+        }
+        $stdoutMarker = Get-FixtureOption $Fixture 'stdout_contains'
+        if ($stdoutMarker) {
+            $temporalMarker = $stdoutMarker -like 'video mode:*'
+            if (-not $temporalMarker -or (Test-RowPin $Recorded $result 'stdout_phase')) {
+                if ((Get-Content -LiteralPath $stdoutPath -Raw) -notlike "*$stdoutMarker*") { $failures += "Missing stdout marker '$stdoutMarker'" }
             }
         }
-
-        # The budget is what ends these two rows. A `test_exit` here would mean
-        # the guest quit to DOS and poked the exit port, i.e. the game died;
-        # anything else means it never reached the budget at all.
-        $result.stop_kind = $profile.stop.kind
-        #
-        # NOT `stop.requested`. An input schedule SLICES the run: the emulator
-        # runs to the first key, then to the second, and `stop.requested` holds
-        # the LAST SLICE's budget, not the total. MEASURED 2026-08-30 on
-        # tombraid3d-586, whose one key at 5e9 made a complete 19e9 run report
-        # `requested: 13999336000` and fail a check it had every right to pass.
-        # The two Glide rows are the first frame-contract rows to carry a
-        # schedule, which is why this sat here unhit.
-        #
-        # `cycle_budget` is the total the run was GIVEN and `elapsed_budget_clocks`
-        # is what it actually spent, so the pair is strictly stronger than the
-        # single field it replaces: it catches a wrong budget AND a run that
-        # ended early, where `stop.requested` only ever spoke to the first.
-        if ($profile.stop.kind -ne "cycle_limit") {
-            $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
-                "'cycle_limit' -- the guest did not run the whole budget")
-        } elseif ([uint64]$profile.cycle_budget -ne (Get-EpochScaledCycles $Fixture.cycles)) {
-            $failures += ("the run was given a budget of $($profile.cycle_budget) " +
-                "cycles, expected the fixture's $(Get-EpochScaledCycles $Fixture.cycles)")
-        } elseif ([uint64]$profile.elapsed_budget_clocks -lt [uint64]$profile.cycle_budget) {
-            $failures += ("the run spent $($profile.elapsed_budget_clocks) of its " +
-                "$($profile.cycle_budget) cycle budget -- it ended early")
-        }
-
-        $anchor = Invoke-AnchorRun $Fixture $ExecutablePath $ScratchRoot
-        $result.anchor_cycles = $contract.anchorCycles
-        $result.anchor_wall_s = $anchor.wall_s
-        if ($null -ne $anchor.failure) {
-            $failures += $anchor.failure
-        } else {
-            $result.anchor_frame_sha256 = $anchor.sha256
-            $result.anchor_display = $anchor.display
-            if ($anchor.display -ne $contract.anchorDisplay) {
-                $failures += ("the anchor frame came from display path " +
-                    "'$($anchor.display)', expected '$($contract.anchorDisplay)'")
+        if ($contract) {
+            $anchor = Invoke-AnchorRun $Fixture $ExecutablePath $ScratchRoot $KeepProfilesIn $result.pin_context.fixture_contract_sha256
+            $result.anchor_cycles = $contract.anchorCycles; $result.anchor_wall_s = $anchor.wall_s
+            if ($anchor.failure) { $failures += $anchor.failure }
+            else {
+                $result.anchor_frame_sha256 = $anchor.sha256; $result.anchor_display = $anchor.display
+                if ((Test-RowPin $Recorded $result 'anchor_geometry') -and $anchor.display -ne $contract.anchorDisplay) {
+                    $failures += 'Anchor display differs from the qualified phase'
+                }
             }
         }
-    }
-
+        $dukemarkResultPath = if ($Fixture.dukemark) { Get-ContainedPath $workingCopy $Fixture.dukemark.resultFile } else { $null }
+        $textResultsProperty = $Fixture.PSObject.Properties['textResults']
+        $textResultPaths = [ordered]@{}
+        if ($textResultsProperty -and $textResultsProperty.Value) {
+            foreach ($file in $textResultsProperty.Value.files) { $textResultPaths[$file] = Get-ContainedPath $workingCopy $file }
+        }
     # DUKEMARK. Four deterministic assertions and three reported measurements;
     # see New-DukemarkPins for why the split falls exactly there. There is no
     # framebuffer hash on this fixture at all any more: the old end-of-budget
@@ -3562,34 +3709,29 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         if ($hashes.Count -gt 0) { $result.text_result_sha256 = $hashes }
     }
 
-    # PROFILE BANDS. A row may pin dotted profile-JSON fields to [min, max]
-    # ranges. The Tyrian rows use them for the guest's own audio-clock
-    # liveness: MPU-401 MIDI byte counts and IRQ0 edge counts collapse to
-    # near-zero when the 70 Hz tick starves (the 2026-08-28 PIT write-edge
-    # bug), and no frame hash can see that. Bands are deliberately WIDE --
-    # they exist to catch collapse and runaway, not cadence drift; the
-    # derivation of each row's numbers is beside the row in the table.
-    # A row with bands also demands the cycle_limit stop: every band was
-    # derived over the full budget, so a short run would read as collapse.
-    $bandsProperty = $Fixture.PSObject.Properties['profileBands']
-    if ($null -ne $bandsProperty -and $bandsProperty.Value) {
-        if ($profile.stop.kind -ne "cycle_limit") {
-            $failures += ("the run stopped as '$($profile.stop.kind)', expected " +
-                "'cycle_limit' -- the profile bands were derived over the full budget")
+        if ($Fixture.name -eq 'mojo-586') {
+            Assert-MojoReports ([IO.File]::ReadAllText($textResultPaths['MOJO.TXT'])) `
+                ([IO.File]::ReadAllText($textResultPaths['MOJOV.TXT']))
         }
-        $graded = Test-ProfileBands $profile $bandsProperty.Value
-        foreach ($entry in $graded.values.GetEnumerator()) {
-            $result | Add-Member -Force -NotePropertyName $entry.Key -NotePropertyValue $entry.Value
+
+        $bands = Get-FixtureOption $Fixture 'profileBands'
+        if ($bands) {
+            $graded = Test-ProfileBands $profile $bands (Test-RowPin $Recorded $result 'profile_bands')
+            foreach ($entry in $graded.values.GetEnumerator()) { $result[$entry.Key] = $entry.Value }
+            $failures += $graded.failures
         }
-        $failures += $graded.failures
+        $result.invariant = if ($failures.Count) { 'FAIL' } else { 'pass' }
+        $result.notes += $failures
+    } catch {
+        $result.invariant = 'FAIL'
+        $result.notes += $_.Exception.Message
+    } finally {
+        Preserve-FixtureArtifacts $Fixture $ScratchRoot $stamp $workingCopy $KeepProfilesIn
+        if (Test-Path -LiteralPath $workingCopy) { Remove-Item -LiteralPath $workingCopy -Recurse -Force }
     }
-
-    $result.invariant = if ($failures.Count -eq 0) { "pass" } else { "FAIL" }
-    $result.notes += $failures
-
-    Remove-Item -LiteralPath $workingCopy -Recurse -Force -ErrorAction SilentlyContinue
     return $result
 }
+
 
 if ($SelfTest) {
     Invoke-ScoreboardSelfTest
@@ -3624,6 +3766,12 @@ if ($Fixtures.Count -gt 0) {
     $table = @($table | Where-Object { $selected -contains $_.name })
 }
 
+foreach ($fixture in $table) {
+    $source = Get-ContainedPath $benchRoot $fixture.folder
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "Missing fixture: $source" }
+    $null = Get-FixtureCdIdentity $fixture
+}
+
 if ([string]::IsNullOrWhiteSpace($ResultsDirectory)) {
     $suffix = if ([string]::IsNullOrWhiteSpace($Label)) { "" } else { "-$Label" }
     $ResultsDirectory = Join-Path $benchRoot "results" `
@@ -3643,293 +3791,9 @@ New-Item -ItemType Directory -Force -Path $profileArchive | Out-Null
 try {
     foreach ($fixture in $table) {
         Write-Host ("running {0} ..." -f $fixture.name) -NoNewline
-        $row = Invoke-Fixture $fixture $executablePath $scratchRoot $profileArchive
-
-        # Compare or record the framebuffer hash. `$row` is still an ordered
-        # hashtable here, so membership is Contains and NOT
-        # `PSObject.Properties.Name`, which on a hashtable enumerates Count and
-        # Keys rather than the entries and silently answers false for every
-        # lookup. That mistake made this whole comparison dead code once already.
-        $allowedHashProperty = $fixture.PSObject.Properties['frame_sha256_allowed']
-        if ($row.Contains("frame_sha256") -and $null -eq $allowedHashProperty) {
-            $expected = if ($invariants.Contains($fixture.name)) {
-                $invariants[$fixture.name].frame_sha256
-            } else { $null }
-
-            if ($RecordInvariants) {
-                if ($null -ne $expected -and $expected -ne $row.frame_sha256 -and -not $Force) {
-                    throw ("$($fixture.name) already has a recorded frame hash and this run " +
-                        "disagrees with it. Re-recording would erase the evidence of a real " +
-                        "change. Pass -Force only if you have established that the move is " +
-                        "legitimate.")
-                }
-                if (-not $invariants.Contains($fixture.name)) {
-                    $invariants[$fixture.name] = @{}
-                }
-                $invariants[$fixture.name].frame_sha256 = $row.frame_sha256
-                $row.notes += "frame hash recorded"
-            } elseif ($null -eq $expected) {
-                $row.notes += "no recorded frame hash to compare against"
-                if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
-            } elseif ($expected -ne $row.frame_sha256) {
-                $row.invariant = "FAIL"
-                $row.notes += "frame hash moved: expected $expected, got $($row.frame_sha256)"
-            }
-        } elseif ($RecordInvariants -and $null -ne $allowedHashProperty) {
-            $row.notes += "allowed frame set is hand-curated and was not re-recorded"
-        }
-
-        # TEXT RESULT hashes. Same sidecar, same -RecordInvariants / -Force
-        # machinery and the same three outcomes as the frame hash above. One
-        # file per key, so a row that grades two reports says WHICH of them
-        # moved instead of failing as a unit.
-        if ($row.Contains("text_result_sha256")) {
-            $recorded = if ($invariants.Contains($fixture.name)) {
-                $invariants[$fixture.name]
-            } else { $null }
-            $pinned = if ($null -ne $recorded -and $recorded.Contains("text_result_sha256")) {
-                $recorded.text_result_sha256
-            } else { $null }
-
-            foreach ($entry in $row.text_result_sha256.GetEnumerator()) {
-                $expectedText = if ($null -ne $pinned -and $pinned.Contains($entry.Key)) {
-                    $pinned[$entry.Key]
-                } else { $null }
-
-                if ($RecordInvariants) {
-                    if ($null -ne $expectedText -and $expectedText -ne $entry.Value -and -not $Force) {
-                        throw ("$($fixture.name) already has a recorded hash for " +
-                            "$($entry.Key) and this run disagrees with it. Re-recording " +
-                            "would erase the evidence of a real change. Pass -Force only " +
-                            "if you have established that the move is legitimate.")
-                    }
-                    if (-not $invariants.Contains($fixture.name)) {
-                        $invariants[$fixture.name] = @{}
-                    }
-                    if (-not $invariants[$fixture.name].Contains("text_result_sha256")) {
-                        $invariants[$fixture.name].text_result_sha256 = @{}
-                    }
-                    $invariants[$fixture.name].text_result_sha256[$entry.Key] = $entry.Value
-                    $row.notes += "$($entry.Key) hash recorded"
-                } elseif ($null -eq $expectedText) {
-                    $row.notes += "no recorded hash for $($entry.Key) to compare against"
-                    if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
-                } elseif ($expectedText -ne $entry.Value) {
-                    $row.invariant = "FAIL"
-                    $row.notes += ("$($entry.Key) moved: expected $expectedText, " +
-                        "got $($entry.Value)")
-                }
-            }
-        }
-
-        # The DUKEMARK extrapolation count, held to a band. Same sidecar, same
-        # -RecordInvariants / -Force machinery and the same three outcomes as the
-        # frame hash above: a moved pin is a reviewable one-line diff with the
-        # manifest sha moved beside it, never a hand edit inside this script.
-        # Unlike the hash it is a BAND, so what the sidecar carries is the centre
-        # and the tolerance, and only a value outside the band fails.
-        if ($row.Contains("dukemark_samples") -and $null -ne $row.dukemark_samples) {
-            $recorded = if ($invariants.Contains($fixture.name)) {
-                $invariants[$fixture.name]
-            } else { $null }
-            $pinned = if ($null -ne $recorded -and $recorded.Contains("dukemark_samples")) {
-                [int]$recorded.dukemark_samples
-            } else { $null }
-            $tolerance = if ($null -ne $recorded -and
-                $recorded.Contains("dukemark_samples_tolerance")) {
-                [double]$recorded.dukemark_samples_tolerance
-            } else { $dukemarkSampleTolerance }
-
-            if ($RecordInvariants) {
-                $allowed = if ($null -ne $pinned) {
-                    [math]::Max(1, [math]::Round($pinned * $tolerance))
-                } else { 0 }
-                if ($null -ne $pinned -and
-                    [math]::Abs($row.dukemark_samples - $pinned) -gt $allowed -and -not $Force) {
-                    throw ("$($fixture.name) already has a recorded DUKEMARK sample pin of " +
-                        "$pinned +/- $allowed and this run read $($row.dukemark_samples). " +
-                        "Re-recording would erase the evidence of a real change. Pass -Force " +
-                        "only if you have established that the move is legitimate.")
-                }
-                if (-not $invariants.Contains($fixture.name)) {
-                    $invariants[$fixture.name] = @{}
-                }
-                $invariants[$fixture.name].dukemark_samples = $row.dukemark_samples
-                $invariants[$fixture.name].dukemark_samples_tolerance = $tolerance
-                $row.notes += "DUKEMARK sample pin recorded ($($row.dukemark_samples) +/- $tolerance)"
-            } elseif ($null -eq $pinned) {
-                $row.notes += "no recorded DUKEMARK sample pin to compare against"
-                if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
-            } else {
-                $allowed = [math]::Max(1, [math]::Round($pinned * $tolerance))
-                $drift = [math]::Abs($row.dukemark_samples - $pinned)
-                $row.dukemark_samples_pin = $pinned
-                $row.dukemark_samples_drift = $drift
-                if ($drift -gt $allowed) {
-                    $row.invariant = "FAIL"
-                    $row.notes += ("DUKEMARK extrapolated $($row.dukemark_samples) samples " +
-                        "against a pin of $pinned +/- $allowed -- the demo stalled or did not " +
-                        "play to completion")
-                }
-            }
-        }
-
-        # FRAME CONTRACT grading. Same sidecar, same -RecordInvariants / -Force
-        # machinery and the same three outcomes as the two blocks above.
-        #
-        # The split between what -RecordInvariants will write and what it will
-        # not is the whole discipline of this design:
-        #
-        #   RECORDED from a run: the anchor hash (an exact value has an obvious
-        #   first observation) and the instruction centre (a point plus a fixed
-        #   tolerance, exactly like the DUKEMARK sample pin).
-        #
-        #   NEVER recorded from a run: the coverage and colour BANDS. A band
-        #   derived from a single sample is a band of width zero around whatever
-        #   that run happened to do, which is the fragile invariant this row was
-        #   rewritten to escape wearing a different hat. They are derived by hand
-        #   from a phase-spread measurement -- several budgets either side of the
-        #   pinned one -- and the derivation for the current numbers is written
-        #   out in the sidecar note. A row missing them reads `unpinned` and says
-        #   so, which is a loud, correct, non-vacuous state.
-        if ($row.Contains("anchor_frame_sha256") -or $row.Contains("final_nonblack_pct")) {
-            $contract = Get-FrameContract $fixture
-            $recorded = if ($invariants.Contains($fixture.name)) {
-                $invariants[$fixture.name]
-            } else { $null }
-            $key = "anchor_frame_sha256"
-            # @() around the WHOLE if-expression. An if used as an expression
-            # sends its result down the pipeline, and the pipeline unrolls a
-            # one-element array into the element itself -- so the inner @() is
-            # not enough and a single recorded anchor arrives here as a bare
-            # string with no .Count. Only the multi-phase row would have looked
-            # right, which is the worst way for this to be wrong.
-            $pinnedAnchors = @(if ($null -ne $recorded -and $recorded.Contains($key)) {
-                    $recorded[$key]
-                } else { @() })
-
-            if ($RecordInvariants) {
-                if (-not $invariants.Contains($fixture.name)) {
-                    $invariants[$fixture.name] = @{}
-                }
-                if ($row.Contains("anchor_frame_sha256")) {
-                    if ($pinnedAnchors -contains $row.anchor_frame_sha256) {
-                        $row.notes += "anchor frame hash already recorded"
-                    } elseif ($pinnedAnchors.Count -eq 0) {
-                        $invariants[$fixture.name][$key] = @($row.anchor_frame_sha256)
-                        $row.notes += "anchor frame hash recorded"
-                    } elseif (-not $Force) {
-                        throw ("$($fixture.name) already has $($pinnedAnchors.Count) " +
-                            "recorded anchor frame hash(es) and this run produced a new " +
-                            "one. The anchor is the row's only exact-frame invariant; " +
-                            "re-recording would erase the evidence of a real change. Pass " +
-                            "-Force only if you have established that the move is legitimate.")
-                    } elseif ($pinnedAnchors.Count -ge $contract.anchorPhases) {
-                        throw ("$($fixture.name) already holds its declared " +
-                            "$($contract.anchorPhases) anchor phase(s) and this run " +
-                            "produced yet another. The extra phases are enumerated and " +
-                            "explained in New-FrameContract; an unexplained one is a real " +
-                            "change and -Force will not absorb it. Re-derive the anchor.")
-                    } else {
-                        $invariants[$fixture.name][$key] = @($pinnedAnchors + $row.anchor_frame_sha256)
-                        $row.notes += ("anchor frame hash recorded as phase " +
-                            "$($pinnedAnchors.Count + 1) of $($contract.anchorPhases)")
-                    }
-                }
-                if ($row.Contains("instructions")) {
-                    $invariants[$fixture.name].final_instructions = $row.instructions
-                    if (-not $invariants[$fixture.name].Contains("final_instructions_tolerance")) {
-                        $invariants[$fixture.name].final_instructions_tolerance =
-                            $frameInstructionTolerance
-                    }
-                    # A fixed cycle_budget retires a different instruction count under a
-                    # different guest-clock model, so the pin is only valid within one
-                    # timing_model_epoch. Stamped alongside the pin so a later comparison
-                    # can refuse rather than silently grading across epochs.
-                    $invariants[$fixture.name].timing_model_epoch = $row.timing_model_epoch
-                    $row.notes += "final instruction pin recorded ($($row.instructions))"
-                }
-                # @() around the PIPELINE, not just its source: under StrictMode a
-                # one-element Where-Object result is a scalar with no .Count.
-                $missing = @(@("final_nonblack_percent_min", "final_nonblack_percent_max",
-                        "final_distinct_colors_min", "final_distinct_colors_max") |
-                    Where-Object { -not $invariants[$fixture.name].Contains($_) })
-                if ($missing.Count -gt 0) {
-                    $row.notes += ("content bands NOT recorded (by design): " +
-                        ($missing -join ", ") + " must be derived from a phase-spread " +
-                        "measurement and written into the sidecar by hand")
-                }
-            } else {
-                if ($row.Contains("anchor_frame_sha256")) {
-                    if ($pinnedAnchors.Count -eq 0) {
-                        $row.notes += "no recorded anchor frame hash to compare against"
-                        if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
-                    } elseif ($pinnedAnchors -notcontains $row.anchor_frame_sha256) {
-                        $row.invariant = "FAIL"
-                        $row.notes += ("anchor frame hash moved: got " +
-                            "$($row.anchor_frame_sha256), expected one of " +
-                            ($pinnedAnchors -join ", "))
-                    }
-                }
-
-                foreach ($band in @(
-                        @{ value = "final_nonblack_pct"; min = "final_nonblack_percent_min"
-                            max = "final_nonblack_percent_max"; label = "non-black coverage %" }
-                        @{ value = "final_distinct_colors"; min = "final_distinct_colors_min"
-                            max = "final_distinct_colors_max"; label = "distinct colours" })) {
-                    if (-not $row.Contains($band.value)) { continue }
-                    $hasBand = $null -ne $recorded -and $recorded.Contains($band.min) -and
-                        $recorded.Contains($band.max)
-                    if (-not $hasBand) {
-                        $row.notes += "no recorded band for $($band.label)"
-                        if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
-                        continue
-                    }
-                    $low = [double]$recorded[$band.min]
-                    $high = [double]$recorded[$band.max]
-                    $observed = [double]$row[$band.value]
-                    if ($observed -lt $low -or $observed -gt $high) {
-                        $row.invariant = "FAIL"
-                        $row.notes += ("$($band.label) is $observed, outside the band " +
-                            "[$low, $high] -- the end-of-budget picture is not the scene " +
-                            "this fixture renders")
-                    }
-                }
-
-                $instructionPin = if ($null -ne $recorded -and
-                    $recorded.Contains("final_instructions")) {
-                    [double]$recorded.final_instructions
-                } else { $null }
-                $epochCheck = Test-InstructionPinTimingEpoch $recorded ([uint32]$row.timing_model_epoch)
-                if ($row.Contains("instructions") -and $null -eq $instructionPin) {
-                    $row.notes += "no recorded final instruction pin to compare against"
-                    if ($row.invariant -eq "pass") { $row.invariant = "unpinned" }
-                } elseif ($row.Contains("instructions") -and $epochCheck.refused) {
-                    # REFUSE the comparison outright rather than grading a drift that has no
-                    # meaning: the recorded pin and this run's instruction count were charged
-                    # under different guest-clock models, so a fixed cycle_budget legitimately
-                    # retires a different number of instructions. Re-record with -RecordInvariants
-                    # -Force once the new epoch's pin has been established.
-                    $row.invariant = "FAIL"
-                    $row.notes += $epochCheck.note
-                } elseif ($row.Contains("instructions")) {
-                    $tolerance = if ($recorded.Contains("final_instructions_tolerance")) {
-                        [double]$recorded.final_instructions_tolerance
-                    } else { $frameInstructionTolerance }
-                    $drift = [math]::Abs([double]$row.instructions - $instructionPin) /
-                        $instructionPin
-                    $row.final_instructions_pin = [uint64]$instructionPin
-                    $row.final_instructions_drift = [math]::Round($drift, 5)
-                    if ($drift -gt $tolerance) {
-                        $row.invariant = "FAIL"
-                        $row.notes += ("retired instructions $($row.instructions) drifted " +
-                            ("{0:P3}" -f $drift) + " from the pin of $([uint64]$instructionPin) " +
-                            "against a tolerance of " + ("{0:P1}" -f $tolerance) +
-                            " -- the guest did not do this fixture's work")
-                    }
-                }
-            }
-        }
+        $recorded = if ($invariants.Contains($fixture.name)) { $invariants[$fixture.name] } else { $null }
+        $row = Invoke-Fixture $fixture $executablePath $scratchRoot $profileArchive $recorded
+        Complete-RowPins $fixture $row $invariants $RecordInvariants.IsPresent $Force.IsPresent
 
         $rows += [pscustomobject]$row
         Write-Host ("  {0}  rt {1}  load {2}%{3}" -f $row.invariant,
@@ -3952,10 +3816,12 @@ $summary = [ordered]@{
     knobs            = $resolvedKnobs
     recorded_at      = (Get-Date).ToString("o")
     executable       = $executablePath
+    executable_sha256 = Get-FileSha256 $executablePath
+    selected_fixtures = @($table.name)
     rows             = $rows
 }
 $jsonPath = Join-Path $ResultsDirectory "scoreboard.json"
-$summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $jsonPath -Encoding utf8
+$summary | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $jsonPath -Encoding utf8
 
 $markdown = @(Get-ScoreboardMarkdown $rows $Label $Arm $OneLookupStore $OneLookupLoad `
         $resolvedKnobs)

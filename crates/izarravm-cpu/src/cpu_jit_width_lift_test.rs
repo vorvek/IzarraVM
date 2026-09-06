@@ -44,6 +44,7 @@ use super::sixteen_bit::{
     arm_native_sixteen_bit, sixteen_bit_bus, sixteen_bit_code_cpu, warm_sixteen_bit,
 };
 use super::*;
+use crate::timing_class::TimingClass;
 
 const ENTRY: u32 = 0x100;
 
@@ -388,7 +389,8 @@ fn leave16_ssb0_pops_bp_and_restores_sp() {
         starts: &[0, 1, 2],
         instructions: 3,
         // 2 (inc) + 4 (the 0xC9 arm's clocks(4)) + 2 (inc).
-        raw_clocks: 8,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Leave),
         pages: &[0x0000, 0x1000],
         memory_len: 0x2000,
         arm: arm_leave16_ssb0,
@@ -444,7 +446,8 @@ fn leave16_ssb1_pops_bp_and_restores_esp() {
         code: &[0x40, 0x66, 0xC9, 0x41, 0xF4],
         starts: &[0, 1, 3],
         instructions: 3,
-        raw_clocks: 8,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Leave),
         pages: &[0x0000, 0x1_8000],
         memory_len: 0x2_0000,
         arm: arm_leave16_ssb1,
@@ -502,7 +505,8 @@ fn enter16_level0_pushes_bp_and_allocates_frame() {
         starts: &[0, 1, 5],
         instructions: 3,
         // 2 (inc) + 10 (the 0xC8 arm's clocks(10)) + 2 (inc).
-        raw_clocks: 14,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Enter),
         pages: &[0x0000, 0x1000],
         memory_len: 0x2000,
         arm: arm_enter16_ssb0,
@@ -563,7 +567,8 @@ fn enter16_ssb1_allocates_on_the_full_pointer() {
         code: &[0x40, 0x66, 0xC8, 0x10, 0x00, 0x00, 0x41, 0xF4],
         starts: &[0, 1, 6],
         instructions: 3,
-        raw_clocks: 14,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Enter),
         pages: &[0x0000, 0x1_8000],
         memory_len: 0x2_0000,
         arm: arm_enter16_ssb1,
@@ -723,7 +728,9 @@ fn enter16_and_leave16_on_a_thirty_two_bit_stack_in_a_sixteen_bit_segment() {
         starts: &[0, 1, 5, 6],
         instructions: 4,
         // 2 (inc) + 10 (ENTER) + 4 (LEAVE) + 2 (inc).
-        raw_clocks: 18,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Enter)
+            + crate::timing_class::I586.raw(TimingClass::Leave),
         pages: &[0x0000, 0x8000, 0x1_8000],
         memory_len: 0x2_0000,
         arm: arm_sixteen_bit_code_thirty_two_bit_stack,
@@ -797,7 +804,9 @@ fn enter16_and_leave16_on_a_sixteen_bit_stack_in_a_flat_segment() {
         code: &[0x40, 0x66, 0xC8, 0x10, 0x00, 0x00, 0x66, 0xC9, 0x41, 0xF4],
         starts: &[0, 1, 6, 8],
         instructions: 4,
-        raw_clocks: 18,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Enter)
+            + crate::timing_class::I586.raw(TimingClass::Leave),
         pages: &[0x0000, 0xf000],
         memory_len: 0x1_0000,
         arm: arm_flat_code_sixteen_bit_stack,
@@ -866,7 +875,8 @@ fn lea16_writes_low_half_only() {
         starts: &[0, 1, 4],
         instructions: 3,
         // 2 (inc) + 2 (the 0x8D arm's clocks(2)) + 2 (inc).
-        raw_clocks: 6,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Lea),
         pages: &[0x0000],
         memory_len: 0x2000,
         arm: arm_lea16,
@@ -912,7 +922,8 @@ fn lea16_at_a_dword_address_size_keeps_the_high_half() {
         code: &[0x41, 0x66, 0x8D, 0x45, 0x22, 0x42, 0xF4],
         starts: &[0, 1, 5],
         instructions: 3,
-        raw_clocks: 6,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Lea),
         pages: &[0x0000, 0x1_0000],
         memory_len: 0x2_0000,
         arm: arm_lea16_dword_address,
@@ -963,7 +974,10 @@ fn cld_word_row_is_native() {
         starts: &[0, 1, 2, 3, 4],
         instructions: 5,
         // 2 + 2 + 2 + 2 + 2: the DF arms ride the `_ => 2` default, as the interpreter does.
-        raw_clocks: 10,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::FlagOp)
+            + crate::timing_class::I586.raw(TimingClass::FlagOp)
+            + crate::timing_class::I586.raw(TimingClass::FlagOp),
         pages: &[0x0000],
         memory_len: 0x2000,
         arm: arm_cld,
@@ -991,7 +1005,9 @@ fn std_word_row_is_native() {
         code: &[0x40, 0xFC, 0xFD, 0x41, 0xF4],
         starts: &[0, 1, 2, 3],
         instructions: 4,
-        raw_clocks: 8,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::FlagOp)
+            + crate::timing_class::I586.raw(TimingClass::FlagOp),
         pages: &[0x0000],
         memory_len: 0x2000,
         arm: arm_cld,
@@ -1067,7 +1083,8 @@ fn push_ss16_ssb0_stores_the_stack_selector() {
         starts: &[0, 1, 2],
         instructions: 3,
         // 2 (inc) + 2 (the 0x16 arm's clocks(2)) + 2 (inc).
-        raw_clocks: 6,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::PushSeg),
         pages: &[0x0000, 0x1000],
         memory_len: 0x2000,
         arm: arm_push_ss16,
@@ -1108,7 +1125,8 @@ fn push_ss32_ssb1_stores_the_zero_extended_selector() {
         code: &[0x40, 0x16, 0x41, 0xF4],
         starts: &[0, 1, 2],
         instructions: 3,
-        raw_clocks: 6,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::PushSeg),
         pages: &[0x0000, 0x1000],
         memory_len: 0x2000,
         arm: arm_push_ss32,
@@ -1149,7 +1167,8 @@ fn push_ss16_prefixed_wraps_the_pointer_and_keeps_the_upper_half() {
         code: &[0x40, 0x66, 0x16, 0x41, 0xF4],
         starts: &[0, 1, 3],
         instructions: 3,
-        raw_clocks: 6,
+        raw_clocks: 2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::PushSeg),
         pages: &[0x0000, 0xf000],
         memory_len: 0x1_0000,
         arm: arm_push_ss_wrap,

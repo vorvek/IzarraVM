@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use crate::timing_class::TimingClass;
 
 #[test]
 fn mode13_read_self_loop_respects_the_tight_native_deadline() {
@@ -220,7 +221,8 @@ fn movzx_memory_forms_declare_their_read_width() {
         // clocks(3) per interpreter arm, three slots, minus the two register moves at 2 each.
         assert_eq!(
             block.raw_clocks(),
-            3 + 2 + 2,
+            crate::timing_class::I586.raw(TimingClass::MovExtend)
+                + 2 * crate::timing_class::I586.raw(TimingClass::Reg),
             "{label}: charged core clocks"
         );
     }
@@ -507,7 +509,12 @@ fn imul_memory_form_declares_its_read_and_its_segment() {
     assert_eq!(block.dword_reads(), 1, "dword-read declaration");
     // clocks(9) for the IMUL per the interpreter's 0x0faf arm, plus 2 each for the two moves. The
     // DirectKind default is 2, so a missing raw_clocks arm shows up here as 2 + 2 + 2.
-    assert_eq!(block.raw_clocks(), 9 + 2 + 2, "charged core clocks");
+    assert_eq!(
+        block.raw_clocks(),
+        crate::timing_class::I586.raw(TimingClass::ImulRm)
+            + 2 * crate::timing_class::I586.raw(TimingClass::Reg),
+        "charged core clocks"
+    );
     // `has_dword_read` feeds the block's `has_wide_accesses`, which run.rs consults before running
     // a block while #AC is armed at CPL 3. Nothing else in this file reads it.
     assert!(block.has_wide_accesses(), "wide-access declaration");
@@ -610,7 +617,11 @@ fn control_word_forms_declare_a_word_access_and_their_segment() {
         // 2 for the MOV and 2 for the register move. The x87 slot contributes ZERO here: its cost
         // is `weighted_fp_clocks`, and an added `Self::X87` arm in `DirectKind::raw_clocks` would
         // double-charge it.
-        assert_eq!(block.raw_clocks(), 2 + 2, "{label}: charged core clocks");
+        assert_eq!(
+            block.raw_clocks(),
+            2 * crate::timing_class::I586.raw(TimingClass::Reg),
+            "{label}: charged core clocks"
+        );
 
         // read_segment / write_segment. Defaulting to None keeps DS out of the block's
         // SegmentLayout mask, and `data_matches` SKIPS every segment outside that mask, so a
@@ -1280,7 +1291,12 @@ fn grp3_imul_memory_form_declares_its_read_and_its_segment() {
     assert!(block.has_wide_accesses(), "wide-access declaration");
     // Group 3 returns clocks(2) for every sub-opcode and both operand forms, so all three slots
     // charge 2. A raw_clocks arm added here by analogy with ImulMem's 9 shows up as 9 + 2 + 2.
-    assert_eq!(block.raw_clocks(), 2 + 2 + 2, "charged core clocks");
+    assert_eq!(
+        block.raw_clocks(),
+        crate::timing_class::I586.raw(TimingClass::Mul32)
+            + 2 * crate::timing_class::I586.raw(TimingClass::Reg),
+        "charged core clocks"
+    );
 
     assert!(
         cpu.jit_direct
@@ -1780,7 +1796,12 @@ fn grp3_mul_memory_form_declares_its_read_and_its_segment() {
     assert_eq!(block.word_reads(), 0, "no word read");
     assert_eq!(block.dword_reads(), 1, "dword-read declaration");
     assert!(block.has_wide_accesses(), "wide-access declaration");
-    assert_eq!(block.raw_clocks(), 2 + 2 + 2, "charged core clocks");
+    assert_eq!(
+        block.raw_clocks(),
+        crate::timing_class::I586.raw(TimingClass::Mul32)
+            + 2 * crate::timing_class::I586.raw(TimingClass::Reg),
+        "charged core clocks"
+    );
 
     assert!(
         cpu.jit_direct
@@ -3335,7 +3356,7 @@ fn loopcc_rows_spelling_table_names_both_arms() {
 struct DirectTimingCase {
     name: &'static str,
     opcode: &'static [u8],
-    expected_raw_clocks: u32,
+    core_class: Option<TimingClass>,
     terminal: bool,
     eflags: u32,
 }
@@ -3345,287 +3366,287 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         DirectTimingCase {
             name: "mov register",
             opcode: &[0x89, 0xc8],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "mov byte register",
             opcode: &[0x88, 0xcc],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "mov immediate",
             opcode: &[0xb8, 0x78, 0x56, 0x34, 0x12],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovImmReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "mov byte immediate",
             opcode: &[0xb4, 0x7f],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovImmReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "lea",
             opcode: &[0x8d, 0x44, 0x8b, 0x10],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Lea),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "inc register",
             opcode: &[0x40],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x203,
         },
         DirectTimingCase {
             name: "alu register",
             opcode: &[0x01, 0xc8],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "alu immediate",
             opcode: &[0x83, 0xc0, 0x01],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "alu byte immediate",
             opcode: &[0x80, 0xc4, 0x01],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "alu memory source",
             opcode: &[0x03, 0x05, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::AluRegMem),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "alu dword memory destination",
             opcode: &[0x01, 0x0d, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::AluMemReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "alu byte memory destination",
             opcode: &[0x80, 0x05, 0x00, 0x30, 0x00, 0x00, 0x01],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::AluMemReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "compare memory destination",
             opcode: &[0x83, 0x3d, 0x00, 0x30, 0x00, 0x00, 0x01],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::AluRegMem),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "test register",
             opcode: &[0x85, 0xc0],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x203,
         },
         DirectTimingCase {
             name: "shift register",
             opcode: &[0xc1, 0xe8, 0x01],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::ShiftImm),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "load byte",
             opcode: &[0x8a, 0x05, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovRegMem),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "load dword",
             opcode: &[0x8b, 0x05, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovRegMem),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "store byte",
             opcode: &[0x88, 0x0d, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovMemReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "store dword",
             opcode: &[0x89, 0x0d, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovMemReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "moffs load byte",
             opcode: &[0xa0, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 8,
+            core_class: Some(TimingClass::MovAccMoffs),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "moffs load dword",
             opcode: &[0xa1, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 8,
+            core_class: Some(TimingClass::MovAccMoffs),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "moffs store byte",
             opcode: &[0xa2, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 8,
+            core_class: Some(TimingClass::MovAccMoffs),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "moffs store dword",
             opcode: &[0xa3, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 8,
+            core_class: Some(TimingClass::MovAccMoffs),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "store byte immediate",
             opcode: &[0xc6, 0x05, 0x00, 0x30, 0x00, 0x00, 0x7f],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovImmMem),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "store dword immediate",
             opcode: &[0xc7, 0x05, 0x00, 0x30, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::MovImmMem),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "memory inc",
             opcode: &[0xff, 0x05, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::IncDecRm),
             terminal: false,
             eflags: 0x203,
         },
         DirectTimingCase {
             name: "push register",
             opcode: &[0x50],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::PushReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "push immediate",
             opcode: &[0x68, 0x78, 0x56, 0x34, 0x12],
-            expected_raw_clocks: 6,
+            core_class: Some(TimingClass::PushImm),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "pop register",
             opcode: &[0x58],
-            expected_raw_clocks: 8,
+            core_class: Some(TimingClass::PopReg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "call relative",
             opcode: &[0xe8, 0x20, 0x00, 0x00, 0x00],
-            expected_raw_clocks: 7,
+            core_class: Some(TimingClass::CallJmpRel),
             terminal: true,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "jump near",
             opcode: &[0xe9, 0x20, 0x00, 0x00, 0x00],
-            expected_raw_clocks: 7,
+            core_class: Some(TimingClass::CallJmpRel),
             terminal: true,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "jump short",
             opcode: &[0xeb, 0x20],
-            expected_raw_clocks: 7,
+            core_class: Some(TimingClass::CallJmpRel),
             terminal: true,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "return",
             opcode: &[0xc3],
-            expected_raw_clocks: 10,
+            core_class: Some(TimingClass::RetNear),
             terminal: true,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "return and release",
             opcode: &[0xc2, 0x08, 0x00],
-            expected_raw_clocks: 10,
+            core_class: Some(TimingClass::RetNearImm),
             terminal: true,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "short jcc fallthrough",
             opcode: &[0x74, 0x20],
-            expected_raw_clocks: 3,
+            core_class: Some(TimingClass::Jcc),
             terminal: true,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "short jcc taken",
             opcode: &[0x74, 0x20],
-            expected_raw_clocks: 3,
+            core_class: Some(TimingClass::Jcc),
             terminal: true,
             eflags: 0x242,
         },
         DirectTimingCase {
             name: "near jcc fallthrough",
             opcode: &[0x0f, 0x85, 0x20, 0x00, 0x00, 0x00],
-            expected_raw_clocks: 3,
+            core_class: Some(TimingClass::Jcc),
             terminal: true,
             eflags: 0x242,
         },
         DirectTimingCase {
             name: "near jcc taken",
             opcode: &[0x0f, 0x85, 0x20, 0x00, 0x00, 0x00],
-            expected_raw_clocks: 3,
+            core_class: Some(TimingClass::Jcc),
             terminal: true,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "x87 register",
             opcode: &[0xd8, 0xc0],
-            expected_raw_clocks: 4,
+            core_class: None,
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "x87 memory load",
             opcode: &[0xd9, 0x05, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 4,
+            core_class: None,
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "x87 memory store and pop",
             opcode: &[0xd9, 0x1d, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 4,
+            core_class: None,
             terminal: false,
             eflags: 0x202,
         },
@@ -3646,21 +3667,21 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         DirectTimingCase {
             name: "x87 sti register binary",
             opcode: &[0xdc, 0xc8],
-            expected_raw_clocks: 4,
+            core_class: None,
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "x87 fldcw m16",
             opcode: &[0xd9, 0x2d, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 4,
+            core_class: None,
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "x87 fnstcw m16",
             opcode: &[0xd9, 0x3d, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 4,
+            core_class: None,
             terminal: false,
             eflags: 0x202,
         },
@@ -3679,14 +3700,14 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         DirectTimingCase {
             name: "three-operand imul register imm32",
             opcode: &[0x69, 0xd8, 0x03, 0x00, 0x00, 0x00],
-            expected_raw_clocks: 14 + 2 + 2,
+            core_class: Some(TimingClass::ImulImm),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "three-operand imul register imm8",
             opcode: &[0x6b, 0xd8, 0x03],
-            expected_raw_clocks: 14 + 2 + 2,
+            core_class: Some(TimingClass::ImulImm),
             terminal: false,
             eflags: 0x202,
         },
@@ -3698,14 +3719,14 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         DirectTimingCase {
             name: "byte alu register destination",
             opcode: &[0x38, 0xc1],
-            expected_raw_clocks: 2 + 2 + 2,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x202,
         },
         DirectTimingCase {
             name: "byte alu register source",
             opcode: &[0x3a, 0xc1],
-            expected_raw_clocks: 2 + 2 + 2,
+            core_class: Some(TimingClass::Reg),
             terminal: false,
             eflags: 0x202,
         },
@@ -3715,7 +3736,7 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         DirectTimingCase {
             name: "byte alu memory source",
             opcode: &[0x02, 0x1d, 0x00, 0x30, 0x00, 0x00],
-            expected_raw_clocks: 2 + 2 + 2,
+            core_class: Some(TimingClass::AluRegMem),
             terminal: false,
             eflags: 0x202,
         },
@@ -3799,7 +3820,13 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
     let block = install_fixture_block(&mut direct, ENTRY);
     assert_eq!(
         block.raw_clocks(),
-        case.expected_raw_clocks,
+        case.core_class
+            .map_or(0, |class| direct.class_table().raw(class))
+            + if case.terminal {
+                0
+            } else {
+                2 * direct.class_table().raw(TimingClass::Reg)
+            },
         "{} {mode:?} raw core table",
         case.name
     );
@@ -5151,7 +5178,12 @@ fn movzx_register_form_declares_no_memory_and_three_clocks() {
     assert_eq!(block.dword_reads(), 0, "no dword read");
     assert!(!block.has_wide_accesses(), "no wide access");
     // clocks(3) for the MOVZX per every interpreter arm, plus 2 each for the two register moves.
-    assert_eq!(block.raw_clocks(), 3 + 2 + 2, "charged core clocks");
+    assert_eq!(
+        block.raw_clocks(),
+        crate::timing_class::I586.raw(TimingClass::MovExtend)
+            + 2 * crate::timing_class::I586.raw(TimingClass::Reg),
+        "charged core clocks"
+    );
 }
 
 #[test]
@@ -6346,76 +6378,73 @@ fn fild_m64_above_2_32_and_2_53_matches_the_interpreter_mid_block() {
 #[test]
 fn rep_legacy_native_prefix_and_interpreted_invoice_conserve_each_return() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        for epoch in [1, 2] {
-            let mut native = fresh();
-            let mut interp = fresh();
-            for cpu in [&mut native, &mut interp] {
-                cpu.set_mode(mode);
-                cpu.set_timing_epoch(epoch);
-                cpu.registers.set_ecx(2);
-                cpu.registers.set_esi(0x2000);
-                cpu.registers.set_edi(0x3000);
-            }
-            let mut memory = vec![0; 0x4000];
-            memory[0x100..0x10a]
-                .copy_from_slice(&[0x90, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0xf3, 0xa4, 0xf4]);
-            memory[0x2000..0x2002].copy_from_slice(&[0x41, 0x52]);
-            let mut native_bus = TestBus::with_memory(memory.clone());
-            let mut interp_bus = TestBus::with_memory(memory);
-            for (cpu, bus) in [
-                (&mut native, &mut native_bus),
-                (&mut interp, &mut interp_bus),
-            ] {
-                bus.uniform_native_fetches = true;
-                bus.direct_pages_enabled = true;
-                bus.direct_page_clocks = true;
-                bus.report_batch_clocks = true;
-                decode_fixture(
-                    cpu,
-                    bus,
-                    &[
-                        0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106, 0x107, 0x109,
-                    ],
-                );
-                cpu.registers.eip = 0x100;
-            }
-            native.set_jit_auto_admit(true);
-            let block = install_fixture_block(&mut native, 0x101);
-            assert_eq!(block.span().instructions, 6);
-            interp.set_native_backend_enabled(false);
-            let mut returned = [0, 0];
-            for (index, cpu, bus) in [
-                (0, &mut native, &mut native_bus),
-                (1, &mut interp, &mut interp_bus),
-            ] {
-                while cpu.registers.eip < 0x109 {
-                    let before = cpu.elapsed_clocks;
-                    let result = cpu.run_budgeted(bus, u64::MAX).unwrap();
-                    assert_eq!(cpu.elapsed_clocks - before, result.consumed_core_clocks);
-                    returned[index] += result.consumed_core_clocks;
-                }
-                assert_eq!(cpu.registers.ecx(), 0);
-                assert_eq!(cpu.registers.ebx(), 6);
-                assert_eq!(&bus.memory[0x3000..0x3002], &[0x41, 0x52]);
-                assert_eq!(cpu.perf.rep_string_iterations, 2);
-                assert!(cpu.rep_execution.resume.is_none());
-            }
-            assert!(
-                native.perf.jit_direct_insns >= 6,
-                "{mode:?} E{epoch} {:?}",
-                native.perf_counters()
-            );
-            assert_eq!(interp.perf.jit_direct_insns, 0);
-            assert_eq!(returned[0], returned[1]);
-            assert_eq!(native.timing_rem, interp.timing_rem);
-            assert_eq!(
-                crate::tests::settled_registers(&native),
-                crate::tests::settled_registers(&interp)
-            );
-            assert_eq!(
-                native_bus.trace.elapsed_clocks(),
-                interp_bus.trace.elapsed_clocks()
-            );
+        let mut native = fresh();
+        let mut interp = fresh();
+        for cpu in [&mut native, &mut interp] {
+            cpu.set_mode(mode);
+            cpu.registers.set_ecx(2);
+            cpu.registers.set_esi(0x2000);
+            cpu.registers.set_edi(0x3000);
         }
+        let mut memory = vec![0; 0x4000];
+        memory[0x100..0x10a]
+            .copy_from_slice(&[0x90, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0xf3, 0xa4, 0xf4]);
+        memory[0x2000..0x2002].copy_from_slice(&[0x41, 0x52]);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            bus.uniform_native_fetches = true;
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.report_batch_clocks = true;
+            decode_fixture(
+                cpu,
+                bus,
+                &[
+                    0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106, 0x107, 0x109,
+                ],
+            );
+            cpu.registers.eip = 0x100;
+        }
+        native.set_jit_auto_admit(true);
+        let block = install_fixture_block(&mut native, 0x101);
+        assert_eq!(block.span().instructions, 6);
+        interp.set_native_backend_enabled(false);
+        let mut returned = [0, 0];
+        for (index, cpu, bus) in [
+            (0, &mut native, &mut native_bus),
+            (1, &mut interp, &mut interp_bus),
+        ] {
+            while cpu.registers.eip < 0x109 {
+                let before = cpu.elapsed_clocks;
+                let result = cpu.run_budgeted(bus, u64::MAX).unwrap();
+                assert_eq!(cpu.elapsed_clocks - before, result.consumed_core_clocks);
+                returned[index] += result.consumed_core_clocks;
+            }
+            assert_eq!(cpu.registers.ecx(), 0);
+            assert_eq!(cpu.registers.ebx(), 6);
+            assert_eq!(&bus.memory[0x3000..0x3002], &[0x41, 0x52]);
+            assert_eq!(cpu.perf.rep_string_iterations, 2);
+            assert!(cpu.rep_execution.resume.is_none());
+        }
+        assert!(
+            native.perf.jit_direct_insns >= 6,
+            "{mode:?} E2 {:?}",
+            native.perf_counters()
+        );
+        assert_eq!(interp.perf.jit_direct_insns, 0);
+        assert_eq!(returned[0], returned[1]);
+        assert_eq!(native.timing_rem, interp.timing_rem);
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp)
+        );
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
     }
 }

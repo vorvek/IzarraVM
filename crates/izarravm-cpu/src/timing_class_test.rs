@@ -1,34 +1,13 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Tests for the timing class table (slice 1a).
-//!
-//! They cover the shape of the table -- density, the epoch-1 pin, the persona
-//! and epoch selection, the `Legacy` escape and the unsourced census. The proof
-//! that a SITE is routed to the right class lives elsewhere, in the several
-//! hundred exact-clock assertions the tree already carries; see
-//! `EPOCH1_FIXTURE`'s comment.
+//! Timing-table density, persona selection, and literal I386 class prices.
 
 use super::*;
 use izarravm_core::CpuPersona;
 
-/// The epoch-1 column, restated class by class as a PIN.
-///
-/// Each entry is the literal the class's charge sites carried at the fork point
-/// (`origin/vorvek/timing-epoch2-ports`): `Ok(clocks(N))` in `execute.rs` /
-/// `execute_extended.rs` / `fpu_exec.rs` / `run.rs`, or the named
-/// `*_CORE_CLOCKS` constant in `lib.rs`.
-///
-/// What this pin is and is not. It is NOT the independent check that routing is
-/// correct -- the tree already has that, in the several hundred exact-clock
-/// assertions across `cpu_test.rs`, `cpu_jit_direct_timing_test.rs`,
-/// `cpu_jit_interpret_one_test.rs` and the board fixtures, every one of which
-/// goes red if a site is routed to a class whose epoch-1 value differs by even
-/// one clock. What it IS: a guard against a later sub-slice editing an EPOCH-1
-/// entry while re-solving an epoch-2 column beside it, which no per-opcode test
-/// would attribute to the table. Change a value here only with the matching
-/// per-opcode test change.
-const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
+// Per-opcode routing is checked by the interpreter and native execution fixtures.
+const I386_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::Reg, 2),
     (TimingClass::AluRegMem, 2),
     (TimingClass::AluMemReg, 2),
@@ -81,6 +60,7 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::LoopCc, 11),
     (TimingClass::Jcxz, 9),
     (TimingClass::Nop, 3),
+    (TimingClass::Hlt, 5),
     (TimingClass::IntN, 37),
     (TimingClass::IntNV86, 37),
     (TimingClass::IntNPm, 37),
@@ -203,27 +183,25 @@ const EPOCH1_FIXTURE: &[(TimingClass, u16)] = &[
     (TimingClass::X87ComparePop, 5),
 ];
 
-/// Every table-backed class must have a pinned epoch-1 value, and the pin must
-/// be what `EPOCH1` charges. See `EPOCH1_FIXTURE`'s doc comment for what this
-/// does and does not prove.
+/// Every I386 class must match its independently recorded literal.
 #[test]
-fn epoch_one_charges_the_pinned_literal_for_every_class() {
+fn i386_charges_the_pinned_literal_for_every_class() {
     assert_eq!(
-        EPOCH1_FIXTURE.len(),
+        I386_FIXTURE.len(),
         N_CLASSES,
-        "every class needs an epoch-1 pin; the fixture and the enum disagree"
+        "every class needs an I386 pin; the fixture and the enum disagree"
     );
-    for (class, literal) in EPOCH1_FIXTURE {
+    for (class, literal) in I386_FIXTURE {
         assert_eq!(
-            EPOCH1.raw(*class),
+            I386.raw(*class),
             u32::from(*literal),
-            "{} charges the wrong epoch-1 literal",
+            "{} charges the wrong I386 literal",
             class.name()
         );
     }
     // And the pins are in table order, so a class inserted in the middle of the
     // list cannot silently shift every pin below it onto its neighbour.
-    for (index, (class, _)) in EPOCH1_FIXTURE.iter().enumerate() {
+    for (index, (class, _)) in I386_FIXTURE.iter().enumerate() {
         assert_eq!(
             class.index(),
             index,
@@ -239,16 +217,12 @@ fn epoch_one_charges_the_pinned_literal_for_every_class() {
 /// the VALUE -- a `0` entry would silently make an instruction free.
 #[test]
 fn every_class_charges_something_in_every_persona_table() {
-    for table in [&EPOCH1, &EPOCH2_I486, &EPOCH2_I586] {
+    for table in [&I386, &I486, &I586] {
         for class in TimingClass::ALL {
-            // `TaskSwitch` is the one class whose epoch-1 entry is not a literal
-            // it replaced: no task-switch term existed at all before slice 8
-            // (the census scores that as under by 100x or more), and inventing
-            // one at epoch 1 would break the knob-unset identity bar. Its
-            // epoch-2 columns are real and are asserted instead.
+            // I386 retains no separate task-switch charge; both fast tables charge it.
             if *class == TimingClass::TaskSwitch {
-                assert_eq!(EPOCH1.raw(*class), 0);
-                assert!(EPOCH2_I486.raw(*class) > 0 && EPOCH2_I586.raw(*class) > 0);
+                assert_eq!(I386.raw(*class), 0);
+                assert!(I486.raw(*class) > 0 && I586.raw(*class) > 0);
                 continue;
             }
             assert!(
@@ -261,47 +235,18 @@ fn every_class_charges_something_in_every_persona_table() {
     }
 }
 
-/// Epoch 1 is byte-identical for every persona BY CONSTRUCTION: one table, no
-/// persona arm. This is the property the knob-unset identity fixture rests on,
-/// stated as a test so a future persona arm cannot be added without noticing.
+/// Each persona selects its own table.
 #[test]
-fn epoch_one_resolves_to_one_table_for_every_persona() {
-    for persona in [CpuPersona::I386, CpuPersona::I486, CpuPersona::I586] {
-        assert!(
-            std::ptr::eq(class_table(persona, 1), &EPOCH1),
-            "{persona:?} must resolve to the epoch-1 table under epoch 1"
-        );
-    }
+fn each_persona_selects_its_column() {
+    assert!(std::ptr::eq(class_table(CpuPersona::I386), &I386));
+    assert!(std::ptr::eq(class_table(CpuPersona::I486), &I486));
+    assert!(std::ptr::eq(class_table(CpuPersona::I586), &I586));
 }
 
-/// The 386 is out of the recalibration's scope (design section 9.9), so it must
-/// stay on the epoch-1 column under epoch 2 as well -- otherwise every 386 board
-/// row re-pins for a persona nobody re-solved.
-#[test]
-fn the_386_never_leaves_the_epoch_one_column() {
-    for epoch in [1u32, 2, 3] {
-        assert!(
-            std::ptr::eq(class_table(CpuPersona::I386, epoch), &EPOCH1),
-            "the 386 moved under epoch {epoch}"
-        );
-    }
-}
-
-/// The two epoch-2 columns are selected by persona, and an epoch above 2
-/// resolves like 2 rather than silently falling back to epoch 1 (the knob parser
-/// is the one place a spelling is refused).
-#[test]
-fn epoch_two_selects_the_persona_column() {
-    assert!(std::ptr::eq(class_table(CpuPersona::I486, 2), &EPOCH2_I486));
-    assert!(std::ptr::eq(class_table(CpuPersona::I586, 2), &EPOCH2_I586));
-    assert!(std::ptr::eq(class_table(CpuPersona::I586, 7), &EPOCH2_I586));
-}
-
-/// The `Legacy` escape charges its own literal under every table, which is what
-/// lets routing proceed site by site without an epoch-1 charge moving.
+/// Legacy charges its explicit literal under every table.
 #[test]
 fn legacy_charges_its_own_literal_under_every_table() {
-    for table in [&EPOCH1, &EPOCH2_I486, &EPOCH2_I586] {
+    for table in [&I386, &I486, &I586] {
         for literal in [0u16, 1, 2, 37, 300, u16::MAX] {
             assert_eq!(table.raw(TimingClass::Legacy(literal)), u32::from(literal));
         }
@@ -404,7 +349,7 @@ const DECLARED_BLENDS: &[(&str, &str)] = &[
 #[test]
 fn epoch_two_entries_are_whole_twelfths_except_the_declared_blends() {
     let mut fractional: Vec<(&str, &str)> = Vec::new();
-    for (name, table) in [("I486", &EPOCH2_I486), ("I586", &EPOCH2_I586)] {
+    for (name, table) in [("I486", &I486), ("I586", &I586)] {
         for class in TimingClass::ALL {
             let raw = table.raw(*class);
             if raw % 12 != 0 {
@@ -421,51 +366,27 @@ fn epoch_two_entries_are_whole_twelfths_except_the_declared_blends() {
     );
 }
 
-/// The seam, end to end on a real CPU: the epoch and the persona pick the
-/// column, `charge` reads it, and epoch 1 charges the same number for all three
-/// personas.
-///
-/// This is the live half of the identity argument. The dead half -- that every
-/// ROUTED site picks the right class -- is carried by the tree's existing
-/// exact-clock assertions, which all still hold with 131 sites routed.
+/// CPU construction and mode changes must select the current persona table.
 #[test]
-fn the_cpu_charges_the_epoch_and_persona_column() {
+fn cpu_default_and_persona_switches_select_the_current_table() {
     use crate::CpuGsw;
     use izarravm_core::GswMode;
-
-    for (mode, persona) in [
-        (GswMode::Gsw386, CpuPersona::I386),
-        (GswMode::Gsw486, CpuPersona::I486),
-        (GswMode::Gsw586, CpuPersona::I586),
+    let mut cpu = CpuGsw::default();
+    assert_eq!(cpu.persona(), CpuPersona::I586);
+    assert!(std::ptr::eq(cpu.class_table(), &I586));
+    for mode in [
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+        GswMode::Gsw386Slow,
     ] {
-        let mut cpu = CpuGsw::default();
         cpu.set_mode(mode);
-        assert_eq!(cpu.timing_epoch(), 1, "a fresh CPU is epoch 1");
-        assert_eq!(cpu.persona(), persona);
-        // Epoch 1: today's literal, the same for every persona.
-        assert_eq!(cpu.charge(TimingClass::Reg).core_clocks, 2);
-        assert_eq!(cpu.charge(TimingClass::Div32).core_clocks, 2);
+        let expected = class_table(mode.persona());
+        assert!(std::ptr::eq(cpu.class_table(), expected));
+        for class in TimingClass::ALL {
+            assert_eq!(cpu.charge(*class).core_clocks, expected.raw(*class));
+        }
         assert_eq!(cpu.charge(TimingClass::Legacy(37)).core_clocks, 37);
-
-        cpu.set_timing_epoch(2);
-        assert_eq!(cpu.timing_epoch(), 2);
-        let expected = class_table(persona, 2);
-        assert_eq!(
-            cpu.charge(TimingClass::Reg).core_clocks,
-            expected.raw(TimingClass::Reg)
-        );
-        // The 386 stays on the epoch-1 column; the other two move.
-        let moved = cpu.charge(TimingClass::Reg).core_clocks != 2;
-        assert_eq!(moved, persona != CpuPersona::I386, "{persona:?}");
-
-        // And the epoch survives a later mode switch, which re-resolves the
-        // table rather than dropping back to epoch 1.
-        cpu.set_mode(GswMode::Gsw586);
-        assert_eq!(cpu.timing_epoch(), 2);
-        assert_eq!(
-            cpu.charge(TimingClass::Reg).core_clocks,
-            EPOCH2_I586.raw(TimingClass::Reg)
-        );
     }
 }
 
@@ -504,7 +425,7 @@ fn every_class_a_classifier_can_return_is_pinned_at_the_sites_literal() {
         TimingClass::Idiv32,
     ] {
         assert_eq!(
-            EPOCH1.raw(class),
+            I386.raw(class),
             2,
             "{} is reachable from a classifier site whose literal was 2",
             class.name()
@@ -558,9 +479,9 @@ fn the_classifiers_pick_the_documented_shapes() {
 
     // And the 246x row itself: `DIV r/m32` charges 41 P5 clocks under epoch 2
     // where it charged 1/6 of a clock under epoch 1.
-    assert_eq!(EPOCH1.raw(TimingClass::Div32), 2);
-    assert_eq!(EPOCH2_I586.raw(TimingClass::Div32), 492);
-    assert_eq!(EPOCH2_I486.raw(TimingClass::Div32), 480);
+    assert_eq!(I386.raw(TimingClass::Div32), 2);
+    assert_eq!(I586.raw(TimingClass::Div32), 492);
+    assert_eq!(I486.raw(TimingClass::Div32), 480);
 }
 
 /// `max_raw` is what the budget bound's per-slot term reads (review B3), so it
@@ -568,11 +489,7 @@ fn the_classifiers_pick_the_documented_shapes() {
 /// to be the largest today.
 #[test]
 fn max_raw_is_the_largest_entry_in_the_table() {
-    for (name, table) in [
-        ("EPOCH1", &EPOCH1),
-        ("I486", &EPOCH2_I486),
-        ("I586", &EPOCH2_I586),
-    ] {
+    for (name, table) in [("I386", &I386), ("I486", &I486), ("I586", &I586)] {
         let expected = TimingClass::ALL
             .iter()
             .map(|class| table.raw(*class))
@@ -590,8 +507,8 @@ fn max_raw_is_the_largest_entry_in_the_table() {
     }
     // The old literal the bound carried was 4, and it was ALREADY an under-bound
     // at epoch 1: `RetFar` charges 17. That is the finding, pinned.
-    assert_eq!(EPOCH1.raw(TimingClass::RetFar), 17);
-    assert!(EPOCH1.max_raw() > 4);
+    assert_eq!(I386.raw(TimingClass::RetFar), 17);
+    assert!(I386.max_raw() > 4);
 }
 
 /// The `InterpretOne` budget term is a maximum over an allowlist, and the
@@ -627,13 +544,13 @@ fn the_interpret_one_budget_term_covers_the_group_three_rows() {
     };
     // Epoch 1: the fold equals the constant it replaces, which the compile-time
     // tripwire in `timing_class.rs` also asserts.
-    assert_eq!(max_at(&EPOCH1), crate::INTERPRET_ONE_MAX_CORE_CLOCKS);
-    assert_eq!(max_at(&EPOCH1), 7);
+    assert_eq!(max_at(&I386), crate::INTERPRET_ONE_MAX_CORE_CLOCKS);
+    assert_eq!(max_at(&I386), 7);
     // Epoch 2: it moves, and it moves to the divide.
-    assert_eq!(max_at(&EPOCH2_I586), EPOCH2_I586.raw(TimingClass::Idiv32));
-    assert_eq!(max_at(&EPOCH2_I586), 552);
-    assert_eq!(max_at(&EPOCH2_I486), EPOCH2_I486.raw(TimingClass::Idiv32));
-    assert_eq!(max_at(&EPOCH2_I486), 528);
+    assert_eq!(max_at(&I586), I586.raw(TimingClass::Idiv32));
+    assert_eq!(max_at(&I586), 552);
+    assert_eq!(max_at(&I486), I486.raw(TimingClass::Idiv32));
+    assert_eq!(max_at(&I486), 528);
 }
 
 /// The four width sites (review B4), checked at the values that would have
@@ -648,12 +565,12 @@ fn the_interpret_one_budget_term_covers_the_group_three_rows() {
 #[test]
 fn the_widest_epoch_two_charges_survive_every_stage() {
     // Stage 1: the table itself. `u16`, so both fit with room.
-    assert_eq!(EPOCH2_I586.raw(TimingClass::Div32), 492);
-    assert_eq!(EPOCH2_I486.raw(TimingClass::Div32), 480);
-    assert_eq!(EPOCH2_I586.raw(TimingClass::X87Sqrt), 840);
-    assert_eq!(EPOCH2_I486.raw(TimingClass::X87Sqrt), 840);
+    assert_eq!(I586.raw(TimingClass::Div32), 492);
+    assert_eq!(I486.raw(TimingClass::Div32), 480);
+    assert_eq!(I586.raw(TimingClass::X87Sqrt), 840);
+    assert_eq!(I486.raw(TimingClass::X87Sqrt), 840);
     for class in [TimingClass::Div32, TimingClass::X87Sqrt] {
-        for (name, table) in [("I486", &EPOCH2_I486), ("I586", &EPOCH2_I586)] {
+        for (name, table) in [("I486", &I486), ("I586", &I586)] {
             assert!(
                 table.raw(class) > u32::from(u8::MAX),
                 "{name} {} would have fitted a u8, so this test proves nothing",
@@ -667,7 +584,7 @@ fn the_widest_epoch_two_charges_survive_every_stage() {
     // truncating, so the worst native block has to fit it.
     #[cfg(feature = "jit")]
     {
-        let worst_native = EPOCH2_I586.raw(TimingClass::Idiv32);
+        let worst_native = I586.raw(TimingClass::Idiv32);
         let worst_block = worst_native * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u32;
         assert!(
             worst_block <= u32::from(u16::MAX),
@@ -680,8 +597,8 @@ fn the_widest_epoch_two_charges_survive_every_stage() {
         // Stage 3: the static accounting accumulator, now u32. The widest entry in
         // the table is `WBINVD`'s printed floor, which is not a native slot but is
         // the number the accumulator has to be safe against if one ever is.
-        let widest = EPOCH2_I586.max_raw();
-        assert_eq!(widest, EPOCH2_I586.raw(TimingClass::Wbinvd));
+        let widest = I586.max_raw();
+        assert_eq!(widest, I586.raw(TimingClass::Wbinvd));
         let worst_accumulation =
             u64::from(widest) * crate::jit::direct::MAX_BLOCK_INSTRUCTIONS as u64;
         assert!(
@@ -727,7 +644,7 @@ fn native_histogram_partitions_only_a_proven_single_block_prefix() {
         0,
         Some(native_metadata(&vector, vector.len(), false)),
     );
-    let snapshot = hist.snapshot(&EPOCH1, 11);
+    let snapshot = hist.snapshot(&I386, 11);
     let known: std::collections::HashMap<_, _> =
         snapshot.native_known_class_counts.into_iter().collect();
     assert_eq!(known["Reg"], 1);
@@ -754,7 +671,7 @@ fn native_histogram_partitions_only_a_proven_single_block_prefix() {
         0,
         Some(native_metadata(&vector, vector.len(), false)),
     );
-    let snapshot = hist.snapshot(&EPOCH1, 11);
+    let snapshot = hist.snapshot(&I386, 11);
     assert_eq!(snapshot.native_unresolved_instructions.linked_entry, 3);
     assert_eq!(snapshot.native_unresolved_entries.linked_entry, 1);
     assert_eq!(
@@ -787,7 +704,7 @@ fn native_histogram_recovers_only_proven_self_loop_multiplicities() {
         0,
         Some(native_metadata(&vector, vector.len(), true)),
     );
-    let snapshot = hist.snapshot(&EPOCH1, 8);
+    let snapshot = hist.snapshot(&I386, 8);
     let known: std::collections::HashMap<_, _> =
         snapshot.native_known_class_counts.iter().copied().collect();
     assert_eq!(known["Reg"], 3);
@@ -816,7 +733,7 @@ fn native_histogram_recovers_only_proven_self_loop_multiplicities() {
         0,
         Some(native_metadata(&vector, vector.len(), false)),
     );
-    let non_loop_snapshot = non_loop.snapshot(&EPOCH1, 8);
+    let non_loop_snapshot = non_loop.snapshot(&I386, 8);
     assert_eq!(
         non_loop_snapshot
             .native_unresolved_instructions
@@ -840,7 +757,7 @@ fn native_histogram_recovers_only_proven_self_loop_multiplicities() {
         0,
         Some(native_metadata(&vector, vector.len(), true)),
     );
-    let short_or_zero_snapshot = short_or_zero.snapshot(&EPOCH1, 2);
+    let short_or_zero_snapshot = short_or_zero.snapshot(&I386, 2);
     assert_eq!(short_or_zero_snapshot.self_loop_recovered_entries, 0);
     assert_eq!(short_or_zero_snapshot.self_loop_recovered_instructions, 0);
     assert_eq!(short_or_zero_snapshot.native_partition_residual, 0);
@@ -867,7 +784,7 @@ fn native_histogram_keeps_helper_and_unknown_slots_unresolved() {
     );
     hist.record(TimingClass::Reg);
     hist.record(TimingClass::Legacy(9));
-    let snapshot = hist.snapshot(&EPOCH2_I586, 5);
+    let snapshot = hist.snapshot(&I586, 5);
     let known: std::collections::HashMap<_, _> =
         snapshot.native_known_class_counts.into_iter().collect();
     assert_eq!(known["Reg"], 1);
@@ -894,7 +811,7 @@ fn native_histogram_marks_missing_and_invalid_vectors_without_panicking() {
         0,
         Some(native_metadata(&invalid, invalid.len(), false)),
     );
-    let snapshot = hist.snapshot(&EPOCH1, 5);
+    let snapshot = hist.snapshot(&I386, 5);
     assert_eq!(snapshot.native_unresolved_entries.missing_vector, 1);
     assert_eq!(snapshot.native_unresolved_instructions.missing_vector, 0);
     assert_eq!(snapshot.native_unresolved_instructions.invalid_vector, 5);
@@ -924,7 +841,7 @@ fn the_system_event_rows_are_mode_keyed_and_epoch_one_flat() {
     // At epoch 1 every mode row carries the literal its one flat arm charged, so
     // the split is invisible to a knob-unset run. That is the merge bar.
     for class in [TimingClass::IntN, TimingClass::IntNPm, TimingClass::IntNV86] {
-        assert_eq!(EPOCH1.raw(class), crate::INT_IMM8_CORE_CLOCKS);
+        assert_eq!(I386.raw(class), crate::INT_IMM8_CORE_CLOCKS);
     }
     for class in [
         TimingClass::Iret,
@@ -932,7 +849,7 @@ fn the_system_event_rows_are_mode_keyed_and_epoch_one_flat() {
         TimingClass::IretV86,
         TimingClass::IretPmToV86,
     ] {
-        assert_eq!(EPOCH1.raw(class), 22);
+        assert_eq!(I386.raw(class), 22);
     }
     for class in [
         TimingClass::CallFar,
@@ -942,23 +859,22 @@ fn the_system_event_rows_are_mode_keyed_and_epoch_one_flat() {
         TimingClass::FarTransferGate,
         TimingClass::FarTransferTss,
     ] {
-        assert_eq!(EPOCH1.raw(class), 17);
+        assert_eq!(I386.raw(class), 17);
     }
-    assert_eq!(EPOCH1.raw(TimingClass::ExceptionDelivery), 59);
-    assert_eq!(EPOCH1.raw(TimingClass::ExceptionDeliveryV86), 59);
-    assert_eq!(EPOCH1.raw(TimingClass::HardwareInterrupt), 61);
+    assert_eq!(I386.raw(TimingClass::ExceptionDelivery), 59);
+    assert_eq!(I386.raw(TimingClass::ExceptionDeliveryV86), 59);
+    assert_eq!(I386.raw(TimingClass::HardwareInterrupt), 61);
 
     // At epoch 2 they separate, and in the direction the census measured.
-    assert!(EPOCH2_I586.raw(TimingClass::IntNV86) > EPOCH2_I586.raw(TimingClass::IntN));
-    assert!(EPOCH2_I586.raw(TimingClass::IretPmToV86) > EPOCH2_I586.raw(TimingClass::Iret));
+    assert!(I586.raw(TimingClass::IntNV86) > I586.raw(TimingClass::IntN));
+    assert!(I586.raw(TimingClass::IretPmToV86) > I586.raw(TimingClass::Iret));
     assert!(
-        EPOCH2_I586.raw(TimingClass::FarTransferTss)
-            > 7 * EPOCH2_I586.raw(TimingClass::FarTransferPm),
+        I586.raw(TimingClass::FarTransferTss) > 7 * I586.raw(TimingClass::FarTransferPm),
         "the census scores the TSS row at ~122x the flat 17 it rode"
     );
     // Census row 7: the V86 monitor trip, 16.7x under at epoch 1.
-    let trip = f64::from(EPOCH2_I586.raw(TimingClass::ExceptionDeliveryV86))
-        / f64::from(EPOCH1.raw(TimingClass::ExceptionDeliveryV86));
+    let trip = f64::from(I586.raw(TimingClass::ExceptionDeliveryV86))
+        / f64::from(I386.raw(TimingClass::ExceptionDeliveryV86));
     assert!(
         (13.0..=14.0).contains(&trip),
         "the V86 trip moved by {trip:.1}x; the census predicted ~16.7x against a 59 that also \
@@ -983,19 +899,16 @@ fn the_system_event_rows_are_mode_keyed_and_epoch_one_flat() {
     assert_eq!(iret_class(true, false, 3, false, 3), TimingClass::IretPm);
 }
 
-/// The task-switch term is the one class with NO epoch-1 literal, because there
-/// was no term at all: a switch rode whichever of 17 / 22 / 37 / 59 delivered
-/// it. Charging zero at epoch 1 is what keeps the knob-unset identity bar.
+/// I386 retains zero separate task-switch work; fast personas charge it.
 #[test]
-fn the_task_switch_term_is_new_and_free_at_epoch_one() {
-    assert_eq!(EPOCH1.raw(TimingClass::TaskSwitch), 0);
-    assert_eq!(EPOCH2_I586.raw(TimingClass::TaskSwitch), 2076);
-    assert_eq!(EPOCH2_I486.raw(TimingClass::TaskSwitch), 2388);
-    // It is the ONLY zero in the epoch-1 column; anything else at zero is a
-    // class that lost its literal.
+fn only_i386_has_no_separate_task_switch_term() {
+    assert_eq!(I386.raw(TimingClass::TaskSwitch), 0);
+    assert_eq!(I586.raw(TimingClass::TaskSwitch), 2076);
+    assert_eq!(I486.raw(TimingClass::TaskSwitch), 2388);
+    // TaskSwitch is the only zero in the I386 table.
     let zeros: Vec<_> = TimingClass::ALL
         .iter()
-        .filter(|class| EPOCH1.raw(**class) == 0)
+        .filter(|class| I386.raw(**class) == 0)
         .map(|class| class.name())
         .collect();
     assert_eq!(zeros, vec!["TaskSwitch"]);
@@ -1011,17 +924,13 @@ fn system_events_do_not_enter_the_retire_counts() {
     hist.record_system_event(TimingClass::ExceptionDeliveryV86);
     hist.record_system_event(TimingClass::TaskSwitch);
 
-    let snapshot = hist.snapshot(&EPOCH2_I586, 1);
+    let snapshot = hist.snapshot(&I586, 1);
     assert_eq!(
         snapshot.interpreter_charge_counts,
         vec![("Reg", 1)],
         "a delivery is not an interpreter charge event"
     );
-    assert_eq!(
-        hist.class_clocks(&EPOCH2_I586),
-        12,
-        "one Reg, and nothing else"
-    );
+    assert_eq!(hist.class_clocks(&I586), 12, "one Reg, and nothing else");
     let events: std::collections::HashMap<_, _> =
         snapshot.system_event_counts.into_iter().collect();
     assert_eq!(events["ExceptionDeliveryV86"], 2);

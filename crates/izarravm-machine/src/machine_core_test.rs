@@ -12,55 +12,43 @@ fn cache_level_config_matches_geometry() {
         GswMode::Gsw486,
         GswMode::Gsw586,
     ] {
-        // Both epochs: slice 2 gives the 486 a 16-byte line and the 586 a 32-byte
-        // one, so the mask must follow the epoch's line size, not a constant.
-        for epoch in [1, 2] {
-            let g = cache_geometry(mode);
-            let config = cache_level_config(mode, epoch);
-            let line = cache_line_bytes(mode, epoch);
-            assert_eq!(1u32 << config.line_shift, line, "{mode:?} epoch {epoch}");
-            let l1_lines = g.l1_bytes / line;
-            let l2_lines = g.l2_bytes / line;
-
-            assert_eq!(
-                config.l1_mask,
-                if l1_lines == 0 {
-                    CACHE_TIER_DISABLED_MASK
-                } else {
-                    l1_lines - 1
-                }
-            );
-            assert_eq!(
-                config.l2_mask,
-                if l2_lines == 0 {
-                    CACHE_TIER_DISABLED_MASK
-                } else {
-                    l2_lines - 1
-                }
-            );
-        }
+        let geometry = cache_geometry(mode);
+        let config = cache_level_config(mode);
+        let line = cache_line_bytes(mode);
+        assert_eq!(1u32 << config.line_shift, line);
+        let l1_lines = geometry.l1_bytes / line;
+        assert_eq!(
+            config.l1_mask,
+            if l1_lines == 0 {
+                CACHE_TIER_DISABLED_MASK
+            } else {
+                l1_lines - 1
+            }
+        );
+        assert_eq!(geometry.l2_bytes / 32, 16_384);
+        assert_eq!(config.l2_mask, 16_383);
     }
 }
 
 #[test]
 fn cache_model_resolves_tiers_by_working_set() {
-    let mut c = CacheModel::new(GswMode::Gsw486, 1);
+    let mut c = CacheModel::new(GswMode::Gsw486);
     let warm = |c: &mut CacheModel, base: u32, len: u32| {
-        for off in (0..len).step_by(64) {
+        for off in (0..len).step_by(16) {
             c.data_tier(GswMode::Gsw486, base + off);
         }
     };
     warm(&mut c, 0x10_0000, 4 * 1024); // 4K fits 486 L1 (8K)
     assert_eq!(c.data_tier(GswMode::Gsw486, 0x10_0000), Tier::L1);
-    warm(&mut c, 0x20_0000, 64 * 1024); // 64K exceeds L1, fits L2 (256K)
+    warm(&mut c, 0x20_0000, 64 * 1024); // 64K exceeds L1, fits L2 (512K)
     assert_eq!(c.data_tier(GswMode::Gsw486, 0x20_0000), Tier::L2);
-    warm(&mut c, 0x40_0000, 512 * 1024); // 512K exceeds 486 L2 -> RAM
+    warm(&mut c, 0x40_0000, 1024 * 1024); // 1 MiB exceeds the fixed L2
     assert_eq!(c.data_tier(GswMode::Gsw486, 0x40_0000), Tier::Ram);
 }
 
 #[test]
 fn cache_model_reset_goes_cold() {
-    let mut c = CacheModel::new(GswMode::Gsw586, 1);
+    let mut c = CacheModel::new(GswMode::Gsw586);
     c.data_tier(GswMode::Gsw586, 0x30_0000); // installs the line
     assert_eq!(c.data_tier(GswMode::Gsw586, 0x30_0000), Tier::L1); // hot
     c.reset();
@@ -145,11 +133,11 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
         );
     }
 
-    // 486: L1 8K, L2 256K. 4K is deep in L1, 64K deep in L2, 512K is RAM.
+    // 486: L1 8K, fixed L2 512K. 4K is in L1, 64K in L2, 2M is RAM.
     {
         let l1 = measure(GswMode::Gsw486, 4 * 1024);
         let l2 = measure(GswMode::Gsw486, 64 * 1024);
-        let ram = measure(GswMode::Gsw486, 512 * 1024);
+        let ram = measure(GswMode::Gsw486, 2 * 1024 * 1024);
         assert!(
             l1 > l2 * 1.05,
             "486: L1 {l1:.1} must exceed L2 {l2:.1} MB/s"
@@ -160,7 +148,7 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
         );
     }
 
-    // 386: L2 64K, no L1. 32K is deep in L2, 1M is well into RAM. The 386 L2-vs-RAM
+    // 386: fixed L2 512K, no L1. 32K is deep in L2, 1M is well into RAM. The 386 L2-vs-RAM
     // step is the narrowest, so pick a small L2 block and a large RAM block to
     // separate them cleanly and assert a >5% margin.
     for mode in [GswMode::Gsw386, GswMode::Gsw386Slow] {
@@ -173,118 +161,169 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
     }
 }
 
-fn scaled_bus_loop_machine(mode: GswMode) -> Machine {
+fn scaled_bus_machine(mode: GswMode, program: &[u8]) -> Machine {
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xeb, 0xfe])
-            .expect("raw loop machine");
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), program).unwrap();
     machine.set_mode(mode);
+    machine.cpu.registers.eflags &= !0x200;
     machine
-}
-
-fn expected_scaled_bus_delta(raw: u64, remainder: u64, mode: GswMode) -> (u64, u64) {
-    let (num, den) = bus_timing(mode.persona(), 1);
-    let numerator = u128::from(raw) * u128::from(num) + u128::from(remainder);
-    (
-        u64::try_from(numerator / u128::from(den)).unwrap(),
-        u64::try_from(numerator % u128::from(den)).unwrap(),
-    )
 }
 
 #[test]
 fn committed_scaled_bus_total_is_split_invariant() {
-    let mode = GswMode::Gsw586;
-    let mut machine = scaled_bus_loop_machine(mode);
-    let raw_before = machine.raw_bus_clocks();
-    let scaled_before = machine.scaled_bus_clocks();
-    let remainder_before = machine.bus_rem;
-
-    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
-    let _ = machine.run_until_halt_or_cycles(30_000).unwrap();
-
-    let raw_delta = machine.raw_bus_clocks() - raw_before;
-    let (expected_delta, expected_remainder) =
-        expected_scaled_bus_delta(raw_delta, remainder_before, mode);
-    assert!(raw_delta > 0);
-    assert_eq!(machine.scaled_bus_clocks() - scaled_before, expected_delta);
-    assert_eq!(machine.bus_rem, expected_remainder);
+    const PROGRAM: &[u8] = &[
+        0x90, 0x90, 0xe4, 0x80, 0x90, 0x90, 0xe4, 0x80, 0x90, 0x90, 0xe4, 0x80, 0xf4,
+    ];
+    for (mode, quantum) in [
+        (GswMode::Gsw386Slow, 747u64),
+        (GswMode::Gsw386, 249),
+        (GswMode::Gsw486, 83),
+        (GswMode::Gsw586, 33),
+    ] {
+        let mut results = Vec::new();
+        for split in [false, true] {
+            let mut machine = scaled_bus_machine(mode, PROGRAM);
+            machine.advance_devices_ticks(quantum - 1);
+            let before = (
+                machine.master_ticks(),
+                machine.elapsed_clocks,
+                machine.scaled_bus_clocks,
+                machine.cpu.elapsed_clocks,
+            );
+            let mut halted = false;
+            for _ in 0..100 {
+                let stop = machine
+                    .run_until_halt_or_cycles(if split { 1 } else { 1_000_000 })
+                    .unwrap();
+                if stop == StopReason::Halted {
+                    halted = true;
+                    break;
+                }
+                assert!(matches!(stop, StopReason::CycleLimit { .. }));
+            }
+            assert!(halted);
+            let batches = &machine.test_batch_observations;
+            let core: u64 = batches.iter().map(|b| b.core_clocks).sum();
+            let raw: u64 = batches.iter().map(|b| b.raw_bus_clocks).sum();
+            let port: u64 = batches.iter().map(|b| b.isa_clocks).sum();
+            assert!(raw >= 3 * 4);
+            assert_eq!(port, 3 * 156);
+            let bus = ((raw + port) * 33).div_ceil(quantum);
+            assert_eq!(
+                machine.master_ticks() - before.0,
+                core * quantum + (raw + port) * 33
+            );
+            assert_eq!(machine.scaled_bus_clocks - before.2, bus);
+            assert_eq!(machine.elapsed_clocks - before.1, core + bus);
+            assert_eq!(machine.cpu.elapsed_clocks - before.3, core);
+            assert_eq!(machine.bus_rem, 0);
+            assert_eq!(machine.cpu.registers.eip, 0x100 + PROGRAM.len() as u32);
+            results.push((machine.timeline, core, raw, port, bus, batches.len()));
+        }
+        assert_eq!(
+            (
+                &results[0].0,
+                results[0].1,
+                results[0].2,
+                results[0].3,
+                results[0].4
+            ),
+            (
+                &results[1].0,
+                results[1].1,
+                results[1].2,
+                results[1].3,
+                results[1].4
+            )
+        );
+        assert!(results[1].5 > results[0].5);
+    }
 }
 
 #[test]
-fn scaled_bus_mode_switch_preserves_total_and_discards_only_old_carry() {
-    let mut machine = scaled_bus_loop_machine(GswMode::Gsw586);
-    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
-    let total_before_switch = machine.scaled_bus_clocks();
-    assert!(total_before_switch > 0);
-    machine.bus_rem = 29;
-
-    machine.set_mode(GswMode::Gsw386);
-    assert_eq!(machine.scaled_bus_clocks(), total_before_switch);
+fn a_mode_switch_preserves_bus_totals_and_resets_the_cpu_conversion_phase() {
+    let mut machine = scaled_bus_machine(GswMode::Gsw486, &[0xe4, 0x80, 0xe4, 0x80, 0xf4]);
+    machine.advance_devices_ticks(82);
+    machine.run_until_halt_or_cycles(1).unwrap();
+    assert_eq!(machine.cpu.registers.eip, 0x102);
+    assert_eq!(machine.scaled_bus_clocks, 64);
+    assert_eq!(machine.master_ticks() % 83, 50);
+    machine
+        .timeline
+        .canonical_projection(GswMode::Gsw486)
+        .unwrap();
+    let ticks = machine.master_ticks();
+    machine.set_mode(GswMode::Gsw586);
+    assert_eq!(machine.master_ticks(), ticks);
+    assert_eq!(machine.scaled_bus_clocks, 64);
+    machine.run_until_halt_or_cycles(1).unwrap();
+    assert_eq!(machine.cpu.registers.eip, 0x104);
+    assert_eq!(machine.scaled_bus_clocks, 64 + 160);
     assert_eq!(machine.bus_rem, 0);
-
-    let raw_before = machine.raw_bus_clocks();
-    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
-    let raw_delta = machine.raw_bus_clocks() - raw_before;
-    let (expected_delta, expected_remainder) =
-        expected_scaled_bus_delta(raw_delta, 0, GswMode::Gsw386);
-    assert_eq!(
-        machine.scaled_bus_clocks() - total_before_switch,
-        expected_delta
-    );
-    assert_eq!(machine.bus_rem, expected_remainder);
+    for batch in &machine.test_batch_observations {
+        assert_eq!((batch.raw_bus_clocks, batch.isa_clocks), (4, 156));
+    }
+    machine
+        .timeline
+        .canonical_projection(GswMode::Gsw586)
+        .unwrap();
 }
 
 #[test]
 fn bandwidth_probe_does_not_commit_scaled_bus_clocks() {
-    let mut machine = scaled_bus_loop_machine(GswMode::Gsw586);
-    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
-    let scaled_before = machine.scaled_bus_clocks();
-    let raw_before = machine.raw_bus_clocks();
-    machine.bus_rem = 29;
-
+    let mut machine = scaled_bus_machine(GswMode::Gsw486, &[0xe4, 0x80, 0xf4]);
+    machine.advance_devices_ticks(82);
+    machine.run_until_halt_or_cycles(1).unwrap();
+    assert!(machine.scaled_bus_clocks > 0);
+    let before = (
+        machine.timeline,
+        machine.elapsed_clocks,
+        machine.cpu.elapsed_clocks,
+        machine.scaled_bus_clocks,
+    );
+    let raw = machine.raw_bus_clocks();
     let sample = machine.measure_read_bandwidth(0x10_0000, 4 * 1024, 64 * 1024);
-
-    assert!(sample.clocks > 0);
-    assert!(machine.raw_bus_clocks() > raw_before);
-    assert_eq!(machine.scaled_bus_clocks(), scaled_before);
-    let raw_delta = machine.raw_bus_clocks() - raw_before;
-    let (_, expected_remainder) = expected_scaled_bus_delta(raw_delta, 0, GswMode::Gsw586);
-    assert_eq!(machine.bus_rem, expected_remainder);
+    let raw = machine.raw_bus_clocks() - raw;
+    assert!(raw > 0);
+    assert_eq!(sample.clocks, (raw * 33).div_ceil(83));
+    assert_eq!(
+        (
+            machine.timeline,
+            machine.elapsed_clocks,
+            machine.cpu.elapsed_clocks,
+            machine.scaled_bus_clocks
+        ),
+        before
+    );
+    assert_eq!(machine.bus_rem, 0);
 }
 
 #[test]
 fn device_and_halted_advances_do_not_commit_scaled_bus_clocks() {
-    let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4])
-            .expect("raw hlt machine");
-    machine.set_mode(GswMode::Gsw586);
-    let raw_before = machine.raw_bus_clocks();
-    let remainder_before = machine.bus_rem;
+    let mut machine = scaled_bus_machine(GswMode::Gsw586, &[0xe4, 0x80, 0xf4]);
     assert_eq!(
         machine.run_until_halt_or_cycles(20_000).unwrap(),
         StopReason::Halted
     );
-    let raw_delta = machine.raw_bus_clocks() - raw_before;
-    let (expected_delta, expected_remainder) =
-        expected_scaled_bus_delta(raw_delta, remainder_before, GswMode::Gsw586);
-    let after_hlt = machine.scaled_bus_clocks();
-    assert!(raw_delta > 0);
-    assert_eq!(after_hlt, expected_delta);
-    assert_eq!(machine.bus_rem, expected_remainder);
-
+    assert_eq!(machine.scaled_bus_clocks, 160);
     machine.advance_devices_ticks(1_000);
+    assert_eq!(machine.scaled_bus_clocks, 160);
     machine.advance_devices_clocks(1_000);
+    assert_eq!(machine.scaled_bus_clocks, 160);
     machine.advance_halted_ticks(1_000);
-
-    assert_eq!(machine.scaled_bus_clocks(), after_hlt);
+    assert_eq!(machine.scaled_bus_clocks, 160);
 }
 
 #[test]
 fn committed_scaled_bus_total_saturates() {
-    let mut machine = scaled_bus_loop_machine(GswMode::Gsw586);
-    machine.scaled_bus_clocks = u64::MAX;
-
-    let _ = machine.run_until_halt_or_cycles(20_000).unwrap();
-
+    let mut machine = scaled_bus_machine(GswMode::Gsw586, &[0xe4, 0x80, 0xf4]);
+    machine.scaled_bus_clocks = u64::MAX - 1;
+    let ticks = machine.master_ticks();
+    machine.run_until_halt_or_cycles(1).unwrap();
+    let batch = machine.test_batch_observations.last().unwrap();
+    assert_eq!((batch.raw_bus_clocks, batch.isa_clocks), (4, 156));
+    assert_eq!(batch.scaled_bus_clocks, 160);
+    assert!(machine.master_ticks() > ticks);
     assert_eq!(machine.scaled_bus_clocks(), u64::MAX);
 }
 
@@ -319,9 +358,9 @@ fn approximate_class_bypasses_cache_tiering_accurate_class_does_not() {
 fn cache_geometry_matches_cache_kb() {
     // The machine geometry must agree with the CPU's cache_kb readout (KB).
     for (mode, (l1_kib, external_kib)) in [
-        (GswMode::Gsw386Slow, (0u16, 64u16)),
-        (GswMode::Gsw386, (0, 64)),
-        (GswMode::Gsw486, (8, 256)),
+        (GswMode::Gsw386Slow, (0u16, 512u16)),
+        (GswMode::Gsw386, (0, 512)),
+        (GswMode::Gsw486, (8, 512)),
         (GswMode::Gsw586, (32, 512)),
     ] {
         let g = cache_geometry(mode);

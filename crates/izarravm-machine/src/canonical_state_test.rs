@@ -15,7 +15,7 @@ use izarravm_cpu::CpuCanonicalCaptureError;
 use izarravm_cpu::SegmentIndex;
 
 use super::*;
-// The epoch-1 line size, which is what every machine in this file runs under.
+// Address units used by the 386 cache fixtures.
 use crate::cache_config::CACHE_LINE_BYTES;
 use crate::{
     BIOS_ROM_SIZE, Bios32Call, JoystickState, MachineProfile, StopReason, WaitStateProfile,
@@ -502,34 +502,23 @@ fn atapi_send_cdb(machine: &mut Machine, cdb: [u8; 12]) {
 }
 
 fn write_speaker_port(machine: &mut Machine, value: u8) {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     bus.write_io(0x61, BusWidth::Byte, u32::from(value), false)
         .unwrap();
 }
 
 fn read_speaker_port(machine: &mut Machine) -> u8 {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     u8::try_from(bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap()).unwrap()
 }
 
-/// Run `body` with the `IZARRAVM_ISA_IO_WAIT` arm forced on this thread, then restore the
-/// ambient reading. Mirrors `with_isa_io_wait` in `machine_bus_timing_test.rs` -- the shipped
-/// knob is a process-wide `OnceLock`, so both arms can only be exercised in one process
-/// through the per-thread override.
-fn with_isa_io_wait<R>(armed: bool, body: impl FnOnce() -> R) -> R {
-    crate::bus::set_isa_io_wait_for_test(Some(armed));
-    let result = body();
-    crate::bus::set_isa_io_wait_for_test(None);
-    result
-}
-
 fn write_pci_port(machine: &mut Machine, port: u16, width: BusWidth, value: u32) {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     bus.write_io(port, width, value, false).unwrap();
 }
 
 fn read_pci_port(machine: &mut Machine, port: u16, width: BusWidth) -> u32 {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     bus.read_io(port, width, 0, false).unwrap()
 }
 
@@ -547,35 +536,35 @@ fn write_pci_bdf(
 }
 
 fn write_pit_port(machine: &mut Machine, port: u16, value: u8) {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     bus.write_io(port, BusWidth::Byte, u32::from(value), false)
         .unwrap();
 }
 
 fn read_pit_port(machine: &mut Machine, port: u16) -> u8 {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     u8::try_from(bus.read_io(port, BusWidth::Byte, 0, false).unwrap()).unwrap()
 }
 
 fn write_pic_port(machine: &mut Machine, port: u16, value: u8) {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     bus.write_io(port, BusWidth::Byte, u32::from(value), false)
         .unwrap();
 }
 
 fn read_pic_port(machine: &mut Machine, port: u16) -> u8 {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     u8::try_from(bus.read_io(port, BusWidth::Byte, 0, false).unwrap()).unwrap()
 }
 
 fn write_rtc_port(machine: &mut Machine, port: u16, value: u8) {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     bus.write_io(port, BusWidth::Byte, u32::from(value), false)
         .unwrap();
 }
 
 fn read_rtc_port(machine: &mut Machine, port: u16) -> u8 {
-    let mut bus = machine.make_bus();
+    let mut bus = machine.make_construction_bus();
     u8::try_from(bus.read_io(port, BusWidth::Byte, 0, false).unwrap()).unwrap()
 }
 
@@ -590,7 +579,9 @@ fn initialize_pic_pair(machine: &mut Machine, level_triggered: bool) {
 }
 
 fn warm_modeled_cache_line(machine: &mut Machine, mode: GswMode, line: u32) {
-    let _ = machine.cache_model.data_tier(mode, line * CACHE_LINE_BYTES);
+    let _ = machine
+        .cache_model
+        .data_tier(mode, line * crate::cache_config::cache_line_bytes(mode));
 }
 
 fn raw_word_read_clocks(machine: &mut Machine, address: u32) -> (u16, u64) {
@@ -794,7 +785,7 @@ fn gameport_payload_captures_attachment_controls_and_absolute_deadlines() {
     assert_eq!(uncharged[98], 1, "button 2 target normal drive");
 
     {
-        let mut bus = machine.make_bus();
+        let mut bus = machine.make_construction_bus();
         bus.write_io(0x0207, BusWidth::Byte, 0, false).unwrap();
     }
     let charged = gameport_payload(&machine);
@@ -945,13 +936,13 @@ fn a20_routing_changes_raw_cells_without_projecting_an_alias() {
     let mut machine = memory_test_machine();
     let unchanged = ram_rom_payload(&machine);
     {
-        let mut bus = machine.make_bus();
+        let mut bus = machine.make_construction_bus();
         bus.write_io(0x0092, BusWidth::Byte, 0, false).unwrap();
     }
     assert_eq!(ram_rom_payload(&machine), unchanged);
 
     {
-        let mut bus = machine.make_bus();
+        let mut bus = machine.make_construction_bus();
         CpuBus::write_memory(
             &mut bus,
             HIGH,
@@ -965,7 +956,7 @@ fn a20_routing_changes_raw_cells_without_projecting_an_alias() {
     assert_eq!(machine.memory.as_slice()[HIGH as usize], 0);
 
     {
-        let mut bus = machine.make_bus();
+        let mut bus = machine.make_construction_bus();
         bus.write_io(0x0092, BusWidth::Byte, 0x02, false).unwrap();
         CpuBus::write_memory(
             &mut bus,
@@ -1005,7 +996,7 @@ fn live_pci_decode_rebuilds_and_publishes_the_excluded_ram_lookup() {
     );
 
     {
-        let mut bus = machine.make_bus();
+        let mut bus = machine.make_construction_bus();
         assert!(
             CpuBus::direct_page(&mut bus, RAM_BAR, BusAccessKind::DataRead)
                 .unwrap()
@@ -1108,9 +1099,9 @@ fn populated_modeled_cache_payload_sorts_full_tags_numerically() {
     let mut expected = Vec::new();
     push_u64(&mut expected, 0);
     push_u64(&mut expected, 3);
-    push_u32(&mut expected, 0x0000_0002);
-    push_u32(&mut expected, 0x0000_0401);
-    push_u32(&mut expected, 0x0000_0800);
+    push_u32(&mut expected, 0x0000_0004);
+    push_u32(&mut expected, 0x0000_0802);
+    push_u32(&mut expected, 0x0000_1000);
     assert_eq!(expected.len(), 28);
 
     for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
@@ -1134,7 +1125,7 @@ fn populated_modeled_cache_payload_sorts_full_tags_numerically() {
 #[test]
 fn accurate_cache_hit_and_collision_preserve_next_access_timing() {
     const TARGET_LINE: u32 = 0x0500;
-    const COLLIDING_LINE: u32 = TARGET_LINE + 0x0400;
+    const COLLIDING_LINE: u32 = TARGET_LINE + 0x2000;
     const TARGET_ADDRESS: u32 = TARGET_LINE * CACHE_LINE_BYTES;
 
     for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
@@ -1156,8 +1147,8 @@ fn accurate_cache_hit_and_collision_preserve_next_access_timing() {
         let hot_read = raw_word_read_clocks(&mut hot, TARGET_ADDRESS);
         let displaced_read = raw_word_read_clocks(&mut displaced, TARGET_ADDRESS);
         assert_eq!(hot_read.0, displaced_read.0, "{mode:?}");
-        assert_eq!(hot_read.1, 2, "{mode:?} L2 hit");
-        assert_eq!(displaced_read.1, 5, "{mode:?} RAM miss");
+        assert_eq!(hot_read.1, 14, "{mode:?} L2 hit");
+        assert_eq!(displaced_read.1, 32, "{mode:?} RAM miss");
         assert_eq!(
             modeled_cache_payload(&hot),
             modeled_cache_payload(&displaced),
@@ -1176,7 +1167,7 @@ fn inert_modeled_cache_residue_is_payload_and_continuation_neutral() {
     residue.cache_model.l1_tags[0] = 0;
     residue.cache_model.l2_tags[3] = 2;
     residue.cache_model.l2_tags[0] = MAX_MODELED_CACHE_LINE + 1;
-    residue.cache_model.l2_tags[1024] = 0x0400;
+    residue.cache_model.l2_tags[1024] = 0x0401;
     residue.cache_model.l2_tags[4] = crate::CACHE_EMPTY_TAG;
 
     assert_eq!(
@@ -1275,10 +1266,10 @@ fn approximate_modes_ignore_all_tag_residue_on_normal_bus_accesses() {
             vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
             "{mode:?}"
         );
-        assert_eq!(
+        assert_ne!(
             modeled_cache_payload(&residue),
-            vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
-            "{mode:?}"
+            modeled_cache_payload(&clean),
+            "{mode:?} persistent L2"
         );
 
         let clean_read = raw_word_read_clocks(&mut clean, ADDRESS);
@@ -1342,10 +1333,10 @@ fn approximate_direct_and_native_bus_contract_ignores_tag_residue() {
         assert_eq!(residue.cache_tier_lookups(), lookups, "{mode:?}");
         assert_eq!(residue.cache_model.l1_tags.as_ref(), l1_tags, "{mode:?}");
         assert_eq!(residue.cache_model.l2_tags.as_ref(), l2_tags, "{mode:?}");
-        assert_eq!(
+        assert_ne!(
             modeled_cache_payload(&residue),
-            vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
-            "{mode:?}"
+            modeled_cache_payload(&clean),
+            "{mode:?} persistent L2"
         );
     }
 }
@@ -1365,17 +1356,17 @@ fn effective_tags_do_not_depend_on_current_a20_or_device_decode() {
     assert!(
         expected
             .windows(4)
-            .any(|bytes| bytes == DEVICE_LINE.to_le_bytes())
+            .any(|bytes| bytes == (0x000a_0000u32 >> 5).to_le_bytes())
     );
     assert!(
         expected
             .windows(4)
-            .any(|bytes| bytes == HIGH_LINE.to_le_bytes())
+            .any(|bytes| bytes == (0x0010_0040u32 >> 5).to_le_bytes())
     );
 }
 
 #[test]
-fn every_mode_change_resets_raw_and_effective_cache_state() {
+fn every_mode_change_clears_l1_and_preserves_the_motherboard_l2() {
     let modes = [
         GswMode::Gsw386Slow,
         GswMode::Gsw386,
@@ -1386,41 +1377,39 @@ fn every_mode_change_resets_raw_and_effective_cache_state() {
         for target in modes {
             let mut machine = test_machine();
             machine.set_mode(source);
-            machine.cache_model.l1_tags.fill(0);
-            machine.cache_model.l2_tags.fill(0);
-            warm_modeled_cache_line(&mut machine, source, 0x0123);
+            machine.cache_model.data_tier(source, 0x4800);
+            let l2 = machine.cache_model.l2_tags.to_vec();
+            let payload = modeled_cache_payload(&machine);
             let lookups = machine.cache_tier_lookups();
-
             machine.set_mode(target);
-
             assert!(
                 machine
                     .cache_model
                     .l1_tags
                     .iter()
-                    .all(|tag| *tag == crate::CACHE_EMPTY_TAG),
-                "{source:?} -> {target:?} L1"
+                    .all(|tag| *tag == crate::CACHE_EMPTY_TAG)
             );
+            assert_eq!(machine.cache_model.l2_tags.as_ref(), l2);
+            assert_eq!(machine.cache_tier_lookups(), lookups);
+            assert_eq!(modeled_cache_payload(&machine), payload);
+            if !target.uses_approximate_timing() {
+                assert_eq!(raw_word_read_clocks(&mut machine, 0x4800).1, 14);
+            }
+            machine.cache_model.reset();
             assert!(
                 machine
                     .cache_model
-                    .l2_tags
+                    .l1_tags
                     .iter()
-                    .all(|tag| *tag == crate::CACHE_EMPTY_TAG),
-                "{source:?} -> {target:?} L2"
+                    .chain(machine.cache_model.l2_tags.iter())
+                    .all(|tag| *tag == crate::CACHE_EMPTY_TAG)
             );
-            assert_eq!(machine.cache_tier_lookups(), lookups);
             assert_eq!(
                 modeled_cache_payload(&machine),
-                vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN],
-                "{source:?} -> {target:?}"
+                vec![0; EMPTY_MODELED_CACHE_PAYLOAD_LEN]
             );
             if !target.uses_approximate_timing() {
-                assert_eq!(
-                    raw_word_read_clocks(&mut machine, 0x0123 * CACHE_LINE_BYTES).1,
-                    5,
-                    "{source:?} -> {target:?} must resume cold"
-                );
+                assert_eq!(raw_word_read_clocks(&mut machine, 0x4800).1, 32);
             }
         }
     }
@@ -1431,7 +1420,7 @@ fn default_machine_control_timing_payload_is_exactly_pinned() {
     let payload = machine_control_timing_payload(&test_machine());
     let mut expected = vec![
         0x10, 0x00, // memory MiB
-        0x00, 0x01, 0x01, 0x02, // RAM, ROM, video, and I/O wait states
+        0x00, 0x01, 0x08, 0x02, // RAM, ROM, video, and I/O wait states
         0x01, // fast POST
         0x00, 0x00, // no effective pending software INT
         0x00, 0x00, // no intercepted INT stash
@@ -1470,7 +1459,7 @@ fn populated_machine_control_timing_payload_pins_every_field_offset() {
     machine.halted_ticks = 20;
     machine.trace.add_elapsed_clocks(300);
     machine.scaled_bus_clocks = 150;
-    machine.bus_rem = 29;
+    machine.bus_rem = 0;
 
     let payload = machine_control_timing_payload(&machine);
     let mut expected = vec![
@@ -1499,7 +1488,7 @@ fn populated_machine_control_timing_payload_pins_every_field_offset() {
         20,
         300,
         150,
-        29,
+        0,
     ] {
         push_u64(&mut expected, value);
     }
@@ -1582,7 +1571,7 @@ fn rtc_pic_and_timeline_payloads_share_one_read_only_capture() {
     // the capture below with `UncommittedBatchTiming` for a reason unrelated to what
     // this test pins. The armed arm's capture-after-a-charged-batch behavior is
     // covered by `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
-    with_isa_io_wait(false, || {
+    {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
         machine.seed_rtc(2026, 7, 19, 1, 23, 58, 41);
@@ -1608,7 +1597,7 @@ fn rtc_pic_and_timeline_payloads_share_one_read_only_capture() {
             machine.rtc.ticks_until_periodic_irq(),
             Some(deadline - deadline / 3)
         );
-    });
+    };
 }
 
 #[test]
@@ -1712,7 +1701,7 @@ fn speaker_payload_pins_every_port_61_latch_value() {
     // reason unrelated to what this test pins. Pin the arm OFF; the armed arm's
     // capture-after-a-charged-batch behavior is covered by
     // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
-    with_isa_io_wait(false, || {
+    {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
 
@@ -1727,7 +1716,7 @@ fn speaker_payload_pins_every_port_61_latch_value() {
                 u8::from(expected & 1 != 0)
             );
         }
-    });
+    };
 }
 
 #[test]
@@ -1738,7 +1727,7 @@ fn speaker_latch_and_pit_gate_remain_independent_owners() {
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
     // armed arm's capture-after-a-charged-batch behavior is covered by
     // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
-    with_isa_io_wait(false, || {
+    {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
 
@@ -1753,7 +1742,7 @@ fn speaker_latch_and_pit_gate_remain_independent_owners() {
         assert_eq!(speaker_payload(&machine), [1]);
         assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 0);
         assert_eq!(read_speaker_port(&mut machine) & 0x03, 1);
-    });
+    };
 }
 
 #[test]
@@ -2642,7 +2631,7 @@ fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
     // setup via a raw bus probe. Pin the arm OFF so setup doesn't leave an uncommitted
     // charge; the armed arm's capture-after-a-charged-batch behavior is covered by
     // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
-    with_isa_io_wait(false, || {
+    {
         let mut whole = test_machine();
         let mut split = test_machine();
         for machine in [&mut whole, &mut split] {
@@ -2680,7 +2669,7 @@ fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
         assert_eq!(rtc_payload(&whole)[0x0c] & 0xf0, 0xf0);
         assert!(whole.pic.irr_bit(8));
         assert!(split.pic.irr_bit(8));
-    });
+    };
 }
 
 #[test]
@@ -2691,7 +2680,7 @@ fn rtc_and_pic_commit_the_irq8_deadline_at_one_capture_boundary() {
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
     // armed arm's capture-after-a-charged-batch behavior is covered by
     // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
-    with_isa_io_wait(false, || {
+    {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
         initialize_pic_pair(&mut machine, false);
@@ -2716,7 +2705,7 @@ fn rtc_and_pic_commit_the_irq8_deadline_at_one_capture_boundary() {
         assert_eq!(rtc_payload(&machine)[0x0c], 0);
         assert!(machine.pic.irr_bit(8));
         assert_eq!(pic_payload(&machine)[17] & 0x01, 0x01);
-    });
+    };
 }
 
 #[test]
@@ -2870,7 +2859,7 @@ fn pit_capture_preserves_the_exact_586_irq0_deadline() {
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
     // armed arm's capture-after-a-charged-batch behavior is covered by
     // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
-    with_isa_io_wait(false, || {
+    {
         fn configured() -> Machine {
             let mut machine = test_machine();
             machine.set_mode(GswMode::Gsw586);
@@ -2932,7 +2921,7 @@ fn pit_capture_preserves_the_exact_586_irq0_deadline() {
         assert_eq!(pic_payload(&captured), pic_payload(&twin));
         assert_eq!(captured.pic.acknowledge(), Some(0x20));
         assert_eq!(twin.pic.acknowledge(), Some(0x20));
-    });
+    };
 }
 
 #[test]
@@ -2944,7 +2933,7 @@ fn pit_timeline_and_pic_payloads_match_split_586_advancement() {
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
     // armed arm's capture-after-a-charged-batch behavior is covered by
     // `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`).
-    with_isa_io_wait(false, || {
+    {
         fn configured() -> Machine {
             let mut machine = test_machine();
             machine.set_mode(GswMode::Gsw586);
@@ -2989,7 +2978,7 @@ fn pit_timeline_and_pic_payloads_match_split_586_advancement() {
             machine_control_timing_payload(&split)
         );
         assert_eq!(pic_payload(&whole), pic_payload(&split));
-    });
+    };
 }
 
 #[test]
@@ -3174,11 +3163,9 @@ fn construction_seed_writes_never_accrue_isa_bus_time() {
     // the machine uncapturable in the meantime. They go through `make_construction_bus`,
     // which disarms the charge; a freshly constructed machine must therefore hold zero and
     // capture cleanly with the knob ARMED.
-    crate::bus::set_isa_io_wait_for_test(Some(true));
     let mut profile = MachineProfile::gsw_386(4, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
     let machine = Machine::new_raw_program(profile, &[0xf4]).unwrap();
-    crate::bus::set_isa_io_wait_for_test(None);
 
     assert_eq!(
         machine.port_bus_batch_clocks, 0,
@@ -3276,7 +3263,7 @@ fn inconsistent_machine_timing_is_rejected_independently() {
         capture_error(&bus),
         MachineCanonicalCaptureError::InvalidBusRemainder {
             remainder: 31,
-            denominator: 31,
+            denominator: 1,
         }
     );
 }
@@ -3307,7 +3294,7 @@ fn inconsistent_modeled_cache_state_is_rejected_independently() {
         }
     );
 
-    let expected_config = cache_level_config(GswMode::Gsw386, 1);
+    let expected_config = cache_level_config(GswMode::Gsw386);
     let mut l1_mask = test_machine();
     l1_mask.cache_model.config.l1_mask = 0;
     assert_eq!(
@@ -3332,7 +3319,7 @@ fn inconsistent_modeled_cache_state_is_rejected_independently() {
         }
     );
 
-    let expected_cost = tier_cost(GswMode::Gsw386, 1);
+    let expected_cost = tier_cost(GswMode::Gsw386);
     for (index, actual) in [[1, 0, 3], [0, 1, 3], [0, 0, 4]].into_iter().enumerate() {
         let mut machine = test_machine();
         machine.cache_model.cost.l1 = actual[0];
@@ -3676,7 +3663,7 @@ fn speaker_latch_survives_a_real_586_test_exit_boundary() {
     // rather than split it, so the guest-side charge and the probe-side charge are both
     // absent uniformly; the armed arm's capture-after-a-charged-batch behavior is
     // covered by `armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary`.
-    with_isa_io_wait(false, || {
+    {
         let rom = rom_with_code(&[
             0xb0, 0xff, 0xe6, 0x61, // latch both speaker bits; upper bits normalize
             0xb0, 0x0c, 0xe6, 0xe4, // select REG_EXIT
@@ -3697,7 +3684,7 @@ fn speaker_latch_survives_a_real_586_test_exit_boundary() {
         assert_eq!(pit_payload(&machine)[PIT_CHANNEL_2_GATE_OFFSET], 1);
         assert_eq!(read_speaker_port(&mut machine) & 0x03, 3);
         assert_eq!(speaker_payload(&machine), [3]);
-    });
+    };
 }
 
 #[test]
@@ -3884,4 +3871,66 @@ fn vega_routing_state_survives_a_real_586_test_exit_boundary() {
     ];
     assert_eq!(vega_routing_payload(&machine), expected);
     assert_eq!(vega_routing_payload(&machine), expected);
+}
+
+#[test]
+fn partial_peripheral_advancement_rejects_capture_even_without_a_port_lane() {
+    for (name, port) in [
+        ("COM1", 0x3f8),
+        ("COM2", 0x2f8),
+        ("LPT1", 0x378),
+        ("LPT2", 0x278),
+    ] {
+        let mut machine = test_machine();
+        match name {
+            "COM1" => {
+                machine.serial.read_port_at(port, 100);
+                machine.serial.advance_master_ticks(30);
+            }
+            "COM2" => {
+                machine.serial2.read_port_at(port, 100);
+                machine.serial2.advance_master_ticks(30);
+            }
+            "LPT1" => {
+                machine.lpt.read_port_at(port, 100);
+                machine.lpt.advance_master_ticks(30);
+            }
+            _ => {
+                machine.lpt2.read_port_at(port, 100);
+                machine.lpt2.advance_master_ticks(30);
+            }
+        }
+        assert_eq!(machine.port_bus_batch_clocks, 0);
+        assert_eq!(
+            capture_error(&machine),
+            MachineCanonicalCaptureError::UncommittedPeripheralAdvance {
+                device: name,
+                ticks: 70
+            }
+        );
+    }
+    let mut machine = test_machine();
+    machine.opl_timer_advance_credit_us = 7;
+    assert_eq!(
+        capture_error(&machine),
+        MachineCanonicalCaptureError::UncommittedOplTimerAdvance { micros: 7 }
+    );
+}
+
+#[test]
+fn fixed_l2_residency_remains_canonical_while_the_cpu_uses_flat_timing() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut cold = test_machine();
+        let mut hot = test_machine();
+        cold.set_mode(GswMode::Gsw386);
+        hot.set_mode(GswMode::Gsw386);
+        assert_eq!(raw_word_read_clocks(&mut hot, 0x20000).1, 32);
+        cold.set_mode(mode);
+        hot.set_mode(mode);
+        assert_ne!(modeled_cache_payload(&hot), modeled_cache_payload(&cold));
+        cold.set_mode(GswMode::Gsw386);
+        hot.set_mode(GswMode::Gsw386);
+        assert_eq!(raw_word_read_clocks(&mut hot, 0x20000).1, 14);
+        assert_eq!(raw_word_read_clocks(&mut cold, 0x20000).1, 32);
+    }
 }

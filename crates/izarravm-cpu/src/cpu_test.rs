@@ -1888,132 +1888,9 @@ fn live_mode_switch_to_an_accurate_persona_stops_the_fast_map_probe() {
 #[test]
 #[cfg(feature = "jit")]
 fn pending_flags_offset() {
-    // Pending flags offset for direct native writes; shifts whenever PerfCounters or CpuGsw's
-    // other fields grow or shrink. The lever-1 slice's interp_fast_map_hits/_misses counters live
-    // in FastMapProbeCounters at the CpuGsw tail instead (see that type), to avoid moving this
-    // pin. The dynarec-refactor Task 2 region-JIT deletion drops the `jit_regions:
-    // jit::RegionTable` field from `CpuGsw` (RegionTable itself is gone) and four PerfCounters
-    // fields (jit_region_entries, jit_region_insns, jit_native_block_ns,
-    // jit_native_block_samples), moving this pin from 4528 to 4456 (measured via a failing-test
-    // readout, not derived: rustc's field reordering is not guaranteed to move linearly with a
-    // struct's size change). Task 3b then deletes four more dead region-only PerfCounters fields
-    // (jit_native_insns, jit_helper_exits, jit_native_memory_helpers, jit_table_clears; 32 bytes),
-    // moving this pin from 4456 to 4424 -- again measured against a failing test, matching the
-    // sibling pin in `arch_payload_keeps_pending_flags_offset_pinned` (canonical_state_test.rs).
-    // The mutable-imm-lane slice adds four PerfCounters fields (the lane registration, accept and
-    // two rejection-reason counters; 32 bytes), moving this pin back from 4424 to 4456, measured
-    // the same way. They belong in PerfCounters rather than at the CpuGsw tail because they are
-    // the slice's diagnostic trio and have to appear in the probe JSON alongside the SMC counters. The Phase 5
-    // call-out slice adds `native_callout: CallOutTable` to `CpuGsw` (a raw pointer and a usize;
-    // 16 bytes), moving this pin from 4456 to 4472, measured the same way. Slice 1 of the
-    // rejected-row campaign adds the PUSHAD and POPAD helpers, so `CallOutTable` gains two more
-    // function-pointer `usize`s (16 bytes) and this pin moves from 4472 to 4488 -- measured, not
-    // derived. Three pointers rather than one dispatching trampoline is deliberate: the emitted
-    // slot stays one plain quadword load and one indirect call, with no per-call-out branch on
-    // 20 M doom executions. The fatal-fault diagnostics slice adds `fault_site: FaultSite` to
-    // `CpuGsw` (an `Option` around a `SegmentRegister`, a `u32` and a `bool`; 24 bytes), moving
-    // this pin from 4488 to 4512 -- measured, not derived. Declaring it at the struct tail does
-    // NOT keep the pin, because repr(Rust) reorders fields by alignment: source position buys
-    // nothing here, so it is written at the tail for readability (it is cold, written at most
-    // once per run) rather than for layout.
-    // The invalidation-scan counters (smc_scan_calls, smc_scan_keys) add two u64 fields to
-    // PerfCounters and move this pin from 4512 to 4528 -- measured, not derived. They belong in
-    // PerfCounters rather than at the CpuGsw tail because they have to appear in the probe JSON
-    // beside the other SMC counters, which is where the invalidation cost is read.
-    // The R15 table-bases slice adds `native_table_slots: NativeTableSlots` ([usize; 6],
-    // 48 bytes) so emitted code can load table bases R15-relative instead of baking imm64s --
-    // it must be a by-value CpuGsw field: behind a Box the emitted load would need a second,
-    // dependent indirection, which is half the point of the slice gone. Its first position
-    // (mid-struct, beside native_callout) moved this pin 4528 -> 4576, and the one-lookup
-    // slice's growth to [usize; 24] moved it again to 4720 -- where the quiet-window gate
-    // measured a uniform ~2-5% doom regression with byte-identical counters: every hot
-    // interpreter field after the array had shifted cache lines. The array now lives at the
-    // struct TAIL (fault_site's precedent) and this pin is back at its pre-R15 value --
-    // measured, not derived. Do not let this array migrate mid-struct again.
-    // The decode-line first-touch slice adds one `Box<[DecodePack]>` to `DecodeCache` (16 bytes
-    // of fat pointer, mid-struct because the cache is a by-value field), moving this pin 4528 ->
-    // 4544 -- measured, not derived. It is a pointer, not a payload: the array it addresses is a
-    // separate 1 MB allocation whose whole purpose is to be the resident one.
-    // Dropping MMX removes the `[u64; 8]` MM register file from `X87`, 64 bytes of state that sat
-    // ahead of the hot interpreter fields, moving this pin 4544 -> 4480. Unlike the growth events
-    // above this is a SHRINK of dead architectural state, so it pulls the fields after it toward
-    // the front of the struct rather than pushing them apart -- but it is still a cache-line
-    // reshuffle of the hot region, so it is measured by the fixture sweep, not assumed inert.
-    // The arena-size slice adds one PerfCounters field (jit_direct_arena_compaction_ns; 8 bytes),
-    // moving this pin 4480 -> 4488 -- measured off a failing-test readout, not derived. It belongs
-    // in PerfCounters rather than at the CpuGsw tail because the phase-mark series carries
-    // `PerfCounters` by value and this counter's whole purpose is to appear per-interval beside
-    // jit_direct_arena_compactions, which is where compaction wall is read.
-    // The S2 `InterpretOne` call-out adds `CallOutTable::interpret_one` (8 bytes), the call-out
-    // window flag and the deferred code-write list to `CpuGsw`, moving this pin 4488 -> 4536 --
-    // measured off a failing-test readout, not derived. None of it is guest state: the flag and
-    // the list are host-side window bookkeeping with an always-equal `PartialEq`, exactly like
-    // `native_callout` beside them.
-    // The data-segment reject governor adds two PerfCounters fields
-    // (jit_direct_reject_data_segment_strict / _masked; 16 bytes), moving this pin 4536 -> 4552 --
-    // measured off a failing-test readout, not derived. They belong in PerfCounters rather than in
-    // the stall tally for one reason: the phase-mark series carries `PerfCounters` BY VALUE, and
-    // the per-phase export carried no data-segment reject column at all, so a whole-run-only split
-    // would leave the slice's phase-scoped bar ungradeable. This IS a cache-line reshuffle of the
-    // hot region, so it is a wall confound between this binary and `main` -- which is why the
-    // slice's ladder takes its base from the OFF leg of the SAME binary and opens with an A/A.
-    // The gp2 in-imm8 callout design adds `CallOutTable::port_read_al_imm8` (8 bytes), moving this
-    // pin 4552 -> 4560 -- measured off a failing-test readout, not derived. Same shape as the S2
-    // `InterpretOne` growth above: host-side window bookkeeping, not guest state.
-    // The run-end ledger fix adds two PerfCounters fields (brk_rep_resume, brk_fatal; 16 bytes),
-    // moving this pin 4560 -> 4576 -- measured off a failing-test readout, not derived. They
-    // belong in PerfCounters, not at the CpuGsw tail, for the same reason the other brk_* fields
-    // do: the bench and phase-mark JSON emit them alongside their siblings.
-    // The gp2 `0xE6` OUT slice adds `CallOutTable::port_write_al_imm8` (8 bytes), moving this pin
-    // 4576 -> 4584 -- measured off a failing-test readout, not derived. Same shape as the
-    // `port_read_al_imm8` growth above: one host-side function-pointer slot in the call-out
-    // window, not guest state. (The slice's OTHER new field, the
-    // `callout_port_out_imm8_served` counter, lives in the stall tally behind `jit_direct` and
-    // does not move this offset.)
-    // The `0xEE` OUT DX,AL slice adds `CallOutTable::port_write_al_dx` (8 bytes), moving this pin
-    // 4584 -> 4592 -- measured off a failing-test readout, not derived. Same shape again: one
-    // host-side function-pointer slot, not guest state. (`callout_port_out_dx_served` lives in
-    // the stall tally and does not move this offset either.)
-    // The Tyrian live-data slice adds four PerfCounters fields
-    // (jit_direct_reject_data_segment_real / _v86 / _pm16 / _pm32; 32 bytes), moving this pin
-    // 4592 -> 4624 -- measured off a failing-test readout, not derived. They belong in
-    // PerfCounters so they ride phase_marks beside the existing strict/masked split.
-    // `SEGWRITE-V86-EDGE` adds one PerfCounters field (jit_direct_seg_guard_mismatch_exits;
-    // 8 bytes), moving this pin 4624 -> 4632 -- measured off a failing-test readout, not derived.
-    // Same shape as every other counter above: host-side bookkeeping the guard's true conversion
-    // rate rides, not guest state.
-    // The CR3/CR0/task-switch flush attribution split adds three PerfCounters fields
-    // (decode_inval_cr3 / _cr0 / _task_switch; 24 bytes), moving this pin 4632 -> 4656 --
-    // measured off a failing-test readout, not derived. They are an attribution of
-    // `decode_inval_other`, host-side diagnostics, not guest state.
-    // The CR3 code-cache gate (`2026-09-02-cr3-code-cache-gate-design.md`) adds six PerfCounters
-    // fields (cr3_code_flush_taken / _skipped, translation_page_writes, translation_a_stores /
-    // _d_stores, translation_pages_marked; 48 bytes) and grows `DecodeCache` (mid-struct, a
-    // by-value field) with the two-slot ring (`contexts`, `next_generation`, `ring_seeded`) and
-    // the `translation_pages` bitmap plus its residency counter, moving this pin 4656 -> 4760 --
-    // measured off a failing-test readout, not derived. None of it is guest state: the counters
-    // are diagnostics like their CR3/CR0/task-switch siblings, and the ring/bitmap are the same
-    // kind of transparent accelerator `DecodeCache` already was.
-    // The CR3 JIT-half gate (`2026-09-02-cr3-jit-half-design.md`) adds two PerfCounters fields
-    // (cr3_link_context_selects, cr3_link_graph_retires; 16 bytes), moving this pin
-    // 4760 -> 4776 -- measured off a failing-test readout, not derived. Both are documentation
-    // counters (design review J8): host-side diagnostics, not guest state.
-    // The CR3 data-side gate T2 (`2026-09-02-cr3-data-side-design.md`) adds one PerfCounters
-    // field (`tlb_walks`; 8 bytes), moving this pin 4776 -> 4784 -- measured off a failing-test
-    // readout, not derived. It is a diagnostic (the T2 win-gate counter), not guest state; the
-    // TLB's own growth (`Tlb::generations`/`live`/`next_generation`) does not move this pin at
-    // all, because `Tlb` sits ahead of `pending_flags` as part of the SAME by-value block that
-    // was already counted, and none of its three new fields change `CpuGsw`'s own field order.
-    // The timing-recalibration class table (slice 1a) adds `timing_epoch: u32` and
-    // `class_table: &'static ClassTable` to `CpuGsw`, moving this pin 4784 -> 4792 -- measured
-    // off a failing-test readout, not derived (the `u32` lands in existing padding; the
-    // reference is the 8 bytes). Neither is architectural state: both are resolved ONCE at
-    // machine construction from `IZARRAVM_TIMING_EPOCH` and never observed by a guest
-    // instruction, so both canonical payloads are unchanged by them.
-    // The `timing-class-histogram` feature adds one boxed field ahead of this
-    // pin, so the offset moves on that build alone. The pin is a PLAIN-build
-    // invariant -- emitted code bakes these offsets and the instrument arm is
-    // never the one that ships -- so it is checked where it means something.
+    // The derived class-table pointer and host diagnostics are excluded from
+    // architectural state. Native code still requires this plain-build layout;
+    // the histogram feature adds a boxed field before the pinned offset.
     #[cfg(not(feature = "timing-class-histogram"))]
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
 }
@@ -2697,65 +2574,30 @@ fn scale_clocks_batches_exactly() {
 /// the shared-denominator property the batch relies on.
 #[test]
 fn scale_fp_clocks_batches_exactly() {
-    use FpOpClass::{F32Mem, F64Mem, IntConvert16, IntConvert32, Register, Wait};
-    let seqs: [&[(u32, FpOpClass)]; 4] = [
-        &[
-            (4, IntConvert32),
-            (1, Register),
-            (3, F64Mem),
-            (2, IntConvert16),
-            (1, Register),
-        ],
-        &[(1, Register); 20],
-        &[
-            (7, F32Mem),
-            (2, IntConvert32),
-            (9, Register),
-            (1, Wait),
-            (5, IntConvert16),
-            (3, F64Mem),
-        ],
-        &[(468, Register), (2, F32Mem), (36, Register), (2, Register)],
+    let sequences: [&[u32]; 4] = [
+        &[4, 1, 3, 2, 1],
+        &[1; 20],
+        &[7, 2, 9, 1, 5, 3],
+        &[468, 2, 36, 2],
     ];
-    for epoch in [1, 2] {
-        for mode in [
-            GswMode::Gsw386Slow,
-            GswMode::Gsw386,
-            GswMode::Gsw486,
-            GswMode::Gsw586,
-        ] {
-            for start_rem in 0..=7 {
-                for seq in seqs {
-                    let mut indiv = CpuGsw::default();
-                    indiv.set_timing_epoch(epoch);
-                    indiv.set_mode(mode);
-                    indiv.fp_rem = start_rem;
-                    let sum_individual: u64 = seq
-                        .iter()
-                        .map(|&(c, cl)| u64::from(indiv.scale_fp_clocks(c, cl)))
-                        .sum();
-
-                    // Closed-form batched value: sum the per-op class-weighted numerators, then one
-                    // exact division with the single carried remainder.
-                    let weighted: u64 = seq
-                        .iter()
-                        .map(|&(c, cl)| {
-                            u64::from(c) * u64::from(fp_timing_class(mode.persona(), cl, epoch))
-                        })
-                        .sum();
-                    let scaled = weighted + start_rem;
-                    let batched = scaled / u64::from(FP_TIMING_DEN);
-                    let final_rem = scaled % u64::from(FP_TIMING_DEN);
-
-                    assert_eq!(
-                        sum_individual, batched,
-                        "epoch {epoch} mode {mode:?} rem {start_rem}: per-op FP sum != batched"
-                    );
-                    assert_eq!(
-                        indiv.fp_rem, final_rem,
-                        "epoch {epoch} mode {mode:?} rem {start_rem}: fp_rem carry diverged"
-                    );
-                }
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for remainder in 0..8 {
+            for sequence in sequences {
+                let mut cpu = CpuGsw::default();
+                cpu.set_mode(mode);
+                cpu.fp_rem = remainder;
+                let actual: u64 = sequence
+                    .iter()
+                    .map(|&raw| u64::from(cpu.scale_fp_clocks(raw)))
+                    .sum();
+                let expected: u64 = sequence.iter().map(|&raw| u64::from(raw)).sum();
+                assert_eq!(actual, expected, "{mode:?}, remainder {remainder}");
+                assert_eq!(cpu.fp_rem, remainder);
             }
         }
     }
@@ -2967,6 +2809,7 @@ pub(crate) struct TestBus {
     // (gp2 in-imm8 callout design mutant table, "bus.read_io argument fidelity").
     last_read_io_ring0: Option<bool>,
     last_write_io_core_clocks_so_far: Option<u64>,
+    io_run_core_origin: u64,
     // When true, `direct_page` hands out host-pointer pages into `memory` (mirroring the production
     // MachineBus), so data accesses take the CPU's cached host-pointer deref path instead of the
     // slow `read_memory_direct` fallback. Default false (the historical no-direct-page behavior).
@@ -3009,14 +2852,14 @@ pub(crate) struct TestBus {
     flat_direct_page_clocks: bool,
     // Opt-in batch-clock reporting for tight event-budget tests. Historical CPU tests leave it
     // off because their TestBus predates machine-level combined core/bus caps.
-    report_batch_clocks: bool,
+    pub(crate) report_batch_clocks: bool,
     // The (num, den) the batch-clock reporting scales raw bus clocks by, mirroring MachineBus's
     // batch-start snapshot of `bus_timing`. Default (1, 1) keeps every historical test on the
     // identity scaling it was written against; the cap-screen tests set a real persona ratio so
     // the screen's bound is looser than the exact test and the fall-through arm is exercised.
     batch_bus_scale: (u64, u64),
     page_walk_bound_available: bool,
-    rep_data_byte_cost_override: Option<u64>,
+    pub(crate) rep_data_byte_cost_override: Option<u64>,
     direct_memory_max_clock_override: Option<u64>,
     project_additional_bus_clocks: bool,
     native_aggregate_accounting_disabled: bool,
@@ -3035,18 +2878,13 @@ pub(crate) struct TestBus {
     mode13_word_writes: u64,
     mode13_dword_writes: u64,
     direct_mapping_epoch: u64,
-    // `IZARRAVM_TIMING_EPOCH=2` without an env write: `CpuBus::timing_epoch` reports 2 when set.
-    // A bool rather than a `u32` so `#[derive(Default)]` still lands on epoch 1, which is what
-    // every fixture written before the port repricing expects.
-    pub(crate) timing_epoch_two: bool,
 }
 
 impl TestBus {
-    fn with_memory(memory: Vec<u8>) -> Self {
+    pub(crate) fn with_memory(memory: Vec<u8>) -> Self {
         Self {
             memory: memory.into(),
             trace: BusTrace::default(),
-            timing_epoch_two: false,
             published_core: 0,
             core_events: None,
             decline_bulk_write: false,
@@ -3066,6 +2904,7 @@ impl TestBus {
             last_read_io_core_clocks_so_far: None,
             last_read_io_ring0: None,
             last_write_io_core_clocks_so_far: None,
+            io_run_core_origin: 0,
             direct_pages_enabled: false,
             direct_pages_writable: true,
             direct_write_denied_page: None,
@@ -3416,15 +3255,6 @@ impl CpuBus for TestBus {
         u64::from(self.uniform_native_fetches) * 2
     }
 
-    /// The two dial flags are plain public fields that fixtures flip between runs, and at least
-    /// one existing fixture flips `uniform_native_fetches` after priming a block
-    /// (`generated_three_block_chain_aggregates_across_event_caps`). Fingerprint both, so the
-    /// Direct backend's memo of the derived worst-case hop cost cannot go stale. Offset by one to
-    /// stay clear of the trait default's 0.
-    fn timing_epoch(&self) -> u32 {
-        if self.timing_epoch_two { 2 } else { 1 }
-    }
-
     fn jit_cost_dial_epoch(&self) -> u64 {
         1 + u64::from(self.uniform_native_fetches) + 2 * u64::from(self.direct_page_clocks)
     }
@@ -3493,6 +3323,14 @@ impl CpuBus for TestBus {
     fn rep_page_walk_cost_upper(&self) -> Option<u64> {
         self.page_walk_bound_available
             .then_some(if self.report_batch_clocks { 8 } else { 0 })
+    }
+
+    fn rep_io_cost_upper(&self, _port: u16, _width: BusWidth) -> u64 {
+        if !self.report_batch_clocks {
+            return 0;
+        }
+        let (num, den) = self.batch_bus_scale;
+        (2 * num).div_ceil(den)
     }
 
     fn rep_data_byte_cost_upper(&self) -> u64 {
@@ -3684,7 +3522,8 @@ impl CpuBus for TestBus {
         }
         self.last_read_io_core_clocks_so_far = Some(core_clocks_so_far);
         self.last_read_io_ring0 = Some(cpu_is_ring0_pm);
-        self.io_reads.push((port, core_clocks_so_far));
+        self.io_reads
+            .push((port, self.io_run_core_origin + core_clocks_so_far));
         self.trace.push(BusCycle::new(
             BusAccessKind::IoRead,
             u32::from(port),
@@ -3715,7 +3554,8 @@ impl CpuBus for TestBus {
         if self.io_write_arms_pending_irq {
             self.pending_irq = Some(0);
         }
-        self.io_writes.push((port, value, core_clocks_so_far));
+        self.io_writes
+            .push((port, value, self.io_run_core_origin + core_clocks_so_far));
         self.last_write_io_core_clocks_so_far = Some(core_clocks_so_far);
         self.trace.push(BusCycle::new(
             BusAccessKind::IoWrite,

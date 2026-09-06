@@ -248,35 +248,9 @@ impl Default for CallOutAdmission {
 /// benefit; 4 stays until something changes what a memory-ALU slot costs to emit.
 const MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS: usize = 4;
 const MAX_MEMORY_ALU_SLOTS: u8 = 3;
-/// Per-hop chain clock bound for a block with any x87 slot. Derived, not chosen:
-/// the worst ADMISSIBLE slot is an `FpOpClass::IntConvert16` memory arith (raw 20, I586
-/// scale 256, ceil(20 * 256 / 8) = 640 core clocks), MAX_X87_SLOTS of those is 5,120, plus
-/// MAX_X87_BLOCK_INSTRUCTIONS non-x87 slots at the 10-clock worst constant charge is 120.
-/// `max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table` re-derives this
-/// from the metadata table and fails the build if a costlier shape ever joins it.
-///
-/// Raised from 3,928 (the IntConvert32 worst) AHEAD of the first IntConvert16 member, so that
-/// slice measures its own effect cleanly. The raise alone was measured on the pinned corpus:
-/// all six anchors byte-identical, the chain quota shrinks (a chain hop is assumed costlier,
-/// so chains return to the dispatcher earlier), entries up about 136,000, roughly 8 ms of wall.
-pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 5_240;
-/// The same bound, per epoch. Epoch 1 is the constant above, unchanged and
-/// unchangeable (it is a live admission input and moving it moves epoch 1).
-///
-/// Slice 4 routes the native x87 metadata onto the class table, so at epoch 2 a
-/// slot's weighted cost is `table.raw(class)` with an IDENTITY FP dial rather
-/// than the epoch-1 literal times `fp_timing_class`. The worst shape the
-/// compiler can build there is `FIDIV m32int` on the I486 (`X87MemArithIntDiv32`,
-/// raw 1,026 -- Table 10.3's own 85.5-clock average), so the bound is
-/// `MAX_X87_SLOTS * 1026 + MAX_X87_BLOCK_INSTRUCTIONS * 10`.
-/// `max_x87_block_core_clocks_dominates_every_shape_in_the_metadata_table`
-/// re-derives BOTH epochs from the metadata table, over both fast personas, and
-/// fails the build if a costlier shape ever joins it.
-pub(crate) const fn max_x87_block_core_clocks(epoch: u32) -> u64 {
-    if epoch >= 2 {
-        return 8_328;
-    }
-    MAX_X87_BLOCK_CORE_CLOCKS
+/// Covers eight worst-case x87 slots plus twelve integer slots.
+pub(crate) const fn max_x87_block_core_clocks() -> u64 {
+    8_328
 }
 /// Mutable imm32 lanes per block. One lane-admitted `0x81 /r` slot claims one lane; slots past
 /// this cap keep their baked immediate, which is a missed optimisation and never a correctness
@@ -6202,14 +6176,12 @@ impl DirectKind {
         }
     }
 
-    fn weighted_fp_clocks(self, persona: CpuPersona, table: &ClassTable, epoch: u32) -> u32 {
+    fn weighted_fp_clocks(self, table: &ClassTable) -> u32 {
         match self {
-            Self::X87 { insn, .. } => u32::try_from(insn.metadata().weighted_fp_clocks(
-                persona,
-                insn.timing_class(),
-                table,
-                epoch,
-            ))
+            Self::X87 { insn, .. } => u32::try_from(
+                insn.metadata()
+                    .weighted_fp_clocks(insn.timing_class(), table),
+            )
             .expect("one x87 instruction's weighted clocks fit u32"),
             _ => 0,
         }
@@ -8913,8 +8885,7 @@ fn compile_with_budget(
             stop = CompileStop::Boundary;
             break;
         }
-        let slot_weighted_fp_clocks =
-            kind.weighted_fp_clocks(cpu.persona(), cpu.class_table(), cpu.timing_epoch());
+        let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.class_table());
         let Some(next_raw_clocks) = raw_clocks.checked_add(kind.raw_clocks(cpu.class_table()))
         else {
             stop = CompileStop::Retry(RetryCause::AccumulatorOverflow);
@@ -30327,7 +30298,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                                 fetch_count: poll.fetch_count() as u8,
                                 status_mask: poll.status_mask(),
                                 spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
-                                raw_core_clocks: cpu.poll_skip_raw_core_clocks(poll, bus),
+                                raw_core_clocks: cpu.poll_skip_raw_core_clocks(poll),
                                 core_clocks_at_block_entry: cpu.core_clocks_so_far,
                                 prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
                                 core_num,
@@ -30506,12 +30477,12 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
                 CallOutOutcome::Continued
             },
         );
-        i64::from(cpu.port_io_core_clocks(bus, false)).saturating_add(extra_raw_clocks as i64)
+        i64::from(cpu.port_io_core_clocks(false)).saturating_add(extra_raw_clocks as i64)
             | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
     }
     #[cfg(not(feature = "direct-callout-attribution"))]
     {
-        i64::from(cpu.port_io_core_clocks(bus, false)).saturating_add(extra_raw_clocks as i64)
+        i64::from(cpu.port_io_core_clocks(false)).saturating_add(extra_raw_clocks as i64)
             | (i64::from(bus.requires_step_break() || forced_step_break) << STATUS_STEP_BREAK_BIT)
     }
 }
@@ -30699,12 +30670,11 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
                 CallOutOutcome::Continued
             },
         );
-        i64::from(cpu.port_io_core_clocks(bus, false))
-            | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
+        i64::from(cpu.port_io_core_clocks(false)) | (i64::from(step_break) << STATUS_STEP_BREAK_BIT)
     }
     #[cfg(not(feature = "direct-callout-attribution"))]
     {
-        i64::from(cpu.port_io_core_clocks(bus, false))
+        i64::from(cpu.port_io_core_clocks(false))
             | (i64::from(bus.requires_step_break()) << STATUS_STEP_BREAK_BIT)
     }
 }
@@ -30944,7 +30914,7 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
         Some(original_port),
         CallOutOutcome::StepBreak,
     );
-    i64::from(cpu.port_io_core_clocks(bus, true)) | (1 << STATUS_STEP_BREAK_BIT)
+    i64::from(cpu.port_io_core_clocks(true)) | (1 << STATUS_STEP_BREAK_BIT)
 }
 
 /// `0xEE` OUT DX,AL through the interpreter's own port path, admitted unconditionally (no knob),
@@ -31165,7 +31135,7 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
         Some(original_port),
         CallOutOutcome::StepBreak,
     );
-    i64::from(cpu.port_io_core_clocks(bus, true)) | (1 << STATUS_STEP_BREAK_BIT)
+    i64::from(cpu.port_io_core_clocks(true)) | (1 << STATUS_STEP_BREAK_BIT)
 }
 
 /// Resolve the published bus for a helper instantiation, or `None` if the window is not open.

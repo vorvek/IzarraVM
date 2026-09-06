@@ -1583,11 +1583,8 @@ fn int13_census_is_silent_until_armed_and_counts_after() {
     assert_eq!(p.read_buf_conv, 2);
     assert_eq!(p.read_buf_uma, 0);
     assert_eq!(p.read_buf_hma, 0);
-    // Both reads start at the same CHS address, so the 8-sector read's first
-    // sector is already resident from the 1-sector read: 9 sectors requested,
-    // 8 charged, 1 served by the host-side cache. That overlap is deliberate --
-    // it makes this assertion fail if the census ever prices a transfer with the
-    // uncached formula while the machine charges the cached one.
+    // The overlapping reads request nine sectors with one host-cache hit.
+    // The census and machine must both charge all nine completed sectors.
     assert_eq!(p.cache_hits, 1, "the repeated first sector was a cache hit");
     assert_eq!(
         p.stall_ticks,
@@ -1597,12 +1594,12 @@ fn int13_census_is_silent_until_armed_and_counts_after() {
     );
     assert_eq!(
         p.stall_ticks,
-        ata::pio_transfer_ticks_cached(1, 0) + ata::pio_transfer_ticks_cached(8, 1),
+        ata::pio_transfer_ticks(1) + ata::pio_transfer_ticks(8),
         "charged ticks must equal what the ATA model actually charged"
     );
     assert!(
-        p.stall_ticks < ata::pio_transfer_ticks(9),
-        "and must be strictly less than the uncached charge for the same 9 sectors"
+        p.stall_ticks == 9 * 256 * 20 * 33,
+        "host cache residency must not change the nine-sector cable time"
     );
     assert!(
         p.host_wall_ns > 0,
@@ -1735,23 +1732,9 @@ fn int13_write_at(machine: &mut Machine, lba: u32, count: u8) {
     );
 }
 
-/// The charged model has to deliver the machine's stated storage rate. With the
-/// per-command latency at zero, a bulk fixed-disk read must price out at
-/// 16.7 MB/s to within the one-tick-per-sector rounding of the tick model, and
-/// -- the half that matters -- a run of SINGLE-sector reads has to price out at
-/// the SAME rate. Under the old 100 us command latency those two differed by a
-/// factor of four, and 98.7% of a real Duke Nukem 3D load was the single-sector
-/// case.
-///
-/// NON-VACUOUS: restoring `COMMAND_LATENCY_TICKS` to `MASTER_CLOCK_HZ / 10_000`
-/// drops the single-sector rate to 3.9 MB/s and fails the second assertion;
-/// it also fails the first, at 14.9 MB/s for a 64-sector read.
-///
-/// Measured off the MACHINE's `io_stall_ticks`, never off the census: the census
-/// recomputes its own figure with the same helper the charge uses, so a census
-/// assertion cannot tell the two apart.
+/// Bulk and single-sector reads pay the same 20 reference clocks per word.
 #[test]
-fn the_charged_fixed_disk_rate_is_sixteen_point_seven_megabytes_per_second() {
+fn the_charged_fixed_disk_rate_follows_the_reference_bus_word_cost() {
     fn charged_rate(sectors: u64, ticks: u64) -> f64 {
         (sectors * 512) as f64 * izarravm_core::MASTER_CLOCK_HZ as f64 / ticks as f64
     }
@@ -1763,8 +1746,8 @@ fn the_charged_fixed_disk_rate_is_sixteen_point_seven_megabytes_per_second() {
     let bulk_ticks = bulk.io_stall_ticks() - before;
     let bulk_rate = charged_rate(64, bulk_ticks);
     assert!(
-        (bulk_rate - 16_700_000.0).abs() < 16_700.0,
-        "a 64-sector read must charge 16.7 MB/s, got {bulk_rate:.0} B/s"
+        (bulk_rate - 16_600_000.0).abs() < 16_600.0,
+        "a 64-sector read must charge 16.6 MB/s, got {bulk_rate:.0} B/s"
     );
     assert_eq!(
         bulk.int13_profile().stall_ticks,
@@ -1788,33 +1771,14 @@ fn the_charged_fixed_disk_rate_is_sixteen_point_seven_megabytes_per_second() {
     );
     let single_rate = charged_rate(64, single_ticks);
     assert!(
-        (single_rate - 16_700_000.0).abs() < 16_700.0,
-        "64 single-sector reads must charge the same 16.7 MB/s, got {single_rate:.0} B/s"
+        (single_rate - 16_600_000.0).abs() < 16_600.0,
+        "64 single-sector reads must charge the same 16.6 MB/s, got {single_rate:.0} B/s"
     );
 }
 
-/// The host-side sector cache, end to end through the BIOS service: a repeat
-/// read is charged NOTHING and returns the same bytes, and a write makes the
-/// next read return the WRITTEN bytes rather than a stale cached copy.
-///
-/// MEASURED OFF THE MACHINE, NOT THE CENSUS. `int13_profile().stall_ticks` is
-/// recomputed by `note_int13_data` through the very same
-/// `pio_transfer_ticks_cached` call that `stall_for_hdd_sectors_cached` uses, so
-/// asserting it proves only that the helper agrees with itself: the earlier shape
-/// of this test passed with the machine charging the UNCACHED form. What the
-/// guest can observe is `io_stall_ticks` and the master timeline, so those are
-/// what is asserted here.
-///
-/// NON-VACUOUS in both directions. Removing the `cache.borrow_mut().put` from
-/// `write_lba` leaves the pre-write bytes resident and fails the write-back
-/// assertion — that is the invalidation half, and without it the cache would be
-/// a correctness bug rather than an accelerator. Charging
-/// `pio_transfer_ticks(done)` instead of the cached form in
-/// `stall_for_hdd_sectors_cached` makes the repeat read cost the same as the
-/// first and fails the free-repeat assertions on both the stall counter and the
-/// timeline.
+/// Cached reads retain guest cable time and guest writes replace cached bytes.
 #[test]
-fn a_repeat_read_costs_nothing_and_a_write_is_never_served_stale() {
+fn a_repeat_read_keeps_guest_time_and_a_write_is_never_served_stale() {
     let mut machine = machine_with_hdd(4096);
     machine.enable_int13_profile();
 
@@ -1831,20 +1795,18 @@ fn a_repeat_read_costs_nothing_and_a_write_is_never_served_stale() {
     assert_eq!(repeat, first, "a hit serves the same bytes");
     assert_eq!(
         machine.io_stall_ticks() - stall_before,
-        0,
-        "a repeat read charges the guest NOTHING: the medium was never touched \
-         (the first read charged {first_stall})"
+        first_stall,
+        "a host cache hit retains the same guest transfer time"
     );
     assert_eq!(
         machine.master_ticks() - clock_before,
-        0,
-        "and the guest-visible timeline does not advance either \
-         (the first read advanced it {first_elapsed})"
+        first_elapsed,
+        "the timeline advances by the same physical transfer duration"
     );
     assert_eq!(machine.int13_profile().cache_hits, 1);
     assert_eq!(
         machine.int13_profile().stall_ticks,
-        first_stall,
+        first_stall * 2,
         "the census must agree with the machine's own charge"
     );
 
@@ -1864,7 +1826,7 @@ fn a_repeat_read_costs_nothing_and_a_write_is_never_served_stale() {
 
 /// Determinism: the charge is a pure function of the guest's own access history.
 /// Two machines driven through the identical sequence must agree tick for tick,
-/// including on which reads were free.
+/// regardless of host cache residency.
 ///
 /// NON-VACUOUS: this is the property the whole charge model rests on. Any
 /// residency decision seeded from host state (an address, a clock, a hash order)
@@ -1900,8 +1862,13 @@ fn the_same_read_sequence_charges_the_same_ticks_every_time() {
     );
     assert_eq!(first.1, second.1);
     assert!(
-        first.1 > 0 && first.0.contains(&0),
-        "the sequence must actually produce free calls, or this proves nothing"
+        first.1 > 0
+            && first
+                .0
+                .iter()
+                .zip(&sequence)
+                .all(|(&ticks, &(_, count))| ticks == u64::from(count) * 256 * 20 * 33),
+        "the sequence must include cache hits and charge every requested sector"
     );
 }
 
@@ -1978,7 +1945,7 @@ fn patterned(sectors: usize) -> Vec<u8> {
 /// one synthesizes its sectors and reads host files.
 ///
 /// NON-VACUOUS: charging `pio_transfer_ticks(done)` instead of the cached form
-/// in `stall_for_hdd_sectors_cached` makes the repeat read cost the same as the
+/// in `stall_for_hdd_sectors` makes the repeat read cost the same as the
 /// first and fails the free-repeat assertion; disabling the cache
 /// (`SectorCache::new(false)`) fails the hit-counter assertion.
 #[test]
@@ -2008,8 +1975,8 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
     assert_eq!(repeat, first, "a hit serves the same bytes");
     assert_eq!(
         machine.io_stall_ticks() - stall_before,
-        0,
-        "the repeat is free (the first read charged {first_stall})"
+        first_stall,
+        "host cache hits retain the original guest transfer time"
     );
     assert_eq!(
         machine.hdd_sector_cache_counters().unwrap().0 - hits_after,
@@ -2019,7 +1986,7 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
     let counters = machine.katea_storage_counters().unwrap();
     assert_eq!(counters.int13_read_commands, 2);
     assert_eq!(counters.int13_read_sectors, 8);
-    assert_eq!(counters.int13_read_wait_ticks, first_stall);
+    assert_eq!(counters.int13_read_wait_ticks, first_stall * 2);
     assert_eq!(counters.host_read_operations, 1);
     // Four sectors asked for, four sectors read. A first touch of a file gets
     // the command extent and nothing more: the read-ahead only fills past the
@@ -3232,4 +3199,48 @@ fn el_torito_emulated_read_counts_only_the_sectors_that_reached_the_caller() {
         "an unreachable buffer page is a data-boundary error"
     );
     assert_ne!(dos_int_flags(&m) & 1, 0, "a short emulated read sets CF");
+}
+
+#[test]
+fn host_sector_cache_does_not_change_int13_guest_time() {
+    for period in [false, true] {
+        let mut cold = machine_with_hdd(4096);
+        let mut warm = machine_with_hdd(4096);
+        cold.device_timing.ata = period;
+        warm.device_timing.ata = period;
+        warm.ata.as_ref().unwrap().read_lba(7).unwrap();
+        let cold_hits = cold.ata.as_ref().unwrap().sector_cache_hits();
+        let warm_hits = warm.ata.as_ref().unwrap().sector_cache_hits();
+        let cold_start = cold.timeline.now_ticks();
+        let warm_start = warm.timeline.now_ticks();
+        assert_eq!(
+            int13_read_at(&mut cold, 7, 1),
+            int13_read_at(&mut warm, 7, 1)
+        );
+        assert_eq!(
+            cold.timeline.now_ticks() - cold_start,
+            warm.timeline.now_ticks() - warm_start,
+            "period={period}"
+        );
+        assert_eq!(
+            cold.timeline.io_stall_ticks(),
+            warm.timeline.io_stall_ticks()
+        );
+        assert_eq!(
+            cold.ata.as_ref().unwrap().sector_cache_hits() - cold_hits,
+            0
+        );
+        assert_eq!(
+            warm.ata.as_ref().unwrap().sector_cache_hits() - warm_hits,
+            1
+        );
+        assert_eq!(
+            int13_read_at(&mut cold, 8, 1),
+            int13_read_at(&mut warm, 8, 1)
+        );
+        assert_eq!(
+            cold.timeline.now_ticks() - cold_start,
+            warm.timeline.now_ticks() - warm_start
+        );
+    }
 }

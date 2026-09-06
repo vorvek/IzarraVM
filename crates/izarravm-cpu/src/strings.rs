@@ -54,45 +54,68 @@ impl RepLimitPlan {
         if cpu.rep_execution.budget.is_none() {
             return Self::Unbounded;
         }
-        let byte_cost = bus.rep_data_byte_cost_upper();
-        // A misaligned wide access may split into byte cycles. Use that larger cost as the
-        // admission bound even though the aligned bulk path normally charges one wide cycle.
-        let access_upper = byte_cost.saturating_mul(u64::from(width.bytes()));
-        let bus_per_iteration = access_upper.saturating_mul(CpuGsw::rep_memory_accesses(op));
-        // Preserve epoch 1 admission. Selected epoch 2 startup is already pending;
-        // only its element term belongs in this next-element bound.
-        let per_iteration = if cpu.timing_epoch() >= 2 {
+        let bounded = || -> Option<(u64, u64)> {
+            let bytes = u64::from(width.bytes());
+            let port_io = matches!(op, StringOp::Ins | StringOp::Outs);
+            let restricted = port_io
+                && matches!(
+                    cpu.port_io_priv_mode(),
+                    crate::PortIoPrivMode::V86 | crate::PortIoPrivMode::ProtectedUnprivileged
+                );
+            let byte_cost = bus.rep_data_byte_cost_upper();
+            let mut bus_per_iteration = byte_cost
+                .checked_mul(bytes)?
+                .checked_mul(CpuGsw::rep_memory_accesses(op))?;
+            if port_io {
+                bus_per_iteration = bus_per_iteration
+                    .checked_add(bus.rep_io_cost_upper(cpu.registers.edx() as u16, width))?;
+            }
+            if restricted {
+                bus_per_iteration =
+                    bus_per_iteration.checked_add(byte_cost.checked_mul(2 + bytes)?)?;
+            }
+            let translations = if width == BusWidth::Byte { 1 } else { 2 };
+            let paging_setup = if cpu.is_paging_enabled() {
+                let walk = bus.rep_page_walk_cost_upper()?;
+                if restricted {
+                    // Bitmap reads can evict the operand translation on every element.
+                    bus_per_iteration = bus_per_iteration
+                        .checked_add(walk.checked_mul(2 + bytes + translations)?)?;
+                    0
+                } else {
+                    walk.checked_mul(CpuGsw::rep_memory_accesses(op))?
+                        .checked_mul(translations)?
+                }
+            } else {
+                0
+            };
             let raw = work
                 .rep
                 .as_ref()
                 .and_then(|invoice| invoice.plan)
                 .map_or_else(
-                    || u64::from(cpu.class_table().raw(TimingClass::StringElem)),
+                    || {
+                        if port_io {
+                            u64::from(crate::string_port_element_core_clocks(matches!(
+                                op,
+                                StringOp::Outs
+                            )))
+                        } else {
+                            u64::from(cpu.class_table().raw(TimingClass::StringElem))
+                        }
+                    },
                     |plan| plan.element_raw,
                 );
             let (num, den) = crate::level_timing(cpu.persona());
-            let core = raw
-                .saturating_mul(u64::from(num))
-                .saturating_add(u64::from(den) - 1)
-                / u64::from(den);
-            bus_per_iteration.saturating_add(core)
-        } else {
-            bus_per_iteration
+            let core = raw.checked_mul(u64::from(num))?.div_ceil(u64::from(den));
+            Some((bus_per_iteration.checked_add(core)?, paging_setup))
         };
-        let paging_setup = if cpu.is_paging_enabled() {
-            let Some(walk_cost) = bus.rep_page_walk_cost_upper() else {
-                return Self::Yield;
-            };
-            let translations_per_operand = if width == BusWidth::Byte { 1 } else { 2 };
-            walk_cost
-                .saturating_mul(CpuGsw::rep_memory_accesses(op))
-                .saturating_mul(translations_per_operand)
-        } else {
-            0
-        };
-        Self::Bounded {
-            per_iteration,
-            paging_setup,
+        match bounded() {
+            Some((per_iteration, paging_setup)) => Self::Bounded {
+                per_iteration,
+                paging_setup,
+            },
+            None => Self::Yield,
         }
     }
 }
@@ -106,9 +129,6 @@ impl CpuGsw {
         op: StringOp,
         address_size: AddressSize,
     ) {
-        if self.timing_epoch() < 2 {
-            return;
-        }
         let Some(invoice) = work.rep.as_mut() else {
             return;
         };
@@ -238,16 +258,14 @@ impl CpuGsw {
     /// `rep_resume_active` state `rep_chunk_limit` and `rep_budget_exhausted` can reach.
     /// `rep_resume_active` collapses this to 0 regardless of persona, checked BEFORE the match so
     /// neither arm has to encode it.
-    fn rep_core_upper<B: CpuBus>(&self, bus: &B, op: StringOp) -> u64 {
+    fn rep_core_upper(&self, op: StringOp) -> u64 {
         if self.rep_resume_active {
             return 0;
         }
         let raw = match op {
-            StringOp::Ins | StringOp::Outs => u64::from(self.string_port_setup_core_clocks(
-                bus,
-                matches!(op, StringOp::Outs),
-                true,
-            )),
+            StringOp::Ins | StringOp::Outs => {
+                u64::from(self.string_port_setup_core_clocks(matches!(op, StringOp::Outs), true))
+            }
             _ => u64::from(Self::rep_core_clocks(op)),
         };
         match self.persona() {
@@ -317,7 +335,7 @@ impl CpuGsw {
         let core_upper = if work.sourced_rep() {
             0
         } else {
-            self.rep_core_upper(bus, op)
+            self.rep_core_upper(op)
         };
         let available = budget
             .cap
@@ -346,7 +364,7 @@ impl CpuGsw {
         let core_upper = if work.sourced_rep() {
             0
         } else {
-            self.rep_core_upper(bus, op)
+            self.rep_core_upper(op)
         };
         self.rep_projected_core(work)
             .saturating_add(bus_growth)
@@ -544,7 +562,7 @@ impl CpuGsw {
                 self.write_string_dst(bus, address_size, width, value)?;
                 self.adjust_index_register(7, address_size, bytes);
                 if prefixes.rep.is_some() {
-                    self.charge_string_port_element_core(bus, false, committed);
+                    self.charge_string_port_element_core(false, committed);
                 }
             }
             StringOp::Outs => {
@@ -561,7 +579,7 @@ impl CpuGsw {
                 )?;
                 self.adjust_index_register(6, address_size, bytes);
                 if prefixes.rep.is_some() {
-                    self.charge_string_port_element_core(bus, true, committed);
+                    self.charge_string_port_element_core(true, committed);
                 }
             }
         }

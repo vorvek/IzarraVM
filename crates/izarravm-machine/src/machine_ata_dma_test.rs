@@ -89,6 +89,175 @@ fn enable_irq14_wake(machine: &mut Machine) {
 }
 
 #[test]
+fn dma_last_prerequisite_sets_the_physical_start_time() {
+    use izarravm_core::MASTER_CLOCK_HZ;
+    const CORE: u64 = 117;
+    const DEST: u32 = 0x2000;
+    let duration = MASTER_CLOCK_HZ / 10_000 + (512 * MASTER_CLOCK_HZ).div_ceil(33_300_000);
+    for last in 0..3 {
+        let mut machine = machine_with_hdd(8);
+        machine.set_mode(GswMode::Gsw386Slow);
+        machine.write_physical_u32(0x1000, DEST);
+        machine.write_physical_u32(0x1004, 0x8000_0200);
+        for offset in 0..514 {
+            machine.write_physical_u8(DEST - 1 + offset, 0xa5);
+        }
+        {
+            let mut bus = machine.make_construction_bus();
+            for (port, width, value) in [
+                (0xcf8, BusWidth::Dword, 0x8000_3904),
+                (0xcfc, BusWidth::Word, if last == 2 { 1 } else { 5 }),
+                (BM_PRD, BusWidth::Dword, 0x1000),
+                (0x1f2, BusWidth::Byte, 1),
+                (0x1f3, BusWidth::Byte, 2),
+                (0x1f4, BusWidth::Byte, 0),
+                (0x1f5, BusWidth::Byte, 0),
+                (0x1f6, BusWidth::Byte, 0x40),
+            ] {
+                CpuBus::write_io(&mut bus, port, width, value, 0, false).unwrap();
+            }
+            if last != 0 {
+                CpuBus::write_io(&mut bus, BM_COMMAND, BusWidth::Byte, 9, 0, false).unwrap();
+            }
+            if last != 1 {
+                CpuBus::write_io(&mut bus, ATA_STATUS, BusWidth::Byte, 0xc8, 0, false).unwrap();
+            }
+        }
+        assert_eq!(machine.bmide.ticks_until_completion(), None);
+        assert_eq!(machine.port_bus_batch_clocks, 0);
+        let (port, width, value, tariff) = match last {
+            0 => (BM_COMMAND, BusWidth::Byte, 9, 56),
+            1 => (ATA_STATUS, BusWidth::Byte, 0xc8, 56),
+            _ => (0xcfc, BusWidth::Word, 5, 56),
+        };
+        let raw = machine.raw_bus_clocks();
+        let prefix = with_bus(&mut machine, |bus| {
+            bus.prior_runs_core_clocks = CORE - 17;
+            CpuBus::write_io(bus, port, width, value, 17, false).unwrap();
+            bus.in_batch_master_ticks()
+        });
+        assert_eq!(prefix, CORE * 747 + tariff * 33, "last={last}");
+        assert_eq!(machine.raw_bus_clocks() - raw, 4);
+        assert_eq!(
+            std::mem::take(&mut machine.port_bus_batch_clocks),
+            tariff - 4
+        );
+        assert_eq!(
+            machine.bmide.ticks_until_completion(),
+            Some(prefix + duration)
+        );
+        {
+            let mut bus = machine.make_construction_bus();
+            CpuBus::write_io(&mut bus, 0xcfc, BusWidth::Word, 5, 0, false).unwrap();
+        }
+        assert_eq!(
+            machine.bmide.ticks_until_completion(),
+            Some(prefix + duration)
+        );
+        machine.advance_devices_ticks(prefix + duration - 1);
+        assert_eq!(machine.bmide.ticks_until_completion(), Some(1));
+        for offset in 0..514 {
+            assert_eq!(machine.read_physical_u8(DEST - 1 + offset), 0xa5);
+        }
+        machine.advance_devices_ticks(1);
+        assert_eq!(machine.bmide.ticks_until_completion(), None);
+        let expected = machine.ata.as_ref().unwrap().read_lba(2).unwrap();
+        for (offset, byte) in expected.into_iter().enumerate() {
+            assert_eq!(machine.read_physical_u8(DEST + offset as u32), byte);
+        }
+        assert_eq!(machine.read_physical_u8(DEST - 1), 0xa5);
+        assert_eq!(machine.read_physical_u8(DEST + 512), 0xa5);
+        let mut bus = machine.make_construction_bus();
+        assert_eq!(
+            bus.read_io(BM_STATUS, BusWidth::Byte, 0, false).unwrap() & 5,
+            4
+        );
+    }
+}
+
+#[test]
+fn mounted_pio_sector_joins_one_cable_bill_to_its_completion() {
+    const CORE: u64 = 117;
+    const CABLE: u64 = 256 * 20 * 33;
+    for write in [false, true] {
+        let mut machine = machine_with_hdd(8);
+        machine.set_mode(GswMode::Gsw386Slow);
+        {
+            let mut bus = machine.make_construction_bus();
+            for (port, value) in [
+                (0x1f2, if write { 1 } else { 2 }),
+                (0x1f3, 1),
+                (0x1f4, 0),
+                (0x1f5, 0),
+                (0x1f6, 0x40),
+                (0x1f7, if write { 0x30 } else { 0x20 }),
+            ] {
+                CpuBus::write_io(&mut bus, port, BusWidth::Byte, value, 0, false).unwrap();
+            }
+        }
+        assert_eq!(
+            machine.ata.as_ref().unwrap().ticks_until_completion(),
+            Some(1)
+        );
+        machine.advance_devices_ticks(1);
+        machine.ata.as_mut().unwrap().read_port(ATA_STATUS);
+        {
+            let mut bus = machine.make_construction_bus();
+            CpuBus::write_io(&mut bus, BM_STATUS, BusWidth::Byte, 4, 0, false).unwrap();
+        }
+        let expected = machine.ata.as_ref().unwrap().read_lba(1).unwrap();
+        let raw = machine.raw_bus_clocks();
+        let mut observed = Vec::new();
+        let prefix = with_bus(&mut machine, |bus| {
+            bus.prior_runs_core_clocks = CORE - 17;
+            for _ in 0..256 {
+                if write {
+                    CpuBus::write_io(bus, 0x1f0, BusWidth::Word, 0x5a5a, 17, false).unwrap();
+                } else {
+                    let word = bus.read_io(0x1f0, BusWidth::Word, 17, false).unwrap();
+                    observed.extend_from_slice(&(word as u16).to_le_bytes());
+                }
+            }
+            bus.in_batch_master_ticks()
+        });
+        if !write {
+            assert_eq!(observed, expected);
+        }
+        assert_eq!(prefix, CORE * 747 + CABLE);
+        assert_eq!(machine.raw_bus_clocks() - raw, 256 * 4);
+        assert_eq!(std::mem::take(&mut machine.port_bus_batch_clocks), 256 * 16);
+        assert_eq!(
+            machine.ata.as_ref().unwrap().ticks_until_completion(),
+            Some(prefix + 1)
+        );
+        machine.advance_devices_ticks(prefix);
+        let disk = machine.ata.as_mut().unwrap();
+        assert_eq!(disk.read_port(ata::PRIMARY_CTRL).unwrap() & STATUS_DRQ, 0);
+        assert_eq!(disk.read_lba(1).unwrap(), expected);
+        assert_eq!(disk.ticks_until_completion(), Some(1));
+        machine.advance_devices_ticks(1);
+        {
+            let mut bus = machine.make_construction_bus();
+            assert_ne!(
+                bus.read_io(BM_STATUS, BusWidth::Byte, 0, false).unwrap() & 4,
+                0
+            );
+        }
+        let disk = machine.ata.as_mut().unwrap();
+        assert_eq!(disk.ticks_until_completion(), None);
+        if write {
+            assert_eq!(disk.read_lba(1).unwrap(), [0x5a; 512]);
+            assert_eq!(disk.read_port(0x1f2), Some(0));
+        } else {
+            assert_ne!(disk.read_port(ata::PRIMARY_CTRL).unwrap() & STATUS_DRQ, 0);
+            assert_eq!(disk.read_port(0x1f2), Some(1));
+            assert_eq!(disk.read_port(0x1f3), Some(2));
+            assert_eq!(disk.read_port(0x1f0), Some(0x12));
+        }
+    }
+}
+
+#[test]
 fn piix4_ide_function_exposes_bar4_and_honors_io_decode() {
     let mut machine = machine_with_hdd(8);
     out(&mut machine, 0xcf8, BusWidth::Dword, 0x8000_3900);

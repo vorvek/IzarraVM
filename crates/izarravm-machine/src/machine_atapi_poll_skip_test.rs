@@ -296,9 +296,13 @@ fn ata_poll_skip_stops_at_an_earlier_pit_edge() {
     let mut machine = poll_machine(true);
     // PIT channel 0, mode 2, a short reload so its OUT rise lands well inside
     // the 100 us ATA window but well above the 20 us floor.
-    out(&mut machine, 0x43, 0x34);
-    out(&mut machine, 0x40, 60);
-    out(&mut machine, 0x40, 0);
+    {
+        let mut bus = machine.make_construction_bus();
+        for (port, value) in [(0x43, 0x34), (0x40, 60), (0x40, 0)] {
+            bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+        }
+    }
+    assert_eq!(machine.port_bus_batch_clocks, 0);
 
     let start = machine.master_ticks();
     let deadline = schedule_identify(&mut machine);

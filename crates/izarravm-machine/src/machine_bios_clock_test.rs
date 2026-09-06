@@ -481,7 +481,7 @@ fn tsc_counts_retired_and_bus_overshoot_clocks_once() {
 
     let mut advanced = make_machine();
     advanced.cpu.elapsed_clocks = 400;
-    advanced.advance_cpu_work(1_000, 400);
+    advanced.advance_cpu_work(1_000 * 33, 400);
     assert_eq!(
         advanced.run_until_halt_or_cycles(1_000_000).unwrap(),
         StopReason::Halted

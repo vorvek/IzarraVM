@@ -75,7 +75,7 @@ fn the_helper_charges_exactly_what_the_interpreter_charges_and_reports_the_step_
         );
         assert_eq!(
             status & 0xffff_ffff,
-            i64::from(IN_PORT_CORE_CLOCKS),
+            48,
             "lazy={lazy}: the helper must return the interpreter's own raw charge"
         );
         assert_eq!(
@@ -855,7 +855,7 @@ fn a_v86_port_is_served_natively_once_the_tss_pages_are_tlb_resident() {
     assert!(status >= 0, "a permitted V86 port must be served");
     assert_eq!(
         status & 0xffff_ffff,
-        i64::from(IN_PORT_CORE_CLOCKS),
+        228,
         "the served V86 arm must charge the interpreter's own constant"
     );
     assert_eq!(
@@ -1423,7 +1423,10 @@ fn the_pushad_helper_moves_exactly_what_the_interpreters_own_pushad_moves() {
     assert!(status >= 0, "a resident frame must not be abnormal");
     assert_eq!(
         status & 0xffff_ffff,
-        i64::from(PUSH_ALL_CORE_CLOCKS),
+        i64::from(
+            cpu.class_table()
+                .raw(crate::timing_class::TimingClass::PushAll)
+        ),
         "the helper must return the interpreter's own raw charge"
     );
     assert_eq!(cpu.registers, twin.registers, "registers");
@@ -1476,7 +1479,10 @@ fn the_popad_helper_loads_exactly_what_the_interpreters_own_popad_loads() {
     assert!(status >= 0, "a resident frame must not be abnormal");
     assert_eq!(
         status & 0xffff_ffff,
-        i64::from(POP_ALL_CORE_CLOCKS),
+        i64::from(
+            cpu.class_table()
+                .raw(crate::timing_class::TimingClass::PopAll)
+        ),
         "the helper must return the interpreter's own raw charge"
     );
     assert_eq!(cpu.registers, twin.registers, "registers");
@@ -2672,7 +2678,7 @@ fn imm8_the_helper_charges_exactly_what_the_interpreter_charges_and_reports_the_
         );
         assert_eq!(
             status & 0xffff_ffff,
-            i64::from(IN_PORT_CORE_CLOCKS),
+            48,
             "lazy={lazy}: the helper must charge the SAME constant PortReadAlDx does"
         );
         assert_eq!(
@@ -3313,7 +3319,7 @@ fn out_imm8_the_helper_charges_exactly_what_the_interpreter_charges() {
     assert!(status >= 0, "a served port write is not abnormal");
     assert_eq!(
         status & 0xffff_ffff,
-        i64::from(OUT_PORT_CORE_CLOCKS),
+        108,
         "the helper must charge the SAME constant the interpreter's 0xE6 arm charges -- 10, not \
          IN_PORT_CORE_CLOCKS' 12"
     );
@@ -3530,6 +3536,7 @@ fn out_imm8_call_out_matches_the_interpreter_mid_block() {
         "block did not run natively"
     );
     for _ in 0..2 {
+        interpreter_bus.io_run_core_origin = interpreter.elapsed_clocks;
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
 
@@ -3562,6 +3569,7 @@ fn out_imm8_call_out_matches_the_interpreter_mid_block() {
         fixture.bus.io_writes, interpreter_bus.io_writes,
         "the device must see the same write, with the same value at the same guest time"
     );
+    assert!(fixture.bus.io_writes[0].2 > 0);
     let stalls = fixture.cpu.direct_stall_snapshot();
     assert_eq!(stalls.side_exit_callout_step_break, 1);
     assert_eq!(stalls.side_exit_callout_abnormal, 0);
@@ -3713,6 +3721,7 @@ fn out_imm8_delivers_the_irq_at_the_same_guest_instruction_as_the_block_free_rol
         };
         let run_to_halt = |cpu: &mut CpuGsw, bus: &mut TestBus| {
             for _ in 0..64 {
+                bus.io_run_core_origin = cpu.elapsed_clocks;
                 if cpu
                     .run_budgeted(bus, u64::MAX)
                     .expect("the guest must not fault")
@@ -3860,7 +3869,7 @@ fn out_dx_the_helper_charges_exactly_what_the_interpreter_charges() {
     assert!(status >= 0, "a served port write is not abnormal");
     assert_eq!(
         status & 0xffff_ffff,
-        i64::from(OUT_PORT_CORE_CLOCKS),
+        108,
         "the helper must charge the SAME constant the interpreter's 0xEE arm charges -- 10, not \
          IN_PORT_CORE_CLOCKS' 12"
     );
@@ -4064,17 +4073,8 @@ fn out_dx_the_interpreter_raises_the_gp_the_call_out_refused() {
             );
         } else {
             outcome.expect("a permitted port must retire");
-            // NOT `elapsed_clocks > 0`: at I586 timing (`scale_clocks`'s 1/12 ratio) a lone
-            // `OUT_PORT_CORE_CLOCKS` (10) charge floors to a zero quotient and lands entirely in
-            // the fractional remainder -- `timing_rem` is the scale-invariant witness that the
-            // charge was deposited at all, and it is what the call-out helper's own charge (this
-            // section's `out_dx_the_helper_charges_exactly_what_the_interpreter_charges`) and the
-            // differential (`out_dx_call_out_matches_the_interpreter_mid_block`, which compares
-            // `elapsed_clocks` after the SAME scaling on both roles) both key off instead.
-            assert_eq!(
-                cpu.timing_rem, 10,
-                "the interpreted OUT must charge the same OUT_PORT_CORE_CLOCKS the call-out does"
-            );
+            assert_eq!(cpu.elapsed_clocks, 26);
+            assert_eq!(cpu.timing_rem, 0);
             assert_eq!(cpu.registers.eip, entry + 1, "the OUT must retire");
             assert_eq!(
                 bus.io_writes.first().map(|write| (write.0, write.1)),
@@ -4355,6 +4355,7 @@ fn out_dx_call_out_matches_the_interpreter_mid_block() {
         "block did not run natively"
     );
     for _ in 0..2 {
+        interpreter_bus.io_run_core_origin = interpreter.elapsed_clocks;
         interpreter.cycle(&mut interpreter_bus).unwrap();
     }
 
@@ -4389,6 +4390,7 @@ fn out_dx_call_out_matches_the_interpreter_mid_block() {
         "the device must see the same write, at the same port, with the same value, at the same \
          guest time -- the device observes the write claim"
     );
+    assert!(fixture.bus.io_writes[0].2 > 0);
     let stalls = fixture.cpu.direct_stall_snapshot();
     assert_eq!(stalls.side_exit_callout_step_break, 1);
     assert_eq!(stalls.side_exit_callout_abnormal, 0);
@@ -4507,7 +4509,7 @@ fn charged_raw_core_clocks(cpu: &CpuGsw) -> u64 {
 /// IOPL 0 (the `CPL > IOPL` column) as built, and adding VM with IOPL 3 moves it to the V86 column
 /// without touching the bitmap it consults. That is deliberate -- a fixture pair differing in more
 /// than the column would not isolate the column.
-fn port_column_fixture(mode: crate::PortIoPrivMode, epoch_two: bool) -> (CpuGsw, TestBus) {
+fn port_column_fixture(mode: crate::PortIoPrivMode) -> (CpuGsw, TestBus) {
     use crate::PortIoPrivMode as Column;
     let (mut cpu, mut bus) = match mode {
         Column::Real => {
@@ -4528,7 +4530,6 @@ fn port_column_fixture(mode: crate::PortIoPrivMode, epoch_two: bool) -> (CpuGsw,
             (cpu, bus)
         }
     };
-    bus.timing_epoch_two = epoch_two;
     // The lazy status-port shape, so neither leg's charge carries a step break the other does not.
     bus.lazy_io_reads = true;
     bus.lazy_io_writes = true;
@@ -4544,7 +4545,7 @@ fn port_column_fixture(mode: crate::PortIoPrivMode, epoch_two: bool) -> (CpuGsw,
 }
 
 #[test]
-fn the_port_charge_is_intels_privilege_column_under_epoch_two_and_flat_under_epoch_one() {
+fn the_port_charge_uses_intels_privilege_column() {
     use crate::PortIoPrivMode as Column;
     // Intel V3 `:32962-32979` (IN 7 / 4 / 21 / 19) and `:35991-35995` (OUT 12 / 9 / 26 / 24), in
     // GUEST clocks; the tree's raw unit is twelfths, so every cell is multiplied by 12 below.
@@ -4555,58 +4556,53 @@ fn the_port_charge_is_intels_privilege_column_under_epoch_two_and_flat_under_epo
         Column::ProtectedUnprivileged,
         Column::V86,
     ];
-    const EPOCH2_IN: [u64; 4] = [7, 4, 21, 19];
-    const EPOCH2_OUT: [u64; 4] = [12, 9, 26, 24];
+    const IN_CLOCKS: [u64; 4] = [7, 4, 21, 19];
+    const OUT_CLOCKS: [u64; 4] = [12, 9, 26, 24];
 
     for (index, column) in COLUMNS.into_iter().enumerate() {
-        for epoch_two in [false, true] {
-            for is_out in [false, true] {
-                let expected: u64 = match (epoch_two, is_out) {
-                    // Epoch 1: the flat pre-repricing constants, mode-independent. A build with
-                    // the knob unset must not move by one clock on any column.
-                    (false, false) => 12,
-                    (false, true) => 10,
-                    (true, false) => EPOCH2_IN[index] * 12,
-                    (true, true) => EPOCH2_OUT[index] * 12,
-                };
-                let lane = format!("{column:?}/epoch2={epoch_two}/out={is_out}");
+        for is_out in [false, true] {
+            let expected = if is_out {
+                OUT_CLOCKS[index]
+            } else {
+                IN_CLOCKS[index]
+            } * 12;
+            let lane = format!("{column:?}/out={is_out}");
 
-                // Leg A: wholly interpreted, through `execute_port_io_decoded`.
-                let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
-                let entry = PORT_COLUMN_ENTRY as usize;
-                bus.memory[entry] = if is_out { 0xee } else { 0xec };
-                bus.memory[entry + 1] = 0xf4;
-                cpu.set_eip(PORT_COLUMN_ENTRY);
-                cpu.elapsed_clocks = 0;
-                cpu.timing_rem = 0;
-                cpu.cycle(&mut bus)
-                    .unwrap_or_else(|_| panic!("{lane}: the permitted port must retire"));
-                assert_eq!(
-                    cpu.registers.eip,
-                    PORT_COLUMN_ENTRY + 1,
-                    "{lane}: the instruction must retire"
-                );
-                let interpreted = charged_raw_core_clocks(&cpu);
+            // Leg A: wholly interpreted, through `execute_port_io_decoded`.
+            let (mut cpu, mut bus) = port_column_fixture(column);
+            let entry = PORT_COLUMN_ENTRY as usize;
+            bus.memory[entry] = if is_out { 0xee } else { 0xec };
+            bus.memory[entry + 1] = 0xf4;
+            cpu.set_eip(PORT_COLUMN_ENTRY);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.cycle(&mut bus)
+                .unwrap_or_else(|_| panic!("{lane}: the permitted port must retire"));
+            assert_eq!(
+                cpu.registers.eip,
+                PORT_COLUMN_ENTRY + 1,
+                "{lane}: the instruction must retire"
+            );
+            let interpreted = charged_raw_core_clocks(&cpu);
 
-                // Leg B: the JIT call-out slot, on a fresh fixture in the same column.
-                let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
-                let status = if is_out {
-                    jit::direct::port_write_al_dx_for_test(&mut cpu, &mut bus, 0, 0)
-                } else {
-                    jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0)
-                };
-                assert!(status >= 0, "{lane}: the call-out must serve");
-                let native = status & 0xffff_ffff;
+            // Leg B: the JIT call-out slot, on a fresh fixture in the same column.
+            let (mut cpu, mut bus) = port_column_fixture(column);
+            let status = if is_out {
+                jit::direct::port_write_al_dx_for_test(&mut cpu, &mut bus, 0, 0)
+            } else {
+                jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0)
+            };
+            assert!(status >= 0, "{lane}: the call-out must serve");
+            let native = status & 0xffff_ffff;
 
-                assert_eq!(
-                    interpreted, expected,
-                    "{lane}: the interpreter charged the wrong column"
-                );
-                assert_eq!(
-                    native, expected as i64,
-                    "{lane}: the call-out charged the wrong column"
-                );
-            }
+            assert_eq!(
+                interpreted, expected,
+                "{lane}: the interpreter charged the wrong column"
+            );
+            assert_eq!(
+                native, expected as i64,
+                "{lane}: the call-out charged the wrong column"
+            );
         }
     }
 }
@@ -4623,23 +4619,21 @@ fn the_imm8_port_call_outs_take_the_same_column_as_their_dx_siblings() {
         Column::ProtectedUnprivileged,
         Column::V86,
     ] {
-        for epoch_two in [false, true] {
-            let lane = format!("{column:?}/epoch2={epoch_two}");
-            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
-            let read = jit::direct::port_read_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT)
-                & 0xffff_ffff;
-            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
-            let write = jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT)
-                & 0xffff_ffff;
-            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
-            let read_dx =
-                jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0) & 0xffff_ffff;
-            let (mut cpu, mut bus) = port_column_fixture(column, epoch_two);
-            let write_dx =
-                jit::direct::port_write_al_dx_for_test(&mut cpu, &mut bus, 0, 0) & 0xffff_ffff;
-            assert_eq!(read, read_dx, "{lane}: 0xE4 and 0xEC disagreed");
-            assert_eq!(write, write_dx, "{lane}: 0xE6 and 0xEE disagreed");
-        }
+        let lane = format!("{column:?}");
+        let (mut cpu, mut bus) = port_column_fixture(column);
+        let read =
+            jit::direct::port_read_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT) & 0xffff_ffff;
+        let (mut cpu, mut bus) = port_column_fixture(column);
+        let write =
+            jit::direct::port_write_al_imm8_for_test(&mut cpu, &mut bus, 0, 0, PORT) & 0xffff_ffff;
+        let (mut cpu, mut bus) = port_column_fixture(column);
+        let read_dx =
+            jit::direct::port_read_al_dx_for_test(&mut cpu, &mut bus, 0, 0, 0) & 0xffff_ffff;
+        let (mut cpu, mut bus) = port_column_fixture(column);
+        let write_dx =
+            jit::direct::port_write_al_dx_for_test(&mut cpu, &mut bus, 0, 0) & 0xffff_ffff;
+        assert_eq!(read, read_dx, "{lane}: 0xE4 and 0xEC disagreed");
+        assert_eq!(write, write_dx, "{lane}: 0xE6 and 0xEE disagreed");
     }
 }
 
@@ -4653,7 +4647,7 @@ fn the_word_port_forms_charge_the_same_column_as_the_byte_forms() {
         for (byte_opcode, word_opcode) in [(0xecu8, 0xedu8), (0xee, 0xef)] {
             let mut charges = Vec::new();
             for opcode in [byte_opcode, word_opcode] {
-                let (mut cpu, mut bus) = port_column_fixture(column, true);
+                let (mut cpu, mut bus) = port_column_fixture(column);
                 let entry = PORT_COLUMN_ENTRY as usize;
                 bus.memory[entry] = opcode;
                 bus.memory[entry + 1] = 0xf4;
@@ -4685,13 +4679,11 @@ fn the_cross_mode_maximum_dominates_every_column_of_both_epochs() {
         Column::ProtectedUnprivileged,
         Column::V86,
     ] {
-        for epoch in [1u32, 2] {
-            for is_out in [false, true] {
-                assert!(
-                    crate::port_core_clocks(epoch, is_out, column) <= crate::MAX_PORT_CORE_CLOCKS,
-                    "{column:?}/epoch={epoch}/out={is_out} exceeds MAX_PORT_CORE_CLOCKS"
-                );
-            }
+        for is_out in [false, true] {
+            assert!(
+                crate::port_core_clocks(is_out, column) <= crate::MAX_PORT_CORE_CLOCKS,
+                "{column:?}/2=2/out={is_out} exceeds MAX_PORT_CORE_CLOCKS"
+            );
         }
     }
     assert_eq!(
@@ -4715,7 +4707,7 @@ fn the_cross_mode_maximum_dominates_every_column_of_both_epochs() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_bitmap_denied_port_charges_no_column_and_the_epoch_cannot_change_that() {
+fn a_bitmap_denied_port_charges_no_column() {
     // Under TOKAEMM exactly one port has its bit set (0x92, `tokaemm.asm:819`), so on that port
     // the V86 guest's `IN`/`OUT` FAULTS instead of executing. The design's rule for that case
     // (§1.2, §5 T7) is that the charge follows the EXECUTED access: the faulting instruction pays
@@ -4729,44 +4721,35 @@ fn a_bitmap_denied_port_charges_no_column_and_the_epoch_cannot_change_that() {
     // charge. A build that reached the column before the permission check -- the natural way to
     // get this wrong, since the charge sits at the bottom of every arm -- would move.
     for is_out in [false, true] {
-        let mut charges = Vec::new();
-        for epoch_two in [false, true] {
-            // PERMITTED while warming, DENIED for the access under test: `warm_the_tss_tlb` runs
-            // two real `IN`s to settle the accessed bits, which a denied bitmap would fault, so
-            // the bit has to go up after the warming and not before it.
-            let (mut cpu, mut bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
-            let bitmap = TSS_BASE as usize + usize::from(TSS_IO_MAP_OFFSET) + usize::from(PORT / 8);
-            bus.memory[bitmap] = 1 << (PORT % 8);
-            cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
-            assert!(cpu.is_v86_mode());
-            bus.timing_epoch_two = epoch_two;
-            bus.lazy_io_reads = true;
-            bus.lazy_io_writes = true;
-            bus.io_reads.clear();
-            bus.io_writes.clear();
-            cpu.registers.set_edx(u32::from(PORT));
-            cpu.set_eip(PORT_COLUMN_ENTRY);
-            bus.memory[PORT_COLUMN_ENTRY as usize] = if is_out { 0xee } else { 0xec };
-            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
-            cpu.elapsed_clocks = 0;
-            cpu.timing_rem = 0;
+        // PERMITTED while warming, DENIED for the access under test: `warm_the_tss_tlb` runs
+        // two real `IN`s to settle the accessed bits, which a denied bitmap would fault, so
+        // the bit has to go up after the warming and not before it.
+        let (mut cpu, mut bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+        let bitmap = TSS_BASE as usize + usize::from(TSS_IO_MAP_OFFSET) + usize::from(PORT / 8);
+        bus.memory[bitmap] = 1 << (PORT % 8);
+        cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+        assert!(cpu.is_v86_mode());
+        bus.lazy_io_reads = true;
+        bus.lazy_io_writes = true;
+        bus.io_reads.clear();
+        bus.io_writes.clear();
+        cpu.registers.set_edx(u32::from(PORT));
+        cpu.set_eip(PORT_COLUMN_ENTRY);
+        bus.memory[PORT_COLUMN_ENTRY as usize] = if is_out { 0xee } else { 0xec };
+        bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
 
-            // NOT unwrapped: the fixture's IVT is zeroed and the `#GP` nests. The subject -- the
-            // permission decision and the charge that did or did not precede it -- has already
-            // happened by then.
-            let _ = cpu.cycle(&mut bus);
+        // NOT unwrapped: the fixture's IVT is zeroed and the `#GP` nests. The subject -- the
+        // permission decision and the charge that did or did not precede it -- has already
+        // happened by then.
+        let _ = cpu.cycle(&mut bus);
 
-            assert!(
-                bus.io_reads.is_empty() && bus.io_writes.is_empty(),
-                "epoch2={epoch_two}/out={is_out}: a denied port must never reach the device"
-            );
-            charges.push(charged_raw_core_clocks(&cpu));
-        }
-        assert_eq!(
-            charges[0], charges[1],
-            "out={is_out}: a bitmap-denied access charged a different amount under epoch 2, so \
-             something on the fault path is reaching the port column"
+        assert!(
+            bus.io_reads.is_empty() && bus.io_writes.is_empty(),
+            "out={is_out}: a denied port must never reach the device"
         );
+        assert_eq!(charged_raw_core_clocks(&cpu), 0);
     }
 }
 
@@ -4784,32 +4767,24 @@ fn the_string_port_singletons_charge_intels_four_columns() {
     ];
     for (mode, ins, outs) in columns {
         for (opcode, expected) in [(0x6cu8, ins), (0x6d, ins), (0x6e, outs), (0x6f, outs)] {
-            for epoch_two in [false, true] {
-                let (mut cpu, mut bus) = port_column_fixture(mode, epoch_two);
-                // ES:DI / DS:SI on a data page the code is not on, so the element access is
-                // plain RAM.
-                cpu.registers.set_edi(0x6000);
-                cpu.registers.set_esi(0x6000);
-                bus.memory[PORT_COLUMN_ENTRY as usize] = opcode;
-                bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
-                cpu.set_eip(PORT_COLUMN_ENTRY);
-                cpu.elapsed_clocks = 0;
-                cpu.timing_rem = 0;
-                cpu.cycle(&mut bus)
-                    .expect("the string port singleton must retire");
-                let want = if epoch_two {
-                    expected * 12
-                } else if opcode >= 0x6e {
-                    14
-                } else {
-                    15
-                };
-                assert_eq!(
-                    charged_raw_core_clocks(&cpu),
-                    want,
-                    "{opcode:#04x} epoch2={epoch_two} mode={mode:?}"
-                );
-            }
+            let (mut cpu, mut bus) = port_column_fixture(mode);
+            // ES:DI / DS:SI on a data page the code is not on, so the element access is
+            // plain RAM.
+            cpu.registers.set_edi(0x6000);
+            cpu.registers.set_esi(0x6000);
+            bus.memory[PORT_COLUMN_ENTRY as usize] = opcode;
+            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = 0xf4;
+            cpu.set_eip(PORT_COLUMN_ENTRY);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.cycle(&mut bus)
+                .expect("the string port singleton must retire");
+            let want = expected * 12;
+            assert_eq!(
+                charged_raw_core_clocks(&cpu),
+                want,
+                "{opcode:#04x} mode={mode:?}"
+            );
         }
     }
 }
@@ -4821,45 +4796,35 @@ fn a_rep_string_port_form_charges_intels_setup_plus_three_or_four_per_element() 
     // singleton per element, which would price a `REP INSW` at seven times its real cost. Both
     // figures are literals here.
     //
-    // The pre-slice model charged the flat 15 / 14 ONCE for the whole repeat regardless of the
-    // element count, which epoch 1 must still do exactly.
     const ELEMENTS: u32 = 5;
-    for (opcode, is_out, setup, element, flat) in
-        [(0x6du8, false, 23u64, 3u64, 15u64), (0x6f, true, 25, 4, 14)]
-    {
-        for epoch_two in [false, true] {
-            let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86, epoch_two);
-            cpu.registers.set_edi(0x6000);
-            cpu.registers.set_esi(0x6000);
-            cpu.registers.set_ecx(ELEMENTS);
-            bus.memory[PORT_COLUMN_ENTRY as usize] = 0xf3; // REP
-            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = opcode;
-            bus.memory[PORT_COLUMN_ENTRY as usize + 2] = 0xf4;
-            cpu.set_eip(PORT_COLUMN_ENTRY);
-            cpu.elapsed_clocks = 0;
-            cpu.timing_rem = 0;
-            cpu.cycle(&mut bus)
-                .expect("the REP string port form must retire");
-            let moved = if is_out {
-                bus.io_writes.len()
-            } else {
-                bus.io_reads.len()
-            };
-            assert_eq!(
-                moved, ELEMENTS as usize,
-                "{opcode:#04x} epoch2={epoch_two}: every element must reach the device"
-            );
-            let want = if epoch_two {
-                (setup + element * u64::from(ELEMENTS)) * 12
-            } else {
-                flat
-            };
-            assert_eq!(
-                charged_raw_core_clocks(&cpu),
-                want,
-                "{opcode:#04x} epoch2={epoch_two}: setup once plus per element"
-            );
-        }
+    for (opcode, is_out, setup, element) in [(0x6du8, false, 23u64, 3u64), (0x6f, true, 25, 4)] {
+        let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86);
+        cpu.registers.set_edi(0x6000);
+        cpu.registers.set_esi(0x6000);
+        cpu.registers.set_ecx(ELEMENTS);
+        bus.memory[PORT_COLUMN_ENTRY as usize] = 0xf3; // REP
+        bus.memory[PORT_COLUMN_ENTRY as usize + 1] = opcode;
+        bus.memory[PORT_COLUMN_ENTRY as usize + 2] = 0xf4;
+        cpu.set_eip(PORT_COLUMN_ENTRY);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.cycle(&mut bus)
+            .expect("the REP string port form must retire");
+        let moved = if is_out {
+            bus.io_writes.len()
+        } else {
+            bus.io_reads.len()
+        };
+        assert_eq!(
+            moved, ELEMENTS as usize,
+            "{opcode:#04x}: every element must reach the device"
+        );
+        let want = (setup + element * u64::from(ELEMENTS)) * 12;
+        assert_eq!(
+            charged_raw_core_clocks(&cpu),
+            want,
+            "{opcode:#04x}: setup once plus per element"
+        );
     }
 }
 
@@ -4877,67 +4842,61 @@ fn a_v86_rep_string_port_form_traps_on_its_first_element() {
     // restartable. The `Result` is not unwrapped -- with no IDT the `#GP` nests, exactly as
     // `a_denied_port_is_abnormal_with_zero_partial_effects` records.
     for (opcode, is_out) in [(0x6du8, false), (0x6f, true)] {
-        for epoch_two in [false, true] {
-            let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86, epoch_two);
-            cpu.set_timing_epoch(if epoch_two { 2 } else { 1 });
-            cpu.timing_rem = 0;
-            cpu.idtr.limit = 0;
-            cpu.tr.limit = 0;
-            cpu.registers.set_edi(0x6000);
-            cpu.registers.set_esi(0x6000);
-            cpu.registers.set_ecx(4);
-            bus.memory[PORT_COLUMN_ENTRY as usize] = 0xf3;
-            bus.memory[PORT_COLUMN_ENTRY as usize + 1] = opcode;
-            bus.memory[PORT_COLUMN_ENTRY as usize + 2..PORT_COLUMN_ENTRY as usize + 4]
-                .copy_from_slice(&[0xb0, 0x5a]);
-            cpu.set_eip(PORT_COLUMN_ENTRY);
-            let elapsed = cpu.elapsed_clocks;
-            let carry = cpu.timing_rem;
-            assert_eq!(carry, 0, "the denied row starts without carry");
-            let retired = cpu.perf_counters().instructions;
-            let destination = bus.memory[0x6000..0x6008].to_vec();
-            let result = cpu.cycle(&mut bus);
-            assert!(matches!(
-                result,
-                Err(CpuRunError {
-                    error: CpuError::TripleFault { .. },
-                    consumed_core_clocks: 0,
-                })
-            ));
-            assert_eq!(cpu.elapsed_clocks, elapsed);
-            assert_eq!(cpu.timing_rem, carry);
-            assert_eq!(cpu.perf_counters().instructions, retired);
-            assert_eq!(cpu.registers.esi(), 0x6000);
-            assert_eq!(cpu.registers.edi(), 0x6000);
-            assert_eq!(&bus.memory[0x6000..0x6008], destination.as_slice());
-            assert_eq!(
-                cpu.fault_site().expect("the denied REP fault site").eip,
-                PORT_COLUMN_ENTRY
-            );
-            assert!(
-                bus.io_reads.is_empty() && bus.io_writes.is_empty(),
-                "{opcode:#04x} epoch2={epoch_two}/out={is_out}: a bitmap-denied string element \
+        let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86);
+        cpu.timing_rem = 0;
+        cpu.idtr.limit = 0;
+        cpu.tr.limit = 0;
+        cpu.registers.set_edi(0x6000);
+        cpu.registers.set_esi(0x6000);
+        cpu.registers.set_ecx(4);
+        bus.memory[PORT_COLUMN_ENTRY as usize] = 0xf3;
+        bus.memory[PORT_COLUMN_ENTRY as usize + 1] = opcode;
+        bus.memory[PORT_COLUMN_ENTRY as usize + 2..PORT_COLUMN_ENTRY as usize + 4]
+            .copy_from_slice(&[0xb0, 0x5a]);
+        cpu.set_eip(PORT_COLUMN_ENTRY);
+        let elapsed = cpu.elapsed_clocks;
+        let carry = cpu.timing_rem;
+        assert_eq!(carry, 0, "the denied row starts without carry");
+        let retired = cpu.perf_counters().instructions;
+        let destination = bus.memory[0x6000..0x6008].to_vec();
+        let result = cpu.cycle(&mut bus);
+        assert!(matches!(
+            result,
+            Err(CpuRunError {
+                error: CpuError::TripleFault { .. },
+                consumed_core_clocks: 0,
+            })
+        ));
+        assert_eq!(cpu.elapsed_clocks, elapsed);
+        assert_eq!(cpu.timing_rem, carry);
+        assert_eq!(cpu.perf_counters().instructions, retired);
+        assert_eq!(cpu.registers.esi(), 0x6000);
+        assert_eq!(cpu.registers.edi(), 0x6000);
+        assert_eq!(&bus.memory[0x6000..0x6008], destination.as_slice());
+        assert_eq!(
+            cpu.fault_site().expect("the denied REP fault site").eip,
+            PORT_COLUMN_ENTRY
+        );
+        assert!(
+            bus.io_reads.is_empty() && bus.io_writes.is_empty(),
+            "{opcode:#04x} out={is_out}: a bitmap-denied string element \
                  must never reach the device"
-            );
-            assert_eq!(
-                cpu.registers.ecx(),
-                4,
-                "{opcode:#04x} epoch2={epoch_two}: the trap must leave every element to count"
-            );
-            assert!(cpu.rep_execution.resume.is_none());
-            cpu.set_eip(PORT_COLUMN_ENTRY + 2);
-            let later_elapsed = cpu.elapsed_clocks;
-            let later_retired = cpu.perf_counters().instructions;
-            let later = cpu.cycle(&mut bus).unwrap();
-            assert_eq!(later.core_clocks, if epoch_two { 1 } else { 0 });
-            assert_eq!(
-                cpu.elapsed_clocks - later_elapsed,
-                if epoch_two { 1 } else { 0 }
-            );
-            assert_eq!(cpu.timing_rem, if epoch_two { 0 } else { 2 });
-            assert_eq!(cpu.perf_counters().instructions - later_retired, 1);
-            assert_eq!(cpu.registers.eip, PORT_COLUMN_ENTRY + 4);
-            assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
-        }
+        );
+        assert_eq!(
+            cpu.registers.ecx(),
+            4,
+            "{opcode:#04x}: the trap must leave every element to count"
+        );
+        assert!(cpu.rep_execution.resume.is_none());
+        cpu.set_eip(PORT_COLUMN_ENTRY + 2);
+        let later_elapsed = cpu.elapsed_clocks;
+        let later_retired = cpu.perf_counters().instructions;
+        let later = cpu.cycle(&mut bus).unwrap();
+        assert_eq!(later.core_clocks, 1);
+        assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
+        assert_eq!(cpu.timing_rem, 0);
+        assert_eq!(cpu.perf_counters().instructions - later_retired, 1);
+        assert_eq!(cpu.registers.eip, PORT_COLUMN_ENTRY + 4);
+        assert_eq!(cpu.registers.eax() & 0xff, 0x5a);
     }
 }

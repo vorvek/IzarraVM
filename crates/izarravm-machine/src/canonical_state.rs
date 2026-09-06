@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use izarravm_core::{CanonicalFieldWriter, CanonicalSectionRequirement, CanonicalStateError};
-use izarravm_cpu::{CanonicalCpuExecution, CpuCanonicalCaptureError, bus_timing};
+use izarravm_cpu::{CanonicalCpuExecution, CpuCanonicalCaptureError};
 use thiserror::Error;
 
 use crate::{
@@ -259,7 +259,11 @@ pub enum MachineCanonicalCaptureError {
     PendingDirectMapChange,
     #[error("a data-only direct-map change has not been published to the CPU")]
     PendingDirectDataMapChange,
-    #[error("{clocks} ISA batch clocks have not been committed")]
+    #[error("{device} has {ticks} master ticks of advancement that have not been committed")]
+    UncommittedPeripheralAdvance { device: &'static str, ticks: u64 },
+    #[error("{micros} microseconds of OPL timer advancement have not been committed")]
+    UncommittedOplTimerAdvance { micros: u64 },
+    #[error("{clocks} reference bus clocks have not been committed")]
     UncommittedBatchTiming { clocks: u64 },
     #[error("{pending} console bytes have not been published to the display")]
     PendingConsolePublication { pending: usize },
@@ -436,12 +440,11 @@ fn effective_modeled_cache_tags(tags: &[u32], mask: u32) -> Result<Vec<u32>, Can
 
 impl CanonicalModeledCacheProjection<'_> {
     fn write_payload(&self, out: &mut CanonicalFieldWriter<'_>) -> Result<(), CanonicalStateError> {
-        if self.flat_data_cost {
-            out.write_count(0)?;
-            return out.write_count(0);
-        }
-
-        let l1_tags = effective_modeled_cache_tags(&self.cache.l1_tags, self.l1_mask)?;
+        let l1_tags = if self.flat_data_cost {
+            Vec::new()
+        } else {
+            effective_modeled_cache_tags(&self.cache.l1_tags, self.l1_mask)?
+        };
         let l2_tags = effective_modeled_cache_tags(&self.cache.l2_tags, self.l2_mask)?;
         out.write_count(
             u64::try_from(l1_tags.len()).map_err(|_| CanonicalStateError::LengthOverflow)?,
@@ -496,7 +499,7 @@ impl CacheModel {
             );
         }
 
-        let expected_config = cache_level_config(mode, self.epoch());
+        let expected_config = cache_level_config(mode);
         if self.config.l1_mask != expected_config.l1_mask
             || self.config.l2_mask != expected_config.l2_mask
         {
@@ -510,7 +513,7 @@ impl CacheModel {
             );
         }
 
-        let expected_cost = tier_cost(mode, self.epoch());
+        let expected_cost = tier_cost(mode);
         let expected_costs = [expected_cost.l1, expected_cost.l2, expected_cost.ram];
         let actual_costs = [self.cost.l1, self.cost.l2, self.cost.ram];
         if actual_costs != expected_costs {
@@ -812,6 +815,24 @@ impl Machine {
                 clocks: self.port_bus_batch_clocks,
             });
         }
+        if self.opl_timer_advance_credit_us != 0 {
+            return Err(MachineCanonicalCaptureError::UncommittedOplTimerAdvance {
+                micros: self.opl_timer_advance_credit_us,
+            });
+        }
+        for (device, ticks) in [
+            ("COM1", self.serial.advance_credit_ticks()),
+            ("COM2", self.serial2.advance_credit_ticks()),
+            ("LPT1", self.lpt.advance_credit_ticks()),
+            ("LPT2", self.lpt2.advance_credit_ticks()),
+        ] {
+            if ticks != 0 {
+                return Err(MachineCanonicalCaptureError::UncommittedPeripheralAdvance {
+                    device,
+                    ticks,
+                });
+            }
+        }
         let console_total = self.program_output.len();
         if self.dos_screen_shown < console_total {
             return Err(MachineCanonicalCaptureError::PendingConsolePublication {
@@ -917,7 +938,7 @@ impl Machine {
                 elapsed_clocks: self.elapsed_clocks,
             });
         }
-        let denominator = bus_timing(self.active_mode.persona(), self.timing_epoch).1;
+        let denominator = 1;
         if self.bus_rem >= u64::from(denominator) {
             return Err(MachineCanonicalCaptureError::InvalidBusRemainder {
                 remainder: self.bus_rem,

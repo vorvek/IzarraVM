@@ -277,22 +277,20 @@ impl Sb16Path {
         Some(value)
     }
 
-    /// Lazy-class settle service: see `SbDsp::service_reset_at`. A no-op
-    /// with no active card or no armed reset.
     pub(crate) fn service_reset_at(&mut self, pending_micros: u64) {
         if let Some(active) = self.active.as_mut() {
             active.dsp.service_reset_at(pending_micros);
         }
     }
 
-    /// Lazy-class arm compensation: see `SbDsp::arm_reset_at`.
+    /// Access-origin compensation: see `SbDsp::arm_reset_at`.
     pub(crate) fn arm_reset_at(&mut self, pending_micros: u64) {
         if let Some(active) = self.active.as_mut() {
             active.dsp.arm_reset_at(pending_micros);
         }
     }
 
-    /// Lazy-class arm compensation for a 0x80 pause: see `SbDsp::arm_pause_at`.
+    /// Access-origin compensation for a 0x80 pause: see `SbDsp::arm_pause_at`.
     pub(crate) fn arm_pause_at(&mut self, pending_micros: u64) {
         if let Some(active) = self.active.as_mut() {
             active.dsp.arm_pause_at(pending_micros);

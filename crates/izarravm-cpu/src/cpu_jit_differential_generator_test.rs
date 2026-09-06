@@ -257,20 +257,9 @@ fn generated_case(index: u32, mode_offset: u32) -> GeneratedCase {
     }
 }
 
+/// Create a CPU with the requested mode and its resolved persona table.
 fn generated_cpu(mode: GswMode) -> CpuGsw {
-    generated_cpu_at_epoch(mode, 1)
-}
-
-/// The same CPU under a stated guest-clock epoch.
-///
-/// `set_timing_epoch` is what `Machine::new` calls with the value of
-/// `IZARRAVM_TIMING_EPOCH`, and it resolves the persona's charge table once. It
-/// is installed BEFORE `set_mode` here for the same reason it is there: the
-/// table is keyed on `(persona, epoch)` and `set_mode` re-resolves it, so the
-/// order makes the sweep independent of which of the two happens to run last.
-fn generated_cpu_at_epoch(mode: GswMode, epoch: u32) -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.set_timing_epoch(epoch);
     cpu.set_mode(mode);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers
@@ -348,13 +337,7 @@ fn prime_direct(cpu: &mut CpuGsw, bus: &mut TestBus, pristine: &[u8], case: &Gen
     );
 }
 
-/// Runs the sweep and returns the ONE-BYTE immediate lanes the direct role registered across it,
-/// so the arm-on caller can prove its sweep actually exercised the lane emitter.
 fn run_generated_mode(mode: GswMode, mode_offset: u32) -> u64 {
-    run_generated_mode_at_epoch(mode, mode_offset, 1)
-}
-
-fn run_generated_mode_at_epoch(mode: GswMode, mode_offset: u32, epoch: u32) -> u64 {
     let cases: Vec<_> = (0..CASES_PER_MODE)
         .map(|index| generated_case(index, mode_offset))
         .collect();
@@ -368,8 +351,8 @@ fn run_generated_mode_at_epoch(mode: GswMode, mode_offset: u32, epoch: u32) -> u
         pristine[start..start + case.bytes.len()].copy_from_slice(&case.bytes);
     }
 
-    let mut interpreter = generated_cpu_at_epoch(mode, epoch);
-    let mut direct = generated_cpu_at_epoch(mode, epoch);
+    let mut interpreter = generated_cpu(mode);
+    let mut direct = generated_cpu(mode);
     let mut interpreter_bus = TestBus::with_memory(pristine.clone());
     let mut direct_bus = TestBus::with_memory(pristine.clone());
     for bus in [&mut interpreter_bus, &mut direct_bus] {
@@ -2839,16 +2822,13 @@ fn generated_shadow_arming_blocks_match_the_interpreter() {
 /// -- so a wrong arm anywhere in `DirectKind::timing_class` shows up here as a
 /// clock difference rather than as quiet agreement.
 ///
-/// `elapsed_clocks` equality is asserted inside `run_generated_mode_at_epoch`,
+/// `elapsed_clocks` equality is asserted inside `run_generated_mode`,
 /// along with full CPU state, memory and bus clocks.
 #[test]
 fn generated_direct_blocks_match_interpreter_under_epoch_two() {
     jit::direct::set_imm8_lanes_for_test(Some(false));
-    assert_eq!(run_generated_mode_at_epoch(GswMode::Gsw486, 0, 2), 0);
-    assert_eq!(
-        run_generated_mode_at_epoch(GswMode::Gsw586, CASES_PER_MODE, 2),
-        0
-    );
+    assert_eq!(run_generated_mode(GswMode::Gsw486, 0), 0);
+    assert_eq!(run_generated_mode(GswMode::Gsw586, CASES_PER_MODE), 0);
     jit::direct::set_imm8_lanes_for_test(None);
 }
 
@@ -2914,15 +2894,15 @@ fn group_three_case() -> GeneratedCase {
     }
 }
 
-fn assert_group_three_legs_agree(mode: GswMode, epoch: u32) {
+fn assert_group_three_legs_agree(mode: GswMode) {
     jit::direct::set_rotate_rows_for_test(Some(true));
     let case = group_three_case();
     let mut pristine = vec![0u8; MEMORY_LEN];
     let start = case.entry as usize;
     pristine[start..start + case.bytes.len()].copy_from_slice(&case.bytes);
 
-    let mut interpreter = generated_cpu_at_epoch(mode, epoch);
-    let mut direct = generated_cpu_at_epoch(mode, epoch);
+    let mut interpreter = generated_cpu(mode);
+    let mut direct = generated_cpu(mode);
     let mut interpreter_bus = TestBus::with_memory(pristine.clone());
     let mut direct_bus = TestBus::with_memory(pristine.clone());
     for bus in [&mut interpreter_bus, &mut direct_bus] {
@@ -2948,15 +2928,12 @@ fn assert_group_three_legs_agree(mode: GswMode, epoch: u32) {
     // the comparison below cannot fail however wrong `timing_class` is.
     assert!(
         direct.perf_counters().jit_direct_insns > before_native_insns,
-        "no slot retired natively, so this differential proves nothing: {mode:?} epoch {epoch}"
+        "no slot retired natively, so this differential proves nothing: {mode:?}"
     );
-    assert_eq!(
-        direct.registers.gpr, interpreter.registers.gpr,
-        "{mode:?} epoch {epoch}"
-    );
+    assert_eq!(direct.registers.gpr, interpreter.registers.gpr, "{mode:?}");
     assert_eq!(
         direct.elapsed_clocks, interpreter.elapsed_clocks,
-        "native and interpreted guest clocks differ on the group-3 block: {mode:?} epoch {epoch}"
+        "native and interpreted guest clocks differ on the group-3 block: {mode:?}"
     );
     jit::direct::set_rotate_rows_for_test(None);
 }
@@ -2964,41 +2941,6 @@ fn assert_group_three_legs_agree(mode: GswMode, epoch: u32) {
 #[test]
 fn group_three_and_group_two_legs_agree_on_both_personas_and_epochs() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        for epoch in [1u32, 2] {
-            assert_group_three_legs_agree(mode, epoch);
-        }
+        assert_group_three_legs_agree(mode);
     }
-}
-
-/// The epoch-2 leg above is only worth running if epoch 2 actually MOVES the
-/// block's cost. This pins that it does, so a future change that quietly makes
-/// the two epochs identical turns this red instead of making the differential
-/// vacuous.
-#[test]
-fn epoch_two_moves_the_group_three_block_by_hundreds_of_clocks() {
-    jit::direct::set_rotate_rows_for_test(Some(true));
-    let case = group_three_case();
-    let mut pristine = vec![0u8; MEMORY_LEN];
-    let start = case.entry as usize;
-    pristine[start..start + case.bytes.len()].copy_from_slice(&case.bytes);
-
-    let mut elapsed = [0u64; 2];
-    for (slot, epoch) in [1u32, 2].into_iter().enumerate() {
-        let mut cpu = generated_cpu_at_epoch(GswMode::Gsw586, epoch);
-        cpu.set_jit_auto_admit(false);
-        let mut bus = TestBus::with_memory(pristine.clone());
-        bus.direct_pages_enabled = true;
-        restore_bus(&mut bus, &pristine);
-        arm(&mut cpu, &case);
-        run_to_halt(&mut cpu, &mut bus, &case).unwrap();
-        elapsed[slot] = cpu.elapsed_clocks;
-    }
-    assert!(
-        elapsed[1] > elapsed[0] + 50,
-        "epoch 2 must cost the group-3 block materially more than epoch 1, else the \
-         arm-equality differential above is vacuous: epoch1={} epoch2={}",
-        elapsed[0],
-        elapsed[1]
-    );
-    jit::direct::set_rotate_rows_for_test(None);
 }

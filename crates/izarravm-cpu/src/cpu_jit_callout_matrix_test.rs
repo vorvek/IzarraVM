@@ -1582,7 +1582,6 @@ fn current_model_inc_dec_register_and_memory_prices_match_native_execution() {
                     &starts,
                     |_| {},
                     |cpu| {
-                        cpu.set_timing_epoch(2);
                         cpu.set_mode(mode);
                         cpu.registers.set_ebx(STACK_TOP - 4);
                     },
@@ -1622,7 +1621,6 @@ fn current_model_pushad_popad_prices_match_native_execution() {
                     &starts,
                     |_| {},
                     |cpu| {
-                        cpu.set_timing_epoch(2);
                         cpu.set_mode(mode);
                     },
                 );
@@ -1665,7 +1663,6 @@ fn inc_dec_memory_keeps_its_class_at_both_operand_widths() {
         ] {
             for carry in 0..den {
                 let mut cpu = flat_cpu();
-                cpu.set_timing_epoch(2);
                 cpu.set_mode(mode);
                 cpu.set_eip(ENTRY);
                 cpu.registers.set_ebx(STACK_TOP - 4);

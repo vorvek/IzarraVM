@@ -97,9 +97,9 @@ fn default_mode_is_full_586() {
 #[test]
 fn cpu_cache_readout_comes_from_the_mode_table() {
     for (mode, cache) in [
-        (GswMode::Gsw386Slow, (0, 64)),
-        (GswMode::Gsw386, (0, 64)),
-        (GswMode::Gsw486, (8, 256)),
+        (GswMode::Gsw386Slow, (0, 512)),
+        (GswMode::Gsw386, (0, 512)),
+        (GswMode::Gsw486, (8, 512)),
         (GswMode::Gsw586, (32, 512)),
     ] {
         let mut cpu = CpuGsw::default();
@@ -196,22 +196,10 @@ fn level_timing_scales_instruction_clocks_per_mode() {
         }
         cpu.elapsed_clocks
     }
-    let slow = elapsed_for(GswMode::Gsw386Slow);
-    let i386 = elapsed_for(GswMode::Gsw386);
-    let i486 = elapsed_for(GswMode::Gsw486);
-    let i586 = elapsed_for(GswMode::Gsw586);
-    assert_eq!(slow, i386, "both 386 modes have identical per-op cycles");
-    // 386 (2/5) charges more than the small-and-equal 486/586 (1/12).
-    assert!(
-        i386 > i486,
-        "386 ({i386}) should charge more instruction clocks than 486 ({i486})"
-    );
-    // 486 and 586 share the same compute ratio (1/12): the bus dial, not this
-    // one, carries the 586's pull-ahead, so the 586 charges no MORE than the 486.
-    assert!(
-        i586 <= i486,
-        "586 ({i586}) shares the 486's compute ratio and must charge no more than 486 ({i486})"
-    );
+    assert_eq!(elapsed_for(GswMode::Gsw386Slow), 800);
+    assert_eq!(elapsed_for(GswMode::Gsw386), 800);
+    assert_eq!(elapsed_for(GswMode::Gsw486), 1000);
+    assert_eq!(elapsed_for(GswMode::Gsw586), 1000);
 }
 
 #[test]

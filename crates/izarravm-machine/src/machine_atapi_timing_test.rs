@@ -226,3 +226,47 @@ fn halted_cpu_uses_the_secondary_ide_deadline_in_every_mode() {
         );
     }
 }
+
+#[test]
+fn packet_acceptance_starts_after_its_arming_access() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let mut machine = cd_machine(8);
+        machine.set_mode(mode);
+        let start = machine.timeline.now_ticks();
+        let prefix = with_bus(&mut machine, |bus| {
+            bus.prior_runs_core_clocks = 50_000;
+            CpuBus::write_io(
+                bus,
+                ide::SECONDARY_CMD_BASE + 7,
+                BusWidth::Byte,
+                0xa0,
+                17,
+                false,
+            )
+            .unwrap();
+            bus.guest_tick_now() - start
+        });
+        let duration = izarravm_core::MASTER_CLOCK_HZ / 20_000;
+        machine.advance_devices_ticks(prefix);
+        assert_eq!(
+            machine.ide.ticks_until_completion(),
+            Some(duration),
+            "{mode:?}"
+        );
+        machine.advance_devices_ticks(duration - 1);
+        assert_eq!(
+            machine.ide.read_port(ide::SECONDARY_CTRL).unwrap() & STATUS_BSY,
+            STATUS_BSY
+        );
+        machine.advance_devices_ticks(1);
+        assert_eq!(
+            machine.ide.read_port(ide::SECONDARY_CTRL).unwrap() & (STATUS_BSY | STATUS_DRQ),
+            STATUS_DRQ
+        );
+    }
+}

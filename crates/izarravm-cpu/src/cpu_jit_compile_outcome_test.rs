@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::run::ContinuationDispatch;
+use crate::timing_class::TimingClass;
 
 const ENTRY: u32 = 0x100;
 
@@ -2803,7 +2804,11 @@ fn a_word_pop_on_a_sixteen_bit_stack_enters_the_block() {
     assert_eq!(compilation.dword_reads, 0);
     // Two INC at 2 each plus the pop at 4. A missing `raw_clocks` arm shows up here as 6,
     // because the pop would fall to the `_ => 2` default.
-    assert_eq!(compilation.raw_clocks, 8);
+    assert_eq!(
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::PopReg)
+    );
 }
 
 /// Matrix row 2 for the pop: a Word pop on a THIRTY-TWO bit stack is not admitted, because the
@@ -2899,7 +2904,11 @@ fn a_word_call_on_a_sixteen_bit_stack_enters_the_block() {
     assert_eq!(compilation.word_stores, 1);
     assert_eq!(compilation.dword_stores, 0);
     // Two INC at 2 each plus the call at 7. A missing `raw_clocks` arm shows up here as 6.
-    assert_eq!(compilation.raw_clocks, 11);
+    assert_eq!(
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::CallJmpRel)
+    );
     // The static link edge is the CALL TARGET, not the fall-through. A kind missing from the
     // successor match lands on the fall-through arm instead, which is a wrong edge rather than
     // a missing one: the emitted terminal sets EIP to the target and then jumps through this
@@ -3037,7 +3046,11 @@ fn a_word_ret_on_a_sixteen_bit_stack_enters_the_block() {
     assert_eq!(compilation.word_reads, 1);
     assert_eq!(compilation.dword_reads, 0);
     // Two INC at 2 each plus the ret at 10. A missing `raw_clocks` arm shows up here as 6.
-    assert_eq!(compilation.raw_clocks, 14);
+    assert_eq!(
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::RetNear)
+    );
     assert!(
         compilation.dynamic_successor,
         "a RET links dynamically, and nothing else observes this"
@@ -3173,8 +3186,9 @@ fn a_leave_on_a_thirty_two_bit_stack_enters_the_block() {
     // and is invisible to every architectural assertion. A mutation battery found that nothing
     // else in the suite catches it.
     assert_eq!(
-        compilation.raw_clocks, 10,
-        "three 2-clock INCs plus a 4-clock LEAVE"
+        compilation.raw_clocks,
+        3 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Leave)
     );
     // The read is one dword off SS, not a byte or a word: a wrong width miscounts the bus split
     // and flips `has_wide_accesses`.
@@ -3205,8 +3219,9 @@ fn a_nop_is_lowered_and_block_growth_continues_through_it() {
     // NOP, which moves core clocks on a real guest and is invisible to every architectural
     // assertion in this suite. The same gap shipped twice before a mutation battery found it.
     assert_eq!(
-        compilation.raw_clocks, 7,
-        "two 2-clock INCs plus a 3-clock NOP"
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::Nop)
     );
     // A NOP touches no memory and no segment. A stray registration here would arm an alignment
     // guard and a code watch for an instruction that emits nothing.
@@ -3281,8 +3296,9 @@ fn a_push_through_memory_is_lowered_with_both_accesses_registered() {
     // checked" are indistinguishable in a diff, and a wrong charge moves core clocks on a real
     // guest without failing any architectural assertion.
     assert_eq!(
-        compilation.raw_clocks, 6,
-        "two 2-clock INCs plus a 2-clock PUSH"
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::PushMem)
     );
     // The static access counts PushMem feeds into the bus charge: one dword read (the source) and
     // one dword store (the stack write), with every byte and word count at zero since this kind
@@ -3476,8 +3492,9 @@ fn a_jmp_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor() {
     // (`execute_extended.rs:920-924`). Without its own `raw_clocks` arm JmpMem rides the `_ => 2`
     // default and undercharges every jump by 5.
     assert_eq!(
-        compilation.raw_clocks, 11,
-        "two 2-clock INCs plus a 7-clock JmpMem"
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::CallJmpRm)
     );
     assert_eq!(compilation.dword_reads, 1);
     assert_eq!(compilation.byte_reads, 0);
@@ -3531,8 +3548,9 @@ fn a_call_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor()
     // (`execute_extended.rs:914-918`). Without its own `raw_clocks` arm CallReg rides the `_ => 2`
     // default and undercharges every call by 5.
     assert_eq!(
-        compilation.raw_clocks, 11,
-        "two 2-clock INCs plus a 7-clock CallReg"
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::CallJmpRm)
     );
     // One dword store (the return push) and no reads at all: the target comes from a register,
     // not memory.
@@ -3599,8 +3617,9 @@ fn a_jmp_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor() 
         "the span must end AT the jump: two one-byte fillers plus the two-byte FF /4 register form"
     );
     assert_eq!(
-        compilation.raw_clocks, 11,
-        "two 2-clock INCs plus a 7-clock JmpReg; the `_ => 2` default would read 6"
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::CallJmpRm)
     );
     assert_eq!(compilation.dword_reads, 0);
     assert_eq!(compilation.dword_stores, 0);
@@ -3656,8 +3675,9 @@ fn a_call_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor() {
         "the span must end AT the call: two one-byte fillers plus the six-byte FF /2 disp32 form"
     );
     assert_eq!(
-        compilation.raw_clocks, 11,
-        "two 2-clock INCs plus a 7-clock CallMem"
+        compilation.raw_clocks,
+        2 * crate::timing_class::I586.raw(TimingClass::Reg)
+            + crate::timing_class::I586.raw(TimingClass::CallJmpRm)
     );
     assert_eq!(compilation.dword_reads, 1, "the target dword");
     assert_eq!(compilation.dword_stores, 1, "the return-address push");
@@ -3696,7 +3716,10 @@ fn a_call_through_memory_at_the_block_entry_compiles_as_a_one_instruction_block(
          permanent structural rejections into compiled blocks"
     );
     assert_eq!(compilation.span.guest_len, 6);
-    assert_eq!(compilation.raw_clocks, 7);
+    assert_eq!(
+        compilation.raw_clocks,
+        crate::timing_class::I586.raw(TimingClass::CallJmpRm)
+    );
     assert!(compilation.dynamic_successor);
 }
 

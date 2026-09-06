@@ -13,7 +13,6 @@ fn rep_port_machine(opcode: u8, port: u16) -> Machine {
     )
     .unwrap();
     machine.set_mode(GswMode::Gsw486);
-    machine.set_timing_epoch_for_test(2);
     machine.cpu.registers.eflags &= !0x200;
     machine.cpu.registers.set_edx(u32::from(port));
     machine.cpu.registers.set_ecx(2);
@@ -25,12 +24,13 @@ fn rep_port_machine(opcode: u8, port: u16) -> Machine {
 }
 
 fn arm_fast_channel2(machine: &mut Machine) {
-    with_bus(machine, |bus| {
+    {
+        let mut bus = machine.make_construction_bus();
         bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
         bus.write_io(0x42, BusWidth::Byte, 0x40, false).unwrap();
         bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0x61, BusWidth::Byte, 0x01, false).unwrap();
-    });
+    }
 }
 
 fn write_descriptor(machine: &mut Machine, base: u32, selector: u16, low: u32, high: u32) {
@@ -71,7 +71,6 @@ fn task_gate_terminal_machine() -> Machine {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(32, VideoCard::Vega), PROG).unwrap();
     machine.set_mode(GswMode::Gsw486);
-    machine.set_timing_epoch_for_test(2);
     write_descriptor(&mut machine, GDT, 0x08, 0x0000_ffff, 0x00cf_9b00);
     write_descriptor(&mut machine, GDT, 0x10, 0x0000_ffff, 0x00cf_9300);
     write_descriptor(&mut machine, GDT, 0x18, 0x3800_0067, 0x0000_8900);
@@ -167,6 +166,12 @@ fn assert_rep_port_batch(
     observation: &TestBatchObservation,
     expected: (u64, u64, u64, u64, u64, u64, u64),
 ) {
+    let quantum = match machine.active_mode {
+        GswMode::Gsw386Slow => 747,
+        GswMode::Gsw386 => 249,
+        GswMode::Gsw486 => 83,
+        GswMode::Gsw586 => 33,
+    };
     assert_eq!(
         (
             observation.core_clocks,
@@ -185,9 +190,8 @@ fn assert_rep_port_batch(
     );
     assert_eq!(
         observation.timeline_ticks_at_exit - observation.timeline_ticks_at_entry,
-        machine
-            .timeline
-            .master_ticks_for_cpu_clocks(observation.step)
+        observation.core_clocks * quantum
+            + (observation.raw_bus_clocks + observation.isa_clocks) * 33
     );
 }
 
@@ -200,7 +204,6 @@ fn machinebus_second_rep_port_observation_crosses_a_real_pit_edge() {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(32, VideoCard::Vega), PROG).unwrap();
     machine.set_mode(GswMode::Gsw486);
-    machine.set_timing_epoch_for_test(2);
     machine.cpu.registers.set_edx(0x61);
     machine.cpu.registers.set_ecx(2);
     machine.cpu.registers.set_edi(0x0300);
@@ -245,8 +248,8 @@ fn machinebus_second_rep_port_observation_crosses_a_real_pit_edge() {
     assert_eq!(observations[1].prior_runs_core_clocks, 1);
     assert_eq!(observations[0].core_clocks_so_far, 0);
     assert_eq!(observations[1].core_clocks_so_far, 3);
-    assert_eq!(observations[0].bus_num_at_batch_start, 1);
-    assert_eq!(observations[0].bus_den_at_batch_start, 1);
+    assert_eq!(observations[0].bus_num_at_batch_start, 33);
+    assert_eq!(observations[0].bus_den_at_batch_start, 83);
     assert_eq!(observations[0].bus_rem_at_batch_start, 0);
     assert_eq!(observations[0].isa_io_clocks, 156);
     assert_eq!(observations[1].isa_io_clocks, 312);
@@ -260,35 +263,35 @@ fn machinebus_second_rep_port_observation_crosses_a_real_pit_edge() {
         "the calibrated guest settles in one batch"
     );
     let calibration = &calibration[0];
-    assert_eq!(calibration.core_clocks, 18);
+    assert_eq!(calibration.core_clocks, 22);
     assert_eq!(calibration.isa_clocks, 312);
-    assert_eq!(calibration.scaled_bus_clocks, calibration.raw_bus_clocks);
+    assert_eq!(calibration.scaled_bus_clocks, 127);
     assert_eq!(calibration.bus_rem_at_entry, 0);
     assert_eq!(calibration.bus_rem_at_exit, 0);
     assert_eq!(
-        calibration.step,
-        18 + calibration.raw_bus_clocks + 312,
+        calibration.step, 149,
         "full settlement includes the second destination access and HLT"
     );
     assert!(
         machine.test_effective_batch_caps[0] > calibration.step,
         "the real event cap must leave the calibrated guest unsplit"
     );
-    let stale = 1 + raw_second + 312;
-    let corrected = stale + 3;
+    assert_eq!((raw_first, raw_second), (4, 8));
+    let stale = 83 + (raw_second + 312) * 33;
+    let corrected = stale + 3 * 83;
+    assert_eq!((stale, corrected), (10_643, 10_892));
     let make_reference = || {
         let mut reference =
             Machine::new_raw_program(MachineProfile::gsw_386(32, VideoCard::Vega), PROG).unwrap();
         reference.set_mode(GswMode::Gsw486);
-        reference.set_timing_epoch_for_test(2);
         arm_fast_channel2(&mut reference);
         reference.port_bus_batch_clocks = 0;
         reference
     };
     let mut stale_reference = make_reference();
     let mut corrected_reference = make_reference();
-    stale_reference.advance_devices(stale);
-    corrected_reference.advance_devices(corrected);
+    stale_reference.advance_devices_ticks(stale);
+    corrected_reference.advance_devices_ticks(corrected);
     let phase_limit =
         (64 * stale_reference.active_mode.clock_hz()).div_ceil(u64::from(PIT_INPUT_HZ));
     let mut phase = 0;
@@ -347,7 +350,7 @@ fn machinebus_second_rep_port_observation_crosses_a_real_pit_edge() {
         calibration.scaled_bus_clocks
     );
     assert_eq!(candidate_calibration.isa_clocks, 312);
-    assert_eq!(candidate_calibration.core_clocks, 18);
+    assert_eq!(candidate_calibration.core_clocks, 22);
     assert_eq!(candidate_calibration.bus_rem_at_entry, 0);
     assert_eq!(candidate_calibration.bus_rem_at_exit, 0);
     assert!(candidate.test_effective_batch_caps[0] > candidate_calibration.step);
@@ -411,20 +414,20 @@ fn machinebus_rep_port_setup_pause_resume_and_forced_progress_keep_each_batch_ow
         let normal_batches = normal.test_batch_observations[normal_start..].to_vec();
         if opcode == 0x6c {
             assert_eq!(normal_batches.len(), 1);
-            assert_rep_port_batch(&normal, &normal_batches[0], (6, 8, 8, 312, 326, 0, 0));
+            assert_rep_port_batch(&normal, &normal_batches[0], (10, 8, 127, 312, 137, 0, 0));
         } else {
             assert_eq!(normal_batches.len(), 3);
-            assert_rep_port_batch(&normal, &normal_batches[0], (4, 4, 4, 156, 164, 0, 0));
-            assert_rep_port_batch(&normal, &normal_batches[1], (4, 4, 4, 156, 164, 0, 0));
-            assert_rep_port_batch(&normal, &normal_batches[2], (0, 0, 0, 0, 0, 0, 0));
+            assert_rep_port_batch(&normal, &normal_batches[0], (4, 4, 63, 156, 67, 0, 0));
+            assert_rep_port_batch(&normal, &normal_batches[1], (4, 4, 64, 156, 68, 0, 0));
+            assert_rep_port_batch(&normal, &normal_batches[2], (4, 0, 0, 0, 4, 0, 0));
         }
         assert_eq!(
             normal.scaled_bus_clocks - scaled_before,
-            8,
+            127,
             "the two string elements own the normal path's complete scaled bus total"
         );
         #[cfg(feature = "jit")]
-        assert_eq!(normal.cpu.poll_skip_timing_remainder(), 5);
+        assert_eq!(normal.cpu.poll_skip_timing_remainder(), 0);
         let normal_ports = normal
             .test_string_port_observations
             .as_ref()
@@ -480,7 +483,7 @@ fn machinebus_rep_port_setup_pause_resume_and_forced_progress_keep_each_batch_ow
         let first_forced_scaled = forced.scaled_bus_clocks;
         let first_forced_ports = forced.test_string_port_observations.as_ref().unwrap().len();
         let forced_batch = run_one_capped_batch(&mut forced, 1);
-        assert_eq!(forced.scaled_bus_clocks - first_forced_scaled, 4);
+        assert_eq!(forced.scaled_bus_clocks - first_forced_scaled, 63);
         #[cfg(feature = "jit")]
         assert_eq!(forced.cpu.poll_skip_timing_remainder(), 0);
         assert_eq!(
@@ -498,15 +501,15 @@ fn machinebus_rep_port_setup_pause_resume_and_forced_progress_keep_each_batch_ow
             &forced,
             &forced.test_batch_observations[forced_batch],
             if opcode == 0x6c {
-                (3, 4, 4, 156, 163, 0, 0)
+                (3, 4, 63, 156, 66, 0, 0)
             } else {
-                (4, 4, 4, 156, 164, 0, 0)
+                (4, 4, 63, 156, 67, 0, 0)
             },
         );
         let second_forced_scaled = forced.scaled_bus_clocks;
         let second_forced_ports = forced.test_string_port_observations.as_ref().unwrap().len();
         let second_forced_batch = run_one_capped_batch(&mut forced, 1);
-        assert_eq!(forced.scaled_bus_clocks - second_forced_scaled, 4);
+        assert_eq!(forced.scaled_bus_clocks - second_forced_scaled, 64);
         #[cfg(feature = "jit")]
         assert_eq!(forced.cpu.poll_skip_timing_remainder(), 0);
         assert_eq!(
@@ -524,9 +527,9 @@ fn machinebus_rep_port_setup_pause_resume_and_forced_progress_keep_each_batch_ow
             &forced,
             &forced.test_batch_observations[second_forced_batch],
             if opcode == 0x6c {
-                (3, 4, 4, 156, 163, 0, 0)
+                (3, 4, 64, 156, 67, 0, 0)
             } else {
-                (4, 4, 4, 156, 164, 0, 0)
+                (4, 4, 64, 156, 68, 0, 0)
             },
         );
         let forced_ports = forced
@@ -573,11 +576,11 @@ fn machinebus_rep_port_setup_pause_resume_and_forced_progress_keep_each_batch_ow
         assert_rep_port_batch(
             &forced,
             &forced.test_batch_observations[halted_batch],
-            (0, 0, 0, 0, 0, 0, 0),
+            (4, 0, 0, 0, 4, 0, 0),
         );
         assert_eq!(forced.scaled_bus_clocks - halted_scaled, 0);
         #[cfg(feature = "jit")]
-        assert_eq!(forced.cpu.poll_skip_timing_remainder(), 5);
+        assert_eq!(forced.cpu.poll_skip_timing_remainder(), 0);
     }
 }
 
@@ -600,10 +603,12 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
     );
     let calibration_observation = &calibration.test_batch_observations[calibration_batch];
     let raw_first = calibration_observation.raw_bus_clocks;
-    let full_first_step = 201 + raw_first;
-    let stale_first_step = 2 + raw_first;
+    let full_first_ticks = 201 * 83 + raw_first * 33;
+    let full_first_step = full_first_ticks / 83;
+    let first_scaled_charge = full_first_step - 201;
+    let stale_first_ticks = 2 * 83 + raw_first * 33;
     assert_eq!(calibration.active_mode, GswMode::Gsw486);
-    assert_eq!(calibration.timing_epoch, 2);
+    assert_eq!(calibration.timing_epoch(), 2);
     assert!(calibration_observation.fatal);
     assert_eq!(
         (
@@ -615,7 +620,15 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
             calibration_observation.bus_rem_at_entry,
             calibration_observation.bus_rem_at_exit,
         ),
-        (201, raw_first, raw_first, 0, full_first_step, 0, 0)
+        (
+            201,
+            raw_first,
+            first_scaled_charge,
+            0,
+            full_first_step,
+            0,
+            0
+        )
     );
     assert_eq!(
         calibration.elapsed_clocks - calibration_elapsed,
@@ -623,7 +636,7 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
     );
     assert_eq!(
         calibration.scaled_bus_clocks - calibration_scaled,
-        raw_first
+        first_scaled_charge
     );
     assert_eq!(
         calibration.cpu.elapsed_clocks - calibration_cpu_elapsed,
@@ -633,8 +646,8 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
 
     let mut stale_reference = task_gate_terminal_pit_machine();
     let mut corrected_reference = task_gate_terminal_pit_machine();
-    stale_reference.advance_cpu_work(stale_first_step, 2);
-    corrected_reference.advance_cpu_work(full_first_step, 201);
+    stale_reference.advance_cpu_work(stale_first_ticks, 2);
+    corrected_reference.advance_cpu_work(full_first_ticks, 201);
     let phase_limit =
         (64 * stale_reference.active_mode.clock_hz()).div_ceil(u64::from(PIT_INPUT_HZ));
     let mut phase = 0;
@@ -678,14 +691,25 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
             first_observation.bus_rem_at_entry,
             first_observation.bus_rem_at_exit,
         ),
-        (201, raw_first, raw_first, 0, full_first_step, 0, 0)
+        (
+            201,
+            raw_first,
+            first_scaled_charge,
+            0,
+            full_first_step,
+            0,
+            0
+        )
     );
     assert_eq!(machine.cpu.tr.selector, 0x18);
     assert_eq!(machine.cpu.registers.eip, 0x90);
     assert_eq!(machine.cpu.fault_site().unwrap().eip, 0x10a);
     assert_eq!(read_u32(&mut machine, 0x3000 + 52), 0x1111);
     assert_eq!(machine.elapsed_clocks - first_elapsed, full_first_step);
-    assert_eq!(machine.scaled_bus_clocks - first_scaled, raw_first);
+    assert_eq!(
+        machine.scaled_bus_clocks - first_scaled,
+        first_scaled_charge
+    );
     assert_eq!(machine.cpu.elapsed_clocks - first_cpu_elapsed, 201);
     assert_eq!(machine.inta_diag.acknowledge_count, acks);
     assert_eq!(machine.pit, corrected_reference.pit);
@@ -702,7 +726,9 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
     assert_eq!(machine.test_batch_observations.len(), resumed + 1);
     let resumed_observation = &machine.test_batch_observations[resumed];
     let raw_second = resumed_observation.raw_bus_clocks;
-    let resumed_step = 1 + raw_second + 52;
+    let resumed_ticks = 83 + (raw_second + 52) * 33;
+    let resumed_step = (full_first_ticks % 83 + resumed_ticks) / 83;
+    let resumed_scaled_charge = resumed_step - 1;
     assert!(resumed_observation.fatal);
     assert_eq!(
         (
@@ -714,15 +740,18 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
             resumed_observation.bus_rem_at_entry,
             resumed_observation.bus_rem_at_exit,
         ),
-        (1, raw_second, raw_second, 52, resumed_step, 0, 0)
+        (1, raw_second, resumed_scaled_charge, 52, resumed_step, 0, 0)
     );
     assert_eq!(machine.cpu.registers.eip, 0x96);
     assert_eq!(machine.cpu.fault_site().unwrap().eip, 0x95);
     assert_eq!(machine.elapsed_clocks - resumed_elapsed, resumed_step);
-    assert_eq!(machine.scaled_bus_clocks - resumed_scaled, raw_second);
+    assert_eq!(
+        machine.scaled_bus_clocks - resumed_scaled,
+        resumed_scaled_charge
+    );
     assert_eq!(machine.cpu.elapsed_clocks - resumed_cpu_elapsed, 1);
     assert_eq!(machine.inta_diag.acknowledge_count, acks);
-    corrected_reference.advance_cpu_work(resumed_step, 1);
+    corrected_reference.advance_cpu_work(resumed_ticks, 1);
     assert_eq!(machine.pit, corrected_reference.pit);
     assert_eq!(machine.timeline, corrected_reference.timeline);
 }
@@ -854,7 +883,6 @@ fn machinebus_rep_prices_fold_aligned_fetch_and_ram_once() {
                         )
                         .unwrap();
                         machine.set_mode(mode);
-                        machine.set_timing_epoch_for_test(2);
                         machine.cpu.registers.eflags &= !0x200;
                         if backwards {
                             machine.cpu.registers.eflags |= 0x400;

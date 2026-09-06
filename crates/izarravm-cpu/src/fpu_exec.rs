@@ -52,7 +52,7 @@ impl CpuGsw {
             // Fall through to the single tail so scale_fp_clocks is applied uniformly.
             let raw = self.charge(TimingClass::X87Wait);
             return Ok(CycleOutcome {
-                core_clocks: self.scale_fp_clocks(raw.core_clocks, FpOpClass::Wait),
+                core_clocks: self.scale_fp_clocks(raw.core_clocks),
                 halted: raw.halted,
             });
         }
@@ -85,20 +85,6 @@ impl CpuGsw {
                 error_code: None,
             });
         }
-        // Single tail: apply the per-mode, per-class FP-timing factor to every x87
-        // op's raw clocks (WAIT handled above). Class derivation mirrors the census
-        // profiler's view: register forms vs the three memory-form families.
-        let fp_class = if modrm.mode == 3 {
-            FpOpClass::Register
-        } else {
-            match opcode {
-                0xdb => FpOpClass::IntConvert32,
-                // DF int16/m64/BCD loads/stores, DE int16 arith, DA int32 arith.
-                0xda | 0xde | 0xdf => FpOpClass::IntConvert16,
-                0xd8 | 0xd9 => FpOpClass::F32Mem,
-                _ => FpOpClass::F64Mem, // 0xdc | 0xdd
-            }
-        };
         let outcome = if modrm.mode == 3 {
             self.execute_fpu_register(opcode, modrm)?
         } else {
@@ -113,7 +99,7 @@ impl CpuGsw {
             self.execute_fpu_memory(bus, opcode, modrm.reg, mem, insn.operand_size)?
         };
         Ok(CycleOutcome {
-            core_clocks: self.scale_fp_clocks(outcome.core_clocks, fp_class),
+            core_clocks: self.scale_fp_clocks(outcome.core_clocks),
             halted: outcome.halted,
         })
     }

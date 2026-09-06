@@ -366,7 +366,6 @@ fn a_retf_return_leaving_the_flags_word_closes_as_a_return_match() {
     let (mut cpu, _bus) = synthetic_reflected_client();
     let open = OpenTrip {
         key: MemoKey {
-            epoch: 1,
             vector: VECTOR,
             ax: 0,
             cs_selector: CODE_SELECTOR,
@@ -440,7 +439,6 @@ fn an_iret_return_with_sp_equal_to_entry_closes_as_a_return_match() {
 fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
     OpenTrip {
         key: MemoKey {
-            epoch: 1,
             vector: VECTOR,
             ax: 0,
             cs_selector: CODE_SELECTOR,
@@ -834,7 +832,6 @@ fn open_trip_samples_the_cumulative_bus_accessor() {
     let (cpu, mut bus) = synthetic_reflected_client();
     bus.bus_clock = 42;
     let key = MemoKey {
-        epoch: 1,
         vector: VECTOR,
         ax: 0,
         cs_selector: CODE_SELECTOR,
@@ -1236,43 +1233,6 @@ fn on_int_rearms_a_disarmed_key_through_the_real_hook() {
     assert_eq!(ks.rearms, 1);
 }
 
-/// A memo learned under one guest-clock epoch must never answer under another.
-///
-/// The memo REPLAYS a trip's recorded `raw_core` and `raw_bus` instead of
-/// re-running it, and slice 8 changes exactly the numbers a reflected trip is
-/// made of -- the V86 monitor trip, the faulting instruction's own class,
-/// `IRET`'s mode rows. Without the epoch in the key, a memo learned at epoch 1
-/// would go on answering with a 16.7x-light trip after the model moved.
-#[test]
-fn the_epoch_is_part_of_the_memo_key() {
-    let mut a = MemoKey {
-        epoch: 1,
-        vector: 0x21,
-        ax: 0x3d00,
-        cs_selector: 0x0170,
-        int_eip: 0x0001_2340,
-        ss_selector: 0x0178,
-        ss_big: true,
-        cpl: 3,
-        vm: false,
-    };
-    let b = MemoKey { epoch: 2, ..a };
-    assert_ne!(a, b, "two epochs must not share a memo bucket");
-
-    // And the epoch is the ONLY thing separating them, so this is a test of
-    // that field rather than of the seventeen bytes beside it.
-    a.epoch = 2;
-    assert_eq!(a, b);
-
-    // Hash agreement follows from `Eq`, but the map is keyed on the hash, so
-    // assert it where the map would see it.
-    use std::collections::HashSet;
-    let mut set = HashSet::new();
-    set.insert(MemoKey { epoch: 1, ..b });
-    set.insert(b);
-    assert_eq!(set.len(), 2, "the two epochs must occupy two buckets");
-}
-
 // ---------------------------------------------------------------------------
 // Amendment 1: A20 retire (plan Revision 2 amendments, item A, BLOCKING).
 // ---------------------------------------------------------------------------
@@ -1304,7 +1264,6 @@ fn an_a20_toggle_retires_every_memo() {
     let (mut cpu, _bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key_a = MemoKey {
-        epoch: 0,
         vector: VECTOR,
         ax: 0,
         cs_selector: CODE_SELECTOR,
@@ -1354,7 +1313,6 @@ fn note_a20_changed_is_the_seam_that_retires() {
     let (mut cpu, _bus) = synthetic_reflected_client();
     arm(&mut cpu);
     let key = MemoKey {
-        epoch: 0,
         vector: VECTOR,
         ax: 0,
         cs_selector: CODE_SELECTOR,
@@ -1677,7 +1635,6 @@ fn native_terminal_reflected_int_returns_its_answer_once_without_running_the_suf
     let _int_rows = IntRowsGuard;
     let (mut cpu, mut bus) = synthetic_reflected_client();
     arm(&mut cpu);
-    cpu.set_timing_epoch(2);
     bus.gate_allowance = Some(1_000_000);
     bus.mem[NATIVE_ENTRY as usize..NATIVE_ENTRY as usize + 12].copy_from_slice(&[
         0xbb, 0xdf, 0x9b, 0x57, 0x13, // MOV EBX, prefix marker
@@ -1778,7 +1735,6 @@ fn public_reflected_int_answers_once_from_cycle_and_cached_head() {
         let (mut cpu, mut bus) = synthetic_reflected_client();
         arm(&mut cpu);
         cpu.set_mode(GswMode::Gsw586);
-        cpu.set_timing_epoch(2);
         bus.gate_allowance = Some(1_000_000);
         bus.mem[ENTRY as usize..ENTRY as usize + 4].copy_from_slice(&[0xcd, VECTOR, 0xb0, 0x5a]);
 

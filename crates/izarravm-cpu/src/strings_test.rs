@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use crate::tests::TestBus;
 
 // The three `level_timing` literal tripwires used to live here, #[cfg(test)]-only. Moved to
 // strings.rs beside rep_core_upper (review N2) so a release build breaks too, not only a test
@@ -35,7 +34,6 @@ const ALL_PERSONAS: [(GswMode, CpuPersona); 3] = [
 /// call exactly.
 #[test]
 fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
-    let bus = TestBus::default();
     for &(mode, persona) in &ALL_PERSONAS {
         let (num, den) = level_timing_for_test(persona);
         for &op in &ALL_STRING_OPS {
@@ -49,13 +47,17 @@ fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
                 let oracle = if resume_active {
                     0
                 } else {
-                    u64::from(CpuGsw::rep_core_clocks(op))
-                        .saturating_mul(u64::from(num))
-                        .saturating_add(u64::from(den) - 1)
+                    u64::from(match op {
+                        StringOp::Ins => 11 * 12,
+                        StringOp::Outs => 13 * 12,
+                        _ => CpuGsw::rep_core_clocks(op),
+                    })
+                    .saturating_mul(u64::from(num))
+                    .saturating_add(u64::from(den) - 1)
                         / u64::from(den)
                 };
                 assert_eq!(
-                    cpu.rep_core_upper(&bus, op),
+                    cpu.rep_core_upper(op),
                     oracle,
                     "{persona:?} {op:?} resume_active={resume_active}"
                 );
@@ -70,14 +72,13 @@ fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
 /// mutation coverage.
 #[test]
 fn rep_core_upper_collapses_to_zero_exactly_when_resuming() {
-    let bus = TestBus::default();
     for &(mode, _persona) in &ALL_PERSONAS {
         for &op in &ALL_STRING_OPS {
             let mut cpu = CpuGsw::default();
             cpu.set_mode(mode);
             cpu.rep_resume_active = true;
             assert_eq!(
-                cpu.rep_core_upper(&bus, op),
+                cpu.rep_core_upper(op),
                 0,
                 "resume_active must zero core_upper"
             );
@@ -87,9 +88,6 @@ fn rep_core_upper_collapses_to_zero_exactly_when_resuming() {
 
 #[test]
 fn rep_core_upper_uses_the_live_epoch_two_port_setup_tariff() {
-    let mut bus = TestBus::default();
-    bus.timing_epoch_two = true;
-
     for (mode, ins, outs) in [
         (GswMode::Gsw386, 53, 63),
         (GswMode::Gsw486, 11, 13),
@@ -97,12 +95,8 @@ fn rep_core_upper_uses_the_live_epoch_two_port_setup_tariff() {
     ] {
         let mut cpu = CpuGsw::default();
         cpu.set_mode(mode);
-        assert_eq!(cpu.rep_core_upper(&bus, StringOp::Ins), ins, "{mode:?} INS");
-        assert_eq!(
-            cpu.rep_core_upper(&bus, StringOp::Outs),
-            outs,
-            "{mode:?} OUTS"
-        );
+        assert_eq!(cpu.rep_core_upper(StringOp::Ins), ins, "{mode:?} INS");
+        assert_eq!(cpu.rep_core_upper(StringOp::Outs), outs, "{mode:?} OUTS");
     }
 }
 
@@ -140,4 +134,68 @@ fn string_forward_chunk_iterations_never_exceeds_one_page() {
             }
         }
     }
+}
+
+#[test]
+fn restricted_rep_bounds_reserve_permission_bytes_and_repeated_walks() {
+    use crate::tests::TestBus;
+    let mut bus = TestBus::with_memory(Vec::new());
+    bus.report_batch_clocks = true;
+    bus.rep_data_byte_cost_override = Some(2);
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.rep_execution.budget = Some(RepBudget {
+        bus_at_entry: 0,
+        cap: 1000,
+    });
+    for v86 in [false, true] {
+        for paged in [false, true] {
+            cpu.control.cr0 = CR0_PE | if paged { CR0_PG } else { 0 };
+            cpu.cpl = 3;
+            cpu.registers.eflags = if v86 { FLAG_VM | 0x3002 } else { 2 };
+            for (width, data, walks) in [
+                (BusWidth::Byte, 4, 4),
+                (BusWidth::Word, 6, 6),
+                (BusWidth::Dword, 10, 8),
+            ] {
+                for (op, core) in [(StringOp::Ins, 3), (StringOp::Outs, 4)] {
+                    let expected = data * 2 + if paged { walks * 8 } else { 0 } + 2 + core;
+                    assert_eq!(
+                        RepLimitPlan::compute(&cpu, &bus, op, width, &InstructionWork::default()),
+                        RepLimitPlan::Bounded {
+                            per_iteration: expected,
+                            paging_setup: 0
+                        }
+                    );
+                }
+            }
+        }
+    }
+    cpu.cpl = 0;
+    cpu.registers.eflags = 2;
+    assert_eq!(
+        RepLimitPlan::compute(
+            &cpu,
+            &bus,
+            StringOp::Ins,
+            BusWidth::Byte,
+            &InstructionWork::default()
+        ),
+        RepLimitPlan::Bounded {
+            per_iteration: 7,
+            paging_setup: 8
+        }
+    );
+    cpu.cpl = 3;
+    bus.rep_data_byte_cost_override = Some(u64::MAX);
+    assert_eq!(
+        RepLimitPlan::compute(
+            &cpu,
+            &bus,
+            StringOp::Ins,
+            BusWidth::Byte,
+            &InstructionWork::default()
+        ),
+        RepLimitPlan::Yield
+    );
 }

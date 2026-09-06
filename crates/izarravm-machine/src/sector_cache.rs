@@ -1,52 +1,9 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! A host-side sector cache sitting under the fixed-disk service.
-//!
-//! This is the SMARTDRV seat. SMARTDRV hooked INT 13h and answered a repeat read
-//! out of XMS without touching the drive; this cache sits one layer lower, under
-//! `AtaDisk`, and costs the guest no conventional memory at all. It exists
-//! because the measured Duke Nukem 3D hitch is on-demand GRP streaming: the game
-//! re-reads the same sound and art lumps through an uncached path, and every
-//! repeat pays the full modelled medium cost a second time.
-//!
-//! ## What it caches
-//!
-//! Every sector the disk serves, whichever backing it came from. Not just the
-//! FAT region: the FAT is the load-phase cost, but the in-demo heartbeat is
-//! re-touched DATA, and a FAT-only cache would answer the first problem and none
-//! of the second. Serving both from one structure also keeps the charge model
-//! from depending on which region an LBA happens to fall in.
-//!
-//! ## Determinism
-//!
-//! The charge a guest read pays depends on whether its sector is resident, so
-//! residency has to be a pure function of the guest's own history. It is: the
-//! capacity is a compile-time constant, insertion happens only on a guest read
-//! miss or a guest write, and eviction is strict LRU over that same sequence.
-//! No wall clock, no host memory pressure, no allocator address feeds into it.
-//! Same guest history, same hit/miss sequence, same charges.
-//!
-//! ## Canonical state, stated once
-//!
-//! The cache is deliberately NOT part of canonical state. It is HOST SCHEDULING
-//! STATE: every byte in it is recomputable from the backing, so no captured or
-//! restored machine can read a different value because of it. CONTENT is
-//! cache-independent.
-//!
-//! CHARGE is not, and the earlier claim that a warm capture and a cold one
-//! "describe the same machine" overstated it. A restored machine restarts COLD,
-//! so its first read of an LBA the original had resident pays the medium cost
-//! the original did not, and the replayed guest-visible timeline may therefore
-//! differ from the uninterrupted run's (see `stall_for_hdd_sectors_cached`).
-//! That is acceptable today only because there is NO restore path: nothing in
-//! the machine reloads a capture and continues from it. Whoever builds one owns
-//! this decision — either capture the residency set with the rest of the state,
-//! or accept a timing discontinuity at the restore point and say so there.
-//!
-//! Limit: bounded at [`CAPACITY_SECTORS`] with no way to raise it at runtime.
-//! Lift by taking the bound from the machine config if a workload ever needs a
-//! working set past 16 MiB.
+//! Bounded LRU cache of backing sectors. Hits avoid host reads while preserving
+//! guest-visible bytes and hardware timing. Residency is excluded from canonical
+//! state because it changes neither. Guest writes update the cached sector.
 
 use std::collections::HashMap;
 

@@ -309,3 +309,114 @@ fn transmit_and_timeout_state_are_batch_invariant() {
     assert_eq!(whole, split);
     assert_eq!(whole.pending_code(), IIR_TIMEOUT);
 }
+
+#[test]
+fn access_catchup_matches_settlement_across_uart_events() {
+    let duration = (MASTER_CLOCK_HZ * 10).div_ceil(115_200);
+    for base in [COM1_BASE, COM2_BASE] {
+        for fifo in [false, true] {
+            for loopback in [false, true] {
+                let mut initial = if base == COM1_BASE {
+                    Uart16450::default()
+                } else {
+                    Uart16450::com2()
+                };
+                initial.write_port(base + 3, 3);
+                initial.write_port(base + 4, MCR_OUT2 | if loopback { MCR_LOOP } else { 0 });
+                initial.write_port(base + 1, IER_RDA | IER_THRE);
+                if fifo {
+                    initial.write_port(base + 2, FCR_FIFO_ENABLE | 0x40);
+                }
+                for byte in b"abcdefghijklmnopq" {
+                    initial.write_port(base, *byte);
+                }
+                for offset in [
+                    duration / 2,
+                    duration - 1,
+                    duration,
+                    duration + 1,
+                    duration * 3,
+                ] {
+                    for (register, value) in [
+                        (0, Some(b'Z')),
+                        (2, Some(FCR_FIFO_ENABLE | FCR_CLEAR_TX)),
+                        (2, Some(FCR_FIFO_ENABLE | FCR_CLEAR_RX)),
+                        (2, Some(0)),
+                        (1, Some(0)),
+                        (1, Some(IER_RDA | IER_THRE)),
+                        (3, Some(0x1f)),
+                        (3, Some(0x83)),
+                        (4, Some(MCR_OUT2)),
+                        (4, Some(MCR_LOOP | MCR_OUT2)),
+                        (0, None),
+                        (2, None),
+                        (5, None),
+                    ] {
+                        let mut split = initial.clone();
+                        let mut whole = initial.clone();
+                        split.advance_master_ticks(offset);
+                        if let Some(value) = value {
+                            assert!(split.write_port(base + register, value));
+                            assert!(whole.write_port_at(base + register, value, offset));
+                        } else {
+                            assert_eq!(
+                                whole.read_port_at(base + register, offset),
+                                split.read_port(base + register)
+                            );
+                        }
+                        let span = duration * 100;
+                        whole.advance_master_ticks(offset / 3);
+                        assert_eq!(whole.advance_credit_ticks(), offset - offset / 3);
+                        whole.advance_master_ticks(span - offset / 3);
+                        split.advance_master_ticks(span - offset);
+                        assert_eq!(
+                            whole, split,
+                            "base={base:x} fifo={fifo} loopback={loopback} offset={offset} register={register} value={value:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_uart_write_after_completion_starts_at_its_own_access() {
+    let duration = (MASTER_CLOCK_HZ * 10).div_ceil(115_200);
+    let mut uart = Uart16450::default();
+    uart.write_port(LCR, 3);
+    uart.write_port_at(THR, b'A', 100);
+    let second = 100 + duration + 17;
+    uart.write_port_at(THR, b'B', second);
+    assert_eq!(uart.output(), b"A");
+    assert_eq!(uart.tx_ticks_remaining, duration);
+    uart.advance_master_ticks(second + duration - 1);
+    assert_eq!(uart.output(), b"A");
+    uart.advance_master_ticks(1);
+    assert_eq!(uart.output(), b"AB");
+    assert_eq!(uart.advance_credit_ticks(), 0);
+}
+
+#[test]
+fn fifo_read_timeout_starts_at_the_read_and_unclaimed_accesses_are_inert() {
+    let duration = (MASTER_CLOCK_HZ * 10).div_ceil(115_200);
+    let mut uart = Uart16450::default();
+    uart.write_port(LCR, 3);
+    uart.write_port(FCR, FCR_FIFO_ENABLE | 0x40);
+    uart.write_port(MCR, MCR_OUT2);
+    uart.write_port(IER, IER_RDA);
+    uart.receive(b'A');
+    uart.receive(b'B');
+    let prefix = duration * 2;
+    let unchanged = uart.clone();
+    assert_eq!(uart.read_port_at(0x1234, prefix), None);
+    assert!(!uart.write_port_at(0x1234, 0, prefix));
+    assert_eq!(uart, unchanged);
+    assert_eq!(uart.read_port_at(RBR, prefix), Some(b'A'));
+    uart.advance_master_ticks(prefix + 4 * duration - 1);
+    assert_eq!(uart.pending_code(), IIR_NONE);
+    uart.advance_master_ticks(1);
+    assert_eq!(uart.pending_code(), IIR_TIMEOUT);
+    assert_eq!(uart.read_port(RBR), Some(b'B'));
+    assert_eq!(uart.pending_code(), IIR_NONE);
+}

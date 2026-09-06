@@ -249,12 +249,16 @@ impl Keyboard8042 {
     }
 
     fn schedule_device_byte(&mut self) {
+        self.schedule_device_byte_at(0);
+    }
+
+    fn schedule_device_byte_at(&mut self, prefix_ticks: u64) {
         if self.status & STATUS_OBF == 0
             && !self.device_byte_ready
             && self.device_byte_ticks.is_none()
             && self.queued_device_byte()
         {
-            self.device_byte_ticks = Some(DEVICE_BYTE_TICKS);
+            self.device_byte_ticks = Some(prefix_ticks.saturating_add(DEVICE_BYTE_TICKS));
         }
     }
 
@@ -473,7 +477,12 @@ impl Keyboard8042 {
         }
     }
 
+    #[cfg(test)]
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
+        self.read_port_at(port, 0)
+    }
+
+    pub(crate) fn read_port_at(&mut self, port: u16, prefix_ticks: u64) -> Option<u8> {
         match port {
             0x60 => {
                 // Real 8042: a read clears OBF but leaves the byte in the output
@@ -488,7 +497,7 @@ impl Keyboard8042 {
                 if self.device_byte_ready {
                     self.latch_ready_device_byte();
                 }
-                self.schedule_device_byte();
+                self.schedule_device_byte_at(prefix_ticks);
                 Some(value)
             }
             0x64 => Some(self.status),
@@ -496,7 +505,12 @@ impl Keyboard8042 {
         }
     }
 
+    #[cfg(test)]
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
+        self.write_port_at(port, value, 0)
+    }
+
+    pub(crate) fn write_port_at(&mut self, port: u16, value: u8, prefix_ticks: u64) -> bool {
         let input = match port {
             0x60 => PendingInput::Data(value),
             0x64 => PendingInput::Command(value),
@@ -504,7 +518,7 @@ impl Keyboard8042 {
         };
         if self.pending_input.is_none() {
             self.pending_input = Some(input);
-            self.input_ticks = CONTROLLER_INPUT_TICKS;
+            self.input_ticks = prefix_ticks.saturating_add(CONTROLLER_INPUT_TICKS);
             self.status |= STATUS_IBF;
             if port == 0x64 {
                 self.status |= STATUS_CMD;

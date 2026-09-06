@@ -50,6 +50,15 @@ impl PciConfig {
         CanonicalPciConfig { pci: self }
     }
 
+    pub(crate) fn owns_io(port: u16, width: BusWidth) -> bool {
+        port_span_in(
+            port,
+            width,
+            PCI_CONFIG_ADDRESS_PORT,
+            PCI_CONFIG_ADDRESS_PORT + 3,
+        ) || port_span_in(port, width, PCI_CONFIG_DATA_PORT, PCI_CONFIG_DATA_END)
+    }
+
     pub(crate) fn read_io(&self, port: u16, width: BusWidth, vega: &Vega) -> Option<u32> {
         if port_span_in(
             port,
@@ -264,7 +273,7 @@ fn read_piix4_isa_byte(offset: u32) -> u8 {
 
 fn port_span_in(port: u16, width: BusWidth, start: u16, end: u16) -> bool {
     let size = width.bytes() as u16;
-    port >= start && port + size - 1 <= end
+    port >= start && port.checked_add(size - 1).is_some_and(|last| last <= end)
 }
 
 fn read_register_bytes(register: u32, byte_offset: u16, width: BusWidth) -> u32 {

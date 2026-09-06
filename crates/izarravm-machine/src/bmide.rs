@@ -119,6 +119,7 @@ impl BusMasterIde {
         bus_master_enabled: bool,
         memory: &Memory,
         disk: &mut AtaDisk,
+        prefix_ticks: u64,
     ) {
         if self.primary.transfer.is_some() {
             if !bus_master_enabled || disk.pending_dma().is_none() {
@@ -161,7 +162,8 @@ impl BusMasterIde {
         self.primary.transfer = Some(Transfer {
             direction: request.direction,
             spans: plan.spans,
-            ticks_remaining: crate::ata::dma_transfer_ticks(request),
+            ticks_remaining: prefix_ticks
+                .saturating_add(crate::ata::dma_transfer_ticks(request).max(1)),
             byte_len: request.byte_len(),
             retires_eot: plan.retires_eot,
         });

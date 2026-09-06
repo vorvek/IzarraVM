@@ -28,7 +28,7 @@ fn advance_to_deadline(disk: &mut AtaDisk) {
 }
 
 #[test]
-fn bios_and_pio_share_the_media_transfer_deadline() {
+fn bios_substitutes_cable_time_and_pio_charges_it_at_the_data_port() {
     assert_eq!(pio_transfer_ticks(0), 0);
     assert_eq!(
         pio_transfer_ticks(3),
@@ -38,7 +38,7 @@ fn bios_and_pio_share_the_media_transfer_deadline() {
     let mut disk = marked_disk(8);
     program_lba(&mut disk, 1, 1);
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x20);
-    assert_eq!(disk.ticks_until_completion(), Some(pio_transfer_ticks(1)));
+    assert_eq!(disk.ticks_until_completion(), Some(1));
 }
 
 #[test]
@@ -438,7 +438,7 @@ fn pio_command_projects_to_the_host_before_flush() {
     let counters = disk.katea_storage_counters().unwrap();
     assert_eq!(counters.pio_write_commands, 1);
     assert_eq!(counters.pio_write_sectors, 1);
-    assert_eq!(counters.pio_write_wait_ticks, pio_transfer_ticks(1));
+    assert_eq!(counters.pio_write_wait_ticks, 2);
     drop(disk);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -458,7 +458,7 @@ fn pio_read_reports_its_guest_visible_wait() {
     let counters = disk.katea_storage_counters().unwrap();
     assert_eq!(counters.pio_read_commands, 1);
     assert_eq!(counters.pio_read_sectors, 1);
-    assert_eq!(counters.pio_read_wait_ticks, pio_transfer_ticks(1));
+    assert_eq!(counters.pio_read_wait_ticks, 1);
     drop(disk);
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -695,17 +695,17 @@ fn image_backed_drive_refuses_fat_chain_mapping() {
 // arm explicitly, the same discipline the 9C-pre poll-skip fixtures follow.
 // ---------------------------------------------------------------------------
 
-/// UNARMED must be byte-identical to the pre-9C `pio_transfer_ticks_cached`
+/// UNARMED must be byte-identical to the pre-9C `pio_transfer_ticks`
 /// formula, and must touch neither the modelled head nor the sequential-run
 /// state -- the knob-unset identity bar every slice-9 family holds.
 #[test]
 fn pio_transfer_charge_is_inert_while_the_ata_family_is_unarmed() {
     let mut disk = marked_disk(64);
     let unarmed = DeviceTimingProfile::default();
-    for (lba, sectors, hits) in [(0u32, 1u32, 0u32), (5, 3, 1), (100, 1, 0)] {
+    for (lba, sectors) in [(0u32, 1u32), (5, 3), (100, 1)] {
         assert_eq!(
-            disk.charge_pio_transfer(lba, sectors, hits, unarmed),
-            pio_transfer_ticks_cached(sectors, hits),
+            disk.charge_pio_transfer(lba, sectors, unarmed),
+            pio_transfer_ticks(sectors),
             "unarmed must stay byte-identical to the pre-9C formula"
         );
     }
@@ -731,12 +731,12 @@ fn sequential_pio_transfer_costs_the_buffer_price_not_a_seek() {
     };
     // First transfer is necessarily cold (no prior state); its own cost is
     // not what this fixture is about.
-    let first = disk.charge_pio_transfer(10, 1, 0, armed);
+    let first = disk.charge_pio_transfer(10, 1, armed);
     assert!(first > 0);
     assert_eq!(disk.last_transfer_end_lba, Some(11));
 
     // Second transfer starts exactly at LBA 11, where the first left off.
-    let second = disk.charge_pio_transfer(11, 1, 0, armed);
+    let second = disk.charge_pio_transfer(11, 1, armed);
     let expected = COMMAND_LATENCY_TICKS_PERIOD + pio_sector_ticks();
     assert_eq!(
         second, expected,
@@ -761,14 +761,12 @@ fn a_sequential_run_beyond_the_buffer_falls_back_to_the_media_rate() {
         ata: true,
         ..DeviceTimingProfile::default()
     };
-    let first = disk.charge_pio_transfer(0, 1, 0, armed);
+    let first = disk.charge_pio_transfer(0, 1, armed);
     assert!(first > 0);
 
     // One big sequential transfer that overruns the buffer.
-    let second = disk.charge_pio_transfer(1, total, 0, armed);
-    let cable_only = COMMAND_LATENCY_TICKS_PERIOD
-        + (u128::from(u64::from(total) * SECTOR as u64) * u128::from(MASTER_CLOCK_HZ))
-            .div_ceil(u128::from(PIO_BYTES_PER_SECOND)) as u64;
+    let second = disk.charge_pio_transfer(1, total, armed);
+    let cable_only = COMMAND_LATENCY_TICKS_PERIOD + u64::from(total) * 256 * 660;
     assert!(
         second > cable_only,
         "the overflow past the buffer must cost more than an all-cable-rate \
@@ -786,10 +784,10 @@ fn random_lba_pio_transfer_costs_seek_and_rotation() {
         ata: true,
         ..DeviceTimingProfile::default()
     };
-    let _ = disk.charge_pio_transfer(10, 1, 0, armed);
+    let _ = disk.charge_pio_transfer(10, 1, armed);
     // Far away from LBA 11 (where the first transfer left off): not a
     // sequential continuation.
-    let random = disk.charge_pio_transfer(500_000, 1, 0, armed);
+    let random = disk.charge_pio_transfer(500_000, 1, armed);
 
     let sequential_cost = COMMAND_LATENCY_TICKS_PERIOD + pio_sector_ticks();
     assert!(
@@ -809,15 +807,18 @@ fn random_lba_pio_transfer_costs_seek_and_rotation() {
 /// modelled drive at all: no charge, no head move -- design §5 risk 1, the
 /// host cache stays a pure host-time avoider.
 #[test]
-fn a_fully_cached_transfer_charges_nothing_and_does_not_move_the_modelled_head() {
+fn a_transfer_updates_the_modeled_head_even_with_cached_backing() {
     let mut disk = marked_disk(64);
     let armed = DeviceTimingProfile {
         ata: true,
         ..DeviceTimingProfile::default()
     };
-    assert_eq!(disk.charge_pio_transfer(10, 4, 4, armed), 0);
-    assert_eq!(disk.head_lba, 0);
-    assert_eq!(disk.last_transfer_end_lba, None);
+    for lba in 10..14 {
+        disk.read_lba(lba).unwrap();
+    }
+    assert!(disk.charge_pio_transfer(10, 4, armed) > 0);
+    assert_eq!(disk.head_lba, 14);
+    assert_eq!(disk.last_transfer_end_lba, Some(14));
 }
 
 // ---------------------------------------------------------------------------
@@ -842,8 +843,8 @@ fn pio_transfer_breakdown_components_sum_to_the_charge() {
     };
 
     // Cold (first-ever) access.
-    let breakdown = disk.pio_transfer_breakdown(10, 1, 0, armed);
-    let charged = disk.charge_pio_transfer(10, 1, 0, armed);
+    let breakdown = disk.pio_transfer_breakdown(10, 1, armed);
+    let charged = disk.charge_pio_transfer(10, 1, armed);
     assert_eq!(breakdown.total(), charged);
     assert!(!breakdown.sequential);
     assert_eq!(
@@ -855,8 +856,8 @@ fn pio_transfer_breakdown_components_sum_to_the_charge() {
     );
 
     // Sequential continuation (LBA 11, right after the first transfer's end).
-    let breakdown = disk.pio_transfer_breakdown(11, 1, 0, armed);
-    let charged = disk.charge_pio_transfer(11, 1, 0, armed);
+    let breakdown = disk.pio_transfer_breakdown(11, 1, armed);
+    let charged = disk.charge_pio_transfer(11, 1, armed);
     assert_eq!(breakdown.total(), charged);
     assert!(breakdown.sequential);
     assert_eq!(breakdown.seek_ticks, 0);
@@ -865,23 +866,58 @@ fn pio_transfer_breakdown_components_sum_to_the_charge() {
     // A big sequential run that overflows the drive buffer.
     let sectors_in_buffer = (DRIVE_BUFFER_BYTES / SECTOR as u64) as u32;
     let overflow = sectors_in_buffer + 8;
-    let breakdown = disk.pio_transfer_breakdown(12, overflow, 0, armed);
-    let charged = disk.charge_pio_transfer(12, overflow, 0, armed);
+    let breakdown = disk.pio_transfer_breakdown(12, overflow, armed);
+    let charged = disk.charge_pio_transfer(12, overflow, armed);
     assert_eq!(breakdown.total(), charged);
 
-    // All-cache-hit call: every component zero, total zero.
-    let breakdown = disk.pio_transfer_breakdown(999, 4, 4, armed);
-    let charged = disk.charge_pio_transfer(999, 4, 4, armed);
-    assert_eq!(breakdown.total(), 0);
-    assert_eq!(charged, 0);
-    assert_eq!(breakdown.charged_sectors, 0);
+    // A random request pays for all completed sectors.
+    let breakdown = disk.pio_transfer_breakdown(999, 4, armed);
+    let charged = disk.charge_pio_transfer(999, 4, armed);
+    assert_eq!(breakdown.total(), charged);
+    assert!(charged > 0);
+    assert_eq!(breakdown.charged_sectors, 4);
 
     // Unarmed: the breakdown still sums to the pre-9C formula, with no seek
     // or rotation component (the model has no head concept when dark).
     let unarmed = DeviceTimingProfile::default();
-    let breakdown = disk.pio_transfer_breakdown(50, 2, 0, unarmed);
-    let charged = disk.charge_pio_transfer(50, 2, 0, unarmed);
+    let breakdown = disk.pio_transfer_breakdown(50, 2, unarmed);
+    let charged = disk.charge_pio_transfer(50, 2, unarmed);
     assert_eq!(breakdown.total(), charged);
     assert_eq!(breakdown.seek_ticks, 0);
     assert_eq!(breakdown.rotation_ticks, 0);
+}
+
+#[test]
+fn pio_data_readiness_does_not_charge_a_second_cable_transfer() {
+    for command in [0x20, 0xc4] {
+        let mut disk = marked_disk(8);
+        program_lba(&mut disk, 1, 2);
+        disk.write_port(PRIMARY_CMD_BASE + 7, command);
+        assert_eq!(disk.ticks_until_completion(), Some(1));
+        disk.advance_master_ticks(1);
+        assert_ne!(disk.status & status::DRQ, 0);
+        disk.read_port(PRIMARY_CMD_BASE + 7);
+        for _ in 0..SECTOR {
+            disk.read_port(PRIMARY_CMD_BASE);
+        }
+        assert_eq!(disk.ticks_until_completion(), Some(1));
+        assert_eq!(disk.status & status::DRQ, 0);
+        disk.advance_master_ticks(1);
+        assert_ne!(disk.status & status::DRQ, 0);
+        assert_eq!(disk.read_port(PRIMARY_CMD_BASE), Some(0x12));
+    }
+    for command in [0x30, 0xc5] {
+        let mut disk = marked_disk(8);
+        program_lba(&mut disk, 1, 1);
+        disk.write_port(PRIMARY_CMD_BASE + 7, command);
+        disk.advance_master_ticks(1);
+        for _ in 0..SECTOR {
+            disk.write_port(PRIMARY_CMD_BASE, 0x5a);
+        }
+        assert_eq!(disk.ticks_until_completion(), Some(1));
+        assert_eq!(disk.read_lba(1).unwrap()[0], 0x11);
+        disk.advance_master_ticks(1);
+        assert_eq!(disk.read_lba(1).unwrap(), [0x5a; SECTOR]);
+        assert!(disk.irq_pending);
+    }
 }

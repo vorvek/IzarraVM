@@ -105,7 +105,6 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
     memory[3] = 0xf3; // DIV BL
     memory[0x80..0x82].copy_from_slice(&[0xb0, 0x5a]);
     let mut cpu = CpuGsw::default();
-    cpu.set_timing_epoch(2);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers
         .set_segment(SegmentIndex::Cs, flat_pm_segment(0x08, 0x9b));
@@ -119,7 +118,6 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
     // of reading a gate.
     cpu.idtr.limit = 0;
     let mut bus = TestBus::with_memory(memory);
-    bus.timing_epoch_two = true;
     // Populate both lines before the run so its cached continuation executes the
     // successful MOV and the fatal DIV in one public call.
     cpu.begin_instruction();
@@ -199,15 +197,13 @@ fn first_fetch_page_walk_fault_returns_no_core_and_leaves_a_clean_next_entry() {
         memory[..2].copy_from_slice(&[0xb0, 0x5a]);
         let mut cpu = CpuGsw::default();
         cpu.set_mode(GswMode::Gsw486);
-        cpu.set_timing_epoch(2);
         cpu.timing_rem = 7;
         cpu.control.cr0 |= CR0_PE | CR0_PG;
         cpu.control.cr3 = 0x1000;
         cpu.registers
             .set_segment(SegmentIndex::Cs, flat_pm_segment(0x08, 0x9b));
         cpu.registers.eip = 0;
-        let mut bus = TestBus::with_memory(memory);
-        bus.timing_epoch_two = true;
+        let bus = TestBus::with_memory(memory);
         (cpu, bus)
     }
 
@@ -279,7 +275,6 @@ fn break_admission_error_keeps_successful_run_prefix() {
     memory[2..7].copy_from_slice(&[0x9a, 0x00, 0x04, 0x20, 0x00]); // CALL FAR 0020:0400
     memory[0x80..0x82].copy_from_slice(&[0xb0, 0x5a]);
     let mut cpu = CpuGsw::default();
-    cpu.set_timing_epoch(2);
     cpu.set_mode(GswMode::Gsw586);
     cpu.set_sixteen_bit_admission_level(1);
     for segment in [SegmentIndex::Cs, SegmentIndex::Ds, SegmentIndex::Ss] {
@@ -292,7 +287,6 @@ fn break_admission_error_keeps_successful_run_prefix() {
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
-    bus.timing_epoch_two = true;
     cpu.set_fast_map_enabled_for_test(true);
     let permissions = jit::fast_map::PagePermissions::UNPAGED;
     let read = bus

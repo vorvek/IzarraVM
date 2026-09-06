@@ -9,18 +9,9 @@ use izarravm_cpu::PollLoop;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PollBusCertificate {
     raw_clocks_per_iteration: u64,
-    /// P2's third lane (`dev_docs/2026-09-05-port-io-repricing-design.md` §2). The polled
-    /// port's own class bus charge for ONE iteration, in UNSCALED guest clocks -- the exact
-    /// figure `charge_port_bus` would accrue into `port_bus_batch_clocks` for the `IN` an
-    /// elided iteration does not execute, i.e. `port_bus_class(port).clocks()` minus the
-    /// already-scaled generic 4-raw-clock bus cycle, so the two lanes sum to the class figure
-    /// with no double count.
-    ///
-    /// **Zero under epoch 1, and zero for the memory family in every epoch.** It is the unit
-    /// mismatch the old ISA refusal was erected to avoid: this term must NEVER be folded into
-    /// `raw_clocks_per_iteration`, which `poll_project_scaled_bus_clocks` puts through
-    /// `scale_bus` -- dividing a microsecond-denominated charge by the persona's bus scaler is
-    /// the one thing the charge exists to escape.
+    /// Board-reference-clock supplement to the generic four-clock port trace.
+    /// Both lanes convert to master ticks together; their split preserves trace
+    /// and census ownership. Memory polls have no port supplement.
     port_bus_clocks_per_iteration: u64,
 }
 
@@ -87,242 +78,8 @@ pub(super) fn extended_ram_screen_enabled() -> bool {
     *ENABLED
 }
 
-/// `IZARRAVM_TIMING_EPOCH`: which guest-clock model a freshly constructed `Machine` runs under,
-/// read ONCE into `Machine::timing_epoch` (never re-read mid-run: the JIT caches per-block raw
-/// clocks that would go stale under a live flip). Unset or `""` is epoch `1`, today's model,
-/// byte-identical to before this knob existed -- never `0` as the off-spelling (memory
-/// `parameter-knobs-have-no-off-spelling`: an epoch is a version, not an on/off switch, so `0`
-/// names no epoch and panics like any other unrecognized spelling). `2` is the port-io repricing
-/// (`dev_docs/2026-09-05-port-io-repricing-design.md`); every other spelling panics rather than
-/// silently running epoch 1, the same discipline `IZARRAVM_ISA_IO_WAIT` uses.
-pub(super) fn timing_epoch_from_env() -> u32 {
-    parse_timing_epoch(std::env::var("IZARRAVM_TIMING_EPOCH"))
-}
-
-/// The `IZARRAVM_TIMING_EPOCH` spelling table, lifted out so it is unit-testable without a
-/// process-global env write.
-fn parse_timing_epoch(value: Result<String, std::env::VarError>) -> u32 {
-    let raw = match value {
-        Err(std::env::VarError::NotPresent) => return 1,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            panic!(
-                "IZARRAVM_TIMING_EPOCH is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset (epoch 1, today's model) and `2` (the port-io repricing)"
-            )
-        }
-        Ok(raw) => raw,
-    };
-    match raw.trim() {
-        "" => 1,
-        "2" => 2,
-        other => panic!(
-            "IZARRAVM_TIMING_EPOCH={other:?} names no epoch; accepted spellings are unset or \
-             `\"\"` (epoch 1, today's guest-clock model, byte-identical) and `2` (the port-io \
-             repricing, dev_docs/2026-09-05-port-io-repricing-design.md). Refusing to guess: a \
-             mistyped leg that silently ran epoch 1 would be read as the epoch it did not run"
-        ),
-    }
-}
-
-#[cfg(test)]
-pub(super) fn parse_timing_epoch_for_test(value: Result<String, std::env::VarError>) -> u32 {
-    parse_timing_epoch(value)
-}
-
-/// Whether a guest port access to a legacy X-bus device is charged its real ISA
-/// bus time (`isa_io_clocks`, ~1.00 us), in BOTH directions.
-/// `IZARRAVM_ISA_IO_WAIT`.
-///
-/// **DEFAULT OFF**, and the OFF arm is byte-identical to the pre-slice tree by
-/// construction: this predicate gates the single call to `charge_isa_io_wait` on
-/// each of `read_io`/`write_io`, and the refusal term it adds to
-/// `poll_bus_certificate_from`.
-///
-/// WHAT THE ON ARM BUYS, and why it is not a nicety. On the I586 persona one
-/// 8-bit `IN` costs the guest 1.610 clocks today (`IN_PORT_CORE_CLOCKS` 12
-/// scaled by `level_timing(I586) = (1,12)`, plus `clocks_for(Byte,
-/// wait_states.io = 2)` = 4 raw bus clocks scaled by `bus_timing(I586) =
-/// (16,105)`), and one `OUT` 1.443. 86Box charges `ISA_CYCLES(8)` = 160 CPU
-/// cycles = 0.96 us on the PIT, on BOTH directions
-/// (`.bench/86Box-source/src/pit_fast.c:423` write, `:563` read; a Pentium
-/// machine always selects `PIT_8254_FAST`, `src/machine/machine.c:199-211`).
-/// The IBM PC AT Technical Reference specifies 6 BCLK = 720-750 ns for an 8-bit
-/// bus operation to an 8-bit device
-/// (`dev_docs/reference/ibm-bios/6183355_PC_AT_Technical_Reference_Mar86.txt:477-484`),
-/// and Abrash measured 780-813 ns for `OUT DX,AL` on a good 486/33 ISA board
-/// (Black Book Table 45.1). We are two orders of magnitude under all three.
-/// Full derivation and prior art: `dev_docs/isa-io-waitstate-research-2026-08-30.md`.
-///
-/// THE CONVENTION (mirroring `out_imm8_rows_armed` in `izarravm-cpu`): unset and
-/// `""` name the SAME (default) arm, `0`/`off` state it, `1`/`on` name the
-/// charge, and anything else panics rather than silently running the base -- a
-/// mistyped ladder leg that quietly ran the default would be read as the arm it
-/// did not run.
-///
-/// Read once per process; the bus stores the resolved bool at construction, so
-/// the per-access hot path is one bool test, never an environment or lazy-static
-/// touch.
-pub(super) fn isa_io_wait_armed() -> bool {
-    #[cfg(test)]
-    if let Some(forced) = ISA_IO_WAIT_OVERRIDE.with(std::cell::Cell::get) {
-        return forced;
-    }
-    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| parse_isa_io_wait_arm(std::env::var("IZARRAVM_ISA_IO_WAIT")))
-}
-
-/// The `IZARRAVM_ISA_IO_WAIT` spelling table, lifted out of the `OnceLock` closure so it can be
-/// unit-tested without a process-global env write. See `isa_io_wait_armed`.
-fn parse_isa_io_wait_arm(value: Result<String, std::env::VarError>) -> bool {
-    let raw = match value {
-        // Unset is the default. The default flipped ON on 2026-08-30, owner-directed, on the
-        // three-row ladder slate (.bench/results/isa-io-wait-ladder-20260830): gp2-586 min-wall
-        // 1.7818 with every round's effect ~30x its own within-arm null (armed legs rt
-        // 2.11-2.17), descent2-3dfx-586 1.0840 min-wall / 1.1019 mean at 4/4 valid rounds under
-        // a pre-declared 4% bar, wolf3d-586 0.9991 as the uncharged-row null control. The flip
-        // is an ERA BOUNDARY for instruction-count and rt series; the four final_instructions
-        // pins moved with it (dev_docs/isa-io-wait-results-2026-08-30.md).
-        Err(std::env::VarError::NotPresent) => return true,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            panic!(
-                "IZARRAVM_ISA_IO_WAIT is set to a value that is not valid UTF-8; accepted \
-                 spellings are unset (the shipped default since the 2026-08-30 flip: ON), `1` \
-                 or `on` (the same arm, stated), and `0` or `off` (the pre-slice charging)"
-            )
-        }
-        Ok(raw) => raw,
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default.
-        "" => true,
-        "0" | "off" => false,
-        "1" | "on" => true,
-        other => panic!(
-            "IZARRAVM_ISA_IO_WAIT={other:?} names no arm; accepted spellings are unset (the \
-             shipped default since the 2026-08-30 flip: ON -- charge every legacy X-bus port \
-             access, both directions, one ISA bus period), `1` or `on` (the same arm, stated) \
-             and `0` or `off` (the pre-slice charging). Refusing to guess: a mistyped ladder \
-             leg that silently ran the default would be read as the arm it did not run"
-        ),
-    }
-}
-
-// Per-THREAD, because the shipped knob is a process-wide `OnceLock` and the tests have to run
-// both arms in one process. Mirrors `OUT_IMM8_ROWS_OVERRIDE` in `izarravm-cpu`.
-#[cfg(test)]
-thread_local! {
-    static ISA_IO_WAIT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-/// Force the `IZARRAVM_ISA_IO_WAIT` arm on this thread for the length of a test; `None` restores
-/// the ambient reading.
-#[cfg(test)]
-pub(super) fn set_isa_io_wait_for_test(forced: Option<bool>) {
-    ISA_IO_WAIT_OVERRIDE.with(|cell| cell.set(forced));
-}
-
-/// The spelling table, reachable from the tests; `isa_io_wait_armed` caches its env reading in a
-/// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process.
-#[cfg(test)]
-pub(super) fn parse_isa_io_wait_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
-    parse_isa_io_wait_arm(value)
-}
-
-/// Whether `port` decodes to a device 86Box charges ISA bus time for -- and
-/// therefore, under `owner-ruling-86box-accuracy-parity`, the exact set this
-/// charge may cover in either direction.
-///
-/// THE SET IS 86BOX'S, PORT FOR PORT. The research note's Shape C proposed the
-/// whole legacy X-bus (PIC, keyboard, DMA, page registers, the x87 latches); an
-/// adversarial read of every `ISA_CYCLES`/`cycles_sub` site in `.bench/86Box-source`
-/// narrowed it to the three device families 86Box actually charges. Charging
-/// beyond 86Box is charging where 86Box is accurate and we would be inventing --
-/// outside the parity ruling, not sheltered by it -- and its largest term would
-/// land on the V86 monitor's PIC OCW3 probes (prince/duke under TOKAEMM), which
-/// no evidence asks for.
-///
-/// | ports | device | 86Box site | charged? |
-/// |---|---|---|---|
-/// | `0x40-0x43` | PIT (8254) | `src/pit_fast.c:423` write, `:563` read | **YES**, `ISA_CYCLES(8)` |
-/// | `0x61`, `0x63` | PPI port B + its mirror | `src/device/port_6x.c:58`, `:91`, `:105` via `cycles_sub` | **YES**, `is486`-gated |
-/// | `0x70-0x71` | RTC/CMOS (NMI mask shares 0x70) | `src/device/nvr_at.c:670`, `:722` | **YES** |
-/// | `0x20-0x21`, `0xA0-0xA1` | PIC 1/2 | `src/device/pic.c` | NO -- no cycle charge anywhere |
-/// | `0x60`, `0x64` | keyboard controller | `src/device/kbc_at.c` | NO |
-/// | `0x00-0x0F`, `0xC0-0xDF` | DMA 1/2 | `src/dma.c` | NO |
-/// | `0x80-0x8F` | DMA page + POST | `src/dma.c` | NO (only the generic unclaimed-port `io_delay`) |
-/// | `0xF0-0xF1` | x87 latch strobes | — | NO |
-///
-/// A Pentium always selects the charging PIT (`PIT_8254_FAST`,
-/// `src/machine/machine.c:199-211`), and `is486` is implied by `is586`, so both
-/// gated charges are live on the persona this slice targets.
-///
-/// **WIDENING THIS SET NEEDS ITS OWN EVIDENCE AND ITS OWN LADDER.** The physical
-/// argument (every one of those devices really does sit on the 8 MHz bus) is
-/// sound and is NOT what was rejected; what was rejected is landing it here, on
-/// the parity ruling's coat-tails, with no measurement of the rows it moves.
-///
-/// THE 4% DELTA, deliberately kept. 86Box charges `ISA_CYCLES(8)` = 8 BCLK = 160
-/// CPU cycles = 0.960 us at 166 MHz; `isa_io_clocks` charges 1.000 us. Both sit
-/// inside the 120-180 clock band the hardware documents support (research note
-/// section 3), and sharing the constant with the OPL and SB16 DSP charges is
-/// worth more than four percent of agreement with one of the two references --
-/// a second, nearly equal constant would be a drift hazard, not a fidelity gain.
-///
-/// WHAT IS DELIBERATELY EXCLUDED, beyond the parity table above, and why each
-/// exclusion is a decision rather than an oversight:
-///
-/// * **The VGA registers, including 0x3DA and the whole 0x3B0-0x3DF range.**
-///   86Box charges these NOTHING: its per-card `vid_timing_*` costs feed
-///   `svga_read_common` (the video MEMORY path,
-///   `.bench/86Box-source/src/video/vid_svga.c:2039`), while `svga_in`'s
-///   `case 0x3da:` (`:622-634`) adds no cycles at all. Under the
-///   `owner-ruling-86box-accuracy-parity` ruling, being inaccurate the same way
-///   86Box is inaccurate can merge -- so 0x3DA stays cheap here even though real
-///   hardware and DOSBox-X both charge it. This is also where the largest counts
-///   on the board live (gp2-586 reads 0x3DA 2.003 billion times in an 80 s run),
-///   so repricing it is a separate slice with a separate risk budget, not a
-///   side effect of this one.
-/// * **The OPL ports and the SB16 DSP read ports.** They ALREADY take
-///   `isa_io_clocks` on the read side (`read_io`'s OPL and DSP arms), default-on
-///   in the Approximate class. Listing them here would charge those reads twice.
-///   Their WRITE side stays uncharged: the research note's Shape C does not list
-///   them, 86Box's charging of OPL writes is not established in the note, and
-///   adding a write charge to a landed default-on mechanism is a different
-///   change from arming a default-off one.
-/// * **The Lotura chipset ports 0xE0-0xE7.** A host-native device of this
-///   machine, not an ISA peripheral; nothing on the metal answers there.
-/// * **IDE/ATA (0x1F0-0x1F7, 0x170-0x177) and PCI configuration (0xCF8-0xCFF).**
-///   Explicitly left alone by the research note's Shape C. The ATA poll-skip
-///   machinery prices its own iterations, and 0xCF8 is a PCI cycle, not an ISA
-///   one.
-/// * **Unclaimed ports.** 86Box charges a smaller `io_delay` (56 cycles at
-///   166 MHz) when no handler answers (`src/io.c:384` and peers), and a real ISA
-///   cycle does happen whether or not a device drives the data lines. That is a
-///   real gap, but it is a different charge with a different magnitude, and
-///   modelling it would move fixtures that touch no modelled device at all.
-///   Left for a follow-up with its own ladder.
-const fn port_is_legacy_isa_io(port: u16) -> bool {
-    matches!(port, 0x0040..=0x0043 | 0x0061 | 0x0063 | 0x0070..=0x0071)
-}
-
-/// Test-only mirror of `port_is_legacy_isa_io`, reachable from `machine_port_bus_class_test.rs`
-/// without widening the real predicate's visibility.
-#[cfg(test)]
-pub(super) const fn port_is_legacy_isa_io_for_test(port: u16) -> bool {
-    port_is_legacy_isa_io(port)
-}
-
-/// A static classification of the 64 K port space into the bus family that answers it, for
-/// `IZARRAVM_TIMING_EPOCH=2`'s per-class bus charge
-/// (`dev_docs/2026-09-05-port-io-repricing-design.md` §1.2). Independent of, and NOT a
-/// replacement for, `port_is_legacy_isa_io` above: that predicate stays exactly as it is and
-/// keeps gating the epoch-1 `IZARRAVM_ISA_IO_WAIT` charge, byte-identical, under epoch 1.
-///
-/// Classes only cover STATIC ranges. The BMIDE bus-master BAR4 and Distira's own BARs are
-/// runtime-programmable PCI base addresses (`pci.rs::PciConfig::piix_ide_bm_base`,
-/// `vega.rs`'s LFB/BAR tracking) and are not decidable from a port number alone in a `const
-/// fn`; those accesses already route through their own PCI-target dispatch, which is where a
-/// live-BAR `PciTarget` charge would be applied, not here.
+/// Static fallback classification of port transactions. Live PCI/BMIDE decode
+/// and configured WSS ownership are resolved before this fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PortBusClass {
     /// The 8 MHz ISA X-bus: DMA (8237A x2), the 8259A PICs, the 8042 keyboard controller, the
@@ -442,7 +199,7 @@ pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
 /// Resulting rate: 3 (`REP INS` per element) + 20 = 23 clocks per word = 138 ns -> **14.5 MB/s**,
 /// against a real P166's PIO mode 4 **16.6 MB/s** -- 87% of the spec rate, period-correct and
 /// erring slow.
-pub(super) const ATA_STRING_WORD_CLOCKS: u64 = 20;
+pub(super) const ATA_STRING_WORD_CLOCKS: u64 = ata::PIO_WORD_REFERENCE_CLOCKS;
 
 /// The IDE/ATAPI DATA registers, primary and secondary. The only ports whose string element rate
 /// is the ATA cycle time; every other register in those blocks (status 0x1F7, the control block)
@@ -495,13 +252,9 @@ pub(super) fn lazy_ports_386_for(mode: GswMode) -> bool {
     lazy_ports_386_composed(mode, lazy_port_reads_386_enabled())
 }
 
-/// Whether `MachineBus::l1_charges_folded` is armed for this mode and epoch.
-///
-/// Epoch 2 and a fast persona. The I386 is out of the recalibration's scope: it
-/// has no epoch-2 class table (`izarravm_cpu`'s `class_table`), so nothing has
-/// absorbed its fetch and data terms and folding them would simply delete them.
-pub(super) const fn l1_charges_folded(mode: GswMode, epoch: u32) -> bool {
-    epoch >= 2 && mode.uses_approximate_timing()
+/// Fast-persona instruction prices include L1 fetch and data access costs.
+pub(super) const fn l1_charges_folded(mode: GswMode) -> bool {
+    mode.uses_approximate_timing()
 }
 
 impl Machine {
@@ -513,12 +266,11 @@ impl Machine {
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
         // Read from the CPU, the same authoritative mode owner that scale_bus
         // uses. Machine's active_mode copy is kept for bus register readback.
-        let (bus_num_at_batch_start, bus_den_at_batch_start) =
-            bus_timing(self.cpu.level(), self.timing_epoch);
+        let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.active_mode);
         // The per-persona I-cache fetch cost, snapshotted for the batch alongside the bus scale
         // (see `MachineBus::icache_fetch_clocks`). Captured here because `cache_model` is also
         // mutably borrowed by the literal below.
-        let l1_charges_folded = l1_charges_folded(self.active_mode, self.timing_epoch);
+        let l1_charges_folded = l1_charges_folded(self.active_mode);
         let icache_fetch_clocks = if l1_charges_folded {
             0
         } else {
@@ -554,6 +306,7 @@ impl Machine {
             inta_diag: &mut self.inta_diag,
             fdc: &mut self.fdc,
             opl: &mut self.opl,
+            opl_timer_advance_credit_us: &mut self.opl_timer_advance_credit_us,
             sb16: &mut self.sb16,
             wavetable_mpu: &mut self.wavetable_mpu,
             midi_mpu: &mut self.midi_mpu,
@@ -587,12 +340,10 @@ impl Machine {
             device_free_extended_floor,
             extended_ram_screen: extended_ram_screen_enabled(),
             lazy_port_reads: self.active_mode.uses_approximate_timing(),
-            isa_io_wait: isa_io_wait_armed(),
             charge_port_timing: true,
-            timing_epoch: self.timing_epoch,
             poll_skip_certificate: &self.poll_skip_certificate,
             retrace_poll: &mut self.retrace_poll,
-            string_port_element_bytes: 0,
+            port_transaction_active: false,
             #[cfg(test)]
             test_string_port_observations: &mut self.test_string_port_observations,
             lazy_ports_386: lazy_ports_386_for(self.active_mode),
@@ -622,6 +373,7 @@ impl Machine {
             beam_at_batch_start,
             margo_scanout_at_batch_start,
             trace_elapsed_at_batch_start,
+            #[cfg(test)]
             bus_rem_at_batch_start: self.bus_rem,
             bus_num_at_batch_start,
             bus_den_at_batch_start,
@@ -637,7 +389,6 @@ impl Machine {
     /// their device and trace effects, but no guest batch owns their port-time lane.
     pub(super) fn make_construction_bus(&mut self) -> MachineBus<'_> {
         let mut bus = self.make_bus();
-        bus.isa_io_wait = false;
         bus.charge_port_timing = false;
         bus
     }
@@ -1153,54 +904,28 @@ impl MachineBus<'_> {
                 .set(self.poll_skip_certificate.refused_inactive.get() + 1);
             return None;
         }
-        // P2, F9 (`dev_docs/2026-09-05-port-io-repricing-review.md`): AN EXPLICIT ADMISSION,
-        // NOT A DELETED REFUSAL.
-        //
-        // What stood here before P2 were two refusals. (1) THE ISA-CHARGE REFUSAL: the
-        // certificate was denominated in RAW BUS CLOCKS -- `poll_project_scaled_bus_clocks`
-        // puts the whole per-iteration figure through `scale_bus` -- while the port charge is
-        // unscaled clocks on a different lane, so a charged port could not be priced without
-        // dividing the charge by the persona's bus scaler. (2) F7's structural EPOCH refusal,
-        // which P1 added because classing 0x3DA made every certificate under-priced by the new
-        // charge. `port_bus_clocks_per_iteration` retires BOTH reasons: it is that unscaled
-        // lane, committed outside `scale_bus`, so the certificate now prices a charged port
-        // exactly.
-        //
-        // The refusal is NOT simply deleted, because the ISA one was also a second layer
-        // keeping the skip off ports whose reads are NOT IDEMPOTENT -- the 8254 read-back
-        // latch (0x40-0x43) and the 0x61 refresh toggle, where 0x3DA's read is idempotent and
-        // its one side effect (`status1_side_effects`, the attribute-controller flip-flop) is
-        // replayed once by `poll_commit_bus`. An elided span performs the port's side effects
-        // ONCE, not `iterations` times, which is only sound for a port that has none that
-        // count. The lane prices a port; it cannot express a port's side effects.
-        //
-        // So: admit exactly `POLL_SKIP_IO_PORT`, refuse everything else BY NAME. That is
-        // byte-identical to the pre-P2 behaviour under epoch 1 -- 0x3DA is not in
-        // `port_is_legacy_isa_io`'s set, so the ISA refusal never fired for it, and no other
-        // port can reach here today (both entry points establish the polled port first) -- and
-        // it is the door F9 asked to keep shut: a future shape that certifies a second port
-        // must come here and argue for it rather than inherit an admission.
-        if port != POLL_SKIP_IO_PORT {
+        // Only the certified status port is admitted. Its flip-flop side effect can
+        // be replayed once; other ports need their own side-effect proof. A live
+        // BMIDE mapping at this address invalidates the status-port certificate.
+        if port != POLL_SKIP_IO_PORT
+            || self
+                .pci
+                .ide_bus_master_io_base()
+                .is_some_and(|base| bmide::BusMasterIde::owns_io(port, BusWidth::Byte, base))
+        {
             self.poll_skip_certificate
                 .refused_unpriced_port
                 .set(self.poll_skip_certificate.refused_unpriced_port.get() + 1);
             return None;
         }
         let mut raw = self.poll_fetch_certificate_raw_from(fetches)?;
-        raw = raw.checked_add(u64::from(BusCycle::clocks_for(
-            BusWidth::Byte,
-            self.wait_states.io,
-        )))?;
-        // The third lane. Zero under epoch 1, so the whole slice is byte-identical with the
-        // knob unset; under epoch 2 it is the SAME `port_bus_lane_clocks` an executed access
-        // accrues, which is what makes an elided iteration cost exactly a natural one.
-        let port_bus_clocks_per_iteration = if self.timing_epoch >= 2 {
+        raw = raw.checked_add(4)?;
+        // An elided read accrues the same supplement as an executed transaction.
+        let port_bus_clocks_per_iteration = {
             self.poll_skip_certificate
                 .admitted_epoch2
                 .set(self.poll_skip_certificate.admitted_epoch2.get() + 1);
             self.port_bus_lane_clocks(port_bus_class(port))
-        } else {
-            0
         };
         Some(PollBusCertificate {
             raw_clocks_per_iteration: raw,
@@ -1292,15 +1017,9 @@ impl MachineBus<'_> {
         })
     }
 
-    /// The batch-absolute bus figure `iterations` elided iterations would leave behind, in the
-    /// SAME units and with the same terms as `in_batch_scaled_bus_clocks()` -- which is what
-    /// makes `callout_poll_skip`'s `batch_instant(0) == in_batch_clocks()` and its
-    /// `bus_growth(0) == 0` identities hold in both epochs.
-    ///
-    /// P2: under epoch 2 that means two added terms, both OUTSIDE `scale_bus`. The batch's
-    /// port lane so far (`*self.isa_io_clocks`, which `in_batch_scaled_bus_clocks` folds in
-    /// under F2) and the certificate's own per-iteration port charge times `iterations`. Under
-    /// epoch 1 both are structurally zero and this is the pre-P2 expression byte for byte.
+    /// Project the combined reference-clock bill into the batch CPU quantum with
+    /// a ceiling, including prior raw and port work. A zero-iteration projection
+    /// equals the current batch bill.
     #[cfg(feature = "jit")]
     pub(super) fn poll_project_scaled_bus_clocks(
         &self,
@@ -1309,17 +1028,9 @@ impl MachineBus<'_> {
     ) -> Option<u64> {
         let additional = certificate
             .raw_clocks_per_iteration
+            .checked_add(certificate.port_bus_clocks_per_iteration)?
             .checked_mul(iterations)?;
-        self.trace.elapsed_clocks().checked_add(additional)?;
-        let scaled = self.jit_projected_batch_scaled_bus_clocks(additional)?;
-        if self.timing_epoch < 2 {
-            return Some(scaled);
-        }
-        scaled.checked_add(*self.isa_io_clocks)?.checked_add(
-            certificate
-                .port_bus_clocks_per_iteration
-                .checked_mul(iterations)?,
-        )
+        self.jit_projected_batch_scaled_bus_clocks(additional)
     }
 
     /// Commit the certified aggregate clocks, then replay the idempotent status
@@ -1335,9 +1046,7 @@ impl MachineBus<'_> {
             .checked_add(additional)
             .expect("projected poll bus clock addition must succeed");
         self.trace.add_elapsed_clocks(additional);
-        // P2's third lane, committed where an executed access would have committed it:
-        // `port_bus_batch_clocks`, which `run_until_tick` folds into the batch's guest-clock
-        // step OUTSIDE `scale_bus`. Structurally zero under epoch 1.
+        // Record the port supplement separately; physical settlement combines both lanes.
         *self.isa_io_clocks += certificate
             .port_bus_clocks_per_iteration
             .saturating_mul(iterations);
@@ -1366,107 +1075,119 @@ impl MachineBus<'_> {
         self.trace.add_elapsed_clocks(additional);
     }
 
-    /// Charge one 8-bit ISA bus cycle for a legacy X-bus port access, in either
-    /// direction. `IZARRAVM_ISA_IO_WAIT`, DEFAULT OFF (`isa_io_wait_armed`).
-    ///
-    /// WHY THE CHARGE IS THE SAME IN BOTH DIRECTIONS, which is the one thing a
-    /// reader is most likely to expect to differ. On the Pentium an I/O write is
-    /// NOT posted: "only memory writes are buffered and I/O writes are not"
-    /// (Pentium Family Developer's Manual Vol 1,
-    /// `dev_docs/reference/Pentium-K6/241428-004_..._Jul95.txt:3332`), and `OUT`
-    /// does not begin the next instruction "before ... the I/O write has
-    /// completed" (`:3403-3416`). 86Box charges the PIT identically on both
-    /// directions (`pit_fast.c:423` write, `:563` read). DOSBox-X's 3/4 discount
-    /// on writes is the outlier and has no Pentium justification, so it is not
-    /// copied.
-    ///
-    /// THE CHARGE IS ADDITIVE, replacing nothing. The CPU-side `IN`/`OUT` core
-    /// clocks and the recorded bus cycle both stay exactly as they are; this is
-    /// the device-side ISA cycle on top, matching 86Box's structure (a flat
-    /// per-instruction cost plus a per-device `ISA_CYCLES` charge).
-    ///
-    /// THE UNIT. `isa_io_clocks` is CPU clocks at the LIVE mode's clock rate --
-    /// 166 at 166 MHz, 100 at 100 MHz -- so what is invariant across personas is
-    /// the microsecond, not the clock count, which is what a fixed-frequency bus
-    /// means. It accrues into `port_bus_batch_clocks`, which `run_until_tick` folds
-    /// into the batch's guest-clock step OUTSIDE `scale_bus` (see the comment
-    /// above that site): expressing this as bus wait states instead would put it
-    /// through the 586's 16/105 bus scaler and shrink a microsecond to 0.15 of
-    /// one, which is exactly the shape the charge exists to escape.
-    ///
-    /// GATED ON `lazy_port_reads` (the Approximate 486/586 class), like both
-    /// existing `isa_io_clocks` sites. The Accurate 386 class advances devices
-    /// per instruction and is the class whose clock bit-identity is still a merge
-    /// bar, so it keeps today's cadence whatever this knob says. A conservative
-    /// fork: the physical argument for the charge applies to a 386 too, and
-    /// arming it there is a separate decision with its own re-pin.
-    /// The whole port-bus charge, both epochs. Epoch 1 (the unset knob) is exactly the
-    /// pre-slice `charge_isa_io_wait` predicate, byte-identical. Epoch 2
-    /// (`IZARRAVM_TIMING_EPOCH=2`) instead charges EVERY port access -- no `port_is_legacy_isa_io`
-    /// gate, no `lazy_port_reads`/`isa_io_wait` gate -- `port_bus_class(port).clocks()` minus the
-    /// already-scaled generic 4-raw-clock cycle `read_io`/`write_io` charge through
-    /// `trace.record`, so the two lanes sum to exactly the class figure with no double count
-    /// (design §1.3). `bus_num_at_batch_start`/`bus_den_at_batch_start` are this batch's
-    /// snapshotted `bus_timing(level)` ratio -- while it is still `(16,105)` for I586 (pre
-    /// recalibration slice 2), the subtrahend must be scaled by it too, exactly as the design's
-    /// §7 slice-order note requires.
-    fn charge_port_bus(&mut self, port: u16) {
-        let class = port_bus_class(port);
-        // Counted FIRST and in every epoch, before any charge decision: this is the ladder's
-        // denominator, and a count taken inside the epoch-2 arm could not tell a row that makes
-        // fewer accesses from one whose accesses merely cost more.
-        self.port_accesses_by_class[class.index()] += 1;
-        if !self.charge_port_timing {
+    fn port_access_prefix(&self) -> u64 {
+        if self.charge_port_timing {
+            self.in_batch_master_ticks()
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn in_batch_reference_bus_clocks(&self) -> u64 {
+        (self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start)
+            .saturating_add(*self.isa_io_clocks)
+    }
+
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_project_master_ticks(
+        &self,
+        certificate: PollBusCertificate,
+        iterations: u64,
+        core: u64,
+    ) -> Option<u64> {
+        let additional = certificate
+            .raw_clocks_per_iteration
+            .checked_add(certificate.port_bus_clocks_per_iteration)?
+            .checked_mul(iterations)?;
+        let bus_ticks = self
+            .in_batch_reference_bus_clocks()
+            .checked_add(additional)?
+            .checked_mul(BUS_CLOCK_MASTER_TICKS)?;
+        core.checked_mul(u64::from(self.bus_den_at_batch_start))?
+            .checked_add(bus_ticks)
+    }
+
+    /// Record the access and charge its bus class outside construction.
+    fn charge_port_bus(&mut self, port: u16, kind: BusAccessKind) {
+        if self.port_transaction_active {
             return;
         }
-        if self.timing_epoch >= 2 {
-            *self.isa_io_clocks += match self.string_port_element_bytes {
-                0 => self.port_bus_lane_clocks(class),
-                bytes => self.string_element_lane_clocks(port, class, bytes),
-            };
-        } else if self.isa_io_wait && self.lazy_port_reads && port_is_legacy_isa_io(port) {
-            *self.isa_io_clocks += isa_io_clocks(self.active_mode);
+        let (class, ata_data) = self.port_transaction_kind(port);
+        let clocks = if ata_data {
+            ATA_STRING_WORD_CLOCKS
+        } else {
+            class.clocks().max(4)
+        };
+        self.charge_port_transaction(port, BusWidth::Byte, kind, class, clocks, 1);
+    }
+
+    /// PCI and BMIDE have already resolved before this byte-register path.
+    fn port_transaction_kind(&self, port: u16) -> (PortBusClass, bool) {
+        if self.wss_offset(port).is_some() {
+            (PortBusClass::IsaXBus, false)
+        } else {
+            (port_bus_class(port), is_ata_data_port(port))
         }
     }
 
-    /// The epoch-2 port lane's own per-access figure for one byte cycle of `class`: the class
-    /// charge minus the already-scaled generic bus cycle `read_io`/`write_io` records through
-    /// `trace.record`, so lane + generic cycle == the class figure exactly (design §1.3).
-    ///
-    /// Factored out of `charge_port_bus` because P2's poll-skip certificate needs the SAME
-    /// figure for an iteration it elides: one function, so an elided iteration and an executed
-    /// one can never be priced differently.
-    /// P3. The epoch-2 port lane's per-BYTE-CYCLE figure for one byte cycle of a STRING element
-    /// `bytes` wide.
-    ///
-    /// Every port but the IDE/ATAPI DATA register keeps its class figure: an ISA card driven by
-    /// `REP OUTSB` (a floppy PIO stream) really does pay a full 8 MHz X-bus cycle per byte, and
-    /// Intel's pipelining note for string I/O is a CPU-side statement we claim no bus credit for.
-    ///
-    /// The data register is the exception the design's blocker (b) is about, and it is priced at
-    /// the ATA PIO **cycle time** rather than the `PciTarget` access latency:
-    /// `ATA_STRING_WORD_CLOCKS` per 16-bit word, divided across the byte cycles the element
-    /// decomposes into. A 1-byte element pays a whole word cycle (nothing narrower exists on the
-    /// wire); 2 and 4 pay 10 per byte cycle, i.e. 20 and 40 for the element. Exact for every
-    /// element width the ISA can encode, with no remainder to lose.
-    fn string_element_lane_clocks(&self, port: u16, class: PortBusClass, bytes: u8) -> u64 {
-        if !is_ata_data_port(port) {
-            return self.port_bus_lane_clocks(class);
+    fn port_reference_cost_upper(&self, port: u16, width: BusWidth) -> u64 {
+        if pci::PciConfig::owns_io(port, width)
+            || self
+                .pci
+                .ide_bus_master_io_base()
+                .is_some_and(|base| bmide::BusMasterIde::owns_io(port, width, base))
+        {
+            return 56 * (u64::from(port & 3) + u64::from(width.bytes())).div_ceil(4);
         }
-        let bytes = u64::from(bytes.max(1));
-        let words = bytes.div_ceil(2);
-        let element_clocks = words * ATA_STRING_WORD_CLOCKS;
-        let generic_raw = u64::from(BusCycle::clocks_for(BusWidth::Byte, self.wait_states.io));
-        let scaled_generic = (generic_raw * u64::from(self.bus_num_at_batch_start))
-            / u64::from(self.bus_den_at_batch_start);
-        (element_clocks / bytes).saturating_sub(scaled_generic)
+        let (class, ata_data) = self.port_transaction_kind(port);
+        if ata_data {
+            return ATA_STRING_WORD_CLOCKS * u64::from(width.bytes()).div_ceil(2);
+        }
+        if width == BusWidth::Byte {
+            return class.clocks().max(4);
+        }
+        let changes_pci =
+            (0..width.bytes()).any(|i| (0xcfc..=0xcff).contains(&port.wrapping_add(i as u16)));
+        if changes_pci {
+            // An early byte can relocate BMIDE and expose an ISA device to later bytes.
+            return 160 * u64::from(width.bytes());
+        }
+        (0..width.bytes())
+            .map(|i| self.port_reference_cost_upper(port.wrapping_add(i as u16), BusWidth::Byte))
+            .sum()
     }
 
+    fn charge_port_transaction(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        kind: BusAccessKind,
+        class: PortBusClass,
+        clocks: u64,
+        transactions: u64,
+    ) {
+        self.trace.record(kind, u32::from(port), width, 2);
+        self.port_accesses_by_class[class.index()] += transactions;
+        if self.charge_port_timing {
+            *self.isa_io_clocks += clocks - 4;
+        }
+    }
+
+    fn charge_pci_transaction(&mut self, port: u16, width: BusWidth, kind: BusAccessKind) {
+        let beats = (u64::from(port & 3) + u64::from(width.bytes())).div_ceil(4);
+        self.charge_port_transaction(
+            port,
+            width,
+            kind,
+            PortBusClass::PciTarget,
+            56 * beats,
+            beats,
+        );
+    }
+
+    /// Supplement to the four reference clocks retained in the bus trace.
     fn port_bus_lane_clocks(&self, class: PortBusClass) -> u64 {
-        let generic_raw = u64::from(BusCycle::clocks_for(BusWidth::Byte, self.wait_states.io));
-        let scaled_generic = (generic_raw * u64::from(self.bus_num_at_batch_start))
-            / u64::from(self.bus_den_at_batch_start);
-        class.clocks().saturating_sub(scaled_generic)
+        class.clocks().saturating_sub(4)
     }
 
     fn record_pending_device_memory_write(&mut self, physical: u32, width: u32) {
@@ -1655,14 +1376,6 @@ impl MachineBus<'_> {
     }
 }
 
-const fn io_word_sub_port(port: u16, index: u32) -> u16 {
-    if port == ata::PRIMARY_CMD_BASE || port == ide::SECONDARY_CMD_BASE {
-        port
-    } else {
-        port.wrapping_add(index as u16)
-    }
-}
-
 impl MachineBus<'_> {
     /// The RAM-only tail of `charge_direct_memory`: the flat L1 cost in the Approximate class, or
     /// the full A20-plus-wait-state routing otherwise. Factored out so the interpreter's FastMap
@@ -1795,25 +1508,8 @@ impl MachineBus<'_> {
     }
 }
 
-/// The call-out-site poll skip's 32-bit return-lane bound (GP2 poll-skip design obligation 4),
-/// factored out of `MachineBus::callout_poll_skip` so it is unit-testable on its own (Rank-4
-/// killer, GP2 poll-skip revision review: "no fixture ever produces a span within four orders of
-/// magnitude of the ceiling, so a future edit to `direct_poll_skip_max_raw` or to the clamp
-/// expression would ship silently"). A hardcoded ceiling INDEPENDENT of `max_skipped_raw`: the
-/// caller's clock lane takes the LOW 32 BITS of an `i64`, and bit 32 is the step-break status
-/// bit, so nothing this may admit may let `raw_core_clocks * iterations` reach it -- whatever a
-/// misconfigured `IZARRAVM_DIRECT_POLL_MAX_RAW` claims. `max_skipped_raw` can still tune the
-/// bound DOWN (a smaller request always wins the `.min`); it can never tune it up past this
-/// ceiling. The margin must cover the port charge the caller folds in on top of this function's
-/// own return (`direct.rs`'s `port_read_al_dx`, which adds `port_io_core_clocks` to the skip's
-/// `extra_raw_clocks`) plus any other small additive term.
-///
-/// Review finding F5 (`dev_docs/2026-09-05-port-io-repricing-review.md`): that margin used to be a
-/// literal 64, sized to the flat `IN_PORT_CORE_CLOCKS` of 12. Under `IZARRAVM_TIMING_EPOCH=2` the
-/// same charge reaches 312 raw (`OUT`, `CPL>IOPL`), so 64 was a latent 32-bit lane overflow. It is
-/// now `izarravm_cpu::MAX_PORT_CORE_CLOCKS` -- imported, not copied, so a widened column raises
-/// this bound by construction -- plus the same 64 clocks of slack the original carried for
-/// "any other small additive term".
+/// Per-instruction budget bound for native I/O, including the largest current
+/// privilege-column core charge and its physical board transaction.
 #[cfg(feature = "jit")]
 pub(crate) const LANE_SAFETY_CEILING: u64 =
     u32::MAX as u64 - (izarravm_cpu::MAX_PORT_CORE_CLOCKS as u64 + 64);
@@ -2203,8 +1899,8 @@ impl CpuBus for MachineBus<'_> {
                 self.jit_mode13_data_cost_clocks(BusWidth::Word),
                 self.jit_mode13_data_cost_clocks(BusWidth::Dword),
             ],
-            raw,
-            self.bus_rem_at_batch_start,
+            raw.checked_add(*self.isa_io_clocks)?,
+            u64::from(self.bus_den_at_batch_start) - 1,
             self.bus_num_at_batch_start,
             self.bus_den_at_batch_start,
         )
@@ -2217,6 +1913,7 @@ impl CpuBus for MachineBus<'_> {
             self.trace
                 .elapsed_clocks()
                 .saturating_sub(self.trace_elapsed_at_batch_start)
+                .saturating_add(*self.isa_io_clocks)
         );
         let writes = delta.vga_writes();
         debug_assert_eq!(writes.is_empty(), writes.dirty_pages == 0);
@@ -2245,11 +1942,7 @@ impl CpuBus for MachineBus<'_> {
             if kind == BusAccessKind::DataWrite {
                 self.vega.note_direct_write(address, width.bytes() as usize);
             }
-            let ws = if self.active_mode.uses_approximate_timing() {
-                video_wait_states_approx(self.active_mode.persona(), self.timing_epoch)
-            } else {
-                self.wait_states.video
-            };
+            let ws = self.wait_states.video;
             self.trace.record(kind, address, width, ws);
             return Ok(());
         }
@@ -2452,11 +2145,10 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
-        let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
-        raw.checked_add(additional_raw)?
-            .checked_mul(u64::from(self.bus_num_at_batch_start))?
-            .checked_add(self.bus_rem_at_batch_start)
-            .map(|scaled| scaled / u64::from(self.bus_den_at_batch_start))
+        self.in_batch_reference_bus_clocks()
+            .checked_add(additional_raw)?
+            .checked_mul(BUS_CLOCK_MASTER_TICKS)
+            .map(|ticks| ticks.div_ceil(u64::from(self.bus_den_at_batch_start)))
     }
 
     /// One instruction-fetch access of cacheable RAM: see `cached_fetch_clocks`.
@@ -2594,47 +2286,24 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn jit_mode13_data_cost_clocks(&self, width: BusWidth) -> u64 {
-        let wait_states = if self.active_mode.uses_approximate_timing() {
-            video_wait_states_approx(self.active_mode.persona(), self.timing_epoch)
-        } else {
-            self.wait_states.video
-        };
+        let wait_states = self.wait_states.video;
         u64::from(izarravm_bus::BusCycle::clocks_for(width, wait_states))
     }
 
-    /// What `read_io`/`write_io` record for one port access: `clocks_for(width, wait_states.io)`,
-    /// the exact figure `self.trace.record` uses. `wait_states` is copied once at bus
-    /// construction and never rewritten, so it is constant within a `jit_cost_dial_epoch`.
+    /// Admission reserves the largest complete port transaction of this width.
     fn jit_io_cost_clocks(&self, width: BusWidth) -> u64 {
-        u64::from(izarravm_bus::BusCycle::clocks_for(
-            width,
-            self.wait_states.io,
-        ))
+        160 * u64::from(width.bytes())
     }
 
-    /// EPOCH 2 (census row 4): carry the batch's own `bus_rem` instead of the
-    /// `den - 1` worst case. `scale_bus` accumulates its remainder across a
-    /// batch's calls, and a sequence of floors with a carried remainder sums to
-    /// `floor((sum(raw) * num + rem_0) / den)` exactly -- so with the real
-    /// remainder this bound is EXACT rather than merely an upper bound, and it
-    /// still never under-estimates (`rem < den`). Epoch-gated because tightening
-    /// an admission bound changes what the JIT admits, which would move epoch 1.
-    ///
-    /// RECORDED FINDING: at `bus_timing = (1, 1)` -- which is every epoch-2
-    /// 486/586 batch -- `den = 1`, so `den - 1` and `bus_rem` are both 0 and the
-    /// two expressions are identical. This item is therefore behaviourally inert
-    /// in slice 2; it is here so the bound is right if a fast persona ever runs
-    /// under a non-unit ratio again.
+    /// Conservative CPU-budget projection of an additional reference bus bill.
     fn jit_scale_bus_cost_upper(&self, raw_clocks: u64) -> u64 {
-        let carry = if self.timing_epoch >= 2 {
-            self.bus_rem_at_batch_start
-        } else {
-            u64::from(self.bus_den_at_batch_start) - 1
-        };
         raw_clocks
-            .saturating_mul(u64::from(self.bus_num_at_batch_start))
-            .saturating_add(carry)
-            / u64::from(self.bus_den_at_batch_start)
+            .saturating_mul(BUS_CLOCK_MASTER_TICKS)
+            .div_ceil(u64::from(self.bus_den_at_batch_start))
+    }
+
+    fn rep_io_cost_upper(&self, port: u16, width: BusWidth) -> u64 {
+        self.jit_scale_bus_cost_upper(self.port_reference_cost_upper(port, width))
     }
 
     fn rep_data_byte_cost_upper(&self) -> u64 {
@@ -2650,11 +2319,7 @@ impl CpuBus for MachineBus<'_> {
                 .max(self.cache.cost.l2)
                 .max(self.cache.cost.ram)
         };
-        let video = if self.flat_data_cost {
-            video_wait_states_approx(self.active_mode.persona(), self.timing_epoch)
-        } else {
-            self.wait_states.video
-        };
+        let video = self.wait_states.video;
         let wait_states = ram
             .max(self.wait_states.ram)
             .max(self.wait_states.rom)
@@ -2663,18 +2328,14 @@ impl CpuBus for MachineBus<'_> {
             BusWidth::Byte,
             wait_states,
         ));
-        let (num, den) = bus_timing(self.active_mode.persona(), self.timing_epoch);
+        let (num, den) = bus_timing(self.active_mode);
         raw.saturating_mul(u64::from(num))
             .saturating_add(u64::from(den) - 1)
             / u64::from(den)
     }
 
     fn rep_page_walk_cost_upper(&self) -> Option<u64> {
-        let video = if self.active_mode.uses_approximate_timing() {
-            video_wait_states_approx(self.active_mode.persona(), self.timing_epoch)
-        } else {
-            self.wait_states.video
-        };
+        let video = self.wait_states.video;
         let wait_states = self
             .cache
             .cost
@@ -2712,58 +2373,14 @@ impl CpuBus for MachineBus<'_> {
         self.trace.add_elapsed_clocks(clocks);
     }
 
-    /// See the trait doc: the straight-line run loop adds this figure's growth
-    /// to its core total against the guest-clock run cap. The same scaled-bus
-    /// accounting applies in every CPU mode so a bus-heavy run cannot cross an
-    /// earlier master-timeline deadline unnoticed.
-    /// `Machine::timing_epoch`, copied into this bus at construction. The CPU reads it at every
-    /// port access to pick the `IN`/`OUT` privilege column (`CpuGsw::port_io_core_clocks`); it is
-    /// a plain field, so it cannot change mid-run and the JIT's cached per-block raw clocks stay
-    /// valid.
-    fn timing_epoch(&self) -> u32 {
-        self.timing_epoch
-    }
-
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
-        let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
-        let scaled = (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
-            / u64::from(self.bus_den_at_batch_start);
-        // F2 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2 the port lane joins
-        // the figure the run loop's `spent` is built from, so the charge is counted AGAINST the cap
-        // instead of only joining the batch-end `step`. See `in_batch_scaled_bus_clocks_screen_scale`
-        // for the other half of the fix -- without it the CPU's per-instruction screen would let a
-        // burst run past the cap unasked. Epoch 1 is byte-identical: the pre-slice lane was
-        // OPL/DSP-poll-only and `run.rs`'s overshoot note (route (c)) still describes it exactly.
-        if self.timing_epoch >= 2 {
-            scaled.saturating_add(*self.isa_io_clocks)
-        } else {
-            scaled
-        }
+        self.jit_projected_batch_scaled_bus_clocks(0)
+            .unwrap_or(u64::MAX)
     }
 
-    /// The division-free form of the run-loop cap test. Exactly equivalent to
-    /// `in_batch_scaled_bus_clocks() >= target` by `floor(A / den) >= target` iff
-    /// `A >= target * den`, so the run boundaries and `brk_cap` counts are bit-identical.
-    /// Widened to `u128` for the two products so no bound argument about `raw * num` or
-    /// `target * den` is needed; a 128-bit multiply is a few cycles against a 64-bit divide's
-    /// tens, and this runs once per retired instruction.
-    #[inline]
+    /// Include the unscaled port lane in the exact batch deadline test.
     fn in_batch_scaled_bus_clocks_at_least(&self, target: u64) -> bool {
-        // Under epoch 2 the figure carries an ADDITIVE unscaled term (the port lane, F2), which
-        // does not survive the multiply-through: `floor(A/den) + p >= t` is not
-        // `A >= (t - p) * den` when `t < p`, and folding `p * den` back in would re-introduce the
-        // very divide this form exists to avoid only to lose exactness at the floor. Ask the value
-        // question instead. It costs one 64-bit divide per retired instruction, which is the 2.99%
-        // of wall this form was written to remove -- accepted, because epoch 2 is not the shipping
-        // configuration and an inexact cap test would be a guest-visible defect rather than a
-        // slow one.
-        if self.timing_epoch >= 2 {
-            return self.in_batch_scaled_bus_clocks() >= target;
-        }
-        let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
-        let scaled = u128::from(raw) * u128::from(self.bus_num_at_batch_start)
-            + u128::from(self.bus_rem_at_batch_start);
-        scaled >= u128::from(target) * u128::from(self.bus_den_at_batch_start)
+        self.in_batch_scaled_bus_clocks() >= target
     }
 
     /// The `raw` that `in_batch_scaled_bus_clocks` scales. Monotone within a batch because
@@ -2781,31 +2398,9 @@ impl CpuBus for MachineBus<'_> {
         self.trace.elapsed_clocks()
     }
 
-    /// `F = ceil(num / den)` over this batch's snapshotted scale. See the trait doc for why that
-    /// is a valid bound on the scaled figure's growth per raw clock. `num` and `den` are `u32`
-    /// and `den > 0` (every `bus_timing` pair is), so the ceiling cannot overflow and is never 0.
-    /// A mode change never lands mid-batch — it is staged in `pending_mode` and applied after the
-    /// batch — so this stays constant for the whole batch, which is what makes it safe for the
-    /// run loop to read once per run.
-    #[inline]
+    /// Raw bus clocks alone cannot bound growth of the separate port lane.
     fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
-        // F2, second half. `ceil(num/den)` bounds the SCALED figure's growth per raw bus clock, and
-        // under epoch 2 the figure carries a term that is not a function of raw bus clocks at all:
-        // one port access adds up to 160 unscaled clocks for four raw ones. A screen sized to the
-        // bus ratio would then be an INVALID bound -- it would answer "certainly below the cap"
-        // for a burst that had already crossed it, and the run would keep retiring `OUT`s past the
-        // cap unasked. A bound of `40 + ceil(num/den)` would be sound (160 per 4 raw clocks), but
-        // it rests on every port access recording exactly four raw clocks alongside its lane
-        // charge, in that order, at every one of the two call sites -- a coupling no test states.
-        // `0` is the trait's own "this bus offers no bound", which turns the screen off and sends
-        // every ask to the exact test: the pre-screen behaviour, sound by construction, and what
-        // makes the batch's overshoot past the cap exactly one instruction under epoch 2.
-        if self.timing_epoch >= 2 {
-            return 0;
-        }
-        let num = u64::from(self.bus_num_at_batch_start);
-        let den = u64::from(self.bus_den_at_batch_start);
-        num.div_ceil(den).max(1)
+        0
     }
 
     fn read_memory(
@@ -3071,12 +2666,6 @@ impl CpuBus for MachineBus<'_> {
         // Bus-clock trace recording stays unconditional for every port, both timing
         // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
         // here, so a lazy read that skipped this would under-predict its own beam.
-        self.trace.record(
-            BusAccessKind::IoRead,
-            u32::from(port),
-            width,
-            self.wait_states.io,
-        );
 
         if let Some(value) = self.pci.read_io(port, width, self.vega) {
             // F4 (`dev_docs/2026-09-05-port-io-repricing-review.md`): this arm claims
@@ -3085,9 +2674,7 @@ impl CpuBus for MachineBus<'_> {
             // `PciTarget` prices a byte cycle, same as every other class, so a wider access
             // pays once per byte it decomposes into on the real bus, even though `pci.read_io`
             // itself answers the whole width in one call.
-            for _ in 0..width.bytes() {
-                self.charge_port_bus(port);
-            }
+            self.charge_pci_transaction(port, width, BusAccessKind::IoRead);
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -3099,9 +2686,7 @@ impl CpuBus for MachineBus<'_> {
         {
             // F4: same reason as the PCI arm above -- the live BMIDE BAR4 block also sits
             // above the general charge site.
-            for _ in 0..width.bytes() {
-                self.charge_port_bus(port);
-            }
+            self.charge_pci_transaction(port, width, BusAccessKind::IoRead);
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -3116,23 +2701,32 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if width != BusWidth::Byte {
-            // A wider-than-byte port access decomposes into byte cycles, the way the
-            // ISA bus does for a port that is not 16-bit: the low byte comes from the
-            // port and each higher byte from the next port (`io_word_sub_port` keeps
-            // the IDE/ATA data registers on the same port). This is the canonical VGA
-            // mode-set path - a single 16-bit `OUT 0x3C4`/`0x3CE`/`0x3D4` sets an
-            // index and its datum - which used to halt the VM with WidthMismatch.
-            // Per-byte io_touched/lazy dispatch happens in the recursive calls below
-            // (each byte re-enters read_io), so nothing to set here directly.
             let mut value = 0u32;
             for i in 0..width.bytes() {
-                let byte = self.read_io(
-                    io_word_sub_port(port, i),
+                let ata_word = self.port_transaction_kind(port).1;
+                if ata_word && i % 2 == 0 {
+                    self.charge_port_transaction(
+                        port,
+                        BusWidth::Word,
+                        BusAccessKind::IoRead,
+                        PortBusClass::PciTarget,
+                        ATA_STRING_WORD_CLOCKS,
+                        1,
+                    );
+                }
+                self.port_transaction_active = ata_word;
+                let result = self.read_io(
+                    if ata_word {
+                        port
+                    } else {
+                        port.wrapping_add(i as u16)
+                    },
                     BusWidth::Byte,
                     core_clocks_so_far,
                     cpu_is_ring0_pm,
-                )?;
-                value |= (byte & 0xff) << (8 * i);
+                );
+                self.port_transaction_active = false;
+                value |= (result? & 0xff) << (8 * i);
             }
             return Ok(value);
         }
@@ -3149,7 +2743,7 @@ impl CpuBus for MachineBus<'_> {
         // overlaps the charged set as configured; a guest that relocated BAR4 into
         // the X-bus range would skip the charge on those sixteen ports, which is
         // strictly the conservative direction.
-        self.charge_port_bus(port);
+        self.charge_port_bus(port, BusAccessKind::IoRead);
 
         // THE 0x3DA FAST PATH. GP2 reads this one port 2.003 billion times in a run, and in
         // decode order it walks `port_disabled` plus four UART/LPT range checks first, every
@@ -3190,25 +2784,41 @@ impl CpuBus for MachineBus<'_> {
             return Ok(0xff);
         }
 
-        if let Some(value) = self.serial.read_port(port) {
+        if let Some(value) = if self.charge_port_timing {
+            self.serial.read_port_at(port, self.port_access_prefix())
+        } else {
+            self.serial.read_port(port)
+        } {
             if !skip_io_touched {
                 *self.io_touched = true;
             }
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.serial2.read_port(port) {
+        if let Some(value) = if self.charge_port_timing {
+            self.serial2.read_port_at(port, self.port_access_prefix())
+        } else {
+            self.serial2.read_port(port)
+        } {
             if !skip_io_touched {
                 *self.io_touched = true;
             }
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.lpt.read_port(port) {
+        if let Some(value) = if self.charge_port_timing {
+            self.lpt.read_port_at(port, self.port_access_prefix())
+        } else {
+            self.lpt.read_port(port)
+        } {
             if !skip_io_touched {
                 *self.io_touched = true;
             }
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.lpt2.read_port(port) {
+        if let Some(value) = if self.charge_port_timing {
+            self.lpt2.read_port_at(port, self.port_access_prefix())
+        } else {
+            self.lpt2.read_port(port)
+        } {
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -3382,17 +2992,8 @@ impl CpuBus for MachineBus<'_> {
             // detection loop runs inside one batch, the timer only advances at batch
             // end (after every poll already read a stale 0x00), and detection fails.
             *self.io_touched = true;
-            // Charge the poll its real ISA bus time in the fast modes so it
-            // cannot outrun the 80 us OPL timer on a fast CPU (folded into the batch
-            // device advance in run_until_tick). The 386 modes do not need this
-            // charge because their slower clocks already span the window.
-            // F3 (`dev_docs/2026-09-05-port-io-repricing-review.md`): epoch 2's
-            // `charge_port_bus` already prices this same access through the unified class
-            // charge (`IsaXBus` on 0x388-0x38B), so this hand accrual must stay epoch-1-only
-            // or `IN 0x388` double-charges (166 + 156 + 19 instead of 179).
-            if self.lazy_port_reads && self.timing_epoch < 2 {
-                *self.isa_io_clocks += isa_io_clocks(self.active_mode);
-            }
+            // The unified board tariff already charged this OPL transaction.
+
             // The chip drives only the status byte on reads; data ports read open-bus.
             //
             // In the Approximate class the chip has not been stepped since the
@@ -3497,7 +3098,10 @@ impl CpuBus for MachineBus<'_> {
                 && lazy_alt_status
                 && !skip_io_touched
                 && self.ide.note_alt_status_read();
-            let value = self.ide.read_port(port).unwrap_or(0xff);
+            let value = self
+                .ide
+                .read_port_at(port, self.port_access_prefix())
+                .unwrap_or(0xff);
             // SUPPRESS THE CLEAR, never force the set. `io_touched` is already
             // true by the time this arm runs UNLESS `skip_io_touched` suppressed
             // it, and that suppression is the documented "V86 trap tax, Part 1"
@@ -3540,10 +3144,11 @@ impl CpuBus for MachineBus<'_> {
                     .ata
                     .as_mut()
                     .is_some_and(ata::AtaDisk::note_alt_status_read);
+            let prefix_ticks = self.port_access_prefix();
             let value = self
                 .ata
                 .as_mut()
-                .and_then(|d| d.read_port(port))
+                .and_then(|d| d.read_port_at(port, prefix_ticks))
                 .unwrap_or(0xff);
             // SUPPRESS THE CLEAR, never force the set -- same contract as the
             // ATAPI arm above.
@@ -3560,9 +3165,6 @@ impl CpuBus for MachineBus<'_> {
         }
         if !matches!(port, 0x224 | 0x225) {
             if self.lazy_port_reads && matches!(port, 0x226 | 0x22A | 0x22C | 0x22E | 0x22F) {
-                if self.timing_epoch < 2 {
-                    *self.isa_io_clocks += isa_io_clocks(self.active_mode);
-                }
                 let pending = self.pending_device_micros();
                 self.sb16.service_reset_at(pending);
             }
@@ -3637,7 +3239,7 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.rtc.read_port(port) {
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.keyboard.read_port(port) {
+        if let Some(value) = self.keyboard.read_port_at(port, self.port_access_prefix()) {
             // Reading the data register drops the 8042's keyboard or auxiliary
             // output line in the same I/O cycle. Keep the PIC's electrical input
             // in step here so LTIM cannot reassert a byte the guest consumed.
@@ -3692,12 +3294,6 @@ impl CpuBus for MachineBus<'_> {
             // See read_io: an exempted write still programs a device.
             *self.exempt_io_touched = true;
         }
-        self.trace.record(
-            BusAccessKind::IoWrite,
-            u32::from(port),
-            width,
-            self.wait_states.io,
-        );
 
         // Keep in step with the PCI BIOS write arm in bios.rs handle_pci_bios,
         // which mirrors this post-write block for the HLE path.
@@ -3705,9 +3301,7 @@ impl CpuBus for MachineBus<'_> {
         if self.pci.write_io(port, width, value, self.vega) {
             // F4: see the matching comment in `read_io` -- 0xCF8-0xCFF sits above the width
             // split and the general charge site.
-            for _ in 0..width.bytes() {
-                self.charge_port_bus(port);
-            }
+            self.charge_pci_transaction(port, width, BusAccessKind::IoWrite);
             // The only bus-side door onto Distira's PCI command register and BAR, so the only
             // place the extended-RAM floor snapshot can go stale while this view is live. The
             // HLE PCI BIOS arm (`bios.rs handle_pci_bios`) writes through `Machine`, which
@@ -3719,9 +3313,14 @@ impl CpuBus for MachineBus<'_> {
                 self.mark_direct_map_changed();
                 debug_assert!(*self.io_touched);
             }
+            let prefix_ticks = self.port_access_prefix();
             if let Some(disk) = self.ata.as_mut() {
-                self.bmide
-                    .synchronize(self.pci.ide_bus_master_enabled(), self.memory, disk);
+                self.bmide.synchronize(
+                    self.pci.ide_bus_master_enabled(),
+                    self.memory,
+                    disk,
+                    prefix_ticks,
+                );
             }
             return Ok(());
         }
@@ -3730,36 +3329,51 @@ impl CpuBus for MachineBus<'_> {
             && bmide::BusMasterIde::owns_io(port, width, base)
         {
             // F4: see the matching comment in `read_io`.
-            for _ in 0..width.bytes() {
-                self.charge_port_bus(port);
-            }
+            self.charge_pci_transaction(port, width, BusAccessKind::IoWrite);
             if self.pci.ide_io_enabled() {
                 self.bmide
                     .write_io(port, width, value, self.ata.as_mut(), base);
+                let prefix_ticks = self.port_access_prefix();
                 if let Some(disk) = self.ata.as_mut() {
-                    self.bmide
-                        .synchronize(self.pci.ide_bus_master_enabled(), self.memory, disk);
+                    self.bmide.synchronize(
+                        self.pci.ide_bus_master_enabled(),
+                        self.memory,
+                        disk,
+                        prefix_ticks,
+                    );
                 }
             }
             return Ok(());
         }
 
         if width != BusWidth::Byte {
-            // A wider-than-byte port write decomposes into byte cycles, mirroring
-            // `read_io`: the low byte goes to the port and each higher byte to the
-            // next port (`io_word_sub_port` keeps the IDE/ATA data registers on the
-            // same port). The VGA index/data idiom (a single 16-bit `OUT 0x3C4`/
-            // `0x3CE`/`0x3D4`) depends on this; it used to halt the VM with
-            // WidthMismatch.
             for i in 0..width.bytes() {
-                <Self as CpuBus>::write_io(
+                let ata_word = self.port_transaction_kind(port).1;
+                if ata_word && i % 2 == 0 {
+                    self.charge_port_transaction(
+                        port,
+                        BusWidth::Word,
+                        BusAccessKind::IoWrite,
+                        PortBusClass::PciTarget,
+                        ATA_STRING_WORD_CLOCKS,
+                        1,
+                    );
+                }
+                self.port_transaction_active = ata_word;
+                let result = <Self as CpuBus>::write_io(
                     self,
-                    io_word_sub_port(port, i),
+                    if ata_word {
+                        port
+                    } else {
+                        port.wrapping_add(i as u16)
+                    },
                     BusWidth::Byte,
                     value >> (8 * i),
                     core_clocks_so_far,
                     cpu_is_ring0_pm,
-                )?;
+                );
+                self.port_transaction_active = false;
+                result?;
             }
             return Ok(());
         }
@@ -3767,7 +3381,7 @@ impl CpuBus for MachineBus<'_> {
         // See `read_io`'s matching site: below the width split (one charge per
         // byte cycle), above every device arm, and above `port_disabled` -- an
         // ISA cycle to a listed port happens whether or not the decode answers.
-        self.charge_port_bus(port);
+        self.charge_port_bus(port, BusAccessKind::IoWrite);
 
         if self.vega.port_disabled(port) {
             return Ok(());
@@ -3784,6 +3398,14 @@ impl CpuBus for MachineBus<'_> {
                 // An address-latch write addresses no register itself.
                 _ => None,
             };
+            if self.charge_port_timing && bank == 0 && matches!(register, Some(2..=4)) {
+                let pending = self.pending_device_micros();
+                let delta = pending
+                    .checked_sub(*self.opl_timer_advance_credit_us)
+                    .expect("OPL timer access moved backward");
+                self.opl.advance_micros(delta);
+                *self.opl_timer_advance_credit_us = pending;
+            }
             self.opl_probe
                 .record_write(port, bank, register, byte, self.core_clocks_so_far);
             self.opl.write_port(opl_port, byte);
@@ -3832,16 +3454,22 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if ide::IdeChannel::owns_port(port) {
-            self.ide.write_port(port, value as u8);
+            self.ide
+                .write_port_at(port, value as u8, self.port_access_prefix());
             return Ok(());
         }
         if ata::AtaDisk::owns_port(port) {
             // Writes to an empty primary channel are dropped; a probe of a bare
             // channel must not fault. A mounted disk takes the task-file write.
+            let prefix_ticks = self.port_access_prefix();
             if let Some(disk) = self.ata.as_mut() {
-                disk.write_port(port, value as u8);
-                self.bmide
-                    .synchronize(self.pci.ide_bus_master_enabled(), self.memory, disk);
+                disk.write_port_at(port, value as u8, prefix_ticks);
+                self.bmide.synchronize(
+                    self.pci.ide_bus_master_enabled(),
+                    self.memory,
+                    disk,
+                    prefix_ticks,
+                );
             }
             return Ok(());
         }
@@ -3856,13 +3484,13 @@ impl CpuBus for MachineBus<'_> {
             // `SbDsp::arm_reset_at`. Only the reset port: nothing on the
             // silicon moves the settle except the reset line, and a command
             // write (0x22C) during a live settle must not restart it.
-            if self.lazy_port_reads && port == 0x226 {
+            if self.charge_port_timing && port == 0x226 {
                 let pending = self.pending_device_micros();
                 self.sb16.arm_reset_at(pending);
             }
             // Same for the pause countdown a 0x80 command arms: the DSP folds
             // the span only when this write completed that command.
-            if self.lazy_port_reads && port == 0x22C {
+            if self.charge_port_timing && port == 0x22C {
                 let pending = self.pending_device_micros();
                 self.sb16.arm_pause_at(pending);
             }
@@ -3957,11 +3585,27 @@ impl CpuBus for MachineBus<'_> {
         if self.rtc.write_port(port, value as u8) {
             return Ok(());
         }
-        if self.serial.write_port(port, value as u8)
-            || self.serial2.write_port(port, value as u8)
-            || self.lpt.write_port(port, value as u8)
-            || self.lpt2.write_port(port, value as u8)
-        {
+        if (if self.charge_port_timing {
+            self.serial
+                .write_port_at(port, value as u8, self.port_access_prefix())
+        } else {
+            self.serial.write_port(port, value as u8)
+        }) || (if self.charge_port_timing {
+            self.serial2
+                .write_port_at(port, value as u8, self.port_access_prefix())
+        } else {
+            self.serial2.write_port(port, value as u8)
+        }) || (if self.charge_port_timing {
+            self.lpt
+                .write_port_at(port, value as u8, self.port_access_prefix())
+        } else {
+            self.lpt.write_port(port, value as u8)
+        }) || (if self.charge_port_timing {
+            self.lpt2
+                .write_port_at(port, value as u8, self.port_access_prefix())
+        } else {
+            self.lpt2.write_port(port, value as u8)
+        }) {
             return Ok(());
         }
         // IDENTITY, not the bare token: a 4F05 that moves margo_bank leaves the token
@@ -4051,7 +3695,10 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         let a20_before = self.keyboard.a20_enabled();
-        if self.keyboard.write_port(port, value as u8) {
+        if self
+            .keyboard
+            .write_port_at(port, value as u8, self.port_access_prefix())
+        {
             if self.keyboard.a20_enabled() != a20_before {
                 // The other writer of the `a20_open` snapshot: an 8042 output-port command.
                 self.a20_open = !a20_before;
@@ -4219,8 +3866,7 @@ impl CpuBus for MachineBus<'_> {
         };
         let batch_instant = |iterations: u64| -> Option<u64> {
             let core = now_at_batch(iterations)?;
-            let bus = self.poll_project_scaled_bus_clocks(certificate, iterations)?;
-            core.checked_add(bus)
+            self.poll_project_master_ticks(certificate, iterations, core)
         };
         // `run_spent(n)` is what the RUN-remaining `req.cap` actually bounds: RUN-scoped core plus
         // RUN-scoped bus GROWTH (the batch-absolute bus reading minus the batch-absolute bus total
@@ -4320,10 +3966,8 @@ impl CpuBus for MachineBus<'_> {
         core_clocks_so_far: u64,
         cpu_is_ring0_pm: bool,
     ) -> Result<u32, BusError> {
-        self.string_port_element_bytes = width.bytes() as u8;
         let result =
             <Self as CpuBus>::read_io(self, port, width, core_clocks_so_far, cpu_is_ring0_pm);
-        self.string_port_element_bytes = 0;
         #[cfg(test)]
         self.record_string_port_observation(
             false,
@@ -4343,7 +3987,6 @@ impl CpuBus for MachineBus<'_> {
         core_clocks_so_far: u64,
         cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError> {
-        self.string_port_element_bytes = width.bytes() as u8;
         let result = <Self as CpuBus>::write_io(
             self,
             port,
@@ -4352,7 +3995,6 @@ impl CpuBus for MachineBus<'_> {
             core_clocks_so_far,
             cpu_is_ring0_pm,
         );
-        self.string_port_element_bytes = 0;
         #[cfg(test)]
         self.record_string_port_observation(
             true,
@@ -4961,11 +4603,7 @@ impl MachineBus<'_> {
         kind: BusAccessKind,
     ) {
         self.vega.record_direct_access(address, bytes, kind);
-        let wait_states = if self.active_mode.uses_approximate_timing() {
-            video_wait_states_approx(self.active_mode.persona(), self.timing_epoch)
-        } else {
-            self.wait_states.video
-        };
+        let wait_states = self.wait_states.video;
         let count = bytes / width.bytes() as usize;
         self.trace
             .record_memory_run(kind, address, count as u32, width, wait_states);
@@ -5471,14 +5109,7 @@ impl MachineBus<'_> {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
         } else if self.vega.owns_memory(address, 1) {
-            // The Approximate class charges the era bus latency of a real video
-            // card (see `video_wait_states_approx`); the Accurate class keeps the
-            // frozen profile value bit-for-bit.
-            if self.active_mode.uses_approximate_timing() {
-                video_wait_states_approx(self.active_mode.persona(), self.timing_epoch)
-            } else {
-                self.wait_states.video
-            }
+            self.wait_states.video
         } else {
             self.wait_states.ram
         }

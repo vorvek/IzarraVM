@@ -531,12 +531,15 @@ fn serial_tx_is_captured_and_lsr_reports_empty() {
     // THRE/TEMT then report that both the holding and shift registers are empty.
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-    with_bus(&mut machine, |bus| {
+    {
+        let mut bus = machine.make_construction_bus();
         bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'H'), false)
             .unwrap();
         bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'i'), false)
             .unwrap();
-    });
+    }
+    assert_eq!(machine.serial.advance_credit_ticks(), 0);
+    assert_eq!(machine.port_bus_batch_clocks, 0);
     assert!(machine.serial_output().is_empty());
     machine.advance_devices_ticks(machine.serial.ticks_until_idle());
     assert!(machine.serial_text().ends_with("Hi"));

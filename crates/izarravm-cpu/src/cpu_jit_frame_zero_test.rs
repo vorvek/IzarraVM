@@ -89,6 +89,7 @@ fn repeated_entries_do_not_inherit_the_previous_frames_accumulators() {
             cpu.elapsed_clocks,
             bus.trace.elapsed_clocks(),
             cpu.perf_counters().jit_direct_entries,
+            cpu.timing_rem,
         );
         arm_store_fixture(&mut cpu);
         drive(&mut cpu, &mut bus);
@@ -101,10 +102,12 @@ fn repeated_entries_do_not_inherit_the_previous_frames_accumulators() {
             cpu.perf_counters().instructions - before.0,
             bus.trace.elapsed_clocks() - before.2,
             cpu.perf_counters().jit_direct_entries - before.3,
+            (cpu.elapsed_clocks - before.1) * 12 + cpu.timing_rem - before.4,
         ));
-        assert!(
-            cpu.elapsed_clocks - before.1 <= 2,
-            "round {round}: core clocks are scaler jitter around a two-clock round, not a lane"
+        assert_eq!(
+            rounds.last().unwrap().3,
+            5 * 12 + 60,
+            "one NOP, four MOVs and the five-clock HLT entry"
         );
     }
     assert!(

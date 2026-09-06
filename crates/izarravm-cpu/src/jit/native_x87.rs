@@ -5,7 +5,7 @@
 
 use super::super::{
     AddrMode, CR0_EM, CR0_NE, CR0_TS, CpuPersona, DecodeGroup, DecodedInsn, DecodedOperand,
-    FP_TIMING_DEN, FpOpClass, fp_timing_class,
+    FP_TIMING_DEN,
 };
 use crate::timing_class::{ClassTable, TimingClass};
 
@@ -341,36 +341,15 @@ pub(crate) struct NativeX87Metadata {
     /// `MAX_X87_BLOCK_CORE_CLOCKS`'s compile-time dominance check re-derives
     /// itself from this table rather than from the field's width.
     pub(crate) raw_clocks: u16,
-    pub(crate) fp_class: FpOpClass,
     pub(crate) memory: Option<NativeX87MemoryAccess>,
     pub(crate) pops: bool,
     pub(crate) terminates_block: bool,
 }
 
 impl NativeX87Metadata {
-    /// This shape's cost under one `(persona, epoch)` charge table, times its
-    /// FP-dial numerator; the caller divides by [`FP_TIMING_DEN`] through
-    /// `scale_weighted_fp_clocks`, carrying the remainder.
-    ///
-    /// `class` is [`NativeX87Insn::timing_class`]. At epoch 1
-    /// `table.raw(class)` IS `self.raw_clocks` -- every class's epoch-1 column
-    /// is the literal the interpreter site carried, and
-    /// `every_native_x87_shape_charges_its_epoch_1_literal` asserts that shape
-    /// by shape -- and `fp_timing_class` is the shipped dial, so epoch 1 is the
-    /// pre-slice expression byte for byte. At epoch 2 the dial is IDENTITY
-    /// (design section 4 deletes it) and the table carries the honest Appendix
-    /// F count, which is what puts the native leg and the interpreter leg on
-    /// the same number: before slice 4 `fpu_exec.rs` charged
-    /// `X87StoreInt32 = 72` under epoch 2 while this table charged the epoch-1
-    /// literal 14, a 5x leg divergence.
-    pub(crate) const fn weighted_fp_clocks(
-        self,
-        persona: CpuPersona,
-        class: TimingClass,
-        table: &ClassTable,
-        epoch: u32,
-    ) -> u64 {
-        table.raw(class) as u64 * fp_timing_class(persona, self.fp_class, epoch) as u64
+    /// Native accounting keeps weighted eighths until the shared settlement step.
+    pub(crate) const fn weighted_fp_clocks(self, class: TimingClass, table: &ClassTable) -> u64 {
+        table.raw(class) as u64 * FP_TIMING_DEN as u64
     }
 }
 
@@ -568,19 +547,8 @@ impl NativeX87Insn {
         }
     }
 
-    /// The charge CLASS this shape carries -- the sibling of
-    /// [`NativeX87Metadata::raw_clocks`], and what an epoch-2 run charges
-    /// instead of it.
-    ///
-    /// Slice 4. `metadata()`'s `raw_clocks` is the epoch-1 literal the
-    /// interpreter site carried; the interpreter has charged
-    /// `table.raw(class)` since slice 1a (`fpu_exec.rs`'s 69 routed sites),
-    /// and this is what lets the NATIVE leg read the same table. The mapping
-    /// mirrors `fpu_exec.rs` opcode for opcode, and every class named here has
-    /// the shape's `raw_clocks` as its epoch-1 column, so epoch 1 cannot move.
-    /// Kept OFF `NativeX87Metadata` deliberately: that struct is pinned field
-    /// by field by `metadata_matches_interpreter_timing_and_memory_effects`,
-    /// and a class is a routing fact rather than a timing effect.
+    /// Route native x87 work to the same class as the interpreter.
+    /// Metadata retains the original I386 literal; execution uses the live table.
     pub(crate) const fn timing_class(self) -> TimingClass {
         match self {
             // 0xd8 memory: real m32 arithmetic, with FDIV/FDIVR split out.
@@ -590,10 +558,8 @@ impl NativeX87Insn {
                 }
                 _ => TimingClass::X87MemArith32,
             },
-            // 0xda memory: integer m32 arithmetic. `FIDIV`/`FIDIVR` (/6, /7)
-            // splits out exactly as `fpu_exec.rs`'s 0xda arm splits it -- 42 P5
-            // clocks against the rest of the family's 7-8. Both classes carry
-            // the SAME epoch-1 literal (20), so the split cannot move epoch 1.
+            // Integer m32 division has a separate class, matching the interpreter.
+            // Both classes retain I386 raw 20.
             Self::IntBinaryMemory { op, .. } => match op {
                 NativeX87BinaryOp::Divide | NativeX87BinaryOp::DivideReverse => {
                     TimingClass::X87MemArithIntDiv32
@@ -627,10 +593,8 @@ impl NativeX87Insn {
             Self::LoadI64 { .. } => TimingClass::X87LoadInt64,
             Self::StoreI64 { .. } => TimingClass::X87StoreInt64,
             Self::StoreExtended80 { .. } => TimingClass::X87StoreExtended80,
-            // SPLIT here, where epoch 1 gave all four `clocks(4)`: Appendix F
-            // prices `FLD ST(i)`/`FXCH` at the design's raw 12 and `FLD1`/`FLDZ`
-            // at 2 latency = raw 24. Both classes carry 4 as their epoch-1
-            // column, so the split is invisible at epoch 1.
+            // Register exchange and cheap constants have distinct fast-persona costs.
+            // Both retain I386 raw 4.
             Self::LoadRegister { .. } | Self::Exchange { .. } => TimingClass::X87RegExchange,
             Self::LoadOne | Self::LoadZero => TimingClass::X87RegConstCheap,
             // `FTST` shares `X87RegConstCheap` with FLD1/FLDZ, as it does in
@@ -682,7 +646,6 @@ impl NativeX87Insn {
         match self {
             Self::BinaryMemory { op, .. } => NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::F32Mem,
                 memory: read_dword,
                 pops: op.pops(),
                 terminates_block: false,
@@ -693,28 +656,24 @@ impl NativeX87Insn {
             // (`fpu_exec.rs:87`).
             Self::IntBinaryMemory { op, .. } => NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::IntConvert16,
                 memory: read_dword,
                 pops: op.pops(),
                 terminates_block: false,
             },
             Self::BinaryRegister { op, .. } => NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: op.pops(),
                 terminates_block: false,
             },
             Self::LoadF32 { .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F32Mem,
                 memory: read_dword,
                 pops: false,
                 terminates_block: false,
             },
             Self::StoreF32 { pop, .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F32Mem,
                 memory: write_dword,
                 pops: pop,
                 terminates_block: false,
@@ -722,7 +681,6 @@ impl NativeX87Insn {
             Self::LoadRegister { .. } | Self::Exchange { .. } | Self::LoadOne | Self::LoadZero => {
                 NativeX87Metadata {
                     raw_clocks: 4,
-                    fp_class: FpOpClass::Register,
                     memory: None,
                     pops: false,
                     terminates_block: false,
@@ -730,21 +688,18 @@ impl NativeX87Insn {
             }
             Self::StoreRegister { pop, .. } => NativeX87Metadata {
                 raw_clocks: 3,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: pop,
                 terminates_block: false,
             },
             Self::LoadI32 { .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert32,
                 memory: read_dword,
                 pops: false,
                 terminates_block: false,
             },
             Self::StoreI32 { pop, .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert32,
                 memory: write_dword,
                 pops: pop,
                 terminates_block: false,
@@ -756,14 +711,12 @@ impl NativeX87Insn {
             // what actually carries the stack effect.
             Self::PopBinary { .. } => NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
                 terminates_block: false,
             },
             Self::BinaryRegisterDest { .. } => NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -774,14 +727,12 @@ impl NativeX87Insn {
             // get three arms and three pinned rows in the metadata battery.
             Self::SignOp { .. } => NativeX87Metadata {
                 raw_clocks: 6,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
             },
             Self::TestZero => NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -792,7 +743,6 @@ impl NativeX87Insn {
             // by 256/8: ceil(70 * 2 / 8) = 18 against the bound's 640.
             Self::SquareRoot => NativeX87Metadata {
                 raw_clocks: 70,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -802,7 +752,6 @@ impl NativeX87Insn {
             // one arm.
             Self::RoundToInt => NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -810,18 +759,16 @@ impl NativeX87Insn {
             // WAIT's OWN class, `FpOpClass::Wait`, and it is the only user of it. Copying
             // `Register` here is the realistic mistake and it would be a guest-visible timing
             // divergence rather than a rounding one: `execute_fpu_decoded`'s 0x9b head returns
-            // `clocks(6)` and then scales it through `scale_fp_clocks(.., FpOpClass::Wait)`, a
+            // `clocks(6)` and then scales it through `scale_fp_clocks(..)`, a
             // different `fp_timing_class` entry from every other shape in this table.
             Self::Wait => NativeX87Metadata {
                 raw_clocks: 6,
-                fp_class: FpOpClass::Wait,
                 memory: None,
                 pops: false,
                 terminates_block: false,
             },
             Self::Examine => NativeX87Metadata {
                 raw_clocks: 8,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -831,21 +778,18 @@ impl NativeX87Insn {
             // FUCOM by 5x its weighted cost; the mutation battery targets the concrete number.
             Self::UnorderedCompare { pop, .. } => NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: pop,
                 terminates_block: false,
             },
             Self::ComparePopPop => NativeX87Metadata {
                 raw_clocks: 5,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
                 terminates_block: false,
             },
             Self::StoreStatusAx => NativeX87Metadata {
                 raw_clocks: 3,
-                fp_class: FpOpClass::Register,
                 memory: None,
                 pops: false,
                 terminates_block: false,
@@ -858,14 +802,12 @@ impl NativeX87Insn {
             // width, and 0xd9 maps to F32Mem there.
             Self::LoadControlWord { .. } => NativeX87Metadata {
                 raw_clocks: 4,
-                fp_class: FpOpClass::F32Mem,
                 memory: read_word,
                 pops: false,
                 terminates_block: false,
             },
             Self::StoreControlWord { .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F32Mem,
                 memory: write_word,
                 pops: false,
                 terminates_block: false,
@@ -875,7 +817,6 @@ impl NativeX87Insn {
             // byte, and 0xdd (unlike 0xd9) maps to F64Mem in the timing tail (fpu_exec.rs:88-89).
             Self::LoadF64 { .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F64Mem,
                 memory: read_qword,
                 pops: false,
                 terminates_block: false,
@@ -884,7 +825,6 @@ impl NativeX87Insn {
             // differs between the two sub-opcodes, mirroring `StoreF32`.
             Self::StoreF64 { pop, .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::F64Mem,
                 memory: write_qword,
                 pops: pop,
                 terminates_block: false,
@@ -894,7 +834,6 @@ impl NativeX87Insn {
             // class and the operand width differ.
             Self::BinaryMemoryF64 { op, .. } => NativeX87Metadata {
                 raw_clocks: 20,
-                fp_class: FpOpClass::F64Mem,
                 memory: read_qword,
                 pops: op.pops(),
                 terminates_block: false,
@@ -907,7 +846,6 @@ impl NativeX87Insn {
             // correct 256, a 6 percent undercharge) and is what the mutation battery targets.
             Self::LoadI64 { .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert16,
                 memory: read_qword,
                 pops: false,
                 terminates_block: false,
@@ -921,7 +859,6 @@ impl NativeX87Insn {
             // all-or-nothing across a page boundary; see that variant's comment.
             Self::StoreExtended80 { .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert32,
                 memory: Some(NativeX87MemoryAccess {
                     direction: Write,
                     width: 10,
@@ -935,7 +872,6 @@ impl NativeX87Insn {
             // `StoreI32`'s class here because both are integer STORES is the mistake.
             Self::StoreI64 { .. } => NativeX87Metadata {
                 raw_clocks: 14,
-                fp_class: FpOpClass::IntConvert16,
                 memory: write_qword,
                 pops: true,
                 terminates_block: false,

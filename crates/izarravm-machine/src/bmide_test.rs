@@ -45,7 +45,7 @@ fn write_bm(
     match disk {
         Some(disk) => {
             controller.write_io(port, width, value, Some(&mut *disk), BASE);
-            controller.synchronize(true, memory, disk);
+            controller.synchronize(true, memory, disk, 0);
         }
         None => controller.write_io(port, width, value, None, BASE),
     }
@@ -88,7 +88,7 @@ fn active_read(start_first: bool) -> (BusMasterIde, Memory, AtaDisk) {
         );
     }
     disk.write_port(PRIMARY_CMD_BASE + 7, 0xc8);
-    controller.synchronize(true, &memory, &mut disk);
+    controller.synchronize(true, &memory, &mut disk, 0);
     if !start_first {
         write_bm(
             &mut controller,
@@ -167,7 +167,7 @@ fn write_dma_gathers_multiple_prds_without_a_pio_loop() {
     set_prd(&mut controller, &memory, &mut disk);
     program_lba(&mut disk, 9, 2);
     disk.write_port(PRIMARY_CMD_BASE + 7, 0xca);
-    controller.synchronize(true, &memory, &mut disk);
+    controller.synchronize(true, &memory, &mut disk, 0);
     write_bm(
         &mut controller,
         &memory,
@@ -451,7 +451,7 @@ fn disabling_or_stopping_an_active_transfer_aborts_it() {
     for disable_pci in [false, true] {
         let (mut controller, memory, mut disk) = active_read(false);
         if disable_pci {
-            controller.synchronize(false, &memory, &mut disk);
+            controller.synchronize(false, &memory, &mut disk, 0);
         } else {
             write_bm(
                 &mut controller,

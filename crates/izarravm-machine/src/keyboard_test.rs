@@ -591,3 +591,51 @@ fn host_motion_faster_than_the_aux_wire_does_not_backlog() {
         drain.dx_sum
     );
 }
+
+#[test]
+fn accepted_input_owns_its_origin_and_ignored_writes_do_not_extend_it() {
+    for ignored_port in [0x60, 0x64] {
+        let mut kbd = Keyboard8042::default();
+        let prefix = CONTROLLER_INPUT_TICKS * 3;
+        assert!(kbd.write_port_at(0x64, 0xaa, prefix));
+        assert!(kbd.write_port_at(ignored_port, 0xab, prefix + 1));
+        assert_ne!(kbd.read_port(0x64).unwrap() & STATUS_CMD, 0);
+        kbd.advance_master_ticks(prefix + CONTROLLER_INPUT_TICKS - 1);
+        assert_ne!(kbd.read_port(0x64).unwrap() & STATUS_IBF, 0);
+        kbd.advance_master_ticks(1);
+        assert_eq!(kbd.read_port(0x60), Some(0x55));
+        assert_eq!(kbd.read_port(0x64).unwrap() & STATUS_IBF, 0);
+    }
+}
+
+#[test]
+fn a_data_read_starts_the_next_wire_byte_at_its_access() {
+    let mut kbd = Keyboard8042::default();
+    kbd.push_scancodes(&[0x1e, 0x9e]);
+    kbd.advance_master_ticks(DEVICE_BYTE_TICKS);
+    assert_eq!(kbd.device_byte_ticks, None);
+    let prefix = DEVICE_BYTE_TICKS * 3;
+    assert_eq!(kbd.read_port_at(0x60, prefix), Some(0x1e));
+    assert_eq!(kbd.device_byte_ticks, Some(prefix + DEVICE_BYTE_TICKS));
+    kbd.read_port_at(0x64, prefix + 1);
+    kbd.read_port_at(0x60, prefix + 2);
+    assert_eq!(kbd.device_byte_ticks, Some(prefix + DEVICE_BYTE_TICKS));
+    kbd.advance_master_ticks(prefix + DEVICE_BYTE_TICKS - 1);
+    assert_eq!(kbd.read_port(0x64).unwrap() & STATUS_OBF, 0);
+    kbd.advance_master_ticks(1);
+    assert_eq!(kbd.read_port(0x60), Some(0x9e));
+}
+
+#[test]
+fn controller_reply_uses_one_input_origin_and_one_successor_wire_delay() {
+    let mut kbd = Keyboard8042::default();
+    let prefix = DEVICE_BYTE_TICKS * 2;
+    kbd.write_port_at(0x60, 0xee, prefix);
+    kbd.advance_master_ticks(prefix + CONTROLLER_INPUT_TICKS);
+    assert_eq!(kbd.read_port(0x64).unwrap() & (STATUS_IBF | STATUS_OBF), 0);
+    assert_eq!(kbd.device_byte_ticks, Some(DEVICE_BYTE_TICKS));
+    kbd.advance_master_ticks(DEVICE_BYTE_TICKS - 1);
+    assert_eq!(kbd.read_port(0x64).unwrap() & STATUS_OBF, 0);
+    kbd.advance_master_ticks(1);
+    assert_eq!(kbd.read_port(0x60), Some(0xee));
+}

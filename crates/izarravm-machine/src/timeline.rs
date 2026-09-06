@@ -5,6 +5,10 @@ use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, GswMode, MASTER_C
 
 use crate::timing::PIT_INPUT_HZ;
 
+/// Tariff unit at the 166 MHz accounting reference, not a literal FSB cycle.
+/// Board latency tariffs already include the modeled 66 MHz bus timing.
+pub(crate) const BUS_CLOCK_MASTER_TICKS: u64 = 33;
+
 const MICROSECOND_HZ: u64 = 1_000_000;
 pub(crate) const NANOSECOND_HZ: u64 = 1_000_000_000;
 /// Re-exported, not redeclared. Margo's frame rate is its own datasheet number
@@ -331,6 +335,7 @@ impl Timeline {
         master_ticks.div_ceil(self.ticks_per_cpu_clock)
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_cpu_clocks(
         &mut self,
         cpu_clocks: u64,
@@ -411,8 +416,12 @@ impl Timeline {
         advance
     }
 
+    #[cfg(test)]
     pub(crate) fn preview_cpu_clocks(self, cpu_clocks: u64, vga_dot_hz: u64) -> (u64, u64) {
-        let ticks = self.master_ticks_for_cpu_clocks(cpu_clocks);
+        self.preview_master_ticks(self.master_ticks_for_cpu_clocks(cpu_clocks), vga_dot_hz)
+    }
+
+    pub(crate) fn preview_master_ticks(self, ticks: u64, vga_dot_hz: u64) -> (u64, u64) {
         let mut pit = self.pit;
         let mut vga = self.vga;
         (
@@ -432,8 +441,7 @@ impl Timeline {
     /// Same arithmetic as the `microseconds` field of `advance_master_ticks`,
     /// run on a copy of the phase accumulator, so a peek and the real advance
     /// that follows it cannot disagree. `preview_cpu_clocks` is the precedent.
-    pub(crate) fn preview_microseconds(self, cpu_clocks: u64) -> u64 {
-        let ticks = self.master_ticks_for_cpu_clocks(cpu_clocks);
+    pub(crate) fn preview_microseconds_at_ticks(self, ticks: u64) -> u64 {
         let mut microseconds = self.microseconds;
         microseconds.advance(ticks, MICROSECOND_HZ)
     }
@@ -445,8 +453,7 @@ impl Timeline {
     /// follows it cannot disagree -- the fractional carry `RatePhase` holds is why
     /// this clones the accumulator instead of recomputing ns from a rate.
     /// `preview_microseconds` is the precedent.
-    pub(crate) fn preview_margo_nanoseconds(self, cpu_clocks: u64) -> u64 {
-        let ticks = self.master_ticks_for_cpu_clocks(cpu_clocks);
+    pub(crate) fn preview_margo_nanoseconds_at_ticks(self, ticks: u64) -> u64 {
         let mut margo = self.margo;
         margo.advance(ticks, NANOSECOND_HZ)
     }
@@ -474,10 +481,20 @@ impl Timeline {
     /// Runs on a COPY of the phase accumulator, like `preview_microseconds`, so
     /// a mid-batch peek and the real advance that follows it cannot disagree.
     pub(crate) fn preview_margo_scanout(self, cpu_clocks: u64, frame_dots: u64) -> MargoScanout {
+        self.preview_margo_scanout_at_ticks(
+            self.master_ticks_for_cpu_clocks(cpu_clocks),
+            frame_dots,
+        )
+    }
+
+    pub(crate) fn preview_margo_scanout_at_ticks(
+        self,
+        ticks: u64,
+        frame_dots: u64,
+    ) -> MargoScanout {
         if frame_dots == 0 {
             return MargoScanout { dots: 0, beam: 0 };
         }
-        let ticks = self.master_ticks_for_cpu_clocks(cpu_clocks);
         let mut margo_frame = self.margo_frame;
         let frames = margo_frame.advance(ticks, MARGO_FRAME_HZ);
         let beam =
@@ -547,10 +564,18 @@ impl Default for Timeline {
     }
 }
 
-fn exact_cpu_quantum(mode: GswMode) -> u64 {
+pub(crate) fn exact_cpu_quantum(mode: GswMode) -> u64 {
     mode.clock_rate()
         .master_ticks_per_clock()
         .expect("every GSW CPU rate must divide the master clock exactly")
+}
+
+/// Reference bus clocks projected into the active CPU's budget units.
+pub(crate) fn bus_timing(mode: GswMode) -> (u32, u32) {
+    (
+        BUS_CLOCK_MASTER_TICKS as u32,
+        exact_cpu_quantum(mode) as u32,
+    )
 }
 
 #[cfg(test)]

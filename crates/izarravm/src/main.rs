@@ -2260,17 +2260,9 @@ fn write_hdd_profile_json(
         "schema": "izarravm-hdd-profile-v2",
         "workload": workload.display().to_string(),
         "mode": mode.canonical_name(),
-        // The EFFECTIVE guest-clock model epoch this run used (`Machine::timing_epoch`, set
-        // once at construction from `IZARRAVM_TIMING_EPOCH`) -- not the static
-        // `izarravm_cpu::TIMING_MODEL_EPOCH` constant, so a harness epoch refusal (#843) sees
-        // `2` whenever the knob armed the port-io repricing, not the base `1`. Bumped whenever
-        // a change alters guest clocks charged per instruction for any persona; rt numbers
-        // recorded under different epochs are not comparable as performance.
+        // Current model identity for interpreting the recorded guest work and runtime.
         "timing_model_epoch": machine.timing_epoch(),
-        // Port accesses this run, by bus class (`izarravm_machine::PortBusClass`). Counted in
-        // BOTH epochs, so a P1 ladder leg can separate "this row makes fewer port accesses" from
-        // "the same accesses cost more" -- the accounting-closure check the design's section 6
-        // requires on every moved row. Diagnostic only; no emulation decision reads it.
+        // Port accesses by physical bus class.
         "port_accesses_by_class": port_accesses_by_class_json,
         // F14's `VL_WaitVBL` exit-rate instrument: vertical-retrace bit edges the guest observed
         // through its OWN 0x3DA/0x3BA reads, i.e. the number of times a retrace poll loop

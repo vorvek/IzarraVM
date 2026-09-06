@@ -361,10 +361,8 @@ pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus)
     let beam_at_batch_start = machine.scanout_beam_dots();
     let margo_scanout_at_batch_start = machine.vega.margo_scanout().is_some();
     let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
-    let (bus_num_at_batch_start, bus_den_at_batch_start) =
-        bus_timing(machine.cpu.level(), machine.timing_epoch);
-    let l1_charges_folded =
-        crate::bus::l1_charges_folded(machine.active_mode, machine.timing_epoch);
+    let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.active_mode);
+    let l1_charges_folded = crate::bus::l1_charges_folded(machine.active_mode);
     let icache_fetch_clocks = if l1_charges_folded {
         0
     } else {
@@ -399,6 +397,7 @@ pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus)
         inta_diag: &mut machine.inta_diag,
         fdc: &mut machine.fdc,
         opl: &mut machine.opl,
+        opl_timer_advance_credit_us: &mut machine.opl_timer_advance_credit_us,
         sb16: &mut machine.sb16,
         wavetable_mpu: &mut machine.wavetable_mpu,
         midi_mpu: &mut machine.midi_mpu,
@@ -431,12 +430,10 @@ pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus)
         device_free_extended_floor,
         extended_ram_screen: crate::bus::extended_ram_screen_enabled(),
         lazy_port_reads: machine.active_mode.uses_approximate_timing(),
-        isa_io_wait: crate::bus::isa_io_wait_armed(),
         charge_port_timing: true,
-        timing_epoch: machine.timing_epoch,
         poll_skip_certificate: &machine.poll_skip_certificate,
         retrace_poll: &mut machine.retrace_poll,
-        string_port_element_bytes: 0,
+        port_transaction_active: false,
         test_string_port_observations: &mut machine.test_string_port_observations,
         lazy_ports_386: crate::bus::lazy_ports_386_for(machine.active_mode),
         io_touched: &mut machine.io_touched,

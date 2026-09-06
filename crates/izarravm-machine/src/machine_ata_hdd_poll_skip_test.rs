@@ -472,17 +472,6 @@ fn ata_hdd_poll_skip_carries_a_guest_poll_loop_through_the_run_loop() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 6. Slice 9C follow-up: the skip fires on a REAL command, not only via the
-//    `schedule_test_pending` seam. The raw ATA task-file path is untouched by
-//    9C's seek/rotational/drive-buffer model (design row: 9C scopes that
-//    model to the BIOS INT 13h path only), so a single-sector READ SECTORS's
-//    deadline is `pio_transfer_ticks(1)` -- ~30.6 us of cable-rate transfer,
-//    already above `ATA_POLL_FLOOR_TICKS` (20 us) even under today's
-//    unchanged `COMMAND_LATENCY_TICKS = 0`. Only the `ata` family's ARM gate
-//    (in bus.rs) was ever untested end to end with a genuine command.
-// ---------------------------------------------------------------------------
-
 /// Program a real LBA28 READ SECTORS (0x20) through the task-file ports, the
 /// way a driver actually would -- no test seam.
 fn issue_real_read_sectors(machine: &mut Machine, lba: u32) {
@@ -499,7 +488,7 @@ fn issue_real_read_sectors(machine: &mut Machine, lba: u32) {
 }
 
 #[test]
-fn ata_hdd_poll_skip_fires_on_a_real_read_sectors_command_under_the_profile() {
+fn ata_hdd_poll_skip_declines_a_real_read_below_the_floor() {
     let mut machine = hdd_machine(true);
     issue_real_read_sectors(&mut machine, 1);
     let deadline = machine
@@ -508,32 +497,35 @@ fn ata_hdd_poll_skip_fires_on_a_real_read_sectors_command_under_the_profile() {
         .and_then(ata::AtaDisk::ticks_until_completion)
         .expect("READ SECTORS schedules a pending completion");
     assert!(
-        deadline >= ata::ATA_POLL_FLOOR_TICKS,
-        "VACUOUS unless a real single-sector PIO deadline already clears the \
-         floor: deadline={deadline} floor={}",
+        deadline < ata::ATA_POLL_FLOOR_TICKS,
+        "the command-ready deadline must remain below the skip floor: deadline={deadline} floor={}",
         ata::ATA_POLL_FLOOR_TICKS
     );
 
     poll_alt_status(&mut machine, ata::ATA_POLL_RUN);
     assert!(
-        machine.ata_hdd_poll_skip_armed,
-        "the arm fires on a genuine command, not only via the test seam"
+        !machine.ata_hdd_poll_skip_armed,
+        "a below-floor command must not arm a skip"
     );
 
     let before = machine.master_ticks();
     machine.actuate_ata_hdd_poll_skip(before + deadline * 8, false);
 
-    assert_eq!(
-        machine.master_ticks() - before,
-        deadline,
-        "one span, landing exactly on the completion"
-    );
+    assert_eq!(machine.master_ticks(), before);
     let c = counters(&machine);
-    assert_eq!(c.skips, 1);
-    assert_eq!(c.skipped_ticks, deadline);
+    assert_eq!(c.skips, 0);
+    assert_eq!(c.skipped_ticks, 0);
+    machine.advance_devices_ticks(deadline - 1);
+    assert_ne!(input(&mut machine, ata::PRIMARY_CTRL) & STATUS_BSY, 0);
+    machine.advance_devices_ticks(1);
     assert_eq!(
         input(&mut machine, ata::PRIMARY_CTRL) & STATUS_BSY,
         0,
-        "BSY clears exactly as it would have spinning"
+        "BSY clears at the real command-ready edge"
+    );
+    assert_ne!(
+        input(&mut machine, ata::PRIMARY_CTRL) & 0x08,
+        0,
+        "DRQ is ready"
     );
 }

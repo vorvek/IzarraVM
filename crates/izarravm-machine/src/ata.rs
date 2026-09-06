@@ -46,19 +46,17 @@ pub const SECTOR: usize = 512;
 /// the only image-dependent value.
 const HEADS: u32 = 16;
 const SECTORS_PER_TRACK: u32 = 63;
-/// Fixed per-command overhead before the first byte moves.
-///
-/// ZERO by design. The Izarra3000's storage profile is "16.7 MB/s of data on
-/// command": the machine's disk is host-backed and has no platter, no head and no
-/// rotational position, so there is nothing for a seek-and-settle charge to
-/// model. It was 100 us, and that number dominated: 98.7% of the guest's
-/// fixed-disk reads in a Duke Nukem 3D load are SINGLE-SECTOR, where 100 us of
-/// latency against 30.6 us of transfer made the effective rate 3.9 MB/s -- a
-/// four-fold understatement of the spec the rest of the model implements. Kept as
-/// a named constant, not deleted, because it is where a future drive model with
-/// real geometry would put its seek time.
+/// Nominal command latency for the default host-backed ATA profile. A zero
+/// duration still schedules a one-tick ready edge. Data-port transfers cost
+/// 20 board-reference clocks per word; the optional ATA profile adds media time.
 const COMMAND_LATENCY_TICKS: u64 = 0;
-const PIO_BYTES_PER_SECOND: u64 = 16_700_000;
+// A zero nominal latency still schedules a positive completion edge.
+const COMMAND_READY_TICKS: u64 = 1;
+pub(crate) const PIO_WORD_REFERENCE_CLOCKS: u64 = 20;
+
+pub(crate) fn pio_cable_ticks(words: u64) -> u64 {
+    words.saturating_mul(PIO_WORD_REFERENCE_CLOCKS * crate::timeline::BUS_CLOCK_MASTER_TICKS)
+}
 const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 
 // ---------------------------------------------------------------------------
@@ -127,32 +125,16 @@ pub(crate) const ATA_POLL_RUN: u32 = 16;
 pub(crate) const ATA_POLL_FLOOR_TICKS: u64 = MASTER_CLOCK_HZ / 50_000;
 
 fn pio_sector_ticks() -> u64 {
-    (SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(PIO_BYTES_PER_SECOND as u128) as u64
+    pio_cable_ticks((SECTOR / 2) as u64)
 }
 
-/// Time from command acceptance through the final sector boundary for a PIO
-/// media transfer. The BIOS fixed-disk path uses the same disk and deadline as
-/// the ATA task-file path, without charging for guest data-port instructions.
+/// HLE substitutes the modeled transfer for a guest data-port stream.
+#[cfg(test)]
 pub(crate) fn pio_transfer_ticks(sectors: u32) -> u64 {
-    pio_transfer_ticks_cached(sectors, 0)
-}
-
-/// The same charge, less the sectors that came out of the host-side sector cache.
-///
-/// A cache hit charges NOTHING. The medium was never touched: no command was
-/// issued, no bytes crossed the cable, and the bytes were already in host memory.
-/// That is the same accounting SMARTDRV's INT 13h hook produced on real hardware,
-/// where a hit returned without the drive ever seeing the request, and it is the
-/// only charge that keeps the model's story straight -- charging a fraction of a
-/// transfer for a transfer that did not happen would be a number with nothing
-/// behind it. `hits` is clamped to `sectors` so a miscounted delta can only ever
-/// under-credit.
-pub(crate) fn pio_transfer_ticks_cached(sectors: u32, hits: u32) -> u64 {
     if sectors == 0 {
         return 0;
     }
-    let charged = u64::from(sectors.saturating_sub(hits.min(sectors)));
-    COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(charged))
+    COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(u64::from(sectors)))
 }
 
 pub(crate) fn dma_transfer_ticks(request: AtaDmaRequest) -> u64 {
@@ -381,10 +363,8 @@ pub struct AtaDisk {
     last_transfer_end_lba: Option<u32>,
 }
 
-/// Whether new disks get a live sector cache. Read once per disk from
-/// `IZARRAVM_HDD_CACHE`; the default is ON because a host-backed disk really is
-/// instant and the cache is what makes the charged model say so on a re-read.
-/// `=0` is the A/B control leg.
+/// Enable the host-sector cache by default; IZARRAVM_HDD_CACHE=0 disables it.
+/// Cache residency changes host work and counters, never guest transfer time.
 fn sector_cache_enabled() -> bool {
     std::env::var("IZARRAVM_HDD_CACHE").as_deref() != Ok("0")
 }
@@ -579,7 +559,7 @@ impl AtaDisk {
         // The host-side sector cache sits HERE, under every addressing form, so
         // CHS, LBA28 and EDD share one residency set and one hit/miss counter.
         // A hit skips the backing entirely; the caller reads the counter delta to
-        // learn what to charge (see `pio_transfer_ticks_cached`).
+        // learn what to charge (see `pio_transfer_ticks`).
         //
         // CHARGE ASYMMETRY, deliberate: only the BIOS fixed-disk service reads
         // that delta. The ATA task-file and BMIDE DMA paths take cache hits for
@@ -863,36 +843,15 @@ impl AtaDisk {
         linear.max(SEEK_TRACK_TO_TRACK_TICKS)
     }
 
-    /// The guest-visible PIO transfer charge for `sectors` sectors starting
-    /// at `lba`, less the `hits` the host-side sector cache already served
-    /// (identical role to `pio_transfer_ticks_cached`'s `hits`: a cache hit
-    /// charges NOTHING, because on real hardware SMARTDRV's hook returned
-    /// before the drive ever saw the request).
-    ///
-    /// With `DeviceTimingProfile::ata` UNARMED this is BYTE-IDENTICAL to
-    /// `pio_transfer_ticks_cached`'s pre-9C formula, and touches neither
-    /// `head_lba` nor `last_transfer_end_lba` -- the whole seek/buffer model
-    /// stays dark, matching every other slice-9 family.
-    ///
-    /// Armed, the charge separates the HOST sector cache (still zero-cost,
-    /// per `hits` above -- design §5 risk 1: the host cache is a host-time
-    /// avoider, real machines never had one) from the modelled DRIVE buffer
-    /// (`DRIVE_BUFFER_BYTES`, a guest-time thing, §5 risk 2): a request whose
-    /// start LBA continues immediately where the last charged transfer left
-    /// off is a SEQUENTIAL CONTINUATION and costs only `COMMAND_LATENCY_
-    /// TICKS_PERIOD` plus a cable-burst transfer (up to the buffer's own
-    /// size, beyond which the drive falls back to the sustained rate); any
-    /// other request is COLD -- it pays seek plus rotational latency, and
-    /// every byte comes off the platter at the sustained media rate, because
-    /// nothing was staged for it.
+    /// Charge completed guest sectors. Host-cache residency affects host work only.
+    /// The optional medium model updates its head once at this owner.
     pub(crate) fn charge_pio_transfer(
         &mut self,
         lba: u32,
         sectors: u32,
-        hits: u32,
         profile: DeviceTimingProfile,
     ) -> u64 {
-        let breakdown = self.pio_transfer_breakdown_impl(lba, sectors, hits, profile);
+        let breakdown = self.pio_transfer_breakdown_impl(lba, sectors, profile);
         if profile.ata && breakdown.charged_sectors > 0 {
             self.head_lba = lba.saturating_add(sectors);
             self.last_transfer_end_lba = Some(self.head_lba);
@@ -912,10 +871,9 @@ impl AtaDisk {
         &self,
         lba: u32,
         sectors: u32,
-        hits: u32,
         profile: DeviceTimingProfile,
     ) -> PioChargeBreakdown {
-        self.pio_transfer_breakdown_impl(lba, sectors, hits, profile)
+        self.pio_transfer_breakdown_impl(lba, sectors, profile)
     }
 
     /// Shared, side-effect-free computation behind both `charge_pio_transfer`
@@ -926,13 +884,12 @@ impl AtaDisk {
         &self,
         lba: u32,
         sectors: u32,
-        hits: u32,
         profile: DeviceTimingProfile,
     ) -> PioChargeBreakdown {
         if sectors == 0 {
             return PioChargeBreakdown::default();
         }
-        let charged = u64::from(sectors.saturating_sub(hits.min(sectors)));
+        let charged = u64::from(sectors);
         if !profile.ata {
             return PioChargeBreakdown {
                 command_ticks: COMMAND_LATENCY_TICKS,
@@ -941,11 +898,7 @@ impl AtaDisk {
                 ..PioChargeBreakdown::default()
             };
         }
-        if charged == 0 {
-            // A fully host-cached transfer never touched the modelled drive
-            // either: no command, no seek, no buffer-state move.
-            return PioChargeBreakdown::default();
-        }
+
         let sequential = self.last_transfer_end_lba == Some(lba);
         let (seek_ticks, rotation_ticks) = if sequential {
             (0, 0)
@@ -961,8 +914,7 @@ impl AtaDisk {
         } else {
             (0, bytes)
         };
-        let cable_ticks = (u128::from(cable_bytes) * u128::from(MASTER_CLOCK_HZ))
-            .div_ceil(u128::from(PIO_BYTES_PER_SECOND)) as u64;
+        let cable_ticks = pio_cable_ticks(cable_bytes.div_ceil(2));
         let media_ticks = (u128::from(media_bytes) * u128::from(MASTER_CLOCK_HZ))
             .div_ceil(u128::from(MEDIA_BYTES_PER_SECOND)) as u64;
         PioChargeBreakdown {
@@ -982,7 +934,12 @@ impl AtaDisk {
 
     /// Read one byte from a channel port. The data register drains the read
     /// buffer; the rest return their task-file values.
+    #[cfg(test)]
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
+        self.read_port_at(port, 0)
+    }
+
+    pub fn read_port_at(&mut self, port: u16, prefix_ticks: u64) -> Option<u8> {
         if port == PRIMARY_CTRL {
             // Alt status: the status register without clearing the IRQ latch.
             return Some(self.status);
@@ -999,7 +956,7 @@ impl AtaDisk {
         self.reset_alt_status_run();
         let reg = port - PRIMARY_CMD_BASE;
         let value = match reg {
-            0 => self.read_data_byte(),
+            0 => self.read_data_byte(prefix_ticks),
             1 => self.error,
             2 => self.sector_count,
             3 => self.lba_low,
@@ -1019,7 +976,12 @@ impl AtaDisk {
 
     /// Write one byte to a channel port. Word writes to the data register split
     /// into two byte writes at the bus layer, so the PIO buffer is byte-fed.
+    #[cfg(test)]
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
+        self.write_port_at(port, value, 0)
+    }
+
+    pub fn write_port_at(&mut self, port: u16, value: u8, prefix_ticks: u64) -> bool {
         // A write is not a poll, and a control-port write can trigger SRST,
         // which clears `pending_command` mid-batch -- mirroring
         // `ide::IdeChannel::write_port`'s two guards. Ordering is
@@ -1044,14 +1006,14 @@ impl AtaDisk {
             return true;
         }
         match reg {
-            0 => self.write_data_byte(value),
+            0 => self.write_data_byte(value, prefix_ticks),
             1 => self.features = value,
             2 => self.sector_count = value,
             3 => self.lba_low = value,
             4 => self.lba_mid = value,
             5 => self.lba_high = value,
             6 => self.drive_head = value,
-            7 => self.write_command(value),
+            7 => self.write_command(value, prefix_ticks),
             _ => {}
         }
         true
@@ -1102,7 +1064,7 @@ impl AtaDisk {
         Some((lba, count))
     }
 
-    fn write_command(&mut self, command: u8) {
+    fn write_command(&mut self, command: u8, prefix_ticks: u64) {
         // The command register is not accepted while a command or PIO buffer is
         // in flight. SRST remains available through the control port.
         if self.dma_request.is_some() || self.pending_command.is_some() || self.phase != Phase::Idle
@@ -1111,57 +1073,92 @@ impl AtaDisk {
         }
         if !self.master_selected() {
             // No slave device: any command to it aborts after command latency.
-            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
+            self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks);
             return;
         }
         match command {
-            0xEC => self.schedule(PendingAction::PrepareIdentify, COMMAND_LATENCY_TICKS),
-            0x20 | 0x21 => self.read_sectors(),
-            0x30 | 0x31 => self.write_sectors(),
+            0xEC => self.schedule_at(
+                PendingAction::PrepareIdentify,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
+            0x20 | 0x21 => self.read_sectors(prefix_ticks),
+            0x30 | 0x31 => self.write_sectors(prefix_ticks),
             0xC8 | 0xC9 => self.begin_dma(AtaDmaDirection::DeviceToMemory),
             0xCA | 0xCB => self.begin_dma(AtaDmaDirection::MemoryToDevice),
             // READ/WRITE MULTIPLE behave like the single-sector PIO forms here:
             // the model has no per-block interrupt, so each sector still drains
             // through the data port. Limit: no multi-count block size, lift by
             // honoring the SET MULTIPLE MODE block and interrupting per block.
-            0xC4 => self.read_sectors(),
-            0xC5 => self.write_sectors(),
+            0xC4 => self.read_sectors(prefix_ticks),
+            0xC5 => self.write_sectors(prefix_ticks),
             // RECALIBRATE (0x10-0x1F): seek to cylinder 0, complete with DSC.
-            0x10..=0x1F => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
+            0x10..=0x1F => self.schedule_at(
+                PendingAction::CompleteOk,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
             // SEEK (0x70-0x7F): the HLE medium has no mechanical head state.
-            0x70..=0x7F => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
+            0x70..=0x7F => self.schedule_at(
+                PendingAction::CompleteOk,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
             // INITIALIZE DEVICE PARAMETERS (0x91): set the logical CHS the host
             // wants. sector_count = sectors per track, drive_head low nibble + 1
             // = heads. Accept and ack.
-            0x91 => self.schedule(
+            0x91 => self.schedule_at(
                 PendingAction::Initialize {
                     sectors: self.sector_count,
                     heads: (self.drive_head & 0x0F) + 1,
                 },
                 COMMAND_LATENCY_TICKS,
+                prefix_ticks,
             ),
             // SET FEATURES (0xEF): transfer-mode selection is guest-visible in
             // IDENTIFY. Other established feature toggles remain acknowledged.
-            0xEF => self.schedule(
+            0xEF => self.schedule_at(
                 PendingAction::SetFeatures {
                     feature: self.features,
                     mode: self.sector_count,
                 },
                 COMMAND_LATENCY_TICKS,
+                prefix_ticks,
             ),
             // EXECUTE DEVICE DIAGNOSTIC (0x90): report device 0 passed (0x01).
-            0x90 => self.schedule(PendingAction::Diagnostic, COMMAND_LATENCY_TICKS),
+            0x90 => self.schedule_at(
+                PendingAction::Diagnostic,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
             // CHECK POWER MODE reports active. IDLE and STANDBY have no mechanical
             // state; FLUSH CACHE projects metadata and flushes host-file handles.
-            0xE5 => self.schedule(PendingAction::CheckPower, COMMAND_LATENCY_TICKS),
-            0xE2 | 0xE3 => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
-            0xE7 => self.schedule(PendingAction::FlushCache, COMMAND_LATENCY_TICKS),
+            0xE5 => self.schedule_at(
+                PendingAction::CheckPower,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
+            0xE2 | 0xE3 => self.schedule_at(
+                PendingAction::CompleteOk,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
+            0xE7 => self.schedule_at(
+                PendingAction::FlushCache,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            ),
             // NOP (0x00) always aborts on hardware, never a silent success.
-            _ => self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS),
+            _ => self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks),
         }
     }
 
+    #[cfg(test)]
     fn schedule(&mut self, action: PendingAction, ticks: u64) {
+        self.schedule_at(action, ticks, 0);
+    }
+
+    fn schedule_at(&mut self, action: PendingAction, ticks: u64, prefix_ticks: u64) {
         // A NEW pending command gets a fresh chance at the skip: the latch
         // bounds ONE wasted batch break per command, mirroring
         // `ide::IdeChannel::schedule`.
@@ -1171,7 +1168,7 @@ impl AtaDisk {
         self.error = 0;
         self.irq_pending = false;
         self.pending_command = Some(PendingCommand {
-            ticks_remaining: ticks.max(1),
+            ticks_remaining: prefix_ticks.saturating_add(ticks.max(1)),
             action,
         });
     }
@@ -1282,20 +1279,24 @@ impl AtaDisk {
     }
 
     /// READ SECTORS validates the task file, then schedules the first sector.
-    fn read_sectors(&mut self) {
+    fn read_sectors(&mut self, prefix_ticks: u64) {
         let Some((lba, count)) = self.command_lba() else {
-            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
+            self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks);
             return;
         };
         let end = lba.saturating_add(count);
         if end > self.total_sectors() {
-            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
+            self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks);
             return;
         }
         self.pio_lba = lba;
         self.pio_sectors_remaining = count;
         self.last_access_bytes = 0;
-        self.schedule(PendingAction::PrepareRead, pio_transfer_ticks(1));
+        self.schedule_at(
+            PendingAction::PrepareRead,
+            COMMAND_LATENCY_TICKS,
+            prefix_ticks,
+        );
     }
 
     /// DELIBERATELY UNBATCHED. The other read paths declare their whole range
@@ -1335,20 +1336,24 @@ impl AtaDisk {
     }
 
     /// WRITE SECTORS validates the task file, then schedules the first DRQ.
-    fn write_sectors(&mut self) {
+    fn write_sectors(&mut self, prefix_ticks: u64) {
         let Some((lba, count)) = self.command_lba() else {
-            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
+            self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks);
             return;
         };
         let end = lba.saturating_add(count);
         if end > self.total_sectors() {
-            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
+            self.schedule_at(PendingAction::Abort, COMMAND_LATENCY_TICKS, prefix_ticks);
             return;
         }
         self.pio_lba = lba;
         self.pio_sectors_remaining = count;
         self.last_access_bytes = 0;
-        self.schedule(PendingAction::PrepareWrite, COMMAND_LATENCY_TICKS);
+        self.schedule_at(
+            PendingAction::PrepareWrite,
+            COMMAND_LATENCY_TICKS,
+            prefix_ticks,
+        );
     }
 
     fn prepare_write_sector(&mut self, raise_irq: bool) {
@@ -1498,7 +1503,7 @@ impl AtaDisk {
         }
     }
 
-    fn read_data_byte(&mut self) -> u8 {
+    fn read_data_byte(&mut self, prefix_ticks: u64) -> u8 {
         if self.phase != Phase::DataIn {
             return 0;
         }
@@ -1513,13 +1518,17 @@ impl AtaDisk {
                 self.advance_pio_task_file();
             }
             if self.pio_sectors_remaining > 0 {
-                self.schedule(PendingAction::PrepareRead, pio_sector_ticks());
+                self.schedule_at(
+                    PendingAction::PrepareRead,
+                    COMMAND_LATENCY_TICKS,
+                    prefix_ticks,
+                );
             } else {
                 let sectors = self.last_access_bytes / SECTOR;
                 self.note_guest_read_batch(
                     crate::katea_tree::GuestStorageRoute::Pio,
                     sectors as u64,
-                    pio_transfer_ticks(sectors as u32),
+                    COMMAND_READY_TICKS.saturating_mul(sectors as u64),
                 );
                 self.status = status::DRDY | status::DSC;
             }
@@ -1527,7 +1536,7 @@ impl AtaDisk {
         byte
     }
 
-    fn write_data_byte(&mut self, value: u8) {
+    fn write_data_byte(&mut self, value: u8, prefix_ticks: u64) {
         if self.phase != Phase::DataOut {
             return;
         }
@@ -1537,7 +1546,11 @@ impl AtaDisk {
         }
         if self.buffer_pos >= self.buffer.len() {
             self.phase = Phase::Idle;
-            self.schedule(PendingAction::CommitWrite, pio_sector_ticks());
+            self.schedule_at(
+                PendingAction::CommitWrite,
+                COMMAND_LATENCY_TICKS,
+                prefix_ticks,
+            );
         }
     }
 
@@ -1562,7 +1575,7 @@ impl AtaDisk {
             let sectors = self.last_access_bytes / SECTOR;
             self.note_guest_write_wait(
                 crate::katea_tree::GuestStorageRoute::Pio,
-                pio_transfer_ticks(sectors as u32),
+                COMMAND_READY_TICKS.saturating_mul(sectors as u64 + 1),
             );
             if self.commit_guest_write_batch(crate::katea_tree::GuestWriteRoute::Pio)
                 == crate::katea_tree::CommitGuestWriteResult::HostIoFailure

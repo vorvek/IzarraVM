@@ -144,7 +144,6 @@ fn native_task_gate_fixture(
 
     let mut cpu = CpuGsw::default();
     cpu.set_mode(mode);
-    cpu.set_timing_epoch(2);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers
         .set_segment(SegmentIndex::Cs, SegmentRegister::flat(SEL_CODE, 0x9b));
@@ -178,7 +177,6 @@ fn native_task_gate_fixture(
     cpu.set_eip(ENTRY);
 
     let mut bus = sixteen_bit_bus(memory);
-    bus.timing_epoch_two = true;
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0, 0x1000]);
     warm_sixteen_bit(
         &mut cpu,
