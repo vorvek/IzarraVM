@@ -1326,7 +1326,12 @@ fn a_mode_set_leaves_no_presented_frame_until_the_next_raster_completes() {
 #[test]
 fn a_presented_frame_is_never_smaller_than_a_real_video_mode() {
     let mut machine = test_machine();
-    for mode in [0x13u8, 0x0D, 0x12, 0x10] {
+    for (mode, expected) in [
+        (0x13u8, (320, 400)),
+        (0x0D, (320, 400)),
+        (0x12, (640, 480)),
+        (0x10, (640, 350)),
+    ] {
         assert!(machine.set_vga_mode(mode), "mode {mode:#04x}");
         // Sample across the whole frame, including the window right after the
         // mode set where the old code substituted a one-pixel image.
@@ -1343,6 +1348,11 @@ fn a_presented_frame_is_never_smaller_than_a_real_video_mode() {
                 assert_eq!(words.len(), width * height);
             }
         }
+        let (words, width, height) = machine
+            .presented_frame_argb()
+            .unwrap_or_else(|| panic!("mode {mode:#04x} produced no completed frame"));
+        assert_eq!((width, height), expected, "mode {mode:#04x}");
+        assert_eq!(words.len(), width * height);
     }
 }
 

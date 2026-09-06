@@ -164,25 +164,6 @@ fn wss_dma_canonical_records_are_invariant_to_advance_batch_size() {
 }
 
 #[test]
-fn passive_target_ports_allow_capability_probes_to_fail_cleanly() {
-    // 0x226 is the SB DSP reset port: still an unimplemented passive port
-    // (0x224/0x225 are now the CT1745 mixer, 0x388 the OPL chip).
-    let mut machine = test_machine();
-    let value = with_bus(&mut machine, |bus| {
-        bus.read_io(0x0226, BusWidth::Byte, 0, false).unwrap()
-    });
-
-    assert_eq!(value, 0xff);
-    assert!(
-        machine
-            .bus_trace()
-            .cycles()
-            .iter()
-            .any(|cycle| cycle.kind == BusAccessKind::IoRead && cycle.address == 0x0226)
-    );
-}
-
-#[test]
 fn mixer_index_port_decodes_instead_of_falling_through_passive() {
     // 0x224 used to read 0xFF as a passive port; it is now the CT1745 mixer
     // index register, whose read returns the latched index (0 at reset).

@@ -64,9 +64,38 @@ fn drops_steps_the_budget_would_never_reach() {
 
 #[test]
 fn round_trips_through_the_recipe_file_format() {
-    let json = serde_json::to_string(&Recipe::generic()).expect("serialize");
-    let back: Recipe = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back.keys.len(), Recipe::generic().keys.len());
+    let recipe = Recipe {
+        notes: "menu and mouse setup".to_string(),
+        keys: vec![KeyStep {
+            guest_ms: 1234,
+            text: "{esc}\\r".to_string(),
+        }],
+        mouse: vec![MouseStep {
+            guest_ms: 5678,
+            action: "move:-5,12".to_string(),
+        }],
+    };
+    let encoded = serde_json::to_value(&recipe).expect("serialize");
+    assert_eq!(
+        encoded,
+        serde_json::json!({
+            "notes": "menu and mouse setup",
+            "keys": [{"guest_ms": 1234, "text": "{esc}\\r"}],
+            "mouse": [{"guest_ms": 5678, "action": "move:-5,12"}]
+        })
+    );
+    let back: Recipe = serde_json::from_value(encoded).expect("deserialize");
+    assert_eq!(back.notes, "menu and mouse setup");
+    assert_eq!(back.keys.len(), 1);
+    assert_eq!(
+        (back.keys[0].guest_ms, back.keys[0].text.as_str()),
+        (1234, "{esc}\\r")
+    );
+    assert_eq!(back.mouse.len(), 1);
+    assert_eq!(
+        (back.mouse[0].guest_ms, back.mouse[0].action.as_str()),
+        (5678, "move:-5,12")
+    );
 }
 
 #[test]

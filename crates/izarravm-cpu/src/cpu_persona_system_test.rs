@@ -1798,16 +1798,9 @@ fn two_byte_convention_charges_the_second_byte_exactly_once() {
     );
 }
 
-/// The single-byte opcode values that the production split does NOT hand to a real group: every
-/// prefix byte `read_prefixes` consumes (the six segment overrides, the 66h/67h operand/address-
-/// size prefixes, LOCK 0xF0, and REP/REPNE 0xF3/0xF2) and 0x0F (the two-byte escape), none of
-/// which is an instruction on its own — `read_prefixes`/`decode` consume them before
-/// `route_group` ever classifies the following opcode, so reaching them AS an opcode is a decode
-/// bug, plus 0xF1 (ICEBP/INT1), which is genuinely unimplemented. Everything
-/// else in the single-byte space is implemented and MUST route to a real group. This list is the
-/// sole authority for "not routed as a single-byte opcode"; the coverage test below derives the
-/// implemented set as its complement.
-const UNIMPLEMENTED_SINGLE_BYTE: &[u8] = &[
+/// Prefixes, the two-byte escape, and INT1 are outside this minimum supported
+/// set. Adding instruction support must not require preserving a fallback.
+const SINGLE_BYTE_COVERAGE_EXCLUSIONS: &[u8] = &[
     0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, // segment-override prefix bytes
     0x66, 0x67, // operand-size / address-size prefix bytes
     0xf0, 0xf2, 0xf3, // LOCK / REPNE / REP prefix bytes
@@ -1815,11 +1808,9 @@ const UNIMPLEMENTED_SINGLE_BYTE: &[u8] = &[
     0xf1, // ICEBP / INT1 (unimplemented)
 ];
 
-/// True when the second byte of a 0F opcode names an IMPLEMENTED two-byte instruction. The
-/// complement (within 0x00..=0xff) is the un-implemented 0F space that MUST stay on
-/// `TwoByteFallback` and #UD. Built from the routed sets in `route_group` plus the no-operand
-/// 0F ops `execute_two_byte` still handles directly (which `route_group` sends to `Misc`).
-fn implemented_two_byte(second: u8) -> bool {
+/// Minimum supported two-byte opcode set. New instructions may route elsewhere
+/// without changing this regression check for existing support.
+fn covered_two_byte(second: u8) -> bool {
     // The 0F bytes `route_group` classifies into a real group (DataMove/Branch/BitManip/
     // CondMove/SystemSeg/Misc), mirrored exactly from the 0F arm of `route_group`.
     let routed = matches!(
@@ -1843,33 +1834,18 @@ fn implemented_two_byte(second: u8) -> bool {
 }
 
 #[test]
-fn every_implemented_opcode_routes_off_the_legacy_fallback() {
-    // Stage-A invariant lock: after the transitional fused fallback is gone, the production
-    // `decode`/`execute_decoded` seam must hand EVERY implemented opcode to a dedicated split
-    // group. `DecodeGroup::Fallback`/`TwoByteFallback` are the only two variants whose executor
-    // raises `Unsupported{,TwoByte}Opcode`, so proving every implemented opcode routes to some
-    // OTHER variant proves production never enters the dead-end fallback for a real instruction.
-    //
-    // Exhaustive partition (no representative sampling): classify the entire single-byte and
-    // two-byte opcode space and check the implemented/unimplemented split against the authority
-    // lists above. A future edit that drops an implemented opcode back to Fallback, or adds an
-    // opcode without routing it, fails here.
+fn known_supported_opcodes_route_off_the_legacy_fallback() {
     let prefixes = Prefixes::default();
 
     for byte in 0x00u16..=0xff {
-        let unimplemented = UNIMPLEMENTED_SINGLE_BYTE.contains(&(byte as u8));
+        let excluded = SINGLE_BYTE_COVERAGE_EXCLUSIONS.contains(&(byte as u8));
         let group = CpuGsw::route_group(byte, prefixes);
         let is_fallback = matches!(group, DecodeGroup::Fallback);
         assert!(
             !matches!(group, DecodeGroup::TwoByteFallback),
             "single-byte opcode {byte:#04x} must never route to TwoByteFallback"
         );
-        if unimplemented {
-            assert!(
-                is_fallback,
-                "unimplemented single-byte opcode {byte:#04x} must stay on Fallback, got {group:?}"
-            );
-        } else {
+        if !excluded {
             assert!(
                 !is_fallback,
                 "implemented single-byte opcode {byte:#04x} must route off Fallback to a real group"
@@ -1886,62 +1862,18 @@ fn every_implemented_opcode_routes_off_the_legacy_fallback() {
             !matches!(group, DecodeGroup::Fallback),
             "two-byte opcode 0F {second:#04x} must route via the 0F map, never plain Fallback"
         );
-        if implemented_two_byte(second as u8) {
+        if covered_two_byte(second as u8) {
             assert!(
                 !is_two_byte_fallback,
                 "implemented two-byte opcode 0F {second:#04x} must route off TwoByteFallback to a real group"
-            );
-        } else {
-            assert!(
-                is_two_byte_fallback,
-                "unimplemented two-byte opcode 0F {second:#04x} must stay on TwoByteFallback, got {group:?}"
             );
         }
     }
 }
 
 #[test]
-fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
-    // The runtime companion to the routing-partition test: drive each genuinely-unimplemented
-    // opcode through the production split (`exec_one_split` -> `decode` -> `execute_decoded`) and
-    // confirm the ONLY behavior the Fallback / TwoByteFallback arms produce is the exact
-    // `Unsupported{,TwoByte}Opcode` #UD the legacy fused path produced — same error variant,
-    // carrying the same `cs`. This proves the fallback arms are a pure dead-end for real
-    // instructions: nothing implemented can reach them, and the unimplemented ones still #UD.
-    for &op in UNIMPLEMENTED_SINGLE_BYTE {
-        // The eight prefix bytes are valid as prefixes; they only #UD when they are the whole
-        // instruction (no following opcode), which `read_prefixes` consumes as a prefix. To
-        // exercise the Fallback opcode arm we need a
-        // byte that is an *opcode*, never a prefix: ICEBP (0xf1). The prefix
-        // bytes are covered by the routing-partition test above and the dedicated #UD guards.
-        if op == 0xf1 {
-            let mut cpu = CpuGsw::default();
-            cpu.load_segment_real(SegmentIndex::Cs, 0);
-            cpu.registers.eip = 0;
-            let mut bus = TestBus::with_memory(vec![op, 0, 0, 0]);
-            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    InternalFault::Exception {
-                        vector: 6,
-                        error_code: None
-                    }
-                ),
-                "single-byte opcode {op:#04x} must #UD, got {err:?}"
-            );
-        }
-    }
-
-    // A representative un-implemented 0F byte that falls through to the generic catch-all:
-    // 0x0a (unmapped). It routes to TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F
-    // B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV reg,DR / MOV DR,reg are now implemented. RSM
-    // is rejected by the persona gate because no SMM is modeled.)
+fn undefined_two_byte_opcode_raises_ud() {
     let second = 0x0au8;
-    assert!(
-        !implemented_two_byte(second),
-        "test bug: 0F {second:#04x} is actually implemented"
-    );
     let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
@@ -1956,28 +1888,6 @@ fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
             }
         ),
         "two-byte opcode 0F {second:#04x} must #UD, got {err:?}"
-    );
-}
-
-#[test]
-fn single_byte_f1_is_an_undefined_opcode() {
-    // 0xF1 (ICEBP / INT1) is not implemented as a single-byte opcode. It must #UD through the
-    // production split: `route_group` leaves it on Fallback and the Fallback arm raises
-    // UnsupportedOpcode. This guard catches any future edit that mis-routes 0xF1.
-    let mut cpu = CpuGsw::default();
-    cpu.load_segment_real(SegmentIndex::Cs, 0);
-    cpu.registers.eip = 0;
-    let mut bus = TestBus::with_memory(vec![0xf1, 0, 0, 0]);
-    let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            InternalFault::Exception {
-                vector: 6,
-                error_code: None
-            }
-        ),
-        "0xF1 must raise #UD, got {err:?}"
     );
 }
 

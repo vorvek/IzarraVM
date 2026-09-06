@@ -2262,11 +2262,6 @@ fn atapi_payload_pins_default_golden_and_task_file_writes() {
     let payload = atapi_payload(&machine);
     assert_eq!(payload.len(), ATAPI_IDLE_PAYLOAD_LEN);
     assert_eq!(payload, atapi_idle_golden());
-    let capture = machine.canonical_state_capture().unwrap();
-    assert_eq!(
-        atapi_payload_from_capture(&capture),
-        atapi_payload_from_capture(&capture)
-    );
 
     let mut machine = test_machine();
     let base = crate::ide::SECONDARY_CMD_BASE;

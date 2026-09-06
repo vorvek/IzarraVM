@@ -807,21 +807,6 @@ fn the_off_arm_is_bit_identical() {
 }
 
 // ---------------------------------------------------------------------------
-// A20 hook is a documented no-op in this commit (deliberate scope cut); a
-// smoke test that it does not panic when called, so a future slice's wiring
-// starts from a known-good baseline.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn maybe_compare_bench_is_off_by_default_and_does_not_panic() {
-    // No env var set by default in a test process; must be a silent no-op.
-    maybe_run_compare_bench();
-    let (ns_per_read, ns_total) = run_compare_bench(155);
-    assert!(ns_per_read >= 0.0);
-    assert!(ns_total >= 0.0);
-}
-
-// ---------------------------------------------------------------------------
 // Fable review 2026-09-03, finding 1: raw bus clocks must be recovered from
 // a cumulative (whole-run) counter, never a per-batch one that resets at
 // every IF-edge machine-batch re-entry.

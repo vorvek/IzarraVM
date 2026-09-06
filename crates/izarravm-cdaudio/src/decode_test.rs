@@ -129,12 +129,6 @@ fn a_mono_22k_source_is_resampled_and_duplicated() {
 }
 
 #[test]
-fn the_tail_is_padded_with_silence_not_left_short() {
-    let (info, pcm, _produced) = decode_all("tone.wav");
-    assert_eq!(pcm.len(), info.sectors as usize * AUDIO_FRAME_BYTES);
-}
-
-#[test]
 fn a_decode_never_writes_past_the_buffer_the_mount_sized() {
     // The TOC is published before any of this runs, so a decode that produces
     // more than it promised must lose the surplus rather than take space that

@@ -99,11 +99,6 @@ fn reader_borrows_sections_and_accepts_later_minor() {
 }
 
 #[test]
-fn writer_is_deterministic() {
-    assert_eq!(golden_container(), golden_container());
-}
-
-#[test]
 fn empty_container_is_valid() {
     let bytes = CanonicalStateWriter::new().unwrap().finish().unwrap();
     assert_eq!(

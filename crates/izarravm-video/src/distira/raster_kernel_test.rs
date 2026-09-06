@@ -307,27 +307,3 @@ fn every_kernel_matches_the_generic_oracle_across_the_mode_space() {
         }
     }
 }
-
-#[test]
-fn select_kernel_is_total_over_the_mode_space() {
-    // Every boolean combination `ModeKey` can hold maps to a real kernel:
-    // there is no "unlisted key" case for these four flags, so a caller
-    // never falls back to the generic path for coverage reasons. This test
-    // is here mainly so the match arms stay exhaustive as the enum grows —
-    // rustc already enforces it at compile time, but a compile error on an
-    // unrelated file is a confusing way to learn the table is incomplete.
-    for depth in [false, true] {
-        for wbuffer in [false, true] {
-            for textured in [false, true] {
-                for blend in [false, true] {
-                    let _ = select_kernel(ModeKey {
-                        depth,
-                        wbuffer,
-                        textured,
-                        blend,
-                    });
-                }
-            }
-        }
-    }
-}

@@ -106,10 +106,11 @@ fn release_all_breaks_every_held_key_then_forgets_them() {
     let mut kb = HostKeyboard::default();
     kb.key(KeyCode::ShiftLeft, true);
     kb.key(KeyCode::ArrowUp, true);
-    let mut codes = kb.release_all();
-    codes.sort_unstable();
-    // 0xaa (shift break) and 0xe0,0xc8 (arrow-up break), order-independent.
-    assert_eq!(codes, vec![0xaa, 0xc8, 0xe0]);
+    let codes = kb.release_all();
+    assert!(
+        matches!(codes.as_slice(), [0xaa, 0xe0, 0xc8] | [0xe0, 0xc8, 0xaa]),
+        "break codes must keep each E0 prefix with its key: {codes:02x?}"
+    );
     assert!(kb.release_all().is_empty());
 }
 
