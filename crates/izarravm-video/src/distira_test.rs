@@ -3,6 +3,48 @@
 
 use super::*;
 
+#[test]
+fn changing_workers_settles_queued_and_in_flight_raster_work() {
+    fn scene(change: bool) -> (Vec<u32>, u64, u64) {
+        let mut distira = Distira::new();
+        distira.set_raster_lanes(1);
+        distira.set_frame_size(128, 128);
+        write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_FRONT);
+        write_reg(&mut distira, SST_VERTEX_AX, 0);
+        write_reg(&mut distira, SST_VERTEX_AY, 0);
+        write_reg(&mut distira, SST_VERTEX_BX, 128 << 4);
+        write_reg(&mut distira, SST_VERTEX_BY, 0);
+        write_reg(&mut distira, SST_VERTEX_CX, 0);
+        write_reg(&mut distira, SST_VERTEX_CY, 128 << 4);
+        for (index, workers) in [4, 8, 1, 2, 4].into_iter().enumerate() {
+            write_reg(&mut distira, SST_START_R, (32 + index as u32 * 20) << 12);
+            write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+            assert_eq!(distira.raster_queue_depth(), 1);
+            if index % 2 == 0 {
+                distira.flush_raster_queue(DrainCause::Config);
+                assert!(distira.in_flight.is_some());
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| distira.clone()))
+                        .is_err()
+                );
+            }
+            let workers = if change { workers } else { 1 };
+            distira.set_raster_lanes(workers);
+            assert!(distira.in_flight.is_none());
+            assert_eq!(distira.raster_queue_depth(), 0);
+            assert_eq!(distira.scanout_state().raster_pool_size, workers);
+        }
+        let state = distira.scanout_state();
+        assert!(state.triangles.color_written > 0);
+        (
+            distira.scanout_argb(),
+            state.triangles.pixels_in,
+            state.triangles.color_written,
+        )
+    }
+    assert_eq!(scene(false), scene(true));
+}
+
 /// Reproduces the latent aliasing defect recorded in
 /// `dev_docs/2026-09-01-tr-mipmap-diag.md` section 5: Distira advertises a
 /// dual-TMU board (`DISTIRA_TMU_CONFIG` sets both TMU-count bits, matching

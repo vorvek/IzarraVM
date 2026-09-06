@@ -59,6 +59,7 @@ pub(super) struct SessionSpec {
     /// takes effect on the next power-on, the same as a CPU, memory, or video
     /// card change.
     pub(super) glide_force_point_sampling: bool,
+    pub(super) glide_workers: Option<usize>,
     pub(super) sink: Option<AudioSink>,
     pub(super) rtc_setup: crate::cmos::RtcSetup,
     /// The host playback level (the volume knob). Applied to the finished mix
@@ -66,6 +67,8 @@ pub(super) struct SessionSpec {
     pub(super) gain: SharedGain,
     #[cfg(test)]
     pub(super) finalization_probe: Option<Arc<AtomicU64>>,
+    #[cfg(test)]
+    pub(super) raster_pool_probe: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,6 +509,11 @@ impl GuiSession {
         }
     }
 
+    /// Stage worker selection for the next power-on or reset.
+    pub(super) fn set_glide_workers(&mut self, workers: Option<usize>) {
+        self.spec.glide_workers = workers;
+    }
+
     /// Stage the Glide texture filtering setting for the NEXT power-on. Like
     /// `profile`, this is a boot-time-only field: it takes effect the next
     /// time `MachineGeneration::build` runs, not on the machine that is
@@ -904,6 +912,19 @@ impl MachineGeneration {
         let mut machine = Machine::new(spec.profile.clone(), &spec.rom)
             .map_err(|err| SessionFailure::new(format!("failed to start machine: {err}")))?;
         machine.set_glide_force_point_sampling(spec.glide_force_point_sampling);
+        let workers = spec.glide_workers.unwrap_or_else(|| {
+            izarravm_video::Distira::raster_lanes_for_cores(
+                std::thread::available_parallelism().map_or(1, |count| count.get()),
+            )
+        });
+        machine.set_glide_workers(workers);
+        #[cfg(test)]
+        if let Some(probe) = &spec.raster_pool_probe {
+            probe.store(
+                machine.distira_scanout_state().raster_pool_size as u64,
+                Ordering::SeqCst,
+            );
+        }
         #[cfg(test)]
         let finalization_probe = spec.finalization_probe.clone();
         Ok(Self {

@@ -9,6 +9,56 @@ use std::time::{Duration, Instant};
 
 static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn generation_applies_each_glide_worker_selection() {
+    let scratch = TestScratch::new("glide-workers");
+    for workers in [1, 2, 4, 8] {
+        let mut spec = test_spec(&scratch);
+        spec.glide_workers = Some(workers);
+        let mut generation = MachineGeneration::build(spec, workers as u64).unwrap();
+        let state = generation.machine.distira_scanout_state();
+        assert_eq!(state.raster_lane_count, workers);
+        assert_eq!(state.raster_pool_size, workers);
+    }
+}
+
+#[test]
+fn gui_auto_workers_ignore_environment_override_after_explicit_eight() {
+    const CHILD: &str = "IZARRAVM_TEST_GLIDE_AUTO_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gui::session::tests::gui_auto_workers_ignore_environment_override_after_explicit_eight", "--nocapture"])
+            .env(CHILD, "1")
+            .env("IZARRAVM_DISTIRA_LANES", "8")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let scratch = TestScratch::new("glide-auto");
+    let mut spec = test_spec(&scratch);
+    spec.glide_workers = Some(8);
+    let probe = Arc::new(AtomicU64::new(0));
+    spec.raster_pool_probe = Some(Arc::clone(&probe));
+    let mut session = GuiSession::start(spec, PreparedInitialMedia::default()).unwrap();
+    assert_eq!(probe.load(Ordering::SeqCst), 8);
+    session.set_glide_workers(None);
+    assert_eq!(probe.load(Ordering::SeqCst), 8, "staging does not rebuild");
+    assert_eq!(session.reset().unwrap().generation, 2);
+    let expected = izarravm_video::Distira::raster_lanes_for_cores(
+        std::thread::available_parallelism().map_or(1, |count| count.get()),
+    );
+    assert!(expected <= 4);
+    assert_eq!(probe.load(Ordering::SeqCst), expected as u64);
+    session.set_glide_workers(Some(1));
+    assert_eq!(session.reset().unwrap().generation, 3);
+    assert_eq!(probe.load(Ordering::SeqCst), 1);
+}
+
 struct TestScratch(PathBuf);
 
 impl TestScratch {
@@ -45,10 +95,12 @@ fn test_spec(scratch: &TestScratch) -> SessionSpec {
         glide_ovl: None,
         test_pattern: false,
         glide_force_point_sampling: false,
+        glide_workers: None,
         sink: None,
         rtc_setup: crate::cmos::RtcSetup::from_c_root(scratch.path()),
         gain: SharedGain::new(1.0),
         finalization_probe: None,
+        raster_pool_probe: None,
     }
 }
 

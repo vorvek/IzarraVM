@@ -7,6 +7,21 @@ use izarravm_input::{ControllerDeviceMatcher, GuestControllerProfile, GuestKey, 
 use winit::keyboard::KeyCode;
 
 #[test]
+fn glide_workers_round_trip_and_old_preferences_use_auto() {
+    let old: GuiPrefs = toml::from_str("master_volume = 1.0").unwrap();
+    assert_eq!(old.glide_workers, GlideWorkers::Auto);
+    for (workers, _) in GlideWorkers::CHOICES {
+        let prefs = GuiPrefs {
+            glide_workers: workers,
+            ..GuiPrefs::default()
+        };
+        let restored: GuiPrefs = toml::from_str(&toml::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(restored.glide_workers, workers);
+    }
+    assert!(toml::from_str::<GuiPrefs>("glide_workers = '16'").is_err());
+}
+
+#[test]
 fn round_trips_through_toml() {
     let prefs = GuiPrefs {
         master_volume: 0.65,
@@ -14,6 +29,7 @@ fn round_trips_through_toml() {
         monitor_gamma: Some(2.2),
         glide_gamma: GlideGamma::Original,
         glide_texture_filter: GlideTextureFilter::Disabled,
+        glide_workers: GlideWorkers::Eight,
         start_fullscreen: true,
         mouse_sensitivity: 150,
         input_release: KeyBinding::new(true, true, false, true, "F4"),

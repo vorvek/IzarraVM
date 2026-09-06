@@ -347,6 +347,54 @@ fn word_write_at_the_lane_start_retires_the_block() {
     );
 }
 
+#[test]
+fn decode_range_word_patch_reexecutes_with_exact_state_and_clocks() {
+    let mut native = flat_cpu();
+    let mut interpreter = flat_cpu();
+    native.set_mode(GswMode::Gsw586);
+    interpreter.set_mode(GswMode::Gsw586);
+    let mut native_bus = test_bus(image(0x1234_0001));
+    let mut interpreter_bus = test_bus(image(0x1234_0001));
+    decode_at(&mut native, &mut native_bus, &block_starts());
+    decode_at(&mut interpreter, &mut interpreter_bus, &block_starts());
+    let old = install(&mut native, ENTRY, 3);
+    guest_store_word(&mut native, &mut native_bus, LANE, 0x5678);
+    guest_store_word(&mut interpreter, &mut interpreter_bus, LANE, 0x5678);
+    assert!(native.jit_direct.block(old).is_none());
+    assert!(native.perf.smc_narrow_kills > 0);
+    assert_eq!(
+        native.perf.smc_narrow_kills,
+        interpreter.perf.smc_narrow_kills
+    );
+    decode_at(&mut native, &mut native_bus, &block_starts());
+    decode_at(&mut interpreter, &mut interpreter_bus, &block_starts());
+    let id = install(&mut native, ENTRY, 3);
+    let block = native.jit_direct.block(id).unwrap();
+    arm(&mut native, 1);
+    arm(&mut interpreter, 1);
+    let retired = native.perf.jit_direct_insns;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    assert_eq!(native.perf.jit_direct_insns - retired, 3);
+    for _ in 0..3 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+    assert_eq!(native.registers.ebp(), 0x1234_5679);
+    assert_eq!(
+        crate::tests::settled_registers(&native),
+        crate::tests::settled_registers(&interpreter)
+    );
+    assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native_bus.memory, interpreter_bus.memory);
+}
+
 /// A write to the instruction's OTHER bytes — its opcode and ModRM — is structural and retires the
 /// block. It overlaps no lane byte, so it is not even a lane rejection.
 #[test]

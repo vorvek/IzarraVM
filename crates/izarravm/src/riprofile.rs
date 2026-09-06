@@ -318,7 +318,9 @@ impl Sampler {
             let mut path = [0u16; 1024];
             let len = GetModuleFileNameW(std::ptr::null_mut(), path.as_mut_ptr(), 1024);
             let exe_dir = exe_directory(&path[..len as usize]);
-            let search = exe_dir.map_or(std::ptr::null(), |dir| dir.as_ptr());
+            let search = exe_dir
+                .as_ref()
+                .map_or(std::ptr::null(), |dir| dir.as_ptr());
             if SymInitializeW(process, search, 1) == 0 {
                 eprintln!("riprofile: SymInitializeW failed; dumping raw addresses");
             }

@@ -310,6 +310,7 @@ impl GuiApp {
             monitor_gamma: self.monitor_gamma,
             glide_gamma: self.glide_gamma,
             glide_texture_filter: self.glide_texture_filter,
+            glide_workers: self.glide_workers,
             midi_backend: midi_config.backend,
             external_midi_port: midi_config.external_port,
             soundfont: midi_config.soundfont,
@@ -643,10 +644,32 @@ impl GuiApp {
                                         },
                                     );
                                 });
+                                ui.horizontal(|ui| {
+                                    ui.label("Glide workers");
+                                    let selected = crate::prefs::GlideWorkers::CHOICES
+                                        .iter()
+                                        .find(|(value, _)| *value == dialog.glide_workers)
+                                        .unwrap()
+                                        .1;
+                                    egui::ComboBox::from_id_salt("glide-workers")
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            for (value, label) in
+                                                crate::prefs::GlideWorkers::CHOICES
+                                            {
+                                                ui.selectable_value(
+                                                    &mut dialog.glide_workers,
+                                                    value,
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                });
                             });
+                            ui.small("Auto uses up to 4 workers.");
                             ui.small(
-                                "Glide texture filtering takes effect the next time the \
-                                 machine powers on.",
+                                "Glide workers and texture filtering apply the next time the \
+                                 machine powers on or resets.",
                             );
                         }
                         ConfigPage::Hotkeys => {
@@ -832,6 +855,8 @@ impl GuiApp {
         self.monitor_gamma = dialog.monitor_gamma;
         self.glide_gamma = dialog.glide_gamma;
         self.glide_texture_filter = dialog.glide_texture_filter;
+        self.glide_workers = dialog.glide_workers;
+        self.session.set_glide_workers(dialog.glide_workers.count());
         self.session.set_glide_force_point_sampling(matches!(
             dialog.glide_texture_filter,
             crate::prefs::GlideTextureFilter::Disabled
@@ -846,6 +871,7 @@ impl GuiApp {
         self.prefs.monitor_gamma = dialog.monitor_gamma;
         self.prefs.glide_gamma = dialog.glide_gamma;
         self.prefs.glide_texture_filter = dialog.glide_texture_filter;
+        self.prefs.glide_workers = dialog.glide_workers;
         let midi_config = MidiConfig {
             backend: dialog.midi_backend,
             external_port: dialog.external_midi_port.clone(),

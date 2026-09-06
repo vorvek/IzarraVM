@@ -247,6 +247,41 @@ pub enum GlideTextureFilter {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GlideWorkers {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "1")]
+    One,
+    #[serde(rename = "2")]
+    Two,
+    #[serde(rename = "4")]
+    Four,
+    #[serde(rename = "8")]
+    Eight,
+}
+
+impl GlideWorkers {
+    pub const CHOICES: [(Self, &'static str); 5] = [
+        (Self::Auto, "Auto"),
+        (Self::One, "1"),
+        (Self::Two, "2"),
+        (Self::Four, "4"),
+        (Self::Eight, "8"),
+    ];
+
+    pub fn count(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::One => Some(1),
+            Self::Two => Some(2),
+            Self::Four => Some(4),
+            Self::Eight => Some(8),
+        }
+    }
+}
+
 /// Default assumed CRT gamma: the midpoint of the 2.2-2.5 desktop-SVGA band,
 /// and the analytically special value at which the correction collapses to a
 /// pure black-level offset above the sRGB knee (see
@@ -314,6 +349,7 @@ pub struct GuiPrefs {
     /// (`Original`, the default) or forces nearest/point sampling regardless
     /// (`Disabled`). Applies to Distira's output only.
     pub glide_texture_filter: GlideTextureFilter,
+    pub glide_workers: GlideWorkers,
     /// Whether a new GUI window starts in borderless full screen.
     pub start_fullscreen: bool,
     /// Mouse sensitivity in percent, the DOSBox-X `sensitivity` scale (default
@@ -355,6 +391,7 @@ impl Default for GuiPrefs {
             monitor_gamma: Some(DEFAULT_MONITOR_GAMMA),
             glide_gamma: GlideGamma::default(),
             glide_texture_filter: GlideTextureFilter::default(),
+            glide_workers: GlideWorkers::default(),
             start_fullscreen: false,
             mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
             input_release: default_input_release(),
@@ -383,6 +420,7 @@ struct GuiPrefsWire {
     glide_gamma: GlideGamma,
     #[serde(default)]
     glide_texture_filter: GlideTextureFilter,
+    glide_workers: GlideWorkers,
     start_fullscreen: bool,
     mouse_sensitivity: u16,
     input_release: KeyBinding,
@@ -407,6 +445,7 @@ impl Default for GuiPrefsWire {
             monitor_gamma: prefs.monitor_gamma.unwrap_or(0.0),
             glide_gamma: prefs.glide_gamma,
             glide_texture_filter: prefs.glide_texture_filter,
+            glide_workers: prefs.glide_workers,
             start_fullscreen: prefs.start_fullscreen,
             mouse_sensitivity: prefs.mouse_sensitivity,
             input_release: prefs.input_release,
@@ -439,6 +478,7 @@ impl<'de> Deserialize<'de> for GuiPrefs {
             ),
             glide_gamma: wire.glide_gamma,
             glide_texture_filter: wire.glide_texture_filter,
+            glide_workers: wire.glide_workers,
             start_fullscreen: wire.start_fullscreen,
             mouse_sensitivity: wire
                 .mouse_sensitivity

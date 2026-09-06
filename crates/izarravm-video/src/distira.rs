@@ -21,7 +21,7 @@ mod texture_raster;
 use crate::{DistiraCensus, DistiraCensusKey};
 use ncc::NccState;
 use raster_math::*;
-use raster_pool::{DiagCounter, FrameStore, raster_pool};
+use raster_pool::{DiagCounter, FrameStore, RasterPool};
 #[cfg(test)]
 use raster_queue::RASTER_QUEUE_CAPACITY;
 use raster_queue::{
@@ -721,6 +721,7 @@ pub struct Distira {
     /// [`Distira::raster_lanes_for_cores`]. `set_raster_lanes` overrides it
     /// after construction, which is what the A/B lane-cap tests use.
     raster_lanes: usize,
+    raster_pool: RasterPool,
     /// Triangles submitted but not yet drawn. See `distira/raster_queue.rs`.
     raster_queue: RasterQueue,
     /// Whether a guest triangle may wait on the queue at all. Off draws
@@ -1091,31 +1092,20 @@ fn raster_run(
         // lines, and a per-pixel counter write there makes the lanes
         // false-share their way back to serial speed.
         let (worker_stats, install_stats) = lane_stats.split_at_mut(lanes - 1);
-        // `install` moves the whole fork onto the pool: the scope then
-        // spawns into a worker-local queue, which the other workers
-        // steal far faster than an external injection wakes them. The
-        // installed worker rasterises the last lane. This closure already
-        // runs ON a pool thread (the batch driver
-        // `Distira::flush_raster_queue` spawned onto), so `install` here
-        // runs the fork inline on the current worker rather than adding a
-        // thread -- the pool still does exactly `raster_lanes` threads of
-        // work, not `raster_lanes + 1`
-        // (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 7).
-        raster_pool().install(|| {
-            rayon::scope(|scope| {
-                for (lane, stats) in worker_stats.iter_mut().enumerate() {
-                    scope.spawn(move |_| {
-                        render_band(jobs, memory, lane as u32, lane_count, stats);
-                    });
-                }
-                render_band(
-                    jobs,
-                    memory,
-                    lane_count - 1,
-                    lane_count,
-                    &mut install_stats[0],
-                );
-            });
+        // The batch already runs on this device's pool.
+        rayon::scope(|scope| {
+            for (lane, stats) in worker_stats.iter_mut().enumerate() {
+                scope.spawn(move |_| {
+                    render_band(jobs, memory, lane as u32, lane_count, stats);
+                });
+            }
+            render_band(
+                jobs,
+                memory,
+                lane_count - 1,
+                lane_count,
+                &mut install_stats[0],
+            );
         });
     }
     (lane_stats, lanes)
@@ -1140,6 +1130,7 @@ fn run_raster_batch(
     fb: &FrameStore,
     raster_lanes: usize,
 ) -> RasterBatchResult {
+    debug_assert_eq!(rayon::current_num_threads(), raster_lanes);
     let mut runs = Vec::new();
     let mut any_parallel = false;
     // A run of triangles between two `TextureWrite`s (or the batch's
@@ -1210,6 +1201,7 @@ impl Distira {
             dither_enabled: false,
             force_point_sampling: false,
             raster_lanes: raster_pool::host_lanes(),
+            raster_pool: RasterPool::default(),
             raster_queue: RasterQueue::default(),
             raster_queue_enabled: true,
             clear_color: 0,
@@ -1696,7 +1688,10 @@ impl Distira {
             },
             frame_store_bytes: self.fb.len(),
             raster_lane_count: self.raster_lanes,
-            raster_pool_size: raster_pool::pool_size(),
+            raster_pool_size: self
+                .raster_pool
+                .get(self.raster_lanes)
+                .current_num_threads(),
         }
     }
 
@@ -1741,11 +1736,14 @@ impl Distira {
     }
 
     /// Override the raster thread count (clamped to
-    /// `1..=raster_pool::MAX_LANES`). One lane disables the worker pool
-    /// entirely.
+    /// `1..=raster_pool::MAX_LANES`). One worker keeps asynchronous batching.
     pub fn set_raster_lanes(&mut self, lanes: usize) {
         self.drain_raster_queue(DrainCause::Config);
-        self.raster_lanes = lanes.clamp(1, raster_pool::MAX_LANES);
+        let lanes = lanes.clamp(1, raster_pool::MAX_LANES);
+        if self.raster_lanes != lanes {
+            self.raster_pool = RasterPool::default();
+            self.raster_lanes = lanes;
+        }
     }
 
     pub fn set_frame_size(&mut self, width: u32, height: u32) {
@@ -2169,6 +2167,7 @@ impl Distira {
         if let Some(outcome) = self.join_raster() {
             self.record_join(cause, &outcome);
         }
+        let pool = self.raster_pool.get(self.raster_lanes);
         let commands = self.raster_queue.take();
         self.triangle_census.queue_drains += 1;
         self.triangle_census.async_batches += 1;
@@ -2183,7 +2182,7 @@ impl Distira {
         let fb = Arc::clone(&self.fb);
         let raster_lanes = self.raster_lanes;
         let (tx, rx) = std::sync::mpsc::channel();
-        raster_pool().spawn(move || {
+        pool.spawn(move || {
             // S1 of `dev_docs/2026-09-05-distira-async-slice1-review.md`:
             // `raster_pool()` has no `panic_handler`, so an unwound panic
             // that escaped this closure would abort the whole process

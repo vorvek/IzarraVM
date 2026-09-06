@@ -1111,13 +1111,7 @@ impl CpuGsw {
             // decision; a multi-byte write crossing into an aliased/straddled/unknown page falls
             // back for the whole write). The global generation is untouched on the narrow path,
             // so every other cached line survives the self-patch.
-            let narrow = (0..width).try_fold(0u32, |acc, i| {
-                let byte = physical.wrapping_add(i);
-                if !self.decode_cache.is_code_byte(byte) {
-                    return Some(acc);
-                }
-                self.decode_cache.narrow_invalidate(byte).map(|k| acc + k)
-            });
+            let narrow = self.decode_cache.narrow_invalidate_write(physical, width);
             match narrow {
                 Some(kills) => {
                     action.narrow_kills = kills;

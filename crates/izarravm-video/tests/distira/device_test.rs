@@ -1192,10 +1192,7 @@ fn w_buffer_depth_codes_are_encoded_per_pixel_not_interpolated() {
 
 #[test]
 fn raster_lane_policy_uses_four_lanes_only_with_six_or_more_cores() {
-    // Two raster threads by default. Four from six cores (so the
-    // rasteriser does not compete with the main emulation thread), eight
-    // from eight cores (`dev_docs/2026-09-05-lane-cap-ladder.md`'s
-    // verdict: default 8, not 16).
+    // Leave room for emulation on smaller hosts.
     assert_eq!(Distira::raster_lanes_for_cores(1), 2);
     assert_eq!(Distira::raster_lanes_for_cores(2), 2);
     assert_eq!(Distira::raster_lanes_for_cores(4), 2);
@@ -1205,14 +1202,26 @@ fn raster_lane_policy_uses_four_lanes_only_with_six_or_more_cores() {
 }
 
 #[test]
-fn raster_lane_policy_uses_eight_lanes_from_eight_cores() {
-    // The ladder verdict's default: a host with >= 8 logical CPUs gets 8
-    // raster lanes, not the old 4-lane ceiling. `IZARRAVM_DISTIRA_LANES`
-    // still overrides this (`raster_pool::lane_override`); 16 stays an
-    // opt-in knob (descent2-3dfx-586 regresses +10.08% min-wall at 16).
-    assert_eq!(Distira::raster_lanes_for_cores(8), 8);
-    assert_eq!(Distira::raster_lanes_for_cores(16), 8);
-    assert_eq!(Distira::raster_lanes_for_cores(32), 8);
+fn raster_lane_policy_caps_auto_at_four() {
+    for cores in [8, 16, 32, 64, 128] {
+        assert_eq!(Distira::raster_lanes_for_cores(cores), 4);
+    }
+}
+
+#[test]
+fn raster_worker_pool_follows_selection_and_clones_independently() {
+    let mut original = Distira::new();
+    for lanes in [4, 8, 1, 2, 4] {
+        original.set_raster_lanes(lanes);
+        let state = original.scanout_state();
+        assert_eq!(state.raster_lane_count, lanes);
+        assert_eq!(state.raster_pool_size, lanes);
+    }
+    let mut cloned = original.clone();
+    assert_eq!(original, cloned);
+    cloned.set_raster_lanes(8);
+    assert_eq!(cloned.scanout_state().raster_pool_size, 8);
+    assert_eq!(original.scanout_state().raster_pool_size, 4);
 }
 
 #[test]
