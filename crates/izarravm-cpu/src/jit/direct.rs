@@ -1607,6 +1607,7 @@ impl BlockCache {
         self.fast_map_enabled_for_test = enabled;
     }
 
+    #[inline]
     pub(crate) fn probe(&mut self, watch: &mut NativeCodeWatch, key: BlockKey) -> BlockProbe {
         if self.disabled {
             return BlockProbe::Rejected;
@@ -1617,6 +1618,16 @@ impl BlockCache {
             self.stats.hot_hits += 1;
             return BlockProbe::Ready(hit.id);
         }
+        self.probe_hash(watch, key, hot_index)
+    }
+
+    #[inline(never)]
+    fn probe_hash(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        key: BlockKey,
+        hot_index: usize,
+    ) -> BlockProbe {
         match self.entries.get(&key).copied() {
             Some(BlockState::Compiled(id)) => {
                 self.stats.hash_hits += 1;

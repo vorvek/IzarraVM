@@ -358,6 +358,7 @@ impl Clone for JitState {
 // every existing `jit_direct.<method>(..)` call site, production and test, compiles
 // unchanged against the hoisted ownership.
 impl JitState {
+    #[inline]
     pub(crate) fn probe(&mut self, key: direct::BlockKey) -> direct::BlockProbe {
         self.direct.probe(&mut self.code_watch, key)
     }

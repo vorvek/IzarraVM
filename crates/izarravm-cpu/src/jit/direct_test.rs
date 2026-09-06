@@ -295,6 +295,64 @@ fn hash_fallback_preserves_hot_slot_collisions() {
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 #[test]
+fn probe_preserves_full_keys_and_hit_counters() {
+    let mut cache = BlockCache::default();
+    let first = key(0x1000);
+    let keys = [
+        first,
+        BlockKey {
+            physical: first.physical + 16,
+            ..first
+        },
+        BlockKey {
+            mode_key: first.mode_key ^ 1,
+            ..first
+        },
+    ];
+    let ids = keys.map(|key| install_trivial(&mut cache, key, 1));
+    let hits = cache.stats.hot_hits;
+    let hashes = cache.stats.hash_hits;
+    let misses = cache.stats.lookup_misses;
+    for (key, id) in keys.into_iter().zip(ids) {
+        assert_eq!(key.hot_index(), first.hot_index());
+        assert!(matches!(cache.probe(key), BlockProbe::Ready(hit) if hit == id));
+        assert!(matches!(cache.probe(key), BlockProbe::Ready(hit) if hit == id));
+    }
+    assert_eq!(cache.stats.hot_hits, hits + 3);
+    assert_eq!(cache.stats.hash_hits, hashes + 3);
+    assert_eq!(cache.stats.lookup_misses, misses);
+
+    cache.disabled = true;
+    assert!(matches!(cache.probe(keys[2]), BlockProbe::Rejected));
+    assert_eq!(cache.stats.hot_hits, hits + 3);
+    assert_eq!(cache.stats.hash_hits, hashes + 3);
+    assert_eq!(cache.stats.lookup_misses, misses);
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn probe_cannot_reuse_hot_entries_after_generation_rollover() {
+    let mut cache = BlockCache::default();
+    let key = key(0x1000);
+    install_trivial(&mut cache, key, 1);
+    assert_eq!(cache.hot_generation, 1);
+    cache.hot_generation = u32::MAX;
+    cache.clear();
+    assert_eq!(cache.hot_generation, 1);
+    assert!(cache.hot[key.hot_index()].is_none());
+    assert!(!cache.code_watch.has_resident_pages());
+    assert!(matches!(cache.probe(key), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(key), BlockProbe::Compile));
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
 fn both_successor_cells_resolve_unlink_recompile_and_reset() {
     let mut cache = BlockCache::default();
     let source = key(0x1000);
