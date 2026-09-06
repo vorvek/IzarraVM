@@ -95,32 +95,92 @@ pub(super) struct QueuedTextureWrite {
     pub(super) bytes: [u8; 4],
 }
 
+/// A COALESCED RUN of guest LFB writes waiting to be applied, all against
+/// one snapshot (`distira/lfb_write.rs`) and one store width. The words
+/// themselves live in the batch's own `lfb_words` buffer, not in the entry:
+/// see [`RasterQueue::push_lfb_write`] for why a run is one entry however
+/// many words it holds.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct QueuedLfbWrite {
+    pub(super) params: LfbWriteParams,
+    pub(super) width: LfbWriteWidth,
+    /// First word of this run in the batch's `lfb_words`.
+    pub(super) start: u32,
+    /// How many words the run holds. Always at least one.
+    pub(super) count: u32,
+}
+
+/// What [`RasterQueue::push_lfb_write`] did with a word, so the caller can
+/// tell a coalesced word (free) from a new run (one more queue entry) from a
+/// refusal (drain and retry) without re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LfbPush {
+    /// Folded into the run already at the tail of the queue.
+    Extended,
+    /// Started a new run, which cost one `RASTER_QUEUE_CAPACITY` entry.
+    Started,
+    /// The queue (or the word buffer) is full; the caller must drain.
+    Full,
+}
+
+/// One guest LFB store, as `(aperture offset, value)`. A `u16` store keeps
+/// its value in the low half.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LfbWord {
+    pub(super) offset: u32,
+    pub(super) value: u32,
+}
+
 /// One entry on the raster queue, in submission order.
 ///
-/// `TextureWrite` pays `QueuedTriangle`'s full size (~600 bytes, mostly the
-/// `f32`/`f64` interpolation planes in `TriangleContext`) as padding.
-/// Boxing the triangle would shrink that, but it would also make the queue
-/// allocate per triangle and lose `Copy` -- exactly the cost this queue
-/// exists to avoid paying per entry (see this module's header). The queue
-/// is capacity-bounded (`RASTER_QUEUE_CAPACITY`), so the wasted bytes are a
-/// few hundred KB at most, once, not a per-pixel cost.
+/// `TextureWrite` and `LfbWrite` pay `QueuedTriangle`'s full size (~600
+/// bytes, mostly the `f32`/`f64` interpolation planes in `TriangleContext`)
+/// as padding. Boxing the triangle would shrink that, but it would also make
+/// the queue allocate per triangle and lose `Copy` -- exactly the cost this
+/// queue exists to avoid paying per entry (see this module's header). The
+/// queue is capacity-bounded (`RASTER_QUEUE_CAPACITY`), so the wasted bytes
+/// are a few hundred KB at most, once, not a per-pixel cost.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy)]
 pub(super) enum QueuedCommand {
     Triangle(QueuedTriangle),
     TextureWrite(QueuedTextureWrite),
+    LfbWrite(QueuedLfbWrite),
+}
+
+/// How many LFB words one batch may coalesce before the queue forces a
+/// drain. Descent II's per-frame blit is ~40,830 words
+/// (`dev_docs/2026-09-05-distira-async-slice1-review.md` section 7), so this
+/// holds several frames' worth and the cap is a runaway guard, not a working
+/// limit: at 8 bytes a word it bounds the buffer at 2 MB, on the one
+/// allocation `RasterQueue::recycle` keeps alive.
+pub(super) const LFB_WORD_CAPACITY: usize = 1 << 18;
+
+/// A batch handed to the raster worker: the ordered commands, plus the word
+/// payload every `QueuedCommand::LfbWrite` in them indexes into.
+#[derive(Default)]
+pub(super) struct RasterBatch {
+    pub(super) commands: Vec<QueuedCommand>,
+    pub(super) lfb_words: Vec<LfbWord>,
 }
 
 /// The pending commands.
 #[derive(Default)]
 pub(super) struct RasterQueue {
     pending: Vec<QueuedCommand>,
+    /// The word payload for the `QueuedCommand::LfbWrite` entries in
+    /// `pending`, in submission order. Kept beside the commands rather than
+    /// inside them so a run of thousands of guest stores is ONE entry
+    /// against `RASTER_QUEUE_CAPACITY` -- see `push_lfb_write`.
+    lfb_words: Vec<LfbWord>,
     /// S2 of `dev_docs/2026-09-05-distira-async-slice1-review.md`: a
     /// recycled batch allocation parked here when `recycle` ran but
     /// `pending` was not itself available to adopt it. See `recycle`'s doc
     /// comment for why that happens under async and did not before.
     /// `push` claims it the next time `pending` needs to grow from empty.
     spare: Vec<QueuedCommand>,
+    /// The same idea for the word payload.
+    spare_words: Vec<LfbWord>,
 }
 
 impl RasterQueue {
@@ -145,13 +205,83 @@ impl RasterQueue {
         if self.pending.is_empty() && self.spare.capacity() > self.pending.capacity() {
             self.pending = std::mem::take(&mut self.spare);
         }
+        if self.lfb_words.is_empty() && self.spare_words.capacity() > self.lfb_words.capacity() {
+            self.lfb_words = std::mem::take(&mut self.spare_words);
+        }
         self.pending.push(command);
         true
     }
 
+    /// Add a guest LFB store, coalescing it into the run at the tail of the
+    /// queue when it can. Returns false when the caller must drain first.
+    ///
+    /// **Coalescing is what makes slice 2 pay at all.** Descent II writes
+    /// ~40,830 LFB words a frame; as one entry each they would overrun
+    /// `RASTER_QUEUE_CAPACITY` forty times a frame, and every overrun is a
+    /// `queue_full` drain -- a flush AND a full join -- so the burst would
+    /// force MORE joins than the synchronous J2 it replaced, not fewer
+    /// (`dev_docs/2026-09-05-distira-async-slice1-review.md` section 7,
+    /// caveat 1). A run therefore extends for as long as the next write
+    /// carries the SAME snapshot and the same store width, and the words
+    /// pile into `lfb_words` behind one entry.
+    ///
+    /// **The run key is the snapshot and the width, not address
+    /// contiguity.** The design and the review both say "`{base, bytes}`
+    /// runs", and a contiguity-keyed run is the natural reading of that --
+    /// but an LFB aperture offset packs `x` into bits 0..10 and `y` above
+    /// them, so a full-width blit is contiguous only WITHIN a scanline and
+    /// jumps at every row boundary. On `descent2-3dfx-586` (640x480, two
+    /// bytes a pixel) that is ~480 entries a frame beside ~891 triangles --
+    /// back over the 1024 cap, and back to `queue_full` drains, which is the
+    /// exact failure coalescing exists to prevent. Keying on the snapshot
+    /// instead costs 4 bytes a word (the offset rides along) and makes the
+    /// whole burst ONE entry. Ordering is unaffected either way: the words
+    /// replay in submission order inside the run, and the run itself sits in
+    /// submission order among the triangles.
+    pub(super) fn push_lfb_write(
+        &mut self,
+        params: LfbWriteParams,
+        width: LfbWriteWidth,
+        offset: u32,
+        value: u32,
+    ) -> LfbPush {
+        if self.lfb_words.len() >= LFB_WORD_CAPACITY {
+            return LfbPush::Full;
+        }
+        let word = LfbWord { offset, value };
+        if let Some(QueuedCommand::LfbWrite(run)) = self.pending.last_mut()
+            && run.width == width
+            && run.params == params
+        {
+            self.lfb_words.push(word);
+            run.count += 1;
+            return LfbPush::Extended;
+        }
+        if self.pending.len() >= RASTER_QUEUE_CAPACITY {
+            return LfbPush::Full;
+        }
+        let start = self.lfb_words.len() as u32;
+        self.lfb_words.push(word);
+        // Not `self.push`: the spare-allocation adoption there would swap
+        // `pending` out from under the run this call may have just extended,
+        // and a new run is exactly the case where `pending` is NOT empty (it
+        // holds the triangles this run is ordered against) often enough that
+        // the adoption would not fire anyway.
+        self.pending.push(QueuedCommand::LfbWrite(QueuedLfbWrite {
+            params,
+            width,
+            start,
+            count: 1,
+        }));
+        LfbPush::Started
+    }
+
     /// Hand the batch to the caller, leaving the queue empty.
-    pub(super) fn take(&mut self) -> Vec<QueuedCommand> {
-        std::mem::take(&mut self.pending)
+    pub(super) fn take(&mut self) -> RasterBatch {
+        RasterBatch {
+            commands: std::mem::take(&mut self.pending),
+            lfb_words: std::mem::take(&mut self.lfb_words),
+        }
     }
 
     /// Take the drained batch's allocation back, so a steady render loop
@@ -170,12 +300,22 @@ impl RasterQueue {
     /// paying. `spare` is the fallback: when `pending` cannot adopt the
     /// allocation directly, it waits in `spare` instead of being dropped,
     /// and `push` above claims it the next time `pending` empties.
-    pub(super) fn recycle(&mut self, mut batch: Vec<QueuedCommand>) {
-        batch.clear();
-        if self.pending.is_empty() && batch.capacity() > self.pending.capacity() {
-            self.pending = batch;
-        } else if batch.capacity() > self.spare.capacity() {
-            self.spare = batch;
+    pub(super) fn recycle(&mut self, batch: RasterBatch) {
+        let RasterBatch {
+            mut commands,
+            mut lfb_words,
+        } = batch;
+        commands.clear();
+        if self.pending.is_empty() && commands.capacity() > self.pending.capacity() {
+            self.pending = commands;
+        } else if commands.capacity() > self.spare.capacity() {
+            self.spare = commands;
+        }
+        lfb_words.clear();
+        if self.lfb_words.is_empty() && lfb_words.capacity() > self.lfb_words.capacity() {
+            self.lfb_words = lfb_words;
+        } else if lfb_words.capacity() > self.spare_words.capacity() {
+            self.spare_words = lfb_words;
         }
     }
 }
@@ -208,7 +348,9 @@ impl Clone for RasterQueue {
         // empty is simpler than deciding whether to clone dead memory too.
         Self {
             pending: self.pending.clone(),
+            lfb_words: self.lfb_words.clone(),
             spare: Vec::new(),
+            spare_words: Vec::new(),
         }
     }
 }

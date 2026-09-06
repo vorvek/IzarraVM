@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+mod lfb_write;
 mod ncc;
 mod raster_kernel;
 mod raster_math;
@@ -19,13 +20,15 @@ mod texture_combine;
 mod texture_raster;
 
 use crate::{DistiraCensus, DistiraCensusKey};
+use lfb_write::{LfbWriteParams, LfbWriteStats, LfbWriteWidth, LfbWriter};
 use ncc::NccState;
 use raster_math::*;
 use raster_pool::{DiagCounter, FrameStore, raster_pool};
 #[cfg(test)]
 use raster_queue::RASTER_QUEUE_CAPACITY;
 use raster_queue::{
-    QueuedCommand, QueuedTextureWrite, QueuedTriangle, RasterQueue, ViewMemory, render_band,
+    LfbPush, QueuedCommand, QueuedTextureWrite, QueuedTriangle, RasterBatch, RasterQueue,
+    ViewMemory, render_band,
 };
 use raster_view::{RasterParams, RasterView};
 pub use registers::*;
@@ -331,6 +334,26 @@ pub struct DistiraTriangleCensus {
     /// (`window_ns_by_cause[c] - blocked_ns_by_cause[c]`, precomputed at the
     /// join so a reader does not have to subtract two histograms by hand).
     pub overlap_ns_by_cause: DistiraDrainNanos,
+
+    /// Slice 2 of `dev_docs/2026-09-05-distira-async-overlap-design.md`
+    /// (section 8): how many COALESCED runs of guest LFB writes were pushed
+    /// onto the raster queue, and how many individual guest stores those
+    /// runs hold. `lfb_write_run_words / lfb_write_runs` is the coalescing
+    /// ratio, and it is the number that says whether slice 2 can work at
+    /// all: Descent II's ~40,830 stores a frame would be ~40 whole
+    /// `RASTER_QUEUE_CAPACITY` refills as one entry each, and every refill
+    /// is a `queue_full` drain -- a flush AND a full join -- so an
+    /// uncoalesced slice 2 would force MORE joins than the synchronous J2 it
+    /// replaced. See `RasterQueue::push_lfb_write`.
+    pub lfb_write_runs: u64,
+    /// See `lfb_write_runs`.
+    pub lfb_write_run_words: u64,
+    /// Guest LFB writes that could NOT be deferred and were applied
+    /// synchronously after a full drain -- the queue disabled, or a rotating
+    /// stipple (`lfb_write_defers`). A regression sentinel: on both Glide
+    /// rows this should stay at zero, and the day it is not, something put
+    /// the burst back on the emulation thread.
+    pub lfb_writes_immediate: u64,
 }
 
 /// Per-reason breakdown of [`DistiraTriangleCensus::queue_drains`]. Answers
@@ -935,10 +958,14 @@ struct RasterRunResult {
 /// handed back exactly as the old synchronous `drain_raster_queue` did
 /// before returning), and one `RasterRunResult` per triangle run.
 struct RasterBatchResult {
-    commands: Vec<QueuedCommand>,
+    batch: RasterBatch,
     owned: Box<RasterOwned>,
     runs: Vec<RasterRunResult>,
     any_parallel: bool,
+    /// Slice 2: what the batch's `QueuedCommand::LfbWrite` runs did to the
+    /// device counters, folded in at the join the same way a lane's
+    /// `PixelStats` are. Zero on a batch with no LFB write in it.
+    lfb_stats: LfbWriteStats,
 }
 
 /// The one batch `Distira` ever lets be in flight at a time (depth one,
@@ -1135,13 +1162,18 @@ fn raster_run(
 /// with `self` and the batch's `jobs` slice both in hand, never on the
 /// worker.
 fn run_raster_batch(
-    commands: Vec<QueuedCommand>,
+    batch: RasterBatch,
     mut owned: Box<RasterOwned>,
     fb: &FrameStore,
     raster_lanes: usize,
 ) -> RasterBatchResult {
+    let RasterBatch {
+        commands,
+        lfb_words,
+    } = batch;
     let mut runs = Vec::new();
     let mut any_parallel = false;
+    let mut lfb_stats = LfbWriteStats::default();
     // A run of triangles between two `TextureWrite`s (or the batch's
     // edges) is a CONTIGUOUS subslice of `commands` -- `run_start..index`
     // tracks it by index instead of copying triangles into a side `Vec`,
@@ -1149,9 +1181,18 @@ fn run_raster_batch(
     // drain, even the common case with no write in the batch at all.
     let mut run_start = 0usize;
     for (index, command) in commands.iter().enumerate() {
-        let QueuedCommand::TextureWrite(write) = *command else {
+        // Slice 2: an `LfbWrite` run splits the batch exactly the way a
+        // `TextureWrite` does, and for the same reason -- a triangle queued
+        // BEFORE the guest's store must land under it, one queued after must
+        // land on top of it. One coalesced run is one split, however many
+        // words it carries, which is the whole point of the coalescing (see
+        // `RasterQueue::push_lfb_write`).
+        if !matches!(
+            command,
+            QueuedCommand::TextureWrite(_) | QueuedCommand::LfbWrite(_)
+        ) {
             continue;
-        };
+        }
         if index > run_start {
             let (lane_stats, lanes) =
                 raster_run(&commands[run_start..index], &owned, fb, raster_lanes);
@@ -1162,9 +1203,35 @@ fn run_raster_batch(
                 lanes,
             });
         }
-        let mask = DISTIRA_TEX_SIZE - 1;
-        for (byte_index, byte) in write.bytes.into_iter().enumerate() {
-            owned.texture[write.tmu][(write.offset + byte_index) & mask] = byte;
+        match *command {
+            QueuedCommand::TextureWrite(write) => {
+                let mask = DISTIRA_TEX_SIZE - 1;
+                for (byte_index, byte) in write.bytes.into_iter().enumerate() {
+                    owned.texture[write.tmu][(write.offset + byte_index) & mask] = byte;
+                }
+            }
+            QueuedCommand::LfbWrite(run) => {
+                let memory = ViewMemory {
+                    fb,
+                    texture: &owned.texture,
+                    ncc: &owned.ncc,
+                };
+                // The run's own snapshot seeds the stipple, and a deferred
+                // run is never a ROTATING one (`Distira::lfb_write_defers`),
+                // so this value never moves and nothing is written back to
+                // `Distira::stipple` at the join.
+                let mut stats = LfbWriteStats {
+                    stipple: run.params.params.stipple,
+                    ..LfbWriteStats::default()
+                };
+                let mut writer = LfbWriter::new(run.params, memory, &mut stats);
+                let start = run.start as usize;
+                for word in &lfb_words[start..start + run.count as usize] {
+                    writer.write(run.width, word.offset as usize, word.value);
+                }
+                lfb_stats.add(&stats);
+            }
+            QueuedCommand::Triangle(_) => unreachable!("guarded by the matches! above"),
         }
         run_start = index + 1;
     }
@@ -1178,10 +1245,14 @@ fn run_raster_batch(
         });
     }
     RasterBatchResult {
-        commands,
+        batch: RasterBatch {
+            commands,
+            lfb_words,
+        },
         owned,
         runs,
         any_parallel,
+        lfb_stats,
     }
 }
 
@@ -1838,9 +1909,16 @@ impl Distira {
         }
     }
 
-    /// The pipeline's view of the device THIS INSTANT. The LFB write path and
-    /// the texture-aperture decode use it; a triangle uses the params it was
-    /// submitted with instead.
+    /// The pipeline's view of the device THIS INSTANT.
+    ///
+    /// **Test-only since slice 2 of
+    /// `dev_docs/2026-09-05-distira-async-overlap-design.md`**: the LFB write
+    /// path was its last production caller, and that path builds its view
+    /// from the batch's own `ViewMemory` inside `distira/lfb_write.rs` now,
+    /// rather than reading the live device. It stays as a door for the tests
+    /// that sample texture memory through the real pipeline, and it keeps
+    /// the door discipline of section 1 of
+    /// `dev_docs/2026-09-05-distira-async-slice1-review.md`.
     ///
     /// `&mut self`: joins first (see [`Self::join_raster`]), then borrows
     /// `self.fb`/`self.raster_owned` directly rather than through
@@ -1849,6 +1927,7 @@ impl Distira {
     /// [`RasterView`] lives, which is longer than `self.raster_params()`
     /// (also `&self`) can tolerate. Reading the fields straight keeps the two
     /// borrows disjoint.
+    #[cfg(test)]
     fn raster_view(&mut self) -> RasterView<'_> {
         self.join_raster();
         let params = self.raster_params();
@@ -2036,14 +2115,15 @@ impl Distira {
         for run in &result.runs {
             written += self.merge_pixel_stats(
                 &run.lane_stats,
-                &result.commands[run.range.clone()],
+                &result.batch.commands[run.range.clone()],
                 run.lanes,
             );
         }
         if result.any_parallel {
             self.triangle_census.queue_drains_parallel += 1;
         }
-        self.raster_queue.recycle(result.commands);
+        self.merge_lfb_write_stats(&result.lfb_stats);
+        self.raster_queue.recycle(result.batch);
         self.raster_owned = Some(result.owned);
         Some(JoinResult {
             written,
@@ -2169,7 +2249,7 @@ impl Distira {
         if let Some(outcome) = self.join_raster() {
             self.record_join(cause, &outcome);
         }
-        let commands = self.raster_queue.take();
+        let batch = self.raster_queue.take();
         self.triangle_census.queue_drains += 1;
         self.triangle_census.async_batches += 1;
         // The batch's memories move to the worker: `join_raster` above
@@ -2198,7 +2278,7 @@ impl Distira {
             // and `commands` are owned, moved-in data with no borrows to
             // invalidate.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_raster_batch(commands, owned, fb.as_ref(), raster_lanes)
+                run_raster_batch(batch, owned, fb.as_ref(), raster_lanes)
             }));
             // The receiver may already be gone (the `Distira` was dropped
             // mid-batch); the batch still ran to completion (or panicked)
@@ -2405,232 +2485,121 @@ impl Distira {
         }
     }
 
+    /// **Slice 2 of `dev_docs/2026-09-05-distira-async-overlap-design.md`
+    /// (section 8): this no longer joins.** It used to open with
+    /// `drain_raster_queue(DrainCause::LfbWrite)` -- the design's J2 -- and
+    /// then run the whole per-pixel pipeline on the emulation thread.
+    /// Descent II writes ~40,830 LFB words a frame, so under slice 1's async
+    /// overlap the first word of that blit would have joined the frame's
+    /// in-flight batch and collapsed the whole overlap window
+    /// (`dev_docs/2026-09-05-distira-async-slice1-review.md` section 7). The
+    /// write is an ORDERED QUEUE ENTRY now, coalesced with its neighbours,
+    /// and the pipeline runs on the raster worker between the triangle runs
+    /// it separates. LFB *reads* (J1) and every other join site in the
+    /// design's section 1 still join.
     pub fn write_lfb_u16(&mut self, offset: usize, value: u16) {
-        self.drain_raster_queue(DrainCause::LfbWrite);
+        self.lfb_write(LfbWriteWidth::U16, offset, u32::from(value));
+    }
+
+    /// See [`Self::write_lfb_u16`].
+    pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
+        self.lfb_write(LfbWriteWidth::U32, offset, value);
+    }
+
+    /// Queue one guest LFB store, or apply it synchronously when it cannot
+    /// be deferred.
+    ///
+    /// `aperture_traffic.lfb_writes` is bumped HERE, on the emulation
+    /// thread, at submission -- invariant 1 of the #840 review, restated by
+    /// section 7 of the slice 1 review as something slice 2 must not move.
+    fn lfb_write(&mut self, width: LfbWriteWidth, offset: usize, value: u32) {
         self.aperture_traffic.lfb_writes += 1;
-        let base = self.lfb_write_base();
-        let write_color = self.lfb_pipeline_writes_color();
-        let write_depth = self.lfb_pipeline_writes_depth();
-        let pipeline = self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE != 0;
-        let position = lfb_position(offset, false);
-        match self.lfb_mode & LFB_FORMAT_MASK {
-            LFB_FORMAT_RGB565 => {
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    position,
-                    value,
-                    rgb565_components(value),
-                    0xff,
-                );
-            }
-            LFB_FORMAT_RGB555 => {
-                let raw = rgb555_to_rgb565(value);
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    position,
-                    raw,
-                    rgb565_components(raw),
-                    0xff,
-                );
-            }
-            LFB_FORMAT_ARGB1555 => {
-                let raw = rgb555_to_rgb565(value);
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    position,
-                    raw,
-                    rgb565_components(raw),
-                    argb1555_alpha(value),
-                );
-            }
-            LFB_FORMAT_DEPTH if write_depth || write_color || pipeline => {
-                if let Some(color) = self.lfb_pipeline_depth_only_color(base, position, value) {
-                    if let Some(color) = color {
-                        self.write_color_pixel(base, position, color);
-                    }
-                    if write_depth {
-                        self.write_depth_pixel_at(position, value);
-                    }
+        let params = self.lfb_write_params();
+        // `u32::try_from`: the queued word carries its aperture offset in 32
+        // bits. Every real caller is far inside that (`vega.rs` masks the
+        // LFB aperture), so this is a total-function guard, not a live path
+        // -- an offset that did not fit takes the synchronous arm below and
+        // behaves exactly as it did before slice 2.
+        if self.raster_queue_enabled
+            && lfb_write_defers(&params)
+            && let Ok(aperture_offset) = u32::try_from(offset)
+        {
+            self.triangle_census.lfb_write_run_words += 1;
+            match self
+                .raster_queue
+                .push_lfb_write(params, width, aperture_offset, value)
+            {
+                LfbPush::Extended => {}
+                LfbPush::Started => self.triangle_census.lfb_write_runs += 1,
+                LfbPush::Full => {
+                    // Full. Draw what is waiting, then this word joins an
+                    // empty queue, so it is never dropped. The second push
+                    // cannot refuse: the drain leaves the queue at zero and
+                    // neither capacity is zero.
+                    self.drain_raster_queue(DrainCause::QueueFull);
+                    let pushed =
+                        self.raster_queue
+                            .push_lfb_write(params, width, aperture_offset, value);
+                    debug_assert_eq!(
+                        pushed,
+                        LfbPush::Started,
+                        "a drained queue accepts, and starts a fresh run"
+                    );
+                    self.triangle_census.lfb_write_runs += 1;
                 }
             }
-            _ => {}
+            return;
+        }
+        // The synchronous arm: the queue is off, the offset does not fit a
+        // queued word, or the ROTATING stipple makes this write a serial
+        // dependency on the one before it (`lfb_write_defers`). Draining
+        // first is the pre-slice-2 behaviour exactly, and it leaves this
+        // write alone against a settled frame store.
+        self.drain_raster_queue(DrainCause::LfbWrite);
+        self.triangle_census.lfb_writes_immediate += 1;
+        let mut stats = LfbWriteStats {
+            stipple: self.stipple,
+            ..LfbWriteStats::default()
+        };
+        {
+            let owned = self.raster_owned.as_ref().expect(
+                "raster_owned is only None while a batch is in flight, and the \
+                 drain above just joined any in-flight batch",
+            );
+            let memory = ViewMemory {
+                fb: self.fb.as_ref(),
+                texture: &owned.texture,
+                ncc: &owned.ncc,
+            };
+            LfbWriter::new(params, memory, &mut stats).write(width, offset, value);
+        }
+        // The rotating stipple's state chains from one write to the next,
+        // which is exactly why this arm exists; a patterned stipple never
+        // moved, so storing it back is a no-op.
+        self.stipple = stats.stipple;
+        self.merge_lfb_write_stats(&stats);
+    }
+
+    /// The snapshot one LFB write applies against. See
+    /// `distira/lfb_write.rs` for why the list is [`RasterParams`] plus
+    /// `lfbMode` and nothing else.
+    fn lfb_write_params(&self) -> LfbWriteParams {
+        LfbWriteParams {
+            params: self.raster_params(),
+            lfb_mode: self.lfb_mode,
         }
     }
 
-    pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
-        self.drain_raster_queue(DrainCause::LfbWrite);
-        self.aperture_traffic.lfb_writes += 1;
-        let base = self.lfb_write_base();
-        let write_color = self.lfb_pipeline_writes_color();
-        let write_depth = self.lfb_pipeline_writes_depth();
-        let format = self.lfb_mode & LFB_FORMAT_MASK;
-        let position = lfb_position(
-            offset,
-            matches!(
-                format,
-                LFB_FORMAT_XRGB8888
-                    | LFB_FORMAT_ARGB8888
-                    | LFB_FORMAT_DEPTH_RGB565
-                    | LFB_FORMAT_DEPTH_RGB555
-                    | LFB_FORMAT_DEPTH_ARGB1555
-            ),
-        );
-        let next = (position.0 + 1, position.1);
-        match format {
-            LFB_FORMAT_RGB565 => {
-                let raw0 = value as u16;
-                let raw1 = (value >> 16) as u16;
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    position,
-                    raw0,
-                    rgb565_components(raw0),
-                    0xff,
-                );
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    next,
-                    raw1,
-                    rgb565_components(raw1),
-                    0xff,
-                );
-            }
-            LFB_FORMAT_RGB555 => {
-                let raw0 = value as u16;
-                let raw1 = (value >> 16) as u16;
-                let raw0_rgb565 = rgb555_to_rgb565(raw0);
-                let raw1_rgb565 = rgb555_to_rgb565(raw1);
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    position,
-                    raw0_rgb565,
-                    rgb565_components(raw0_rgb565),
-                    0xff,
-                );
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    next,
-                    raw1_rgb565,
-                    rgb565_components(raw1_rgb565),
-                    0xff,
-                );
-            }
-            LFB_FORMAT_ARGB1555 => {
-                let raw0 = value as u16;
-                let raw1 = (value >> 16) as u16;
-                let raw0_rgb565 = rgb555_to_rgb565(raw0);
-                let raw1_rgb565 = rgb555_to_rgb565(raw1);
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    position,
-                    raw0_rgb565,
-                    rgb565_components(raw0_rgb565),
-                    argb1555_alpha(raw0),
-                );
-                self.write_lfb_color_pipeline_pixel(
-                    base,
-                    next,
-                    raw1_rgb565,
-                    rgb565_components(raw1_rgb565),
-                    argb1555_alpha(raw1),
-                );
-            }
-            LFB_FORMAT_XRGB8888 | LFB_FORMAT_ARGB8888 => {
-                let r = (value >> 16) as u8;
-                let g = (value >> 8) as u8;
-                let b = value as u8;
-                let alpha = if (self.lfb_mode & LFB_FORMAT_MASK) == LFB_FORMAT_ARGB8888 {
-                    (value >> 24) as u8
-                } else {
-                    0xff
-                };
-                let raw = pack_rgb565(r, g, b);
-                self.write_lfb_color_pipeline_pixel(base, position, raw, (r, g, b), alpha);
-            }
-            LFB_FORMAT_DEPTH_RGB565 => {
-                let raw = value as u16;
-                let depth = (value >> 16) as u16;
-                let color = self.lfb_pipeline_depth_color_pixel(
-                    base,
-                    position,
-                    raw,
-                    rgb565_components(raw),
-                    0xff,
-                    depth,
-                );
-                if let Some(color) = color {
-                    if write_color {
-                        self.write_color_pixel(base, position, color);
-                    }
-                    if write_depth {
-                        self.write_depth_pixel_at(position, depth);
-                    }
-                }
-            }
-            LFB_FORMAT_DEPTH_RGB555 => {
-                let raw = value as u16;
-                let raw_rgb565 = rgb555_to_rgb565(raw);
-                let depth = (value >> 16) as u16;
-                let color = self.lfb_pipeline_depth_color_pixel(
-                    base,
-                    position,
-                    raw_rgb565,
-                    rgb565_components(raw_rgb565),
-                    0xff,
-                    depth,
-                );
-                if let Some(color) = color {
-                    if write_color {
-                        self.write_color_pixel(base, position, color);
-                    }
-                    if write_depth {
-                        self.write_depth_pixel_at(position, depth);
-                    }
-                }
-            }
-            LFB_FORMAT_DEPTH_ARGB1555 => {
-                let raw = value as u16;
-                let raw_rgb565 = rgb555_to_rgb565(raw);
-                let depth = (value >> 16) as u16;
-                let color = self.lfb_pipeline_depth_color_pixel(
-                    base,
-                    position,
-                    raw_rgb565,
-                    rgb565_components(raw_rgb565),
-                    argb1555_alpha(raw),
-                    depth,
-                );
-                if let Some(color) = color {
-                    if write_color {
-                        self.write_color_pixel(base, position, color);
-                    }
-                    if write_depth {
-                        self.write_depth_pixel_at(position, depth);
-                    }
-                }
-            }
-            LFB_FORMAT_DEPTH if write_depth || write_color => {
-                let depth0 = value as u16;
-                let depth1 = (value >> 16) as u16;
-                if let Some(color) = self.lfb_pipeline_depth_only_color(base, position, depth0) {
-                    if let Some(color) = color {
-                        self.write_color_pixel(base, position, color);
-                    }
-                    if write_depth {
-                        self.write_depth_pixel_at(position, depth0);
-                    }
-                }
-                if let Some(color) = self.lfb_pipeline_depth_only_color(base, next, depth1) {
-                    if let Some(color) = color {
-                        self.write_color_pixel(base, next, color);
-                    }
-                    if write_depth {
-                        self.write_depth_pixel_at(next, depth1);
-                    }
-                }
-            }
-            _ => {}
-        }
+    /// Fold one LFB-write run's counters into the device. The mirror of
+    /// [`Self::merge_pixel_stats`] for the write path, and it runs in the
+    /// same place: on the thread that owns `self`, at the join, never on the
+    /// raster worker.
+    fn merge_lfb_write_stats(&mut self, stats: &LfbWriteStats) {
+        self.color_pixels_stored = self
+            .color_pixels_stored
+            .saturating_add(stats.color_pixels_stored);
+        self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(stats.fbi_chroma_fail);
+        self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(stats.fbi_afunc_fail);
     }
 
     pub fn queue_register_write(&mut self, offset: usize, value: u32) -> bool {
@@ -3609,181 +3578,6 @@ impl Distira {
         bytes
     }
 
-    fn lfb_pipeline_writes_color(&self) -> bool {
-        self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_RGB_WMASK != 0
-    }
-
-    fn lfb_pipeline_writes_depth(&self) -> bool {
-        self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_WMASK != 0
-    }
-
-    fn write_lfb_color_pipeline_pixel(
-        &mut self,
-        base: u32,
-        position: (u32, u32),
-        raw: u16,
-        color: (u8, u8, u8),
-        alpha: u8,
-    ) {
-        let pipeline = self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE != 0;
-        let write_color = self.lfb_pipeline_writes_color();
-        let write_depth = pipeline && self.fbz_mode & FBZ_DEPTH_WMASK != 0;
-        let depth = self.za_color as u16;
-        let color = if pipeline {
-            self.lfb_pipeline_depth_color_pixel(base, position, raw, color, alpha, depth)
-        } else {
-            self.lfb_pipeline_color_pixel(base, position, raw, color, alpha)
-        };
-        if let Some(color) = color {
-            if write_color {
-                self.write_color_pixel(base, position, color);
-            }
-            if write_depth {
-                self.write_depth_pixel_at(position, depth);
-            }
-        }
-    }
-
-    fn lfb_pipeline_depth_test_passes(&mut self, position: (u32, u32), depth: u16) -> bool {
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
-            return true;
-        }
-        let Some(old_depth) = self.raster_view().read_depth_pixel(position.0, position.1) else {
-            return false;
-        };
-        depth_compare_passes(self.fbz_mode, old_depth, depth)
-    }
-
-    fn lfb_pipeline_color_passes(&mut self, color: (u8, u8, u8)) -> bool {
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0
-            || self
-                .raster_params()
-                .chroma_key_passes(color.0, color.1, color.2)
-        {
-            return true;
-        }
-        self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
-        false
-    }
-
-    fn lfb_pipeline_alpha_passes(&mut self, alpha: u8) -> bool {
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0
-            || self.raster_params().alpha_test_passes(alpha)
-        {
-            return true;
-        }
-        self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
-        false
-    }
-
-    fn lfb_pipeline_color_pixel(
-        &mut self,
-        base: u32,
-        position: (u32, u32),
-        raw: u16,
-        color: (u8, u8, u8),
-        alpha: u8,
-    ) -> Option<u16> {
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
-            return Some(raw);
-        }
-        let position = self.lfb_pipeline_stipple_position(position)?;
-        self.lfb_pipeline_shade_color_at(base, position, raw, color, alpha)
-    }
-
-    fn lfb_pipeline_depth_color_pixel(
-        &mut self,
-        base: u32,
-        position: (u32, u32),
-        raw: u16,
-        color: (u8, u8, u8),
-        alpha: u8,
-        depth: u16,
-    ) -> Option<u16> {
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
-            return Some(raw);
-        }
-        let position = self.lfb_pipeline_stipple_position(position)?;
-        if !self.lfb_pipeline_depth_test_passes(position, depth) {
-            return None;
-        }
-        self.lfb_pipeline_shade_color_at(base, position, raw, color, alpha)
-    }
-
-    fn lfb_pipeline_depth_only_color(
-        &mut self,
-        base: u32,
-        position: (u32, u32),
-        depth: u16,
-    ) -> Option<Option<u16>> {
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
-            return Some(None);
-        }
-        let position = self.lfb_pipeline_stipple_position(position)?;
-        if !self.lfb_pipeline_depth_test_passes(position, depth) {
-            return None;
-        }
-        let alpha = (self.za_color >> 24) as u8;
-        self.lfb_pipeline_shade_color_at(base, position, pack_rgb565(0, 0, 0), (0, 0, 0), alpha)
-            .map(Some)
-    }
-
-    fn lfb_pipeline_stipple_position(&mut self, position: (u32, u32)) -> Option<(u32, u32)> {
-        let (x, y) = position;
-        self.raster_params()
-            .framebuffer_pixel_offset(self.lfb_write_base(), x, y)?;
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.stipple_test_passes(x, y) {
-            return Some((x, y));
-        }
-        None
-    }
-
-    fn stipple_test_passes(&mut self, x: u32, y: u32) -> bool {
-        let mut stipple = self.stipple;
-        let passes = self.raster_params().stipple_test(&mut stipple, x, y);
-        self.stipple = stipple;
-        passes
-    }
-
-    fn lfb_pipeline_shade_color_at(
-        &mut self,
-        base: u32,
-        position: (u32, u32),
-        _raw: u16,
-        color: (u8, u8, u8),
-        alpha: u8,
-    ) -> Option<u16> {
-        if !self.lfb_pipeline_color_passes(color) || !self.lfb_pipeline_alpha_passes(alpha) {
-            return None;
-        }
-        let (x, y) = position;
-        let view = self.raster_view();
-        let (r, g, b) = view.apply_fog_color(color.0, color.1, color.2);
-        let (r, g, b) = view.alpha_blend_color_at_base(base, (x, y), (r, g, b), alpha);
-        Some(pack_rgb565_for_pixel(r, g, b, x, y, self.dither_enabled))
-    }
-
-    fn write_depth_pixel_at(&mut self, position: (u32, u32), value: u16) {
-        let Some(offset) =
-            self.raster_params()
-                .framebuffer_pixel_offset(self.aux_base, position.0, position.1)
-        else {
-            return;
-        };
-        self.fb.write_u16_le(offset, value);
-    }
-
-    fn write_color_pixel(&mut self, base: u32, position: (u32, u32), value: u16) {
-        self.color_pixels_stored = self.color_pixels_stored.saturating_add(1);
-        let Some(offset) = self
-            .raster_params()
-            .framebuffer_pixel_offset(base, position.0, position.1)
-        else {
-            return;
-        };
-        self.fb.write_u16_le(offset, value);
-    }
-
     fn run_fastfill(&mut self) {
         let write_color = self.fbz_mode & FBZ_RGB_WMASK != 0;
         let write_depth = self.fbz_mode & FBZ_DEPTH_WMASK != 0;
@@ -3951,6 +3745,23 @@ impl Distira {
 fn triangle_defers(triangle: &QueuedTriangle) -> bool {
     let mode = triangle.params.fbz_mode;
     mode & FBZ_STIPPLE == 0 || mode & FBZ_STIPPLE_PATT != 0
+}
+
+/// Whether an LFB write may ride the queue, or has to be applied now.
+///
+/// The twin of [`triangle_defers`], and it refuses for the same reason: the
+/// ROTATING stipple is a serial dependency, here from one guest STORE to the
+/// next. A rotating write's snapshot would differ at every word (the stipple
+/// pattern is a `RasterParams` field), so no run could ever coalesce, and
+/// `Distira::stipple` would need a write-back ordered against the guest's own
+/// stipple register writes. It is also unreachable when the LFB pixel
+/// pipeline is off, because nothing consults the stipple then -- see
+/// `distira/lfb_write.rs`'s `lfb_pipeline_stipple_position`.
+fn lfb_write_defers(params: &LfbWriteParams) -> bool {
+    let mode = params.params.fbz_mode;
+    params.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0
+        || mode & FBZ_STIPPLE == 0
+        || mode & FBZ_STIPPLE_PATT != 0
 }
 
 /// Whether [`RasterParams`] carries everything a write to this register
