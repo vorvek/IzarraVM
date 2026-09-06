@@ -5199,6 +5199,30 @@ impl DecodeCache {
     /// stays set either way: a stale mark only costs a future narrow attempt, never correctness.
     #[inline]
     fn narrow_invalidate(&mut self, physical: u32) -> Option<u32> {
+        self.narrow_invalidate_span(physical, physical)
+    }
+
+    #[inline]
+    fn narrow_invalidate_write(&mut self, physical: u32, width: u32) -> Option<u32> {
+        if matches!(width, 2 | 4)
+            && let Some(last) = physical.checked_add(width - 1)
+            && physical >> 12 == last >> 12
+            && (0..width).all(|i| self.is_code_byte(physical + i))
+        {
+            return self.narrow_invalidate_span(physical, last);
+        }
+        (0..width).try_fold(0u32, |acc, i| {
+            let byte = physical.wrapping_add(i);
+            if !self.is_code_byte(byte) {
+                return Some(acc);
+            }
+            self.narrow_invalidate(byte).map(|k| acc + k)
+        })
+    }
+
+    #[inline]
+    fn narrow_invalidate_span(&mut self, physical: u32, last: u32) -> Option<u32> {
+        debug_assert!(physical <= last && physical >> 12 == last >> 12);
         // R4: with two ring contexts live, `code_page_lin`'s one-linear-per-physical entry
         // belongs to whichever context wrote it last and cannot name a candidate carrying the
         // OTHER context's generation. Refusing here degrades to the wholesale fallback for
@@ -5216,8 +5240,9 @@ impl DecodeCache {
         // narrow too). Any line covering the byte starts at most 14 bytes earlier (15-byte max
         // instruction), under this same mapping (a different mapping would have set `aliased`).
         let written_lin = (info.lin_page << 12) | (physical & 0xfff);
+        let last_lin = written_lin.checked_add(last - physical)?;
         let mut killed = 0u32;
-        for candidate in written_lin.saturating_sub(14)..=written_lin {
+        for candidate in written_lin.saturating_sub(14)..=last_lin {
             let index = (candidate & self.mask) as usize;
             let removed = {
                 let line = &self.lines[index];
@@ -5225,7 +5250,9 @@ impl DecodeCache {
                     false
                 } else {
                     let len = line.insn.map_or(0, |i| u32::from(i.len));
-                    line.phys_start <= physical && physical < line.phys_start.wrapping_add(len)
+                    len != 0
+                        && line.phys_start <= last
+                        && physical < line.phys_start.wrapping_add(len)
                 }
             };
             if removed {

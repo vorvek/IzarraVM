@@ -266,6 +266,11 @@ impl Vega {
         &mut self.distira
     }
 
+    /// Set the raster worker count after settling pending rendering.
+    pub(crate) fn set_glide_workers(&mut self, workers: usize) {
+        self.distira.set_raster_lanes(workers);
+    }
+
     /// Host override for the Glide texture filtering setting. See
     /// `Distira::set_force_point_sampling`.
     pub(crate) fn set_glide_force_point_sampling(&mut self, enabled: bool) {

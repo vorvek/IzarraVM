@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "cpu_decode_range_test.rs"]
+mod decode_range;
+
 fn run_cpuid(leaf: u32) -> CpuGsw {
     // CPUID (0F A2) with the leaf selector in EAX. Returns the CPU after one step so the
     // caller can read EAX/EBX/ECX/EDX.

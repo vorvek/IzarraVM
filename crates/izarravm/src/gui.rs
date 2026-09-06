@@ -18,7 +18,9 @@ pub(crate) use session::load_cd_image_from_path;
 use crate::controller_names::ControllerNameResolver;
 use crate::controller_profiles::ControllerProfileStore;
 use crate::host_input::HostInputPolicy;
-use crate::prefs::{CrtStyle, GlideGamma, GlideTextureFilter, GuiPrefs, KeyBinding, MAX_VOLUME};
+use crate::prefs::{
+    CrtStyle, GlideGamma, GlideTextureFilter, GlideWorkers, GuiPrefs, KeyBinding, MAX_VOLUME,
+};
 use crate::startup::GuiLaunch;
 use izarravm_audio::{AudioPlayer, MidiEngine};
 use izarravm_core::{GswMode, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
@@ -722,6 +724,7 @@ pub struct GuiApp {
     // (Disabled). Persisted; takes effect on the next power-on. See
     // `gui_session::SessionSpec::glide_force_point_sampling`.
     glide_texture_filter: GlideTextureFilter,
+    glide_workers: GlideWorkers,
     // The engine that produced the frame currently on the texture. The uniform
     // is rewritten every paint but a frame arrives only on some of them, so
     // this has to persist rather than be read off the frame in hand.
@@ -777,6 +780,7 @@ struct ConfigDialog {
     monitor_gamma: Option<f32>,
     glide_gamma: GlideGamma,
     glide_texture_filter: GlideTextureFilter,
+    glide_workers: GlideWorkers,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
     soundfont: Option<PathBuf>,
@@ -1157,11 +1161,14 @@ impl GuiApp {
                 prefs.glide_texture_filter,
                 GlideTextureFilter::Disabled
             ),
+            glide_workers: prefs.glide_workers.count(),
             sink: Some(audio.sink()),
             rtc_setup,
             gain: gain.clone(),
             #[cfg(test)]
             finalization_probe: None,
+            #[cfg(test)]
+            raster_pool_probe: None,
         };
         let mut session = GuiSession::start(spec, initial_media)?;
         let initial_update = session.poll();
@@ -1171,6 +1178,7 @@ impl GuiApp {
         let monitor_gamma = prefs.monitor_gamma;
         let glide_gamma = prefs.glide_gamma;
         let glide_texture_filter = prefs.glide_texture_filter;
+        let glide_workers = prefs.glide_workers;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
         let screenshot_key = prefs.screenshot.clone();
@@ -1251,6 +1259,7 @@ impl GuiApp {
             monitor_gamma,
             glide_gamma,
             glide_texture_filter,
+            glide_workers,
             input_release,
             fullscreen_key,
             screenshot_key,
