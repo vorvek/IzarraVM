@@ -14,6 +14,8 @@ calibration and refuses the current sole timing model.
 
 Product measurements use unrestricted process affinity and four raster workers. Explicit processor pins and experimental knobs are labelled
 diagnostic. A single-core process pin also constrains the Glide workers.
+Mojo is available explicitly with -Fixtures mojo-586 as a Voodoo diagnostic;
+the default performance sweep excludes it.
 
 Each fixture is invoked with the EXACT arguments recorded for it in
 .bench/PROTOCOL.md. That is not a style choice: the framebuffer hashes below
@@ -2096,8 +2098,14 @@ function Get-FixtureTable {
     )
 }
 
+function Test-DefaultScoreboardFixture([string]$Name) {
+    return $Name -ne 'mojo-586'
+}
+
 if ($ListFixtures) {
-    Get-FixtureTable | Select-Object name, folder, cycles | Format-Table -AutoSize
+    Get-FixtureTable | Select-Object name, folder, cycles, @{ Name = 'scope'; Expression = {
+        if (Test-DefaultScoreboardFixture $_.name) { 'default' } else { 'diagnostic' }
+    } } | Format-Table -AutoSize
     return
 }
 
@@ -3182,6 +3190,15 @@ function Resolve-FixtureSelection([string[]]$Specification, [string[]]$KnownName
     return ,$selected
 }
 
+function Select-ScoreboardFixtures([string[]]$Specification) {
+    $table = @(Get-FixtureTable)
+    if ($Specification.Count -eq 0) {
+        return $table | Where-Object { Test-DefaultScoreboardFixture $_.name }
+    }
+    $selected = Resolve-FixtureSelection $Specification @($table.name)
+    return $table | Where-Object { $selected -contains $_.name }
+}
+
 # The child environment for one row: scrub, then the board's own table, then the
 # caller's explicit -Knobs passthrough.
 #
@@ -3420,6 +3437,15 @@ harness itself works, so the red row cannot pass by being unable to run.
 #>
 function Assert-ScoreboardFixtureSelectionSelfTest {
     $known = @((Get-FixtureTable).name)
+    $default = @(Select-ScoreboardFixtures @())
+    Assert-ScoreboardSelfTestEqual $default.Count 20 'default performance row count'
+    Assert-ScoreboardSelfTestEqual ($default.name -contains 'mojo-586') $false 'Mojo excluded by default'
+    $mojo = @(Select-ScoreboardFixtures @('mojo-586'))
+    Assert-ScoreboardSelfTestEqual $mojo.Count 1 'explicit diagnostic row count'
+    Assert-ScoreboardSelfTestEqual $mojo[0].name 'mojo-586' 'explicit Mojo selection'
+    $mixed = @(Select-ScoreboardFixtures @('doom-586,mojo-586'))
+    Assert-ScoreboardSelfTestEqual $mixed.Count 2 'mixed performance and diagnostic selection'
+    Assert-ScoreboardSelfTestEqual ($mixed.name -contains 'mojo-586') $true 'mixed selection retains Mojo'
 
     # --- the `pwsh -File` comma-binding trap, resolved not rejected ----------
     $split = Resolve-FixtureSelection @("doom-486,wolf3d-486") $known
@@ -3990,11 +4016,7 @@ if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
     throw "Executable not found: $Executable"
 }
 
-$table = Get-FixtureTable
-if ($Fixtures.Count -gt 0) {
-    $selected = Resolve-FixtureSelection $Fixtures @($table.name)
-    $table = @($table | Where-Object { $selected -contains $_.name })
-}
+$table = @(Select-ScoreboardFixtures $Fixtures)
 
 foreach ($fixture in $table) {
     $source = Get-ContainedPath $benchRoot $fixture.folder
