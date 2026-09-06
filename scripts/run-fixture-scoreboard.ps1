@@ -12,8 +12,7 @@ One current-model capture per fixture, with runtime validity checked separately
 from context-qualified historical pins. The realtime gate retains historical
 calibration and refuses the current sole timing model.
 
-Product measurements use unrestricted process affinity and automatic raster
-worker selection. Explicit processor pins and experimental knobs are labelled
+Product measurements use unrestricted process affinity and four raster workers. Explicit processor pins and experimental knobs are labelled
 diagnostic. A single-core process pin also constrains the Glide workers.
 
 Each fixture is invoked with the EXACT arguments recorded for it in
@@ -115,7 +114,7 @@ param(
     [string]$Arm = "on",
     # The one-lookup store emission arm (dev_docs/2026-08-07-one-lookup-store-design.md D8):
     # "1" is the shipped default, "0" restores the classic classify/resolve store emission.
-    # Set explicitly on every run for the same inherit-hazard reason as the JIT16 pair —
+    # Set explicitly on every run for the same inherit-hazard reason as the JIT16 pair -
     # IZARRAVM_ONE_LOOKUP_STORE is on for every value except exactly "0", so a stray "0" left
     # in the caller's environment would silently turn an "on" observation into an "off" one.
     [ValidateSet("1", "0")]
@@ -444,7 +443,7 @@ function Get-ScoreboardMarkdown($Rows, [string]$BoardLabel, [string]$BoardArm,
     if ($null -ne $BoardKnobs -and $BoardKnobs.Count -gt 0) {
         $markdown += ("Arm passthrough: " + (($BoardKnobs.GetEnumerator() |
             ForEach-Object { "``$($_.Key)=$($_.Value)``" }) -join ", ") +
-            ". Every other IZARRAVM_* knob is removed from the child environment.")
+            ". Other IZARRAVM_* knobs use the fixture defaults or are removed.")
     }
     $markdown += "Direct insns/entry includes emitted instructions and successful helper instructions. Abnormal helper attempts replay in the interpreter and do not count as helper-retired instructions."
     $markdown += 'An unpinned invariant means historical correctness references are unqualified; it does not describe CPU affinity.'
@@ -777,6 +776,17 @@ videoDimensions: 00000000      20c
 
 
 function Assert-ScoreboardAffinitySelfTest {
+    $inheritedLanes = [Environment]::GetEnvironmentVariable('IZARRAVM_DISTIRA_LANES')
+    try {
+        [Environment]::SetEnvironmentVariable('IZARRAVM_DISTIRA_LANES', '8')
+        $defaultEnvironment = Get-ChildEnvironmentSnapshot (Get-RowEnvironment @())
+        Assert-ScoreboardSelfTestEqual $defaultEnvironment['IZARRAVM_DISTIRA_LANES'] '4' 'fixture default ignores inherited workers'
+        $overrideEnvironment = Get-ChildEnvironmentSnapshot (Get-RowEnvironment @('IZARRAVM_DISTIRA_LANES=8'))
+        Assert-ScoreboardSelfTestEqual $overrideEnvironment['IZARRAVM_DISTIRA_LANES'] '8' 'explicit worker override'
+    } finally {
+        [Environment]::SetEnvironmentVariable('IZARRAVM_DISTIRA_LANES', $inheritedLanes)
+    }
+
     Assert-ScoreboardSelfTestThrows {
         New-ScoreboardHostPolicy -1 @{} 1 255
     } 'restricted' 'inherited single-core affinity'
@@ -3198,6 +3208,7 @@ function Get-RowEnvironment {
         $environment[$entry.Key] = $entry.Value
     }
 
+    $environment["IZARRAVM_DISTIRA_LANES"] = "4"
     $knobValues = Resolve-KnobPassthrough $KnobSpecification @($boardOwned.Keys)
     foreach ($entry in $knobValues.GetEnumerator()) {
         $environment[$entry.Key] = $entry.Value
@@ -3564,7 +3575,7 @@ function New-ScoreboardHostPolicy([int]$Index, $KnobValues, [uint64]$ProcessMask
         effective_process_mask = $effective.ToString('X16')
         allowed_logical_processors = [Numerics.BitOperations]::PopCount($effective)
         system_logical_processors = [Numerics.BitOperations]::PopCount($SystemMask)
-        raster_lanes = $(if ($override) { "override:$($KnobValues['IZARRAVM_DISTIRA_LANES'])" } else { 'auto' })
+        raster_lanes = $(if ($override) { "override:$($KnobValues['IZARRAVM_DISTIRA_LANES'])" } else { 'default:4' })
         child_affinity_verified = $false
     }
 }

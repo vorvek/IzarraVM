@@ -2589,6 +2589,11 @@ impl Machine {
         self.vega.host_metrics()
     }
 
+    /// Set the raster worker count after settling pending rendering.
+    pub fn set_glide_workers(&mut self, workers: usize) {
+        self.vega.set_glide_workers(workers);
+    }
+
     /// Host override for the Glide texture filtering setting: forces nearest
     /// (point) sampling on Distira for every TMU, regardless of the guest's
     /// own `texture_mode` bilinear bit. Off (the default) leaves every
