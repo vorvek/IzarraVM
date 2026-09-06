@@ -632,6 +632,32 @@ function Assert-ScoreboardQualificationSelfTest {
         Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'Invalid real_time_factor' 'NaN capture'
         $nanBand = Test-ProfileBands $profile @(@{ path = 'real_time_factor'; min = 0; max = 10 }) $false
         Assert-ScoreboardSelfTestEqual $nanBand.failures.Count 1 'unqualified bands still reject malformed fields'
+        $profile.real_time_factor = 1.0
+        $profile.elapsed_budget_clocks = 50
+        $profile.stop = [pscustomobject]@{ kind = 'test_exit'; code = 81 }
+        foreach ($completionName in @('duke3d-586', 'mojo-586')) {
+            $completionFixture = @($table | Where-Object name -eq $completionName)[0]
+            Assert-FixtureCapture $completionFixture $profile 0 100
+            Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $completionFixture $profile 81 100 } 'Host exit code' 'guest code is not a host success code'
+            $profile.stop.code = 0
+            Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $completionFixture $profile 0 100 } 'Guest did not complete' 'wrong guest completion code'
+            $profile.stop.code = 81
+        }
+        $doom = @($table | Where-Object name -eq 'doom-586')[0]
+        $profile.stop.code = 0
+        Assert-FixtureCapture $doom $profile 0 100
+        $profile.stop.kind = 'cycle_limit'; $profile.elapsed_budget_clocks = 100
+        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $doom $profile 0 100 } 'Guest did not complete' 'Doom idle tail is not completion'
+        $prepared = Join-Path $directory 'prepared-doom'
+        Copy-Fixture $hdd $prepared
+        Prepare-FixtureInputs $doom $prepared
+        Assert-ScoreboardSelfTestEqual (Test-Path -LiteralPath (Join-Path $hdd 'EXITVM.COM')) $false 'original fixture stays untouched'
+        Assert-ScoreboardSelfTestEqual ([IO.File]::ReadAllText((Join-Path $prepared 'AUTOEXEC.BAT'))) 'GAME.EXE' 'preparation preserves AUTOEXEC'
+        Assert-ScoreboardSelfTestEqual ([Convert]::ToHexString([IO.File]::ReadAllBytes((Join-Path $prepared 'EXITVM.COM')))) 'B00CE6E4B000E6E5B003E6E6F4EBFD' 'canonical zero-exit helper'
+        $preparedDescriptor = Get-FixtureDescriptor $doom $prepared
+        Assert-ScoreboardSelfTestEqual $preparedDescriptor.hdd_files.Count 3 'prepared identity includes the exit helper'
+        Prepare-FixtureInputs $fixture $hdd
+        Assert-ScoreboardSelfTestEqual (Test-Path -LiteralPath (Join-Path $hdd 'EXITVM.COM')) $false 'unrelated fixture receives no helper'
         $quake = Join-Path $directory 'qconsole.log'
         [IO.File]::WriteAllText($quake, '969 frames 24.3 seconds 39.9 fps')
         $null = Read-ScoreboardQuakeResult $quake
@@ -2516,6 +2542,15 @@ function Clear-FixtureOutputs($Fixture, [string]$WorkingCopy) {
     }
 }
 
+function Prepare-FixtureInputs($Fixture, [string]$WorkingCopy) {
+    Clear-FixtureOutputs $Fixture $WorkingCopy
+    if ($Fixture.name -in @('doom-486', 'doom-586')) {
+        [IO.File]::WriteAllBytes((Join-Path $WorkingCopy 'EXITVM.COM'),
+            [byte[]]@(0xB0, 0x0C, 0xE6, 0xE4, 0xB0, 0x00, 0xE6, 0xE5,
+                0xB0, 0x03, 0xE6, 0xE6, 0xF4, 0xEB, 0xFD))
+    }
+}
+
 function Get-FixtureDescriptor($Fixture, [string]$WorkingCopy) {
     $knobValues = Resolve-KnobPassthrough $Knobs @((Get-BoardOwnedEnvironment).Keys)
     $knobNames = [string[]]@($knobValues.Keys)
@@ -2597,7 +2632,7 @@ function Assert-FixtureCapture($Fixture, $Profile, [int]$ExitCode, [uint64]$Budg
     $completion = -not $Anchor -and ($null -ne $Fixture.gametics -or $Fixture.dukemark -or $text)
     $code = if ($completion -and $Fixture.dukemark) { $Fixture.dukemark.exitCode }
         elseif ($completion -and $text) { $text.exitCode } else { 0 }
-    if ($ExitCode -ne $code) { throw "Host exit code $ExitCode, expected $code" }
+    if ($ExitCode -ne 0) { throw "Host exit code $ExitCode, expected 0" }
     if ($completion) {
         if ($Profile.stop.kind -ne 'test_exit' -or
             (Get-RequiredUInt64Property $Profile.stop 'code' 'profile.stop') -ne $code) {
@@ -3411,7 +3446,7 @@ function Invoke-AnchorRun($Fixture, [string]$ExecutablePath, [string]$ScratchRoo
     $result = @{ sha256 = $null; display = $null; wall_s = 0.0; failure = $null }
     try {
         Copy-Fixture (Join-Path $benchRoot $Fixture.folder) $workingCopy
-        Clear-FixtureOutputs $Fixture $workingCopy
+        Prepare-FixtureInputs $Fixture $workingCopy
         $descriptor = Get-FixtureDescriptor $Fixture $workingCopy
         $descriptor | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath `
             (Join-Path $ScratchRoot "$stem.inputs.json") -Encoding utf8
@@ -3469,7 +3504,7 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     }
     try {
         Copy-Fixture (Join-Path $benchRoot $Fixture.folder) $workingCopy
-        Clear-FixtureOutputs $Fixture $workingCopy
+        Prepare-FixtureInputs $Fixture $workingCopy
         $descriptor = Get-FixtureDescriptor $Fixture $workingCopy
         $descriptor | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath `
             (Join-Path $ScratchRoot "$stem.inputs.json") -Encoding utf8
