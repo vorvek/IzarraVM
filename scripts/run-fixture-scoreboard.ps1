@@ -12,6 +12,10 @@ One current-model capture per fixture, with runtime validity checked separately
 from context-qualified historical pins. The realtime gate retains historical
 calibration and refuses the current sole timing model.
 
+Product measurements use unrestricted process affinity and automatic raster
+worker selection. Explicit processor pins and experimental knobs are labelled
+diagnostic. A single-core process pin also constrains the Glide workers.
+
 Each fixture is invoked with the EXACT arguments recorded for it in
 .bench/PROTOCOL.md. That is not a style choice: the framebuffer hashes below
 were measured under those arguments, so changing a persona, a memory size or a
@@ -88,6 +92,7 @@ param(
     [string[]]$Fixtures = @(),
     [string]$Label = "",
     [string]$ResultsDirectory = "",
+    # -1 verifies unrestricted process affinity; an explicit core is diagnostic.
     [int]$ProcessorIndex = -1,
     # Per fixture, not for the sweep. duke3d-586 alone is about half an hour of
     # wall since it has to play a DUKEMARK demo to completion, so the old 1800
@@ -418,11 +423,20 @@ function Format-ScoreboardDecimal([double]$Value) {
 }
 
 function Get-ScoreboardMarkdown($Rows, [string]$BoardLabel, [string]$BoardArm,
-    [string]$StoreArm, [string]$LoadArm, $BoardKnobs = $null) {
+    [string]$StoreArm, [string]$LoadArm, $BoardKnobs = $null, $HostPolicy = $null) {
     $markdown = @()
     $markdown += "# Fixture scoreboard$(if ($BoardLabel) { ": $BoardLabel" })"
     $markdown += ""
     $markdown += "Recorded $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), JIT arm ``$BoardArm``, one-lookup store ``$StoreArm``, one-lookup load ``$LoadArm``. rt is guest seconds per wall second; 1.0 is real time."
+    if ($null -eq $HostPolicy) {
+        $markdown += 'Host affinity is unverified; not a product throughput result.'
+    } else {
+        $markdown += "Host measurement: **$($HostPolicy.measurement_class)**; $($HostPolicy.affinity_policy); $($HostPolicy.allowed_logical_processors) allowed logical processors; raster lanes: $($HostPolicy.raster_lanes)."
+        if ($HostPolicy.measurement_class -eq 'diagnostic') {
+            $markdown += 'This is not a product throughput result. Do not mix it with unrestricted runs.'
+        }
+        $markdown += 'Process affinity does not verify CPU Sets, job restrictions or actual raster worker activity.'
+    }
     # State the passthrough on the human-readable board too. A ladder leg whose
     # Markdown does not say which arm it ran is a leg that gets mislabelled the
     # moment two of them sit in the same directory. `NAME=` with nothing after
@@ -433,6 +447,7 @@ function Get-ScoreboardMarkdown($Rows, [string]$BoardLabel, [string]$BoardArm,
             ". Every other IZARRAVM_* knob is removed from the child environment.")
     }
     $markdown += "Direct insns/entry includes emitted instructions and successful helper instructions. Abnormal helper attempts replay in the interpreter and do not count as helper-retired instructions."
+    $markdown += 'An unpinned invariant means historical correctness references are unqualified; it does not describe CPU affinity.'
     $markdown += ""
     $markdown += "| fixture | rt | wall s | emitted | helper | interpreter | entries | direct insns/entry | emitted insns/entry | 16-bit direct insns/entry | governor win/back/probe/rearm | invariant |"
     $markdown += "|---|---|---|---|---|---|---|---|---|---|---|---|"
@@ -761,7 +776,75 @@ videoDimensions: 00000000      20c
 }
 
 
+function Assert-ScoreboardAffinitySelfTest {
+    Assert-ScoreboardSelfTestThrows {
+        New-ScoreboardHostPolicy -1 @{} 1 255
+    } 'restricted' 'inherited single-core affinity'
+    $full = New-ScoreboardHostPolicy -1 (Resolve-KnobPassthrough @() @()) 255 255
+    Assert-ScoreboardSelfTestEqual $full.measurement_class 'product-throughput' 'default host policy'
+    $single = New-ScoreboardHostPolicy 3 @{} 255 255
+    Assert-ScoreboardSelfTestEqual $single.measurement_class 'diagnostic' 'single core is diagnostic'
+    $override = New-ScoreboardHostPolicy -1 (Resolve-KnobPassthrough @('IZARRAVM_DISTIRA_LANES=8') @()) 255 255
+    Assert-ScoreboardSelfTestEqual $override.measurement_class 'diagnostic' 'explicit lanes are diagnostic'
+    $other = New-ScoreboardHostPolicy -1 (Resolve-KnobPassthrough @('IZARRAVM_JIT_UNWIND=0') @()) 255 255
+    Assert-ScoreboardSelfTestEqual $other.measurement_class 'diagnostic' 'other experimental knobs'
+    Assert-ScoreboardSelfTestThrows {
+        New-ScoreboardHostPolicy 3 @{} 1 255
+    } 'available' 'unavailable processor'
+    $sparse = New-ScoreboardHostPolicy -1 @{} 160 160
+    Assert-ScoreboardSelfTestEqual $sparse.allowed_logical_processors 2 'sparse system mask'
+    $wide = New-ScoreboardHostPolicy -1 @{} ([uint64]::MaxValue) ([uint64]::MaxValue)
+    Assert-ScoreboardSelfTestEqual $wide.allowed_logical_processors 64 'bit 63 preserved'
+    $rendered = (Get-ScoreboardMarkdown @() '' 'on' '1' '1' @{} $single) -join "`n"
+    if ($rendered -notmatch 'diagnostic' -or $rendered -notmatch 'not a product throughput result') {
+        throw 'Missing diagnostic label in Markdown'
+    }
+    if (-not $IsWindows) { return }
+    $parent = Get-Process -Id $PID
+    $original = $parent.ProcessorAffinity
+    $masks = Get-ScoreboardAffinity $parent
+    $index = 0
+    while (($masks.process_mask -band ([uint64]1 -shl $index)) -eq 0) { $index++ }
+    if ($index -gt 62) { throw 'No test processor below index 63' }
+    $policy = New-ScoreboardHostPolicy $index @{} $masks.process_mask $masks.system_mask
+    $scratch = Join-Path ([IO.Path]::GetTempPath()) ('izarravm-affinity-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $scratch | Out-Null
+    $child = $null
+    try {
+        $probe = Join-Path $scratch 'probe.ps1'
+        @'
+param($Output, $Release)
+(Get-Process -Id $PID).ProcessorAffinity.ToInt64().ToString('X16') | Set-Content $Output
+while (-not (Test-Path $Release)) { Start-Sleep -Milliseconds 20 }
+'@ | Set-Content $probe
+        $output = Join-Path $scratch 'mask.txt'
+        $release = Join-Path $scratch 'release'
+        $start = @{
+            FilePath=$parent.Path
+            ArgumentList=@('-NoProfile','-File', ('"' + $probe + '"'), ('"' + $output + '"'), ('"' + $release + '"'))
+            PassThru=$true; WindowStyle='Hidden'
+        }
+        $launch = Start-ScoreboardProcess $start $policy
+        $child = $launch.process
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while (-not (Test-Path $output) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
+        Assert-ScoreboardSelfTestEqual (Get-Content $output -Raw).Trim() $policy.effective_process_mask 'child starts pinned'
+        Assert-ScoreboardSelfTestEqual $parent.ProcessorAffinity $original 'parent restored after spawn'
+        New-Item -ItemType File $release | Out-Null
+        if (-not $child.WaitForExit(20000)) { throw 'Affinity test child did not exit' }
+        Assert-ScoreboardSelfTestThrows {
+            Start-ScoreboardProcess @{FilePath=(Join-Path $scratch 'missing.exe');PassThru=$true;ErrorAction='Stop'} $policy
+        } '' 'spawn failure'
+        Assert-ScoreboardSelfTestEqual $parent.ProcessorAffinity $original 'parent restored on failure'
+    } finally {
+        if ($null -ne $child -and -not $child.HasExited) { $child.Kill($true); $child.WaitForExit() }
+        $parent.ProcessorAffinity = $original
+        Remove-Item -LiteralPath $scratch -Recurse -Force
+    }
+}
+
 function Invoke-ScoreboardSelfTest {
+    Assert-ScoreboardAffinitySelfTest
     # The profile-band grader must be provable RED: a gate that cannot fail is
     # systemic. One in-range band, one below the floor, one missing path.
     $bandProfile = [pscustomobject]@{
@@ -1803,7 +1886,7 @@ function Get-FixtureTable {
             # DEMO 50-85, title 85-100, DEMO 100-130, and so on. The budget lands
             # 14 seconds into the SECOND demo, so the run holds one COMPLETE demo
             # plus half of another and the end frame sits 16 seconds clear of the
-            # nearest transition. Real-time factor 0.87, 132 s wall.
+            # nearest transition.
             cycles = [uint64]19000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; dukemark = $null
@@ -1842,8 +1925,7 @@ function Get-FixtureTable {
             name = "descent2-3dfx-586"; folder = "descent2_c"
             # The second Glide row, and not a duplicate of the first: it ships
             # the BYTE-IDENTICAL glide2x.ovl (md5 341b8f5d82daa46fd1ce2363...)
-            # and drives it far harder. Where Tomb Raider runs at rt 0.87, this
-            # runs at 0.32 -- six-degree-of-freedom geometry, per-pixel lighting
+            # and drives it far harder: six-degree-of-freedom geometry, per-pixel lighting
             # and a rear-view viewport, all through the same rasteriser. It is
             # the heavier of the two and the one a Distira regression should
             # reach first.
@@ -1852,7 +1934,7 @@ function Get-FixtureTable {
             # notice at 23-24, and the recorded demo from 29 onward, still
             # running past 170. The budget lands 25 seconds into the demo, at
             # "PLAYBACK (33% DONE)", deep inside the phase and far from either
-            # end of it. 170 s wall.
+            # end of it.
             cycles = [uint64]9000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
             qconsole = $false; resultPpm = $true; dukemark = $null
@@ -3435,6 +3517,92 @@ It is cheap relative to what it protects: 7 s against tombraid-586's ~250 s,
 Nothing here is timed. The anchor run contributes NO wall, NO real-time factor
 and NO coverage counters to the row -- only a frame hash.
 #>
+function Get-ScoreboardAffinity($Process) {
+    if (-not ('ScoreboardAffinity' -as [type])) {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class ScoreboardAffinity {
+    [DllImport("kernel32.dll", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetProcessAffinityMask(IntPtr process, out UIntPtr mask, out UIntPtr system);
+    [DllImport("kernel32.dll")]
+    public static extern ushort GetActiveProcessorGroupCount();
+}
+'@
+    }
+    if ([IntPtr]::Size -ne 8 -or [ScoreboardAffinity]::GetActiveProcessorGroupCount() -ne 1) {
+        throw 'Scoreboard affinity verification requires a 64-bit process and one processor group'
+    }
+    $mask = [UIntPtr]::Zero; $system = [UIntPtr]::Zero
+    if (-not [ScoreboardAffinity]::GetProcessAffinityMask($Process.Handle, [ref]$mask, [ref]$system)) {
+        throw [ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    }
+    if ($mask -eq [UIntPtr]::Zero -or $system -eq [UIntPtr]::Zero) { throw 'Empty affinity mask' }
+    return @{ process_mask=$mask.ToUInt64(); system_mask=$system.ToUInt64() }
+}
+
+function New-ScoreboardHostPolicy([int]$Index, $KnobValues, [uint64]$ProcessMask, [uint64]$SystemMask) {
+    if ($Index -lt -1 -or $Index -gt 62) { throw 'ProcessorIndex must be -1 or 0 through 62' }
+    if ($ProcessMask -eq 0 -or $SystemMask -eq 0 -or ($ProcessMask -band $SystemMask) -ne $ProcessMask) {
+        throw 'Invalid process/system affinity masks'
+    }
+    $effective = $ProcessMask
+    if ($Index -lt 0) {
+        if ($ProcessMask -ne $SystemMask) { throw 'Inherited process affinity is restricted; run the product scoreboard from an unrestricted shell' }
+    } else {
+        $effective = [uint64]1 -shl $Index
+        if (($ProcessMask -band $effective) -eq 0) { throw 'Requested processor is not available' }
+    }
+    $override = $KnobValues.Contains('IZARRAVM_DISTIRA_LANES')
+    return [ordered]@{
+        measurement_class = $(if ($Index -ge 0 -or $KnobValues.Count -gt 0) { 'diagnostic' } else { 'product-throughput' })
+        affinity_policy = $(if ($Index -ge 0) { 'single-core process affinity' } else { 'unrestricted process affinity' })
+        requested_processor_index = $Index
+        parent_process_mask = $ProcessMask.ToString('X16')
+        system_mask = $SystemMask.ToString('X16')
+        effective_process_mask = $effective.ToString('X16')
+        allowed_logical_processors = [Numerics.BitOperations]::PopCount($effective)
+        system_logical_processors = [Numerics.BitOperations]::PopCount($SystemMask)
+        raster_lanes = $(if ($override) { "override:$($KnobValues['IZARRAVM_DISTIRA_LANES'])" } else { 'auto' })
+        child_affinity_verified = $false
+    }
+}
+
+function Start-ScoreboardProcess($Start, $Policy) {
+    if (-not $IsWindows) {
+        return @{ process=(Start-Process @Start); host_policy=$Policy }
+    }
+    $parent = Get-Process -Id $PID
+    $original = $parent.ProcessorAffinity
+    $child = $null
+    try {
+        try {
+            $current = Get-ScoreboardAffinity $parent
+            if ($current.process_mask.ToString('X16') -ne $Policy.parent_process_mask -or
+                $current.system_mask.ToString('X16') -ne $Policy.system_mask) { throw 'Parent affinity changed before launch' }
+            $mask = [Convert]::ToUInt64($Policy.effective_process_mask, 16)
+            $parent.ProcessorAffinity = [IntPtr][BitConverter]::ToInt64([BitConverter]::GetBytes($mask), 0)
+            if ((Get-ScoreboardAffinity $parent).process_mask -ne $mask) { throw 'Parent affinity setting failed' }
+            $child = Start-Process @Start
+            $observed = Get-ScoreboardAffinity $child
+            if ($observed.process_mask -ne $mask -or $observed.system_mask.ToString('X16') -ne $Policy.system_mask) {
+                throw 'Child affinity differs from requested policy'
+            }
+        } finally {
+            $parent.ProcessorAffinity = $original
+            if ($parent.ProcessorAffinity -ne $original) { throw 'Parent affinity restoration failed' }
+        }
+        $verified = [ordered]@{}
+        foreach ($key in $Policy.Keys) { $verified[$key] = $Policy[$key] }
+        $verified.child_affinity_verified = $true
+        return @{ process=$child; host_policy=$verified }
+    } catch {
+        if ($null -ne $child -and -not $child.HasExited) { $child.Kill($true); $child.WaitForExit() }
+        throw
+    }
+}
+
 function Invoke-AnchorRun($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     [string]$Archive, [string]$InputSha256) {
     $contract = Get-FrameContract $Fixture
@@ -3443,7 +3611,8 @@ function Invoke-AnchorRun($Fixture, [string]$ExecutablePath, [string]$ScratchRoo
     $workingCopy = Join-Path $ScratchRoot $stem
     $profilePath = Join-Path $ScratchRoot "$stem.json"
     $ppmPath = Join-Path $ScratchRoot "$stem.ppm"
-    $result = @{ sha256 = $null; display = $null; wall_s = 0.0; failure = $null }
+    $result = @{ sha256 = $null; display = $null; wall_s = 0.0; failure = $null
+        host_policy = @{ child_affinity_verified = $false } }
     try {
         Copy-Fixture (Join-Path $benchRoot $Fixture.folder) $workingCopy
         Prepare-FixtureInputs $Fixture $workingCopy
@@ -3459,8 +3628,9 @@ function Invoke-AnchorRun($Fixture, [string]$ExecutablePath, [string]$ScratchRoo
             RedirectStandardError = Join-Path $ScratchRoot "$stem.err"
         }
         $wall = [Diagnostics.Stopwatch]::StartNew()
-        $process = Start-Process @start
-        if ($ProcessorIndex -ge 0) { $process.ProcessorAffinity = [IntPtr]([int64]1 -shl $ProcessorIndex) }
+        $launch = Start-ScoreboardProcess $start $hostPolicy
+        $process = $launch.process
+        $result.host_policy = $launch.host_policy
         if (-not $process.WaitForExit($HostTimeoutSeconds * 1000)) {
             $process.Kill($true); $process.WaitForExit()
             throw "Anchor exceeded $HostTimeoutSeconds seconds"
@@ -3501,6 +3671,7 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         knobs = Resolve-KnobPassthrough $Knobs @((Get-BoardOwnedEnvironment).Keys)
         exit_code = $null; host_wall_s = 0.0; background_load = 0.0; background_peak = 0.0
         load_samples = 0; contaminated = $false; invariant = 'FAIL'; notes = @(); refused_axes = @()
+        host_policy = @{ child_affinity_verified = $false }
     }
     try {
         Copy-Fixture (Join-Path $benchRoot $Fixture.folder) $workingCopy
@@ -3518,8 +3689,9 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
             RedirectStandardError = Join-Path $ScratchRoot "$stem.err"
         }
         $wall = [Diagnostics.Stopwatch]::StartNew()
-        $process = Start-Process @start
-        if ($ProcessorIndex -ge 0) { $process.ProcessorAffinity = [IntPtr]([int64]1 -shl $ProcessorIndex) }
+        $launch = Start-ScoreboardProcess $start $hostPolicy
+        $process = $launch.process
+        $result.host_policy = $launch.host_policy
         $waited = Wait-WithLoadSampling $process $HostTimeoutSeconds
         if ($waited.timedOut) {
             $process.Kill($true); $process.WaitForExit()
@@ -3606,6 +3778,7 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         if ($contract) {
             $anchor = Invoke-AnchorRun $Fixture $ExecutablePath $ScratchRoot $KeepProfilesIn $result.pin_context.fixture_contract_sha256
             $result.anchor_cycles = $contract.anchorCycles; $result.anchor_wall_s = $anchor.wall_s
+            $result.anchor_host_policy = $anchor.host_policy
             if ($anchor.failure) { $failures += $anchor.failure }
             else {
                 $result.anchor_frame_sha256 = $anchor.sha256; $result.anchor_display = $anchor.display
@@ -3782,6 +3955,17 @@ if ($SelfTest) {
 # measured the default arm and labelled it something else; failing in the first
 # second is the whole point of validating here rather than at the first row.
 $resolvedKnobs = Resolve-KnobPassthrough $Knobs @((Get-BoardOwnedEnvironment).Keys)
+$hostPolicy = if ($IsWindows) {
+    $masks = Get-ScoreboardAffinity (Get-Process -Id $PID)
+    New-ScoreboardHostPolicy $ProcessorIndex $resolvedKnobs $masks.process_mask $masks.system_mask
+} else {
+    if ($ProcessorIndex -ne -1) { throw 'Explicit processor affinity is supported only on Windows' }
+    @{ measurement_class='diagnostic'; affinity_policy='inherited, unverified';
+        allowed_logical_processors=$null; raster_lanes='unverified'; child_affinity_verified=$false }
+}
+if ($Arm -ne 'on' -or $OneLookupStore -ne '1' -or $OneLookupLoad -ne '1') {
+    $hostPolicy.measurement_class = 'diagnostic'
+}
 if ($resolvedKnobs.Count -gt 0) {
     Write-Host ("arm passthrough: " + (($resolvedKnobs.GetEnumerator() |
         ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '))
@@ -3842,6 +4026,10 @@ try {
     Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+$hostPolicy.child_affinity_verified = $rows.Count -gt 0 -and @($rows | Where-Object {
+    -not $_.host_policy.child_affinity_verified -or
+    ($_.PSObject.Properties.Name -contains 'anchor_host_policy' -and -not $_.anchor_host_policy.child_affinity_verified)
+}).Count -eq 0
 $summary = [ordered]@{
     schema           = $scoreboardSchema
     label            = $Label
@@ -3853,13 +4041,14 @@ $summary = [ordered]@{
     executable       = $executablePath
     executable_sha256 = Get-FileSha256 $executablePath
     selected_fixtures = @($table.name)
+    host_policy      = $hostPolicy
     rows             = $rows
 }
 $jsonPath = Join-Path $ResultsDirectory "scoreboard.json"
 $summary | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $jsonPath -Encoding utf8
 
 $markdown = @(Get-ScoreboardMarkdown $rows $Label $Arm $OneLookupStore $OneLookupLoad `
-        $resolvedKnobs)
+        $resolvedKnobs $hostPolicy)
 $markdownPath = Join-Path $ResultsDirectory "scoreboard.md"
 $markdown -join "`n" | Set-Content -LiteralPath $markdownPath -Encoding utf8
 
