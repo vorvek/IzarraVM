@@ -3,6 +3,19 @@
 
 use super::*;
 
+fn texture_mip_offset_loop(texture_lod: u32, lod: u32, bytes_per_texel: usize) -> usize {
+    (0..lod)
+        .filter(|&level| owns_lod(texture_lod, level))
+        .map(|level| {
+            let (width, height) = texture_dimensions(texture_lod, level);
+            width
+                .saturating_mul(height)
+                .max(4)
+                .saturating_mul(bytes_per_texel)
+        })
+        .sum()
+}
+
 #[test]
 fn fractional_lod_keeps_logical_fraction_before_split_selection() {
     const LOD8_MAX: u32 = (8 * 4) << 6;
@@ -163,4 +176,66 @@ fn tiny_mips_reserve_at_least_four_texels() {
     let lod8 = texture_mip_offset(lod, 8, 2);
 
     assert_eq!(lod8 - lod7, 4 * 2);
+}
+
+#[test]
+fn texture_mip_prefix_table_matches_the_loop_for_all_fast_path_inputs() {
+    const IRRELEVANT_BITS: [u32; 2] = [0, !0x007c_0000];
+
+    for aspect in 0..4 {
+        for ownership in 0..4 {
+            for s_is_wider in [false, true] {
+                for lod in 0..=8 {
+                    for bytes_per_texel in [1, 2] {
+                        for irrelevant in IRRELEVANT_BITS {
+                            let texture_lod = (aspect << 21)
+                                | (ownership << 18)
+                                | if s_is_wider { LOD_S_IS_WIDER } else { 0 }
+                                | irrelevant;
+                            assert_eq!(
+                                texture_mip_offset(texture_lod, lod, bytes_per_texel),
+                                texture_mip_offset_loop(texture_lod, lod, bytes_per_texel),
+                                "aspect={aspect} ownership={ownership} s_is_wider={s_is_wider} \
+                                 lod={lod} bytes_per_texel={bytes_per_texel} \
+                                 irrelevant={irrelevant:#010x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn texture_mip_offset_fallback_matches_the_loop_result_and_panic_behavior() {
+    let safe_cases = [
+        (0, 9, 1),
+        (LOD_S_IS_WIDER | (3 << 21), 9, 2),
+        (LOD_SPLIT | LOD_ODD | (2 << 21), 8, 3),
+        (LOD_SPLIT | (1 << 21), 8, 0),
+    ];
+    for (texture_lod, lod, bytes_per_texel) in safe_cases {
+        assert_eq!(
+            texture_mip_offset(texture_lod, lod, bytes_per_texel),
+            texture_mip_offset_loop(texture_lod, lod, bytes_per_texel),
+            "safe fallback texture_lod={texture_lod:#010x} lod={lod} \
+             bytes_per_texel={bytes_per_texel}"
+        );
+    }
+
+    let overflow_cases = [(0, 0), (0, 1), (0, 2), (LOD_SPLIT | LOD_ODD | (3 << 21), 4)];
+    for (texture_lod, lod) in overflow_cases {
+        let actual = std::panic::catch_unwind(|| texture_mip_offset(texture_lod, lod, usize::MAX));
+        let expected =
+            std::panic::catch_unwind(|| texture_mip_offset_loop(texture_lod, lod, usize::MAX));
+        assert_eq!(
+            actual.is_ok(),
+            expected.is_ok(),
+            "overflow fallback texture_lod={texture_lod:#010x} lod={lod}"
+        );
+        if let (Ok(actual), Ok(expected)) = (actual, expected) {
+            assert_eq!(actual, expected);
+        }
+    }
 }

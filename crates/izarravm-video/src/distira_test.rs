@@ -4,6 +4,30 @@
 use super::*;
 
 #[test]
+fn rgb565_sampler_wraps_the_second_texel_byte_at_texture_memory_end() {
+    let mut distira = Distira::new();
+    let texture = &mut distira.raster_owned.as_mut().unwrap().texture[0];
+    texture[DISTIRA_TEX_SIZE - 1] = 0;
+    texture[0] = 0xf8;
+
+    let color = distira.raster_view().sample_rgb565_texel(
+        0,
+        0,
+        TmuTextureSample {
+            tmu: 0,
+            width: 1,
+            height: 1,
+            base_addr: (DISTIRA_TEX_SIZE - 1) as u32,
+            mip_offset: 0,
+            mode: 0,
+            lod_reg: 0,
+        },
+    );
+
+    assert_eq!(color, (255, 0, 0));
+}
+
+#[test]
 fn changing_workers_settles_queued_and_in_flight_raster_work() {
     fn scene(change: bool) -> (Vec<u32>, u64, u64) {
         let mut distira = Distira::new();
