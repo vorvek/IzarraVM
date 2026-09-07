@@ -357,6 +357,7 @@ fn break_admission_error_keeps_successful_run_prefix() {
         "the measured CPU starts with no block"
     );
     let mut preflight = cpu.clone();
+    preflight.set_jit_auto_admit(true);
     let mut preflight_bus = TestBus::with_memory(bus.memory.to_vec());
     preflight_bus.direct_pages_enabled = true;
     preflight.set_fast_map_enabled_for_test(true);
@@ -395,6 +396,45 @@ fn break_admission_error_keeps_successful_run_prefix() {
             panic!("the copied CALL FAR retried before bus injection: {cause:?}")
         }
     }
+    let preflight_slot = preflight
+        .decode_cache
+        .get_view(2, false)
+        .unwrap()
+        .screen()
+        .slot;
+    for _ in 0..2 {
+        preflight
+            .decode_cache
+            .direct_hot_at(preflight_slot, preflight.jit_direct.admission_heat());
+    }
+    assert!(matches!(
+        preflight.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let preflight_eip = preflight.registers.eip;
+    let preflight_perf = preflight.perf_counters().clone();
+    preflight_bus.fail_instruction_prefetch_direct_page = true;
+    let error = preflight
+        .try_direct_continuation_for_test(&mut preflight_bus, 2, false)
+        .expect_err("continuation admission must expose the injected bus failure");
+    assert_eq!(
+        error.error,
+        CpuError::Bus(izarravm_bus::BusError::UnmappedMemory { address: 2 })
+    );
+    assert_eq!(error.consumed_core_clocks, 0);
+    assert_eq!(preflight.registers.eip, preflight_eip);
+    let after = preflight.perf_counters();
+    assert_eq!(after.instructions, preflight_perf.instructions);
+    assert_eq!(
+        after.jit_direct_compile_attempts,
+        preflight_perf.jit_direct_compile_attempts + 1
+    );
+    assert_eq!(
+        after.jit_direct_blocks_installed,
+        preflight_perf.jit_direct_blocks_installed
+    );
+    assert_eq!(after.jit_direct_entries, preflight_perf.jit_direct_entries);
+
     let elapsed_before = cpu.elapsed_clocks;
     let requests_before = bus.instruction_prefetch_direct_page_requests;
     let compile_attempts_before = cpu.perf_counters().jit_direct_compile_attempts;
