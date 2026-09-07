@@ -411,11 +411,7 @@ fn epoch_2_counts_the_port_lane_against_the_batch_cap() {
 
 #[test]
 fn the_cap_test_agrees_with_the_value_form() {
-    // The run loop asks `in_batch_scaled_bus_clocks_at_least(target)` once per retired
-    // instruction and takes its answer as EXACTLY `in_batch_scaled_bus_clocks() >= target`. Epoch
-    // 2 adds an unscaled additive term to the value form that does not survive the u128
-    // multiply-through, so the two forms had to stop sharing an implementation -- and a
-    // divergence between them would move run boundaries with nothing to notice.
+    // The exact comparison must include the port lane or it moves run boundaries.
     {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw586);
@@ -439,6 +435,62 @@ fn the_cap_test_agrees_with_the_value_form() {
                 !bus.in_batch_scaled_bus_clocks_at_least(u64::MAX),
                 "an unreachable target must answer 'not at the cap'"
             );
+        });
+    }
+}
+
+#[test]
+fn exact_cap_comparison_preserves_rounding_and_saturation() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            let den = u64::from(bus.bus_den_at_batch_start);
+            let limit = u64::MAX / BUS_CLOCK_MASTER_TICKS;
+            let mut contributions = vec![
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (limit, 0),
+                (limit + 1, 0),
+                (0, limit + 1),
+                (1, u64::MAX),
+                (limit, u64::MAX),
+            ];
+            for clocks in 1..=den * 2 {
+                contributions.push((clocks, 0));
+                contributions.push((0, clocks));
+                contributions.push((clocks / 2, clocks - clocks / 2));
+            }
+            for (raw, isa) in contributions {
+                *bus.trace = BusTrace::default();
+                bus.trace.add_elapsed_clocks(123);
+                bus.trace_elapsed_at_batch_start = 123;
+                bus.trace.add_elapsed_clocks(raw);
+                *bus.isa_io_clocks = isa;
+                let value = bus.in_batch_scaled_bus_clocks();
+                for target in [
+                    0,
+                    1,
+                    value.saturating_sub(1),
+                    value,
+                    value.saturating_add(1),
+                    u64::MAX / den,
+                    (u64::MAX / den).saturating_add(2),
+                    u64::MAX,
+                ] {
+                    assert_eq!(
+                        bus.in_batch_scaled_bus_clocks_at_least(target),
+                        value >= target,
+                        "mode={mode:?} raw={raw} isa={isa} value={value} target={target}"
+                    );
+                }
+            }
         });
     }
 }
