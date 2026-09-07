@@ -2239,14 +2239,15 @@ impl CpuGsw {
         d: bool,
         budget: ContinuationBudget,
     ) -> CpuExecutionResult<DirectContinuation> {
-        let Some(block) = self
-            .try_admit_direct_block(bus, screen, lin, d, false)
-            .map_err(|error| CpuRunError {
-                error,
-                consumed_core_clocks: 0,
-            })?
-        else {
-            return Ok(DirectContinuation::Interpret);
+        let block = match self.try_admit_direct_block(bus, screen, lin, d, false) {
+            Ok(Some(block)) => block,
+            Ok(None) => return Ok(DirectContinuation::Interpret),
+            Err(error) => {
+                return Err(CpuRunError {
+                    error,
+                    consumed_core_clocks: 0,
+                });
+            }
         };
         // A hidden short block must pass the canonical decode scan above before it becomes a link
         // target again. Once current, avoid the heavier native-entry validation until one of its
