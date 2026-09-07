@@ -16,6 +16,34 @@ const DX: usize = 1;
 const DY: usize = 2;
 const INTERNAL_SCALE: f64 = (1_u64 << 32) as f64;
 
+const MIP_PREFIX_TEXELS: [[[u32; 9]; 4]; 4] = mip_prefix_texels();
+
+const fn mip_prefix_texels() -> [[[u32; 9]; 4]; 4] {
+    let mut prefixes = [[[0; 9]; 4]; 4];
+    let mut aspect = 0;
+    while aspect < 4 {
+        let mut ownership = 0;
+        while ownership < 4 {
+            let texture_lod = ((aspect as u32) << 21) | ((ownership as u32) << 18);
+            let mut prefix = 0;
+            let mut lod = 0;
+            while lod <= 8 {
+                prefixes[aspect][ownership][lod] = prefix;
+                if owns_lod(texture_lod, lod as u32) {
+                    let (width, height) = texture_dimensions(texture_lod, lod as u32);
+                    let texels = width.saturating_mul(height);
+                    let texels = if texels < 4 { 4 } else { texels };
+                    prefix += texels as u32;
+                }
+                lod += 1;
+            }
+            ownership += 1;
+        }
+        aspect += 1;
+    }
+    prefixes
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct RegisterPlane {
     values: [u32; 3],
@@ -330,14 +358,26 @@ impl RasterPlane {
     }
 }
 
-pub(super) fn texture_dimensions(texture_lod: u32, lod: u32) -> (usize, usize) {
+pub(super) const fn texture_dimensions(texture_lod: u32, lod: u32) -> (usize, usize) {
     let aspect = ((texture_lod >> 21) & 0x3) as usize;
-    let mut width = (256_usize >> lod).max(1);
-    let mut height = (256_usize >> lod).max(1);
+    let mut width = 256_usize >> lod;
+    let mut height = 256_usize >> lod;
+    if width == 0 {
+        width = 1;
+    }
+    if height == 0 {
+        height = 1;
+    }
     if texture_lod & LOD_S_IS_WIDER != 0 {
-        height = (height >> aspect).max(1);
+        height >>= aspect;
+        if height == 0 {
+            height = 1;
+        }
     } else {
-        width = (width >> aspect).max(1);
+        width >>= aspect;
+        if width == 0 {
+            width = 1;
+        }
     }
     (width, height)
 }
@@ -351,6 +391,16 @@ pub(super) fn texture_base_slot(texture_lod: u32, lod: u32) -> usize {
 }
 
 pub(super) fn texture_mip_offset(texture_lod: u32, lod: u32, bytes_per_texel: usize) -> usize {
+    if lod == 0 {
+        return 0;
+    }
+
+    if lod <= 8 && matches!(bytes_per_texel, 1 | 2) {
+        let aspect = ((texture_lod >> 21) & 0x3) as usize;
+        let ownership = ((texture_lod >> 18) & 0x3) as usize;
+        return MIP_PREFIX_TEXELS[aspect][ownership][lod as usize] as usize * bytes_per_texel;
+    }
+
     (0..lod)
         .filter(|&level| owns_lod(texture_lod, level))
         .map(|level| {
@@ -427,7 +477,7 @@ fn select_lod_hoisted(
     }
 }
 
-fn owns_lod(texture_lod: u32, lod: u32) -> bool {
+const fn owns_lod(texture_lod: u32, lod: u32) -> bool {
     texture_lod & LOD_SPLIT == 0 || (lod & 1 != 0) == (texture_lod & LOD_ODD != 0)
 }
 
