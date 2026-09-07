@@ -274,6 +274,7 @@ struct TmuRaster {
     /// `texture_lod` here instead of at every pixel.
     lod_min: f64,
     lod_max: f64,
+    lod_forces_max: bool,
     lod_bias: f64,
     lod_perspective: bool,
 }
@@ -290,6 +291,9 @@ impl TmuRaster {
         let rho_x = s_over_w.dx.hypot(t_over_w.dx);
         let rho_y = s_over_w.dy.hypot(t_over_w.dy);
         let rho = rho_x.max(rho_y);
+        let lod_min = lod_min(texture_lod);
+        let lod_max = lod_max(texture_lod);
+        let lod_forces_max = lod_min >= lod_max;
         Self {
             s_over_w,
             t_over_w,
@@ -302,8 +306,9 @@ impl TmuRaster {
             } else {
                 f64::NEG_INFINITY
             },
-            lod_min: lod_min(texture_lod),
-            lod_max: lod_max(texture_lod),
+            lod_min,
+            lod_max,
+            lod_forces_max,
             lod_bias: lod_bias(texture_lod),
             lod_perspective: texture_mode & TEXTUREMODE_TPERSP_ST != 0,
         }
@@ -333,6 +338,7 @@ impl TmuRaster {
             self.texture_lod,
             self.lod_min,
             self.lod_max,
+            self.lod_forces_max,
             self.lod_bias,
         );
         TextureSample {
@@ -436,13 +442,16 @@ fn lod_bias(texture_lod: u32) -> f64 {
 /// pre-derived so a triangle's raster loop computes them once instead of
 /// per pixel.
 fn select_lod(base_lod: f64, reciprocal_w: f64, texture_mode: u32, texture_lod: u32) -> TextureLod {
+    let min = lod_min(texture_lod);
+    let max = lod_max(texture_lod);
     select_lod_hoisted(
         base_lod,
         reciprocal_w,
         texture_mode & TEXTUREMODE_TPERSP_ST != 0,
         texture_lod,
-        lod_min(texture_lod),
-        lod_max(texture_lod),
+        min,
+        max,
+        min >= max,
         lod_bias(texture_lod),
     )
 }
@@ -455,14 +464,19 @@ fn select_lod_hoisted(
     texture_lod: u32,
     min: f64,
     max: f64,
+    lod_forces_max: bool,
     bias: f64,
 ) -> TextureLod {
-    let perspective_adjust = if perspective && reciprocal_w > 0.0 {
-        reciprocal_w.log2()
+    let lod = if lod_forces_max {
+        max
     } else {
-        0.0
+        let perspective_adjust = if perspective && reciprocal_w > 0.0 {
+            reciprocal_w.log2()
+        } else {
+            0.0
+        };
+        (base_lod - perspective_adjust + bias).max(min).min(max)
     };
-    let lod = (base_lod - perspective_adjust + bias).max(min).min(max);
     let fixed = ((lod * 256.0).floor() as u32).min(8 << 8);
     let floor = fixed >> 8;
     let physical = if owns_lod(texture_lod, floor) {

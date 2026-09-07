@@ -16,6 +16,12 @@ fn texture_mip_offset_loop(texture_lod: u32, lod: u32, bytes_per_texel: usize) -
         .sum()
 }
 
+fn write_start(state: &mut TextureIteratorState, chip: usize, register: usize, value: u32) {
+    for (byte, b) in value.to_le_bytes().into_iter().enumerate() {
+        state.write_register(chip, register, byte, b);
+    }
+}
+
 #[test]
 fn fractional_lod_keeps_logical_fraction_before_split_selection() {
     const LOD8_MAX: u32 = (8 * 4) << 6;
@@ -104,6 +110,136 @@ fn select_lod_hoist_is_bit_identical_to_the_unhoisted_formula() {
 }
 
 #[test]
+fn tmu_raster_caches_clamped_bound_direction_for_both_tmus() {
+    let cases = [
+        ("equal", [(12, 12, true), (12, 12, true)]),
+        ("inverted", [(20, 8, true), (20, 8, true)]),
+        ("ordinary", [(8, 20, false), (8, 20, false)]),
+        ("raw63-clamped", [(32, 63, true), (63, 32, true)]),
+        (
+            "tmu0-ordinary-tmu1-inverted",
+            [(8, 20, false), (20, 8, true)],
+        ),
+        (
+            "tmu0-inverted-tmu1-ordinary",
+            [(20, 8, true), (8, 20, false)],
+        ),
+    ];
+
+    for (name, bounds) in cases {
+        let mut state = TextureIteratorState::default();
+        for (chip, s_dx, t_dy) in [
+            (CHIP_TREX0, 0x0004_0000, 0x0008_0000),
+            (CHIP_TREX1, 0x0008_0000, 0x0004_0000),
+        ] {
+            write_start(&mut state, chip, SST_DS_DX, s_dx);
+            write_start(&mut state, chip, SST_DT_DY, t_dy);
+            write_start(&mut state, chip, SST_START_W, 0x4000_0000);
+        }
+        let texture_lods = [
+            bounds[0].0 | bounds[0].1 << 6,
+            bounds[1].0 | bounds[1].1 << 6 | LOD_SPLIT | LOD_ODD,
+        ];
+        let texture_modes = [0, TEXTUREMODE_TPERSP_ST];
+        let raster = state.raster(texture_modes, texture_lods, (0.0, 0.0));
+        let samples = raster.samples_masked(1.5, 2.5, [true, true]);
+
+        for tmu in 0..2 {
+            assert_eq!(
+                raster.tmu[tmu].lod_forces_max, bounds[tmu].2,
+                "{name} TMU{tmu}",
+            );
+            if name == "raw63-clamped" {
+                assert_eq!(raster.tmu[tmu].lod_min, 8.0, "TMU{tmu}");
+                assert_eq!(raster.tmu[tmu].lod_max, 8.0, "TMU{tmu}");
+            }
+            let reciprocal_w = raster.tmu[tmu].reciprocal_w.at(1.5, 2.5, 0.0, 0.0);
+            let want = select_lod_unhoisted(
+                raster.tmu[tmu].base_lod,
+                reciprocal_w,
+                texture_modes[tmu],
+                texture_lods[tmu],
+            );
+            assert_eq!(samples[tmu].lod, want.physical, "{name} TMU{tmu}");
+            assert_eq!(samples[tmu].lod_floor, want.floor, "{name} TMU{tmu}");
+            assert_eq!(samples[tmu].lod_fraction, want.fraction, "{name} TMU{tmu}");
+        }
+    }
+}
+
+#[test]
+fn select_lod_constant_bounds_matches_the_independent_old_formula() {
+    // The oracle is copied inline above and must stay independent of the
+    // branch in `select_lod_hoisted`. It covers every decoded min/max value,
+    // raw 63's clamp to 8, signed bias edges, texture ownership bits, and
+    // finite and non-finite perspective inputs.
+    let base_lods = [
+        f64::NEG_INFINITY,
+        -8.0,
+        -0.0,
+        0.0,
+        f64::from_bits(1),
+        0.5,
+        1.0,
+        f64::from_bits(1.0_f64.to_bits() - 1),
+        f64::from_bits(1.0_f64.to_bits() + 1),
+        2.0,
+        f64::from_bits(2.0_f64.to_bits() - 1),
+        f64::from_bits(2.0_f64.to_bits() + 1),
+        8.0,
+        f64::INFINITY,
+        f64::NAN,
+    ];
+    let reciprocal_ws = [
+        f64::NEG_INFINITY,
+        -1.0,
+        -0.0,
+        0.0,
+        f64::from_bits(1),
+        f64::from_bits(1.0_f64.to_bits() - 1),
+        1.0,
+        f64::from_bits(1.0_f64.to_bits() + 1),
+        f64::from_bits(2.0_f64.to_bits() - 1),
+        2.0,
+        f64::from_bits(2.0_f64.to_bits() + 1),
+        f64::INFINITY,
+        f64::NAN,
+    ];
+    let raw_bound_pairs = (0..=32)
+        .flat_map(|min| (0..=32).map(move |max| (min, max)))
+        .chain([(63, 0), (0, 63), (32, 63), (63, 32), (63, 63)]);
+
+    for (raw_min, raw_max) in raw_bound_pairs {
+        for raw_bias in [0, 31, 32, 63] {
+            for texture_mode in [0, TEXTUREMODE_TPERSP_ST] {
+                for split_odd in [0, LOD_SPLIT, LOD_ODD, LOD_SPLIT | LOD_ODD] {
+                    let texture_lod = raw_min | raw_max << 6 | raw_bias << 12 | split_odd;
+                    for &base_lod in &base_lods {
+                        for &reciprocal_w in &reciprocal_ws {
+                            let want = select_lod_unhoisted(
+                                base_lod,
+                                reciprocal_w,
+                                texture_mode,
+                                texture_lod,
+                            );
+                            let got = select_lod(base_lod, reciprocal_w, texture_mode, texture_lod);
+                            assert_eq!(
+                                got,
+                                want,
+                                "min={raw_min} max={raw_max} bias={raw_bias} \
+                                 split_odd={split_odd:#x} base={base_lod:?} w={reciprocal_w:?} \
+                                 perspective={}",
+                                texture_mode != 0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn samples_masked_matches_the_unmasked_sample_on_the_needed_slot() {
     // The needed slot must read exactly what the pre-hoist `samples()`
     // (recreated here as need = [true, true]) read; the unneeded slot
@@ -118,12 +254,6 @@ fn samples_masked_matches_the_unmasked_sample_on_the_needed_slot() {
     // silently: if a future edit collapses `full` back to the placeholder,
     // those guards fail before the rest of the test gets a chance to be
     // vacuous again.
-    fn write_start(state: &mut TextureIteratorState, chip: usize, register: usize, value: u32) {
-        for (byte, b) in value.to_le_bytes().into_iter().enumerate() {
-            state.write_register(chip, register, byte, b);
-        }
-    }
-
     let mut state = TextureIteratorState::default();
     write_start(&mut state, CHIP_TREX0, SST_START_S, 1);
     write_start(&mut state, CHIP_TREX0, SST_START_T, 2);
