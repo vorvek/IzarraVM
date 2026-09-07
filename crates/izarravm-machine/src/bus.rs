@@ -2380,7 +2380,20 @@ impl CpuBus for MachineBus<'_> {
 
     /// Include the unscaled port lane in the exact batch deadline test.
     fn in_batch_scaled_bus_clocks_at_least(&self, target: u64) -> bool {
-        self.in_batch_scaled_bus_clocks() >= target
+        if target == 0 {
+            return true;
+        }
+        let Some(ticks) = self
+            .in_batch_reference_bus_clocks()
+            .checked_mul(BUS_CLOCK_MASTER_TICKS)
+        else {
+            return true;
+        };
+        let Some(threshold) = (target - 1).checked_mul(u64::from(self.bus_den_at_batch_start))
+        else {
+            return false;
+        };
+        ticks > threshold
     }
 
     /// The `raw` that `in_batch_scaled_bus_clocks` scales. Monotone within a batch because
