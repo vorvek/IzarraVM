@@ -832,7 +832,7 @@ impl CpuGsw {
         Ok(())
     }
 
-    fn execute_group_decoded<B: CpuBus>(
+    pub(super) fn execute_group_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,

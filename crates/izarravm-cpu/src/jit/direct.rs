@@ -4412,6 +4412,7 @@ struct DirectInsn {
     len: u8,
     weighted_fp_clocks: u32,
     kind: DirectKind,
+    callout_helper_offset: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -9182,6 +9183,18 @@ fn compile_with_budget(
             len: insn.len,
             weighted_fp_clocks: slot_weighted_fp_clocks,
             kind,
+            callout_helper_offset: match kind {
+                DirectKind::CallOut { helper } => {
+                    if helper.interprets_one() && is_test_word_memory(&insn) {
+                        (core::mem::offset_of!(CpuGsw, native_table_slots)
+                            + core::mem::offset_of!(NativeTableSlots, interpret_test_word))
+                            as i32
+                    } else {
+                        helper_offset(helper)
+                    }
+                }
+                _ => 0,
+            },
         });
         lin = next;
         if kind.is_terminal() {
@@ -11153,6 +11166,9 @@ fn dynamic_counter_fields() -> [(i8, usize); 7] {
 /// emission already depended on; `publish` merely re-states it where a
 /// violation would finally be VISIBLE instead of a silent miscompile.
 ///
+/// The separate TEST helper pointer follows the live-bus window of `CallOutTable`.
+/// It lives here to preserve the pinned CPU layout, outside the write-once slots.
+///
 /// Host pointers, not guest state: `Clone` resets to default and `PartialEq`
 /// ignores the slots, `CallOutTable`'s shape and reason. A cloned CPU gets a
 /// fresh `BlockCache` (its clone drops compiled blocks), so its first compile
@@ -11160,6 +11176,8 @@ fn dynamic_counter_fields() -> [(i8, usize); 7] {
 #[derive(Debug)]
 pub(crate) struct NativeTableSlots {
     slots: [usize; 6 + 1 + STORE_STUB_COUNT + 1 + READ_STUB_COUNT],
+    /// Published with the live bus and cleared after native return; not a write-once slot.
+    pub(crate) interpret_test_word: usize,
 }
 
 // Manual because `Default` is not derivable past 32 array elements.
@@ -11167,6 +11185,7 @@ impl Default for NativeTableSlots {
     fn default() -> Self {
         Self {
             slots: [0; 6 + 1 + STORE_STUB_COUNT + 1 + READ_STUB_COUNT],
+            interpret_test_word: 0,
         }
     }
 }
@@ -20906,6 +20925,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 emit_call_out(
                     &mut e,
                     helper,
+                    slot.callout_helper_offset,
                     completed.raw_clocks,
                     abnormal_stub,
                     step_break_stub,
@@ -29260,29 +29280,32 @@ impl PartialEq for CallOutTable {
 impl Eq for CallOutTable {}
 
 impl CallOutTable {
-    /// Publish `bus` and the helpers monomorphised over its type.
-    pub(crate) fn publish<B: CpuBus>(bus: &mut B) -> Self {
-        Self {
-            bus: (bus as *mut B).cast::<()>(),
-            // `CallOutSlotFn`, not `CallOutFn`: the GP2 poll-skip design gives every `IN AL,DX`
-            // slot a fourth argument (`slot_delta`), the same ABI shape `interpret_one` already
-            // uses.
-            port_read_al_dx: port_read_al_dx::<B> as CallOutSlotFn as usize,
-            // `CallOutSlotFn` too, for a third reason: its fourth argument is the compile-time
-            // PORT immediate, not a `slot_delta` or a cell address (gp2 in-imm8 callout design).
-            port_read_al_imm8: port_read_al_imm8::<B> as CallOutSlotFn as usize,
-            // `CallOutSlotFn` for the same reason as the line above: its fourth argument is the
-            // compile-time PORT immediate.
-            port_write_al_imm8: port_write_al_imm8::<B> as CallOutSlotFn as usize,
-            // `CallOutFn`, not `CallOutSlotFn`: `PortWriteAlDx` carries neither a `slot_delta`
-            // (no poll-skip scan) nor a port immediate (the port is read from DX at runtime), so
-            // it needs no fourth argument at all -- the same shape `push_all_dword` and
-            // `pop_all_dword` already have.
-            port_write_al_dx: port_write_al_dx::<B> as CallOutFn as usize,
-            push_all_dword: push_all_dword::<B> as CallOutFn as usize,
-            pop_all_dword: pop_all_dword::<B> as CallOutFn as usize,
-            interpret_one: interpret_one::<B> as CallOutSlotFn as usize,
-        }
+    /// Publish `bus` and its helpers, including the pointer stored at the CPU tail.
+    pub(crate) fn publish<B: CpuBus>(bus: &mut B) -> (Self, usize) {
+        (
+            Self {
+                bus: (bus as *mut B).cast::<()>(),
+                // `CallOutSlotFn`, not `CallOutFn`: the GP2 poll-skip design gives every `IN AL,DX`
+                // slot a fourth argument (`slot_delta`), the same ABI shape `interpret_one` already
+                // uses.
+                port_read_al_dx: port_read_al_dx::<B> as CallOutSlotFn as usize,
+                // `CallOutSlotFn` too, for a third reason: its fourth argument is the compile-time
+                // PORT immediate, not a `slot_delta` or a cell address (gp2 in-imm8 callout design).
+                port_read_al_imm8: port_read_al_imm8::<B> as CallOutSlotFn as usize,
+                // `CallOutSlotFn` for the same reason as the line above: its fourth argument is the
+                // compile-time PORT immediate.
+                port_write_al_imm8: port_write_al_imm8::<B> as CallOutSlotFn as usize,
+                // `CallOutFn`, not `CallOutSlotFn`: `PortWriteAlDx` carries neither a `slot_delta`
+                // (no poll-skip scan) nor a port immediate (the port is read from DX at runtime), so
+                // it needs no fourth argument at all -- the same shape `push_all_dword` and
+                // `pop_all_dword` already have.
+                port_write_al_dx: port_write_al_dx::<B> as CallOutFn as usize,
+                push_all_dword: push_all_dword::<B> as CallOutFn as usize,
+                pop_all_dword: pop_all_dword::<B> as CallOutFn as usize,
+                interpret_one: interpret_one::<B, false> as CallOutSlotFn as usize,
+            },
+            interpret_one::<B, true> as CallOutSlotFn as usize,
+        )
     }
 }
 
@@ -29929,6 +29952,16 @@ const STATUS_ABNORMAL: i64 = -1;
 pub(crate) const STATUS_STEP_BREAK_BIT: u32 = 32;
 pub(crate) const STATUS_RESYNC_RETIRED_BIT: u32 = 33;
 pub(crate) const STATUS_RESYNC_FAULT_BIT: u32 = 34;
+
+fn is_test_word_memory(insn: &DecodedInsn) -> bool {
+    insn.opcode == 0xf7
+        && insn.group == DecodeGroup::Group
+        && insn.operand_size == OperandSize::Word
+        && !insn.prefixes.lock
+        && insn.prefixes.rep.is_none()
+        && insn.modrm.is_some_and(|modrm| modrm.reg == 0)
+        && matches!(insn.operand, Some(DecodedOperand::Mem(_)))
+}
 
 /// Which byte in `CallOutTable` an emitted slot loads its function pointer from.
 fn helper_offset(helper: CallOutHelper) -> i32 {
@@ -31760,7 +31793,7 @@ impl ResumeSnapshot {
 ///
 /// See `port_read_al_dx`, plus: `cell` must be the address of an `InterpretOneCell` the running
 /// block owns, baked into its emitted bytes by `emit` and kept alive by `BlockCache`.
-unsafe extern "C" fn interpret_one<B: CpuBus>(
+unsafe extern "C" fn interpret_one<B: CpuBus, const TEST_WORD: bool>(
     cpu: *mut CpuGsw,
     prefix_raw_clocks: u64,
     prefix_weighted_fp_clocks: u64,
@@ -31820,7 +31853,7 @@ unsafe extern "C" fn interpret_one<B: CpuBus>(
     // The rest is a separate function for ONE reason: it returns from five places, and the restore
     // above has to happen on all five. A wrapper is a proof of that; five copies of one assignment
     // would have been five chances to miss one.
-    let status = interpret_one_step(cpu, bus, cell, entry_eip, start_eip);
+    let status = interpret_one_step::<B, TEST_WORD>(cpu, bus, cell, entry_eip, start_eip);
 
     cpu.core_clocks_so_far = entry_core_clocks;
     status
@@ -31859,7 +31892,7 @@ fn note_demotion(cpu: &mut CpuGsw, cell: &InterpretOneCell) {
 /// Steps 4 to 10 of the helper contract: everything between the clock preview and the status word.
 ///
 /// See `interpret_one` for why this is not inlined into its caller.
-fn interpret_one_step<B: CpuBus>(
+fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     cpu: &mut CpuGsw,
     bus: &mut B,
     cell: &InterpretOneCell,
@@ -31900,7 +31933,16 @@ fn interpret_one_step<B: CpuBus>(
     let end_eip = start_eip.wrapping_add(u32::from(view.insn.len));
     cpu.registers.eip = end_eip;
     cpu.deferred_code_writes.open();
-    let execution = cpu.execute_hot_cached_or_decoded(&view.insn, bus);
+    let execution = if TEST_WORD && is_test_word_memory(&view.insn) {
+        let result = cpu.execute_group_decoded(&view.insn, bus);
+        cpu.rep_execution.budget = None;
+        InstructionExecution {
+            result,
+            work: Default::default(),
+        }
+    } else {
+        cpu.execute_hot_cached_or_decoded(&view.insn, bus)
+    };
 
     let (outcome, committed) = match execution {
         InstructionExecution {
@@ -32265,21 +32307,29 @@ fn publish_flags(cpu: &mut CpuGsw) {
 /// Drive `push_all_dword` exactly as an emitted slot does, for the helper-level tests.
 #[cfg(test)]
 pub(crate) fn push_all_dword_for_test<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> i64 {
-    cpu.native_callout = CallOutTable::publish(bus);
+    (
+        cpu.native_callout,
+        cpu.native_table_slots.interpret_test_word,
+    ) = CallOutTable::publish(bus);
     // SAFETY: the table was just published for this exact `B`, and `cpu` is not otherwise
     // borrowed across the call.
     let status = unsafe { push_all_dword::<B>(cpu as *mut CpuGsw, 0, 0) };
     cpu.native_callout = CallOutTable::default();
+    cpu.native_table_slots.interpret_test_word = 0;
     status
 }
 
 /// Drive `pop_all_dword` exactly as an emitted slot does, for the helper-level tests.
 #[cfg(test)]
 pub(crate) fn pop_all_dword_for_test<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> i64 {
-    cpu.native_callout = CallOutTable::publish(bus);
+    (
+        cpu.native_callout,
+        cpu.native_table_slots.interpret_test_word,
+    ) = CallOutTable::publish(bus);
     // SAFETY: as `push_all_dword_for_test`.
     let status = unsafe { pop_all_dword::<B>(cpu as *mut CpuGsw, 0, 0) };
     cpu.native_callout = CallOutTable::default();
+    cpu.native_table_slots.interpret_test_word = 0;
     status
 }
 
@@ -32294,7 +32344,10 @@ pub(crate) fn port_read_al_dx_for_test<B: CpuBus>(
     prefix_weighted_fp_clocks: u64,
     slot_delta: u64,
 ) -> i64 {
-    cpu.native_callout = CallOutTable::publish(bus);
+    (
+        cpu.native_callout,
+        cpu.native_table_slots.interpret_test_word,
+    ) = CallOutTable::publish(bus);
     // SAFETY: the table was just published for this exact `B`, and `cpu` is not otherwise
     // borrowed across the call.
     let status = unsafe {
@@ -32306,6 +32359,7 @@ pub(crate) fn port_read_al_dx_for_test<B: CpuBus>(
         )
     };
     cpu.native_callout = CallOutTable::default();
+    cpu.native_table_slots.interpret_test_word = 0;
     status
 }
 
@@ -32321,7 +32375,10 @@ pub(crate) fn port_read_al_imm8_for_test<B: CpuBus>(
     prefix_weighted_fp_clocks: u64,
     port: u16,
 ) -> i64 {
-    cpu.native_callout = CallOutTable::publish(bus);
+    (
+        cpu.native_callout,
+        cpu.native_table_slots.interpret_test_word,
+    ) = CallOutTable::publish(bus);
     // SAFETY: the table was just published for this exact `B`, and `cpu` is not otherwise
     // borrowed across the call.
     let status = unsafe {
@@ -32333,6 +32390,7 @@ pub(crate) fn port_read_al_imm8_for_test<B: CpuBus>(
         )
     };
     cpu.native_callout = CallOutTable::default();
+    cpu.native_table_slots.interpret_test_word = 0;
     status
 }
 
@@ -32347,7 +32405,10 @@ pub(crate) fn port_write_al_imm8_for_test<B: CpuBus>(
     prefix_weighted_fp_clocks: u64,
     port: u16,
 ) -> i64 {
-    cpu.native_callout = CallOutTable::publish(bus);
+    (
+        cpu.native_callout,
+        cpu.native_table_slots.interpret_test_word,
+    ) = CallOutTable::publish(bus);
     // SAFETY: as `port_read_al_imm8_for_test`.
     let status = unsafe {
         port_write_al_imm8::<B>(
@@ -32358,6 +32419,7 @@ pub(crate) fn port_write_al_imm8_for_test<B: CpuBus>(
         )
     };
     cpu.native_callout = CallOutTable::default();
+    cpu.native_table_slots.interpret_test_word = 0;
     status
 }
 
@@ -32372,7 +32434,10 @@ pub(crate) fn port_write_al_dx_for_test<B: CpuBus>(
     prefix_raw_clocks: u64,
     prefix_weighted_fp_clocks: u64,
 ) -> i64 {
-    cpu.native_callout = CallOutTable::publish(bus);
+    (
+        cpu.native_callout,
+        cpu.native_table_slots.interpret_test_word,
+    ) = CallOutTable::publish(bus);
     // SAFETY: as `port_read_al_dx_for_test`.
     let status = unsafe {
         port_write_al_dx::<B>(
@@ -32382,6 +32447,7 @@ pub(crate) fn port_write_al_dx_for_test<B: CpuBus>(
         )
     };
     cpu.native_callout = CallOutTable::default();
+    cpu.native_table_slots.interpret_test_word = 0;
     status
 }
 
@@ -32434,6 +32500,7 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 fn emit_call_out(
     e: &mut Encoder,
     helper: CallOutHelper,
+    helper_displacement: i32,
     // `u32` since slice 1d, with `StaticAccounting::raw_clocks` (review B4.2):
     // this is that accumulator's value for the slots before the call-out, and the
     // two must not disagree about width.
@@ -32499,7 +32566,7 @@ fn emit_call_out(
     if let Some(value) = exit_arg {
         e.mov_r64_imm64(EXIT_ARG, value);
     }
-    e.load_r64_disp32(Reg::RAX, Reg::R15, helper_offset(helper));
+    e.load_r64_disp32(Reg::RAX, Reg::R15, helper_displacement);
     e.call_r64(Reg::RAX);
     e.add_r64_imm32(Reg::RSP, CALLOUT_CALL_FRAME);
     // Reload BEFORE the status branch: the abnormal path leaves through `shared_return`, which

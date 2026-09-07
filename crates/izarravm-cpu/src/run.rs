@@ -3526,7 +3526,10 @@ impl CpuGsw {
         // not merely different: a chained native transfer jumps into a SUCCESSOR block's body
         // without returning here, so an entry block with no call-out can reach a chained block
         // that has one. The entry block's own slot count says nothing about the chain.
-        self.native_callout = jit::direct::CallOutTable::publish(bus);
+        (
+            self.native_callout,
+            self.native_table_slots.interpret_test_word,
+        ) = jit::direct::CallOutTable::publish(bus);
         // R3's entry-shadow clause reads THIS, not the live flag (review finding F2). Published
         // once per entry and cleared after the return, so a shadow an arming slot leaves behind
         // mid-block does not refuse every call-out sitting behind it. The refusal above means it
@@ -3576,6 +3579,7 @@ impl CpuGsw {
         self.jit_direct.set_block_bus_at_entry(0);
         self.jit_direct.set_block_poll_skip_16_armed(false);
         self.native_callout = jit::direct::CallOutTable::default();
+        self.native_table_slots.interpret_test_word = 0;
         ea_mark!(Phase::NativePreamble);
         debug_assert!((exit.trace_len as usize) <= trace_capacity);
         debug_assert_eq!(exit.trace_len == 0, uniform_fetches);

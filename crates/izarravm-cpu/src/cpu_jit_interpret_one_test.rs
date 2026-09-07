@@ -29,6 +29,14 @@ use super::sixteen_bit::{
 use super::*;
 use crate::timing_class::TimingClass;
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_test_word_helper_test.rs"]
+mod test_word_helper;
+
 const ENTRY: u32 = 0x100;
 /// A page the block's code is not on, for the stack and for the POP's destination.
 const DATA_PAGE: u32 = 0x1000;
