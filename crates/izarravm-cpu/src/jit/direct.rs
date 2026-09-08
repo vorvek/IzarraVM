@@ -9366,11 +9366,7 @@ fn compile_with_budget(
     else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
-    let live_data = if cpu.jit_direct.live_data_for_key(key) {
-        LIVE_DATA_BITS
-    } else {
-        0
-    };
+    let live_data = cpu.jit_direct.live_segments_for_key(key);
     let protected_not_v86 = cpu.is_protected_mode() && !cpu.is_v86_mode();
     // A self-loop block accounts by MULTIPLYING its whole static accounting by the iteration
     // count at exit, so nothing inside the loop body may deposit into the runtime lanes per
@@ -9865,10 +9861,9 @@ fn compile_with_budget(
         fetch_trace: cpu.jit_direct.native_fetch_trace,
         segment_write_guard,
     });
-    // Emit reads the full-used snapshot so descriptor() still sees DS/ES. Install gets the
-    // stripped one so the entry compare skips live DS/ES. Selector pins stay in used.
+    // Emit uses the full snapshot; entry checks omit live descriptors but keep selector pins.
     let segment_layout = if live_data != 0 {
-        segment_layout.without_pins(LIVE_DATA_BITS & !selector_segments)
+        segment_layout.without_pins(live_data & !selector_segments)
     } else {
         segment_layout
     };
@@ -19227,7 +19222,7 @@ struct MemoryEmitContext {
     /// `one_lookup_load` so a classic-front integer block still saves and restores RSI.
     hold_load_bias: bool,
     segments: SegmentLayout,
-    /// DS/ES bits to live-load from R15 instead of baking. Zero on a first compile.
+    /// Segment bits to live-load from R15 instead of baking. Zero on a first compile.
     live_data: u8,
     /// PE set and V86 clear, baked from the compile-time mode key. Do not recover this from
     /// `address_wrap`: Word wrap is CS.D, and 16-bit PM would take the real/V86 emit.
@@ -23551,12 +23546,12 @@ fn emit_live_segmented_linear_address(
     wrap: AddressWrap,
     write: bool,
 ) {
-    // Live DS/ES never take the compile-time fold: the live limit may be finite when the
+    // Live descriptors never take the compile-time fold: the live limit may be finite when the
     // captured one was u32::MAX, and a fold would bake the captured base this path exists
     // to stop emitting.
     debug_assert!(
         memory.live_data & segment_bit(addr.segment) != 0,
-        "live emit is only for sticky DS/ES"
+        "live emit requires a promoted segment"
     );
     emit_effective_address(e, addr, wrap, 0);
     let field = segment_field_base(addr.segment);
@@ -23565,7 +23560,7 @@ fn emit_live_segmented_linear_address(
     }
     let limit_exit = sides
         .segment_limit
-        .expect("sticky DS/ES always allocate a segment_limit label");
+        .expect("live descriptors always allocate a segment_limit label");
     e.load_r32_disp32(Reg::RDX, Reg::R15, field + limit_offset());
     let extent = width.bytes() - 1;
     if extent != 0 {
@@ -33723,6 +33718,8 @@ pub(crate) struct DataSegmentRetireRecord {
     /// key on SMC (`forget_data_segment_state_for_key`). `link_source_declined` reads it so a
     /// live key stays a leaf even after the declined set is flushed.
     live_data: bool,
+    stack_rejects: u8,
+    live_stack: bool,
     /// Fingerprints of the distinct live descriptor tuples this key has been rejected against,
     /// MASKED BY THE REJECTING ARM'S OWN MASK.
     ///
@@ -33892,12 +33889,19 @@ impl BlockCache {
             }
         });
         let fingerprint = layout_fingerprint(mask, live);
+        let own = self.segment_layouts[index];
+        let stack_mismatch = key.mode_key & 0xf == 0b0010
+            && own.used & segment_bit(SegmentIndex::Ss) != 0
+            && own.data[segment_index(SegmentIndex::Ss)] != live[segment_index(SegmentIndex::Ss)];
         let spent = {
             let record = match self.data_segment_retires.entry(key) {
                 Entry::Occupied(occupied) => occupied.into_mut(),
                 Entry::Vacant(vacant) => vacant.insert(DataSegmentRetireRecord::default()),
             };
             record.note_layout(fingerprint);
+            if stack_mismatch {
+                record.stack_rejects = (record.stack_rejects + 1).min(DATA_SEGMENT_RETIRE_CAP);
+            }
             record.spent
         };
         if spent >= DATA_SEGMENT_RETIRE_CAP {
@@ -33906,12 +33910,11 @@ impl BlockCache {
                     .data_segment_retires
                     .get_mut(&key)
                     .expect("the reject that just filled this row");
-                if record.live_data {
-                    false
-                } else {
-                    record.live_data = true;
-                    true
-                }
+                let stack_ready = record.stack_rejects >= DATA_SEGMENT_RETIRE_CAP;
+                let promote = !record.live_data || (stack_ready && !record.live_stack);
+                record.live_data = true;
+                record.live_stack |= stack_ready;
+                promote
             };
             if promote {
                 // The promoting entry still returns NotRun; the body has not been rewritten yet.
@@ -34008,10 +34011,19 @@ impl BlockCache {
         })
     }
 
-    pub(crate) fn live_data_for_key(&self, key: BlockKey) -> bool {
-        self.data_segment_retires
-            .get(&key)
-            .is_some_and(|record| record.live_data)
+    fn live_segments_for_key(&self, key: BlockKey) -> u8 {
+        self.data_segment_retires.get(&key).map_or(0, |record| {
+            if record.live_data {
+                LIVE_DATA_BITS
+                    | if record.live_stack {
+                        segment_bit(SegmentIndex::Ss)
+                    } else {
+                        0
+                    }
+            } else {
+                0
+            }
+        })
     }
 
     /// Drop one key's decline. Called from `retire_key_for_recompile` (the flag is a statement
@@ -35185,9 +35197,7 @@ pub(crate) struct DirectStallTally {
     pub data_segment_retires_suppressed: u64,
     pub data_segment_sticky_crossings: u64,
     pub data_segment_link_declines: u64,
-    /// First `spent >= DATA_SEGMENT_RETIRE_CAP` reject on a key that was not yet live-data:
-    /// the promoting entry, which retires so the next compile emits live DS/ES. Already-live
-    /// suppressed rejects stay in `data_segment_retires_suppressed`.
+    /// Retires that enable live DS/ES or promote a PM16 stack after its own repeated rejects.
     pub data_segment_live_promotions: u64,
     /// Sticky-decline memo instruments, always on. Here for this struct's stated reason:
     /// `PerfCounters` sits ahead of `pending_flags` in `CpuGsw` at an offset emitted code bakes,
