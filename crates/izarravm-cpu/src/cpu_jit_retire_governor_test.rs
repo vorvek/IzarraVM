@@ -1610,12 +1610,22 @@ fn stamp_ds(cpu: &mut CpuGsw, selector: u16, base: u32, limit: u32, access: u8) 
 
 fn stack_at(cpu: &mut CpuGsw, base: u32) {
     let mut ss = cpu.registers.segment(SegmentIndex::Ss);
-    ss.selector = if base == 0x1000 { 0x60 } else { 0x68 };
+    let cpl = cpu.current_privilege_level();
+    ss.selector = (if base == 0x1000 { 0x60 } else { 0x68 }) | u16::from(cpl);
     ss.base = base;
     ss.limit = 0xffff;
-    ss.access = 0x93;
+    ss.access = 0x93 | (cpl << 5);
     ss.default_size_32 = false;
     cpu.registers.set_segment(SegmentIndex::Ss, ss);
+}
+
+fn stack_privilege(cpu: &mut CpuGsw, cpl: u8) {
+    cpu.cpl = cpl;
+    let mut cs = cpu.registers.cs();
+    cs.selector = (cs.selector & !3) | u16::from(cpl);
+    cs.access = (cs.access & !0x60) | (cpl << 5);
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    stack_at(cpu, 0x1000);
 }
 
 fn pm16_stack_program(instructions: &[&[u8]]) -> (CpuGsw, TestBus) {
@@ -1824,6 +1834,63 @@ fn live_stack_pm16_loop_accounts_for_every_completed_iteration() {
     assert_eq!(cpu.registers.esp(), 0xabcd_0700);
     assert_eq!(cpu.perf_counters().jit_direct_insns - retired, 36);
     assert_eq!(&bus.memory[0x26fe..0x2700], &0x1234u16.to_le_bytes());
+}
+
+#[test]
+fn live_stack_pm16_privilege_user_churn_does_not_promote_a_supervisor_stack() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50]]);
+    stack_privilege(&mut cpu, 3);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let user = compile_sixteen(&mut cpu, ENTRY);
+    assert!(user.memory_cpl3());
+    stack_at(&mut cpu, 0x2000);
+    assert!(!cpu.try_run_direct_block_for_test(&mut bus, user).unwrap());
+
+    let key = jit::direct::key_for(&cpu, ENTRY, false).unwrap();
+    stack_privilege(&mut cpu, 0);
+    assert_eq!(jit::direct::key_for(&cpu, ENTRY, false).unwrap(), key);
+    assert!(!cpu.try_run_direct_block_for_test(&mut bus, user).unwrap());
+    for _ in 0..DATA_SEGMENT_RETIRE_CAP {
+        stack_at(&mut cpu, 0x1000);
+        let block = compile_sixteen(&mut cpu, ENTRY);
+        assert!(!block.memory_cpl3());
+        stack_at(&mut cpu, 0x2000);
+        let registers = cpu.registers.clone();
+        assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(cpu.registers, registers);
+    }
+    stack_at(&mut cpu, 0x1000);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    stack_at(&mut cpu, 0x2000);
+    cpu.registers.set_eax(0x1234);
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(&bus.memory[0x26fe..0x2700], &0x1234u16.to_le_bytes());
+}
+
+#[test]
+fn live_stack_pm16_privilege_supervisor_promotion_keeps_user_stacks_pinned() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50]]);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let supervisor = compile_sixteen(&mut cpu, ENTRY);
+    let key = jit::direct::key_for(&cpu, ENTRY, false).unwrap();
+    stack_privilege(&mut cpu, 3);
+    assert_eq!(jit::direct::key_for(&cpu, ENTRY, false).unwrap(), key);
+    assert!(
+        !cpu.try_run_direct_block_for_test(&mut bus, supervisor)
+            .unwrap()
+    );
+    let user = compile_sixteen(&mut cpu, ENTRY);
+    assert!(user.memory_cpl3());
+    stack_at(&mut cpu, 0x2000);
+    let registers = cpu.registers.clone();
+    let memory = bus.memory.clone();
+    assert!(!cpu.try_run_direct_block_for_test(&mut bus, user).unwrap());
+    assert_eq!(cpu.registers, registers);
+    assert_eq!(bus.memory, memory);
 }
 
 /// 16-bit PM twin. Compile live under a writable selector, then enter read-only.

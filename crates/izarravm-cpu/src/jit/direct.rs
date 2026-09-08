@@ -9366,7 +9366,11 @@ fn compile_with_budget(
     else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
-    let live_data = cpu.jit_direct.live_segments_for_key(key);
+    let mut live_data = cpu.jit_direct.live_segments_for_key(key);
+    // Promotion state survives CS/CPL retirement; user blocks keep SS pinned.
+    if cpu.current_privilege_level() == 3 {
+        live_data &= !segment_bit(SegmentIndex::Ss);
+    }
     let protected_not_v86 = cpu.is_protected_mode() && !cpu.is_v86_mode();
     // A self-loop block accounts by MULTIPLYING its whole static accounting by the iteration
     // count at exit, so nothing inside the loop body may deposit into the runtime lanes per
@@ -33891,6 +33895,7 @@ impl BlockCache {
         let fingerprint = layout_fingerprint(mask, live);
         let own = self.segment_layouts[index];
         let stack_mismatch = key.mode_key & 0xf == 0b0010
+            && !self.blocks[index].memory_cpl3()
             && own.used & segment_bit(SegmentIndex::Ss) != 0
             && own.data[segment_index(SegmentIndex::Ss)] != live[segment_index(SegmentIndex::Ss)];
         let spent = {
