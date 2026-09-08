@@ -206,6 +206,106 @@ fn first_observation_interprets_and_second_compiles() {
     assert!(matches!(cache.probe(key), BlockProbe::Rejected));
 }
 
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn split_stats_drain_keeps_clean_cold_state_out_of_the_common_path() {
+    let mut cache = BlockCache::default();
+    let block = key(0x1234);
+    let id = install_trivial(&mut cache, block, 1);
+    let collision = (0x1235..)
+        .map(key)
+        .find(|candidate| candidate.hot_index() == block.hot_index())
+        .expect("the finite hot table must collide");
+    install_trivial(&mut cache, collision, 1);
+    let _ = cache.take_stats_split();
+
+    assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
+    assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
+    assert!(matches!(cache.probe(key(0x8000)), BlockProbe::Interpret));
+
+    let (hot, cold) = cache.take_stats_split();
+    assert_eq!(
+        hot,
+        BlockCacheHotStats {
+            hot_hits: 1,
+            hash_hits: 1,
+            lookup_misses: 1,
+        }
+    );
+    assert_eq!(cold, None);
+    assert_eq!(
+        cache.take_stats_split(),
+        (BlockCacheHotStats::default(), None)
+    );
+}
+
+#[test]
+fn arena_compaction_failure_marks_cold_stats_dirty_once() {
+    let mut stats = BlockCacheStatsAccumulator::default();
+
+    stats.note_arena_compaction_failure();
+
+    let (hot, cold) = stats.drain();
+    assert_eq!(hot, BlockCacheHotStats::default());
+    let cold = cold.expect("arena compaction failure dirties the cold counters");
+    assert_eq!(cold.arena_compaction_failures, 1);
+    assert_eq!(stats.drain(), (BlockCacheHotStats::default(), None));
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn split_stats_drain_interleaves_hot_and_cold_mutations_once() {
+    let mut cache = BlockCache::new(8);
+    let block = key(0x4000);
+    let id = install_trivial(&mut cache, block, 1);
+    let _ = cache.take_stats_split();
+
+    assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
+    let slot = block.linear as usize & cache.decode_slot_mask;
+    assert_eq!(cache.suspend_decode_slot(slot), 1);
+    assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
+
+    let (hot, cold) = cache.take_stats_split();
+    assert_eq!(hot.hot_hits, 2);
+    assert_eq!(hot.hash_hits, 0);
+    assert_eq!(hot.lookup_misses, 0);
+    let cold = cold.expect("decode suspension dirties the cold counters");
+    assert_eq!(cold.decode_dependencies_scanned, 1);
+    assert_eq!(cold.portals_hidden, 1);
+    assert_eq!(
+        cache.take_stats_split(),
+        (BlockCacheHotStats::default(), None)
+    );
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn clone_drops_pending_split_stats() {
+    let mut cache = BlockCache::new(8);
+    let block = key(0x4000);
+    install_trivial(&mut cache, block, 1);
+    let slot = block.linear as usize & cache.decode_slot_mask;
+    assert_eq!(cache.suspend_decode_slot(slot), 1);
+
+    let mut clone = cache.clone();
+    assert_eq!(
+        clone.take_stats_split(),
+        (BlockCacheHotStats::default(), None)
+    );
+    let (hot, cold) = cache.take_stats_split();
+    assert_eq!(hot.lookup_misses, 1);
+    assert!(cold.is_some());
+}
+
 #[test]
 fn empty_cache_clear_drains_retained_code_watch_pages() {
     let mut cache = BlockCache::default();
@@ -1174,7 +1274,7 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     assert_eq!(cache.retire_physical_range_for_test(dead.physical, 1), 1);
     let link_epochs = cache.block_link_epochs.clone();
     assert_eq!(
-        cache.stats.arena_compaction_ns, 0,
+        cache.stats.cold.arena_compaction_ns, 0,
         "nothing may charge compaction wall before a compaction runs"
     );
 
@@ -4106,7 +4206,7 @@ fn returning_to_a_directory_restores_its_links() {
     assert!(cache.has_linked_successor(source_id));
     assert!(cache.is_link_visible(target_id));
 
-    let unlinks_before = cache.stats.unlinks;
+    let unlinks_before = cache.stats.cold.unlinks;
     let flushed_before = cache.stalls.links_cleared[LinkClearCause::Flushed as usize];
 
     // R2 allocate: CR3 = B.
@@ -4127,7 +4227,7 @@ fn returning_to_a_directory_restores_its_links() {
         "returning to A must restore the link with no work"
     );
     assert_eq!(
-        cache.stats.unlinks, unlinks_before,
+        cache.stats.cold.unlinks, unlinks_before,
         "neither write may tear down any edge"
     );
     assert_eq!(
@@ -4237,7 +4337,7 @@ fn a_third_directory_retires_the_link_graph() {
     assert!(cache.is_link_visible(b_id));
 
     let epochs_before = cache.link_epochs;
-    let unlinks_before = cache.stats.unlinks;
+    let unlinks_before = cache.stats.cold.unlinks;
     cache.invalidate_translation();
     cache.allocate_link_context(0);
 
@@ -4247,7 +4347,7 @@ fn a_third_directory_retires_the_link_graph() {
     );
     assert!(!cache.is_link_visible(a_id));
     assert!(!cache.is_link_visible(b_id));
-    assert!(cache.stats.unlinks > unlinks_before);
+    assert!(cache.stats.cold.unlinks > unlinks_before);
     assert_ne!(
         cache.link_epochs[0], epochs_before[0],
         "both epochs must be freshly minted, never recycled (design review J2)"

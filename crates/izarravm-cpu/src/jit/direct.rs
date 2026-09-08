@@ -1405,7 +1405,7 @@ pub(crate) struct BlockCache {
     /// clears the shared map before the next heat access. An inactive backend's cache never
     /// resets, so it can never erase the live backend's demotion evidence.
     heat_resets: u64,
-    stats: BlockCacheStats,
+    stats: BlockCacheStatsAccumulator,
     /// See `DirectStallTally`: never drained, never reset.
     stalls: DirectStallTally,
     #[cfg(feature = "direct-link-refusal-census")]
@@ -1541,7 +1541,7 @@ impl BlockCache {
             auto_admit: false,
             admission_heat: DEFAULT_ADMISSION_HEAT,
             heat_resets: 0,
-            stats: BlockCacheStats::default(),
+            stats: BlockCacheStatsAccumulator::default(),
             stalls: DirectStallTally::default(),
             #[cfg(feature = "direct-link-refusal-census")]
             direct_link_refusal_census: direct_link_refusal_census_default(),
@@ -1614,12 +1614,12 @@ impl BlockCache {
         let hot_index = key.hot_index();
         let hot_live = |hit: &HotEntry| hit.generation == self.hot_generation && hit.key == key;
         if let Some(hit) = self.hot[hot_index].filter(hot_live) {
-            self.stats.hot_hits += 1;
+            self.stats.hot.hot_hits += 1;
             return BlockProbe::Ready(hit.id);
         }
         match self.entries.get(&key).copied() {
             Some(BlockState::Compiled(id)) => {
-                self.stats.hash_hits += 1;
+                self.stats.hot.hash_hits += 1;
                 self.hot[hot_index] = Some(HotEntry {
                     key,
                     id,
@@ -1630,7 +1630,7 @@ impl BlockCache {
             Some(BlockState::Seen) => BlockProbe::Compile,
             Some(BlockState::Dormant(..) | BlockState::Rejected(_)) => BlockProbe::Rejected,
             None => {
-                self.stats.lookup_misses += 1;
+                self.stats.hot.lookup_misses += 1;
                 if self.entries.len() == self.entry_cap {
                     self.reset_storage(watch);
                 }
@@ -1673,7 +1673,7 @@ impl BlockCache {
             let can_compact = Self::arena_compaction_can_reclaim(self.live_blocks, capacity);
             if !can_compact || !self.compact_arena() {
                 if can_compact {
-                    self.stats.arena_compaction_failures += 1;
+                    self.stats.note_arena_compaction_failure();
                 }
                 self.reset_storage(watch);
                 self.entries.insert(span.key, BlockState::Seen);
@@ -2935,7 +2935,7 @@ impl BlockCache {
         self.data_segment_link_declined.clear();
         self.waiting.clear();
         self.linear_blocks.clear();
-        self.stats.unlinks += links;
+        self.stats.note_unlinks(links);
         self.stalls.links_cleared[LinkClearCause::Flushed as usize] += links;
         // Both slots re-mint from the SAME monotonic counter (design doc J2), never by bumping
         // each slot's own scalar independently: two independent bumps can alias slot 0's new
@@ -2994,10 +2994,8 @@ impl BlockCache {
         let Some(dependency_len) = self.decode_dependencies.get(slot).map(Vec::len) else {
             return 0;
         };
-        self.stats.decode_dependencies_scanned = self
-            .stats
-            .decode_dependencies_scanned
-            .saturating_add(dependency_len as u64);
+        self.stats
+            .note_decode_dependencies_scanned(dependency_len as u64);
         let mut hidden = 0;
         for offset in 0..dependency_len {
             let id = self.decode_dependencies[slot][offset];
@@ -3023,7 +3021,7 @@ impl BlockCache {
             self.block_portals[index].clear();
             hidden += 1;
         }
-        self.stats.portals_hidden = self.stats.portals_hidden.saturating_add(hidden as u64);
+        self.stats.note_portals_hidden(hidden as u64);
         hidden
     }
 
@@ -3539,8 +3537,40 @@ impl BlockCache {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_stats_split(&mut self) -> (BlockCacheHotStats, Option<BlockCacheColdStats>) {
+        self.stats.drain()
+    }
+
+    #[inline]
+    pub(crate) fn take_hot_stats(&mut self) -> (BlockCacheHotStats, bool) {
+        self.stats.drain_hot()
+    }
+
+    #[inline]
+    pub(crate) fn take_cold_stats(&mut self) -> BlockCacheColdStats {
+        self.stats.drain_cold()
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_stats(&mut self) -> BlockCacheStats {
-        std::mem::take(&mut self.stats)
+        let (hot, cold) = self.take_stats_split();
+        let cold = cold.unwrap_or_default();
+        BlockCacheStats {
+            hot_hits: hot.hot_hits,
+            hash_hits: hot.hash_hits,
+            lookup_misses: hot.lookup_misses,
+            cache_resets: cold.cache_resets,
+            arena_compactions: cold.arena_compactions,
+            arena_compaction_live_blocks: cold.arena_compaction_live_blocks,
+            arena_compaction_bytes: cold.arena_compaction_bytes,
+            arena_compaction_failures: cold.arena_compaction_failures,
+            arena_compaction_ns: cold.arena_compaction_ns,
+            links: cold.links,
+            unlinks: cold.unlinks,
+            decode_dependencies_scanned: cold.decode_dependencies_scanned,
+            portals_hidden: cold.portals_hidden,
+        }
     }
 
     #[cfg(feature = "direct-link-refusal-census")]
@@ -3894,19 +3924,8 @@ impl BlockCache {
         }
 
         self.arena = Some(fresh_arena);
-        self.stats.arena_compactions += 1;
-        self.stats.arena_compaction_ns = self
-            .stats
-            .arena_compaction_ns
-            .saturating_add(started.elapsed().as_nanos() as u64);
-        self.stats.arena_compaction_live_blocks = self
-            .stats
-            .arena_compaction_live_blocks
-            .saturating_add(self.live_blocks as u64);
-        self.stats.arena_compaction_bytes = self
-            .stats
-            .arena_compaction_bytes
-            .saturating_add(moved_bytes);
+        self.stats
+            .note_arena_compaction(self.live_blocks as u64, moved_bytes, started);
         true
     }
 
@@ -3939,9 +3958,9 @@ impl BlockCache {
         for index in 0..self.link_cells.len() {
             self.close_direct_link_rows(index);
         }
-        self.stats.unlinks += links;
+        self.stats.note_unlinks(links);
         self.stalls.links_cleared[LinkClearCause::Reset as usize] += links;
-        self.stats.cache_resets += 1;
+        self.stats.note_cache_reset();
         self.entries.clear();
         self.physical_keys.clear();
         self.blocks.clear();
@@ -32869,7 +32888,7 @@ impl BlockCache {
             block: source,
             slot,
         });
-        self.stats.links += 1;
+        self.stats.note_link();
         #[cfg(feature = "direct-link-refusal-census")]
         self.note_direct_link_linked(source_index, slot_index, target);
         // AFTER the edge is visible: the propagation walks `inbound`, and this edge's own source
@@ -32911,7 +32930,7 @@ impl BlockCache {
                 self.inbound.remove(&target);
             }
         }
-        self.stats.unlinks += 1;
+        self.stats.note_unlinks(1);
         self.stalls.links_cleared[cause as usize] += 1;
         #[cfg(feature = "direct-link-refusal-census")]
         self.note_direct_link_cleared(source_index, slot_index, cause, target);
@@ -32976,7 +32995,7 @@ impl BlockCache {
                         };
                         self.waiting.entry(key).or_default().push(link);
                     }
-                    self.stats.unlinks += 1;
+                    self.stats.note_unlinks(1);
                     self.stalls.links_cleared[LinkClearCause::Retired as usize] += 1;
                     #[cfg(feature = "direct-link-refusal-census")]
                     self.note_direct_link_cleared(source_index, slot, LinkClearCause::Retired, id);
@@ -34547,6 +34566,7 @@ fn census_native_suffix(
 // read every one of these.
 // ---------------------------------------------------------------------------------------
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BlockCacheStats {
     pub hot_hits: u64,
@@ -34565,6 +34585,114 @@ pub(crate) struct BlockCacheStats {
     pub unlinks: u64,
     pub decode_dependencies_scanned: u64,
     pub portals_hidden: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlockCacheHotStats {
+    pub(crate) hot_hits: u64,
+    pub(crate) hash_hits: u64,
+    pub(crate) lookup_misses: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlockCacheColdStats {
+    pub(crate) cache_resets: u64,
+    pub(crate) arena_compactions: u64,
+    pub(crate) arena_compaction_live_blocks: u64,
+    pub(crate) arena_compaction_bytes: u64,
+    pub(crate) arena_compaction_failures: u64,
+    pub(crate) arena_compaction_ns: u64,
+    pub(crate) links: u64,
+    pub(crate) unlinks: u64,
+    pub(crate) decode_dependencies_scanned: u64,
+    pub(crate) portals_hidden: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BlockCacheStatsAccumulator {
+    hot: BlockCacheHotStats,
+    cold: BlockCacheColdStats,
+    cold_dirty: bool,
+}
+
+impl BlockCacheStatsAccumulator {
+    #[cfg(test)]
+    #[inline]
+    fn drain(&mut self) -> (BlockCacheHotStats, Option<BlockCacheColdStats>) {
+        let (hot, cold_dirty) = self.drain_hot();
+        let cold = if cold_dirty {
+            Some(self.drain_cold())
+        } else {
+            None
+        };
+        (hot, cold)
+    }
+
+    #[inline]
+    fn drain_hot(&mut self) -> (BlockCacheHotStats, bool) {
+        (std::mem::take(&mut self.hot), self.cold_dirty)
+    }
+
+    #[inline]
+    fn drain_cold(&mut self) -> BlockCacheColdStats {
+        debug_assert!(self.cold_dirty);
+        self.cold_dirty = false;
+        std::mem::take(&mut self.cold)
+    }
+
+    fn note_cache_reset(&mut self) {
+        self.cold.cache_resets += 1;
+        self.cold_dirty = true;
+    }
+
+    #[inline(always)]
+    fn note_arena_compaction(
+        &mut self,
+        live_blocks: u64,
+        moved_bytes: u64,
+        started: std::time::Instant,
+    ) {
+        self.cold.arena_compactions += 1;
+        self.cold.arena_compaction_ns = self
+            .cold
+            .arena_compaction_ns
+            .saturating_add(started.elapsed().as_nanos() as u64);
+        self.cold.arena_compaction_live_blocks = self
+            .cold
+            .arena_compaction_live_blocks
+            .saturating_add(live_blocks);
+        self.cold.arena_compaction_bytes =
+            self.cold.arena_compaction_bytes.saturating_add(moved_bytes);
+        self.cold_dirty = true;
+    }
+
+    fn note_arena_compaction_failure(&mut self) {
+        self.cold.arena_compaction_failures += 1;
+        self.cold_dirty = true;
+    }
+
+    fn note_link(&mut self) {
+        self.cold.links += 1;
+        self.cold_dirty = true;
+    }
+
+    fn note_unlinks(&mut self, links: u64) {
+        self.cold.unlinks += links;
+        self.cold_dirty = true;
+    }
+
+    fn note_decode_dependencies_scanned(&mut self, dependencies: u64) {
+        self.cold.decode_dependencies_scanned = self
+            .cold
+            .decode_dependencies_scanned
+            .saturating_add(dependencies);
+        self.cold_dirty = true;
+    }
+
+    fn note_portals_hidden(&mut self, portals: u64) {
+        self.cold.portals_hidden = self.cold.portals_hidden.saturating_add(portals);
+        self.cold_dirty = true;
+    }
 }
 
 /// One allowlist row's four outcome counts. A struct rather than four parallel arrays so a row's

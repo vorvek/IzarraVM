@@ -469,6 +469,40 @@ fn perf_counters_track_decode_hits_and_run_breaks() {
     );
 }
 
+#[test]
+fn direct_cache_stats_restart_after_a_folded_perf_reset_boundary() {
+    let mut memory = vec![0u8; 1024];
+    memory[0..4].copy_from_slice(&[0x40, 0x40, 0xeb, 0xfc]);
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.registers.eip = 0;
+    let mut bus = TestBus::with_memory(memory);
+
+    let first_key = jit::direct::BlockKey::new(0x2000, 0x2000, 0);
+    assert!(matches!(
+        cpu.jit_direct.probe(first_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    cpu.jit_direct.clear();
+    let _ = cpu.run_budgeted(&mut bus, 10).unwrap();
+    assert_eq!(cpu.perf_counters().jit_direct_lookup_misses, 1);
+    assert_eq!(cpu.perf_counters().jit_direct_cache_resets, 1);
+
+    cpu.reset_perf_counters();
+    assert_eq!(cpu.perf_counters().jit_direct_lookup_misses, 0);
+    assert_eq!(cpu.perf_counters().jit_direct_cache_resets, 0);
+    for linear in [0x3000, 0x4000] {
+        let key = jit::direct::BlockKey::new(linear, linear, 0);
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+    }
+    let _ = cpu.run_budgeted(&mut bus, 10).unwrap();
+    assert_eq!(cpu.perf_counters().jit_direct_lookup_misses, 2);
+    assert_eq!(cpu.perf_counters().jit_direct_cache_resets, 0);
+}
+
 // Standalone setup for `seam_counters_bound_probes_and_are_deterministic`, mirroring the tight
 // loop and warm-cache-then-run_straight_line shape of `perf_counters_track_decode_hits_and_run_breaks`
 // above. Not extracted FROM that test's body: the sibling test interleaves counter assertions

@@ -920,11 +920,8 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         self.unit_sim_batch_end();
         // Fold the Direct block cache's stats into `perf` once per batch rather than once per
-        // dispatcher entry. The twelve fields are accumulate-only and nothing reads them between
-        // an entry and the end of a batch (the only readers are the end-of-run reporters in
-        // `izarravm`), so the totals are unchanged while the work drops from 88 million calls to
-        // 27.6 million. Sitting in the wrapper rather than in the body also covers the six `?`
-        // propagations inside the loop, which the two calls this replaces did not.
+        // dispatcher entry. Sitting in the wrapper rather than in the body also covers the six
+        // `?` propagations inside the loop, which the two calls this replaces did not.
         #[cfg(feature = "jit")]
         self.flush_direct_cache_stats();
         result
@@ -2405,10 +2402,20 @@ impl CpuGsw {
 
     #[cfg(feature = "jit")]
     fn flush_direct_cache_stats(&mut self) {
-        let stats = self.jit_direct.take_stats();
-        self.perf.jit_direct_hot_hits += stats.hot_hits;
-        self.perf.jit_direct_hash_hits += stats.hash_hits;
-        self.perf.jit_direct_lookup_misses += stats.lookup_misses;
+        let (hot, cold_dirty) = self.jit_direct.take_hot_stats();
+        self.perf.jit_direct_hot_hits += hot.hot_hits;
+        self.perf.jit_direct_hash_hits += hot.hash_hits;
+        self.perf.jit_direct_lookup_misses += hot.lookup_misses;
+        if cold_dirty {
+            self.fold_direct_cache_cold_stats();
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
+    fn fold_direct_cache_cold_stats(&mut self) {
+        let stats = self.jit_direct.take_cold_stats();
         self.perf.jit_direct_cache_resets += stats.cache_resets;
         self.perf.jit_direct_arena_compactions += stats.arena_compactions;
         self.perf.jit_direct_arena_compaction_live_blocks += stats.arena_compaction_live_blocks;

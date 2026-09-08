@@ -127,6 +127,12 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
     cpu.fetch_decoded(&mut bus, 2).unwrap();
     cpu.set_eip(0);
     let elapsed_before = cpu.elapsed_clocks;
+    let pending_key = jit::direct::BlockKey::new(0x2000, 0x2000, 0);
+    assert!(matches!(
+        cpu.jit_direct.probe(pending_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    assert_eq!(cpu.perf_counters().jit_direct_lookup_misses, 0);
 
     let result = cpu.run_budgeted(&mut bus, 10_000);
 
@@ -167,6 +173,10 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
         "the returned fatal core matches the committed CPU clock delta"
     );
     let p = cpu.perf_counters();
+    assert_eq!(
+        p.jit_direct_lookup_misses, 1,
+        "the public wrapper must fold pending cache stats on an error return"
+    );
     assert_eq!(
         p.brk_fatal, 1,
         "the propagated IdtLimit error must be counted, not excused"
