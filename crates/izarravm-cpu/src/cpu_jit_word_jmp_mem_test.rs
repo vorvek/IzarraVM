@@ -287,6 +287,7 @@ fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
             native_bus.trace.elapsed_clocks(),
             interp_bus.trace.elapsed_clocks()
         );
+        assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
         assert_eq!(native_bus.side_effect_read_count, u64::from(unavailable));
         assert_eq!(interp_bus.side_effect_read_count, u64::from(unavailable));
         assert_eq!(
@@ -430,6 +431,7 @@ fn word_memory_jump_source_limit_exits_then_dispatcher_replays_the_fault() {
         native_bus.trace.elapsed_clocks(),
         interp_bus.trace.elapsed_clocks()
     );
+    assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native_bus.side_effect_read_count, 0);
     assert_eq!(interp_bus.side_effect_read_count, 0);
     assert_eq!(native.perf_counters().instructions - guest_before, 3);
@@ -1093,7 +1095,12 @@ fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
 
     let registers = cpu.registers.clone();
     let pending = cpu.pending_flags;
+    let guest_before = cpu.perf_counters().instructions;
+    let direct_before = cpu.perf_counters().jit_direct_insns;
+    let entries_before = cpu.perf_counters().jit_direct_entries;
     let budget_refusals = cpu.perf_counters().jit_direct_reject_zero_budget;
+    let trace_before = bus.trace.clone();
+    let side_effect_reads_before = bus.side_effect_read_count;
     assert!(
         !cpu.try_run_direct_block_with_cap_for_test(&mut bus, block, iteration_upper)
             .unwrap()
@@ -1104,9 +1111,12 @@ fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
         cpu.perf_counters().jit_direct_reject_zero_budget - budget_refusals,
         1
     );
+    assert_eq!(cpu.perf_counters().instructions, guest_before);
+    assert_eq!(cpu.perf_counters().jit_direct_insns, direct_before);
+    assert_eq!(cpu.perf_counters().jit_direct_entries, entries_before);
+    assert_eq!(bus.trace, trace_before);
+    assert_eq!(bus.side_effect_read_count, side_effect_reads_before);
 
-    let guest_before = cpu.perf_counters().instructions;
-    let direct_before = cpu.perf_counters().jit_direct_insns;
     assert!(
         cpu.try_run_direct_block_with_cap_for_test(&mut bus, block, iteration_upper + 1)
             .unwrap()
