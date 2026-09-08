@@ -598,6 +598,228 @@ fn compare_all_conditions(regions: bool, arithmetic: u8) {
 }
 
 #[test]
+fn mkii_region_continues_through_untaken_branches_and_settles_taken_prefixes() {
+    let code = [
+        0x3b, 0x06, 0, 0x20, 0x74, 12, 0xbb, 0x11, 0x11, 0x3b, 0x06, 2, 0x20, 0x74, 3, 0xbb, 0x22,
+        0x22, 0xe4, 0x60,
+    ];
+    for (value, native, bx) in [(0, 2, 0x3333), (1, 5, 0x1111), (2, 6, 0x2222)] {
+        let (mut cpu, mut bus) = fixture(&code);
+        let (mut oracle, mut other) = fixture(&code);
+        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+            enable_read_regions(bus);
+            bus.memory[0x2000..0x2004].copy_from_slice(&[0, 0, 1, 0]);
+            warm_read(cpu, bus, 0x2000);
+            warm_code(cpu, bus, code.len() as u32);
+            cpu.registers.set_eax(value);
+            cpu.registers.set_ebx(0x3333);
+        }
+        compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+        let stats = cpu.dynarec_mkii_stats();
+        assert_eq!(cpu.registers.ebx(), bx);
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.regions, 1);
+        assert_eq!(stats.native, native);
+        assert_eq!(stats.region_guard_misses, 0);
+        assert_eq!(stats.cold, 1);
+    }
+}
+
+#[test]
+fn mkii_interior_branch_caps_preserve_the_exact_executed_prefix() {
+    let code = [
+        0x3b, 0x06, 0, 0x20, 0x74, 12, 0xbb, 0x11, 0x11, 0x3b, 0x06, 2, 0x20, 0x74, 3, 0xbb, 0x22,
+        0x22, 0xe4, 0x60,
+    ];
+    let mut taken_legacy_prefixes = 0;
+    for cap in 0..40 {
+        for remainder in [0, 1, 7, 11] {
+            for value in 0..3 {
+                let (mut cpu, mut bus) = fixture(&code);
+                let (mut oracle, mut other) = fixture(&code);
+                for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                    enable_read_regions(bus);
+                    bus.memory[0x2000..0x2004].copy_from_slice(&[0, 0, 1, 0]);
+                    warm_read(cpu, bus, 0x2000);
+                    warm_code(cpu, bus, code.len() as u32);
+                    cpu.registers.set_eax(value);
+                    cpu.timing_rem = remainder;
+                }
+                compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, cap);
+                let stats = cpu.dynarec_mkii_stats();
+                if value == 0 && stats.regions == 0 && stats.memory_spans == 1 {
+                    taken_legacy_prefixes += 1;
+                    assert_eq!(stats.native, 2);
+                    assert_eq!(cpu.registers.ebx(), 0);
+                }
+            }
+        }
+    }
+    assert!(taken_legacy_prefixes > 0);
+}
+
+#[test]
+fn mkii_interior_branch_skips_or_commits_a_later_guard_and_fault() {
+    let code = [
+        0x3b, 0x06, 0, 0x20, 0x74, 7, 0xbb, 0x11, 0x11, 0x8b, 0x16, 0, 0x30, 0xe4, 0x60,
+    ];
+    for taken in [false, true] {
+        for fault in [false, true] {
+            let (mut cpu, mut bus) = fixture(&code);
+            let (mut oracle, mut other) = fixture(&code);
+            for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                enable_read_regions(bus);
+                warm_read(cpu, bus, 0x2000);
+                warm_code(cpu, bus, code.len() as u32);
+                cpu.registers.set_eax(if taken { 0x5678 } else { 1 });
+                if fault {
+                    let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+                    ds.limit = 0x2fff;
+                    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+                }
+            }
+            compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+            let stats = cpu.dynarec_mkii_stats();
+            assert_eq!(stats.regions, 1);
+            assert_eq!(stats.region_guard_misses, u64::from(!taken));
+            assert_eq!(stats.native, if taken { 2 } else { 3 });
+            assert_eq!(cpu.registers.ebx(), if taken { 0 } else { 0x1111 });
+            if taken {
+                assert_eq!(stats.cold, 1);
+                assert_eq!(cpu.perf.instructions, 3);
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_taken_backedge_reuses_the_trace_until_fallthrough() {
+    let code = [
+        0x05, 1, 0, 0x3d, 3, 0, 0x72, 0xf8, 0xbb, 0x11, 0x11, 0xe4, 0x60,
+    ];
+    let (mut cpu, mut bus) = fixture(&code);
+    let (mut oracle, mut other) = fixture(&code);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_code(cpu, bus, code.len() as u32);
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(cpu.registers.ebx(), 0x1111);
+    assert_eq!(stats.entries, 3);
+    assert_eq!(stats.regions, 3);
+    assert_eq!(stats.native, 10);
+    assert_eq!(stats.compiled, 1);
+    assert!(stats.dispatch_hits > 0);
+}
+
+#[test]
+fn mkii_branch_region_refusal_does_not_fault_an_unexecuted_segment_access() {
+    let code = [
+        0x3b, 0x06, 0, 0x20, 0x74, 5, 0x26, 0x8b, 0x16, 0, 0x30, 0xe4, 0x60,
+    ];
+    for taken in [false, true] {
+        let (mut cpu, mut bus) = fixture(&code);
+        let (mut oracle, mut other) = fixture(&code);
+        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+            enable_read_regions(bus);
+            warm_read(cpu, bus, 0x2000);
+            warm_code(cpu, bus, code.len() as u32);
+            cpu.registers.set_eax(if taken { 0x5678 } else { 1 });
+            let mut es = cpu.registers.segment(SegmentIndex::Es);
+            es.access = 0x98;
+            cpu.registers.set_segment(SegmentIndex::Es, es);
+        }
+        compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+        let stats = cpu.dynarec_mkii_stats();
+        assert_eq!(stats.regions, 0);
+        assert_eq!(stats.memory_spans, 1);
+        assert_eq!(stats.native, 2);
+        assert_eq!(cpu.perf.instructions, if taken { 3 } else { 2 });
+    }
+}
+
+#[test]
+fn mkii_zero_displacement_branch_exits_only_when_taken() {
+    let cases: &[&[u8]] = &[
+        &[
+            0x3b, 0x06, 0, 0x20, 0x74, 0, 0xbb, 0x11, 0x11, 0x53, 0x5a, 0xe4, 0x60,
+        ],
+        &[
+            0x74, 0, 0xb8, 0x11, 0x11, 0x50, 0x5b, 0x74, 0, 0xb9, 0x22, 0x22, 0xe4, 0x60,
+        ],
+    ];
+    for (case, code) in cases.iter().enumerate() {
+        for regions in [false, true] {
+            for taken in [false, true] {
+                let (mut cpu, mut bus) = fixture(code);
+                let (mut oracle, mut other) = fixture(code);
+                for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                    bus.uniform_native_fetches = true;
+                    bus.mkii_exact_fetch_projection = true;
+                    bus.report_batch_clocks = true;
+                    bus.direct_page_clocks = true;
+                    bus.batch_bus_scale = (16, 105);
+                    if regions {
+                        enable_read_regions(bus);
+                    }
+                    warm_read(cpu, bus, 0x2000);
+                    warm_code(cpu, bus, code.len() as u32);
+                    cpu.registers.set_eax(if taken { 0x5678 } else { 1 });
+                    cpu.set_flag(FLAG_ZF, taken);
+                    cpu.prefetch.len = 1;
+                    cpu.prefetch.linear_base = 0x8000;
+                }
+                compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+                let stats = cpu.dynarec_mkii_stats();
+                assert_eq!(stats.entries, if taken { 2 + case as u64 } else { 1 });
+                assert_eq!(cpu.prefetch.len, oracle.prefetch.len);
+                assert_eq!(cpu.registers.ebx(), 0x1111);
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_helper_write_invalidates_a_previously_skipped_fallthrough_tail() {
+    let code = [
+        0x3b, 0x06, 0, 0x20, 0x74, 8, 0xc6, 0x06, 12, 0, 0x77, 0xbb, 0x11, 0x11, 0xe4, 0x60,
+    ];
+    let (mut cpu, mut bus) = fixture(&code);
+    let (mut oracle, mut other) = fixture(&code);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_read(cpu, bus, 0x2000);
+        warm_code(cpu, bus, code.len() as u32);
+        cpu.registers.set_eax(0x5678);
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.registers.ebx(), 0);
+    assert_eq!(bus.memory[12], 0x11);
+    assert_eq!(cpu.jit_direct.code_watch.refcount(12), 1);
+    let before = cpu.dynarec_mkii_stats();
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        bus.io_touched = false;
+        cpu.set_eip(0);
+        cpu.registers.set_eax(1);
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.registers.ebx(), 0x1177);
+    let after = cpu.dynarec_mkii_stats();
+    assert!(after.invalidations > before.invalidations);
+    assert!(after.retired_artifacts > before.retired_artifacts);
+    assert!(after.cold > before.cold);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        bus.io_touched = false;
+        cpu.set_eip(11);
+        cpu.registers.set_ebx(0);
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.registers.ebx(), 0x1177);
+    assert!(cpu.dynarec_mkii_stats().compiled > after.compiled);
+}
+
+#[test]
 fn mkii_memory_pair_cap_matches_independent_instruction_boundaries() {
     let code = [0x3b, 0x06, 0, 0x20, 0x77, 1, 0x90, 0xe4, 0x60];
     for cap in 0..16 {

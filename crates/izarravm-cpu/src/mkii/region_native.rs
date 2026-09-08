@@ -10,22 +10,24 @@ use crate::{AddressSize, SegmentRegister};
 
 pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
     let commit = e.label();
-    let mut misses = Vec::new();
+    let mut exits = Vec::new();
     for (index, op) in operations.iter().enumerate() {
         if op.needs_carry_zero() {
             let miss = e.label();
             emit_carry_zero_guard(e, miss);
-            misses.push((miss, index, 2));
+            exits.push((miss, index, 2));
         }
         if let Some((pure, _)) = op.region_pure() {
             emit_pure(e, pure);
         } else if let Some(read) = op.read {
             let miss = e.label();
             emit_read(e, read, miss);
-            misses.push((miss, index, 1));
+            exits.push((miss, index, 1));
         } else {
             let (alu, width) = operations[index - 1].branch_alu().unwrap();
-            emit_branch(e, op, alu, width);
+            let taken = e.label();
+            emit_branch(e, op, alu, width, taken);
+            exits.push((taken, index + 1, 0));
         }
     }
     e.store_u32_imm_disp32(
@@ -34,7 +36,7 @@ pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
         operations.len() as u32,
     );
     e.jmp(commit);
-    for (label, completed, reason) in misses {
+    for (label, completed, reason) in exits {
         e.place(label);
         e.store_u32_imm_disp32(
             Reg::R13,

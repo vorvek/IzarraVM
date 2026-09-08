@@ -391,6 +391,8 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
             skipped_poll = true;
         }
     }
+    let branch_taken =
+        GROUP == 5 && matches!(insn.opcode, 0x70..=0x7f) && cpu.condition((insn.opcode & 15) as u8);
     let mut work = InstructionWork::default();
     let result = match GROUP {
         1 => cpu.execute_alu_decoded(&insn, bus),
@@ -422,7 +424,7 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
         cpu.perf.brk_step += 1;
         frame.stop = true;
     }
-    u32::from(succeeded && !frame.stop)
+    u32::from(succeeded && !frame.stop && !branch_taken)
 }
 
 unsafe extern "C" fn finish<B: CpuBus>(
@@ -690,10 +692,11 @@ impl Engine {
                 && next <= cs.limit
                 && cs.base.wrapping_add(next) >> 12 == lin >> 12
                 && operations.last().is_none_or(|op| {
-                    !matches!(
-                        op.insn.group,
-                        DecodeGroup::Branch | DecodeGroup::ControlFlow
-                    )
+                    matches!(op.insn.opcode, 0x70..=0x7f)
+                        || !matches!(
+                            op.insn.group,
+                            DecodeGroup::Branch | DecodeGroup::ControlFlow
+                        )
                 })
             {
                 let Some(operation) = Self::decoded_operation(cpu, bus, cs, next, physical) else {
@@ -733,14 +736,11 @@ impl Engine {
             while start < operations.len() {
                 let mut end = start;
                 while end < operations.len()
-                    && (operations[end].region_pure().is_some() || operations[end].read.is_some())
-                {
-                    end += 1;
-                }
-                if end > start
-                    && end < operations.len()
-                    && operations[end - 1].branch_alu().is_some()
-                    && matches!(operations[end].insn.opcode, 0x70..=0x7f)
+                    && (operations[end].region_pure().is_some()
+                        || operations[end].read.is_some()
+                        || (end > start
+                            && operations[end - 1].branch_alu().is_some()
+                            && matches!(operations[end].insn.opcode, 0x70..=0x7f)))
                 {
                     end += 1;
                 }

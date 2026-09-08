@@ -78,11 +78,12 @@ pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
     let info = entry(&mut e);
     let body = e.position();
     let exit = e.label();
+    let settle_exit = e.label();
     let mut index = 0;
     while index < operations.len() {
         let operation = &operations[index];
         if operation.region_len < 2 {
-            index = emit_legacy_span(&mut e, operations, index, exit);
+            index = emit_legacy_span(&mut e, operations, index, exit, settle_exit);
             continue;
         }
         let end = index + operation.region_len;
@@ -97,10 +98,11 @@ pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
         e.jmp(next);
         e.place(slow);
         while index < end {
-            index = emit_legacy_span(&mut e, operations, index, exit);
+            index = emit_legacy_span(&mut e, operations, index, exit, settle_exit);
         }
         e.place(next);
     }
+    e.place(settle_exit);
     call_helper(&mut e, 11, 0);
     e.place(exit);
     #[cfg(test)]
@@ -121,7 +123,13 @@ pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
     })
 }
 
-fn emit_legacy_span(e: &mut Encoder, operations: &[Operation], index: usize, exit: Label) -> usize {
+fn emit_legacy_span(
+    e: &mut Encoder,
+    operations: &[Operation],
+    index: usize,
+    exit: Label,
+    settle_exit: Label,
+) -> usize {
     let operation = &operations[index];
     let end = index + operation.span_len;
     let slow = e.label();
@@ -133,7 +141,7 @@ fn emit_legacy_span(e: &mut Encoder, operations: &[Operation], index: usize, exi
         e.test_r32_r32(Reg::RAX, Reg::RAX);
         e.jcc(4, slow);
         if operation.memory_cmp_branch {
-            emit_memory_cmp_branch(e, operation, &operations[index + 1]);
+            emit_memory_cmp_branch(e, operation, &operations[index + 1], settle_exit);
         } else {
             for op in &operations[index..end] {
                 emit_pure(e, op.pure.unwrap().0);
@@ -268,7 +276,7 @@ fn emit_arithmetic(e: &mut Encoder, op: u8, width: BusWidth) {
     }
 }
 
-fn emit_memory_cmp_branch(e: &mut Encoder, compare: &Operation, branch: &Operation) {
+fn emit_memory_cmp_branch(e: &mut Encoder, compare: &Operation, branch: &Operation, taken: Label) {
     let width = if compare.insn.opcode == 0x3a {
         BusWidth::Byte
     } else {
@@ -291,7 +299,7 @@ fn emit_memory_cmp_branch(e: &mut Encoder, compare: &Operation, branch: &Operati
         BusWidth::Dword => e.load_r32_disp32(Reg::RDX, Reg::R11, 0),
     }
     emit_arithmetic(e, 7, width);
-    emit_branch(e, branch, 7, width);
+    emit_branch(e, branch, 7, width, taken);
 }
 
 fn carry_free_alu(op: u8) -> u8 {
@@ -302,7 +310,7 @@ fn carry_free_alu(op: u8) -> u8 {
     }
 }
 
-fn emit_branch(e: &mut Encoder, branch: &Operation, op: u8, width: BusWidth) {
+fn emit_branch(e: &mut Encoder, branch: &Operation, op: u8, width: BusWidth, taken: Label) {
     let op = carry_free_alu(op);
     match width {
         BusWidth::Byte => e.alu_r8_r8(op, Reg::RAX, Reg::RDX),
@@ -326,6 +334,7 @@ fn emit_branch(e: &mut Encoder, branch: &Operation, op: u8, width: BusWidth) {
         std::mem::offset_of!(Frame, branch_taken) as i32,
         1,
     );
+    e.jmp(taken);
     e.place(untaken);
 }
 

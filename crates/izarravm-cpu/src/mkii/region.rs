@@ -164,6 +164,7 @@ pub(super) unsafe extern "C" fn finish<B: CpuBus>(
     // SAFETY: generated exits report a completed prefix of the leased region.
     let operations = unsafe { std::slice::from_raw_parts(operation, completed) };
     let cost = &first.region.as_ref().unwrap().prefixes[completed];
+    let branch_taken = frame.branch_taken != 0;
     bus.finish_compiled_window(running.window, cost.delta);
     if frame.region_guard_miss != 0 {
         frame.force_canonical = true;
@@ -188,5 +189,5 @@ pub(super) unsafe extern "C" fn finish<B: CpuBus>(
         });
         frame.retire_pending(cpu, bus);
     }
-    u32::from(!frame.stop && !frame.force_canonical)
+    u32::from(!frame.stop && !frame.force_canonical && !branch_taken)
 }
