@@ -6061,12 +6061,10 @@ impl DirectKind {
             Self::LesLds { .. } => TimingClass::LesLds,
 
             // --- group 3, split -----------------------------------------------
-            // `classify` admits every one of these at Dword ONLY: the
-            // `OperandSize::Word` gate at the top of `classify` excludes the
-            // 0xf7 Word forms, and the 0xf6 byte forms become `InterpretOne`
-            // call-outs. So the WIDTH is a property of the kind rather than a
-            // field, and widening that admission means giving these kinds a
-            // width field and splitting these arms -- never adding a default.
+            // `TestImmReg` and `TestImmMem` carry their operand width and admit
+            // the supported byte, word, and dword forms. The other native group-3
+            // kinds are dword-only; word /2../7 and byte forms remain
+            // `InterpretOne` call-outs.
             Self::TestImmReg { .. } => TimingClass::TestImmReg,
             Self::TestImmMem { .. } => TimingClass::TestImmMem,
             Self::NegReg { .. } => TimingClass::NotNegReg,
@@ -18651,11 +18649,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // descriptor tag) since the width field landed, with no caller until the wolf3d
                 // census ranked the register form at 634M block-stopping hits.
                 //
-                // The word MEMORY form is an `InterpretOne` CALL-OUT as of the S3 policy widening,
-                // where it is the loader census's 242 k row. It is not a lowering, and the reason
-                // is an admission question rather than a capability one: the refusal it used to
-                // carry here said "no fixture measures a row for it", the census now does, and the
-                // call-out answers it without an emitter change at all.
+                // The word memory form uses the same width-carrying lowering. If a
+                // future synthetic address cannot form a `DirectAddr`, retain the
+                // Group3 helper instead of refusing the block.
                 let width = if opcode == 0xf6 {
                     MemoryWidth::Byte
                 } else {
@@ -18667,20 +18663,19 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         imm: insn.imm,
                         width,
                     }),
-                    DecodedOperand::Mem(addr) => {
-                        if width == MemoryWidth::Word {
-                            return Some(DirectKind::CallOut {
-                                helper: CallOutHelper::InterpretOne {
-                                    row: InterpretOneRow::Group3,
-                                },
-                            });
-                        }
-                        Some(DirectKind::TestImmMem {
+                    DecodedOperand::Mem(addr) => match direct_addr(addr) {
+                        Some(addr) => Some(DirectKind::TestImmMem {
                             imm: insn.imm,
                             width,
-                            addr: direct_addr(addr)?,
-                        })
-                    }
+                            addr,
+                        }),
+                        None if width == MemoryWidth::Word => Some(DirectKind::CallOut {
+                            helper: CallOutHelper::InterpretOne {
+                                row: InterpretOneRow::Group3,
+                            },
+                        }),
+                        None => None,
+                    },
                 };
             }
             // RETF and RETF imm16. Mode-independent here, exactly like `0xc2`/`0xc3` above: the
@@ -29953,6 +29948,8 @@ pub(crate) const STATUS_STEP_BREAK_BIT: u32 = 32;
 pub(crate) const STATUS_RESYNC_RETIRED_BIT: u32 = 33;
 pub(crate) const STATUS_RESYNC_FAULT_BIT: u32 = 34;
 
+/// The specialized helper remains only for the synthetic `DirectAddr` fallback.
+/// Representable word-memory TEST forms lower to `TestImmMem` before emission.
 fn is_test_word_memory(insn: &DecodedInsn) -> bool {
     insn.opcode == 0xf7
         && insn.group == DecodeGroup::Group

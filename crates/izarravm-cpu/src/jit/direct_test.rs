@@ -2926,6 +2926,59 @@ fn sixteen_bit_addressing_modes_classify_with_the_interpreter_shape() {
     assert!(direct_addr(bad_scale).is_none());
 }
 
+#[test]
+fn word_memory_test_uses_group3_callout_when_direct_address_is_unrepresentable() {
+    let mut address = crate::AddrMode {
+        segment: SegmentIndex::Ds,
+        base: Some(3),
+        index: Some(6),
+        scale: 3,
+        disp: 0,
+        address_size: AddressSize::Word,
+    };
+    assert!(direct_addr(address).is_none());
+    let insn = DecodedInsn {
+        len: 4,
+        prefixes: Prefixes::default(),
+        opcode: 0xf7,
+        operand_size: OperandSize::Word,
+        address_size: AddressSize::Word,
+        modrm: Some(crate::ModRm {
+            mode: 0,
+            reg: 0,
+            rm: 0,
+        }),
+        operand: Some(DecodedOperand::Mem(address)),
+        imm: 0x8123,
+        imm2: 0,
+        group: DecodeGroup::Group,
+        continuable: true,
+        disp_len: 0,
+        imm_len: 2,
+    };
+    assert!(matches!(
+        classify(&insn, 0, 0),
+        Some(DirectKind::CallOut {
+            helper: CallOutHelper::InterpretOne {
+                row: InterpretOneRow::Group3
+            }
+        })
+    ));
+    address.scale = 1;
+    let insn = DecodedInsn {
+        operand: Some(DecodedOperand::Mem(address)),
+        ..insn
+    };
+    assert!(matches!(
+        classify(&insn, 0, 0),
+        Some(DirectKind::TestImmMem {
+            width: MemoryWidth::Word,
+            imm: 0x8123,
+            ..
+        })
+    ));
+}
+
 /// The emitter masks a ModRM-derived effective address at 64K when the block's address size is
 /// 16-bit, and does not when it is 32-bit.
 ///

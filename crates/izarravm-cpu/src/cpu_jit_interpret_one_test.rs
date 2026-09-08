@@ -2389,11 +2389,11 @@ fn bit_string_core_clocks_is_what_the_interpreter_charges() {
     }
 }
 
-/// Row 4: group 3 at Word, `/2../7` in both operand forms plus the `/0` memory form.
+/// Row 4: group 3 at Word, `/2../7` in both operand forms.
 ///
-/// The register and memory shapes of NOT, NEG, MUL, IMUL, DIV and IDIV, and TEST r/m16,imm16
-/// through memory. The divides run on DX:AX over BX, which the fixture leaves at the data pointer
-/// 0x1800, so the quotient fits and the row retires; the faulting case is a fixture of its own.
+/// The register and memory shapes of NOT, NEG, MUL, IMUL, DIV and IDIV. The divides run on DX:AX
+/// over BX, which the fixture leaves at the data pointer 0x1800, so the quotient fits and the row
+/// retires; the faulting case is a fixture of its own.
 ///
 /// MUTATION: delete the Word interception at the head of the `0xf6 | 0xf7` arm and the first case
 /// (`not bx`, which has no lowering at any width) fails on the block shape. The cases behind it
@@ -2433,8 +2433,6 @@ fn interpret_one_group3_word_forms_resume() {
         &[0xF7, 0x2F],
         &[0xF7, 0x37],
         &[0xF7, 0x3F],
-        // F7 /0 with mod 00 r/m 111: test word [bx], 0x1234.
-        &[0xF7, 0x07, 0x34, 0x12],
         // F6 /2../5 register through BH: EBX is 0x1800 so BH is 0x18. DIV/IDIV r8 of
         // AX=0x1111 overflow AL (unsigned 182 for DIV BH, signed overflow for IDIV) so they
         // stay on the fault fixture. A 32-bit NEG of EAX or EBX cannot match a byte NEG of BH.
@@ -2452,21 +2450,17 @@ fn interpret_one_group3_word_forms_resume() {
     }
 }
 
-/// `/0` TEST keeps its native lowering in the REGISTER form and takes the call-out only through
-/// memory.
-///
-/// The two answers sit in one classifier arm, so a slice that widened the memory case by deleting
-/// the width test rather than by routing it would silently move the register case too.
+/// `/0` TEST keeps its native lowering in both register and word-memory forms.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn group3_test_word_splits_native_register_from_call_out_memory() {
+fn group3_test_word_register_and_memory_forms_are_native() {
     // F7 /0 with mod 11 r/m 011: test bx, 0x1234.
     assert_row_is_native(&[0xF7, 0xC3, 0x34, 0x12]);
-    assert_row_is_a_call_out(&[0xF7, 0x07, 0x34, 0x12]);
+    assert_row_is_native(&[0xF7, 0x07, 0x34, 0x12]);
     // F6 /0 TEST r8,imm8 stays native. A FIRST arm of `/0../7` would steal this into Group3
     // and still compile; slot class is the claim. Unprefixed and 66-prefixed.
     assert_row_is_native(&[0xF6, 0xC3, 0x12]);

@@ -387,16 +387,9 @@ fn word_size_0x81_carry_forms_are_lowered() {
     }
 }
 
-/// Group 3's `/0` at Word size: the REGISTER form is lowered through `TestImmReg`'s word lane and
-/// the MEMORY form joins the block as an `InterpretOne` call-out. The wolf3d census ranked the
-/// register form at 634M block-stopping hits and the post-S2 loader census ranks the memory form
-/// at 242 k.
-///
-/// The memory half used to assert a REFUSAL, on the ground that no fixture measured a row for it.
-/// The loader census measures one, and the S3 policy widening answers it with the call-out rather
-/// than with an emitter, so the assertion moved from "the block ends here" to "the block carries
-/// it, and carries it as a call-out": lowering it through `TestImmMem` at Word would still be the
-/// bug the old refusal guarded against, and the slot-count check is what says it did not happen.
+/// Group 3's `/0` at Word size joins the block through the native `TestImmReg` and `TestImmMem`
+/// lanes. The wolf3d census ranked the register form at 634M block-stopping hits and the
+/// post-S2 loader census ranks the memory form at 242 k.
 #[test]
 fn word_size_group3_test_forms_follow_the_slice() {
     let register = [0x66u8, 0xf7, 0xc1, 0x34, 0x12];
@@ -435,12 +428,12 @@ fn word_size_group3_test_forms_follow_the_slice() {
         "test word [mem], imm16: the memory form must join the block"
     );
     assert_eq!(
-        compilation.callout_interpret_one_slots, 1,
-        "test word [mem], imm16: it must join as a call-out, not through TestImmMem's word lane"
+        compilation.callout_interpret_one_slots, 0,
+        "test word [mem], imm16: it must use TestImmMem's native word lane"
     );
     assert_eq!(
-        compilation.word_reads, 0,
-        "a call-out slot declares no static access"
+        compilation.word_reads, 1,
+        "the native slot declares one word read"
     );
 }
 

@@ -10,6 +10,7 @@ const MODE13_TARGET: u32 = 0x000a_1000;
 #[derive(Clone, Copy, Debug)]
 enum Width {
     Byte,
+    Word,
     Dword,
 }
 
@@ -17,6 +18,7 @@ impl Width {
     const fn bytes(self) -> usize {
         match self {
             Self::Byte => 1,
+            Self::Word => 2,
             Self::Dword => 4,
         }
     }
@@ -48,12 +50,22 @@ fn result_signature(result: ExecResult<CycleOutcome>) -> Result<CycleOutcome, (u
 fn instruction(form: Form, width: Width, imm: u32, target: Option<u32>) -> Vec<u8> {
     match (form, width) {
         (Form::Accumulator, Width::Byte) => vec![0xa8, imm as u8],
+        (Form::Accumulator, Width::Word) => {
+            let mut code = vec![0x66, 0xa9];
+            code.extend_from_slice(&(imm as u16).to_le_bytes());
+            code
+        }
         (Form::Accumulator, Width::Dword) => {
             let mut code = vec![0xa9];
             code.extend_from_slice(&imm.to_le_bytes());
             code
         }
         (Form::GroupRegister, Width::Byte) => vec![0xf6, 0xc3, imm as u8],
+        (Form::GroupRegister, Width::Word) => {
+            let mut code = vec![0x66, 0xf7, 0xc3];
+            code.extend_from_slice(&(imm as u16).to_le_bytes());
+            code
+        }
         (Form::GroupRegister, Width::Dword) => {
             let mut code = vec![0xf7, 0xc3];
             code.extend_from_slice(&imm.to_le_bytes());
@@ -63,6 +75,12 @@ fn instruction(form: Form, width: Width, imm: u32, target: Option<u32>) -> Vec<u
             let mut code = vec![0xf6, 0x05];
             code.extend_from_slice(&target.expect("memory TEST target").to_le_bytes());
             code.push(imm as u8);
+            code
+        }
+        (Form::GroupMemory, Width::Word) => {
+            let mut code = vec![0x66, 0xf7, 0x05];
+            code.extend_from_slice(&target.expect("memory TEST target").to_le_bytes());
+            code.extend_from_slice(&(imm as u16).to_le_bytes());
             code
         }
         (Form::GroupMemory, Width::Dword) => {
@@ -858,6 +876,7 @@ fn immediate_test_forms_match_the_interpreter_in_486_and_586_modes() {
         for form in [Form::Accumulator, Form::GroupRegister, Form::GroupMemory] {
             for (width, cases) in [
                 (Width::Byte, [(0x55aa_3380, 0x80), (0x55aa_3355, 0xaa)]),
+                (Width::Word, [(0x55aa_8001, 0x8000), (0x55aa_3355, 0x00aa)]),
                 (
                     Width::Dword,
                     [(0x8000_0001, 0x8000_0000), (0x55aa_3355, 0xaa00_ccaa)],
@@ -887,9 +906,29 @@ fn immediate_test_forms_match_the_interpreter_in_486_and_586_modes() {
 }
 
 #[test]
+fn word_memory_test_is_a_native_word_read_without_a_group3_callout() {
+    let mut fixture = prepare_flat(
+        GswMode::Gsw586,
+        Form::GroupMemory,
+        Width::Word,
+        0x55aa_8001,
+        0x8000,
+        Some(RAM_TARGET),
+        jit::fast_map::PagePermissions::UNPAGED,
+    );
+    let compilation = jit::direct::compile(&mut fixture.native, ENTRY, true)
+        .expect("word-memory TEST block compiles");
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.word_reads, 1);
+    assert_eq!(compilation.callout_slots, 0);
+    assert_eq!(compilation.callout_interpret_one_slots, 0);
+    finish_and_compare(fixture, "word memory TEST native classification");
+}
+
+#[test]
 fn mode13_test_reads_use_native_timing_without_writes_or_dirty_pages() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
-        for width in [Width::Byte, Width::Dword] {
+        for width in [Width::Byte, Width::Word, Width::Dword] {
             finish_and_compare(
                 prepare_flat(
                     mode,
@@ -908,7 +947,7 @@ fn mode13_test_reads_use_native_timing_without_writes_or_dirty_pages() {
 
 #[test]
 fn read_only_and_watched_memory_is_read_without_store_side_effects() {
-    for width in [Width::Byte, Width::Dword] {
+    for width in [Width::Byte, Width::Word, Width::Dword] {
         let mut fixture = prepare_flat(
             GswMode::Gsw586,
             Form::GroupMemory,
