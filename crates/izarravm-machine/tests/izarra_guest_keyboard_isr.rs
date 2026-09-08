@@ -11,7 +11,7 @@
 // that is the "can't stop walking / sticky shift" bug; if it does, custom-ISR
 // keyboard delivery is sound and the fault is elsewhere.
 
-use izarravm_core::VideoCard;
+use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile};
 
@@ -129,4 +129,72 @@ fn guest_int09_receives_make_then_break() {
         2,
         "guest ISR should have run once per scancode"
     );
+}
+
+#[test]
+fn bios_resumes_keyboard_after_a_disabling_guest_handler() {
+    const OLD_VECTOR: u32 = 0x8004;
+    // Wait for IBF, disable the keyboard, read the byte, then chain to the BIOS.
+    const CHAINING_HANDLER: [u8; 32] = [
+        0x50, 0x1e, 0x31, 0xc0, 0x8e, 0xd8, 0xe4, 0x64, 0xa8, 0x02, 0x75, 0xfa, 0xb0, 0xad, 0xe6,
+        0x64, 0xe4, 0x60, 0xa2, 0x00, 0x80, 0xfe, 0x06, 0x01, 0x80, 0x1f, 0x58, 0x2e, 0xff, 0x2e,
+        0x04, 0x80,
+    ];
+
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+    ] {
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        profile.cpu = mode;
+        let mut m = Machine::new(profile, izarra_bios()).unwrap();
+        let mut image = vec![0u8; 1_474_560];
+        // Set the BX canary once, then stay in an interruptible guest loop.
+        image[..9].copy_from_slice(&[0x66, 0xbb, 0x5a, 0xa5, 0x34, 0x12, 0xfb, 0xeb, 0xfd]);
+        image[510..512].copy_from_slice(&[0x55, 0xaa]);
+        m.mount_floppy(image).unwrap();
+        m.run_until_halt_or_cycles(20_000_000).unwrap();
+        let old_offset = m.read_physical_u16(IVT9);
+        let old_segment = m.read_physical_u16(IVT9 + 2);
+        m.write_physical_u16(OLD_VECTOR, old_offset);
+        m.write_physical_u16(OLD_VECTOR + 2, old_segment);
+        for (i, byte) in CHAINING_HANDLER.iter().enumerate() {
+            m.write_physical_u8(HANDLER_ADDR + i as u32, *byte);
+        }
+        m.write_physical_u16(IVT9, HANDLER_ADDR as u16);
+        m.write_physical_u16(IVT9 + 2, 0);
+        m.write_physical_u8(RESULT_COUNT, 0);
+        m.write_physical_u16(0x41a, 0x1e);
+        m.write_physical_u16(0x41c, 0x1e);
+
+        // E0 takes the short BIOS path while the wrapper's AD is still pending.
+        for (index, (scan, tail, shift)) in [
+            (0xe0, 0x1e, 0),
+            (0x4b, 0x20, 0),
+            (0xe0, 0x20, 0),
+            (0xcb, 0x20, 0),
+            (0x2a, 0x20, 2),
+            (0xaa, 0x20, 0),
+            (0x1e, 0x22, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            m.inject_key_scancodes(&[scan]);
+            m.run_until_halt_or_cycles(2_000_000).unwrap();
+            assert_eq!(
+                m.read_physical_u8(RESULT_COUNT),
+                index as u8 + 1,
+                "{mode:?} scan {scan:02x}"
+            );
+            assert_eq!(m.read_physical_u8(RESULT_LAST), scan);
+            assert_eq!(m.read_physical_u16(0x41c), tail);
+            assert_eq!(m.read_physical_u8(0x417) & 2, shift);
+            assert_eq!(m.cpu().registers.ebx(), 0x1234_a55a);
+        }
+        assert_eq!(m.read_physical_u16(0x41e), 0x4be0);
+        assert_eq!(m.read_physical_u16(0x420), 0x1e61);
+    }
 }

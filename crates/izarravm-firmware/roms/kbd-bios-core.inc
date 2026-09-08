@@ -299,6 +299,19 @@ int09:
     mov ds, ax
     and byte [KB_FLAGS_1], 0x7f
 .eoi:
+    ; Chained guest handlers may leave the keyboard disabled with command ADh.
+    mov bx, 0xffff
+.wait_input:
+    in al, 0x64
+    test al, 0x02
+    jz .enable_keyboard
+    dec bx
+    jnz .wait_input
+    jmp .ack
+.enable_keyboard:
+    mov al, 0xae
+    out 0x64, al
+.ack:
     mov al, 0x20
     out 0x20, al           ; EOI to master PIC
     pop ds
