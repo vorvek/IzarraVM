@@ -680,12 +680,15 @@ fn p6_conditional_moves_follow_x87_fault_priority() {
         GswMode::Gsw486,
         GswMode::Gsw586,
     ] {
-        let vector = if mode.persona().has_fpu() { 6 } else { 7 };
         for code in x87_instructions {
-            assert!(matches!(
-                run_at_mode(code, mode).unwrap_err(),
-                InternalFault::Exception { vector: fault, .. } if fault == vector
-            ));
+            if mode.persona().has_fpu() {
+                assert!(matches!(
+                    run_at_mode(code, mode).unwrap_err(),
+                    InternalFault::Exception { vector: 6, .. }
+                ));
+            } else {
+                assert!(run_at_mode(code, mode).is_ok());
+            }
         }
     }
 }
@@ -1607,24 +1610,27 @@ fn x87_availability_follows_the_fixed_cpu_persona() {
         (GswMode::Gsw486, true),
         (GswMode::Gsw586, true),
     ] {
-        let result = run_at_mode(&[0xd9, 0xe8], mode); // FLD1
+        let (mut cpu, memory) = real_mode_cpu(&[0xd9, 0xe8], 0x20); // FLD1
+        cpu.set_mode(mode);
+        let before = cpu.fpu.clone();
+        exec_one_split(&mut cpu, &mut TestBus::with_memory(memory)).unwrap();
         if available {
-            assert!(result.is_ok(), "{mode} has an x87 unit");
+            assert_eq!(cpu.fpu.get(0), 1.0, "{mode}");
+            assert_ne!(cpu.fpu, before, "{mode}");
         } else {
-            assert!(matches!(
-                result,
-                Err(InternalFault::Exception {
-                    vector: 7,
-                    error_code: None
-                })
-            ));
+            assert_eq!(cpu.fpu, before, "{mode}");
         }
     }
 }
 
 #[test]
 fn x87_escapes_honor_emulation_and_task_switched_state() {
-    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
         for cr0 in [CR0_EM, CR0_TS, CR0_EM | CR0_TS] {
             assert!(matches!(
                 run_at_mode_with_cr0(&[0xd9, 0xe8], mode, cr0),
@@ -1675,13 +1681,141 @@ fn live_mode_switch_changes_x87_availability() {
     ] {
         cpu.set_mode(mode);
         cpu.set_eip(0);
+        let before = cpu.fpu.clone();
+        exec_one_split(&mut cpu, &mut bus).unwrap();
+        if available {
+            assert_eq!(cpu.fpu.get(0), 1.0, "{mode}");
+            assert_ne!(cpu.fpu, before, "{mode}");
+        } else {
+            assert_eq!(cpu.fpu, before, "{mode}");
+        }
+    }
+}
+
+#[test]
+fn x87_absent_unit_allows_the_numerics_detection_probe() {
+    // FNINIT; seed status; FNSTSW; FNSTCW; AX = (status == 0); HLT.
+    let code = [
+        0xdb, 0xe3, 0xc7, 0x06, 0x40, 0x00, 0x5a, 0x5a, 0xdd, 0x3e, 0x40, 0x00, 0xd9, 0x3e, 0x42,
+        0x00, 0x31, 0xc0, 0x80, 0x3e, 0x40, 0x00, 0x00, 0x75, 0x01, 0x40, 0xf4,
+    ];
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x80);
+        cpu.set_mode(mode);
+        memory[0x42..0x44].copy_from_slice(&0x5a5au16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        let mut halted = false;
+        for _ in 0..10 {
+            if exec_one_split(&mut cpu, &mut bus).unwrap().halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "{mode}: detection must finish");
+        let expected = if mode.persona().has_fpu() {
+            [0x00, 0x00, 0x7f, 0x03]
+        } else {
+            [0x5a; 4]
+        };
+        assert_eq!(bus.memory[0x40..0x44], expected, "{mode}");
+        assert_eq!(cpu.registers.eax(), u32::from(mode.persona().has_fpu()));
+    }
+}
+
+#[test]
+fn x87_absent_unit_ignores_register_operations_and_pending_errors() {
+    for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
+        for opcode in 0xd8..=0xdf {
+            for modrm in 0xc0..=0xff {
+                let (mut cpu, memory) = real_mode_cpu(&[opcode, modrm], 0x20);
+                cpu.set_mode(mode);
+                cpu.control.cr0 |= CR0_NE;
+                cpu.fpu.push(2.5);
+                cpu.fpu.control &= !1;
+                cpu.fpu.status |= 1;
+                cpu.registers.set_eax(0x1234_5678);
+                let before = cpu.fpu.clone();
+                let flags = cpu.eflags();
+                let outcome = exec_one_split(&mut cpu, &mut TestBus::with_memory(memory)).unwrap();
+                assert!(outcome.core_clocks > 0);
+                assert_eq!(cpu.registers.eip, 2);
+                assert_eq!(cpu.registers.eax(), 0x1234_5678);
+                assert_eq!(cpu.eflags(), flags);
+                assert_eq!(cpu.fpu, before, "{mode}: {opcode:02x} {modrm:02x}");
+            }
+        }
+    }
+}
+
+#[test]
+fn x87_absent_unit_decodes_memory_forms_without_operand_access() {
+    for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
+        for opcode in 0xd8..=0xdf {
+            // Operand/address/FS prefixes, ModRM, SIB and a full displacement.
+            let code = [0x66, 0x67, 0x64, opcode, 0x84, 0x8d, 0xf0, 0xff, 0xff, 0x7f];
+            let (mut cpu, memory) = real_mode_cpu(&code, 0x20);
+            cpu.set_mode(mode);
+            cpu.control.cr0 |= CR0_PE;
+            cpu.registers
+                .set_segment(SegmentIndex::Fs, SegmentRegister::default());
+            let mut bus = TestBus::with_memory(memory);
+            exec_one_split(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.registers.eip, code.len() as u32);
+
+            for cr0 in [CR0_EM, CR0_TS] {
+                cpu.set_eip(0);
+                cpu.control.cr0 = CR0_PE | cr0;
+                assert!(matches!(
+                    exec_one_split(&mut cpu, &mut bus),
+                    Err(InternalFault::Exception { vector: 7, .. })
+                ));
+            }
+
+            cpu.set_eip(0);
+            cpu.control.cr0 = CR0_PE;
+            cpu.registers.set_segment(
+                SegmentIndex::Cs,
+                SegmentRegister {
+                    limit: code.len() as u32 - 2,
+                    ..cpu.registers.cs()
+                },
+            );
+            assert!(matches!(
+                exec_one_split(&mut cpu, &mut bus),
+                Err(InternalFault::Exception { vector: 13, .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn fwait_ignores_pending_errors_while_the_unit_is_absent() {
+    let (mut cpu, memory) = real_mode_cpu(&[0x9b], 0x20);
+    let mut bus = TestBus::with_memory(memory);
+    cpu.control.cr0 |= CR0_NE;
+    cpu.fpu.control &= !1;
+    cpu.fpu.status |= 1;
+    for mode in [
+        GswMode::Gsw486,
+        GswMode::Gsw386Slow,
+        GswMode::Gsw586,
+        GswMode::Gsw386,
+    ] {
+        cpu.set_mode(mode);
+        cpu.set_eip(0);
         let result = exec_one_split(&mut cpu, &mut bus);
-        assert_eq!(result.is_ok(), available, "{mode}");
-        if !available {
+        if mode.persona().has_fpu() {
             assert!(matches!(
                 result,
-                Err(InternalFault::Exception { vector: 7, .. })
+                Err(InternalFault::Exception { vector: 16, .. })
             ));
+        } else {
+            assert!(result.is_ok());
         }
     }
 }

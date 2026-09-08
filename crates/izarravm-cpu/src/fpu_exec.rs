@@ -43,7 +43,10 @@ impl CpuGsw {
             // WAIT/FWAIT: trap with #MF if the x87 has a pending unmasked exception (gated on
             // CR0.NE; otherwise the FERR#/IRQ13 path the PC uses applies and is not modeled). With
             // nothing pending it retires as a no-op. Identical to the former fused 0x9b arm.
-            if self.control.cr0 & CR0_NE != 0 && self.fpu.pending_unmasked_exception() {
+            if self.persona().has_fpu()
+                && self.control.cr0 & CR0_NE != 0
+                && self.fpu.pending_unmasked_exception()
+            {
                 return Err(InternalFault::Exception {
                     vector: 16,
                     error_code: None,
@@ -57,14 +60,16 @@ impl CpuGsw {
             });
         }
 
-        // Every x87 escape raises #NM before touching FPU or memory state when
-        // this fixed persona has no unit, emulation is requested, or a task switch
-        // has left the FPU unavailable.
-        if !self.persona().has_fpu() || self.control.cr0 & (CR0_EM | CR0_TS) != 0 {
+        if self.control.cr0 & (CR0_EM | CR0_TS) != 0 {
             return Err(InternalFault::Exception {
                 vector: 7,
                 error_code: None,
             });
+        }
+        // Without a coprocessor, ESC still decodes but transfers no operand.
+        // Use the NOP charge for the CPU work; there is no x87 latency to scale.
+        if !self.persona().has_fpu() {
+            return Ok(self.charge(TimingClass::Nop));
         }
 
         let modrm = insn
