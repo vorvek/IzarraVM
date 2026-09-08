@@ -54,12 +54,15 @@ fn install_word_jmp(cpu: &mut CpuGsw, entry: u32) -> jit::direct::CompiledBlock 
 }
 
 #[test]
-fn word_memory_jump_emits_two_zero_extending_target_loads() {
+fn word_memory_jump_emits_the_reviewed_odd_ram_shape() {
     let mut cpu = sixteen_bit_code_cpu(SOURCE);
     let mut bus = sixteen_bit_bus(dynamic_word_jmp_program());
     warm_sixteen_bit(&mut cpu, &mut bus, &[SOURCE + 1, SOURCE + 2, SOURCE + 3]);
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
     let compilation = jit::direct::compile(&mut cpu, SOURCE + 1, false).expect("source block");
+    if let Some(path) = std::env::var_os("IZARRAVM_WORD_JMP_CODE_OUT") {
+        std::fs::write(path, &compilation.code).expect("write emitted-code artifact");
+    }
     assert_eq!(compilation.span.instructions, 3);
     assert_eq!(
         compilation
@@ -77,9 +80,75 @@ fn word_memory_jump_emits_two_zero_extending_target_loads() {
             .count(),
         0
     );
-    if let Some(path) = std::env::var_os("IZARRAVM_WORD_JMP_CODE_OUT") {
-        std::fs::write(path, &compilation.code).expect("write emitted-code artifact");
-    }
+    assert_eq!(
+        compilation
+            .code
+            .windows(4)
+            .filter(|bytes| *bytes == [0x0f, 0xb7, 0x4f, 0x00])
+            .count(),
+        1,
+        "the cold route must load the target once into ECX"
+    );
+    let completed_stores = compilation
+        .code
+        .windows(7)
+        .enumerate()
+        .filter(|(_, bytes)| *bytes == [0x41, 0x89, 0x97, 0xc0, 0x02, 0x00, 0x00])
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed_stores.len(),
+        1,
+        "aligned and odd success must share one completed target store"
+    );
+    let cold_load = compilation
+        .code
+        .windows(4)
+        .position(|bytes| bytes == [0x0f, 0xb7, 0x4f, 0x00])
+        .expect("cold ECX Word load");
+    let target_limit = compilation.code[cold_load + 4..]
+        .windows(6)
+        .position(|bytes| bytes == [0x81, 0xf9, 0xff, 0xff, 0x00, 0x00])
+        .map(|offset| cold_load + 4 + offset)
+        .expect("cold ECX target-limit check");
+    let split = compilation.code[target_limit + 6..]
+        .windows(10)
+        .position(|bytes| bytes == [0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
+        .map(|offset| target_limit + 6 + offset)
+        .expect("one-byte split deposit");
+    let target_move = compilation.code[split + 10..]
+        .windows(2)
+        .position(|bytes| bytes == [0x89, 0xca])
+        .map(|offset| split + 10 + offset)
+        .expect("ECX target move into EDX");
+    assert!(cold_load < target_limit && target_limit < split && split < target_move);
+    assert_eq!(
+        compilation.code[cold_load + 4..target_move]
+            .windows(4)
+            .filter(|bytes| {
+                matches!(*bytes, [0x0f, 0xb7, 0x4f, 0x00] | [0x0f, 0xb7, 0x57, 0x00])
+            })
+            .count(),
+        0,
+        "the cold target must not be reloaded after its one payload load"
+    );
+    assert_eq!(
+        &compilation.code[split + 10..target_move],
+        &[0x48, 0x01, 0x54, 0x24, 0x78],
+        "only the split-lane add may sit between its immediate and the target move"
+    );
+    let completion_jump = target_move + 2;
+    assert_eq!(compilation.code[completion_jump], 0xe9);
+    let relative = i32::from_le_bytes(
+        compilation.code[completion_jump + 1..completion_jump + 5]
+            .try_into()
+            .unwrap(),
+    );
+    let destination = (completion_jump + 5).wrapping_add_signed(relative as isize);
+    assert_eq!(
+        destination, completed_stores[0],
+        "the odd route must jump directly from ECX-to-EDX into the shared completed tail"
+    );
 }
 
 #[test]
@@ -202,6 +271,58 @@ fn dynamic_word_jmp_program() -> Vec<u8> {
     memory
 }
 
+fn dynamic_dword_jmp_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x3000];
+    memory[SOURCE as usize..SOURCE as usize + 6]
+        .copy_from_slice(&[0x90, 0x90, 0x90, 0x66, 0xff, 0x27]);
+    memory[TARGET as usize] = 0xf4;
+    memory[POINTER as usize..POINTER as usize + 4].copy_from_slice(&TARGET.to_le_bytes());
+    memory
+}
+
+#[test]
+fn memory_jump_writes_requested_generated_code_artifacts() {
+    for (memory, output_var) in [
+        (dynamic_word_jmp_program(), "IZARRAVM_WORD_JMP_CODE_OUT"),
+        (dynamic_dword_jmp_program(), "IZARRAVM_DWORD_JMP_CODE_OUT"),
+    ] {
+        let mut cpu = sixteen_bit_code_cpu(SOURCE);
+        let mut bus = sixteen_bit_bus(memory);
+        warm_sixteen_bit(&mut cpu, &mut bus, &[SOURCE + 1, SOURCE + 2, SOURCE + 3]);
+        arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
+        let compilation = jit::direct::compile(&mut cpu, SOURCE + 1, false)
+            .expect("memory Jmp block for generated-code artifact");
+        assert!(!compilation.code.is_empty());
+        if let Some(path) = std::env::var_os(output_var) {
+            std::fs::write(path, &compilation.code).expect("write generated-code artifact");
+        }
+    }
+}
+
+#[test]
+fn dword_memory_jump_retains_its_existing_generated_scope() {
+    let mut cpu = sixteen_bit_code_cpu(SOURCE);
+    let mut bus = sixteen_bit_bus(dynamic_dword_jmp_program());
+    warm_sixteen_bit(&mut cpu, &mut bus, &[SOURCE + 1, SOURCE + 2, SOURCE + 3]);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
+    let compilation = jit::direct::compile(&mut cpu, SOURCE + 1, false).expect("Dword JmpMem");
+    assert_eq!(compilation.span.instructions, 3);
+    assert_eq!(compilation.word_reads, 0);
+    assert_eq!(compilation.dword_reads, 1);
+    assert_eq!(
+        compilation
+            .code
+            .windows(4)
+            .filter(|bytes| *bytes == [0x0f, 0xb7, 0x4f, 0x00])
+            .count(),
+        0,
+        "Dword JmpMem must not contain the odd-Word cold load"
+    );
+    if let Some(path) = std::env::var_os("IZARRAVM_DWORD_JMP_CODE_OUT") {
+        std::fs::write(path, &compilation.code).expect("write Dword emitted-code artifact");
+    }
+}
+
 fn prime_dynamic_word_jmp(cpu: &mut CpuGsw, bus: &mut TestBus) {
     cpu.registers.set_ebx(POINTER);
     drive(cpu, bus);
@@ -220,7 +341,7 @@ fn prime_dynamic_word_jmp(cpu: &mut CpuGsw, bus: &mut TestBus) {
 }
 
 #[test]
-fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
+fn word_memory_jump_page_local_odd_ram_and_unavailable_paths_are_distinct() {
     for unavailable in [false, true] {
         let memory = dynamic_word_jmp_program();
         let mut interp = sixteen_bit_code_cpu(SOURCE);
@@ -235,7 +356,7 @@ fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
         prime_dynamic_word_jmp(&mut native, &mut native_bus);
 
         let operand = if unavailable {
-            POINTER + 0x1000
+            POINTER + 0x1001
         } else {
             POINTER + 1
         };
@@ -286,8 +407,17 @@ fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
         assert_eq!(
             native_bus.trace.elapsed_clocks(),
             interp_bus.trace.elapsed_clocks()
+                + if unavailable {
+                    0
+                } else {
+                    native_bus
+                        .jit_data_cost_clocks(BusWidth::Word)
+                        .saturating_sub(native_bus.jit_data_cost_clocks(BusWidth::Byte))
+                }
         );
-        assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
+        if unavailable {
+            assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
+        }
         assert_eq!(native_bus.side_effect_read_count, u64::from(unavailable));
         assert_eq!(interp_bus.side_effect_read_count, u64::from(unavailable));
         assert_eq!(
@@ -299,7 +429,7 @@ fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
                     cycle.kind == BusAccessKind::DataRead && cycle.address == operand
                 })
                 .count(),
-            1
+            usize::from(unavailable)
         );
         let data_reads = native_bus
             .trace
@@ -316,22 +446,25 @@ fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
             if unavailable {
                 vec![(operand, BusWidth::Word)]
             } else {
-                vec![(operand, BusWidth::Byte), (operand + 1, BusWidth::Byte)]
+                Vec::new()
             }
         );
         assert_eq!(native.perf_counters().instructions - guest_before, 7);
         assert_eq!(interp.perf_counters().instructions - interp_guest_before, 7);
-        assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - direct_before,
+            if unavailable { 2 } else { 3 }
+        );
         assert_eq!(
             native.perf_counters().jit_direct_side_exits - exits_before,
-            1
+            u64::from(unavailable)
         );
         assert_eq!(
             native
                 .perf_counters()
                 .jit_direct_exit_cross_page_or_alignment
                 - alignment_before,
-            u64::from(!unavailable)
+            0
         );
         assert_eq!(
             native.perf_counters().jit_direct_exit_unavailable_or_kind - unavailable_before,
@@ -359,6 +492,129 @@ fn word_memory_jump_accepts_a_two_byte_aligned_source() {
     assert_eq!(cpu.perf_counters().jit_direct_side_exits, exits);
 }
 
+#[test]
+fn word_memory_jump_accepts_page_local_odd_ram_with_exact_split_accounting() {
+    for operand in [POINTER + 1, POINTER + 3, 0x1ffd] {
+        let mut memory = dynamic_word_jmp_program();
+        memory[operand as usize..operand as usize + 2]
+            .copy_from_slice(&(TARGET as u16).to_le_bytes());
+        let mut interp = sixteen_bit_code_cpu(SOURCE);
+        let mut native = sixteen_bit_code_cpu(SOURCE);
+        let mut interp_bus = sixteen_bit_bus(memory.clone());
+        let mut native_bus = sixteen_bit_bus(memory);
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.direct_page_clocks = true;
+        }
+        for (cpu, bus) in [
+            (&mut interp, &mut interp_bus),
+            (&mut native, &mut native_bus),
+        ] {
+            warm_sixteen_bit(cpu, bus, &[SOURCE + 1, SOURCE + 2, SOURCE + 3]);
+        }
+        arm_native_sixteen_bit(&mut native, &mut native_bus, &[0, 0x1000]);
+        let block = install_word_jmp(&mut native, SOURCE + 1);
+        for cpu in [&mut interp, &mut native] {
+            cpu.set_eip(SOURCE + 1);
+            cpu.registers.set_ebx(operand);
+            cpu.registers.eflags = 0x246;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        for bus in [&mut interp_bus, &mut native_bus] {
+            bus.trace.clear();
+        }
+        let direct_before = native.perf_counters().jit_direct_insns;
+        let exits_before = native.perf_counters().jit_direct_side_exits;
+
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap()
+        );
+        for _ in 0..3 {
+            interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.registers.eip, TARGET, "operand={operand:#x}");
+        assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 3);
+        assert_eq!(native.perf_counters().jit_direct_side_exits, exits_before);
+        assert_eq!(
+            crate::tests::settled_state(&native),
+            crate::tests::settled_state(&interp)
+        );
+        assert_eq!(native.pending_flags, interp.pending_flags);
+        assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+                + native_bus
+                    .jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_sub(native_bus.jit_data_cost_clocks(BusWidth::Byte)),
+            "the native static Word plus one split byte must match the interpreter's two bytes"
+        );
+    }
+}
+
+#[test]
+fn word_memory_jump_with_one_lookup_disabled_keeps_odd_replay() {
+    let operand = POINTER + 1;
+    let mut memory = dynamic_word_jmp_program();
+    memory[operand as usize..operand as usize + 2].copy_from_slice(&(TARGET as u16).to_le_bytes());
+    let mut cpu = sixteen_bit_code_cpu(SOURCE);
+    cpu.jit_direct.one_lookup_load = false;
+    let mut bus = sixteen_bit_bus(memory);
+    warm_sixteen_bit(&mut cpu, &mut bus, &[SOURCE + 1, SOURCE + 2, SOURCE + 3]);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
+    let key = jit::direct::key_for(&cpu, SOURCE + 1, false).expect("source key");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let compilation = jit::direct::compile(&mut cpu, SOURCE + 1, false).expect("source block");
+    assert_eq!(
+        compilation
+            .code
+            .windows(4)
+            .filter(|bytes| *bytes == [0x0f, 0xb7, 0x4f, 0x00])
+            .count(),
+        0,
+        "the odd-RAM cold load must not exist with one-lookup disabled"
+    );
+    let id = cpu
+        .jit_direct
+        .install(&compilation)
+        .expect("install source");
+    let block = cpu.jit_direct.block(id).expect("live source");
+    cpu.set_eip(SOURCE + 1);
+    cpu.registers.set_ebx(operand);
+    bus.side_effect_read_address = Some(operand);
+    bus.side_effect_read_count = 0;
+    bus.trace.clear();
+    let direct_before = cpu.perf_counters().jit_direct_insns;
+    let exits_before = cpu.perf_counters().jit_direct_side_exits;
+    let crossing_before = cpu.perf_counters().jit_direct_exit_cross_page_or_alignment;
+
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(cpu.registers.eip, SOURCE + 3);
+    assert_eq!(cpu.perf_counters().jit_direct_insns - direct_before, 2);
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits - exits_before, 1);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_cross_page_or_alignment - crossing_before,
+        1
+    );
+    assert_eq!(bus.side_effect_read_count, 0);
+    assert!(bus.trace.cycles().iter().all(|cycle| {
+        cycle.kind != BusAccessKind::DataRead
+            || !matches!(cycle.address, value if value == operand || value == operand + 1)
+    }));
+
+    cpu.cycle_no_interrupt_check(&mut bus)
+        .expect("interpreter replay");
+    assert_eq!(cpu.registers.eip, TARGET);
+}
+
 fn run_to_error(cpu: &mut CpuGsw, bus: &mut TestBus) -> CpuRunError {
     for _ in 0..8 {
         match cpu.run_straight_line(bus, u64::MAX) {
@@ -371,7 +627,7 @@ fn run_to_error(cpu: &mut CpuGsw, bus: &mut TestBus) -> CpuRunError {
 
 #[test]
 fn word_memory_jump_source_limit_exits_then_dispatcher_replays_the_fault() {
-    const FAILING: u32 = 0x900;
+    const FAILING: u32 = 0x901;
     let memory = dynamic_word_jmp_program();
     let mut interp = sixteen_bit_code_cpu(SOURCE);
     let mut native = sixteen_bit_code_cpu(SOURCE);
@@ -459,6 +715,7 @@ fn word_memory_jump_source_limit_exits_then_dispatcher_replays_the_fault() {
 #[test]
 fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread() {
     const TOO_LARGE: u16 = 0x500;
+    const OPERAND: u32 = POINTER + 1;
     let memory = dynamic_word_jmp_program();
     let mut interp = sixteen_bit_code_cpu(SOURCE);
     let mut native = sixteen_bit_code_cpu(SOURCE);
@@ -474,9 +731,9 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
     prime_dynamic_word_jmp(&mut native, &mut native_bus);
 
     for bus in [&mut interp_bus, &mut native_bus] {
-        bus.memory[POINTER as usize..POINTER as usize + 2]
+        bus.memory[OPERAND as usize..OPERAND as usize + 2]
             .copy_from_slice(&TOO_LARGE.to_le_bytes());
-        bus.side_effect_read_address = Some(POINTER);
+        bus.side_effect_read_address = Some(OPERAND);
         bus.side_effect_read_count = 0;
         bus.trace.clear();
     }
@@ -484,7 +741,7 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
         cpu.halted = false;
         cpu.set_eip(SOURCE);
         cpu.registers.gpr.fill(0);
-        cpu.registers.set_ebx(POINTER);
+        cpu.registers.set_ebx(OPERAND);
         cpu.registers.eflags = 0x246;
         cpu.pending_flags = PendingFlags::default();
         cpu.elapsed_clocks = 0;
@@ -608,7 +865,7 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
             .trace
             .cycles()
             .iter()
-            .filter(|cycle| cycle.kind == BusAccessKind::DataRead && cycle.address == POINTER)
+            .filter(|cycle| cycle.kind == BusAccessKind::DataRead && cycle.address == OPERAND)
             .map(|cycle| cycle.width)
             .collect::<Vec<_>>(),
         vec![BusWidth::Word]
@@ -650,13 +907,13 @@ fn word_memory_jump_refuses_an_unreadable_protected_mode_source_segment() {
 }
 
 #[test]
-fn word_memory_jump_reloads_its_target_after_mode13_completion() {
+fn odd_word_memory_jump_replays_mode13_before_any_native_payload_read() {
     const APERTURE: usize = 0x000a_0000;
     let mut memory = vec![0; 0x000b_1000];
     memory[SOURCE as usize..SOURCE as usize + 7]
-        .copy_from_slice(&[0x90, 0x90, 0x90, 0xff, 0x26, 0x00, 0x00]);
+        .copy_from_slice(&[0x90, 0x90, 0x90, 0xff, 0x26, 0x01, 0x00]);
     memory[TARGET as usize..TARGET as usize + 3].copy_from_slice(&[0x90, 0x90, 0xf4]);
-    memory[APERTURE..APERTURE + 4].copy_from_slice(&[
+    memory[APERTURE + 1..APERTURE + 5].copy_from_slice(&[
         TARGET as u8,
         (TARGET >> 8) as u8,
         0xa5,
@@ -673,23 +930,18 @@ fn word_memory_jump_reloads_its_target_after_mode13_completion() {
     for bus in [&mut interp_bus, &mut native_bus] {
         bus.direct_page_clocks = true;
     }
-    drive(&mut interp, &mut interp_bus);
-    drive(&mut native, &mut native_bus);
-    native.set_jit_auto_admit(true);
-    for _ in 0..3 {
-        native.halted = false;
-        native.set_eip(SOURCE);
-        drive(&mut native, &mut native_bus);
+    for (cpu, bus) in [
+        (&mut interp, &mut interp_bus),
+        (&mut native, &mut native_bus),
+    ] {
+        warm_sixteen_bit(cpu, bus, &[SOURCE + 1, SOURCE + 2, SOURCE + 3]);
     }
-    let source_key = jit::direct::key_for(&native, SOURCE + 1, false).expect("source key");
-    assert!(matches!(
-        native.jit_direct.probe(source_key),
-        jit::direct::BlockProbe::Ready(_)
-    ));
+    arm_native_sixteen_bit(&mut native, &mut native_bus, &[0, APERTURE as u32]);
+    let block = install_word_jmp(&mut native, SOURCE + 1);
 
     for cpu in [&mut interp, &mut native] {
         cpu.halted = false;
-        cpu.set_eip(SOURCE);
+        cpu.set_eip(SOURCE + 1);
         cpu.registers.gpr.fill(0);
         cpu.registers.eflags = 0x246;
         cpu.pending_flags = PendingFlags::default();
@@ -698,13 +950,23 @@ fn word_memory_jump_reloads_its_target_after_mode13_completion() {
         cpu.core_clocks_so_far = 0;
     }
     for bus in [&mut interp_bus, &mut native_bus] {
+        bus.side_effect_read_address = Some(APERTURE as u32 + 1);
+        bus.side_effect_read_count = 0;
         bus.trace.clear();
     }
     let direct_before = native.perf_counters().jit_direct_insns;
-    drive(&mut interp, &mut interp_bus);
-    drive(&mut native, &mut native_bus);
+    let exits_before = native.perf_counters().jit_direct_side_exits;
+    let kind_before = native.perf_counters().jit_direct_exit_unavailable_or_kind;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    for _ in 0..2 {
+        interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
+    }
 
-    assert_eq!(native.registers.eip, TARGET + 3);
+    assert_eq!(native.registers.eip, SOURCE + 3);
     assert_eq!(
         crate::tests::settled_state(&native),
         crate::tests::settled_state(&interp)
@@ -715,12 +977,37 @@ fn word_memory_jump_reloads_its_target_after_mode13_completion() {
         native_bus.trace.elapsed_clocks(),
         interp_bus.trace.elapsed_clocks()
     );
-    assert!(native.perf_counters().jit_direct_insns - direct_before >= 3);
+    assert_eq!(native_bus.side_effect_read_count, 0);
+    assert_eq!(interp_bus.side_effect_read_count, 0);
+    assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits - exits_before,
+        1
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_exit_unavailable_or_kind - kind_before,
+        1
+    );
+
+    native
+        .cycle_no_interrupt_check(&mut native_bus)
+        .expect("dispatcher replay");
+    interp
+        .cycle_no_interrupt_check(&mut interp_bus)
+        .expect("interpreter jump");
+    assert_eq!(native.registers.eip, TARGET);
+    assert_eq!(
+        crate::tests::settled_state(&native),
+        crate::tests::settled_state(&interp)
+    );
+    assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
+    assert_eq!(native_bus.side_effect_read_count, 1);
+    assert_eq!(interp_bus.side_effect_read_count, 1);
 }
 
 #[test]
 fn word_memory_jump_target_data_mutation_rebinds_without_retiring_the_source() {
-    const DATA: u32 = 0x1800;
+    const DATA: u32 = 0x1801;
     const TARGET_A: u32 = 0x300;
     const TARGET_B: u32 = 0x500;
     let mut memory = vec![0; 0x3000];
@@ -876,9 +1163,102 @@ fn word_memory_jump_target_data_mutation_rebinds_without_retiring_the_source() {
 }
 
 #[test]
+fn odd_word_memory_jump_tracks_remaps_and_poisoned_read_bias_fallback() {
+    const DATA: u32 = 0x1801;
+    const TARGET_A: u32 = 0x300;
+    const TARGET_B: u32 = 0x500;
+    const TARGET_C: u32 = 0x700;
+    let mut memory = vec![0; 0x4000];
+    memory[SOURCE as usize..SOURCE as usize + 5].copy_from_slice(&[0x90, 0x90, 0x90, 0xff, 0x27]);
+    memory[DATA as usize..DATA as usize + 2].copy_from_slice(&(TARGET_A as u16).to_le_bytes());
+    memory[0x2801..0x2803].copy_from_slice(&(TARGET_B as u16).to_le_bytes());
+    for target in [TARGET_A, TARGET_B, TARGET_C] {
+        memory[target as usize] = 0xf4;
+    }
+    let mut cpu = sixteen_bit_code_cpu(SOURCE);
+    let mut bus = sixteen_bit_bus(memory);
+    warm_sixteen_bit(&mut cpu, &mut bus, &[SOURCE + 1, SOURCE + 2, SOURCE + 3]);
+    arm_native_sixteen_bit(&mut cpu, &mut bus, &[0, 0x1000, 0x2000]);
+    let block = install_word_jmp(&mut cpu, SOURCE + 1);
+
+    cpu.set_eip(SOURCE + 1);
+    cpu.registers.set_ebx(DATA);
+    let exits = cpu.perf_counters().jit_direct_side_exits;
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(cpu.registers.eip, TARGET_A);
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits, exits);
+
+    let remapped = bus
+        .direct_page(0x2000, BusAccessKind::DataRead)
+        .unwrap()
+        .unwrap();
+    assert!(cpu.jit_fast_map.populate_read(
+        0x1000,
+        0x2000,
+        remapped,
+        jit::fast_map::PagePermissions::UNPAGED,
+        false,
+    ));
+    cpu.set_eip(SOURCE + 1);
+    cpu.registers.set_ebx(DATA);
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(cpu.registers.eip, TARGET_B);
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits, exits);
+
+    let mirror: &'static mut [u8] = Box::leak(vec![0; 0x2000].into_boxed_slice());
+    let skew = 1usize;
+    mirror[skew + 0x801..skew + 0x803].copy_from_slice(&(TARGET_C as u16).to_le_bytes());
+    let ptr = unsafe { mirror.as_mut_ptr().add(skew) };
+    assert!(cpu.jit_fast_map.populate_read(
+        0x1000,
+        0x1000,
+        izarravm_bus::DirectPage {
+            physical_page: 0x1000,
+            ptr,
+            len: 0x1000,
+            writable: false,
+            mapping_epoch: bus.direct_mapping_epoch,
+        },
+        jit::fast_map::PagePermissions::UNPAGED,
+        false,
+    ));
+    assert_eq!(
+        cpu.jit_fast_map.load_bias_for_test(DATA),
+        jit::fast_map::NATIVE_LOAD_BIAS_POISON
+    );
+    cpu.set_eip(SOURCE + 1);
+    cpu.registers.set_ebx(DATA);
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(cpu.registers.eip, TARGET_C);
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits, exits);
+
+    bus.memory[DATA as usize..DATA as usize + 2].copy_from_slice(&(TARGET_B as u16).to_le_bytes());
+    bus.non_direct_read_pages.push(DATA >> 12);
+    bus.direct_pages_enabled = false;
+    cpu.jit_fast_map.invalidate_page(DATA);
+    cpu.set_eip(SOURCE + 1);
+    cpu.registers.set_ebx(DATA);
+    bus.side_effect_read_address = Some(DATA);
+    bus.side_effect_read_count = 0;
+    let unavailable = cpu.perf_counters().jit_direct_exit_unavailable_or_kind;
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(cpu.registers.eip, SOURCE + 3);
+    assert_eq!(cpu.perf_counters().jit_direct_side_exits - exits, 1);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_exit_unavailable_or_kind - unavailable,
+        1
+    );
+    assert_eq!(bus.side_effect_read_count, 0);
+    cpu.cycle_no_interrupt_check(&mut bus)
+        .expect("interpreter replay");
+    assert_eq!(cpu.registers.eip, TARGET_B);
+    assert_eq!(bus.side_effect_read_count, 1);
+}
+
+#[test]
 fn aliased_displacement_write_retires_and_recompiles_the_word_memory_jump() {
-    const DATA_A: u32 = 0x1800;
-    const DATA_B: u32 = 0x1a00;
+    const DATA_A: u32 = 0x1801;
+    const DATA_B: u32 = 0x1a01;
     const TARGET_A: u32 = 0x2300;
     const TARGET_B: u32 = 0x2500;
     const PAGE_TABLE: u32 = 0x4000;
@@ -1069,6 +1449,8 @@ fn aliased_displacement_write_retires_and_recompiles_the_word_memory_jump() {
 #[test]
 fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
     let mut memory = dynamic_word_jmp_program();
+    let operand = POINTER + 1;
+    memory[operand as usize..operand as usize + 2].copy_from_slice(&(TARGET as u16).to_le_bytes());
     memory[0] = 0xf4;
     let mut cpu = sixteen_bit_code_cpu(SOURCE);
     let mut bus = sixteen_bit_bus(memory);
@@ -1080,7 +1462,7 @@ fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
     let block = install_word_jmp(&mut cpu, SOURCE + 1);
     cpu.set_eip(SOURCE + 1);
-    cpu.registers.set_ebx(POINTER);
+    cpu.registers.set_ebx(operand);
 
     let (num, den) = level_timing(cpu.persona());
     let scaled_core_upper = u64::from(block.raw_clocks())
@@ -1197,7 +1579,7 @@ fn paged_word_cpu(entry: u32) -> CpuGsw {
 
 #[test]
 fn cpl3_word_memory_jump_permission_exit_replays_through_the_dispatcher() {
-    const DATA: u32 = 0x1800;
+    const DATA: u32 = 0x1801;
     let mut memory = vec![0; 0x6000];
     memory[SOURCE as usize..SOURCE as usize + 7].copy_from_slice(&[
         0x90,

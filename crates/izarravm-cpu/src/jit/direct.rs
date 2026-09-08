@@ -21136,14 +21136,30 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
                 let limit = memory.segments.cs.limit;
                 let limit_exit = (limit != u32::MAX).then(|| e.label());
-                emit_ram_read_pointer_inner(
-                    &mut e,
-                    width,
-                    addr,
-                    memory,
-                    reasons,
-                    memory.address_wrap,
-                );
+                let odd_ram =
+                    (width == MemoryWidth::Word && memory.one_lookup_load).then(|| e.label());
+                if let Some(odd_ram) = odd_ram {
+                    emit_segmented_linear_address(
+                        &mut e,
+                        addr,
+                        width,
+                        memory,
+                        reasons,
+                        memory.address_wrap,
+                        false,
+                    );
+                    emit_alignment_test(&mut e, width, Reg::RDX, odd_ram);
+                    emit_read_probe_parking(&mut e, memory, reasons);
+                } else {
+                    emit_ram_read_pointer_inner(
+                        &mut e,
+                        width,
+                        addr,
+                        memory,
+                        reasons,
+                        memory.address_wrap,
+                    );
+                }
                 match width {
                     MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
                     MemoryWidth::Dword => e.load_r32_disp8(Reg::RDX, Reg::RDI, 0),
@@ -21164,6 +21180,10 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     MemoryWidth::Dword => e.load_r32_disp8(Reg::RDX, Reg::RDI, 0),
                     _ => unreachable!("JmpMem supports Word and Dword only"),
                 }
+                let completed_path = odd_ram.map(|_| e.label());
+                if let Some(completed_path) = completed_path {
+                    e.place(completed_path);
+                }
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 completed.retire(slot, class_table);
@@ -21178,6 +21198,27 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     fetch_trace,
                     false,
                 );
+                if let (Some(odd_ram), Some(completed_path)) = (odd_ram, completed_path) {
+                    e.place(odd_ram);
+                    emit_page_cross_bound(
+                        &mut e,
+                        MemoryWidth::Word,
+                        Reg::RDX,
+                        reasons.cross_page_or_alignment,
+                    );
+                    emit_read_probe_parking(&mut e, memory, reasons);
+                    e.load_r64_disp8(Reg::RDX, Reg::RSP, STACK_READ_KIND);
+                    e.cmp_r32_imm32(Reg::RDX, u32::from(NATIVE_RAM_KIND));
+                    e.jnz(reasons.unavailable_or_kind);
+                    e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0);
+                    if let Some(limit_exit) = limit_exit {
+                        e.cmp_r32_imm32(Reg::RCX, limit);
+                        e.jcc(7, limit_exit);
+                    }
+                    emit_dynamic_split_extra(&mut e, 1);
+                    e.mov_r32_r32(Reg::RDX, Reg::RCX);
+                    e.jmp(completed_path);
+                }
                 terminal = true;
                 break;
             }
@@ -24100,8 +24141,8 @@ fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
 /// `emit_dynamic_word_increment` and `run.rs` unpacks it into `jit_direct_far_ret_native`, having
 /// first MASKED the low half at both of that lane's readers. Do not double-allocate it.
 ///
-/// Scratch: RDX, like both increment primitives above. Every caller is a STUB tail past the point
-/// where the access is committed, so RDX is dead there.
+/// Scratch: RDX, like both increment primitives above. Stub callers have committed the access and
+/// no longer need RDX. The odd Word JmpMem tail keeps its loaded target in RCX across this call.
 fn emit_dynamic_split_extra(e: &mut Encoder, extra: u32) {
     // Word or Dword. The x87 widths keep refusing misaligned accesses, so 7 and 9 never arrive.
     debug_assert!(extra == 1 || extra == 3);

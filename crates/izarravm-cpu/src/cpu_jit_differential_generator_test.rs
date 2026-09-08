@@ -1633,6 +1633,106 @@ fn generated_hma_load_tracks_a20_alias_and_cache_invalidation() {
     }
 }
 
+#[test]
+fn odd_word_memory_jump_rebinds_after_a20_opens() {
+    const SOURCE: u32 = 0x100;
+    const HMA_DATA: u32 = 0x10_0301;
+    const LOW_TARGET: u32 = 0x500;
+    const HIGH_TARGET: u32 = 0x700;
+    let mut memory = vec![0; 0x10_2000];
+    memory[SOURCE as usize..SOURCE as usize + 7]
+        .copy_from_slice(&[0x90, 0x90, 0x90, 0xff, 0x26, 0x11, 0x03]);
+    memory[0x301..0x303].copy_from_slice(&(LOW_TARGET as u16).to_le_bytes());
+    memory[HMA_DATA as usize..HMA_DATA as usize + 2]
+        .copy_from_slice(&(HIGH_TARGET as u16).to_le_bytes());
+    memory[LOW_TARGET as usize] = 0xf4;
+    memory[HIGH_TARGET as usize] = 0xf4;
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+    ] {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.registers.set_esp(0x900);
+    cpu.set_eip(SOURCE);
+    cpu.load_segment_real(SegmentIndex::Ds, 0xffff);
+    cpu.set_fast_map_enabled_for_test(true);
+    let mut bus = A20Bus {
+        inner: TestBus::with_memory(memory),
+        enabled: false,
+    };
+    bus.inner.direct_pages_enabled = true;
+    let low_page = bus
+        .direct_page(0, BusAccessKind::DataRead)
+        .unwrap()
+        .expect("low direct page");
+    assert!(cpu.jit_fast_map.populate_read(
+        0,
+        0,
+        low_page,
+        jit::fast_map::PagePermissions::UNPAGED,
+        false,
+    ));
+
+    for enabled in [false, true] {
+        bus.enabled = enabled;
+        for linear in [SOURCE + 1, SOURCE + 2, SOURCE + 3] {
+            cpu.set_eip(linear);
+            cpu.begin_instruction();
+            cpu.fetch_decoded(&mut bus, linear).expect("fixture decode");
+        }
+        if enabled {
+            let page = bus
+                .direct_page(HMA_DATA, BusAccessKind::DataRead)
+                .unwrap()
+                .expect("open A20 HMA page");
+            assert!(cpu.jit_fast_map.populate_read(
+                HMA_DATA & !0x0fff,
+                HMA_DATA & !0x0fff,
+                page,
+                jit::fast_map::PagePermissions::UNPAGED,
+                false,
+            ));
+        }
+        let key = jit::direct::key_for(&cpu, SOURCE + 1, false).expect("source key");
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let compilation = jit::direct::compile(&mut cpu, SOURCE + 1, false).expect("Word JmpMem");
+        assert_eq!(compilation.span.instructions, 3);
+        let id = cpu
+            .jit_direct
+            .install(&compilation)
+            .expect("install source");
+        let block = cpu.jit_direct.block(id).expect("live source");
+        cpu.set_eip(SOURCE + 1);
+        let direct_before = cpu.perf_counters().jit_direct_insns;
+        let exits_before = cpu.perf_counters().jit_direct_side_exits;
+
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        if enabled {
+            assert_eq!(cpu.registers.eip, HIGH_TARGET);
+            assert_eq!(cpu.perf_counters().jit_direct_insns - direct_before, 3);
+            assert_eq!(cpu.perf_counters().jit_direct_side_exits, exits_before);
+        } else {
+            assert_eq!(cpu.registers.eip, SOURCE + 3);
+            assert_eq!(cpu.perf_counters().jit_direct_insns - direct_before, 2);
+            assert_eq!(cpu.perf_counters().jit_direct_side_exits - exits_before, 1);
+            cpu.cycle_no_interrupt_check(&mut bus)
+                .expect("closed-A20 replay");
+            assert_eq!(cpu.registers.eip, LOW_TARGET);
+            bus.enabled = true;
+            cpu.note_a20_changed();
+            assert_eq!(cpu.jit_direct.len(), 0);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The S1 width lift: 66-prefixed ENTER, LEA and LEAVE inside a generated block.
 // ---------------------------------------------------------------------------

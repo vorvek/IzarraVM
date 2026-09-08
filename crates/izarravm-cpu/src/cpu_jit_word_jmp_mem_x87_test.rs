@@ -6,22 +6,44 @@ use crate::tests::jit_x87_direct::{arm, direct_memory, run_to_halt, x87_cpu};
 
 #[test]
 fn word_memory_jump_chains_float_source_to_integer_target_and_spills_x87() {
+    let aligned_bus_clocks = run_word_memory_jump_x87_case(0x800);
+    let odd_bus_clocks = run_word_memory_jump_x87_case(0x801);
+    assert_eq!(
+        odd_bus_clocks,
+        aligned_bus_clocks + u64::from(izarravm_bus::BusCycle::clocks_for(BusWidth::Byte, 0)),
+        "the odd native route must add exactly one split byte"
+    );
+}
+
+fn run_word_memory_jump_x87_case(pointer: u32) -> u64 {
     const SOURCE: u32 = 0x100;
     const TARGET: u32 = 0x300;
-    const POINTER: u32 = 0x800;
 
     let mut memory = vec![0; 0x2000];
     memory[SOURCE as usize - 1] = 0x90;
     memory[SOURCE as usize..SOURCE as usize + 13].copy_from_slice(&[
-        0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, // three mov ax,ax
-        0x66, 0xd9, 0xe8, // fld1 with the Direct x87 Dword admission size
-        0xff, 0x26, 0x00, 0x08, // jmp word [0x800]
+        // three mov ax,ax
+        0x89,
+        0xc0,
+        0x89,
+        0xc0,
+        0x89,
+        0xc0,
+        // fld1 with the Direct x87 Dword admission size
+        0x66,
+        0xd9,
+        0xe8,
+        // jmp word [pointer]
+        0xff,
+        0x26,
+        pointer as u8,
+        (pointer >> 8) as u8,
     ]);
     memory[TARGET as usize..TARGET as usize + 7].copy_from_slice(&[
         0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, // three mov bx,bx
         0xf4,
     ]);
-    memory[POINTER as usize..POINTER as usize + 4].copy_from_slice(&[
+    memory[pointer as usize..pointer as usize + 4].copy_from_slice(&[
         TARGET as u8,
         (TARGET >> 8) as u8,
         0xa5,
@@ -29,7 +51,7 @@ fn word_memory_jump_chains_float_source_to_integer_target_and_spills_x87() {
     ]);
     assert_ne!(
         u32::from_le_bytes(
-            memory[POINTER as usize..POINTER as usize + 4]
+            memory[pointer as usize..pointer as usize + 4]
                 .try_into()
                 .unwrap()
         ),
@@ -46,6 +68,10 @@ fn word_memory_jump_chains_float_source_to_integer_target_and_spills_x87() {
     }
     let mut native_bus = direct_memory(memory.clone());
     let mut interpreter_bus = direct_memory(memory.clone());
+    for bus in [&mut native_bus, &mut interpreter_bus] {
+        bus.direct_page_clocks = true;
+        bus.flat_direct_page_clocks = true;
+    }
 
     arm(&mut native, 0x0f7f);
     run_to_halt(&mut native, &mut native_bus);
@@ -119,6 +145,7 @@ fn word_memory_jump_chains_float_source_to_integer_target_and_spills_x87() {
     let installs = native.perf_counters().jit_direct_blocks_installed;
     let invalidations = native.perf_counters().code_invalidations;
     let transfers = native.perf_counters().jit_direct_linked_transfers;
+    let side_exits = native.perf_counters().jit_direct_side_exits;
     let first_insns = native.perf_counters().jit_direct_insns;
     assert!(
         native
@@ -170,6 +197,11 @@ fn word_memory_jump_chains_float_source_to_integer_target_and_spills_x87() {
         "the second entry must cross into the integer target natively"
     );
     assert_eq!(
+        native.perf_counters().jit_direct_side_exits,
+        side_exits,
+        "the {pointer:#x} source must complete without replay"
+    );
+    assert_eq!(
         native.perf_counters().jit_direct_insns - direct_insns,
         8,
         "all five source and three target instructions must retire natively"
@@ -201,8 +233,7 @@ fn word_memory_jump_chains_float_source_to_integer_target_and_spills_x87() {
     assert_eq!(native.timing_rem, interpreter.timing_rem);
     assert_eq!(native.fp_rem, interpreter.fp_rem);
     assert_eq!(native_bus.memory, interpreter_bus.memory);
-    assert_eq!(
-        native_bus.trace.elapsed_clocks(),
-        interpreter_bus.trace.elapsed_clocks()
-    );
+    let native_bus_clocks = native_bus.trace.elapsed_clocks();
+    assert_eq!(native_bus_clocks, interpreter_bus.trace.elapsed_clocks());
+    native_bus_clocks
 }
