@@ -2379,6 +2379,22 @@ fn write_hdd_profile_json(
             None,
         ),
     });
+    #[cfg(feature = "dynarec-mkii")]
+    {
+        let stats = machine.cpu().dynarec_mkii_stats();
+        report["dynarec_mkii"] = serde_json::json!({
+            "runs": stats.runs, "entries": stats.entries, "compiled": stats.compiled,
+            "native": stats.native, "helpers": stats.helpers, "cold": stats.cold,
+            "mismatches": stats.mismatches, "invalidations": stats.invalidations, "spans": stats.spans,
+            "census": machine.cpu().dynarec_mkii_census(),
+            "compile_ns": stats.compile_ns, "retired_artifacts": stats.retired_artifacts,
+            "memory_spans": stats.memory_spans,
+            "expansions": stats.expansions,
+            "regions": stats.regions, "region_guard_misses": stats.region_guard_misses,
+            "dispatch_hits": stats.dispatch_hits, "dispatch_misses": stats.dispatch_misses,
+            "carry_native": stats.carry_native, "carry_misses": stats.carry_misses,
+        });
+    }
     // Schema 2 keeps interpreter charge events apart from native instruction
     // partitions. Neither population is a whole-row instruction census.
     #[cfg(feature = "timing-class-histogram")]

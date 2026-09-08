@@ -334,19 +334,23 @@ impl CpuGsw {
         self.cycle_no_interrupt_check_with_budget(bus, None)
     }
 
-    fn cycle_no_interrupt_check_with_budget<B: CpuBus>(
+    pub(super) fn cycle_no_interrupt_check_with_budget<B: CpuBus>(
         &mut self,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
     ) -> CpuExecutionResult<CpuCycleOutcome> {
+        self.cycle_no_interrupt_check_at_prefix(bus, rep_budget, 0)
+    }
+
+    pub(super) fn cycle_no_interrupt_check_at_prefix<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        rep_budget: Option<RepBudget>,
+        core_prefix: u64,
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         self.interrupt_shadow = false;
-        // This is always either a standalone single-step (no prior instructions in
-        // "this run") or run_straight_line's FIRST instruction (total == 0 at that
-        // point, by construction): both cases mean core_clocks_so_far is 0 here.
-        // Continuations inside run_straight_line go through run_one_cached instead,
-        // which does not reset this field; run_straight_line sets it explicitly
-        // before each continuation call.
-        self.core_clocks_so_far = 0;
+        // Cold mkII continuations publish the prefix just like cached continuations.
+        self.core_clocks_so_far = core_prefix;
 
         if self.rep_resume_active {
             return self.resume_rep_instruction(bus, rep_budget);
@@ -424,7 +428,7 @@ impl CpuGsw {
         )
     }
 
-    fn pause_rep_instruction<B: CpuBus>(
+    pub(super) fn pause_rep_instruction<B: CpuBus>(
         &mut self,
         bus: &mut B,
         insn: DecodedInsn,
@@ -574,7 +578,7 @@ impl CpuGsw {
         )
     }
 
-    fn execute_decoded_with_rep_budget<B: CpuBus>(
+    pub(super) fn execute_decoded_with_rep_budget<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
@@ -713,7 +717,7 @@ impl CpuGsw {
     /// fetch, because EIP past 64K is reachable and meaningful there.
     #[cold]
     #[inline(never)]
-    fn wrap_16bit_sequential_run_off(&mut self) {
+    pub(super) fn wrap_16bit_sequential_run_off(&mut self) {
         let cs = self.registers.cs();
         if !cs.default_size_32 && cs.limit == 0xffff {
             self.set_eip(0);
@@ -907,6 +911,13 @@ impl CpuGsw {
         bus: &mut B,
         cap: u64,
     ) -> CpuExecutionResult<BudgetedRunOutcome> {
+        #[cfg(feature = "dynarec-mkii")]
+        let result = if self.mkii_enabled() {
+            self.run_mkii(bus, cap)
+        } else {
+            self.run_budgeted_inner(bus, cap)
+        };
+        #[cfg(not(feature = "dynarec-mkii"))]
         let result = self.run_budgeted_inner(bus, cap);
         // The seventh run-end reason: a propagated hard `CpuError` skips every `brk_*` fold
         // inside the loop (see `straight_line_runs`' identity comment), so it is counted here

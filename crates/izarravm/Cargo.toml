@@ -15,6 +15,7 @@ authors.workspace = true
 # interpreter-only build, while the release binary accepts `--interpreter` at launch.
 default = ["jit"]
 jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
+dynarec-mkii = ["jit", "izarravm-machine/dynarec-mkii"]
 # Passthrough for the compile-time Direct admission census; see izarravm-cpu.
 direct-admission-census = ["jit", "izarravm-cpu/direct-admission-census"]
 # Per-entry Direct attribution observer. Not in `default`; IS in `--all-features` (cargo offers no

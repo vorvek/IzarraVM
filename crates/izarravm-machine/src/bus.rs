@@ -1877,6 +1877,16 @@ impl CpuBus for MachineBus<'_> {
         }))
     }
 
+    fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
+        if !self.native_fetches_are_uniform()
+            || !self.native_aggregate_accounting_allowed()
+            || self.shadow_l1.diagnostics().enabled
+        {
+            return None;
+        }
+        self.begin_compiled_window()
+    }
+
     fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
         if !self.flat_data_cost {
             return None;
@@ -2142,6 +2152,57 @@ impl CpuBus for MachineBus<'_> {
             1
         };
         Some((2 + u64::from(wait_states)) * u64::from(accesses))
+    }
+
+    fn jit_preflight_cached_fetch(&self, linear: u32, physical: u32, len: u8) -> Option<u64> {
+        let end = linear.checked_add(u32::from(len).checked_sub(1)?)?;
+        if linear < FIRMWARE_FETCH_WINDOW_START + FIRMWARE_FETCH_WINDOW_LEN
+            && end >= FIRMWARE_FETCH_WINDOW_START
+        {
+            return None;
+        }
+        self.direct_page_ram_bytes(physical, usize::from(len), BusWidth::Byte)?;
+        self.jit_cached_fetch_run_clocks(physical, u32::from(len))
+    }
+
+    fn jit_preflight_ram_read(
+        &self,
+        physical: u32,
+        width: BusWidth,
+        mapping_epoch: u64,
+    ) -> Option<u64> {
+        if mapping_epoch != *self.direct_mapping_epoch
+            || !self.native_fetches_are_uniform()
+            || !self.native_aggregate_accounting_allowed()
+        {
+            return None;
+        }
+        self.direct_page_ram_bytes(physical, width.bytes() as usize, width)?;
+        Some(self.flat_data_clocks(width))
+    }
+
+    fn certify_owned_code_span(&self, linear: u32, physical: u32, len: u32) -> Option<(u64, u64)> {
+        let epochs = self.owned_code_replay_epochs()?;
+        let last = len.checked_sub(1)?;
+        let end = linear.checked_add(last)?;
+        let physical_end = physical.checked_add(last)?;
+        if linear >> 12 != end >> 12
+            || physical >> 12 != physical_end >> 12
+            || (linear < FIRMWARE_FETCH_WINDOW_START + FIRMWARE_FETCH_WINDOW_LEN
+                && end >= FIRMWARE_FETCH_WINDOW_START)
+        {
+            return None;
+        }
+        self.direct_page_ram_bytes(physical, len as usize, BusWidth::Byte)?;
+        Some(epochs)
+    }
+
+    fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
+        (self.l1_charges_folded
+            && self.native_fetches_are_uniform()
+            && self.native_aggregate_accounting_allowed()
+            && !self.shadow_l1.diagnostics().enabled)
+            .then(|| (*self.direct_mapping_epoch, self.jit_cost_dial_epoch()))
     }
 
     fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {

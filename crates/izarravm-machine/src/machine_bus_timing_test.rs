@@ -195,6 +195,153 @@ fn jit_direct_memory_preview_bounds_the_live_bus_charge() {
 }
 
 #[test]
+fn mkii_fetch_certificate_rejects_firmware_aliases_and_matches_physical_charges() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        assert_eq!(
+            bus.jit_preflight_cached_fetch(BIOS32_DIRECTORY_LINEAR, 0x2000, 1),
+            None
+        );
+        assert_eq!(
+            bus.jit_preflight_cached_fetch(BIOS_INT_STUB_TABLE_LINEAR, 0x2000, 1),
+            None
+        );
+        assert_eq!(bus.jit_preflight_cached_fetch(0x2000, 0xa0000, 1), None);
+        assert_eq!(bus.jit_preflight_cached_fetch(0x2000, 0xfff, 2), None);
+        for (linear, physical, len) in [(0x2000, 0x3000, 3), (0x4000, 0x100000, 6)] {
+            let raw = bus
+                .jit_preflight_cached_fetch(linear, physical, len)
+                .unwrap();
+            let before = bus.in_batch_reference_bus_clocks();
+            bus.note_code_fetch_linear(linear);
+            bus.charge_physical_instruction_fetch_run(physical, u32::from(len))
+                .unwrap();
+            assert_eq!(bus.in_batch_reference_bus_clocks() - before, raw);
+            assert!(!bus.requires_step_break());
+        }
+    });
+}
+
+#[test]
+fn mkii_read_region_window_matches_live_charges_and_refuses_observers() {
+    for mode in [GswMode::Gsw586, GswMode::Gsw486, GswMode::Gsw386] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            bus.trace.set_tracing_mode(TracingMode::Off);
+            if mode == GswMode::Gsw386 {
+                assert!(bus.begin_read_region().is_none());
+                return;
+            }
+            *bus.direct_mapping_epoch += 1;
+            let window = bus.begin_read_region().unwrap();
+            assert_eq!(window.mapping_epoch(), *bus.direct_mapping_epoch);
+            let mut delta = izarravm_bus::CompiledBusDelta::default();
+            delta.add_instruction_fetches(3);
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                delta.add_ram_accesses(width, 1);
+            }
+            let before = bus.trace.elapsed_clocks();
+            bus.finish_compiled_window(window, delta);
+            let aggregated = bus.trace.elapsed_clocks() - before;
+            let before = bus.trace.elapsed_clocks();
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                bus.charge_physical_instruction_fetch_run(0x3000, 4)
+                    .unwrap();
+                bus.charge_direct_ram_memory(0x2000, width, BusAccessKind::DataRead)
+                    .unwrap();
+            }
+            assert_eq!(bus.trace.elapsed_clocks() - before, aggregated);
+            bus.trace.set_tracing_mode(TracingMode::Full);
+            assert!(bus.begin_read_region().is_none());
+            #[cfg(not(feature = "shadow-cache-probe"))]
+            {
+                bus.trace.set_tracing_mode(TracingMode::Off);
+                bus.shadow_l1.enable_for_test();
+                assert!(bus.begin_read_region().is_none());
+            }
+        });
+    }
+}
+
+#[test]
+fn mkii_ram_certificate_tracks_epoch_backing_and_folded_charge() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        bus.trace.set_tracing_mode(TracingMode::Off);
+        let epoch = *bus.direct_mapping_epoch;
+        assert_eq!(
+            bus.jit_preflight_ram_read(0x2000, BusWidth::Word, epoch + 1),
+            None
+        );
+        for address in [0x2001, 0x2fff, 0xa0000] {
+            assert_eq!(
+                bus.jit_preflight_ram_read(address, BusWidth::Word, epoch),
+                None
+            );
+        }
+        let raw = bus
+            .jit_preflight_ram_read(0x2000, BusWidth::Word, epoch)
+            .unwrap();
+        assert_eq!(raw, 0);
+        let before = bus.in_batch_reference_bus_clocks();
+        bus.charge_direct_ram_memory(0x2000, BusWidth::Word, BusAccessKind::DataRead)
+            .unwrap();
+        assert_eq!(bus.in_batch_reference_bus_clocks() - before, raw);
+        bus.trace.set_tracing_mode(TracingMode::Full);
+        assert_eq!(
+            bus.jit_preflight_ram_read(0x2000, BusWidth::Word, epoch),
+            None
+        );
+    });
+}
+
+#[test]
+fn mkii_owned_source_certificate_covers_cold_fetches_and_excludes_special_windows() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        bus.trace.set_tracing_mode(TracingMode::Off);
+        let certificate = bus.certify_owned_code_span(0x2000, 0x3000, 31).unwrap();
+        assert_eq!(
+            certificate,
+            (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch())
+        );
+        let before = bus.trace.elapsed_clocks();
+        for offset in 0..31 {
+            bus.read_memory(
+                0x3000 + offset,
+                BusWidth::Byte,
+                BusAccessKind::InstructionPrefetch,
+            )
+            .unwrap();
+            bus.charge_instruction_fetch(0x3000 + offset).unwrap();
+        }
+        bus.charge_physical_instruction_fetch_run(0x3000, 31)
+            .unwrap();
+        assert_eq!(bus.trace.elapsed_clocks(), before);
+        for (linear, physical, len) in [
+            (0x2000, 0x3000, 0),
+            (0x2fff, 0x3000, 2),
+            (0x2000, 0x3fff, 2),
+            (0x2000, 0xa0000, 1),
+            (BIOS_INT_STUB_TABLE_LINEAR, 0x3000, 1),
+        ] {
+            assert_eq!(bus.certify_owned_code_span(linear, physical, len), None);
+        }
+        *bus.direct_mapping_epoch += 1;
+        assert_ne!(
+            bus.certify_owned_code_span(0x2000, 0x3000, 31).unwrap(),
+            certificate
+        );
+        bus.trace.set_tracing_mode(TracingMode::Full);
+        assert_eq!(bus.certify_owned_code_span(0x2000, 0x3000, 31), None);
+    });
+}
+
+#[test]
 fn accurate_direct_memory_preview_includes_custom_video_wait_states() {
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.wait_states.video = 123;

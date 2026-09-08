@@ -285,6 +285,11 @@ fn shadow_l1_probe_enabled() -> bool {
 }
 
 impl ShadowL1Probe {
+    #[cfg(test)]
+    pub(crate) fn enable_for_test(&mut self) {
+        self.enabled = true;
+    }
+
     pub(crate) fn from_env() -> Self {
         Self {
             tags: ShadowTags::new(),

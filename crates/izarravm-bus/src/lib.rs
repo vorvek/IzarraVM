@@ -1257,6 +1257,57 @@ pub trait CpuBus {
         None
     }
 
+    /// Certify page-local RAM fetches for a fixed native span. The returned raw charge
+    /// matches `charge_physical_instruction_fetch_run`; that charge and the linear
+    /// observation cannot fault, request service, change mappings or observe CPU state.
+    fn jit_preflight_cached_fetch(&self, _linear: u32, _physical: u32, _len: u8) -> Option<u64> {
+        None
+    }
+
+    /// Certify owned instructions in one linear and physical RAM page. Cold decode
+    /// and cached replay both charge zero for these bytes and have no observations,
+    /// faults or service effects. The returned mapping and cost epochs remain valid
+    /// only with a live `owned_code_replay_epochs` grant in the same namespace.
+    /// The CPU separately proves its current translation and watches source writes.
+    fn certify_owned_code_span(
+        &self,
+        _linear: u32,
+        _physical: u32,
+        _len: u32,
+    ) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Revalidate owned source certificates without opening a bus window. `Some`
+    /// accepts their mapping, backing, cost and fetch-observation namespace and
+    /// permits zero-cost, inert cold or cached source replay within one helper-free,
+    /// observer-free native read region protected by a live bus window. Revalidate
+    /// after helpers, mutating bus operations or observer changes.
+    fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Certify an aligned RAM read at the caller's mapping epoch. The returned raw
+    /// cost matches `charge_direct_ram_memory(DataRead)`. That call and certified
+    /// fetch charges cannot fault, request service, observe CPU state, or change
+    /// RAM contents, backing pointers or mappings during the native region.
+    fn jit_preflight_ram_read(
+        &self,
+        _physical: u32,
+        _width: BusWidth,
+        _mapping_epoch: u64,
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Open a read-only native region with no instruction or address observers.
+    /// Current-epoch plain RAM mappings stay valid until completion. For certified
+    /// warm source fetches and aligned RAM reads, aggregate completion is exactly
+    /// equivalent to the ordered accesses and cannot fault or request service.
+    fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
+        None
+    }
+
     /// Project the exact in-batch scaled bus-clock total after `additional_raw` clocks. `Some`
     /// guarantees a fixed integer-rational scaler for the batch, so the scaled delta for the same
     /// raw increment can drift by at most one clock as its starting remainder changes. A JIT may

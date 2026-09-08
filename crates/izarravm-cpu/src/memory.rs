@@ -1919,7 +1919,7 @@ impl CpuGsw {
     // address is not naturally aligned for its width (word on a 2-byte boundary, dword on
     // a 4-byte boundary). Supervisor accesses (CPL < 3) and instruction fetches are exempt;
     // fetches never route through this helper. Byte accesses (width 1) are always aligned.
-    fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
+    pub(super) fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
         if width <= 1 || !self.alignment_armed {
             return Ok(());
         }
@@ -1956,7 +1956,7 @@ impl CpuGsw {
     /// `#[inline]` because it sits on every segmented data access and is two loads and a
     /// comparison on the flat-descriptor arm every 32-bit game takes.
     #[inline]
-    fn segment_linear_range(
+    pub(super) fn segment_linear_range(
         &self,
         segment: SegmentIndex,
         offset: u32,

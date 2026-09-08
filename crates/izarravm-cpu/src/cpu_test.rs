@@ -2829,6 +2829,10 @@ pub(crate) struct TestBus {
     fail_instruction_prefetch_direct_page: bool,
     instruction_prefetch_direct_page_requests: u64,
     uniform_native_fetches: bool,
+    mkii_exact_fetch_projection: bool,
+    mkii_read_regions: bool,
+    mkii_folded_fetches: bool,
+    mkii_owned_replay_disabled: bool,
     // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
     // timing-free, so keep that default and let direct-memory differential tests request clocks.
     direct_page_clocks: bool,
@@ -2913,6 +2917,10 @@ impl TestBus {
             fail_instruction_prefetch_direct_page: false,
             instruction_prefetch_direct_page_requests: 0,
             uniform_native_fetches: false,
+            mkii_exact_fetch_projection: false,
+            mkii_read_regions: false,
+            mkii_folded_fetches: false,
+            mkii_owned_replay_disabled: false,
             direct_page_clocks: false,
             flat_direct_page_clocks: false,
             report_batch_clocks: false,
@@ -2989,7 +2997,12 @@ impl CpuBus for TestBus {
         if let Some(events) = self.core_events.as_mut() {
             events.push(TestCoreEvent::Memory(address, kind, self.published_core));
         }
-        self.trace.push(BusCycle::new(kind, address, width, 0));
+        if !self.mkii_folded_fetches
+            || self.mkii_owned_replay_disabled
+            || kind != BusAccessKind::InstructionPrefetch
+        {
+            self.trace.push(BusCycle::new(kind, address, width, 0));
+        }
         let start = address as usize;
         let end = start
             .checked_add(width.bytes() as usize)
@@ -3217,6 +3230,9 @@ impl CpuBus for TestBus {
     }
 
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
+        if self.mkii_folded_fetches && !self.mkii_owned_replay_disabled {
+            return Ok(());
+        }
         self.trace.push(BusCycle::new(
             BusAccessKind::InstructionPrefetch,
             address,
@@ -3239,6 +3255,9 @@ impl CpuBus for TestBus {
         physical_start: u32,
         count: u32,
     ) -> Result<(), BusError> {
+        if self.mkii_folded_fetches {
+            return Ok(());
+        }
         self.trace.record_instruction_fetch_run(
             physical_start,
             if self.uniform_native_fetches && count != 0 {
@@ -3252,11 +3271,72 @@ impl CpuBus for TestBus {
     }
 
     fn jit_fetch_cost_clocks(&self) -> u64 {
-        u64::from(self.uniform_native_fetches) * 2
+        u64::from(self.uniform_native_fetches && !self.mkii_folded_fetches) * 2
+    }
+
+    fn jit_preflight_cached_fetch(&self, _linear: u32, physical: u32, len: u8) -> Option<u64> {
+        (len != 0
+            && self.direct_memory_bytes(
+                physical,
+                usize::from(len),
+                BusWidth::Byte,
+                BusAccessKind::DataRead,
+            ) == usize::from(len))
+        .then_some(if self.mkii_folded_fetches {
+            0
+        } else if self.uniform_native_fetches {
+            2
+        } else {
+            u64::from(len) * 2
+        })
     }
 
     fn jit_cost_dial_epoch(&self) -> u64 {
-        1 + u64::from(self.uniform_native_fetches) + 2 * u64::from(self.direct_page_clocks)
+        1 + u64::from(self.uniform_native_fetches)
+            + 2 * u64::from(self.direct_page_clocks)
+            + 4 * u64::from(self.mkii_folded_fetches)
+    }
+
+    fn certify_owned_code_span(&self, linear: u32, physical: u32, len: u32) -> Option<(u64, u64)> {
+        let last = len.checked_sub(1)?;
+        (self.mkii_folded_fetches
+            && self.mkii_read_regions
+            && !self.mkii_owned_replay_disabled
+            && self.trace.tracing_mode() == TracingMode::Off
+            && linear >> 12 == linear.checked_add(last)? >> 12
+            && physical >> 12 == physical.checked_add(last)? >> 12
+            && self.direct_memory_bytes(
+                physical,
+                len as usize,
+                BusWidth::Byte,
+                BusAccessKind::DataRead,
+            ) == len as usize)
+            .then(|| (self.direct_mapping_epoch, self.jit_cost_dial_epoch()))
+    }
+
+    fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
+        (self.mkii_folded_fetches
+            && self.mkii_read_regions
+            && !self.mkii_owned_replay_disabled
+            && self.trace.tracing_mode() == TracingMode::Off)
+            .then(|| (self.direct_mapping_epoch, self.jit_cost_dial_epoch()))
+    }
+
+    fn jit_preflight_ram_read(
+        &self,
+        physical: u32,
+        width: BusWidth,
+        mapping_epoch: u64,
+    ) -> Option<u64> {
+        (mapping_epoch == self.direct_mapping_epoch
+            && !width.misaligned_at(physical)
+            && self.direct_memory_bytes(
+                physical,
+                width.bytes() as usize,
+                width,
+                BusAccessKind::DataRead,
+            ) == width.bytes() as usize)
+            .then(|| self.jit_data_cost_clocks(width))
     }
 
     fn native_fetches_are_uniform(&self) -> bool {
@@ -3369,6 +3449,12 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
+        if self.mkii_folded_fetches
+            && !self.mkii_owned_replay_disabled
+            && kind == BusAccessKind::InstructionPrefetch
+        {
+            return Ok(());
+        }
         if kind == BusAccessKind::DataWrite {
             self.note_mode13_write(address, width);
         }
@@ -3414,6 +3500,10 @@ impl CpuBus for TestBus {
     }
 
     fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
+        if self.mkii_exact_fetch_projection {
+            let (num, den) = self.batch_bus_scale;
+            return Some((self.trace.elapsed_clocks() + additional_raw) * num / den);
+        }
         Some(if self.project_additional_bus_clocks {
             self.in_batch_scaled_bus_clocks()
                 .saturating_add(additional_raw)
@@ -3462,6 +3552,13 @@ impl CpuBus for TestBus {
             writable: matches!(kind, BusAccessKind::DataWrite) && self.direct_pages_writable,
             mapping_epoch: self.direct_mapping_epoch,
         }))
+    }
+
+    fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
+        if !self.mkii_read_regions {
+            return None;
+        }
+        self.begin_compiled_window()
     }
 
     fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
@@ -4505,3 +4602,11 @@ fn range_hits_code_masked_test_matches_the_per_byte_definition_at_both_edges() {
 
 #[path = "cpu_cr0_flush_test.rs"]
 mod cr0_flush;
+
+#[cfg(all(
+    feature = "dynarec-mkii",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_mkii_test.rs"]
+mod dynarec_mkii;

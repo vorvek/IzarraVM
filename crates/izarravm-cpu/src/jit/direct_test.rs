@@ -226,6 +226,34 @@ fn empty_cache_clear_drains_retained_code_watch_pages() {
     assert_eq!(cache.native_code_watch_table(), table_base);
 }
 
+#[cfg(feature = "dynarec-mkii")]
+#[test]
+fn direct_clear_preserves_mkii_source_references() {
+    let mut cache = BlockCache::default();
+    let compiled = key(0x1234);
+    let rejected = key(0x1270);
+    cache.acquire_mkii_source(compiled.physical, 4);
+    cache.acquire_mkii_source(rejected.physical, 4);
+    assert!(matches!(cache.probe(compiled), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(compiled), BlockProbe::Compile));
+    assert!(matches!(cache.probe(rejected), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(rejected), BlockProbe::Compile));
+    let span = BlockSpan::new(compiled, 4, 1).unwrap();
+    cache.install(&trivial_compilation(span)).unwrap();
+    reject(&mut cache, rejected, 4);
+    assert_eq!(cache.code_watch.refcount(compiled.physical), 2);
+    assert_eq!(cache.code_watch.refcount(rejected.physical), 2);
+
+    cache.clear();
+    cache.clear();
+    assert_eq!(cache.code_watch.refcount(compiled.physical), 1);
+    assert_eq!(cache.code_watch.refcount(rejected.physical), 1);
+    cache.code_watch.release_range(compiled.physical, 4);
+    cache.code_watch.release_range(rejected.physical, 4);
+    cache.clear();
+    assert!(!cache.code_watch.has_resident_pages());
+}
+
 #[test]
 fn capacity_pressure_clears_seen_entries() {
     let mut cache = BlockCache::with_entry_cap(2);

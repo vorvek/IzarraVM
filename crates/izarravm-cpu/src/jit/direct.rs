@@ -45,11 +45,9 @@ use super::x87_avx2_emit::{
 use crate::{
     AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, DirectBarrierCensusRow,
     DirectBarrierCensusSnapshot, FLAG_IF, FLAG_TF, FLAG_VM, MAX_PORT_CORE_CLOCKS, OperandSize,
-    PendingFlags, PodKeyBuildHasher, PollFamily, Prefixes, Registers, SegmentIndex,
-    SegmentRegister, U32BuildHasher,
+    PendingFlags, PodKeyBuildHasher, Prefixes, Registers, SegmentIndex, SegmentRegister,
+    U32BuildHasher,
 };
-
-use super::block::{PollScanOutcome, build_poll_loop_from};
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -84,7 +82,7 @@ use crate::{
     DirectSmcCensusSnapshot, DirectSmcCensusUnits,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
-use izarravm_bus::{BusAccessKind, BusWidth, CalloutPollDecline, CalloutPollSkipRequest, CpuBus};
+use izarravm_bus::{BusAccessKind, BusWidth, CpuBus};
 #[cfg(feature = "direct-entry-attribution")]
 use std::cell::UnsafeCell;
 use std::collections::hash_map::Entry;
@@ -2869,9 +2867,12 @@ impl BlockCache {
                 self.data_segment_state_is_empty(),
                 "data-segment governor state outlived its entries"
             );
+            #[cfg(not(feature = "dynarec-mkii"))]
             if watch.has_resident_pages() {
                 watch.clear();
             }
+            #[cfg(feature = "dynarec-mkii")]
+            watch.clear_unreferenced();
             // A full clear still drops heat: signal the owner of the hoisted map.
             self.heat_resets = self.heat_resets.wrapping_add(1);
             self.disabled = false;
@@ -3911,6 +3912,19 @@ impl BlockCache {
     }
 
     fn reset_storage(&mut self, watch: &mut NativeCodeWatch) {
+        #[cfg(feature = "dynarec-mkii")]
+        {
+            for (block, active) in self.blocks.iter().zip(&self.block_active) {
+                if *active {
+                    watch.release_range(block.span.key.physical, u32::from(block.span.guest_len));
+                }
+            }
+            for state in self.entries.values() {
+                if let BlockState::Rejected(span) = state {
+                    watch.release_range(span.key.physical, u32::from(span.guest_len));
+                }
+            }
+        }
         let links = self
             .outbound
             .iter()
@@ -3988,7 +4002,10 @@ impl BlockCache {
         self.block_link_epochs.clear();
         self.iteration_upper_cache.clear();
         self.callout_admission.clear();
+        #[cfg(not(feature = "dynarec-mkii"))]
         watch.clear();
+        #[cfg(feature = "dynarec-mkii")]
+        watch.clear_unreferenced();
         // Every storage reset drops heat; the owner of the hoisted map observes this counter.
         self.heat_resets = self.heat_resets.wrapping_add(1);
         self.block_active.clear();
@@ -30176,201 +30193,23 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     let mut extra_raw_clocks: u64 = 0;
     let mut forced_step_break = false;
     if permission.is_none() {
-        cpu.jit_direct.note_poll_attempt();
-        if port != 0x03da {
-            cpu.jit_direct.note_poll_declined_port();
-        } else if !cpu.jit_direct.direct_poll_skip_armed_for() {
-            cpu.jit_direct.note_poll_declined_knob();
-        } else if !(matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586)
-            && !cpu.interrupt_shadow
-            && !cpu.profile.enabled
-            && !crate::run::diff_trace_enabled())
-        {
-            cpu.jit_direct.note_poll_declined_eligibility();
-        } else if !cpu.registers.cs().default_size_32
-            && !(cpu.jit_direct.block_poll_skip_16_armed() && cpu.registers.cs().limit <= 0xffff)
-        {
-            // The 16-bit screen, BEFORE the scan -- and THE KNOB IS TESTED INSIDE IT,
-            // which is what makes the OFF arm bit-identical to `main` rather than
-            // merely equivalent. A 16-bit read on the default arm costs exactly what it
-            // costs on `main`: this one bool test plus a counter bump, no cache probe,
-            // no scan. Ordering matters both ways: a 32-bit read short-circuits on
-            // `default_size_32` and never reads the arm at all, and the arm itself is a
-            // plain field published once per native entry rather than an `Option` +
-            // `OnceLock` read on 1.52e9 reads (review round-2 MAJOR-10).
-            //
-            // Tyrian 2000 spins on 0x3DA from 16-bit native blocks: 1.5e9 doomed scans,
-            // ~80% of its wall, until this screen existed (2026-08-29; OFF-arm A/B: 5.2x
-            // at 586, 4.0x at 486, identical retired instructions). The screen stays;
-            // the 16-bit slice opens it only under `IZARRAVM_DIRECT_POLL_SKIP_16`.
-            //
-            // `cs.limit <= 0xFFFF` rides beside the arm as a pure optimisation (review
-            // round-2 MINOR-9). `build_poll_loop_at` carries the same term as its own
-            // admission condition, which is what makes the `sixteen_bit_ok` parameter
-            // sound on its own terms -- but that one refuses VOLATILE, and a volatile is
-            // never cached, so a `CS.D = 0, limit > 0xFFFF` guest on the ON arm would pay
-            // a full scan per read to reach it. One compare here avoids the scan
-            // entirely. C0 measured this state as unreached on tyrian; it is a
-            // fail-closed guard, not a coverage cost.
-            //
-            // The interpreter path has carried its own 16-bit screen inside
-            // `poll_head_possible` all along, and this slice does NOT touch it.
-            cpu.jit_direct.note_poll_declined_sixteen_bit();
-        } else {
-            // Live `d` from here down, replacing a hardcoded `true`. Inert on `main` --
-            // those lines sat inside the `else` arm of an unconditional 16-bit screen, so
-            // `d` was provably `true` there -- but it is no longer provable now that the
-            // arm admits 16-bit code, and the negative cache is keyed on `(lin, d)`.
-            let d = cpu.registers.cs().default_size_32;
-            // The 16-bit arm is the only one that consults the mask-decline memo and the
-            // only one that can produce a D1b shape, so `sixteen_bit_ok` and every piece
-            // of D1b bookkeeping below are gated on `!d`. The 32-bit path is byte-for-byte
-            // unchanged, which is what keeps gp2-586 a clean control for the ladder.
-            let sixteen_bit_ok = !d;
-            let slot_linear = cpu
+        let context = super::poll::PollCalloutContext {
+            linear: cpu
                 .registers
                 .cs()
                 .base
-                .wrapping_add(cpu.registers.eip.wrapping_add(slot_delta as u32));
-            // The D1b mask-decline memo, tested BEFORE the negative-cache probe. A
-            // structurally-certified register-mask shape whose live AH is not `0x01`/`0x08`
-            // declines from a `Found`, and a `Found` is never cached (positives are rebuilt
-            // every call so an SMC restamp replaces the descriptor), so without this a
-            // constant wrong `MOV AH,imm8` re-creates the exact per-read scan storm the
-            // 16-bit screen was merged to remove. A pure refusal keyed on AH and the page
-            // generation, so a changed mask or a restamp re-enters the scan.
-            let memo_key = sixteen_bit_ok
-                .then(|| (cpu.read_gpr8(4), cpu.decode_cache.poll_neg_gen(slot_linear)));
-            if let Some((ah, page_gen)) = memo_key
-                && cpu
-                    .jit_direct
-                    .poll_mask_decline_memo_hit(slot_linear, ah, page_gen)
-            {
-                cpu.jit_direct.note_poll_declined_mask_source();
-            } else if cpu.poll_neg_cache_enabled
-                && cpu.decode_cache.poll_negative_live(slot_linear, d)
-            {
-                // The interpreter path's negative cache, on the same key
-                // discipline: the scan ANCHOR (its `current`), a structural
-                // negative only, guarded by the page insert generation. Without
-                // this a loop that never certifies re-scans on every iteration.
-                cpu.perf.poll_neg_cache_hits += 1;
-                cpu.jit_direct.note_poll_declined_shape();
-            } else {
-                match build_poll_loop_from(cpu, slot_linear, sixteen_bit_ok) {
-                    PollScanOutcome::NegativeCacheable => {
-                        if cpu.poll_neg_cache_enabled {
-                            cpu.perf.poll_neg_cache_stores += 1;
-                            cpu.decode_cache.record_poll_negative(slot_linear, d);
-                        }
-                        cpu.jit_direct.note_poll_declined_shape();
-                    }
-                    PollScanOutcome::NegativeVolatile => {
-                        cpu.perf.poll_neg_cache_volatile += 1;
-                        cpu.jit_direct.note_poll_declined_shape();
-                    }
-                    PollScanOutcome::Found(poll) => {
-                        // Unreachable by construction (review MEDIUM 7 on the GP2 poll-skip design: a
-                        // backward scan containing an `IN` slot cannot return a memory-family shape,
-                        // which has no `0xEC` fetch start). `debug_assert!` rather than a counted
-                        // decline lane the review found could never be non-zero.
-                        debug_assert_eq!(
-                            poll.family(),
-                            PollFamily::Io,
-                            "a port call-out's backward scan certified a non-Io shape"
-                        );
-                        // Positional: the slot the scan was told to contain must be the shape's OWN
-                        // `IN` fetch, one byte long. `build_poll_loop_from`'s containment test already
-                        // guarantees SOME fetch matches `slot_linear`; this pins it to the right one.
-                        debug_assert!(
-                            (0..poll.fetch_count()).any(|index| poll
-                                .fetch(index)
-                                .is_some_and(|(linear, _, len)| linear == slot_linear && len == 1)),
-                            "the certified shape does not contain this call-out's own IN slot"
-                        );
-                        // Resolve the symbolic mask ONCE, here, where the registers are
-                        // live -- the exact place and the exact discipline `resolved_port`
-                        // already uses. Everything below reads the RESOLVED copy, so
-                        // `req.status_mask` and `spins_when_bit_set` come from one value
-                        // structurally rather than from two independent derivations. On a
-                        // D1 (`Immediate`) shape this is the identity.
-                        let poll = poll.with_resolved_mask(cpu);
-                        if poll.family() != PollFamily::Io || poll.resolved_port(cpu) != 0x03da {
-                            cpu.jit_direct.note_poll_declined_port_source();
-                        } else if !matches!(poll.status_mask(), 0x01 | 0x08) {
-                            // The mask VALUE check, in the same place and for the same
-                            // reason the port-source check is here: it is the half of the
-                            // shape that lives in a register, so it can only be answered
-                            // against live state and must never become a cached negative.
-                            // `callout_poll_skip` depends on this range -- it takes
-                            // `status_mask.trailing_zeros()` and the analytic edge oracle
-                            // understands only status1 bits 0 and 3 -- so a shape outside it
-                            // is refused rather than approximated. For a D1 shape the same
-                            // condition was already checked at certification from a code
-                            // byte, so only a D1b shape can reach this arm.
-                            //
-                            // Memoised, because a `Found` is never cached: without the memo
-                            // a persistent wrong-AH site rescans on every read.
-                            cpu.jit_direct.note_poll_declined_mask_source();
-                            if let Some((ah, page_gen)) = memo_key {
-                                cpu.jit_direct
-                                    .record_poll_mask_decline(slot_linear, ah, page_gen);
-                            }
-                        } else {
-                            bus.publish_core_clocks(now);
-                            let mut fetches = [(0u32, 0u32, 0u8); 6];
-                            for (slot, index) in fetches.iter_mut().zip(0..poll.fetch_count()) {
-                                if let Some(fetch) = poll.fetch(index) {
-                                    *slot = fetch;
-                                }
-                            }
-                            let (core_num, core_den) = crate::level_timing(cpu.persona());
-                            let request = CalloutPollSkipRequest {
-                                fetches,
-                                fetch_count: poll.fetch_count() as u8,
-                                status_mask: poll.status_mask(),
-                                spins_when_bit_set: poll.fresh_iteration_spins(poll.status_mask()),
-                                raw_core_clocks: cpu.poll_skip_raw_core_clocks(poll),
-                                core_clocks_at_block_entry: cpu.core_clocks_so_far,
-                                prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
-                                core_num,
-                                core_den,
-                                timing_rem: cpu.poll_skip_timing_remainder(),
-                                cap: cpu.jit_direct.block_batch_cap(),
-                                bus_scaled_at_run_entry: cpu.jit_direct.block_bus_at_entry(),
-                                min_iterations: direct_poll_skip_min_iterations(),
-                                max_skipped_raw: direct_poll_skip_max_raw(),
-                            };
-                            match bus.callout_poll_skip(&request) {
-                                Ok(outcome) => {
-                                    extra_raw_clocks = outcome.skipped_raw_core_clocks;
-                                    now = outcome.now_after;
-                                    bus.publish_core_clocks(now);
-                                    forced_step_break = true;
-                                    let head = poll.fetch(0).map_or(slot_linear, |(l, _, _)| l);
-                                    cpu.jit_direct.note_poll_skip_span(
-                                        poll.diagnostic_class(),
-                                        outcome.iterations,
-                                        outcome.skipped_raw_core_clocks,
-                                        outcome.committed_raw_bus_clocks,
-                                        head,
-                                    );
-                                }
-                                // M3: `Cap` is split into its own lane -- it is exactly what BOTH
-                                // BLOCKER 1 and BLOCKER 2 surfaced through before their fixes, so a
-                                // ladder profile needs to tell "the budget genuinely ran out" apart
-                                // from "the other four screens declined" (`poll_declined_seam`).
-                                Err(CalloutPollDecline::Cap) => {
-                                    cpu.jit_direct.note_poll_declined_cap();
-                                }
-                                Err(_) => {
-                                    cpu.jit_direct.note_poll_declined_seam();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                .wrapping_add(cpu.registers.eip.wrapping_add(slot_delta as u32)),
+            interrupt_shadow: cpu.interrupt_shadow,
+            sixteen_bit_armed: cpu.jit_direct.block_poll_skip_16_armed(),
+            core_at_entry: cpu.core_clocks_so_far,
+            prefix_raw: prefix_raw_clocks.saturating_add(fp.clocks),
+            cap: cpu.jit_direct.block_batch_cap(),
+            bus_at_entry: cpu.jit_direct.block_bus_at_entry(),
+        };
+        if let Some(outcome) = super::poll::try_callout_poll_skip(cpu, bus, context) {
+            extra_raw_clocks = outcome.skipped_raw_core_clocks;
+            now = outcome.now_after;
+            forced_step_break = true;
         }
     }
 

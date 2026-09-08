@@ -132,6 +132,27 @@ impl ArenaUnwind {
         max_entries: u32,
     ) -> Option<Self> {
         let info = unwind_info_bytes();
+        Self::new_with_info(
+            range_base,
+            code_len,
+            metadata_page,
+            page_len,
+            max_entries,
+            &info,
+        )
+    }
+
+    pub(crate) fn new_with_info(
+        range_base: *const u8,
+        code_len: usize,
+        metadata_page: *mut u8,
+        page_len: usize,
+        max_entries: u32,
+        info: &[u8],
+    ) -> Option<Self> {
+        if info.is_empty() || info.len() > page_len || code_len > u32::MAX as usize {
+            return None;
+        }
         // SAFETY: the caller over-allocated exactly one RW page at range_base + code_len.
         unsafe { core::ptr::copy_nonoverlapping(info.as_ptr(), metadata_page, info.len()) };
         let entries = (0..max_entries)
