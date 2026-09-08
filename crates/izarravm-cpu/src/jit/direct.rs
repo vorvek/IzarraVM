@@ -3685,6 +3685,21 @@ impl BlockCache {
             .sum()
     }
 
+    #[cfg(test)]
+    pub(crate) fn link_cell_state_for_test(
+        &self,
+        id: BlockId,
+        slot: usize,
+    ) -> Option<(usize, u32, bool)> {
+        let index = self.active_index(id)?;
+        let cell = self.link_cells.get(index)?.get(slot)?;
+        Some((
+            cell.address(),
+            cell.target_eip.load(Ordering::Acquire),
+            cell.linked(),
+        ))
+    }
+
     pub(crate) fn block_for_trace(
         &self,
         linear: u32,
@@ -5616,8 +5631,8 @@ pub(crate) enum DirectKind {
     PushMem {
         addr: DirectAddr,
     },
-    /// JMP r/m32, MEMORY form (0xFF /4): one dword read at `addr`, and EIP becomes the value
-    /// read. Nothing else changes: no stack, no push, no flags.
+    /// JMP r/m, MEMORY form (0xFF /4): one read at `width`, and EIP becomes the zero-extended
+    /// value read. Nothing else changes: no stack, no push, no flags.
     ///
     /// The register form is `JmpReg`, below. It was absent for two reasons that have both since
     /// been settled: the attribution census measured zero occurrences of it (the duke3d-486
@@ -5641,6 +5656,7 @@ pub(crate) enum DirectKind {
     /// cell's static edge is retargeted.
     JmpMem {
         addr: DirectAddr,
+        width: MemoryWidth,
     },
     /// JMP r/m32, REGISTER form (`0xFF /4`, mod == 3): EIP becomes the register's value and
     /// nothing else changes. `CallReg` minus the push, or `JmpMem` minus the memory read -- it
@@ -5648,15 +5664,8 @@ pub(crate) enum DirectKind {
     ///
     /// Four properties, each inherited rather than invented, and each pinned by a mutation:
     ///
-    /// * **Dword only, gated in `classify`.** `0xff` is on the `OperandSize::Word` allowlist, so a
-    ///   `66 FF /4` in 32-bit code reaches the arm at Word size, where the interpreter reads two
-    ///   bytes and masks EIP to 16 bits. Nothing downstream refuses that: `uses_stack` is false
-    ///   for a jump so the stack-width admission matrix never sees this kind, and
-    ///   `static_control_target` is `None` for a dynamic target so the Word control clamp never
-    ///   sees it either. The `/4` arm's existing `insn.operand_size != OperandSize::Dword` gate is
-    ///   the ONLY thing standing between this kind and a miscompile, and it is shared with the
-    ///   memory form rather than duplicated. The residual `0xFF /4` register WORD census row
-    ///   (78,585 exits) stays refused by it, deliberately.
+    /// * **Dword only, gated in `classify`.** Word register jumps remain refused in both code
+    ///   widths. The Word memory form has its own `JmpMem` lowering and does not share this gate.
     /// * **`raw_clocks` 7**, joining the `Call`/`Call16`/`Jmp`/`JmpMem`/`CallReg`/`CallMem` arm.
     ///   `execute_extended.rs` group-5 arm 4 reads its target through `read_operand_sized`, which
     ///   serves both operand forms, and returns `Ok(clocks(7))` without branching on the shape. So
@@ -6241,6 +6250,10 @@ impl DirectKind {
                     // OPERAND size, which is Word for both `Leave16` cells.
                     | Self::Leave16 { .. }
                     | Self::Ret16 { .. }
+                    | Self::JmpMem {
+                        width: MemoryWidth::Word,
+                        ..
+                    }
                     | Self::TestImmMem {
                         width: MemoryWidth::Word,
                         ..
@@ -6293,7 +6306,10 @@ impl DirectKind {
                     | Self::Leave
                     | Self::Ret { .. }
                     | Self::PushMem { .. }
-                    | Self::JmpMem { .. }
+                    | Self::JmpMem {
+                        width: MemoryWidth::Dword,
+                        ..
+                    }
                     | Self::CallMem { .. }
             ) || x87_memory_access_is(self, NativeX87MemoryDirection::Read, MemoryWidth::Dword),
         ) + 2 * u8::from(x87_memory_access_is(
@@ -6450,10 +6466,10 @@ impl DirectKind {
                 addr,
                 ..
             } => Some((addr, width)),
+            Self::JmpMem { addr, width } => Some((addr, width)),
             Self::DoubleShiftMem { addr, .. }
             | Self::PushMem { addr }
             | Self::CallMem { addr, .. }
-            | Self::JmpMem { addr }
             | Self::DivMem { addr, .. } => Some((addr, MemoryWidth::Dword)),
             Self::X87 {
                 insn,
@@ -18848,57 +18864,31 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         addr: direct_addr(addr)?,
                     });
                 }
-                // /4 JMP r/m32, BOTH operand forms. `0xff` is in the `OperandSize::Word` allowlist
-                // above, so a 66-prefixed `FF /4` in 32-bit code reaches this arm at Word size.
-                // NOTHING downstream refuses that: `uses_stack` is false for a jump, so the
-                // stack-width admission matrix never sees this kind, and `static_control_target`
-                // is `None` for a dynamic target, so the Word control clamp never sees it either.
-                // This check is the only gate, on I586 (every other persona refuses Word before
-                // reaching here). At Word size the interpreter reads TWO bytes and masks EIP to
-                // 16 bits; lowering that as the Dword construction reads four bytes and jumps
-                // unmasked, a miscompile twice over.
-                //
-                // The gate is SHARED by the two operand forms rather than duplicated inside each,
-                // and it is the only thing refusing the register form at Word: the residual
-                // `0xFF /4` register word census row (78,585 exits) stays out through this line
-                // and nothing else. `jmp_reg_stays_refused_at_word_size` pins that, and deleting
-                // this check is mutation M1.
-                //
-                // The register form is lowered as `JmpReg`. The "census zero, PUSH-r32-style
-                // clock risk" note this arm used to carry recorded two objections and both have
-                // been answered: the duke3d-486 census reads 11,718,562 static exits and
-                // 11,736,700 interpreted executions here (32.8M/32.8M at 586, its fourth-largest
-                // rejected row), and the clock charge is not a guess -- `execute_extended.rs`
-                // group-5 arm 4 returns `clocks(7)` unconditionally, reading its target through
-                // `read_operand_sized`, which serves the register and memory operands alike.
-                // NOT ON THE `InterpretOne` ALLOWLIST, and the reason is structural rather than
-                // a matter of census weight. The S3 policy widening was asked to consider the
-                // Word memory form (510 k block-stopping hits on the post-S2 loader census, with
-                // a segment override) and REFUTED it.
-                //
-                // An `InterpretOne` slot resumes only when `ResumeSnapshot::allows_resume`'s R1
-                // holds, and R1 demands `cpu.registers.eip == slot_start + insn_len`. A JMP sets
-                // EIP to its TARGET. The two are equal only for a jump to the next instruction,
-                // so the slot resyncs on every real execution, and the governor demotes it after
-                // three of the first eight -- back to the boundary it replaced, having paid a
-                // spill, a call, a run, a reload and a side exit three times over to get there.
-                //
-                // The compile walk makes the same point from the other side. `DirectKind::JmpMem`
-                // is `is_terminal()` and a `CallOut` is not, so admitting the row would let the
-                // walk keep appending slots AFTER the jump: slots the resync guarantees can never
-                // retire, carried in the block's static accounting and its budget bound.
-                //
-                // A native `JmpMem16` is the shape that would serve this row, and it is an S4
-                // question about an emitter rather than an S3 question about policy.
+                // Dword register and memory jumps retain their existing lowerings. A Word memory
+                // jump lowers only when Word is the code segment's default operand size; the 0x66
+                // Word form in 32-bit code stays refused. Word register jumps stay refused in both
+                // code widths. `JmpMem` carries the memory width through accounting and emission.
                 if m.reg == 4 {
-                    if insn.operand_size != OperandSize::Dword {
-                        return None;
-                    }
-                    return match insn.operand? {
-                        DecodedOperand::Reg(dst) => Some(DirectKind::JmpReg { dst }),
-                        DecodedOperand::Mem(addr) => Some(DirectKind::JmpMem {
-                            addr: direct_addr(addr)?,
-                        }),
+                    return match (insn.operand_size, insn.operand?) {
+                        (OperandSize::Dword, DecodedOperand::Reg(dst)) => {
+                            Some(DirectKind::JmpReg { dst })
+                        }
+                        (OperandSize::Dword, DecodedOperand::Mem(addr)) => {
+                            Some(DirectKind::JmpMem {
+                                addr: direct_addr(addr)?,
+                                width: MemoryWidth::Dword,
+                            })
+                        }
+                        (OperandSize::Word, DecodedOperand::Mem(addr))
+                            if !insn.prefixes.operand_size_override =>
+                        {
+                            Some(DirectKind::JmpMem {
+                                addr: direct_addr(addr)?,
+                                width: MemoryWidth::Word,
+                            })
+                        }
+                        (OperandSize::Word, DecodedOperand::Mem(_))
+                        | (OperandSize::Word, DecodedOperand::Reg(_)) => None,
                     };
                 }
                 if !matches!(m.reg, 0 | 1) {
@@ -21137,7 +21127,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 terminal = true;
                 break;
             }
-            DirectKind::JmpMem { addr } => {
+            DirectKind::JmpMem { addr, width } => {
                 // Modelled on the Ret arm above, minus the ESP adjust: the address is the
                 // operand's own `addr`, not the stack slot, and the wrap is `memory.address_wrap`
                 // (a 66-prefixed Dword form in a CS.D = 0 segment needs the Word wrap), not
@@ -21148,24 +21138,32 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let limit_exit = (limit != u32::MAX).then(|| e.label());
                 emit_ram_read_pointer_inner(
                     &mut e,
-                    MemoryWidth::Dword,
+                    width,
                     addr,
                     memory,
                     reasons,
                     memory.address_wrap,
                 );
-                e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
+                match width {
+                    MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
+                    MemoryWidth::Dword => e.load_r32_disp8(Reg::RDX, Reg::RDI, 0),
+                    _ => unreachable!("JmpMem supports Word and Dword only"),
+                }
                 if let Some(limit_exit) = limit_exit {
                     e.cmp_r32_imm32(Reg::RDX, limit);
                     e.jcc(7, limit_exit);
                     side_exit_reason_stubs.push((limit_exit, side, SideExitReason::SegmentLimit));
                 }
-                emit_mode13_read_completion(&mut e, MemoryWidth::Dword);
+                emit_mode13_read_completion(&mut e, width);
                 // Re-load the target. `emit_mode13_read_completion` clobbers RDX on its mode13
                 // branch, the exact bug the Ret arm shipped once and fixed above: the completion
                 // is emitted AFTER the last side-exit branch, so RDI still holds the pointer and
                 // reloading from it is the only way to get the target back into RDX.
-                e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
+                match width {
+                    MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
+                    MemoryWidth::Dword => e.load_r32_disp8(Reg::RDX, Reg::RDI, 0),
+                    _ => unreachable!("JmpMem supports Word and Dword only"),
+                }
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
                 completed.retire(slot, class_table);

@@ -1561,53 +1561,33 @@ fn word_size_call_through_memory_stays_refused() {
     }
 }
 
-/// A 66-prefixed `FF /4` REGISTER form (`jmp bx`) must stay REFUSED — and here, unlike every
-/// paired fixture above, there is genuinely only ONE check that can refuse it.
-///
-/// The residual census row this pins is small and real: 78,585 exits at duke3d-486 against the
-/// 11.7M the Dword register form carries. It is deliberately left unlowered.
-///
-/// `JmpReg` is not `uses_stack()`, so the stack-width admission matrix never sees it — the
-/// escape hatch that redundantly covers `CallReg`, `CallMem` and `PushMem` at Word does not exist
-/// for this kind. `static_control_target` is `None` for a dynamic target, so the Word control
-/// clamp never sees it either. The classifier's `insn.operand_size != OperandSize::Dword` gate,
-/// shared with the memory form one line above it, is the whole defence. Deleting it is mutation
-/// M1, and this fixture is the only thing in the tree that goes red.
-///
-/// What the gate prevents is an EIP-mask miscompile: at Word size the interpreter reads TWO bytes
-/// for the target and masks EIP to 16 bits (`read_operand_sized(.., Word, ..)` then
-/// `target & operand_size.mask()`), while the Dword construction takes the full register and jumps
-/// unmasked. `jmp bx` with EBX = 0x1234_0500 lands at 0x0500 architecturally and at 0x1234_0500
-/// natively — two different blocks, not a rounding difference.
-///
-/// EXACT counts, paired against a POSITIVE CONTROL: the unprefixed `FF /4` register form at the
-/// same entry must lower and grow the block to four instructions. Without the control, "three
-/// instructions" is satisfied identically by correct refusal and by `JmpReg` never reaching the
-/// classifier at all. No stack widening is needed for either case, so the 0x66 prefix is the only
-/// difference between them.
+/// Register jumps remain Dword-only in either code width. The Dword rows are positive controls
+/// for both prefix directions.
 #[test]
-fn word_size_jmp_through_a_register_stays_refused() {
-    let cases: &[(&str, &[u8], u8)] = &[
-        ("unprefixed control", &[0xff, 0xe3], 4),
-        (
-            // 66 ff e3: jmp bx at Word operand size.
-            "0x66-prefixed",
-            &[0x66, 0xff, 0xe3],
-            3,
-        ),
+fn jmp_register_width_matrix_preserves_word_refusals() {
+    let cases: &[(&str, &[u8], bool, u8)] = &[
+        ("Dword in 32-bit code", &[0xff, 0xe3], true, 4),
+        ("Word in 32-bit code", &[0x66, 0xff, 0xe3], true, 3),
+        ("Word in 16-bit code", &[0xff, 0xe3], false, 3),
+        ("Dword in 16-bit code", &[0x66, 0xff, 0xe3], false, 4),
     ];
 
-    for &(label, form, expected_instructions) in cases {
+    for &(label, form, d, expected_instructions) in cases {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(form);
         let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        for segment in [SegmentIndex::Cs, SegmentIndex::Ss] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.default_size_32 = d;
+            cpu.registers.set_segment(segment, descriptor);
+        }
         warm(
             &mut cpu,
             &mut bus,
             &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
         );
 
-        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, d));
         assert_eq!(
             compilation.span.instructions, expected_instructions,
             "{label}: the Dword form must lower and the Word form must stay refused"
@@ -1615,52 +1595,67 @@ fn word_size_jmp_through_a_register_stays_refused() {
     }
 }
 
-/// A 66-prefixed `FF /4` must stay REFUSED, and nothing else in the crate can catch it.
-///
-/// `0xff` is in the Word allowlist, so this form reaches the classifier and would otherwise
-/// produce a `JmpMem`. Nothing downstream refuses it the way the stack-width matrix refuses
-/// `PushMem`'s Word form: `uses_stack` is false for a jump, so that matrix never sees this kind,
-/// and `static_control_target` is `None` for a dynamic target, so the Word control clamp never
-/// sees it either. The classifier's own operand-size check is the ONLY gate. At Word size the
-/// interpreter reads TWO bytes and masks EIP to 16 bits; lowering that as the Dword construction
-/// would read four bytes and jump unmasked, a miscompile twice over.
-///
-/// The assertion is an EXACT count, paired against a POSITIVE CONTROL: the unprefixed `FF /4` at
-/// the same entry must lower and grow the block to four instructions. Without the control, "the
-/// block is three instructions" is satisfied identically by the Word form being correctly refused
-/// OR by `JmpMem` never reaching the classifier at all, and the fixture cannot tell those apart.
-/// `JmpMem` needs no stack widening, unlike the `PushMem` pairing above: the only difference
-/// between the two cases here is the 0x66 prefix.
+/// Memory jumps admit Dword in either code width and default-Word only in 16-bit code. The
+/// 66-prefixed Word form in 32-bit code remains outside this pilot.
 #[test]
-fn word_size_jmp_through_memory_stays_refused() {
-    let cases: &[(&str, &[u8], u8)] = &[
+fn jmp_memory_width_matrix_admits_only_default_word() {
+    type WidthCase<'a> = (&'a str, &'a [u8], bool, u8, u8, u8);
+    let cases: &[WidthCase<'_>] = &[
         (
-            "unprefixed control",
+            "Dword in 32-bit code",
             &[0xff, 0x25, 0x00, 0x08, 0x00, 0x00],
+            true,
             4,
+            0,
+            1,
         ),
         (
-            // 66 ff 25 00 08 00 00: jmp word [0x800] at Word operand size.
-            "0x66-prefixed",
+            "Word in 32-bit code",
             &[0x66, 0xff, 0x25, 0x00, 0x08, 0x00, 0x00],
+            true,
             3,
+            0,
+            0,
+        ),
+        (
+            "Word in 16-bit code",
+            &[0xff, 0x26, 0x00, 0x08],
+            false,
+            4,
+            1,
+            0,
+        ),
+        (
+            "Dword in 16-bit code",
+            &[0x66, 0xff, 0x26, 0x00, 0x08],
+            false,
+            4,
+            0,
+            1,
         ),
     ];
 
-    for &(label, form, expected_instructions) in cases {
+    for &(label, form, d, expected_instructions, word_reads, dword_reads) in cases {
         let mut code = vec![0x40, 0x41, 0x42];
         code.extend_from_slice(form);
         let (mut cpu, mut bus) = flat_fixture(ENTRY, &code);
+        for segment in [SegmentIndex::Cs, SegmentIndex::Ss] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.default_size_32 = d;
+            cpu.registers.set_segment(segment, descriptor);
+        }
         warm(
             &mut cpu,
             &mut bus,
             &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
         );
 
-        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, d));
         assert_eq!(
             compilation.span.instructions, expected_instructions,
             "{label}: the Dword form must lower and the Word form must stay refused"
         );
+        assert_eq!(compilation.word_reads, word_reads, "{label}: word reads");
+        assert_eq!(compilation.dword_reads, dword_reads, "{label}: dword reads");
     }
 }

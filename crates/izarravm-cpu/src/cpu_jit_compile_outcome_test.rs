@@ -3471,52 +3471,56 @@ fn ff_slash_6_register_form_stays_refused() {
 /// past it, `JmpMem` is a terminal and stops the block right there.
 #[test]
 fn a_jmp_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor() {
-    let (mut cpu, mut bus) = fixture(&[
-        0x40, // inc eax
-        0x41, // inc ecx
-        0xff, 0x25, 0x00, 0x08, 0x00, 0x00, // jmp dword [0x800]
-    ]);
-    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    type JmpCase<'a> = (&'a str, &'a [u8], bool, u16, u8, u8);
+    let cases: &[JmpCase<'_>] = &[
+        (
+            "Dword",
+            &[0x40, 0x41, 0xff, 0x25, 0x00, 0x08, 0x00, 0x00],
+            true,
+            8,
+            0,
+            1,
+        ),
+        (
+            "Word",
+            &[0x40, 0x41, 0xff, 0x26, 0x00, 0x08],
+            false,
+            6,
+            1,
+            0,
+        ),
+    ];
+    for &(label, code, d, guest_len, word_reads, dword_reads) in cases {
+        let (mut cpu, mut bus) = fixture(code);
+        for segment in [SegmentIndex::Cs, SegmentIndex::Ss] {
+            let mut descriptor = cpu.registers.segment(segment);
+            descriptor.default_size_32 = d;
+            cpu.registers.set_segment(segment, descriptor);
+        }
+        warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
 
-    let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, true));
-    assert_eq!(
-        compilation.span.instructions, 3,
-        "two fillers plus the jump, and nothing past it: JmpMem is a terminal"
-    );
-    assert_eq!(
-        compilation.span.guest_len, 8,
-        "the span must end AT the jump, not run past it: two one-byte fillers plus the six-byte \
-         FF /4 form"
-    );
-    // The clock pin. Two 2-clock INCs plus the interpreter's explicit clocks(7) for group-5 arm 4
-    // (`execute_extended.rs:920-924`). Without its own `raw_clocks` arm JmpMem rides the `_ => 2`
-    // default and undercharges every jump by 5.
-    assert_eq!(
-        compilation.raw_clocks,
-        2 * crate::timing_class::I586.raw(TimingClass::Reg)
-            + crate::timing_class::I586.raw(TimingClass::CallJmpRm)
-    );
-    assert_eq!(compilation.dword_reads, 1);
-    assert_eq!(compilation.byte_reads, 0);
-    assert_eq!(compilation.word_reads, 0);
-    assert_eq!(compilation.byte_stores, 0);
-    assert_eq!(compilation.word_stores, 0);
-    assert_eq!(compilation.dword_stores, 0);
-    // The whole value of the slice rides on these two. Dropping either registration compiles a
-    // working-looking block whose jump either never links (`dynamic_successor`) or statically
-    // binds the wrong edge (`successors`), the bytes after the jump that are never a successor of
-    // an unconditional one.
-    assert!(
-        compilation.dynamic_successor,
-        "without this, link_sources never learns the cell and every jump exits to the dispatcher \
-         forever"
-    );
-    assert_eq!(
-        compilation.successors,
-        [None, None],
-        "a dynamic target has no static successor; the fall-through arm would record the bytes \
-         after the jump as one, a phantom edge a stale dynamically-bound cell can transfer into"
-    );
+        let compilation = compiled(jit::direct::compile(&mut cpu, ENTRY, d));
+        assert_eq!(compilation.span.instructions, 3, "{label}: terminal span");
+        assert_eq!(compilation.span.guest_len, guest_len, "{label}: guest span");
+        assert_eq!(
+            compilation.raw_clocks,
+            2 * crate::timing_class::I586.raw(TimingClass::Reg)
+                + crate::timing_class::I586.raw(TimingClass::CallJmpRm),
+            "{label}: raw clocks"
+        );
+        assert_eq!(compilation.byte_reads, 0, "{label}: byte reads");
+        assert_eq!(compilation.word_reads, word_reads, "{label}: word reads");
+        assert_eq!(compilation.dword_reads, dword_reads, "{label}: dword reads");
+        assert_eq!(compilation.byte_stores, 0, "{label}: byte stores");
+        assert_eq!(compilation.word_stores, 0, "{label}: word stores");
+        assert_eq!(compilation.dword_stores, 0, "{label}: dword stores");
+        assert!(compilation.dynamic_successor, "{label}: dynamic successor");
+        assert_eq!(
+            compilation.successors,
+            [None, None],
+            "{label}: static successors"
+        );
+    }
 }
 
 /// The first fixture to compile a `CallReg` slot at all: `call ebx`, the REGISTER form of

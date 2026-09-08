@@ -2926,6 +2926,41 @@ fn sixteen_bit_addressing_modes_classify_with_the_interpreter_shape() {
     assert!(direct_addr(bad_scale).is_none());
 }
 
+#[test]
+fn word_memory_jump_refuses_an_unrepresentable_address() {
+    let insn = DecodedInsn {
+        len: 2,
+        prefixes: Prefixes::default(),
+        opcode: 0xff,
+        operand_size: OperandSize::Word,
+        address_size: AddressSize::Word,
+        modrm: Some(crate::ModRm {
+            mode: 0,
+            reg: 4,
+            rm: 0,
+        }),
+        operand: Some(DecodedOperand::Mem(crate::AddrMode {
+            segment: SegmentIndex::Ds,
+            base: Some(3),
+            index: Some(6),
+            scale: 3,
+            disp: 0,
+            address_size: AddressSize::Word,
+        })),
+        imm: 0,
+        imm2: 0,
+        group: DecodeGroup::ControlFlow,
+        continuable: true,
+        disp_len: 0,
+        imm_len: 0,
+    };
+    assert!(classify(&insn, 0x100, 0x100).is_none());
+    assert!(matches!(
+        DirectUnitPlanner::classify(&insn, 0x100, 0x100),
+        PlannedInsn::HardBoundary
+    ));
+}
+
 /// The emitter masks a ModRM-derived effective address at 64K when the block's address size is
 /// 16-bit, and does not when it is 32-bit.
 ///

@@ -3519,6 +3519,9 @@ mod retire_governor;
 #[path = "cpu_jit_sixteen_bit_test.rs"]
 mod sixteen_bit;
 
+#[path = "cpu_jit_word_jmp_mem_test.rs"]
+mod word_jmp_mem;
+
 #[path = "cpu_jit_width_lift_test.rs"]
 mod width_lift;
 

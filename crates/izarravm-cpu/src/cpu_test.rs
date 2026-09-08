@@ -2823,6 +2823,8 @@ pub(crate) struct TestBus {
     // there), which is the situation the slow-read page histogram exists to take apart. Without it
     // TestBus has no readable-but-not-direct region at all: every in-range `DataRead` is direct.
     non_direct_read_pages: Vec<u32>,
+    side_effect_read_address: Option<u32>,
+    side_effect_read_count: u64,
     decline_bulk_write: bool,
     // G4: deny direct pages under InstructionPrefetch only, modeling a non-RAM code page.
     deny_instruction_prefetch_direct_page: bool,
@@ -2909,6 +2911,8 @@ impl TestBus {
             direct_pages_writable: true,
             direct_write_denied_page: None,
             non_direct_read_pages: Vec::new(),
+            side_effect_read_address: None,
+            side_effect_read_count: 0,
             deny_instruction_prefetch_direct_page: false,
             fail_instruction_prefetch_direct_page: false,
             instruction_prefetch_direct_page_requests: 0,
@@ -2986,6 +2990,9 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<u32, BusError> {
+        if kind == BusAccessKind::DataRead && self.side_effect_read_address == Some(address) {
+            self.side_effect_read_count += 1;
+        }
         if let Some(events) = self.core_events.as_mut() {
             events.push(TestCoreEvent::Memory(address, kind, self.published_core));
         }

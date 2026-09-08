@@ -1363,9 +1363,9 @@ fn the_cs_override_word_memory_forms_match_the_interpreter() {
 /// a 16-bit segment: `RmwIncDec` (`emit_rmw_inc_dec`) and `AluMemDest` with a writing op
 /// (`emit_alu_mem_dest`'s non-CMP branch). The second is the one the review found missing from the
 /// rule's first version, and the census ranks it: `0x83 /5 cs:` carries 9,464,397 unbound exits.
-/// The read-side sites are in `a_protected_mode_segment_base_decides_the_alignment`, because
-/// `DivMem`, `PushMem`, `CallMem`, `JmpMem` and the x87 memory forms are all Dword-only and so
-/// unreachable in a 16-bit code segment.
+/// The other read-side sites are in `a_protected_mode_segment_base_decides_the_alignment`.
+/// `DivMem`, `PushMem`, `CallMem` and the x87 memory forms are Dword-only and unreachable in a
+/// 16-bit code segment; default-Word `JmpMem` is covered here.
 ///
 /// THE ESCAPES ARE THE POINT, and each names a different clause of the predicate:
 ///
@@ -1396,6 +1396,10 @@ fn a_statically_misaligned_cs_operand_stays_a_barrier() {
         (
             "add word cs:[odd], 1 (AluMemDest /0)",
             [vec![0x2e, 0x83, 0x06], w(odd), vec![0x01]].concat(),
+        ),
+        (
+            "jmp word cs:[odd] (JmpMem)",
+            [vec![0x2e, 0xff, 0x26], w(odd)].concat(),
         ),
     ] {
         assert_eq!(
@@ -1448,6 +1452,11 @@ fn a_statically_misaligned_cs_operand_stays_a_barrier() {
             "{name} must still compile, or the rule is wider than its argument"
         );
     }
+    assert_eq!(
+        compile16(&[vec![0x2e, 0xff, 0x26], w(OPERAND)].concat()),
+        Some(2),
+        "the aligned word memory jump must compile through its terminal slot"
+    );
     // ...and with the gate OFF the rule must not fire at all.
     select_v86_loop_rows(false);
     assert_eq!(
