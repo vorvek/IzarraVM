@@ -248,6 +248,7 @@ fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
             if unavailable {
                 bus.non_direct_read_pages.push(operand >> 12);
                 bus.direct_pages_enabled = false;
+                assert!(bus.peek_direct_ram(operand, BusWidth::Word).is_none());
             }
         }
         if unavailable {
@@ -299,10 +300,26 @@ fn word_memory_jump_alignment_and_unavailable_exits_replay_once() {
                 .count(),
             1
         );
+        let data_reads = native_bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|cycle| {
+                cycle.kind == BusAccessKind::DataRead
+                    && (cycle.address == operand || cycle.address == operand + 1)
+            })
+            .map(|cycle| (cycle.address, cycle.width))
+            .collect::<Vec<_>>();
         assert_eq!(
-            native.perf_counters().instructions - guest_before,
-            interp.perf_counters().instructions - interp_guest_before
+            data_reads,
+            if unavailable {
+                vec![(operand, BusWidth::Word)]
+            } else {
+                vec![(operand, BusWidth::Byte), (operand + 1, BusWidth::Byte)]
+            }
         );
+        assert_eq!(native.perf_counters().instructions - guest_before, 7);
+        assert_eq!(interp.perf_counters().instructions - interp_guest_before, 7);
         assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
         assert_eq!(
             native.perf_counters().jit_direct_side_exits - exits_before,
@@ -395,7 +412,14 @@ fn word_memory_jump_source_limit_exits_then_dispatcher_replays_the_fault() {
     let interp_error = run_to_error(&mut interp, &mut interp_bus);
     let native_error = run_to_error(&mut native, &mut native_bus);
 
-    assert_eq!(format!("{native_error:?}"), format!("{interp_error:?}"));
+    assert_eq!(native_error, interp_error);
+    assert!(matches!(
+        native_error,
+        CpuRunError {
+            error: CpuError::Bus(BusError::UnmappedMemory { address: 0xfffe }),
+            consumed_core_clocks: 3,
+        }
+    ));
     assert_eq!(
         crate::tests::settled_state(&native),
         crate::tests::settled_state(&interp)
@@ -408,9 +432,16 @@ fn word_memory_jump_source_limit_exits_then_dispatcher_replays_the_fault() {
     );
     assert_eq!(native_bus.side_effect_read_count, 0);
     assert_eq!(interp_bus.side_effect_read_count, 0);
+    assert_eq!(native.perf_counters().instructions - guest_before, 3);
+    assert_eq!(interp.perf_counters().instructions - interp_guest_before, 3);
     assert_eq!(
-        native.perf_counters().instructions - guest_before,
-        interp.perf_counters().instructions - interp_guest_before
+        native_bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|cycle| cycle.kind == BusAccessKind::DataRead && cycle.address == FAILING)
+            .count(),
+        0
     );
     assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
     assert_eq!(
@@ -460,6 +491,9 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
     }
     let direct_before = native.perf_counters().jit_direct_insns;
     let exits_before = native.perf_counters().jit_direct_side_exits;
+    let guest_before = native.perf_counters().instructions;
+    let interp_guest_before = interp.perf_counters().instructions;
+    let limits_before = native.direct_stall_snapshot().side_exit_segment_limit;
 
     interp
         .cycle_no_interrupt_check(&mut interp_bus)
@@ -488,6 +522,8 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
         .expect("second interpreted filler");
 
     assert_eq!(native.registers.eip, SOURCE + 3);
+    assert_eq!(native.perf_counters().instructions - guest_before, 3);
+    assert_eq!(interp.perf_counters().instructions - interp_guest_before, 3);
     assert_eq!(native_bus.side_effect_read_count, 0);
     assert_eq!(interp_bus.side_effect_read_count, 0);
     assert_eq!(
@@ -516,6 +552,8 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
         .cycle_no_interrupt_check(&mut native_bus)
         .expect("dispatcher replay retires the jump");
     assert_eq!(native.registers.eip, u32::from(TOO_LARGE));
+    assert_eq!(native.perf_counters().instructions - guest_before, 4);
+    assert_eq!(interp.perf_counters().instructions - interp_guest_before, 4);
     assert_eq!(native_bus.side_effect_read_count, 1);
     assert_eq!(interp_bus.side_effect_read_count, 1);
     assert_eq!(
@@ -537,8 +575,20 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
         .cycle_no_interrupt_check(&mut native_bus)
         .expect_err("next replay fetch must fault");
 
-    assert_eq!(format!("{native_error:?}"), format!("{interp_error:?}"));
+    assert_eq!(native_error, interp_error);
+    assert!(
+        matches!(
+            native_error,
+            CpuRunError {
+                error: CpuError::Bus(BusError::UnmappedMemory { address: 0xfffe }),
+                consumed_core_clocks: 0,
+            }
+        ),
+        "{native_error:?}"
+    );
     assert_eq!(native.registers.eip, u32::from(TOO_LARGE));
+    assert_eq!(native.perf_counters().instructions - guest_before, 4);
+    assert_eq!(interp.perf_counters().instructions - interp_guest_before, 4);
     assert_eq!(
         crate::tests::settled_state(&native),
         crate::tests::settled_state(&interp)
@@ -551,9 +601,23 @@ fn word_memory_jump_target_limit_replays_then_next_fetch_faults_without_reread()
     );
     assert_eq!(native_bus.side_effect_read_count, 1);
     assert_eq!(interp_bus.side_effect_read_count, 1);
+    assert_eq!(
+        native_bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|cycle| cycle.kind == BusAccessKind::DataRead && cycle.address == POINTER)
+            .map(|cycle| cycle.width)
+            .collect::<Vec<_>>(),
+        vec![BusWidth::Word]
+    );
     assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
     assert_eq!(
         native.perf_counters().jit_direct_side_exits - exits_before,
+        1
+    );
+    assert_eq!(
+        native.direct_stall_snapshot().side_exit_segment_limit - limits_before,
         1
     );
 }
@@ -731,6 +795,16 @@ fn word_memory_jump_target_data_mutation_rebinds_without_retiring_the_source() {
             .1,
         TARGET_A
     );
+    let cells_bound = [0, 1].map(|slot| {
+        cpu.jit_direct
+            .link_cell_state_for_test(source_id, slot)
+            .expect("bound source link cell")
+    });
+    assert!(
+        cells_bound
+            .iter()
+            .any(|state| state.1 == TARGET_A && state.2)
+    );
     cpu.set_eip(SOURCE);
     cpu.registers.gpr.fill(0);
     assert!(cpu.try_run_direct_block_for_test(&mut bus, source).unwrap());
@@ -765,6 +839,15 @@ fn word_memory_jump_target_data_mutation_rebinds_without_retiring_the_source() {
             initial.0
         );
     }
+    assert_eq!(
+        [0, 1].map(|slot| {
+            cpu.jit_direct
+                .link_cell_state_for_test(source_id, slot)
+                .expect("bound cell survives target-data write")
+        }),
+        cells_bound,
+        "the unwatched target-data write must preserve the full A binding"
+    );
 
     let transfers = cpu.perf_counters().jit_direct_linked_transfers;
     cpu.set_eip(SOURCE);
@@ -995,12 +1078,24 @@ fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
     arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
     let block = install_word_jmp(&mut cpu, SOURCE + 1);
     cpu.set_eip(SOURCE + 1);
+    cpu.registers.set_ebx(POINTER);
+
+    let (num, den) = level_timing(cpu.persona());
+    let scaled_core_upper = u64::from(block.raw_clocks())
+        .saturating_mul(u64::from(num))
+        .div_ceil(u64::from(den));
+    let fetch_upper = bus
+        .jit_fetch_cost_clocks()
+        .saturating_mul(u64::from(block.span().instructions));
+    let word_read_upper = bus.jit_data_cost_clocks(BusWidth::Word);
+    let iteration_upper = scaled_core_upper
+        .saturating_add(bus.jit_scale_bus_cost_upper(fetch_upper.saturating_add(word_read_upper)));
 
     let registers = cpu.registers.clone();
     let pending = cpu.pending_flags;
     let budget_refusals = cpu.perf_counters().jit_direct_reject_zero_budget;
     assert!(
-        !cpu.try_run_direct_block_with_cap_for_test(&mut bus, block, 1)
+        !cpu.try_run_direct_block_with_cap_for_test(&mut bus, block, iteration_upper)
             .unwrap()
     );
     assert_eq!(cpu.registers, registers);
@@ -1009,6 +1104,21 @@ fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
         cpu.perf_counters().jit_direct_reject_zero_budget - budget_refusals,
         1
     );
+
+    let guest_before = cpu.perf_counters().instructions;
+    let direct_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_with_cap_for_test(&mut bus, block, iteration_upper + 1)
+            .unwrap()
+    );
+    assert_eq!(cpu.registers.eip, TARGET);
+    assert_eq!(cpu.perf_counters().instructions - guest_before, 3);
+    assert_eq!(cpu.perf_counters().jit_direct_insns - direct_before, 3);
+
+    cpu.registers = registers.clone();
+    cpu.elapsed_clocks = 0;
+    cpu.timing_rem = 0;
+    cpu.core_clocks_so_far = 0;
 
     let shadow_refusals = cpu.perf_counters().jit_direct_reject_interrupt_shadow;
     cpu.interrupt_shadow = true;
@@ -1024,6 +1134,12 @@ fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
     cpu.set_eip(SOURCE + 1);
     cpu.registers.eflags |= FLAG_IF;
     bus.pending_irq = Some(8);
+    let source_key = jit::direct::key_for(&cpu, SOURCE + 1, false).expect("source key");
+    assert!(matches!(
+        cpu.jit_direct.probe(source_key),
+        jit::direct::BlockProbe::Ready(_)
+    ));
+    let entries_before = cpu.perf_counters().jit_direct_entries;
     let direct_before = cpu.perf_counters().jit_direct_insns;
     assert!(
         cpu.service_pending_interrupt(&mut bus)
@@ -1031,6 +1147,8 @@ fn word_memory_jump_respects_tight_budget_pending_irq_and_interrupt_shadow() {
             .is_some()
     );
     assert_eq!(cpu.registers.eip, 0);
+    assert_eq!(cpu.perf_counters().jit_direct_entries, entries_before);
+    assert_eq!(cpu.perf_counters().jit_direct_insns, direct_before);
     cpu.cycle(&mut bus).unwrap();
     assert!(cpu.halted);
     assert_eq!(cpu.registers.eip, 1);
@@ -1082,11 +1200,12 @@ fn cpl3_word_memory_jump_permission_exit_replays_through_the_dispatcher() {
     ]);
     memory[DATA as usize..DATA as usize + 2].copy_from_slice(&(TARGET as u16).to_le_bytes());
     memory[TARGET as usize..TARGET as usize + 3].copy_from_slice(&[0x90, 0x90, 0xf4]);
+    memory[0x3000..0x3004].copy_from_slice(&0x4007u32.to_le_bytes());
+    memory[0x4000..0x4004].copy_from_slice(&0x0007u32.to_le_bytes());
+    memory[0x4004..0x4008].copy_from_slice(&0x1003u32.to_le_bytes());
 
     let mut interp = paged_word_cpu(SOURCE);
     let mut native = paged_word_cpu(SOURCE);
-    interp.control.cr0 &= !CR0_PG;
-    native.control.cr0 &= !CR0_PG;
     let mut interp_bus = sixteen_bit_bus(memory.clone());
     let mut native_bus = sixteen_bit_bus(memory);
     warm_sixteen_bit(
@@ -1126,26 +1245,58 @@ fn cpl3_word_memory_jump_permission_exit_replays_through_the_dispatcher() {
     for bus in [&mut interp_bus, &mut native_bus] {
         bus.trace.clear();
     }
+    let guest_before = native.perf_counters().instructions;
+    let interp_guest_before = interp.perf_counters().instructions;
     let direct_before = native.perf_counters().jit_direct_insns;
     let exits_before = native.perf_counters().jit_direct_side_exits;
     let permission_before = native.perf_counters().jit_direct_exit_permission;
+    let native_walks_before = native.perf_counters().tlb_walks;
+    let interp_walks_before = interp.perf_counters().tlb_walks;
 
-    native.cycle(&mut native_bus).unwrap();
-    interp.cycle(&mut interp_bus).unwrap();
+    native.cycle_no_interrupt_check(&mut native_bus).unwrap();
+    interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
     assert!(
         native
             .try_run_direct_block_for_test(&mut native_bus, block)
             .unwrap()
     );
-    interp.cycle(&mut interp_bus).unwrap();
-    interp.cycle(&mut interp_bus).unwrap();
+    interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
+    interp.cycle_no_interrupt_check(&mut interp_bus).unwrap();
     assert_eq!(native.registers.eip, SOURCE + 3);
     assert_eq!(native.registers.eip, interp.registers.eip);
+    assert_eq!(native.perf_counters().instructions - guest_before, 3);
+    assert_eq!(interp.perf_counters().instructions - interp_guest_before, 3);
+    assert_eq!(native.perf_counters().tlb_walks, native_walks_before);
+    assert_eq!(interp.perf_counters().tlb_walks, interp_walks_before);
+    assert!(
+        native_bus
+            .trace
+            .cycles()
+            .iter()
+            .all(|cycle| cycle.kind != BusAccessKind::DataRead || cycle.address != DATA)
+    );
+
+    native.jit_fast_map.invalidate_page(DATA);
     let interp_error = run_to_error(&mut interp, &mut interp_bus);
     let native_error = run_to_error(&mut native, &mut native_bus);
 
-    assert_eq!(format!("{native_error:?}"), format!("{interp_error:?}"));
-    assert_eq!(native.registers.eip, TARGET + 2);
+    assert_eq!(native_error, interp_error);
+    assert!(matches!(
+        native_error,
+        CpuRunError {
+            error: CpuError::TripleFault {
+                original_vector: 14,
+                nested_vector: 11,
+            },
+            consumed_core_clocks: 0,
+        }
+    ));
+    assert_eq!(native.control.cr2, DATA);
+    assert_eq!(native.control.cr2, interp.control.cr2);
+    assert_eq!(native.perf_counters().instructions - guest_before, 3);
+    assert_eq!(interp.perf_counters().instructions - interp_guest_before, 3);
+    assert_eq!(native.perf_counters().tlb_walks - native_walks_before, 1);
+    assert_eq!(interp.perf_counters().tlb_walks - interp_walks_before, 1);
     assert_eq!(
         crate::tests::settled_state(&native),
         crate::tests::settled_state(&interp)
@@ -1153,6 +1304,36 @@ fn cpl3_word_memory_jump_permission_exit_replays_through_the_dispatcher() {
     assert_eq!(native_bus.memory, interp_bus.memory);
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
     assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+    let page_walk_reads = native_bus
+        .trace
+        .cycles()
+        .iter()
+        .filter(|cycle| cycle.kind == BusAccessKind::PageWalkRead)
+        .map(|cycle| (cycle.address, cycle.width, cycle.clocks))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        page_walk_reads,
+        vec![(0x3000, BusWidth::Dword, 2), (0x4004, BusWidth::Dword, 2),]
+    );
+    let page_walk_writes = native_bus
+        .trace
+        .cycles()
+        .iter()
+        .filter(|cycle| cycle.kind == BusAccessKind::PageWalkWrite)
+        .map(|cycle| (cycle.address, cycle.width, cycle.clocks))
+        .collect::<Vec<_>>();
+    assert!(page_walk_writes.is_empty());
+    assert_eq!(
+        u32::from_le_bytes(native_bus.memory[0x4004..0x4008].try_into().unwrap()),
+        0x1003
+    );
+    assert!(
+        native_bus
+            .trace
+            .cycles()
+            .iter()
+            .all(|cycle| cycle.kind != BusAccessKind::DataRead || cycle.address != DATA)
+    );
     assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
     assert_eq!(
         native.perf_counters().jit_direct_side_exits - exits_before,
@@ -1211,16 +1392,33 @@ fn crossing_word_memory_jump_faults_on_the_first_unmapped_page_in_replay_order()
             cpu.core_clocks_so_far = 0;
         }
         let direct_before = native.perf_counters().jit_direct_insns;
+        let guest_before = native.perf_counters().instructions;
+        let interp_guest_before = interp.perf_counters().instructions;
         let exits_before = native.perf_counters().jit_direct_side_exits;
         let crossing_before = native
             .perf_counters()
             .jit_direct_exit_cross_page_or_alignment;
+        let native_walks_before = native.perf_counters().tlb_walks;
+        let interp_walks_before = interp.perf_counters().tlb_walks;
 
         let interp_error = run_to_error(&mut interp, &mut interp_bus);
         let native_error = run_to_error(&mut native, &mut native_bus);
         let expected_cr2 = if first_present { 0x2000 } else { 0x1fff };
 
-        assert_eq!(format!("{native_error:?}"), format!("{interp_error:?}"));
+        assert_eq!(native_error, interp_error);
+        assert!(
+            matches!(
+                native_error,
+                CpuRunError {
+                    error: CpuError::TripleFault {
+                        original_vector: 14,
+                        nested_vector: 11,
+                    },
+                    consumed_core_clocks: 3,
+                }
+            ),
+            "first_present={first_present}: {native_error:?}"
+        );
         assert_eq!(native.control.cr2, expected_cr2);
         assert_eq!(native.control.cr2, interp.control.cr2);
         assert_eq!(
@@ -1233,6 +1431,77 @@ fn crossing_word_memory_jump_faults_on_the_first_unmapped_page_in_replay_order()
         assert_eq!(
             native_bus.side_effect_read_count,
             interp_bus.side_effect_read_count
+        );
+        assert_eq!(native.perf_counters().instructions - guest_before, 3);
+        assert_eq!(interp.perf_counters().instructions - interp_guest_before, 3);
+        let expected_walks = if first_present { 3 } else { 1 };
+        assert_eq!(
+            native.perf_counters().tlb_walks - native_walks_before,
+            expected_walks
+        );
+        assert_eq!(
+            interp.perf_counters().tlb_walks - interp_walks_before,
+            expected_walks
+        );
+        let page_walk_reads = native_bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|cycle| cycle.kind == BusAccessKind::PageWalkRead)
+            .map(|cycle| (cycle.address, cycle.width, cycle.clocks))
+            .collect::<Vec<_>>();
+        let expected_reads = if first_present {
+            vec![
+                (0x3000, BusWidth::Dword, 2),
+                (0x4004, BusWidth::Dword, 2),
+                (0x3000, BusWidth::Dword, 2),
+                (0x4008, BusWidth::Dword, 2),
+                (0x3000, BusWidth::Dword, 2),
+                (0x4000, BusWidth::Dword, 2),
+            ]
+        } else {
+            vec![(0x3000, BusWidth::Dword, 2), (0x4004, BusWidth::Dword, 2)]
+        };
+        assert_eq!(page_walk_reads, expected_reads);
+        let page_walk_writes = native_bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|cycle| cycle.kind == BusAccessKind::PageWalkWrite)
+            .map(|cycle| (cycle.address, cycle.width, cycle.clocks))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page_walk_writes,
+            if first_present {
+                vec![(0x4004, BusWidth::Dword, 2)]
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(
+            native_bus
+                .trace
+                .cycles()
+                .iter()
+                .filter(|cycle| {
+                    cycle.kind == BusAccessKind::DataRead
+                        && matches!(cycle.address, 0x1fff | 0x2000)
+                })
+                .map(|cycle| (cycle.address, cycle.width))
+                .collect::<Vec<_>>(),
+            if first_present {
+                vec![(0x1fff, BusWidth::Byte)]
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(
+            u32::from_le_bytes(native_bus.memory[0x4004..0x4008].try_into().unwrap()),
+            if first_present { 0x1027 } else { 0x1006 }
+        );
+        assert_eq!(
+            u32::from_le_bytes(native_bus.memory[0x4008..0x400c].try_into().unwrap()),
+            if first_present { 0x2006 } else { 0x2007 }
         );
         assert_eq!(native.perf_counters().jit_direct_insns - direct_before, 2);
         assert_eq!(
