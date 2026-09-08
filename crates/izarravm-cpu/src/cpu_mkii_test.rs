@@ -659,6 +659,77 @@ fn mkii_helper_patch_replaces_the_next_native_operand() {
     assert!(cpu.dynarec_mkii_stats().invalidations >= 1);
 }
 
+#[test]
+fn mkii_cold_mismatch_executes_the_fetched_instruction_once_after_a_native_prefix() {
+    let code = [0x90, 0xb8, 0x34, 0x12, 0x93, 0xe4, 0x60];
+    for replacement in [[0x83, 0xc0, 0x01], [0x8e, 0xd0, 0x90]] {
+        let (mut cpu, mut bus) = fixture(&code);
+        let (mut oracle, mut other) = fixture(&code);
+        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+            warm_code(cpu, bus, code.len() as u32);
+        }
+        compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 0);
+        assert_eq!(cpu.dynarec_mkii_stats().compiled, 1);
+        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+            // Keep the owned trace to exercise its cold-decode mismatch exit.
+            bus.memory[1..4].copy_from_slice(&replacement);
+            cpu.decode_cache.kill_line_at(1);
+            cpu.set_eip(0);
+        }
+        compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+        assert_eq!(cpu.dynarec_mkii_stats().mismatches, 1);
+        if replacement[0] == 0x83 {
+            assert_eq!(cpu.registers.ebx(), 1);
+            assert_eq!(cpu.perf.instructions, 5);
+        } else {
+            assert_eq!(cpu.perf.instructions, 2);
+        }
+    }
+}
+
+#[test]
+fn mkii_dispatcher_failure_and_cold_selection_preserve_the_stop_boundary() {
+    let code = [0xb8, 0x34, 0x12, 0x90, 0xe4, 0x60];
+    for available in [false, true] {
+        for warm in [false, true] {
+            for cap in [0, 1, 7, 1000] {
+                let (mut cpu, mut bus) = fixture(&code);
+                let (mut oracle, mut other) = fixture(&code);
+                if warm {
+                    warm_code(&mut cpu, &mut bus, code.len() as u32);
+                    warm_code(&mut oracle, &mut other, code.len() as u32);
+                }
+                let actual = if available {
+                    cpu.fail_mkii_compile_for_test();
+                    cpu.run_mkii(&mut bus, cap)
+                } else {
+                    cpu.run_mkii_without_dispatcher_for_test(&mut bus, cap)
+                }
+                .unwrap();
+                let mut core = 0;
+                loop {
+                    core += oracle
+                        .cycle_no_interrupt_check(&mut other)
+                        .unwrap()
+                        .core_clocks;
+                    if core >= cap || other.requires_step_break() {
+                        break;
+                    }
+                }
+                assert_eq!(actual.consumed_core_clocks, core);
+                assert_eq!(cpu.perf.instructions, oracle.perf.instructions);
+                assert_eq!(cpu.registers, oracle.registers);
+                assert_eq!(cpu.elapsed_clocks, oracle.elapsed_clocks);
+                assert_eq!(cpu.timing_rem, oracle.timing_rem);
+                assert_eq!(bus.trace.cycles(), other.trace.cycles());
+                if !available || cap == 0 {
+                    assert_eq!(cpu.dynarec_mkii_stats().entries, 0);
+                }
+            }
+        }
+    }
+}
+
 fn compare_pair_run(
     cpu: &mut CpuGsw,
     bus: &mut TestBus,

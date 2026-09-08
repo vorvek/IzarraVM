@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::ops::Operation;
-use crate::jit::exec_mem::ExecutableBuffer;
 use crate::run::{budgeted_run_outcome, checked_run_core_total};
 use crate::timing_class::TimingClass;
 use crate::*;
@@ -32,7 +31,7 @@ struct Key {
 
 struct Trace {
     operations: Box<[Operation]>,
-    code: ExecutableBuffer,
+    code: super::native::Code,
     open_tail: Option<u32>,
     source_certificate: Option<(u64, u64)>,
 }
@@ -80,9 +79,13 @@ pub struct Stats {
 }
 
 type Helper = unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame, *const Operation) -> u32;
+type Resolver = unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame) -> usize;
 
 pub(super) struct Frame {
     pub helpers: [Helper; 15],
+    pub resolve: Resolver,
+    pub dispatch: usize,
+    engine: *mut Engine,
     pub memory_ptr: *mut u8,
     pub branch_taken: u32,
     pub region_completed: u32,
@@ -126,7 +129,7 @@ struct Fetched {
 }
 
 impl Frame {
-    fn new<B: CpuBus>(cpu: &CpuGsw, bus: &mut B, cap: u64) -> Self {
+    pub(super) fn new<B: CpuBus>(cpu: &CpuGsw, bus: &mut B, cap: u64) -> Self {
         Self {
             helpers: [
                 step::<B, 0>,
@@ -145,6 +148,9 @@ impl Frame {
                 region::prepare::<B>,
                 region::finish::<B>,
             ],
+            resolve: resolve::<B>,
+            dispatch: 0,
+            engine: std::ptr::null_mut(),
             memory_ptr: std::ptr::null_mut(),
             branch_taken: 0,
             region_completed: 0,
@@ -221,6 +227,20 @@ impl Frame {
             cpu.perf.brk_cap += 1;
         }
         self.stop = true;
+    }
+
+    fn cold<B: CpuBus>(&mut self, cpu: &mut CpuGsw, bus: &mut B) {
+        let can_take = cpu.can_take_interrupt();
+        let result = cpu.cycle_no_interrupt_check_at_prefix(
+            bus,
+            Some(RepBudget {
+                bus_at_entry: self.bus_at_entry,
+                cap: self.cap,
+            }),
+            self.total,
+        );
+        self.stats.cold += 1;
+        self.observe(cpu, bus, can_take, result);
     }
 
     fn retire_pending<B: CpuBus>(&mut self, cpu: &mut CpuGsw, bus: &mut B) {
@@ -800,6 +820,76 @@ impl Engine {
     }
 }
 
+fn select_next<B: CpuBus>(
+    engine: &mut Engine,
+    cpu: &mut CpuGsw,
+    bus: &mut B,
+    frame: &mut Frame,
+) -> usize {
+    loop {
+        if cpu.jit_direct.mkii.code_dirty {
+            engine.drain_writes(cpu);
+        }
+        cpu.jit_direct.mkii.mapping_dirty = false;
+        if !std::mem::take(&mut frame.force_canonical)
+            && let Some(trace) = engine.trace(cpu, bus)
+        {
+            frame.cs = cpu.registers.cs();
+            frame.table = cpu.class_table() as *const _ as usize;
+            frame.source_certificate = trace.source_certificate;
+            frame.stats.entries += 1;
+            return trace.code.body_ptr() as usize;
+        }
+        frame.cold(cpu, bus);
+        if frame.stop || !cpu.mkii_context() {
+            return 0;
+        }
+    }
+}
+
+unsafe extern "C" fn resolve<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    bus: *mut (),
+    frame: *mut Frame,
+) -> usize {
+    // SAFETY: only the stable dispatcher calls this, after the trace has tail-jumped out.
+    // All pointers belong to this run; no engine borrow crosses a native transfer.
+    let (cpu, bus, frame) = unsafe { (&mut *cpu, &mut *bus.cast::<B>(), &mut *frame) };
+    debug_assert!(frame.pending.is_none());
+    debug_assert!(frame.region_running.is_none());
+    if let Some(fetched) = frame.fetched.take() {
+        let execution = cpu.execute_decoded_with_rep_budget(
+            &fetched.insn,
+            bus,
+            Some(RepBudget {
+                bus_at_entry: frame.bus_at_entry,
+                cap: frame.cap,
+            }),
+            None,
+        );
+        let outcome = if cpu.rep_execution.yielded {
+            Ok(cpu.pause_rep_instruction(bus, fetched.insn, fetched.eip, fetched.cs, execution))
+        } else {
+            cpu.finish_instruction(
+                bus,
+                execution,
+                fetched.eip,
+                fetched.cs.selector,
+                0,
+                None,
+                None,
+            )
+        };
+        frame.observe(cpu, bus, fetched.can_take, outcome);
+        cpu.jit_direct.mkii.invalidate_code();
+    }
+    if frame.stop || !cpu.mkii_context() {
+        return 0;
+    }
+    // SAFETY: the local engine is stationary until the dispatcher returns to run_mkii.
+    select_next(unsafe { &mut *frame.engine }, cpu, bus, frame)
+}
+
 impl CpuGsw {
     #[cfg(all(
         target_arch = "x86_64",
@@ -913,6 +1003,20 @@ impl CpuGsw {
         bus: &mut B,
         cap: u64,
     ) -> CpuExecutionResult<BudgetedRunOutcome> {
+        static DISPATCHER: OnceLock<Option<super::native::Code>> = OnceLock::new();
+        self.run_mkii_with_dispatcher(
+            bus,
+            cap,
+            DISPATCHER.get_or_init(super::native::dispatcher).as_ref(),
+        )
+    }
+
+    fn run_mkii_with_dispatcher<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        cap: u64,
+        dispatcher: Option<&super::native::Code>,
+    ) -> CpuExecutionResult<BudgetedRunOutcome> {
         static CENSUS: OnceLock<bool> = OnceLock::new();
         if *CENSUS.get_or_init(|| std::env::var_os("IZARRAVM_MKII_CENSUS").is_some())
             && self.jit_direct.mkii.census.is_none()
@@ -922,72 +1026,27 @@ impl CpuGsw {
         let mut engine = std::mem::take(&mut self.jit_direct.mkii.engine);
         let mut frame = Frame::new(self, bus, cap);
         self.perf.straight_line_runs += 1;
-        loop {
-            if self.jit_direct.mkii.code_dirty {
-                engine.drain_writes(self);
+        if let Some(dispatcher) = dispatcher {
+            let first = select_next(&mut engine, self, bus, &mut frame);
+            if first != 0 {
+                frame.engine = std::ptr::from_mut(&mut engine);
+                frame.dispatch = dispatcher.body_ptr() as usize;
+                // SAFETY: the dispatcher owns the common frame. Only its resolver mutates
+                // the stationary engine, after every return address has left trace code.
+                let entry: unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame, usize) =
+                    unsafe { std::mem::transmute(dispatcher.entry_ptr()) };
+                unsafe { entry(self, (bus as *mut B).cast(), &mut frame, first) };
             }
-            self.jit_direct.mkii.mapping_dirty = false;
-            if !std::mem::take(&mut frame.force_canonical)
-                && let Some(trace) = engine.trace(self, bus)
-            {
-                frame.cs = self.registers.cs();
-                frame.table = self.class_table() as *const _ as usize;
-                frame.source_certificate = trace.source_certificate;
-                frame.stats.entries += 1;
-                // SAFETY: the leased trace and its operations remain live until this call returns.
-                // Helpers have this run's concrete B type and cannot mutate the leased engine.
-                unsafe {
-                    let entry: unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame) =
-                        std::mem::transmute(trace.code.entry_ptr());
-                    entry(self, (bus as *mut B).cast(), &mut frame);
+        } else {
+            loop {
+                if self.jit_direct.mkii.code_dirty {
+                    engine.drain_writes(self);
                 }
-                if let Some(fetched) = frame.fetched.take() {
-                    let execution = self.execute_decoded_with_rep_budget(
-                        &fetched.insn,
-                        bus,
-                        Some(RepBudget {
-                            bus_at_entry: frame.bus_at_entry,
-                            cap,
-                        }),
-                        None,
-                    );
-                    let outcome = if self.rep_execution.yielded {
-                        Ok(self.pause_rep_instruction(
-                            bus,
-                            fetched.insn,
-                            fetched.eip,
-                            fetched.cs,
-                            execution,
-                        ))
-                    } else {
-                        self.finish_instruction(
-                            bus,
-                            execution,
-                            fetched.eip,
-                            fetched.cs.selector,
-                            0,
-                            None,
-                            None,
-                        )
-                    };
-                    frame.observe(self, bus, fetched.can_take, outcome);
-                    self.jit_direct.mkii.invalidate_code();
+                self.jit_direct.mkii.mapping_dirty = false;
+                frame.cold(self, bus);
+                if frame.stop || !self.mkii_context() {
+                    break;
                 }
-            } else {
-                let can_take = self.can_take_interrupt();
-                let result = self.cycle_no_interrupt_check_at_prefix(
-                    bus,
-                    Some(RepBudget {
-                        bus_at_entry: frame.bus_at_entry,
-                        cap,
-                    }),
-                    frame.total,
-                );
-                frame.stats.cold += 1;
-                frame.observe(self, bus, can_take, result);
-            }
-            if frame.stop || !self.mkii_context() {
-                break;
             }
         }
         engine.stats.runs += 1;
@@ -1028,5 +1087,14 @@ impl CpuGsw {
     #[cfg(test)]
     pub(crate) fn fail_mkii_compile_for_test(&mut self) {
         self.jit_direct.mkii.engine.fail_next_compile = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_mkii_without_dispatcher_for_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        cap: u64,
+    ) -> CpuExecutionResult<BudgetedRunOutcome> {
+        self.run_mkii_with_dispatcher(bus, cap, None)
     }
 }

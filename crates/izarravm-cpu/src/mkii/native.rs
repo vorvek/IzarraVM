@@ -18,12 +18,65 @@ const ARGS: [Reg; 4] = [Reg::RCX, Reg::RDX, Reg::R8, Reg::R9];
 #[cfg(not(target_os = "windows"))]
 const ARGS: [Reg; 4] = [Reg::RDI, Reg::RSI, Reg::RDX, Reg::RCX];
 
-pub(super) fn compile(operations: &[Operation]) -> Option<ExecutableBuffer> {
-    let mut e = Encoder::new();
-    let info = prologue(&mut e);
+pub(super) struct Code {
+    buffer: ExecutableBuffer,
+    body: usize,
+    #[cfg(test)]
+    unwind_points: Vec<usize>,
+}
+
+impl Code {
+    pub fn entry_ptr(&self) -> *const u8 {
+        self.buffer.entry_ptr()
+    }
+
+    pub fn body_ptr(&self) -> *const u8 {
+        self.entry_ptr().wrapping_add(self.body)
+    }
+}
+
+fn entry(e: &mut Encoder) -> Vec<u8> {
+    let info = prologue(e);
     e.mov_r64_r64(Reg::RBX, ARGS[0]);
     e.mov_r64_r64(Reg::R12, ARGS[1]);
     e.mov_r64_r64(Reg::R13, ARGS[2]);
+    info
+}
+
+pub(super) fn dispatcher() -> Option<Code> {
+    let mut e = Encoder::new();
+    let info = entry(&mut e);
+    e.mov_r64_r64(Reg::RAX, ARGS[3]);
+    e.jmp_r64(Reg::RAX);
+    let body = e.position();
+    e.mov_r64_r64(ARGS[0], Reg::RBX);
+    e.mov_r64_r64(ARGS[1], Reg::R12);
+    e.mov_r64_r64(ARGS[2], Reg::R13);
+    e.call_m64_disp32(Reg::R13, std::mem::offset_of!(Frame, resolve) as i32);
+    #[cfg(test)]
+    let resolver_return = e.position();
+    e.cmp_r64_imm32(Reg::RAX, 0);
+    let exit = e.label();
+    e.jcc(4, exit);
+    #[cfg(test)]
+    let transfer = e.position();
+    e.jmp_r64(Reg::RAX);
+    e.place(exit);
+    #[cfg(test)]
+    let epilogue_start = e.position();
+    epilogue(&mut e);
+    Some(Code {
+        buffer: ExecutableBuffer::new_with_unwind(&e.finish(), &info)?,
+        body,
+        #[cfg(test)]
+        unwind_points: vec![body, resolver_return, transfer, epilogue_start],
+    })
+}
+
+pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
+    let mut e = Encoder::new();
+    let info = entry(&mut e);
+    let body = e.position();
     let exit = e.label();
     let mut index = 0;
     while index < operations.len() {
@@ -50,8 +103,22 @@ pub(super) fn compile(operations: &[Operation]) -> Option<ExecutableBuffer> {
     }
     call_helper(&mut e, 11, 0);
     e.place(exit);
-    epilogue(&mut e);
-    ExecutableBuffer::new_with_unwind(&e.finish(), &info)
+    #[cfg(test)]
+    let helper_return = e.position();
+    e.load_r64_disp32(
+        Reg::RAX,
+        Reg::R13,
+        std::mem::offset_of!(Frame, dispatch) as i32,
+    );
+    #[cfg(test)]
+    let transfer = e.position();
+    e.jmp_r64(Reg::RAX);
+    Some(Code {
+        buffer: ExecutableBuffer::new_with_unwind(&e.finish(), &info)?,
+        body,
+        #[cfg(test)]
+        unwind_points: vec![body, helper_return, transfer],
+    })
 }
 
 fn emit_legacy_span(e: &mut Encoder, operations: &[Operation], index: usize, exit: Label) -> usize {
