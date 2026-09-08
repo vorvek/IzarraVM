@@ -1608,6 +1608,291 @@ fn stamp_ds(cpu: &mut CpuGsw, selector: u16, base: u32, limit: u32, access: u8) 
     cpu.registers.set_segment(SegmentIndex::Ds, descriptor);
 }
 
+fn stack_at(cpu: &mut CpuGsw, base: u32) {
+    let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+    let cpl = cpu.current_privilege_level();
+    ss.selector = (if base == 0x1000 { 0x60 } else { 0x68 }) | u16::from(cpl);
+    ss.base = base;
+    ss.limit = 0xffff;
+    ss.access = 0x93 | (cpl << 5);
+    ss.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Ss, ss);
+}
+
+fn stack_privilege(cpu: &mut CpuGsw, cpl: u8) {
+    cpu.cpl = cpl;
+    let mut cs = cpu.registers.cs();
+    cs.selector = (cs.selector & !3) | u16::from(cpl);
+    cs.access = (cs.access & !0x60) | (cpl << 5);
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    stack_at(cpu, 0x1000);
+}
+
+fn pm16_stack_program(instructions: &[&[u8]]) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0; 0x20000];
+    let mut starts = Vec::new();
+    let mut cursor = ENTRY;
+    for instruction in instructions {
+        starts.push(cursor);
+        memory[cursor as usize..cursor as usize + instruction.len()].copy_from_slice(instruction);
+        cursor += instruction.len() as u32;
+    }
+    starts.push(cursor);
+    memory[cursor as usize..cursor as usize + 3].copy_from_slice(&jmp16(cursor, DONE));
+    memory[DONE as usize] = 0xf4;
+    let mut bus = super::sixteen_bit::sixteen_bit_bus(memory);
+    let mut cpu = protected16_at(ENTRY);
+    stack_at(&mut cpu, 0x1000);
+    let pages: Vec<_> = (0..0x20000).step_by(0x1000).collect();
+    super::sixteen_bit::arm_native_sixteen_bit(&mut cpu, &mut bus, &pages);
+    super::sixteen_bit::warm_sixteen_bit(&mut cpu, &mut bus, &starts);
+    (cpu, bus)
+}
+
+fn promote_pm16_stack(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) + 1 {
+        stack_at(cpu, 0x1000);
+        let block = compile_sixteen(cpu, ENTRY);
+        stack_at(cpu, 0x2000);
+        cpu.set_eip(ENTRY);
+        assert!(!cpu.try_run_direct_block_for_test(bus, block).unwrap());
+        assert_eq!(cpu.registers.eip, ENTRY);
+    }
+}
+
+#[test]
+fn live_stack_pm16_push_pop_and_frame_load_use_current_physical_stack() {
+    for armed in [true, false] {
+        let _check = force_entry_check(armed);
+        let _guard = force_arm(SegmentRetireGovernor::Cap);
+        let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50], &[0x5b], &[0x8b, 0x56, 0x00]]);
+        promote_pm16_stack(&mut cpu, &mut bus);
+        stack_at(&mut cpu, 0x1000);
+        let block = compile_sixteen(&mut cpu, ENTRY);
+        for (base, value) in [(0x1000, 0x1357u16), (0x2000, 0x2468)] {
+            let other = if base == 0x1000 { 0x2000 } else { 0x1000 };
+            bus.memory[other + 0x6fe..other + 0x700].copy_from_slice(&0xa55au16.to_le_bytes());
+            bus.memory[base + 0x710..base + 0x712].copy_from_slice(&value.to_le_bytes());
+            stack_at(&mut cpu, base as u32);
+            cpu.set_eip(ENTRY);
+            cpu.registers.set_esp(0xabcd_0700);
+            cpu.registers.set_ebp(0xdcba_0710);
+            cpu.registers.set_eax(u32::from(value));
+            cpu.registers.set_ebx(0xbeef_0000);
+            cpu.registers.set_edx(0xcafe_0000);
+            assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+            assert_eq!(cpu.registers.eip, DONE);
+            assert_eq!(cpu.registers.esp(), 0xabcd_0700);
+            assert_eq!(cpu.registers.ebp(), 0xdcba_0710);
+            assert_eq!(cpu.registers.ebx(), 0xbeef_0000 | u32::from(value));
+            assert_eq!(cpu.registers.edx(), 0xcafe_0000 | u32::from(value));
+            assert_eq!(
+                &bus.memory[base + 0x6fe..base + 0x700],
+                &value.to_le_bytes()
+            );
+            assert_eq!(
+                &bus.memory[other + 0x6fe..other + 0x700],
+                &0xa55au16.to_le_bytes()
+            );
+        }
+    }
+}
+
+#[test]
+fn live_stack_pm16_near_return_reads_the_current_stack_target() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0xc3]]);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    bus.memory[0x1700..0x1702].copy_from_slice(&0x0260u16.to_le_bytes());
+    bus.memory[0x2700..0x2702].copy_from_slice(&0x0280u16.to_le_bytes());
+    for (base, target) in [(0x1000, 0x260), (0x2000, 0x280)] {
+        stack_at(&mut cpu, base);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_esp(0xabcd_0700);
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(cpu.registers.eip, target);
+        assert_eq!(cpu.registers.esp(), 0xabcd_0702);
+    }
+}
+
+#[test]
+fn live_stack_pm16_word_push_wraps_without_changing_upper_esp() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50]]);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    bus.memory[0x10ffe..0x11000].copy_from_slice(&0xa55au16.to_le_bytes());
+    stack_at(&mut cpu, 0x2000);
+    cpu.set_eip(ENTRY);
+    cpu.registers.set_esp(0xabcd_0000);
+    cpu.registers.set_eax(0x1234);
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(cpu.registers.esp(), 0xabcd_fffe);
+    assert_eq!(&bus.memory[0x11ffe..0x12000], &0x1234u16.to_le_bytes());
+    assert_eq!(&bus.memory[0x10ffe..0x11000], &0xa55au16.to_le_bytes());
+}
+
+#[test]
+fn live_stack_pm16_faulting_push_keeps_registers_and_memory_unchanged() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50]]);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    for (limit, access) in [
+        (0x6fe, 0x93),
+        (0xffff, 0x91),
+        (0xffff, 0x13),
+        (0xffff, 0x97),
+    ] {
+        stack_at(&mut cpu, 0x2000);
+        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+        ss.limit = limit;
+        ss.access = access;
+        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+        cpu.set_eip(ENTRY);
+        cpu.registers.set_esp(0xabcd_0700);
+        cpu.registers.set_ebp(0xdcba_0710);
+        cpu.registers.set_eax(0x1234);
+        let memory = bus.memory.clone();
+        let retired = cpu.perf_counters().jit_direct_insns;
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(cpu.registers.eip, ENTRY);
+        assert_eq!(cpu.registers.esp(), 0xabcd_0700);
+        assert_eq!(cpu.registers.ebp(), 0xdcba_0710);
+        assert_eq!(cpu.perf_counters().jit_direct_insns, retired);
+        assert_eq!(bus.memory, memory);
+    }
+}
+
+#[test]
+fn live_stack_pm16_selector_reads_keep_the_stack_pinned() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    for instruction in [&[0x8c, 0xd3][..], &[0x16][..]] {
+        let (mut cpu, mut bus) = pm16_stack_program(&[instruction]);
+        promote_pm16_stack(&mut cpu, &mut bus);
+        stack_at(&mut cpu, 0x1000);
+        let block = compile_sixteen(&mut cpu, ENTRY);
+        stack_at(&mut cpu, 0x2000);
+        cpu.set_eip(ENTRY);
+        let registers = cpu.registers.clone();
+        let memory = bus.memory.clone();
+        assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(cpu.registers, registers);
+        assert_eq!(bus.memory, memory);
+    }
+}
+
+#[test]
+fn live_stack_pm16_requires_its_own_repeated_rejections_after_data_churn() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x8b, 0x16, 0x00, 0x30], &[0x50]]);
+    promote_sixteen_masked(&mut cpu, &mut bus);
+    for _ in 0..u32::from(DATA_SEGMENT_RETIRE_CAP) {
+        stack_at(&mut cpu, 0x1000);
+        let block = compile_sixteen(&mut cpu, ENTRY);
+        stack_at(&mut cpu, 0x2000);
+        cpu.set_eip(ENTRY);
+        let memory = bus.memory.clone();
+        assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(bus.memory, memory);
+    }
+    stack_at(&mut cpu, 0x1000);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    stack_at(&mut cpu, 0x2000);
+    cpu.set_eip(ENTRY);
+    cpu.registers.set_eax(0x1234);
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(&bus.memory[0x26fe..0x2700], &0x1234u16.to_le_bytes());
+}
+
+#[test]
+fn live_stack_pm16_loop_accounts_for_every_completed_iteration() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50], &[0x5b], &[0x49], &[0x75, 0xfb]]);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    assert!(block.is_self_loop());
+    stack_at(&mut cpu, 0x2000);
+    cpu.set_eip(ENTRY);
+    cpu.registers.set_esp(0xabcd_0700);
+    cpu.registers.set_ecx(9);
+    cpu.registers.set_eax(0x1234);
+    let retired = cpu.perf_counters().jit_direct_insns;
+    for _ in 0..9 {
+        assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        if cpu.registers.eip != ENTRY {
+            break;
+        }
+    }
+    assert_eq!(cpu.registers.eip, ENTRY + 5);
+    assert_eq!(cpu.registers.ecx(), 0);
+    assert_eq!(cpu.registers.esp(), 0xabcd_0700);
+    assert_eq!(cpu.perf_counters().jit_direct_insns - retired, 36);
+    assert_eq!(&bus.memory[0x26fe..0x2700], &0x1234u16.to_le_bytes());
+}
+
+#[test]
+fn live_stack_pm16_privilege_user_churn_does_not_promote_a_supervisor_stack() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50]]);
+    stack_privilege(&mut cpu, 3);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let user = compile_sixteen(&mut cpu, ENTRY);
+    assert!(user.memory_cpl3());
+    stack_at(&mut cpu, 0x2000);
+    assert!(!cpu.try_run_direct_block_for_test(&mut bus, user).unwrap());
+
+    let key = jit::direct::key_for(&cpu, ENTRY, false).unwrap();
+    stack_privilege(&mut cpu, 0);
+    assert_eq!(jit::direct::key_for(&cpu, ENTRY, false).unwrap(), key);
+    assert!(!cpu.try_run_direct_block_for_test(&mut bus, user).unwrap());
+    for _ in 0..DATA_SEGMENT_RETIRE_CAP {
+        stack_at(&mut cpu, 0x1000);
+        let block = compile_sixteen(&mut cpu, ENTRY);
+        assert!(!block.memory_cpl3());
+        stack_at(&mut cpu, 0x2000);
+        let registers = cpu.registers.clone();
+        assert!(!cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+        assert_eq!(cpu.registers, registers);
+    }
+    stack_at(&mut cpu, 0x1000);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    stack_at(&mut cpu, 0x2000);
+    cpu.registers.set_eax(0x1234);
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, block).unwrap());
+    assert_eq!(&bus.memory[0x26fe..0x2700], &0x1234u16.to_le_bytes());
+}
+
+#[test]
+fn live_stack_pm16_privilege_supervisor_promotion_keeps_user_stacks_pinned() {
+    let _guard = force_arm(SegmentRetireGovernor::Cap);
+    let (mut cpu, mut bus) = pm16_stack_program(&[&[0x50]]);
+    promote_pm16_stack(&mut cpu, &mut bus);
+    stack_at(&mut cpu, 0x1000);
+    let supervisor = compile_sixteen(&mut cpu, ENTRY);
+    let key = jit::direct::key_for(&cpu, ENTRY, false).unwrap();
+    stack_privilege(&mut cpu, 3);
+    assert_eq!(jit::direct::key_for(&cpu, ENTRY, false).unwrap(), key);
+    assert!(
+        !cpu.try_run_direct_block_for_test(&mut bus, supervisor)
+            .unwrap()
+    );
+    let user = compile_sixteen(&mut cpu, ENTRY);
+    assert!(user.memory_cpl3());
+    stack_at(&mut cpu, 0x2000);
+    let registers = cpu.registers.clone();
+    let memory = bus.memory.clone();
+    assert!(!cpu.try_run_direct_block_for_test(&mut bus, user).unwrap());
+    assert_eq!(cpu.registers, registers);
+    assert_eq!(bus.memory, memory);
+}
+
 /// 16-bit PM twin. Compile live under a writable selector, then enter read-only.
 ///
 /// Mutant: live-base plus baked limit/access.
