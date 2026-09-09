@@ -314,11 +314,18 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
             screen.phys_start == operation.physical && screen.len == operation.insn.len
         })
         && CpuGsw::fetch_within_limit(operation.eip, operation.insn.len, frame.cs.limit);
+    let decoded;
     let fetched = if warm {
         cpu.charge_cached_fetch_at(bus, lin, operation.insn.len, operation.physical)
-            .map(|()| operation.insn)
+            .map(|()| &operation.insn)
     } else {
-        cpu.fetch_decoded(bus, lin)
+        match cpu.fetch_decoded(bus, lin) {
+            Ok(insn) => {
+                decoded = insn;
+                Ok(&decoded)
+            }
+            Err(fault) => Err(fault),
+        }
     };
     let insn = match fetched {
         Ok(insn) => insn,
@@ -343,12 +350,12 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
         census[opcode + width + memory] += 1;
     }
     if !warm
-        && (insn != operation.insn
+        && (*insn != operation.insn
             || cpu.decode_cache.line_phys_start(lin, false) != Some(operation.physical))
     {
         frame.stats.mismatches += 1;
         frame.fetched = Some(Fetched {
-            insn,
+            insn: *insn,
             eip: operation.eip,
             cs: frame.cs,
             can_take,
@@ -395,17 +402,17 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
         GROUP == 5 && matches!(insn.opcode, 0x70..=0x7f) && cpu.condition((insn.opcode & 15) as u8);
     let mut work = InstructionWork::default();
     let result = match GROUP {
-        1 => cpu.execute_alu_decoded(&insn, bus),
-        2 => cpu.execute_datamove_decoded(&insn, bus),
-        3 => cpu.execute_stack_decoded(&insn, bus),
-        4 => cpu.execute_group_decoded(&insn, bus),
-        5 => cpu.execute_branch_decoded(&insn, bus),
-        6 if insn.opcode == 0xec => cpu.execute_port_io_decoded(&insn, bus),
-        6 => cpu.execute_flags_misc_decoded(&insn, bus),
-        7 => cpu.execute_system_seg_decoded(&insn, bus, &mut work.committed),
-        8 => cpu.execute_control_flow_decoded(&insn, bus, &mut work.committed),
-        9 => cpu.execute_bitmanip_decoded(&insn, bus),
-        10 => cpu.execute_condmove_decoded(&insn, bus),
+        1 => cpu.execute_alu_decoded(insn, bus),
+        2 => cpu.execute_datamove_decoded(insn, bus),
+        3 => cpu.execute_stack_decoded(insn, bus),
+        4 => cpu.execute_group_decoded(insn, bus),
+        5 => cpu.execute_branch_decoded(insn, bus),
+        6 if insn.opcode == 0xec => cpu.execute_port_io_decoded(insn, bus),
+        6 => cpu.execute_flags_misc_decoded(insn, bus),
+        7 => cpu.execute_system_seg_decoded(insn, bus, &mut work.committed),
+        8 => cpu.execute_control_flow_decoded(insn, bus, &mut work.committed),
+        9 => cpu.execute_bitmanip_decoded(insn, bus),
+        10 => cpu.execute_condmove_decoded(insn, bus),
         _ => unreachable!(),
     };
     let succeeded = result.is_ok();
