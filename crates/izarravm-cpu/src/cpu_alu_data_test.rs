@@ -3,6 +3,9 @@
 
 use super::*;
 
+// Architectural fields retain the fused-reference capture. Fetch counts exclude
+// the decoder's removed opcode reread.
+
 #[test]
 fn seam_matches_fused_path_across_addressing_forms() {
     // Historically this diffed a *still-on-Fallback* memory-read opcode through cycle()
@@ -27,12 +30,10 @@ fn seam_matches_fused_path_across_addressing_forms() {
     // AL = [DS:BX+AL] = mem[0x12] = 0xab; the rest of AX (AH=0x01) is unchanged.
     assert_eq!(split.read_reg16(Reg16::Ax), 0x01ab, "xlat result");
     assert_eq!(split.registers.eip, 0x1, "eip past the 1-byte opcode");
-    // Clock-neutrality guard: 1 opcode-prefetch peek + 1 opcode byte = 2 instruction fetches;
-    // the data read of the table byte is a DataRead, not an InstructionPrefetch. A decode/execute
-    // double-charge of the opcode would push this past 2.
+    // The table lookup is a DataRead; the opcode is fetched once.
     assert_eq!(
         seam_fetch_count(&sbus),
-        2,
+        1,
         "the seam must charge each instruction-fetch byte exactly once"
     );
 }
@@ -74,7 +75,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x06,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "add [bx+si],ax",
@@ -83,7 +84,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(24, 2), (25, 1)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "add [bp+di+4],cx",
@@ -92,7 +93,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x03,
             deltas: &[(44, 4), (45, 3)],
-            fetch: 4,
+            fetch: 3,
         },
         AluGolden {
             name: "add [0x20],dx",
@@ -101,7 +102,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x06,
             eip: 0x04,
             deltas: &[(32, 23), (33, 22)],
-            fetch: 5,
+            fetch: 4,
         },
         AluGolden {
             name: "add [si],al(byte)",
@@ -110,7 +111,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(8, 2)],
-            fetch: 3,
+            fetch: 2,
         },
         // Every ALU op through word r/m,reg (form 1) with a memory operand: op-by-op coverage.
         AluGolden {
@@ -120,7 +121,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(16, 2), (17, 1)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "or [bx],ax(form1)",
@@ -129,7 +130,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(16, 2), (17, 1)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "adc [bx],ax(form1)",
@@ -138,7 +139,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(16, 2), (17, 1)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "sbb [bx],ax(form1)",
@@ -147,7 +148,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x93,
             eip: 0x02,
             deltas: &[(16, 254), (17, 254)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "and [bx],ax(form1)",
@@ -156,7 +157,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x46,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "sub [bx],ax(form1)",
@@ -165,7 +166,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x93,
             eip: 0x02,
             deltas: &[(16, 254), (17, 254)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "xor [bx],ax(form1)",
@@ -174,7 +175,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(16, 2), (17, 1)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "cmp [bx],ax(form1)",
@@ -183,7 +184,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x93,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // reg,r/m direction (form 3, word; writes a register) and byte directions (forms 0/2).
         AluGolden {
@@ -193,7 +194,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "and dx,[di]",
@@ -202,7 +203,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x46,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "adc al,[bx](byte form2)",
@@ -211,7 +212,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "xor [si],bl(byte form0)",
@@ -220,7 +221,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(8, 16)],
-            fetch: 3,
+            fetch: 2,
         },
         // Immediate accumulator forms: byte AL,imm8 (form 4) and word AX,imm16 (form 5).
         AluGolden {
@@ -230,7 +231,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x896,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "or al,imm8(form4)",
@@ -239,7 +240,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x86,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "cmp al,imm8(form4)",
@@ -248,7 +249,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x93,
             eip: 0x02,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "add ax,imm16(form5)",
@@ -257,7 +258,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x06,
             eip: 0x03,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         AluGolden {
             name: "sub ax,imm16(form5)",
@@ -266,7 +267,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x93,
             eip: 0x03,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         AluGolden {
             name: "cmp ax,imm16(form5)",
@@ -275,7 +276,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x46,
             eip: 0x03,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // Remaining addressing forms carried over from the original battery.
         AluGolden {
@@ -285,7 +286,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x93,
             eip: 0x03,
             deltas: &[(18, 254), (19, 254)],
-            fetch: 4,
+            fetch: 3,
         },
         AluGolden {
             name: "xor [di],bx",
@@ -294,7 +295,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x02,
             eip: 0x02,
             deltas: &[(24, 16)],
-            fetch: 3,
+            fetch: 2,
         },
         AluGolden {
             name: "cmp [bx+4],dx",
@@ -303,7 +304,7 @@ fn alu_golden_cases() -> &'static [AluGolden] {
             eflags: 0x97,
             eip: 0x03,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
     ]
 }
@@ -443,7 +444,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[(16, 4), (17, 3)],
-            fetch: 3,
+            fetch: 2,
         },
         DataMoveGolden {
             name: "mov [bp+si+4],al(byte)",
@@ -452,7 +453,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[(28, 2)],
-            fetch: 4,
+            fetch: 3,
         },
         DataMoveGolden {
             name: "mov dx,bx(reg)",
@@ -461,7 +462,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         DataMoveGolden {
             name: "mov cx,[0x20]",
@@ -470,7 +471,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         DataMoveGolden {
             name: "mov al,[bx](byte)",
@@ -479,7 +480,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // MOV r/m,Sreg and MOV Sreg,r/m (load ES, leaves the addressing segments untouched).
         DataMoveGolden {
@@ -489,7 +490,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         DataMoveGolden {
             name: "mov es,[0x20]",
@@ -498,7 +499,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         // LEA: effective address into the register, disp+index and direct-disp forms.
         DataMoveGolden {
@@ -508,7 +509,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         DataMoveGolden {
             name: "lea dx,[0x20]",
@@ -517,7 +518,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         // MOV (E)AX<->moffs, byte and word, read and write.
         DataMoveGolden {
@@ -527,7 +528,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         DataMoveGolden {
             name: "mov ax,[moffs 0x20]",
@@ -536,7 +537,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         DataMoveGolden {
             name: "mov [moffs8 0x30],al",
@@ -545,7 +546,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[(48, 2)],
-            fetch: 4,
+            fetch: 3,
         },
         DataMoveGolden {
             name: "mov [moffs 0x30],ax",
@@ -554,7 +555,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[(48, 2), (49, 1)],
-            fetch: 4,
+            fetch: 3,
         },
         // MOV r,imm (byte and word).
         DataMoveGolden {
@@ -564,7 +565,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         DataMoveGolden {
             name: "mov si,0x1234",
@@ -573,7 +574,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // MOV r/m,imm (group 11), register and memory.
         DataMoveGolden {
@@ -583,7 +584,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[(16, 85)],
-            fetch: 4,
+            fetch: 3,
         },
         DataMoveGolden {
             name: "mov word [bx],0xbeef",
@@ -592,7 +593,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(16, 239), (17, 190)],
-            fetch: 5,
+            fetch: 4,
         },
         DataMoveGolden {
             name: "mov dx,0xabcd(grp11 reg)",
@@ -601,7 +602,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         // XCHG r/m,reg (byte and word, register and memory) and XCHG (E)AX,reg + NOP.
         DataMoveGolden {
@@ -611,7 +612,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[(16, 4), (17, 3)],
-            fetch: 3,
+            fetch: 2,
         },
         DataMoveGolden {
             name: "xchg dl,bl(byte reg)",
@@ -620,7 +621,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         DataMoveGolden {
             name: "xchg ax,cx",
@@ -629,7 +630,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         DataMoveGolden {
             name: "nop",
@@ -638,7 +639,7 @@ fn datamove_golden_cases() -> &'static [DataMoveGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
     ]
 }
@@ -773,7 +774,7 @@ fn movzx_movsx_golden_cases() -> &'static [MovzxMovsxGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // byte [BX] = [0x10] = 0x80, zero-extended to 0x0080 (= 128).
         MovzxMovsxGolden {
@@ -783,7 +784,7 @@ fn movzx_movsx_golden_cases() -> &'static [MovzxMovsxGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // MOVZX r16, r/m16 (0F B7): word [0x20] = 0xBEEF, zero-extended (= 48879).
         MovzxMovsxGolden {
@@ -793,7 +794,7 @@ fn movzx_movsx_golden_cases() -> &'static [MovzxMovsxGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[],
-            fetch: 6,
+            fetch: 5,
         },
         // MOVSX r16, r/m8 (0F BE): byte [BX] = 0x80, sign-extended to 0xFF80 (= 65408).
         MovzxMovsxGolden {
@@ -803,7 +804,7 @@ fn movzx_movsx_golden_cases() -> &'static [MovzxMovsxGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // DL = low byte of DX(0x0506) = 0x06, positive, sign-extends to 0x0006 (= 6).
         MovzxMovsxGolden {
@@ -813,7 +814,7 @@ fn movzx_movsx_golden_cases() -> &'static [MovzxMovsxGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // MOVSX r16, r/m16 (0F BF), EA recomputed from live BX+SI = 0x18; word [0x18] = 0x8081,
         // sign-extended stays 0x8081 at 16 bits (= 32897).
@@ -824,7 +825,7 @@ fn movzx_movsx_golden_cases() -> &'static [MovzxMovsxGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
     ]
 }

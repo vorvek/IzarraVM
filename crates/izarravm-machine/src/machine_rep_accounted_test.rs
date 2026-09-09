@@ -372,7 +372,7 @@ fn machinebus_rep_port_setup_pause_resume_and_forced_progress_keep_each_batch_ow
     for (opcode, port, cap, setup) in [(0x6c, 0x40, 11, 11), (0x6e, 0x80, 13, 13)] {
         let mut normal = rep_port_machine(opcode, port);
         assert_eq!(normal.active_mode(), GswMode::Gsw486);
-        assert_eq!(normal.timing_epoch(), 2);
+        assert_eq!(normal.timing_epoch(), izarravm_cpu::TIMING_MODEL_EPOCH);
         assert_eq!(normal.bus_rem, 0);
         assert_eq!(normal.cpu.registers.eflags & 0x200, 0);
         normal.test_string_port_observations = Some(Vec::new());
@@ -461,7 +461,7 @@ fn machinebus_rep_port_setup_pause_resume_and_forced_progress_keep_each_batch_ow
 
         let mut forced = rep_port_machine(opcode, port);
         assert_eq!(forced.active_mode(), GswMode::Gsw486);
-        assert_eq!(forced.timing_epoch(), 2);
+        assert_eq!(forced.timing_epoch(), izarravm_cpu::TIMING_MODEL_EPOCH);
         assert_eq!(forced.bus_rem, 0);
         assert_eq!(forced.cpu.registers.eflags & 0x200, 0);
         forced.test_string_port_observations = Some(Vec::new());
@@ -608,7 +608,7 @@ fn machine_task_gate_terminal_fault_settles_switch_work_once_before_resume() {
     let first_scaled_charge = full_first_step - 201;
     let stale_first_ticks = 2 * 83 + raw_first * 33;
     assert_eq!(calibration.active_mode, GswMode::Gsw486);
-    assert_eq!(calibration.timing_epoch(), 2);
+    assert_eq!(calibration.timing_epoch(), izarravm_cpu::TIMING_MODEL_EPOCH);
     assert!(calibration_observation.fatal);
     assert_eq!(
         (

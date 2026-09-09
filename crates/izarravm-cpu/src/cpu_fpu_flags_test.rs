@@ -3,6 +3,9 @@
 
 use super::*;
 
+// Architectural fields retain the fused-reference capture. Fetch counts exclude
+// the decoder's removed opcode reread.
+
 // ---- Task A13: x87 FPU (0xD8-0xDF) + WAIT (0x9B) decode/execute split ----
 
 struct FpuGolden {
@@ -95,7 +98,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -117,7 +120,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x2800,
             fpu_tag: 0x3ff,
@@ -139,7 +142,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(306, 96), (307, 64)],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -161,7 +164,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(306, 96), (307, 64)],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x3800,
             fpu_tag: 0x3fff,
@@ -183,7 +186,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -205,7 +208,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -227,7 +230,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -249,7 +252,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -271,7 +274,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -293,7 +296,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -315,7 +318,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -337,7 +340,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(304, 127), (305, 3)],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -359,7 +362,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -381,7 +384,7 @@ fn fpu_golden_cases() -> &'static [FpuGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(305, 48)],
-            fetch: 5,
+            fetch: 4,
             fpu_control: 0x37f,
             fpu_status: 0x3000,
             fpu_tag: 0xfff,
@@ -931,7 +934,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x93,
         eip: 0x1,
         deltas: &[],
-        fetch: 2,
+        fetch: 1,
     },
     MiscGolden {
         name: "das (2f)",
@@ -940,7 +943,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x97,
         eip: 0x1,
         deltas: &[],
-        fetch: 2,
+        fetch: 1,
     },
     MiscGolden {
         name: "aaa (37)",
@@ -949,7 +952,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x1,
         deltas: &[],
-        fetch: 2,
+        fetch: 1,
     },
     MiscGolden {
         name: "aas (3f)",
@@ -958,7 +961,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x1,
         deltas: &[],
-        fetch: 2,
+        fetch: 1,
     },
     MiscGolden {
         name: "aam (d4 0a)",
@@ -967,7 +970,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x2,
         deltas: &[],
-        fetch: 3,
+        fetch: 2,
     },
     MiscGolden {
         name: "aad (d5 0a)",
@@ -976,7 +979,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x2,
         deltas: &[],
-        fetch: 3,
+        fetch: 2,
     },
     MiscGolden {
         name: "test al,imm8 (a8 0f)",
@@ -985,7 +988,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x16,
         eip: 0x2,
         deltas: &[],
-        fetch: 3,
+        fetch: 2,
     },
     MiscGolden {
         name: "test ax,imm16 (a9 ff 00)",
@@ -994,7 +997,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x12,
         eip: 0x3,
         deltas: &[],
-        fetch: 4,
+        fetch: 3,
     },
     MiscGolden {
         name: "imul ax,bx,imm8 (6b c3 02)",
@@ -1003,7 +1006,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x12,
         eip: 0x3,
         deltas: &[],
-        fetch: 4,
+        fetch: 3,
     },
     MiscGolden {
         name: "imul ax,bx,imm16 (69 c3 00 40)",
@@ -1012,7 +1015,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x813,
         eip: 0x4,
         deltas: &[],
-        fetch: 5,
+        fetch: 4,
     },
     MiscGolden {
         name: "salc (d6)",
@@ -1021,7 +1024,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x1,
         deltas: &[],
-        fetch: 2,
+        fetch: 1,
     },
     MiscGolden {
         name: "xlat (d7)",
@@ -1030,7 +1033,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x1,
         deltas: &[],
-        fetch: 2,
+        fetch: 1,
     },
     MiscGolden {
         name: "rdtsc (0f 31)",
@@ -1039,7 +1042,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x2,
         deltas: &[],
-        fetch: 3,
+        fetch: 2,
     },
     MiscGolden {
         name: "cmpxchg8b [0x40] (0f c7 0e 40 00)",
@@ -1048,7 +1051,7 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
         eflags: 0x13,
         eip: 0x5,
         deltas: &[],
-        fetch: 6,
+        fetch: 5,
     },
 ];
 

@@ -364,15 +364,9 @@ impl CpuGsw {
     /// per byte). The decode line supplies its translated physical start; linear observation stays
     /// on `note_code_fetch_linear`.
     ///
-    /// Calibration note (B-T8/B-T9): the COLD decode path (`decode` -> `fetch_u8`) still charges one
-    /// fetch cycle per byte PLUS the opcode double-charge (`read_prefixes` peeks the opcode, then
-    /// `decode` re-fetches it), i.e. `len + 1` cycles. This warm replay no longer mirrors that: the
-    /// `len + 1` per-byte charge and the opcode double-charge are slow-bus/decode-time artifacts, not
-    /// I-cache costs. Charging them on every execution floored the fast modes' Dhrystone/Sieve far
-    /// below their era bands. A warm hit costs one I-cache access; the cold decode legitimately costs
-    /// more. Over a benchmark loop the warm replay dominates, so the per-mode metric reflects the
-    /// I-cache cost. The first (cold) execution costing more is physically correct and guest-invisible
-    /// (it changes only the bus-clock metric, never a result).
+    /// Cold decoding charges each consumed byte once. Warm replay collapses cacheable RAM to
+    /// one I-cache access; folded modes include that cost in the instruction class. ROM/device
+    /// replay retains the per-byte charge. LOCK validation has its own uncached operand peeks.
     pub(super) fn charge_cached_fetch<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -511,8 +505,7 @@ impl CpuGsw {
     /// fused dispatch from where decode left off (it does NOT re-read the prefixes/opcode).
     pub(super) fn decode<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<DecodedInsn> {
         let start_eip = self.registers.eip;
-        let prefixes = self.read_prefixes(bus)?;
-        let opcode = self.fetch_u8(bus)?;
+        let (prefixes, opcode) = self.read_prefixes(bus)?;
         if prefixes.lock {
             // The LOCK check runs on the first opcode byte and peeks (does not consume) the byte
             // after it — for 0F that peek is the second opcode byte, so it must happen before the
@@ -1014,10 +1007,9 @@ impl CpuGsw {
         self.require_isa_generation(two_byte_isa_generation(second))
     }
 
-    fn read_prefixes<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<Prefixes> {
+    fn read_prefixes<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<(Prefixes, u8)> {
         let mut prefixes = Prefixes::default();
         loop {
-            let eip = self.registers.eip;
             let byte = self.fetch_u8(bus)?;
             match byte {
                 0x26 => prefixes.segment_override = Some(SegmentIndex::Es),
@@ -1033,10 +1025,7 @@ impl CpuGsw {
                 0xf0 => prefixes.lock = true,
                 0xf3 => prefixes.rep = Some(RepKind::Repe),
                 0xf2 => prefixes.rep = Some(RepKind::Repne),
-                _ => {
-                    self.registers.eip = eip;
-                    return Ok(prefixes);
-                }
+                _ => return Ok((prefixes, byte)),
             }
         }
     }

@@ -3,6 +3,9 @@
 
 use super::*;
 
+// Architectural fields retain the fused-reference capture. Fetch counts exclude
+// the decoder's removed opcode reread.
+
 // ---- Stack-group golden battery (A4) ----
 
 /// One golden end-state for a stack-group case, captured from the fused reference
@@ -56,7 +59,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(494, 2), (495, 1)],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "push bx",
@@ -65,7 +68,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(494, 8), (495, 7)],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "push cx",
@@ -74,7 +77,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(494, 4), (495, 3)],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "push si",
@@ -83,7 +86,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(494, 8)],
-            fetch: 2,
+            fetch: 1,
         },
         // POP reg (0x58-0x5f): reads from SS:SP=0x1f0 (BEEF planted there), SP += 2.
         StackGolden {
@@ -93,7 +96,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "pop bx",
@@ -102,7 +105,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // PUSH seg (0x06/0x0e/0x16/0x1e): push ES/CS/SS/DS selectors. All are 0 from
         // stack_seed, so no bytes change from initial (they write 0x0000 over 0x0000).
@@ -113,7 +116,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "push cs",
@@ -122,7 +125,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "push ss",
@@ -131,7 +134,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "push ds",
@@ -140,7 +143,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // POP seg (0x07/0x17/0x1f): pops 0xBEEF from stack into ES/SS/DS. No gpr delta
         // (segment selectors are not in `gpr`); SP advances.
@@ -151,7 +154,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "pop ss",
@@ -160,7 +163,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         StackGolden {
             name: "pop ds",
@@ -169,7 +172,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // PUSH imm16 (0x68): push 0x1234 to ss:0x1ee.
         StackGolden {
@@ -179,7 +182,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[(494, 52), (495, 18)],
-            fetch: 4,
+            fetch: 3,
         },
         // PUSH imm8 +5 (0x6a 0x05): sign-extended to 0x0005; high byte 0x00 over 0x00 = no delta.
         StackGolden {
@@ -189,7 +192,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[(494, 5)],
-            fetch: 3,
+            fetch: 2,
         },
         // PUSH imm8 -1 (0x6a 0xff): sign-extended to 0xffff; both bytes 0xff change.
         StackGolden {
@@ -199,7 +202,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[(494, 255), (495, 255)],
-            fetch: 3,
+            fetch: 2,
         },
         // POP r/m (0x8f /0) memory form: 8F 06 10 01 = POP word [0x0110]. Pops 0xBEEF from
         // ss:0x1f0, writes to ds:0x0110 (= offset 272 dec). SP advances to 0x1f2 (= 498).
@@ -210,7 +213,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(272, 239), (273, 190)],
-            fetch: 5,
+            fetch: 4,
         },
         // POP r/m register form: 8F /0 mod=11 rm=000 -> POP AX. AX gets 0xBEEF.
         StackGolden {
@@ -220,7 +223,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // PUSHA (0x60): snapshot SP=0x1f0 before pushing 8 words. Pushes AX,CX,DX,BX,
         // snapshot-SP,BP,SI,DI. SP ends at 0x1e0 (= 480). The BEEF word at 0x1f0 is
@@ -247,7 +250,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
                 (494, 2),
                 (495, 1),
             ],
-            fetch: 2,
+            fetch: 1,
         },
         // POPA (0x61): pops DI,SI,BP,discard,BX,DX,CX,AX from SP=0x1f0. DI gets 0xBEEF
         // (it's the first pop at 0x1f0). All others pop 0x00. SP ends at 0x200 (= 512).
@@ -258,7 +261,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // PUSHF (0x9c): push eflags (0x0002) to ss:0x1ee. High byte 0x00 over 0x00 = no delta.
         StackGolden {
@@ -268,7 +271,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(494, 2)],
-            fetch: 2,
+            fetch: 1,
         },
         // POPF (0x9d): pops 0x0097 from ss:0x1f0 (overridden from BEEF in the test loop).
         // CF+PF+AF+ZF+SF all set. SP advances to 0x1f2 (= 498).
@@ -279,7 +282,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x97,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // ENTER imm16=4, imm8=1 (nesting level 1): push BP (0x01f0), copy frame ptr, set
         // BP = pre-push SP - 2, then SP -= alloc (4). Stack frame consumes 4 bytes (2 for
@@ -291,7 +294,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(492, 238), (493, 1), (494, 240), (495, 1)],
-            fetch: 5,
+            fetch: 4,
         },
         // LEAVE (0xc9): SP <- BP = 0x1f0, then pop BP from ss:0x1f0 (BEEF). BP = 0xBEEF,
         // SP = 0x1f2 (= 498).
@@ -302,7 +305,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
     ]
 }
@@ -457,7 +460,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x6,
             eip: 0x3,
             deltas: &[(16, 23)],
-            fetch: 4,
+            fetch: 3,
         },
         GroupGolden {
             name: "or byte [bx],0xf0 (80 /1)",
@@ -466,7 +469,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x82,
             eip: 0x3,
             deltas: &[(16, 242)],
-            fetch: 4,
+            fetch: 3,
         },
         GroupGolden {
             name: "cmp byte [bx],0x12 (80 /7 no writeback)",
@@ -475,7 +478,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x46,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         GroupGolden {
             name: "add word [bx],0x1234 (81 /0)",
@@ -484,7 +487,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[(16, 70), (17, 70)],
-            fetch: 5,
+            fetch: 4,
         },
         GroupGolden {
             name: "cmp word [bx],0x3412 (81 /7 no writeback)",
@@ -493,7 +496,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x46,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         GroupGolden {
             name: "add word [bx],-2 (83 /0 sign-extend)",
@@ -502,7 +505,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x13,
             eip: 0x3,
             deltas: &[(16, 16)],
-            fetch: 4,
+            fetch: 3,
         },
         GroupGolden {
             name: "sub ax,-1 (83 /5 sign-extend reg)",
@@ -511,7 +514,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x17,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // Group 2: shift/rotate (0xc0/0xc1/0xd0-0xd3). Flags load-bearing; count 1/CL/imm8.
         GroupGolden {
@@ -521,7 +524,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x6,
             eip: 0x2,
             deltas: &[(16, 36)],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "shr word [bx],1 (d1 /5)",
@@ -530,7 +533,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x6,
             eip: 0x2,
             deltas: &[(16, 9), (17, 26)],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "shl ax,1 (d1 /4 reg)",
@@ -539,7 +542,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "rol byte [bx],cl (d2 /0)",
@@ -548,7 +551,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x3,
             eip: 0x2,
             deltas: &[(16, 33)],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "sar word [bx],cl (d3 /7)",
@@ -557,7 +560,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x6,
             eip: 0x2,
             deltas: &[(16, 65), (17, 3)],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "rcr word [bx],3 (c1 /3 imm8)",
@@ -566,7 +569,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[(16, 130), (17, 166)],
-            fetch: 4,
+            fetch: 3,
         },
         GroupGolden {
             name: "shl ax,4 (c1 /4 imm8 reg)",
@@ -575,7 +578,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // Group 3: F6/F7 (TEST-with-imm/NOT/NEG/MUL/IMUL/DIV). DIV here is non-faulting; the
         // DIV-by-zero #DE is covered by `group_div_by_zero_raises_de_through_the_split`.
@@ -586,7 +589,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         GroupGolden {
             name: "test ax,0x00ff (f7 /0 imm reg)",
@@ -595,7 +598,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         GroupGolden {
             name: "not word [bx] (f7 /2)",
@@ -604,7 +607,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x3,
             eip: 0x2,
             deltas: &[(16, 237), (17, 203)],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "neg ax (f7 /3 reg)",
@@ -613,7 +616,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x93,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "mul bl (f6 /4 reg)",
@@ -622,7 +625,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "imul cx (f7 /5 reg)",
@@ -631,7 +634,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x803,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "div bl (f6 /6 reg, non-faulting)",
@@ -640,7 +643,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x3,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // Group 4: INC/DEC byte (0xfe). CF must be preserved (the seed pre-sets CF; both end
         // states keep bit 0 set).
@@ -651,7 +654,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x3,
             eip: 0x2,
             deltas: &[(16, 19)],
-            fetch: 3,
+            fetch: 2,
         },
         GroupGolden {
             name: "dec byte [bx] (fe /1, CF preserved)",
@@ -660,7 +663,7 @@ fn group_golden_cases() -> &'static [GroupGolden] {
             eflags: 0x7,
             eip: 0x2,
             deltas: &[(16, 17)],
-            fetch: 3,
+            fetch: 2,
         },
     ]
 }
@@ -760,10 +763,8 @@ fn group_div_by_zero_raises_de_through_the_split() {
     // runs below `finish_instruction`/`deliver_exception`, so this checks the raise site
     // itself, not the delivered frame. The `div` helper checks divide-by-zero BEFORE any
     // register write, and `decode` consumes exactly the F6 + ModRM bytes (no immediate for
-    // /6), so we also assert eip advanced by 2. The InstructionPrefetch count (3, one
-    // read-ahead past the 2-byte op — see the non-faulting `div bl` golden, which also
-    // reports 3) confirms decode charged the fetch and the executor faulted with no extra
-    // fetch.
+    // /6), so we also assert eip advanced by 2. The two InstructionPrefetch events
+    // confirm decode charged each consumed byte once before the executor faulted.
     let code = [0xf6, 0xf3]; // div bl
     let mut mem = vec![0u8; 0x40];
     mem[..code.len()].copy_from_slice(&code);
@@ -799,8 +800,8 @@ fn group_div_by_zero_raises_de_through_the_split() {
     );
     assert_eq!(
         seam_fetch_count(&sbus),
-        3,
-        "the split must charge the same fetches as the non-faulting div bl golden (3)"
+        2,
+        "faulting DIV must fetch its opcode and ModRM once"
     );
 }
 
@@ -855,7 +856,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x7,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         BranchGolden {
             name: "jnz +5 not taken (75, ZF set)",
@@ -865,7 +866,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // Jcc short with a backward (negative) rel8 — exercises the sign-extension.
         BranchGolden {
@@ -876,7 +877,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x0,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // Jcc near, two-byte (rel16). ZF pre-set: 0F 84 taken, 0F 85 falls through.
         BranchGolden {
@@ -887,7 +888,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x104,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         BranchGolden {
             name: "jnz near +0x100 not taken (0F 85, ZF set)",
@@ -897,7 +898,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         // JMP short (rel8) and JMP near (rel16): unconditional.
         BranchGolden {
@@ -908,7 +909,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x7,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         BranchGolden {
             name: "jmp near +0x100 (e9)",
@@ -918,7 +919,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x103,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // CALL near (rel16): push the return address (post-instruction eip = 3) then branch.
         // SP drops by 2 (0x100 -> 0xfe) and [SS:0xfe] holds the little-endian return address.
@@ -930,7 +931,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x103,
             deltas: &[(0xfe, 0x03)],
-            fetch: 4,
+            fetch: 3,
         },
         // LOOP (0xe2): decrement CX, branch while nonzero.
         BranchGolden {
@@ -941,7 +942,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x7,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         BranchGolden {
             name: "loop +5 not taken (e2, cx 1->0)",
@@ -951,7 +952,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // LOOPE (0xe1, loops while ZF=1) and LOOPNE (0xe0, loops while ZF=0). ZF pre-set.
         BranchGolden {
@@ -962,7 +963,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x7,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         BranchGolden {
             name: "loopne +5 not taken (e0, ZF set, cx 3->2)",
@@ -972,7 +973,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // JCXZ (0xe3): branch when CX == 0, no decrement.
         BranchGolden {
@@ -983,7 +984,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x7,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         BranchGolden {
             name: "jcxz +5 not taken (e3, cx!=0)",
@@ -993,7 +994,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             eflags: 0x42,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
     ]
 }

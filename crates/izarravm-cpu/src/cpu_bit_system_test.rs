@@ -3,6 +3,9 @@
 
 use super::*;
 
+// Architectural fields retain the fused-reference capture. Fetch counts exclude
+// the decoder's removed opcode reread.
+
 /// One golden end-state for a bit-manipulation case (task A10). BT/BTS/BTR/BTC, BSF/BSR,
 /// SHLD/SHRD, CMPXCHG, and XADD all set flags (CF for BT-family, ZF for BSF/BSR/CMPXCHG, the
 /// full ALU set for SHLD/SHRD/CMPXCHG/XADD), write registers, and — for the memory r/m forms —
@@ -73,7 +76,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x3,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // BTS CX, BX (0F AB D9): set bit 3 of CX=0x0008 (already set) -> CF=1, CX unchanged.
         BitManipGolden {
@@ -83,7 +86,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x3,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // BTR CX, BX (0F B3 D9): reset bit 3 of CX=0x0008 -> CF=1 (old bit), CX=0x0000.
         BitManipGolden {
@@ -93,7 +96,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x3,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // BTC CX, BX (0F BB D9): toggle bit 3 of CX=0x0008 -> CF=1 (old), CX=0x0000.
         BitManipGolden {
@@ -103,7 +106,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x3,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // BTS [0x40], BX (0F AB 1E 40 00): BX=3 -> sets bit 3 of the word at 0x40=0x1234.
         // (No walk: index 3 < 16, lands in the first word.) 0x1234 has bit 3 clear, so the low
@@ -115,7 +118,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[(64, 60)],
-            fetch: 6,
+            fetch: 5,
         },
         // BTS [0x40], DX with DX=16 -> bit index 16 walks to the NEXT word at 0x42 (the subtle
         // BT-memory case): sets bit 0 of the 0x0000 word at 0x42, so the delta is at byte 66
@@ -128,7 +131,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[(66, 1)],
-            fetch: 6,
+            fetch: 5,
         },
         // BTS [0x40], imm8=5 (0F BA 2E 40 00 05): /5=BTS, fixed imm8 index 5 -> bit 5 of the
         // word at 0x40=0x1234 is already set, so CF=1 and NO memory write (no delta). Proves the
@@ -140,7 +143,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x3,
             eip: 0x6,
             deltas: &[],
-            fetch: 7,
+            fetch: 6,
         },
         // BT CX, imm8=3 (0F BA E1 03): /4=BT, mod=3 rm=CX -> CF = bit 3 of CX=0x0008 = 1.
         BitManipGolden {
@@ -150,7 +153,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x3,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         // BSF BX, CX (0F BC D9): CX=0x0008 -> lowest set bit index 3 into BX, ZF=0.
         BitManipGolden {
@@ -160,7 +163,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // BSR BX, CX (0F BD D9): CX=0x0008 -> highest set bit index 3 into BX, ZF=0.
         BitManipGolden {
@@ -170,7 +173,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // BSF BX, CX with CX=0 (0F BC D9, CX overridden to 0): ZF=1 (eflags 0x42), BX preserved
         // at its preset 0xbeef (=48879). Proves the zero-source path leaves the destination.
@@ -181,7 +184,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x42,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // SHLD AX, BX, imm8=4 (0F A4 D8 04): mod=3 reg=BX rm=AX. AX=0x0034, BX=3 -> shifts AX
         // left 4, filling from BX's high bits -> AX=0x0340 (=832). Proves the imm8 count + flags.
@@ -192,7 +195,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         // SHRD AX, BX, imm8=4 (0F AC D8 04): shifts AX right 4, filling from BX's low bits ->
         // AX=0x3003 (=12291), CF=1 + PF (eflags 0x6).
@@ -203,7 +206,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x6,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
         },
         // SHLD AX, BX, CL (0F A5 D8): CL=8 (CX=0x0008 -> CL=8) -> shift AX left 8 -> AX=0x3400
         // (=13312).
@@ -214,7 +217,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x6,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // SHRD AX, BX, CL (0F AD D8): CL=8 -> shift AX right 8 -> AX=0x0300 (=768).
         BitManipGolden {
@@ -224,7 +227,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x6,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // CMPXCHG [0x40], BL byte form (0F B0 1E 40 00): AL=0x34 == dest byte 0x34 -> equal:
         // ZF=1 (eflags 0x46), store BL=3 into [0x40]: delta (64, 3). The equal branch + write.
@@ -235,7 +238,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x46,
             eip: 0x5,
             deltas: &[(64, 3)],
-            fetch: 6,
+            fetch: 5,
         },
         // CMPXCHG CX, BX word form (0F B1 D9): AX=0x0034 != CX=0x0008 -> unequal: ZF=0
         // (eflags 0x12), load CX into AX (AX=0x0008). Register dest, the unequal re-write.
@@ -246,7 +249,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x12,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // XADD BL, CL byte form (0F C0 CB): mod=3 reg=CL(1) rm=BL(3). dest=BL=3, src=CL=8 ->
         // BL=11, CL=3 (old dest), flags like ADD(3,8).
@@ -257,7 +260,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // XADD [0x40], CX word form (0F C1 0E 40 00): dest=word[0x40]=0x1234, src=CX=0x0008 ->
         // [0x40]=0x123c (low byte 0x34 -> 0x3c=60: delta (64, 60)), CX=0x1234 (=4660, old dest),
@@ -269,7 +272,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
             eflags: 0x6,
             eip: 0x5,
             deltas: &[(64, 60)],
-            fetch: 6,
+            fetch: 5,
         },
     ]
 }
@@ -438,7 +441,7 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // SETcc true: SETNZ BL (0F 95 C3): ZF=0 → condition true → BL=1 (BX=0x0001).
         CondMoveGolden {
@@ -448,7 +451,7 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // SETcc mem false: SETZ [0x50] (0F 94 1E 50 00): ZF=0 → write 0 to [0x50] (no delta, mem
         // already 0). Proves the byte-wide memory write fires even for the false condition.
@@ -459,7 +462,7 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[],
-            fetch: 6,
+            fetch: 5,
         },
         // SETcc mem true: SETNZ [0x50] (0F 95 1E 50 00): ZF=0 → write 1 to [0x50]; delta (80, 1).
         CondMoveGolden {
@@ -469,7 +472,7 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[(80, 1)],
-            fetch: 6,
+            fetch: 5,
         },
         // IMUL no overflow: IMUL AX, BX (0F AF C3): 5*3=15, fits in 16 bits → CF=OF=0.
         CondMoveGolden {
@@ -479,7 +482,7 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         // IMUL overflow: IMUL CX, DX (0F AF CA): 0x0100*0x4000=0x400000, truncated to
         // CX=0x0000 → CF=OF=1 (eflags 0x803: bit11=OF, bit1=reserved, bit0=CF).
@@ -490,7 +493,7 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
             eflags: 0x803,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
     ]
 }
@@ -692,7 +695,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -711,7 +714,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[(96, 10)],
-            fetch: 6,
+            fetch: 5,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -730,7 +733,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0x5,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -749,7 +752,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
             cr0: 0x2,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -768,7 +771,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[(96, 255), (99, 1)],
-            fetch: 6,
+            fetch: 5,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -787,7 +790,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[(96, 255), (97, 3), (99, 9)],
-            fetch: 6,
+            fetch: 5,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -806,7 +809,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[],
-            fetch: 6,
+            fetch: 5,
             cr0: 0xa,
             gdtr_base: 0x1000,
             gdtr_limit: 0xff,
@@ -825,7 +828,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x5,
             deltas: &[],
-            fetch: 6,
+            fetch: 5,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -844,7 +847,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -863,7 +866,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -882,7 +885,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -901,7 +904,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -920,7 +923,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x4,
             deltas: &[],
-            fetch: 5,
+            fetch: 4,
             cr0: 0xa,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -939,7 +942,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xb,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -958,7 +961,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xb,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -977,7 +980,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x2,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xb,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -996,7 +999,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x42,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xb,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -1015,7 +1018,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x42,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xb,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -1034,7 +1037,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x42,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xb,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,
@@ -1053,7 +1056,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
             eflags: 0x42,
             eip: 0x3,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
             cr0: 0xb,
             gdtr_base: 0x100,
             gdtr_limit: 0xff,

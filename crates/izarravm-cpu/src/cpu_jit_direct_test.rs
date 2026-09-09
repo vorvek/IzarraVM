@@ -644,25 +644,18 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
     assert_eq!(native.registers.eax(), 3);
     assert_eq!(native.registers.ebx(), 7);
     assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
-    assert_eq!(native_bus.trace.cycles().len(), 26);
-    assert_eq!(native_bus.trace.elapsed_clocks(), 52);
+    assert_eq!(native_bus.trace.cycles().len(), 25);
+    assert_eq!(native_bus.trace.elapsed_clocks(), 50);
     assert_eq!(
         native_bus
             .trace
             .cycles()
             .iter()
             .skip(14)
-            .take(6)
+            .take(5)
             .map(|cycle| cycle.address)
             .collect::<Vec<_>>(),
-        vec![
-            TARGET,
-            TARGET,
-            TARGET + 1,
-            TARGET + 2,
-            TARGET + 3,
-            TARGET + 4
-        ]
+        vec![TARGET, TARGET + 1, TARGET + 2, TARGET + 3, TARGET + 4]
     );
 
     let after = native.perf_counters();

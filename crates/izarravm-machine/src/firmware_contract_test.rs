@@ -595,6 +595,65 @@ fn per_vector_linear_stub_identity_posts_the_matching_service() {
     assert_eq!(machine.pending_soft_int, Some(0x10));
 }
 
+#[test]
+fn opcode_fetch_int2f_stub_has_equal_cold_and_warm_rom_charges() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    machine.set_mode(GswMode::Gsw586);
+    machine.pending_soft_int = None;
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    let offset = u32::from(bios_int_stub_off(0x2f)) + 1;
+    let physical = BIOS_INT_STUB_TABLE_LINEAR + 0x2f * 2 + 1;
+    assert_eq!(physical, 0xff25f);
+    assert_eq!(machine.read_physical_u8(physical), 0xcf);
+    for (index, byte) in [0x00, 0x01, 0x00, 0x00, 0x02, 0x00].into_iter().enumerate() {
+        machine.write_physical_u8(0x2000 + index as u32, byte);
+    }
+    for cold in [true, false, false] {
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::real(BIOS_ROM_IRET_SEG));
+        cpu.registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::real(0));
+        cpu.registers.eip = offset;
+        cpu.registers.set_esp(0x2000);
+        cpu.registers.eflags = 2;
+        let misses = cpu.perf_counters().decode_misses;
+        let raw = {
+            let mut bus = machine.make_bus();
+            let before = bus.trace.elapsed_clocks();
+            assert!(!cpu.cycle(&mut bus).unwrap().halted);
+            bus.trace.elapsed_clocks() - before
+        };
+        assert_eq!(raw, 3, "cold={cold}");
+        assert_eq!(cpu.perf_counters().decode_misses - misses, u64::from(cold));
+        assert_eq!(cpu.registers.eip, 0x100);
+        assert_eq!(cpu.registers.cs().selector, 0);
+        assert_eq!(cpu.registers.esp(), 0x2006);
+        assert_eq!(machine.pending_soft_int, None);
+    }
+    for cold in [true, false] {
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::real(BIOS_ROM_IRET_SEG));
+        cpu.registers.eip = offset - 1;
+        machine.pending_soft_int = None;
+        let misses = cpu.perf_counters().decode_misses;
+        let raw = {
+            let mut bus = machine.make_bus();
+            let before = bus.trace.elapsed_clocks();
+            assert!(!cpu.cycle(&mut bus).unwrap().halted);
+            bus.trace.elapsed_clocks() - before
+        };
+        assert_eq!(raw, 3, "NOP cold={cold}");
+        assert_eq!(cpu.perf_counters().decode_misses - misses, u64::from(cold));
+        assert_eq!(cpu.registers.eip, offset);
+        assert_eq!(machine.pending_soft_int, Some(0x2f));
+    }
+}
+
 /// TOKAEMM addresses itself with 16-bit offsets, so everything it can name has
 /// to fit under 64 KB. The paging tables are the exception: they are reserved
 /// past the end of the file and reached only by linear address through

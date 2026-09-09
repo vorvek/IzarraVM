@@ -2741,6 +2741,8 @@ enum TestCoreEvent {
 
 #[derive(Default)]
 pub(crate) struct TestBus {
+    code_fetch_observations: Option<Vec<u32>>,
+    fail_fetch_charge_at: Option<u32>,
     published_core: u64,
     core_events: Option<Vec<TestCoreEvent>>,
     // Aligned like the production `Memory` backing, and for the same reason: `direct_page`
@@ -2887,6 +2889,8 @@ pub(crate) struct TestBus {
 impl TestBus {
     pub(crate) fn with_memory(memory: Vec<u8>) -> Self {
         Self {
+            code_fetch_observations: None,
+            fail_fetch_charge_at: None,
             memory: memory.into(),
             trace: BusTrace::default(),
             published_core: 0,
@@ -3230,6 +3234,9 @@ impl CpuBus for TestBus {
     }
 
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
+        if self.fail_fetch_charge_at == Some(address) {
+            return Err(BusError::UnmappedMemory { address });
+        }
         if self.mkii_folded_fetches && !self.mkii_owned_replay_disabled {
             return Ok(());
         }
@@ -3240,6 +3247,12 @@ impl CpuBus for TestBus {
             0,
         ));
         Ok(())
+    }
+
+    fn note_code_fetch_linear(&mut self, linear: u32) {
+        if let Some(observations) = &mut self.code_fetch_observations {
+            observations.push(linear);
+        }
     }
 
     // The trait default charges a fetch run byte-by-byte (one cross-crate call + push per
@@ -4318,6 +4331,9 @@ mod jit_segwrite_edge;
 ))]
 #[path = "cpu_decode_pack_test.rs"]
 mod decode_pack;
+
+#[path = "cpu_opcode_fetch_test.rs"]
+mod opcode_fetch;
 
 #[cfg(all(
     feature = "jit",

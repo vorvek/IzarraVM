@@ -534,8 +534,8 @@ fn i386_rep_ports_keep_first_and_resumed_owners() {
         assert_eq!(cpu.registers.ecx(), 1);
         assert_eq!(cpu.registers.eip, 0x40);
         assert!(cpu.rep_execution.resume.is_some());
-        assert_eq!(bus.trace.elapsed_clocks(), 10);
-        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 10);
+        assert_eq!(bus.trace.elapsed_clocks(), 8);
+        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 8);
         assert_eq!(cpu.perf_counters().instructions, 0);
         assert_eq!(cpu.perf_counters().rep_string_iterations, 1);
         let fetches = bus
@@ -545,7 +545,7 @@ fn i386_rep_ports_keep_first_and_resumed_owners() {
             .filter(|cycle| cycle.kind == BusAccessKind::InstructionPrefetch)
             .map(|cycle| cycle.address)
             .collect::<Vec<_>>();
-        assert_eq!(fetches, vec![0x40, 0x41, 0x41]);
+        assert_eq!(fetches, vec![0x40, 0x41]);
         assert_eq!(
             bus.trace
                 .cycles()
@@ -557,14 +557,12 @@ fn i386_rep_ports_keep_first_and_resumed_owners() {
                 vec![
                     (BusAccessKind::InstructionPrefetch, 0x40),
                     (BusAccessKind::InstructionPrefetch, 0x41),
-                    (BusAccessKind::InstructionPrefetch, 0x41),
                     (BusAccessKind::DataRead, 0x200),
                     (BusAccessKind::IoWrite, 0x03da),
                 ]
             } else {
                 vec![
                     (BusAccessKind::InstructionPrefetch, 0x40),
-                    (BusAccessKind::InstructionPrefetch, 0x41),
                     (BusAccessKind::InstructionPrefetch, 0x41),
                     (BusAccessKind::IoRead, 0x03da),
                     (BusAccessKind::DataWrite, 0x200),
@@ -594,8 +592,8 @@ fn i386_rep_ports_keep_first_and_resumed_owners() {
         assert_eq!(cpu.registers.ecx(), 0);
         assert_eq!(cpu.registers.eip, 0x42);
         assert!(cpu.rep_execution.resume.is_none());
-        assert_eq!(bus.trace.elapsed_clocks(), 14);
-        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 14);
+        assert_eq!(bus.trace.elapsed_clocks(), 12);
+        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 12);
         assert_eq!(cpu.perf_counters().instructions, 1);
         assert_eq!(cpu.perf_counters().rep_string_iterations, 2);
         assert_eq!(
@@ -638,9 +636,9 @@ fn i386_rep_ports_keep_first_and_resumed_owners() {
         assert_eq!(later.core_clocks, 1);
         assert_eq!(cpu.elapsed_clocks - later_elapsed, 1);
         assert_eq!(cpu.timing_rem, later_carry);
-        assert_eq!(bus.trace.elapsed_clocks() - later_bus, 6);
-        assert_eq!(bus.trace.elapsed_clocks(), 20);
-        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 20);
+        assert_eq!(bus.trace.elapsed_clocks() - later_bus, 4);
+        assert_eq!(bus.trace.elapsed_clocks(), 16);
+        assert_eq!(izarravm_bus::CpuBus::in_batch_scaled_bus_clocks(&bus), 16);
         assert_eq!(
             bus.trace
                 .cycles()
@@ -649,7 +647,6 @@ fn i386_rep_ports_keep_first_and_resumed_owners() {
                 .map(|cycle| (cycle.kind, cycle.address))
                 .collect::<Vec<_>>(),
             vec![
-                (BusAccessKind::InstructionPrefetch, 0x42),
                 (BusAccessKind::InstructionPrefetch, 0x42),
                 (BusAccessKind::InstructionPrefetch, 0x43),
             ]
