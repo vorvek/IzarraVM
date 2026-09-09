@@ -598,6 +598,53 @@ fn compare_all_conditions(regions: bool, arithmetic: u8) {
 }
 
 #[test]
+fn mkii_final_helper_settles_pure_work_and_preserves_earlier_taken_pairs() {
+    for grant in [false, true] {
+        for taken in [false, true] {
+            let code = [0x3b, 0x06, 0, 0x20, 0x74, 1, 0x50, 0xee];
+            let (mut cpu, mut bus) = fixture(&code);
+            let (mut oracle, mut other) = fixture(&code);
+            for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                enable_read_regions(bus);
+                bus.mkii_read_regions = grant;
+                warm_read(cpu, bus, 0x2000);
+                warm_code(cpu, bus, code.len() as u32);
+                cpu.registers.set_eax(if taken { 0x5678 } else { 1 });
+            }
+            compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+            let stats = cpu.dynarec_mkii_stats();
+            assert_eq!(stats.entries, 1);
+            assert_eq!(stats.native, 2);
+            assert_eq!(stats.regions, u64::from(grant));
+            assert_eq!(stats.memory_spans, u64::from(!grant));
+            assert_eq!(cpu.registers.esp(), if taken { 0x9000 } else { 0x8ffe });
+        }
+        for helper in [false, true] {
+            let mut code = vec![0xb8, 0x34, 0x12, 0x90];
+            if helper {
+                code.push(0x50);
+            }
+            code.push(0xee);
+            let (mut cpu, mut bus) = fixture(&code);
+            let (mut oracle, mut other) = fixture(&code);
+            for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                enable_read_regions(bus);
+                bus.mkii_read_regions = grant;
+                warm_code(cpu, bus, code.len() as u32);
+            }
+            compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+            let stats = cpu.dynarec_mkii_stats();
+            assert_eq!(stats.entries, 1);
+            assert_eq!(stats.native, 2);
+            assert_eq!(stats.regions, u64::from(grant));
+            assert_eq!(stats.spans, u64::from(!grant));
+            assert_eq!(cpu.registers.eax(), 0x1234);
+            assert_eq!(cpu.registers.esp(), if helper { 0x8ffe } else { 0x9000 });
+        }
+    }
+}
+
+#[test]
 fn mkii_region_continues_through_untaken_branches_and_settles_taken_prefixes() {
     let code = [
         0x3b, 0x06, 0, 0x20, 0x74, 12, 0xbb, 0x11, 0x11, 0x3b, 0x06, 2, 0x20, 0x74, 3, 0xbb, 0x22,

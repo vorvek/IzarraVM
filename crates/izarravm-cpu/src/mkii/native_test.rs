@@ -4,12 +4,92 @@
 use super::*;
 use crate::jit::exec_mem::ExecutableBuffer;
 
+fn operations(bytes: &[u8]) -> Vec<Operation> {
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(crate::SegmentIndex::Cs, 0);
+    cpu.registers.eip = 0;
+    let mut memory = vec![0; 65536];
+    memory[..bytes.len()].copy_from_slice(bytes);
+    let mut bus = crate::tests::TestBus::with_memory(memory);
+    let mut operations = Vec::new();
+    while cpu.registers.eip < bytes.len() as u32 {
+        let eip = cpu.registers.eip;
+        let insn = cpu.fetch_decoded(&mut bus, eip).unwrap();
+        operations.push(Operation::lower(eip, eip, insn).unwrap());
+    }
+    operations
+}
+
+fn settlement_calls(operations: &[Operation]) -> usize {
+    let code = compile(operations).unwrap();
+    let end = code.unwind_points.last().unwrap() + 2;
+    // SAFETY: the final recorded point precedes the generated two-byte JMP RAX.
+    let bytes = unsafe { std::slice::from_raw_parts(code.entry_ptr(), end) };
+    let mut e = Encoder::new();
+    e.call_m64_disp32(
+        Reg::R13,
+        (std::mem::offset_of!(Frame, helpers) + 11 * std::mem::size_of::<usize>()) as i32,
+    );
+    let call = e.finish();
+    bytes
+        .windows(call.len())
+        .filter(|part| *part == call)
+        .count()
+}
+
+#[test]
+fn mkii_final_settlement_calls_follow_all_pending_paths() {
+    assert_eq!(settlement_calls(&[]), 0);
+    assert_eq!(settlement_calls(&operations(&[0x50])), 0);
+    assert_eq!(settlement_calls(&operations(&[0x90, 0x50])), 0);
+    assert_eq!(settlement_calls(&operations(&[0x90])), 1);
+    let mut read = operations(&[0x90, 0x8b, 0x06, 0, 0x20]);
+    read[0].region_len = 2;
+    assert_eq!(settlement_calls(&read), 0);
+    for region in [false, true] {
+        let mut pure = operations(&[0x90, 0x90]);
+        pure[0].span_len = 2;
+        pure[0].region_len = if region { 2 } else { 0 };
+        assert_eq!(settlement_calls(&pure), 1);
+        for terminal_helper in [false, true] {
+            let mut pair = operations(&[0x3b, 0x06, 0, 0x20, 0x74, 1, 0x50]);
+            if !terminal_helper {
+                pair.pop();
+            }
+            pair[0].span_len = 2;
+            pair[0].memory_cmp_branch = true;
+            pair[0].region_len = if region { 2 } else { 0 };
+            assert_eq!(settlement_calls(&pair), 1);
+        }
+    }
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 mod session {
     use super::*;
+
+    fn observer_trace() -> Code {
+        let mut e = Encoder::new();
+        let info = entry(&mut e);
+        let body = e.position();
+        call_helper(&mut e, 11, 0);
+        let helper_return = e.position();
+        e.load_r64_disp32(
+            Reg::RAX,
+            Reg::R13,
+            std::mem::offset_of!(Frame, dispatch) as i32,
+        );
+        let transfer = e.position();
+        e.jmp_r64(Reg::RAX);
+        Code {
+            buffer: ExecutableBuffer::new_with_unwind(&e.finish(), &info).unwrap(),
+            body,
+            unwind_points: vec![body, helper_return, transfer],
+        }
+    }
 
     const SENTINELS: [u64; 3] = [
         0x1357_9bdf_2468_ace0,
@@ -76,7 +156,7 @@ mod session {
                     probe.outer_stack[0],
                 );
             }
-            probe.traces[finished] = Some(compile(&[]).unwrap());
+            probe.traces[finished] = Some(observer_trace());
         }
         if probe.helpers == 4096 {
             0
@@ -161,7 +241,7 @@ mod session {
             frame.resolve = resolve;
             frame.dispatch = dispatcher.body_ptr() as usize;
             let mut probe = Probe {
-                traces: [Some(compile(&[]).unwrap()), Some(compile(&[]).unwrap())],
+                traces: [Some(observer_trace()), Some(observer_trace())],
                 dispatcher: &dispatcher,
                 cpu: &mut cpu,
                 frame: &mut frame,

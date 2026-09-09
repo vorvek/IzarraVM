@@ -80,10 +80,15 @@ pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
     let exit = e.label();
     let settle_exit = e.label();
     let mut index = 0;
+    let mut pending_on_fallthrough = false;
+    let mut has_pending_side_exit = false;
     while index < operations.len() {
         let operation = &operations[index];
         if operation.region_len < 2 {
-            index = emit_legacy_span(&mut e, operations, index, exit, settle_exit);
+            let tail = emit_legacy_span(&mut e, operations, index, exit, settle_exit);
+            index = tail.next;
+            pending_on_fallthrough = tail.pending_on_fallthrough;
+            has_pending_side_exit |= tail.has_pending_side_exit;
             continue;
         }
         let end = index + operation.region_len;
@@ -98,12 +103,20 @@ pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
         e.jmp(next);
         e.place(slow);
         while index < end {
-            index = emit_legacy_span(&mut e, operations, index, exit, settle_exit);
+            let tail = emit_legacy_span(&mut e, operations, index, exit, settle_exit);
+            index = tail.next;
+            pending_on_fallthrough = tail.pending_on_fallthrough;
+            has_pending_side_exit |= tail.has_pending_side_exit;
         }
         e.place(next);
     }
+    if !pending_on_fallthrough && has_pending_side_exit {
+        e.jmp(exit);
+    }
     e.place(settle_exit);
-    call_helper(&mut e, 11, 0);
+    if pending_on_fallthrough || has_pending_side_exit {
+        call_helper(&mut e, 11, 0);
+    }
     e.place(exit);
     #[cfg(test)]
     let helper_return = e.position();
@@ -123,13 +136,19 @@ pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
     })
 }
 
+struct SpanTail {
+    next: usize,
+    pending_on_fallthrough: bool,
+    has_pending_side_exit: bool,
+}
+
 fn emit_legacy_span(
     e: &mut Encoder,
     operations: &[Operation],
     index: usize,
     exit: Label,
     settle_exit: Label,
-) -> usize {
+) -> SpanTail {
     let operation = &operations[index];
     let end = index + operation.span_len;
     let slow = e.label();
@@ -159,7 +178,11 @@ fn emit_legacy_span(
         }
     }
     e.place(next);
-    end
+    SpanTail {
+        next: end,
+        pending_on_fallthrough: operation.span_len > 1 || operation.pure.is_some(),
+        has_pending_side_exit: operation.span_len > 1 && operation.memory_cmp_branch,
+    }
 }
 
 fn call_helper(e: &mut Encoder, slot: usize, operation: usize) {
