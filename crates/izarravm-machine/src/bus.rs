@@ -1887,6 +1887,22 @@ impl CpuBus for MachineBus<'_> {
         self.begin_compiled_window()
     }
 
+    fn certify_inert_read_region(&self) -> Option<izarravm_bus::InertReadRegion> {
+        let (mapping_epoch, cost_epoch) = self.owned_code_replay_epochs()?;
+        izarravm_bus::InertReadRegion::certify(
+            mapping_epoch,
+            cost_epoch,
+            self.trace.tracing_mode(),
+            self.jit_fetch_cost_clocks(),
+            [
+                self.jit_data_cost_clocks(BusWidth::Byte),
+                self.jit_data_cost_clocks(BusWidth::Word),
+                self.jit_data_cost_clocks(BusWidth::Dword),
+            ],
+            self.jit_projected_batch_scaled_bus_clocks(0)?,
+        )
+    }
+
     fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
         if !self.flat_data_cost {
             return None;

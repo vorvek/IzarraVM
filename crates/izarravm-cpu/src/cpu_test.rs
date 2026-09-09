@@ -2833,6 +2833,7 @@ pub(crate) struct TestBus {
     uniform_native_fetches: bool,
     mkii_exact_fetch_projection: bool,
     mkii_read_regions: bool,
+    mkii_inert_regions: bool,
     mkii_folded_fetches: bool,
     mkii_owned_replay_disabled: bool,
     // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
@@ -2887,6 +2888,13 @@ pub(crate) struct TestBus {
 }
 
 impl TestBus {
+    fn mkii_region_effects_quiet(&self) -> bool {
+        self.code_fetch_observations.is_none()
+            && self.core_events.is_none()
+            && self.fail_fetch_charge_at.is_none()
+            && !self.fail_instruction_prefetch_direct_page
+    }
+
     pub(crate) fn with_memory(memory: Vec<u8>) -> Self {
         Self {
             code_fetch_observations: None,
@@ -2923,6 +2931,7 @@ impl TestBus {
             uniform_native_fetches: false,
             mkii_exact_fetch_projection: false,
             mkii_read_regions: false,
+            mkii_inert_regions: false,
             mkii_folded_fetches: false,
             mkii_owned_replay_disabled: false,
             direct_page_clocks: false,
@@ -3288,7 +3297,8 @@ impl CpuBus for TestBus {
     }
 
     fn jit_preflight_cached_fetch(&self, _linear: u32, physical: u32, len: u8) -> Option<u64> {
-        (len != 0
+        (self.mkii_region_effects_quiet()
+            && len != 0
             && self.direct_memory_bytes(
                 physical,
                 usize::from(len),
@@ -3312,7 +3322,8 @@ impl CpuBus for TestBus {
 
     fn certify_owned_code_span(&self, linear: u32, physical: u32, len: u32) -> Option<(u64, u64)> {
         let last = len.checked_sub(1)?;
-        (self.mkii_folded_fetches
+        (self.mkii_region_effects_quiet()
+            && self.mkii_folded_fetches
             && self.mkii_read_regions
             && !self.mkii_owned_replay_disabled
             && self.trace.tracing_mode() == TracingMode::Off
@@ -3328,7 +3339,8 @@ impl CpuBus for TestBus {
     }
 
     fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
-        (self.mkii_folded_fetches
+        (self.mkii_region_effects_quiet()
+            && self.mkii_folded_fetches
             && self.mkii_read_regions
             && !self.mkii_owned_replay_disabled
             && self.trace.tracing_mode() == TracingMode::Off)
@@ -3568,10 +3580,38 @@ impl CpuBus for TestBus {
     }
 
     fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
-        if !self.mkii_read_regions {
+        if !self.mkii_read_regions || !self.mkii_region_effects_quiet() {
             return None;
         }
         self.begin_compiled_window()
+    }
+
+    fn certify_inert_read_region(&self) -> Option<izarravm_bus::InertReadRegion> {
+        if !self.mkii_inert_regions
+            || !self.mkii_region_effects_quiet()
+            || !self.direct_pages_enabled
+            || !self.uniform_native_fetches
+            || self.native_aggregate_accounting_disabled
+        {
+            return None;
+        }
+        let (mapping, cost) = self.owned_code_replay_epochs()?;
+        let total = self.jit_projected_batch_scaled_bus_clocks(0)?;
+        if total != self.in_batch_scaled_bus_clocks() {
+            return None;
+        }
+        izarravm_bus::InertReadRegion::certify(
+            mapping,
+            cost,
+            self.trace.tracing_mode(),
+            self.jit_fetch_cost_clocks(),
+            [
+                self.jit_data_cost_clocks(BusWidth::Byte),
+                self.jit_data_cost_clocks(BusWidth::Word),
+                self.jit_data_cost_clocks(BusWidth::Dword),
+            ],
+            total,
+        )
     }
 
     fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {

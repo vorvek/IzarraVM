@@ -10,6 +10,7 @@ use crate::{AddressSize, SegmentRegister};
 
 pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
     let commit = e.label();
+    let done = e.label();
     let mut exits = Vec::new();
     for (index, op) in operations.iter().enumerate() {
         if op.needs_carry_zero() {
@@ -35,6 +36,23 @@ pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
         std::mem::offset_of!(Frame, region_completed) as i32,
         operations.len() as u32,
     );
+    let last = operations.last().unwrap();
+    if operations.len() >= 2
+        && last
+            .eip
+            .checked_add(u32::from(last.insn.len))
+            .is_some_and(|eip| eip < 0x10000)
+    {
+        e.load_r32_disp32(
+            Reg::RAX,
+            Reg::R13,
+            std::mem::offset_of!(Frame, region_inert) as i32,
+        );
+        e.test_r32_r32(Reg::RAX, Reg::RAX);
+        e.jcc(4, commit);
+        emit_inert_finish(e, operations);
+        e.jmp(done);
+    }
     e.jmp(commit);
     for (label, completed, reason) in exits {
         e.place(label);
@@ -54,6 +72,100 @@ pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
     call_helper(e, 14, operations.as_ptr() as usize);
     e.test_r32_r32(Reg::RAX, Reg::RAX);
     e.jcc(4, exit);
+    e.place(done);
+}
+
+fn emit_inert_finish(e: &mut Encoder, operations: &[Operation]) {
+    let cost = &operations[0].region.as_ref().unwrap().prefixes[operations.len()];
+    let perf = std::mem::offset_of!(CpuGsw, perf);
+    let stats = std::mem::offset_of!(Frame, stats);
+    let last = operations.last().unwrap();
+    e.store_u32_imm_disp32(
+        Reg::R13,
+        std::mem::offset_of!(Frame, region_inert) as i32,
+        0,
+    );
+    e.store_u32_imm_disp32(
+        Reg::RBX,
+        (std::mem::offset_of!(CpuGsw, registers) + std::mem::offset_of!(Registers, eip)) as i32,
+        last.eip + u32::from(last.insn.len),
+    );
+    e.load_r64_disp32(
+        Reg::RAX,
+        Reg::R13,
+        std::mem::offset_of!(Frame, region_full_rem) as i32,
+    );
+    e.store_r64_disp32(
+        Reg::RBX,
+        std::mem::offset_of!(CpuGsw, timing_rem) as i32,
+        Reg::RAX,
+    );
+    e.load_r64_disp32(
+        Reg::RAX,
+        Reg::R13,
+        std::mem::offset_of!(Frame, region_full_core) as i32,
+    );
+    for (base, offset) in [
+        (Reg::RBX, std::mem::offset_of!(CpuGsw, elapsed_clocks)),
+        (Reg::R13, std::mem::offset_of!(Frame, total)),
+    ] {
+        e.load_r64_disp32(Reg::RDX, base, offset as i32);
+        e.add_r64_r64(Reg::RDX, Reg::RAX);
+        e.store_r64_disp32(base, offset as i32, Reg::RDX);
+    }
+    let counters = e.label();
+    e.load_r32_disp32(
+        Reg::RDX,
+        Reg::R13,
+        std::mem::offset_of!(Frame, region_monitor) as i32,
+    );
+    e.test_r32_r32(Reg::RDX, Reg::RDX);
+    e.jcc(4, counters);
+    let monitor =
+        (perf + std::mem::offset_of!(crate::PerfCounters, monitor_resident_core_clocks)) as i32;
+    e.load_r64_disp32(Reg::RDX, Reg::RBX, monitor);
+    e.add_r64_r64(Reg::RDX, Reg::RAX);
+    e.store_r64_disp32(Reg::RBX, monitor, Reg::RDX);
+    e.place(counters);
+    for (base, offset, count) in [
+        (
+            Reg::RBX,
+            perf + std::mem::offset_of!(crate::PerfCounters, instructions),
+            operations.len() as u64,
+        ),
+        (
+            Reg::RBX,
+            perf + std::mem::offset_of!(crate::PerfCounters, data_direct_reads),
+            cost.reads,
+        ),
+        (
+            Reg::RBX,
+            perf + std::mem::offset_of!(crate::PerfCounters, direct_data_pointer_reads),
+            cost.reads,
+        ),
+        (
+            Reg::RBX,
+            std::mem::offset_of!(CpuGsw, fast_map_probe)
+                + std::mem::offset_of!(crate::FastMapProbeCounters, hits),
+            cost.reads,
+        ),
+        (
+            Reg::R13,
+            stats + std::mem::offset_of!(crate::mkii::runtime::Stats, native),
+            operations.len() as u64,
+        ),
+        (
+            Reg::R13,
+            stats + std::mem::offset_of!(crate::mkii::runtime::Stats, carry_native),
+            cost.carry_ops,
+        ),
+    ] {
+        if count != 0 {
+            e.load_r64_disp32(Reg::RDX, base, offset as i32);
+            e.add_r64_imm32(Reg::RDX, u32::try_from(count).unwrap());
+            e.store_r64_disp32(base, offset as i32, Reg::RDX);
+        }
+    }
 }
 
 fn emit_carry_zero_guard(e: &mut Encoder, miss: Label) {

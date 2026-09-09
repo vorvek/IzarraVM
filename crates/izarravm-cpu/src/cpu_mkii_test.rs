@@ -1695,3 +1695,197 @@ fn mkii_poll_committed_time_and_pending_flags_survive_a_real_in_fault() {
         }
     }
 }
+
+fn enable_inert_regions(bus: &mut TestBus) {
+    enable_read_regions(bus);
+    bus.mkii_inert_regions = true;
+    bus.mkii_folded_fetches = true;
+    bus.direct_page_clocks = false;
+}
+
+#[test]
+fn mkii_inert_completion_matches_all_remainders_caps_and_privilege_levels() {
+    let code = [0x90, 0xb8, 1, 0, 0x03, 0x06, 0, 0x20, 0x90, 0xe4, 0x60];
+    for cpl in 0..4 {
+        for remainder in 0..12 {
+            for cap in [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 40] {
+                let (mut cpu, mut bus) = fixture(&code);
+                let (mut oracle, mut other) = fixture(&code);
+                for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                    enable_inert_regions(bus);
+                    cpu.cpl = cpl;
+                    cpu.registers.eflags |= 3 << 12;
+                    cpu.registers.segments[SegmentIndex::Ds.index()].access = 0x93 | (cpl << 5);
+                    warm_read(cpu, bus, 0x2000);
+                    warm_code(cpu, bus, code.len() as u32);
+                    bus.trace.add_elapsed_clocks(177);
+                    cpu.elapsed_clocks = 71;
+                    cpu.timing_rem = remainder;
+                    assert!(bus.certify_inert_read_region().is_some());
+                }
+                compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, cap);
+                if cap == 40 {
+                    assert!(cpu.dynarec_mkii_stats().regions > 0);
+                    assert!(cpu.dynarec_mkii_stats().native >= 4);
+                    assert_eq!(cpu.perf.monitor_resident_core_clocks != 0, cpl == 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_inert_completion_preserves_taken_and_faulting_prefixes() {
+    for taken in [false, true] {
+        for valid_read in [false, true] {
+            for carry in [false, true] {
+                for remainder in 0..12 {
+                    let code = [
+                        0x90, 0x13, 0x06, 0, 0x20, 0x75, 4, 0x8b, 0x06, 0, 0x30, 0xe4, 0x60,
+                    ];
+                    let (mut cpu, mut bus) = fixture(&code);
+                    let (mut oracle, mut other) = fixture(&code);
+                    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                        enable_inert_regions(bus);
+                        bus.memory[0x2000..0x2002].copy_from_slice(&u16::from(taken).to_le_bytes());
+                        cpu.registers.set_eax(0);
+                        warm_read(cpu, bus, 0x2000);
+                        if valid_read {
+                            warm_read(cpu, bus, 0x3000);
+                        } else {
+                            cpu.registers.segments[SegmentIndex::Ds.index()].limit = 0x2fff;
+                        }
+                        warm_code(cpu, bus, code.len() as u32);
+                        cpu.set_flag(FLAG_CF, carry);
+                        cpu.timing_rem = remainder;
+                    }
+                    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+                    assert!(cpu.dynarec_mkii_stats().regions > 0);
+                    if carry {
+                        assert!(cpu.dynarec_mkii_stats().carry_misses > 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_inert_grants_refuse_observers_faults_and_inexact_prior_bus_totals() {
+    for refusal in 0..10 {
+        let (cpu, mut bus) = fixture(&[0x90, 0x90]);
+        enable_inert_regions(&mut bus);
+        bus.trace.add_elapsed_clocks(177);
+        let grant = bus.certify_inert_read_region().unwrap();
+        assert_eq!(grant.scaled_bus_clocks(), bus.in_batch_scaled_bus_clocks());
+        assert_eq!(
+            grant.epochs(),
+            (bus.direct_mapping_epoch, bus.jit_cost_dial_epoch())
+        );
+        match refusal {
+            0 => bus.code_fetch_observations = Some(Vec::new()),
+            1 => bus.core_events = Some(Vec::new()),
+            2 => bus.fail_fetch_charge_at = Some(0),
+            3 => bus.fail_instruction_prefetch_direct_page = true,
+            4 => bus.direct_page_clocks = true,
+            5 => bus.mkii_folded_fetches = false,
+            6 => bus.native_aggregate_accounting_disabled = true,
+            7 => bus.trace.set_tracing_mode(TracingMode::Full),
+            8 => bus.mkii_owned_replay_disabled = true,
+            9 => bus.mkii_exact_fetch_projection = false,
+            _ => unreachable!(),
+        }
+        assert!(
+            bus.certify_inert_read_region().is_none(),
+            "refusal={refusal}"
+        );
+        if refusal < 4 {
+            assert!(bus.begin_read_region().is_none());
+            assert!(bus.owned_code_replay_epochs().is_none());
+            assert!(bus.certify_owned_code_span(0, 0, 2).is_none());
+            assert!(
+                bus.jit_preflight_cached_fetch(cpu.linear_eip(), 0, 1)
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn mkii_inert_admission_includes_a_prior_helper_bus_charge() {
+    let code = [
+        0x50, 0x90, 0xb8, 1, 0, 0x03, 0x06, 0, 0x20, 0x90, 0xe4, 0x60,
+    ];
+    for remainder in 0..12 {
+        for cap in 0..24 {
+            let (mut cpu, mut bus) = fixture(&code);
+            let (mut oracle, mut other) = fixture(&code);
+            for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                enable_inert_regions(bus);
+                bus.direct_write_denied_page = Some(0x8000);
+                warm_read(cpu, bus, 0x2000);
+                warm_code(cpu, bus, code.len() as u32);
+                bus.trace.add_elapsed_clocks(177);
+                cpu.timing_rem = remainder;
+            }
+            let before = bus.trace.elapsed_clocks();
+            compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, cap);
+            assert!(bus.trace.elapsed_clocks() > before);
+            if cap == 23 {
+                assert_eq!(cpu.dynarec_mkii_stats().regions, 1);
+                assert_eq!(cpu.dynarec_mkii_stats().native, 4);
+                assert_eq!(cpu.registers.esp(), 0x8ffe);
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_inert_zero_prefix_guard_replays_the_unexecuted_instruction() {
+    let code = [0x13, 0x06, 0, 0x20, 0x75, 0, 0xe4, 0x60];
+    let (mut cpu, mut bus) = fixture(&code);
+    let (mut oracle, mut other) = fixture(&code);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_inert_regions(bus);
+        warm_read(cpu, bus, 0x2000);
+        warm_code(cpu, bus, code.len() as u32);
+        cpu.set_flag(FLAG_CF, true);
+        cpu.timing_rem = 11;
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.dynarec_mkii_stats().regions, 1);
+    assert_eq!(cpu.dynarec_mkii_stats().carry_misses, 1);
+    assert_eq!(cpu.dynarec_mkii_stats().native, 0);
+}
+
+#[test]
+fn mkii_inert_endpoint_at_10000_uses_canonical_wrap_settlement() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for limit in [0xffff, 0x1ffff] {
+            for remainder in 0..12 {
+                let (mut cpu, mut bus) = fixture(&[0xe4, 0x60]);
+                let (mut oracle, mut other) = fixture(&[0xe4, 0x60]);
+                for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                    cpu.set_mode(mode);
+                    enable_inert_regions(bus);
+                    cpu.registers.segments[SegmentIndex::Cs.index()].limit = limit;
+                    bus.memory[0xfffc..0x10000].copy_from_slice(&[0xb8, 0x34, 0x12, 0x90]);
+                    for eip in [0xfffc, 0xffff] {
+                        cpu.set_eip(eip);
+                        cpu.fetch_decoded(bus, eip).unwrap();
+                    }
+                    cpu.set_eip(0xfffc);
+                    cpu.prefetch.len = 1;
+                    cpu.prefetch.linear_base = 0x8000;
+                    cpu.timing_rem = remainder;
+                }
+                compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+                assert_eq!(cpu.dynarec_mkii_stats().regions, 1);
+                assert_eq!(cpu.dynarec_mkii_stats().native, 2);
+                assert_eq!(cpu.registers.eip, if limit == 0xffff { 2 } else { 0x10000 });
+                assert_eq!(cpu.prefetch.len, oracle.prefetch.len);
+                assert_eq!(cpu.prefetch.linear_base, oracle.prefetch.linear_base);
+            }
+        }
+    }
+}

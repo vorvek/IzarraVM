@@ -5555,3 +5555,49 @@ fn dsp_lazy_settle_does_not_service_unrelated_ports_or_accurate_reads() {
         assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0);
     }
 }
+
+#[test]
+fn mkii_inert_read_grant_matches_live_zero_charges_and_prior_bus_total() {
+    for mode in [GswMode::Gsw586, GswMode::Gsw486, GswMode::Gsw386] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            bus.trace.set_tracing_mode(TracingMode::Off);
+            bus.trace.add_elapsed_clocks(177);
+            *bus.isa_io_clocks += 5;
+            if mode == GswMode::Gsw386 {
+                assert!(bus.certify_inert_read_region().is_none());
+                return;
+            }
+            let grant = bus.certify_inert_read_region().unwrap();
+            assert_eq!(
+                grant.epochs(),
+                (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch())
+            );
+            assert_eq!(grant.scaled_bus_clocks(), bus.in_batch_scaled_bus_clocks());
+            let raw = bus.in_batch_reference_bus_clocks();
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                bus.note_code_fetch_linear(0x3000);
+                bus.charge_physical_instruction_fetch_run(0x3000, 4)
+                    .unwrap();
+                bus.charge_direct_ram_memory(0x2000, width, BusAccessKind::DataRead)
+                    .unwrap();
+            }
+            assert_eq!(bus.in_batch_reference_bus_clocks(), raw);
+            assert!(!bus.requires_step_break());
+            for tracing in [TracingMode::Full, TracingMode::Counts] {
+                bus.trace.set_tracing_mode(tracing);
+                assert!(bus.certify_inert_read_region().is_none());
+            }
+            bus.trace.set_tracing_mode(TracingMode::Off);
+            bus.l1_charges_folded = false;
+            assert!(bus.certify_inert_read_region().is_none());
+            bus.l1_charges_folded = true;
+            #[cfg(not(feature = "shadow-cache-probe"))]
+            {
+                bus.shadow_l1.enable_for_test();
+                assert!(bus.certify_inert_read_region().is_none());
+            }
+        });
+    }
+}

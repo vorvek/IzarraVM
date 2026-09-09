@@ -37,6 +37,16 @@ fn settlement_calls(operations: &[Operation]) -> usize {
         .count()
 }
 
+fn region(operations: &mut [Operation], len: usize) {
+    operations[0].region_len = len;
+    if len != 0 {
+        operations[0].region = Some(crate::mkii::ops::Region::build(
+            CpuGsw::default().class_table(),
+            &operations[..len],
+        ));
+    }
+}
+
 #[test]
 fn mkii_final_settlement_calls_follow_all_pending_paths() {
     assert_eq!(settlement_calls(&[]), 0);
@@ -44,12 +54,12 @@ fn mkii_final_settlement_calls_follow_all_pending_paths() {
     assert_eq!(settlement_calls(&operations(&[0x90, 0x50])), 0);
     assert_eq!(settlement_calls(&operations(&[0x90])), 1);
     let mut read = operations(&[0x90, 0x8b, 0x06, 0, 0x20]);
-    read[0].region_len = 2;
+    region(&mut read, 2);
     assert_eq!(settlement_calls(&read), 0);
-    for region in [false, true] {
+    for native_region in [false, true] {
         let mut pure = operations(&[0x90, 0x90]);
         pure[0].span_len = 2;
-        pure[0].region_len = if region { 2 } else { 0 };
+        region(&mut pure, if native_region { 2 } else { 0 });
         assert_eq!(settlement_calls(&pure), 1);
         for terminal_helper in [false, true] {
             let mut pair = operations(&[0x3b, 0x06, 0, 0x20, 0x74, 1, 0x50]);
@@ -58,7 +68,7 @@ fn mkii_final_settlement_calls_follow_all_pending_paths() {
             }
             pair[0].span_len = 2;
             pair[0].memory_cmp_branch = true;
-            pair[0].region_len = if region { 2 } else { 0 };
+            region(&mut pair, if native_region { 2 } else { 0 });
             assert_eq!(settlement_calls(&pair), 1);
         }
     }
@@ -427,4 +437,120 @@ fn mkii_frame_windows_walk_reaches_both_generated_callers() {
             "{frames:x?}"
         );
     });
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn mkii_inert_emission_commits_before_a_helper_without_a_finish_callback() {
+    #[derive(Default)]
+    struct Probe {
+        prepares: usize,
+        finishes: usize,
+        helpers: usize,
+        resolves: usize,
+        observed: bool,
+        monitor: bool,
+    }
+    unsafe extern "C" fn prepare(
+        _: *mut CpuGsw,
+        bus: *mut (),
+        _: *mut Frame,
+        _: *const Operation,
+    ) -> u32 {
+        // SAFETY: each callback receives the test's live Probe.
+        unsafe { (*bus.cast::<Probe>()).prepares += 1 };
+        1
+    }
+    unsafe extern "C" fn finish(
+        _: *mut CpuGsw,
+        bus: *mut (),
+        _: *mut Frame,
+        _: *const Operation,
+    ) -> u32 {
+        unsafe { (*bus.cast::<Probe>()).finishes += 1 };
+        0
+    }
+    unsafe extern "C" fn observe(
+        cpu: *mut CpuGsw,
+        bus: *mut (),
+        frame: *mut Frame,
+        _: *const Operation,
+    ) -> u32 {
+        let (cpu, probe, frame) = unsafe { (&*cpu, &mut *bus.cast::<Probe>(), &*frame) };
+        probe.helpers += 1;
+        probe.observed = cpu.registers.eax() == 0xabcd_1234
+            && cpu.registers.eip == 5
+            && cpu.timing_rem == 7
+            && cpu.elapsed_clocks == 76
+            && cpu.core_clocks_so_far == 9
+            && cpu.perf.instructions == 9
+            && cpu.perf.monitor_resident_core_clocks == 17 + 5 * u64::from(probe.monitor)
+            && cpu.perf.data_direct_reads == 20
+            && cpu.perf.direct_data_pointer_reads == 24
+            && cpu.fast_map_probe.hits == 30
+            && frame.total == 16
+            && frame.stats.native == 5
+            && frame.region_completed == 2
+            && frame.region_inert == 0;
+        0
+    }
+    unsafe extern "C" fn resolve(_: *mut CpuGsw, bus: *mut (), _: *mut Frame) -> usize {
+        unsafe { (*bus.cast::<Probe>()).resolves += 1 };
+        0
+    }
+    for monitor in [false, true] {
+        let mut operations = operations(&[0x90, 0x8b, 0x06, 0, 0x20, 0x50]);
+        region(&mut operations, 2);
+        let code = compile(&operations).unwrap();
+        let dispatcher = dispatcher().unwrap();
+        let mut cpu = CpuGsw::default();
+        cpu.load_segment_real(crate::SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0xabcd_0000);
+        cpu.elapsed_clocks = 71;
+        cpu.timing_rem = 3;
+        cpu.core_clocks_so_far = 9;
+        cpu.perf.instructions = 7;
+        cpu.perf.monitor_resident_core_clocks = 17;
+        cpu.perf.data_direct_reads = 19;
+        cpu.perf.direct_data_pointer_reads = 23;
+        cpu.fast_map_probe.hits = 29;
+        let mut bus = crate::tests::TestBus::with_memory(Vec::new());
+        let mut frame = Frame::new(&cpu, &mut bus, 1000);
+        frame.helpers = [observe; 15];
+        frame.helpers[13] = prepare;
+        frame.helpers[14] = finish;
+        frame.resolve = resolve;
+        frame.dispatch = dispatcher.body_ptr() as usize;
+        frame.total = 11;
+        frame.stats.native = 3;
+        frame.region_inert = 1;
+        frame.region_full_core = 5;
+        frame.region_full_rem = 7;
+        frame.region_monitor = u32::from(monitor);
+        frame.region_epoch = 55;
+        let mut memory = izarravm_bus::PageAlignedBytes::zeroed(65536);
+        memory[0x2000..0x2002].copy_from_slice(&0x1234u16.to_le_bytes());
+        let biases = [memory.as_ptr() as usize; 16];
+        let epochs = [55u64; 16];
+        frame.region_load_biases = biases.as_ptr() as usize;
+        frame.region_mapping_epochs = epochs.as_ptr() as usize;
+        let mut probe = Probe {
+            monitor,
+            ..Probe::default()
+        };
+        // SAFETY: the trace and dispatcher share the emitted ABI; all referenced
+        // operations, maps, RAM, callbacks and state outlive the native call.
+        let invoke: unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame) =
+            unsafe { std::mem::transmute(code.entry_ptr()) };
+        unsafe { invoke(&mut cpu, (&mut probe as *mut Probe).cast(), &mut frame) };
+        assert_eq!(probe.prepares, 1);
+        assert_eq!(probe.finishes, 0);
+        assert_eq!(probe.helpers, 1);
+        assert_eq!(probe.resolves, 1);
+        assert!(probe.observed);
+    }
 }

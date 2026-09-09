@@ -92,41 +92,84 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
     if region.segments != 0 && maps.is_none() {
         return 0;
     }
-    let Some(window) = bus.begin_read_region() else {
+    let cost = &region.prefixes[first.region_len];
+    let persona = cpu.persona();
+    let (num, den) = level_timing(persona);
+    let Some(scaled_core) = cost
+        .raw_core
+        .checked_mul(u64::from(num))
+        .and_then(|scaled| scaled.checked_add(cpu.timing_rem))
+    else {
         return 0;
     };
+    let full_core = match persona {
+        CpuPersona::I386 => scaled_core / 5,
+        CpuPersona::I486 | CpuPersona::I586 => scaled_core / 12,
+    };
+    let inert = bus
+        .certify_inert_read_region()
+        .filter(|_| cpu.elapsed_clocks.checked_add(full_core).is_some());
+    let window = if inert.is_none() {
+        let Some(window) = bus.begin_read_region() else {
+            return 0;
+        };
+        Some(window)
+    } else {
+        None
+    };
+    let (mapping_epoch, fetch_cost) = inert.map_or_else(
+        || {
+            let window = window.as_ref().unwrap();
+            (window.mapping_epoch(), window.fetch_raw_clocks())
+        },
+        |grant| (grant.epochs().0, 0),
+    );
     let fetch_raw = if frame.source_certificate.is_some_and(|certificate| {
         bus.owned_code_replay_epochs() == Some(certificate)
-            && certificate == (window.mapping_epoch(), bus.jit_cost_dial_epoch())
-    }) && window.fetch_raw_clocks() == 0
+            && certificate == (mapping_epoch, bus.jit_cost_dial_epoch())
+    }) && fetch_cost == 0
     {
         Some(0)
     } else {
         validate_fetches(cpu, bus, frame, operations)
     };
-    let cost = &region.prefixes[first.region_len];
-    let raw_bus = window.delta_raw_clocks(&cost.delta);
-    let projected = bus
-        .jit_projected_batch_scaled_bus_clocks(raw_bus)
+    let projected_bus = inert.map_or_else(
+        || {
+            bus.jit_projected_batch_scaled_bus_clocks(
+                window.as_ref().unwrap().delta_raw_clocks(&cost.delta),
+            )
+        },
+        |grant| Some(grant.scaled_bus_clocks()),
+    );
+    let projected = projected_bus
         .and_then(|bus| bus.checked_sub(frame.bus_at_entry))
         .and_then(|bus| bus.checked_add(frame.total))
-        .and_then(|total| total.checked_add(cpu.preview_scale_clocks(cost.raw_core)));
-    if fetch_raw != Some(window.fetch_raw_clocks() * operations.len() as u64)
+        .and_then(|total| total.checked_add(full_core));
+    if fetch_raw != Some(fetch_cost * operations.len() as u64)
         || !projected.is_some_and(|total| total < frame.cap)
     {
-        bus.finish_compiled_window(window, CompiledBusDelta::default());
+        if let Some(window) = window {
+            bus.finish_compiled_window(window, CompiledBusDelta::default());
+        }
         return 0;
     }
-    frame.region_epoch = window.mapping_epoch();
+    debug_assert!(frame.region_running.is_none());
+    debug_assert_eq!(frame.region_inert, 0);
+    frame.region_epoch = mapping_epoch;
     frame.region_user = u32::from(cpu.current_privilege_level() == 3);
     (frame.region_load_biases, frame.region_mapping_epochs) = maps.unwrap_or_default();
     frame.region_completed = 0;
     frame.region_guard_miss = 0;
     frame.branch_taken = 0;
     cpu.core_clocks_so_far = frame.total;
-    frame.region_running = Some(Running {
+    frame.region_inert = u32::from(inert.is_some());
+    frame.region_full_core = full_core;
+    frame.region_full_rem = scaled_core - full_core * u64::from(den);
+    frame.region_monitor = u32::from(cpu.is_ring0_protected());
+    frame.region_can_take = cpu.can_take_interrupt();
+    frame.region_running = window.map(|window| Running {
         window,
-        can_take: cpu.can_take_interrupt(),
+        can_take: frame.region_can_take,
     });
     frame.stats.regions += 1;
     1
@@ -158,14 +201,20 @@ pub(super) unsafe extern "C" fn finish<B: CpuBus>(
 ) -> u32 {
     let (cpu, bus, frame, first) =
         unsafe { (&mut *cpu, &mut *bus.cast::<B>(), &mut *frame, &*operation) };
-    let running = frame.region_running.take().expect("prepared native region");
     let completed = frame.region_completed as usize;
     assert!(completed <= first.region_len);
     // SAFETY: generated exits report a completed prefix of the leased region.
     let operations = unsafe { std::slice::from_raw_parts(operation, completed) };
     let cost = &first.region.as_ref().unwrap().prefixes[completed];
     let branch_taken = frame.branch_taken != 0;
-    bus.finish_compiled_window(running.window, cost.delta);
+    let can_take = if let Some(running) = frame.region_running.take() {
+        debug_assert_eq!(frame.region_inert, 0);
+        bus.finish_compiled_window(running.window, cost.delta);
+        running.can_take
+    } else {
+        assert_ne!(std::mem::take(&mut frame.region_inert), 0);
+        frame.region_can_take
+    };
     if frame.region_guard_miss != 0 {
         frame.force_canonical = true;
         frame.stats.region_guard_misses += 1;
@@ -185,7 +234,7 @@ pub(super) unsafe extern "C" fn finish<B: CpuBus>(
             retired: completed as u64,
             start_eip: first.eip,
             start_cs: frame.cs.selector,
-            can_take: running.can_take,
+            can_take,
         });
         frame.retire_pending(cpu, bus);
     }

@@ -390,6 +390,41 @@ impl CompiledBusDelta {
     }
 }
 
+/// Inert fetch and RAM-read accounting within one helper-free native region.
+/// This grant has no completion obligation and expires at any helper or side exit.
+#[derive(Debug, Clone, Copy)]
+pub struct InertReadRegion {
+    mapping_epoch: u64,
+    cost_epoch: u64,
+    scaled_bus_clocks: u64,
+}
+
+impl InertReadRegion {
+    pub fn certify(
+        mapping_epoch: u64,
+        cost_epoch: u64,
+        tracing_mode: TracingMode,
+        fetch_raw_clocks: u64,
+        ram_raw_clocks: [u64; 3],
+        scaled_bus_clocks: u64,
+    ) -> Option<Self> {
+        (tracing_mode == TracingMode::Off && fetch_raw_clocks == 0 && ram_raw_clocks == [0; 3])
+            .then_some(Self {
+                mapping_epoch,
+                cost_epoch,
+                scaled_bus_clocks,
+            })
+    }
+
+    pub const fn epochs(self) -> (u64, u64) {
+        (self.mapping_epoch, self.cost_epoch)
+    }
+
+    pub const fn scaled_bus_clocks(self) -> u64 {
+        self.scaled_bus_clocks
+    }
+}
+
 /// Stable bus state certified for one compiled-execution residency window.
 ///
 /// The value is neither `Copy` nor `Clone`. Passing it to
@@ -1281,7 +1316,8 @@ pub trait CpuBus {
     /// Revalidate owned source certificates without opening a bus window. `Some`
     /// accepts their mapping, backing, cost and fetch-observation namespace and
     /// permits zero-cost, inert cold or cached source replay within one helper-free,
-    /// observer-free native read region protected by a live bus window. Revalidate
+    /// observer-free native read region protected by a live bus window or inert
+    /// read grant. Revalidate
     /// after helpers, mutating bus operations or observer changes.
     fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
         None
@@ -1305,6 +1341,16 @@ pub trait CpuBus {
     /// warm source fetches and aligned RAM reads, aggregate completion is exactly
     /// equivalent to the ordered accesses and cannot fault or request service.
     fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
+        None
+    }
+
+    /// Certify inert accounting for separately validated source fetches and aligned
+    /// plain-RAM reads. Those accesses and their completion have no effects,
+    /// including observations, faults, service or clock charges.
+    /// RAM contents, backing and mappings stay stable until a helper or side exit.
+    /// The grant records the exact current scaled batch bus total. Owned cold
+    /// source replay still requires its separate live capability.
+    fn certify_inert_read_region(&self) -> Option<InertReadRegion> {
         None
     }
 

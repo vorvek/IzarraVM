@@ -94,9 +94,14 @@ pub(super) struct Frame {
     pub region_user: u32,
     pub region_load_biases: usize,
     pub region_mapping_epochs: usize,
+    pub region_inert: u32,
+    pub region_full_core: u64,
+    pub region_full_rem: u64,
+    pub region_monitor: u32,
+    region_can_take: bool,
     region_running: Option<region::Running>,
     force_canonical: bool,
-    total: u64,
+    pub(super) total: u64,
     cap: u64,
     bus_at_entry: u64,
     raw_at_entry: u64,
@@ -110,7 +115,7 @@ pub(super) struct Frame {
     stop: bool,
     halted: bool,
     error: Option<CpuRunError>,
-    stats: Stats,
+    pub(super) stats: Stats,
 }
 
 struct Pending {
@@ -159,6 +164,11 @@ impl Frame {
             region_user: 0,
             region_load_biases: 0,
             region_mapping_epochs: 0,
+            region_inert: 0,
+            region_full_core: 0,
+            region_full_rem: 0,
+            region_monitor: 0,
+            region_can_take: false,
             region_running: None,
             force_canonical: false,
             total: 0,
@@ -882,6 +892,7 @@ unsafe extern "C" fn resolve<B: CpuBus>(
     let (cpu, bus, frame) = unsafe { (&mut *cpu, &mut *bus.cast::<B>(), &mut *frame) };
     debug_assert!(frame.pending.is_none());
     debug_assert!(frame.region_running.is_none());
+    debug_assert_eq!(frame.region_inert, 0);
     if let Some(fetched) = frame.fetched.take() {
         let execution = cpu.execute_decoded_with_rep_budget(
             &fetched.insn,
