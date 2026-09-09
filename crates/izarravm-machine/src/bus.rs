@@ -1537,7 +1537,11 @@ impl CpuBus for MachineBus<'_> {
         if let Some((address, start, end)) =
             self.direct_page_ram_bytes(address, width.bytes() as usize, width)
         {
-            let ws = self.data_access_wait_states(address, width, kind);
+            let ws = if address < MARGO_LFB_BASE {
+                self.ram_data_access_wait_states(address, width, kind)
+            } else {
+                self.data_access_wait_states(address, width, kind)
+            };
             self.record_data_cycle(kind, address, width, ws);
             let data = &self.memory.as_slice()[start..end];
             let value = match width {
@@ -5019,6 +5023,15 @@ impl MachineBus<'_> {
             // an aperture or ROM access is not inside anyone's instruction count.
             return Some(self.memory_wait_states(address));
         }
+        self.ram_data_access_wait_states(address, width, kind)
+    }
+
+    fn ram_data_access_wait_states(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Option<u8> {
         if self.flat_data_cost {
             // Approximate class (486/586): charge the flat L1-resident cost and skip
             // the per-access tag-array tiering. The
