@@ -724,6 +724,24 @@ impl CpuGsw {
         }
     }
 
+    #[inline]
+    pub(super) fn retire_instruction_core(&mut self, raw_core: u32) -> u64 {
+        if self.registers.eip == 0x1_0000 {
+            self.wrap_16bit_sequential_run_off();
+        }
+        let charged = self.scale_clocks(raw_core);
+        self.elapsed_clocks += charged;
+        #[cfg(feature = "reflected-call-diagnostic")]
+        if self.retire_gates.reflected_call_diag_armed {
+            crate::reflected_call_diag::on_clock_charge();
+        }
+        self.perf.instructions += 1;
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
+        charged
+    }
+
     /// The shared rewind / deliver / scale tail of a single instruction's execution. It owns ONLY
     /// what happens after `result` is produced: on a delivered exception it rewinds eip (and CS, if a
     /// far transfer moved it) to the faulting instruction and delivers the fault through
@@ -837,23 +855,7 @@ impl CpuGsw {
             }
         };
 
-        // Retire seam: an instruction whose last byte sat at offset 0xFFFF
-        // advanced EIP to the unwrapped 0x10000; wrap it before anything can
-        // observe it. See `wrap_16bit_sequential_run_off`.
-        if self.registers.eip == 0x1_0000 {
-            self.wrap_16bit_sequential_run_off();
-        }
-        let charged = self.scale_clocks(outcome.core_clocks);
-        self.elapsed_clocks += charged;
-        #[cfg(feature = "reflected-call-diagnostic")]
-        if self.retire_gates.reflected_call_diag_armed {
-            crate::reflected_call_diag::on_clock_charge();
-        }
-        self.perf.instructions += 1;
-        // V86 trap tax residency: see PerfCounters::monitor_resident_core_clocks.
-        if self.is_ring0_protected() {
-            self.perf.monitor_resident_core_clocks += charged;
-        }
+        let charged = self.retire_instruction_core(outcome.core_clocks);
         if let Some((group, opcode, form)) = profile_key {
             // The hot-address histogram wants the linear address of the instruction START.
             // A far transfer already moved the CS base by now, mis-attributing that one

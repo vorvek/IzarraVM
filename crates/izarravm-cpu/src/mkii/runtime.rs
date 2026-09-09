@@ -416,15 +416,33 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
         _ => unreachable!(),
     };
     let succeeded = result.is_ok();
-    let outcome = cpu.finish_instruction(
-        bus,
-        InstructionExecution { result, work },
-        operation.eip,
-        frame.cs.selector,
-        0,
-        None,
-        None,
-    );
+    #[cfg(feature = "reflected-call-memo")]
+    let journal = cpu.reflected_call_journal;
+    #[cfg(not(feature = "reflected-call-memo"))]
+    let journal = false;
+    let outcome = match result {
+        Ok(outcome)
+            if GROUP != 8
+                && work.rep.is_none()
+                && work.committed.total() == 0
+                && !journal
+                && cpu.mkii_span_observers_quiet() =>
+        {
+            Ok(CpuCycleOutcome {
+                core_clocks: cpu.retire_instruction_core(outcome.core_clocks),
+                halted: outcome.halted,
+            })
+        }
+        result => cpu.finish_instruction(
+            bus,
+            InstructionExecution { result, work },
+            operation.eip,
+            frame.cs.selector,
+            0,
+            None,
+            None,
+        ),
+    };
     frame.stats.helpers += 1;
     frame.observe(cpu, bus, can_take, outcome);
     if skipped_poll && !frame.stop {

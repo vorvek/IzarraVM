@@ -981,11 +981,19 @@ fn compare_pair_run(
             }
         }
     }
+    assert_pair_state(cpu, bus, oracle, other);
+}
+
+fn assert_pair_state(cpu: &CpuGsw, bus: &TestBus, oracle: &CpuGsw, other: &TestBus) {
     assert_eq!(cpu.registers, oracle.registers);
     assert_eq!(cpu.pending_flags, oracle.pending_flags);
     assert_eq!(cpu.perf.instructions, oracle.perf.instructions);
     assert_eq!(cpu.timing_rem, oracle.timing_rem);
     assert_eq!(cpu.elapsed_clocks, oracle.elapsed_clocks);
+    assert_eq!(
+        cpu.perf.monitor_resident_core_clocks,
+        oracle.perf.monitor_resident_core_clocks
+    );
     assert_eq!(bus.trace.cycles(), other.trace.cycles());
     assert_eq!(bus.trace.elapsed_clocks(), other.trace.elapsed_clocks());
     assert_eq!(&bus.memory[..], &other.memory[..]);
@@ -1380,12 +1388,115 @@ fn mkii_fault_keeps_native_prefix_and_partial_helper_work() {
 
 #[test]
 fn mkii_shadow_stops_after_exactly_one_successor() {
-    let (mut cpu, mut bus) = fixture(&[0xfb, 0x90, 0x90]);
-    cpu.run_budgeted(&mut bus, 100).unwrap();
-    assert_eq!(cpu.registers.eip, 2);
-    assert_eq!(cpu.perf.instructions, 2);
-    assert!(!cpu.interrupt_shadow);
-    assert_eq!(cpu.perf.brk_interrupt, 1);
+    for code in [
+        &[0xfb, 0x90, 0x90][..],
+        &[0x8e, 0xd0, 0x90, 0x90],
+        &[0x17, 0x90, 0x90],
+    ] {
+        let (mut cpu, mut bus) = fixture(code);
+        let (mut oracle, mut other) = fixture(code);
+        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+            if code[0] != 0xfb {
+                cpu.gdtr = DescriptorTable {
+                    base: 0x3000,
+                    limit: 15,
+                };
+                bus.memory[0x3008..0x3010].copy_from_slice(&descriptor(0, 0xffff, 0x93, 0));
+                cpu.registers.set_eax(8);
+                bus.memory[0x9000..0x9002].copy_from_slice(&8u16.to_le_bytes());
+                cpu.registers.eflags |= FLAG_IF;
+            }
+            warm_code(cpu, bus, code.len() as u32);
+        }
+        let actual = cpu.run_budgeted(&mut bus, 100).unwrap();
+        let core: u64 = (0..2)
+            .map(|_| {
+                oracle
+                    .cycle_no_interrupt_check(&mut other)
+                    .unwrap()
+                    .core_clocks
+            })
+            .sum();
+        assert_eq!(actual.consumed_core_clocks, core);
+        assert_pair_state(&cpu, &bus, &oracle, &other);
+        assert_eq!(cpu.registers.eip, code.len() as u32 - 1);
+        assert_eq!(cpu.perf.instructions, 2);
+        assert!(!cpu.interrupt_shadow);
+        assert_eq!(cpu.perf.brk_interrupt, 1);
+        assert_eq!(cpu.dynarec_mkii_stats().helpers, 1);
+        assert_eq!(cpu.dynarec_mkii_stats().native, 1);
+        assert_eq!(cpu.dynarec_mkii_stats().cold, 0);
+    }
+}
+
+#[test]
+fn mkii_warm_push_retirement_preserves_wrap_and_live_accounting() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for limit in [0xffff, 0x1ffff] {
+            for cpl in [0, 3] {
+                for remainder in [0, 7, 11] {
+                    let (mut cpu, mut bus) = fixture(&[]);
+                    let (mut oracle, mut other) = fixture(&[]);
+                    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                        cpu.set_mode(mode);
+                        cpu.cpl = cpl;
+                        let mut cs = cpu.registers.cs();
+                        cs.limit = limit;
+                        cs.selector = u16::from(cpl);
+                        cs.access = (cs.access & !0x60) | (cpl << 5);
+                        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+                        let mut ss = cpu.registers.segment(SegmentIndex::Ss);
+                        ss.selector = u16::from(cpl);
+                        ss.access = (ss.access & !0x60) | (cpl << 5);
+                        cpu.registers.set_segment(SegmentIndex::Ss, ss);
+                        cpu.registers.set_eax(0x1234);
+                        bus.memory[0xffff] = 0x50;
+                        cpu.set_eip(0xffff);
+                        let lin = cpu.linear_eip();
+                        cpu.fetch_decoded(bus, lin).unwrap();
+                        cpu.set_eip(0xffff);
+                        cpu.timing_rem = remainder;
+                    }
+                    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 0);
+                    assert_eq!(cpu.registers.eip, if limit == 0xffff { 0 } else { 0x10000 });
+                    assert_eq!(cpu.registers.esp(), 0x8ffe);
+                    assert_eq!(cpu.perf.instructions, 1);
+                    assert_eq!(cpu.dynarec_mkii_stats().helpers, 1);
+                    assert_eq!(cpu.dynarec_mkii_stats().cold, 0);
+                    assert_eq!(
+                        cpu.perf.monitor_resident_core_clocks,
+                        if cpl == 0 { cpu.elapsed_clocks } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_warm_popf_stops_before_the_suffix_when_if_or_tf_changes() {
+    let code = [0x9d, 0x43, 0xe4, 0x60];
+    for flags in [FLAG_IF, FLAG_TF] {
+        let (mut cpu, mut bus) = fixture(&code);
+        let (mut oracle, mut other) = fixture(&code);
+        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+            bus.memory[0x9000..0x9002]
+                .copy_from_slice(&((2 | flags | FLAG_CF) as u16).to_le_bytes());
+            warm_code(cpu, bus, code.len() as u32);
+            cpu.timing_rem = 7;
+        }
+        let actual = cpu.run_budgeted(&mut bus, 100).unwrap();
+        let expected = oracle.cycle_no_interrupt_check(&mut other).unwrap();
+        assert_eq!(actual.consumed_core_clocks, expected.core_clocks);
+        assert_pair_state(&cpu, &bus, &oracle, &other);
+        assert_eq!(cpu.registers.eip, 1);
+        assert_eq!(cpu.registers.esp(), 0x9002);
+        assert_eq!(cpu.registers.ebx(), 0);
+        assert_eq!(cpu.perf.instructions, 1);
+        assert_eq!(cpu.dynarec_mkii_stats().helpers, 1);
+        assert_eq!(cpu.dynarec_mkii_stats().cold, 0);
+        assert_eq!(cpu.perf.brk_interrupt, u64::from(flags == FLAG_IF));
+    }
 }
 
 #[test]
