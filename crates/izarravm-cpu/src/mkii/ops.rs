@@ -204,6 +204,14 @@ fn lower_read(insn: &DecodedInsn) -> Option<Read> {
 }
 
 fn lower_pure(insn: &DecodedInsn) -> Option<(Pure, TimingClass)> {
+    // Poll recognition still needs these TESTs and their following branches in the decode cache.
+    if insn.opcode == 0xa8
+        || (insn.opcode == 0x84
+            && insn.modrm.is_some_and(|modrm| modrm.reg == 4)
+            && matches!(insn.operand, Some(DecodedOperand::Reg(0))))
+    {
+        return None;
+    }
     let sized = insn.operand_size.bus_width();
     let reg = match insn.operand {
         Some(DecodedOperand::Reg(reg)) => Some(reg),
@@ -320,9 +328,6 @@ fn lower_pure(insn: &DecodedInsn) -> Option<(Pure, TimingClass)> {
     } else {
         return None;
     };
-    if !matches!(op, 0 | 2 | 3 | 5 | 7) {
-        return None;
-    }
     Some((
         Pure::Alu {
             op,

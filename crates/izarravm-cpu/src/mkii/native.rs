@@ -269,6 +269,10 @@ fn emit_pure(e: &mut Encoder, pure: Pure) {
 
 fn emit_arithmetic(e: &mut Encoder, op: u8, width: BusWidth) {
     let op = carry_free_alu(op);
+    let logic = matches!(op, 1 | 4 | 6);
+    if logic {
+        emit_logic_af(e);
+    }
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.alu_r32_r32(if op == 7 { 5 } else { op }, Reg::RCX, Reg::RDX);
     if width != BusWidth::Dword {
@@ -295,8 +299,49 @@ fn emit_arithmetic(e: &mut Encoder, op: u8, width: BusWidth) {
         (std::mem::offset_of!(PendingFlags, b), Reg::RDX),
         (std::mem::offset_of!(PendingFlags, result), Reg::RCX),
     ] {
-        e.store_r32_disp32(Reg::RBX, offset + field as i32, register);
+        if logic && register != Reg::RCX {
+            e.store_u32_imm_disp32(Reg::RBX, offset + field as i32, 0);
+        } else {
+            e.store_r32_disp32(Reg::RBX, offset + field as i32, register);
+        }
     }
+}
+
+fn emit_logic_af(e: &mut Encoder) {
+    let pending = std::mem::offset_of!(CpuGsw, pending_flags) as i32;
+    let flags =
+        (std::mem::offset_of!(CpuGsw, registers) + std::mem::offset_of!(Registers, eflags)) as i32;
+    let publish = e.label();
+    e.load_r32_disp32(Reg::R8, Reg::RBX, flags);
+    e.load_r32_disp32(Reg::R9, Reg::RBX, pending);
+    e.test_r32_imm32(Reg::R9, 1 << 31);
+    e.jcc(4, publish);
+    e.alu_r32_imm32(4, Reg::R9, 255);
+    e.cmp_r32_imm32(Reg::R9, 1);
+    e.jcc(7, publish);
+    e.load_r32_disp32(
+        Reg::R9,
+        Reg::RBX,
+        pending + std::mem::offset_of!(PendingFlags, a) as i32,
+    );
+    e.load_r32_disp32(
+        Reg::R10,
+        Reg::RBX,
+        pending + std::mem::offset_of!(PendingFlags, b) as i32,
+    );
+    e.alu_r32_r32(6, Reg::R9, Reg::R10);
+    e.load_r32_disp32(
+        Reg::R10,
+        Reg::RBX,
+        pending + std::mem::offset_of!(PendingFlags, result) as i32,
+    );
+    e.alu_r32_r32(6, Reg::R9, Reg::R10);
+    e.alu_r32_imm32(4, Reg::R9, crate::FLAG_AF);
+    e.alu_r32_imm32(4, Reg::R8, !crate::FLAG_AF);
+    e.alu_r32_r32(1, Reg::R8, Reg::R9);
+    e.place(publish);
+    e.alu_r32_imm32(1, Reg::R8, 2);
+    e.store_r32_disp32(Reg::RBX, flags, Reg::R8);
 }
 
 fn emit_memory_cmp_branch(e: &mut Encoder, compare: &Operation, branch: &Operation, taken: Label) {

@@ -1704,6 +1704,108 @@ fn enable_inert_regions(bus: &mut TestBus) {
 }
 
 #[test]
+fn mkii_logical_regions_feed_native_carry_guards() {
+    let code = [
+        0x0b, 0xc1, 0x11, 0xd3, 0x85, 0xc0, 0x19, 0xca, 0x90, 0xe6, 0x60,
+    ];
+    for inert in [false, true] {
+        for carry in [false, true] {
+            for remainder in 0..12 {
+                let (mut cpu, mut bus) = fixture(&code);
+                let (mut oracle, mut other) = fixture(&code);
+                for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                    if inert {
+                        enable_inert_regions(bus);
+                    } else {
+                        enable_read_regions(bus);
+                    }
+                    warm_code(cpu, bus, code.len() as u32);
+                    cpu.registers.set_eax(0xaabb8000);
+                    cpu.registers.set_ebx(0xccdd0004);
+                    cpu.registers.set_ecx(0x11220001);
+                    cpu.registers.set_edx(0x33440002);
+                    cpu.registers.eflags = FLAG_AF | (u32::from(carry) * FLAG_CF);
+                    cpu.timing_rem = remainder;
+                }
+                compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+                let stats = cpu.dynarec_mkii_stats();
+                assert_eq!(stats.regions, 1);
+                assert_eq!(stats.native, 5);
+                assert_eq!(stats.carry_native, 2);
+                assert_eq!(stats.carry_misses, 0);
+                assert_eq!(cpu.registers.eax(), 0xaabb8001);
+                assert_eq!(cpu.registers.ebx(), 0xccdd0006);
+                assert_eq!(cpu.registers.edx(), 0x33440001);
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_logical_poll_tests_refill_cold_tails() {
+    use crate::jit::block::{PollScanOutcome, build_poll_loop_from};
+
+    for test in [[0xa8, 8], [0x84, 0xe0]] {
+        let code = [0xec, test[0], test[1], 0x75, 0xfb, 0xe6, 0x60];
+        let (mut cpu, mut bus) = fixture(&code);
+        enable_inert_regions(&mut bus);
+        bus.lazy_io_reads = true;
+        bus.io_read_value = Some(0);
+        cpu.registers.set_eax(0x800);
+        cpu.registers.set_edx(0x3da);
+        cpu.set_direct_poll_skip_override(Some(true));
+        cpu.set_direct_poll_skip_16_override(Some(true));
+        warm_code(&mut cpu, &mut bus, code.len() as u32);
+        assert!(matches!(
+            build_poll_loop_from(&cpu, 0, true),
+            PollScanOutcome::Found(_)
+        ));
+        cpu.run_budgeted(&mut bus, 0).unwrap();
+        assert_eq!(cpu.registers.eip, 1);
+        let compiled = cpu.dynarec_mkii_stats().compiled;
+        let retired = cpu.dynarec_mkii_stats().retired_artifacts;
+        assert_eq!(compiled, 1);
+        cpu.decode_cache.kill_line_at(1);
+        cpu.decode_cache.kill_line_at(3);
+        cpu.set_eip(0);
+        cpu.run_budgeted(&mut bus, 0).unwrap();
+        assert_eq!(cpu.registers.eip, 1);
+        assert!(cpu.decode_cache.poll_negative_live(0, false));
+        assert!(cpu.decode_cache.get_packed(1, false).is_none());
+        assert!(cpu.decode_cache.get_packed(3, false).is_none());
+        assert!(cpu.decode_cache.get_packed(5, false).is_some());
+        let before = cpu.dynarec_mkii_stats();
+        let instructions = cpu.perf.instructions;
+        cpu.set_eip(0);
+        cpu.run_budgeted(&mut bus, 1000).unwrap();
+        assert!(cpu.decode_cache.get_packed(1, false).is_some(), "{test:x?}");
+        assert!(cpu.decode_cache.get_packed(3, false).is_some(), "{test:x?}");
+        assert!(!cpu.decode_cache.poll_negative_live(0, false), "{test:x?}");
+        assert!(matches!(
+            build_poll_loop_from(&cpu, 0, true),
+            PollScanOutcome::Found(_)
+        ));
+        let after = cpu.dynarec_mkii_stats();
+        assert_eq!(after.compiled, compiled);
+        assert_eq!(after.retired_artifacts, retired);
+        assert_eq!(
+            after.helpers - before.helpers,
+            if test[0] == 0xa8 { 1 } else { 3 },
+            "test={test:x?} eip={} instructions={} before={before:?} after={after:?}",
+            cpu.registers.eip,
+            cpu.perf.instructions - instructions
+        );
+        assert_eq!(
+            after.cold - before.cold,
+            if test[0] == 0xa8 { 3 } else { 1 }
+        );
+        assert_eq!(after.native - before.native, 0);
+        assert_eq!(cpu.perf.instructions - instructions, 4);
+        assert_eq!(cpu.registers.eip, 7);
+    }
+}
+
+#[test]
 fn mkii_inert_completion_matches_all_remainders_caps_and_privilege_levels() {
     let code = [0x90, 0xb8, 1, 0, 0x03, 0x06, 0, 0x20, 0x90, 0xe4, 0x60];
     for cpl in 0..4 {
@@ -1885,6 +1987,311 @@ fn mkii_inert_endpoint_at_10000_uses_canonical_wrap_settlement() {
                 assert_eq!(cpu.registers.eip, if limit == 0xffff { 2 } else { 0x10000 });
                 assert_eq!(cpu.prefetch.len, oracle.prefetch.len);
                 assert_eq!(cpu.prefetch.linear_base, oracle.prefetch.linear_base);
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_logical_registers_preserve_pending_auxiliary_and_raw_flags() {
+    for inert in [false, true] {
+        let mut prior = vec![
+            PendingFlags::default(),
+            PendingFlags {
+                tag: 3 << 16,
+                a: 9,
+                b: 7,
+                result: 0x10,
+            },
+        ];
+        for width in 0..3 {
+            for op in [0, 1, 2, 7] {
+                for af in [false, true] {
+                    let (a, b, result) = match (op, af) {
+                        (0, true) => (15, 1, 16),
+                        (1, true) => (16, 1, 15),
+                        (0, false) => (1, 1, 2),
+                        (1, false) => (2, 1, 1),
+                        (_, true) => (1, 2, 16),
+                        (_, false) => (1, 2, 0),
+                    };
+                    let pending = PendingFlags {
+                        tag: (1 << 31) | (width << 8) | op,
+                        a,
+                        b,
+                        result,
+                    };
+                    prior.extend([
+                        pending,
+                        pending.with_cf_override(false),
+                        pending.with_cf_override(true),
+                    ]);
+                }
+            }
+        }
+        for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+            for op in [1u8, 4, 6] {
+                let mut code = Vec::new();
+                if width == BusWidth::Dword {
+                    code.push(0x66);
+                }
+                code.extend_from_slice(&[
+                    op * 8 + if width == BusWidth::Byte { 2 } else { 3 },
+                    if width == BusWidth::Byte { 0xfd } else { 0xd9 },
+                    0x90,
+                    0xe6,
+                    0x60,
+                ]);
+                for (index, pending) in prior.iter().enumerate() {
+                    let (mut cpu, mut bus) = fixture(&code);
+                    let (mut oracle, mut other) = fixture(&code);
+                    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                        if inert {
+                            enable_inert_regions(bus);
+                        } else {
+                            enable_read_regions(bus);
+                        }
+                        warm_code(cpu, bus, code.len() as u32);
+                        cpu.registers.set_ebx(0xa55a00f0);
+                        cpu.registers.set_ecx(0xdeadb50f);
+                        cpu.registers.eflags =
+                            FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF | FLAG_PF | FLAG_DF;
+                        if index & 1 != 0 {
+                            cpu.registers.eflags |= FLAG_AF;
+                        }
+                        cpu.pending_flags = *pending;
+                    }
+                    let af = cpu.flag(FLAG_AF);
+                    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+                    let stats = cpu.dynarec_mkii_stats();
+                    assert_eq!(stats.regions, 1);
+                    assert_eq!(stats.native, 2);
+                    assert_eq!(stats.helpers, 0);
+                    assert_eq!(cpu.pending_flags.a, 0);
+                    assert_eq!(cpu.pending_flags.b, 0);
+                    assert_eq!(cpu.pending_flags.cf_override(), None);
+                    assert_eq!(cpu.pending_flags.op(), LazyFlagOp::Logic);
+                    assert_eq!(cpu.pending_flags.width(), width);
+                    assert_eq!(cpu.flag(FLAG_AF), af, "{pending:?} {width:?} op={op}");
+                    assert!(!cpu.flag(FLAG_CF));
+                    assert!(!cpu.flag(FLAG_OF));
+                    cpu.materialize_flags();
+                    oracle.materialize_flags();
+                    assert_eq!(cpu.registers, oracle.registers);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_logical_operand_forms_and_test_no_write_match_oracle() {
+    for inert in [false, true] {
+        let forms: &[&[u8]] = &[
+            &[0x08, 0xec],
+            &[0x09, 0xcb],
+            &[0x0a, 0xe5],
+            &[0x0b, 0xd9],
+            &[0x0c, 0x80],
+            &[0x66, 0x0d, 0x80, 0, 0, 0x80],
+            &[0x20, 0xec],
+            &[0x21, 0xcb],
+            &[0x22, 0xe5],
+            &[0x23, 0xd9],
+            &[0x24, 0x0f],
+            &[0x25, 0x0f, 0xf0],
+            &[0x30, 0xec],
+            &[0x31, 0xcb],
+            &[0x32, 0xe5],
+            &[0x33, 0xd9],
+            &[0x34, 0x80],
+            &[0x35, 0, 0x80],
+            &[0x80, 0xcc, 0x80],
+            &[0x81, 0xe3, 0x0f, 0xf0],
+            &[0x82, 0xf5, 0xff],
+            &[0x83, 0xe3, 0x80],
+            &[0x66, 0x83, 0xcb, 0x80],
+            &[0x66, 0x81, 0xf3, 0, 0, 0, 0x80],
+            &[0x84, 0xec],
+            &[0x84, 0xe0],
+            &[0x85, 0xcb],
+            &[0x66, 0x85, 0xcb],
+            &[0xa8, 0],
+            &[0xa9, 0, 0],
+            &[0x66, 0xa9, 0, 0, 0, 0],
+        ];
+        for form in forms {
+            for grant in [false, true] {
+                let mut code = form.to_vec();
+                code.extend_from_slice(&[0x90, 0xe6, 0x60]);
+                let (mut cpu, mut bus) = fixture(&code);
+                let (mut oracle, mut other) = fixture(&code);
+                for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                    if inert {
+                        enable_inert_regions(bus);
+                    } else {
+                        enable_read_regions(bus);
+                    }
+                    bus.mkii_read_regions = grant;
+                    bus.mkii_inert_regions &= grant;
+                    cpu.registers.set_eax(0xabcd1234);
+                    cpu.registers.set_ebx(0xa55a00f0);
+                    cpu.registers.set_ecx(0xdeadb50f);
+                    warm_code(cpu, bus, code.len() as u32);
+                }
+                let before = cpu.registers.clone();
+                compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+                let opcode = form[usize::from(form[0] == 0x66)];
+                let helper = opcode == 0x84 && form.last() == Some(&0xe0);
+                let canonical = opcode == 0xa8 || helper;
+                assert_eq!(
+                    cpu.dynarec_mkii_stats().native,
+                    2 - u64::from(canonical),
+                    "{form:x?}"
+                );
+                assert_eq!(cpu.dynarec_mkii_stats().helpers, u64::from(helper));
+                assert_eq!(
+                    cpu.dynarec_mkii_stats().regions,
+                    u64::from(grant && !canonical)
+                );
+                if matches!(opcode, 0x84 | 0x85 | 0xa8 | 0xa9) {
+                    assert_eq!(cpu.registers.eax(), before.eax());
+                    assert_eq!(cpu.registers.ebx(), before.ebx());
+                    assert_eq!(cpu.registers.ecx(), before.ecx());
+                    if opcode >= 0xa8 {
+                        assert_eq!(cpu.pending_flags.result, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_logical_sequence_accepts_native_and_helper_flag_producers() {
+    for inert in [false, true] {
+        for producer in [
+            &[0x05, 1, 0][..],
+            &[0xd1, 0xe0],
+            &[0xd1, 0xd0],
+            &[0xd3, 0xe0],
+        ] {
+            let mut code = producer.to_vec();
+            code.extend_from_slice(&[0x0b, 0xd9, 0x33, 0xc0, 0x90, 0xe6, 0x60]);
+            let (mut cpu, mut bus) = fixture(&code);
+            let (mut oracle, mut other) = fixture(&code);
+            for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                if inert {
+                    enable_inert_regions(bus);
+                } else {
+                    enable_read_regions(bus);
+                }
+                cpu.registers.set_eax(15);
+                cpu.registers.set_ecx(0);
+                cpu.registers.eflags |= FLAG_AF | FLAG_CF;
+                warm_code(cpu, bus, code.len() as u32);
+            }
+            compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+            assert_eq!(
+                cpu.dynarec_mkii_stats().native,
+                if producer[0] == 0x05 { 4 } else { 3 }
+            );
+            assert_eq!(cpu.registers.eax(), 0);
+            assert!(cpu.flag(FLAG_AF));
+        }
+    }
+}
+
+#[test]
+fn mkii_logical_branches_preserve_all_conditions_and_later_faults() {
+    for inert in [false, true] {
+        for op in [1u8, 4, 6, 8] {
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                for condition in 0..16 {
+                    for (a, b) in [(0, 0), (0x80008080, u32::MAX), (1, 0x101)] {
+                        let mut code = Vec::new();
+                        if width == BusWidth::Dword {
+                            code.push(0x66);
+                        }
+                        let byte = width == BusWidth::Byte;
+                        code.extend_from_slice(&[
+                            if op == 8 {
+                                if byte { 0x84 } else { 0x85 }
+                            } else {
+                                op * 8 + if byte { 2 } else { 3 }
+                            },
+                            if op == 8 { 0xcb } else { 0xd9 },
+                            0x70 + condition,
+                            4,
+                            0x8b,
+                            0x16,
+                            0,
+                            0x30,
+                            0xe6,
+                            0x60,
+                        ]);
+                        let (mut cpu, mut bus) = fixture(&code);
+                        let (mut oracle, mut other) = fixture(&code);
+                        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                            if inert {
+                                enable_inert_regions(bus);
+                            } else {
+                                enable_read_regions(bus);
+                            }
+                            cpu.registers.set_ebx(a);
+                            cpu.registers.set_ecx(b);
+                            warm_read(cpu, bus, 0x2000);
+                            warm_code(cpu, bus, code.len() as u32);
+                            let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+                            ds.limit = 0x2fff;
+                            cpu.registers.set_segment(SegmentIndex::Ds, ds);
+                        }
+                        compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+                        let stats = cpu.dynarec_mkii_stats();
+                        assert_eq!(stats.regions, 1);
+                        assert_eq!(stats.native, 2, "op={op} {width:?} condition={condition}");
+                        assert_eq!(
+                            stats.region_guard_misses,
+                            u64::from(!oracle.condition(condition))
+                        );
+                        if op == 8 {
+                            assert_eq!(cpu.registers.ebx(), a);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_logical_region_caps_match_each_instruction_boundary() {
+    for inert in [false, true] {
+        let code = [
+            0x0b, 0xc1, 0x84, 0xec, 0x33, 0xda, 0x83, 0xe3, 0x80, 0xe6, 0x60,
+        ];
+        for grant in [false, true] {
+            for cap in 0..40 {
+                for remainder in 0..12 {
+                    let (mut cpu, mut bus) = fixture(&code);
+                    let (mut oracle, mut other) = fixture(&code);
+                    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                        if inert {
+                            enable_inert_regions(bus);
+                        } else {
+                            enable_read_regions(bus);
+                        }
+                        bus.mkii_read_regions = grant;
+                        bus.mkii_inert_regions &= grant;
+                        cpu.registers.set_eax(0x12340001);
+                        cpu.registers.set_ecx(0xaabb0000);
+                        cpu.registers.set_ebx(0x55aa00ff);
+                        cpu.registers.set_edx(0xff);
+                        warm_code(cpu, bus, code.len() as u32);
+                        cpu.timing_rem = remainder;
+                    }
+                    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, cap);
+                }
             }
         }
     }
