@@ -2836,6 +2836,12 @@ pub(crate) struct TestBus {
     mkii_inert_regions: bool,
     mkii_folded_fetches: bool,
     mkii_owned_replay_disabled: bool,
+    mkii_session_ledger: bool,
+    mkii_native_session: bool,
+    mkii_session_trace_origin: u64,
+    mkii_session_isa: u64,
+    mkii_session_indirect_isa: bool,
+    mkii_session_boxed_isa: Box<u64>,
     // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
     // timing-free, so keep that default and let direct-memory differential tests request clocks.
     direct_page_clocks: bool,
@@ -2888,6 +2894,27 @@ pub(crate) struct TestBus {
 }
 
 impl TestBus {
+    fn mkii_session_isa_clocks(&self) -> u64 {
+        if self.mkii_session_indirect_isa {
+            *self.mkii_session_boxed_isa
+        } else {
+            self.mkii_session_isa
+        }
+    }
+
+    fn mkii_session_raw_clocks(&self) -> u64 {
+        self.trace.elapsed_clocks() - self.mkii_session_trace_origin
+            + self.mkii_session_isa_clocks()
+    }
+
+    fn mkii_session_scaled_clocks(&self, additional: u64) -> Option<u64> {
+        let (num, den) = self.batch_bus_scale;
+        self.mkii_session_raw_clocks()
+            .checked_add(additional)?
+            .checked_mul(num)
+            .map(|ticks| ticks.div_ceil(den))
+    }
+
     fn mkii_region_effects_quiet(&self) -> bool {
         self.code_fetch_observations.is_none()
             && self.core_events.is_none()
@@ -2934,6 +2961,12 @@ impl TestBus {
             mkii_inert_regions: false,
             mkii_folded_fetches: false,
             mkii_owned_replay_disabled: false,
+            mkii_session_ledger: false,
+            mkii_native_session: false,
+            mkii_session_trace_origin: 0,
+            mkii_session_isa: 0,
+            mkii_session_indirect_isa: false,
+            mkii_session_boxed_isa: Box::default(),
             direct_page_clocks: false,
             flat_direct_page_clocks: false,
             report_batch_clocks: false,
@@ -3389,6 +3422,9 @@ impl CpuBus for TestBus {
     }
 
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
+        if self.mkii_session_ledger {
+            return self.mkii_session_scaled_clocks(0).unwrap_or(u64::MAX);
+        }
         if self.report_batch_clocks {
             let (num, den) = self.batch_bus_scale;
             self.trace.elapsed_clocks() * num / den
@@ -3398,6 +3434,9 @@ impl CpuBus for TestBus {
     }
 
     fn in_batch_raw_bus_clocks(&self) -> u64 {
+        if self.mkii_session_ledger {
+            return self.mkii_session_raw_clocks();
+        }
         if self.report_batch_clocks {
             self.trace.elapsed_clocks()
         } else {
@@ -3406,6 +3445,9 @@ impl CpuBus for TestBus {
     }
 
     fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
+        if self.mkii_session_ledger {
+            return 0;
+        }
         if self.report_batch_clocks {
             let (num, den) = self.batch_bus_scale;
             num.div_ceil(den).max(1)
@@ -3525,6 +3567,9 @@ impl CpuBus for TestBus {
     }
 
     fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
+        if self.mkii_session_ledger {
+            return self.mkii_session_scaled_clocks(additional_raw);
+        }
         if self.mkii_exact_fetch_projection {
             let (num, den) = self.batch_bus_scale;
             return Some((self.trace.elapsed_clocks() + additional_raw) * num / den);
@@ -3614,6 +3659,38 @@ impl CpuBus for TestBus {
         )
     }
 
+    fn mkii_bus_session(&self) -> Option<izarravm_bus::MkiiBusSession<'_, Self>> {
+        use izarravm_bus::{MkiiBusSession, MkiiBusSessionParts, MkiiCounterPath};
+        use std::mem::offset_of;
+        if !self.mkii_session_ledger
+            || !self.mkii_native_session
+            || !self.report_batch_clocks
+            || self.requires_step_break()
+        {
+            return None;
+        }
+        let grant = self.certify_inert_read_region()?;
+        let isa_clocks = if self.mkii_session_indirect_isa {
+            MkiiCounterPath::indirect(offset_of!(Self, mkii_session_boxed_isa) as u32, 0)
+        } else {
+            MkiiCounterPath::direct(offset_of!(Self, mkii_session_isa) as u32)
+        };
+        let parts = MkiiBusSessionParts {
+            trace_clocks: MkiiCounterPath::direct(
+                offset_of!(Self, trace) as u32 + MkiiCounterPath::trace(0).pointee_offset,
+            ),
+            isa_clocks,
+            mapping_epoch: MkiiCounterPath::direct(offset_of!(Self, direct_mapping_epoch) as u32),
+            trace_origin: self.mkii_session_trace_origin,
+            cost_epoch: grant.epochs().1,
+            bus_numerator: self.batch_bus_scale.0,
+            bus_denominator: self.batch_bus_scale.1,
+        };
+        // SAFETY: these initialized counters and inert policy survive the run;
+        // helpers preserve pricing and report service requests before continuation.
+        unsafe { MkiiBusSession::certify(self, parts) }
+    }
+
     fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
         if !self.direct_pages_enabled
             || !self.uniform_native_fetches
@@ -3674,12 +3751,20 @@ impl CpuBus for TestBus {
         self.last_read_io_ring0 = Some(cpu_is_ring0_pm);
         self.io_reads
             .push((port, self.io_run_core_origin + core_clocks_so_far));
-        self.trace.push(BusCycle::new(
-            BusAccessKind::IoRead,
-            u32::from(port),
-            width,
-            0,
-        ));
+        if self.mkii_session_ledger {
+            if self.mkii_session_indirect_isa {
+                *self.mkii_session_boxed_isa += 2;
+            } else {
+                self.mkii_session_isa += 2;
+            }
+        } else {
+            self.trace.push(BusCycle::new(
+                BusAccessKind::IoRead,
+                u32::from(port),
+                width,
+                0,
+            ));
+        }
         let sequenced = self.io_read_sequence.get(self.io_read_cursor).copied();
         if sequenced.is_some() {
             self.io_read_cursor += 1;

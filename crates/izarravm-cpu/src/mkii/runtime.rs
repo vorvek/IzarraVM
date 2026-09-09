@@ -71,6 +71,7 @@ pub struct Stats {
     pub retired_artifacts: u64,
     pub expansions: u64,
     pub regions: u64,
+    pub native_admissions: u64,
     pub region_guard_misses: u64,
     pub dispatch_hits: u64,
     pub dispatch_misses: u64,
@@ -80,6 +81,42 @@ pub struct Stats {
 
 type Helper = unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame, *const Operation) -> u32;
 type Resolver = unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame) -> usize;
+
+#[derive(Default)]
+pub(super) struct Session {
+    pub enabled: u32,
+    pub bus: izarravm_bus::MkiiBusSessionParts,
+    pub raw_limit: u64,
+    pub threshold_limit: u64,
+    pub load_biases: usize,
+    pub mapping_epochs: usize,
+}
+
+impl Session {
+    fn acquire<B: CpuBus>(cpu: &CpuGsw, bus: &B, owner: *const B) -> Self {
+        if cfg!(feature = "int-trace")
+            || cfg!(feature = "timing-class-histogram")
+            || !cpu.mkii_span_observers_quiet()
+        {
+            return Self::default();
+        }
+        let Some(parts) = bus
+            .mkii_bus_session()
+            .and_then(|grant| grant.into_parts(owner))
+        else {
+            return Self::default();
+        };
+        let (load_biases, mapping_epochs) = region::region_maps(cpu).unwrap_or_default();
+        Self {
+            enabled: 1,
+            raw_limit: u64::MAX / parts.bus_numerator,
+            threshold_limit: u64::MAX / parts.bus_denominator,
+            bus: parts,
+            load_biases,
+            mapping_epochs,
+        }
+    }
+}
 
 pub(super) struct Frame {
     pub helpers: [Helper; 15],
@@ -98,21 +135,24 @@ pub(super) struct Frame {
     pub region_full_core: u64,
     pub region_full_rem: u64,
     pub region_monitor: u32,
-    region_can_take: bool,
+    pub(super) region_can_take: bool,
     region_running: Option<region::Running>,
     force_canonical: bool,
     pub(super) total: u64,
-    cap: u64,
-    bus_at_entry: u64,
+    pub(super) cap: u64,
+    pub(super) bus_at_entry: u64,
     raw_at_entry: u64,
     screen_scale: u64,
-    cs: SegmentRegister,
-    table: usize,
-    source_certificate: Option<(u64, u64)>,
+    pub(super) cs: SegmentRegister,
+    pub(super) table: usize,
+    pub(super) source_present: u32,
+    pub(super) source_mapping: u64,
+    pub(super) source_cost: u64,
+    pub(super) session: Session,
     pending: Option<Pending>,
     fetched: Option<Fetched>,
     poll_16_armed: bool,
-    stop: bool,
+    pub(super) stop: bool,
     halted: bool,
     error: Option<CpuRunError>,
     pub(super) stats: Stats,
@@ -178,7 +218,10 @@ impl Frame {
             screen_scale: bus.in_batch_scaled_bus_clocks_screen_scale(),
             cs: cpu.registers.cs(),
             table: cpu.class_table() as *const _ as usize,
-            source_certificate: None,
+            source_present: 0,
+            source_mapping: 0,
+            source_cost: 0,
+            session: Session::default(),
             pending: None,
             fetched: None,
             poll_16_armed: cpu.jit_direct.direct_poll_skip_16_armed_for(),
@@ -187,6 +230,10 @@ impl Frame {
             error: None,
             stats: Stats::default(),
         }
+    }
+
+    fn source_certificate(&self) -> Option<(u64, u64)> {
+        (self.source_present != 0).then_some((self.source_mapping, self.source_cost))
     }
 
     fn observe<B: CpuBus>(
@@ -792,7 +839,7 @@ impl Engine {
             if std::mem::take(&mut self.fail_next_compile) {
                 return existing.and_then(|index| self.arena[index].as_ref());
             }
-            let Some(code) = super::native::compile(&operations) else {
+            let Some(code) = super::native::compile(&operations, cpu.persona()) else {
                 return existing.and_then(|index| self.arena[index].as_ref());
             };
             let last = operations.last().unwrap();
@@ -871,7 +918,13 @@ fn select_next<B: CpuBus>(
         {
             frame.cs = cpu.registers.cs();
             frame.table = cpu.class_table() as *const _ as usize;
-            frame.source_certificate = trace.source_certificate;
+            (
+                frame.source_present,
+                frame.source_mapping,
+                frame.source_cost,
+            ) = trace
+                .source_certificate
+                .map_or((0, 0, 0), |(mapping, cost)| (1, mapping, cost));
             frame.stats.entries += 1;
             return trace.code.body_ptr() as usize;
         }
@@ -1060,10 +1113,13 @@ impl CpuGsw {
             self.jit_direct.mkii.census = Some(Box::new([0; 2048]));
         }
         let mut engine = std::mem::take(&mut self.jit_direct.mkii.engine);
-        let mut frame = Frame::new(self, bus, cap);
+        let bus_root = std::ptr::from_mut(bus);
+        // SAFETY: all subsequent execution borrows come from this invocation's owner.
+        let mut frame = Frame::new(self, unsafe { &mut *bus_root }, cap);
+        frame.session = Session::acquire(self, unsafe { &*bus_root }, bus_root);
         self.perf.straight_line_runs += 1;
         if let Some(dispatcher) = dispatcher {
-            let first = select_next(&mut engine, self, bus, &mut frame);
+            let first = select_next(&mut engine, self, unsafe { &mut *bus_root }, &mut frame);
             if first != 0 {
                 frame.engine = std::ptr::from_mut(&mut engine);
                 frame.dispatch = dispatcher.body_ptr() as usize;
@@ -1071,9 +1127,10 @@ impl CpuGsw {
                 // the stationary engine, after every return address has left trace code.
                 let entry: unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame, usize) =
                     unsafe { std::mem::transmute(dispatcher.entry_ptr()) };
-                unsafe { entry(self, (bus as *mut B).cast(), &mut frame, first) };
+                unsafe { entry(self, bus_root.cast(), &mut frame, first) };
             }
         } else {
+            let bus = unsafe { &mut *bus_root };
             loop {
                 if self.jit_direct.mkii.code_dirty {
                     engine.drain_writes(self);
@@ -1094,6 +1151,7 @@ impl CpuGsw {
         engine.stats.spans += frame.stats.spans;
         engine.stats.memory_spans += frame.stats.memory_spans;
         engine.stats.regions += frame.stats.regions;
+        engine.stats.native_admissions += frame.stats.native_admissions;
         engine.stats.region_guard_misses += frame.stats.region_guard_misses;
         engine.stats.carry_native += frame.stats.carry_native;
         engine.stats.carry_misses += frame.stats.carry_misses;

@@ -1,7 +1,10 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+mod mkii_session;
+pub use mkii_session::{MkiiBusSession, MkiiBusSessionParts, MkiiCounterPath};
 
 use std::collections::VecDeque;
 
@@ -32,7 +35,7 @@ pub struct Memory {
 
 /// Guest RAM's backing bytes, windowed to host-page (4096) alignment inside a deliberately
 /// over-allocated `Vec` — `align_offset` finds the boundary and every accessor sees only the
-/// aligned window, so the whole scheme stays inside this crate's `forbid(unsafe_code)`.
+/// aligned window, so the allocation and alignment use safe Rust.
 ///
 /// The alignment is a PERFORMANCE contract, not a correctness one: the CPU's one-lookup store
 /// table (`dev_docs/2026-08-07-one-lookup-store-design.md` D7) steals the low bits of each
@@ -1351,6 +1354,14 @@ pub trait CpuBus {
     /// The grant records the exact current scaled batch bus total. Owned cold
     /// source replay still requires its separate live capability.
     fn certify_inert_read_region(&self) -> Option<InertReadRegion> {
+        None
+    }
+
+    /// Acquire fresh mkII policy and counter access paths for one CPU invocation.
+    fn mkii_bus_session(&self) -> Option<MkiiBusSession<'_, Self>>
+    where
+        Self: Sized,
+    {
         None
     }
 

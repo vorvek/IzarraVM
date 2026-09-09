@@ -5602,6 +5602,46 @@ fn mkii_inert_read_grant_matches_live_zero_charges_and_prior_bus_total() {
     }
 }
 
+#[cfg(feature = "dynarec-mkii")]
+#[test]
+fn mkii_session_rechecks_policy_after_bus_construction() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        bus.trace.set_tracing_mode(TracingMode::Off);
+        let root = std::ptr::from_ref(&*bus);
+        let epochs = (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch());
+        assert!(bus.mkii_bus_session().unwrap().into_parts(root).is_some());
+        for (flat, folded) in [(false, true), (true, false), (false, false), (true, true)] {
+            bus.flat_data_cost = flat;
+            bus.l1_charges_folded = folded;
+            assert_eq!(bus.mkii_bus_session().is_some(), flat && folded);
+            assert_eq!(
+                (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch()),
+                epochs
+            );
+        }
+        for tracing in [TracingMode::Counts, TracingMode::Full, TracingMode::Off] {
+            bus.trace.set_tracing_mode(tracing);
+            assert_eq!(
+                bus.mkii_bus_session().is_some(),
+                tracing == TracingMode::Off
+            );
+        }
+        *bus.io_touched = true;
+        assert!(bus.mkii_bus_session().is_none());
+        *bus.io_touched = false;
+        *bus.pending_soft_int = Some(0x21);
+        assert!(bus.mkii_bus_session().is_none());
+        *bus.pending_soft_int = None;
+        let parts = bus.mkii_bus_session().unwrap().into_parts(root).unwrap();
+        assert_eq!(parts.trace_origin, bus.trace_elapsed_at_batch_start);
+        assert_eq!(parts.cost_epoch, bus.jit_cost_dial_epoch());
+        assert_eq!(parts.bus_numerator, BUS_CLOCK_MASTER_TICKS);
+        assert_eq!(parts.bus_denominator, u64::from(bus.bus_den_at_batch_start));
+    });
+}
+
 #[test]
 fn mkii_ram_read_proof_avoids_repeated_device_classification() {
     for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {

@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "cpu_mkii_admission_test.rs"]
+mod admission;
+
 fn fixture(code: &[u8]) -> (CpuGsw, TestBus) {
     let (mut cpu, mut memory) = real_mode_cpu(code, 65536);
     cpu.set_mode(GswMode::Gsw586);
@@ -1048,130 +1051,154 @@ fn assert_pair_state(cpu: &CpuGsw, bus: &TestBus, oracle: &CpuGsw, other: &TestB
 
 #[test]
 fn mkii_memory_pair_revalidates_live_segments_maps_and_observers() {
-    compare_live_memory_guards(false);
+    compare_live_memory_guards(false, false);
 }
 
 #[test]
 fn mkii_read_region_revalidates_live_segments_maps_and_observers() {
-    compare_live_memory_guards(true);
+    compare_live_memory_guards(true, false);
 }
 
-fn compare_live_memory_guards(regions: bool) {
+#[test]
+fn mkii_native_admission_revalidates_live_segments_maps_and_observers() {
+    compare_live_memory_guards(true, true);
+}
+
+fn compare_live_memory_guards(regions: bool, session: bool) {
     // CMP AX,[BX]; JA +1; NOP; IN AL,60h.
     let code = [0x3b, 0x07, 0x77, 1, 0x90, 0xe4, 0x60];
-    for case in 0..14 {
-        let (mut cpu, mut bus) = fixture(&code);
-        let (mut oracle, mut other) = fixture(&code);
-        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
-            bus.uniform_native_fetches = true;
-            bus.mkii_exact_fetch_projection = true;
-            bus.report_batch_clocks = true;
-            bus.direct_page_clocks = true;
-            bus.batch_bus_scale = (16, 105);
-            if regions {
-                enable_read_regions(bus);
-            }
-            cpu.registers.set_ebx(0x2000);
-            cpu.read_memory_bus_width(
-                bus,
-                SegmentIndex::Ds,
-                0x2000,
-                BusWidth::Word,
-                BusAccessKind::DataRead,
-            )
-            .unwrap();
-            warm_code(cpu, bus, code.len() as u32);
-            let mut ds = cpu.registers.segment(SegmentIndex::Ds);
-            match case {
-                0 => {
-                    cpu.jit_fast_map.invalidate_page(0x2000);
+    for remainder in 0..if session { 12 } else { 1 } {
+        for case in 0..14 {
+            let (mut cpu, mut bus) = fixture(&code);
+            let (mut oracle, mut other) = fixture(&code);
+            for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+                bus.uniform_native_fetches = true;
+                bus.mkii_exact_fetch_projection = true;
+                bus.report_batch_clocks = true;
+                bus.direct_page_clocks = true;
+                bus.batch_bus_scale = (16, 105);
+                if regions {
+                    enable_read_regions(bus);
                 }
-                1 => {
-                    cpu.registers.set_ebx(0x2001);
+                if session {
+                    admission::enable_session(bus, false);
                 }
-                2 => {
-                    cpu.registers.set_ebx(0x2fff);
-                }
-                3 => {
-                    ds.base = 0x1000;
-                    cpu.registers.set_ebx(0x1000);
-                }
-                4 => {
-                    ds.limit = 0x1fff;
-                }
-                5 => {
-                    ds.access = 0x98;
-                }
-                6 => {
-                    ds.access = 0x96;
-                    ds.limit = 0x1fff;
-                }
-                7 => {
-                    cpu.rmw_census_enabled = true;
-                }
-                8 => {
-                    cpu.slot_census_enabled = true;
-                }
-                9 => {
-                    cpu.cpl = 3;
-                    cpu.control.cr0 |= CR0_AM;
-                    cpu.registers.eflags |= FLAG_AC;
-                    cpu.recompute_alignment_armed();
-                    ds.base = 1;
-                    cpu.registers.set_ebx(0x1fff);
-                }
-                10 => {
-                    cpu.set_jit_auto_admit(false);
-                }
-                11 | 13 => {
-                    let mut page = bus
-                        .direct_page(0x2000, BusAccessKind::DataRead)
-                        .unwrap()
-                        .unwrap();
-                    if case == 11 {
-                        page.mapping_epoch += 1;
-                    } else {
-                        cpu.cpl = 3;
-                        cpu.registers.eflags |= FLAG_IOPL;
+                cpu.timing_rem = remainder;
+                cpu.registers.set_ebx(0x2000);
+                cpu.read_memory_bus_width(
+                    bus,
+                    SegmentIndex::Ds,
+                    0x2000,
+                    BusWidth::Word,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap();
+                warm_code(cpu, bus, code.len() as u32);
+                let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+                match case {
+                    0 => {
+                        cpu.jit_fast_map.invalidate_page(0x2000);
                     }
-                    cpu.jit_fast_map.invalidate_page(0x2000);
-                    assert!(cpu.jit_fast_map.populate_read(
-                        0x2000,
-                        0x2000,
-                        page,
-                        jit::fast_map::PagePermissions {
-                            writable: true,
-                            user: case != 13
-                        },
-                        false
-                    ));
+                    1 => {
+                        cpu.registers.set_ebx(0x2001);
+                    }
+                    2 => {
+                        cpu.registers.set_ebx(0x2fff);
+                    }
+                    3 => {
+                        ds.base = 0x1000;
+                        cpu.registers.set_ebx(0x1000);
+                    }
+                    4 => {
+                        ds.limit = 0x1fff;
+                    }
+                    5 => {
+                        ds.access = 0x98;
+                    }
+                    6 => {
+                        ds.access = 0x96;
+                        ds.limit = 0x1fff;
+                    }
+                    7 => {
+                        cpu.rmw_census_enabled = true;
+                    }
+                    8 => {
+                        cpu.slot_census_enabled = true;
+                    }
+                    9 => {
+                        cpu.cpl = 3;
+                        cpu.control.cr0 |= CR0_AM;
+                        cpu.registers.eflags |= FLAG_AC;
+                        cpu.recompute_alignment_armed();
+                        ds.base = 1;
+                        cpu.registers.set_ebx(0x1fff);
+                    }
+                    10 => {
+                        cpu.set_jit_auto_admit(false);
+                    }
+                    11 | 13 => {
+                        let mut page = bus
+                            .direct_page(0x2000, BusAccessKind::DataRead)
+                            .unwrap()
+                            .unwrap();
+                        if case == 11 {
+                            page.mapping_epoch += 1;
+                        } else {
+                            cpu.cpl = 3;
+                            cpu.registers.eflags |= FLAG_IOPL;
+                        }
+                        cpu.jit_fast_map.invalidate_page(0x2000);
+                        assert!(cpu.jit_fast_map.populate_read(
+                            0x2000,
+                            0x2000,
+                            page,
+                            jit::fast_map::PagePermissions {
+                                writable: true,
+                                user: case != 13
+                            },
+                            false
+                        ));
+                    }
+                    12 => {
+                        bus.direct_mapping_epoch += 1;
+                    }
+                    _ => unreachable!(),
                 }
-                12 => {
-                    bus.direct_mapping_epoch += 1;
-                }
-                _ => unreachable!(),
+                cpu.registers.set_segment(SegmentIndex::Ds, ds);
             }
-            cpu.registers.set_segment(SegmentIndex::Ds, ds);
-        }
-        compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 100);
-        let stats = cpu.dynarec_mkii_stats();
-        if regions {
-            assert_eq!(
-                stats.regions,
-                u64::from(!matches!(case, 5 | 7..=10)),
-                "case={case}"
-            );
-            assert_eq!(
-                stats.region_guard_misses,
-                u64::from(matches!(case, 0..=2 | 4 | 11..=13)),
-                "case={case}"
-            );
-        } else {
-            assert_eq!(
-                stats.memory_spans,
-                u64::from(matches!(case, 3 | 6)),
-                "case={case}"
-            );
+            if session {
+                bus.mkii_native_session = true;
+                assert!(bus.mkii_bus_session().is_some());
+                admission::compare_session_run(&mut cpu, &mut bus, &mut oracle, &mut other, 100);
+            } else {
+                compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 100);
+            }
+            let stats = cpu.dynarec_mkii_stats();
+            if session {
+                assert_eq!(
+                    stats.native_admissions,
+                    u64::from(!matches!(case, 5 | 7..=10)),
+                    "case={case} rem={remainder}"
+                );
+            }
+            if regions {
+                assert_eq!(
+                    stats.regions,
+                    u64::from(!matches!(case, 5 | 7..=10)),
+                    "case={case}"
+                );
+                assert_eq!(
+                    stats.region_guard_misses,
+                    u64::from(matches!(case, 0..=2 | 4 | 11..=13)),
+                    "case={case}"
+                );
+            } else {
+                assert_eq!(
+                    stats.memory_spans,
+                    u64::from(matches!(case, 3 | 6)),
+                    "case={case}"
+                );
+            }
         }
     }
 }

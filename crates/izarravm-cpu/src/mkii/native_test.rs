@@ -4,6 +4,42 @@
 use super::*;
 use crate::jit::exec_mem::ExecutableBuffer;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux"),
+    not(any(feature = "int-trace", feature = "timing-class-histogram"))
+))]
+#[path = "admission_test.rs"]
+mod admission_guards;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn mkii_native_admission_emitted_size() {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(crate::GswMode::Gsw586);
+    for (name, bytes) in [
+        ("pure", &[0x90, 0x90][..]),
+        ("read", &[0x90, 0x8b, 0x06, 0, 0x20][..]),
+    ] {
+        let mut ops = operations(bytes);
+        ops[0].region_len = ops.len();
+        ops[0].region = Some(crate::mkii::ops::Region::build(cpu.class_table(), &ops));
+        let mut encoder = Encoder::new();
+        let prepared = encoder.label();
+        admission::emit(&mut encoder, &ops[0], cpu.persona(), prepared);
+        encoder.place(prepared);
+        let emitted = encoder.finish();
+        assert_eq!(
+            emitted.is_empty(),
+            cfg!(feature = "int-trace") || cfg!(feature = "timing-class-histogram")
+        );
+        println!("mkII {name} admission bytes: {}", emitted.len());
+    }
+}
+
 fn operations(bytes: &[u8]) -> Vec<Operation> {
     let mut cpu = CpuGsw::default();
     cpu.load_segment_real(crate::SegmentIndex::Cs, 0);
@@ -21,7 +57,7 @@ fn operations(bytes: &[u8]) -> Vec<Operation> {
 }
 
 fn settlement_calls(operations: &[Operation]) -> usize {
-    let code = compile(operations).unwrap();
+    let code = compile(operations, CpuGsw::default().persona()).unwrap();
     let end = code.unwind_points.last().unwrap() + 2;
     // SAFETY: the final recorded point precedes the generated two-byte JMP RAX.
     let bytes = unsafe { std::slice::from_raw_parts(code.entry_ptr(), end) };
@@ -85,6 +121,12 @@ mod session {
         let mut e = Encoder::new();
         let info = entry(&mut e);
         let body = e.position();
+        let admission = admission::code_for(crate::CpuPersona::I586, 0).unwrap();
+        e.mov_r32_imm32(Reg::R10, 0);
+        e.mov_r64_imm64(Reg::R8, 0);
+        e.mov_r64_imm64(Reg::R9, 0);
+        e.mov_r64_imm64(Reg::RAX, admission.entry_ptr() as u64);
+        e.call_r64(Reg::RAX);
         call_helper(&mut e, 11, 0);
         let helper_return = e.position();
         e.load_r64_disp32(
@@ -191,6 +233,59 @@ mod session {
                 let mut base = 0;
                 let entry = RtlLookupFunctionEntry(context.Rip, &mut base, std::ptr::null_mut());
                 if base == code.entry_ptr() as u64 && !entry.is_null() {
+                    let leaf = admission::code_for(crate::CpuPersona::I586, 0).unwrap();
+                    let return_slot = context.Rip;
+                    let stack = std::ptr::from_ref(&return_slot) as u64;
+                    for &offset in &leaf.unwind_points {
+                        let mut sample = AlignedContext(std::ptr::read(context));
+                        sample.0.Rip = leaf.entry_ptr() as u64 + offset as u64;
+                        sample.0.Rsp = stack;
+                        let mut leaf_base = 0;
+                        let leaf_entry = RtlLookupFunctionEntry(
+                            sample.0.Rip,
+                            &mut leaf_base,
+                            std::ptr::null_mut(),
+                        );
+                        if leaf_entry.is_null() || leaf_base != leaf.entry_ptr() as u64 {
+                            return false;
+                        }
+                        let mut data = std::ptr::null_mut();
+                        let mut establisher = 0;
+                        RtlVirtualUnwind(
+                            0,
+                            leaf_base,
+                            sample.0.Rip,
+                            leaf_entry,
+                            &mut sample.0,
+                            &mut data,
+                            &mut establisher,
+                            std::ptr::null_mut(),
+                        );
+                        if sample.0.Rip != context.Rip
+                            || sample.0.Rsp != stack + 8
+                            || [
+                                sample.0.Rbx,
+                                sample.0.Rbp,
+                                sample.0.Rsi,
+                                sample.0.Rdi,
+                                sample.0.R12,
+                                sample.0.R13,
+                                sample.0.R14,
+                                sample.0.R15,
+                            ] != [
+                                context.Rbx,
+                                context.Rbp,
+                                context.Rsi,
+                                context.Rdi,
+                                context.R12,
+                                context.R13,
+                                context.R14,
+                                context.R15,
+                            ]
+                        {
+                            return false;
+                        }
+                    }
                     for &offset in &code.unwind_points {
                         let mut sample = AlignedContext(std::ptr::read(context));
                         sample.0.Rip = base + offset as u64;
@@ -504,7 +599,7 @@ fn mkii_inert_emission_commits_before_a_helper_without_a_finish_callback() {
     for monitor in [false, true] {
         let mut operations = operations(&[0x90, 0x8b, 0x06, 0, 0x20, 0x50]);
         region(&mut operations, 2);
-        let code = compile(&operations).unwrap();
+        let code = compile(&operations, CpuGsw::default().persona()).unwrap();
         let dispatcher = dispatcher().unwrap();
         let mut cpu = CpuGsw::default();
         cpu.load_segment_real(crate::SegmentIndex::Cs, 0);

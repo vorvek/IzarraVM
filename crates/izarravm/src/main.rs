@@ -2391,6 +2391,7 @@ fn write_hdd_profile_json(
             "memory_spans": stats.memory_spans,
             "expansions": stats.expansions,
             "regions": stats.regions, "region_guard_misses": stats.region_guard_misses,
+            "native_admissions": stats.native_admissions,
             "dispatch_hits": stats.dispatch_hits, "dispatch_misses": stats.dispatch_misses,
             "carry_native": stats.carry_native, "carry_misses": stats.carry_misses,
         });

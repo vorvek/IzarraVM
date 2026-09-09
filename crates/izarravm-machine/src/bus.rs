@@ -1907,6 +1907,33 @@ impl CpuBus for MachineBus<'_> {
         )
     }
 
+    #[cfg(feature = "dynarec-mkii")]
+    fn mkii_bus_session(&self) -> Option<izarravm_bus::MkiiBusSession<'_, Self>> {
+        use izarravm_bus::{MkiiBusSession, MkiiBusSessionParts, MkiiCounterPath};
+        let grant = self.certify_inert_read_region()?;
+        if self.requires_step_break() {
+            return None;
+        }
+        let parts = MkiiBusSessionParts {
+            trace_clocks: MkiiCounterPath::trace(std::mem::offset_of!(Self, trace) as u32),
+            isa_clocks: MkiiCounterPath::indirect(
+                std::mem::offset_of!(Self, isa_io_clocks) as u32,
+                0,
+            ),
+            mapping_epoch: MkiiCounterPath::indirect(
+                std::mem::offset_of!(Self, direct_mapping_epoch) as u32,
+                0,
+            ),
+            trace_origin: self.trace_elapsed_at_batch_start,
+            cost_epoch: grant.epochs().1,
+            bus_numerator: BUS_CLOCK_MASTER_TICKS,
+            bus_denominator: u64::from(self.bus_den_at_batch_start),
+        };
+        // SAFETY: pricing and observers are fixed for this CPU invocation. The
+        // referenced counters stay live, and source formation cannot request service.
+        unsafe { MkiiBusSession::certify(self, parts) }
+    }
+
     fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
         if !self.flat_data_cost {
             return None;

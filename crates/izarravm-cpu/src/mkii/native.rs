@@ -10,6 +10,13 @@ use crate::{BusWidth, CpuGsw, PendingFlags, Registers};
 #[path = "region_native.rs"]
 mod region;
 
+#[path = "admission_native.rs"]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+mod admission;
+
 const SAVED: [Reg; 3] = [Reg::RBX, Reg::R12, Reg::R13];
 const STACK_BYTES: u32 = 32;
 
@@ -73,7 +80,12 @@ pub(super) fn dispatcher() -> Option<Code> {
     })
 }
 
-pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
+pub(super) fn compile(operations: &[Operation], persona: crate::CpuPersona) -> Option<Code> {
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    let _ = persona;
     let mut e = Encoder::new();
     let info = entry(&mut e);
     let body = e.position();
@@ -94,11 +106,20 @@ pub(super) fn compile(operations: &[Operation]) -> Option<Code> {
         let end = index + operation.region_len;
         let slow = e.label();
         let next = e.label();
+        let prepared = e.label();
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if !pending_on_fallthrough {
+            admission::emit(&mut e, operation, persona, prepared);
+        }
         call_helper(&mut e, 13, operation as *const Operation as usize);
         e.cmp_r32_imm32(Reg::RAX, 2);
         e.jcc(4, exit);
         e.test_r32_r32(Reg::RAX, Reg::RAX);
         e.jcc(4, slow);
+        e.place(prepared);
         region::emit(&mut e, &operations[index..end], exit);
         e.jmp(next);
         e.place(slow);

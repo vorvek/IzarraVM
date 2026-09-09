@@ -3,6 +3,133 @@
 
 use super::*;
 
+#[path = "session_test.rs"]
+mod session;
+
+#[cfg(not(any(feature = "int-trace", feature = "timing-class-histogram")))]
+impl CpuGsw {
+    pub(crate) fn check_mkii_adjacent_pending_for_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        adjacent: bool,
+    ) {
+        let mut operations = Vec::new();
+        self.set_eip(0);
+        while self.registers.eip < 8 {
+            let eip = self.registers.eip;
+            let insn = self.fetch_decoded(bus, eip).unwrap();
+            operations.push(Operation::lower(eip, eip, insn).unwrap());
+        }
+        assert_eq!(operations.len(), 6);
+        operations[0].region_len = 4;
+        operations[0].span_len = 4;
+        operations[0].region = Some(super::super::ops::Region::build(
+            self.class_table(),
+            &operations[..4],
+        ));
+        operations[0].region.as_mut().unwrap().segments = 1 << SegmentIndex::Ds.index();
+        operations[4].region_len = 2;
+        operations[4].region = Some(super::super::ops::Region::build(
+            self.class_table(),
+            &operations[4..],
+        ));
+        assert_eq!(operations[4].span_len, 1);
+        assert_eq!(operations[5].span_len, 1);
+        self.registers.segments[SegmentIndex::Ds.index()].access = 0x98;
+        self.set_eip(if adjacent { 0 } else { 4 });
+        self.timing_rem = 0;
+        self.registers.set_eax(0xabcd_5678);
+        self.jit_direct.mkii.code_dirty = false;
+        self.jit_direct.mkii.mapping_dirty = false;
+        let elapsed = self.elapsed_clocks;
+        let instructions = self.perf.instructions;
+        let mut frame = Frame::new(self, bus, 5);
+        frame.session = Session::acquire(self, bus, std::ptr::from_ref(bus));
+        assert_eq!(frame.session.enabled, 1);
+        let (mapping, cost) = bus.owned_code_replay_epochs().unwrap();
+        frame.source_present = 1;
+        frame.source_mapping = mapping;
+        frame.source_cost = cost;
+        unsafe extern "C" fn stop(_: *mut CpuGsw, _: *mut (), _: *mut Frame) -> usize {
+            0
+        }
+        let dispatcher = super::super::native::dispatcher().unwrap();
+        frame.dispatch = dispatcher.body_ptr() as usize;
+        frame.resolve = stop;
+        let code = super::super::native::compile(
+            &operations[if adjacent { 0 } else { 4 }..],
+            self.persona(),
+        )
+        .unwrap();
+        // SAFETY: operations, bus, frame and both generated allocations outlive this call.
+        let invoke: unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame) =
+            unsafe { std::mem::transmute(code.entry_ptr()) };
+        unsafe { invoke(self, std::ptr::from_mut(bus).cast(), &mut frame) };
+        assert_eq!(
+            self.registers.eax(),
+            if adjacent { 0xabcd_5678 } else { 0xabcd_1234 }
+        );
+        assert_eq!(self.registers.eip, if adjacent { 5 } else { 8 });
+        let clocks = if adjacent { 5 } else { 2 };
+        assert_eq!(frame.total, clocks);
+        assert_eq!(self.elapsed_clocks - elapsed, clocks);
+        assert_eq!(self.perf.instructions - instructions, clocks);
+        assert_eq!(self.timing_rem, 0);
+        assert_eq!(frame.stats.spans, u64::from(adjacent));
+        assert_eq!(frame.stats.native_admissions, u64::from(!adjacent));
+        assert_eq!(frame.stop, adjacent);
+        assert!(frame.pending.is_none());
+        assert!(frame.error.is_none());
+        assert_eq!(frame.stats.cold, 0);
+        assert!(!self.jit_direct.mkii.code_dirty);
+        assert!(!self.jit_direct.mkii.mapping_dirty);
+    }
+}
+
+#[test]
+fn mkii_selection_clears_a_previous_source_certificate() {
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    let mut bus = crate::tests::TestBus::with_memory(vec![0x90; 65536]);
+    let mut engine = Engine::default();
+    let mut bodies = Vec::new();
+    for eip in [0, 16] {
+        cpu.set_eip(eip);
+        cpu.fetch_decoded(&mut bus, eip).unwrap();
+        let key = install(&mut engine, &mut cpu, eip, eip);
+        let index = engine.lookup(key).unwrap();
+        engine.arena[index].as_mut().unwrap().source_certificate = (eip == 0).then_some((55, 71));
+        bodies.push(engine.arena[index].as_ref().unwrap().code.body_ptr() as usize);
+    }
+    let mut frame = Frame::new(&cpu, &mut bus, 100);
+    cpu.set_eip(0);
+    assert_eq!(
+        select_next(&mut engine, &mut cpu, &mut bus, &mut frame),
+        bodies[0]
+    );
+    assert_eq!(
+        (
+            frame.source_present,
+            frame.source_mapping,
+            frame.source_cost
+        ),
+        (1, 55, 71)
+    );
+    cpu.set_eip(16);
+    assert_eq!(
+        select_next(&mut engine, &mut cpu, &mut bus, &mut frame),
+        bodies[1]
+    );
+    assert_eq!(
+        (
+            frame.source_present,
+            frame.source_mapping,
+            frame.source_cost
+        ),
+        (0, 0, 0)
+    );
+}
+
 fn install(engine: &mut Engine, cpu: &mut CpuGsw, eip: u32, physical: u32) -> Key {
     let insn = DecodedInsn {
         len: 1,
@@ -20,7 +147,7 @@ fn install(engine: &mut Engine, cpu: &mut CpuGsw, eip: u32, physical: u32) -> Ke
         imm_len: 0,
     };
     let operations = vec![Operation::lower(eip, physical, insn).unwrap()].into_boxed_slice();
-    let code = super::super::native::compile(&operations).unwrap();
+    let code = super::super::native::compile(&operations, cpu.persona()).unwrap();
     cpu.mkii_watch_source(physical, 1);
     let index = engine.free.pop().unwrap_or_else(|| {
         engine.arena.push(None);

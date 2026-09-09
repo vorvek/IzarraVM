@@ -124,7 +124,7 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
         },
         |grant| (grant.epochs().0, 0),
     );
-    let fetch_raw = if frame.source_certificate.is_some_and(|certificate| {
+    let fetch_raw = if frame.source_certificate().is_some_and(|certificate| {
         bus.owned_code_replay_epochs() == Some(certificate)
             && certificate == (mapping_epoch, bus.jit_cost_dial_epoch())
     }) && fetch_cost == 0
@@ -179,7 +179,7 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn region_maps(cpu: &CpuGsw) -> Option<(usize, usize)> {
+pub(super) fn region_maps(cpu: &CpuGsw) -> Option<(usize, usize)> {
     cpu.jit_fast_map
         .native_bases()
         .map(|maps| (maps.load_biases(), maps.mapping_epochs()))
@@ -189,7 +189,7 @@ fn region_maps(cpu: &CpuGsw) -> Option<(usize, usize)> {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 )))]
-fn region_maps(_: &CpuGsw) -> Option<(usize, usize)> {
+pub(super) fn region_maps(_: &CpuGsw) -> Option<(usize, usize)> {
     None
 }
 
