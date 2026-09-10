@@ -81,8 +81,9 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
             SegmentIndex::Fs,
             SegmentIndex::Gs,
         ][index];
+        let write = region.store_segments & (1 << index) != 0;
         if cpu
-            .check_segment_access_kind(segment, cpu.registers.segment(segment).access, false)
+            .check_segment_access_kind(segment, cpu.registers.segment(segment).access, write)
             .is_err()
         {
             return 0;
@@ -106,11 +107,19 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
         CpuPersona::I386 => scaled_core / 5,
         CpuPersona::I486 | CpuPersona::I586 => scaled_core / 12,
     };
-    let inert = bus
-        .certify_inert_read_region()
-        .filter(|_| cpu.elapsed_clocks.checked_add(full_core).is_some());
+    let writes = cost.writes != 0;
+    let inert = if writes {
+        None
+    } else {
+        bus.certify_inert_read_region()
+            .filter(|_| cpu.elapsed_clocks.checked_add(full_core).is_some())
+    };
     let window = if inert.is_none() {
-        let Some(window) = bus.begin_read_region() else {
+        let Some(window) = (if writes {
+            bus.begin_ram_write_region()
+        } else {
+            bus.begin_read_region()
+        }) else {
             return 0;
         };
         Some(window)
@@ -157,12 +166,19 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
     debug_assert_eq!(frame.region_inert, 0);
     frame.region_epoch = mapping_epoch;
     frame.region_user = u32::from(cpu.current_privilege_level() == 3);
-    (frame.region_load_biases, frame.region_mapping_epochs) = maps.unwrap_or_default();
+    (
+        frame.region_load_biases,
+        frame.region_store_biases,
+        frame.region_mapping_epochs,
+        frame.region_physical_pages,
+    ) = maps.unwrap_or_default();
     frame.region_completed = 0;
     frame.region_guard_miss = 0;
     frame.branch_taken = 0;
+    frame.region_write_page = 0;
+    frame.region_write_count = 0;
     cpu.core_clocks_so_far = frame.total;
-    frame.region_inert = u32::from(inert.is_some());
+    frame.region_inert = u32::from(inert.is_some() && cost.writes == 0);
     frame.region_full_core = full_core;
     frame.region_full_rem = scaled_core - full_core * u64::from(den);
     frame.region_monitor = u32::from(cpu.is_ring0_protected());
@@ -179,17 +195,22 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-pub(super) fn region_maps(cpu: &CpuGsw) -> Option<(usize, usize)> {
-    cpu.jit_fast_map
-        .native_bases()
-        .map(|maps| (maps.load_biases(), maps.mapping_epochs()))
+pub(super) fn region_maps(cpu: &CpuGsw) -> Option<(usize, usize, usize, usize)> {
+    cpu.jit_fast_map.native_bases().map(|maps| {
+        (
+            maps.load_biases(),
+            maps.store_biases(),
+            maps.mapping_epochs(),
+            maps.physical_pages(),
+        )
+    })
 }
 
 #[cfg(not(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 )))]
-pub(super) fn region_maps(_: &CpuGsw) -> Option<(usize, usize)> {
+pub(super) fn region_maps(_: &CpuGsw) -> Option<(usize, usize, usize, usize)> {
     None
 }
 
@@ -229,6 +250,9 @@ pub(super) unsafe extern "C" fn finish<B: CpuBus>(
         cpu.perf.data_direct_reads += cost.reads;
         cpu.perf.direct_data_pointer_reads += cost.reads;
         cpu.fast_map_probe.hits += cost.reads;
+        if frame.region_write_count != 0 && completed == first.region_len {
+            cpu.record_write_page(frame.region_write_page);
+        }
         frame.pending = Some(Pending {
             raw: cost.raw_core,
             retired: completed as u64,

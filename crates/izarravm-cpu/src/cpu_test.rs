@@ -3631,6 +3631,13 @@ impl CpuBus for TestBus {
         self.begin_compiled_window()
     }
 
+    fn begin_ram_write_region(&mut self) -> Option<CompiledBusWindow> {
+        if !self.mkii_read_regions || !self.mkii_region_effects_quiet() {
+            return None;
+        }
+        self.begin_compiled_window()
+    }
+
     fn certify_inert_read_region(&self) -> Option<izarravm_bus::InertReadRegion> {
         if !self.mkii_inert_regions
             || !self.mkii_region_effects_quiet()

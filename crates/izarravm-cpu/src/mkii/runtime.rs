@@ -106,7 +106,7 @@ impl Session {
         else {
             return Self::default();
         };
-        let (load_biases, mapping_epochs) = region::region_maps(cpu).unwrap_or_default();
+        let (load_biases, _, mapping_epochs, _) = region::region_maps(cpu).unwrap_or_default();
         Self {
             enabled: 1,
             raw_limit: u64::MAX / parts.bus_numerator,
@@ -130,7 +130,11 @@ pub(super) struct Frame {
     pub region_epoch: u64,
     pub region_user: u32,
     pub region_load_biases: usize,
+    pub region_store_biases: usize,
+    pub region_physical_pages: usize,
     pub region_mapping_epochs: usize,
+    pub region_write_page: u32,
+    pub region_write_count: u32,
     pub region_inert: u32,
     pub region_full_core: u64,
     pub region_full_rem: u64,
@@ -203,7 +207,11 @@ impl Frame {
             region_epoch: 0,
             region_user: 0,
             region_load_biases: 0,
+            region_store_biases: 0,
+            region_physical_pages: 0,
             region_mapping_epochs: 0,
+            region_write_page: 0,
+            region_write_count: 0,
             region_inert: 0,
             region_full_core: 0,
             region_full_rem: 0,
@@ -827,6 +835,9 @@ impl Engine {
                     end += 1;
                 }
                 if end - start >= 2 {
+                    if end < operations.len() && operations[end].store.is_some() {
+                        end += 1;
+                    }
                     operations[start].region_len = end - start;
                     operations[start].region = Some(super::ops::Region::build(
                         cpu.class_table(),

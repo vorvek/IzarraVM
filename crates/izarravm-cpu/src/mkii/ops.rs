@@ -37,11 +37,20 @@ pub(super) struct Read {
     pub class: TimingClass,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Store {
+    pub address: AddrMode,
+    pub width: BusWidth,
+    pub src: Input,
+    pub class: TimingClass,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct RegionCost {
     pub raw_core: u64,
     pub delta: CompiledBusDelta,
     pub reads: u64,
+    pub writes: u64,
     pub carry_ops: u64,
 }
 
@@ -49,6 +58,7 @@ pub(super) struct RegionCost {
 pub(super) struct Region {
     pub prefixes: Box<[RegionCost]>,
     pub segments: u8,
+    pub store_segments: u8,
 }
 
 impl Region {
@@ -56,6 +66,7 @@ impl Region {
         let mut cost = RegionCost::default();
         let mut prefixes = vec![cost];
         let mut segments = 0;
+        let mut store_segments = 0;
         for op in operations {
             cost.carry_ops += u64::from(op.needs_carry_zero());
             cost.raw_core += u64::from(table.raw(op.region_class()));
@@ -65,11 +76,18 @@ impl Region {
                 cost.reads += 1;
                 segments |= 1 << read.address.segment.index();
             }
+            if let Some(store) = op.store {
+                cost.delta.add_ram_accesses(store.width, 1);
+                cost.writes += 1;
+                store_segments |= 1 << store.address.segment.index();
+                segments |= 1 << store.address.segment.index();
+            }
             prefixes.push(cost);
         }
         Self {
             prefixes: prefixes.into_boxed_slice(),
             segments,
+            store_segments,
         }
     }
 }
@@ -85,6 +103,7 @@ pub(super) struct Operation {
     pub span_len: usize,
     pub memory_cmp_branch: bool,
     pub read: Option<Read>,
+    pub store: Option<Store>,
     pub region_len: usize,
     pub region: Option<Region>,
 }
@@ -128,6 +147,7 @@ impl Operation {
             span_len: 1,
             memory_cmp_branch: false,
             read: lower_read(&insn),
+            store: lower_store(&insn),
             region_len: 0,
             region: None,
         })
@@ -137,6 +157,7 @@ impl Operation {
         self.region_pure()
             .map(|(_, class)| class)
             .or(self.read.map(|read| read.class))
+            .or(self.store.map(|store| store.class))
             .unwrap_or(TimingClass::Jcc)
     }
 
@@ -196,6 +217,40 @@ fn lower_read(insn: &DecodedInsn) -> Option<Read> {
         alu,
         class,
         width: if opcode & 1 == 0 {
+            BusWidth::Byte
+        } else {
+            insn.operand_size.bus_width()
+        },
+    })
+}
+
+fn lower_store(insn: &DecodedInsn) -> Option<Store> {
+    let opcode = insn.opcode;
+    let (src, class) = match opcode {
+        0x88 | 0x89 => (Input::Reg(insn.modrm?.reg), TimingClass::MovMemReg),
+        0xa2 | 0xa3 => (Input::Reg(0), TimingClass::MovAccMoffs),
+        0xc6 | 0xc7 if insn.modrm?.reg == 0 => (Input::Immediate(insn.imm), TimingClass::MovImmMem),
+        _ => return None,
+    };
+    let address = if matches!(opcode, 0xa2 | 0xa3) {
+        AddrMode {
+            segment: insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+            base: None,
+            index: None,
+            scale: 1,
+            disp: insn.imm as i32,
+            address_size: insn.address_size,
+        }
+    } else if let Some(DecodedOperand::Mem(address)) = insn.operand {
+        address
+    } else {
+        return None;
+    };
+    Some(Store {
+        address,
+        src,
+        class,
+        width: if matches!(opcode, 0x88 | 0xa2 | 0xc6) {
             BusWidth::Byte
         } else {
             insn.operand_size.bus_width()

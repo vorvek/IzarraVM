@@ -1347,6 +1347,14 @@ pub trait CpuBus {
         None
     }
 
+    /// Open a native region that may write ordinary RAM. Certified source bytes stay
+    /// unchanged. Mapping epoch and bus-clock machinery match `begin_read_region`.
+    /// Data RAM contents may change. Tracing, non-uniform fetches and write-watch
+    /// observers must refuse.
+    fn begin_ram_write_region(&mut self) -> Option<CompiledBusWindow> {
+        None
+    }
+
     /// Certify inert accounting for separately validated source fetches and aligned
     /// plain-RAM reads. Those accesses and their completion have no effects,
     /// including observations, faults, service or clock charges.

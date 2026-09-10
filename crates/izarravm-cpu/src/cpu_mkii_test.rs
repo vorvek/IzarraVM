@@ -132,6 +132,46 @@ fn enable_read_regions(bus: &mut TestBus) {
 }
 
 #[test]
+fn mkii_trailing_store_matches_oracle() {
+    let code = [0x90, 0x90, 0xa3, 0, 0x20, 0xe6, 0x60];
+    for inert in [false, true] {
+        let (mut cpu, mut bus) = fixture(&code);
+        let (mut oracle, mut other) = fixture(&code);
+        for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+            if inert {
+                enable_inert_regions(bus);
+            } else {
+                enable_read_regions(bus);
+            }
+            admission::enable_session(bus, false);
+            bus.mkii_native_session = true;
+            cpu.registers.set_eax(0x5678);
+            cpu.write_memory_bus_width(
+                bus,
+                SegmentIndex::Ds,
+                0x2000,
+                BusWidth::Word,
+                0,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+            cpu.settle_write_record();
+            warm_code(cpu, bus, code.len() as u32);
+        }
+        let a = cpu.run_budgeted(&mut bus, 200).unwrap();
+        let b = oracle.run_budgeted(&mut other, 200).unwrap();
+        assert_eq!(a.consumed_core_clocks, b.consumed_core_clocks);
+        assert_pair_state(&cpu, &bus, &oracle, &other);
+        assert_eq!(&bus.memory[0x2000..0x2002], &[0x78, 0x56]);
+        assert!(
+            cpu.dynarec_mkii_stats().native >= 3,
+            "{:?}",
+            cpu.dynarec_mkii_stats()
+        );
+    }
+}
+
+#[test]
 fn mkii_owned_source_replay_survives_decode_eviction_but_rechecks_epochs() {
     let code = [0x90, 0xb8, 0x34, 0x12, 0x90, 0xe4, 0x60];
     for change in 0..5 {

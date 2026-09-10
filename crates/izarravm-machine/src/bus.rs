@@ -1891,6 +1891,16 @@ impl CpuBus for MachineBus<'_> {
         self.begin_compiled_window()
     }
 
+    fn begin_ram_write_region(&mut self) -> Option<CompiledBusWindow> {
+        if !self.native_fetches_are_uniform()
+            || !self.native_aggregate_accounting_allowed()
+            || self.shadow_l1.diagnostics().enabled
+        {
+            return None;
+        }
+        self.begin_compiled_window()
+    }
+
     fn certify_inert_read_region(&self) -> Option<izarravm_bus::InertReadRegion> {
         let (mapping_epoch, cost_epoch) = self.owned_code_replay_epochs()?;
         izarravm_bus::InertReadRegion::certify(
