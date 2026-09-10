@@ -64,7 +64,9 @@ impl<'a, B> MkiiBusSession<'a, B> {
     /// acquisition borrow ends. Helpers must not re-enter native execution.
     ///
     /// Policy and cost epoch must remain fixed until the invocation returns.
-    /// Certified source fetches and aligned plain-RAM reads must remain inert.
+    /// Certified source fetches stay inert. Aligned plain-RAM reads stay inert
+    /// unless a write-extended mkII region runs under this session. That region
+    /// may change data RAM. Source bytes must not change.
     /// The live total is ceil(((trace - origin) + ISA) * numerator / denominator),
     /// and mapping epochs share the owned-source namespace. No service request
     /// may be outstanding at acquisition; trace formation/certification cannot

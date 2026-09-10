@@ -111,12 +111,7 @@ pub(super) fn compile(operations: &[Operation], persona: crate::CpuPersona) -> O
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if !pending_on_fallthrough
-            && operation
-                .region
-                .as_ref()
-                .is_none_or(|region| region.prefixes.last().is_none_or(|cost| cost.writes == 0))
-        {
+        if !pending_on_fallthrough {
             admission::emit(&mut e, operation, persona, prepared);
         }
         call_helper(&mut e, 13, operation as *const Operation as usize);

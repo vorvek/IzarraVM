@@ -89,7 +89,9 @@ pub(super) struct Session {
     pub raw_limit: u64,
     pub threshold_limit: u64,
     pub load_biases: usize,
+    pub store_biases: usize,
     pub mapping_epochs: usize,
+    pub physical_pages: usize,
 }
 
 impl Session {
@@ -106,14 +108,17 @@ impl Session {
         else {
             return Self::default();
         };
-        let (load_biases, _, mapping_epochs, _) = region::region_maps(cpu).unwrap_or_default();
+        let (load_biases, store_biases, mapping_epochs, physical_pages) =
+            region::region_maps(cpu).unwrap_or_default();
         Self {
             enabled: 1,
             raw_limit: u64::MAX / parts.bus_numerator,
             threshold_limit: u64::MAX / parts.bus_denominator,
             bus: parts,
             load_biases,
+            store_biases,
             mapping_epochs,
+            physical_pages,
         }
     }
 }

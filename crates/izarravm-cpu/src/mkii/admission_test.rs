@@ -123,6 +123,36 @@ fn mkii_shared_admission_separates_segment_masks() {
 }
 
 #[test]
+fn mkii_shared_admission_write_mask_sets_inert_zero_and_refuses_read_only_data() {
+    for writable in [false, true] {
+        let (mut cpu, mut frame, mut probe) = fixture(crate::GswMode::Gsw586);
+        cpu.registers.segments[crate::SegmentIndex::Ds.index()].access =
+            if writable { 0x93 } else { 0x91 };
+        let biases = [1usize];
+        let pages = [0x2000u32];
+        let epochs = [55u64];
+        frame.session.load_biases = biases.as_ptr() as usize;
+        frame.session.store_biases = biases.as_ptr() as usize;
+        frame.session.mapping_epochs = epochs.as_ptr() as usize;
+        frame.session.physical_pages = pages.as_ptr() as usize;
+        let mut ops = operations(&[0x90, 0x90, 0xa3, 0, 0x20]);
+        ops[0].region_len = 3;
+        ops[0].region = Some(crate::mkii::ops::Region::build(cpu.class_table(), &ops));
+        let code = probe_code(&ops[0], cpu.persona());
+        let invoke: unsafe extern "C" fn(*mut CpuGsw, *mut Probe, *mut Frame) -> u32 =
+            unsafe { std::mem::transmute(code.entry_ptr()) };
+        let accepted = unsafe { invoke(&mut cpu, &mut probe, &mut frame) };
+        assert_eq!(accepted, u32::from(writable), "writable={writable}");
+        if writable {
+            assert_eq!(frame.region_inert, 0);
+            assert_eq!(frame.region_store_biases, biases.as_ptr() as usize);
+            assert_eq!(frame.region_physical_pages, pages.as_ptr() as usize);
+            assert_eq!(frame.region_write_count, 0);
+        }
+    }
+}
+
+#[test]
 fn mkii_shared_admission_failed_lookup_emits_no_call() {
     let (cpu, _, _) = fixture(crate::GswMode::Gsw586);
     let mut ops = operations(&[0x90, 0x90]);

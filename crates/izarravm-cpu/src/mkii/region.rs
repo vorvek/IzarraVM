@@ -233,7 +233,7 @@ pub(super) unsafe extern "C" fn finish<B: CpuBus>(
         bus.finish_compiled_window(running.window, cost.delta);
         running.can_take
     } else {
-        assert_ne!(std::mem::take(&mut frame.region_inert), 0);
+        let _ = std::mem::take(&mut frame.region_inert);
         frame.region_can_take
     };
     if frame.region_guard_miss != 0 {

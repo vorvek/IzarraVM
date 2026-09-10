@@ -42,6 +42,7 @@ pub(super) fn emit_with(
     e.mov_r32_imm32(Reg::R10, op.eip);
     e.mov_r64_imm64(Reg::R8, product / u64::from(den));
     e.mov_r64_imm64(Reg::R9, product % u64::from(den));
+    e.mov_r32_imm32(Reg::R11, u32::from(region.store_segments));
     e.mov_r64_imm64(Reg::RAX, entry as u64);
     e.call_r64(Reg::RAX);
     e.test_r32_r32(Reg::RAX, Reg::RAX);
@@ -210,11 +211,27 @@ fn emit_body(e: &mut Encoder, persona: CpuPersona, segments: u8) {
                 + index * std::mem::size_of::<SegmentRegister>()
                 + offset_of!(SegmentRegister, access);
             e.movzx_r32_byte_disp32(Reg::RAX, Reg::RBX, access as i32);
+            e.test_r32_imm32(Reg::R11, 1 << index);
+            let read_check = e.label();
+            e.jcc(4, read_check);
+            e.test_r32_imm32(Reg::RAX, 0x08);
+            e.jcc(5, miss);
+            e.test_r32_imm32(Reg::RAX, 0x02);
+            e.jcc(4, miss);
+            let next = e.label();
+            e.jmp(next);
+            e.place(read_check);
             e.and_r32_imm32(Reg::RAX, 0x0a);
             e.cmp_r32_imm32(Reg::RAX, 0x08);
             e.jcc(4, miss);
+            e.place(next);
         }
     }
+    e.store_r32_disp32(
+        Reg::R13,
+        offset_of!(Frame, region_write_count) as i32,
+        Reg::R11,
+    );
     counter(e, offset_of!(MkiiBusSessionParts, mapping_epoch), Reg::R10);
     e.load_r64_disp32(Reg::RAX, Reg::R13, offset_of!(Frame, source_mapping) as i32);
     e.cmp_r64_r64(Reg::RAX, Reg::R10);
@@ -302,11 +319,21 @@ fn emit_body(e: &mut Encoder, persona: CpuPersona, segments: u8) {
     ] {
         e.store_r64_disp32(Reg::R13, offset as i32, value);
     }
+    e.load_r32_disp32(
+        Reg::RAX,
+        Reg::R13,
+        offset_of!(Frame, region_write_count) as i32,
+    );
+    e.mov_r32_imm32(Reg::RDX, 0);
+    e.test_r32_r32(Reg::RAX, Reg::RAX);
+    e.setcc(4, Reg::RDX);
+    e.store_r32_disp32(Reg::R13, offset_of!(Frame, region_inert) as i32, Reg::RDX);
     for (offset, value) in [
         (offset_of!(Frame, region_completed), 0),
         (offset_of!(Frame, region_guard_miss), 0),
         (offset_of!(Frame, branch_taken), 0),
-        (offset_of!(Frame, region_inert), 1),
+        (offset_of!(Frame, region_write_page), 0),
+        (offset_of!(Frame, region_write_count), 0),
     ] {
         e.store_u32_imm_disp32(Reg::R13, offset as i32, value);
     }
@@ -316,8 +343,16 @@ fn emit_body(e: &mut Encoder, persona: CpuPersona, segments: u8) {
             offset_of!(Frame, region_load_biases),
         ),
         (
+            offset_of!(Session, store_biases),
+            offset_of!(Frame, region_store_biases),
+        ),
+        (
             offset_of!(Session, mapping_epochs),
             offset_of!(Frame, region_mapping_epochs),
+        ),
+        (
+            offset_of!(Session, physical_pages),
+            offset_of!(Frame, region_physical_pages),
         ),
     ] {
         e.load_r64_disp32(Reg::RAX, Reg::R13, (SESSION + source) as i32);

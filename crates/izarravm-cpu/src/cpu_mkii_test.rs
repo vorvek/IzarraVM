@@ -164,7 +164,7 @@ fn mkii_trailing_store_matches_oracle() {
         assert_pair_state(&cpu, &bus, &oracle, &other);
         assert_eq!(&bus.memory[0x2000..0x2002], &[0x78, 0x56]);
         assert!(
-            cpu.dynarec_mkii_stats().native >= 3,
+            cpu.dynarec_mkii_stats().native >= 3 && cpu.dynarec_mkii_stats().native_admissions > 0,
             "{:?}",
             cpu.dynarec_mkii_stats()
         );
