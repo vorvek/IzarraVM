@@ -171,6 +171,94 @@ fn mkii_trailing_store_matches_oracle() {
     }
 }
 
+fn lea_oracle(code: &[u8], setup: impl Fn(&mut CpuGsw, &mut TestBus)) {
+    let (mut cpu, mut bus) = fixture(code);
+    let (mut oracle, mut other) = fixture(code);
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        bus.mkii_native_session = true;
+        setup(cpu, bus);
+        warm_code(cpu, bus, code.len() as u32);
+    }
+    admission::compare_session_run(&mut cpu, &mut bus, &mut oracle, &mut other, 200);
+    assert_eq!(cpu.pending_flags, oracle.pending_flags);
+}
+
+#[test]
+fn mkii_native_lea_matches_interpreter() {
+    lea_oracle(&[0x90, 0x8d, 0x07, 0xe6, 0x60], |cpu, _| {
+        cpu.registers.set_ebx(0x1234);
+    });
+    let (mut cpu, mut bus) = fixture(&[0x90, 0x8d, 0x07, 0xe6, 0x60]);
+    admission::enable_session(&mut bus, false);
+    bus.mkii_native_session = true;
+    cpu.registers.set_ebx(0x1234);
+    warm_code(&mut cpu, &mut bus, 5);
+    cpu.run_budgeted(&mut bus, 200).unwrap();
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native >= 2 && stats.native_admissions > 0 && stats.region_guard_misses == 0);
+    assert_eq!(cpu.registers.eax() & 0xffff, 0x1234);
+
+    lea_oracle(&[0x8d, 0x07, 0x8d, 0x04, 0xe6, 0x60], |cpu, _| {
+        cpu.registers.set_ebx(0x10);
+        cpu.registers.set_esi(0x20);
+    });
+}
+
+#[test]
+fn mkii_native_lea_offset_not_linear_and_mod3_faults() {
+    lea_oracle(&[0x90, 0x8d, 0x07, 0xe6, 0x60], |cpu, _| {
+        cpu.registers.set_ebx(0x5);
+        cpu.registers.segments[SegmentIndex::Ds.index()].base = 0x12340000;
+        cpu.registers.segments[SegmentIndex::Ds.index()].limit = 0;
+    });
+    let (mut cpu, mut bus) = fixture(&[0x90, 0x8d, 0x07, 0xe6, 0x60]);
+    admission::enable_session(&mut bus, false);
+    bus.mkii_native_session = true;
+    cpu.registers.set_ebx(0x5);
+    cpu.registers.segments[SegmentIndex::Ds.index()].base = 0x12340000;
+    cpu.registers.segments[SegmentIndex::Ds.index()].limit = 0;
+    warm_code(&mut cpu, &mut bus, 5);
+    cpu.run_budgeted(&mut bus, 200).unwrap();
+    assert_eq!(cpu.registers.eax() & 0xffff, 0x5);
+    assert_eq!(cpu.dynarec_mkii_stats().region_guard_misses, 0);
+
+    let (mut cpu, mut bus) = fixture(&[0x8d, 0xc0, 0xe6, 0x60]);
+    let (mut oracle, mut other) = fixture(&[0x8d, 0xc0, 0xe6, 0x60]);
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_code(cpu, bus, 4);
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 50);
+    assert_eq!(cpu.dynarec_mkii_stats().regions, 0);
+    assert_eq!(cpu.dynarec_mkii_stats().native, 0);
+}
+
+#[test]
+fn mkii_native_lea_widths_wrap_and_old_base() {
+    lea_oracle(&[0x90, 0x66, 0x8d, 0x07, 0xe6, 0x60], |cpu, _| {
+        cpu.registers.set_ebx(0x0000_ffff);
+        cpu.registers.set_eax(0xabcd_0000);
+    });
+    lea_oracle(&[0x90, 0x67, 0x8d, 0x03, 0xe6, 0x60], |cpu, _| {
+        cpu.registers.set_ebx(0x10001);
+    });
+    lea_oracle(&[0x90, 0x8d, 0x1f, 0xe6, 0x60], |cpu, _| {
+        cpu.registers.set_ebx(0x00aa);
+    });
+    let (mut cpu, mut bus) = fixture(&[0x90, 0x8d, 0x1f, 0xe6, 0x60]);
+    admission::enable_session(&mut bus, false);
+    bus.mkii_native_session = true;
+    cpu.registers.set_ebx(0x00aa);
+    warm_code(&mut cpu, &mut bus, 5);
+    cpu.run_budgeted(&mut bus, 200).unwrap();
+    assert_eq!(cpu.registers.ebx() & 0xffff, 0x00aa);
+}
+
 #[test]
 fn mkii_owned_source_replay_survives_decode_eviction_but_rechecks_epochs() {
     let code = [0x90, 0xb8, 0x34, 0x12, 0x90, 0xe4, 0x60];

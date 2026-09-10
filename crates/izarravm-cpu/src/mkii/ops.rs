@@ -25,6 +25,11 @@ pub(super) enum Pure {
         width: BusWidth,
         store: bool,
     },
+    Lea {
+        dst: u8,
+        address: AddrMode,
+        width: BusWidth,
+    },
     Nop,
 }
 
@@ -323,6 +328,19 @@ fn lower_pure(insn: &DecodedInsn) -> Option<(Pure, TimingClass)> {
     }
     if opcode == 0x90 {
         return Some((Pure::Nop, TimingClass::Nop));
+    }
+    if opcode == 0x8d {
+        if let Some(DecodedOperand::Mem(address)) = insn.operand {
+            return Some((
+                Pure::Lea {
+                    dst: insn.modrm?.reg,
+                    address,
+                    width: sized,
+                },
+                TimingClass::Lea,
+            ));
+        }
+        return None;
     }
     let (op, dst, src, width, store, class) = if opcode < 0x40 && opcode & 7 < 6 {
         let op = (opcode as u8 >> 3) & 7;

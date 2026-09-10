@@ -5,7 +5,7 @@ use super::ops::{Input, Operation, Pure};
 use super::runtime::Frame;
 use crate::jit::encoder::{Encoder, Label, Reg};
 use crate::jit::exec_mem::ExecutableBuffer;
-use crate::{BusWidth, CpuGsw, PendingFlags, Registers};
+use crate::{AddrMode, AddressSize, BusWidth, CpuGsw, PendingFlags, Registers};
 
 #[path = "region_native.rs"]
 mod region;
@@ -264,6 +264,29 @@ fn mask(width: BusWidth) -> u32 {
     }
 }
 
+fn emit_addr_offset(e: &mut Encoder, address: AddrMode) {
+    let address_width = if address.address_size == AddressSize::Word {
+        BusWidth::Word
+    } else {
+        BusWidth::Dword
+    };
+    e.mov_r32_imm32(Reg::R10, address.disp as u32);
+    if let Some(base) = address.base {
+        load(e, Reg::RAX, Input::Reg(base), address_width);
+        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
+    }
+    if let Some(index) = address.index {
+        load(e, Reg::RAX, Input::Reg(index), address_width);
+        if address.address_size == AddressSize::Dword && address.scale != 1 {
+            e.shift_r32_imm8(4, Reg::RAX, address.scale.trailing_zeros() as u8);
+        }
+        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
+    }
+    if address.address_size == AddressSize::Word {
+        e.alu_r32_imm32(4, Reg::R10, 0xffff);
+    }
+}
+
 fn emit_pure(e: &mut Encoder, pure: Pure) {
     match pure {
         Pure::Nop => {}
@@ -284,6 +307,14 @@ fn emit_pure(e: &mut Encoder, pure: Pure) {
             if write {
                 store(e, dst, Reg::RCX, width);
             }
+        }
+        Pure::Lea {
+            dst,
+            address,
+            width,
+        } => {
+            emit_addr_offset(e, address);
+            store(e, dst, Reg::R10, width);
         }
     }
 }
