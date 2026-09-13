@@ -195,6 +195,153 @@ fn jit_direct_memory_preview_bounds_the_live_bus_charge() {
 }
 
 #[test]
+fn mkii_fetch_certificate_rejects_firmware_aliases_and_matches_physical_charges() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        assert_eq!(
+            bus.jit_preflight_cached_fetch(BIOS32_DIRECTORY_LINEAR, 0x2000, 1),
+            None
+        );
+        assert_eq!(
+            bus.jit_preflight_cached_fetch(BIOS_INT_STUB_TABLE_LINEAR, 0x2000, 1),
+            None
+        );
+        assert_eq!(bus.jit_preflight_cached_fetch(0x2000, 0xa0000, 1), None);
+        assert_eq!(bus.jit_preflight_cached_fetch(0x2000, 0xfff, 2), None);
+        for (linear, physical, len) in [(0x2000, 0x3000, 3), (0x4000, 0x100000, 6)] {
+            let raw = bus
+                .jit_preflight_cached_fetch(linear, physical, len)
+                .unwrap();
+            let before = bus.in_batch_reference_bus_clocks();
+            bus.note_code_fetch_linear(linear);
+            bus.charge_physical_instruction_fetch_run(physical, u32::from(len))
+                .unwrap();
+            assert_eq!(bus.in_batch_reference_bus_clocks() - before, raw);
+            assert!(!bus.requires_step_break());
+        }
+    });
+}
+
+#[test]
+fn mkii_read_region_window_matches_live_charges_and_refuses_observers() {
+    for mode in [GswMode::Gsw586, GswMode::Gsw486, GswMode::Gsw386] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            bus.trace.set_tracing_mode(TracingMode::Off);
+            if mode == GswMode::Gsw386 {
+                assert!(bus.begin_read_region().is_none());
+                return;
+            }
+            *bus.direct_mapping_epoch += 1;
+            let window = bus.begin_read_region().unwrap();
+            assert_eq!(window.mapping_epoch(), *bus.direct_mapping_epoch);
+            let mut delta = izarravm_bus::CompiledBusDelta::default();
+            delta.add_instruction_fetches(3);
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                delta.add_ram_accesses(width, 1);
+            }
+            let before = bus.trace.elapsed_clocks();
+            bus.finish_compiled_window(window, delta);
+            let aggregated = bus.trace.elapsed_clocks() - before;
+            let before = bus.trace.elapsed_clocks();
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                bus.charge_physical_instruction_fetch_run(0x3000, 4)
+                    .unwrap();
+                bus.charge_direct_ram_memory(0x2000, width, BusAccessKind::DataRead)
+                    .unwrap();
+            }
+            assert_eq!(bus.trace.elapsed_clocks() - before, aggregated);
+            bus.trace.set_tracing_mode(TracingMode::Full);
+            assert!(bus.begin_read_region().is_none());
+            #[cfg(not(feature = "shadow-cache-probe"))]
+            {
+                bus.trace.set_tracing_mode(TracingMode::Off);
+                bus.shadow_l1.enable_for_test();
+                assert!(bus.begin_read_region().is_none());
+            }
+        });
+    }
+}
+
+#[test]
+fn mkii_ram_certificate_tracks_epoch_backing_and_folded_charge() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        bus.trace.set_tracing_mode(TracingMode::Off);
+        let epoch = *bus.direct_mapping_epoch;
+        assert_eq!(
+            bus.jit_preflight_ram_read(0x2000, BusWidth::Word, epoch + 1),
+            None
+        );
+        for address in [0x2001, 0x2fff, 0xa0000] {
+            assert_eq!(
+                bus.jit_preflight_ram_read(address, BusWidth::Word, epoch),
+                None
+            );
+        }
+        let raw = bus
+            .jit_preflight_ram_read(0x2000, BusWidth::Word, epoch)
+            .unwrap();
+        assert_eq!(raw, 0);
+        let before = bus.in_batch_reference_bus_clocks();
+        bus.charge_direct_ram_memory(0x2000, BusWidth::Word, BusAccessKind::DataRead)
+            .unwrap();
+        assert_eq!(bus.in_batch_reference_bus_clocks() - before, raw);
+        bus.trace.set_tracing_mode(TracingMode::Full);
+        assert_eq!(
+            bus.jit_preflight_ram_read(0x2000, BusWidth::Word, epoch),
+            None
+        );
+    });
+}
+
+#[test]
+fn mkii_owned_source_certificate_covers_cold_fetches_and_excludes_special_windows() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        bus.trace.set_tracing_mode(TracingMode::Off);
+        let certificate = bus.certify_owned_code_span(0x2000, 0x3000, 31).unwrap();
+        assert_eq!(
+            certificate,
+            (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch())
+        );
+        let before = bus.trace.elapsed_clocks();
+        for offset in 0..31 {
+            bus.read_memory(
+                0x3000 + offset,
+                BusWidth::Byte,
+                BusAccessKind::InstructionPrefetch,
+            )
+            .unwrap();
+            bus.charge_instruction_fetch(0x3000 + offset).unwrap();
+        }
+        bus.charge_physical_instruction_fetch_run(0x3000, 31)
+            .unwrap();
+        assert_eq!(bus.trace.elapsed_clocks(), before);
+        for (linear, physical, len) in [
+            (0x2000, 0x3000, 0),
+            (0x2fff, 0x3000, 2),
+            (0x2000, 0x3fff, 2),
+            (0x2000, 0xa0000, 1),
+            (BIOS_INT_STUB_TABLE_LINEAR, 0x3000, 1),
+        ] {
+            assert_eq!(bus.certify_owned_code_span(linear, physical, len), None);
+        }
+        *bus.direct_mapping_epoch += 1;
+        assert_ne!(
+            bus.certify_owned_code_span(0x2000, 0x3000, 31).unwrap(),
+            certificate
+        );
+        bus.trace.set_tracing_mode(TracingMode::Full);
+        assert_eq!(bus.certify_owned_code_span(0x2000, 0x3000, 31), None);
+    });
+}
+
+#[test]
 fn accurate_direct_memory_preview_includes_custom_video_wait_states() {
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.wait_states.video = 123;
@@ -5407,4 +5554,288 @@ fn dsp_lazy_settle_does_not_service_unrelated_ports_or_accurate_reads() {
         assert_eq!(machine.sb16.read_port(0x22a), Some(0xaa));
         assert_eq!(machine.sb16.read_port(0x22e).unwrap() & 0x80, 0);
     }
+}
+
+#[test]
+fn mkii_inert_read_grant_matches_live_zero_charges_and_prior_bus_total() {
+    for mode in [GswMode::Gsw586, GswMode::Gsw486, GswMode::Gsw386] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            bus.trace.set_tracing_mode(TracingMode::Off);
+            bus.trace.add_elapsed_clocks(177);
+            *bus.isa_io_clocks += 5;
+            if mode == GswMode::Gsw386 {
+                assert!(bus.certify_inert_read_region().is_none());
+                return;
+            }
+            let grant = bus.certify_inert_read_region().unwrap();
+            assert_eq!(
+                grant.epochs(),
+                (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch())
+            );
+            assert_eq!(grant.scaled_bus_clocks(), bus.in_batch_scaled_bus_clocks());
+            let raw = bus.in_batch_reference_bus_clocks();
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                bus.note_code_fetch_linear(0x3000);
+                bus.charge_physical_instruction_fetch_run(0x3000, 4)
+                    .unwrap();
+                bus.charge_direct_ram_memory(0x2000, width, BusAccessKind::DataRead)
+                    .unwrap();
+            }
+            assert_eq!(bus.in_batch_reference_bus_clocks(), raw);
+            assert!(!bus.requires_step_break());
+            for tracing in [TracingMode::Full, TracingMode::Counts] {
+                bus.trace.set_tracing_mode(tracing);
+                assert!(bus.certify_inert_read_region().is_none());
+            }
+            bus.trace.set_tracing_mode(TracingMode::Off);
+            bus.l1_charges_folded = false;
+            assert!(bus.certify_inert_read_region().is_none());
+            bus.l1_charges_folded = true;
+            #[cfg(not(feature = "shadow-cache-probe"))]
+            {
+                bus.shadow_l1.enable_for_test();
+                assert!(bus.certify_inert_read_region().is_none());
+            }
+        });
+    }
+}
+
+#[cfg(feature = "dynarec-mkii")]
+#[test]
+fn mkii_session_rechecks_policy_after_bus_construction() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    with_bus(&mut machine, |bus| {
+        bus.trace.set_tracing_mode(TracingMode::Off);
+        let root = std::ptr::from_ref(&*bus);
+        let epochs = (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch());
+        assert!(bus.mkii_bus_session().unwrap().into_parts(root).is_some());
+        for (flat, folded) in [(false, true), (true, false), (false, false), (true, true)] {
+            bus.flat_data_cost = flat;
+            bus.l1_charges_folded = folded;
+            assert_eq!(bus.mkii_bus_session().is_some(), flat && folded);
+            assert_eq!(
+                (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch()),
+                epochs
+            );
+        }
+        for tracing in [TracingMode::Counts, TracingMode::Full, TracingMode::Off] {
+            bus.trace.set_tracing_mode(tracing);
+            assert_eq!(
+                bus.mkii_bus_session().is_some(),
+                tracing == TracingMode::Off
+            );
+        }
+        *bus.io_touched = true;
+        assert!(bus.mkii_bus_session().is_none());
+        *bus.io_touched = false;
+        *bus.pending_soft_int = Some(0x21);
+        assert!(bus.mkii_bus_session().is_none());
+        *bus.pending_soft_int = None;
+        let parts = bus.mkii_bus_session().unwrap().into_parts(root).unwrap();
+        assert_eq!(parts.trace_origin, bus.trace_elapsed_at_batch_start);
+        assert_eq!(parts.cost_epoch, bus.jit_cost_dial_epoch());
+        assert_eq!(parts.bus_numerator, BUS_CLOCK_MASTER_TICKS);
+        assert_eq!(parts.bus_denominator, u64::from(bus.bus_den_at_batch_start));
+    });
+}
+
+#[test]
+fn mkii_ram_read_proof_avoids_repeated_device_classification() {
+    for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        machine.memory.write_u32(0x0020_0000, 0x7654_3210).unwrap();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x92, BusWidth::Byte, 2, false).unwrap();
+            bus.trace.set_tracing_mode(TracingMode::Full);
+            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+                let questions = bus.vega.device_window_questions();
+                let read = bus
+                    .read_memory_direct(0x0020_0000, width, BusAccessKind::DataRead)
+                    .unwrap();
+                assert!(read.direct);
+                let mask = match width {
+                    BusWidth::Byte => 0xff,
+                    BusWidth::Word => 0xffff,
+                    BusWidth::Dword => u32::MAX,
+                };
+                assert_eq!(read.value, 0x7654_3210 & mask);
+                assert_eq!(bus.vega.device_window_questions(), questions);
+            }
+            if mode == GswMode::Gsw386 {
+                assert!(bus.trace.elapsed_clocks() > 0);
+                assert!(bus.cache.lookups > 0);
+            }
+        });
+    }
+}
+
+#[test]
+fn mkii_ram_read_proof_preserves_live_costs_cache_and_observers() {
+    for mode in [
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for tracing in [TracingMode::Off, TracingMode::Counts, TracingMode::Full] {
+            for shadow in [false, true] {
+                if cfg!(feature = "shadow-cache-probe") && shadow {
+                    continue;
+                }
+                let run = |direct: bool| {
+                    let mut machine = test_machine();
+                    machine.set_mode(mode);
+                    assert!(machine.set_vga_mode(0x13));
+                    for address in [0x2000u32, 0x0020_0000, 0x0030_0000] {
+                        machine
+                            .memory
+                            .write_u32(address as usize, address ^ 0x7654_3210)
+                            .unwrap();
+                    }
+                    with_bus(&mut machine, |bus| {
+                        #[cfg(not(feature = "shadow-cache-probe"))]
+                        if shadow {
+                            bus.shadow_l1.enable_for_test();
+                        }
+                        let mut reads = Vec::new();
+                        for (flat, folded) in [
+                            (bus.flat_data_cost, bus.l1_charges_folded),
+                            (false, false),
+                            (true, false),
+                            (true, true),
+                        ] {
+                            bus.flat_data_cost = flat;
+                            bus.l1_charges_folded = folded;
+                            bus.trace.set_tracing_mode(tracing);
+                            for gate in [2, 0] {
+                                bus.write_io(0x92, BusWidth::Byte, gate, false).unwrap();
+                                for _ in 0..2 {
+                                    for address in [
+                                        0x2000,
+                                        0x2001,
+                                        0x2fff,
+                                        0x0020_0000,
+                                        0x0020_0001,
+                                        0x0020_0fff,
+                                        0x0030_0000,
+                                        0x000a_0000,
+                                        0x000c_0000,
+                                        0x000f_8000,
+                                        MARGO_LFB_BASE,
+                                        MARGO_MMIO_BASE,
+                                        HIGH_ROM_BASE,
+                                    ] {
+                                        for width in
+                                            [BusWidth::Byte, BusWidth::Word, BusWidth::Dword]
+                                        {
+                                            let value = if direct {
+                                                bus.read_memory_direct(
+                                                    address,
+                                                    width,
+                                                    BusAccessKind::DataRead,
+                                                )
+                                                .unwrap()
+                                                .value
+                                            } else {
+                                                bus.read_memory(
+                                                    address,
+                                                    width,
+                                                    BusAccessKind::DataRead,
+                                                )
+                                                .unwrap()
+                                            };
+                                            reads.push((
+                                                value,
+                                                bus.trace.elapsed_clocks(),
+                                                bus.trace.access_count(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let observed = bus.shadow_l1.diagnostics();
+                        if shadow {
+                            assert!(observed.data_read.hits > 0);
+                            assert!(observed.data_read.misses > 0);
+                        }
+                        assert!(bus.cache.lookups > 0);
+                        (
+                            reads,
+                            bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
+                            bus.cache.lookups,
+                            bus.cache.l1_tags.to_vec(),
+                            bus.cache.l2_tags.to_vec(),
+                            observed,
+                        )
+                    })
+                };
+                assert_eq!(
+                    run(true),
+                    run(false),
+                    "{mode:?}/{tracing:?}/shadow={shadow}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mkii_ram_read_proof_obeys_a_bar_changed_during_the_bus_borrow() {
+    const BAR: u32 = 0x0200_0000;
+    const ADDRESS: u32 = BAR + 0x0040_0000;
+    let run = |direct: bool| {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(64, VideoCard::Vega),
+            I386DX25_TEST_ROM,
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw586);
+        machine
+            .memory
+            .write_u32(ADDRESS as usize, 0xaabb_ccdd)
+            .unwrap();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x92, BusWidth::Byte, 2, false).unwrap();
+            bus.trace.set_tracing_mode(TracingMode::Full);
+            bus.write_io(0xcf8, BusWidth::Dword, 0x8000_8010, false)
+                .unwrap();
+            bus.write_io(0xcfc, BusWidth::Dword, BAR, false).unwrap();
+            let mut reads = Vec::new();
+            for enabled in [false, true, false] {
+                bus.write_io(0xcf8, BusWidth::Dword, 0x8000_8004, false)
+                    .unwrap();
+                bus.write_io(0xcfc, BusWidth::Word, u32::from(enabled) * 2, false)
+                    .unwrap();
+                assert_eq!(
+                    bus.vega
+                        .memory_bar_overlaps(ADDRESS as usize, ADDRESS as usize + 4),
+                    enabled
+                );
+                let value = if direct {
+                    let read = bus
+                        .read_memory_direct(ADDRESS, BusWidth::Dword, BusAccessKind::DataRead)
+                        .unwrap();
+                    assert_eq!(read.direct, !enabled);
+                    read.value
+                } else {
+                    bus.read_memory(ADDRESS, BusWidth::Dword, BusAccessKind::DataRead)
+                        .unwrap()
+                };
+                if !enabled {
+                    assert_eq!(value, 0xaabb_ccdd);
+                }
+                reads.push((value, bus.trace.elapsed_clocks(), bus.trace.access_count()));
+            }
+            (
+                reads,
+                bus.trace.cycles().iter().cloned().collect::<Vec<_>>(),
+            )
+        })
+    };
+    assert_eq!(run(true), run(false));
 }

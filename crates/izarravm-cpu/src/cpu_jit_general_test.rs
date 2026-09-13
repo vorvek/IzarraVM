@@ -376,6 +376,10 @@ fn fast_map_byte_write_feeds_unit_sim_even_when_unwatched() {
         BusAccessKind::DataWrite,
     )
     .unwrap();
+    assert!(
+        cpu.jit_fast_map.page_watched_bit_for_test(UNRELATED_BYTE),
+        "the existing fixture must exercise a set-bit page with an unrelated byte"
+    );
 
     // The measured write: must take the fast path, must change the byte, must hit no watched code.
     let hits_before = cpu.fast_map_probe_counters().hits;
@@ -400,6 +404,55 @@ fn fast_map_byte_write_feeds_unit_sim_even_when_unwatched() {
         report.sim_invalidations > 0,
         "L0 saw no SMC kill -- the fast byte-write path did not feed the unit sim for a \
          changed-but-unwatched byte"
+    );
+}
+
+#[test]
+fn fast_map_clear_page_byte_write_still_feeds_unit_sim() {
+    const UNRELATED_BYTE: u32 = 0x0800;
+
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(usim_program(3));
+    bus.direct_pages_enabled = true;
+    cpu.set_jit_auto_admit(true);
+    cpu.set_unit_sim_enabled(true);
+    usim_arm(&mut cpu, 6);
+    drive_to_halt(&mut cpu, &mut bus);
+
+    cpu.jit_direct.clear();
+    let _ = cpu.decode_cache.invalidate_and_clear_code_marks(true);
+    cpu.jit_fast_map.invalidate_page(UNRELATED_BYTE);
+    assert!(!cpu.code_write_watched(UNRELATED_BYTE, 1));
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        UNRELATED_BYTE,
+        0,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(
+        cpu.jit_fast_map
+            .has_write_mapping(UNRELATED_BYTE, UNRELATED_BYTE)
+    );
+    assert!(!cpu.jit_fast_map.page_watched_bit_for_test(UNRELATED_BYTE));
+
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        UNRELATED_BYTE,
+        0xaa,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert_eq!(cpu.fast_map_probe_counters().hits, hits_before + 1);
+
+    let reports = cpu.take_unit_sim_report().expect("sim enabled");
+    assert!(
+        reports[0].1.sim_invalidations > 0,
+        "the clear-bit write skipped the unit-sim consumer"
     );
 }
 

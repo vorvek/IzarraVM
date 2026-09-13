@@ -3,6 +3,9 @@
 
 use super::*;
 
+// Architectural fields retain the fused-reference capture. Fetch counts exclude
+// the decoder's removed opcode reread.
+
 /// One golden end-state for a control-flow case (task A6b). Mirrors the `BranchGolden` shape but
 /// adds `cs` (the CS selector) and a per-case `setup` closure, because this group changes
 /// segment state (RETF, far-direct CALL/JMP, and the INT/IRET deliveries reload CS) and each
@@ -63,7 +66,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x100,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         ControlFlowGolden {
             name: "ret near imm16 (c2 04 00, pop then release 4)",
@@ -74,7 +77,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x100,
             deltas: &[],
-            fetch: 4,
+            fetch: 3,
         },
         ControlFlowGolden {
             name: "retf (cb, pop 0x0100:0x3000)",
@@ -88,7 +91,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x100,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         ControlFlowGolden {
             name: "ff /0 inc word [bx] (0x0080 -> 0x0081)",
@@ -99,7 +102,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0x206,
             eip: 0x2,
             deltas: &[(64, 129)],
-            fetch: 3,
+            fetch: 2,
         },
         ControlFlowGolden {
             name: "ff /1 dec word [bx] (0x0080 -> 0x007f)",
@@ -110,7 +113,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0x212,
             eip: 0x2,
             deltas: &[(64, 127)],
-            fetch: 3,
+            fetch: 2,
         },
         ControlFlowGolden {
             name: "ff /6 push word [bx] (push 0x0080)",
@@ -121,7 +124,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x2,
             deltas: &[(254, 128)],
-            fetch: 3,
+            fetch: 2,
         },
         ControlFlowGolden {
             name: "ff /2 call near [bx] (push return 2, jump 0x0080)",
@@ -132,7 +135,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x80,
             deltas: &[(254, 2)],
-            fetch: 3,
+            fetch: 2,
         },
         ControlFlowGolden {
             name: "ff /4 jmp near [bx] (jump 0x0080, nothing pushed)",
@@ -143,7 +146,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x80,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         ControlFlowGolden {
             name: "call far 0x3000:0x0100 (9a, push cs:ip)",
@@ -154,7 +157,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x100,
             deltas: &[(252, 5)],
-            fetch: 6,
+            fetch: 5,
         },
         ControlFlowGolden {
             name: "jmp far 0x3000:0x0100 (ea, nothing pushed)",
@@ -165,7 +168,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0xa02,
             eip: 0x100,
             deltas: &[],
-            fetch: 6,
+            fetch: 5,
         },
         ControlFlowGolden {
             name: "int3 (cc, ivt[3] -> 0000:0040)",
@@ -176,7 +179,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0x802,
             eip: 0x40,
             deltas: &[(250, 1), (254, 2), (255, 10)],
-            fetch: 2,
+            fetch: 1,
         },
         ControlFlowGolden {
             name: "int 0x21 (cd 21, ivt[0x21] -> 0000:0050)",
@@ -187,7 +190,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0x802,
             eip: 0x50,
             deltas: &[(250, 2), (254, 2), (255, 10)],
-            fetch: 3,
+            fetch: 2,
         },
         ControlFlowGolden {
             name: "into with OF set (ce, ivt[4] -> 0000:0060)",
@@ -198,7 +201,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0x802,
             eip: 0x60,
             deltas: &[(250, 1), (254, 2), (255, 10)],
-            fetch: 2,
+            fetch: 1,
         },
         ControlFlowGolden {
             name: "iret (cf, restore 0000:0100 flags 0x0202)",
@@ -213,7 +216,7 @@ fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
             eflags: 0x202,
             eip: 0x100,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
     ]
 }
@@ -398,7 +401,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x2,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // TEST r/m8,reg8 (0x84): TEST [bx],cl: [0x10]=0x12 AND CL=0x04 → 0x00, ZF=1 → 0x46.
         FlagsMiscGolden {
@@ -407,7 +410,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x46,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // TEST r/m16,reg16 (0x85): TEST BX,CX: 0x0010 AND 0x0304 = 0x0000, ZF=1 PF=1 → 0x46.
         FlagsMiscGolden {
@@ -416,7 +419,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x46,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // TEST r/m16,reg16 (0x85): TEST [bx],cx: [0x10]=0x3412 AND 0x0304 = 0x0000, ZF=1 → 0x46.
         FlagsMiscGolden {
@@ -425,7 +428,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x46,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // INC AX (0x40): AX=0xd702 → 0xd703. CF preserved (stays 1). AF set (low nibble 2→3).
         FlagsMiscGolden {
@@ -434,7 +437,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55043, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x87,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // INC DI (0x47): DI=0x0018 → 0x0019. CF preserved (stays 1). No half-carry.
         FlagsMiscGolden {
@@ -443,7 +446,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 25],
             eflags: 0x3,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // DEC AX (0x48): AX=0xd702 → 0xd701. CF preserved (stays 1). SF set (high bit of AH).
         FlagsMiscGolden {
@@ -452,7 +455,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55041, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x83,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // DEC DI (0x4f): DI=0x0018 → 0x0017. CF preserved (stays 1). AF set.
         FlagsMiscGolden {
@@ -461,7 +464,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 23],
             eflags: 0x7,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // CBW (0x98): sign-extend AL=0x02 (positive) → AX=0x0002. AH cleared.
         FlagsMiscGolden {
@@ -470,7 +473,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [2, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x3,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // CWD (0x99): AX=0xd702 (sign bit set; 0xd702 as i16 = -10494 < 0) → DX=0xFFFF.
         FlagsMiscGolden {
@@ -479,7 +482,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 65535, 16, 0, 16, 8, 24],
             eflags: 0x3,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // SAHF (0x9e): AH=0xd7 (= 1101_0111b) → flags low byte = d7 (CF=1 PF=1 AF=1 ZF=1 SF=1).
         FlagsMiscGolden {
@@ -488,7 +491,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0xd7,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // LAHF (0x9f): eflags=0x03 → AH = (0x03 & 0xD5) | 0x02 = 0x03. AX = 0x0302=770.
         FlagsMiscGolden {
@@ -497,7 +500,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [770, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x3,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // CMC (0xf5): CF was 1 → CF=0. eflags: 0x03 → 0x02.
         FlagsMiscGolden {
@@ -506,7 +509,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x2,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // CLC (0xf8): CF=0. eflags: 0x03 → 0x02.
         FlagsMiscGolden {
@@ -515,7 +518,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x2,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // STC (0xf9): CF=1. eflags stays 0x03 (already set).
         FlagsMiscGolden {
@@ -524,7 +527,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x3,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // CLD (0xfc): DF=0. DF was already 0 in seed; eflags stays 0x03.
         FlagsMiscGolden {
@@ -533,7 +536,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x3,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // STD (0xfd): DF=1. eflags: 0x03 → 0x403.
         FlagsMiscGolden {
@@ -542,7 +545,7 @@ fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
             gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
             eflags: 0x403,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
     ]
 }
@@ -759,7 +762,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(0x200, 0x42)],
-            fetch: 2,
+            fetch: 1,
         },
         // MOVSB backward (0xa4), DF=1: same copy, but SI/DI decrement.
         StringGolden {
@@ -775,7 +778,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x402,
             eip: 0x1,
             deltas: &[(0x200, 0x42)],
-            fetch: 2,
+            fetch: 1,
         },
         // MOVSW (0xa5), DF=0: word [0x100..0x102]=0x1234 → [0x200..0x202]; SI/DI += 2.
         StringGolden {
@@ -791,7 +794,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(0x200, 0x34), (0x201, 0x12)],
-            fetch: 2,
+            fetch: 1,
         },
         // CMPSB unequal (0xa6): [ds:si]=0x10, [es:di]=0x20 → 0x10-0x20 borrows (ZF=0, CF=1);
         // SI/DI advance even on mismatch. No memory write.
@@ -811,7 +814,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x87,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // STOSB (0xaa): AL=0x5a → [es:di]=0x200; DI increments. AL preserved.
         StringGolden {
@@ -827,7 +830,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[(0x200, 0x5a)],
-            fetch: 2,
+            fetch: 1,
         },
         // LODSB (0xac): [ds:si]=0x7e at 0x100 → AL; SI increments. No memory write.
         StringGolden {
@@ -842,7 +845,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x2,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // SCASB equal (0xae): AL=0x41, [es:di]=0x41 → ZF set; DI increments, SI untouched.
         StringGolden {
@@ -858,7 +861,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x46,
             eip: 0x1,
             deltas: &[],
-            fetch: 2,
+            fetch: 1,
         },
         // MOVSB with an ES: source segment override (0x26 0xa4): ds=0, es base 0x200, so the source
         // reads from es:si (0x210), not ds:si (0x10); the destination stays es:di (0x230).
@@ -876,7 +879,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[(0x230, 0x99)],
-            fetch: 3,
+            fetch: 2,
         },
         // REP MOVSB (0xf3 0xa4), CX=3, DF=0: copies 3 bytes [0x100..0x103]→[0x200..0x203];
         // CX→0, SI/DI advance by 3. The fetch count is small (prefix+opcode), CX-independent.
@@ -894,7 +897,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x2,
             eip: 0x2,
             deltas: &[(0x200, 1), (0x201, 2), (0x202, 3)],
-            fetch: 3,
+            fetch: 2,
         },
         // REPE CMPSB (0xf3 0xa6), CX=4, DF=0: "AABB" vs "AACC" mismatches at index 2, so the
         // repeat stops there with ZF clear after 3 iterations; CX 4→3→2→1, SI/DI advance by 3.
@@ -915,7 +918,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x97,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
         // REPNE SCASB (0xf2 0xae), CX=4, AL='C', DF=0: dest "AACA" scans until the match at
         // index 2, stopping with ZF set after 3 iterations; CX 4→3→2→1, DI advances by 3.
@@ -933,7 +936,7 @@ fn string_golden_cases() -> &'static [StringGolden] {
             eflags: 0x46,
             eip: 0x2,
             deltas: &[],
-            fetch: 3,
+            fetch: 2,
         },
     ]
 }
@@ -1063,7 +1066,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0100, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // IN AX, imm8 (0xe5 0x78): port 0x78 → AX=0x0000 (word read), eip=2, fetch=3.
         PortIoGolden {
@@ -1072,7 +1075,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0000, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // OUT imm8, AL (0xe6 0x78): writes AL=0x02 to port 0x78, no register change. eip=2, fetch=3.
         PortIoGolden {
@@ -1081,7 +1084,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // OUT imm8, AX (0xe7 0x78): writes AX=0x0102 to port 0x78, no register change. eip=2, fetch=3.
         PortIoGolden {
@@ -1090,7 +1093,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x2,
-            fetch: 3,
+            fetch: 2,
         },
         // IN AL, DX (0xec): port=DX=0x0506 → AL=0. AH unchanged → AX=0x0100, eip=1, fetch=2.
         PortIoGolden {
@@ -1099,7 +1102,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0100, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // IN AX, DX (0xed): port=DX=0x0506 → AX=0x0000 (word), eip=1, fetch=2.
         PortIoGolden {
@@ -1108,7 +1111,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0000, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // OUT DX, AL (0xee): writes AL=0x02 to port DX=0x0506, no register change. eip=1, fetch=2.
         PortIoGolden {
@@ -1117,7 +1120,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
         // OUT DX, AX (0xef): writes AX=0x0102 to port DX=0x0506, no register change. eip=1, fetch=2.
         PortIoGolden {
@@ -1126,7 +1129,7 @@ fn port_io_golden_cases() -> &'static [PortIoGolden] {
             gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
             eflags: 0x2,
             eip: 0x1,
-            fetch: 2,
+            fetch: 1,
         },
     ]
 }

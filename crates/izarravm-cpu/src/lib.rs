@@ -63,6 +63,8 @@ pub use reflected_call_diag::{
 pub mod reflected_call_memo;
 #[cfg(feature = "reflected-call-memo")]
 pub use reflected_call_memo::reflected_call_memo_json;
+#[cfg(feature = "dynarec-mkii")]
+mod mkii;
 mod run;
 mod smc_trace;
 mod strings;
@@ -6385,7 +6387,7 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 /// Identity of the guest timing model, recorded with runtime observations.
 /// Changes to instruction or board pricing can change guest work per second.
 /// Cross-model runtime differences therefore need guest-work attribution.
-pub const TIMING_MODEL_EPOCH: u32 = 2;
+pub const TIMING_MODEL_EPOCH: u32 = 3;
 
 /// Convert class-table raw work into CPU clocks. Fast persona tables use twelfths;
 /// the 386 retains its 2/5 conversion. The CPU carries fractional work between

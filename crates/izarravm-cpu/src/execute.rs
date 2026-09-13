@@ -124,7 +124,7 @@ impl CpuGsw {
     /// live registers each call), and the immediate for forms 4-5 is taken from `insn.imm` (decode
     /// already fetched and charged it, so the executor must NOT re-fetch). `self.alu` is reused
     /// verbatim so the flag logic lives in exactly one place.
-    fn execute_alu_decoded<B: CpuBus>(
+    pub(super) fn execute_alu_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
@@ -202,7 +202,7 @@ impl CpuGsw {
     /// same clocks — but consumes the ModRM/operand/immediate `decode` already parsed (so the
     /// executor never re-fetches an instruction byte). Memory operands resolve from the pre-decoded
     /// descriptor, so the effective address is recomputed against the live registers each call.
-    fn execute_datamove_decoded<B: CpuBus>(
+    pub(super) fn execute_datamove_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
@@ -513,7 +513,7 @@ impl CpuGsw {
     /// masking via `check_v86_iopl` + `load_flags`, same PUSHA SP-snapshot, same ENTER
     /// nesting frame-copy, same LEAVE SP/BP semantics), but consumes the ModRM/immediate
     /// `decode` already parsed so the executor never re-fetches an instruction byte.
-    fn execute_stack_decoded<B: CpuBus>(
+    pub(super) fn execute_stack_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
@@ -982,7 +982,7 @@ impl CpuGsw {
     /// charged it) instead of re-reading it. eip is already at the instruction end here (decode
     /// advanced it), so `relative_jump(disp, operand_size)` reproduces the fused eip-relative target
     /// math (16- vs 32-bit IP wrap, operand-size mask) bit-for-bit.
-    fn execute_branch_decoded<B: CpuBus>(
+    pub(super) fn execute_branch_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
@@ -1084,7 +1084,7 @@ impl CpuGsw {
     /// for the flag-bit ops, and same STI interrupt shadow — but consumes the ModRM/operand
     /// `decode` pre-parsed for TEST (so the executor re-fetches nothing). The r/m operand for TEST
     /// is resolved from the pre-decoded descriptor against the live registers each call.
-    fn execute_flags_misc_decoded<B: CpuBus>(
+    pub(super) fn execute_flags_misc_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
@@ -1336,7 +1336,7 @@ impl CpuGsw {
         Ok(())
     }
 
-    fn execute_port_io_decoded<B: CpuBus>(
+    pub(super) fn execute_port_io_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,

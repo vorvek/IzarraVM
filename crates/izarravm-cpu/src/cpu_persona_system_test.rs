@@ -1893,11 +1893,8 @@ fn two_byte_convention_charges_the_second_byte_exactly_once() {
     // RDTSC (0F 31) is a two-byte op routed through `DecodeGroup::Misc` (it leaf-calls
     // `execute_two_byte`). The two-byte decode convention folds the second byte into
     // `insn.opcode` as 0x0F31 in `decode`, and the executor never re-reads it. Guard that
-    // single-charge here: running RDTSC through the production split must advance eip past both
-    // bytes, write a sane TSC into EDX:EAX, and charge exactly 3 instruction fetches (one
-    // prefetch-window peek plus the two opcode bytes 0x0F and 0x31). A second-byte double-read in
-    // the convention would push the fetch count past 3; nothing else in the file pins this
-    // convention property for a 0F op so directly.
+    // single-charge here: RDTSC must advance EIP past both bytes, return the TSC in EDX:EAX,
+    // and charge one fetch for each opcode byte.
     let code = [0x0f, 0x31];
     let mut mem = vec![0u8; 64];
     mem[..code.len()].copy_from_slice(&code);
@@ -1918,7 +1915,7 @@ fn two_byte_convention_charges_the_second_byte_exactly_once() {
     assert_eq!(split.registers.eax(), 42, "TSC low dword = elapsed clocks");
     assert_eq!(
         seam_fetch_count(&sbus),
-        3,
+        2,
         "the convention must charge the second 0F byte exactly once (no re-read)"
     );
 }

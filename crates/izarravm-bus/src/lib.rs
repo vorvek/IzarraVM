@@ -1,7 +1,10 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+mod mkii_session;
+pub use mkii_session::{MkiiBusSession, MkiiBusSessionParts, MkiiCounterPath};
 
 use std::collections::VecDeque;
 
@@ -32,7 +35,7 @@ pub struct Memory {
 
 /// Guest RAM's backing bytes, windowed to host-page (4096) alignment inside a deliberately
 /// over-allocated `Vec` — `align_offset` finds the boundary and every accessor sees only the
-/// aligned window, so the whole scheme stays inside this crate's `forbid(unsafe_code)`.
+/// aligned window, so the allocation and alignment use safe Rust.
 ///
 /// The alignment is a PERFORMANCE contract, not a correctness one: the CPU's one-lookup store
 /// table (`dev_docs/2026-08-07-one-lookup-store-design.md` D7) steals the low bits of each
@@ -387,6 +390,41 @@ impl CompiledBusDelta {
 
     pub const fn vga_writes(&self) -> NativeVgaWrites {
         self.vga_writes
+    }
+}
+
+/// Inert fetch and RAM-read accounting within one helper-free native region.
+/// This grant has no completion obligation and expires at any helper or side exit.
+#[derive(Debug, Clone, Copy)]
+pub struct InertReadRegion {
+    mapping_epoch: u64,
+    cost_epoch: u64,
+    scaled_bus_clocks: u64,
+}
+
+impl InertReadRegion {
+    pub fn certify(
+        mapping_epoch: u64,
+        cost_epoch: u64,
+        tracing_mode: TracingMode,
+        fetch_raw_clocks: u64,
+        ram_raw_clocks: [u64; 3],
+        scaled_bus_clocks: u64,
+    ) -> Option<Self> {
+        (tracing_mode == TracingMode::Off && fetch_raw_clocks == 0 && ram_raw_clocks == [0; 3])
+            .then_some(Self {
+                mapping_epoch,
+                cost_epoch,
+                scaled_bus_clocks,
+            })
+    }
+
+    pub const fn epochs(self) -> (u64, u64) {
+        (self.mapping_epoch, self.cost_epoch)
+    }
+
+    pub const fn scaled_bus_clocks(self) -> u64 {
+        self.scaled_bus_clocks
     }
 }
 
@@ -1254,6 +1292,84 @@ pub trait CpuBus {
     /// reports a step break. A JIT uses this to preflight non-faulting fixed-cost native groups;
     /// `None` keeps the per-instruction path.
     fn jit_cached_fetch_run_clocks(&self, _start: u32, _count: u32) -> Option<u64> {
+        None
+    }
+
+    /// Certify page-local RAM fetches for a fixed native span. The returned raw charge
+    /// matches `charge_physical_instruction_fetch_run`; that charge and the linear
+    /// observation cannot fault, request service, change mappings or observe CPU state.
+    fn jit_preflight_cached_fetch(&self, _linear: u32, _physical: u32, _len: u8) -> Option<u64> {
+        None
+    }
+
+    /// Certify owned instructions in one linear and physical RAM page. Cold decode
+    /// and cached replay both charge zero for these bytes and have no observations,
+    /// faults or service effects. The returned mapping and cost epochs remain valid
+    /// only with a live `owned_code_replay_epochs` grant in the same namespace.
+    /// The CPU separately proves its current translation and watches source writes.
+    fn certify_owned_code_span(
+        &self,
+        _linear: u32,
+        _physical: u32,
+        _len: u32,
+    ) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Revalidate owned source certificates without opening a bus window. `Some`
+    /// accepts their mapping, backing, cost and fetch-observation namespace and
+    /// permits zero-cost, inert cold or cached source replay within one helper-free,
+    /// observer-free native read region protected by a live bus window or inert
+    /// read grant. Revalidate
+    /// after helpers, mutating bus operations or observer changes.
+    fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Certify an aligned RAM read at the caller's mapping epoch. The returned raw
+    /// cost matches `charge_direct_ram_memory(DataRead)`. That call and certified
+    /// fetch charges cannot fault, request service, observe CPU state, or change
+    /// RAM contents, backing pointers or mappings during the native region.
+    fn jit_preflight_ram_read(
+        &self,
+        _physical: u32,
+        _width: BusWidth,
+        _mapping_epoch: u64,
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Open a read-only native region with no instruction or address observers.
+    /// Current-epoch plain RAM mappings stay valid until completion. For certified
+    /// warm source fetches and aligned RAM reads, aggregate completion is exactly
+    /// equivalent to the ordered accesses and cannot fault or request service.
+    fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
+        None
+    }
+
+    /// Open a native region that may write ordinary RAM. Certified source bytes stay
+    /// unchanged. Mapping epoch and bus-clock machinery match `begin_read_region`.
+    /// Data RAM contents may change. Tracing, non-uniform fetches and write-watch
+    /// observers must refuse.
+    fn begin_ram_write_region(&mut self) -> Option<CompiledBusWindow> {
+        None
+    }
+
+    /// Certify inert accounting for separately validated source fetches and aligned
+    /// plain-RAM reads. Those accesses and their completion have no effects,
+    /// including observations, faults, service or clock charges.
+    /// RAM contents, backing and mappings stay stable until a helper or side exit.
+    /// The grant records the exact current scaled batch bus total. Owned cold
+    /// source replay still requires its separate live capability.
+    fn certify_inert_read_region(&self) -> Option<InertReadRegion> {
+        None
+    }
+
+    /// Acquire fresh mkII policy and counter access paths for one CPU invocation.
+    fn mkii_bus_session(&self) -> Option<MkiiBusSession<'_, Self>>
+    where
+        Self: Sized,
+    {
         None
     }
 

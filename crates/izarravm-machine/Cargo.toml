@@ -14,6 +14,7 @@ authors.workspace = true
 # Forward the CPU template JIT by default. Disabling defaults keeps the interpreter-only path.
 default = ["jit"]
 jit = ["izarravm-cpu/jit"]
+dynarec-mkii = ["jit", "izarravm-cpu/dynarec-mkii"]
 poll-head-probe = ["jit", "izarravm-cpu/poll-head-probe"]
 # Slice 0b of the reflected-call HLE design's trip-shape instrument (plan
 # `dev_docs/2026-09-04-reflected-call-slice0b-plan.md` §14 Q2): the ONLY

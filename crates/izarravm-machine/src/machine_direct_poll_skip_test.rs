@@ -1392,3 +1392,274 @@ fn the_sixteen_bit_arm_is_on_by_default_end_to_end() {
         "on the default arm the 16-bit screen can never be true"
     );
 }
+
+#[cfg(feature = "dynarec-mkii")]
+#[test]
+fn mkii_poll_skip_stops_after_the_real_in_without_virtual_retirement() {
+    for mask in [1, 8] {
+        for register_mask in [false, true] {
+            for spins_set in [false, true] {
+                for interrupts in [false, true] {
+                    let test = if register_mask {
+                        [0x84, 0xe0]
+                    } else {
+                        [0xa8, mask]
+                    };
+                    let code = [
+                        0xec,
+                        test[0],
+                        test[1],
+                        if spins_set { 0x75 } else { 0x74 },
+                        0xfb,
+                    ];
+                    let mut machine =
+                        sixteen_bit_spin_machine_for_mask(&code, u32::from(mask) << 8, true, mask);
+                    machine.cpu.control.cr0 |= 1;
+                    machine.cpu.registers.eflags = 2 | if interrupts { 0x200 } else { 0 };
+                    machine.cpu.set_native_backend_enabled(false);
+                    set_status1_bit(&mut machine, mask, spins_set);
+                    with_cpu_and_bus(&mut machine, |cpu, bus| {
+                        for offset in [0, 1, 3] {
+                            cpu.registers.eip = 0x100 + offset;
+                            cpu.run_budgeted(bus, 0).unwrap();
+                        }
+                        cpu.registers.eip = 0x100;
+                        cpu.set_native_backend_enabled(true);
+                        cpu.set_dynarec_mkii_enabled(true);
+                        let before = cpu.perf_counters().instructions;
+                        let flags = cpu.registers.eflags;
+                        let elapsed = cpu.elapsed_clocks;
+                        let bus_before = bus.in_batch_scaled_bus_clocks();
+                        let result = cpu.run_budgeted(bus, 10_000).unwrap();
+                        let snapshot = cpu.direct_stall_snapshot();
+                        assert!(
+                            snapshot.poll_skip_iterations[0] >= 2,
+                            "mask={mask} register={register_mask} set={spins_set}: {snapshot:?}"
+                        );
+                        assert_eq!(cpu.perf_counters().instructions - before, 1);
+                        assert_eq!(cpu.perf_counters().poll_skip_iterations, 0);
+                        assert_eq!(cpu.registers.eip, 0x101);
+                        assert_eq!(cpu.registers.eflags, flags);
+                        assert_eq!(
+                            cpu.registers.eax() & u32::from(mask),
+                            u32::from(bus.vega.status1_bits(bus.predicted_beam()) & mask)
+                        );
+                        assert_eq!(cpu.elapsed_clocks - elapsed, result.consumed_core_clocks);
+                        assert!(
+                            result.consumed_core_clocks + bus.in_batch_scaled_bus_clocks()
+                                - bus_before
+                                < 10_000
+                        );
+                        assert_eq!(cpu.dynarec_mkii_stats().helpers, 1);
+                        assert_eq!(cpu.dynarec_mkii_stats().entries, 1);
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dynarec-mkii")]
+#[test]
+fn mkii_poll_adapter_matches_the_bus_seam_with_prior_work() {
+    for prefix in [0, 5] {
+        for warm_turns in 1..=3 {
+            let prepare = || {
+                let mut code = vec![0x90; prefix as usize];
+                code.extend_from_slice(&[0xec, 0xa8, 8, 0x75, 0xfb]);
+                let mut machine = sixteen_bit_spin_machine(&code, 0x1234_ab00, true);
+                machine.cpu.control.cr0 |= 1;
+                machine.cpu.registers.eflags = 2;
+                machine.cpu.set_native_backend_enabled(false);
+                with_cpu_and_bus(&mut machine, |cpu, bus| {
+                    for _ in 0..warm_turns {
+                        for offset in (0..prefix).chain([prefix, prefix + 1, prefix + 3]) {
+                            cpu.registers.eip = 0x100 + offset;
+                            cpu.cycle_no_interrupt_check(bus).unwrap();
+                        }
+                    }
+                    cpu.registers.eip = 0x100;
+                    cpu.set_native_backend_enabled(true);
+                    cpu.set_dynarec_mkii_enabled(true);
+                });
+                set_status1_bit(&mut machine, 8, true);
+                machine
+            };
+            let mut actual = prepare();
+            let mut oracle = prepare();
+            let measured = with_cpu_and_bus(&mut actual, |cpu, bus| {
+                *bus.io_touched = false;
+                bus.trace.add_elapsed_clocks(200);
+                bus.prior_runs_core_clocks = 173;
+                let retired = cpu.perf_counters().instructions;
+                let elapsed = cpu.elapsed_clocks;
+                let result = cpu.run_budgeted(bus, 1500).unwrap();
+                let snapshot = cpu.direct_stall_snapshot();
+                assert!(
+                    snapshot.poll_skip_iterations[0] >= 2,
+                    "prefix={prefix} warm={warm_turns} attempts={} cap={} seam={} shape={} entries={} cold={} eip={:x}",
+                    snapshot.poll_attempts,
+                    snapshot.poll_declined_cap,
+                    snapshot.poll_declined_seam,
+                    snapshot.poll_declined_shape,
+                    cpu.dynarec_mkii_stats().entries,
+                    cpu.dynarec_mkii_stats().cold,
+                    cpu.registers.eip
+                );
+                assert_eq!(
+                    cpu.perf_counters().instructions - retired,
+                    u64::from(prefix) + 1
+                );
+                assert_eq!(cpu.registers.eip, 0x101 + prefix);
+                assert_eq!(cpu.elapsed_clocks - elapsed, result.consumed_core_clocks);
+                assert_eq!(bus.prior_runs_core_clocks, 173);
+                assert_eq!(
+                    cpu.perf_counters().straight_line_runs,
+                    cpu.perf_counters().brk_cap + cpu.perf_counters().brk_step
+                );
+                (
+                    cpu.registers.eax(),
+                    cpu.registers.eflags,
+                    result.consumed_core_clocks,
+                    cpu.poll_skip_timing_remainder(),
+                    bus.in_batch_raw_bus_clocks(),
+                    bus.in_batch_scaled_bus_clocks(),
+                    snapshot.poll_skip_iterations[0],
+                    snapshot.poll_skip_raw_core_clocks,
+                    *bus.io_touched,
+                )
+            });
+            let expected = with_cpu_and_bus(&mut oracle, |cpu, bus| {
+                *bus.io_touched = false;
+                bus.trace.add_elapsed_clocks(200);
+                bus.prior_runs_core_clocks = 173;
+                let bus_at_entry = bus.in_batch_scaled_bus_clocks();
+                let mut core = 0;
+                for _ in 0..prefix {
+                    core += cpu.cycle_no_interrupt_check(bus).unwrap().core_clocks;
+                }
+                let linear = cpu.registers.cs().base + 0x100 + prefix;
+                bus.charge_instruction_fetch(linear).unwrap();
+                let mut fetches = [(0, 0, 0); 6];
+                for (index, (offset, len)) in [(0, 1), (1, 2), (3, 2)].into_iter().enumerate() {
+                    fetches[index] = (linear + offset, linear + offset, len);
+                }
+                let (core_num, core_den) = izarravm_cpu::level_timing_for_test(cpu.persona());
+                let rem = cpu.poll_skip_timing_remainder();
+                let request = CalloutPollSkipRequest {
+                    fetches,
+                    fetch_count: 3,
+                    status_mask: 8,
+                    spins_when_bit_set: true,
+                    raw_core_clocks: 76,
+                    core_clocks_at_block_entry: core,
+                    prefix_raw: 0,
+                    core_num,
+                    core_den,
+                    timing_rem: rem,
+                    cap: 1500,
+                    bus_scaled_at_run_entry: bus_at_entry,
+                    min_iterations: 2,
+                    max_skipped_raw: u64::from(u32::MAX)
+                        - u64::from(izarravm_cpu::MAX_PORT_CORE_CLOCKS),
+                };
+                bus.publish_core_clocks(core);
+                let skipped = bus.callout_poll_skip(&request).unwrap();
+                bus.publish_core_clocks(skipped.now_after);
+                let al = bus
+                    .read_io(0x3da, BusWidth::Byte, skipped.now_after, true)
+                    .unwrap();
+                let scaled = (skipped.skipped_raw_core_clocks + 48) * u64::from(core_num) + rem;
+                (
+                    cpu.registers.eax() & !255 | al,
+                    cpu.registers.eflags,
+                    core + scaled / u64::from(core_den),
+                    scaled % u64::from(core_den),
+                    bus.in_batch_raw_bus_clocks(),
+                    bus.in_batch_scaled_bus_clocks(),
+                    skipped.iterations,
+                    skipped.skipped_raw_core_clocks,
+                    *bus.io_touched,
+                )
+            });
+            assert_eq!(
+                measured, expected,
+                "prefix={prefix} warm_turns={warm_turns}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "dynarec-mkii")]
+#[test]
+fn mkii_poll_refusals_preserve_the_canonical_in() {
+    for refusal in 0..8 {
+        let prepare = || {
+            let code = [0xec, 0x84, 0xe0, 0x75, 0xfb, 0xfb];
+            let mut machine = sixteen_bit_spin_machine(&code, 0x1234_0800, true);
+            machine.cpu.control.cr0 |= 1;
+            machine.cpu.registers.eflags = 2;
+            machine.cpu.set_native_backend_enabled(false);
+            with_cpu_and_bus(&mut machine, |cpu, bus| {
+                for offset in [0, 1, 3] {
+                    cpu.registers.eip = 0x100 + offset;
+                    cpu.cycle_no_interrupt_check(bus).unwrap();
+                }
+                if refusal == 6 {
+                    cpu.registers.eip = 0x105;
+                    cpu.cycle_no_interrupt_check(bus).unwrap();
+                }
+                cpu.registers.eip = 0x100;
+                match refusal {
+                    0 => cpu.set_direct_poll_skip_override(Some(false)),
+                    1 => cpu.set_direct_poll_skip_16_override(Some(false)),
+                    2 => cpu.registers.set_edx(0x3db),
+                    3 => cpu.registers.set_eax(0x1234_0200),
+                    4 => {
+                        let mut cs = cpu.registers.cs();
+                        cs.limit = 0x102;
+                        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+                    }
+                    7 => bus.write_io(0x3c3, BusWidth::Byte, 0, false).unwrap(),
+                    _ => {}
+                }
+                cpu.set_native_backend_enabled(true);
+                cpu.set_dynarec_mkii_enabled(true);
+            });
+            if refusal == 5 {
+                machine.trace.set_tracing_mode(TracingMode::Full);
+            }
+            machine
+        };
+        let mut actual = prepare();
+        let mut oracle = prepare();
+        let execute = |machine: &mut Machine, native| {
+            with_cpu_and_bus(machine, |cpu, bus| {
+                *bus.io_touched = true;
+                let retired = cpu.perf_counters().instructions;
+                let clocks = if native {
+                    cpu.run_budgeted(bus, 10_000).unwrap().consumed_core_clocks
+                } else {
+                    cpu.cycle_no_interrupt_check(bus).unwrap().core_clocks
+                };
+                assert_eq!(cpu.perf_counters().instructions - retired, 1);
+                assert_eq!(cpu.direct_stall_snapshot().poll_skip_iterations, [0; 3]);
+                if native {
+                    assert_eq!(cpu.dynarec_mkii_stats().helpers, 1);
+                }
+                (
+                    cpu.registers.clone(),
+                    cpu.poll_skip_timing_remainder(),
+                    clocks,
+                    bus.in_batch_raw_bus_clocks(),
+                    bus.in_batch_scaled_bus_clocks(),
+                )
+            })
+        };
+        assert_eq!(
+            execute(&mut actual, true),
+            execute(&mut oracle, false),
+            "refusal={refusal}"
+        );
+    }
+}

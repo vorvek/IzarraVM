@@ -809,6 +809,13 @@ impl NativeCodeWatch {
         !self.pages.is_empty()
     }
 
+    #[cfg(feature = "dynarec-mkii")]
+    pub(crate) fn clear_unreferenced(&mut self) {
+        if self.has_resident_pages() && self.pages.len() == self.inactive_pages {
+            self.clear();
+        }
+    }
+
     pub(crate) fn page_edges(&self) -> u64 {
         self.page_edges
     }

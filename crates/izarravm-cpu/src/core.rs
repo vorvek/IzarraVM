@@ -156,6 +156,8 @@ impl CpuGsw {
     }
 
     fn invalidate_code_caches_uncounted(&mut self) {
+        #[cfg(feature = "dynarec-mkii")]
+        self.jit_direct.mkii.invalidate_code();
         // None of this function's callers (A20 toggle, direct-map change, device DMA, aperture
         // remap) flush the whole TLB in the same operation, so `translation_pages` must not clear
         // here (F11): a stale TLB entry could still serve a code translation with no fresh walk
@@ -183,6 +185,10 @@ impl CpuGsw {
     /// segmentation, and the code page / fetch page are per-fetch translation caches. A mode
     /// change has to drop them whether or not the linear->physical map moved.
     fn invalidate_fetch_frontend(&mut self) {
+        #[cfg(feature = "dynarec-mkii")]
+        {
+            self.jit_direct.mkii.mapping_dirty = true;
+        }
         self.code_page.valid = false;
         self.prefetch.invalidate();
         self.fetch_page.invalidate();
@@ -926,6 +932,8 @@ impl CpuGsw {
     /// runs, and a block cannot patch its own lane from under itself.
     #[inline]
     fn note_code_write_inner(&mut self, physical: u32, width: u32, lanes: bool) -> bool {
+        #[cfg(feature = "dynarec-mkii")]
+        let session_hit = self.jit_direct.mkii.note_write(physical, width);
         // THE CALL-OUT WINDOW. `InterpretOne` runs one interpreter instruction with a native block
         // live on the host stack, and that instruction is allowed to STORE. The proof this
         // function's doc comment rests on -- "no compiled block is mid-execution when this runs" --
@@ -1037,7 +1045,7 @@ impl CpuGsw {
                 .jit_direct
                 .invalidate_physical_range(physical, width, lanes);
             action.blocks_killed = outcome.blocks as u32;
-            invalidated = outcome.blocks != 0;
+            invalidated |= outcome.blocks != 0;
             heat_hit |= outcome.blocks != 0;
             lane_only = outcome.lane_accepts != 0 && outcome.blocks == 0;
             self.perf.smc_lane_accepts += u64::from(outcome.lane_accepts);
@@ -1068,6 +1076,10 @@ impl CpuGsw {
             action.wholesale = true;
             self.perf.translation_page_writes += 1;
             self.perf.code_invalidations += 1;
+            #[cfg(feature = "dynarec-mkii")]
+            {
+                self.jit_direct.mkii.mapping_dirty = true;
+            }
             let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
             self.tlb.retire_all_slots(retired);
             self.has_aperture_code.0 = false;
@@ -1125,6 +1137,10 @@ impl CpuGsw {
                     action.wholesale = true;
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
+                    #[cfg(feature = "dynarec-mkii")]
+                    {
+                        self.jit_direct.mkii.mapping_dirty = true;
+                    }
                     // `false`: an SMC store does not flush the TLB, so `translation_pages` must
                     // stay set (F11) -- the ring's slots are still retired below via this same
                     // call, only the bitmap survives. SMC has no bearing on any linear->physical
@@ -1206,6 +1222,10 @@ impl CpuGsw {
         #[cfg(feature = "reflected-call-memo")]
         if invalidated && self.reflected_call.is_some() {
             crate::reflected_call_memo::note_code_hit(self);
+        }
+        #[cfg(feature = "dynarec-mkii")]
+        {
+            invalidated |= session_hit;
         }
         invalidated
     }

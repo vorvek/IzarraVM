@@ -5,6 +5,12 @@ use super::*;
 
 const MAPPING_EPOCH: u64 = 7;
 
+#[test]
+fn fast_map_access_keeps_the_hot_result_size() {
+    assert_eq!(std::mem::size_of::<FastMapAccess>(), 16);
+    assert_eq!(std::mem::size_of::<Option<FastMapAccess>>(), 16);
+}
+
 fn page(bytes: &mut [u8; PAGE_SIZE], physical_page: u32, writable: bool) -> DirectPage {
     DirectPage {
         physical_page,
@@ -150,6 +156,96 @@ fn interpreter_lookup_requires_a_live_bias_and_current_permissions() {
         map.lookup_physical(linear, MAPPING_EPOCH, false, false, false),
         None
     );
+}
+
+#[test]
+fn interpreter_lookup_returns_the_population_watch_proof() {
+    let mut clear_bytes = aligned_page();
+    let mut watched_bytes = aligned_page();
+    let mut map = FastMap::default();
+    let clear_linear = 0x0040_0000;
+    let watched_linear = 0x0041_0000;
+    let clear_ptr = clear_bytes.0.as_mut_ptr();
+    let watched_ptr = watched_bytes.0.as_mut_ptr();
+
+    assert!(map.populate_read(
+        clear_linear,
+        0x0009_0000,
+        direct(&mut clear_bytes, 0x0009_0000, true),
+        PagePermissions::UNPAGED,
+        false,
+    ));
+    assert!(map.populate_write(
+        clear_linear,
+        0x0009_0000,
+        direct(&mut clear_bytes, 0x0009_0000, true),
+        PagePermissions::UNPAGED,
+        false,
+    ));
+    assert!(map.populate_read(
+        watched_linear,
+        0x0009_1000,
+        direct(&mut watched_bytes, 0x0009_1000, true),
+        PagePermissions::UNPAGED,
+        true,
+    ));
+    assert!(map.populate_write(
+        watched_linear,
+        0x0009_1000,
+        direct(&mut watched_bytes, 0x0009_1000, true),
+        PagePermissions::UNPAGED,
+        true,
+    ));
+
+    for (linear, physical, ptr, watched) in [
+        (
+            clear_linear + 0x123,
+            0x0009_0123,
+            clear_ptr.wrapping_add(0x123),
+            false,
+        ),
+        (
+            watched_linear + 0x123,
+            0x0009_1123,
+            watched_ptr.wrapping_add(0x123),
+            true,
+        ),
+    ] {
+        for write in [false, true] {
+            let access = map
+                .lookup_access(linear, MAPPING_EPOCH, BusWidth::Dword, write, false, false)
+                .unwrap();
+            assert_eq!(access.physical(), physical);
+            assert_eq!(access.ptr(), ptr);
+            assert_eq!(access.page_watched(), watched);
+            assert!(!access.is_mode13());
+        }
+    }
+
+    for (width, last) in [(BusWidth::Word, 0xffe), (BusWidth::Dword, 0xffc)] {
+        assert!(
+            map.lookup_access(
+                clear_linear + last,
+                MAPPING_EPOCH,
+                width,
+                true,
+                false,
+                false,
+            )
+            .is_some()
+        );
+        assert!(
+            map.lookup_access(
+                clear_linear + last + 1,
+                MAPPING_EPOCH,
+                width,
+                true,
+                false,
+                false,
+            )
+            .is_none()
+        );
+    }
 }
 
 #[test]

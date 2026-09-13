@@ -230,7 +230,7 @@ impl CpuGsw {
         width: BusWidth,
         write: bool,
         split: bool,
-    ) -> Option<(u32, *mut u8, bool)> {
+    ) -> Option<jit::fast_map::FastMapAccess> {
         debug_assert_eq!(split, width.misaligned_at(linear));
         if !self.fast_map_serve_enabled.enabled {
             return None;
@@ -278,7 +278,7 @@ impl CpuGsw {
                 if self.slot_census_enabled && split {
                     self.jit_direct.fast_map_audit.slot_admit_misaligned += 1;
                 }
-                Some((access.physical(), access.ptr(), access.is_mode13()))
+                Some(access)
             }
             None => {
                 self.fast_map_probe.misses += 1;
@@ -633,16 +633,17 @@ impl CpuGsw {
     fn finish_fast_map_write<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        physical: u32,
-        ptr: *mut u8,
-        mode13: bool,
+        access: jit::fast_map::FastMapAccess,
         width: BusWidth,
         split: bool,
         value: u32,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
+        let physical = access.physical();
+        let ptr = access.ptr();
+        let mode13 = access.is_mode13();
         self.record_write_page(physical);
-        let watched = self.code_write_watched(physical, width.bytes());
+        let watched = access.page_watched() && self.code_write_watched(physical, width.bytes());
         // See `finish_fast_map_read` for the routing; `split && mode13` is unreachable here too.
         match (mode13, split) {
             (true, _) => bus.charge_direct_memory(physical, width, kind)?,
@@ -1282,13 +1283,21 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) =
+        if let Some(access) =
             // A byte access is aligned by definition, so `split` is a constant `false` here and
             // folds away along with the charge selection it feeds.
             self.fast_map_data_slot(linear, BusWidth::Byte, false, false)
         {
             return self
-                .finish_fast_map_read(bus, physical, ptr, mode13, BusWidth::Byte, false, kind)
+                .finish_fast_map_read(
+                    bus,
+                    access.physical(),
+                    access.ptr(),
+                    access.is_mode13(),
+                    BusWidth::Byte,
+                    false,
+                    kind,
+                )
                 .map(|value| value as u8);
         }
         let physical = if self.control.cr0 & CR0_PG == 0 {
@@ -1357,15 +1366,13 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some((physical, ptr, mode13)) =
+        if let Some(access) =
             // `split` is a constant `false` for a byte access; see `read_linear_u8`.
             self.fast_map_data_slot(linear, BusWidth::Byte, true, false)
         {
             return self.finish_fast_map_write(
                 bus,
-                physical,
-                ptr,
-                mode13,
+                access,
                 BusWidth::Byte,
                 false,
                 u32::from(value),
@@ -1587,10 +1594,16 @@ impl CpuGsw {
         ))]
         {
             let split = width.misaligned_at(linear);
-            if let Some((physical, ptr, mode13)) =
-                self.fast_map_data_slot(linear, width, false, split)
-            {
-                return self.finish_fast_map_read(bus, physical, ptr, mode13, width, split, kind);
+            if let Some(access) = self.fast_map_data_slot(linear, width, false, split) {
+                return self.finish_fast_map_read(
+                    bus,
+                    access.physical(),
+                    access.ptr(),
+                    access.is_mode13(),
+                    width,
+                    split,
+                    kind,
+                );
             }
         }
         // REORDERED BEHIND THE PROBE, and behaviour-identical. On a hit, page-locality was already
@@ -1682,11 +1695,8 @@ impl CpuGsw {
         ))]
         {
             let split = width.misaligned_at(linear);
-            if let Some((physical, ptr, mode13)) =
-                self.fast_map_data_slot(linear, width, true, split)
-            {
-                return self
-                    .finish_fast_map_write(bus, physical, ptr, mode13, width, split, value, kind);
+            if let Some(access) = self.fast_map_data_slot(linear, width, true, split) {
+                return self.finish_fast_map_write(bus, access, width, split, value, kind);
             }
         }
         // Reordered behind the probe; see `read_memory_bus_width` for the proof.
@@ -1789,10 +1799,16 @@ impl CpuGsw {
         ))]
         {
             let split = width.misaligned_at(linear);
-            if let Some((physical, ptr, mode13)) =
-                self.fast_map_data_slot(linear, width, false, split)
-            {
-                return self.finish_fast_map_read(bus, physical, ptr, mode13, width, split, kind);
+            if let Some(access) = self.fast_map_data_slot(linear, width, false, split) {
+                return self.finish_fast_map_read(
+                    bus,
+                    access.physical(),
+                    access.ptr(),
+                    access.is_mode13(),
+                    width,
+                    split,
+                    kind,
+                );
             }
         }
         self.read_linear_fragment_after_probe(bus, linear, width, kind)
@@ -1851,11 +1867,8 @@ impl CpuGsw {
         ))]
         {
             let split = width.misaligned_at(linear);
-            if let Some((physical, ptr, mode13)) =
-                self.fast_map_data_slot(linear, width, true, split)
-            {
-                return self
-                    .finish_fast_map_write(bus, physical, ptr, mode13, width, split, value, kind);
+            if let Some(access) = self.fast_map_data_slot(linear, width, true, split) {
+                return self.finish_fast_map_write(bus, access, width, split, value, kind);
             }
         }
         self.write_linear_fragment_after_probe(bus, linear, width, value, kind)
@@ -1919,7 +1932,7 @@ impl CpuGsw {
     // address is not naturally aligned for its width (word on a 2-byte boundary, dword on
     // a 4-byte boundary). Supervisor accesses (CPL < 3) and instruction fetches are exempt;
     // fetches never route through this helper. Byte accesses (width 1) are always aligned.
-    fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
+    pub(super) fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
         if width <= 1 || !self.alignment_armed {
             return Ok(());
         }
@@ -1956,7 +1969,7 @@ impl CpuGsw {
     /// `#[inline]` because it sits on every segmented data access and is two loads and a
     /// comparison on the flat-descriptor arm every 32-bit game takes.
     #[inline]
-    fn segment_linear_range(
+    pub(super) fn segment_linear_range(
         &self,
         segment: SegmentIndex,
         offset: u32,

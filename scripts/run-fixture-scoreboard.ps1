@@ -578,6 +578,9 @@ function Assert-ScoreboardQualificationSelfTest {
         Assert-ScoreboardSelfTestEqual (Test-RowPin $pins $row 'frame') $true 'exact qualified context'
         Assert-ScoreboardSelfTestEqual (Test-RowPin $pins $row 'profile_bands') $false 'axis is independently qualified'
         Assert-ScoreboardSelfTestEqual (Test-PinContext @{} $context) $false 'historical context absent'
+        $oldTiming = $context | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable
+        $oldTiming.timing_model_epoch = 2
+        Assert-ScoreboardSelfTestEqual (Test-PinContext @{ pin_context = $oldTiming } $context) $false 'epoch 2 pin remains unqualified'
         foreach ($key in @('timing_model_epoch', 'cycle_budget', 'anchor_cycle_budget', 'fixture_contract_sha256')) {
             $changed = $context | ConvertTo-Json -Depth 16 | ConvertFrom-Json -AsHashtable
             $changed[$key] = if ($key -eq 'fixture_contract_sha256') { 'different' } else { 999 }
@@ -626,7 +629,7 @@ function Assert-ScoreboardQualificationSelfTest {
         Assert-ScoreboardSelfTestThrows { Complete-RowPins $fixture $invalid @{} $true $true } 'Cannot record invalid capture' 'failed anchor cannot qualify pins'
         $profile = [pscustomobject]@{
             schema = 'izarravm-hdd-profile-v2'
-            timing_model_epoch = 2; mode = '586'; cycle_budget = 100; elapsed_budget_clocks = 100
+            timing_model_epoch = 3; mode = '586'; cycle_budget = 100; elapsed_budget_clocks = 100
             real_time_factor = 1.0; guest_seconds = 1.0; wall_seconds = 1.0
             stop = [pscustomobject]@{ kind = 'cycle_limit'; requested = 7 }
         }
@@ -637,11 +640,14 @@ function Assert-ScoreboardQualificationSelfTest {
         Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 1 100 } 'Host exit code' 'host failure'
         $profile.mode = '486'
         Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'Effective CPU' 'CMOS override'
-        $profile.mode = '586'; $profile.timing_model_epoch = 1
-        Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'explicitly report timing model 2' 'old model'
+        $profile.mode = '586'
+        foreach ($oldEpoch in @(1, 2)) {
+            $profile.timing_model_epoch = $oldEpoch
+            Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'explicitly report timing model 3' "old model $oldEpoch"
+        }
         $profile.PSObject.Properties.Remove('timing_model_epoch')
         Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'missing profile.timing_model_epoch' 'missing current model'
-        $profile | Add-Member timing_model_epoch 2
+        $profile | Add-Member timing_model_epoch 3
         $profile.elapsed_budget_clocks = 99
         Assert-ScoreboardSelfTestThrows { Assert-FixtureCapture $fixture $profile 0 100 } 'full cycle window' 'truncated window'
         $profile.elapsed_budget_clocks = 100; $profile.real_time_factor = [double]::NaN
@@ -2676,7 +2682,7 @@ function Get-DescriptorSha256($Descriptor) {
 function New-PinContext($Fixture, $Descriptor) {
     $contract = Get-FrameContract $Fixture
     return [ordered]@{
-        schema = 'fixture-pin-context-v1'; timing_model_epoch = 2
+        schema = 'fixture-pin-context-v1'; timing_model_epoch = 3
         cycle_budget = [uint64]$Fixture.cycles
         anchor_cycle_budget = $(if ($contract) { [uint64]$contract.anchorCycles } else { $null })
         fixture_contract_sha256 = Get-DescriptorSha256 $Descriptor
@@ -2715,8 +2721,8 @@ function Assert-FixtureCapture($Fixture, $Profile, [int]$ExitCode, [uint64]$Budg
     if ((Get-FixtureOption $Profile 'schema') -cne 'izarravm-hdd-profile-v2') {
         throw 'Capture has no supported HDD profile schema'
     }
-    if ((Get-RequiredUInt64Property $Profile 'timing_model_epoch' 'profile') -ne 2) {
-        throw 'The capture must explicitly report timing model 2'
+    if ((Get-RequiredUInt64Property $Profile 'timing_model_epoch' 'profile') -ne 3) {
+        throw 'The capture must explicitly report timing model 3'
     }
     $cpuAt = [Array]::IndexOf([string[]]$Fixture.arguments, '--cpu')
     if ($cpuAt -lt 0 -or $Profile.mode -cne $Fixture.arguments[$cpuAt + 1]) {

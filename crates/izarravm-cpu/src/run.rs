@@ -334,19 +334,23 @@ impl CpuGsw {
         self.cycle_no_interrupt_check_with_budget(bus, None)
     }
 
-    fn cycle_no_interrupt_check_with_budget<B: CpuBus>(
+    pub(super) fn cycle_no_interrupt_check_with_budget<B: CpuBus>(
         &mut self,
         bus: &mut B,
         rep_budget: Option<RepBudget>,
     ) -> CpuExecutionResult<CpuCycleOutcome> {
+        self.cycle_no_interrupt_check_at_prefix(bus, rep_budget, 0)
+    }
+
+    pub(super) fn cycle_no_interrupt_check_at_prefix<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        rep_budget: Option<RepBudget>,
+        core_prefix: u64,
+    ) -> CpuExecutionResult<CpuCycleOutcome> {
         self.interrupt_shadow = false;
-        // This is always either a standalone single-step (no prior instructions in
-        // "this run") or run_straight_line's FIRST instruction (total == 0 at that
-        // point, by construction): both cases mean core_clocks_so_far is 0 here.
-        // Continuations inside run_straight_line go through run_one_cached instead,
-        // which does not reset this field; run_straight_line sets it explicitly
-        // before each continuation call.
-        self.core_clocks_so_far = 0;
+        // Cold mkII continuations publish the prefix just like cached continuations.
+        self.core_clocks_so_far = core_prefix;
 
         if self.rep_resume_active {
             return self.resume_rep_instruction(bus, rep_budget);
@@ -424,7 +428,7 @@ impl CpuGsw {
         )
     }
 
-    fn pause_rep_instruction<B: CpuBus>(
+    pub(super) fn pause_rep_instruction<B: CpuBus>(
         &mut self,
         bus: &mut B,
         insn: DecodedInsn,
@@ -574,7 +578,7 @@ impl CpuGsw {
         )
     }
 
-    fn execute_decoded_with_rep_budget<B: CpuBus>(
+    pub(super) fn execute_decoded_with_rep_budget<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
@@ -713,11 +717,29 @@ impl CpuGsw {
     /// fetch, because EIP past 64K is reachable and meaningful there.
     #[cold]
     #[inline(never)]
-    fn wrap_16bit_sequential_run_off(&mut self) {
+    pub(super) fn wrap_16bit_sequential_run_off(&mut self) {
         let cs = self.registers.cs();
         if !cs.default_size_32 && cs.limit == 0xffff {
             self.set_eip(0);
         }
+    }
+
+    #[inline]
+    pub(super) fn retire_instruction_core(&mut self, raw_core: u32) -> u64 {
+        if self.registers.eip == 0x1_0000 {
+            self.wrap_16bit_sequential_run_off();
+        }
+        let charged = self.scale_clocks(raw_core);
+        self.elapsed_clocks += charged;
+        #[cfg(feature = "reflected-call-diagnostic")]
+        if self.retire_gates.reflected_call_diag_armed {
+            crate::reflected_call_diag::on_clock_charge();
+        }
+        self.perf.instructions += 1;
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
+        charged
     }
 
     /// The shared rewind / deliver / scale tail of a single instruction's execution. It owns ONLY
@@ -833,23 +855,7 @@ impl CpuGsw {
             }
         };
 
-        // Retire seam: an instruction whose last byte sat at offset 0xFFFF
-        // advanced EIP to the unwrapped 0x10000; wrap it before anything can
-        // observe it. See `wrap_16bit_sequential_run_off`.
-        if self.registers.eip == 0x1_0000 {
-            self.wrap_16bit_sequential_run_off();
-        }
-        let charged = self.scale_clocks(outcome.core_clocks);
-        self.elapsed_clocks += charged;
-        #[cfg(feature = "reflected-call-diagnostic")]
-        if self.retire_gates.reflected_call_diag_armed {
-            crate::reflected_call_diag::on_clock_charge();
-        }
-        self.perf.instructions += 1;
-        // V86 trap tax residency: see PerfCounters::monitor_resident_core_clocks.
-        if self.is_ring0_protected() {
-            self.perf.monitor_resident_core_clocks += charged;
-        }
+        let charged = self.retire_instruction_core(outcome.core_clocks);
         if let Some((group, opcode, form)) = profile_key {
             // The hot-address histogram wants the linear address of the instruction START.
             // A far transfer already moved the CS base by now, mis-attributing that one
@@ -907,6 +913,13 @@ impl CpuGsw {
         bus: &mut B,
         cap: u64,
     ) -> CpuExecutionResult<BudgetedRunOutcome> {
+        #[cfg(feature = "dynarec-mkii")]
+        let result = if self.mkii_enabled() {
+            self.run_mkii(bus, cap)
+        } else {
+            self.run_budgeted_inner(bus, cap)
+        };
+        #[cfg(not(feature = "dynarec-mkii"))]
         let result = self.run_budgeted_inner(bus, cap);
         // The seventh run-end reason: a propagated hard `CpuError` skips every `brk_*` fold
         // inside the loop (see `straight_line_runs`' identity comment), so it is counted here

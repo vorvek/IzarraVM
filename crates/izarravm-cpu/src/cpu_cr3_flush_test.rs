@@ -228,6 +228,8 @@ fn pte_edit_under_a_live_cr3_forces_a_redecode() {
 #[test]
 fn pte_edit_with_a_tlb_warm_target_still_retires() {
     let (mut cpu, mut bus) = cr3_fixture();
+    bus.direct_pages_enabled = true;
+    cpu.set_jit_auto_admit(true);
     let d = cpu.registers.cs().default_size_32;
 
     // Throwaway: page 14's PTE slot, same table page as the witness's PTE but an entry the
@@ -263,6 +265,7 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
     let a_stores_before = cpu.perf_counters().translation_a_stores;
     let d_stores_before = cpu.perf_counters().translation_d_stores;
     let writes_before = cpu.perf_counters().translation_page_writes;
+    let hits_before = cpu.fast_map_probe_counters().hits;
     let witness_pte = 0x9000 + (WITNESS >> 12) * 4;
     let new_pte = ALT_FRAME | 3;
     cpu.write_memory_sized(
@@ -274,6 +277,11 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
         BusAccessKind::DataWrite,
     )
     .expect("the store under test must retire");
+    assert_eq!(
+        cpu.fast_map_probe_counters().hits,
+        hits_before + 1,
+        "the translation-page store must use the primed FastMap write hit"
+    );
     assert_eq!(
         cpu.perf_counters().translation_a_stores,
         a_stores_before,

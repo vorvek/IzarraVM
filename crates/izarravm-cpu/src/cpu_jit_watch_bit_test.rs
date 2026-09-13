@@ -69,20 +69,23 @@ fn a_sticky_mark_sweeps_bit_clear_entries_and_the_refill_carries_the_bit() {
 fn a_block_watch_acquire_sweeps_bit_clear_entries() {
     let (mut cpu, mut bus) = watched_fixture();
     populate_target(&mut cpu, &mut bus, PHYS);
+    populate_target(&mut cpu, &mut bus, ALIAS);
     assert!(!cpu.jit_fast_map.page_watched_bit_for_test(PHYS));
 
     cpu.mark_block_code_for_test(PHYS + 0x20, 4);
-    assert!(
-        !cpu.jit_fast_map.has_write_mapping(PHYS, PHYS),
-        "the block-watch edge must invalidate the bit-clear entry (INV-W)"
-    );
+    for linear in [PHYS, ALIAS] {
+        assert!(
+            !cpu.jit_fast_map.has_write_mapping(linear, PHYS),
+            "the block-watch edge left a bit-clear alias live at {linear:#x}"
+        );
+    }
 
     populate_target(&mut cpu, &mut bus, PHYS);
     assert!(
         cpu.jit_fast_map.page_watched_bit_for_test(PHYS),
         "the refill sees the block watch through physical_page_watched"
     );
-    assert_eq!(cpu.code_watch_edge_counters().sweep_cleared_entries, 1);
+    assert_eq!(cpu.code_watch_edge_counters().sweep_cleared_entries, 2);
 }
 
 /// T3: the sweep matches by PHYSICAL page, so every linear alias with a clear bit goes (H2).
@@ -117,6 +120,24 @@ fn an_edge_sweeps_every_alias_of_the_physical_page() {
         );
     }
     assert_eq!(cpu.code_watch_edge_counters().sweep_cleared_entries, 2);
+}
+
+#[test]
+fn translation_watch_acquisition_sweeps_every_clear_alias() {
+    let (mut cpu, mut bus) = watched_fixture();
+    populate_target(&mut cpu, &mut bus, PHYS);
+    populate_target(&mut cpu, &mut bus, ALIAS);
+
+    cpu.mark_translation_page(PHYS + 0x34);
+
+    for linear in [PHYS, ALIAS] {
+        assert!(
+            !cpu.jit_fast_map.has_write_mapping(linear, PHYS),
+            "translation watch left a clear alias live at {linear:#x}"
+        );
+        populate_target(&mut cpu, &mut bus, linear);
+        assert!(cpu.jit_fast_map.page_watched_bit_for_test(linear));
+    }
 }
 
 /// T6: the lazy edges (E4 here) leave bits STALE-SET with no sweep — the doom generation
