@@ -2886,6 +2886,7 @@ pub(crate) struct TestBus {
     shadow_probe_sample_next_entry: bool,
     jit_cached_fetch_requests: std::cell::RefCell<Vec<(u32, u32)>>,
     fail_write_address: Option<u32>,
+    step_break_write_address: Option<u32>,
     mode13_dirty_pages: u16,
     mode13_byte_writes: u64,
     mode13_word_writes: u64,
@@ -2894,6 +2895,11 @@ pub(crate) struct TestBus {
 }
 
 impl TestBus {
+    #[cfg(feature = "dynarec-mkii")]
+    pub(crate) fn bus_cycles_for_test(&self) -> Vec<BusCycle> {
+        self.trace.cycles().iter().cloned().collect()
+    }
+
     fn mkii_session_isa_clocks(&self) -> u64 {
         if self.mkii_session_indirect_isa {
             *self.mkii_session_boxed_isa
@@ -2980,6 +2986,7 @@ impl TestBus {
             shadow_probe_sample_next_entry: false,
             jit_cached_fetch_requests: std::cell::RefCell::new(Vec::new()),
             fail_write_address: None,
+            step_break_write_address: None,
             mode13_dirty_pages: 0,
             mode13_byte_writes: 0,
             mode13_word_writes: 0,
@@ -3099,6 +3106,8 @@ impl CpuBus for TestBus {
             }
             BusWidth::Dword => self.memory[start..start + 4].copy_from_slice(&value.to_le_bytes()),
         }
+        self.io_touched |=
+            kind == BusAccessKind::DataWrite && self.step_break_write_address == Some(address);
         Ok(())
     }
 

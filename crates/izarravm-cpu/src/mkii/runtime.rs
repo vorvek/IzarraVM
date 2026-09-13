@@ -812,13 +812,7 @@ impl Engine {
                 && next < 0x10000
                 && next <= cs.limit
                 && cs.base.wrapping_add(next) >> 12 == lin >> 12
-                && operations.last().is_none_or(|op| {
-                    matches!(op.insn.opcode, 0x70..=0x7f)
-                        || !matches!(
-                            op.insn.group,
-                            DecodeGroup::Branch | DecodeGroup::ControlFlow
-                        )
-                })
+                && operations.last().is_none_or(trace_can_continue_after)
             {
                 let Some(operation) = Self::decoded_operation(cpu, bus, cs, next, physical) else {
                     open_tail = Some(next);
@@ -942,6 +936,21 @@ impl Engine {
         bus.jit_preflight_cached_fetch(linear, view.phys_start, view.insn.len)?;
         Operation::lower(eip, view.phys_start, view.insn)
     }
+}
+
+fn trace_can_continue_after(operation: &Operation) -> bool {
+    matches!(operation.insn.opcode, 0x70..=0x7f)
+        || !matches!(
+            operation.insn.group,
+            DecodeGroup::Branch | DecodeGroup::ControlFlow
+        )
+        || is_ff6_fallthrough(operation)
+}
+
+fn is_ff6_fallthrough(operation: &Operation) -> bool {
+    operation.helper == 8
+        && operation.insn.opcode == 0xff
+        && matches!(operation.insn.modrm, Some(modrm) if modrm.reg == 6)
 }
 
 fn select_next<B: CpuBus>(

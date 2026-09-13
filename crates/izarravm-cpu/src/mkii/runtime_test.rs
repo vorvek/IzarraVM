@@ -203,6 +203,368 @@ fn source_contains(state: &super::super::State, physical: u32) -> bool {
         .is_some_and(|(_, &end)| end > u64::from(physical))
 }
 
+fn decoded_operation(code: &[u8]) -> Option<Operation> {
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.load_segment_real(SegmentIndex::Ss, 0);
+    cpu.set_eip(0);
+    let mut memory = vec![0; 65536];
+    memory[..code.len()].copy_from_slice(code);
+    let mut bus = crate::tests::TestBus::with_memory(memory);
+    let insn = cpu.fetch_decoded(&mut bus, 0).ok()?;
+    Operation::lower(0, 0, insn)
+}
+
+#[test]
+fn mkii_trace_continuation_admits_only_owned_ff6_push() {
+    for extension in 0..8 {
+        for mode in [0x00, 0xc0] {
+            let operation = decoded_operation(&[0xff, mode | (extension << 3)]);
+            assert_eq!(
+                operation.as_ref().is_some_and(is_ff6_fallthrough),
+                extension == 6,
+                "extension={extension} mode={mode:02x} operation={operation:?}"
+            );
+        }
+    }
+    let non_ff6 = decoded_operation(&[0xfe, 0xf0]).unwrap();
+    assert!(!is_ff6_fallthrough(&non_ff6));
+    assert!(trace_can_continue_after(&non_ff6));
+    for code in [&[0xe8, 0, 0][..], &[0xeb, 0], &[0xc3]] {
+        assert!(
+            decoded_operation(code)
+                .as_ref()
+                .is_none_or(|operation| !trace_can_continue_after(operation)),
+            "{code:02x?}"
+        );
+    }
+    for code in [&[0xf0, 0xff, 0xf0][..], &[0xf3, 0xff, 0xf0]] {
+        assert!(decoded_operation(code).is_none(), "{code:02x?}");
+    }
+}
+
+#[test]
+fn mkii_trace_owns_ff6_push_and_its_sequential_successor() {
+    let code = [0xff, 0xf0, 0x43, 0xeb, 0xfe];
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.load_segment_real(SegmentIndex::Ss, 0);
+    cpu.set_eip(0);
+    let mut memory = vec![0; 65536];
+    memory[..code.len()].copy_from_slice(&code);
+    let mut bus = crate::tests::TestBus::with_memory(memory);
+    while cpu.registers.eip < code.len() as u32 {
+        let eip = cpu.registers.eip;
+        cpu.fetch_decoded(&mut bus, eip).unwrap();
+    }
+    cpu.set_eip(0);
+    let mut engine = Engine::default();
+    let trace = engine.trace(&mut cpu, &mut bus).unwrap();
+    assert_eq!(
+        trace
+            .operations
+            .iter()
+            .map(|operation| (operation.eip, operation.helper))
+            .collect::<Vec<_>>(),
+        [(0, 8), (2, 6), (3, 5)]
+    );
+    assert!(trace.operations[0].pure.is_none());
+    assert_eq!(trace.operations[0].span_len, 1);
+    assert_eq!(trace.operations[0].region_len, 0);
+}
+
+#[test]
+fn mkii_ff6_source_or_backing_change_refuses_guarded_suffixes() {
+    for source_dirty in [false, true] {
+        for suffix in 0..3 {
+            let code: &[u8] = match suffix {
+                0 => &[0xff, 0xf0, 0x43],
+                1 => &[0xff, 0xf0, 0x90, 0x90],
+                2 => &[0xff, 0xf0, 0xb8, 1, 0, 0x03, 0x06, 0, 0x20],
+                _ => unreachable!(),
+            };
+            let mut cpu = CpuGsw::default();
+            cpu.set_mode(crate::GswMode::Gsw586);
+            cpu.control.cr0 |= crate::CR0_PE;
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            cpu.registers.set_esp(0x9000);
+            cpu.registers.set_ebx(0xa5a5_0000);
+            cpu.set_jit_auto_admit(true);
+            cpu.set_dynarec_mkii_enabled(true);
+            cpu.set_eip(0);
+            let mut memory = vec![0; 65536];
+            memory[..code.len()].copy_from_slice(code);
+            let mut bus = crate::tests::TestBus::with_memory(memory);
+            let mut operations = Vec::new();
+            while cpu.registers.eip < code.len() as u32 {
+                let eip = cpu.registers.eip;
+                let insn = cpu.fetch_decoded(&mut bus, eip).unwrap();
+                operations.push(Operation::lower(eip, eip, insn).unwrap());
+            }
+            if suffix == 1 {
+                operations[1].span_len = 2;
+            } else if suffix == 2 {
+                operations[1].region_len = 2;
+                operations[1].region = Some(super::super::ops::Region::build(
+                    cpu.class_table(),
+                    &operations[1..],
+                ));
+            }
+            let _code = super::super::native::compile(&operations, cpu.persona()).unwrap();
+            cpu.set_eip(0);
+            cpu.jit_direct.mkii.code_dirty = false;
+            cpu.jit_direct.mkii.mapping_dirty = false;
+            let mut frame = Frame::new(&cpu, &mut bus, 1000);
+            let first = unsafe {
+                step::<crate::tests::TestBus, 8>(
+                    &mut cpu,
+                    std::ptr::from_mut(&mut bus).cast(),
+                    &mut frame,
+                    &operations[0],
+                )
+            };
+            assert_eq!(first, 1);
+            assert_eq!(cpu.registers.eip, 2);
+            assert_eq!(cpu.perf.instructions, 1);
+            assert!(frame.pending.is_none());
+            let before = (
+                cpu.perf.instructions,
+                cpu.elapsed_clocks,
+                cpu.core_clocks_so_far,
+                bus.bus_cycles_for_test(),
+            );
+            if source_dirty {
+                cpu.jit_direct.mkii.code_dirty = true;
+            } else {
+                cpu.note_direct_map_changed();
+                assert!(cpu.jit_direct.mkii.mapping_dirty);
+            }
+            let result = match suffix {
+                0 => unsafe {
+                    step::<crate::tests::TestBus, 6>(
+                        &mut cpu,
+                        std::ptr::from_mut(&mut bus).cast(),
+                        &mut frame,
+                        &operations[1],
+                    )
+                },
+                1 => unsafe {
+                    prepare_span::<crate::tests::TestBus>(
+                        &mut cpu,
+                        std::ptr::from_mut(&mut bus).cast(),
+                        &mut frame,
+                        &operations[1],
+                    )
+                },
+                2 => unsafe {
+                    super::region::prepare::<crate::tests::TestBus>(
+                        &mut cpu,
+                        std::ptr::from_mut(&mut bus).cast(),
+                        &mut frame,
+                        &operations[1],
+                    )
+                },
+                _ => unreachable!(),
+            };
+            assert_eq!(result, if suffix == 0 { 0 } else { 2 });
+            assert_eq!(cpu.registers.ebx(), 0xa5a5_0000);
+            assert_eq!(cpu.registers.eax(), 0);
+            assert_eq!(
+                (
+                    cpu.perf.instructions,
+                    cpu.elapsed_clocks,
+                    cpu.core_clocks_so_far,
+                    bus.bus_cycles_for_test(),
+                ),
+                before
+            );
+            assert!(frame.pending.is_none());
+            assert_eq!(frame.stats.helpers, 1);
+        }
+    }
+}
+
+#[test]
+fn mkii_ff6_fallthrough_uses_the_existing_64_operation_trace_cap() {
+    let mut code = vec![0xff, 0xf0].repeat(65);
+    code.extend_from_slice(&[0xeb, 0xfe]);
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.load_segment_real(SegmentIndex::Ss, 0);
+    cpu.set_eip(0);
+    let mut memory = vec![0; 65536];
+    memory[..code.len()].copy_from_slice(&code);
+    let mut bus = crate::tests::TestBus::with_memory(memory);
+    while cpu.registers.eip < code.len() as u32 {
+        let eip = cpu.registers.eip;
+        cpu.fetch_decoded(&mut bus, eip).unwrap();
+    }
+    cpu.set_eip(0);
+    let mut engine = Engine::default();
+    let first = engine.trace(&mut cpu, &mut bus).unwrap();
+    assert_eq!(first.operations.len(), 64);
+    assert!(first.operations.iter().all(is_ff6_fallthrough));
+    assert_eq!(first.operations.last().unwrap().eip, 126);
+    cpu.set_eip(128);
+    let second = engine.trace(&mut cpu, &mut bus).unwrap();
+    assert_eq!(second.operations.len(), 2);
+    assert!(is_ff6_fallthrough(&second.operations[0]));
+    assert_eq!(second.operations[1].insn.opcode, 0xeb);
+}
+
+#[test]
+fn mkii_ff6_cold_tail_growth_retries_and_preserves_source_ownership() {
+    for invalidated in [1, 3] {
+        let code = [0x90, 0xff, 0xf0, 0x43, 0xeb, 0xfe];
+        let mut cpu = CpuGsw::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.set_eip(0);
+        let mut memory = vec![0; 65536];
+        memory[..code.len()].copy_from_slice(&code);
+        let mut bus = crate::tests::TestBus::with_memory(memory);
+        for eip in [0, 1] {
+            cpu.set_eip(eip);
+            cpu.fetch_decoded(&mut bus, eip).unwrap();
+        }
+        cpu.set_eip(0);
+        let mut engine = Engine::default();
+        let before = (
+            cpu.registers.eip,
+            cpu.elapsed_clocks,
+            cpu.core_clocks_so_far,
+            cpu.perf.instructions,
+            cpu.perf.decode_misses,
+            bus.bus_cycles_for_test(),
+        );
+        {
+            let trace = engine.trace(&mut cpu, &mut bus).unwrap();
+            assert_eq!(trace.operations.len(), 2);
+            assert_eq!(trace.open_tail, Some(3));
+        }
+        assert_eq!(
+            (
+                cpu.registers.eip,
+                cpu.elapsed_clocks,
+                cpu.core_clocks_so_far,
+                cpu.perf.instructions,
+                cpu.perf.decode_misses,
+                bus.bus_cycles_for_test(),
+            ),
+            before
+        );
+        assert_eq!(cpu.jit_direct.code_watch.refcount(0), 1);
+        assert_eq!(cpu.jit_direct.code_watch.refcount(3), 0);
+        cpu.decode_cache.kill_line_at(1);
+        cpu.set_eip(3);
+        cpu.fetch_decoded(&mut bus, 3).unwrap();
+        cpu.set_eip(0);
+        engine.fail_next_compile = true;
+        let before = (
+            cpu.registers.eip,
+            cpu.elapsed_clocks,
+            cpu.core_clocks_so_far,
+            cpu.perf.instructions,
+            cpu.perf.decode_misses,
+            bus.bus_cycles_for_test(),
+        );
+        {
+            let trace = engine.trace(&mut cpu, &mut bus).unwrap();
+            assert_eq!(trace.operations.len(), 2);
+            assert_eq!(trace.open_tail, Some(3));
+        }
+        assert_eq!(
+            (
+                cpu.registers.eip,
+                cpu.elapsed_clocks,
+                cpu.core_clocks_so_far,
+                cpu.perf.instructions,
+                cpu.perf.decode_misses,
+                bus.bus_cycles_for_test(),
+            ),
+            before
+        );
+        assert_eq!(cpu.jit_direct.code_watch.refcount(0), 1);
+        assert_eq!(cpu.jit_direct.code_watch.refcount(3), 0);
+        let before = (
+            cpu.registers.eip,
+            cpu.elapsed_clocks,
+            cpu.core_clocks_so_far,
+            cpu.perf.instructions,
+            cpu.perf.decode_misses,
+            bus.bus_cycles_for_test(),
+        );
+        {
+            let trace = engine.trace(&mut cpu, &mut bus).unwrap();
+            assert_eq!(trace.operations.len(), 3);
+            assert_eq!(trace.open_tail, Some(4));
+            assert!(is_ff6_fallthrough(&trace.operations[1]));
+        }
+        assert_eq!(
+            (
+                cpu.registers.eip,
+                cpu.elapsed_clocks,
+                cpu.core_clocks_so_far,
+                cpu.perf.instructions,
+                cpu.perf.decode_misses,
+                bus.bus_cycles_for_test(),
+            ),
+            before
+        );
+        assert_eq!(engine.stats.expansions, 1);
+        assert_eq!(cpu.jit_direct.code_watch.refcount(0), 1);
+        assert_eq!(cpu.jit_direct.code_watch.refcount(3), 1);
+        assert!(cpu.jit_direct.mkii.note_write(invalidated, 1));
+        engine.drain_writes(&mut cpu);
+        assert!(engine.traces.is_empty());
+        assert_eq!(cpu.jit_direct.code_watch.refcount(0), 0);
+        assert_eq!(cpu.jit_direct.code_watch.refcount(3), 0);
+    }
+}
+
+#[test]
+fn mkii_ff6_fallthrough_keeps_cs_page_straddle_and_runoff_bounds() {
+    for (start, limit, warm_successor, expected) in [
+        (0x0800, 0xffff, true, Some(3)),
+        (0x0ffe, 0xffff, true, Some(1)),
+        (0xfffc, 0xfffd, false, Some(1)),
+        (0xfffe, 0x1ffff, false, Some(1)),
+        (0x0fff, 0xffff, false, None),
+    ] {
+        let code = [0xff, 0xf0, 0x43, 0xeb, 0xfe];
+        let mut cpu = CpuGsw::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.segments[SegmentIndex::Cs.index()].limit = limit;
+        cpu.set_eip(start);
+        let mut memory = vec![0; 0x11000];
+        memory[start as usize..start as usize + code.len()].copy_from_slice(&code);
+        let mut bus = crate::tests::TestBus::with_memory(memory);
+        cpu.fetch_decoded(&mut bus, start).unwrap();
+        if warm_successor {
+            cpu.set_eip(start + 2);
+            cpu.fetch_decoded(&mut bus, start + 2).unwrap();
+            cpu.set_eip(start + 3);
+            cpu.fetch_decoded(&mut bus, start + 3).unwrap();
+        }
+        cpu.set_eip(start);
+        let mut engine = Engine::default();
+        let trace = engine.trace(&mut cpu, &mut bus);
+        assert_eq!(
+            trace.map(|trace| trace.operations.len()),
+            expected,
+            "start={start:#x} limit={limit:#x}"
+        );
+    }
+}
+
 #[test]
 fn mkii_source_rebuild_preserves_exact_union_for_adjacency_gaps_aliases_and_wrap() {
     let layouts: &[&[(u32, u8)]] = &[
