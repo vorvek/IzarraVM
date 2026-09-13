@@ -122,6 +122,7 @@ pub(crate) struct FastMapAccess {
     physical: u32,
     ptr: *mut u8,
     kind: PageKind,
+    page_watched: u8,
 }
 
 impl FastMapAccess {
@@ -131,6 +132,10 @@ impl FastMapAccess {
 
     pub(crate) const fn ptr(self) -> *mut u8 {
         self.ptr
+    }
+
+    pub(crate) const fn page_watched(self) -> bool {
+        self.page_watched != 0
     }
 
     /// Whether this hit resolved to the Mode 13h VGA aperture rather than plain RAM. The
@@ -474,6 +479,7 @@ impl FastMap {
             physical: physical_page | offset,
             ptr: bias.wrapping_add(linear as usize) as *mut u8,
             kind: decode_kind(flags),
+            page_watched: u8::from(flags & PAGE_WATCHED != 0),
         })
     }
 

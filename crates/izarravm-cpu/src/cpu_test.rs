@@ -1081,8 +1081,13 @@ fn fast_map_serve_path_matches_slow_path_for_ram_reads_and_writes() {
         write_by_width(&mut fast, &mut fast_bus, LINEAR, width, existing);
         write_by_width(&mut slow, &mut slow_bus, LINEAR, width, existing);
         assert!(fast.jit_fast_map.has_write_mapping(LINEAR, LINEAR));
+        assert!(!fast.jit_fast_map.page_watched_bit_for_test(LINEAR));
         assert!(!slow.jit_fast_map.has_write_mapping(LINEAR, LINEAR));
 
+        fast.written_pages = [None; TRACKED_WRITE_PAGES];
+        fast.written_count = 0;
+        fast.written_pages_overflow = false;
+        fast.last_written_page = NO_LAST_WRITTEN_PAGE;
         let hits_before = fast.fast_map_probe_counters().hits;
         fast_bus.trace.clear();
         slow_bus.trace.clear();
@@ -1108,6 +1113,8 @@ fn fast_map_serve_path_matches_slow_path_for_ram_reads_and_writes() {
             "{width:?} write charged different bus clocks"
         );
         assert_eq!(fast.registers.eflags, slow.registers.eflags);
+        assert_eq!(fast.written_count, 1);
+        assert_eq!(fast.written_pages[0], Some(LINEAR >> 12));
     }
 }
 
@@ -1563,6 +1570,117 @@ fn fast_map_write_hit_still_invalidates_watched_code() {
         invalidations_before + 1
     );
     assert_eq!(bus.memory[CODE as usize], 0xcc);
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_stale_set_proof_keeps_exact_byte_range_precision() {
+    const CODE: u32 = 0x0000_0200;
+    const DATA: u32 = 0x0000_0800;
+
+    let mut memory = vec![0u8; 0x1000];
+    memory[CODE as usize] = 0x90;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(true);
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.set_eip(CODE);
+    cpu.fetch_decoded(&mut bus, CODE).unwrap();
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        DATA,
+        0,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(cpu.jit_fast_map.page_watched_bit_for_test(DATA));
+
+    cpu.jit_direct.clear();
+    let _ = cpu.decode_cache.invalidate_and_clear_code_marks(true);
+    assert!(!cpu.code_write_watched(DATA, 1));
+    assert!(cpu.jit_fast_map.page_watched_bit_for_test(DATA));
+
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    let invalidations_before = cpu.perf_counters().code_invalidations;
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        DATA,
+        0xaa,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+
+    assert_eq!(cpu.fast_map_probe_counters().hits, hits_before + 1);
+    assert_eq!(cpu.perf_counters().code_invalidations, invalidations_before);
+    assert_eq!(bus.memory[DATA as usize], 0xaa);
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_write_charge_failure_precedes_store_and_invalidation() {
+    const CODE: u32 = 0x0000_0200;
+
+    let mut memory = vec![0u8; 0x1000];
+    memory[CODE as usize] = 0x90;
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(true);
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.set_eip(CODE);
+    cpu.fetch_decoded(&mut bus, CODE).unwrap();
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        CODE,
+        0x90,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(cpu.jit_fast_map.has_write_mapping(CODE, CODE));
+    assert!(cpu.jit_fast_map.page_watched_bit_for_test(CODE));
+
+    cpu.written_pages = [None; TRACKED_WRITE_PAGES];
+    cpu.written_count = 0;
+    cpu.written_pages_overflow = false;
+    cpu.last_written_page = NO_LAST_WRITTEN_PAGE;
+    bus.fail_direct_charge_address = Some(CODE);
+    let hits_before = cpu.fast_map_probe_counters().hits;
+    let invalidations_before = cpu.perf_counters().code_invalidations;
+
+    let result = cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        CODE,
+        0xcc,
+        BusAccessKind::DataWrite,
+    );
+
+    assert!(matches!(
+        result,
+        Err(InternalFault::Cpu(CpuError::Bus(
+            BusError::UnmappedMemory { address: CODE }
+        )))
+    ));
+    assert_eq!(cpu.fast_map_probe_counters().hits, hits_before + 1);
+    assert_eq!(bus.memory[CODE as usize], 0x90);
+    assert!(cpu.decode_cache.line_live(CODE, false));
+    assert_eq!(cpu.perf_counters().code_invalidations, invalidations_before);
+    assert_eq!(cpu.written_count, 1);
+    assert_eq!(cpu.written_pages[0], Some(CODE >> 12));
 }
 
 /// The N5 read/write/RMW shape census (`IZARRAVM_RMW_CENSUS`) must count what it claims to
@@ -2886,6 +3004,7 @@ pub(crate) struct TestBus {
     shadow_probe_sample_next_entry: bool,
     jit_cached_fetch_requests: std::cell::RefCell<Vec<(u32, u32)>>,
     fail_write_address: Option<u32>,
+    fail_direct_charge_address: Option<u32>,
     step_break_write_address: Option<u32>,
     mode13_dirty_pages: u16,
     mode13_byte_writes: u64,
@@ -2986,6 +3105,7 @@ impl TestBus {
             shadow_probe_sample_next_entry: false,
             jit_cached_fetch_requests: std::cell::RefCell::new(Vec::new()),
             fail_write_address: None,
+            fail_direct_charge_address: None,
             step_break_write_address: None,
             mode13_dirty_pages: 0,
             mode13_byte_writes: 0,
@@ -2993,6 +3113,16 @@ impl TestBus {
             mode13_dword_writes: 0,
             direct_mapping_epoch: 1,
         }
+    }
+
+    #[cfg(feature = "dynarec-mkii")]
+    pub(crate) fn enable_direct_pages_for_test(&mut self) {
+        self.direct_pages_enabled = true;
+    }
+
+    #[cfg(feature = "dynarec-mkii")]
+    pub(crate) fn memory_byte_for_test(&self, address: u32) -> u8 {
+        self.memory[address as usize]
     }
 
     /// The direct-page dial actually charged, honouring `flat_direct_page_clocks`.
@@ -3525,6 +3655,9 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
+        if self.fail_direct_charge_address == Some(address) {
+            return Err(BusError::UnmappedMemory { address });
+        }
         if self.mkii_folded_fetches
             && !self.mkii_owned_replay_disabled
             && kind == BusAccessKind::InstructionPrefetch
@@ -3557,6 +3690,9 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
+        if self.fail_direct_charge_address == Some(address) {
+            return Err(BusError::UnmappedMemory { address });
+        }
         if self.direct_page_clocks {
             self.trace
                 .record(kind, address, width, self.direct_dial(width));
