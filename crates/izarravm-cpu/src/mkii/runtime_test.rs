@@ -130,9 +130,9 @@ fn mkii_selection_clears_a_previous_source_certificate() {
     );
 }
 
-fn install(engine: &mut Engine, cpu: &mut CpuGsw, eip: u32, physical: u32) -> Key {
+fn test_operation(eip: u32, physical: u32, len: u8) -> Operation {
     let insn = DecodedInsn {
-        len: 1,
+        len,
         prefixes: Prefixes::default(),
         opcode: 0x90,
         operand_size: OperandSize::Word,
@@ -146,16 +146,35 @@ fn install(engine: &mut Engine, cpu: &mut CpuGsw, eip: u32, physical: u32) -> Ke
         disp_len: 0,
         imm_len: 0,
     };
-    let operations = vec![Operation::lower(eip, physical, insn).unwrap()].into_boxed_slice();
+    Operation::lower(eip, physical, insn).unwrap()
+}
+
+fn install_operations(
+    engine: &mut Engine,
+    cpu: &mut CpuGsw,
+    eip: u32,
+    ranges: &[(u32, u8)],
+) -> Key {
+    let operations = ranges
+        .iter()
+        .scan(eip, |operation_eip, &(physical, len)| {
+            let operation = test_operation(*operation_eip, physical, len);
+            *operation_eip = operation_eip.wrapping_add(u32::from(len));
+            Some(operation)
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let code = super::super::native::compile(&operations, cpu.persona()).unwrap();
-    cpu.mkii_watch_source(physical, 1);
+    for operation in &operations {
+        cpu.mkii_watch_source(operation.physical, u32::from(operation.insn.len));
+    }
     let index = engine.free.pop().unwrap_or_else(|| {
         engine.arena.push(None);
         engine.arena.len() - 1
     });
     let key = Key {
         table: cpu.class_table() as *const _ as usize,
-        physical,
+        physical: ranges[0].0,
         eip,
         cs_base: 0,
         cs_limit: 0xffff,
@@ -170,6 +189,117 @@ fn install(engine: &mut Engine, cpu: &mut CpuGsw, eip: u32, physical: u32) -> Ke
         source_certificate: None,
     });
     key
+}
+
+fn install(engine: &mut Engine, cpu: &mut CpuGsw, eip: u32, physical: u32) -> Key {
+    install_operations(engine, cpu, eip, &[(physical, 1)])
+}
+
+fn source_contains(state: &super::super::State, physical: u32) -> bool {
+    state
+        .sources
+        .range(..=physical)
+        .next_back()
+        .is_some_and(|(_, &end)| end > u64::from(physical))
+}
+
+#[test]
+fn mkii_source_rebuild_preserves_exact_union_for_adjacency_gaps_aliases_and_wrap() {
+    let layouts: &[&[(u32, u8)]] = &[
+        &[(0x100, 1), (0x101, 2), (0x103, 1)],
+        &[(0x200, 1), (0x202, 1)],
+        &[(0x300, 2), (0x301, 2), (0x300, 1), (0x2ff, 1)],
+        &[(0xffe, 2), (0x1000, 2)],
+        &[(u32::MAX - 1, 3)],
+    ];
+    let mut expected = super::super::State::default();
+    let mut actual = super::super::State::default();
+    for (index, layout) in layouts.iter().enumerate() {
+        let operations = layout
+            .iter()
+            .scan(index as u32 * 0x100, |eip, &(physical, len)| {
+                let operation = test_operation(*eip, physical, len);
+                *eip += u32::from(len);
+                Some(operation)
+            })
+            .collect::<Vec<_>>();
+        Engine::rebuild_trace_sources(&mut actual, &operations);
+        for &(physical, len) in *layout {
+            expected.add_source(physical, u32::from(len));
+        }
+    }
+    Engine::rebuild_trace_sources(&mut actual, &[]);
+    assert_eq!(actual.sources, expected.sources);
+    for (physical, present) in [
+        (0, true),
+        (1, false),
+        (0xff, false),
+        (0x100, true),
+        (0x103, true),
+        (0x104, false),
+        (0x200, true),
+        (0x201, false),
+        (0x202, true),
+        (0x2fe, false),
+        (0x2ff, true),
+        (0x303, false),
+        (0xffd, false),
+        (0xffe, true),
+        (0x1001, true),
+        (0x1002, false),
+        (u32::MAX - 2, false),
+        (u32::MAX - 1, true),
+        (u32::MAX, true),
+    ] {
+        assert_eq!(source_contains(&actual, physical), present, "{physical:#x}");
+    }
+}
+
+#[test]
+fn mkii_source_rebuild_after_retirement_keeps_union_and_watch_references_exact() {
+    let mut cpu = CpuGsw::default();
+    let mut engine = Engine::default();
+    let survivors: &[&[(u32, u8)]] = &[
+        &[(0x100, 2), (0x102, 2)],
+        &[(0x101, 2), (0x105, 1)],
+        &[(0x200, 1), (0x202, 1)],
+        &[(u32::MAX, 2)],
+    ];
+    for (index, layout) in survivors.iter().enumerate() {
+        install_operations(&mut engine, &mut cpu, 0x1000 + index as u32 * 0x10, layout);
+    }
+    install(&mut engine, &mut cpu, 0x2000, 0x500);
+
+    let mut expected = super::super::State::default();
+    let mut expected_refs = std::collections::BTreeMap::<u32, u32>::new();
+    for layout in survivors {
+        for &(physical, len) in *layout {
+            expected.add_source(physical, u32::from(len));
+            for (start, end) in super::super::physical_ranges(physical, u32::from(len))
+                .into_iter()
+                .flatten()
+            {
+                for byte in u64::from(start)..end {
+                    *expected_refs.entry(byte as u32).or_default() += 1;
+                }
+            }
+        }
+    }
+    assert!(cpu.jit_direct.mkii.note_write(0x500, 1));
+    engine.drain_writes(&mut cpu);
+
+    assert_eq!(cpu.jit_direct.mkii.sources, expected.sources);
+    assert_eq!(engine.traces.len(), survivors.len());
+    assert_eq!(engine.stats.invalidations, 1);
+    assert_eq!(engine.stats.retired_artifacts, 1);
+    assert_eq!(cpu.jit_direct.code_watch.refcount(0x500), 0);
+    for (&physical, &refs) in &expected_refs {
+        assert_eq!(cpu.jit_direct.code_watch.refcount(physical), refs);
+    }
+    for physical in [0x104, 0x106, 0x1ff, 0x201, 0x203] {
+        assert!(!source_contains(&cpu.jit_direct.mkii, physical));
+        assert_eq!(cpu.jit_direct.code_watch.refcount(physical), 0);
+    }
 }
 
 #[test]

@@ -645,6 +645,36 @@ unsafe extern "C" fn prepare_span<B: CpuBus>(
 }
 
 impl Engine {
+    fn rebuild_trace_sources(state: &mut super::State, operations: &[Operation]) {
+        fn flush(state: &mut super::State, pending: &mut Option<(u32, u64)>) {
+            if let Some((start, end)) = pending.take() {
+                let len = u32::try_from(end - u64::from(start))
+                    .expect("one physical source run must fit in u32");
+                state.add_source(start, len);
+            }
+        }
+
+        let mut pending = None;
+        for operation in operations {
+            for (start, end) in
+                super::physical_ranges(operation.physical, u32::from(operation.insn.len))
+                    .into_iter()
+                    .flatten()
+            {
+                if let Some((pending_start, pending_end)) = pending
+                    && u64::from(start) == pending_end
+                    && u32::try_from(end - u64::from(pending_start)).is_ok()
+                {
+                    pending = Some((pending_start, end));
+                } else {
+                    flush(state, &mut pending);
+                    pending = Some((start, end));
+                }
+            }
+        }
+        flush(state, &mut pending);
+    }
+
     fn lookup(&mut self, key: Key) -> Option<usize> {
         if self.dispatch.is_empty() {
             self.dispatch.resize(4096, None);
@@ -718,11 +748,7 @@ impl Engine {
         });
         cpu.jit_direct.mkii.sources.clear();
         for trace in self.arena.iter().flatten() {
-            for op in &trace.operations {
-                cpu.jit_direct
-                    .mkii
-                    .add_source(op.physical, u32::from(op.insn.len));
-            }
+            Self::rebuild_trace_sources(&mut cpu.jit_direct.mkii, &trace.operations);
         }
         cpu.jit_direct.mkii.dirty_writes.clear();
         cpu.jit_direct.mkii.code_dirty = false;
