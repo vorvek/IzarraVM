@@ -3091,6 +3091,8 @@ pub struct CpuGsw {
     // the 386 holds off interrupts until the instruction after STI, which makes
     // the STI; HLT idle idiom safe (the HLT runs before any interrupt is taken).
     interrupt_shadow: bool,
+    single_step_armed: bool,
+    single_step_repeat: bool,
     // Inline hot gate for the boxed REP continuation. Ordinary run entries read this bool without
     // chasing the cold resume-state pointer.
     rep_resume_active: bool,
@@ -3372,6 +3374,8 @@ impl Default for CpuGsw {
             fp_rem: 0,
             halted: false,
             interrupt_shadow: false,
+            single_step_armed: false,
+            single_step_repeat: false,
             rep_resume_active: false,
             rep_execution: Box::default(),
             mode: GswMode::Gsw586,

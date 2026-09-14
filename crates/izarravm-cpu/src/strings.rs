@@ -946,6 +946,32 @@ impl CpuGsw {
                 self.string_step(bus, &mut work.committed, op, width, prefixes, address_size)?
             }
             Some(kind) => {
+                if self.single_step_armed {
+                    if self.string_count(address_size) != 0 {
+                        self.string_step(
+                            bus,
+                            &mut work.committed,
+                            op,
+                            width,
+                            prefixes,
+                            address_size,
+                        )?;
+                        if let Some(invoice) = work.rep.as_mut() {
+                            invoice.complete(1);
+                        }
+                        self.perf.rep_string_iterations += 1;
+                        self.decrement_string_count(address_size);
+                        let repeats = match (op, kind) {
+                            (StringOp::Cmps | StringOp::Scas, RepKind::Repe) => self.flag(FLAG_ZF),
+                            (StringOp::Cmps | StringOp::Scas, RepKind::Repne) => {
+                                !self.flag(FLAG_ZF)
+                            }
+                            _ => true,
+                        };
+                        self.single_step_repeat = repeats && self.string_count(address_size) != 0;
+                    }
+                    return Ok(());
+                }
                 let mut chunk_iterations = 0u32;
                 // Priced once for the whole REP: see RepLimitPlan's doc for why per_iteration
                 // and the paging setup cost cannot change across this loop's iterations.

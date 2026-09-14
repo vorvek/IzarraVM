@@ -497,6 +497,7 @@ impl CpuGsw {
             self.rep_resume_active = false;
             return self.cycle_no_interrupt_check_with_budget(bus, rep_budget);
         }
+        self.begin_instruction();
 
         if let Some(history) = resume.price_history {
             assert!(history.startup_paid, "REP resume has unpaid startup");
@@ -763,13 +764,46 @@ impl CpuGsw {
         profile_key: Option<(DecodeGroup, u16, CpuProfileOperandForm)>,
         profile_start: Option<std::time::Instant>,
     ) -> CpuExecutionResult<CpuCycleOutcome> {
+        let single_step = std::mem::take(&mut self.single_step_armed);
+        let step_repeat = std::mem::take(&mut self.single_step_repeat);
         let sourced = execution.work.sourced_rep();
         let paid_core = self
             .prepare_rep_settlement(bus, &mut execution)
             .map_or(0, |paid| paid.paid_core);
         let mut committed = execution.work.committed;
         let outcome = match execution.result {
-            Ok(outcome) => outcome,
+            Ok(mut outcome) => {
+                if single_step {
+                    if step_repeat {
+                        self.set_eip(start_eip);
+                    }
+                    self.rep_resume_active = false;
+                    self.rep_execution.resume = None;
+                    self.control.dr6 |= 1 << 14;
+                    self.halted = false;
+                    let delivery = if self.is_v86_mode() {
+                        crate::timing_class::TimingClass::ExceptionDeliveryV86
+                    } else {
+                        crate::timing_class::TimingClass::ExceptionDelivery
+                    };
+                    if let Err(error) =
+                        self.deliver_exception_escalating(bus, 1, None, false, &mut committed)
+                    {
+                        self.publish_rep_handoff(bus, sourced, committed.total());
+                        return Err(CpuRunError {
+                            error,
+                            consumed_core_clocks: committed.into_inner(),
+                        });
+                    }
+                    #[cfg(feature = "timing-class-histogram")]
+                    self.class_histogram.record_system_event(delivery);
+                    outcome.core_clocks = outcome
+                        .core_clocks
+                        .saturating_add(self.class_table().raw(delivery));
+                    outcome.halted = false;
+                }
+                outcome
+            }
             Err(InternalFault::Exception { vector, error_code }) => {
                 // Both reads are INSIDE the arm, so the success path pays for
                 // neither. `deliver_exception` clears VM on the way into a
@@ -4335,7 +4369,7 @@ impl CpuGsw {
         let start_cs_register = self.registers.cs();
         let start_cs = start_cs_register.selector;
         let profiling = self.profile.enabled;
-        if !profiling {
+        if !profiling && !self.single_step_armed {
             let mut execution =
                 match self.charge_cached_fetch_at(bus, lin, insn.len, view.phys_start) {
                     Ok(()) => self.execute_hot_cached_or_decoded(insn, bus),
@@ -4445,7 +4479,7 @@ impl CpuGsw {
         let start_cs = start_cs_register.selector;
         let profiling = self.profile.enabled;
         self.rep_execution.yielded = false;
-        if !profiling {
+        if !profiling && !self.single_step_armed {
             let mut execution =
                 match self.charge_cached_fetch_at(bus, lin, insn.len, view.phys_start) {
                     Ok(()) => self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget),

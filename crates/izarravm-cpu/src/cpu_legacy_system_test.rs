@@ -2712,6 +2712,7 @@ fn cli_faults_in_v86_below_iopl3() {
     let (mut cpu, memory) = real_mode_cpu(&[0xfa], 0x40);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.eflags = 0x2 | FLAG_VM; // IOPL 0
+    cpu.cpl = 3;
     let mut bus = TestBus::with_memory(memory);
     let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
     assert!(matches!(fault, InternalFault::Exception { vector: 13, .. }));
@@ -2723,6 +2724,7 @@ fn cli_runs_in_v86_at_iopl3() {
     let (mut cpu, memory) = real_mode_cpu(&[0xfa], 0x40);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000 | FLAG_IF; // IOPL 3, IF set
+    cpu.cpl = 3;
     let mut bus = TestBus::with_memory(memory);
     cpu.cycle(&mut bus).unwrap();
     assert!(!cpu.flag(FLAG_IF), "CLI cleared IF");

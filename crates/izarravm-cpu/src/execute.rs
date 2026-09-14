@@ -1213,8 +1213,7 @@ impl CpuGsw {
                 Ok(self.charge(TimingClass::FlagOp))
             }
             0xfa => {
-                // CLI. IOPL-sensitive: faults to the monitor in a V86 task below IOPL 3.
-                self.check_v86_iopl()?;
+                self.check_interrupt_flag_privilege()?;
                 self.set_flag(FLAG_IF, false);
                 // Named because CLI is an `InterpretOne` call-out row: its budget bound and this
                 // arm must charge the same number.
@@ -1224,7 +1223,7 @@ impl CpuGsw {
                 // STI sets IF and arms the one-instruction shadow so the instruction immediately
                 // after STI always executes before any interrupt is taken. The shadow is set here
                 // in the executor exactly as the fused handler did.
-                self.check_v86_iopl()?;
+                self.check_interrupt_flag_privilege()?;
                 self.set_flag(FLAG_IF, true);
                 self.interrupt_shadow = true;
                 Ok(self.charge(TimingClass::Sti))

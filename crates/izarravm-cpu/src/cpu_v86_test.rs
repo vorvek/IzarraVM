@@ -750,6 +750,286 @@ fn enter_ring3(cpu: &mut CpuGsw, bus: &mut TestBus) {
     assert_eq!(cpu.current_privilege_level(), 3);
 }
 
+#[test]
+fn protected_cli_sti_check_iopl_before_changing_flags_or_shadow() {
+    for opcode in [0xfa, 0xfb] {
+        for iopl in 0..=3 {
+            for initial_if in [false, true] {
+                for shadow in [false, true] {
+                    let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0]);
+                    enter_ring3(&mut cpu, &mut bus);
+                    bus.memory[0x1234] = opcode;
+                    cpu.registers.eflags |= iopl << 12;
+                    cpu.set_flag(FLAG_IF, initial_if);
+                    cpu.interrupt_shadow = shadow;
+                    let flags = cpu.registers.eflags;
+                    let insn = cpu.fetch_decoded(&mut bus, 0x1234).unwrap();
+                    let result = cpu.execute_flags_misc_decoded(&insn, &mut bus);
+                    if iopl < 3 {
+                        assert!(matches!(
+                            result,
+                            Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            })
+                        ));
+                        assert_eq!(cpu.registers.eflags, flags);
+                        assert_eq!(cpu.interrupt_shadow, shadow);
+                    } else {
+                        result.unwrap();
+                        assert_eq!(cpu.flag(FLAG_IF), opcode == 0xfb);
+                        if opcode == 0xfa {
+                            assert_eq!(cpu.interrupt_shadow, shadow);
+                        } else if !initial_if {
+                            assert!(cpu.interrupt_shadow);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn protected_cli_sti_fault_frame_preserves_instruction_and_if() {
+    for opcode in [0xfa, 0xfb] {
+        for initial_if in [false, true] {
+            let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0]);
+            enter_ring3(&mut cpu, &mut bus);
+            bus.memory[0x1234] = opcode;
+            cpu.set_flag(FLAG_IF, initial_if);
+            let flags = cpu.registers.eflags;
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(cpu.registers.cs().selector, R0_CS);
+            assert_eq!(cpu.registers.eip, MON_CODE);
+            let esp = cpu.registers.esp();
+            assert_eq!(u32::from_le_bytes(cpu_mem(&bus, esp)), 0);
+            assert_eq!(u32::from_le_bytes(cpu_mem(&bus, esp + 4)), 0x1234);
+            assert_eq!(u32::from_le_bytes(cpu_mem(&bus, esp + 12)), flags);
+            assert!(!cpu.interrupt_shadow);
+        }
+    }
+}
+
+#[test]
+fn protected_popfd_below_iopl_preserves_if_without_fault() {
+    for initial_if in [false, true] {
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0]);
+        enter_ring3(&mut cpu, &mut bus);
+        bus.memory[0x1234] = 0x9d;
+        cpu.set_flag(FLAG_IF, initial_if);
+        let value = 2 | FLAG_CF | FLAG_IOPL | if initial_if { 0 } else { FLAG_IF };
+        cpu.push(&mut bus, value, OperandSize::Dword).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.current_privilege_level(), 3);
+        assert_eq!(cpu.registers.eip, 0x1235);
+        assert_eq!(cpu.flag(FLAG_IF), initial_if);
+        assert_eq!(cpu.iopl(), 0);
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(cpu.registers.esp(), 0x2000);
+    }
+}
+
+fn single_step_world(code: &[u8]) -> (CpuGsw, TestBus) {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0]);
+    enter_ring3(&mut cpu, &mut bus);
+    int_gate(&mut bus.memory, 1, MON_CODE + 0x100);
+    bus.memory[(MON_CODE + 0x100) as usize] = 0xcf;
+    bus.memory[0x1234..0x1234 + code.len()].copy_from_slice(code);
+    (cpu, bus)
+}
+
+fn single_step_saved_ip(cpu: &CpuGsw, bus: &TestBus) -> u32 {
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    assert_eq!(cpu.registers.eip, MON_CODE + 0x100);
+    assert_ne!(cpu.control.dr6 & (1 << 14), 0);
+    assert!(!cpu.flag(FLAG_TF));
+    assert!(!cpu.single_step_armed);
+    assert!(!cpu.single_step_repeat);
+    u32::from_le_bytes(cpu_mem(bus, cpu.registers.esp()))
+}
+
+#[test]
+fn single_step_uses_entry_tf_for_popfd_and_iret() {
+    let (mut cpu, mut bus) = single_step_world(&[0x9d, 0x90, 0x36, 0x9d]);
+    cpu.push(&mut bus, 2, OperandSize::Dword).unwrap();
+    cpu.push(&mut bus, 2 | FLAG_TF, OperandSize::Dword).unwrap();
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(cpu.registers.eip, 0x1235);
+    assert!(cpu.flag(FLAG_TF));
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(single_step_saved_ip(&cpu, &bus), 0x1236);
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(cpu.registers.eip, 0x1236);
+    assert!(cpu.flag(FLAG_TF));
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(single_step_saved_ip(&cpu, &bus), 0x1238);
+    let flags = u32::from_le_bytes(cpu_mem(&bus, cpu.registers.esp() + 8));
+    assert_eq!(flags & FLAG_TF, 0);
+}
+
+#[test]
+fn single_step_fault_takes_priority_and_preserves_fault_ip() {
+    let (mut cpu, mut bus) = single_step_world(&[0xfa]);
+    cpu.set_flag(FLAG_TF, true);
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(cpu.registers.eip, MON_CODE);
+    assert_eq!(cpu.control.dr6 & (1 << 14), 0);
+    let esp = cpu.registers.esp();
+    assert_eq!(u32::from_le_bytes(cpu_mem(&bus, esp + 4)), 0x1234);
+    assert_ne!(u32::from_le_bytes(cpu_mem(&bus, esp + 12)) & FLAG_TF, 0);
+    assert!(!cpu.single_step_armed);
+}
+
+#[test]
+fn single_step_ss_load_defers_trap_until_next_instruction() {
+    for code in [
+        vec![0x8e, 0xd0, 0x90],
+        vec![0x17, 0x90],
+        vec![0x0f, 0xb2, 0x25, 0x00, 0x30, 0x00, 0x00, 0x90],
+    ] {
+        let (mut cpu, mut bus) = single_step_world(&code);
+        cpu.write_reg16(Reg16::Ax, 0x2b);
+        cpu.load_segment(&mut bus, SegmentIndex::Ds, 0x2b).unwrap();
+        cpu.push(&mut bus, 0x2b, OperandSize::Dword).unwrap();
+        put32(&mut bus.memory, 0x3000, 0x2000);
+        put16(&mut bus.memory, 0x3004, 0x2b);
+        cpu.set_flag(FLAG_TF, true);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.current_privilege_level(), 3);
+        assert!(cpu.flag(FLAG_TF));
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(single_step_saved_ip(&cpu, &bus), 0x1234 + code.len() as u32);
+    }
+}
+
+#[test]
+fn single_step_software_interrupt_discards_outgoing_trap() {
+    let (mut cpu, mut bus) = single_step_world(&[0xcd, 0x21]);
+    bus.memory[(IDT + 0x21 * 8 + 5) as usize] = 0xee;
+    cpu.set_flag(FLAG_TF, true);
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(cpu.registers.eip, MON_CODE);
+    assert!(!cpu.flag(FLAG_TF));
+    assert!(!cpu.single_step_armed);
+    assert_eq!(cpu.control.dr6 & (1 << 14), 0);
+}
+
+#[test]
+fn single_step_rep_movsb_traps_after_each_committed_element() {
+    let (mut cpu, mut bus) = single_step_world(&[0xf3, 0xa4]);
+    cpu.load_segment(&mut bus, SegmentIndex::Ds, 0x2b).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Es, 0x2b).unwrap();
+    cpu.write_gpr32(1, 3);
+    cpu.write_gpr32(6, 0x3000);
+    cpu.write_gpr32(7, 0x4000);
+    bus.memory[0x3000..0x3003].copy_from_slice(&[0x12, 0x34, 0x56]);
+    cpu.set_flag(FLAG_TF, true);
+    for completed in 1..=3 {
+        cpu.cycle(&mut bus).unwrap();
+        let expected_ip = if completed == 3 { 0x1236 } else { 0x1234 };
+        assert_eq!(single_step_saved_ip(&cpu, &bus), expected_ip);
+        assert_eq!(cpu.read_gpr32(1), 3 - completed);
+        assert_eq!(cpu.read_gpr32(6), 0x3000 + completed);
+        assert_eq!(cpu.read_gpr32(7), 0x4000 + completed);
+        assert_eq!(
+            &bus.memory[0x4000..0x4000 + completed as usize],
+            &bus.memory[0x3000..0x3000 + completed as usize]
+        );
+        assert!(!cpu.rep_resume_active);
+        cpu.cycle(&mut bus).unwrap();
+    }
+}
+
+#[test]
+fn single_step_cached_continuation_delivers_trap() {
+    let (mut cpu, mut bus) = single_step_world(&[0x9d, 0x90]);
+    cpu.push(&mut bus, 2 | FLAG_TF, OperandSize::Dword).unwrap();
+    cpu.fetch_decoded(&mut bus, 0x1235).unwrap();
+    cpu.set_eip(0x1234);
+    cpu.run_straight_line(&mut bus, 100).unwrap();
+    assert_eq!(single_step_saved_ip(&cpu, &bus), 0x1236);
+}
+
+#[test]
+fn single_step_rep_zero_count_and_conditional_stop_use_next_ip() {
+    for (opcode, count) in [(0xa4, 0), (0xa6, 3)] {
+        let (mut cpu, mut bus) = single_step_world(&[0xf3, opcode]);
+        cpu.load_segment(&mut bus, SegmentIndex::Ds, 0x2b).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Es, 0x2b).unwrap();
+        cpu.write_gpr32(1, count);
+        cpu.write_gpr32(6, 0x3000);
+        cpu.write_gpr32(7, 0x4000);
+        bus.memory[0x3000] = 1;
+        bus.memory[0x4000] = 2;
+        cpu.set_flag(FLAG_TF, true);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(single_step_saved_ip(&cpu, &bus), 0x1236);
+        assert_eq!(cpu.read_gpr32(1), count.saturating_sub(1));
+        assert_eq!(bus.memory[0x4000], 2);
+    }
+}
+
+#[test]
+fn single_step_rep_fault_keeps_count_and_indices() {
+    let (mut cpu, mut bus) = single_step_world(&[0xf3, 0xa4]);
+    cpu.load_segment(&mut bus, SegmentIndex::Ds, 0x2b).unwrap();
+    cpu.load_segment(&mut bus, SegmentIndex::Es, 0x2b).unwrap();
+    cpu.registers.segments[SegmentIndex::Es as usize].limit = 0x3fff;
+    cpu.write_gpr32(1, 3);
+    cpu.write_gpr32(6, 0x3000);
+    cpu.write_gpr32(7, 0x4000);
+    cpu.set_flag(FLAG_TF, true);
+    cpu.cycle(&mut bus).unwrap();
+    assert_eq!(cpu.registers.eip, MON_CODE);
+    assert_eq!(cpu.control.dr6 & (1 << 14), 0);
+    assert_eq!(cpu.read_gpr32(1), 3);
+    assert_eq!(cpu.read_gpr32(6), 0x3000);
+    assert_eq!(cpu.read_gpr32(7), 0x4000);
+    assert_eq!(bus.memory[0x4000], 0);
+    assert!(!cpu.rep_resume_active);
+}
+
+#[test]
+fn single_step_task_switch_discards_old_sample_and_uses_new_tf() {
+    for new_tf in [false, true] {
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[], &[0]);
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.registers.set_esp(0x6800);
+        cpu.set_eip(0x1234);
+        cpu.registers.eflags = 2 | FLAG_TF;
+        let new_tss = 0xb000;
+        let tss_descriptor = descriptor(new_tss, 0x67, 0x89, 0);
+        bus.memory[(GDT + 0x30) as usize..(GDT + 0x38) as usize].copy_from_slice(&tss_descriptor);
+        put32(&mut bus.memory, new_tss + 28, 0x1000);
+        put32(&mut bus.memory, new_tss + 32, 0x1400);
+        put32(
+            &mut bus.memory,
+            new_tss + 36,
+            2 | if new_tf { FLAG_TF } else { 0 },
+        );
+        put32(&mut bus.memory, new_tss + 56, 0x6800);
+        for offset in [72, 80, 84, 88, 92] {
+            put16(&mut bus.memory, new_tss + offset, R0_SS);
+        }
+        put16(&mut bus.memory, new_tss + 76, R0_CS);
+        bus.memory[0x1234..0x123b].copy_from_slice(&[0xea, 0, 0, 0, 0, 0x30, 0]);
+        bus.memory[0x1400] = 0x90;
+        int_gate(&mut bus.memory, 1, MON_CODE + 0x100);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.tr.selector, 0x30);
+        assert_eq!(cpu.registers.eip, 0x1400);
+        assert_eq!(cpu.flag(FLAG_TF), new_tf);
+        cpu.cycle(&mut bus).unwrap();
+        if new_tf {
+            assert_eq!(single_step_saved_ip(&cpu, &bus), 0x1401);
+        } else {
+            assert_eq!(cpu.registers.eip, 0x1401);
+        }
+    }
+}
+
 /// Write a 16-bit gate (type in `access`, e.g. 0xe6 interrupt / 0xe7 trap)
 /// for `vector`, targeting R0_CS:offset. Poisons the reserved high word.
 fn gate16(m: &mut [u8], vector: u8, offset: u16, access: u8) {
