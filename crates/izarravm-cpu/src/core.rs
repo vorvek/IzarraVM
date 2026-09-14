@@ -1305,6 +1305,8 @@ impl CpuGsw {
     }
 
     pub(super) fn begin_instruction(&mut self) {
+        self.single_step_armed = self.flag(FLAG_TF);
+        self.single_step_repeat = false;
         #[cfg(feature = "int-trace")]
         if crate::int_trace::armed() {
             crate::int_trace::on_instruction(
@@ -2530,6 +2532,16 @@ impl CpuGsw {
     /// inside a V86 task when IOPL is below 3.
     pub(super) fn check_v86_iopl(&self) -> ExecResult<()> {
         if self.is_v86_mode() && self.iopl() < 3 {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_interrupt_flag_privilege(&self) -> ExecResult<()> {
+        if self.is_protected_mode() && self.current_privilege_level() > self.iopl() {
             return Err(InternalFault::Exception {
                 vector: 13,
                 error_code: Some(0),

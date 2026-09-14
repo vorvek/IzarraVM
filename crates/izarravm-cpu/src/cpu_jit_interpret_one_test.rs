@@ -3034,16 +3034,13 @@ fn pushf_core_clocks_is_what_the_interpreter_charges() {
     );
 }
 
-/// `POPF_CORE_CLOCKS` is what the interpreter charges. `assert_row_charges` drives the pure
-/// interpreter (`cpu.cycle`, no native block, no resume predicate in play at all), and
-/// `execute.rs`'s `0x9d` arm returns the same flat `clocks(4)` whatever value it pops, so no seed
-/// is needed -- the same no-op every other charge fixture in this file uses.
+/// Measure POPF with TF clear so the charge excludes debug-trap delivery.
 #[test]
 fn popf_core_clocks_is_what_the_interpreter_charges() {
     assert_row_charges(
         &[0x9D],
         crate::timing_class::I586.raw(TimingClass::PopFlags),
-        |_, _| {},
+        |cpu, _| cpu.registers.set_esp(STACK_TOP + 2),
     );
 }
 

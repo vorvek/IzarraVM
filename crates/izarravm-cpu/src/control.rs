@@ -61,6 +61,7 @@ impl CpuGsw {
         vector: u8,
         committed: &mut CommittedCore,
     ) -> ExecResult<()> {
+        self.single_step_armed = false;
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
         // Slice 0b of the reflected-call HLE design's trip-shape instrument
         // (dev_docs/2026-09-04-reflected-call-slice0b-plan.md): the design's
@@ -2062,6 +2063,7 @@ impl CpuGsw {
         self.tr = new_tss;
         self.tr.access |= 0x02;
         self.control.cr0 |= CR0_TS;
+        self.single_step_armed = false;
         Ok(())
     }
 
@@ -2204,6 +2206,7 @@ impl CpuGsw {
         self.load_segment(bus, segment, selector)?;
         if segment == SegmentIndex::Ss {
             self.interrupt_shadow = true;
+            self.single_step_armed = false;
         }
         Ok(())
     }
