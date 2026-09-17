@@ -895,6 +895,18 @@ fn mkii_taken_backedge_reuses_the_trace_until_fallthrough() {
 }
 
 #[test]
+fn mkii_closed_loop_hits_the_native_probe() {
+    let code = [0x05, 1, 0, 0xeb, 0xfb];
+    let (mut cpu, mut bus) = fixture(&code);
+    let (mut oracle, mut other) = fixture(&code);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 200);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.compiled >= 1, "{stats:?}");
+    assert!(stats.probe_hits > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
 fn mkii_branch_region_refusal_does_not_fault_an_unexecuted_segment_access() {
     let code = [
         0x3b, 0x06, 0, 0x20, 0x74, 5, 0x26, 0x8b, 0x16, 0, 0x30, 0xe4, 0x60,

@@ -776,3 +776,123 @@ fn mkii_dirty_queue_overflow_promotes_to_a_bounded_full_flush() {
     assert_eq!(cpu.jit_direct.code_watch.refcount(0x100), 0);
     assert!(!cpu.jit_direct.mkii.code_dirty);
 }
+
+#[test]
+fn mkii_probe_slot_is_sixty_four_bytes_and_default_allocates_nothing() {
+    assert_eq!(std::mem::size_of::<super::ProbeSlot>(), 64);
+    assert_eq!(std::mem::align_of::<super::ProbeSlot>(), 8);
+    let engine = Engine::default();
+    assert!(engine.probe.is_empty());
+    assert_eq!(engine.probe_gen, 1);
+}
+
+fn colliding_eip(start: u32) -> u32 {
+    (start + 1..)
+        .find(|&eip| super::probe_index(eip) == super::probe_index(start))
+        .unwrap()
+}
+
+#[test]
+fn mkii_probe_last_writer_wins_a_hash_collision_and_keeps_the_other_key() {
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.registers.segments[SegmentIndex::Cs.index()].limit = u32::MAX;
+    cpu.registers.segments[SegmentIndex::Cs.index()].default_size_32 = true;
+    cpu.control.cr0 |= crate::CR0_PE;
+    let first_eip = 0x100;
+    let second_eip = colliding_eip(first_eip);
+    let mut memory = vec![0x90; second_eip as usize + 64];
+    for eip in [first_eip, second_eip] {
+        memory[eip as usize] = 0xeb;
+        memory[eip as usize + 1] = 0xfe;
+    }
+    let mut bus = crate::tests::TestBus::with_memory(memory);
+    cpu.set_eip(first_eip);
+    cpu.fetch_decoded(&mut bus, first_eip).unwrap();
+    cpu.set_eip(second_eip);
+    cpu.fetch_decoded(&mut bus, second_eip).unwrap();
+    let mut engine = Engine::default();
+    let mut frame = Frame::new(&cpu, &mut bus, 100);
+    cpu.set_eip(first_eip);
+    let first_body = select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
+    assert_ne!(first_body, 0);
+    cpu.set_eip(second_eip);
+    let second_body = select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
+    assert_ne!(second_body, 0);
+    assert_ne!(first_body, second_body);
+    let slot = engine.probe[super::probe_index(first_eip)];
+    assert_eq!(slot.eip, second_eip);
+    assert_eq!(slot.body, second_body as u64);
+    cpu.set_eip(first_eip);
+    assert_eq!(
+        select_next(&mut engine, &mut cpu, &mut bus, &mut frame),
+        first_body
+    );
+}
+
+#[test]
+fn mkii_mapping_dirty_in_the_same_run_advances_frame_probe_generation() {
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.registers.segments[SegmentIndex::Cs.index()].limit = u32::MAX;
+    cpu.registers.segments[SegmentIndex::Cs.index()].default_size_32 = true;
+    cpu.control.cr0 |= crate::CR0_PE;
+    let mut memory = vec![0x90; 65536];
+    memory[0x100] = 0xeb;
+    memory[0x101] = 0xfe;
+    let mut bus = crate::tests::TestBus::with_memory(memory);
+    cpu.set_eip(0x100);
+    cpu.fetch_decoded(&mut bus, 0x100).unwrap();
+    cpu.set_eip(0x100);
+    let mut engine = Engine::default();
+    let mut frame = Frame::new(&cpu, &mut bus, 100);
+    assert_ne!(select_next(&mut engine, &mut cpu, &mut bus, &mut frame), 0);
+    let generation = frame.probe_gen;
+    assert_eq!(generation, engine.probe_gen);
+    assert!(!frame.probe.is_null());
+    cpu.jit_direct.mkii.mapping_dirty = true;
+    select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
+    assert!(frame.probe_gen > generation);
+    assert_eq!(frame.probe_gen, engine.probe_gen);
+    assert!(!cpu.jit_direct.mkii.mapping_dirty);
+    let slot = engine.probe[super::probe_index(0x100)];
+    assert_eq!(slot.generation, frame.probe_gen);
+    assert_ne!(slot.body, 0);
+}
+
+#[test]
+fn mkii_open_tail_is_not_published_and_still_grows() {
+    let code = [0x90, 0xff, 0xf0, 0x43, 0xeb, 0xfe];
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.load_segment_real(SegmentIndex::Ss, 0);
+    cpu.control.cr0 |= crate::CR0_PE;
+    cpu.set_eip(0);
+    let mut memory = vec![0; 65536];
+    memory[..code.len()].copy_from_slice(&code);
+    let mut bus = crate::tests::TestBus::with_memory(memory);
+    cpu.fetch_decoded(&mut bus, 0).unwrap();
+    cpu.fetch_decoded(&mut bus, 1).unwrap();
+    cpu.set_eip(0);
+    let mut engine = Engine::default();
+    let mut frame = Frame::new(&cpu, &mut bus, 100);
+    select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
+    let index = *engine
+        .traces
+        .values()
+        .next()
+        .expect("open prefix must compile");
+    assert_eq!(engine.arena[index].as_ref().unwrap().open_tail, Some(3));
+    assert!(
+        engine.probe.is_empty()
+            || engine.probe[super::probe_index(0)].body == 0
+            || engine.probe[super::probe_index(0)].generation != engine.probe_gen
+    );
+    cpu.set_eip(3);
+    cpu.fetch_decoded(&mut bus, 3).unwrap();
+    cpu.set_eip(0);
+    select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
+    assert_eq!(engine.arena[index].as_ref().unwrap().open_tail, Some(4));
+    assert_eq!(engine.stats.expansions, 1);
+}

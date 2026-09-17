@@ -1,11 +1,17 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
+use super::State;
 use super::ops::{Input, Operation, Pure};
-use super::runtime::Frame;
+use super::runtime::{Frame, PROBE_FLAG_D, PROBE_HASH, ProbeSlot, Stats};
+use crate::jit::JitState;
 use crate::jit::encoder::{Encoder, Label, Reg};
 use crate::jit::exec_mem::ExecutableBuffer;
-use crate::{AddrMode, AddressSize, BusWidth, CpuGsw, PendingFlags, Registers};
+use crate::{
+    AddrMode, AddressSize, BusWidth, ControlRegisters, CpuGsw, PendingFlags, Registers,
+    SegmentIndex, SegmentRegister,
+};
+use std::mem::offset_of;
 
 #[path = "region_native.rs"]
 mod region;
@@ -56,10 +62,16 @@ pub(super) fn dispatcher() -> Option<Code> {
     e.mov_r64_r64(Reg::RAX, ARGS[3]);
     e.jmp_r64(Reg::RAX);
     let body = e.position();
+    let resolve_path = e.label();
+    let counted_miss = e.label();
+    emit_probe(&mut e, resolve_path, counted_miss);
+    e.place(counted_miss);
+    add_stat(&mut e, offset_of!(Stats, probe_misses));
+    e.place(resolve_path);
     e.mov_r64_r64(ARGS[0], Reg::RBX);
     e.mov_r64_r64(ARGS[1], Reg::R12);
     e.mov_r64_r64(ARGS[2], Reg::R13);
-    e.call_m64_disp32(Reg::R13, std::mem::offset_of!(Frame, resolve) as i32);
+    e.call_m64_disp32(Reg::R13, offset_of!(Frame, resolve) as i32);
     #[cfg(test)]
     let resolver_return = e.position();
     e.cmp_r64_imm32(Reg::RAX, 0);
@@ -78,6 +90,212 @@ pub(super) fn dispatcher() -> Option<Code> {
         #[cfg(test)]
         unwind_points: vec![body, resolver_return, transfer, epilogue_start],
     })
+}
+
+fn add_stat(e: &mut Encoder, field: usize) {
+    let disp = (offset_of!(Frame, stats) + field) as i32;
+    e.load_r64_disp32(Reg::RAX, Reg::R13, disp);
+    e.add_r64_imm32(Reg::RAX, 1);
+    e.store_r64_disp32(Reg::R13, disp, Reg::RAX);
+}
+
+fn emit_probe(e: &mut Encoder, resolve_path: Label, counted_miss: Label) {
+    e.load_r64_disp32(Reg::RAX, Reg::R13, offset_of!(Frame, probe) as i32);
+    e.cmp_r64_imm32(Reg::RAX, 0);
+    e.jcc(4, resolve_path);
+
+    e.movzx_r32_byte_disp32(Reg::RDX, Reg::R13, offset_of!(Frame, stop) as i32);
+    e.test_r32_r32(Reg::RDX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.movzx_r32_byte_disp32(
+        Reg::RDX,
+        Reg::R13,
+        offset_of!(Frame, force_canonical) as i32,
+    );
+    e.test_r32_r32(Reg::RDX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.load_r32_disp32(Reg::RDX, Reg::R13, offset_of!(Frame, fetched_live) as i32);
+    e.test_r32_r32(Reg::RDX, Reg::RDX);
+    e.jcc(5, counted_miss);
+
+    e.load_r64_disp32(Reg::RAX, Reg::RBX, offset_of!(CpuGsw, jit_direct) as i32);
+    let mkii = offset_of!(JitState, mkii);
+    e.movzx_r32_byte_disp32(
+        Reg::RDX,
+        Reg::RAX,
+        (mkii + offset_of!(State, code_dirty)) as i32,
+    );
+    e.test_r32_r32(Reg::RDX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.movzx_r32_byte_disp32(
+        Reg::RDX,
+        Reg::RAX,
+        (mkii + offset_of!(State, mapping_dirty)) as i32,
+    );
+    e.test_r32_r32(Reg::RDX, Reg::RDX);
+    e.jcc(5, counted_miss);
+
+    e.load_r32_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (offset_of!(CpuGsw, control) + offset_of!(ControlRegisters, cr0)) as i32,
+    );
+    e.test_r32_imm32(Reg::RAX, crate::CR0_PE);
+    e.jcc(4, counted_miss);
+    e.load_r32_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (offset_of!(CpuGsw, registers) + offset_of!(Registers, eflags)) as i32,
+    );
+    e.test_r32_imm32(Reg::RAX, crate::FLAG_VM | crate::FLAG_TF);
+    e.jcc(5, counted_miss);
+    e.movzx_r32_byte_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        offset_of!(CpuGsw, rep_resume_active) as i32,
+    );
+    e.test_r32_r32(Reg::RAX, Reg::RAX);
+    e.jcc(5, counted_miss);
+
+    let registers = offset_of!(CpuGsw, registers);
+    let cs = registers
+        + offset_of!(Registers, segments)
+        + SegmentIndex::Cs.index() * std::mem::size_of::<SegmentRegister>();
+    e.load_r32_disp32(
+        Reg::RCX,
+        Reg::RBX,
+        (registers + offset_of!(Registers, eip)) as i32,
+    );
+    e.load_r32_disp32(
+        Reg::RDX,
+        Reg::RBX,
+        (cs + offset_of!(SegmentRegister, base)) as i32,
+    );
+    e.add_r32_r32(Reg::RCX, Reg::RDX);
+    e.imul_r32_r32_imm32(Reg::RCX, Reg::RCX, PROBE_HASH);
+    e.shr_r32_imm8(Reg::RCX, 16);
+    e.shl_r32_imm8(Reg::RCX, 6);
+    e.load_r64_disp32(Reg::RAX, Reg::R13, offset_of!(Frame, probe) as i32);
+    e.add_r64_r64(Reg::RAX, Reg::RCX);
+    e.mov_r64_r64(Reg::R9, Reg::RAX);
+
+    e.load_r32_disp32(Reg::RDX, Reg::R13, offset_of!(Frame, probe_gen) as i32);
+    e.load_r32_disp8(Reg::RAX, Reg::R9, offset_of!(ProbeSlot, generation) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.load_r64_disp8(Reg::R8, Reg::R9, offset_of!(ProbeSlot, body) as i8);
+    e.cmp_r64_imm32(Reg::R8, 0);
+    e.jcc(4, counted_miss);
+
+    e.load_r32_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (registers + offset_of!(Registers, eip)) as i32,
+    );
+    e.load_r32_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, eip) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+
+    e.movzx_r32_word_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (cs + offset_of!(SegmentRegister, selector)) as i32,
+    );
+    e.movzx_r32_word_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, cs_selector) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.load_r32_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (cs + offset_of!(SegmentRegister, base)) as i32,
+    );
+    e.load_r32_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, cs_base) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.load_r32_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (cs + offset_of!(SegmentRegister, limit)) as i32,
+    );
+    e.load_r32_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, cs_limit) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.movzx_r32_byte_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (cs + offset_of!(SegmentRegister, access)) as i32,
+    );
+    e.movzx_r32_byte_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, cs_access) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.movzx_r32_byte_disp32(
+        Reg::RAX,
+        Reg::RBX,
+        (cs + offset_of!(SegmentRegister, default_size_32)) as i32,
+    );
+    e.movzx_r32_byte_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, flags) as i8);
+    e.and_r32_imm32(Reg::RDX, u32::from(PROBE_FLAG_D));
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.movzx_r32_byte_disp32(Reg::RAX, Reg::RBX, offset_of!(CpuGsw, cpl) as i32);
+    e.movzx_r32_byte_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, cpl) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+    e.load_r64_disp32(Reg::RAX, Reg::RBX, offset_of!(CpuGsw, class_table) as i32);
+    e.load_r64_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, table) as i8);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jcc(5, counted_miss);
+
+    let frame_cs = offset_of!(Frame, cs);
+    e.movzx_r32_word_disp8(Reg::RAX, Reg::R9, offset_of!(ProbeSlot, cs_selector) as i8);
+    e.store_r32_disp32(
+        Reg::R13,
+        (frame_cs + offset_of!(SegmentRegister, selector)) as i32,
+        Reg::RAX,
+    );
+    e.load_r32_disp8(Reg::RAX, Reg::R9, offset_of!(ProbeSlot, cs_base) as i8);
+    e.store_r32_disp32(
+        Reg::R13,
+        (frame_cs + offset_of!(SegmentRegister, base)) as i32,
+        Reg::RAX,
+    );
+    e.load_r32_disp8(Reg::RAX, Reg::R9, offset_of!(ProbeSlot, cs_limit) as i8);
+    e.store_r32_disp32(
+        Reg::R13,
+        (frame_cs + offset_of!(SegmentRegister, limit)) as i32,
+        Reg::RAX,
+    );
+    e.movzx_r32_byte_disp8(Reg::RAX, Reg::R9, offset_of!(ProbeSlot, cs_access) as i8);
+    e.movzx_r32_byte_disp8(Reg::RDX, Reg::R9, offset_of!(ProbeSlot, flags) as i8);
+    e.and_r32_imm32(Reg::RDX, u32::from(PROBE_FLAG_D));
+    e.shl_r32_imm8(Reg::RDX, 8);
+    e.add_r32_r32(Reg::RAX, Reg::RDX);
+    e.store_r32_disp32(
+        Reg::R13,
+        (frame_cs + offset_of!(SegmentRegister, access)) as i32,
+        Reg::RAX,
+    );
+
+    e.load_r64_disp8(Reg::RAX, Reg::R9, offset_of!(ProbeSlot, table) as i8);
+    e.store_r64_disp32(Reg::R13, offset_of!(Frame, table) as i32, Reg::RAX);
+    e.load_r32_disp8(
+        Reg::RAX,
+        Reg::R9,
+        offset_of!(ProbeSlot, source_present) as i8,
+    );
+    e.store_r32_disp32(Reg::R13, offset_of!(Frame, source_present) as i32, Reg::RAX);
+    e.load_r64_disp8(
+        Reg::RAX,
+        Reg::R9,
+        offset_of!(ProbeSlot, source_mapping) as i8,
+    );
+    e.store_r64_disp32(Reg::R13, offset_of!(Frame, source_mapping) as i32, Reg::RAX);
+    e.load_r64_disp8(Reg::RAX, Reg::R9, offset_of!(ProbeSlot, source_cost) as i8);
+    e.store_r64_disp32(Reg::R13, offset_of!(Frame, source_cost) as i32, Reg::RAX);
+
+    add_stat(e, offset_of!(Stats, entries));
+    add_stat(e, offset_of!(Stats, probe_hits));
+    e.jmp_r64(Reg::R8);
 }
 
 pub(super) fn compile(
