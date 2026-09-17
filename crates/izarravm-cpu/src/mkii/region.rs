@@ -18,7 +18,9 @@ fn validate_fetches<B: CpuBus>(
     let mut raw = 0;
     for op in operations {
         let linear = frame.cs.base.wrapping_add(op.eip);
-        let view = cpu.decode_cache.get_packed(linear, false)?;
+        let view = cpu
+            .decode_cache
+            .get_packed(linear, frame.cs.default_size_32)?;
         if view.len != op.insn.len
             || view.phys_start != op.physical
             || !CpuGsw::fetch_within_limit(op.eip, op.insn.len, frame.cs.limit)

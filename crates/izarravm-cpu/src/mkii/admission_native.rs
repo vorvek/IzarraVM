@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::mkii::runtime::{Session, Stats};
-use crate::{ControlRegisters, CpuPersona, SegmentIndex, SegmentRegister};
+use crate::{ControlRegisters, CpuPersona, Registers, SegmentIndex, SegmentRegister};
 use izarravm_bus::{MkiiBusSessionParts, MkiiCounterPath};
 use std::mem::offset_of;
 use std::sync::OnceLock;
@@ -11,16 +11,28 @@ use std::sync::OnceLock;
 const SESSION: usize = offset_of!(Frame, session);
 const BUS: usize = SESSION + offset_of!(Session, bus);
 
-pub(super) fn emit(e: &mut Encoder, op: &Operation, persona: CpuPersona, prepared: Label) {
-    emit_with(e, op, persona, prepared, |persona, segments| {
-        code_for(persona, segments).map(|code| code.entry_ptr() as usize)
-    });
+pub(super) fn emit(
+    e: &mut Encoder,
+    op: &Operation,
+    persona: CpuPersona,
+    cs_default_size_32: bool,
+    prepared: Label,
+) {
+    emit_with(
+        e,
+        op,
+        persona,
+        cs_default_size_32,
+        prepared,
+        |persona, segments| code_for(persona, segments).map(|code| code.entry_ptr() as usize),
+    );
 }
 
 pub(super) fn emit_with(
     e: &mut Encoder,
     op: &Operation,
     persona: CpuPersona,
+    cs_default_size_32: bool,
     prepared: Label,
     lookup: impl FnOnce(CpuPersona, u8) -> Option<usize>,
 ) {
@@ -43,8 +55,22 @@ pub(super) fn emit_with(
     e.mov_r64_imm64(Reg::R8, product / u64::from(den));
     e.mov_r64_imm64(Reg::R9, product % u64::from(den));
     e.mov_r32_imm32(Reg::R11, u32::from(region.store_segments));
+    let registers = offset_of!(CpuGsw, registers);
+    let cs_d = registers
+        + offset_of!(Registers, segments)
+        + SegmentIndex::Cs.index() * std::mem::size_of::<SegmentRegister>()
+        + offset_of!(SegmentRegister, default_size_32);
+    e.movzx_r32_byte_disp32(Reg::RAX, Reg::RBX, cs_d as i32);
+    e.cmp_r32_imm32(Reg::RAX, u32::from(cs_default_size_32));
+    let skip = e.label();
+    let after = e.label();
+    e.jcc(5, skip);
     e.mov_r64_imm64(Reg::RAX, entry as u64);
     e.call_r64(Reg::RAX);
+    e.jmp(after);
+    e.place(skip);
+    e.mov_r32_imm32(Reg::RAX, 0);
+    e.place(after);
     e.test_r32_r32(Reg::RAX, Reg::RAX);
     e.jcc(5, prepared);
 }
@@ -170,12 +196,6 @@ fn emit_body(e: &mut Encoder, persona: CpuPersona, segments: u8) {
     let cs = registers
         + offset_of!(Registers, segments)
         + SegmentIndex::Cs.index() * std::mem::size_of::<SegmentRegister>();
-    clear_byte(
-        e,
-        Reg::RBX,
-        cs + offset_of!(SegmentRegister, default_size_32),
-        miss,
-    );
     for (offset, width) in [
         (offset_of!(SegmentRegister, selector), BusWidth::Word),
         (offset_of!(SegmentRegister, base), BusWidth::Dword),

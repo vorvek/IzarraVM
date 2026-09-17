@@ -9,7 +9,12 @@ use crate::jit::fast_map::{
 use crate::mkii::ops::{Read, Store};
 use crate::{AddressSize, SegmentRegister};
 
-pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
+pub(super) fn emit(
+    e: &mut Encoder,
+    operations: &[Operation],
+    exit: Label,
+    cs_default_size_32: bool,
+) {
     let commit = e.label();
     let done = e.label();
     let mut exits = Vec::new();
@@ -47,7 +52,7 @@ pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
         && last
             .eip
             .checked_add(u32::from(last.insn.len))
-            .is_some_and(|eip| eip < 0x10000)
+            .is_some_and(|eip| cs_default_size_32 || eip < 0x10000)
     {
         e.load_r32_disp32(
             Reg::RAX,

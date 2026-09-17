@@ -80,12 +80,16 @@ pub(super) fn dispatcher() -> Option<Code> {
     })
 }
 
-pub(super) fn compile(operations: &[Operation], persona: crate::CpuPersona) -> Option<Code> {
+pub(super) fn compile(
+    operations: &[Operation],
+    persona: crate::CpuPersona,
+    cs_default_size_32: bool,
+) -> Option<Code> {
     #[cfg(not(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     )))]
-    let _ = persona;
+    let _ = (persona, cs_default_size_32);
     let mut e = Encoder::new();
     let info = entry(&mut e);
     let body = e.position();
@@ -112,7 +116,7 @@ pub(super) fn compile(operations: &[Operation], persona: crate::CpuPersona) -> O
             any(target_os = "windows", target_os = "linux")
         ))]
         if !pending_on_fallthrough {
-            admission::emit(&mut e, operation, persona, prepared);
+            admission::emit(&mut e, operation, persona, cs_default_size_32, prepared);
         }
         call_helper(&mut e, 13, operation as *const Operation as usize);
         e.cmp_r32_imm32(Reg::RAX, 2);
@@ -120,7 +124,7 @@ pub(super) fn compile(operations: &[Operation], persona: crate::CpuPersona) -> O
         e.test_r32_r32(Reg::RAX, Reg::RAX);
         e.jcc(4, slow);
         e.place(prepared);
-        region::emit(&mut e, &operations[index..end], exit);
+        region::emit(&mut e, &operations[index..end], exit, cs_default_size_32);
         e.jmp(next);
         e.place(slow);
         while index < end {

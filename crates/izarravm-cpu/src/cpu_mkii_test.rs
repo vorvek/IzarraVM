@@ -2906,3 +2906,178 @@ fn mkii_logical_region_caps_match_each_instruction_boundary() {
         }
     }
 }
+
+fn pm32_fixture(code: &[u8], eip: u32) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0u8; 0x20000];
+    let start = eip as usize;
+    memory[start..start + code.len()].copy_from_slice(code);
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.control.cr0 |= CR0_PE;
+    for segment in [SegmentIndex::Cs, SegmentIndex::Ds, SegmentIndex::Ss] {
+        cpu.load_segment_real(segment, 0);
+        cpu.registers.segments[segment.index()].default_size_32 = true;
+        cpu.registers.segments[segment.index()].limit = u32::MAX;
+    }
+    cpu.registers.set_esp(0x9000);
+    cpu.set_eip(eip);
+    cpu.set_jit_auto_admit(true);
+    cpu.set_dynarec_mkii_enabled(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.mkii_native_session = true;
+    (cpu, bus)
+}
+
+fn warm_from(cpu: &mut CpuGsw, bus: &mut TestBus, start: u32, len: u32) {
+    cpu.set_eip(start);
+    let end = start + len;
+    while cpu.registers.eip < end {
+        let lin = cpu.linear_eip();
+        cpu.fetch_decoded(bus, lin).unwrap();
+    }
+    cpu.set_eip(start);
+}
+
+fn retire_until_eip_moves(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    let start = cpu.registers.eip;
+    for cap in 1..200 {
+        cpu.run_budgeted(bus, cap).unwrap();
+        if cpu.registers.eip != start {
+            return;
+        }
+    }
+    panic!("eip did not move from {start:#x}");
+}
+
+#[test]
+fn mkii_context_allows_protected_32bit_cs() {
+    let (cpu, _) = pm32_fixture(&[0x90, 0x90], 0x10000);
+    assert!(cpu.mkii_enabled());
+}
+
+#[test]
+fn mkii_pm32_forms_a_trace_above_64k() {
+    let code = [0x90, 0x90];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    enable_read_regions(&mut bus);
+    warm_from(&mut cpu, &mut bus, 0x10000, code.len() as u32);
+    cpu.run_budgeted(&mut bus, 1000).unwrap();
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.compiled > 0, "{stats:?}");
+    assert!(stats.entries > 0, "{stats:?}");
+    assert!(stats.native >= 2, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+    assert!(cpu.registers.eip > 0x10000, "eip={:#x}", cpu.registers.eip);
+}
+
+#[test]
+fn mkii_pm16_does_not_own_eip_10000() {
+    let (mut cpu, mut bus) = fixture(&[0x90, 0x90]);
+    cpu.registers.segments[SegmentIndex::Cs.index()].limit = 0xffff;
+    cpu.registers.segments[SegmentIndex::Cs.index()].default_size_32 = false;
+    cpu.set_eip(0x10000);
+    assert!(cpu.fetch_decoded(&mut bus, cpu.linear_eip()).is_err());
+    assert_eq!(cpu.dynarec_mkii_stats().compiled, 0);
+}
+
+#[test]
+fn mkii_key_splits_pm16_and_pm32_at_the_same_linear() {
+    let code = [0xb8, 0x78, 0x56, 0x34, 0x12, 0xe4, 0x60];
+    let (mut pm16, mut bus16) = fixture(&code);
+    let (mut pm32, mut bus32) = pm32_fixture(&code, 0);
+    enable_read_regions(&mut bus16);
+    enable_read_regions(&mut bus32);
+    warm_code(&mut pm16, &mut bus16, 3);
+    warm_from(&mut pm32, &mut bus32, 0, 5);
+    retire_until_eip_moves(&mut pm16, &mut bus16);
+    retire_until_eip_moves(&mut pm32, &mut bus32);
+    assert!(pm16.dynarec_mkii_stats().compiled > 0);
+    assert!(pm32.dynarec_mkii_stats().compiled > 0);
+    assert_eq!(pm16.registers.eax() & 0xffff, 0x5678);
+    assert_eq!(pm32.registers.eax(), 0x1234_5678);
+    assert_eq!(pm16.registers.eip, 3);
+    assert_eq!(pm32.registers.eip, 5);
+
+    pm16.registers.segments[SegmentIndex::Cs.index()].default_size_32 = true;
+    pm16.registers.segments[SegmentIndex::Cs.index()].limit = u32::MAX;
+    pm16.set_eip(0);
+    pm16.registers.set_eax(0);
+    warm_from(&mut pm16, &mut bus16, 0, 5);
+    let compiled = pm16.dynarec_mkii_stats().compiled;
+    retire_until_eip_moves(&mut pm16, &mut bus16);
+    assert_eq!(pm16.registers.eax(), 0x1234_5678);
+    assert_eq!(pm16.registers.eip, 5);
+    assert!(pm16.dynarec_mkii_stats().compiled > compiled);
+}
+
+#[test]
+fn mkii_pm32_sequential_run_keeps_eip_10000() {
+    let code = [0x90, 0x90];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0xfffe);
+    bus.memory[0xfffe] = 0x90;
+    bus.memory[0xffff] = 0x90;
+    bus.memory[0x10000] = 0x90;
+    bus.memory[0x10001] = 0x90;
+    enable_read_regions(&mut bus);
+    warm_from(&mut cpu, &mut bus, 0xfffe, 4);
+    cpu.run_budgeted(&mut bus, 1000).unwrap();
+    assert!(cpu.registers.eip >= 0x10000, "eip={:#x}", cpu.registers.eip);
+    assert_ne!(cpu.registers.eip, 0);
+}
+
+#[test]
+fn mkii_pm32_user_page_region_matches_oracle() {
+    let code = [0x90, 0x90, 0xa1, 0x00, 0x10, 0x01, 0x00];
+    let eip = 0x10000;
+    let (mut cpu, mut bus) = pm32_fixture(&code, eip);
+    let (mut oracle, mut other) = pm32_fixture(&code, eip);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        cpu.control.cr0 |= CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        cpu.cpl = 3;
+        bus.memory[0x1000..0x1004].copy_from_slice(&(0x2000u32 | 7).to_le_bytes());
+        for page in 0..0x20u32 {
+            let offset = 0x2000 + page * 4;
+            bus.memory[offset as usize..offset as usize + 4]
+                .copy_from_slice(&((page << 12) | 7).to_le_bytes());
+        }
+        bus.memory[0x11000..0x11004].copy_from_slice(&0xaabb_ccddu32.to_le_bytes());
+        enable_read_regions(bus);
+        warm_from(cpu, bus, eip, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert!(
+        cpu.dynarec_mkii_stats().native > 0,
+        "{:?}",
+        cpu.dynarec_mkii_stats()
+    );
+    assert_eq!(cpu.registers.eax(), 0xaabb_ccdd);
+}
+
+#[test]
+fn mkii_pm32_unmapped_leaf_raises_page_fault() {
+    let code = [0xa1, 0x00, 0x00, 0x12, 0x00];
+    let eip = 0x10000;
+    let (mut cpu, mut bus) = pm32_fixture(&code, eip);
+    let (mut oracle, mut other) = pm32_fixture(&code, eip);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        cpu.control.cr0 |= CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        cpu.cpl = 3;
+        bus.memory[0x1000..0x1004].copy_from_slice(&(0x2000u32 | 7).to_le_bytes());
+        for page in 0..0x11u32 {
+            let offset = 0x2000 + page * 4;
+            bus.memory[offset as usize..offset as usize + 4]
+                .copy_from_slice(&((page << 12) | 7).to_le_bytes());
+        }
+        enable_read_regions(bus);
+        warm_from(cpu, bus, eip, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.registers.eip, eip);
+}

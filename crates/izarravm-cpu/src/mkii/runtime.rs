@@ -27,6 +27,7 @@ struct Key {
     cs_limit: u32,
     cs_selector: u16,
     cpl: u8,
+    cs_default_size_32: bool,
 }
 
 struct Trace {
@@ -377,13 +378,10 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
     cpu.core_clocks_so_far = frame.total;
     cpu.begin_instruction();
     let lin = cpu.linear_eip();
-    let warm = cpu
-        .decode_cache
-        .get_packed(lin, false)
-        .is_some_and(|screen| {
-            screen.phys_start == operation.physical && screen.len == operation.insn.len
-        })
-        && CpuGsw::fetch_within_limit(operation.eip, operation.insn.len, frame.cs.limit);
+    let d = cpu.registers.cs().default_size_32;
+    let warm = cpu.decode_cache.get_packed(lin, d).is_some_and(|screen| {
+        screen.phys_start == operation.physical && screen.len == operation.insn.len
+    }) && CpuGsw::fetch_within_limit(operation.eip, operation.insn.len, frame.cs.limit);
     let decoded;
     let fetched = if warm {
         cpu.charge_cached_fetch_at(bus, lin, operation.insn.len, operation.physical)
@@ -421,7 +419,7 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
     }
     if !warm
         && (*insn != operation.insn
-            || cpu.decode_cache.line_phys_start(lin, false) != Some(operation.physical))
+            || cpu.decode_cache.line_phys_start(lin, d) != Some(operation.physical))
     {
         frame.stats.mismatches += 1;
         frame.fetched = Some(Fetched {
@@ -574,7 +572,10 @@ unsafe extern "C" fn prepare_span<B: CpuBus>(
     let mut raw_bus = memory.map_or(0, |(_, _, _, clocks)| clocks);
     for (index, op) in operations.iter().enumerate() {
         let linear = frame.cs.base.wrapping_add(op.eip);
-        let Some(view) = cpu.decode_cache.get_packed(linear, false) else {
+        let Some(view) = cpu
+            .decode_cache
+            .get_packed(linear, frame.cs.default_size_32)
+        else {
             return 0;
         };
         if view.len != op.insn.len
@@ -760,7 +761,8 @@ impl Engine {
         let cs = cpu.registers.cs();
         let eip = cpu.registers.eip;
         let lin = cpu.linear_eip();
-        let physical = cpu.decode_cache.line_phys_start(lin, false)?;
+        let d = cs.default_size_32;
+        let physical = cpu.decode_cache.line_phys_start(lin, d)?;
         bus.jit_preflight_cached_fetch(lin, physical, 1)?;
         let key = Key {
             table: cpu.class_table() as *const _ as usize,
@@ -770,6 +772,7 @@ impl Engine {
             cs_limit: cs.limit,
             cs_selector: cs.selector,
             cpl: cpu.cpl,
+            cs_default_size_32: d,
         };
         let mut existing = self.lookup(key);
         let extension = if let Some(index) = existing {
@@ -809,7 +812,7 @@ impl Engine {
                 .map_or(eip, |op| op.eip + u32::from(op.insn.len));
             let mut open_tail = None;
             while operations.len() < 64
-                && next < 0x10000
+                && (d || next < 0x10000)
                 && next <= cs.limit
                 && cs.base.wrapping_add(next) >> 12 == lin >> 12
                 && operations.last().is_none_or(trace_can_continue_after)
@@ -875,7 +878,7 @@ impl Engine {
             if std::mem::take(&mut self.fail_next_compile) {
                 return existing.and_then(|index| self.arena[index].as_ref());
             }
-            let Some(code) = super::native::compile(&operations, cpu.persona()) else {
+            let Some(code) = super::native::compile(&operations, cpu.persona(), d) else {
                 return existing.and_then(|index| self.arena[index].as_ref());
             };
             let last = operations.last().unwrap();
@@ -925,7 +928,7 @@ impl Engine {
         physical: u32,
     ) -> Option<Operation> {
         let linear = cs.base.wrapping_add(eip);
-        let view = cpu.decode_cache.get_view(linear, false)?;
+        let view = cpu.decode_cache.get_view(linear, cs.default_size_32)?;
         if !CpuGsw::fetch_within_limit(eip, view.insn.len, cs.limit)
             || (0xa0..=0xbf).contains(&(view.phys_start >> 12))
             || (linear & 0xfff) + u32::from(view.insn.len) > 4096
@@ -1112,7 +1115,6 @@ impl CpuGsw {
     pub(super) fn mkii_context(&self) -> bool {
         self.is_protected_mode()
             && !self.is_v86_mode()
-            && !self.registers.cs().default_size_32
             && !self.rep_resume_active
             && self.registers.eflags & FLAG_TF == 0
     }

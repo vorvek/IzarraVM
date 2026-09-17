@@ -13,6 +13,14 @@ struct Probe {
 }
 
 fn probe_code(op: &Operation, persona: crate::CpuPersona) -> ExecutableBuffer {
+    probe_code_for(op, persona, false)
+}
+
+fn probe_code_for(
+    op: &Operation,
+    persona: crate::CpuPersona,
+    cs_default_size_32: bool,
+) -> ExecutableBuffer {
     let mut e = Encoder::new();
     let unwind = entry(&mut e);
     for (index, register) in SAVED.into_iter().enumerate() {
@@ -21,7 +29,7 @@ fn probe_code(op: &Operation, persona: crate::CpuPersona) -> ExecutableBuffer {
     let prepared = e.label();
     let check = e.label();
     let corrupt = e.label();
-    admission::emit(&mut e, op, persona, prepared);
+    admission::emit(&mut e, op, persona, cs_default_size_32, prepared);
     e.mov_r32_imm32(Reg::R9, 0);
     e.jmp(check);
     e.place(prepared);
@@ -161,7 +169,7 @@ fn mkii_shared_admission_failed_lookup_emits_no_call() {
     let mut e = Encoder::new();
     let prepared = e.label();
     let mut lookups = 0;
-    admission::emit_with(&mut e, &ops[0], cpu.persona(), prepared, |_, _| {
+    admission::emit_with(&mut e, &ops[0], cpu.persona(), false, prepared, |_, _| {
         lookups += 1;
         None
     });
@@ -381,4 +389,42 @@ fn mkii_native_admission_refuses_live_guards_before_publication() {
             assert_eq!(published(&cpu, &frame), before, "case={case}");
         }
     }
+}
+
+#[test]
+fn mkii_native_admission_accepts_matching_pm32_cs() {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(crate::GswMode::Gsw586);
+    let mut ops = operations(&[0x90, 0x90]);
+    ops[0].region_len = 2;
+    ops[0].region = Some(crate::mkii::ops::Region::build(cpu.class_table(), &ops));
+    let code = probe_code_for(&ops[0], cpu.persona(), true);
+    let invoke: unsafe extern "C" fn(*mut CpuGsw, *mut Probe, *mut Frame) -> u32 =
+        unsafe { std::mem::transmute(code.entry_ptr()) };
+    let (mut cpu, mut frame, mut probe) = fixture(crate::GswMode::Gsw586);
+    cpu.registers.segments[crate::SegmentIndex::Cs.index()].default_size_32 = true;
+    frame.cs.default_size_32 = true;
+    frame.session.raw_limit = u64::MAX / frame.session.bus.bus_numerator;
+    frame.session.threshold_limit = u64::MAX / frame.session.bus.bus_denominator;
+    let accepted = unsafe { invoke(&mut cpu, &mut probe, &mut frame) };
+    assert_eq!(accepted, 1);
+}
+
+#[test]
+fn mkii_native_admission_bakes_compile_time_cs_d() {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(crate::GswMode::Gsw586);
+    let mut ops = operations(&[0x90, 0x90]);
+    ops[0].region_len = 2;
+    ops[0].region = Some(crate::mkii::ops::Region::build(cpu.class_table(), &ops));
+    let code = probe_code_for(&ops[0], cpu.persona(), false);
+    let invoke: unsafe extern "C" fn(*mut CpuGsw, *mut Probe, *mut Frame) -> u32 =
+        unsafe { std::mem::transmute(code.entry_ptr()) };
+    let (mut cpu, mut frame, mut probe) = fixture(crate::GswMode::Gsw586);
+    cpu.registers.segments[crate::SegmentIndex::Cs.index()].default_size_32 = true;
+    frame.cs.default_size_32 = true;
+    frame.session.raw_limit = u64::MAX / frame.session.bus.bus_numerator;
+    frame.session.threshold_limit = u64::MAX / frame.session.bus.bus_denominator;
+    let accepted = unsafe { invoke(&mut cpu, &mut probe, &mut frame) };
+    assert_eq!(accepted, 0);
 }

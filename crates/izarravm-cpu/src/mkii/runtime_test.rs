@@ -59,6 +59,7 @@ impl CpuGsw {
         let code = super::super::native::compile(
             &operations[if adjacent { 0 } else { 4 }..],
             self.persona(),
+            self.registers.cs().default_size_32,
         )
         .unwrap();
         // SAFETY: operations, bus, frame and both generated allocations outlive this call.
@@ -164,7 +165,12 @@ fn install_operations(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let code = super::super::native::compile(&operations, cpu.persona()).unwrap();
+    let code = super::super::native::compile(
+        &operations,
+        cpu.persona(),
+        cpu.registers.cs().default_size_32,
+    )
+    .unwrap();
     for operation in &operations {
         cpu.mkii_watch_source(operation.physical, u32::from(operation.insn.len));
     }
@@ -180,6 +186,7 @@ fn install_operations(
         cs_limit: 0xffff,
         cs_selector: 0,
         cpl: 0,
+        cs_default_size_32: cpu.registers.cs().default_size_32,
     };
     engine.traces.insert(key, index);
     engine.arena[index] = Some(Trace {
@@ -314,7 +321,12 @@ fn mkii_ff6_source_or_backing_change_refuses_guarded_suffixes() {
                     &operations[1..],
                 ));
             }
-            let _code = super::super::native::compile(&operations, cpu.persona()).unwrap();
+            let _code = super::super::native::compile(
+                &operations,
+                cpu.persona(),
+                cpu.registers.cs().default_size_32,
+            )
+            .unwrap();
             cpu.set_eip(0);
             cpu.jit_direct.mkii.code_dirty = false;
             cpu.jit_direct.mkii.mapping_dirty = false;
@@ -699,6 +711,10 @@ fn mkii_dispatch_cache_checks_full_keys_and_forgets_retired_arena_slots() {
             ..first
         },
         Key { table: 1, ..first },
+        Key {
+            cs_default_size_32: true,
+            ..first
+        },
     ] {
         assert_eq!(engine.lookup(alias), None);
         assert_eq!(engine.lookup(first), Some(first_index));
