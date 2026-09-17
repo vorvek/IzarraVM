@@ -871,10 +871,13 @@ impl Engine {
                 {
                     end += 1;
                 }
+                if end < operations.len()
+                    && (operations[end].store.is_some()
+                        || (d && operations[end].is_dword_near_transfer()))
+                {
+                    end += 1;
+                }
                 if end - start >= 2 {
-                    if end < operations.len() && operations[end].store.is_some() {
-                        end += 1;
-                    }
                     let x87_top = operations[start..end]
                         .iter()
                         .any(|op| op.x87.is_some())

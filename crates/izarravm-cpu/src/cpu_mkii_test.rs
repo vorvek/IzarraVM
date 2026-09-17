@@ -3101,3 +3101,24 @@ fn mkii_pm32_native_x87_register_matches_oracle() {
         cpu.dynarec_mkii_stats()
     );
 }
+
+#[test]
+fn mkii_pm32_native_jmp_call_ret_match_oracle() {
+    let code = [
+        0x90, 0x90, 0xe8, 0x01, 0x00, 0x00, 0x00, 0x90, 0xc3, 0x90, 0x90, 0xeb, 0x00,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        cpu.registers.segments[SegmentIndex::Ss.index()].default_size_32 = true;
+        cpu.registers.set_esp(0x9000);
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.regions > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}

@@ -70,6 +70,13 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
     cpu.settle_write_record();
     // SAFETY: this region is a contiguous part of the leased operation allocation.
     let operations = unsafe { std::slice::from_raw_parts(operation, first.region_len) };
+    if operations
+        .last()
+        .is_some_and(|op| matches!(op.insn.opcode, 0xe8 | 0xc3) && op.is_dword_near_transfer())
+        && !cpu.stack_is_32bit()
+    {
+        return 0;
+    }
     let region = first.region.as_ref().unwrap();
     let mut segments = region.segments;
     while segments != 0 {

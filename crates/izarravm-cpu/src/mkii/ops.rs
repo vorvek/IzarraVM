@@ -101,6 +101,22 @@ impl Region {
                 store_segments |= 1 << store.address.segment.index();
                 segments |= 1 << store.address.segment.index();
             }
+            if op.is_dword_near_transfer() {
+                match op.insn.opcode {
+                    0xe8 => {
+                        cost.delta.add_ram_accesses(BusWidth::Dword, 1);
+                        cost.writes += 1;
+                        segments |= 1 << SegmentIndex::Ss.index();
+                        store_segments |= 1 << SegmentIndex::Ss.index();
+                    }
+                    0xc3 => {
+                        cost.delta.add_ram_accesses(BusWidth::Dword, 1);
+                        cost.reads += 1;
+                        segments |= 1 << SegmentIndex::Ss.index();
+                    }
+                    _ => {}
+                }
+            }
             if let Some(x87) = op.x87 {
                 has_x87 = true;
                 if let Some(access) = x87.metadata().memory {
@@ -208,7 +224,23 @@ impl Operation {
             .or(self.read.map(|read| read.class))
             .or(self.store.map(|store| store.class))
             .or(self.x87.map(NativeX87Insn::timing_class))
+            .or(self.near_transfer_class())
             .unwrap_or(TimingClass::Jcc)
+    }
+
+    pub fn is_dword_near_transfer(&self) -> bool {
+        self.insn.operand_size == OperandSize::Dword
+            && matches!(self.insn.opcode, 0xe8 | 0xe9 | 0xeb | 0xc3)
+    }
+
+    pub fn near_transfer_class(&self) -> Option<TimingClass> {
+        if !self.is_dword_near_transfer() {
+            return None;
+        }
+        Some(match self.insn.opcode {
+            0xc3 => TimingClass::RetNear,
+            _ => TimingClass::CallJmpRel,
+        })
     }
 
     pub fn region_pure(&self) -> Option<(Pure, TimingClass)> {

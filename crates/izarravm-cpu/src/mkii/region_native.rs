@@ -10,7 +10,8 @@ use crate::jit::native_x87::{NativeX87Insn, NativeX87MemoryDirection};
 use crate::jit::x87_avx2_emit::{Avx2X87EmitContext, emit_enter, emit_native_x87, emit_spill};
 use crate::mkii::ops::{Read, Store};
 use crate::mkii::runtime::Frame;
-use crate::{AddressSize, SegmentRegister};
+use crate::timing_class::TimingClass;
+use crate::{AddrMode, AddressSize, SegmentIndex, SegmentRegister};
 
 pub(super) fn emit(
     e: &mut Encoder,
@@ -54,6 +55,10 @@ pub(super) fn emit(
             let miss = e.label();
             emit_store(e, store, miss);
             exits.push((miss, index, 1, x87_live));
+        } else if op.is_dword_near_transfer() {
+            let miss = e.label();
+            emit_near_transfer(e, op, miss);
+            exits.push((miss, index, 1, x87_live));
         } else {
             let (alu, width) = operations[index - 1].branch_alu().unwrap();
             let taken = e.label();
@@ -73,6 +78,7 @@ pub(super) fn emit(
     let last = operations.last().unwrap();
     if operations.len() >= 2
         && last.store.is_none()
+        && !last.is_dword_near_transfer()
         && last
             .eip
             .checked_add(u32::from(last.insn.len))
@@ -687,5 +693,84 @@ fn emit_x87_op(e: &mut Encoder, x87: NativeX87Insn, top: u8, check_gate: bool, m
             check_gate,
             top,
         },
+    );
+}
+
+fn emit_near_transfer(e: &mut Encoder, op: &Operation, miss: Label) {
+    let len = u32::from(op.insn.len);
+    let return_eip = op.eip.wrapping_add(len);
+    let target = return_eip.wrapping_add(op.insn.imm);
+    let eip =
+        (std::mem::offset_of!(CpuGsw, registers) + std::mem::offset_of!(Registers, eip)) as i32;
+    let esp = super::gpr_offset(4, BusWidth::Dword);
+    match op.insn.opcode {
+        0xe8 => {
+            emit_store_into(
+                e,
+                Store {
+                    address: AddrMode {
+                        segment: SegmentIndex::Ss,
+                        base: Some(4),
+                        index: None,
+                        scale: 1,
+                        disp: -4,
+                        address_size: AddressSize::Dword,
+                    },
+                    width: BusWidth::Dword,
+                    src: Input::Immediate(return_eip),
+                    class: TimingClass::CallJmpRel,
+                },
+                miss,
+                true,
+            );
+            e.store_u32_imm_disp32(Reg::R8, 0, return_eip);
+            e.load_r32_disp32(Reg::R10, Reg::RBX, esp);
+            e.alu_r32_imm32(5, Reg::R10, 4);
+            e.store_r32_disp32(Reg::RBX, esp, Reg::R10);
+            e.store_u32_imm_disp32(Reg::RBX, eip, target);
+        }
+        0xe9 | 0xeb => {
+            e.store_u32_imm_disp32(Reg::RBX, eip, target);
+        }
+        0xc3 => {
+            emit_read_into(
+                e,
+                Read {
+                    address: AddrMode {
+                        segment: SegmentIndex::Ss,
+                        base: Some(4),
+                        index: None,
+                        scale: 1,
+                        disp: 0,
+                        address_size: AddressSize::Dword,
+                    },
+                    width: BusWidth::Dword,
+                    dst: 0,
+                    alu: None,
+                    class: TimingClass::RetNear,
+                },
+                miss,
+                true,
+            );
+            e.load_r32_disp32(Reg::RAX, Reg::R8, 0);
+            e.load_r32_disp32(
+                Reg::RDX,
+                Reg::R13,
+                (std::mem::offset_of!(Frame, cs) + std::mem::offset_of!(SegmentRegister, limit))
+                    as i32,
+            );
+            e.alu_r32_r32(7, Reg::RAX, Reg::RDX);
+            e.jcc(7, miss);
+            e.load_r32_disp32(Reg::R10, Reg::RBX, esp);
+            e.alu_r32_imm32(0, Reg::R10, 4);
+            e.store_r32_disp32(Reg::RBX, esp, Reg::R10);
+            e.store_r32_disp32(Reg::RBX, eip, Reg::RAX);
+        }
+        _ => {}
+    }
+    e.store_u32_imm_disp32(
+        Reg::R13,
+        std::mem::offset_of!(Frame, branch_taken) as i32,
+        1,
     );
 }
