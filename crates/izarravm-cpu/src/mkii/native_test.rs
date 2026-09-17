@@ -615,7 +615,7 @@ fn mkii_inert_emission_commits_before_a_helper_without_a_finish_callback() {
         cpu.fast_map_probe.hits = 29;
         let mut bus = crate::tests::TestBus::with_memory(Vec::new());
         let mut frame = Frame::new(&cpu, &mut bus, 1000);
-        frame.helpers = [observe; 15];
+        frame.helpers = [observe; 16];
         frame.helpers[13] = prepare;
         frame.helpers[14] = finish;
         frame.resolve = resolve;

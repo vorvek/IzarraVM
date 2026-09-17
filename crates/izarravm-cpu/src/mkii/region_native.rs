@@ -6,7 +6,10 @@ use crate::jit::fast_map::{
     NATIVE_LOAD_BIAS_MODE13, NATIVE_LOAD_BIAS_SUPERVISOR, NATIVE_LOAD_BIAS_TAG_MASK,
     NATIVE_STORE_BIAS_MODE13, NATIVE_STORE_BIAS_SUPERVISOR, NATIVE_STORE_BIAS_TAG_MASK,
 };
+use crate::jit::native_x87::{NativeX87Insn, NativeX87MemoryDirection};
+use crate::jit::x87_avx2_emit::{Avx2X87EmitContext, emit_enter, emit_native_x87, emit_spill};
 use crate::mkii::ops::{Read, Store};
+use crate::mkii::runtime::Frame;
 use crate::{AddressSize, SegmentRegister};
 
 pub(super) fn emit(
@@ -18,28 +21,49 @@ pub(super) fn emit(
     let commit = e.label();
     let done = e.label();
     let mut exits = Vec::new();
+    let mut x87_top = operations
+        .first()
+        .and_then(|op| op.region.as_ref())
+        .and_then(|region| region.x87_top);
+    let mut x87_live = false;
+    let mut x87_gate = true;
     for (index, op) in operations.iter().enumerate() {
         if op.needs_carry_zero() {
             let miss = e.label();
             emit_carry_zero_guard(e, miss);
-            exits.push((miss, index, 2));
+            exits.push((miss, index, 2, x87_live));
         }
-        if let Some((pure, _)) = op.region_pure() {
+        if let Some(x87) = op.x87 {
+            if !x87_live {
+                emit_x87_save_host(e);
+                emit_enter(e, Reg::RBX);
+                x87_live = true;
+            }
+            let miss = e.label();
+            emit_x87_op(e, x87, x87_top.unwrap_or(0), x87_gate, miss);
+            x87_gate = false;
+            x87_top = Some(x87.advance_top(x87_top.unwrap_or(0)));
+            exits.push((miss, index, 1, true));
+        } else if let Some((pure, _)) = op.region_pure() {
             emit_pure(e, pure);
         } else if let Some(read) = op.read {
             let miss = e.label();
             emit_read(e, read, miss);
-            exits.push((miss, index, 1));
+            exits.push((miss, index, 1, x87_live));
         } else if let Some(store) = op.store {
             let miss = e.label();
             emit_store(e, store, miss);
-            exits.push((miss, index, 1));
+            exits.push((miss, index, 1, x87_live));
         } else {
             let (alu, width) = operations[index - 1].branch_alu().unwrap();
             let taken = e.label();
             emit_branch(e, op, alu, width, taken);
-            exits.push((taken, index + 1, 0));
+            exits.push((taken, index + 1, 0, x87_live));
         }
+    }
+    if x87_live {
+        emit_spill(e, Reg::RBX);
+        emit_x87_restore_host(e);
     }
     e.store_u32_imm_disp32(
         Reg::R13,
@@ -65,7 +89,9 @@ pub(super) fn emit(
         e.jmp(done);
     }
     e.jmp(commit);
-    for (label, completed, reason) in exits {
+    let spill = e.label();
+    let mut needs_spill = false;
+    for (label, completed, reason, x87) in exits {
         e.place(label);
         e.store_u32_imm_disp32(
             Reg::R13,
@@ -77,6 +103,17 @@ pub(super) fn emit(
             std::mem::offset_of!(Frame, region_guard_miss) as i32,
             reason,
         );
+        if x87 {
+            needs_spill = true;
+            e.jmp(spill);
+        } else {
+            e.jmp(commit);
+        }
+    }
+    if needs_spill {
+        e.place(spill);
+        emit_spill(e, Reg::RBX);
+        emit_x87_restore_host(e);
         e.jmp(commit);
     }
     e.place(commit);
@@ -248,6 +285,10 @@ fn emit_carry_zero_guard(e: &mut Encoder, miss: Label) {
 }
 
 fn emit_read(e: &mut Encoder, read: Read, miss: Label) {
+    emit_read_into(e, read, miss, false);
+}
+
+fn emit_read_into(e: &mut Encoder, read: Read, miss: Label, pointer_only: bool) {
     let address = read.address;
     let address_width = if address.address_size == AddressSize::Word {
         BusWidth::Word
@@ -362,6 +403,9 @@ fn emit_read(e: &mut Encoder, read: Read, miss: Label) {
     e.place(permitted);
     e.and_r64_imm32(Reg::R8, !(NATIVE_LOAD_BIAS_TAG_MASK as u32));
     e.add_r64_r64(Reg::R8, Reg::R10);
+    if pointer_only {
+        return;
+    }
     match read.width {
         BusWidth::Byte => e.movzx_r32_byte_disp32(Reg::RDX, Reg::R8, 0),
         BusWidth::Word => e.movzx_r32_word_disp32(Reg::RDX, Reg::R8, 0),
@@ -379,6 +423,10 @@ fn emit_read(e: &mut Encoder, read: Read, miss: Label) {
 }
 
 fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
+    emit_store_into(e, store, miss, false);
+}
+
+fn emit_store_into(e: &mut Encoder, store: Store, miss: Label, pointer_only: bool) {
     let address = store.address;
     let address_width = if address.address_size == AddressSize::Word {
         BusWidth::Word
@@ -512,10 +560,132 @@ fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
         std::mem::offset_of!(Frame, region_write_count) as i32,
         1,
     );
+    if pointer_only {
+        return;
+    }
     load(e, Reg::RDX, store.src, store.width);
     match store.width {
         BusWidth::Byte => e.store_r8_disp8(Reg::R8, 0, Reg::RDX),
         BusWidth::Word => e.store_r16_disp32(Reg::R8, 0, Reg::RDX),
         BusWidth::Dword => e.store_r32_disp32(Reg::R8, 0, Reg::RDX),
     }
+}
+
+fn emit_x87_save_host(e: &mut Encoder) {
+    e.store_r64_disp32(
+        Reg::R13,
+        std::mem::offset_of!(Frame, x87_save_rsi) as i32,
+        Reg::RSI,
+    );
+    e.store_r64_disp32(
+        Reg::R13,
+        std::mem::offset_of!(Frame, x87_save_rdi) as i32,
+        Reg::RDI,
+    );
+    #[cfg(target_os = "windows")]
+    {
+        use crate::jit::encoder::Xmm;
+        const XMMS: [Xmm; 6] = [
+            Xmm::XMM6,
+            Xmm::XMM7,
+            Xmm::XMM8,
+            Xmm::XMM9,
+            Xmm::XMM10,
+            Xmm::XMM11,
+        ];
+        let base = std::mem::offset_of!(Frame, x87_save_xmm) as i32;
+        for (index, xmm) in XMMS.into_iter().enumerate() {
+            e.vmovupd_disp32_xmm(Reg::R13, base + index as i32 * 16, xmm);
+        }
+    }
+}
+
+fn emit_x87_restore_host(e: &mut Encoder) {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::jit::encoder::Xmm;
+        const XMMS: [Xmm; 6] = [
+            Xmm::XMM6,
+            Xmm::XMM7,
+            Xmm::XMM8,
+            Xmm::XMM9,
+            Xmm::XMM10,
+            Xmm::XMM11,
+        ];
+        let base = std::mem::offset_of!(Frame, x87_save_xmm) as i32;
+        for (index, xmm) in XMMS.into_iter().enumerate() {
+            e.vmovupd_xmm_disp32(xmm, Reg::R13, base + index as i32 * 16);
+        }
+    }
+    e.load_r64_disp32(
+        Reg::RSI,
+        Reg::R13,
+        std::mem::offset_of!(Frame, x87_save_rsi) as i32,
+    );
+    e.load_r64_disp32(
+        Reg::RDI,
+        Reg::R13,
+        std::mem::offset_of!(Frame, x87_save_rdi) as i32,
+    );
+}
+
+fn emit_x87_op(e: &mut Encoder, x87: NativeX87Insn, top: u8, check_gate: bool, miss: Label) {
+    let memory = x87.metadata().memory.and_then(|access| {
+        let address = match x87 {
+            NativeX87Insn::BinaryMemory { addr, .. }
+            | NativeX87Insn::IntBinaryMemory { addr, .. }
+            | NativeX87Insn::LoadF32 { addr }
+            | NativeX87Insn::StoreF32 { addr, .. }
+            | NativeX87Insn::LoadI32 { addr }
+            | NativeX87Insn::StoreI32 { addr, .. }
+            | NativeX87Insn::LoadControlWord { addr }
+            | NativeX87Insn::StoreControlWord { addr } => addr,
+            _ => return None,
+        };
+        let width = if access.width <= 2 {
+            BusWidth::Word
+        } else {
+            BusWidth::Dword
+        };
+        let write = access.direction == NativeX87MemoryDirection::Write;
+        if write {
+            emit_store_into(
+                e,
+                Store {
+                    address,
+                    width,
+                    src: Input::Reg(0),
+                    class: x87.timing_class(),
+                },
+                miss,
+                true,
+            );
+        } else {
+            emit_read_into(
+                e,
+                Read {
+                    address,
+                    width,
+                    dst: 0,
+                    alu: None,
+                    class: x87.timing_class(),
+                },
+                miss,
+                true,
+            );
+        }
+        e.mov_r64_r64(Reg::RDI, Reg::R8);
+        Some(Reg::RDI)
+    });
+    emit_native_x87(
+        e,
+        x87,
+        Avx2X87EmitContext {
+            cpu: Reg::RBX,
+            memory,
+            side_exit: miss,
+            check_gate,
+            top,
+        },
+    );
 }

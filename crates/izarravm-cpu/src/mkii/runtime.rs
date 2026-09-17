@@ -125,7 +125,7 @@ impl Session {
 }
 
 pub(super) struct Frame {
-    pub helpers: [Helper; 15],
+    pub helpers: [Helper; 16],
     pub resolve: Resolver,
     pub dispatch: usize,
     engine: *mut Engine,
@@ -159,6 +159,9 @@ pub(super) struct Frame {
     pub(super) source_mapping: u64,
     pub(super) source_cost: u64,
     pub(super) session: Session,
+    pub x87_save_rsi: u64,
+    pub x87_save_rdi: u64,
+    pub x87_save_xmm: [u128; 6],
     pending: Option<Pending>,
     fetched: Option<Fetched>,
     poll_16_armed: bool,
@@ -202,6 +205,7 @@ impl Frame {
                 prepare_span::<B>,
                 region::prepare::<B>,
                 region::finish::<B>,
+                step::<B, 15>,
             ],
             resolve: resolve::<B>,
             dispatch: 0,
@@ -236,6 +240,9 @@ impl Frame {
             source_mapping: 0,
             source_cost: 0,
             session: Session::default(),
+            x87_save_rsi: 0,
+            x87_save_rdi: 0,
+            x87_save_xmm: [0; 6],
             pending: None,
             fetched: None,
             poll_16_armed: cpu.jit_direct.direct_poll_skip_16_armed_for(),
@@ -481,6 +488,7 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
         8 => cpu.execute_control_flow_decoded(insn, bus, &mut work.committed),
         9 => cpu.execute_bitmanip_decoded(insn, bus),
         10 => cpu.execute_condmove_decoded(insn, bus),
+        15 => cpu.execute_fpu_decoded(insn, bus),
         _ => unreachable!(),
     };
     let succeeded = result.is_ok();
@@ -856,6 +864,7 @@ impl Engine {
                 while end < operations.len()
                     && (operations[end].region_pure().is_some()
                         || operations[end].read.is_some()
+                        || operations[end].x87.is_some()
                         || (end > start
                             && operations[end - 1].branch_alu().is_some()
                             && matches!(operations[end].insn.opcode, 0x70..=0x7f)))
@@ -866,10 +875,15 @@ impl Engine {
                     if end < operations.len() && operations[end].store.is_some() {
                         end += 1;
                     }
+                    let x87_top = operations[start..end]
+                        .iter()
+                        .any(|op| op.x87.is_some())
+                        .then_some(x87_top_at(&operations[..start], cpu.fpu.top()));
                     operations[start].region_len = end - start;
-                    operations[start].region = Some(super::ops::Region::build(
+                    operations[start].region = Some(super::ops::Region::build_with_x87(
                         cpu.class_table(),
                         &operations[start..end],
+                        x87_top,
                     ));
                 }
                 start = end.max(start + 1);
@@ -937,8 +951,19 @@ impl Engine {
             return None;
         }
         bus.jit_preflight_cached_fetch(linear, view.phys_start, view.insn.len)?;
-        Operation::lower(eip, view.phys_start, view.insn)
+        let operation = Operation::lower(eip, view.phys_start, view.insn)?;
+        if operation.x87.is_some() && !cs.default_size_32 {
+            return None;
+        }
+        Some(operation)
     }
+}
+
+fn x87_top_at(prefix: &[Operation], start: u8) -> u8 {
+    prefix
+        .iter()
+        .filter_map(|op| op.x87)
+        .fold(start, |top, x87| x87.advance_top(top))
 }
 
 fn trace_can_continue_after(operation: &Operation) -> bool {

@@ -124,6 +124,19 @@ pub(super) fn compile(
         e.test_r32_r32(Reg::RAX, Reg::RAX);
         e.jcc(4, slow);
         e.place(prepared);
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(top) = operation.region.as_ref().and_then(|region| region.x87_top) {
+            let status = std::mem::offset_of!(CpuGsw, fpu)
+                + crate::jit::native_x87::native_x87_layout().status;
+            e.movzx_r32_word_disp32(Reg::RAX, Reg::RBX, status as i32);
+            e.shr_r32_imm8(Reg::RAX, 11);
+            e.and_r32_imm32(Reg::RAX, 7);
+            e.cmp_r32_imm32(Reg::RAX, u32::from(top));
+            e.jcc(5, slow);
+        }
         region::emit(&mut e, &operations[index..end], exit, cs_default_size_32);
         e.jmp(next);
         e.place(slow);

@@ -3081,3 +3081,23 @@ fn mkii_pm32_unmapped_leaf_raises_page_fault() {
     compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
     assert_eq!(cpu.registers.eip, eip);
 }
+
+#[test]
+fn mkii_pm32_native_x87_register_matches_oracle() {
+    let code = [0x90, 0xd9, 0xe8, 0xd9, 0xee, 0xd8, 0xc1];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.fpu.top(), oracle.fpu.top());
+    assert!(
+        cpu.dynarec_mkii_stats().native > 0,
+        "{:?}",
+        cpu.dynarec_mkii_stats()
+    );
+}
