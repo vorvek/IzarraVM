@@ -3157,6 +3157,61 @@ fn mkii_pm32_x87_m64_page_cross_misses_native() {
 }
 
 #[test]
+fn mkii_pm32_native_x87_i64_fild_fistp_chop_matches_oracle() {
+    let code = [
+        0x90, 0xdd, 0x05, 0x00, 0x20, 0x00, 0x00, 0xdf, 0x3d, 0x08, 0x20, 0x00, 0x00,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for cpu in [&mut cpu, &mut oracle] {
+        cpu.fpu.control = 0x0f7f;
+    }
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2000..0x2008].copy_from_slice(&3.5f64.to_bits().to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(
+        i64::from_le_bytes(bus.memory[0x2008..0x2010].try_into().unwrap()),
+        3
+    );
+    assert_eq!(cpu.fpu, oracle.fpu);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_native_x87_i64_fild_wide_mantissa_matches_oracle() {
+    let code = [
+        0x90, 0xdf, 0x2d, 0x00, 0x20, 0x00, 0x00, 0xdd, 0x1d, 0x08, 0x20, 0x00, 0x00,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    let value = (1i64 << 53) + 1;
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2000..0x2008].copy_from_slice(&value.to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(cpu.fpu, oracle.fpu);
+    assert_eq!(&bus.memory[0x2008..0x2010], &other.memory[0x2008..0x2010]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
 fn mkii_pm32_native_jmp_call_ret_match_oracle() {
     let code = [
         0x90, 0x90, 0xe8, 0x01, 0x00, 0x00, 0x00, 0x90, 0xc3, 0x90, 0x90, 0xeb, 0x00,

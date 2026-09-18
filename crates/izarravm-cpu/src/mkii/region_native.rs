@@ -802,6 +802,8 @@ fn emit_x87_op(e: &mut Encoder, x87: NativeX87Insn, top: u8, check_gate: bool, m
             | NativeX87Insn::StoreF64 { addr, .. }
             | NativeX87Insn::LoadI32 { addr }
             | NativeX87Insn::StoreI32 { addr, .. }
+            | NativeX87Insn::LoadI64 { addr }
+            | NativeX87Insn::StoreI64 { addr }
             | NativeX87Insn::LoadControlWord { addr }
             | NativeX87Insn::StoreControlWord { addr } => addr,
             _ => return None,

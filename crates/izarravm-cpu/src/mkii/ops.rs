@@ -501,8 +501,6 @@ fn admit_x87(insn: &DecodedInsn) -> Option<NativeX87Insn> {
         NativeX87Insn::StoreStatusAx
         | NativeX87Insn::Wait
         | NativeX87Insn::RoundToInt
-        | NativeX87Insn::LoadI64 { .. }
-        | NativeX87Insn::StoreI64 { .. }
         | NativeX87Insn::StoreExtended80 { .. } => None,
         _ => Some(x87),
     }
@@ -519,6 +517,8 @@ fn x87_address(x87: NativeX87Insn) -> Option<AddrMode> {
         | NativeX87Insn::StoreF64 { addr, .. }
         | NativeX87Insn::LoadI32 { addr }
         | NativeX87Insn::StoreI32 { addr, .. }
+        | NativeX87Insn::LoadI64 { addr }
+        | NativeX87Insn::StoreI64 { addr }
         | NativeX87Insn::LoadControlWord { addr }
         | NativeX87Insn::StoreControlWord { addr } => Some(addr),
         _ => None,
