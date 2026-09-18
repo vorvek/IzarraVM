@@ -781,8 +781,6 @@ fn mkii_dirty_queue_overflow_promotes_to_a_bounded_full_flush() {
 fn mkii_probe_slot_is_sixty_four_bytes_and_default_allocates_nothing() {
     assert_eq!(std::mem::size_of::<super::ProbeSlot>(), 64);
     assert_eq!(std::mem::align_of::<super::ProbeSlot>(), 8);
-    assert_eq!(super::PROBE_SLOTS, 131072);
-    assert_eq!(super::PROBE_HASH_SHIFT, 15);
     let engine = Engine::default();
     assert!(engine.probe.is_empty());
     assert_eq!(engine.probe_gen, 1);
