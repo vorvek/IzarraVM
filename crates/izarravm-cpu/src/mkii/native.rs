@@ -333,6 +333,11 @@ pub(super) fn compile(
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
+        emit_region_entry_guards(&mut e, operations, index, end, slow);
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
         if !pending_on_fallthrough {
             admission::emit(&mut e, operation, persona, cs_default_size_32, prepared);
         }
@@ -342,19 +347,6 @@ pub(super) fn compile(
         e.test_r32_r32(Reg::RAX, Reg::RAX);
         e.jcc(4, slow);
         e.place(prepared);
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        if let Some(top) = operation.region.as_ref().and_then(|region| region.x87_top) {
-            let status = std::mem::offset_of!(CpuGsw, fpu)
-                + crate::jit::native_x87::native_x87_layout().status;
-            e.movzx_r32_word_disp32(Reg::RAX, Reg::RBX, status as i32);
-            e.shr_r32_imm8(Reg::RAX, 11);
-            e.and_r32_imm32(Reg::RAX, 7);
-            e.cmp_r32_imm32(Reg::RAX, u32::from(top));
-            e.jcc(5, slow);
-        }
         region::emit(&mut e, &operations[index..end], exit, cs_default_size_32);
         e.jmp(next);
         e.place(slow);
@@ -396,6 +388,42 @@ struct SpanTail {
     next: usize,
     pending_on_fallthrough: bool,
     has_pending_side_exit: bool,
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_region_entry_guards(
+    e: &mut Encoder,
+    operations: &[Operation],
+    index: usize,
+    end: usize,
+    slow: Label,
+) {
+    if let Some(top) = operations[index]
+        .region
+        .as_ref()
+        .and_then(|region| region.x87_top)
+    {
+        let status =
+            std::mem::offset_of!(CpuGsw, fpu) + crate::jit::native_x87::native_x87_layout().status;
+        e.movzx_r32_word_disp32(Reg::RAX, Reg::RBX, status as i32);
+        e.shr_r32_imm8(Reg::RAX, 11);
+        e.and_r32_imm32(Reg::RAX, 7);
+        e.cmp_r32_imm32(Reg::RAX, u32::from(top));
+        e.jcc(5, slow);
+    }
+    let last = &operations[end - 1];
+    if matches!(last.insn.opcode, 0xe8 | 0xc3) && last.is_dword_near_transfer() {
+        let ss_b = std::mem::offset_of!(CpuGsw, registers)
+            + std::mem::offset_of!(Registers, segments)
+            + SegmentIndex::Ss.index() * std::mem::size_of::<SegmentRegister>()
+            + std::mem::offset_of!(SegmentRegister, default_size_32);
+        e.movzx_r32_byte_disp32(Reg::RAX, Reg::RBX, ss_b as i32);
+        e.test_r32_r32(Reg::RAX, Reg::RAX);
+        e.jcc(4, slow);
+    }
 }
 
 fn emit_legacy_span(

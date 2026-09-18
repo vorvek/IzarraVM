@@ -42,7 +42,7 @@ pub(super) fn emit(
             }
             let miss = e.label();
             emit_x87_op(e, x87, x87_top.unwrap_or(0), x87_gate, miss);
-            x87_gate = false;
+            x87_gate = matches!(x87, NativeX87Insn::LoadControlWord { .. });
             x87_top = Some(x87.advance_top(x87_top.unwrap_or(0)));
             exits.push((miss, index, 1, true));
         } else if let Some((pure, _)) = op.region_pure() {
@@ -792,22 +792,7 @@ fn emit_x87_restore_host(e: &mut Encoder) {
 
 fn emit_x87_op(e: &mut Encoder, x87: NativeX87Insn, top: u8, check_gate: bool, miss: Label) {
     let memory = x87.metadata().memory.and_then(|access| {
-        let address = match x87 {
-            NativeX87Insn::BinaryMemory { addr, .. }
-            | NativeX87Insn::IntBinaryMemory { addr, .. }
-            | NativeX87Insn::BinaryMemoryF64 { addr, .. }
-            | NativeX87Insn::LoadF32 { addr }
-            | NativeX87Insn::StoreF32 { addr, .. }
-            | NativeX87Insn::LoadF64 { addr }
-            | NativeX87Insn::StoreF64 { addr, .. }
-            | NativeX87Insn::LoadI32 { addr }
-            | NativeX87Insn::StoreI32 { addr, .. }
-            | NativeX87Insn::LoadI64 { addr }
-            | NativeX87Insn::StoreI64 { addr }
-            | NativeX87Insn::LoadControlWord { addr }
-            | NativeX87Insn::StoreControlWord { addr } => addr,
-            _ => return None,
-        };
+        let address = x87.memory_address()?;
         let write = access.direction == NativeX87MemoryDirection::Write;
         if access.width == 8 {
             emit_m64_pointer(e, address, write, miss);

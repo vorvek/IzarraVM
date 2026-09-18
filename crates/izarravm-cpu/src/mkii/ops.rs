@@ -507,20 +507,5 @@ fn admit_x87(insn: &DecodedInsn) -> Option<NativeX87Insn> {
 }
 
 fn x87_address(x87: NativeX87Insn) -> Option<AddrMode> {
-    match x87 {
-        NativeX87Insn::BinaryMemory { addr, .. }
-        | NativeX87Insn::IntBinaryMemory { addr, .. }
-        | NativeX87Insn::BinaryMemoryF64 { addr, .. }
-        | NativeX87Insn::LoadF32 { addr }
-        | NativeX87Insn::StoreF32 { addr, .. }
-        | NativeX87Insn::LoadF64 { addr }
-        | NativeX87Insn::StoreF64 { addr, .. }
-        | NativeX87Insn::LoadI32 { addr }
-        | NativeX87Insn::StoreI32 { addr, .. }
-        | NativeX87Insn::LoadI64 { addr }
-        | NativeX87Insn::StoreI64 { addr }
-        | NativeX87Insn::LoadControlWord { addr }
-        | NativeX87Insn::StoreControlWord { addr } => Some(addr),
-        _ => None,
-    }
+    x87.memory_address()
 }
