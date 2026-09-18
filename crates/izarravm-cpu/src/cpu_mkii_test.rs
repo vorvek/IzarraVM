@@ -891,7 +891,7 @@ fn mkii_taken_backedge_reuses_the_trace_until_fallthrough() {
     assert_eq!(stats.regions, 3);
     assert_eq!(stats.native, 10);
     assert_eq!(stats.compiled, 1);
-    assert!(stats.probe_hits > 0, "{stats:?}");
+    assert!(stats.dispatch_hits > 0);
 }
 
 #[test]

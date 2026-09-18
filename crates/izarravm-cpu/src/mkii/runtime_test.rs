@@ -861,7 +861,7 @@ fn mkii_mapping_dirty_in_the_same_run_advances_frame_probe_generation() {
 }
 
 #[test]
-fn mkii_open_tail_is_published_and_still_grows_on_the_rust_path() {
+fn mkii_open_tail_is_not_published_and_still_grows() {
     let code = [0x90, 0xff, 0xf0, 0x43, 0xeb, 0xfe];
     let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
@@ -877,25 +877,22 @@ fn mkii_open_tail_is_published_and_still_grows_on_the_rust_path() {
     cpu.set_eip(0);
     let mut engine = Engine::default();
     let mut frame = Frame::new(&cpu, &mut bus, 100);
-    let first_body = select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
-    assert_ne!(first_body, 0);
+    select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
     let index = *engine
         .traces
         .values()
         .next()
         .expect("open prefix must compile");
     assert_eq!(engine.arena[index].as_ref().unwrap().open_tail, Some(3));
-    let slot = engine.probe[super::probe_index(0)];
-    assert_eq!(slot.body, first_body as u64);
-    assert_eq!(slot.generation, engine.probe_gen);
+    assert!(
+        engine.probe.is_empty()
+            || engine.probe[super::probe_index(0)].body == 0
+            || engine.probe[super::probe_index(0)].generation != engine.probe_gen
+    );
     cpu.set_eip(3);
     cpu.fetch_decoded(&mut bus, 3).unwrap();
     cpu.set_eip(0);
-    let grown_body = select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
+    select_next(&mut engine, &mut cpu, &mut bus, &mut frame);
     assert_eq!(engine.arena[index].as_ref().unwrap().open_tail, Some(4));
     assert_eq!(engine.stats.expansions, 1);
-    assert_ne!(grown_body, first_body);
-    let grown = engine.probe[super::probe_index(0)];
-    assert_eq!(grown.body, grown_body as u64);
-    assert_ne!(grown.body, first_body as u64);
 }

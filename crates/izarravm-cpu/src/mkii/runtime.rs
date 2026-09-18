@@ -1155,6 +1155,7 @@ fn select_next<B: CpuBus>(
             frame.cs = cpu.registers.cs();
             frame.table = cpu.class_table() as *const _ as usize;
             let body = trace.code.body_ptr() as usize;
+            let closed = trace.open_tail.is_none();
             let physical = trace.operations[0].physical;
             let certificate = trace.source_certificate;
             (
@@ -1163,7 +1164,11 @@ fn select_next<B: CpuBus>(
                 frame.source_cost,
             ) = certificate.map_or((0, 0, 0), |(mapping, cost)| (1, mapping, cost));
             frame.stats.entries += 1;
-            engine.publish(cpu, frame, physical, certificate, body as u64);
+            if closed {
+                engine.publish(cpu, frame, physical, certificate, body as u64);
+            } else {
+                engine.sync_probe(frame);
+            }
             return body;
         }
         engine.sync_probe(frame);
