@@ -3,7 +3,7 @@
 
 use super::State;
 use super::ops::{Input, Operation, Pure};
-use super::runtime::{Frame, PROBE_FLAG_D, PROBE_HASH, ProbeSlot, Stats};
+use super::runtime::{Frame, PROBE_FLAG_D, PROBE_HASH, PROBE_HASH_SHIFT, ProbeSlot, Stats};
 use crate::jit::JitState;
 use crate::jit::encoder::{Encoder, Label, Reg};
 use crate::jit::exec_mem::ExecutableBuffer;
@@ -173,7 +173,7 @@ fn emit_probe(e: &mut Encoder, resolve_path: Label, counted_miss: Label) {
     );
     e.add_r32_r32(Reg::RCX, Reg::RDX);
     e.imul_r32_r32_imm32(Reg::RCX, Reg::RCX, PROBE_HASH);
-    e.shr_r32_imm8(Reg::RCX, 16);
+    e.shr_r32_imm8(Reg::RCX, PROBE_HASH_SHIFT as u8);
     e.shl_r32_imm8(Reg::RCX, 6);
     e.load_r64_disp32(Reg::RAX, Reg::R13, offset_of!(Frame, probe) as i32);
     e.add_r64_r64(Reg::RAX, Reg::RCX);

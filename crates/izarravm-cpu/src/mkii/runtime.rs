@@ -114,9 +114,14 @@ pub struct Stats {
     pub probe_misses: u64,
 }
 
-pub(super) const PROBE_SLOTS: usize = 65536;
+pub(super) const PROBE_HASH_BITS: u32 = 17;
+pub(super) const PROBE_SLOTS: usize = 1 << PROBE_HASH_BITS;
+pub(super) const PROBE_HASH_SHIFT: u32 = 32 - PROBE_HASH_BITS;
 pub(super) const PROBE_HASH: u32 = 0x9e37_79b9;
 pub(super) const PROBE_FLAG_D: u8 = 1;
+
+const _: () = assert!(PROBE_SLOTS == 131072);
+const _: () = assert!(PROBE_HASH_SHIFT == 15);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -162,7 +167,7 @@ impl ProbeSlot {
 }
 
 pub(super) fn probe_index(linear: u32) -> usize {
-    (linear.wrapping_mul(PROBE_HASH) >> 16) as usize
+    (linear.wrapping_mul(PROBE_HASH) >> PROBE_HASH_SHIFT) as usize
 }
 
 type Helper = unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame, *const Operation) -> u32;
