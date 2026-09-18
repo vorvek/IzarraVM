@@ -3115,6 +3115,48 @@ fn mkii_pm32_native_x87_register_matches_oracle() {
 }
 
 #[test]
+fn mkii_pm32_native_x87_m64_matches_oracle() {
+    let code = [
+        0x90, 0xdd, 0x05, 0x00, 0x20, 0x00, 0x00, 0xd9, 0xe8, 0xdc, 0x05, 0x00, 0x20, 0x00, 0x00,
+        0xdd, 0x1d, 0x08, 0x20, 0x00, 0x00,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2000..0x2008].copy_from_slice(&1.0f64.to_bits().to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(&bus.memory[0x2008..0x2010], &other.memory[0x2008..0x2010]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_x87_m64_page_cross_misses_native() {
+    let code = [0x90, 0xdd, 0x05, 0xfc, 0x1f, 0x00, 0x00, 0x90];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native_admissions, 0, "{stats:?}");
+    assert!(stats.helpers > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
 fn mkii_pm32_native_jmp_call_ret_match_oracle() {
     let code = [
         0x90, 0x90, 0xe8, 0x01, 0x00, 0x00, 0x00, 0x90, 0xc3, 0x90, 0x90, 0xeb, 0x00,

@@ -120,12 +120,14 @@ impl Region {
             if let Some(x87) = op.x87 {
                 has_x87 = true;
                 if let Some(access) = x87.metadata().memory {
-                    let width = if access.width <= 2 {
-                        BusWidth::Word
+                    let (width, count) = if access.width <= 2 {
+                        (BusWidth::Word, 1)
+                    } else if access.width == 8 {
+                        (BusWidth::Dword, 2)
                     } else {
-                        BusWidth::Dword
+                        (BusWidth::Dword, 1)
                     };
-                    cost.delta.add_ram_accesses(width, 1);
+                    cost.delta.add_ram_accesses(width, count);
                     if access.direction == crate::jit::native_x87::NativeX87MemoryDirection::Write {
                         cost.writes += 1;
                     } else {
@@ -499,9 +501,6 @@ fn admit_x87(insn: &DecodedInsn) -> Option<NativeX87Insn> {
         NativeX87Insn::StoreStatusAx
         | NativeX87Insn::Wait
         | NativeX87Insn::RoundToInt
-        | NativeX87Insn::LoadF64 { .. }
-        | NativeX87Insn::StoreF64 { .. }
-        | NativeX87Insn::BinaryMemoryF64 { .. }
         | NativeX87Insn::LoadI64 { .. }
         | NativeX87Insn::StoreI64 { .. }
         | NativeX87Insn::StoreExtended80 { .. } => None,
@@ -513,8 +512,11 @@ fn x87_address(x87: NativeX87Insn) -> Option<AddrMode> {
     match x87 {
         NativeX87Insn::BinaryMemory { addr, .. }
         | NativeX87Insn::IntBinaryMemory { addr, .. }
+        | NativeX87Insn::BinaryMemoryF64 { addr, .. }
         | NativeX87Insn::LoadF32 { addr }
         | NativeX87Insn::StoreF32 { addr, .. }
+        | NativeX87Insn::LoadF64 { addr }
+        | NativeX87Insn::StoreF64 { addr, .. }
         | NativeX87Insn::LoadI32 { addr }
         | NativeX87Insn::StoreI32 { addr, .. }
         | NativeX87Insn::LoadControlWord { addr }
