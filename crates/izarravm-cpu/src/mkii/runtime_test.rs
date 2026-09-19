@@ -402,7 +402,7 @@ fn mkii_ff6_source_or_backing_change_refuses_guarded_suffixes() {
 
 #[test]
 fn mkii_ff6_fallthrough_uses_the_existing_64_operation_trace_cap() {
-    let mut code = vec![0xff, 0xf0].repeat(65);
+    let mut code = [0xff, 0xf0].repeat(65);
     code.extend_from_slice(&[0xeb, 0xfe]);
     let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);

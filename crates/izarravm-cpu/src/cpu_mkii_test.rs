@@ -2126,7 +2126,7 @@ fn mkii_ff6_helper_and_native_successor_routes_match_the_oracle() {
 
 #[test]
 fn mkii_ff6_chain_reduces_dispatches_and_stops_at_the_64_operation_cap() {
-    let mut code = vec![0xff, 0xf0].repeat(65);
+    let mut code = [0xff, 0xf0].repeat(65);
     code.extend_from_slice(&[0xe4, 0x60]);
     let (mut cpu, mut bus) = fixture(&code);
     let (mut oracle, mut other) = fixture(&code);
