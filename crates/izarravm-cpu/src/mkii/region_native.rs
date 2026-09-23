@@ -295,120 +295,14 @@ fn emit_read(e: &mut Encoder, read: Read, miss: Label) {
 }
 
 fn emit_read_into(e: &mut Encoder, read: Read, miss: Label, pointer_only: bool) {
-    let address = read.address;
-    let address_width = if address.address_size == AddressSize::Word {
-        BusWidth::Word
-    } else {
-        BusWidth::Dword
-    };
-    e.mov_r32_imm32(Reg::R10, address.disp as u32);
-    if let Some(base) = address.base {
-        load(e, Reg::RAX, Input::Reg(base), address_width);
-        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
-    }
-    if let Some(index) = address.index {
-        load(e, Reg::RAX, Input::Reg(index), address_width);
-        if address.address_size == AddressSize::Dword && address.scale != 1 {
-            e.shift_r32_imm8(4, Reg::RAX, address.scale.trailing_zeros() as u8);
-        }
-        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
-    }
-    if address.address_size == AddressSize::Word {
-        e.alu_r32_imm32(4, Reg::R10, 0xffff);
-    }
-    let segment = (std::mem::offset_of!(CpuGsw, registers)
-        + std::mem::offset_of!(Registers, segments)
-        + address.segment.index() * std::mem::size_of::<SegmentRegister>())
-        as i32;
-    e.load_r32_disp32(
-        Reg::R8,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, limit) as i32,
+    emit_pointer(
+        e,
+        read.address,
+        read.width.bytes(),
+        read.width.bytes(),
+        false,
+        miss,
     );
-    e.load_r32_disp32(
-        Reg::R9,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, base) as i32,
-    );
-    let bounds = e.label();
-    let checked = e.label();
-    e.cmp_r32_imm32(Reg::R8, u32::MAX);
-    e.jcc(5, bounds);
-    e.test_r32_r32(Reg::R9, Reg::R9);
-    e.jcc(4, checked);
-    e.place(bounds);
-    e.mov_r32_r32(Reg::RDX, Reg::R10);
-    if read.width != BusWidth::Byte {
-        e.alu_r32_imm32(0, Reg::RDX, read.width.bytes() - 1);
-        e.jcc(2, miss);
-    }
-    e.movzx_r32_byte_disp32(
-        Reg::RAX,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, access) as i32,
-    );
-    e.alu_r32_imm32(4, Reg::RAX, 0x1c);
-    e.cmp_r32_imm32(Reg::RAX, 0x14);
-    let down = e.label();
-    e.jcc(4, down);
-    e.alu_r32_r32(7, Reg::RDX, Reg::R8);
-    e.jcc(7, miss);
-    e.jmp(checked);
-    e.place(down);
-    e.alu_r32_r32(7, Reg::R10, Reg::R8);
-    e.jcc(6, miss);
-    e.movzx_r32_byte_disp32(
-        Reg::RAX,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, default_size_32) as i32,
-    );
-    e.test_r32_r32(Reg::RAX, Reg::RAX);
-    e.jcc(5, checked);
-    e.cmp_r32_imm32(Reg::RDX, 0xffff);
-    e.jcc(7, miss);
-    e.place(checked);
-    e.alu_r32_r32(0, Reg::R10, Reg::R9);
-    // Natural alignment of 1/2/4-byte accesses also proves 4 KiB page locality.
-    if read.width != BusWidth::Byte {
-        e.test_r32_imm32(Reg::R10, read.width.bytes() - 1);
-        e.jcc(5, miss);
-    }
-    e.mov_r32_r32(Reg::R11, Reg::R10);
-    e.shift_r32_imm8(5, Reg::R11, 12);
-    e.load_r64_disp32(
-        Reg::R8,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_mapping_epochs) as i32,
-    );
-    e.load_r64_sib_scale8(Reg::R8, Reg::R8, Reg::R11);
-    e.load_r64_disp32(
-        Reg::R9,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_epoch) as i32,
-    );
-    e.cmp_r64_r64(Reg::R8, Reg::R9);
-    e.jcc(5, miss);
-    e.load_r64_disp32(
-        Reg::R8,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_load_biases) as i32,
-    );
-    e.load_r64_sib_scale8(Reg::R8, Reg::R8, Reg::R11);
-    e.test_r32_imm32(Reg::R8, NATIVE_LOAD_BIAS_MODE13 as u32);
-    e.jcc(5, miss);
-    let permitted = e.label();
-    e.test_r32_imm32(Reg::R8, NATIVE_LOAD_BIAS_SUPERVISOR as u32);
-    e.jcc(4, permitted);
-    e.load_r32_disp32(
-        Reg::RAX,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_user) as i32,
-    );
-    e.test_r32_r32(Reg::RAX, Reg::RAX);
-    e.jcc(5, miss);
-    e.place(permitted);
-    e.and_r64_imm32(Reg::R8, !(NATIVE_LOAD_BIAS_TAG_MASK as u32));
-    e.add_r64_r64(Reg::R8, Reg::R10);
     if pointer_only {
         return;
     }
@@ -433,138 +327,13 @@ fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
 }
 
 fn emit_store_into(e: &mut Encoder, store: Store, miss: Label, pointer_only: bool) {
-    let address = store.address;
-    let address_width = if address.address_size == AddressSize::Word {
-        BusWidth::Word
-    } else {
-        BusWidth::Dword
-    };
-    e.mov_r32_imm32(Reg::R10, address.disp as u32);
-    if let Some(base) = address.base {
-        load(e, Reg::RAX, Input::Reg(base), address_width);
-        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
-    }
-    if let Some(index) = address.index {
-        load(e, Reg::RAX, Input::Reg(index), address_width);
-        if address.address_size == AddressSize::Dword && address.scale != 1 {
-            e.shift_r32_imm8(4, Reg::RAX, address.scale.trailing_zeros() as u8);
-        }
-        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
-    }
-    if address.address_size == AddressSize::Word {
-        e.alu_r32_imm32(4, Reg::R10, 0xffff);
-    }
-    let segment = (std::mem::offset_of!(CpuGsw, registers)
-        + std::mem::offset_of!(Registers, segments)
-        + address.segment.index() * std::mem::size_of::<SegmentRegister>())
-        as i32;
-    e.load_r32_disp32(
-        Reg::R8,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, limit) as i32,
-    );
-    e.load_r32_disp32(
-        Reg::R9,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, base) as i32,
-    );
-    let bounds = e.label();
-    let checked = e.label();
-    e.cmp_r32_imm32(Reg::R8, u32::MAX);
-    e.jcc(5, bounds);
-    e.test_r32_r32(Reg::R9, Reg::R9);
-    e.jcc(4, checked);
-    e.place(bounds);
-    e.mov_r32_r32(Reg::RDX, Reg::R10);
-    if store.width != BusWidth::Byte {
-        e.alu_r32_imm32(0, Reg::RDX, store.width.bytes() - 1);
-        e.jcc(2, miss);
-    }
-    e.movzx_r32_byte_disp32(
-        Reg::RAX,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, access) as i32,
-    );
-    e.test_r32_imm32(Reg::RAX, 0x08);
-    e.jcc(5, miss);
-    e.test_r32_imm32(Reg::RAX, 0x02);
-    e.jcc(4, miss);
-    e.alu_r32_imm32(4, Reg::RAX, 0x1c);
-    e.cmp_r32_imm32(Reg::RAX, 0x14);
-    let down = e.label();
-    e.jcc(4, down);
-    e.alu_r32_r32(7, Reg::RDX, Reg::R8);
-    e.jcc(7, miss);
-    e.jmp(checked);
-    e.place(down);
-    e.alu_r32_r32(7, Reg::R10, Reg::R8);
-    e.jcc(6, miss);
-    e.movzx_r32_byte_disp32(
-        Reg::RAX,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, default_size_32) as i32,
-    );
-    e.test_r32_r32(Reg::RAX, Reg::RAX);
-    e.jcc(5, checked);
-    e.cmp_r32_imm32(Reg::RDX, 0xffff);
-    e.jcc(7, miss);
-    e.place(checked);
-    e.alu_r32_r32(0, Reg::R10, Reg::R9);
-    if store.width != BusWidth::Byte {
-        e.test_r32_imm32(Reg::R10, store.width.bytes() - 1);
-        e.jcc(5, miss);
-    }
-    e.mov_r32_r32(Reg::R11, Reg::R10);
-    e.shift_r32_imm8(5, Reg::R11, 12);
-    e.load_r64_disp32(
-        Reg::R8,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_mapping_epochs) as i32,
-    );
-    e.load_r64_sib_scale8(Reg::R8, Reg::R8, Reg::R11);
-    e.load_r64_disp32(
-        Reg::R9,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_epoch) as i32,
-    );
-    e.cmp_r64_r64(Reg::R8, Reg::R9);
-    e.jcc(5, miss);
-    e.load_r64_disp32(
-        Reg::R8,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_store_biases) as i32,
-    );
-    e.load_r64_sib_scale8(Reg::R8, Reg::R8, Reg::R11);
-    e.test_r32_imm32(Reg::R8, NATIVE_STORE_BIAS_MODE13 as u32);
-    e.jcc(5, miss);
-    let permitted = e.label();
-    e.test_r32_imm32(Reg::R8, NATIVE_STORE_BIAS_SUPERVISOR as u32);
-    e.jcc(4, permitted);
-    e.load_r32_disp32(
-        Reg::RAX,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_user) as i32,
-    );
-    e.test_r32_r32(Reg::RAX, Reg::RAX);
-    e.jcc(5, miss);
-    e.place(permitted);
-    e.and_r64_imm32(Reg::R8, !(NATIVE_STORE_BIAS_TAG_MASK as u32));
-    e.add_r64_r64(Reg::R8, Reg::R10);
-    e.load_r64_disp32(
-        Reg::RAX,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_physical_pages) as i32,
-    );
-    e.load_r32_sib_scale4(Reg::R9, Reg::RAX, Reg::R11);
-    e.store_r32_disp32(
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_write_page) as i32,
-        Reg::R9,
-    );
-    e.store_u32_imm_disp32(
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_write_count) as i32,
-        1,
+    emit_pointer(
+        e,
+        store.address,
+        store.width.bytes(),
+        store.width.bytes(),
+        true,
+        miss,
     );
     if pointer_only {
         return;
@@ -577,7 +346,18 @@ fn emit_store_into(e: &mut Encoder, store: Store, miss: Label, pointer_only: boo
     }
 }
 
-fn emit_m64_pointer(e: &mut Encoder, address: AddrMode, write: bool, miss: Label) {
+fn emit_pointer(
+    e: &mut Encoder,
+    address: AddrMode,
+    span_bytes: u32,
+    alignment: u32,
+    write: bool,
+    miss: Label,
+) {
+    debug_assert!(matches!(
+        (span_bytes, alignment),
+        (1, 1) | (2, 2) | (4, 4) | (8, 4)
+    ));
     let address_width = if address.address_size == AddressSize::Word {
         BusWidth::Word
     } else {
@@ -620,8 +400,10 @@ fn emit_m64_pointer(e: &mut Encoder, address: AddrMode, write: bool, miss: Label
     e.jcc(4, checked);
     e.place(bounds);
     e.mov_r32_r32(Reg::RDX, Reg::R10);
-    e.alu_r32_imm32(0, Reg::RDX, 7);
-    e.jcc(2, miss);
+    if span_bytes > 1 {
+        e.alu_r32_imm32(0, Reg::RDX, span_bytes - 1);
+        e.jcc(2, miss);
+    }
     e.movzx_r32_byte_disp32(
         Reg::RAX,
         Reg::RBX,
@@ -654,12 +436,16 @@ fn emit_m64_pointer(e: &mut Encoder, address: AddrMode, write: bool, miss: Label
     e.jcc(7, miss);
     e.place(checked);
     e.alu_r32_r32(0, Reg::R10, Reg::R9);
-    e.test_r32_imm32(Reg::R10, 3);
-    e.jcc(5, miss);
-    e.mov_r32_r32(Reg::RAX, Reg::R10);
-    e.and_r32_imm32(Reg::RAX, 0xfff);
-    e.cmp_r32_imm32(Reg::RAX, 0xff8);
-    e.jcc(7, miss);
+    if alignment > 1 {
+        e.test_r32_imm32(Reg::R10, alignment - 1);
+        e.jcc(5, miss);
+    }
+    if span_bytes > alignment {
+        e.mov_r32_r32(Reg::RAX, Reg::R10);
+        e.and_r32_imm32(Reg::RAX, 0xfff);
+        e.cmp_r32_imm32(Reg::RAX, 0x1000 - span_bytes);
+        e.jcc(7, miss);
+    }
     e.mov_r32_r32(Reg::R11, Reg::R10);
     e.shift_r32_imm8(5, Reg::R11, 12);
     e.load_r64_disp32(
@@ -794,41 +580,14 @@ fn emit_x87_op(e: &mut Encoder, x87: NativeX87Insn, top: u8, check_gate: bool, m
     let memory = x87.metadata().memory.and_then(|access| {
         let address = x87.memory_address()?;
         let write = access.direction == NativeX87MemoryDirection::Write;
-        if access.width == 8 {
-            emit_m64_pointer(e, address, write, miss);
+        let (span_bytes, alignment) = if access.width == 8 {
+            (8, 4)
+        } else if access.width <= 2 {
+            (2, 2)
         } else {
-            let width = if access.width <= 2 {
-                BusWidth::Word
-            } else {
-                BusWidth::Dword
-            };
-            if write {
-                emit_store_into(
-                    e,
-                    Store {
-                        address,
-                        width,
-                        src: Input::Reg(0),
-                        class: x87.timing_class(),
-                    },
-                    miss,
-                    true,
-                );
-            } else {
-                emit_read_into(
-                    e,
-                    Read {
-                        address,
-                        width,
-                        dst: 0,
-                        alu: None,
-                        class: x87.timing_class(),
-                    },
-                    miss,
-                    true,
-                );
-            }
-        }
+            (4, 4)
+        };
+        emit_pointer(e, address, span_bytes, alignment, write, miss);
         e.mov_r64_r64(Reg::RDI, Reg::R8);
         Some(Reg::RDI)
     });

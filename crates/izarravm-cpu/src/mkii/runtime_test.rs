@@ -792,6 +792,149 @@ fn colliding_eip(start: u32) -> u32 {
         .unwrap()
 }
 
+fn invoke_native_probe(cpu: &mut CpuGsw, bus: &mut crate::tests::TestBus, frame: &mut Frame) {
+    unsafe extern "C" fn stop(_: *mut CpuGsw, _: *mut (), _: *mut Frame) -> usize {
+        0
+    }
+    let dispatcher = super::super::native::dispatcher().unwrap();
+    frame.dispatch = dispatcher.body_ptr() as usize;
+    frame.resolve = stop;
+    let entry: unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame, usize) =
+        unsafe { std::mem::transmute(dispatcher.entry_ptr()) };
+    unsafe {
+        entry(
+            cpu,
+            std::ptr::from_mut(bus).cast(),
+            frame,
+            dispatcher.body_ptr() as usize,
+        );
+    }
+}
+
+#[test]
+fn mkii_native_probe_checks_context_and_copies_source_certificate() {
+    for case in 0..9 {
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(crate::GswMode::Gsw586);
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.control.cr0 |= crate::CR0_PE;
+        cpu.set_eip(0x100);
+        let mut memory = vec![0x90; 65536];
+        memory[0x100] = 0x90;
+        let mut bus = crate::tests::TestBus::with_memory(memory);
+        cpu.fetch_decoded(&mut bus, 0x100).unwrap();
+        cpu.set_eip(0x100);
+        let mut engine = Engine::default();
+        let key = install(&mut engine, &mut cpu, 0x100, 0x100);
+        let index = engine.lookup(key).unwrap();
+        let body = engine.arena[index].as_ref().unwrap().code.body_ptr() as u64;
+        cpu.jit_direct.mkii.code_dirty = false;
+        cpu.jit_direct.mkii.mapping_dirty = false;
+        let mut frame = Frame::new(&cpu, &mut bus, 100);
+        engine.publish(
+            &cpu,
+            &mut frame,
+            0x100,
+            (case != 8).then_some((41, 73)),
+            body,
+        );
+        assert!(!cpu.jit_direct.mkii.code_dirty);
+        assert!(!cpu.jit_direct.mkii.mapping_dirty);
+        assert!(!frame.probe.is_null());
+        frame.source_present = 0;
+        frame.source_mapping = 0;
+        frame.source_cost = 0;
+        match case {
+            0 | 8 => {}
+            1 => frame.force_canonical = true,
+            2 => frame.stop = true,
+            3 => cpu.registers.eflags |= crate::FLAG_TF,
+            4 => cpu.registers.eflags |= crate::FLAG_VM,
+            5 => cpu.control.cr0 &= !crate::CR0_PE,
+            6 => cpu.jit_direct.mkii.mapping_dirty = true,
+            7 => cpu.jit_direct.mkii.code_dirty = true,
+            _ => unreachable!(),
+        }
+        invoke_native_probe(&mut cpu, &mut bus, &mut frame);
+        if case == 0 || case == 8 {
+            assert_eq!(frame.stats.probe_hits, 1);
+            assert_eq!(frame.source_certificate(), (case == 0).then_some((41, 73)));
+            assert_eq!(cpu.registers.eip, 0x101);
+        } else {
+            assert_eq!(frame.stats.probe_hits, 0, "case={case}");
+            assert_eq!(frame.stats.probe_misses, 1, "case={case}");
+            assert_eq!(frame.source_certificate(), None, "case={case}");
+            assert_eq!(cpu.registers.eip, 0x100, "case={case}");
+        }
+    }
+}
+
+#[test]
+fn mkii_native_probe_rejects_retired_body_after_arena_reuse() {
+    let first = 0x100;
+    let second = colliding_eip(first);
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(crate::GswMode::Gsw586);
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.registers.segments[SegmentIndex::Cs.index()].limit = u32::MAX;
+    cpu.registers.segments[SegmentIndex::Cs.index()].default_size_32 = true;
+    cpu.control.cr0 |= crate::CR0_PE;
+    let mut bus = crate::tests::TestBus::with_memory(vec![0x90; second as usize + 64]);
+    for eip in [first, second] {
+        cpu.set_eip(eip);
+        cpu.fetch_decoded(&mut bus, eip).unwrap();
+    }
+    let mut engine = Engine::default();
+    let first_key = install(&mut engine, &mut cpu, first, first);
+    let first_index = engine.lookup(first_key).unwrap();
+    let first_body = engine.arena[first_index].as_ref().unwrap().code.body_ptr() as u64;
+    cpu.jit_direct.mkii.code_dirty = false;
+    cpu.jit_direct.mkii.mapping_dirty = false;
+    cpu.jit_direct.mkii.full_flush = false;
+    cpu.jit_direct.mkii.dirty_writes.clear();
+    cpu.set_eip(first);
+    let mut frame = Frame::new(&cpu, &mut bus, 100);
+    engine.publish(&cpu, &mut frame, first, None, first_body);
+    invoke_native_probe(&mut cpu, &mut bus, &mut frame);
+    assert_eq!(frame.stats.probe_hits, 1);
+    assert_eq!(cpu.registers.eip, first + 1);
+
+    bus.write_memory(first, BusWidth::Byte, 0x40, BusAccessKind::DataWrite)
+        .unwrap();
+    assert!(cpu.jit_direct.mkii.note_write(first, 1));
+    engine.drain_writes(&mut cpu);
+    assert!(engine.arena[first_index].is_none());
+    assert!(engine.free.contains(&first_index));
+    cpu.set_eip(first);
+    let mut stale = Frame::new(&cpu, &mut bus, 100);
+    engine.sync_probe(&mut stale);
+    invoke_native_probe(&mut cpu, &mut bus, &mut stale);
+    assert_eq!(stale.stats.probe_hits, 0);
+    assert_eq!(stale.stats.probe_misses, 1);
+    assert_eq!(cpu.registers.eip, first);
+
+    let second_key = install(&mut engine, &mut cpu, second, second);
+    let second_index = engine.lookup(second_key).unwrap();
+    assert_eq!(second_index, first_index);
+    let second_body = engine.arena[second_index].as_ref().unwrap().code.body_ptr() as u64;
+    cpu.jit_direct.mkii.code_dirty = false;
+    cpu.jit_direct.mkii.mapping_dirty = false;
+    cpu.set_eip(second);
+    let mut live = Frame::new(&cpu, &mut bus, 100);
+    engine.publish(&cpu, &mut live, second, None, second_body);
+    invoke_native_probe(&mut cpu, &mut bus, &mut live);
+    assert_eq!(live.stats.probe_hits, 1);
+    assert_eq!(cpu.registers.eip, second + 1);
+    cpu.set_eip(first);
+    let mut collision = Frame::new(&cpu, &mut bus, 100);
+    engine.sync_probe(&mut collision);
+    invoke_native_probe(&mut cpu, &mut bus, &mut collision);
+    assert_eq!(collision.stats.probe_hits, 0);
+    assert_eq!(collision.stats.probe_misses, 1);
+    assert_eq!(cpu.registers.eip, first);
+}
+
 #[test]
 fn mkii_probe_last_writer_wins_a_hash_collision_and_keeps_the_other_key() {
     let mut cpu = CpuGsw::default();
