@@ -326,6 +326,19 @@ fn warm_read(cpu: &mut CpuGsw, bus: &mut TestBus, address: u32) {
     .unwrap();
 }
 
+fn warm_write(cpu: &mut CpuGsw, bus: &mut TestBus, address: u32) {
+    cpu.write_memory_bus_width(
+        bus,
+        SegmentIndex::Ds,
+        address,
+        BusWidth::Dword,
+        0,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    cpu.settle_write_record();
+}
+
 #[test]
 fn mkii_carry_zero_guard_matches_pending_and_live_flags() {
     let mut flags = vec![
@@ -892,6 +905,82 @@ fn mkii_taken_backedge_reuses_the_trace_until_fallthrough() {
     assert_eq!(stats.native, 10);
     assert_eq!(stats.compiled, 1);
     assert!(stats.dispatch_hits > 0);
+}
+
+#[test]
+fn mkii_closed_loop_hits_the_native_probe() {
+    let code = [0x05, 1, 0, 0xeb, 0xfb];
+    let (mut cpu, mut bus) = fixture(&code);
+    let (mut oracle, mut other) = fixture(&code);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 200);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.compiled >= 1, "{stats:?}");
+    assert!(stats.probe_hits > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_native_probe_rechecks_changed_code_against_oracle() {
+    let code = [0xb8, 1, 0, 0xeb, 0xfb];
+    let (mut cpu, mut bus) = fixture(&code);
+    let (mut oracle, mut other) = fixture(&code);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        warm_code(cpu, bus, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 200);
+    let before = cpu.dynarec_mkii_stats();
+    assert!(before.probe_hits > 0, "{before:?}");
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        bus.memory[1] = 2;
+        cpu.note_code_write(1, 1);
+        cpu.set_eip(0);
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 200);
+    let after = cpu.dynarec_mkii_stats();
+    assert_eq!(cpu.registers.eax() & 0xffff, 2);
+    assert!(after.invalidations > before.invalidations, "{after:?}");
+    assert!(after.probe_hits > before.probe_hits, "{after:?}");
+    assert_eq!(after.mismatches, 0);
+}
+
+#[test]
+fn mkii_native_probe_rechecks_new_physical_code_mapping() {
+    let eip = 0x10000;
+    let code_a = [0xb8, 1, 0, 0, 0, 0xeb, 0xf9];
+    let code_b = [0xb8, 2, 0, 0, 0, 0xeb, 0xf9];
+    let (mut cpu, mut bus) = pm32_fixture(&[], eip);
+    let (mut oracle, mut other) = pm32_fixture(&[], eip);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        bus.memory[0x3000..0x3007].copy_from_slice(&code_a);
+        bus.memory[0x4000..0x4007].copy_from_slice(&code_b);
+        bus.memory[0x1000..0x1004].copy_from_slice(&0x2003u32.to_le_bytes());
+        bus.memory[0x2040..0x2044].copy_from_slice(&0x3003u32.to_le_bytes());
+        cpu.control.cr0 |= CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        warm_from(cpu, bus, eip, code_a.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 200);
+    assert_eq!(cpu.registers.eax(), 1);
+    assert_eq!(cpu.decode_cache.line_phys_start(eip, true), Some(0x3000));
+    let before = cpu.dynarec_mkii_stats();
+    assert!(before.probe_hits > 0, "{before:?}");
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        bus.memory[0x2040..0x2044].copy_from_slice(&0x4003u32.to_le_bytes());
+        bus.direct_mapping_epoch += 1;
+        cpu.flush_tlb_and_code_caches(TranslationFlushReason::Cr3);
+        cpu.set_eip(eip);
+    }
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 200);
+    let after = cpu.dynarec_mkii_stats();
+    assert_eq!(cpu.registers.eax(), 2);
+    assert_eq!(cpu.decode_cache.line_phys_start(eip, true), Some(0x4000));
+    assert!(after.compiled > before.compiled, "{after:?}");
+    assert!(after.probe_hits > before.probe_hits, "{after:?}");
+    assert_eq!(after.mismatches, 0);
 }
 
 #[test]
@@ -2114,7 +2203,7 @@ fn mkii_ff6_helper_and_native_successor_routes_match_the_oracle() {
 
 #[test]
 fn mkii_ff6_chain_reduces_dispatches_and_stops_at_the_64_operation_cap() {
-    let mut code = vec![0xff, 0xf0].repeat(65);
+    let mut code = [0xff, 0xf0].repeat(65);
     code.extend_from_slice(&[0xe4, 0x60]);
     let (mut cpu, mut bus) = fixture(&code);
     let (mut oracle, mut other) = fixture(&code);
@@ -2905,4 +2994,633 @@ fn mkii_logical_region_caps_match_each_instruction_boundary() {
             }
         }
     }
+}
+
+fn pm32_fixture(code: &[u8], eip: u32) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0u8; 0x20000];
+    let start = eip as usize;
+    memory[start..start + code.len()].copy_from_slice(code);
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw586);
+    cpu.control.cr0 |= CR0_PE;
+    for segment in [SegmentIndex::Cs, SegmentIndex::Ds, SegmentIndex::Ss] {
+        cpu.load_segment_real(segment, 0);
+        cpu.registers.segments[segment.index()].default_size_32 = true;
+        cpu.registers.segments[segment.index()].limit = u32::MAX;
+    }
+    cpu.registers.set_esp(0x9000);
+    cpu.set_eip(eip);
+    cpu.set_jit_auto_admit(true);
+    cpu.set_dynarec_mkii_enabled(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.mkii_native_session = true;
+    (cpu, bus)
+}
+
+fn warm_from(cpu: &mut CpuGsw, bus: &mut TestBus, start: u32, len: u32) {
+    cpu.set_eip(start);
+    let end = start + len;
+    while cpu.registers.eip < end {
+        let lin = cpu.linear_eip();
+        cpu.fetch_decoded(bus, lin).unwrap();
+    }
+    cpu.set_eip(start);
+}
+
+fn retire_until_eip_moves(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    let start = cpu.registers.eip;
+    for cap in 1..200 {
+        cpu.run_budgeted(bus, cap).unwrap();
+        if cpu.registers.eip != start {
+            return;
+        }
+    }
+    panic!("eip did not move from {start:#x}");
+}
+
+#[test]
+fn mkii_context_allows_protected_32bit_cs() {
+    let (cpu, _) = pm32_fixture(&[0x90, 0x90], 0x10000);
+    assert!(cpu.mkii_enabled());
+}
+
+#[test]
+fn mkii_pm32_forms_a_trace_above_64k() {
+    let code = [0x90, 0x90];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    enable_read_regions(&mut bus);
+    warm_from(&mut cpu, &mut bus, 0x10000, code.len() as u32);
+    cpu.run_budgeted(&mut bus, 1000).unwrap();
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.compiled > 0, "{stats:?}");
+    assert!(stats.entries > 0, "{stats:?}");
+    assert!(stats.native >= 2, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+    assert!(cpu.registers.eip > 0x10000, "eip={:#x}", cpu.registers.eip);
+}
+
+#[test]
+fn mkii_pm16_does_not_own_eip_10000() {
+    let (mut cpu, mut bus) = fixture(&[0x90, 0x90]);
+    cpu.registers.segments[SegmentIndex::Cs.index()].limit = 0xffff;
+    cpu.registers.segments[SegmentIndex::Cs.index()].default_size_32 = false;
+    cpu.set_eip(0x10000);
+    assert!(cpu.fetch_decoded(&mut bus, cpu.linear_eip()).is_err());
+    assert_eq!(cpu.dynarec_mkii_stats().compiled, 0);
+}
+
+#[test]
+fn mkii_key_splits_pm16_and_pm32_at_the_same_linear() {
+    let code = [0xb8, 0x78, 0x56, 0x34, 0x12, 0xe4, 0x60];
+    let (mut pm16, mut bus16) = fixture(&code);
+    let (mut pm32, mut bus32) = pm32_fixture(&code, 0);
+    enable_read_regions(&mut bus16);
+    enable_read_regions(&mut bus32);
+    warm_code(&mut pm16, &mut bus16, 3);
+    warm_from(&mut pm32, &mut bus32, 0, 5);
+    retire_until_eip_moves(&mut pm16, &mut bus16);
+    retire_until_eip_moves(&mut pm32, &mut bus32);
+    assert!(pm16.dynarec_mkii_stats().compiled > 0);
+    assert!(pm32.dynarec_mkii_stats().compiled > 0);
+    assert_eq!(pm16.registers.eax() & 0xffff, 0x5678);
+    assert_eq!(pm32.registers.eax(), 0x1234_5678);
+    assert_eq!(pm16.registers.eip, 3);
+    assert_eq!(pm32.registers.eip, 5);
+
+    pm16.registers.segments[SegmentIndex::Cs.index()].default_size_32 = true;
+    pm16.registers.segments[SegmentIndex::Cs.index()].limit = u32::MAX;
+    pm16.set_eip(0);
+    pm16.registers.set_eax(0);
+    warm_from(&mut pm16, &mut bus16, 0, 5);
+    let compiled = pm16.dynarec_mkii_stats().compiled;
+    retire_until_eip_moves(&mut pm16, &mut bus16);
+    assert_eq!(pm16.registers.eax(), 0x1234_5678);
+    assert_eq!(pm16.registers.eip, 5);
+    assert!(pm16.dynarec_mkii_stats().compiled > compiled);
+}
+
+#[test]
+fn mkii_pm32_sequential_run_keeps_eip_10000() {
+    let code = [0x90, 0x90];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0xfffe);
+    bus.memory[0xfffe] = 0x90;
+    bus.memory[0xffff] = 0x90;
+    bus.memory[0x10000] = 0x90;
+    bus.memory[0x10001] = 0x90;
+    enable_read_regions(&mut bus);
+    warm_from(&mut cpu, &mut bus, 0xfffe, 4);
+    cpu.run_budgeted(&mut bus, 1000).unwrap();
+    assert!(cpu.registers.eip >= 0x10000, "eip={:#x}", cpu.registers.eip);
+    assert_ne!(cpu.registers.eip, 0);
+}
+
+#[test]
+fn mkii_pm32_user_page_region_matches_oracle() {
+    let code = [0x90, 0x90, 0xa1, 0x00, 0x10, 0x01, 0x00];
+    let eip = 0x10000;
+    let (mut cpu, mut bus) = pm32_fixture(&code, eip);
+    let (mut oracle, mut other) = pm32_fixture(&code, eip);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        cpu.control.cr0 |= CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        cpu.cpl = 3;
+        bus.memory[0x1000..0x1004].copy_from_slice(&(0x2000u32 | 7).to_le_bytes());
+        for page in 0..0x20u32 {
+            let offset = 0x2000 + page * 4;
+            bus.memory[offset as usize..offset as usize + 4]
+                .copy_from_slice(&((page << 12) | 7).to_le_bytes());
+        }
+        bus.memory[0x11000..0x11004].copy_from_slice(&0xaabb_ccddu32.to_le_bytes());
+        enable_read_regions(bus);
+        warm_from(cpu, bus, eip, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert!(
+        cpu.dynarec_mkii_stats().native > 0,
+        "{:?}",
+        cpu.dynarec_mkii_stats()
+    );
+    assert_eq!(cpu.registers.eax(), 0xaabb_ccdd);
+}
+
+#[test]
+fn mkii_pm32_unmapped_leaf_raises_page_fault() {
+    let code = [0xa1, 0x00, 0x00, 0x12, 0x00];
+    let eip = 0x10000;
+    let (mut cpu, mut bus) = pm32_fixture(&code, eip);
+    let (mut oracle, mut other) = pm32_fixture(&code, eip);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        cpu.control.cr0 |= CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        cpu.cpl = 3;
+        bus.memory[0x1000..0x1004].copy_from_slice(&(0x2000u32 | 7).to_le_bytes());
+        for page in 0..0x11u32 {
+            let offset = 0x2000 + page * 4;
+            bus.memory[offset as usize..offset as usize + 4]
+                .copy_from_slice(&((page << 12) | 7).to_le_bytes());
+        }
+        enable_read_regions(bus);
+        warm_from(cpu, bus, eip, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.registers.eip, eip);
+}
+
+#[test]
+fn mkii_pm32_native_x87_register_matches_oracle() {
+    let code = [0x90, 0xd9, 0xe8, 0xd9, 0xee, 0xd8, 0xc1];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.fpu.top(), oracle.fpu.top());
+    assert!(
+        cpu.dynarec_mkii_stats().native > 0,
+        "{:?}",
+        cpu.dynarec_mkii_stats()
+    );
+}
+
+#[test]
+fn mkii_pm32_native_x87_m64_matches_oracle() {
+    let code = [
+        0xdd, 0x05, 0x00, 0x20, 0x00, 0x00, 0xd9, 0xe8, 0xdc, 0x05, 0x00, 0x20, 0x00, 0x00, 0xdd,
+        0x1d, 0x08, 0x20, 0x00, 0x00, 0xeb, 0xfe,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2000..0x2008].copy_from_slice(&1.0f64.to_bits().to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        warm_read(cpu, bus, 0x2000);
+        warm_write(cpu, bus, 0x2008);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(&bus.memory[0x2008..0x2010], &other.memory[0x2008..0x2010]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native_admissions > 0, "{stats:?}");
+    assert!(stats.native >= 4, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_native_x87_m64_four_aligned_matches_oracle() {
+    let code = [
+        0xdd, 0x05, 0x04, 0x20, 0x00, 0x00, 0xdd, 0x1d, 0x0c, 0x20, 0x00, 0x00, 0xeb, 0xfe,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2004..0x200c].copy_from_slice(&7.25f64.to_bits().to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        warm_read(cpu, bus, 0x2004);
+        warm_write(cpu, bus, 0x200c);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(&bus.memory[0x200c..0x2014], &other.memory[0x200c..0x2014]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(
+        stats.native_admissions > 0 && stats.native >= 2,
+        "{stats:?}"
+    );
+    assert_eq!(stats.region_guard_misses, 0, "{stats:?}");
+}
+
+#[test]
+fn mkii_pm32_x87_m64_segment_limit_misses_native() {
+    let code = [
+        0xdd, 0x05, 0x04, 0x20, 0x00, 0x00, 0xdd, 0x1d, 0x0c, 0x20, 0x00, 0x00,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        warm_read(cpu, bus, 0x2004);
+        warm_write(cpu, bus, 0x200c);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+        cpu.registers.segments[SegmentIndex::Ds.index()].limit = 0x2007;
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native, 0, "{stats:?}");
+    assert_eq!(stats.region_guard_misses, 1, "{stats:?}");
+}
+
+#[test]
+fn mkii_pm32_x87_m64_page_cross_misses_native() {
+    let code = [0x90, 0xdd, 0x05, 0xfc, 0x1f, 0x00, 0x00, 0x90];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native_admissions, 0, "{stats:?}");
+    assert!(stats.helpers > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_native_x87_fld_fistp_i64_chop_matches_oracle() {
+    let code = [
+        0xdd, 0x05, 0x00, 0x20, 0x00, 0x00, 0xdf, 0x3d, 0x08, 0x20, 0x00, 0x00, 0xeb, 0xfe,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for cpu in [&mut cpu, &mut oracle] {
+        cpu.fpu.control = 0x0f7f;
+    }
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2000..0x2008].copy_from_slice(&3.5f64.to_bits().to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        warm_read(cpu, bus, 0x2000);
+        warm_write(cpu, bus, 0x2008);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(
+        i64::from_le_bytes(bus.memory[0x2008..0x2010].try_into().unwrap()),
+        3
+    );
+    assert_eq!(cpu.fpu, oracle.fpu);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native_admissions > 0, "{stats:?}");
+    assert!(stats.native >= 2, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_native_x87_fild_fistp_i64_matches_oracle() {
+    let code = [
+        0xdf, 0x2d, 0x00, 0x20, 0x00, 0x00, 0xdf, 0x3d, 0x08, 0x20, 0x00, 0x00, 0xeb, 0xfe,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for cpu in [&mut cpu, &mut oracle] {
+        cpu.fpu.control = 0x0f7f;
+    }
+    let value = (1i64 << 52) + 3;
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2000..0x2008].copy_from_slice(&value.to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        warm_read(cpu, bus, 0x2000);
+        warm_write(cpu, bus, 0x2008);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(
+        i64::from_le_bytes(bus.memory[0x2008..0x2010].try_into().unwrap()),
+        value
+    );
+    assert_eq!(cpu.fpu, oracle.fpu);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native_admissions > 0, "{stats:?}");
+    assert!(stats.native >= 2, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_native_x87_i64_fild_wide_mantissa_matches_oracle() {
+    let code = [
+        0xdf, 0x2d, 0x00, 0x20, 0x00, 0x00, 0xdd, 0x1d, 0x08, 0x20, 0x00, 0x00, 0xeb, 0xfe,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    let value = (1i64 << 53) + 1;
+    for memory in [&mut bus.memory, &mut other.memory] {
+        memory[0x2000..0x2008].copy_from_slice(&value.to_le_bytes());
+    }
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        warm_read(cpu, bus, 0x2000);
+        warm_write(cpu, bus, 0x2008);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    assert_eq!(cpu.fpu, oracle.fpu);
+    assert_eq!(&bus.memory[0x2008..0x2010], &other.memory[0x2008..0x2010]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.native_admissions > 0, "{stats:?}");
+    assert!(stats.native >= 2, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_native_jmp_call_ret_match_oracle() {
+    let code = [
+        0x90, 0x90, 0xe8, 0x01, 0x00, 0x00, 0x00, 0x90, 0xc3, 0x90, 0x90, 0xeb, 0x00,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        cpu.registers.segments[SegmentIndex::Ss.index()].default_size_32 = true;
+        cpu.registers.set_esp(0x9000);
+        enable_read_regions(bus);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 2000);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(stats.regions > 0, "{stats:?}");
+    assert_eq!(stats.mismatches, 0);
+}
+
+fn disable_oracle_backends(oracle: &mut CpuGsw) {
+    oracle.set_dynarec_mkii_enabled(false);
+    oracle.set_native_backend_enabled(false);
+}
+
+fn plant_data_dword(cpu: &mut CpuGsw, bus: &mut TestBus, address: u32, value: u32) {
+    cpu.write_memory_bus_width(
+        bus,
+        SegmentIndex::Ds,
+        address,
+        BusWidth::Dword,
+        value,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    cpu.settle_write_record();
+}
+
+fn clear_ss_b(cpu: &mut CpuGsw, esp: u32) {
+    cpu.registers.segments[SegmentIndex::Ss.index()].default_size_32 = false;
+    cpu.registers.set_esp(esp);
+}
+
+#[test]
+fn mkii_pm32_top_mismatch_releases_rust_prepare() {
+    let code = [0x90, 0xd9, 0xe8, 0xeb, 0xfb];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        bus.mkii_native_session = false;
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    disable_oracle_backends(&mut oracle);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.fpu.top(), oracle.fpu.top());
+    assert_eq!(cpu.fpu.status, oracle.fpu.status);
+    assert_eq!(cpu.fpu.control, oracle.fpu.control);
+    assert!(cpu.dynarec_mkii_stats().regions > 0);
+    assert_eq!(cpu.dynarec_mkii_stats().mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_top_mismatch_skips_generated_admission() {
+    let code = [0x90, 0xd9, 0xe8, 0xeb, 0xfb];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        bus.mkii_native_session = true;
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    disable_oracle_backends(&mut oracle);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.fpu.top(), oracle.fpu.top());
+    assert_eq!(cpu.fpu.status, oracle.fpu.status);
+    assert_eq!(cpu.fpu.control, oracle.fpu.control);
+    assert!(cpu.dynarec_mkii_stats().native_admissions > 0);
+    assert_eq!(cpu.dynarec_mkii_stats().mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_top_mismatch_after_pending_jcc_prefix() {
+    let code = [
+        0x3b, 0x05, 0x00, 0x20, 0x00, 0x00, 0x74, 0x03, 0x90, 0xd9, 0xe8, 0xeb, 0xf3,
+    ];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        bus.mkii_native_session = true;
+        cpu.registers.set_eax(1);
+        plant_data_dword(cpu, bus, 0x2000, 0);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    disable_oracle_backends(&mut oracle);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.fpu.top(), oracle.fpu.top());
+    assert_eq!(cpu.fpu.status, oracle.fpu.status);
+    assert_eq!(cpu.fpu.control, oracle.fpu.control);
+    assert_eq!(cpu.dynarec_mkii_stats().mismatches, 0);
+}
+
+fn run_ssb0_call_or_ret(
+    code: &[u8],
+    esp: u32,
+    native_session: bool,
+    stack_slots: &[(u32, u32)],
+) -> (CpuGsw, TestBus) {
+    let (mut cpu, mut bus) = pm32_fixture(code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        if native_session {
+            admission::enable_session(bus, false);
+            bus.mkii_native_session = true;
+        } else {
+            enable_read_regions(bus);
+            bus.mkii_native_session = false;
+        }
+        clear_ss_b(cpu, esp);
+        for &(address, value) in stack_slots {
+            plant_data_dword(cpu, bus, address, value);
+        }
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    disable_oracle_backends(&mut oracle);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    (cpu, bus)
+}
+
+#[test]
+fn mkii_pm32_call_refuses_16bit_stack_generated_admission() {
+    let code = [0x90, 0x90, 0xe8, 0, 0, 0, 0, 0xeb, 0xfe];
+    let (cpu, bus) = run_ssb0_call_or_ret(&code, 0x19000, true, &[(0x8ffc, 0), (0x18ffc, 0)]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native_admissions, 0, "{stats:?}");
+    assert_eq!(&bus.memory[0x8ffc..0x9000], &0x10007u32.to_le_bytes());
+    assert_eq!(&bus.memory[0x18ffc..0x19000], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn mkii_pm32_call_refuses_16bit_stack_rust_prepare() {
+    let code = [0x90, 0x90, 0xe8, 0, 0, 0, 0, 0xeb, 0xfe];
+    let (cpu, bus) = run_ssb0_call_or_ret(&code, 0x19000, false, &[(0x8ffc, 0), (0x18ffc, 0)]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native_admissions, 0, "{stats:?}");
+    assert_eq!(stats.regions, 0, "{stats:?}");
+    assert_eq!(&bus.memory[0x8ffc..0x9000], &0x10007u32.to_le_bytes());
+    assert_eq!(&bus.memory[0x18ffc..0x19000], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn mkii_pm32_call_refuses_16bit_stack_wrap() {
+    let code = [0x90, 0x90, 0xe8, 0, 0, 0, 0, 0xeb, 0xfe];
+    let (cpu, bus) = run_ssb0_call_or_ret(&code, 0x20000, true, &[(0xfffc, 0), (0x1fffc, 0)]);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native_admissions, 0, "{stats:?}");
+    assert_eq!(&bus.memory[0xfffc..0x10000], &0x10007u32.to_le_bytes());
+    assert_eq!(&bus.memory[0x1fffc..0x20000], &[0, 0, 0, 0]);
+}
+
+#[test]
+fn mkii_pm32_ret_refuses_16bit_stack_generated_admission() {
+    let code = [0x90, 0x90, 0xc3, 0xeb, 0xfe];
+    let (cpu, _) = run_ssb0_call_or_ret(
+        &code,
+        0x19000,
+        true,
+        &[(0x9000, 0x10003), (0x19000, 0xdead_beef)],
+    );
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native_admissions, 0, "{stats:?}");
+    assert_eq!(cpu.registers.eip, 0x10003);
+}
+
+#[test]
+fn mkii_pm32_ret_refuses_16bit_stack_wrap() {
+    let code = [0x90, 0x90, 0xc3, 0xeb, 0xfe];
+    let (cpu, _) = run_ssb0_call_or_ret(
+        &code,
+        0x1fffc,
+        true,
+        &[(0xfffc, 0x10003), (0x1fffc, 0xdead_beef)],
+    );
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native_admissions, 0, "{stats:?}");
+    assert_eq!(cpu.registers.eip, 0x10003);
+}
+
+#[test]
+fn mkii_pm32_jmp_admits_with_16bit_stack() {
+    let code = [0x90, 0x90, 0xeb, 0xfe];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        admission::enable_session(bus, false);
+        bus.mkii_native_session = true;
+        clear_ss_b(cpu, 0x19000);
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    disable_oracle_backends(&mut oracle);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    let stats = cpu.dynarec_mkii_stats();
+    assert!(
+        stats.native_admissions > 0 || stats.regions > 0,
+        "{stats:?}"
+    );
+    assert_eq!(stats.mismatches, 0);
+}
+
+#[test]
+fn mkii_pm32_fldcw_rearms_exception_gate() {
+    let code = [0x90, 0xd9, 0x2d, 0, 0x20, 0, 0, 0xd9, 0xe8, 0xeb, 0xfe];
+    let (mut cpu, mut bus) = pm32_fixture(&code, 0x10000);
+    let (mut oracle, mut other) = pm32_fixture(&code, 0x10000);
+    for (cpu, bus) in [(&mut cpu, &mut bus), (&mut oracle, &mut other)] {
+        enable_read_regions(bus);
+        cpu.control.cr0 |= CR0_NE;
+        cpu.control.cr0 &= !(CR0_EM | CR0_TS);
+        cpu.fpu.control = 0x037f;
+        cpu.fpu.raise_exception(1);
+        bus.memory[0x2000..0x2002].copy_from_slice(&0x037eu16.to_le_bytes());
+        cpu.read_memory_bus_width(
+            bus,
+            SegmentIndex::Ds,
+            0x2000,
+            BusWidth::Word,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+        warm_from(cpu, bus, 0x10000, code.len() as u32);
+    }
+    disable_oracle_backends(&mut oracle);
+    compare_pair_run(&mut cpu, &mut bus, &mut oracle, &mut other, 1000);
+    assert_eq!(cpu.fpu.control, 0x037e);
+    assert_eq!(oracle.fpu.control, 0x037e);
+    assert_eq!(cpu.fpu.top(), 0);
+    assert_eq!(oracle.fpu.top(), 0);
+    let stats = cpu.dynarec_mkii_stats();
+    assert_eq!(stats.native, 2, "{stats:?}");
+    assert!(stats.region_guard_misses > 0, "{stats:?}");
 }

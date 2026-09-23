@@ -6,35 +6,69 @@ use crate::jit::fast_map::{
     NATIVE_LOAD_BIAS_MODE13, NATIVE_LOAD_BIAS_SUPERVISOR, NATIVE_LOAD_BIAS_TAG_MASK,
     NATIVE_STORE_BIAS_MODE13, NATIVE_STORE_BIAS_SUPERVISOR, NATIVE_STORE_BIAS_TAG_MASK,
 };
+use crate::jit::native_x87::{NativeX87Insn, NativeX87MemoryDirection};
+use crate::jit::x87_avx2_emit::{Avx2X87EmitContext, emit_enter, emit_native_x87, emit_spill};
 use crate::mkii::ops::{Read, Store};
-use crate::{AddressSize, SegmentRegister};
+use crate::mkii::runtime::Frame;
+use crate::timing_class::TimingClass;
+use crate::{AddrMode, AddressSize, SegmentIndex, SegmentRegister};
 
-pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
+pub(super) fn emit(
+    e: &mut Encoder,
+    operations: &[Operation],
+    exit: Label,
+    cs_default_size_32: bool,
+) {
     let commit = e.label();
     let done = e.label();
     let mut exits = Vec::new();
+    let mut x87_top = operations
+        .first()
+        .and_then(|op| op.region.as_ref())
+        .and_then(|region| region.x87_top);
+    let mut x87_live = false;
+    let mut x87_gate = true;
     for (index, op) in operations.iter().enumerate() {
         if op.needs_carry_zero() {
             let miss = e.label();
             emit_carry_zero_guard(e, miss);
-            exits.push((miss, index, 2));
+            exits.push((miss, index, 2, x87_live));
         }
-        if let Some((pure, _)) = op.region_pure() {
+        if let Some(x87) = op.x87 {
+            if !x87_live {
+                emit_x87_save_host(e);
+                emit_enter(e, Reg::RBX);
+                x87_live = true;
+            }
+            let miss = e.label();
+            emit_x87_op(e, x87, x87_top.unwrap_or(0), x87_gate, miss);
+            x87_gate = matches!(x87, NativeX87Insn::LoadControlWord { .. });
+            x87_top = Some(x87.advance_top(x87_top.unwrap_or(0)));
+            exits.push((miss, index, 1, true));
+        } else if let Some((pure, _)) = op.region_pure() {
             emit_pure(e, pure);
         } else if let Some(read) = op.read {
             let miss = e.label();
             emit_read(e, read, miss);
-            exits.push((miss, index, 1));
+            exits.push((miss, index, 1, x87_live));
         } else if let Some(store) = op.store {
             let miss = e.label();
             emit_store(e, store, miss);
-            exits.push((miss, index, 1));
+            exits.push((miss, index, 1, x87_live));
+        } else if op.is_dword_near_transfer() {
+            let miss = e.label();
+            emit_near_transfer(e, op, miss);
+            exits.push((miss, index, 1, x87_live));
         } else {
             let (alu, width) = operations[index - 1].branch_alu().unwrap();
             let taken = e.label();
             emit_branch(e, op, alu, width, taken);
-            exits.push((taken, index + 1, 0));
+            exits.push((taken, index + 1, 0, x87_live));
         }
+    }
+    if x87_live {
+        emit_spill(e, Reg::RBX);
+        emit_x87_restore_host(e);
     }
     e.store_u32_imm_disp32(
         Reg::R13,
@@ -44,10 +78,11 @@ pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
     let last = operations.last().unwrap();
     if operations.len() >= 2
         && last.store.is_none()
+        && !last.is_dword_near_transfer()
         && last
             .eip
             .checked_add(u32::from(last.insn.len))
-            .is_some_and(|eip| eip < 0x10000)
+            .is_some_and(|eip| cs_default_size_32 || eip < 0x10000)
     {
         e.load_r32_disp32(
             Reg::RAX,
@@ -60,7 +95,9 @@ pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
         e.jmp(done);
     }
     e.jmp(commit);
-    for (label, completed, reason) in exits {
+    let spill = e.label();
+    let mut needs_spill = false;
+    for (label, completed, reason, x87) in exits {
         e.place(label);
         e.store_u32_imm_disp32(
             Reg::R13,
@@ -72,6 +109,17 @@ pub(super) fn emit(e: &mut Encoder, operations: &[Operation], exit: Label) {
             std::mem::offset_of!(Frame, region_guard_miss) as i32,
             reason,
         );
+        if x87 {
+            needs_spill = true;
+            e.jmp(spill);
+        } else {
+            e.jmp(commit);
+        }
+    }
+    if needs_spill {
+        e.place(spill);
+        emit_spill(e, Reg::RBX);
+        emit_x87_restore_host(e);
         e.jmp(commit);
     }
     e.place(commit);
@@ -243,120 +291,21 @@ fn emit_carry_zero_guard(e: &mut Encoder, miss: Label) {
 }
 
 fn emit_read(e: &mut Encoder, read: Read, miss: Label) {
-    let address = read.address;
-    let address_width = if address.address_size == AddressSize::Word {
-        BusWidth::Word
-    } else {
-        BusWidth::Dword
-    };
-    e.mov_r32_imm32(Reg::R10, address.disp as u32);
-    if let Some(base) = address.base {
-        load(e, Reg::RAX, Input::Reg(base), address_width);
-        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
+    emit_read_into(e, read, miss, false);
+}
+
+fn emit_read_into(e: &mut Encoder, read: Read, miss: Label, pointer_only: bool) {
+    emit_pointer(
+        e,
+        read.address,
+        read.width.bytes(),
+        read.width.bytes(),
+        false,
+        miss,
+    );
+    if pointer_only {
+        return;
     }
-    if let Some(index) = address.index {
-        load(e, Reg::RAX, Input::Reg(index), address_width);
-        if address.address_size == AddressSize::Dword && address.scale != 1 {
-            e.shift_r32_imm8(4, Reg::RAX, address.scale.trailing_zeros() as u8);
-        }
-        e.alu_r32_r32(0, Reg::R10, Reg::RAX);
-    }
-    if address.address_size == AddressSize::Word {
-        e.alu_r32_imm32(4, Reg::R10, 0xffff);
-    }
-    let segment = (std::mem::offset_of!(CpuGsw, registers)
-        + std::mem::offset_of!(Registers, segments)
-        + address.segment.index() * std::mem::size_of::<SegmentRegister>())
-        as i32;
-    e.load_r32_disp32(
-        Reg::R8,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, limit) as i32,
-    );
-    e.load_r32_disp32(
-        Reg::R9,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, base) as i32,
-    );
-    let bounds = e.label();
-    let checked = e.label();
-    e.cmp_r32_imm32(Reg::R8, u32::MAX);
-    e.jcc(5, bounds);
-    e.test_r32_r32(Reg::R9, Reg::R9);
-    e.jcc(4, checked);
-    e.place(bounds);
-    e.mov_r32_r32(Reg::RDX, Reg::R10);
-    if read.width != BusWidth::Byte {
-        e.alu_r32_imm32(0, Reg::RDX, read.width.bytes() - 1);
-        e.jcc(2, miss);
-    }
-    e.movzx_r32_byte_disp32(
-        Reg::RAX,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, access) as i32,
-    );
-    e.alu_r32_imm32(4, Reg::RAX, 0x1c);
-    e.cmp_r32_imm32(Reg::RAX, 0x14);
-    let down = e.label();
-    e.jcc(4, down);
-    e.alu_r32_r32(7, Reg::RDX, Reg::R8);
-    e.jcc(7, miss);
-    e.jmp(checked);
-    e.place(down);
-    e.alu_r32_r32(7, Reg::R10, Reg::R8);
-    e.jcc(6, miss);
-    e.movzx_r32_byte_disp32(
-        Reg::RAX,
-        Reg::RBX,
-        segment + std::mem::offset_of!(SegmentRegister, default_size_32) as i32,
-    );
-    e.test_r32_r32(Reg::RAX, Reg::RAX);
-    e.jcc(5, checked);
-    e.cmp_r32_imm32(Reg::RDX, 0xffff);
-    e.jcc(7, miss);
-    e.place(checked);
-    e.alu_r32_r32(0, Reg::R10, Reg::R9);
-    // Natural alignment of 1/2/4-byte accesses also proves 4 KiB page locality.
-    if read.width != BusWidth::Byte {
-        e.test_r32_imm32(Reg::R10, read.width.bytes() - 1);
-        e.jcc(5, miss);
-    }
-    e.mov_r32_r32(Reg::R11, Reg::R10);
-    e.shift_r32_imm8(5, Reg::R11, 12);
-    e.load_r64_disp32(
-        Reg::R8,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_mapping_epochs) as i32,
-    );
-    e.load_r64_sib_scale8(Reg::R8, Reg::R8, Reg::R11);
-    e.load_r64_disp32(
-        Reg::R9,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_epoch) as i32,
-    );
-    e.cmp_r64_r64(Reg::R8, Reg::R9);
-    e.jcc(5, miss);
-    e.load_r64_disp32(
-        Reg::R8,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_load_biases) as i32,
-    );
-    e.load_r64_sib_scale8(Reg::R8, Reg::R8, Reg::R11);
-    e.test_r32_imm32(Reg::R8, NATIVE_LOAD_BIAS_MODE13 as u32);
-    e.jcc(5, miss);
-    let permitted = e.label();
-    e.test_r32_imm32(Reg::R8, NATIVE_LOAD_BIAS_SUPERVISOR as u32);
-    e.jcc(4, permitted);
-    e.load_r32_disp32(
-        Reg::RAX,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_user) as i32,
-    );
-    e.test_r32_r32(Reg::RAX, Reg::RAX);
-    e.jcc(5, miss);
-    e.place(permitted);
-    e.and_r64_imm32(Reg::R8, !(NATIVE_LOAD_BIAS_TAG_MASK as u32));
-    e.add_r64_r64(Reg::R8, Reg::R10);
     match read.width {
         BusWidth::Byte => e.movzx_r32_byte_disp32(Reg::RDX, Reg::R8, 0),
         BusWidth::Word => e.movzx_r32_word_disp32(Reg::RDX, Reg::R8, 0),
@@ -374,7 +323,41 @@ fn emit_read(e: &mut Encoder, read: Read, miss: Label) {
 }
 
 fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
-    let address = store.address;
+    emit_store_into(e, store, miss, false);
+}
+
+fn emit_store_into(e: &mut Encoder, store: Store, miss: Label, pointer_only: bool) {
+    emit_pointer(
+        e,
+        store.address,
+        store.width.bytes(),
+        store.width.bytes(),
+        true,
+        miss,
+    );
+    if pointer_only {
+        return;
+    }
+    load(e, Reg::RDX, store.src, store.width);
+    match store.width {
+        BusWidth::Byte => e.store_r8_disp8(Reg::R8, 0, Reg::RDX),
+        BusWidth::Word => e.store_r16_disp32(Reg::R8, 0, Reg::RDX),
+        BusWidth::Dword => e.store_r32_disp32(Reg::R8, 0, Reg::RDX),
+    }
+}
+
+fn emit_pointer(
+    e: &mut Encoder,
+    address: AddrMode,
+    span_bytes: u32,
+    alignment: u32,
+    write: bool,
+    miss: Label,
+) {
+    debug_assert!(matches!(
+        (span_bytes, alignment),
+        (1, 1) | (2, 2) | (4, 4) | (8, 4)
+    ));
     let address_width = if address.address_size == AddressSize::Word {
         BusWidth::Word
     } else {
@@ -417,8 +400,8 @@ fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
     e.jcc(4, checked);
     e.place(bounds);
     e.mov_r32_r32(Reg::RDX, Reg::R10);
-    if store.width != BusWidth::Byte {
-        e.alu_r32_imm32(0, Reg::RDX, store.width.bytes() - 1);
+    if span_bytes > 1 {
+        e.alu_r32_imm32(0, Reg::RDX, span_bytes - 1);
         e.jcc(2, miss);
     }
     e.movzx_r32_byte_disp32(
@@ -426,10 +409,12 @@ fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
         Reg::RBX,
         segment + std::mem::offset_of!(SegmentRegister, access) as i32,
     );
-    e.test_r32_imm32(Reg::RAX, 0x08);
-    e.jcc(5, miss);
-    e.test_r32_imm32(Reg::RAX, 0x02);
-    e.jcc(4, miss);
+    if write {
+        e.test_r32_imm32(Reg::RAX, 0x08);
+        e.jcc(5, miss);
+        e.test_r32_imm32(Reg::RAX, 0x02);
+        e.jcc(4, miss);
+    }
     e.alu_r32_imm32(4, Reg::RAX, 0x1c);
     e.cmp_r32_imm32(Reg::RAX, 0x14);
     let down = e.label();
@@ -451,9 +436,15 @@ fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
     e.jcc(7, miss);
     e.place(checked);
     e.alu_r32_r32(0, Reg::R10, Reg::R9);
-    if store.width != BusWidth::Byte {
-        e.test_r32_imm32(Reg::R10, store.width.bytes() - 1);
+    if alignment > 1 {
+        e.test_r32_imm32(Reg::R10, alignment - 1);
         e.jcc(5, miss);
+    }
+    if span_bytes > alignment {
+        e.mov_r32_r32(Reg::RAX, Reg::R10);
+        e.and_r32_imm32(Reg::RAX, 0xfff);
+        e.cmp_r32_imm32(Reg::RAX, 0x1000 - span_bytes);
+        e.jcc(7, miss);
     }
     e.mov_r32_r32(Reg::R11, Reg::R10);
     e.shift_r32_imm8(5, Reg::R11, 12);
@@ -470,16 +461,27 @@ fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
     );
     e.cmp_r64_r64(Reg::R8, Reg::R9);
     e.jcc(5, miss);
-    e.load_r64_disp32(
-        Reg::R8,
-        Reg::R13,
-        std::mem::offset_of!(Frame, region_store_biases) as i32,
-    );
+    let bias = if write {
+        std::mem::offset_of!(Frame, region_store_biases)
+    } else {
+        std::mem::offset_of!(Frame, region_load_biases)
+    };
+    e.load_r64_disp32(Reg::R8, Reg::R13, bias as i32);
     e.load_r64_sib_scale8(Reg::R8, Reg::R8, Reg::R11);
-    e.test_r32_imm32(Reg::R8, NATIVE_STORE_BIAS_MODE13 as u32);
+    let mode13 = if write {
+        NATIVE_STORE_BIAS_MODE13
+    } else {
+        NATIVE_LOAD_BIAS_MODE13
+    };
+    e.test_r32_imm32(Reg::R8, mode13 as u32);
     e.jcc(5, miss);
     let permitted = e.label();
-    e.test_r32_imm32(Reg::R8, NATIVE_STORE_BIAS_SUPERVISOR as u32);
+    let supervisor = if write {
+        NATIVE_STORE_BIAS_SUPERVISOR
+    } else {
+        NATIVE_LOAD_BIAS_SUPERVISOR
+    };
+    e.test_r32_imm32(Reg::R8, supervisor as u32);
     e.jcc(4, permitted);
     e.load_r32_disp32(
         Reg::RAX,
@@ -489,28 +491,194 @@ fn emit_store(e: &mut Encoder, store: Store, miss: Label) {
     e.test_r32_r32(Reg::RAX, Reg::RAX);
     e.jcc(5, miss);
     e.place(permitted);
-    e.and_r64_imm32(Reg::R8, !(NATIVE_STORE_BIAS_TAG_MASK as u32));
+    let tag = if write {
+        NATIVE_STORE_BIAS_TAG_MASK
+    } else {
+        NATIVE_LOAD_BIAS_TAG_MASK
+    };
+    e.and_r64_imm32(Reg::R8, !(tag as u32));
     e.add_r64_r64(Reg::R8, Reg::R10);
+    if write {
+        e.load_r64_disp32(
+            Reg::RAX,
+            Reg::R13,
+            std::mem::offset_of!(Frame, region_physical_pages) as i32,
+        );
+        e.load_r32_sib_scale4(Reg::R9, Reg::RAX, Reg::R11);
+        e.store_r32_disp32(
+            Reg::R13,
+            std::mem::offset_of!(Frame, region_write_page) as i32,
+            Reg::R9,
+        );
+        e.store_u32_imm_disp32(
+            Reg::R13,
+            std::mem::offset_of!(Frame, region_write_count) as i32,
+            1,
+        );
+    }
+}
+
+fn emit_x87_save_host(e: &mut Encoder) {
+    e.store_r64_disp32(
+        Reg::R13,
+        std::mem::offset_of!(Frame, x87_save_rsi) as i32,
+        Reg::RSI,
+    );
+    e.store_r64_disp32(
+        Reg::R13,
+        std::mem::offset_of!(Frame, x87_save_rdi) as i32,
+        Reg::RDI,
+    );
+    #[cfg(target_os = "windows")]
+    {
+        use crate::jit::encoder::Xmm;
+        const XMMS: [Xmm; 6] = [
+            Xmm::XMM6,
+            Xmm::XMM7,
+            Xmm::XMM8,
+            Xmm::XMM9,
+            Xmm::XMM10,
+            Xmm::XMM11,
+        ];
+        let base = std::mem::offset_of!(Frame, x87_save_xmm) as i32;
+        for (index, xmm) in XMMS.into_iter().enumerate() {
+            e.vmovupd_disp32_xmm(Reg::R13, base + index as i32 * 16, xmm);
+        }
+    }
+}
+
+fn emit_x87_restore_host(e: &mut Encoder) {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::jit::encoder::Xmm;
+        const XMMS: [Xmm; 6] = [
+            Xmm::XMM6,
+            Xmm::XMM7,
+            Xmm::XMM8,
+            Xmm::XMM9,
+            Xmm::XMM10,
+            Xmm::XMM11,
+        ];
+        let base = std::mem::offset_of!(Frame, x87_save_xmm) as i32;
+        for (index, xmm) in XMMS.into_iter().enumerate() {
+            e.vmovupd_xmm_disp32(xmm, Reg::R13, base + index as i32 * 16);
+        }
+    }
     e.load_r64_disp32(
-        Reg::RAX,
+        Reg::RSI,
         Reg::R13,
-        std::mem::offset_of!(Frame, region_physical_pages) as i32,
+        std::mem::offset_of!(Frame, x87_save_rsi) as i32,
     );
-    e.load_r32_sib_scale4(Reg::R9, Reg::RAX, Reg::R11);
-    e.store_r32_disp32(
+    e.load_r64_disp32(
+        Reg::RDI,
         Reg::R13,
-        std::mem::offset_of!(Frame, region_write_page) as i32,
-        Reg::R9,
+        std::mem::offset_of!(Frame, x87_save_rdi) as i32,
     );
+}
+
+fn emit_x87_op(e: &mut Encoder, x87: NativeX87Insn, top: u8, check_gate: bool, miss: Label) {
+    let memory = x87.metadata().memory.and_then(|access| {
+        let address = x87.memory_address()?;
+        let write = access.direction == NativeX87MemoryDirection::Write;
+        let (span_bytes, alignment) = if access.width == 8 {
+            (8, 4)
+        } else if access.width <= 2 {
+            (2, 2)
+        } else {
+            (4, 4)
+        };
+        emit_pointer(e, address, span_bytes, alignment, write, miss);
+        e.mov_r64_r64(Reg::RDI, Reg::R8);
+        Some(Reg::RDI)
+    });
+    emit_native_x87(
+        e,
+        x87,
+        Avx2X87EmitContext {
+            cpu: Reg::RBX,
+            memory,
+            side_exit: miss,
+            check_gate,
+            top,
+        },
+    );
+}
+
+fn emit_near_transfer(e: &mut Encoder, op: &Operation, miss: Label) {
+    let len = u32::from(op.insn.len);
+    let return_eip = op.eip.wrapping_add(len);
+    let target = return_eip.wrapping_add(op.insn.imm);
+    let eip =
+        (std::mem::offset_of!(CpuGsw, registers) + std::mem::offset_of!(Registers, eip)) as i32;
+    let esp = super::gpr_offset(4, BusWidth::Dword);
+    match op.insn.opcode {
+        0xe8 => {
+            emit_store_into(
+                e,
+                Store {
+                    address: AddrMode {
+                        segment: SegmentIndex::Ss,
+                        base: Some(4),
+                        index: None,
+                        scale: 1,
+                        disp: -4,
+                        address_size: AddressSize::Dword,
+                    },
+                    width: BusWidth::Dword,
+                    src: Input::Immediate(return_eip),
+                    class: TimingClass::CallJmpRel,
+                },
+                miss,
+                true,
+            );
+            e.store_u32_imm_disp32(Reg::R8, 0, return_eip);
+            e.load_r32_disp32(Reg::R10, Reg::RBX, esp);
+            e.alu_r32_imm32(5, Reg::R10, 4);
+            e.store_r32_disp32(Reg::RBX, esp, Reg::R10);
+            e.store_u32_imm_disp32(Reg::RBX, eip, target);
+        }
+        0xe9 | 0xeb => {
+            e.store_u32_imm_disp32(Reg::RBX, eip, target);
+        }
+        0xc3 => {
+            emit_read_into(
+                e,
+                Read {
+                    address: AddrMode {
+                        segment: SegmentIndex::Ss,
+                        base: Some(4),
+                        index: None,
+                        scale: 1,
+                        disp: 0,
+                        address_size: AddressSize::Dword,
+                    },
+                    width: BusWidth::Dword,
+                    dst: 0,
+                    alu: None,
+                    class: TimingClass::RetNear,
+                },
+                miss,
+                true,
+            );
+            e.load_r32_disp32(Reg::RAX, Reg::R8, 0);
+            e.load_r32_disp32(
+                Reg::RDX,
+                Reg::R13,
+                (std::mem::offset_of!(Frame, cs) + std::mem::offset_of!(SegmentRegister, limit))
+                    as i32,
+            );
+            e.alu_r32_r32(7, Reg::RAX, Reg::RDX);
+            e.jcc(7, miss);
+            e.load_r32_disp32(Reg::R10, Reg::RBX, esp);
+            e.alu_r32_imm32(0, Reg::R10, 4);
+            e.store_r32_disp32(Reg::RBX, esp, Reg::R10);
+            e.store_r32_disp32(Reg::RBX, eip, Reg::RAX);
+        }
+        _ => {}
+    }
     e.store_u32_imm_disp32(
         Reg::R13,
-        std::mem::offset_of!(Frame, region_write_count) as i32,
+        std::mem::offset_of!(Frame, branch_taken) as i32,
         1,
     );
-    load(e, Reg::RDX, store.src, store.width);
-    match store.width {
-        BusWidth::Byte => e.store_r8_disp8(Reg::R8, 0, Reg::RDX),
-        BusWidth::Word => e.store_r16_disp32(Reg::R8, 0, Reg::RDX),
-        BusWidth::Dword => e.store_r32_disp32(Reg::R8, 0, Reg::RDX),
-    }
 }

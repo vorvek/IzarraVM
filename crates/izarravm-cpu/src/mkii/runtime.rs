@@ -6,6 +6,7 @@ use crate::run::{budgeted_run_outcome, checked_run_core_total};
 use crate::timing_class::TimingClass;
 use crate::*;
 use std::collections::HashMap;
+use std::mem::{align_of, size_of};
 
 #[path = "region.rs"]
 mod region;
@@ -27,6 +28,7 @@ struct Key {
     cs_limit: u32,
     cs_selector: u16,
     cpl: u8,
+    cs_default_size_32: bool,
 }
 
 struct Trace {
@@ -44,15 +46,46 @@ impl std::fmt::Debug for Trace {
     }
 }
 
-#[derive(Debug, Default)]
 pub(super) struct Engine {
     traces: HashMap<Key, usize>,
     arena: Vec<Option<Trace>>,
     free: Vec<usize>,
     dispatch: Vec<Option<(Key, usize)>>,
+    probe: Vec<ProbeSlot>,
+    probe_gen: u32,
     pub stats: Stats,
     #[cfg(test)]
     fail_next_compile: bool,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self {
+            traces: HashMap::new(),
+            arena: Vec::new(),
+            free: Vec::new(),
+            dispatch: Vec::new(),
+            probe: Vec::new(),
+            probe_gen: 1,
+            stats: Stats::default(),
+            #[cfg(test)]
+            fail_next_compile: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("traces", &self.traces.len())
+            .field("arena", &self.arena.len())
+            .field("free", &self.free.len())
+            .field("dispatch", &self.dispatch.len())
+            .field("probe", &self.probe.len())
+            .field("probe_gen", &self.probe_gen)
+            .field("stats", &self.stats)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -77,6 +110,59 @@ pub struct Stats {
     pub dispatch_misses: u64,
     pub carry_native: u64,
     pub carry_misses: u64,
+    pub probe_hits: u64,
+    pub probe_misses: u64,
+}
+
+pub(super) const PROBE_SLOTS: usize = 65536;
+pub(super) const PROBE_HASH: u32 = 0x9e37_79b9;
+pub(super) const PROBE_FLAG_D: u8 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct ProbeSlot {
+    pub eip: u32,
+    pub cs_base: u32,
+    pub cs_limit: u32,
+    pub physical: u32,
+    pub cs_selector: u16,
+    pub cpl: u8,
+    pub flags: u8,
+    pub cs_access: u8,
+    _pad: [u8; 3],
+    pub generation: u32,
+    pub source_present: u32,
+    pub table: u64,
+    pub body: u64,
+    pub source_mapping: u64,
+    pub source_cost: u64,
+}
+
+const _: () = assert!(size_of::<ProbeSlot>() == 64);
+const _: () = assert!(align_of::<ProbeSlot>() == 8);
+
+impl ProbeSlot {
+    pub(super) const EMPTY: Self = Self {
+        eip: 0,
+        cs_base: 0,
+        cs_limit: 0,
+        physical: 0,
+        cs_selector: 0,
+        cpl: 0,
+        flags: 0,
+        cs_access: 0,
+        _pad: [0; 3],
+        generation: 0,
+        source_present: 0,
+        table: 0,
+        body: 0,
+        source_mapping: 0,
+        source_cost: 0,
+    };
+}
+
+pub(super) fn probe_index(linear: u32) -> usize {
+    (linear.wrapping_mul(PROBE_HASH) >> 16) as usize
 }
 
 type Helper = unsafe extern "C" fn(*mut CpuGsw, *mut (), *mut Frame, *const Operation) -> u32;
@@ -124,9 +210,12 @@ impl Session {
 }
 
 pub(super) struct Frame {
-    pub helpers: [Helper; 15],
+    pub helpers: [Helper; 16],
     pub resolve: Resolver,
     pub dispatch: usize,
+    pub probe: *mut ProbeSlot,
+    pub probe_gen: u32,
+    pub fetched_live: u32,
     engine: *mut Engine,
     pub memory_ptr: *mut u8,
     pub branch_taken: u32,
@@ -146,7 +235,7 @@ pub(super) struct Frame {
     pub region_monitor: u32,
     pub(super) region_can_take: bool,
     region_running: Option<region::Running>,
-    force_canonical: bool,
+    pub(super) force_canonical: bool,
     pub(super) total: u64,
     pub(super) cap: u64,
     pub(super) bus_at_entry: u64,
@@ -158,6 +247,9 @@ pub(super) struct Frame {
     pub(super) source_mapping: u64,
     pub(super) source_cost: u64,
     pub(super) session: Session,
+    pub x87_save_rsi: u64,
+    pub x87_save_rdi: u64,
+    pub x87_save_xmm: [u128; 6],
     pending: Option<Pending>,
     fetched: Option<Fetched>,
     poll_16_armed: bool,
@@ -201,9 +293,13 @@ impl Frame {
                 prepare_span::<B>,
                 region::prepare::<B>,
                 region::finish::<B>,
+                step::<B, 15>,
             ],
             resolve: resolve::<B>,
             dispatch: 0,
+            probe: std::ptr::null_mut(),
+            probe_gen: 0,
+            fetched_live: 0,
             engine: std::ptr::null_mut(),
             memory_ptr: std::ptr::null_mut(),
             branch_taken: 0,
@@ -235,6 +331,9 @@ impl Frame {
             source_mapping: 0,
             source_cost: 0,
             session: Session::default(),
+            x87_save_rsi: 0,
+            x87_save_rdi: 0,
+            x87_save_xmm: [0; 6],
             pending: None,
             fetched: None,
             poll_16_armed: cpu.jit_direct.direct_poll_skip_16_armed_for(),
@@ -377,13 +476,10 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
     cpu.core_clocks_so_far = frame.total;
     cpu.begin_instruction();
     let lin = cpu.linear_eip();
-    let warm = cpu
-        .decode_cache
-        .get_packed(lin, false)
-        .is_some_and(|screen| {
-            screen.phys_start == operation.physical && screen.len == operation.insn.len
-        })
-        && CpuGsw::fetch_within_limit(operation.eip, operation.insn.len, frame.cs.limit);
+    let d = cpu.registers.cs().default_size_32;
+    let warm = cpu.decode_cache.get_packed(lin, d).is_some_and(|screen| {
+        screen.phys_start == operation.physical && screen.len == operation.insn.len
+    }) && CpuGsw::fetch_within_limit(operation.eip, operation.insn.len, frame.cs.limit);
     let decoded;
     let fetched = if warm {
         cpu.charge_cached_fetch_at(bus, lin, operation.insn.len, operation.physical)
@@ -421,7 +517,7 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
     }
     if !warm
         && (*insn != operation.insn
-            || cpu.decode_cache.line_phys_start(lin, false) != Some(operation.physical))
+            || cpu.decode_cache.line_phys_start(lin, d) != Some(operation.physical))
     {
         frame.stats.mismatches += 1;
         frame.fetched = Some(Fetched {
@@ -430,6 +526,7 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
             cs: frame.cs,
             can_take,
         });
+        frame.fetched_live = 1;
         return 0;
     }
     if GROUP == 0 {
@@ -483,6 +580,7 @@ unsafe extern "C" fn step<B: CpuBus, const GROUP: usize>(
         8 => cpu.execute_control_flow_decoded(insn, bus, &mut work.committed),
         9 => cpu.execute_bitmanip_decoded(insn, bus),
         10 => cpu.execute_condmove_decoded(insn, bus),
+        15 => cpu.execute_fpu_decoded(insn, bus),
         _ => unreachable!(),
     };
     let succeeded = result.is_ok();
@@ -574,7 +672,10 @@ unsafe extern "C" fn prepare_span<B: CpuBus>(
     let mut raw_bus = memory.map_or(0, |(_, _, _, clocks)| clocks);
     for (index, op) in operations.iter().enumerate() {
         let linear = frame.cs.base.wrapping_add(op.eip);
-        let Some(view) = cpu.decode_cache.get_packed(linear, false) else {
+        let Some(view) = cpu
+            .decode_cache
+            .get_packed(linear, frame.cs.default_size_32)
+        else {
             return 0;
         };
         if view.len != op.insn.len
@@ -675,6 +776,63 @@ impl Engine {
         flush(state, &mut pending);
     }
 
+    fn probe_ptr(&mut self) -> *mut ProbeSlot {
+        if self.probe.len() == PROBE_SLOTS {
+            self.probe.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    fn sync_probe(&mut self, frame: &mut Frame) {
+        frame.probe = self.probe_ptr();
+        frame.probe_gen = self.probe_gen;
+    }
+
+    fn invalidate_probe(&mut self) {
+        let next = self.probe_gen.wrapping_add(1);
+        if next == 0 {
+            self.probe.fill(ProbeSlot::EMPTY);
+            self.probe_gen = 1;
+        } else {
+            self.probe_gen = next;
+        }
+    }
+
+    fn publish(
+        &mut self,
+        cpu: &CpuGsw,
+        frame: &mut Frame,
+        physical: u32,
+        certificate: Option<(u64, u64)>,
+        body: u64,
+    ) {
+        if self.probe.is_empty() {
+            self.probe = vec![ProbeSlot::EMPTY; PROBE_SLOTS];
+        }
+        let cs = cpu.registers.cs();
+        let linear = cs.base.wrapping_add(cpu.registers.eip);
+        let (source_mapping, source_cost) = certificate.unwrap_or((0, 0));
+        self.probe[probe_index(linear)] = ProbeSlot {
+            eip: cpu.registers.eip,
+            cs_base: cs.base,
+            cs_limit: cs.limit,
+            physical,
+            cs_selector: cs.selector,
+            cpl: cpu.cpl,
+            flags: u8::from(cs.default_size_32) * PROBE_FLAG_D,
+            cs_access: cs.access,
+            _pad: [0; 3],
+            generation: self.probe_gen,
+            source_present: u32::from(certificate.is_some()),
+            table: cpu.class_table() as *const _ as u64,
+            body,
+            source_mapping,
+            source_cost,
+        };
+        self.sync_probe(frame);
+    }
+
     fn lookup(&mut self, key: Key) -> Option<usize> {
         if self.dispatch.is_empty() {
             self.dispatch.resize(4096, None);
@@ -693,6 +851,7 @@ impl Engine {
     }
 
     fn clear(&mut self, cpu: &mut CpuGsw) {
+        self.invalidate_probe();
         self.dispatch.fill(None);
         for trace in self.arena.iter().flatten() {
             for operation in &trace.operations {
@@ -716,6 +875,7 @@ impl Engine {
             self.clear(cpu);
             return;
         }
+        self.invalidate_probe();
         let before = self.traces.len();
         self.dispatch.fill(None);
         self.traces.retain(|_, index| {
@@ -760,7 +920,8 @@ impl Engine {
         let cs = cpu.registers.cs();
         let eip = cpu.registers.eip;
         let lin = cpu.linear_eip();
-        let physical = cpu.decode_cache.line_phys_start(lin, false)?;
+        let d = cs.default_size_32;
+        let physical = cpu.decode_cache.line_phys_start(lin, d)?;
         bus.jit_preflight_cached_fetch(lin, physical, 1)?;
         let key = Key {
             table: cpu.class_table() as *const _ as usize,
@@ -770,6 +931,7 @@ impl Engine {
             cs_limit: cs.limit,
             cs_selector: cs.selector,
             cpl: cpu.cpl,
+            cs_default_size_32: d,
         };
         let mut existing = self.lookup(key);
         let extension = if let Some(index) = existing {
@@ -809,7 +971,7 @@ impl Engine {
                 .map_or(eip, |op| op.eip + u32::from(op.insn.len));
             let mut open_tail = None;
             while operations.len() < 64
-                && next < 0x10000
+                && (d || next < 0x10000)
                 && next <= cs.limit
                 && cs.base.wrapping_add(next) >> 12 == lin >> 12
                 && operations.last().is_none_or(trace_can_continue_after)
@@ -853,20 +1015,29 @@ impl Engine {
                 while end < operations.len()
                     && (operations[end].region_pure().is_some()
                         || operations[end].read.is_some()
+                        || operations[end].x87.is_some()
                         || (end > start
                             && operations[end - 1].branch_alu().is_some()
                             && matches!(operations[end].insn.opcode, 0x70..=0x7f)))
                 {
                     end += 1;
                 }
+                if end < operations.len()
+                    && (operations[end].store.is_some()
+                        || (d && operations[end].is_dword_near_transfer()))
+                {
+                    end += 1;
+                }
                 if end - start >= 2 {
-                    if end < operations.len() && operations[end].store.is_some() {
-                        end += 1;
-                    }
+                    let x87_top = operations[start..end]
+                        .iter()
+                        .any(|op| op.x87.is_some())
+                        .then_some(x87_top_at(&operations[..start], cpu.fpu.top()));
                     operations[start].region_len = end - start;
-                    operations[start].region = Some(super::ops::Region::build(
+                    operations[start].region = Some(super::ops::Region::build_with_x87(
                         cpu.class_table(),
                         &operations[start..end],
+                        x87_top,
                     ));
                 }
                 start = end.max(start + 1);
@@ -875,7 +1046,7 @@ impl Engine {
             if std::mem::take(&mut self.fail_next_compile) {
                 return existing.and_then(|index| self.arena[index].as_ref());
             }
-            let Some(code) = super::native::compile(&operations, cpu.persona()) else {
+            let Some(code) = super::native::compile(&operations, cpu.persona(), d) else {
                 return existing.and_then(|index| self.arena[index].as_ref());
             };
             let last = operations.last().unwrap();
@@ -925,7 +1096,7 @@ impl Engine {
         physical: u32,
     ) -> Option<Operation> {
         let linear = cs.base.wrapping_add(eip);
-        let view = cpu.decode_cache.get_view(linear, false)?;
+        let view = cpu.decode_cache.get_view(linear, cs.default_size_32)?;
         if !CpuGsw::fetch_within_limit(eip, view.insn.len, cs.limit)
             || (0xa0..=0xbf).contains(&(view.phys_start >> 12))
             || (linear & 0xfff) + u32::from(view.insn.len) > 4096
@@ -934,8 +1105,19 @@ impl Engine {
             return None;
         }
         bus.jit_preflight_cached_fetch(linear, view.phys_start, view.insn.len)?;
-        Operation::lower(eip, view.phys_start, view.insn)
+        let operation = Operation::lower(eip, view.phys_start, view.insn)?;
+        if operation.x87.is_some() && !cs.default_size_32 {
+            return None;
+        }
+        Some(operation)
     }
+}
+
+fn x87_top_at(prefix: &[Operation], start: u8) -> u8 {
+    prefix
+        .iter()
+        .filter_map(|op| op.x87)
+        .fold(start, |top, x87| x87.advance_top(top))
 }
 
 fn trace_can_continue_after(operation: &Operation) -> bool {
@@ -962,23 +1144,34 @@ fn select_next<B: CpuBus>(
     loop {
         if cpu.jit_direct.mkii.code_dirty {
             engine.drain_writes(cpu);
+        } else if cpu.jit_direct.mkii.mapping_dirty {
+            engine.invalidate_probe();
         }
         cpu.jit_direct.mkii.mapping_dirty = false;
+        engine.sync_probe(frame);
         if !std::mem::take(&mut frame.force_canonical)
             && let Some(trace) = engine.trace(cpu, bus)
         {
             frame.cs = cpu.registers.cs();
             frame.table = cpu.class_table() as *const _ as usize;
+            let body = trace.code.body_ptr() as usize;
+            let closed = trace.open_tail.is_none();
+            let physical = trace.operations[0].physical;
+            let certificate = trace.source_certificate;
             (
                 frame.source_present,
                 frame.source_mapping,
                 frame.source_cost,
-            ) = trace
-                .source_certificate
-                .map_or((0, 0, 0), |(mapping, cost)| (1, mapping, cost));
+            ) = certificate.map_or((0, 0, 0), |(mapping, cost)| (1, mapping, cost));
             frame.stats.entries += 1;
-            return trace.code.body_ptr() as usize;
+            if closed {
+                engine.publish(cpu, frame, physical, certificate, body as u64);
+            } else {
+                engine.sync_probe(frame);
+            }
+            return body;
         }
+        engine.sync_probe(frame);
         frame.cold(cpu, bus);
         if frame.stop || !cpu.mkii_context() {
             return 0;
@@ -998,6 +1191,7 @@ unsafe extern "C" fn resolve<B: CpuBus>(
     debug_assert!(frame.region_running.is_none());
     debug_assert_eq!(frame.region_inert, 0);
     if let Some(fetched) = frame.fetched.take() {
+        frame.fetched_live = 0;
         let execution = cpu.execute_decoded_with_rep_budget(
             &fetched.insn,
             bus,
@@ -1112,7 +1306,6 @@ impl CpuGsw {
     pub(super) fn mkii_context(&self) -> bool {
         self.is_protected_mode()
             && !self.is_v86_mode()
-            && !self.registers.cs().default_size_32
             && !self.rep_resume_active
             && self.registers.eflags & FLAG_TF == 0
     }
@@ -1167,6 +1360,7 @@ impl CpuGsw {
         let bus_root = std::ptr::from_mut(bus);
         // SAFETY: all subsequent execution borrows come from this invocation's owner.
         let mut frame = Frame::new(self, unsafe { &mut *bus_root }, cap);
+        engine.sync_probe(&mut frame);
         frame.session = Session::acquire(self, unsafe { &*bus_root }, bus_root);
         self.perf.straight_line_runs += 1;
         if let Some(dispatcher) = dispatcher {
@@ -1206,6 +1400,8 @@ impl CpuGsw {
         engine.stats.region_guard_misses += frame.stats.region_guard_misses;
         engine.stats.carry_native += frame.stats.carry_native;
         engine.stats.carry_misses += frame.stats.carry_misses;
+        engine.stats.probe_hits += frame.stats.probe_hits;
+        engine.stats.probe_misses += frame.stats.probe_misses;
         self.jit_direct.mkii.engine = engine;
         match frame.error {
             Some(error) => Err(error),

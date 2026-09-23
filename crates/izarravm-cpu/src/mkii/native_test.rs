@@ -29,7 +29,7 @@ fn mkii_native_admission_emitted_size() {
         ops[0].region = Some(crate::mkii::ops::Region::build(cpu.class_table(), &ops));
         let mut encoder = Encoder::new();
         let prepared = encoder.label();
-        admission::emit(&mut encoder, &ops[0], cpu.persona(), prepared);
+        admission::emit(&mut encoder, &ops[0], cpu.persona(), false, prepared);
         encoder.place(prepared);
         let emitted = encoder.finish();
         assert_eq!(
@@ -57,7 +57,7 @@ fn operations(bytes: &[u8]) -> Vec<Operation> {
 }
 
 fn settlement_calls(operations: &[Operation]) -> usize {
-    let code = compile(operations, CpuGsw::default().persona()).unwrap();
+    let code = compile(operations, CpuGsw::default().persona(), false).unwrap();
     let end = code.unwind_points.last().unwrap() + 2;
     // SAFETY: the final recorded point precedes the generated two-byte JMP RAX.
     let bytes = unsafe { std::slice::from_raw_parts(code.entry_ptr(), end) };
@@ -599,7 +599,7 @@ fn mkii_inert_emission_commits_before_a_helper_without_a_finish_callback() {
     for monitor in [false, true] {
         let mut operations = operations(&[0x90, 0x8b, 0x06, 0, 0x20, 0x50]);
         region(&mut operations, 2);
-        let code = compile(&operations, CpuGsw::default().persona()).unwrap();
+        let code = compile(&operations, CpuGsw::default().persona(), false).unwrap();
         let dispatcher = dispatcher().unwrap();
         let mut cpu = CpuGsw::default();
         cpu.load_segment_real(crate::SegmentIndex::Cs, 0);
@@ -615,7 +615,7 @@ fn mkii_inert_emission_commits_before_a_helper_without_a_finish_callback() {
         cpu.fast_map_probe.hits = 29;
         let mut bus = crate::tests::TestBus::with_memory(Vec::new());
         let mut frame = Frame::new(&cpu, &mut bus, 1000);
-        frame.helpers = [observe; 15];
+        frame.helpers = [observe; 16];
         frame.helpers[13] = prepare;
         frame.helpers[14] = finish;
         frame.resolve = resolve;

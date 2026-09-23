@@ -423,6 +423,25 @@ impl NativeX87Insn {
         top.wrapping_add_signed(self.top_delta()) & 7
     }
 
+    pub(crate) const fn memory_address(self) -> Option<AddrMode> {
+        match self {
+            Self::BinaryMemory { addr, .. }
+            | Self::IntBinaryMemory { addr, .. }
+            | Self::BinaryMemoryF64 { addr, .. }
+            | Self::LoadF32 { addr }
+            | Self::StoreF32 { addr, .. }
+            | Self::LoadF64 { addr }
+            | Self::StoreF64 { addr, .. }
+            | Self::LoadI32 { addr }
+            | Self::StoreI32 { addr, .. }
+            | Self::LoadI64 { addr }
+            | Self::StoreI64 { addr }
+            | Self::LoadControlWord { addr }
+            | Self::StoreControlWord { addr } => Some(addr),
+            _ => None,
+        }
+    }
+
     pub(crate) fn classify(insn: &DecodedInsn) -> Option<Self> {
         if insn.group != DecodeGroup::Fpu
             || insn.prefixes.lock

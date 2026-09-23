@@ -1,8 +1,11 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
+use crate::jit::native_x87::NativeX87Insn;
 use crate::timing_class::{ClassTable, TimingClass};
-use crate::{AddrMode, BusWidth, DecodeGroup, DecodedInsn, DecodedOperand, SegmentIndex};
+use crate::{
+    AddrMode, BusWidth, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, SegmentIndex,
+};
 use izarravm_bus::CompiledBusDelta;
 
 #[derive(Debug, Clone, Copy)]
@@ -64,14 +67,25 @@ pub(super) struct Region {
     pub prefixes: Box<[RegionCost]>,
     pub segments: u8,
     pub store_segments: u8,
+    pub x87_top: Option<u8>,
 }
 
 impl Region {
+    #[cfg(test)]
     pub fn build(table: &ClassTable, operations: &[Operation]) -> Self {
+        Self::build_with_x87(table, operations, None)
+    }
+
+    pub fn build_with_x87(
+        table: &ClassTable,
+        operations: &[Operation],
+        x87_top: Option<u8>,
+    ) -> Self {
         let mut cost = RegionCost::default();
         let mut prefixes = vec![cost];
         let mut segments = 0;
         let mut store_segments = 0;
+        let mut has_x87 = false;
         for op in operations {
             cost.carry_ops += u64::from(op.needs_carry_zero());
             cost.raw_core += u64::from(table.raw(op.region_class()));
@@ -87,12 +101,56 @@ impl Region {
                 store_segments |= 1 << store.address.segment.index();
                 segments |= 1 << store.address.segment.index();
             }
+            if op.is_dword_near_transfer() {
+                match op.insn.opcode {
+                    0xe8 => {
+                        cost.delta.add_ram_accesses(BusWidth::Dword, 1);
+                        cost.writes += 1;
+                        segments |= 1 << SegmentIndex::Ss.index();
+                        store_segments |= 1 << SegmentIndex::Ss.index();
+                    }
+                    0xc3 => {
+                        cost.delta.add_ram_accesses(BusWidth::Dword, 1);
+                        cost.reads += 1;
+                        segments |= 1 << SegmentIndex::Ss.index();
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(x87) = op.x87 {
+                has_x87 = true;
+                if let Some(access) = x87.metadata().memory {
+                    let (width, count) = if access.width <= 2 {
+                        (BusWidth::Word, 1)
+                    } else if access.width == 8 {
+                        (BusWidth::Dword, 2)
+                    } else {
+                        (BusWidth::Dword, 1)
+                    };
+                    cost.delta.add_ram_accesses(width, count);
+                    if access.direction == crate::jit::native_x87::NativeX87MemoryDirection::Write {
+                        cost.writes += 1;
+                    } else {
+                        cost.reads += 1;
+                    }
+                    if let Some(address) = x87_address(x87) {
+                        let bit = 1 << address.segment.index();
+                        segments |= bit;
+                        if access.direction
+                            == crate::jit::native_x87::NativeX87MemoryDirection::Write
+                        {
+                            store_segments |= bit;
+                        }
+                    }
+                }
+            }
             prefixes.push(cost);
         }
         Self {
             prefixes: prefixes.into_boxed_slice(),
             segments,
             store_segments,
+            x87_top: has_x87.then_some(x87_top.unwrap_or(0)),
         }
     }
 }
@@ -109,6 +167,7 @@ pub(super) struct Operation {
     pub memory_cmp_branch: bool,
     pub read: Option<Read>,
     pub store: Option<Store>,
+    pub x87: Option<NativeX87Insn>,
     pub region_len: usize,
     pub region: Option<Region>,
 }
@@ -124,6 +183,7 @@ impl Operation {
         } else {
             (lowered, None)
         };
+        let x87 = admit_x87(&insn);
         let helper = if pure.is_some() {
             0
         } else {
@@ -139,6 +199,7 @@ impl Operation {
                 DecodeGroup::ControlFlow => 8,
                 DecodeGroup::BitManip => 9,
                 DecodeGroup::CondMove => 10,
+                DecodeGroup::Fpu if x87.is_some() => 15,
                 _ => return None,
             }
         };
@@ -153,6 +214,7 @@ impl Operation {
             memory_cmp_branch: false,
             read: lower_read(&insn),
             store: lower_store(&insn),
+            x87,
             region_len: 0,
             region: None,
         })
@@ -163,7 +225,24 @@ impl Operation {
             .map(|(_, class)| class)
             .or(self.read.map(|read| read.class))
             .or(self.store.map(|store| store.class))
+            .or(self.x87.map(NativeX87Insn::timing_class))
+            .or(self.near_transfer_class())
             .unwrap_or(TimingClass::Jcc)
+    }
+
+    pub fn is_dword_near_transfer(&self) -> bool {
+        self.insn.operand_size == OperandSize::Dword
+            && matches!(self.insn.opcode, 0xe8 | 0xe9 | 0xeb | 0xc3)
+    }
+
+    pub fn near_transfer_class(&self) -> Option<TimingClass> {
+        if !self.is_dword_near_transfer() {
+            return None;
+        }
+        Some(match self.insn.opcode {
+            0xc3 => TimingClass::RetNear,
+            _ => TimingClass::CallJmpRel,
+        })
     }
 
     pub fn region_pure(&self) -> Option<(Pure, TimingClass)> {
@@ -411,4 +490,22 @@ fn lower_pure(insn: &DecodedInsn) -> Option<(Pure, TimingClass)> {
         },
         class,
     ))
+}
+
+fn admit_x87(insn: &DecodedInsn) -> Option<NativeX87Insn> {
+    if insn.group != DecodeGroup::Fpu || insn.operand_size != OperandSize::Dword {
+        return None;
+    }
+    let x87 = NativeX87Insn::classify(insn)?;
+    match x87 {
+        NativeX87Insn::StoreStatusAx
+        | NativeX87Insn::Wait
+        | NativeX87Insn::RoundToInt
+        | NativeX87Insn::StoreExtended80 { .. } => None,
+        _ => Some(x87),
+    }
+}
+
+fn x87_address(x87: NativeX87Insn) -> Option<AddrMode> {
+    x87.memory_address()
 }
