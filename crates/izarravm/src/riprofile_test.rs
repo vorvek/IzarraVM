@@ -2,12 +2,237 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::{
-    Frame, achieved_interval, beyond_extent, conservation_mismatch, exe_directory,
-    resolve_inline_chain, resolve_physical, sample_rate_line, sidecar_path,
-    symbols_are_trustworthy, write_sidecar,
+    Frame, MemoryClass, RawSample, achieved_interval, beyond_extent, classify_memory,
+    conservation_mismatch, exe_directory, memory_query_allowed, memory_sample_counts,
+    memory_sidecar_path, observe_memory, render_memory_classes, resolve_inline_chain,
+    resolve_physical, sample_counts, sample_rate_line, sidecar_path, symbols_are_trustworthy,
+    write_memory_sidecar, write_sidecar,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::time::Duration;
+
+#[test]
+fn riprofile_memory_query_requires_the_normal_resume_count() {
+    assert!(memory_query_allowed(1));
+    for count in [0, 2, 3, u32::MAX] {
+        assert!(!memory_query_allowed(count));
+    }
+}
+
+fn memory_info(
+    state: u32,
+    protect: u32,
+    kind: u32,
+) -> windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION {
+    // SAFETY: this Windows record has only pointer and integer fields.
+    let mut info: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION =
+        unsafe { std::mem::zeroed() };
+    info.BaseAddress = 0x1000usize as *mut _;
+    info.RegionSize = 0x1000;
+    info.State = state;
+    info.Protect = protect;
+    info.Type = kind;
+    info
+}
+
+#[test]
+fn riprofile_memory_classifier_uses_current_state_protection_and_type() {
+    use windows_sys::Win32::System::Memory::*;
+    let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    for protect in [
+        PAGE_EXECUTE,
+        PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY,
+    ] {
+        for (kind, expected) in [
+            (MEM_IMAGE, MemoryClass::ExecutableImage),
+            (MEM_PRIVATE, MemoryClass::ExecutablePrivate),
+            (MEM_MAPPED, MemoryClass::ExecutableMapped),
+            (0, MemoryClass::Unknown),
+        ] {
+            for modifiers in [0, PAGE_NOCACHE, PAGE_WRITECOMBINE] {
+                let info = memory_info(MEM_COMMIT, protect | modifiers, kind);
+                assert_eq!(classify_memory(0x1800, size, &info), expected);
+            }
+        }
+    }
+    for state in [MEM_FREE, MEM_RESERVE] {
+        let info = memory_info(state, PAGE_EXECUTE_READ | PAGE_GUARD, MEM_IMAGE);
+        assert_eq!(
+            classify_memory(0x1800, size, &info),
+            MemoryClass::NonExecutable
+        );
+    }
+    for protect in [PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY] {
+        let mut info = memory_info(MEM_COMMIT, protect, MEM_IMAGE);
+        info.AllocationProtect = PAGE_EXECUTE_READ;
+        assert_eq!(
+            classify_memory(0x1800, size, &info),
+            MemoryClass::NonExecutable
+        );
+    }
+    let guarded = memory_info(MEM_COMMIT, PAGE_EXECUTE_READ | PAGE_GUARD, MEM_PRIVATE);
+    assert_eq!(
+        classify_memory(0x1800, size, &guarded),
+        MemoryClass::Guarded
+    );
+    for info in [
+        memory_info(0, PAGE_EXECUTE, MEM_PRIVATE),
+        memory_info(MEM_COMMIT, 0, MEM_PRIVATE),
+    ] {
+        assert_eq!(classify_memory(0x1800, size, &info), MemoryClass::Unknown);
+    }
+}
+
+#[test]
+fn riprofile_memory_classifier_rejects_failed_partial_and_invalid_ranges() {
+    use windows_sys::Win32::System::Memory::*;
+    let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    let mut info = memory_info(MEM_COMMIT, PAGE_EXECUTE_READ, MEM_PRIVATE);
+    for returned in [0, size - 1, size + 1] {
+        assert_eq!(
+            classify_memory(0x1800, returned, &info),
+            MemoryClass::Unknown
+        );
+    }
+    for rip in [0xfff, 0x2000] {
+        assert_eq!(classify_memory(rip, size, &info), MemoryClass::Unknown);
+    }
+    info.RegionSize = 0;
+    assert_eq!(classify_memory(0x1000, size, &info), MemoryClass::Unknown);
+    info.BaseAddress = (usize::MAX - 8) as *mut _;
+    info.RegionSize = 32;
+    assert_eq!(
+        classify_memory((usize::MAX - 4) as u64, size, &info),
+        MemoryClass::Unknown
+    );
+}
+
+#[test]
+fn riprofile_memory_observes_real_image_data_and_private_pages_without_execution() {
+    use windows_sys::Win32::System::Memory::*;
+    struct Allocation(*mut std::ffi::c_void);
+    impl Drop for Allocation {
+        fn drop(&mut self) {
+            // SAFETY: this test owns the allocation and never executes it.
+            unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+        }
+    }
+    let (image, failed) = observe_memory(extent_anchor as *const () as usize as u64);
+    assert!(!failed);
+    assert_eq!(image, MemoryClass::ExecutableImage);
+    let data = std::hint::black_box(42u64);
+    let (class, failed) = observe_memory(std::ptr::from_ref(&data) as usize as u64);
+    assert!(!failed);
+    assert_eq!(class, MemoryClass::NonExecutable);
+    // SAFETY: the page is private to this test; it is queried but never executed.
+    let allocation = Allocation(unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            4096,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    });
+    assert!(!allocation.0.is_null());
+    let address = allocation.0 as usize as u64;
+    let mut old = 0;
+    assert_ne!(
+        unsafe { VirtualProtect(allocation.0, 4096, PAGE_EXECUTE_READ, &mut old) },
+        0
+    );
+    assert_eq!(
+        observe_memory(address),
+        (MemoryClass::ExecutablePrivate, false)
+    );
+    assert_ne!(
+        unsafe { VirtualProtect(allocation.0, 4096, PAGE_READWRITE, &mut old) },
+        0
+    );
+    assert_eq!(observe_memory(address), (MemoryClass::NonExecutable, false));
+    assert_eq!(observe_memory(u64::MAX), (MemoryClass::Unknown, true));
+}
+
+#[test]
+fn riprofile_memory_aggregation_preserves_reused_addresses_and_old_sidecar_counts() {
+    let samples = [
+        RawSample {
+            rip: 0x1000,
+            phase: 1,
+            memory: MemoryClass::ExecutableImage,
+        },
+        RawSample {
+            rip: 0x1000,
+            phase: 1,
+            memory: MemoryClass::ExecutablePrivate,
+        },
+        RawSample {
+            rip: 0x1000,
+            phase: 1,
+            memory: MemoryClass::Unknown,
+        },
+        RawSample {
+            rip: 0x1000,
+            phase: 1,
+            memory: MemoryClass::ExecutablePrivate,
+        },
+        RawSample {
+            rip: 0x1000,
+            phase: 2,
+            memory: MemoryClass::ExecutablePrivate,
+        },
+        RawSample {
+            rip: 0x2000,
+            phase: 2,
+            memory: MemoryClass::NonExecutable,
+        },
+    ];
+    let memory = memory_sample_counts(&samples);
+    let (counts, phases) = sample_counts(&samples);
+    assert_eq!(memory[&(0x1000, 1, MemoryClass::ExecutableImage)], 1);
+    assert_eq!(memory[&(0x1000, 1, MemoryClass::ExecutablePrivate)], 2);
+    assert_eq!(memory[&(0x1000, 1, MemoryClass::Unknown)], 1);
+    assert_eq!(memory.values().sum::<u64>(), samples.len() as u64);
+    assert_eq!(counts[&0x1000], 5);
+    assert_eq!(counts.values().sum::<u64>(), samples.len() as u64);
+    let unresolved = HashSet::from([0x1000]);
+    let all = render_memory_classes(&memory, &unresolved, None, 6, 5);
+    let first = render_memory_classes(&memory, &unresolved, Some(1), 4, 4);
+    let second = render_memory_classes(&memory, &unresolved, Some(2), 2, 1);
+    for text in [&all, &first, &second] {
+        assert!(!text.contains("CONSERVATION FAILED"));
+        assert!(text.contains("not atomic RIP provenance or JIT ownership"));
+    }
+    assert!(
+        render_memory_classes(&memory, &unresolved, None, 7, 5).contains("CONSERVATION FAILED")
+    );
+    let report = std::env::temp_dir().join(format!("izarravm-rip-memory-{}", std::process::id()));
+    let old_path = sidecar_path(&report);
+    let memory_path = memory_sidecar_path(&report);
+    write_sidecar(&old_path, 0x400000, &phases).unwrap();
+    write_memory_sidecar(&memory_path, 0x400000, &memory).unwrap();
+    let old = std::fs::read_to_string(&old_path).unwrap();
+    assert!(old.starts_with("# riprofile raw samples v1\n"));
+    assert_eq!(
+        parse_sidecar(&old),
+        [(0x1000, 1, 4), (0x1000, 2, 1), (0x2000, 2, 1)]
+    );
+    let text = std::fs::read_to_string(&memory_path).unwrap();
+    assert!(text.starts_with("# riprofile memory observations v1\n"));
+    assert!(text.contains("0x1000,1,executable_image,1\n"));
+    assert!(text.contains("0x1000,1,executable_private,2\n"));
+    assert!(text.contains("0x1000,1,unknown,1\n"));
+    let total: u64 = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.rsplit(',').next().unwrap().parse::<u64>().unwrap())
+        .sum();
+    assert_eq!(total, samples.len() as u64);
+    std::fs::remove_file(old_path).unwrap();
+    std::fs::remove_file(memory_path).unwrap();
+}
 
 /// Parses [`write_sidecar`]'s format back into `(rip, phase, count)` triples.
 /// Test-only: exists to give the sidecar its OWN round-trip test, independent

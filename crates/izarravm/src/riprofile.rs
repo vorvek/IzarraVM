@@ -96,11 +96,12 @@
 //! nothing this is used for (relative shares, not absolute wall). Never build
 //! an A/B ladder against this profile.
 //!
-//! Everything this file adds beyond the original resolver runs in
-//! `stop_and_report`, strictly after `self.join.join()`, i.e. after the
-//! emulation thread has stopped. Nothing here executes while the guest runs.
+//! Memory protection and allocation type are queried after each resume. These
+//! are near-sample observations, not atomic RIP provenance or JIT ownership.
+//! A concurrent remap can change the answer before the query. Symbol resolution
+//! and report aggregation run only after sampling stops.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -118,6 +119,12 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     SymSetOptions,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
+    MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_WRITECOPY, VirtualQuery,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, ResumeThread, SuspendThread,
 };
@@ -144,14 +151,58 @@ pub fn set_phase(phase: u32) {
     ACTIVE_PHASE.store(phase, Ordering::Relaxed);
 }
 
-/// The sampler thread's raw output: the collected `(rip, phase)` pairs plus
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum MemoryClass {
+    ExecutableImage,
+    ExecutablePrivate,
+    ExecutableMapped,
+    Guarded,
+    NonExecutable,
+    Unknown,
+}
+
+const MEMORY_CLASSES: [MemoryClass; 6] = [
+    MemoryClass::ExecutableImage,
+    MemoryClass::ExecutablePrivate,
+    MemoryClass::ExecutableMapped,
+    MemoryClass::Guarded,
+    MemoryClass::NonExecutable,
+    MemoryClass::Unknown,
+];
+
+impl MemoryClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExecutableImage => "executable_image",
+            Self::ExecutablePrivate => "executable_private",
+            Self::ExecutableMapped => "executable_mapped",
+            Self::Guarded => "guarded",
+            Self::NonExecutable => "non_executable_or_uncommitted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawSample {
+    rip: u64,
+    phase: u32,
+    memory: MemoryClass,
+}
+
+type MemoryCounts = HashMap<(u64, u32, MemoryClass), u64>;
+type AddressCounts = HashMap<u64, u64>;
+type PhaseCounts = HashMap<u32, AddressCounts>;
+
+/// The sampler thread's raw output: the collected observations plus
 /// the wall-clock span they actually cover. The span is what lets
 /// `stop_and_report` print the ACHIEVED sample interval instead of the
 /// nominal `SAMPLE_INTERVAL`, which `std::thread::sleep` cannot deliver on
 /// Windows (see the module doc).
 #[derive(Default)]
 struct RawSamples {
-    samples: Vec<(u64, u32)>,
+    samples: Vec<RawSample>,
+    memory_observation_failures: u64,
     first_at: Option<Instant>,
     last_at: Option<Instant>,
 }
@@ -228,7 +279,7 @@ impl Sampler {
                             let mut ctx: AlignedContext = mem::zeroed();
                             ctx.0.ContextFlags = CONTEXT_CONTROL_AMD64;
                             let ok = GetThreadContext(target, &mut ctx.0);
-                            ResumeThread(target);
+                            let resumed = ResumeThread(target);
                             if ok == 0 {
                                 context_failures += 1;
                                 first_error.get_or_insert_with(|| {
@@ -238,15 +289,21 @@ impl Sampler {
                                     )
                                 });
                             }
-                            (ok != 0).then_some(ctx.0.Rip)
+                            (ok != 0).then_some((ctx.0.Rip, resumed))
                         }
                     };
-                    if let Some(rip) = rip {
+                    if let Some((rip, resumed)) = rip {
+                        let phase = ACTIVE_PHASE.load(Ordering::Relaxed);
                         let now = Instant::now();
+                        let (memory, failed) = if memory_query_allowed(resumed) {
+                            observe_memory(rip)
+                        } else {
+                            (MemoryClass::Unknown, true)
+                        };
+                        raw.memory_observation_failures += u64::from(failed);
                         raw.first_at.get_or_insert(now);
                         raw.last_at = Some(now);
-                        raw.samples
-                            .push((rip, ACTIVE_PHASE.load(Ordering::Relaxed)));
+                        raw.samples.push(RawSample { rip, phase, memory });
                     }
                 }
                 if suspend_failures + context_failures > 0 {
@@ -293,12 +350,8 @@ impl Sampler {
         // Resolve symbols once over the whole run, then attribute per phase: an
         // address costs a dbghelp round trip, and the same address recurs in
         // every phase.
-        let mut counts: HashMap<u64, u64> = HashMap::new();
-        let mut per_phase: HashMap<u32, HashMap<u64, u64>> = HashMap::new();
-        for &(rip, phase) in &samples {
-            *counts.entry(rip).or_default() += 1;
-            *per_phase.entry(phase).or_default().entry(rip).or_default() += 1;
-        }
+        let (counts, per_phase) = sample_counts(&samples);
+        let memory_counts = memory_sample_counts(&samples);
 
         let process = unsafe { GetCurrentProcess() };
         let module_base = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
@@ -372,6 +425,7 @@ impl Sampler {
         // symbolization is healthy.
         let mut unresolved_addrs = 0u64;
         let mut unresolved_samples = 0u64;
+        let mut unresolved_addresses = HashSet::new();
         let mut beyond_samples = 0u64;
         // (samples, rip, name, displacement, recorded size) for every address
         // past its symbol's extent. These stay in the main tables under the
@@ -387,6 +441,7 @@ impl Sampler {
         for (&rip, &n) in &counts {
             let symbol = resolve_symbol(process, rip);
             if symbol.is_none() {
+                unresolved_addresses.insert(rip);
                 unresolved_addrs += 1;
                 unresolved_samples += n;
             }
@@ -473,6 +528,17 @@ impl Sampler {
             report.push('\n');
         }
         report.push_str(&render_tables(&counts, &resolved, &inline_resolved));
+        report.push_str(&format!(
+            "\nMemory observations unavailable for {} samples: resume count was not one, or VirtualQuery failed or returned an unexpected size. These remain unknown.\n",
+            raw.memory_observation_failures,
+        ));
+        report.push_str(&render_memory_classes(
+            &memory_counts,
+            &unresolved_addresses,
+            None,
+            total,
+            unresolved_samples,
+        ));
 
         if !beyond_rows.is_empty() {
             beyond_rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -519,6 +585,18 @@ impl Sampler {
                     phase_total as f64 * 100.0 / total as f64,
                 ));
                 report.push_str(&render_tables(phase_counts, &resolved, &inline_resolved));
+                let phase_unresolved = phase_counts
+                    .iter()
+                    .filter(|(rip, _)| unresolved_addresses.contains(*rip))
+                    .map(|(_, n)| *n)
+                    .sum();
+                report.push_str(&render_memory_classes(
+                    &memory_counts,
+                    &unresolved_addresses,
+                    Some(phase),
+                    phase_total,
+                    phase_unresolved,
+                ));
             }
         }
         match std::fs::File::create(out_path).and_then(|mut f| f.write_all(report.as_bytes())) {
@@ -540,6 +618,14 @@ impl Sampler {
                 samples_path.display()
             ),
             Err(e) => eprintln!("riprofile: could not write {}: {e}", samples_path.display()),
+        }
+        let memory_path = memory_sidecar_path(out_path);
+        match write_memory_sidecar(&memory_path, module_base, &memory_counts) {
+            Ok(()) => eprintln!(
+                "riprofile: memory observations written to {}",
+                memory_path.display()
+            ),
+            Err(e) => eprintln!("riprofile: could not write {}: {e}", memory_path.display()),
         }
     }
 }
@@ -968,6 +1054,150 @@ fn write_sidecar(
         for rip in rips {
             out.push_str(&format!("{rip:#x},{phase},{}\n", map[&rip]));
         }
+    }
+    std::fs::write(path, out)
+}
+
+fn classify_memory(rip: u64, returned: usize, info: &MEMORY_BASIC_INFORMATION) -> MemoryClass {
+    if returned != mem::size_of::<MEMORY_BASIC_INFORMATION>() {
+        return MemoryClass::Unknown;
+    }
+    let base = info.BaseAddress as usize as u64;
+    if !base
+        .checked_add(info.RegionSize as u64)
+        .is_some_and(|end| base <= rip && rip < end)
+    {
+        return MemoryClass::Unknown;
+    }
+    match info.State {
+        MEM_FREE | MEM_RESERVE => return MemoryClass::NonExecutable,
+        MEM_COMMIT => {}
+        _ => return MemoryClass::Unknown,
+    }
+    if info.Protect & PAGE_GUARD != 0 {
+        return MemoryClass::Guarded;
+    }
+    match info.Protect & 0xff {
+        PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY => {
+            MemoryClass::NonExecutable
+        }
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => {
+            match info.Type {
+                MEM_IMAGE => MemoryClass::ExecutableImage,
+                MEM_PRIVATE => MemoryClass::ExecutablePrivate,
+                MEM_MAPPED => MemoryClass::ExecutableMapped,
+                _ => MemoryClass::Unknown,
+            }
+        }
+        _ => MemoryClass::Unknown,
+    }
+}
+
+fn observe_memory(rip: u64) -> (MemoryClass, bool) {
+    // SAFETY: VirtualQuery writes only to this stack buffer. The target has resumed.
+    let (info, returned) = unsafe {
+        let mut info: MEMORY_BASIC_INFORMATION = mem::zeroed();
+        let returned = VirtualQuery(
+            rip as usize as *const _,
+            &mut info,
+            mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
+        (info, returned)
+    };
+    (
+        classify_memory(rip, returned, &info),
+        returned != mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+    )
+}
+
+fn memory_query_allowed(resume_count: u32) -> bool {
+    resume_count == 1
+}
+
+fn memory_sample_counts(samples: &[RawSample]) -> MemoryCounts {
+    let mut counts = HashMap::new();
+    for sample in samples {
+        *counts
+            .entry((sample.rip, sample.phase, sample.memory))
+            .or_default() += 1;
+    }
+    counts
+}
+
+fn sample_counts(samples: &[RawSample]) -> (AddressCounts, PhaseCounts) {
+    let mut counts = HashMap::new();
+    let mut per_phase: PhaseCounts = HashMap::new();
+    for &RawSample { rip, phase, .. } in samples {
+        *counts.entry(rip).or_default() += 1;
+        *per_phase.entry(phase).or_default().entry(rip).or_default() += 1;
+    }
+    (counts, per_phase)
+}
+
+fn render_memory_classes(
+    counts: &MemoryCounts,
+    unresolved: &HashSet<u64>,
+    phase: Option<u32>,
+    expected_total: u64,
+    expected_unresolved: u64,
+) -> String {
+    let mut all = [0u64; MEMORY_CLASSES.len()];
+    let mut missing = all;
+    for (&(rip, sample_phase, class), &count) in counts {
+        if phase.is_some_and(|phase| phase != sample_phase) {
+            continue;
+        }
+        all[class as usize] += count;
+        if unresolved.contains(&rip) {
+            missing[class as usize] += count;
+        }
+    }
+    let total: u64 = all.iter().sum();
+    let missing_total: u64 = missing.iter().sum();
+    let mut out = String::from(
+        "\n== MEMORY OBSERVATIONS AFTER RESUME ==\n\
+         Near-sample current mappings can race with remaps. These are not atomic RIP provenance or JIT ownership.\n\
+         Unresolved means the post-run symbol lookup failed. Percentages use their own column totals.\n\
+         class                              all_samples   all_pct  unresolved_samples  unresolved_pct\n",
+    );
+    if total != expected_total || missing_total != expected_unresolved {
+        out.push_str(&format!(
+            "CONSERVATION FAILED: all={total}/{expected_total}, unresolved={missing_total}/{expected_unresolved}\n",
+        ));
+    }
+    for class in MEMORY_CLASSES {
+        let index = class as usize;
+        out.push_str(&format!(
+            "{:<34} {:>11} {:>9.3}% {:>19} {:>14.3}%\n",
+            class.label(),
+            all[index],
+            all[index] as f64 * 100.0 / total.max(1) as f64,
+            missing[index],
+            missing[index] as f64 * 100.0 / missing_total.max(1) as f64,
+        ));
+    }
+    out
+}
+
+fn memory_sidecar_path(report_path: &Path) -> PathBuf {
+    let mut name = report_path.as_os_str().to_os_string();
+    name.push(".memory.samples");
+    PathBuf::from(name)
+}
+
+fn write_memory_sidecar(
+    path: &Path,
+    module_base: u64,
+    counts: &MemoryCounts,
+) -> std::io::Result<()> {
+    let mut out = String::from("# riprofile memory observations v1\n");
+    out.push_str(&format!("# module_base={module_base:#x}\n"));
+    out.push_str("# post-resume current mapping; not atomic RIP provenance or JIT ownership\n");
+    out.push_str("# rip_hex,phase,class,count\n");
+    let mut rows: Vec<_> = counts.iter().collect();
+    rows.sort_unstable_by_key(|(key, _)| (key.1, key.0, key.2));
+    for (&(rip, phase, class), &count) in rows {
+        out.push_str(&format!("{rip:#x},{phase},{},{count}\n", class.label()));
     }
     std::fs::write(path, out)
 }
