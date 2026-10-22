@@ -6,6 +6,10 @@ use super::*;
 #[path = "session_test.rs"]
 mod session;
 
+#[path = "singleton_test.rs"]
+#[cfg(not(any(feature = "int-trace", feature = "timing-class-histogram")))]
+mod singleton;
+
 #[cfg(not(any(feature = "int-trace", feature = "timing-class-histogram")))]
 impl CpuGsw {
     pub(crate) fn check_mkii_adjacent_pending_for_test<B: CpuBus>(

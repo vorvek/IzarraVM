@@ -51,6 +51,15 @@ pub(super) fn emit_with(
     let Some(entry) = lookup(persona, region.segments) else {
         return;
     };
+    let skip = e.label();
+    if op.region_len == 1 {
+        for offset in [
+            offset_of!(CpuGsw, single_step_armed),
+            offset_of!(CpuGsw, single_step_repeat),
+        ] {
+            clear_byte(e, Reg::RBX, offset, skip);
+        }
+    }
     e.mov_r32_imm32(Reg::R10, op.eip);
     e.mov_r64_imm64(Reg::R8, product / u64::from(den));
     e.mov_r64_imm64(Reg::R9, product % u64::from(den));
@@ -62,7 +71,6 @@ pub(super) fn emit_with(
         + offset_of!(SegmentRegister, default_size_32);
     e.movzx_r32_byte_disp32(Reg::RAX, Reg::RBX, cs_d as i32);
     e.cmp_r32_imm32(Reg::RAX, u32::from(cs_default_size_32));
-    let skip = e.label();
     let after = e.label();
     e.jcc(5, skip);
     e.mov_r64_imm64(Reg::RAX, entry as u64);
@@ -95,6 +103,11 @@ pub(super) fn code_for(persona: CpuPersona, segments: u8) -> Option<&'static Cod
                 body: 0,
                 #[cfg(test)]
                 unwind_points: vec![0, bytes.len() - 1],
+                #[cfg(all(
+                    test,
+                    not(any(feature = "int-trace", feature = "timing-class-histogram"))
+                ))]
+                emitted_len: bytes.len(),
             })
         })
         .as_ref()

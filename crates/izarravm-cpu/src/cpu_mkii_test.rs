@@ -6,6 +6,10 @@ use super::*;
 #[path = "cpu_mkii_admission_test.rs"]
 mod admission;
 
+#[path = "cpu_mkii_singleton_test.rs"]
+#[cfg(not(any(feature = "int-trace", feature = "timing-class-histogram")))]
+mod singleton;
+
 fn fixture(code: &[u8]) -> (CpuGsw, TestBus) {
     let (mut cpu, mut memory) = real_mode_cpu(code, 65536);
     cpu.set_mode(GswMode::Gsw586);

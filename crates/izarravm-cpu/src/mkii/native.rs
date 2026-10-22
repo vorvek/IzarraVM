@@ -36,6 +36,11 @@ pub(super) struct Code {
     body: usize,
     #[cfg(test)]
     unwind_points: Vec<usize>,
+    #[cfg(all(
+        test,
+        not(any(feature = "int-trace", feature = "timing-class-histogram"))
+    ))]
+    pub(super) emitted_len: usize,
 }
 
 impl Code {
@@ -84,11 +89,21 @@ pub(super) fn dispatcher() -> Option<Code> {
     #[cfg(test)]
     let epilogue_start = e.position();
     epilogue(&mut e);
+    #[cfg(all(
+        test,
+        not(any(feature = "int-trace", feature = "timing-class-histogram"))
+    ))]
+    let emitted_len = e.position();
     Some(Code {
         buffer: ExecutableBuffer::new_with_unwind(&e.finish(), &info)?,
         body,
         #[cfg(test)]
         unwind_points: vec![body, resolver_return, transfer, epilogue_start],
+        #[cfg(all(
+            test,
+            not(any(feature = "int-trace", feature = "timing-class-histogram"))
+        ))]
+        emitted_len,
     })
 }
 
@@ -318,7 +333,9 @@ pub(super) fn compile(
     let mut has_pending_side_exit = false;
     while index < operations.len() {
         let operation = &operations[index];
-        if operation.region_len < 2 {
+        if operation.region_len < 2
+            && !(operation.region_len == 1 && operation.singleton_region(cs_default_size_32))
+        {
             let tail = emit_legacy_span(&mut e, operations, index, exit, settle_exit);
             index = tail.next;
             pending_on_fallthrough = tail.pending_on_fallthrough;
@@ -376,11 +393,21 @@ pub(super) fn compile(
     #[cfg(test)]
     let transfer = e.position();
     e.jmp_r64(Reg::RAX);
+    #[cfg(all(
+        test,
+        not(any(feature = "int-trace", feature = "timing-class-histogram"))
+    ))]
+    let emitted_len = e.position();
     Some(Code {
         buffer: ExecutableBuffer::new_with_unwind(&e.finish(), &info)?,
         body,
         #[cfg(test)]
         unwind_points: vec![body, helper_return, transfer],
+        #[cfg(all(
+            test,
+            not(any(feature = "int-trace", feature = "timing-class-histogram"))
+        ))]
+        emitted_len,
     })
 }
 

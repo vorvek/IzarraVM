@@ -76,7 +76,7 @@ pub(super) fn emit(
         operations.len() as u32,
     );
     let last = operations.last().unwrap();
-    if operations.len() >= 2
+    if (operations.len() >= 2 || last.singleton_region(cs_default_size_32))
         && last.store.is_none()
         && !last.is_dword_near_transfer()
         && last

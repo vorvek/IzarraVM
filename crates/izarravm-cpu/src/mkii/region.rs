@@ -51,6 +51,9 @@ pub(super) unsafe extern "C" fn prepare<B: CpuBus>(
     {
         return 2;
     }
+    if first.region_len == 1 && (cpu.single_step_armed || cpu.single_step_repeat) {
+        return 0;
+    }
     if cpu.interrupt_shadow
         || !cpu.mkii_span_observers_quiet()
         || !cpu.fast_map_serve_enabled.enabled

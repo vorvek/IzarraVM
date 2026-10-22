@@ -173,6 +173,25 @@ pub(super) struct Operation {
 }
 
 impl Operation {
+    pub fn singleton_region(&self, cs_default_size_32: bool) -> bool {
+        self.insn.opcode == 0xb8
+            && matches!(
+                self.pure,
+                Some((
+                    Pure::Mov {
+                        dst: 0,
+                        src: Input::Immediate(_),
+                        width: BusWidth::Word,
+                    },
+                    _
+                ))
+            )
+            && self
+                .eip
+                .checked_add(u32::from(self.insn.len))
+                .is_some_and(|next| next != 0x10000 && (cs_default_size_32 || next < 0x10000))
+    }
+
     pub fn lower(eip: u32, physical: u32, insn: DecodedInsn) -> Option<Self> {
         if insn.prefixes.lock || insn.prefixes.rep.is_some() {
             return None;

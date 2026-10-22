@@ -1028,7 +1028,7 @@ impl Engine {
                 {
                     end += 1;
                 }
-                if end - start >= 2 {
+                if end - start >= 2 || (end - start == 1 && operations[start].singleton_region(d)) {
                     let x87_top = operations[start..end]
                         .iter()
                         .any(|op| op.x87.is_some())

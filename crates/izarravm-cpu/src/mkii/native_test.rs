@@ -136,10 +136,14 @@ mod session {
         );
         let transfer = e.position();
         e.jmp_r64(Reg::RAX);
+        #[cfg(not(any(feature = "int-trace", feature = "timing-class-histogram")))]
+        let emitted_len = e.position();
         Code {
             buffer: ExecutableBuffer::new_with_unwind(&e.finish(), &info).unwrap(),
             body,
             unwind_points: vec![body, helper_return, transfer],
+            #[cfg(not(any(feature = "int-trace", feature = "timing-class-histogram")))]
+            emitted_len,
         }
     }
 
