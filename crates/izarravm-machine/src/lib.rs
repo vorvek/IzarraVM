@@ -669,6 +669,20 @@ pub mod phase_mark {
     pub const BENCH_END: u8 = 202;
 }
 
+/// CPU state at one sampled endpoint. Mode changes between samples are not recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseCpuSnapshot {
+    pub protected_mode: bool,
+    pub eflags_vm: bool,
+    pub cs_default_size_32: bool,
+    pub gsw_mode: GswMode,
+    /// Configuration only. This does not prove native execution at the endpoint.
+    pub native_backend_configured: bool,
+    /// Cumulative work. None when mkII is not compiled.
+    pub mkii_entries: Option<u64>,
+    pub mkii_native_instructions: Option<u64>,
+}
+
 /// One phase boundary, with every counter the boot profiler attributes per
 /// phase snapshotted at the instant it fired. The profiler reports differences
 /// between consecutive marks, so POST cannot hide inside boot.
@@ -678,6 +692,7 @@ pub struct PhaseMark {
     pub wall: std::time::Instant,
     pub master_ticks: u64,
     pub elapsed_clocks: u64,
+    pub cpu_mode: PhaseCpuSnapshot,
     pub perf: izarravm_cpu::PerfCounters,
     pub machine_phases: MachineHostProfileSnapshot,
     /// None when C: is not a mounted host folder.
@@ -2821,6 +2836,27 @@ impl Machine {
         self.note_phase_mark(id);
     }
 
+    #[cold]
+    #[inline(never)]
+    fn phase_cpu_snapshot(&self) -> PhaseCpuSnapshot {
+        #[cfg(feature = "dynarec-mkii")]
+        let (mkii_entries, mkii_native_instructions) = {
+            let stats = self.cpu.dynarec_mkii_stats();
+            (Some(stats.entries), Some(stats.native))
+        };
+        #[cfg(not(feature = "dynarec-mkii"))]
+        let (mkii_entries, mkii_native_instructions) = (None, None);
+        PhaseCpuSnapshot {
+            protected_mode: self.cpu.is_protected_mode(),
+            eflags_vm: self.cpu.registers.eflags & (1 << 17) != 0,
+            cs_default_size_32: self.cpu.registers.cs().default_size_32,
+            gsw_mode: self.cpu.mode(),
+            native_backend_configured: self.native_backend_configured,
+            mkii_entries,
+            mkii_native_instructions,
+        }
+    }
+
     /// Snapshot every counter the profiler attributes per phase, at the instant
     /// this boundary fired. Ignored unless `enable_phase_marks` armed recording.
     pub(crate) fn note_phase_mark(&mut self, id: u8) {
@@ -2832,6 +2868,7 @@ impl Machine {
             wall: std::time::Instant::now(),
             master_ticks: self.master_ticks(),
             elapsed_clocks: self.elapsed_clocks(),
+            cpu_mode: self.phase_cpu_snapshot(),
             perf: self.cpu.perf_counters().clone(),
             machine_phases: self.host_profile.snapshot(),
             katea: self.katea_storage_counters(),
@@ -2914,6 +2951,7 @@ impl Machine {
             wall: std::time::Instant::now(),
             master_ticks: now,
             elapsed_clocks: self.elapsed_clocks(),
+            cpu_mode: self.phase_cpu_snapshot(),
             perf: self.cpu.perf_counters().clone(),
             machine_phases: MachineHostProfileSnapshot::default(),
             katea: self.katea_storage_counters(),

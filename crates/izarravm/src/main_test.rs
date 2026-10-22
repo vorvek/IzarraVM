@@ -3034,6 +3034,7 @@ fn phase_mark_series_carries_the_break_and_smc_scan_columns() {
         wall: std::time::Instant::now(),
         master_ticks: 0,
         elapsed_clocks: 0,
+        cpu_mode: phase_mark_cpu_snapshot_for_test(),
         perf,
         machine_phases: Default::default(),
         katea: None,
@@ -3099,6 +3100,7 @@ fn phase_mark_series_carries_the_cd_columns() {
         wall: std::time::Instant::now(),
         master_ticks: 0,
         elapsed_clocks: 0,
+        cpu_mode: phase_mark_cpu_snapshot_for_test(),
         perf: Default::default(),
         machine_phases: Default::default(),
         katea: None,
@@ -3124,6 +3126,69 @@ fn phase_mark_series_carries_the_cd_columns() {
             Some(expected),
             "{key} must be serialised into the phase-mark series"
         );
+    }
+}
+
+fn phase_mark_cpu_snapshot_for_test() -> izarravm_machine::PhaseCpuSnapshot {
+    izarravm_machine::PhaseCpuSnapshot {
+        protected_mode: false,
+        eflags_vm: false,
+        cs_default_size_32: false,
+        gsw_mode: izarravm_core::GswMode::Gsw586,
+        native_backend_configured: false,
+        mkii_entries: None,
+        mkii_native_instructions: None,
+    }
+}
+
+#[test]
+fn phase_mark_series_preserves_sampled_mode_and_optional_backend_work() {
+    let mut mark = izarravm_machine::PhaseMark {
+        id: izarravm_machine::phase_mark::PERIODIC,
+        wall: std::time::Instant::now(),
+        master_ticks: 17,
+        elapsed_clocks: 19,
+        cpu_mode: phase_mark_cpu_snapshot_for_test(),
+        perf: izarravm_cpu::PerfCounters {
+            instructions: 123,
+            jit_direct_insns: 100,
+            jit_direct_entries: 7,
+            ..Default::default()
+        },
+        machine_phases: Default::default(),
+        katea: None,
+        io_stall_ticks: 0,
+        halted_ticks: 0,
+        int13: Default::default(),
+        fast_map_audit: Default::default(),
+        cd_pio_bytes: 0,
+        cd_accesses: 0,
+        atapi_packet_commands: 0,
+        cpu_profile: None,
+    };
+    mark.cpu_mode.eflags_vm = true;
+    mark.cpu_mode.cs_default_size_32 = true;
+    mark.cpu_mode.native_backend_configured = true;
+    for (count, native) in [(None, None), (Some(0), Some(0)), (Some(23), Some(29))] {
+        mark.cpu_mode.mkii_entries = count;
+        mark.cpu_mode.mkii_native_instructions = native;
+        let rows = phase_mark_series_json(std::slice::from_ref(&mark));
+        let row = &rows[0];
+        let mode = &row["cpu_mode"];
+        assert_eq!(mode["protected_mode"], false);
+        assert_eq!(mode["eflags_vm"], true);
+        assert_eq!(mode["cs_default_size_32"], true);
+        assert_eq!(mode["gsw_mode"], "Gsw586");
+        assert_eq!(mode["native_backend_configured"], true);
+        assert_eq!(mode["mkii_entries"].as_u64(), count);
+        assert_eq!(mode["mkii_native_instructions"].as_u64(), native);
+        assert_eq!(mode["mkii_entries"].is_null(), count.is_none());
+        assert_eq!(mode["mkii_native_instructions"].is_null(), native.is_none());
+        assert_eq!(row["master_ticks"], 17);
+        assert_eq!(row["elapsed_clocks"], 19);
+        assert_eq!(row["instructions"], 123);
+        assert_eq!(row["jit_direct_insns"], 100);
+        assert_eq!(row["jit_direct_entries"], 7);
     }
 }
 

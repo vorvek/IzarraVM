@@ -51,6 +51,88 @@ fn periodic(machine: &Machine) -> Vec<&PhaseMark> {
         .collect()
 }
 
+#[test]
+fn phase_mark_cpu_mode_distinguishes_raw_flags_and_code_width() {
+    let mut machine = spinning_machine();
+    machine.enable_phase_marks();
+    for (pe, vm, wide, native) in [
+        (false, false, false, false),
+        (true, false, false, true),
+        (true, false, true, false),
+        (true, true, false, true),
+        (false, true, false, true),
+    ] {
+        machine.cpu.control.cr0 = (machine.cpu.control.cr0 & !1) | u32::from(pe);
+        machine.cpu.registers.eflags = 2 | (u32::from(vm) << 17);
+        let mut cs = machine.cpu.registers.cs();
+        cs.default_size_32 = wide;
+        machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        machine.native_backend_configured = native;
+        let cpu = machine.cpu.clone();
+        let ticks = machine.master_ticks();
+        machine.note_phase_mark(42);
+        let explicit = machine.phase_marks.last().unwrap().cpu_mode;
+        machine.periodic_phase_mark_interval = 1;
+        machine.next_phase_mark_ticks = ticks;
+        machine.fire_periodic_phase_mark();
+        let periodic = machine.phase_marks.last().unwrap().cpu_mode;
+        assert_eq!(explicit, periodic);
+        assert_eq!(explicit.protected_mode, pe);
+        assert_eq!(explicit.eflags_vm, vm);
+        assert_eq!(explicit.cs_default_size_32, wide);
+        assert_eq!(explicit.gsw_mode, machine.cpu.mode());
+        assert_eq!(explicit.native_backend_configured, native);
+        assert_eq!(
+            explicit.mkii_entries,
+            cfg!(feature = "dynarec-mkii").then_some(0)
+        );
+        assert_eq!(
+            explicit.mkii_native_instructions,
+            cfg!(feature = "dynarec-mkii").then_some(0)
+        );
+        assert_eq!(machine.cpu, cpu);
+        assert_eq!(machine.master_ticks(), ticks);
+    }
+}
+
+#[test]
+fn phase_mark_disabled_explicit_capture_preserves_cpu_state() {
+    let mut machine = spinning_machine();
+    let cpu = machine.cpu.clone();
+    let ticks = machine.master_ticks();
+    machine.record_host_phase_mark(42);
+    assert!(machine.phase_marks().is_empty());
+    assert_eq!(machine.cpu, cpu);
+    assert_eq!(machine.master_ticks(), ticks);
+    assert_eq!(machine.next_phase_mark_ticks, u64::MAX);
+}
+
+#[test]
+fn phase_mark_cpu_snapshot_preserves_armed_guest_execution() {
+    let mut plain = spinning_machine();
+    let mut sampled = spinning_machine();
+    let budget = plain
+        .profile()
+        .cpu
+        .clock_rate()
+        .clocks_for_fraction_floor(1, 500);
+    sampled.arm_periodic_phase_marks((budget / 8).max(1), budget);
+    plain.run_until_halt_or_cycles(budget).unwrap();
+    sampled.run_until_halt_or_cycles(budget).unwrap();
+    assert!(plain.phase_marks().is_empty());
+    assert!(!periodic(&sampled).is_empty());
+    assert_eq!(plain.cpu.registers, sampled.cpu.registers);
+    assert_eq!(plain.cpu.control, sampled.cpu.control);
+    assert_eq!(plain.elapsed_clocks(), sampled.elapsed_clocks());
+    assert_eq!(plain.raw_bus_clocks(), sampled.raw_bus_clocks());
+    assert_eq!(plain.master_ticks(), sampled.master_ticks());
+    let a = plain.cpu.perf_counters();
+    let b = sampled.cpu.perf_counters();
+    assert_eq!(a.instructions, b.instructions);
+    assert_eq!(a.jit_direct_insns, b.jit_direct_insns);
+    assert_eq!(a.jit_direct_entries, b.jit_direct_entries);
+}
+
 /// The disarmed path records nothing, and it is the DEFAULT path: every shipped fixture run takes
 /// it. The sentinel is what makes the run loop's check one compare against an already-live value,
 /// so this also pins that `u64::MAX` is really the off state rather than a large-but-reachable
