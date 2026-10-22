@@ -181,6 +181,7 @@ struct Fixture {
     cpu: CpuGsw,
     bus: TestBus,
     block: jit::direct::CompiledBlock,
+    span: jit::direct::BlockSpan,
 }
 
 /// Build the three-slot block `mov esi,esi` / `in al,dx` / `mov edi,edi`, with the call-out
@@ -198,11 +199,29 @@ fn slot_block_with(
     configure: impl Fn(&mut TestBus),
     configure_cpu: impl Fn(&mut CpuGsw),
 ) -> (Fixture, CpuGsw, TestBus) {
-    let mut code = vec![0x89, 0xf6];
+    slot_block_with_policy::<true>(configure, configure_cpu, false)
+}
+
+fn slot_block_with_policy<const RETAIN_PORT_HOMES: bool>(
+    configure: impl Fn(&mut TestBus),
+    configure_cpu: impl Fn(&mut CpuGsw),
+    narrow: bool,
+) -> (Fixture, CpuGsw, TestBus) {
+    let mut code = if narrow {
+        vec![0x66, 0xbe, 0x78, 0x56]
+    } else {
+        vec![0x89, 0xf6]
+    };
     let body_at = ENTRY + code.len() as u32;
     code.push(0xec);
     let tail_at = ENTRY + code.len() as u32;
-    code.extend_from_slice(&[0x89, 0xff, 0xf4]);
+    code.extend_from_slice(if narrow {
+        &[
+            0x88, 0xff, 0x33, 0xc4, 0x33, 0xc5, 0x33, 0xc6, 0x33, 0xc7, 0xf4,
+        ]
+    } else {
+        &[0x89, 0xff, 0xf4]
+    });
 
     let mut memory = vec![0u8; 0x5000];
     memory[(ENTRY - 1) as usize] = 0x90;
@@ -227,6 +246,13 @@ fn slot_block_with(
             cpu.set_eip(linear);
             cpu.fetch_decoded(bus, linear).unwrap();
         }
+        if narrow {
+            for delta in [2, 4, 6, 8] {
+                let linear = tail_at + delta;
+                cpu.set_eip(linear);
+                cpu.fetch_decoded(bus, linear).unwrap();
+            }
+        }
     }
 
     let key = jit::direct::key_for(&native, ENTRY, true).expect("entry key");
@@ -234,7 +260,12 @@ fn slot_block_with(
         native.jit_direct.probe(key),
         jit::direct::BlockProbe::Interpret
     ));
-    let compilation = match jit::direct::compile(&mut native, ENTRY, true) {
+    let result = if RETAIN_PORT_HOMES {
+        jit::direct::compile(&mut native, ENTRY, true)
+    } else {
+        jit::direct::compile_with_callout_policy_for_test::<false>(&mut native, ENTRY, true)
+    };
+    let compilation = match result {
         jit::direct::CompileOutcome::Compiled(compilation) => compilation,
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: IN AL,DX is still a barrier")
@@ -242,13 +273,16 @@ fn slot_block_with(
         jit::direct::CompileOutcome::Retry(_) => panic!("compile asked for a retry"),
     };
     assert_eq!(
-        compilation.span.instructions, 3,
+        compilation.span.instructions,
+        if narrow { 7 } else { 3 },
         "the block must extend THROUGH the call-out, not stop at it"
     );
     assert_eq!(
         compilation.callout_slots, 1,
         "the call-out must be counted for the budget bound"
     );
+    assert!(compilation.code.len() <= jit::exec_mem::host_page_len());
+    let span = compilation.span;
     let id = native
         .jit_direct
         .install(&compilation)
@@ -276,6 +310,7 @@ fn slot_block_with(
             cpu: native,
             bus: native_bus,
             block,
+            span,
         },
         interpreter,
         interpreter_bus,
@@ -329,6 +364,92 @@ fn call_out_matches_the_interpreter_mid_block() {
         interpreter_bus.trace.elapsed_clocks(),
         "bus clocks"
     );
+}
+
+#[test]
+fn callout_retained_homes_match_legacy_on_success_stop_and_failure() {
+    fn run<const RETAIN: bool>(
+        lazy: bool,
+        fails: bool,
+        refused: bool,
+    ) -> (Registers, u64, u64, Vec<(u16, u64)>, jit::direct::BlockSpan) {
+        let (mut fixture, mut interpreter, mut interpreter_bus) = slot_block_with_policy::<RETAIN>(
+            |bus| {
+                bus.lazy_io_reads = lazy;
+                bus.io_read_fails = fails;
+                bus.io_read_value = Some(0x5a);
+            },
+            |cpu| {
+                if refused {
+                    cpu.cpl = 3;
+                    cpu.tr.limit = 0;
+                }
+            },
+            true,
+        );
+        for cpu in [&mut fixture.cpu, &mut interpreter] {
+            cpu.registers.gpr = [
+                0xa1b2_c3d4,
+                0x91a2_b3c4,
+                u32::from(PORT),
+                0x8192_a3b4,
+                STACK_TOP,
+                0x7182_93a4,
+                0x6172_8394,
+                0x5162_7384,
+            ];
+        }
+        let before = fixture.cpu.perf_counters().jit_direct_insns;
+        assert!(
+            fixture
+                .cpu
+                .try_run_direct_block_for_test(&mut fixture.bus, fixture.block)
+                .unwrap()
+        );
+        let retired = if fails || refused {
+            1
+        } else if lazy {
+            7
+        } else {
+            2
+        };
+        for _ in 0..retired {
+            interpreter.cycle(&mut interpreter_bus).unwrap();
+        }
+        assert_eq!(
+            fixture.cpu.perf_counters().jit_direct_insns - before,
+            retired
+        );
+        assert_eq!(
+            crate::tests::settled_registers(&fixture.cpu),
+            crate::tests::settled_registers(&interpreter)
+        );
+        assert_eq!(fixture.cpu.elapsed_clocks, interpreter.elapsed_clocks);
+        assert_eq!(fixture.cpu.timing_rem, interpreter.timing_rem);
+        assert_eq!(
+            fixture.bus.trace.elapsed_clocks(),
+            interpreter_bus.trace.elapsed_clocks()
+        );
+        assert_eq!(fixture.bus.io_reads.len(), interpreter_bus.io_reads.len());
+        (
+            crate::tests::settled_registers(&fixture.cpu),
+            fixture.cpu.elapsed_clocks,
+            fixture.bus.trace.elapsed_clocks(),
+            fixture.bus.io_reads,
+            fixture.span,
+        )
+    }
+    for (lazy, fails, refused) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        assert_eq!(
+            run::<false>(lazy, fails, refused),
+            run::<true>(lazy, fails, refused)
+        );
+    }
 }
 
 #[test]
@@ -1966,7 +2087,12 @@ fn governor_block(
         .expect("block installs");
     let block = cpu.jit_direct.block(id).expect("live block");
 
-    let mut fixture = Fixture { cpu, bus, block };
+    let mut fixture = Fixture {
+        cpu,
+        bus,
+        block,
+        span: compilation.span,
+    };
     rearm_governor_block(&mut fixture);
     fixture
 }
@@ -2656,6 +2782,7 @@ fn slot_block_imm8(port: u8, configure: impl Fn(&mut TestBus)) -> (Fixture, CpuG
             cpu: native,
             bus: native_bus,
             block,
+            span: compilation.span,
         },
         interpreter,
         interpreter_bus,
@@ -3303,6 +3430,7 @@ fn slot_block_out_imm8(port: u8, configure: impl Fn(&mut TestBus)) -> (Fixture, 
             cpu: native,
             bus: native_bus,
             block,
+            span: compilation.span,
         },
         interpreter,
         interpreter_bus,
@@ -4218,6 +4346,7 @@ fn slot_block_out_dx(port: u16, configure: impl Fn(&mut TestBus)) -> (Fixture, C
             cpu: native,
             bus: native_bus,
             block,
+            span: compilation.span,
         },
         interpreter,
         interpreter_bus,

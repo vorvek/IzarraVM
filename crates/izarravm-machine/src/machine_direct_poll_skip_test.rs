@@ -271,6 +271,111 @@ fn poll_skip_seam_test_machine(mode: GswMode) -> Machine {
     machine
 }
 
+fn run_retained_poll_to_exit(machine: &mut Machine, program: &[u8]) {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut baseline = Machine::new_raw_program(profile, program).unwrap();
+    baseline.cpu.registers = machine.cpu.registers.clone();
+    baseline.set_jit_auto_admit(false);
+    baseline.cpu.set_native_backend_enabled(false);
+    baseline.cpu.set_direct_poll_skip_override(Some(false));
+    baseline.cpu.set_direct_poll_skip_16_override(Some(false));
+    baseline.poll_skip_enabled = false;
+    baseline.trace.set_tracing_mode(TracingMode::Off);
+    set_status1_bit(&mut baseline, 0x08, true);
+    assert_eq!(machine.unittester.exit_code(), 0);
+    assert_eq!(baseline.unittester.exit_code(), 0);
+    for role in [&mut *machine, &mut baseline] {
+        assert_eq!(
+            role.run_cycles(2_000_000)
+                .expect("the bounded guest must exit"),
+            StopReason::TestExit { code: 0 }
+        );
+    }
+    assert_eq!(baseline.cpu.perf_counters().jit_direct_entries, 0);
+    assert_eq!(baseline.cpu.perf_counters().jit_direct_insns, 0);
+    let mut actual_registers = machine.cpu.registers.clone();
+    actual_registers.eflags = machine.cpu.eflags();
+    let mut expected_registers = baseline.cpu.registers.clone();
+    expected_registers.eflags = baseline.cpu.eflags();
+    assert_eq!(actual_registers, expected_registers);
+    assert_eq!(
+        (
+            &machine.cpu.fpu,
+            &machine.cpu.control,
+            &machine.cpu.msr,
+            &machine.cpu.gdtr,
+            &machine.cpu.idtr,
+            &machine.cpu.ldtr,
+            &machine.cpu.tr,
+            machine.cpu.halted
+        ),
+        (
+            &baseline.cpu.fpu,
+            &baseline.cpu.control,
+            &baseline.cpu.msr,
+            &baseline.cpu.gdtr,
+            &baseline.cpu.idtr,
+            &baseline.cpu.ldtr,
+            &baseline.cpu.tr,
+            baseline.cpu.halted
+        )
+    );
+    assert_eq!(machine.cpu.elapsed_clocks, baseline.cpu.elapsed_clocks);
+    assert_eq!(
+        machine.cpu.poll_skip_timing_remainder(),
+        baseline.cpu.poll_skip_timing_remainder()
+    );
+    assert_eq!(
+        (
+            &machine.timeline,
+            machine.bus_rem,
+            machine.elapsed_clocks,
+            machine.trace.elapsed_clocks()
+        ),
+        (
+            &baseline.timeline,
+            baseline.bus_rem,
+            baseline.elapsed_clocks,
+            baseline.trace.elapsed_clocks()
+        )
+    );
+    let actual_beam = machine.vega.beam_dots();
+    let expected_beam = baseline.vega.beam_dots();
+    assert_eq!(
+        (
+            actual_beam,
+            machine.vega.frame_sequence(),
+            machine.vega.status1_bits(actual_beam)
+        ),
+        (
+            expected_beam,
+            baseline.vega.frame_sequence(),
+            baseline.vega.status1_bits(expected_beam)
+        )
+    );
+    assert_eq!(
+        (
+            &machine.pit,
+            &machine.pic,
+            &machine.serial,
+            &machine.serial2,
+            &machine.lpt,
+            &machine.lpt2,
+            &machine.keyboard
+        ),
+        (
+            &baseline.pit,
+            &baseline.pic,
+            &baseline.serial,
+            &baseline.serial2,
+            &baseline.lpt,
+            &baseline.lpt2,
+            &baseline.keyboard
+        )
+    );
+}
+
 /// **I4/I1/I2, the seam's engagement bar, driven through the REAL bus.** A certified 3-slot shape
 /// spinning on a fresh-programmed CRTC's vsync bit must let `callout_poll_skip` commit a span,
 /// and the committed core/bus clocks must be exactly `raw_core_clocks * iterations` /
@@ -396,7 +501,7 @@ fn direct_poll_skip_engages_through_native_codegen() {
     // subtlety to get wrong): index 0 == guest offset 0x100 (the loader's `+0x100` COM
     // convention), so `HEAD` there is `0x100`, distinct from this file's other fixtures' `HEAD`
     // (`0x103`) only in that this program has no `mov dx,3dah` prefix -- EDX is preloaded instead.
-    let program = [0xec, 0xa8, 0x08, 0x75, 0xfb];
+    let program = [0xec, 0xa8, 0x08, 0x75, 0xfb, 0xb0, 0x03, 0xe6, 0xe6];
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
     let mut machine = Machine::new_raw_program(profile, &program).unwrap();
@@ -408,14 +513,26 @@ fn direct_poll_skip_engages_through_native_codegen() {
     cs.limit = u32::MAX;
     machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
     machine.cpu.registers.set_edx(0x03da);
+    let retained = [0x7a00, 0x8192_a3b4, 0x91a2_b3c4, 0xa1b2_c3d4];
+    machine.cpu.registers.set_esp(retained[0]);
+    machine.cpu.registers.set_ebp(retained[1]);
+    machine.cpu.registers.set_esi(retained[2]);
+    machine.cpu.registers.set_edi(retained[3]);
     machine.cpu.registers.eip = 0x100;
     machine.trace.set_tracing_mode(TracingMode::Off);
     set_status1_bit(&mut machine, 0x08, true);
 
-    machine
-        .run_cycles(2_000_000)
-        .expect("the fixture must not stop the machine");
+    run_retained_poll_to_exit(&mut machine, &program);
     let snapshot = machine.cpu.direct_stall_snapshot();
+    assert_eq!(
+        [
+            machine.cpu.registers.esp(),
+            machine.cpu.registers.ebp(),
+            machine.cpu.registers.esi(),
+            machine.cpu.registers.edi()
+        ],
+        retained
+    );
     let spans: u64 = snapshot.poll_skip_spans.iter().sum();
     assert!(
         spans > 0,
@@ -575,6 +692,7 @@ fn direct_poll_skip_engages_in_a_chained_successor_block() {
     program[0x12] = 0x08; // mask (vsync bit)
     program[0x13] = 0x75; // jnz
     program[0x14] = 0xfb; // rel8 -5, back to BLOCK_B_HEAD
+    program.extend_from_slice(&[0xb0, 0x03, 0xe6, 0xe6]);
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
     let mut machine = Machine::new_raw_program(profile, &program).unwrap();
@@ -589,15 +707,27 @@ fn direct_poll_skip_engages_in_a_chained_successor_block() {
     machine.cpu.registers.eip = 0x100;
     machine.trace.set_tracing_mode(TracingMode::Off);
     set_status1_bit(&mut machine, 0x08, true);
+    let retained = [0x7a00, 0x8192_a3b4, 0x91a2_b3c4, 0xa1b2_c3d4];
+    machine.cpu.registers.set_esp(retained[0]);
+    machine.cpu.registers.set_ebp(retained[1]);
+    machine.cpu.registers.set_esi(retained[2]);
+    machine.cpu.registers.set_edi(retained[3]);
     // The expected LINEAR head is CS.base + the guest offset, not the bare offset: the loader's
     // segment base is not zero (`Machine::new_raw_program`'s own COM convention), and the whole
     // point of this assertion is the certified shape's actual linear address, wherever that is.
     let block_b_head_linear = cs.base.wrapping_add(0x110);
 
-    machine
-        .run_cycles(2_000_000)
-        .expect("the fixture must not stop the machine");
+    run_retained_poll_to_exit(&mut machine, &program);
     let snapshot = machine.cpu.direct_stall_snapshot();
+    assert_eq!(
+        [
+            machine.cpu.registers.esp(),
+            machine.cpu.registers.ebp(),
+            machine.cpu.registers.esi(),
+            machine.cpu.registers.edi()
+        ],
+        retained
+    );
     let spans: u64 = snapshot.poll_skip_spans.iter().sum();
     assert!(
         spans > 0,
@@ -1143,12 +1273,25 @@ fn sixteen_bit_spin_machine_for_mask(
 #[cfg(feature = "jit")]
 #[test]
 fn a_sixteen_bit_poll_loop_commits_a_span_with_the_knob_on() {
-    let mut machine = sixteen_bit_spin_machine(&[0xec, 0xa8, 0x08, 0x75, 0xfb], 0, true);
+    let program = [0xec, 0xa8, 0x08, 0x75, 0xfb, 0xb0, 0x03, 0xe6, 0xe6];
+    let mut machine = sixteen_bit_spin_machine(&program, 0, true);
+    let retained = [0x7a00, 0x8192_a3b4, 0x91a2_b3c4, 0xa1b2_c3d4];
+    machine.cpu.registers.set_esp(retained[0]);
+    machine.cpu.registers.set_ebp(retained[1]);
+    machine.cpu.registers.set_esi(retained[2]);
+    machine.cpu.registers.set_edi(retained[3]);
     let head = machine.cpu.registers.cs().base + 0x100;
-    machine
-        .run_cycles(2_000_000)
-        .expect("the fixture must not stop the machine");
+    run_retained_poll_to_exit(&mut machine, &program);
     let snapshot = machine.cpu.direct_stall_snapshot();
+    assert_eq!(
+        [
+            machine.cpu.registers.esp(),
+            machine.cpu.registers.ebp(),
+            machine.cpu.registers.esi(),
+            machine.cpu.registers.edi()
+        ],
+        retained
+    );
     let spans: u64 = snapshot.poll_skip_spans.iter().sum();
     assert!(
         spans > 0,

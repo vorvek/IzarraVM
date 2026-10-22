@@ -3453,6 +3453,13 @@ impl BlockCache {
             .and_then(|index| self.blocks.get(index).copied())
     }
 
+    #[cfg(test)]
+    pub(crate) fn block_code_for_test(&self, id: BlockId) -> Option<&[u8]> {
+        let block = self.block(id)?;
+        // The live installed block owns this readable interval until cache mutation or drop.
+        Some(unsafe { core::slice::from_raw_parts(block.entry_ptr(), block.code_len as usize) })
+    }
+
     /// The entry pointer for a block id, re-resolved through the same generational lookup
     /// `block()` uses. Arena compaction can relocate code while a caller holds a copied
     /// descriptor, so this resolve sits below every refusal and before the transmute into a
@@ -8221,6 +8228,22 @@ fn compile_with_budget(
     instruction_limit: usize,
     byte_budget: usize,
 ) -> CompileOutcome {
+    compile_with_budget_and_callout_policy::<true>(
+        cpu,
+        entry_lin,
+        d,
+        instruction_limit,
+        byte_budget,
+    )
+}
+
+fn compile_with_budget_and_callout_policy<const RETAIN_PORT_HOMES: bool>(
+    cpu: &mut CpuGsw,
+    entry_lin: u32,
+    d: bool,
+    instruction_limit: usize,
+    byte_budget: usize,
+) -> CompileOutcome {
     let Some(key) = key_for(cpu, entry_lin, d) else {
         return CompileOutcome::Retry(RetryCause::NoKey);
     };
@@ -9841,7 +9864,7 @@ fn compile_with_budget(
         .iter()
         .map(|cell| cell.address())
         .collect();
-    let emitted = emit(EmitInput {
+    let emitted = emit::<RETAIN_PORT_HOMES>(EmitInput {
         slots: &slots,
         span,
         raw_clocks,
@@ -9939,6 +9962,21 @@ fn compile_with_budget(
         align_test_al_sites: emitted.align_test_al_sites,
         code: emitted.code,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn compile_with_callout_policy_for_test<const RETAIN_PORT_HOMES: bool>(
+    cpu: &mut CpuGsw,
+    entry_lin: u32,
+    d: bool,
+) -> CompileOutcome {
+    compile_with_budget_and_callout_policy::<RETAIN_PORT_HOMES>(
+        cpu,
+        entry_lin,
+        d,
+        MAX_BLOCK_INSTRUCTIONS,
+        usize::MAX,
+    )
 }
 
 #[cfg(test)]
@@ -19350,7 +19388,7 @@ impl MemorySideExits {
     }
 }
 
-fn emit(input: EmitInput<'_>) -> EmittedCode {
+fn emit<const RETAIN_PORT_HOMES: bool>(input: EmitInput<'_>) -> EmittedCode {
     let EmitInput {
         slots,
         span,
@@ -20938,7 +20976,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     .or(port_imm8);
                 let resync_labels =
                     interpret_one_cell.map(|_| ((e.label(), e.label()), (e.label(), e.label())));
-                emit_call_out(
+                emit_call_out::<RETAIN_PORT_HOMES>(
                     &mut e,
                     helper,
                     slot.callout_helper_offset,
@@ -32335,7 +32373,7 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 /// `abnormal` and `step_break` are side-exit reason stubs the caller has already registered; this
 /// function only branches to them.
 #[allow(clippy::too_many_arguments)]
-fn emit_call_out(
+fn emit_call_out<const RETAIN_PORT_HOMES: bool>(
     e: &mut Encoder,
     helper: CallOutHelper,
     helper_displacement: i32,
@@ -32398,9 +32436,7 @@ fn emit_call_out(
     e.mov_r64_r64(QUOTA_ARG, Reg::RDX);
     e.mov_r64_r64(FLAGS_ARG, Reg::RAX);
     e.mov_r64_r64(CPU_ARG, Reg::R15);
-    // Argument 4, and only for the class that has one. `EXIT_ARG` is R9 on Windows and RCX on
-    // SysV: neither is a `GUEST_HOMES` register, so nothing live is destroyed and the reload after
-    // the call does not have to cover it.
+    // Argument 4 uses R9 on Windows, the spilled ECX home. Reload it after the call.
     if let Some(value) = exit_arg {
         e.mov_r64_imm64(EXIT_ARG, value);
     }
@@ -32410,7 +32446,15 @@ fn emit_call_out(
     // Reload BEFORE the status branch: the abnormal path leaves through `shared_return`, which
     // stores the homes, so a reload placed only on the success path would let a call-clobbered
     // R8-R11 overwrite live guest registers. `mov` writes no flags, so RAX's status survives.
-    for (index, home) in GUEST_HOMES.into_iter().enumerate() {
+    // IN changes only AL. The ABI preserves the last four homes, including their zero upper
+    // halves: entry loads clear them, narrow writes preserve them, and wider writes clear them.
+    // Restore these loads if this helper starts writing a retained canonical guest register.
+    let reloads = if RETAIN_PORT_HOMES && matches!(helper, CallOutHelper::PortReadAlDx) {
+        4
+    } else {
+        GUEST_HOMES.len()
+    };
+    for (index, home) in GUEST_HOMES.into_iter().take(reloads).enumerate() {
         e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
     }
     #[cfg(all(
@@ -39260,6 +39304,10 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 #[path = "direct_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "direct/port_home_reload_test.rs"]
+mod port_home_reload_tests;
 
 // ---- test module of jit/direct/entry_attribution/armed.rs --------------------------------------
 #[cfg(all(test, feature = "direct-entry-attribution"))]

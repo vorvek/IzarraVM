@@ -66,6 +66,7 @@ struct Roles {
     block: jit::direct::CompiledBlock,
     instructions: u8,
     callout_slots: u8,
+    code_bytes: usize,
 }
 
 /// Assemble `body` between a leading `mov esi,esi` and a `mov edi,edi` / `hlt` tail, returning the
@@ -108,6 +109,15 @@ fn build(
     configure_bus: impl Fn(&mut TestBus),
     configure_cpu: impl Fn(&mut CpuGsw),
 ) -> Roles {
+    build_with_callout_policy::<true>(code, starts, configure_bus, configure_cpu)
+}
+
+fn build_with_callout_policy<const RETAIN: bool>(
+    code: &[u8],
+    starts: &[u32],
+    configure_bus: impl Fn(&mut TestBus),
+    configure_cpu: impl Fn(&mut CpuGsw),
+) -> Roles {
     let mut memory = vec![0u8; 0x5000];
     // A NOP before the entry, so a run-loop-driven role reaches ENTRY as a CONTINUATION. The run
     // loop always interprets its first instruction, so a role started AT the entry would never
@@ -143,7 +153,12 @@ fn build(
         native.jit_direct.probe(key),
         jit::direct::BlockProbe::Interpret
     ));
-    let compilation = match jit::direct::compile(&mut native, ENTRY, true) {
+    let result = if RETAIN {
+        jit::direct::compile(&mut native, ENTRY, true)
+    } else {
+        jit::direct::compile_with_callout_policy_for_test::<false>(&mut native, ENTRY, true)
+    };
+    let compilation = match result {
         jit::direct::CompileOutcome::Compiled(compilation) => compilation,
         jit::direct::CompileOutcome::StructuralReject(_) => {
             panic!("structurally rejected: IN AL,DX is still a barrier")
@@ -152,6 +167,7 @@ fn build(
     };
     let instructions = compilation.span.instructions;
     let callout_slots = compilation.callout_slots;
+    let code_bytes = compilation.code.len();
     let id = native
         .jit_direct
         .install(&compilation)
@@ -166,6 +182,7 @@ fn build(
         block,
         instructions,
         callout_slots,
+        code_bytes,
     };
     arm(&mut roles, ENTRY);
     roles
@@ -290,6 +307,249 @@ fn compare_state(roles: &Roles, context: &str) {
         roles.native_bus.memory, roles.interp_bus.memory,
         "{context}: guest RAM"
     );
+}
+
+#[test]
+#[ignore = "release-only fixed-work callout timing"]
+fn callout_retained_homes_fixed_work_benchmark() {
+    assert!(
+        !std::hint::black_box(cfg!(debug_assertions)),
+        "run this ignored test with --release"
+    );
+    const ITERATIONS: u32 = 131_072;
+    const READS: usize = ITERATIONS as usize * 4;
+    const NATIVE_INSTRUCTIONS: u64 = ITERATIONS as u64 * 7;
+    const INSTRUCTIONS: u64 = NATIVE_INSTRUCTIONS + 2;
+
+    fn make<const RETAIN: bool>() -> Roles {
+        let mut code = vec![0x89, 0xf6];
+        let mut starts = vec![ENTRY];
+        for _ in 0..4 {
+            starts.push(ENTRY + code.len() as u32);
+            code.push(0xec);
+        }
+        starts.push(ENTRY + code.len() as u32);
+        code.push(0x49);
+        starts.push(ENTRY + code.len() as u32);
+        code.extend_from_slice(&[0x75, 0xf7]);
+        starts.push(ENTRY + code.len() as u32);
+        code.push(HLT);
+        let mut roles = build_with_callout_policy::<RETAIN>(
+            &code,
+            &starts,
+            |bus| {
+                assert!(!bus.native_fetches_are_uniform());
+                bus.lazy_io_reads = true;
+                bus.io_read_value = Some(0x5a);
+                bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
+                bus.io_reads.reserve(READS);
+            },
+            |cpu| {
+                assert!(cpu.jit_direct.native_fetch_trace);
+                cpu.set_direct_poll_skip_override(Some(false));
+                cpu.set_direct_poll_skip_16_override(Some(false));
+            },
+        );
+        assert_eq!(roles.callout_slots, 4);
+        assert_eq!(roles.instructions, 7);
+        enable_dispatch(&mut roles);
+        assert_eq!(
+            roles.native.jit_direct.native_fetch_trace,
+            !roles.native_bus.native_fetches_are_uniform()
+        );
+        roles
+    }
+
+    fn reset(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        cpu.registers.gpr = [
+            0xa1b2_c3d4,
+            ITERATIONS,
+            u32::from(PORT),
+            0x8192_a3b4,
+            STACK_TOP,
+            0x7182_93a4,
+            0x6172_8394,
+            0x5162_7384,
+        ];
+        cpu.registers.eip = ENTRY - 1;
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.single_step_armed = false;
+        cpu.single_step_repeat = false;
+        cpu.rep_resume_active = false;
+        *cpu.rep_execution = Default::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.core_clocks_so_far = 0;
+        bus.trace.clear();
+        bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
+        bus.io_reads.clear();
+        bus.io_read_cursor = 0;
+        bus.io_run_core_origin = 0;
+        bus.io_touched = false;
+        bus.last_read_io_core_clocks_so_far = None;
+        bus.last_read_io_ring0 = None;
+    }
+
+    fn drive(cpu: &mut CpuGsw, bus: &mut TestBus) -> u64 {
+        for calls in 1..=INSTRUCTIONS + 1 {
+            if cpu.run_straight_line(bus, u64::MAX).unwrap().halted {
+                return calls;
+            }
+        }
+        panic!("the fixed guest loop did not halt");
+    }
+
+    fn validate(roles: &Roles, oracle: &Roles, before: u64) -> (u64, u64) {
+        assert_eq!(
+            roles.native.perf_counters().instructions - before,
+            INSTRUCTIONS
+        );
+        assert_eq!(roles.native_bus.io_reads.len(), READS);
+        assert_eq!(roles.native_bus.io_reads, oracle.interp_bus.io_reads);
+        assert_eq!(
+            crate::tests::settled_registers(&roles.native),
+            crate::tests::settled_registers(&oracle.interp)
+        );
+        assert_eq!(roles.native.elapsed_clocks, oracle.interp.elapsed_clocks);
+        assert_eq!(roles.native.timing_rem, oracle.interp.timing_rem);
+        assert_eq!(
+            roles.native_bus.in_batch_raw_bus_clocks(),
+            oracle.interp_bus.in_batch_raw_bus_clocks()
+        );
+        assert_eq!(
+            roles.native_bus.in_batch_scaled_bus_clocks(),
+            oracle.interp_bus.in_batch_scaled_bus_clocks()
+        );
+        assert!(roles.native.halted);
+        assert_eq!(roles.native.registers.ecx(), 0);
+        assert!(!roles.native.rep_resume_active);
+        assert!(!roles.native.single_step_armed && !roles.native.single_step_repeat);
+        (
+            roles.native.elapsed_clocks,
+            roles.native_bus.in_batch_scaled_bus_clocks(),
+        )
+    }
+
+    fn checked_code(roles: &mut Roles) -> &[u8] {
+        let live = roles
+            .native
+            .jit_direct
+            .block(roles.block.id())
+            .expect("original block remains live");
+        assert_eq!(live.id(), roles.block.id());
+        assert_eq!(live.span(), roles.block.span());
+        assert_eq!(live.entry_ptr(), roles.block.entry_ptr());
+        let key = jit::direct::key_for(&roles.native, ENTRY, true).expect("original entry key");
+        match roles.native.jit_direct.probe(key) {
+            jit::direct::BlockProbe::Ready(id) => assert_eq!(id, roles.block.id()),
+            other => panic!("original entry no longer resolves to its block: {other:?}"),
+        }
+        let code = roles
+            .native
+            .jit_direct
+            .block_code_for_test(live.id())
+            .expect("live code interval");
+        assert_eq!(code.len(), roles.code_bytes);
+        code
+    }
+
+    let mut legacy = make::<false>();
+    let mut candidate = make::<true>();
+    let legacy_image = checked_code(&mut legacy).to_vec();
+    let candidate_image = checked_code(&mut candidate).to_vec();
+    let mut oracle = make::<true>();
+    reset(&mut oracle.interp, &mut oracle.interp_bus);
+    let oracle_before = oracle.interp.perf_counters().instructions;
+    let oracle_native_before = (
+        oracle.interp.perf_counters().jit_direct_entries,
+        oracle.interp.perf_counters().jit_direct_insns,
+    );
+    drive(&mut oracle.interp, &mut oracle.interp_bus);
+    assert_eq!(
+        oracle.interp.perf_counters().instructions - oracle_before,
+        INSTRUCTIONS
+    );
+    assert_eq!(oracle.interp_bus.io_reads.len(), READS);
+    assert_eq!(
+        (
+            oracle.interp.perf_counters().jit_direct_entries,
+            oracle.interp.perf_counters().jit_direct_insns,
+        ),
+        oracle_native_before
+    );
+    for (roles, image) in [
+        (&mut legacy, &legacy_image),
+        (&mut candidate, &candidate_image),
+    ] {
+        reset(&mut roles.native, &mut roles.native_bus);
+        assert_eq!(checked_code(roles), image);
+        let before = roles.native.perf_counters().instructions;
+        let installed = roles.native.perf_counters().jit_direct_blocks_installed;
+        drive(&mut roles.native, &mut roles.native_bus);
+        validate(roles, &oracle, before);
+        assert_eq!(
+            roles.native.perf_counters().jit_direct_blocks_installed,
+            installed
+        );
+        assert_eq!(checked_code(roles), image);
+    }
+    eprintln!(
+        "IN benchmark instructions={INSTRUCTIONS} reads={READS} legacy_bytes={} candidate_bytes={} PE={} VM={} CS.D={}",
+        legacy.code_bytes,
+        candidate.code_bytes,
+        candidate.native.is_protected_mode(),
+        candidate.native.registers.eflags & FLAG_VM != 0,
+        candidate.native.registers.cs().default_size_32
+    );
+    for pair in 0..10 {
+        let mut coverage = Vec::new();
+        for retain in if pair % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let (roles, image) = if retain {
+                (&mut candidate, &candidate_image)
+            } else {
+                (&mut legacy, &legacy_image)
+            };
+            reset(&mut roles.native, &mut roles.native_bus);
+            assert_eq!(checked_code(roles), image);
+            let pointer = roles.native_bus.io_reads.as_ptr();
+            let capacity = roles.native_bus.io_reads.capacity();
+            let perf = roles.native.perf_counters();
+            let before = (
+                perf.instructions,
+                perf.jit_direct_entries,
+                perf.jit_direct_insns,
+                perf.jit_direct_blocks_installed,
+            );
+            let started = std::time::Instant::now();
+            let calls = drive(&mut roles.native, &mut roles.native_bus);
+            let ns = started.elapsed().as_nanos();
+            assert_eq!(checked_code(roles), image);
+            assert_eq!(roles.native_bus.io_reads.as_ptr(), pointer);
+            assert_eq!(roles.native_bus.io_reads.capacity(), capacity);
+            let clocks = validate(roles, &oracle, before.0);
+            let perf = roles.native.perf_counters();
+            assert_eq!(perf.jit_direct_blocks_installed, before.3);
+            let native = (
+                perf.jit_direct_entries - before.1,
+                perf.jit_direct_insns - before.2,
+            );
+            assert!(native.0 > 0 && native.1 > 0);
+            assert_eq!(native.1, NATIVE_INSTRUCTIONS);
+            coverage.push(native);
+            eprintln!(
+                "pair={pair} candidate={retain} ns={ns} instructions={INSTRUCTIONS} reads={READS} entries={} native_insns={} core={} bus={} driver_calls={calls}",
+                native.0, native.1, clocks.0, clocks.1
+            );
+        }
+        assert_eq!(coverage[0], coverage[1]);
+    }
 }
 
 /// The ORDER of the device's reads, without their timestamps. Everything a block-driven fixture
