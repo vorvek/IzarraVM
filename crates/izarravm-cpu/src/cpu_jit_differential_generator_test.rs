@@ -277,6 +277,28 @@ fn generated_cpu(mode: GswMode) -> CpuGsw {
     cpu
 }
 
+/// The six segment records and the CPL that `arm` installs while the segment sweeps run.
+#[derive(Clone, Copy)]
+struct SegmentArming {
+    segments: [SegmentRegister; 6],
+    cpl: u8,
+}
+
+/// The order of `SegmentArming::segments`.
+const ARMED_SEGMENTS: [SegmentIndex; 6] = [
+    SegmentIndex::Cs,
+    SegmentIndex::Ds,
+    SegmentIndex::Ss,
+    SegmentIndex::Es,
+    SegmentIndex::Fs,
+    SegmentIndex::Gs,
+];
+
+thread_local! {
+    static SEGMENT_ARMING: std::cell::Cell<Option<SegmentArming>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn arm(cpu: &mut CpuGsw, case: &GeneratedCase) {
     cpu.halted = false;
     cpu.interrupt_shadow = false;
@@ -291,6 +313,14 @@ fn arm(cpu: &mut CpuGsw, case: &GeneratedCase) {
     cpu.fpu.finit();
     cpu.fpu.push(1.25);
     cpu.fpu.push(-2.5);
+    // The segment sweeps set the arming. Without it, `arm` leaves the segment registers as the
+    // previous run left them, and the priming runs would start the case from different segments.
+    if let Some(arming) = SEGMENT_ARMING.with(std::cell::Cell::get) {
+        for (index, record) in ARMED_SEGMENTS.iter().zip(arming.segments) {
+            cpu.registers.set_segment(*index, record);
+        }
+        cpu.cpl = arming.cpl;
+    }
 }
 
 fn restore_bus(bus: &mut TestBus, pristine: &[u8]) {
@@ -2942,5 +2972,1623 @@ fn assert_group_three_legs_agree(mode: GswMode) {
 fn group_three_and_group_two_legs_agree_on_both_personas_and_epochs() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
         assert_group_three_legs_agree(mode);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The data-segment oracle: real mode, unreal mode, short limits and V86.
+//
+// A block bakes the base, limit and selector of each data segment that it uses. These cases run a
+// block natively and interpreted from the same state, and compare the whole CPU, guest RAM and
+// clocks. Each case is measured two times after priming: with the entry segments of the priming
+// runs, and with a second set. A change that lets a block run with segments that differ from its
+// compile time must keep both measurements equal. The harness rules are in
+// `dev_docs/dynarec-plan-2026-11-10/stage1-design.md`, section 10.
+// ---------------------------------------------------------------------------
+
+/// Where the case code starts.
+const SEG_ENTRY: u32 = 0x1000;
+/// The selector pool. Each base is 16-byte aligned and not page aligned, so an access at a limit
+/// edge does not also cross a page.
+const SEG_POOL: [u16; 5] = [0x0812, 0x0A34, 0x0C56, 0x0E78, 0x0F12];
+/// Offset of the selector table, with one copy at each pool base.
+const SEG_TABLE: u16 = 0x0800;
+/// Offset of the far pointer table (offset word, then selector word), one copy at each pool base.
+const SEG_FAR_TABLE: u16 = 0x0810;
+const SEG_BX: u16 = 0x0040;
+const SEG_SI: u16 = 0x0080;
+const SEG_DI: u16 = 0x00C0;
+const SEG_BP: u16 = 0x0100;
+const SEG_SP: u16 = 0x0700;
+/// The real-mode fault handler. IVT entries 12 and 13 point here.
+const SEG_REAL_MONITOR: u32 = 0x0500;
+/// The real-mode handler of vector 12 (#SS). It has its own `hlt`, so the final EIP tells a stack
+/// fault from a general protection fault.
+const SEG_REAL_STACK_MONITOR: u32 = 0x0510;
+/// The ring 0 fault handler of the V86 fixture.
+const SEG_V86_MONITOR: u32 = 0x6000;
+const SEG_V86_ESP0: u32 = 0x7000;
+/// The two sets of entry segments, as pool indexes for DS, ES, SS, FS and GS. Every register
+/// differs between the two sets.
+const SEG_ENTRY_SETS: [[usize; 5]; 2] = [[0, 1, 2, 3, 4], [1, 2, 3, 4, 0]];
+
+const SREG_ES: u8 = 0;
+const SREG_SS: u8 = 2;
+const SREG_DS: u8 = 3;
+const SREG_FS: u8 = 4;
+const SREG_GS: u8 = 5;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seg {
+    Ds,
+    Es,
+    Ss,
+    Fs,
+    Gs,
+}
+
+impl Seg {
+    const ALL: [Seg; 5] = [Seg::Ds, Seg::Es, Seg::Ss, Seg::Fs, Seg::Gs];
+
+    /// The position in `SEG_ENTRY_SETS` and in the current-selector table of the generator.
+    fn slot(self) -> usize {
+        match self {
+            Seg::Ds => 0,
+            Seg::Es => 1,
+            Seg::Ss => 2,
+            Seg::Fs => 3,
+            Seg::Gs => 4,
+        }
+    }
+
+    fn sreg(self) -> u8 {
+        match self {
+            Seg::Es => SREG_ES,
+            Seg::Ss => SREG_SS,
+            Seg::Ds => SREG_DS,
+            Seg::Fs => SREG_FS,
+            Seg::Gs => SREG_GS,
+        }
+    }
+
+    fn prefix(self) -> u8 {
+        match self {
+            Seg::Ds => 0x3e,
+            Seg::Es => 0x26,
+            Seg::Ss => 0x36,
+            Seg::Fs => 0x64,
+            Seg::Gs => 0x65,
+        }
+    }
+
+    fn index(self) -> SegmentIndex {
+        match self {
+            Seg::Ds => SegmentIndex::Ds,
+            Seg::Es => SegmentIndex::Es,
+            Seg::Ss => SegmentIndex::Ss,
+            Seg::Fs => SegmentIndex::Fs,
+            Seg::Gs => SegmentIndex::Gs,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SegWorld {
+    Real,
+    Unreal,
+    ShortLimit,
+    /// Real mode with an SS limit of 0x0FFF. DS and ES keep the limit 0xFFFF.
+    ShortStack,
+    V86,
+}
+
+/// Real mode, all limits 0xFFFF.
+fn segment_real_cpu(mode: GswMode) -> CpuGsw {
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(mode);
+    for segment in ARMED_SEGMENTS {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.set_sixteen_bit_admission_level(1);
+    cpu.set_word_operands_at_486(true);
+    cpu
+}
+
+fn stamp_limit(cpu: &mut CpuGsw, limit: u32) {
+    for segment in [SegmentIndex::Ds, SegmentIndex::Es] {
+        let mut record = cpu.registers.segment(segment);
+        record.limit = limit;
+        cpu.registers.set_segment(segment, record);
+    }
+}
+
+fn stamp_ss_limit(cpu: &mut CpuGsw, limit: u32) {
+    let mut record = cpu.registers.segment(SegmentIndex::Ss);
+    record.limit = limit;
+    cpu.registers.set_segment(SegmentIndex::Ss, record);
+}
+
+/// Real mode with a DS and ES limit of 0x1FFFF. A real-mode segment load keeps the limit.
+fn segment_unreal_cpu(mode: GswMode) -> CpuGsw {
+    let mut cpu = segment_real_cpu(mode);
+    stamp_limit(&mut cpu, 0x1_ffff);
+    cpu
+}
+
+/// Real mode with a DS and ES limit of 0x0FFF.
+fn segment_short_limit_cpu(mode: GswMode) -> CpuGsw {
+    let mut cpu = segment_real_cpu(mode);
+    stamp_limit(&mut cpu, 0x0fff);
+    cpu
+}
+
+/// V86 with a ring 0 stack, a TSS and an IDT whose entry 13 leads to a ring 0 `hlt`.
+fn segment_v86_cpu(mode: GswMode) -> CpuGsw {
+    let mut cpu = segment_real_cpu(mode);
+    cpu.control.cr0 |= CR0_PE;
+    cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
+    cpu.cpl = 3;
+    cpu.gdtr.base = GDT;
+    cpu.gdtr.limit = 0xff;
+    cpu.idtr.base = IDT;
+    cpu.idtr.limit = 0xfff;
+    cpu.tr = SegmentRegister {
+        selector: TSS_SEL,
+        base: TSS,
+        limit: 0x68,
+        access: 0x89,
+        default_size_32: false,
+    };
+    assert!(cpu.is_v86_mode(), "the V86 fixture must be in V86");
+    cpu
+}
+
+impl SegWorld {
+    const ALL: [SegWorld; 4] = [
+        SegWorld::Real,
+        SegWorld::Unreal,
+        SegWorld::ShortLimit,
+        SegWorld::V86,
+    ];
+
+    fn cpu(self, mode: GswMode) -> CpuGsw {
+        match self {
+            SegWorld::Real => segment_real_cpu(mode),
+            SegWorld::Unreal => segment_unreal_cpu(mode),
+            SegWorld::ShortLimit => segment_short_limit_cpu(mode),
+            SegWorld::ShortStack => {
+                let mut cpu = segment_real_cpu(mode);
+                stamp_ss_limit(&mut cpu, 0x0fff);
+                cpu
+            }
+            SegWorld::V86 => segment_v86_cpu(mode),
+        }
+    }
+
+    /// The DS and ES limit at the first entry set.
+    fn limit(self) -> u32 {
+        match self {
+            SegWorld::Unreal => 0x1_ffff,
+            SegWorld::ShortLimit => 0x0fff,
+            SegWorld::Real | SegWorld::ShortStack | SegWorld::V86 => 0xffff,
+        }
+    }
+
+    fn eflags(self) -> u32 {
+        match self {
+            SegWorld::V86 => 0x202 | FLAG_VM | (3 << 12),
+            _ => 0x202,
+        }
+    }
+
+    /// The segment records and CPL of one entry set. `other_limit` gives the short-limit world
+    /// the limit 0xFFFF instead of 0x0FFF, and it gives the V86 world a DS and ES limit of
+    /// 0x1FFFF, which V86 does not make by itself. The other worlds ignore it.
+    fn arming(self, set: usize, other_limit: bool) -> SegmentArming {
+        let mut cpu = CpuGsw::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        for seg in Seg::ALL {
+            let selector = SEG_POOL[SEG_ENTRY_SETS[set][seg.slot()]];
+            cpu.load_segment_real(seg.index(), selector);
+        }
+        let limit = match (self, other_limit) {
+            (SegWorld::ShortLimit, true) => 0xffff,
+            (SegWorld::V86, true) => 0x1_ffff,
+            _ => self.limit(),
+        };
+        stamp_limit(&mut cpu, limit);
+        if self == SegWorld::ShortStack {
+            stamp_ss_limit(&mut cpu, 0x0fff);
+        }
+        let mut segments = [SegmentRegister::default(); 6];
+        for (record, index) in segments.iter_mut().zip(ARMED_SEGMENTS) {
+            *record = cpu.registers.segment(index);
+        }
+        SegmentArming {
+            segments,
+            cpl: if self == SegWorld::V86 { 3 } else { 0 },
+        }
+    }
+}
+
+/// States the gate arms and installs the segment arming for the length of one run. The arms are
+/// stated here and none is inherited: the sixteen-bit level and the word operands at 486 are set
+/// in the CPU builder, and the rest are thread-local test overrides.
+struct SegmentScope;
+
+impl SegmentScope {
+    fn new(arming: SegmentArming) -> Self {
+        // The chain entry check is read when the block cache is built, so this runs before the
+        // CPU builders.
+        jit::direct::set_chain_entry_check_for_test(Some(true));
+        jit::direct::set_v86_loop_rows_for_test(Some(true));
+        // The loop probes use LOOP (0xE2), so the loop arm is stated as well.
+        jit::direct::set_loop_rows_for_test(Some(true));
+        jit::direct::set_generic_callout_for_test(Some(true));
+        jit::direct::set_callout_segment_resume_for_test(Some(false));
+        jit::direct::set_segment_retire_governor_for_test(Some(
+            jit::direct::SegmentRetireGovernor::Cap,
+        ));
+        jit::direct::set_disp_lanes_for_test(Some(true));
+        jit::direct::set_disp_store_lanes_for_test(Some(true));
+        jit::direct::set_disp_load_widen_for_test(Some(false));
+        jit::direct::set_imm8_lanes_for_test(Some(true));
+        jit::direct::set_count_lanes_for_test(Some(true));
+        SEGMENT_ARMING.with(|cell| cell.set(Some(arming)));
+        Self
+    }
+
+    fn set_arming(&self, arming: SegmentArming) {
+        SEGMENT_ARMING.with(|cell| cell.set(Some(arming)));
+    }
+}
+
+impl Drop for SegmentScope {
+    fn drop(&mut self) {
+        SEGMENT_ARMING.with(|cell| cell.set(None));
+        jit::direct::set_chain_entry_check_for_test(None);
+        jit::direct::set_v86_loop_rows_for_test(None);
+        jit::direct::set_loop_rows_for_test(None);
+        jit::direct::set_generic_callout_for_test(None);
+        jit::direct::set_callout_segment_resume_for_test(None);
+        jit::direct::set_segment_retire_governor_for_test(None);
+        jit::direct::set_disp_lanes_for_test(None);
+        jit::direct::set_disp_store_lanes_for_test(None);
+        jit::direct::set_disp_load_widen_for_test(None);
+        jit::direct::set_imm8_lanes_for_test(None);
+        jit::direct::set_count_lanes_for_test(None);
+    }
+}
+
+fn push_u16(code: &mut Vec<u8>, value: u16) {
+    code.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Guest RAM for one case: random bytes from 0x8000, the selector and far pointer tables at each
+/// pool base, the code, and the fault path of the world.
+fn segment_memory(world: SegWorld, seed: u64, code: &[u8]) -> Vec<u8> {
+    let mut memory = vec![0u8; MEMORY_LEN];
+    let mut fill = Rng::new(seed ^ 0x7365_6766_696c_6c31);
+    for byte in &mut memory[0x8000..] {
+        *byte = fill.u32() as u8;
+    }
+    for base in SEG_POOL {
+        let linear = u32::from(base) << 4;
+        for (k, selector) in SEG_POOL.iter().enumerate() {
+            let k = k as u32;
+            put16(
+                &mut memory,
+                linear + u32::from(SEG_TABLE) + 2 * k,
+                *selector,
+            );
+            let far = linear + u32::from(SEG_FAR_TABLE) + 4 * k;
+            put16(&mut memory, far, 0x1230 + 0x11 * k as u16);
+            put16(&mut memory, far + 2, *selector);
+        }
+    }
+    let start = SEG_ENTRY as usize;
+    memory[start..start + code.len()].copy_from_slice(code);
+    if world == SegWorld::V86 {
+        let code_descriptor = descriptor(0, 0xf_ffff, 0x9b, 0xc0);
+        memory[(GDT + 0x08) as usize..(GDT + 0x10) as usize].copy_from_slice(&code_descriptor);
+        let data_descriptor = descriptor(0, 0xf_ffff, 0x93, 0xc0);
+        memory[(GDT + 0x10) as usize..(GDT + 0x18) as usize].copy_from_slice(&data_descriptor);
+        let tss_descriptor = descriptor(TSS, 0x68, 0x89, 0x00);
+        memory[(GDT + 0x18) as usize..(GDT + 0x20) as usize].copy_from_slice(&tss_descriptor);
+        put32(&mut memory, TSS + 4, SEG_V86_ESP0);
+        put16(&mut memory, TSS + 8, R0_SS);
+        put16(&mut memory, TSS + 0x66, 0x68);
+        int_gate(&mut memory, 13, SEG_V86_MONITOR);
+        memory[SEG_V86_MONITOR as usize] = 0xf4;
+    } else {
+        for (vector, handler) in [(12u32, SEG_REAL_STACK_MONITOR), (13, SEG_REAL_MONITOR)] {
+            put16(&mut memory, vector * 4, handler as u16);
+            put16(&mut memory, vector * 4 + 2, 0);
+            memory[handler as usize] = 0xf4;
+        }
+    }
+    memory
+}
+
+/// One case: the bytes between the three leading instructions and the closing HLT, and whether
+/// the two roles must return the same sequence of run outcomes.
+struct SegmentCase {
+    case: GeneratedCase,
+    exact_run_boundaries: bool,
+}
+
+fn segment_case_from_body(
+    world: SegWorld,
+    seed: u64,
+    body: &[u8],
+    exact_run_boundaries: bool,
+) -> SegmentCase {
+    let mut rng = Rng::new(seed);
+    // The NOP and two filler moves (`mov si,si`, `mov di,di`) come first. They clear the
+    // three-instruction floor of a block, so a segment load in the body does not leave a block
+    // that is too short to compile, and the first body instruction is not the entry slot.
+    let mut bytes = vec![0x90, 0x89, 0xf6, 0x89, 0xff];
+    bytes.extend_from_slice(body);
+    bytes.push(0xf4);
+    let mut gpr = [0u32; 8];
+    gpr[0] = rng.u32();
+    gpr[1] = rng.u32();
+    gpr[2] = rng.u32();
+    gpr[3] = u32::from(SEG_BX);
+    gpr[4] = u32::from(SEG_SP);
+    gpr[5] = u32::from(SEG_BP);
+    gpr[6] = u32::from(SEG_SI);
+    gpr[7] = u32::from(SEG_DI);
+    let arithmetic_flags = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+    SegmentCase {
+        case: GeneratedCase {
+            seed,
+            entry: SEG_ENTRY,
+            bytes,
+            gpr,
+            eflags: world.eflags() | (rng.u32() & arithmetic_flags),
+            cap: 512,
+            memory_slot_exits: false,
+        },
+        exact_run_boundaries,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccessWidth {
+    Byte,
+    Word,
+    Dword,
+}
+
+impl AccessWidth {
+    const ALL: [AccessWidth; 3] = [AccessWidth::Byte, AccessWidth::Word, AccessWidth::Dword];
+
+    fn bytes(self) -> u16 {
+        match self {
+            AccessWidth::Byte => 1,
+            AccessWidth::Word => 2,
+            AccessWidth::Dword => 4,
+        }
+    }
+}
+
+/// The value of the base registers sum for each 16-bit r/m form.
+fn rm_base(rm: u8) -> u16 {
+    match rm {
+        0 => SEG_BX + SEG_SI,
+        1 => SEG_BX + SEG_DI,
+        2 => SEG_BP + SEG_SI,
+        3 => SEG_BP + SEG_DI,
+        4 => SEG_SI,
+        5 => SEG_DI,
+        6 => SEG_BP,
+        _ => SEG_BX,
+    }
+}
+
+fn rm_default_segment(rm: u8) -> Seg {
+    if matches!(rm, 2 | 3 | 6) {
+        Seg::Ss
+    } else {
+        Seg::Ds
+    }
+}
+
+/// A data access through `seg` at offset `off`, with the r/m form `rm` and a 16-bit displacement.
+/// The override prefix is emitted when the segment differs from the default of the form, or when
+/// `force_prefix` is set. Register 0 (AL, AX or EAX) moves the data.
+fn emit_access(
+    code: &mut Vec<u8>,
+    seg: Seg,
+    rm: u8,
+    width: AccessWidth,
+    store: bool,
+    off: u16,
+    force_prefix: bool,
+) {
+    if width == AccessWidth::Dword {
+        code.push(0x66);
+    }
+    if rm_default_segment(rm) != seg || force_prefix {
+        code.push(seg.prefix());
+    }
+    let opcode = match (width, store) {
+        (AccessWidth::Byte, false) => 0x8a,
+        (AccessWidth::Byte, true) => 0x88,
+        (_, false) => 0x8b,
+        (_, true) => 0x89,
+    };
+    code.push(opcode);
+    code.push(0x80 | rm);
+    push_u16(code, off.wrapping_sub(rm_base(rm)));
+}
+
+fn emit_mov_sreg_imm(code: &mut Vec<u8>, seg: Seg, selector: u16) {
+    code.push(0xb8);
+    push_u16(code, selector);
+    code.extend_from_slice(&[0x8e, 0xc0 | (seg.sreg() << 3)]);
+}
+
+/// `mov sreg,[bx+d]`, where the word at `d + bx` is entry `k` of the selector table.
+fn emit_mov_sreg_table(code: &mut Vec<u8>, seg: Seg, k: usize) {
+    code.extend_from_slice(&[0x8e, 0x80 | (seg.sreg() << 3) | 7]);
+    push_u16(code, SEG_TABLE + 2 * k as u16 - SEG_BX);
+}
+
+/// `les ax,[bx+d]` or `lds ax,[bx+d]` from far pointer `k`.
+fn emit_far_load(code: &mut Vec<u8>, seg: Seg, k: usize) {
+    code.extend_from_slice(&[if seg == Seg::Es { 0xc4 } else { 0xc5 }, 0x87]);
+    push_u16(code, SEG_FAR_TABLE + 4 * k as u16 - SEG_BX);
+}
+
+/// Prime the direct role: one interpreted run, then `compiled_runs` compiled runs. Twelve are
+/// enough that every block of the case, and the successor of a segment load, has time to install. `prime_direct` asserts after
+/// four runs that the block count grew. A block with a segment-writing call-out can leave the
+/// cache again at the third run and return later, so this helper checks that something installed
+/// instead.
+fn prime_segment_direct(
+    direct: &mut CpuGsw,
+    bus: &mut TestBus,
+    pristine: &[u8],
+    case: &GeneratedCase,
+    compiled_runs: usize,
+) {
+    direct.set_jit_auto_admit(false);
+    restore_bus(bus, pristine);
+    arm(direct, case);
+    run_to_halt(direct, bus, case).unwrap();
+    direct.set_jit_auto_admit(true);
+    for _ in 0..compiled_runs {
+        restore_bus(bus, pristine);
+        arm(direct, case);
+        run_to_halt(direct, bus, case).unwrap();
+    }
+    assert!(
+        direct.perf_counters().jit_direct_blocks_installed > 0,
+        "no block installed: seed={:#x}, bytes={:02x?}, perf={:#?}",
+        case.seed,
+        case.bytes,
+        direct.perf_counters()
+    );
+}
+
+struct SetOutcome {
+    retired: u64,
+    /// Instructions that the interpreter role retired in this measured run.
+    interpreted: u64,
+    /// Call-outs that ran in this measured run.
+    callouts: u64,
+    /// Call-outs of this measured run that ended the native run (a resync).
+    resyncs: u64,
+    /// Call-outs that ran in the whole life of the CPU, including the priming runs. A call-out
+    /// site that resynced is demoted, so a later run can retire the instruction in the
+    /// interpreter, and that run adds nothing.
+    callouts_total: u64,
+    limit_exits: u64,
+    cross_page_exits: u64,
+}
+
+struct SegmentOutcome {
+    sets: Vec<SetOutcome>,
+    direct: CpuGsw,
+    direct_bus: TestBus,
+}
+
+/// Run one case in a world on a persona. Each `(set, other_limit)` entry of `sets` is one measured
+/// run after priming. The priming runs use the first entry.
+fn run_segment_case(
+    world: SegWorld,
+    mode: GswMode,
+    segment_case: &SegmentCase,
+    sets: &[(usize, bool)],
+) -> SegmentOutcome {
+    run_segment_case_primed(world, mode, segment_case, sets, 12)
+}
+
+/// Every page that holds pool base data: the operand window, the table window and the stack of
+/// each base, and the 64 KiB reach of a 16-bit offset. The code, the tables of the fault path
+/// and the IVT are below 0x8000.
+const SEG_DATA_PAGES: std::ops::Range<u32> = 8..0x20;
+
+/// Put every data page into the fast map of the direct role. A block reaches only pages that the
+/// fast map holds, and the interpreter repairs any other access with the correct base. A block
+/// with a wrong baked base on a cold page would pass unseen without this. The interpreter role
+/// does not use the fast map, so it has nothing to warm.
+fn warm_data_pages(direct: &mut CpuGsw, bus: &mut TestBus) {
+    let permissions = jit::fast_map::PagePermissions::UNPAGED;
+    for page in SEG_DATA_PAGES {
+        let address = page << 12;
+        let read = bus
+            .direct_page(address, BusAccessKind::DataRead)
+            .unwrap()
+            .expect("the test bus serves a direct read page");
+        let write = bus
+            .direct_page(address, BusAccessKind::DataWrite)
+            .unwrap()
+            .expect("the test bus serves a direct write page");
+        let watched = direct.physical_page_watched(address);
+        direct
+            .jit_fast_map
+            .populate_read(address, address, read, permissions, watched);
+        direct
+            .jit_fast_map
+            .populate_write(address, address, write, permissions, watched);
+    }
+    assert_data_pages_mapped(direct);
+}
+
+/// Every data page is in the fast map for reads and for writes.
+fn assert_data_pages_mapped(direct: &CpuGsw) {
+    for page in SEG_DATA_PAGES {
+        let address = page << 12;
+        assert!(
+            direct.jit_fast_map.has_read_mapping(address, address),
+            "page {page:#x} has no read mapping"
+        );
+        assert!(
+            direct.jit_fast_map.has_write_mapping(address, address),
+            "page {page:#x} has no write mapping"
+        );
+    }
+}
+
+/// As `run_segment_case`, with the number of compiled priming runs given.
+fn run_segment_case_primed(
+    world: SegWorld,
+    mode: GswMode,
+    segment_case: &SegmentCase,
+    sets: &[(usize, bool)],
+    compiled_runs: usize,
+) -> SegmentOutcome {
+    let case = &segment_case.case;
+    let scope = SegmentScope::new(world.arming(sets[0].0, sets[0].1));
+    let pristine = segment_memory(world, case.seed, &case.bytes);
+    let mut interpreter = world.cpu(mode);
+    let mut direct = world.cpu(mode);
+    let mut interpreter_bus = TestBus::with_memory(pristine.clone());
+    let mut direct_bus = TestBus::with_memory(pristine.clone());
+    for bus in [&mut interpreter_bus, &mut direct_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        bus.flat_direct_page_clocks = true;
+    }
+    restore_bus(&mut interpreter_bus, &pristine);
+    arm(&mut interpreter, case);
+    run_to_halt(&mut interpreter, &mut interpreter_bus, case).unwrap();
+    prime_segment_direct(&mut direct, &mut direct_bus, &pristine, case, compiled_runs);
+    warm_data_pages(&mut direct, &mut direct_bus);
+    let mut outcomes = Vec::new();
+    for &(set, other_limit) in sets {
+        scope.set_arming(world.arming(set, other_limit));
+        let perf_before = direct.perf_counters().clone();
+        let stalls_before = direct.direct_stall_snapshot();
+        let interpreted_before = interpreter.perf_counters().instructions;
+        let retired = assert_measured_pair(
+            &mut interpreter,
+            &mut interpreter_bus,
+            &mut direct,
+            &mut direct_bus,
+            &pristine,
+            case,
+            segment_case.exact_run_boundaries,
+        );
+        let stalls_after = direct.direct_stall_snapshot();
+        outcomes.push(SetOutcome {
+            retired,
+            interpreted: interpreter.perf_counters().instructions - interpreted_before,
+            callouts: stalls_after.callout_interpret_one_executed
+                - stalls_before.callout_interpret_one_executed,
+            resyncs: stalls_after.callout_interpret_one_resync
+                - stalls_before.callout_interpret_one_resync,
+            callouts_total: stalls_after.callout_interpret_one_executed,
+            limit_exits: stalls_after.side_exit_segment_limit
+                - stalls_before.side_exit_segment_limit,
+            cross_page_exits: direct
+                .perf_counters()
+                .jit_direct_exit_cross_page_or_alignment
+                - perf_before.jit_direct_exit_cross_page_or_alignment,
+        });
+    }
+    SegmentOutcome {
+        sets: outcomes,
+        direct,
+        direct_bus,
+    }
+}
+
+/// The two measured runs of every case that is not a limit edge probe. The second run uses the
+/// second entry set. The short-limit world also changes the limit.
+fn two_sets(world: SegWorld) -> [(usize, bool); 2] {
+    [(0, false), (1, world == SegWorld::ShortLimit)]
+}
+
+const PERSONAS: [GswMode; 2] = [GswMode::Gsw486, GswMode::Gsw586];
+
+// ---------------------------------------------------------------------------
+// Class probes: one deterministic case for each class of the design.
+// ---------------------------------------------------------------------------
+
+/// A probe body with a count of its instructions.
+struct Asm {
+    code: Vec<u8>,
+    insns: u64,
+}
+
+impl Asm {
+    fn new() -> Self {
+        Self {
+            code: Vec::new(),
+            insns: 0,
+        }
+    }
+
+    fn raw(&mut self, bytes: &[u8], insns: u64) {
+        self.code.extend_from_slice(bytes);
+        self.insns += insns;
+    }
+
+    /// Two filler moves (`mov si,si`, `mov di,di`). A block that stops at a dirty segment needs
+    /// three instructions to compile, so a pad after each load and after each access lets the
+    /// blocks on both sides of the stop clear the floor.
+    fn pad(&mut self) {
+        self.raw(&[0x89, 0xf6, 0x89, 0xff], 2);
+    }
+
+    fn access(&mut self, seg: Seg, rm: u8, width: AccessWidth, store: bool, off: u16) {
+        emit_access(&mut self.code, seg, rm, width, store, off, false);
+        self.insns += 1;
+    }
+
+    fn mov_sreg_imm(&mut self, seg: Seg, selector: u16) {
+        emit_mov_sreg_imm(&mut self.code, seg, selector);
+        self.insns += 2;
+    }
+
+    fn mov_sreg_table(&mut self, seg: Seg, k: usize) {
+        emit_mov_sreg_table(&mut self.code, seg, k);
+        self.insns += 1;
+    }
+
+    fn far_load(&mut self, seg: Seg, k: usize) {
+        emit_far_load(&mut self.code, seg, k);
+        self.insns += 1;
+    }
+}
+
+/// What a probe asserts: the instructions that retire natively in the measured run, and whether a
+/// call-out ran. The leading NOP, which no block covers, and the closing HLT are not counted. The
+/// two filler moves that every case starts with are counted.
+struct ClassProbe {
+    name: &'static str,
+    body: Vec<u8>,
+    native: u64,
+    callout: bool,
+    exact_run_boundaries: bool,
+}
+
+/// The two filler moves at the start of every case.
+const CASE_PREFIX_INSNS: u64 = 2;
+
+/// One access pair for each segment and each r/m form that reaches it.
+const PROBE_FORMS: [(Seg, u8); 9] = [
+    (Seg::Ds, 7),
+    (Seg::Ds, 0),
+    (Seg::Es, 4),
+    (Seg::Ss, 6),
+    (Seg::Ss, 2),
+    (Seg::Ss, 5),
+    (Seg::Ds, 3),
+    (Seg::Fs, 1),
+    (Seg::Gs, 7),
+];
+
+fn probe_access_pairs(asm: &mut Asm, width: AccessWidth) {
+    for (n, (seg, rm)) in PROBE_FORMS.iter().enumerate() {
+        let off = 0x100 + 0x40 * n as u16;
+        asm.access(*seg, *rm, width, false, off);
+        asm.access(*seg, *rm, width, true, off + 0x10);
+    }
+}
+
+/// `mov ds,ax`, `mov es,ax` and `mov es,[bx+d]`, each followed by an access through the loaded
+/// segment. The pads let the block before the access and the block after it compile.
+fn probe_segment_loads() -> Asm {
+    let mut asm = Asm::new();
+    asm.mov_sreg_imm(Seg::Ds, SEG_POOL[2]);
+    asm.pad();
+    asm.access(Seg::Ds, 7, AccessWidth::Word, false, 0x300);
+    asm.pad();
+    asm.mov_sreg_imm(Seg::Es, SEG_POOL[4]);
+    asm.pad();
+    asm.access(Seg::Es, 7, AccessWidth::Word, true, 0x310);
+    asm.pad();
+    asm.mov_sreg_table(Seg::Es, 3);
+    asm.pad();
+    asm.access(Seg::Es, 7, AccessWidth::Byte, false, 0x320);
+    asm.pad();
+    asm
+}
+
+fn probe_far_loads() -> Asm {
+    let mut asm = Asm::new();
+    asm.far_load(Seg::Es, 3);
+    asm.pad();
+    asm.access(Seg::Es, 7, AccessWidth::Word, false, 0x340);
+    asm.pad();
+    asm.far_load(Seg::Ds, 4);
+    asm.pad();
+    asm.access(Seg::Ds, 7, AccessWidth::Word, true, 0x350);
+    asm.pad();
+    asm
+}
+
+fn probe_push_pop() -> Asm {
+    let mut asm = Asm::new();
+    asm.raw(&[0x06, 0x1f], 2);
+    asm.pad();
+    asm.access(Seg::Ds, 7, AccessWidth::Word, false, 0x360);
+    asm.pad();
+    asm.raw(&[0x1e, 0x07], 2);
+    asm.pad();
+    asm.access(Seg::Es, 7, AccessWidth::Word, true, 0x370);
+    asm.pad();
+    asm
+}
+
+/// `mov ax,es` and `push ds` / `pop ax` after a load. Each one bakes a selector, so it stops the
+/// block that wrote the segment, and the pads keep the next block long enough.
+fn probe_read_segment() -> Asm {
+    let mut asm = Asm::new();
+    asm.mov_sreg_imm(Seg::Es, SEG_POOL[4]);
+    asm.pad();
+    asm.raw(&[0x8c, 0xc0], 1);
+    asm.pad();
+    asm.mov_sreg_imm(Seg::Ds, SEG_POOL[2]);
+    asm.pad();
+    asm.raw(&[0x1e, 0x58], 2);
+    asm.pad();
+    asm
+}
+
+/// `mov fs,ax` is a call-out. The call-out itself does not count as a native instruction.
+fn probe_fs_load() -> Asm {
+    let mut asm = Asm::new();
+    asm.mov_sreg_imm(Seg::Fs, SEG_POOL[1]);
+    asm.pad();
+    asm.access(Seg::Fs, 7, AccessWidth::Byte, false, 0x380);
+    asm.pad();
+    asm
+}
+
+/// Loop A: load ES from the table, then store through ES. Three iterations. Neither loop is a
+/// native self-loop today. The native count is what the shape gives: the segment load ends the
+/// first block, the loop-back target is inside it, and a block that holds only the load is too
+/// short to compile.
+fn probe_loop_a() -> Vec<u8> {
+    let mut code = vec![0xb9, 0x03, 0x00];
+    // mov es,[di+d]: the table entry moves with DI.
+    code.extend_from_slice(&[0x8e, 0x85]);
+    push_u16(&mut code, SEG_TABLE + 4 - SEG_DI);
+    emit_access(&mut code, Seg::Es, 7, AccessWidth::Word, true, 0x390, false);
+    // add di,2 / loop back over the three instructions
+    code.extend_from_slice(&[0x83, 0xc7, 0x02, 0xe2, 0xf2]);
+    // sub di,6
+    code.extend_from_slice(&[0x83, 0xef, 0x06]);
+    code
+}
+
+/// Loop B: store through ES, then load ES from the table. Three iterations.
+fn probe_loop_b() -> Vec<u8> {
+    let mut code = vec![0xb9, 0x03, 0x00];
+    emit_access(&mut code, Seg::Es, 7, AccessWidth::Word, true, 0x3a0, false);
+    code.extend_from_slice(&[0x8e, 0x85]);
+    push_u16(&mut code, SEG_TABLE + 4 - SEG_DI);
+    code.extend_from_slice(&[0x83, 0xc7, 0x02, 0xe2, 0xf2]);
+    code.extend_from_slice(&[0x83, 0xef, 0x06]);
+    code
+}
+
+/// Load, `jmp short`, then an access through the loaded segment in the successor block.
+fn probe_chained_edge() -> Asm {
+    let mut asm = Asm::new();
+    asm.mov_sreg_imm(Seg::Es, SEG_POOL[4]);
+    asm.raw(&[0xeb, 0x00], 1);
+    asm.access(Seg::Es, 7, AccessWidth::Word, false, 0x3b0);
+    asm.pad();
+    asm
+}
+
+fn class_probes() -> Vec<ClassProbe> {
+    // A probe whose instructions all retire natively, except `callouts` of them.
+    let counted = |name, asm: Asm, callouts: u64, exact_run_boundaries| ClassProbe {
+        name,
+        native: CASE_PREFIX_INSNS + asm.insns - callouts,
+        callout: callouts > 0,
+        exact_run_boundaries,
+        body: asm.code,
+    };
+    let mut byte_word = Asm::new();
+    probe_access_pairs(&mut byte_word, AccessWidth::Byte);
+    probe_access_pairs(&mut byte_word, AccessWidth::Word);
+    let mut dword = Asm::new();
+    probe_access_pairs(&mut dword, AccessWidth::Dword);
+    let loop_probe = |name, body, native| ClassProbe {
+        name,
+        body,
+        native,
+        callout: false,
+        exact_run_boundaries: false,
+    };
+    vec![
+        counted(
+            "byte and word access through DS, ES, SS, FS, GS",
+            byte_word,
+            0,
+            true,
+        ),
+        counted("dword access through DS, ES, SS, FS, GS", dword, 0, true),
+        counted(
+            "mov sreg,ax and mov es,[bx+d]",
+            probe_segment_loads(),
+            0,
+            false,
+        ),
+        counted("les and lds", probe_far_loads(), 0, false),
+        counted(
+            "push es / pop ds and push ds / pop es",
+            probe_push_pop(),
+            0,
+            false,
+        ),
+        counted(
+            "mov ax,es and push ds / pop ax",
+            probe_read_segment(),
+            0,
+            false,
+        ),
+        counted(
+            "mov fs,ax and an access through FS",
+            probe_fs_load(),
+            1,
+            false,
+        ),
+        // 2 filler moves, mov cx, the first mov es, and three rounds of store, add and loop.
+        loop_probe("loop A: load ES, then store through ES", probe_loop_a(), 13),
+        // 2 filler moves, mov cx, then one block of store, mov es, add and loop for each round.
+        loop_probe("loop B: store through ES, then load ES", probe_loop_b(), 15),
+        counted("load, jmp short, access", probe_chained_edge(), 0, false),
+    ]
+}
+
+fn run_class_probes(world: SegWorld) {
+    let mut mismatches = Vec::new();
+    for mode in PERSONAS {
+        for (n, probe) in class_probes().into_iter().enumerate() {
+            let case = segment_case_from_body(
+                world,
+                0x5e60_c1a5_0000_0000 + n as u64,
+                &probe.body,
+                probe.exact_run_boundaries,
+            );
+            let outcome = run_segment_case(world, mode, &case, &two_sets(world));
+            // The first set is the one the priming runs used, so a block ran natively there. The
+            // call-out is asserted on the total over all runs: the site is demoted after it
+            // resyncs, so the measured run itself can retire the instruction in the interpreter.
+            let first = &outcome.sets[0];
+            if first.retired != probe.native || (first.callouts_total > 0) != probe.callout {
+                mismatches.push(format!(
+                    "{world:?} {mode:?} {}: retired {} (expected {}), call-outs {} \
+                     (expected call-out: {})",
+                    probe.name, first.retired, probe.native, first.callouts_total, probe.callout
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "class probe counts:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn segment_class_probes_in_real_mode() {
+    run_class_probes(SegWorld::Real);
+}
+
+#[test]
+fn segment_class_probes_in_v86() {
+    run_class_probes(SegWorld::V86);
+}
+
+#[test]
+fn segment_class_probes_keep_the_native_count_with_a_finite_or_wide_limit() {
+    for world in [SegWorld::Unreal, SegWorld::ShortLimit] {
+        run_class_probes(world);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Limit edge probes.
+// ---------------------------------------------------------------------------
+
+/// One access at a fixed offset: `mov al,[off]`, `mov ax,[off]` or `mov eax,[off]` through DS (or
+/// the store forms), or the same through SS with `[bp+d]`.
+fn edge_body(seg: Seg, width: AccessWidth, store: bool, off: u16) -> Vec<u8> {
+    let mut code = Vec::new();
+    if seg == Seg::Ds {
+        if width == AccessWidth::Dword {
+            code.push(0x66);
+        }
+        code.push(match (width, store) {
+            (AccessWidth::Byte, false) => 0x8a,
+            (AccessWidth::Byte, true) => 0x88,
+            (_, false) => 0x8b,
+            (_, true) => 0x89,
+        });
+        code.push(0x06);
+        push_u16(&mut code, off);
+    } else {
+        emit_access(&mut code, seg, 6, width, store, off, false);
+    }
+    code
+}
+
+/// The limit of the segment that an edge probe goes through.
+fn edge_limit(world: SegWorld, seg: Seg) -> u32 {
+    if seg == Seg::Ss {
+        0x0fff
+    } else {
+        world.limit()
+    }
+}
+
+/// The base of a segment at an entry set.
+fn entry_base(set: usize, seg: Seg) -> usize {
+    usize::from(SEG_POOL[SEG_ENTRY_SETS[set][seg.slot()]]) << 4
+}
+
+/// The handler frame of the real-mode fault is three words below SP. Its first word is the IP of
+/// the faulting instruction.
+fn fault_frame_ip(outcome: &SegmentOutcome, set: usize) -> u32 {
+    let frame = entry_base(set, Seg::Ss) + usize::from(SEG_SP) - 6;
+    u32::from(u16::from_le_bytes([
+        outcome.direct_bus.memory[frame],
+        outcome.direct_bus.memory[frame + 1],
+    ]))
+}
+
+/// At each width, one access at the last offset in the limit and one at the first offset out of
+/// it, through `seg`. The in-limit access is native and takes no limit exit. The out-of-limit
+/// access takes one limit exit, not a page exit, and both roles end in the handler of the right
+/// vector with the same frame. A store that is in the limit lands in guest RAM in both roles. A
+/// store that is out of the limit writes no byte.
+fn run_limit_edges(worlds: &[SegWorld], seg: Seg, store: bool) {
+    for mode in PERSONAS {
+        for &world in worlds {
+            let limit = edge_limit(world, seg);
+            for width in AccessWidth::ALL {
+                let extent = width.bytes() - 1;
+                // The last offset that a 16-bit address can reach and that is in the limit.
+                let last = (limit - u32::from(extent)).min(0xffff) as u16;
+                let seed = 0x5e60_ed9e_0000_0000 + u64::from(last) + u64::from(store) * 0x100_0000;
+                let case =
+                    segment_case_from_body(world, seed, &edge_body(seg, width, store, last), true);
+                let outcome = run_segment_case(world, mode, &case, &[(0, false), (1, false)]);
+                // The counters describe the first set. The entry check of today refuses the
+                // second set, so that run only has to match the interpreter.
+                let first = &outcome.sets[0];
+                let label = format!(
+                    "{world:?} {seg:?} store {store} {mode:?} width {width:?} offset {last:#x}"
+                );
+                assert_eq!(
+                    first.limit_exits, 0,
+                    "{label}: the last offset is in the limit"
+                );
+                assert_eq!(first.cross_page_exits, 0, "{label}");
+                // Two filler moves and the access.
+                assert_eq!(first.retired, 3, "{label}: the access is native");
+                if store {
+                    let at = entry_base(1, seg) + usize::from(last);
+                    let data = case.case.gpr[0].to_le_bytes();
+                    assert_eq!(
+                        outcome.direct_bus.memory[at..at + usize::from(width.bytes())],
+                        data[..usize::from(width.bytes())],
+                        "{label}: the store lands in guest RAM"
+                    );
+                }
+
+                let first_bad = u32::from(last) + 1;
+                if first_bad > 0xffff || first_bad + u32::from(extent) <= limit {
+                    continue;
+                }
+                let seed = 0x5e60_ed9e_1000_0000 + first_bad as u64 + u64::from(store) * 0x100_0000;
+                let case = segment_case_from_body(
+                    world,
+                    seed,
+                    &edge_body(seg, width, store, first_bad as u16),
+                    true,
+                );
+                let outcome = run_segment_case(world, mode, &case, &[(0, false), (1, false)]);
+                let first = &outcome.sets[0];
+                let label = format!(
+                    "{world:?} {seg:?} store {store} {mode:?} width {width:?} offset {first_bad:#x}"
+                );
+                assert_eq!(first.limit_exits, 1, "{label}: one limit exit");
+                assert_eq!(first.cross_page_exits, 0, "{label}: not a page exit");
+                // The two filler moves retire. The access takes the side exit and retires in the
+                // interpreter.
+                assert_eq!(first.retired, 2, "{label}");
+                // Both roles ended in the handler with one frame. `assert_measured_pair` compared
+                // the frames in guest RAM. These lines prove that the frame exists, and that it
+                // is the frame of the right vector: a stack fault is vector 12 and has its own
+                // `hlt`.
+                let handler = if seg == Seg::Ss {
+                    SEG_REAL_STACK_MONITOR
+                } else {
+                    SEG_REAL_MONITOR
+                };
+                assert_eq!(outcome.direct.registers.eip, handler + 1, "{label}: vector");
+                assert_eq!(
+                    fault_frame_ip(&outcome, 1),
+                    SEG_ENTRY + 5,
+                    "{label}: frame IP"
+                );
+                if store {
+                    let pristine = segment_memory(world, case.case.seed, &case.case.bytes);
+                    let at = entry_base(1, seg) + first_bad as usize;
+                    let end = at + usize::from(width.bytes());
+                    assert_eq!(
+                        outcome.direct_bus.memory[at..end],
+                        pristine[at..end],
+                        "{label}: a faulting store writes no byte"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn segment_limit_edge_probes_split_exactly_at_the_limit() {
+    run_limit_edges(
+        &[SegWorld::Real, SegWorld::Unreal, SegWorld::ShortLimit],
+        Seg::Ds,
+        false,
+    );
+}
+
+#[test]
+fn segment_limit_edge_stores_split_exactly_at_the_limit() {
+    run_limit_edges(
+        &[SegWorld::Real, SegWorld::Unreal, SegWorld::ShortLimit],
+        Seg::Ds,
+        true,
+    );
+}
+
+#[test]
+fn stack_segment_limit_edge_probes_split_exactly_at_the_limit() {
+    run_limit_edges(&[SegWorld::ShortStack], Seg::Ss, false);
+}
+
+// ---------------------------------------------------------------------------
+// The random sweep.
+// ---------------------------------------------------------------------------
+
+/// An aligned offset in 0x100..0x7FF.
+fn operand_offset(rng: &mut Rng, width: AccessWidth) -> u16 {
+    let off = 0x100 + (rng.u32() % 0x700) as u16;
+    off & !(width.bytes() - 1)
+}
+
+fn pick_rm(rng: &mut Rng, seg: Seg) -> u8 {
+    let stack_forms = [2u8, 3, 6];
+    let data_forms = [0u8, 1, 4, 5, 7];
+    match seg {
+        Seg::Ss if rng.u32() & 1 == 0 => stack_forms[(rng.u32() % 3) as usize],
+        Seg::Ds if rng.u32() & 1 == 0 => data_forms[(rng.u32() % 5) as usize],
+        _ => (rng.u32() & 7) as u8,
+    }
+}
+
+fn random_access(code: &mut Vec<u8>, rng: &mut Rng, seg: Seg) {
+    let width = AccessWidth::ALL[(rng.u32() % 3) as usize];
+    let rm = pick_rm(rng, seg);
+    let store = rng.u32() & 1 == 1;
+    let off = operand_offset(rng, width);
+    let force_prefix = rng.u32() & 7 == 0;
+    emit_access(code, seg, rm, width, store, off, force_prefix);
+}
+
+/// A selector pool index that differs from `current`.
+fn new_selector(rng: &mut Rng, current: usize) -> usize {
+    (current + 1 + (rng.u32() % 4) as usize) % 5
+}
+
+/// Build one sweep case: 6 to 10 snippets in random order. The generator tracks the selector of
+/// each segment at the first entry set, so that every load uses a selector that differs from the
+/// current one.
+fn segment_sweep_case(world: SegWorld, index: u32, mode_offset: u32) -> SegmentCase {
+    let seed = 0x5e60_5eed_0000_0001u64
+        ^ u64::from(index + mode_offset)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(world as u64);
+    let mut rng = Rng::new(seed);
+    let mut current = SEG_ENTRY_SETS[0];
+    let mut body = Vec::new();
+    let mut exact = true;
+    let snippets = 6 + rng.u32() % 5;
+    for _ in 0..snippets {
+        match rng.u32() % 11 {
+            0 | 1 => {
+                let seg = Seg::ALL[(rng.u32() % 5) as usize];
+                random_access(&mut body, &mut rng, seg);
+            }
+            2 => {
+                exact = false;
+                let seg = if rng.u32() & 1 == 0 { Seg::Ds } else { Seg::Es };
+                let k = new_selector(&mut rng, current[seg.slot()]);
+                emit_mov_sreg_imm(&mut body, seg, SEG_POOL[k]);
+                current[seg.slot()] = k;
+                random_access(&mut body, &mut rng, seg);
+            }
+            3 => {
+                exact = false;
+                let seg = if rng.u32() & 1 == 0 { Seg::Ds } else { Seg::Es };
+                let k = new_selector(&mut rng, current[seg.slot()]);
+                emit_mov_sreg_table(&mut body, seg, k);
+                current[seg.slot()] = k;
+                random_access(&mut body, &mut rng, seg);
+            }
+            4 => {
+                exact = false;
+                let seg = if rng.u32() & 1 == 0 { Seg::Ds } else { Seg::Es };
+                let k = new_selector(&mut rng, current[seg.slot()]);
+                emit_far_load(&mut body, seg, k);
+                current[seg.slot()] = k;
+                random_access(&mut body, &mut rng, seg);
+            }
+            5 => {
+                exact = false;
+                if rng.u32() & 1 == 0 {
+                    body.extend_from_slice(&[0x06, 0x1f]);
+                    current[Seg::Ds.slot()] = current[Seg::Es.slot()];
+                    random_access(&mut body, &mut rng, Seg::Ds);
+                } else {
+                    body.extend_from_slice(&[0x1e, 0x07]);
+                    current[Seg::Es.slot()] = current[Seg::Ds.slot()];
+                    random_access(&mut body, &mut rng, Seg::Es);
+                }
+            }
+            6 => {
+                // mov ax,es / mov ax,ds / push ds, pop ax
+                match rng.u32() % 3 {
+                    0 => body.extend_from_slice(&[0x8c, 0xc0]),
+                    1 => body.extend_from_slice(&[0x8c, 0xd8]),
+                    _ => body.extend_from_slice(&[0x1e, 0x58]),
+                }
+            }
+            7 => {
+                exact = false;
+                let seg = if rng.u32() & 1 == 0 { Seg::Fs } else { Seg::Gs };
+                let k = new_selector(&mut rng, current[seg.slot()]);
+                emit_mov_sreg_imm(&mut body, seg, SEG_POOL[k]);
+                current[seg.slot()] = k;
+                random_access(&mut body, &mut rng, seg);
+            }
+            8 | 9 => {
+                exact = false;
+                // The table entries 0..2 or 1..3 or 2..4 feed the three iterations through DI.
+                let mut first = (rng.u32() % 3) as usize;
+                if first == current[Seg::Es.slot()] {
+                    first = (first + 1) % 3;
+                    if first == current[Seg::Es.slot()] {
+                        first = (first + 1) % 3;
+                    }
+                }
+                let table = SEG_TABLE + 2 * first as u16 - SEG_DI;
+                let store_offset = operand_offset(&mut rng, AccessWidth::Word);
+                body.extend_from_slice(&[0xb9, 0x03, 0x00]);
+                if rng.u32() % 11 < 9 {
+                    // loop A
+                    body.extend_from_slice(&[0x8e, 0x85]);
+                    push_u16(&mut body, table);
+                    emit_access(
+                        &mut body,
+                        Seg::Es,
+                        7,
+                        AccessWidth::Word,
+                        true,
+                        store_offset,
+                        false,
+                    );
+                } else {
+                    // loop B
+                    emit_access(
+                        &mut body,
+                        Seg::Es,
+                        7,
+                        AccessWidth::Word,
+                        true,
+                        store_offset,
+                        false,
+                    );
+                    body.extend_from_slice(&[0x8e, 0x85]);
+                    push_u16(&mut body, table);
+                }
+                body.extend_from_slice(&[0x83, 0xc7, 0x02, 0xe2, 0xf2, 0x83, 0xef, 0x06]);
+                current[Seg::Es.slot()] = first + 2;
+            }
+            _ => {
+                exact = false;
+                let seg = if rng.u32() & 1 == 0 { Seg::Ds } else { Seg::Es };
+                let k = new_selector(&mut rng, current[seg.slot()]);
+                emit_mov_sreg_imm(&mut body, seg, SEG_POOL[k]);
+                current[seg.slot()] = k;
+                body.extend_from_slice(&[0xeb, 0x00]);
+                random_access(&mut body, &mut rng, seg);
+            }
+        }
+    }
+    segment_case_from_body(world, seed, &body, exact)
+}
+
+/// The floor of native instructions for a sweep case. A block of 6 to 10 snippets retires more.
+const SEG_SWEEP_FLOOR: u64 = 4;
+
+fn run_segment_sweep(world: SegWorld) {
+    // The aggregate floor: over all cases of the sweep, the native instructions of the first
+    // measured run must be at least half of the instructions that the interpreter retires in the
+    // same run. A sweep whose blocks stop early would pass the per-case floor and fail this one.
+    let mut native_total = 0u64;
+    let mut interpreted_total = 0u64;
+    for (persona, mode) in PERSONAS.into_iter().enumerate() {
+        let mode_offset = persona as u32 * CASES_PER_MODE;
+        for index in 0..CASES_PER_MODE {
+            let case = segment_sweep_case(world, index, mode_offset);
+            let outcome = run_segment_case(world, mode, &case, &two_sets(world));
+            let first = &outcome.sets[0];
+            assert!(
+                first.retired >= SEG_SWEEP_FLOOR,
+                "{world:?} {mode:?}: only {} instructions retired natively: {:#?}",
+                first.retired,
+                case.case
+            );
+            native_total += first.retired;
+            interpreted_total += first.interpreted;
+        }
+    }
+    assert!(
+        native_total * 2 >= interpreted_total,
+        "{world:?}: {native_total} native instructions against {interpreted_total} interpreted"
+    );
+}
+
+#[test]
+fn segment_sweep_real_mode_matches_the_interpreter() {
+    run_segment_sweep(SegWorld::Real);
+}
+
+#[test]
+fn segment_sweep_unreal_mode_matches_the_interpreter() {
+    run_segment_sweep(SegWorld::Unreal);
+}
+
+#[test]
+fn segment_sweep_short_limit_matches_the_interpreter() {
+    run_segment_sweep(SegWorld::ShortLimit);
+}
+
+#[test]
+fn segment_sweep_v86_matches_the_interpreter() {
+    run_segment_sweep(SegWorld::V86);
+}
+
+#[test]
+#[ignore = "the native V86 load keeps a non-canonical limit and the interpreter resets it; the \
+            state is not reachable from a guest, because the native load relies on INV-V86-CANON \
+            (IRETD into V86 and the task switch load all six records through `load_segment_real`, \
+            and V86 exit clears the data segments)"]
+fn v86_segment_load_resets_a_limit_that_is_not_canonical() {
+    // The entry set has DS with the limit 0x1FFFF. Real mode would keep it. V86 rebuilds the
+    // record from the selector, so the word at 0xFFFF must fault in both roles. A role that kept
+    // the limit would read the word and fault later, at the HLT.
+    for mode in PERSONAS {
+        let mut body = Vec::new();
+        emit_mov_sreg_imm(&mut body, Seg::Ds, SEG_POOL[2]);
+        body.extend_from_slice(&[0x8b, 0x06, 0xff, 0xff]);
+        let case = segment_case_from_body(SegWorld::V86, 0x5e60_0086_0000_0001, &body, false);
+        let outcome = run_segment_case(SegWorld::V86, mode, &case, &[(0, true)]);
+        let direct = &outcome.direct;
+        // The ring 0 frame is, from ESP up: error code, EIP, CS, EFLAGS, ESP, SS, ES, DS, FS, GS.
+        let esp = direct.registers.esp() as usize;
+        let frame_eip = u32::from_le_bytes(
+            outcome.direct_bus.memory[esp + 4..esp + 8]
+                .try_into()
+                .unwrap(),
+        );
+        // The NOP (1) and two filler moves (4), then mov ax,imm16 (3) and mov ds,ax (2), come
+        // before the word read.
+        assert_eq!(
+            frame_eip,
+            SEG_ENTRY + 10,
+            "{mode:?}: the read faults, not the HLT"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proof that the oracle sees a stale baked segment.
+// ---------------------------------------------------------------------------
+
+/// Returns the final AL of the direct role, the final AL of the interpreter role, the byte at the
+/// base that ES has at entry, the byte at the base that the case loads into ES, and the number of
+/// instructions that retired natively. The roles are NOT compared here. Each reader decides what
+/// the two values must be.
+fn run_stale_segment_case(rule_disabled: bool) -> (u8, u8, u8, u8, u64) {
+    let world = SegWorld::Real;
+    let mode = GswMode::Gsw586;
+    // ES is pool 1 at entry. The case reads a byte through it first, which warms the page of the
+    // old base in the fast map: a block can only bake an access to a page that the interpreter
+    // touched. Then the case loads pool 3 and reads a byte through ES again.
+    let mut body = Vec::new();
+    emit_access(
+        &mut body,
+        Seg::Es,
+        5,
+        AccessWidth::Byte,
+        false,
+        SEG_DI,
+        false,
+    );
+    emit_mov_sreg_imm(&mut body, Seg::Es, SEG_POOL[3]);
+    emit_access(
+        &mut body,
+        Seg::Es,
+        5,
+        AccessWidth::Byte,
+        false,
+        SEG_DI,
+        false,
+    );
+    let segment_case = segment_case_from_body(world, 0x5e60_57a1_0000_0001, &body, false);
+    let case = &segment_case.case;
+    let scope = SegmentScope::new(world.arming(0, false));
+    let pristine = segment_memory(world, case.seed, &case.bytes);
+    let old_byte = pristine[(usize::from(SEG_POOL[1]) << 4) + usize::from(SEG_DI)];
+    let new_byte = pristine[(usize::from(SEG_POOL[3]) << 4) + usize::from(SEG_DI)];
+    jit::direct::set_dirty_segment_rule_disabled_for_test(rule_disabled);
+    let mut interpreter = world.cpu(mode);
+    let mut direct = world.cpu(mode);
+    let mut interpreter_bus = TestBus::with_memory(pristine.clone());
+    let mut direct_bus = TestBus::with_memory(pristine.clone());
+    for bus in [&mut interpreter_bus, &mut direct_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        bus.flat_direct_page_clocks = true;
+    }
+    restore_bus(&mut interpreter_bus, &pristine);
+    arm(&mut interpreter, case);
+    run_to_halt(&mut interpreter, &mut interpreter_bus, case).unwrap();
+    prime_segment_direct(&mut direct, &mut direct_bus, &pristine, case, 12);
+    restore_bus(&mut interpreter_bus, &pristine);
+    restore_bus(&mut direct_bus, &pristine);
+    arm(&mut interpreter, case);
+    arm(&mut direct, case);
+    let before = direct.perf_counters().jit_direct_insns;
+    run_to_halt(&mut interpreter, &mut interpreter_bus, case).unwrap();
+    run_to_halt(&mut direct, &mut direct_bus, case).unwrap();
+    let retired = direct.perf_counters().jit_direct_insns - before;
+    jit::direct::set_dirty_segment_rule_disabled_for_test(false);
+    drop(scope);
+    (
+        direct.registers.gpr[0] as u8,
+        interpreter.registers.gpr[0] as u8,
+        old_byte,
+        new_byte,
+        retired,
+    )
+}
+
+// This test pins the baked form. It must force the stage 1A switch off when that switch exists.
+#[test]
+fn the_oracle_sees_a_stale_baked_segment_when_the_dirty_rule_is_off() {
+    let (direct_on, interpreter_on, old_byte, new_byte, retired_on) = run_stale_segment_case(false);
+    assert_ne!(
+        old_byte, new_byte,
+        "the two bases must hold different bytes, or the proof cannot tell them apart"
+    );
+    assert_eq!(
+        interpreter_on, new_byte,
+        "the interpreter reads the loaded base"
+    );
+    assert_eq!(
+        direct_on, new_byte,
+        "with the rule on, the direct role reads the loaded base"
+    );
+    // With the rule on, the block ends at the load, and the second read runs in the interpreter.
+    assert_eq!(retired_on, 5, "the rule ends the block after the load");
+
+    let (direct_off, interpreter_off, old_byte, new_byte, retired) = run_stale_segment_case(true);
+    assert_eq!(
+        interpreter_off, new_byte,
+        "the interpreter does not change with the rule"
+    );
+    assert_eq!(
+        direct_off, old_byte,
+        "with the rule off, the direct role reads the base that ES had at compile time"
+    );
+    assert_ne!(direct_off, interpreter_off, "the two roles differ");
+    // The two filler moves, the first read, the selector move, the load and the second read. The
+    // second read must be inside the native block, or the proof tests nothing.
+    assert_eq!(
+        retired, 6,
+        "the whole body retires natively with the rule off"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scratch register check: RDX after the baked address form.
+// ---------------------------------------------------------------------------
+
+// This test pins the baked form. It must force the stage 1A switch off when that switch exists.
+#[test]
+fn the_address_scratch_poison_reaches_the_baked_address_form() {
+    let world = SegWorld::Real;
+    let mut body = Vec::new();
+    emit_access(
+        &mut body,
+        Seg::Ds,
+        7,
+        AccessWidth::Word,
+        false,
+        0x120,
+        false,
+    );
+    let segment_case = segment_case_from_body(world, 0x5e60_9015_0000_0001, &body, true);
+    let mut outcome = run_segment_case(world, GswMode::Gsw586, &segment_case, &[(0, false)]);
+    let poison = [0xba, 0xef, 0xbe, 0xad, 0xde];
+    let has_poison = |code: &[u8]| code.windows(poison.len()).any(|window| window == poison);
+    jit::direct::set_address_scratch_poison_for_test(Some(true));
+    let with = jit::direct::compile(&mut outcome.direct, SEG_ENTRY, false)
+        .unwrap()
+        .code;
+    jit::direct::set_address_scratch_poison_for_test(Some(false));
+    let without = jit::direct::compile(&mut outcome.direct, SEG_ENTRY, false)
+        .unwrap()
+        .code;
+    // With no override, the environment variable decides.
+    jit::direct::set_address_scratch_poison_for_test(None);
+    let ambient = jit::direct::compile(&mut outcome.direct, SEG_ENTRY, false)
+        .unwrap()
+        .code;
+    assert_eq!(
+        has_poison(&ambient),
+        std::env::var("IZARRAVM_TEST_ADDRESS_SCRATCH_POISON").as_deref() == Ok("1"),
+        "the environment variable must set the ambient arm"
+    );
+    assert!(
+        has_poison(&with),
+        "the poison arm must write 0xDEADBEEF to EDX"
+    );
+    assert!(!has_poison(&without), "the plain arm must not write it");
+    assert_eq!(
+        with.len(),
+        without.len() + poison.len(),
+        "one poison for the one access"
+    );
+}
+
+/// The sweeps of this file, run with RDX poisoned after every baked address form. A consumer that
+/// reads RDX across the address form fails here. The sweeps do not reach the 16-bit
+/// read-modify-write, ALU-memory, `PUSH [m]`, `CALL [m]`, `RET` and `SETcc [m]` sites. The whole
+/// crate run with `IZARRAVM_TEST_ADDRESS_SCRATCH_POISON=1` reaches them.
+#[test]
+fn the_sweeps_agree_with_the_interpreter_under_the_address_scratch_poison() {
+    jit::direct::set_address_scratch_poison_for_test(Some(true));
+    generated_direct_blocks_match_interpreter_in_486_and_586_modes();
+    generated_direct_blocks_match_interpreter_with_imm8_lanes_admitted();
+    generated_width_lift_blocks_match_the_interpreter();
+    generated_interpret_one_blocks_match_the_interpreter();
+    for world in SegWorld::ALL {
+        run_segment_sweep(world);
+    }
+    jit::direct::set_address_scratch_poison_for_test(None);
+}
+
+// ---------------------------------------------------------------------------
+// Call-out execution inside a measured run, a block that meets a shorter limit, and the warm
+// fast map.
+// ---------------------------------------------------------------------------
+
+/// `mov fs,ax` is a call-out. After 12 priming runs its site is demoted, so the measured run of
+/// the class probe interprets it. This case is primed with two compiled runs only, so the call-out
+/// executes inside the measured run. The deltas are what the block does TODAY: the call-out
+/// executes once and resyncs once, because a segment-writing call-out ends the native run.
+/// Stage 1A step 3 must change them to executed 1 and resync 0.
+#[test]
+fn a_segment_call_out_executes_and_resyncs_inside_a_measured_run() {
+    for world in [SegWorld::Real, SegWorld::V86] {
+        for mode in PERSONAS {
+            let asm = probe_fs_load();
+            let case = segment_case_from_body(world, 0x5e60_ca11_0000_0001, &asm.code, false);
+            let outcome = run_segment_case_primed(world, mode, &case, &[(0, false), (1, false)], 2);
+            let first = &outcome.sets[0];
+            let label = format!("{world:?} {mode:?}");
+            assert_eq!(first.callouts, 1, "{label}: the call-out executes");
+            assert_eq!(first.resyncs, 1, "{label}: step 3 must change this to 0");
+            assert_eq!(first.retired, 8, "{label}: all but the call-out are native");
+        }
+    }
+}
+
+/// A block compiled under the wide limit 0xFFFF has no byte limit compare. Set A enters it with
+/// that limit. Set B enters with the limit 0x0FFF and reads a byte at 0x1000, which is out of
+/// the limit. Both roles must fault. Today the entry check refuses a block whose DS record
+/// differs, so the interpreter takes the access in set B.
+#[test]
+fn a_block_compiled_under_a_wide_limit_meets_the_short_limit() {
+    for mode in PERSONAS {
+        let world = SegWorld::ShortLimit;
+        let case = segment_case_from_body(
+            world,
+            0x5e60_11a1_0000_0001,
+            &edge_body(Seg::Ds, AccessWidth::Byte, false, 0x1000),
+            true,
+        );
+        // Priming and set A use the wide limit. Set B is the short limit.
+        let outcome = run_segment_case(world, mode, &case, &[(0, true), (0, false)]);
+        let label = format!("{mode:?}");
+        let (a, b) = (&outcome.sets[0], &outcome.sets[1]);
+        assert_eq!(a.limit_exits, 0, "{label}: set A is in the limit");
+        assert_eq!(a.retired, 3, "{label}: set A reads natively");
+        // Set B: the entry check refuses the block, so no native access and no limit exit.
+        assert_eq!(b.limit_exits, 0, "{label}: set B takes no limit exit");
+        assert_eq!(b.retired, 0, "{label}: set B retires nothing natively");
+        // The last measured run is set B. Both roles faulted in the handler with one frame.
+        assert_eq!(
+            outcome.direct.registers.eip,
+            SEG_REAL_MONITOR + 1,
+            "{label}"
+        );
+        assert_eq!(
+            fault_frame_ip(&outcome, 0),
+            SEG_ENTRY + 5,
+            "{label}: frame IP"
+        );
+    }
+}
+
+/// The fast map of the direct role holds every data page after priming, for reads and for
+/// writes. Step 2 relies on this: a block reaches only pages that the fast map holds, so a block
+/// with a wrong baked base on a cold page would side-exit and the interpreter would repair it.
+#[test]
+fn the_fast_map_holds_every_data_page_after_priming() {
+    for world in SegWorld::ALL {
+        let case = segment_sweep_case(world, 3, 0);
+        let outcome = run_segment_case(world, GswMode::Gsw586, &case, &two_sets(world));
+        assert_data_pages_mapped(&outcome.direct);
     }
 }
