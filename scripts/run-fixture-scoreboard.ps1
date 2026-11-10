@@ -612,6 +612,22 @@ function Assert-ScoreboardQualificationSelfTest {
                 Get-FixtureFileIdentities $junction @('AUTOEXEC.BAT')
             } 'reparse point' 'selected input root cannot be a junction'
         } finally { Remove-Item -LiteralPath $junction -Force }
+        $anchorPins = [ordered]@{ synthetic = @{ anchor_frame_sha256 = @('old'); pin_context = @{ schema = 'obsolete' } } }
+        $anchorRow = [ordered]@{ pin_context = $context; invariant = 'pass'; notes = @(); refused_axes = @()
+            anchor_frame_sha256 = 'new'; instructions = [uint64]10 }
+        Complete-RowPins $fixture $anchorRow $anchorPins $true $true
+        Assert-ScoreboardSelfTestEqual (@($anchorPins.synthetic.anchor_frame_sha256) -join ',') 'new' 'a new context replaces the old anchor'
+        Complete-RowPins $fixture $anchorRow $anchorPins $true $true
+        Assert-ScoreboardSelfTestEqual (@($anchorPins.synthetic.anchor_frame_sha256) -join ',') 'new' 'the same anchor is not recorded twice'
+        $otherAnchorRow = [ordered]@{ pin_context = $context; invariant = 'pass'; notes = @(); refused_axes = @()
+            anchor_frame_sha256 = 'other'; instructions = [uint64]10 }
+        Assert-ScoreboardSelfTestThrows {
+            Complete-RowPins $fixture $otherAnchorRow $anchorPins $true $true
+        } 'Anchor phase limit exceeded' 'a second anchor needs a declared phase'
+        $twoPhaseFixture = [pscustomobject]@{ name = 'synthetic'
+            frameContract = New-FrameContract -AnchorCycles 20 -AnchorDisplay VgaRaster -AnchorPhases 2 }
+        Complete-RowPins $twoPhaseFixture $otherAnchorRow $anchorPins $true $true
+        Assert-ScoreboardSelfTestEqual (@($anchorPins.synthetic.anchor_frame_sha256) -join ',') 'new,other' 'a declared second phase is appended in the same context'
         $fixture.PSObject.Properties.Remove('frameContract')
         $context = New-PinContext $fixture (Get-FixtureDescriptor $fixture $hdd)
         $invariants = [ordered]@{ synthetic = @{ frame_sha256 = 'old'; final_nonblack_percent_min = 80
@@ -2881,7 +2897,9 @@ function Complete-RowPins($Fixture, $Row, $Invariants, [bool]$Record = $false, [
         if ($Record) {
             if ($hasPin -and -not $matches -and -not $Overwrite) { throw "Recording $key would replace a pin; use -Force after reviewing the change" }
             if ($spec.axis -eq 'anchor_frame') {
-                $anchors = if ($sameContext -and $hasPin) { @($expected) } else { @() }
+                # An `if` that yields an empty array assigns $null, and `$null.Count` throws in
+                # strict mode. That made the first record after a context change fail.
+                $anchors = @(if ($sameContext -and $hasPin) { $expected })
                 if ($anchors -notcontains $spec.value) {
                     if ($anchors.Count -ge (Get-FrameContract $Fixture).anchorPhases) { throw 'Anchor phase limit exceeded' }
                     $anchors += $spec.value
