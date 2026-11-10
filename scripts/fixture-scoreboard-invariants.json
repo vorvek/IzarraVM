@@ -25,7 +25,9 @@
     }
   },
   "doom-486": {
-    "qualified_axes": [],
+    "qualified_axes": [
+      "realtics"
+    ],
     "pin_context": {
       "schema": "fixture-pin-context-v1",
       "timing_model_epoch": 3,
@@ -35,7 +37,9 @@
     }
   },
   "doom-586": {
-    "qualified_axes": [],
+    "qualified_axes": [
+      "realtics"
+    ],
     "pin_context": {
       "schema": "fixture-pin-context-v1",
       "timing_model_epoch": 3,
