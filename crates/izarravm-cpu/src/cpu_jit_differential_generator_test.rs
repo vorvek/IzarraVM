@@ -3211,13 +3211,51 @@ impl SegWorld {
     }
 }
 
+thread_local! {
+    /// The `IZARRAVM_LIVE_DATA_SEGMENTS` arm that the oracle runs under. `SegmentScope` sets it
+    /// as the override before the CPUs are built, so the environment never decides.
+    static SEGMENT_ARM: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn segment_arm() -> u8 {
+    SEGMENT_ARM.with(std::cell::Cell::get)
+}
+
+/// Sets the arm of the oracle for the length of one scope. The arm is 0 again afterwards.
+struct SegmentArmGuard;
+
+impl SegmentArmGuard {
+    fn new(arm: u8) -> Self {
+        SEGMENT_ARM.with(|cell| cell.set(arm));
+        Self
+    }
+}
+
+impl Drop for SegmentArmGuard {
+    fn drop(&mut self) {
+        SEGMENT_ARM.with(|cell| cell.set(0));
+    }
+}
+
+/// Runs `body` once for each arm of the live data segment switch: off, 1, and 2. The arm number
+/// goes to the test output, so a failure names the arm.
+fn for_each_segment_arm(mut body: impl FnMut(u8)) {
+    for arm in [0u8, 1, 2] {
+        eprintln!("live data segment arm {arm}");
+        let _guard = SegmentArmGuard::new(arm);
+        body(arm);
+    }
+}
+
 /// States the gate arms and installs the segment arming for the length of one run. The arms are
 /// stated here and none is inherited: the sixteen-bit level and the word operands at 486 are set
-/// in the CPU builder, and the rest are thread-local test overrides.
+/// in the CPU builder, and the rest are thread-local test overrides. The live data segment arm is
+/// the one of `segment_arm`.
 struct SegmentScope;
 
 impl SegmentScope {
     fn new(arming: SegmentArming) -> Self {
+        jit::direct::set_live_data_segments_for_test(Some(segment_arm()));
         // The chain entry check is read when the block cache is built, so this runs before the
         // CPU builders.
         jit::direct::set_chain_entry_check_for_test(Some(true));
@@ -3246,6 +3284,7 @@ impl SegmentScope {
 impl Drop for SegmentScope {
     fn drop(&mut self) {
         SEGMENT_ARMING.with(|cell| cell.set(None));
+        jit::direct::set_live_data_segments_for_test(None);
         jit::direct::set_chain_entry_check_for_test(None);
         jit::direct::set_v86_loop_rows_for_test(None);
         jit::direct::set_loop_rows_for_test(None);
@@ -3896,6 +3935,13 @@ fn run_class_probes(world: SegWorld) {
             // call-out is asserted on the total over all runs: the site is demoted after it
             // resyncs, so the measured run itself can retire the instruction in the interpreter.
             let first = &outcome.sets[0];
+            // With the switch on, the second entry set runs natively with the same count.
+            if segment_arm() != 0 && outcome.sets[1].retired != probe.native {
+                mismatches.push(format!(
+                    "{world:?} {mode:?} {}: set 2 retired {} (expected {})",
+                    probe.name, outcome.sets[1].retired, probe.native
+                ));
+            }
             if first.retired != probe.native || (first.callouts_total > 0) != probe.callout {
                 mismatches.push(format!(
                     "{world:?} {mode:?} {}: retired {} (expected {}), call-outs {} \
@@ -3914,19 +3960,21 @@ fn run_class_probes(world: SegWorld) {
 
 #[test]
 fn segment_class_probes_in_real_mode() {
-    run_class_probes(SegWorld::Real);
+    for_each_segment_arm(|_| run_class_probes(SegWorld::Real));
 }
 
 #[test]
 fn segment_class_probes_in_v86() {
-    run_class_probes(SegWorld::V86);
+    for_each_segment_arm(|_| run_class_probes(SegWorld::V86));
 }
 
 #[test]
 fn segment_class_probes_keep_the_native_count_with_a_finite_or_wide_limit() {
-    for world in [SegWorld::Unreal, SegWorld::ShortLimit] {
-        run_class_probes(world);
-    }
+    for_each_segment_arm(|_| {
+        for world in [SegWorld::Unreal, SegWorld::ShortLimit] {
+            run_class_probes(world);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3996,8 +4044,9 @@ fn run_limit_edges(worlds: &[SegWorld], seg: Seg, store: bool) {
                 let case =
                     segment_case_from_body(world, seed, &edge_body(seg, width, store, last), true);
                 let outcome = run_segment_case(world, mode, &case, &[(0, false), (1, false)]);
-                // The counters describe the first set. The entry check of today refuses the
-                // second set, so that run only has to match the interpreter.
+                // The counters describe the first set. With the switch off, the entry check
+                // refuses the second set, so that run only has to match the interpreter. With
+                // the switch on, the second set runs natively and has the same counters.
                 let first = &outcome.sets[0];
                 let label = format!(
                     "{world:?} {seg:?} store {store} {mode:?} width {width:?} offset {last:#x}"
@@ -4009,6 +4058,12 @@ fn run_limit_edges(worlds: &[SegWorld], seg: Seg, store: bool) {
                 assert_eq!(first.cross_page_exits, 0, "{label}");
                 // Two filler moves and the access.
                 assert_eq!(first.retired, 3, "{label}: the access is native");
+                if segment_arm() != 0 {
+                    let second = &outcome.sets[1];
+                    assert_eq!(second.limit_exits, 0, "{label}: set 2, in the limit");
+                    assert_eq!(second.cross_page_exits, 0, "{label}: set 2");
+                    assert_eq!(second.retired, 3, "{label}: set 2, the access is native");
+                }
                 if store {
                     let at = entry_base(1, seg) + usize::from(last);
                     let data = case.case.gpr[0].to_le_bytes();
@@ -4040,6 +4095,15 @@ fn run_limit_edges(worlds: &[SegWorld], seg: Seg, store: bool) {
                 // The two filler moves retire. The access takes the side exit and retires in the
                 // interpreter.
                 assert_eq!(first.retired, 2, "{label}");
+                if segment_arm() != 0 {
+                    let second = &outcome.sets[1];
+                    assert_eq!(second.limit_exits, 1, "{label}: set 2, one limit exit");
+                    assert_eq!(
+                        second.cross_page_exits, 0,
+                        "{label}: set 2, not a page exit"
+                    );
+                    assert_eq!(second.retired, 2, "{label}: set 2");
+                }
                 // Both roles ended in the handler with one frame. `assert_measured_pair` compared
                 // the frames in guest RAM. These lines prove that the frame exists, and that it
                 // is the frame of the right vector: a stack fault is vector 12 and has its own
@@ -4072,25 +4136,29 @@ fn run_limit_edges(worlds: &[SegWorld], seg: Seg, store: bool) {
 
 #[test]
 fn segment_limit_edge_probes_split_exactly_at_the_limit() {
-    run_limit_edges(
-        &[SegWorld::Real, SegWorld::Unreal, SegWorld::ShortLimit],
-        Seg::Ds,
-        false,
-    );
+    for_each_segment_arm(|_| {
+        run_limit_edges(
+            &[SegWorld::Real, SegWorld::Unreal, SegWorld::ShortLimit],
+            Seg::Ds,
+            false,
+        );
+    });
 }
 
 #[test]
 fn segment_limit_edge_stores_split_exactly_at_the_limit() {
-    run_limit_edges(
-        &[SegWorld::Real, SegWorld::Unreal, SegWorld::ShortLimit],
-        Seg::Ds,
-        true,
-    );
+    for_each_segment_arm(|_| {
+        run_limit_edges(
+            &[SegWorld::Real, SegWorld::Unreal, SegWorld::ShortLimit],
+            Seg::Ds,
+            true,
+        );
+    });
 }
 
 #[test]
 fn stack_segment_limit_edge_probes_split_exactly_at_the_limit() {
-    run_limit_edges(&[SegWorld::ShortStack], Seg::Ss, false);
+    for_each_segment_arm(|_| run_limit_edges(&[SegWorld::ShortStack], Seg::Ss, false));
 }
 
 // ---------------------------------------------------------------------------
@@ -4278,6 +4346,15 @@ fn run_segment_sweep(world: SegWorld) {
             );
             native_total += first.retired;
             interpreted_total += first.interpreted;
+            if segment_arm() != 0 {
+                let second = &outcome.sets[1];
+                assert!(
+                    second.retired >= SEG_SWEEP_FLOOR,
+                    "{world:?} {mode:?}: set 2 retired only {} instructions natively: {:#?}",
+                    second.retired,
+                    case.case
+                );
+            }
         }
     }
     assert!(
@@ -4288,22 +4365,22 @@ fn run_segment_sweep(world: SegWorld) {
 
 #[test]
 fn segment_sweep_real_mode_matches_the_interpreter() {
-    run_segment_sweep(SegWorld::Real);
+    for_each_segment_arm(|_| run_segment_sweep(SegWorld::Real));
 }
 
 #[test]
 fn segment_sweep_unreal_mode_matches_the_interpreter() {
-    run_segment_sweep(SegWorld::Unreal);
+    for_each_segment_arm(|_| run_segment_sweep(SegWorld::Unreal));
 }
 
 #[test]
 fn segment_sweep_short_limit_matches_the_interpreter() {
-    run_segment_sweep(SegWorld::ShortLimit);
+    for_each_segment_arm(|_| run_segment_sweep(SegWorld::ShortLimit));
 }
 
 #[test]
 fn segment_sweep_v86_matches_the_interpreter() {
-    run_segment_sweep(SegWorld::V86);
+    for_each_segment_arm(|_| run_segment_sweep(SegWorld::V86));
 }
 
 #[test]
@@ -4412,9 +4489,10 @@ fn run_stale_segment_case(rule_disabled: bool) -> (u8, u8, u8, u8, u64) {
     )
 }
 
-// This test pins the baked form. It must force the stage 1A switch off when that switch exists.
+// This test pins the baked form, so it forces the live data segment switch off.
 #[test]
 fn the_oracle_sees_a_stale_baked_segment_when_the_dirty_rule_is_off() {
+    let _arm = SegmentArmGuard::new(0);
     let (direct_on, interpreter_on, old_byte, new_byte, retired_on) = run_stale_segment_case(false);
     assert_ne!(
         old_byte, new_byte,
@@ -4449,13 +4527,119 @@ fn the_oracle_sees_a_stale_baked_segment_when_the_dirty_rule_is_off() {
     );
 }
 
+/// With the live data segment switch on and the dirty rule off, a block continues past a
+/// segment load and reads the segment from the CPU state. The direct role reads the NEW byte and
+/// the whole body retires natively. This is early evidence for the removal of the dirty rule.
+#[test]
+fn a_live_block_reads_the_new_segment_when_the_dirty_rule_is_off() {
+    for arm in [1u8, 2] {
+        let _arm = SegmentArmGuard::new(arm);
+        let (direct, interpreter, old_byte, new_byte, retired) = run_stale_segment_case(true);
+        assert_ne!(
+            old_byte, new_byte,
+            "arm {arm}: the two bases must hold different bytes"
+        );
+        assert_eq!(
+            interpreter, new_byte,
+            "arm {arm}: the interpreter reads the loaded base"
+        );
+        assert_eq!(
+            direct, new_byte,
+            "arm {arm}: the direct role reads the loaded base"
+        );
+        assert_eq!(
+            retired, 6,
+            "arm {arm}: the whole body retires natively with the rule off"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A protected-mode block does not change with the live data segment switch.
+// ---------------------------------------------------------------------------
+
+/// Runs the first generated protected-mode cases on a direct CPU built under `arm` and returns the
+/// counters that describe block shape, and the number of installed blocks after each case.
+fn protected_mode_shape(live_arm: u8) -> Vec<u64> {
+    const CASES: u32 = 16;
+    let cases: Vec<_> = (0..CASES).map(|index| generated_case(index, 0)).collect();
+    let mut pristine = vec![0; MEMORY_LEN];
+    let mut fill = Rng::new(0x7265_7072_6f64_7563);
+    for byte in &mut pristine {
+        *byte = fill.u32() as u8;
+    }
+    for case in &cases {
+        let start = case.entry as usize;
+        pristine[start..start + case.bytes.len()].copy_from_slice(&case.bytes);
+    }
+    jit::direct::set_live_data_segments_for_test(Some(live_arm));
+    let mut direct = generated_cpu(GswMode::Gsw586);
+    jit::direct::set_live_data_segments_for_test(None);
+    let mut bus = TestBus::with_memory(pristine.clone());
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    bus.flat_direct_page_clocks = true;
+    let mut shape = Vec::new();
+    for case in &cases {
+        prime_direct(&mut direct, &mut bus, &pristine, case);
+        restore_bus(&mut bus, &pristine);
+        arm(&mut direct, case);
+        run_to_halt(&mut direct, &mut bus, case).unwrap();
+        shape.push(direct.jit_direct.len() as u64);
+    }
+    let perf = direct.perf_counters();
+    shape.extend([
+        perf.jit_direct_compile_attempts,
+        perf.jit_direct_blocks_installed,
+        perf.jit_direct_insns,
+        perf.jit_direct_entries,
+        perf.jit_direct_linked_transfers,
+        perf.jit_direct_reject_data_segment,
+    ]);
+    assert_ne!(shape[shape.len() - 5], 0, "the cases must install blocks");
+    shape
+}
+
+#[test]
+fn the_live_data_segment_switch_spellings() {
+    let parse =
+        |value: &str| jit::direct::parse_live_data_segments_arm_for_test(Ok(value.to_string()));
+    assert_eq!(
+        jit::direct::parse_live_data_segments_arm_for_test(Err(std::env::VarError::NotPresent)),
+        0
+    );
+    assert_eq!(parse(""), 0);
+    assert_eq!(parse("0"), 0);
+    assert_eq!(parse("1"), 1);
+    assert_eq!(parse("2"), 2);
+    for bad in ["3", "on", "off", "true"] {
+        let result = std::panic::catch_unwind(|| {
+            jit::direct::parse_live_data_segments_arm_for_test(Ok(bad.to_string()))
+        });
+        assert!(result.is_err(), "the value {bad:?} must stop the program");
+    }
+}
+
+#[test]
+fn a_protected_mode_block_is_the_same_with_the_live_data_segment_switch_on() {
+    let off = protected_mode_shape(0);
+    for live_arm in [1u8, 2] {
+        assert_eq!(
+            protected_mode_shape(live_arm),
+            off,
+            "arm {live_arm}: a protected-mode block must keep its shape and its counters"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scratch register check: RDX after the baked address form.
 // ---------------------------------------------------------------------------
 
-// This test pins the baked form. It must force the stage 1A switch off when that switch exists.
+// This test pins the baked form, so it forces the live data segment switch off.
 #[test]
 fn the_address_scratch_poison_reaches_the_baked_address_form() {
+    let _arm = SegmentArmGuard::new(0);
     let world = SegWorld::Real;
     let mut body = Vec::new();
     emit_access(
@@ -4530,6 +4714,11 @@ fn the_sweeps_agree_with_the_interpreter_under_the_address_scratch_poison() {
 /// Stage 1A step 3 must change them to executed 1 and resync 0.
 #[test]
 fn a_segment_call_out_executes_and_resyncs_inside_a_measured_run() {
+    // The call-out rule is the same on every arm of the live data segment switch.
+    for_each_segment_arm(|_| a_segment_call_out_case());
+}
+
+fn a_segment_call_out_case() {
     for world in [SegWorld::Real, SegWorld::V86] {
         for mode in PERSONAS {
             let asm = probe_fs_load();
@@ -4546,10 +4735,15 @@ fn a_segment_call_out_executes_and_resyncs_inside_a_measured_run() {
 
 /// A block compiled under the wide limit 0xFFFF has no byte limit compare. Set A enters it with
 /// that limit. Set B enters with the limit 0x0FFF and reads a byte at 0x1000, which is out of
-/// the limit. Both roles must fault. Today the entry check refuses a block whose DS record
-/// differs, so the interpreter takes the access in set B.
+/// the limit. Both roles must fault. With the switch off, the entry check refuses a block whose
+/// DS record differs, so the interpreter takes the access in set B. With the switch on, the block
+/// takes the limit exit itself.
 #[test]
 fn a_block_compiled_under_a_wide_limit_meets_the_short_limit() {
+    for_each_segment_arm(|_| a_wide_limit_block_case());
+}
+
+fn a_wide_limit_block_case() {
     for mode in PERSONAS {
         let world = SegWorld::ShortLimit;
         let case = segment_case_from_body(
@@ -4564,9 +4758,16 @@ fn a_block_compiled_under_a_wide_limit_meets_the_short_limit() {
         let (a, b) = (&outcome.sets[0], &outcome.sets[1]);
         assert_eq!(a.limit_exits, 0, "{label}: set A is in the limit");
         assert_eq!(a.retired, 3, "{label}: set A reads natively");
-        // Set B: the entry check refuses the block, so no native access and no limit exit.
-        assert_eq!(b.limit_exits, 0, "{label}: set B takes no limit exit");
-        assert_eq!(b.retired, 0, "{label}: set B retires nothing natively");
+        if segment_arm() == 0 {
+            // Set B: the entry check refuses the block, so no native access and no limit exit.
+            assert_eq!(b.limit_exits, 0, "{label}: set B takes no limit exit");
+            assert_eq!(b.retired, 0, "{label}: set B retires nothing natively");
+        } else {
+            // A live block has no baked limit. Set B takes the limit exit in the block itself:
+            // the two filler moves retire natively and the access retires in the interpreter.
+            assert_eq!(b.limit_exits, 1, "{label}: set B takes one limit exit");
+            assert_eq!(b.retired, 2, "{label}: set B retires the two filler moves");
+        }
         // The last measured run is set B. Both roles faulted in the handler with one frame.
         assert_eq!(
             outcome.direct.registers.eip,
@@ -4586,9 +4787,11 @@ fn a_block_compiled_under_a_wide_limit_meets_the_short_limit() {
 /// with a wrong baked base on a cold page would side-exit and the interpreter would repair it.
 #[test]
 fn the_fast_map_holds_every_data_page_after_priming() {
-    for world in SegWorld::ALL {
-        let case = segment_sweep_case(world, 3, 0);
-        let outcome = run_segment_case(world, GswMode::Gsw586, &case, &two_sets(world));
-        assert_data_pages_mapped(&outcome.direct);
-    }
+    for_each_segment_arm(|_| {
+        for world in SegWorld::ALL {
+            let case = segment_sweep_case(world, 3, 0);
+            let outcome = run_segment_case(world, GswMode::Gsw586, &case, &two_sets(world));
+            assert_data_pages_mapped(&outcome.direct);
+        }
+    });
 }

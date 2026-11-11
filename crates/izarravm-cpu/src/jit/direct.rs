@@ -1025,6 +1025,10 @@ pub(crate) struct BlockCache {
     /// `chain_entry_check_armed` for the arm table and the nulling semantics,
     /// and `BlockCache::entry_layout` for what it selects.
     chain_entry_check_armed: bool,
+    /// `IZARRAVM_LIVE_DATA_SEGMENTS`: 0 off, 1 live operands and selector reads, 2 also links the
+    /// successors of a live block that writes data segments. Read once per cache, so one CPU has
+    /// one form for its whole life. See `live_data_segments_arm`.
+    live_data_segments_arm: u8,
     /// How many indexed layout copies `entry_layout` has taken. Mutant M14's only witness: the
     /// entry check must REPLACE the 116-byte fetch, never add a second one, and "this accessor
     /// reads one `Vec`" is not otherwise assertable in Rust. Atomic rather than `Cell` because
@@ -1464,6 +1468,7 @@ impl BlockCache {
             #[cfg(feature = "seg-head-diagnostic")]
             seg_head_last_selector: HashMap::default(),
             chain_entry_check_armed: chain_entry_check_armed(),
+            live_data_segments_arm: live_data_segments_arm(),
             #[cfg(test)]
             entry_layout_fetches: std::sync::atomic::AtomicU32::new(0),
             block_imm_lanes: Vec::new(),
@@ -4133,6 +4138,7 @@ impl Clone for BlockCache {
         cache.backend_enabled = self.backend_enabled;
         cache.admission_heat = self.admission_heat;
         cache.entry_cap = self.entry_cap;
+        cache.live_data_segments_arm = self.live_data_segments_arm;
         #[cfg(test)]
         {
             cache.defer_short_for_test = self.defer_short_for_test;
@@ -8246,6 +8252,9 @@ fn compile_with_budget(
         cpu.jit_direct
             .note_lane_probe(key.linear(), lane_probe::WALKED);
     }
+    // A live block is compiled in real mode or V86 while `IZARRAVM_LIVE_DATA_SEGMENTS` is on.
+    // It reads all five data segments from the CPU state and bakes none of them.
+    let live_form = live_form_for(cpu);
     let cs = cpu.registers.cs();
     let entry_eip = entry_lin.wrapping_sub(cs.base);
     let mut slots = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
@@ -9386,12 +9395,16 @@ fn compile_with_budget(
     else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
-    let mut live_data = cpu.jit_direct.live_segments_for_key(key);
+    let protected_not_v86 = cpu.is_protected_mode() && !cpu.is_v86_mode();
+    let mut live_data = if live_form {
+        ALL_DATA_SEGMENTS
+    } else {
+        cpu.jit_direct.live_segments_for_key(key)
+    };
     // Promotion state survives CS/CPL retirement; user blocks keep SS pinned.
-    if cpu.current_privilege_level() == 3 {
+    if cpu.current_privilege_level() == 3 && !live_form {
         live_data &= !segment_bit(SegmentIndex::Ss);
     }
-    let protected_not_v86 = cpu.is_protected_mode() && !cpu.is_v86_mode();
     // A self-loop block accounts by MULTIPLYING its whole static accounting by the iteration
     // count at exit, so nothing inside the loop body may deposit into the runtime lanes per
     // iteration. A call-out does exactly that (it adds the helper's runtime clocks at the call
@@ -9661,10 +9674,21 @@ fn compile_with_budget(
     // heads, L9 §9.1). The link-time twin at `try_link_inner`'s `expected_selector` bind already
     // treats this as an `expect`-worthy impossibility; this site must agree rather than quietly
     // disarming the guard while that one panics.
-    let segment_write_guard =
-        seg_write_edge_eligible.then(|| segment_of_bit(dirty_segments).expect(
+    // A live block reads the selector from the CPU state, so the edge needs no selector compare.
+    let segment_write_guard = (seg_write_edge_eligible && !live_form).then(|| {
+        segment_of_bit(dirty_segments).expect(
             "seg_write_edge_eligible's count_ones() == 1 term admits only a single-bit written mask",
-        ));
+        )
+    });
+    // Arm 2 of `IZARRAVM_LIVE_DATA_SEGMENTS`: a live block that writes data segments only treats
+    // its successors like a block with no segment write. A live successor has no data pin that
+    // `data_matches` would need to check. A block that writes CS keeps the bar and its own rules.
+    // This sees native segment loads only, because call-out rows do not feed `dirty_segments`. A
+    // call-out row that can change CS always resyncs.
+    let successor_bar = segment_write_block
+        && !(live_form
+            && cpu.jit_direct.live_data_segments_arm() == 2
+            && dirty_segments & segment_bit(SegmentIndex::Cs) == 0);
     // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
     // segment-write block -- it writes CS, which is the whole point -- so the `!segment_write_block`
     // term above would make the far cell unreachable and the slice inert.
@@ -9687,7 +9711,7 @@ fn compile_with_budget(
         Some(DirectKind::RetFar16 { .. } | DirectKind::CallFar16 { .. })
     );
     let dynamic_successor = far_dynamic
-        || (!segment_write_block
+        || (!successor_bar
             && matches!(
                 slots.last().map(|slot| slot.kind),
                 Some(
@@ -9768,7 +9792,7 @@ fn compile_with_budget(
         },
     };
     #[cfg(feature = "direct-link-refusal-census")]
-    let successors = if segment_write_block && !seg_write_edge_eligible {
+    let successors = if successor_bar && !seg_write_edge_eligible {
         [None, None]
     } else {
         [
@@ -9789,7 +9813,7 @@ fn compile_with_budget(
         // order still matters for the non-eligible population, which is every other reason
         // `segment_write_block` can be true (CS/SS writes, multi-write heads, call-out writes,
         // plain real mode, a non-fallthrough terminal).
-        _ if segment_write_block && !seg_write_edge_eligible => [None, None],
+        _ if successor_bar && !seg_write_edge_eligible => [None, None],
         Some(
             DirectKind::Jcc { taken_delta, .. }
             | DirectKind::Loop { taken_delta, .. }
@@ -9874,6 +9898,7 @@ fn compile_with_budget(
             segments: segment_layout,
             live_data,
             protected_not_v86,
+            live_form,
             address_wrap: if d {
                 AddressWrap::None
             } else {
@@ -9886,7 +9911,9 @@ fn compile_with_budget(
         segment_write_guard,
     });
     // Emit uses the full snapshot; entry checks omit live descriptors but keep selector pins.
-    let segment_layout = if live_data != 0 {
+    let segment_layout = if live_form {
+        segment_layout.without_pins(ALL_DATA_SEGMENTS)
+    } else if live_data != 0 {
         segment_layout.without_pins(live_data & !selector_segments)
     } else {
         segment_layout
@@ -9920,7 +9947,13 @@ fn compile_with_budget(
         dynamic_successor,
         far_dynamic,
         successors,
-        written_segments: dirty_segments,
+        // A live block publishes no data-segment bits: a link treats it as a block that wrote no
+        // data segment, because no successor of a live block bakes a data value.
+        written_segments: if live_form {
+            dirty_segments & !ALL_DATA_SEGMENTS
+        } else {
+            dirty_segments
+        },
         #[cfg(feature = "seg-head-diagnostic")]
         seg_head_guard_eligible,
         #[cfg(feature = "direct-link-refusal-census")]
@@ -10245,6 +10278,13 @@ pub(crate) struct BlockKey {
 /// take the relaxed path, and `BlockKey`/the entry check already refuse to enter a block admitted
 /// under one mode key from another.
 pub(crate) const JIT_MODE_KEY_V86_BIT: u32 = 1 << 2;
+/// Bit 1 of `jit_mode_key`: CR0.PE was set when the key was captured.
+pub(crate) const JIT_MODE_KEY_PE_BIT: u32 = 1 << 1;
+
+/// Whether a mode key names real mode or V86. These are the modes of a live block.
+pub(crate) const fn mode_key_is_real_or_v86(mode_key: u32) -> bool {
+    mode_key & JIT_MODE_KEY_PE_BIT == 0 || mode_key & JIT_MODE_KEY_V86_BIT != 0
+}
 
 impl BlockKey {
     pub(crate) const fn new(linear: u32, physical: u32, mode_key: u32) -> Self {
@@ -10787,6 +10827,19 @@ const fn segment_bit(segment: SegmentIndex) -> u8 {
 
 /// DS and ES only. Sticky keys live-load these two; SS/FS/GS stay baked.
 pub(crate) const LIVE_DATA_BITS: u8 = segment_bit(SegmentIndex::Ds) | segment_bit(SegmentIndex::Es);
+
+/// Whether a block compiled now is a live block: the switch is on and the mode is real mode or
+/// V86.
+fn live_form_for(cpu: &CpuGsw) -> bool {
+    cpu.jit_direct.live_data_segments_arm() != 0 && !(cpu.is_protected_mode() && !cpu.is_v86_mode())
+}
+
+/// ES, SS, DS, FS, and GS. A live block (`IZARRAVM_LIVE_DATA_SEGMENTS`) loads all of them from the
+/// CPU state.
+const ALL_DATA_SEGMENTS: u8 = LIVE_DATA_BITS
+    | segment_bit(SegmentIndex::Ss)
+    | segment_bit(SegmentIndex::Fs)
+    | segment_bit(SegmentIndex::Gs);
 
 /// The inverse of `segment_bit` for a mask holding exactly one bit, `None` for anything else.
 /// Used on the default path since `SEGWRITE-V86-EDGE`: the compile walk turns a single-bit
@@ -14839,6 +14892,61 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_chain_entry_check_for_test(forced: Option<bool>) {
     CHAIN_ENTRY_CHECK_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The arm of `IZARRAVM_LIVE_DATA_SEGMENTS`. Off by default. A block compiled in real mode or V86
+/// under arm 1 or 2 reads ES, SS, DS, FS, and GS from the CPU state and bakes none of them. Arm 2
+/// also links the successors of such a block when it writes data segments. The value is read once
+/// per `BlockCache`.
+pub(crate) fn live_data_segments_arm() -> u8 {
+    #[cfg(test)]
+    if let Some(forced) = LIVE_DATA_SEGMENTS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ARM: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ARM.get_or_init(|| parse_live_data_segments_arm(std::env::var("IZARRAVM_LIVE_DATA_SEGMENTS")))
+}
+
+/// The `IZARRAVM_LIVE_DATA_SEGMENTS` spelling table. Unset, empty, and `0` name the off arm.
+fn parse_live_data_segments_arm(value: Result<String, std::env::VarError>) -> u8 {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` (off), `1` (live operands                             and selector reads), and `2` (also links the successors of a live                             block that writes data segments)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return 0,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_LIVE_DATA_SEGMENTS is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim() {
+        "" | "0" => 0,
+        "1" => 1,
+        "2" => 2,
+        other => panic!(
+            "IZARRAVM_LIVE_DATA_SEGMENTS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a              mistyped value that ran the default would look like a change that does nothing"
+        ),
+    }
+}
+
+// Per-thread, like `CHAIN_ENTRY_CHECK_OVERRIDE`. A fixture sets it BEFORE it builds the cache.
+#[cfg(test)]
+thread_local! {
+    static LIVE_DATA_SEGMENTS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the live data segment arm on this thread; `None` restores the ambient reading. Set it
+/// BEFORE constructing the `BlockCache` under test.
+#[cfg(test)]
+pub(crate) fn set_live_data_segments_for_test(forced: Option<u8>) {
+    LIVE_DATA_SEGMENTS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_live_data_segments_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> u8 {
+    parse_live_data_segments_arm(value)
 }
 
 /// The spelling table, reachable from the fixtures. `chain_entry_check_armed` caches its env
@@ -19302,6 +19410,9 @@ struct MemoryEmitContext {
     /// PE set and V86 clear, baked from the compile-time mode key. Do not recover this from
     /// `address_wrap`: Word wrap is CS.D, and 16-bit PM would take the real/V86 emit.
     protected_not_v86: bool,
+    /// The block is a live block: `PUSH Sreg` and `MOV r16,Sreg` read the selector of ES, SS, DS,
+    /// FS, and GS from the CPU state, not from a baked immediate.
+    live_form: bool,
     /// Whether a ModRM-derived effective address wraps at 64K.
     ///
     /// A BLOCK property, not an address one. `decode` computes
@@ -19738,8 +19849,16 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::MovSegToReg { dst, segment } => {
-                let selector = memory.segments.selector(segment);
-                e.mov_r32_imm32(Reg::RDX, u32::from(selector));
+                if memory.live_form && segment != SegmentIndex::Cs {
+                    e.movzx_r32_word_disp32(
+                        Reg::RDX,
+                        Reg::R15,
+                        segment_field_base(segment) + selector_offset(),
+                    );
+                } else {
+                    let selector = memory.segments.selector(segment);
+                    e.mov_r32_imm32(Reg::RDX, u32::from(selector));
+                }
                 e.mov_r16_r16(home(dst), Reg::RDX);
             }
             // RDX is cleared BEFORE the flag load, not after: `setcc` writes only DL, so the
@@ -23696,8 +23815,10 @@ fn emit_store(
     // `PUSH Sreg`'s selector becomes an immediate here and nowhere earlier. This is the first
     // point that holds the `SegmentLayout`, and the constant it bakes is the same one
     // `data_matches` pins on entry, because both read the segment the block was captured under.
+    // A live block keeps the selector of a data segment as a load from the CPU state; the source
+    // reader does that load.
     let source = match source {
-        StoreSource::Selector(segment) => {
+        StoreSource::Selector(segment) if !(memory.live_form && segment != SegmentIndex::Cs) => {
             StoreSource::Imm(u32::from(memory.segments.selector(segment)))
         }
         other => other,
@@ -24095,7 +24216,16 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
         // caller with a `SegmentLayout` to resolve it from. Reaching this arm means a second store
         // path grew and did not.
         StoreSource::Selector(segment) => {
-            unreachable!("PUSH {segment:?} must be resolved to an immediate in emit_store")
+            debug_assert_ne!(
+                segment,
+                SegmentIndex::Cs,
+                "PUSH CS must be resolved to an immediate in emit_store"
+            );
+            e.movzx_r32_word_disp32(
+                value,
+                Reg::R15,
+                segment_field_base(segment) + selector_offset(),
+            );
         }
         // The byte `SetCcMem` computed at the top of its slot. Byte width only: the parker is the
         // only producer and it stores a `setcc` result, so a wider read here would pick up the
@@ -33246,6 +33376,11 @@ impl BlockCache {
         self.entry_layout_fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         from[index]
+    }
+
+    /// The `IZARRAVM_LIVE_DATA_SEGMENTS` arm of this cache: 0, 1, or 2.
+    pub(crate) fn live_data_segments_arm(&self) -> u8 {
+        self.live_data_segments_arm
     }
 
     /// Whether the entry check reads the chain requirement. Read once per cache, in

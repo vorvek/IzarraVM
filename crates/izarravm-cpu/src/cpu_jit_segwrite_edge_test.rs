@@ -188,12 +188,25 @@ fn install_at(cpu: &mut CpuGsw, linear: u32) -> jit::direct::CompiledBlock {
 /// own linear, every decode line warmed and every page fast-mapped. Returns the CPU, its bus, and
 /// block B's linear address.
 fn stage(builder: fn() -> CpuGsw, body_b: &[u8]) -> (CpuGsw, TestBus, u32) {
+    let lengths = vec![2; body_b.len() / 2];
+    stage_with(builder, &MOV_DS_AX, body_b, &lengths)
+}
+
+/// As `stage`, with the segment write of block A and the instruction lengths of block B given.
+fn stage_with(
+    builder: fn() -> CpuGsw,
+    segment_write: &[u8; 2],
+    body_b: &[u8],
+    lengths_b: &[u32],
+) -> (CpuGsw, TestBus, u32) {
     let mut code = filler();
     let mut starts = vec![ENTRY, ENTRY + 2, ENTRY + 4];
-    code.extend_from_slice(&MOV_DS_AX);
+    code.extend_from_slice(segment_write);
     let b_linear = ENTRY + code.len() as u32;
-    for i in 0..(body_b.len() / 2) {
-        starts.push(b_linear + 2 * i as u32);
+    let mut at = b_linear;
+    for length in lengths_b {
+        starts.push(at);
+        at += length;
     }
     code.extend_from_slice(body_b);
     code.push(0xf4); // HLT, so a chain that runs off the end of B halts rather than decoding junk.
@@ -785,4 +798,207 @@ fn a_v86_block_mixing_a_native_write_with_an_fs_callout_still_gets_the_guarded_e
         "B must have run and read the byte at the NEW DS:[BX]"
     );
     let _ = block_b;
+}
+
+// =================================================================================================
+// The live data segment switch (`IZARRAVM_LIVE_DATA_SEGMENTS`).
+// =================================================================================================
+
+/// `mov es,ax`.
+const MOV_ES_AX: [u8; 2] = [0x8e, 0xc0];
+
+/// Block B of the selector read fixture: `mov ax,es`, `push es`, `mov cl,cl`.
+const READ_ES_BODY: [u8; 5] = [0x8c, 0xc0, 0x06, 0x88, 0xc9];
+
+/// Builds the staged CPU with the switch forced to `arm`. The cache reads the switch when it is
+/// built, so the override is cleared as soon as `stage_with` has built the CPU.
+fn stage_under_arm(
+    arm: u8,
+    builder: fn() -> CpuGsw,
+    segment_write: &[u8; 2],
+    body_b: &[u8],
+    lengths_b: &[u32],
+) -> (CpuGsw, TestBus, u32) {
+    jit::direct::set_live_data_segments_for_test(Some(arm));
+    let staged = stage_with(builder, segment_write, body_b, lengths_b);
+    jit::direct::set_live_data_segments_for_test(None);
+    staged
+}
+
+/// A reads ES from AX and B reads the selector of ES into AX and onto the stack. The selector
+/// read of a live block comes from the CPU state, so B sees the value that A wrote, and A and B
+/// run as one linked entry.
+#[test]
+fn a_selector_read_is_live_across_a_link_in_real_mode_and_v86() {
+    const NEW_SELECTOR: u16 = 0x0040;
+    const STALE_SELECTOR: u16 = 0x0077;
+    for (name, builder, arms) in [
+        ("real mode", real_cpu as fn() -> CpuGsw, &[2u8][..]),
+        ("V86", v86_cpu as fn() -> CpuGsw, &[1u8, 2][..]),
+    ] {
+        for &arm in arms {
+            let label = format!("{name}, arm {arm}");
+            let (mut cpu, mut bus, b_linear) =
+                stage_under_arm(arm, builder, &MOV_ES_AX, &READ_ES_BODY, &[2, 1, 2]);
+            let block_a = install_at(&mut cpu, ENTRY);
+            assert!(
+                !block_a.is_segment_write_block(),
+                "{label}: A must publish a successor"
+            );
+            // B is compiled with a stale ES. A baked selector would show it.
+            cpu.load_segment_real(SegmentIndex::Es, STALE_SELECTOR);
+            install_at(&mut cpu, b_linear);
+
+            cpu.registers.set_eax(u32::from(NEW_SELECTOR));
+            cpu.load_segment_real(SegmentIndex::Es, 0);
+            cpu.set_eip(ENTRY);
+            cpu.halted = false;
+            let entries_before = cpu.perf_counters().jit_direct_entries;
+            let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+            let sp_before = cpu.registers.esp() as usize;
+            assert!(
+                cpu.try_run_direct_block_for_test(&mut bus, block_a)
+                    .unwrap(),
+                "{label}"
+            );
+            assert_eq!(
+                cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+                1,
+                "{label}: a linked transfer from A into B"
+            );
+            assert_eq!(
+                cpu.perf_counters().jit_direct_entries - entries_before,
+                1,
+                "{label}: A and B run as one entry"
+            );
+            assert_eq!(
+                cpu.registers.segment(SegmentIndex::Es).selector,
+                NEW_SELECTOR,
+                "{label}"
+            );
+            assert_eq!(
+                cpu.registers.eax() & 0xffff,
+                u32::from(NEW_SELECTOR),
+                "{label}: mov ax,es reads the new selector"
+            );
+            assert_eq!(cpu.registers.esp() as usize, sp_before - 2, "{label}");
+            let pushed = u16::from_le_bytes([bus.memory[sp_before - 2], bus.memory[sp_before - 1]]);
+            assert_eq!(
+                pushed, NEW_SELECTOR,
+                "{label}: push es stores the new selector"
+            );
+        }
+    }
+}
+
+/// Arm 1 keeps the successor bar except for the V86 edge that links today, and publishes that
+/// edge with no selector guard. In real mode it still publishes no successor.
+#[test]
+fn arm_one_links_the_eligible_v86_edge_and_still_bars_real_mode() {
+    let (mut cpu, mut bus, b_linear) =
+        stage_under_arm(1, v86_cpu, &MOV_DS_AX, &block_b_body(), &[2, 2, 2]);
+    let block_a = install_at(&mut cpu, ENTRY);
+    assert!(
+        !block_a.is_segment_write_block(),
+        "the eligible V86 edge is published on arm 1"
+    );
+    cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+    install_at(&mut cpu, b_linear);
+    // A selector that differs from the one that B was compiled under. A guard would refuse it.
+    const OTHER_SELECTOR: u16 = 0x0050;
+    cpu.registers.set_eax(u32::from(OTHER_SELECTOR));
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+    let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+    let mismatches_before = cpu.perf_counters().jit_direct_seg_guard_mismatch_exits;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+        1,
+        "the V86 edge links on arm 1"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_seg_guard_mismatch_exits,
+        mismatches_before,
+        "a live block emits no selector guard"
+    );
+    assert_eq!(
+        cpu.registers.segment(SegmentIndex::Ds).selector,
+        OTHER_SELECTOR
+    );
+
+    let (mut real, mut real_bus, real_b) =
+        stage_under_arm(1, real_cpu, &MOV_DS_AX, &block_b_body(), &[2, 2, 2]);
+    let real_a = install_at(&mut real, ENTRY);
+    assert!(
+        real_a.is_segment_write_block(),
+        "real mode keeps the successor bar on arm 1"
+    );
+    assert_eq!(real_a.successors_for_test(), [None, None]);
+    install_at(&mut real, real_b);
+    real.registers.set_eax(u32::from(OTHER_SELECTOR));
+    real.set_eip(ENTRY);
+    real.halted = false;
+    let transfers_before = real.perf_counters().jit_direct_linked_transfers;
+    assert!(
+        real.try_run_direct_block_for_test(&mut real_bus, real_a)
+            .unwrap()
+    );
+    assert_eq!(
+        real.perf_counters().jit_direct_linked_transfers,
+        transfers_before,
+        "real mode does not link on arm 1"
+    );
+}
+
+/// A linked live block is entered again after DS changed, with the chain entry check off. With
+/// the check off, a linked block would take `all_data_matches`, which compares all six captured
+/// records. A live block bakes no data record, so it must take the masked compare and run.
+#[test]
+fn a_linked_live_block_is_entered_after_ds_changed_with_the_chain_entry_check_off() {
+    const NEW_SELECTOR: u16 = 0x0040;
+    jit::direct::set_chain_entry_check_for_test(Some(false));
+    let (mut cpu, mut bus, b_linear) =
+        stage_under_arm(2, real_cpu, &MOV_ES_AX, &READ_ES_BODY, &[2, 1, 2]);
+    jit::direct::set_chain_entry_check_for_test(None);
+    assert!(
+        !cpu.jit_direct.chain_entry_check_armed(),
+        "the check is off"
+    );
+    let block_a = install_at(&mut cpu, ENTRY);
+    install_at(&mut cpu, b_linear);
+    // Resolve the link before A runs.
+    cpu.registers.set_eax(u32::from(NEW_SELECTOR));
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap()
+    );
+    assert!(
+        cpu.jit_direct.has_linked_successor(block_a.id()),
+        "A must be linked to B"
+    );
+    // DS changes. A does not use DS, and a live block bakes no data record.
+    cpu.load_segment_real(SegmentIndex::Ds, 0x0077);
+    cpu.registers.set_eax(u32::from(NEW_SELECTOR));
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+    let rejects_before = cpu.perf_counters().jit_direct_reject_data_segment;
+    let insns_before = cpu.perf_counters().jit_direct_insns;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap(),
+        "the linked live block must run natively after DS changed"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_reject_data_segment,
+        rejects_before,
+        "no data segment reject"
+    );
+    assert!(cpu.perf_counters().jit_direct_insns > insns_before);
 }
