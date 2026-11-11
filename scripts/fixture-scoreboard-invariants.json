@@ -5,30 +5,118 @@
     ],
     "final_distinct_colors_max": 20000,
     "final_distinct_colors_min": 120,
-    "final_instructions": 6614138522,
+    "final_instructions": 3442646539,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
-    "final_nonblack_percent_min": 60.0
+    "final_nonblack_percent_min": 60.0,
+    "qualified_axes": [
+      "anchor_frame",
+      "final_instructions",
+      "geometry",
+      "anchor_geometry",
+      "content_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 9000000000,
+      "anchor_cycle_budget": 500000000,
+      "fixture_contract_sha256": "94c0b19354e03806cc4bb8d14b342d7b1af0c9f2541af767bd3be512cb1de46d"
+    }
+  },
+  "doom-486": {
+    "qualified_axes": [
+      "realtics"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 32000000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "1131850f0d14e899417c43579481016b8bac1edd736e49097b3a15463759aa05"
+    }
+  },
+  "doom-586": {
+    "qualified_axes": [
+      "realtics"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 26560000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "0d4501705b92e4406a9c193e6b8f987e50c83dbb148d3ae51147fd5f801f0f7a"
+    }
   },
   "duke3d-486": {
-    "dukemark_samples": 940,
-    "dukemark_samples_tolerance": 0.02
+    "dukemark_samples": 908,
+    "dukemark_samples_tolerance": 0.02,
+    "qualified_axes": [
+      "dukemark_samples"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 26400000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "a525a2781dbd66e2adc459089f647d3d75acdd1bc61d2134ddd066a74e81ab9e"
+    }
   },
   "duke3d-586": {
-    "dukemark_samples": 1026,
-    "dukemark_samples_tolerance": 0.02
+    "dukemark_samples": 1019,
+    "dukemark_samples_tolerance": 0.02,
+    "qualified_axes": [
+      "dukemark_samples"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 79680000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "a26bed038598042d0873a6135e8d0d4595895690c5541e0cffa7ce50fb64c13f"
+    }
   },
   "duke3d-586-short": {
-    "dukemark_samples": 404,
-    "dukemark_samples_tolerance": 0.02
+    "dukemark_samples": 401,
+    "dukemark_samples_tolerance": 0.02,
+    "qualified_axes": [
+      "dukemark_samples"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 33200000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "a5404221a318920fd2c27cd8ee748481a893b657a95d032ea7a276c8fb46bccc"
+    }
   },
   "gp2-586": {
-    "frame_sha256": "8b6e1e450e5d25262bb901a74ba9fc467d05906b5b205542707bf0524cbc98f6"
+    "frame_sha256": "d22d4a6abe3549e442fa26824cb41192da6d255458e089f2c352c9a4a8ca938c",
+    "qualified_axes": [
+      "frame"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 13280000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "888356937d25f932b6198200d338bfb387eeb957b8f5e114ff2f69afd1a225a2"
+    }
   },
   "mojo-586": {
     "text_result_sha256": {
       "MOJO.TXT": "aeaa75522e2f472b36d1459333d2196ebd9bda2a239283a648ff1d95c5cb37ff",
       "MOJOV.TXT": "64c5a0fe167b4f3690c7e8c37503811bec3f5fdd0d6c8f793a3e1cf03c8bf8b9"
+    },
+    "qualified_axes": [
+      "text_reports"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 4000000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "852848b7859cc1fedf4f5d3b5d5fc2c25a8646178fbde8f80f1ed478e43b1175"
     }
   },
   "nascar-586": {
@@ -37,13 +125,37 @@
     ],
     "final_distinct_colors_max": 256,
     "final_distinct_colors_min": 45,
-    "final_instructions": 6337150214,
+    "final_instructions": 2548442061,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
-    "final_nonblack_percent_min": 84.0
+    "final_nonblack_percent_min": 84.0,
+    "qualified_axes": [
+      "anchor_frame",
+      "final_instructions",
+      "geometry",
+      "anchor_geometry",
+      "content_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 4980000000,
+      "anchor_cycle_budget": 445000000,
+      "fixture_contract_sha256": "16ba06e3d4478623ee0aeaca5b20b4a39f6dc2032ff8059f15a5ba1396d4d9b2"
+    }
   },
   "prince-486": {
-    "frame_sha256": "6cc0d3549968b72031469eb7894f7465fe727919d5a7926d499188526ed4479c"
+    "frame_sha256": "a2d7947c9ebe9ba184dbad676bc378d8123d8206420c74971be443a838459066",
+    "qualified_axes": [
+      "frame"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 4000000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "6d04fd85c080bd99794a4d921e9862963b7299b48b99c8e58a602d2269aca3f6"
+    }
   },
   "psycho-486": {
     "anchor_frame_sha256": [
@@ -51,10 +163,34 @@
     ],
     "final_distinct_colors_max": 256,
     "final_distinct_colors_min": 40,
-    "final_instructions": 3734683259,
+    "final_instructions": 2787119426,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 95.0,
-    "final_nonblack_percent_min": 60.0
+    "final_nonblack_percent_min": 60.0,
+    "qualified_axes": [
+      "anchor_frame",
+      "final_instructions",
+      "geometry",
+      "anchor_geometry",
+      "content_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 8000000000,
+      "anchor_cycle_budget": 40000000,
+      "fixture_contract_sha256": "8bfe5c9782d298e43dbfa1dd3ece8285ad7f1c1252581210981384aaa94350d2"
+    }
+  },
+  "quake-586": {
+    "qualified_axes": [],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 24800000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "0f081ce9166f1308b4764af11bad7c3030c8544a6fbc833368b353ee86307efa"
+    }
   },
   "tombraid-586": {
     "anchor_frame_sha256": [
@@ -62,10 +198,37 @@
     ],
     "final_distinct_colors_max": 256,
     "final_distinct_colors_min": 79,
-    "final_instructions": 17990425766,
+    "final_instructions": 15132676063,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
-    "final_nonblack_percent_min": 89.0
+    "final_nonblack_percent_min": 89.0,
+    "qualified_axes": [
+      "anchor_frame",
+      "final_instructions",
+      "geometry",
+      "anchor_geometry",
+      "content_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 28000000000,
+      "anchor_cycle_budget": 500000000,
+      "fixture_contract_sha256": "a8544dfb72538f4c35621c82e087de8c974f414946fa5299781f48698985c8e2"
+    }
+  },
+  "tombraid-loader-586": {
+    "qualified_axes": [
+      "geometry",
+      "allowed_frames"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 500000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "b2c5ada3fb81dd26296ea43c378a449a815615417f9636f73d14edaa2e585d65"
+    }
   },
   "tombraid3d-586": {
     "anchor_frame_sha256": [
@@ -73,18 +236,101 @@
     ],
     "final_distinct_colors_max": 3000,
     "final_distinct_colors_min": 80,
-    "final_instructions": 19864703204,
+    "final_instructions": 13670623199,
     "final_instructions_tolerance": 0.05,
     "final_nonblack_percent_max": 100.0,
-    "final_nonblack_percent_min": 95.0
+    "final_nonblack_percent_min": 95.0,
+    "qualified_axes": [
+      "anchor_frame",
+      "final_instructions",
+      "geometry",
+      "anchor_geometry",
+      "content_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 19000000000,
+      "anchor_cycle_budget": 500000000,
+      "fixture_contract_sha256": "f24d61ea5df31912fbc58ed4af387f81fffcbe70b43ae8943c4b16f92d1ea557"
+    }
+  },
+  "tyrian-486": {
+    "qualified_axes": [
+      "profile_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 3200000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "f8af97707e79324551ce0a81830ee6d31814b4eefccf8d7894ef9aaa186a33d6"
+    }
+  },
+  "tyrian-586": {
+    "qualified_axes": [
+      "profile_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 8050000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "ea235ac4b48e1428c03fa358063e61af10ec5fc53650f446adc32d9ac94e30cb"
+    }
   },
   "tyrian-setup-486": {
-    "frame_sha256": "479a10ea0c16837ec1d2b8018a2641bd8c1820d291e0092bf1f13ee8e2edf5eb"
+    "frame_sha256": "479a10ea0c16837ec1d2b8018a2641bd8c1820d291e0092bf1f13ee8e2edf5eb",
+    "qualified_axes": [
+      "frame",
+      "profile_bands"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 4700000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "94f96109526b3d50ef7c6249cd5781275dbddbc616577dbac91b4b69a154781f"
+    }
+  },
+  "tyrian-specs-586": {
+    "qualified_axes": [
+      "geometry",
+      "allowed_frames",
+      "stdout_phase"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 5150000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "726548c848a0d71e72a2a4db29a2e2a0d4d7607f63bcad29efde991c91ae9c27"
+    }
   },
   "wolf3d-486": {
-    "frame_sha256": "6101c4f39ee50cdee2fa3bc12c8ca3c678d82c9c22fee3275f5d22379dfbee04"
+    "frame_sha256": "6101c4f39ee50cdee2fa3bc12c8ca3c678d82c9c22fee3275f5d22379dfbee04",
+    "qualified_axes": [
+      "frame"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 8000000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "ea1f38aced2af6b4614fd818fa0a8c2360188531da6cd0d8d77636ab2b11e898"
+    }
   },
   "wolf3d-586": {
-    "frame_sha256": "e33418bbd34c13ad9c99e23c3d1cddb68df08beecec8676378557a4cc102f963"
+    "frame_sha256": "e33418bbd34c13ad9c99e23c3d1cddb68df08beecec8676378557a4cc102f963",
+    "qualified_axes": [
+      "frame"
+    ],
+    "pin_context": {
+      "schema": "fixture-pin-context-v1",
+      "timing_model_epoch": 3,
+      "cycle_budget": 12000000000,
+      "anchor_cycle_budget": null,
+      "fixture_contract_sha256": "e5f9ff04efa53f2b090ec48cab1499e219f88956bc83c5dc814a9d8d59189400"
+    }
   }
 }
