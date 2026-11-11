@@ -8804,7 +8804,10 @@ fn compile_with_budget(
         // segment the block does not use: extra `data_matches` comparisons and a retirement every
         // time that unrelated segment moves, or a spurious Retry out of `segment_access_supported`
         // for a descriptor nothing in the block reaches.
-        if kind.pinned_segments() & dirty_segments != 0 {
+        let dirty_segment_hit = kind.pinned_segments() & dirty_segments != 0;
+        #[cfg(test)]
+        let dirty_segment_hit = dirty_segment_hit && !dirty_segment_rule_disabled();
+        if dirty_segment_hit {
             // Censused since the dirty-stop slice, and it is the only `Boundary` arm that is.
             // `CompileStop::Boundary` is five-way ambiguous (this rule, the walk's initializer,
             // the two block caps and a terminal slot), so the recording has to sit AT the rule
@@ -15161,6 +15164,57 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_jcc_shadow_for_test(forced: Option<bool>) {
     JCC_SHADOW_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+// Test-only. Turns off the dirty-segment rule of the compile walk, so a block keeps a baked data
+// segment value across a segment load in the same block. The differential generator uses it to
+// prove that its oracle detects a stale baked segment. Per-THREAD, for the reason of
+// `JCC_SHADOW_OVERRIDE`.
+#[cfg(test)]
+thread_local! {
+    static DIRTY_SEGMENT_RULE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn dirty_segment_rule_disabled() -> bool {
+    DIRTY_SEGMENT_RULE_DISABLED.with(std::cell::Cell::get)
+}
+
+/// Turn off the dirty-segment rule on this thread for the length of a fixture.
+#[cfg(test)]
+pub(crate) fn set_dirty_segment_rule_disabled_for_test(disabled: bool) {
+    DIRTY_SEGMENT_RULE_DISABLED.with(|cell| cell.set(disabled));
+}
+
+// Test-only. Writes a poison value to RDX in the baked form of `emit_segmented_linear_address`,
+// directly after the effective address. The live form uses RDX as scratch at that point, so a
+// consumer that needs RDX to survive the address form fails under the poison. The thread-local
+// forces the arm on or off. When it is unset, `IZARRAVM_TEST_ADDRESS_SCRATCH_POISON=1` turns it on.
+#[cfg(test)]
+thread_local! {
+    static ADDRESS_SCRATCH_POISON_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn address_scratch_poison_enabled() -> bool {
+    if let Some(forced) = ADDRESS_SCRATCH_POISON_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("IZARRAVM_TEST_ADDRESS_SCRATCH_POISON").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+/// Force the RDX poison arm on this thread for the length of a fixture; `None` restores the
+/// environment reading.
+#[cfg(test)]
+pub(crate) fn set_address_scratch_poison_for_test(forced: Option<bool>) {
+    ADDRESS_SCRATCH_POISON_OVERRIDE.with(|cell| cell.set(forced));
 }
 
 /// The spelling table, reachable from the fixtures. See `parse_disp_store_lanes_arm_for_test`.
@@ -23507,6 +23561,10 @@ fn emit_segmented_linear_address(
         descriptor.limit == u32::MAX && wrap == AddressWrap::None && addr.disp_lane.is_none();
     let fold = if foldable { descriptor.base } else { 0 };
     emit_effective_address(e, addr, wrap, fold);
+    #[cfg(test)]
+    if address_scratch_poison_enabled() {
+        e.mov_r32_imm32(Reg::RDX, 0xDEAD_BEEF);
+    }
     if descriptor.limit != u32::MAX {
         // `bytes() - 1` here is the access's EXTENT, the offset of its last byte, not an alignment
         // mask and not the split charge. It shares a spelling with `split_extra_bytes` and
