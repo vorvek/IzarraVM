@@ -3228,7 +3228,15 @@ impl CpuGsw {
         // `has_link` is still computed on both arms: `chain_eligible` below needs it.
         ea_mark!(Phase::BlockFields);
         let chain_entry_check = self.jit_direct.chain_entry_check_armed();
-        let data_descriptors_match = if chain_entry_check {
+        // A live block (`IZARRAVM_LIVE_DATA_SEGMENTS`, real mode or V86) bakes no data
+        // descriptor, so it takes the masked compare on both arms. `all_data_matches` would
+        // reject it at each segment change.
+        // Read only when the chain entry check is off, so the default path does no more work.
+        let live_block = || {
+            self.jit_direct.live_data_segments_arm() != 0
+                && jit::direct::mode_key_is_real_or_v86(span.key.mode_key)
+        };
+        let data_descriptors_match = if chain_entry_check || live_block() {
             segments.data_matches(self)
         } else if has_link {
             segments.all_data_matches(self)
@@ -3395,7 +3403,9 @@ impl CpuGsw {
         } else {
             // Devices advance only after native return. I/O, flag-control operations, segment
             // changes, and interrupt-shadow boundaries are compiler barriers, so budget and the
-            // bounded block count are the only steady-state boundary checks needed here.
+            // bounded block count are the only steady-state boundary checks needed here. A data
+            // segment change inside a live block is not a barrier: the block reads the segment
+            // from the CPU state.
             if !chain_eligible {
                 1
             } else {

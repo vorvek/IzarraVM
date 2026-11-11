@@ -1886,3 +1886,111 @@ fn the_barrier_census_suffix_scan_walks_through_an_admitted_retf() {
     );
     jit::direct::set_direct_retf_v86_for_test(None);
 }
+
+/// `pop ds` then `retf` in V86, under every arm of the live data segment switch. The stack holds
+/// the new DS selector, then the return offset, then the return selector. The dirty segment rule
+/// ends the block after `pop ds`, so the RETF does not join it today and the interpreter runs it.
+/// The state must match the interpreter on DS, CS, IP, SP and guest RAM after the block and after
+/// the RETF.
+#[test]
+fn pop_ds_then_retf_in_v86_matches_the_interpreter_on_every_live_data_segment_arm() {
+    const NEW_DS: u16 = 0x0030;
+    select_retf(jit::direct::RetfArm::V86);
+    let body = [vec![0x1f], retf(None)].concat();
+    for live_arm in [0u8, 1, 2] {
+        let label = format!("arm {live_arm}");
+        let stage_role = |arm: u8| {
+            jit::direct::set_live_data_segments_for_test(Some(arm));
+            // The far return address sits two bytes above SP, so the DS word fits below it.
+            let (cpu, mut bus, _) = stage_with(
+                v86_cpu,
+                &body,
+                TARGET_SELECTOR,
+                TARGET_OFFSET,
+                STACK_ESP + 2,
+            );
+            jit::direct::set_live_data_segments_for_test(None);
+            let sp = (STACK_ESP & 0xffff) as usize;
+            bus.memory[sp..sp + 2].copy_from_slice(&NEW_DS.to_le_bytes());
+            (cpu, bus)
+        };
+        let (mut native, mut native_bus) = stage_role(live_arm);
+        let (mut interp, mut interp_bus) = stage_role(live_arm);
+        let compilation = match jit::direct::compile(&mut native, ENTRY, false) {
+            jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+            _ => panic!("{label}: the block did not compile"),
+        };
+        let covered = u64::from(compilation.span.instructions);
+        // The dirty segment rule ends the block after `pop ds`, so the RETF is not in it today.
+        assert_eq!(
+            covered,
+            FILL.len() as u64 + 1,
+            "{label}: the block covers the filler and pop ds, and stops before the retf"
+        );
+        let key = jit::direct::key_for(&native, ENTRY, false).expect("entry key");
+        let _ = native.jit_direct.probe(key);
+        let id = native
+            .jit_direct
+            .install(&compilation)
+            .expect("block installs");
+        let block = native.jit_direct.block(id).expect("live block");
+        for cpu in [&mut native, &mut interp] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr = std::array::from_fn(|i| 0xdead_0000 | (0xa0 + i as u32));
+            cpu.registers.set_esp(STACK_ESP);
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(ENTRY);
+            cpu.elapsed_clocks = 0;
+            cpu.timing_rem = 0;
+            cpu.core_clocks_so_far = 0;
+        }
+        native_bus.trace = BusTrace::default();
+        interp_bus.trace = BusTrace::default();
+        assert_ne!(
+            native.registers.segment(SegmentIndex::Ds).selector,
+            NEW_DS,
+            "{label}: the entry DS differs from the popped one"
+        );
+        let before = native.perf_counters().jit_direct_insns;
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap(),
+            "{label}: the block runs natively"
+        );
+        assert_eq!(
+            native.perf_counters().jit_direct_insns - before,
+            covered,
+            "{label}: every slot retires natively"
+        );
+        for _ in 0..covered {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers after the block"
+        );
+        assert_eq!(native.registers.segment(SegmentIndex::Ds).selector, NEW_DS);
+        // The RETF runs in the interpreter on both roles.
+        native.cycle(&mut native_bus).unwrap();
+        interp.cycle(&mut interp_bus).unwrap();
+        assert_eq!(
+            crate::tests::settled_registers(&native),
+            crate::tests::settled_registers(&interp),
+            "{label}: registers after the retf"
+        );
+        assert_eq!(native.registers.segment(SegmentIndex::Ds).selector, NEW_DS);
+        assert_eq!(native.registers.cs().selector, TARGET_SELECTOR);
+        assert_eq!(native.registers.eip, u32::from(TARGET_OFFSET));
+        assert_eq!(native.registers.esp(), STACK_ESP + 6, "{label}: SP");
+        assert_eq!(native.eflags(), interp.eflags(), "{label}: flags");
+        assert_eq!(
+            native.elapsed_clocks, interp.elapsed_clocks,
+            "{label}: core clocks"
+        );
+        assert_eq!(native_bus.memory, interp_bus.memory, "{label}: guest RAM");
+    }
+    jit::direct::set_direct_retf_v86_for_test(None);
+}
