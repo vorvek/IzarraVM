@@ -538,8 +538,7 @@ impl CpuGsw {
             0x07 => {
                 // POP ES. 386 PRM: a 32-bit operand size pops a full dword and loads the
                 // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
-                let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Es, value)?;
+                self.pop_segment(bus, SegmentIndex::Es, operand_size)?;
                 Ok(self.charge(TimingClass::PopSeg))
             }
             0x0e => {
@@ -564,12 +563,11 @@ impl CpuGsw {
                 // POP SS. Arms the one-instruction interrupt shadow like MOV SS (386 PRM 11-16),
                 // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
                 // Same 386 PRM operand-size rule as POP ES above.
-                let value = self.pop(bus, operand_size)? as u16;
                 // The M5 measurement's other half, behind the same gate. See the `0x8e` arm.
                 let before = self
                     .ss_load_census_active()
                     .then(|| self.registers.segment(SegmentIndex::Ss));
-                self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
+                self.pop_segment(bus, SegmentIndex::Ss, operand_size)?;
                 if let Some(before) = before {
                     self.note_ss_load_record(before);
                 }
@@ -589,8 +587,7 @@ impl CpuGsw {
             }
             0x1f => {
                 // POP DS. Same 386 PRM operand-size rule as POP ES above.
-                let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Ds, value)?;
+                self.pop_segment(bus, SegmentIndex::Ds, operand_size)?;
                 Ok(self.charge(TimingClass::PopSeg))
             }
             0x50..=0x57 => {
@@ -685,64 +682,39 @@ impl CpuGsw {
             0xc8 => {
                 // ENTER imm16, imm8: build a stack frame. NestingLevel (already masked to 5
                 // bits by `decode`) is taken from `insn.imm2`; frame size from `insn.imm`.
+                // Commit last: a fault in any push or display read restores ESP and leaves
+                // EBP as it was, so the instruction restarts whole.
                 let alloc = insn.imm as u16;
-                let level = insn.imm2; // already & 0x1f from decode
-                let size = operand_size.bytes();
-                let frame_bp = self.read_gpr_sized(5, operand_size);
-                self.push(bus, frame_bp, operand_size)?;
-                // frame-ptr <- eSP (386 PRM 17-62): the saved stack pointer is read at
-                // StackAddrSize (SS.B), not the operand size -- on a B=0 stack it is the
-                // 16-bit SP, even for an ENTER with a 32-bit operand size.
-                let frame_temp = if self.stack_is_32bit() {
-                    self.registers.esp()
-                } else {
-                    u32::from(self.read_gpr16(4))
-                };
-                if level > 0 {
-                    // Copy the display: the saved frame pointers of the enclosing scopes.
-                    let mut bp = self.read_gpr_sized(5, operand_size);
-                    for _ in 1..level {
-                        bp = bp.wrapping_sub(size) & operand_size.mask();
-                        self.write_gpr_sized(5, operand_size, bp);
-                        let display = self.read_memory_sized(
-                            bus,
-                            SegmentIndex::Ss,
-                            bp,
-                            operand_size,
-                            BusAccessKind::DataRead,
-                        )?;
-                        self.push(bus, display, operand_size)?;
-                    }
-                    self.push(bus, frame_temp, operand_size)?;
-                }
-                self.write_gpr_sized(5, operand_size, frame_temp);
-                // The final allocation is an implicit stack reference (no memory
-                // access here, just the SP/ESP update), so it follows SS.B like
-                // push/pop -- not the operand size.
-                if self.stack_is_32bit() {
-                    let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
-                    self.registers.set_esp(esp);
-                } else {
-                    let sp = self.read_gpr16(4).wrapping_sub(alloc);
-                    self.write_gpr16(4, sp);
+                let level = insn.imm2;
+                let esp_before = self.registers.esp();
+                if let Err(fault) = self.enter_frame(bus, alloc, level, operand_size) {
+                    self.registers.set_esp(esp_before);
+                    return Err(fault);
                 }
                 Ok(self.charge(TimingClass::Enter))
             }
             0xc9 => {
-                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop (386 PRM 17-96). Both the
-                // read of BP/EBP and the write to SP/ESP are keyed on SS.B, not operand
-                // size: a B=1 stack moves the FULL EBP into the FULL ESP even for a
-                // 16-bit operand size (StackAddrSize=32 => ESP <- EBP, no truncation);
-                // a B=0 stack moves only BP into SP and leaves ESP's high word alone.
-                // The operand size only selects BP vs EBP for the popped frame pointer.
-                if self.stack_is_32bit() {
-                    let frame = self.read_gpr32(5);
-                    self.registers.set_esp(frame);
+                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop (386 PRM 17-96). The frame pointer
+                // is read at the stack width (SS.B); the popped value has the operand size.
+                // The stack read comes first and nothing changes if it faults.
+                let frame = if self.stack_is_32bit() {
+                    self.read_gpr32(5)
                 } else {
-                    let frame = self.read_gpr16(5);
-                    self.write_gpr16(4, frame);
+                    u32::from(self.read_gpr16(5))
+                };
+                let saved = self.read_memory_sized(
+                    bus,
+                    SegmentIndex::Ss,
+                    frame,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let next = frame.wrapping_add(operand_size.bytes());
+                if self.stack_is_32bit() {
+                    self.registers.set_esp(next);
+                } else {
+                    self.write_gpr16(4, next as u16);
                 }
-                let saved = self.pop(bus, operand_size)?;
                 self.write_gpr_sized(5, operand_size, saved);
                 Ok(self.charge(TimingClass::Leave))
             }
@@ -1302,6 +1274,68 @@ impl CpuGsw {
             outcome.core_clocks = 0;
         }
         Ok(outcome)
+    }
+
+    /// POP into a segment register. The pop commits only when the segment load succeeds, so
+    /// a faulting load leaves (E)SP at its value before the instruction.
+    pub(super) fn pop_segment<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        let esp_before = self.registers.esp();
+        let value = self.pop(bus, operand_size)? as u16;
+        if let Err(fault) = self.load_segment_arming_ss_shadow(bus, segment, value) {
+            self.registers.set_esp(esp_before);
+            return Err(fault);
+        }
+        Ok(())
+    }
+
+    /// The body of ENTER in manual order. The caller restores ESP when this returns an error.
+    /// The display pointer stays in a local; EBP changes only at the end.
+    fn enter_frame<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        alloc: u16,
+        level: u32,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        let size = operand_size.bytes();
+        let saved_bp = self.read_gpr_sized(5, operand_size);
+        self.push(bus, saved_bp, operand_size)?;
+        // FrameTemp is the stack pointer at the stack width (SS.B), whatever the operand size.
+        let frame_temp = if self.stack_is_32bit() {
+            self.registers.esp()
+        } else {
+            u32::from(self.read_gpr16(4))
+        };
+        if level > 0 {
+            let mut bp = saved_bp;
+            for _ in 1..level {
+                bp = bp.wrapping_sub(size) & operand_size.mask();
+                let display = self.read_memory_sized(
+                    bus,
+                    SegmentIndex::Ss,
+                    bp,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                self.push(bus, display, operand_size)?;
+            }
+            self.push(bus, frame_temp, operand_size)?;
+        }
+        self.write_gpr_sized(5, operand_size, frame_temp);
+        // The allocation is an implicit stack reference: it follows SS.B, not the operand size.
+        if self.stack_is_32bit() {
+            let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
+            self.registers.set_esp(esp);
+        } else {
+            let sp = self.read_gpr16(4).wrapping_sub(alloc);
+            self.write_gpr16(4, sp);
+        }
+        Ok(())
     }
 
     /// Execute a decoded IN/OUT with shared live-privilege core pricing.

@@ -3390,3 +3390,89 @@ fn waiting_fpu_forms_still_raise_mf_on_a_pending_unmasked_exception() {
         );
     }
 }
+
+
+fn assert_exception(result: ExecResult<CycleOutcome>, vector: u8, code: Option<u32>) {
+    match result {
+        Err(InternalFault::Exception {
+            vector: v,
+            error_code,
+        }) => {
+            assert_eq!(v, vector, "vector");
+            assert_eq!(error_code, code, "error code");
+        }
+        other => panic!("expected vector {vector}, got {other:?}"),
+    }
+}
+
+#[test]
+fn pop_sreg_fault_restores_the_stack_pointer() {
+    // A not-present data descriptor at 0x08. The selector sits on the stack at 0x80.
+    let not_present = (0x08u16, 0x0000_ffff, 0x0000_1200);
+    let cases: [(&[u8], u8); 6] = [
+        (&[0x07], 11),
+        (&[0x17], 12),
+        (&[0x1f], 11),
+        (&[0x0f, 0xa1], 11),
+        (&[0x0f, 0xa9], 11),
+        (&[0x66, 0x07], 11),
+    ];
+    for (code, vector) in cases {
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(code, &[not_present]);
+        memory[0x80..0x84].copy_from_slice(&0x0008u32.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, vector, Some(0x08));
+        assert_eq!(cpu.registers.esp(), 0x80, "{code:02x?}");
+    }
+}
+
+#[test]
+fn leave_fault_leaves_esp_and_ebp_untouched() {
+    for code in [&[0xc9][..], &[0x66, 0xc9][..]] {
+        let (mut cpu, memory) = protected_cpu_with_gdt(code, &[]);
+        let ss = cpu.registers.segment(SegmentIndex::Ss);
+        cpu.registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister { limit: 0xff, ..ss });
+        cpu.write_gpr16(5, 0x300);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, 12, Some(0));
+        assert_eq!(cpu.registers.esp(), 0x80, "{code:02x?}");
+        assert_eq!(cpu.read_gpr16(5), 0x300, "{code:02x?}");
+    }
+}
+
+#[test]
+fn enter_nested_fault_leaves_esp_and_ebp_untouched() {
+    // ENTER 0x10,3: the first display read lies past the SS limit.
+    let (mut cpu, memory) = protected_cpu_with_gdt(&[0xc8, 0x10, 0x00, 0x03], &[]);
+    let ss = cpu.registers.segment(SegmentIndex::Ss);
+    cpu.registers
+        .set_segment(SegmentIndex::Ss, SegmentRegister { limit: 0xff, ..ss });
+    cpu.write_gpr16(5, 0x300);
+    let mut bus = TestBus::with_memory(memory);
+    let result = exec_one_split(&mut cpu, &mut bus);
+    assert_exception(result, 12, Some(0));
+    assert_eq!(cpu.registers.esp(), 0x80);
+    assert_eq!(cpu.read_gpr16(5), 0x300);
+}
+
+#[test]
+fn enter_with_nesting_builds_the_display_in_manual_order() {
+    // ENTER 4,2 at SP 0x80 with BP 0x100 and a word 0xBEEF at [0xFE].
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(&[0xc8, 0x04, 0x00, 0x02], &[]);
+    memory[0xfe..0x100].copy_from_slice(&0xbeefu16.to_le_bytes());
+    cpu.write_gpr16(5, 0x100);
+    let mut bus = TestBus::with_memory(memory);
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_gpr16(5), 0x7e, "BP = FrameTemp");
+    assert_eq!(cpu.registers.esp() & 0xffff, 0x76, "SP after the allocation");
+    let word = |at: usize| u16::from_le_bytes(bus.memory[at..at + 2].try_into().unwrap());
+    assert_eq!(word(0x7e), 0x100, "saved BP");
+    assert_eq!(word(0x7c), 0xbeef, "display entry");
+    assert_eq!(word(0x7a), 0x7e, "FrameTemp");
+}
+
+
+#[test]

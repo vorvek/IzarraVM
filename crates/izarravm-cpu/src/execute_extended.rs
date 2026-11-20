@@ -1314,13 +1314,11 @@ impl CpuGsw {
             // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
             // Same clock cost (7) as those.
             0xa1 => {
-                let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Fs, value)?;
+                self.pop_segment(bus, SegmentIndex::Fs, operand_size)?;
                 Ok(self.charge(TimingClass::PopSeg))
             }
             0xa9 => {
-                let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Gs, value)?;
+                self.pop_segment(bus, SegmentIndex::Gs, operand_size)?;
                 Ok(self.charge(TimingClass::PopSeg))
             }
             _ => Err(undefined_opcode()),
