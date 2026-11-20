@@ -501,3 +501,116 @@ fn proprietary_mode_0x150_is_320x240x8() {
     assert_eq!((display.width, display.height, display.bpp), (320, 240, 8));
     assert_eq!(display.pitch, 320); // 320 * 1 byte per pixel
 }
+
+/// The destination offsets of an overlay rectangle that land inside the screen
+/// and inside the rows being composed, by the plain per-pixel rules.
+fn reference_overlay(margo: &Margo, out: &mut [u32], rows: std::ops::Range<usize>) {
+    let width = margo.display.width as u64;
+    let height = margo.display.height as u64;
+    let dst_xy = margo.overlay_reg(REG_OVL_DST_XY);
+    let dst_dim = margo.overlay_reg(REG_OVL_DST_DIM);
+    let src_dim = margo.overlay_reg(REG_OVL_SRC_DIM);
+    let (dst_x, dst_y) = ((dst_xy & 0xffff) as u64, (dst_xy >> 16) as u64);
+    let (dst_w, dst_h) = ((dst_dim & 0xffff) as u64, (dst_dim >> 16) as u64);
+    let (src_w, src_h) = ((src_dim & 0xffff) as u64, (src_dim >> 16) as u64);
+    let len = margo.vram.len() as u64;
+    for dy in 0..dst_h {
+        let sy_screen = dst_y + dy;
+        if sy_screen >= height || !rows.contains(&(sy_screen as usize)) {
+            continue;
+        }
+        for dx in 0..dst_w {
+            let sx_screen = dst_x + dx;
+            if sx_screen >= width {
+                continue;
+            }
+            let sx = (dx * src_w) / dst_w;
+            let sy = (dy * src_h) / dst_h;
+            if let Some((y, u, v)) = margo.sample_overlay(0, sx, sy, len) {
+                out[(sy_screen * width + sx_screen) as usize] =
+                    margo.present_overlay_pixel(yuv_to_argb(y, u, v), sx_screen, sy_screen);
+            }
+        }
+    }
+}
+
+fn overlay_margo(dst_xy: u32, dst_dim: u32) -> Margo {
+    let mut margo = Margo::default();
+    margo.set_mode_640x480x8();
+    let base = 0x10_0000usize;
+    for i in 0..16 * 8 {
+        margo.write_vram_u8(base + i, (i as u8).wrapping_mul(37).wrapping_add(11));
+    }
+    write_reg(&mut margo, REG_OVL_CTRL, 1); // enabled, YUY2
+    write_reg(&mut margo, REG_OVL_SRC_Y, base as u32);
+    write_reg(&mut margo, REG_OVL_SRC_PITCH, 16);
+    write_reg(&mut margo, REG_OVL_SRC_DIM, 8 | (8 << 16));
+    write_reg(&mut margo, REG_OVL_DST_XY, dst_xy);
+    write_reg(&mut margo, REG_OVL_DST_DIM, dst_dim);
+    margo
+}
+
+#[test]
+fn a_partly_off_screen_overlay_matches_the_per_pixel_reference() {
+    // 40x30 rectangle whose top-left is 10 pixels inside the right edge and 7
+    // inside the bottom edge of the 640x480 screen.
+    let margo = overlay_margo((640 - 10) | ((480 - 7) << 16), 40 | (30 << 16));
+    let palette = [0u32; 256];
+    let actual = margo.scanout_argb(&palette);
+    let mut expected = vec![0u32; 640 * 480];
+    reference_overlay(&margo, &mut expected, 0..480);
+    assert_eq!(actual, expected);
+    assert_ne!(
+        actual[(480 - 1) * 640 + 639],
+        0,
+        "the corner pixel is drawn"
+    );
+}
+
+#[test]
+fn an_overlay_limited_to_some_rows_composes_only_those_rows() {
+    let margo = overlay_margo(100 | (100 << 16), 64 | (64 << 16));
+    let palette = [0u32; 256];
+    let mut actual = Vec::new();
+    let rows = 120..130;
+    margo.scanout_argb_rows(&palette, std::slice::from_ref(&rows), &mut actual);
+    let mut expected = vec![0u32; 640 * 480];
+    reference_overlay(&margo, &mut expected, 120..130);
+    for y in 120..130 {
+        assert_eq!(
+            actual[y * 640..(y + 1) * 640],
+            expected[y * 640..(y + 1) * 640]
+        );
+    }
+}
+
+#[test]
+fn a_65535_square_overlay_composes_quickly_and_matches_the_reference() {
+    let margo = overlay_margo(0, 0xffff | (0xffff << 16));
+    let palette = [0u32; 256];
+    let started = std::time::Instant::now();
+    let actual = margo.scanout_argb(&palette);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let mut expected = vec![0u32; 640 * 480];
+    reference_overlay(&margo, &mut expected, 0..480);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn visible_span_clamps_to_the_screen_and_the_row_window() {
+    // Fully inside.
+    assert_eq!(visible_span(10, 20, 100, 0..100), 0..20);
+    // Cut by the screen edge.
+    assert_eq!(visible_span(90, 20, 100, 0..100), 0..10);
+    // Origin at or past the edge.
+    assert!(visible_span(100, 20, 100, 0..100).is_empty());
+    assert!(visible_span(500, 20, 100, 0..100).is_empty());
+    // Zero extent.
+    assert!(visible_span(5, 0, 100, 0..100).is_empty());
+    // A row window that starts and ends inside the rectangle.
+    assert_eq!(visible_span(10, 50, 100, 20..30), 10..20);
+    // A window that misses the rectangle.
+    assert!(visible_span(10, 5, 100, 40..60).is_empty());
+    // Huge extent.
+    assert_eq!(visible_span(0, 65_535, 480, 0..480), 0..480);
+}

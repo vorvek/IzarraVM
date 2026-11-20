@@ -901,16 +901,15 @@ impl Margo {
         }
         let len = self.vram.len() as u64;
 
-        for dy in 0..dst_h {
+        // Only the part of the rectangle on the screen and inside the composed
+        // rows is visited. The guest sets the rectangle size up to 65535 in
+        // each direction.
+        let dy_span = visible_span(dst_y, dst_h, height, rows.start as u64..rows.end as u64);
+        let dx_span = visible_span(dst_x, dst_w, width, 0..width);
+        for dy in dy_span {
             let screen_y = dst_y + dy;
-            if screen_y >= height || !(rows.start..rows.end).contains(&(screen_y as usize)) {
-                continue;
-            }
-            for dx in 0..dst_w {
+            for dx in dx_span.clone() {
                 let screen_x = dst_x + dx;
-                if screen_x >= width {
-                    continue;
-                }
                 if key_en && !self.primary_keyed(screen_x, screen_y, colorkey) {
                     continue; // occluded: another surface painted over the key here
                 }
@@ -1494,6 +1493,17 @@ impl Margo {
         self.busy_credit_ns -= credit;
         self.busy_ns = self.busy_ns.saturating_sub(ns - credit);
     }
+}
+
+/// The offsets, counted from `origin`, of an `extent`-long run that lie below
+/// `limit` and inside `window` (absolute positions). Empty when nothing is
+/// visible. All arithmetic saturates, so a guest-sized extent cannot overflow.
+fn visible_span(origin: u64, extent: u64, limit: u64, window: Range<u64>) -> Range<u64> {
+    let start = window.start.saturating_sub(origin);
+    let end = extent
+        .min(limit.saturating_sub(origin))
+        .min(window.end.saturating_sub(origin));
+    if start >= end { 0..0 } else { start..end }
 }
 
 #[cfg(test)]
