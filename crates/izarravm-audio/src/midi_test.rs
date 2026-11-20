@@ -634,3 +634,26 @@ fn open_munt_reports_which_rom_requirement_failed() {
         MidiStatus::RomsNotPairable
     );
 }
+
+#[test]
+fn a_full_pending_queue_counts_the_message_it_drops() {
+    let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
+    for frame in 0..MAX_PENDING_MESSAGES as u64 {
+        midi.queue(message(frame, &[0x90, 60, 100]));
+    }
+    assert_eq!(midi.rejected_messages(), 0);
+    midi.queue(message(1, &[0x90, 61, 100]));
+    assert_eq!(midi.pending.len(), MAX_PENDING_MESSAGES);
+    assert_eq!(midi.rejected_messages(), 1);
+}
+
+#[test]
+fn equal_timestamps_keep_their_arrival_order() {
+    let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
+    midi.queue(message(10, &[0x90, 60, 100]));
+    midi.queue(message(10, &[0x90, 61, 100]));
+    midi.queue(message(5, &[0x90, 62, 100]));
+    midi.queue(message(10, &[0x90, 63, 100]));
+    let notes: Vec<_> = midi.pending.iter().map(|m| m.bytes[1]).collect();
+    assert_eq!(notes, [62, 60, 61, 63]);
+}
