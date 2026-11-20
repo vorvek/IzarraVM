@@ -3,8 +3,9 @@
 
 # izarravm-exodos
 
-Classify and translate the eXoDOS corpus. Read-only against the corpus: nothing
-here opens a path under the collection root for write.
+Classify and translate the eXoDOS corpus. Read-only against the corpus: no
+command opens a path under the collection root for write. `translate` and
+`census` refuse an extract root or an output path that overlaps the corpus.
 
 The companion harness is `scripts/sweep-exodos.ps1`, which extracts, calls this
 tool, runs the emulator, archives every artifact and deletes the extracted game
@@ -53,11 +54,20 @@ Turn one already-extracted game into a runnable folder plus an invocation.
 Extraction is the caller's job, so this never opens a zip.
 
     izarravm-exodos translate --conf <dosbox.conf> --extract-root <scratch> \
-        --short DOOM --persona 586 --cycles 20000000000 --output plan.json
+        --short DOOM --persona 586 --cycles 20000000000 --output plan.json         --exodos-root <corpus>
 
 It writes `CONFIG.SYS`, `AUTOEXEC.BAT` and `EXITVM.COM` into the resolved mount
-root, removes eXo's zero-byte `.exo` title marker, clears read-only bits, and
-emits the emulator argument vector along with the classification and a flag set.
+root, deletes every file there whose name ends in `.exo` (eXo's title marker,
+normally zero bytes), clears read-only bits, and emits the emulator argument
+vector along with the classification and a flag set. `--dry-run` skips the
+writes and the clean-up.
+
+Both modes run the path guards first. The tool refuses to run when the extract
+root contains the conf, lies inside the conf's folder, or overlaps the corpus
+root. The corpus root is `--exodos-root`. Without it, the root is the parent of
+the `!dos` folder above `--conf`. The tool also refuses an `--output` path
+inside the corpus root, and a mount root that leaves the extract root through a
+link.
 
 ### What the flattener does
 

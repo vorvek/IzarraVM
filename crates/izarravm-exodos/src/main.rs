@@ -15,6 +15,7 @@ mod bat;
 mod bucket;
 mod classify;
 mod conf;
+mod guard;
 mod recipe;
 mod translate;
 mod tree;
@@ -29,7 +30,7 @@ use serde::Serialize;
 use crate::classify::{Class, classify_conf};
 use crate::conf::DosboxConf;
 use crate::recipe::Recipe;
-use crate::translate::{TranslateOptions, persona_clock_hz, translate};
+use crate::translate::{TranslateOptions, persona_clock_hz, translate_guarded};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Classify and translate the eXoDOS corpus.")]
@@ -73,7 +74,16 @@ enum Command {
         /// when there is no per-game file.
         #[arg(long)]
         recipe_dir: Option<PathBuf>,
-        /// Do not write CONFIG.SYS, AUTOEXEC.BAT or EXITVM.COM.
+        /// The corpus root, the folder that holds `!dos` and the zips. The
+        /// extract root and `--output` must not overlap it. When this is not
+        /// given, the root is the parent of the `!dos` folder above `--conf`,
+        /// if there is one.
+        #[arg(long)]
+        exodos_root: Option<PathBuf>,
+        /// Do not write CONFIG.SYS, AUTOEXEC.BAT or EXITVM.COM into the mount
+        /// root, and do not delete `.exo` files or clear read-only bits there.
+        /// Without this flag, `translate` does all of that. The path guards run
+        /// in both modes.
         #[arg(long)]
         dry_run: bool,
         /// Write the translation record here as well as to stdout.
@@ -110,6 +120,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             cycles,
             recipe,
             recipe_dir,
+            exodos_root,
             dry_run,
             output,
         } => {
@@ -124,7 +135,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 recipe,
                 write: !dry_run,
             };
-            let result = translate(&parsed, &options)?;
+            let result = translate_guarded(
+                &conf,
+                &parsed,
+                &options,
+                exodos_root.as_deref(),
+                output.as_deref(),
+            )?;
             let json = serde_json::to_string_pretty(&result)?;
             if let Some(path) = output {
                 if let Some(parent) = path.parent() {
@@ -203,6 +220,10 @@ struct CensusSummary {
 }
 
 fn run_census(dos_root: &Path, output: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    if let Some(dir) = output {
+        let root = guard::census_corpus_root(dos_root)?;
+        guard::check_output(dir, Some(&root))?;
+    }
     let mut rows = Vec::new();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dos_root)?
         .filter_map(Result::ok)

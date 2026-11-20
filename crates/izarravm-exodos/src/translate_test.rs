@@ -308,3 +308,138 @@ fn an_untranslatable_title_writes_nothing() {
     assert_eq!(result.class, Class::Untranslatable);
     assert!(!dir.path().join("DOOM/AUTOEXEC.BAT").exists());
 }
+
+fn fill_game(extract_root: &Path) {
+    let game = extract_root.join("DOOM");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::write(game.join("RUN.BAT"), RUN_BAT).unwrap();
+    std::fs::write(game.join("DOOM.EXE"), b"x").unwrap();
+    std::fs::write(game.join("DOOM (1993).exo"), b"").unwrap();
+}
+
+/// A corpus laid out as `<tmp>\corpus\!dos\doom\dosbox.conf`.
+fn corpus_conf(dir: &TempDir) -> PathBuf {
+    let folder = dir.path().join("corpus").join("!dos").join("doom");
+    std::fs::create_dir_all(&folder).unwrap();
+    let conf = folder.join("dosbox.conf");
+    std::fs::write(&conf, DOOM_CONF).unwrap();
+    conf
+}
+
+fn guarded(
+    conf_path: &Path,
+    extract_root: &Path,
+    exodos_root: Option<&Path>,
+    output: Option<&Path>,
+    write: bool,
+) -> std::io::Result<TranslateResult> {
+    let options = TranslateOptions {
+        extract_root: extract_root.to_path_buf(),
+        short: "DOOM".to_string(),
+        persona: "586".to_string(),
+        clock_hz: 166_000_000,
+        cycle_budget: 20_000_000_000,
+        recipe: Recipe::generic(),
+        write,
+    };
+    translate_guarded(
+        conf_path,
+        &DosboxConf::parse(DOOM_CONF),
+        &options,
+        exodos_root,
+        output,
+    )
+}
+
+#[test]
+fn an_extract_root_inside_the_corpus_is_refused_and_nothing_is_written() {
+    let dir = TempDir::new();
+    let conf = corpus_conf(&dir);
+    let scratch = dir.path().join("corpus").join("scratch");
+    fill_game(&scratch);
+
+    let error = guarded(&conf, &scratch, None, None, true).expect_err("refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    let game = scratch.join("DOOM");
+    assert!(!game.join("CONFIG.SYS").exists());
+    assert!(!game.join("AUTOEXEC.BAT").exists());
+    assert!(!game.join("EXITVM.COM").exists());
+    assert!(game.join("DOOM (1993).exo").exists());
+}
+
+#[test]
+fn an_extract_root_beside_the_corpus_is_accepted_and_written() {
+    let dir = TempDir::new();
+    let conf = corpus_conf(&dir);
+    let scratch = dir.path().join("scratch");
+    fill_game(&scratch);
+
+    guarded(&conf, &scratch, None, None, true).expect("accepted");
+    assert!(scratch.join("DOOM").join("CONFIG.SYS").exists());
+}
+
+#[test]
+fn the_guard_runs_in_a_dry_run_too() {
+    let dir = TempDir::new();
+    let conf = corpus_conf(&dir);
+    let scratch = dir.path().join("corpus").join("scratch");
+    fill_game(&scratch);
+    assert!(guarded(&conf, &scratch, None, None, false).is_err());
+}
+
+#[test]
+fn an_extract_root_that_holds_the_conf_is_refused() {
+    let dir = TempDir::new();
+    let conf = corpus_conf(&dir);
+    fill_game(dir.path());
+    assert!(guarded(&conf, dir.path(), None, None, true).is_err());
+    assert!(!dir.path().join("DOOM").join("CONFIG.SYS").exists());
+}
+
+#[test]
+fn an_explicit_exodos_root_is_the_corpus_for_the_overlap_test() {
+    let dir = TempDir::new();
+    let conf = corpus_conf(&dir);
+    let root = dir.path().join("corpus");
+    let inside = root.join("scratch");
+    fill_game(&inside);
+    assert!(guarded(&conf, &inside, Some(&root), None, true).is_err());
+    let beside = dir.path().join("scratch");
+    fill_game(&beside);
+    assert!(guarded(&conf, &beside, Some(&root), None, true).is_ok());
+}
+
+#[test]
+fn an_output_path_inside_the_corpus_is_refused_in_a_dry_run() {
+    let dir = TempDir::new();
+    let conf = corpus_conf(&dir);
+    let scratch = dir.path().join("scratch");
+    fill_game(&scratch);
+    let inside = dir.path().join("corpus").join("plan.json");
+    assert!(guarded(&conf, &scratch, None, Some(&inside), false).is_err());
+    let beside = dir.path().join("plan.json");
+    assert!(guarded(&conf, &scratch, None, Some(&beside), false).is_ok());
+}
+
+#[test]
+fn a_mount_root_that_leaves_the_extract_root_is_refused() {
+    let dir = TempDir::new();
+    let conf = corpus_conf(&dir);
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let target = dir.path().join("corpus").join("real-game");
+    fill_game(&target);
+    std::fs::rename(target.join("DOOM"), dir.path().join("moved")).unwrap();
+    let link = scratch.join("DOOM");
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_dir(dir.path().join("moved"), &link);
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(dir.path().join("moved"), &link);
+    if linked.is_err() {
+        // Creating a link needs a privilege some hosts do not grant.
+        return;
+    }
+    let error = guarded(&conf, &scratch, None, None, true).expect_err("refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!dir.path().join("moved").join("CONFIG.SYS").exists());
+}

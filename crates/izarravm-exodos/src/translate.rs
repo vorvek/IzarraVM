@@ -18,6 +18,7 @@ use serde::Serialize;
 use crate::bat::{Flattened, Flattener};
 use crate::classify::{Class, ConfVerdict, classify_conf};
 use crate::conf::{AutoexecStep, DosboxConf};
+use crate::guard;
 use crate::recipe::Recipe;
 use crate::tree::{Tree, guest_path};
 
@@ -95,6 +96,24 @@ pub fn persona_clock_hz(persona: &str) -> u64 {
     }
 }
 
+/// Run the path guards, then `translate`. The guards run before anything is
+/// read from the extract root, and also in a dry run: `output` is a write
+/// target in both modes.
+pub fn translate_guarded(
+    conf_path: &Path,
+    conf: &DosboxConf,
+    options: &TranslateOptions,
+    exodos_root: Option<&Path>,
+    output: Option<&Path>,
+) -> std::io::Result<TranslateResult> {
+    guard::check_extract_root(conf_path, &options.extract_root, exodos_root)?;
+    if let Some(output) = output {
+        let root = guard::corpus_root(conf_path, exodos_root)?;
+        guard::check_output(output, root.as_deref())?;
+    }
+    translate(conf, options)
+}
+
 pub fn translate(
     conf: &DosboxConf,
     options: &TranslateOptions,
@@ -104,6 +123,19 @@ pub fn translate(
     let mut reasons: Vec<String> = verdict.reasons.clone();
 
     let hdd_folder = resolve_mount_root(&options.extract_root, conf, &options.short);
+    // A link inside the extract root can lead out of it. The mount root must
+    // still lie inside the extract root after links are resolved.
+    let canonical_extract = guard::canonical_lenient(&options.extract_root)?;
+    if !guard::canonical_lenient(&hdd_folder)?.starts_with(&canonical_extract) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "the mount root {} leaves the extract root {}",
+                hdd_folder.display(),
+                options.extract_root.display()
+            ),
+        ));
+    }
     let tree = Tree::index(&hdd_folder)?;
     if tree.max_depth > crate::tree::MAX_TREE_DEPTH {
         reasons.push("tree-too-deep".to_string());
@@ -613,10 +645,11 @@ fn resolve_corpus_path(extract_root: &Path, spec: &str) -> Option<PathBuf> {
     Some(current)
 }
 
-/// Make the scratch tree safe to mount: drop eXo's zero-byte `.exo` title
-/// marker (the one name in a typical tree that FAT folding would rename), and
-/// clear read-only bits, which make Katea's write reconciliation retry a
-/// rename forever.
+/// Make the scratch tree safe to mount: delete every file whose name ends in
+/// `.exo` whatever its size (eXo's title marker is such a file, normally with
+/// zero bytes, and it is the one name in a typical tree that FAT folding would
+/// rename), and clear read-only bits, which make Katea's write reconciliation
+/// retry a rename forever.
 fn prepare_tree(root: &Path) -> std::io::Result<()> {
     for entry in walkdir::WalkDir::new(root)
         .into_iter()

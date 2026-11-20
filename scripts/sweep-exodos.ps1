@@ -668,6 +668,7 @@ foreach ($short in $Games) {
             'translate',
             '--conf', $conf,
             '--extract-root', $scratch,
+            '--exodos-root', $Corpus,
             '--short', $short,
             '--persona', $Persona,
             '--cycles', "$cycleBudget",
