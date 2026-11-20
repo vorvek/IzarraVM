@@ -444,6 +444,12 @@ impl CpuGsw {
                                     OperandSize::Dword,
                                     BusAccessKind::DataRead,
                                 )?;
+                                // A 16-bit operand size loads a 24-bit base.
+                                let base = if operand_size == OperandSize::Word {
+                                    base & 0x00ff_ffff
+                                } else {
+                                    base
+                                };
                                 let table = DescriptorTable { base, limit };
                                 if reg == 2 {
                                     self.gdtr = table;

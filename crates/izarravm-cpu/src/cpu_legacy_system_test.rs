@@ -3575,3 +3575,23 @@ fn task_switch_ldt_load_keeps_its_fault_vector() {
 }
 
 #[test]
+fn lgdt_and_lidt_with_a_16_bit_operand_keep_a_24_bit_base() {
+    for (modrm, prefix) in [(0x16u8, false), (0x1e, false), (0x16, true), (0x1e, true)] {
+        let mut code = Vec::new();
+        if prefix {
+            code.push(0x66);
+        }
+        code.extend_from_slice(&[0x0f, 0x01, modrm, 0x20, 0x00]);
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x80);
+        memory[0x20..0x22].copy_from_slice(&0x0027u16.to_le_bytes());
+        memory[0x22..0x26].copy_from_slice(&0xff12_3456u32.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        exec_one_split(&mut cpu, &mut bus).unwrap();
+        let table = if modrm == 0x16 { cpu.gdtr } else { cpu.idtr };
+        let expected = if prefix { 0xff12_3456 } else { 0x0012_3456 };
+        assert_eq!(table.base, expected, "modrm {modrm:#x} prefix {prefix}");
+        assert_eq!(table.limit, 0x27);
+    }
+}
+
+#[test]
