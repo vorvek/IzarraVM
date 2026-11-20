@@ -4210,6 +4210,7 @@ fn restricted_rep_collision_fixture(is_out: bool) -> (CpuGsw, TestBus) {
     }
     cpu.tr.base = TSS;
     cpu.tr.limit = 0xfff;
+    cpu.tr.access = 0x8b;
     cpu.registers.eip = 0x100;
     cpu.registers.set_esi(OPERAND);
     cpu.registers.set_edi(OPERAND);

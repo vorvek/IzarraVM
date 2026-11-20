@@ -1347,6 +1347,14 @@ impl CpuGsw {
         if !self.is_v86_mode() && self.current_privilege_level() <= self.iopl() {
             return Ok(());
         }
+        // Only a 32-bit TSS holds an I/O permission bitmap. A 16-bit TSS, or a TSS too short
+        // for the I/O map base field, denies every port.
+        if !matches!(self.tr.access & 0x1f, 0x09 | 0x0b) || self.tr.limit < 0x67 {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
+        }
         let io_base = self.read_system_linear(bus, self.tr.base + 0x66, BusWidth::Word)?;
         for p in u32::from(port)..u32::from(port) + width.bytes() {
             let byte_index = io_base + p / 8;

@@ -3391,7 +3391,6 @@ fn waiting_fpu_forms_still_raise_mf_on_a_pending_unmasked_exception() {
     }
 }
 
-
 fn assert_exception(result: ExecResult<CycleOutcome>, vector: u8, code: Option<u32>) {
     match result {
         Err(InternalFault::Exception {
@@ -3467,13 +3466,16 @@ fn enter_with_nesting_builds_the_display_in_manual_order() {
     let mut bus = TestBus::with_memory(memory);
     exec_one_split(&mut cpu, &mut bus).unwrap();
     assert_eq!(cpu.read_gpr16(5), 0x7e, "BP = FrameTemp");
-    assert_eq!(cpu.registers.esp() & 0xffff, 0x76, "SP after the allocation");
+    assert_eq!(
+        cpu.registers.esp() & 0xffff,
+        0x76,
+        "SP after the allocation"
+    );
     let word = |at: usize| u16::from_le_bytes(bus.memory[at..at + 2].try_into().unwrap());
     assert_eq!(word(0x7e), 0x100, "saved BP");
     assert_eq!(word(0x7c), 0xbeef, "display entry");
     assert_eq!(word(0x7a), 0x7e, "FrameTemp");
 }
-
 
 #[test]
 fn iretd_in_real_mode_ignores_vm_in_the_popped_flags() {
@@ -3507,7 +3509,6 @@ fn group6_lar_and_lsl_raise_ud_in_v86_mode() {
         assert_exception(result, 6, None);
     }
 }
-
 
 #[test]
 fn mov_sreg_encodings_without_a_register_raise_ud() {
@@ -3619,3 +3620,31 @@ fn mov_ss_requires_rpl_and_dpl_equal_to_cpl() {
 }
 
 #[test]
+fn io_permission_needs_a_32_bit_tss_that_holds_the_bitmap() {
+    // IN AL,0x10 at CPL 3 with IOPL 0 reads the bitmap bit for port 0x10. The bitmap starts at
+    // TSS offset 0x68. Port 0x10 is bit 0 of byte 2.
+    // (access byte, limit, permitted)
+    let cases: [(u8, u32, bool); 5] = [
+        (0x8b, 0x6f, true),
+        (0x89, 0x6f, true),
+        (0x81, 0x6f, false),
+        (0x83, 0x6f, false),
+        (0x8b, 0x60, false),
+    ];
+    for (access, limit, permitted) in cases {
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(&[0xe4, 0x10], &[]);
+        memory[0x300 + 0x66..0x300 + 0x68].copy_from_slice(&0x68u16.to_le_bytes());
+        cpu.cpl = 3;
+        cpu.registers.eflags = 0x202;
+        cpu.tr.base = 0x300;
+        cpu.tr.limit = limit;
+        cpu.tr.access = access;
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        if permitted {
+            result.unwrap();
+        } else {
+            assert_exception(result, 13, Some(0));
+        }
+    }
+}
