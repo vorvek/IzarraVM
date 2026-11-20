@@ -886,7 +886,10 @@ impl Machine {
             ("AUTOEXEC.BAT", "AUTOEXEC.OLD", &autoexec),
         ] {
             let live = root.join(live_name);
-            if live.exists() {
+            // A live file that already equals the defaults holds nothing to save.
+            // Renaming it would replace the earlier backup with the defaults.
+            let is_default = std::fs::read(&live).is_ok_and(|current| current == *bytes);
+            if live.exists() && !is_default {
                 // Best-effort backup (std::fs::rename replaces an existing .OLD on Windows).
                 let _ = std::fs::rename(&live, root.join(old_name));
             }

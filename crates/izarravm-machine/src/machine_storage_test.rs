@@ -535,6 +535,55 @@ fn repair_uses_the_disabled_stock_autoexec() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+fn repair_machine(tag: &str) -> (Machine, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("katea_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .unwrap();
+    machine.mount_hdd_folder(&dir).unwrap();
+    std::fs::write(dir.join("CONFIG.SYS"), b"REM USER CONFIG\r\n").unwrap();
+    std::fs::write(dir.join("AUTOEXEC.BAT"), b"SET BLASTER=USER\r\n").unwrap();
+    (machine, dir)
+}
+
+#[test]
+fn second_repair_keeps_the_first_backup() {
+    let (mut machine, dir) = repair_machine("repair_twice");
+    machine.perform_toka_service(0x01);
+    assert_eq!(machine.toka_service_status, 0);
+    machine.perform_toka_service(0x01);
+    assert_eq!(machine.toka_service_status, 0);
+    assert_eq!(
+        std::fs::read(dir.join("AUTOEXEC.OLD")).unwrap(),
+        b"SET BLASTER=USER\r\n"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("CONFIG.OLD")).unwrap(),
+        b"REM USER CONFIG\r\n"
+    );
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repair_after_an_edit_backs_up_the_edit() {
+    let (mut machine, dir) = repair_machine("repair_edit");
+    machine.perform_toka_service(0x01);
+    std::fs::write(dir.join("AUTOEXEC.BAT"), b"SET BLASTER=EDITED\r\n").unwrap();
+    machine.perform_toka_service(0x01);
+    assert_eq!(machine.toka_service_status, 0);
+    assert_eq!(
+        std::fs::read(dir.join("AUTOEXEC.OLD")).unwrap(),
+        b"SET BLASTER=EDITED\r\n"
+    );
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn user_folder_overlay_keeps_binaries_drops_config() {
     let payload = vec![
