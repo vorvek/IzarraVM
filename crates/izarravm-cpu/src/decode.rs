@@ -493,16 +493,16 @@ impl CpuGsw {
         }
     }
 
-    /// Stage A of the decode/execute split. Reads the prefixes and opcode (mirroring the top
-    /// of the legacy fused path) and, for the opcodes already converted to the split, parses
-    /// the ModRM + addressing-mode descriptor up front. Opcodes still on the legacy path leave
-    /// `modrm`/`operand` as `None`; `execute_decoded` hands them to the shared fused dispatch,
-    /// which re-reads their ModRM/immediates from the post-opcode eip.
+    /// Stage A of the decode/execute split. Reads the prefixes and opcode and, for
+    /// the opcodes in a split group, parses the ModRM + addressing-mode descriptor up front.
+    /// Opcodes on the fallback path leave `modrm`/`operand` as `None`; `execute_decoded` hands
+    /// them to the fallback dispatch, which re-reads their ModRM/immediates from the
+    /// post-opcode eip.
     ///
     /// Clock note (rule 2): decode's real `fetch_u8` reads charge the instruction-fetch clocks
     /// for the prefixes + opcode exactly once. `execute_decoded` charges nothing extra: the
-    /// split opcode runs from the pre-decoded operand, and the legacy fallback continues the
-    /// fused dispatch from where decode left off (it does NOT re-read the prefixes/opcode).
+    /// split opcode runs from the pre-decoded operand, and the fallback continues the
+    /// dispatch from where decode left off (it does NOT re-read the prefixes/opcode).
     pub(super) fn decode<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<DecodedInsn> {
         let start_eip = self.registers.eip;
         let (prefixes, opcode) = self.read_prefixes(bus)?;

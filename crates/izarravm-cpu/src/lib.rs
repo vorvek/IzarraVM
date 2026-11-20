@@ -3767,9 +3767,8 @@ enum DecodeGroup {
     /// LSS additionally arms the one-instruction interrupt shadow (the same shadow MOV SS/POP SS
     /// arm) so a following instruction cannot be interrupted between the offset and selector
     /// halves of the pointer settling. Folded into `insn.opcode` as 0x0F00 | second for the 0F
-    /// forms and dispatched off the full u16. The genuinely-unimplemented neighbours (0F 21/23 MOV
-    /// reg,DR / MOV DR,reg, 0x63 ARPL) are NOT routed here -- they stay on Fallback / TwoByteFallback
-    /// (the fused path #UDs them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
+    /// forms and dispatched off the full u16. The neighbours 0F 21/23 (MOV reg,DR / MOV DR,reg)
+    /// and 0x63 (ARPL) are routed here too (`route_group` and `execute_system_seg_decoded`).
     SystemSeg,
     /// The x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF plus WAIT/FWAIT (0x9B).
     /// Each escape opcode carries a ModRM whose `mod` field selects the form — `mod != 3` is a

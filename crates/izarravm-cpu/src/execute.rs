@@ -721,14 +721,6 @@ impl CpuGsw {
         }
     }
 
-    /// The arithmetic /ext groups 1-4 (ALU r/m,imm; shift/rotate; TEST/NOT/NEG/MUL/IMUL/DIV/IDIV;
-    /// INC/DEC byte) through the decode/execute split. Every opcode is a ModRM whose `reg` field
-    /// selects the sub-op; `decode` already parsed the ModRM + addressing descriptor and fetched the
-    /// conditional immediate, so the executor resolves the r/m operand from the pre-decoded
-    /// descriptor (EA recomputed against the live registers) and reuses `self.alu`/`shift_rotate`/
-    /// `mul`/`div`/`inc_dec` verbatim. Each arm mirrors its former fused handler exactly — same
-    /// operand wiring, same write-back gating (CMP and TEST compute flags only), same #DE/#UD fault
-    /// points, same clocks — so behavior and the bytes consumed stay byte-for-byte unchanged.
     /// The whole architectural body of `PUSHA`/`PUSHAD` (0x60), factored out of the opcode arm so
     /// the JIT's `PushAllDword` call-out slot runs THIS code rather than a copy of it. Two
     /// consumers, one body: the exact-clocks and exact-effects claims the call-out makes are then
@@ -803,6 +795,14 @@ impl CpuGsw {
         Ok(())
     }
 
+    /// The arithmetic /ext groups 1-4 (ALU r/m,imm; shift/rotate; TEST/NOT/NEG/MUL/IMUL/DIV/IDIV;
+    /// INC/DEC byte) through the decode/execute split. Every opcode is a ModRM whose `reg` field
+    /// selects the sub-op; `decode` already parsed the ModRM + addressing descriptor and fetched the
+    /// conditional immediate, so the executor resolves the r/m operand from the pre-decoded
+    /// descriptor (EA recomputed against the live registers) and reuses `self.alu`/`shift_rotate`/
+    /// `mul`/`div`/`inc_dec` verbatim. Each arm keeps the old handler behavior: same
+    /// operand wiring, same write-back gating (CMP and TEST compute flags only), same #DE/#UD fault
+    /// points, same clocks, so the behavior and the bytes consumed do not change.
     pub(super) fn execute_group_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
@@ -1337,7 +1337,9 @@ impl CpuGsw {
         Ok(())
     }
 
-    /// Execute a decoded IN/OUT with shared live-privilege core pricing.
+    /// Check the I/O permission for an access of `width` bytes at `port`. Return #GP(0) when the
+    /// TSS is not a 32-bit TSS with an I/O map base field, when the bitmap lies beyond the TSS
+    /// limit, or when any covered bit is set.
     pub(crate) fn check_io_permission<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1376,6 +1378,7 @@ impl CpuGsw {
         Ok(())
     }
 
+    /// Execute a decoded IN/OUT with shared live-privilege core pricing.
     pub(super) fn execute_port_io_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,

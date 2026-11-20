@@ -984,29 +984,6 @@ impl CpuGsw {
         Ok(value)
     }
 
-    /// Write a value to a linear address through paging with implicit-supervisor
-    /// semantics. See `read_system_linear_u32`. Used for TSS busy-bit updates, the segment
-    /// descriptor's Accessed bit, the task-switch state save, and page-table-adjacent
-    /// bookkeeping (accessed/dirty bits) done on the guest's behalf while servicing a
-    /// system-structure access.
-    ///
-    /// IT REPORTS THE WRITE, exactly as `write_page_walk_entry` (memory.rs) does for the other
-    /// on-the-guest's-behalf store the CPU makes. It did neither: no `record_write_page`, so a
-    /// descriptor write left the 486 prefetch queue holding bytes it had just overwritten, and no
-    /// `note_code_write`, so a descriptor sharing a page with code did not invalidate the decode
-    /// cache or a compiled block covering it.
-    ///
-    /// The `InterpretOne` call-out is where that second omission stopped being merely exotic.
-    /// `load_protected_segment` writes the Accessed bit from inside the helper, with a native
-    /// block live on the host stack, and R5 decides whether the block may resume by reading the
-    /// deferred list -- which `note_code_write` is the only thing that fills. A GDT entry on the
-    /// running block's own page was therefore invisible to R5, and the block resumed over code the
-    /// descriptor write had just changed. Reporting it here puts that store on the same footing as
-    /// every other write the guest can make: deferred while the window is open, drained after.
-    ///
-    /// Unconditional invalidation, no same-value elision, for `write_page_walk_entry`'s reason:
-    /// the old bytes were consumed before the write and re-reading them to compare would not earn
-    /// its cost on a path this cold.
     /// The reflected-call memo's REPLAY write entry point (slice1 plan Revision 2
     /// amendments, item 2). Its body is exactly `write_system_linear`'s TAIL, taken
     /// from an address that is ALREADY PHYSICAL:
@@ -1048,6 +1025,29 @@ impl CpuGsw {
         Ok(())
     }
 
+    /// Write a value to a linear address through paging with implicit-supervisor
+    /// semantics. See `read_system_linear_u32`. Used for TSS busy-bit updates, the segment
+    /// descriptor's Accessed bit, the task-switch state save, and page-table-adjacent
+    /// bookkeeping (accessed/dirty bits) done on the guest's behalf while servicing a
+    /// system-structure access.
+    ///
+    /// IT REPORTS THE WRITE, exactly as `write_page_walk_entry` (memory.rs) does for the other
+    /// on-the-guest's-behalf store the CPU makes. It did neither: no `record_write_page`, so a
+    /// descriptor write left the 486 prefetch queue holding bytes it had just overwritten, and no
+    /// `note_code_write`, so a descriptor sharing a page with code did not invalidate the decode
+    /// cache or a compiled block covering it.
+    ///
+    /// The `InterpretOne` call-out is where that second omission stopped being merely exotic.
+    /// `load_protected_segment` writes the Accessed bit from inside the helper, with a native
+    /// block live on the host stack, and R5 decides whether the block may resume by reading the
+    /// deferred list -- which `note_code_write` is the only thing that fills. A GDT entry on the
+    /// running block's own page was therefore invisible to R5, and the block resumed over code the
+    /// descriptor write had just changed. Reporting it here puts that store on the same footing as
+    /// every other write the guest can make: deferred while the window is open, drained after.
+    ///
+    /// Unconditional invalidation, no same-value elision, for `write_page_walk_entry`'s reason:
+    /// the old bytes were consumed before the write and re-reading them to compare would not earn
+    /// its cost on a path this cold.
     fn write_system_linear<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1441,12 +1441,6 @@ impl CpuGsw {
         Ok(())
     }
 
-    /// `release` is the RETF imm16 count. The caller still applies it to the
-    /// OUTER stack after this returns (the PRM's second increment); the
-    /// inter-privilege arm below additionally applies it to the INNER stack
-    /// before popping SS:eSP (386 PRM RET, outer level: "Increment eSP by 8
-    /// plus the immediate offset" -- the parameter block copied by the call
-    /// gate sits between CS:IP and the saved SS:eSP).
     /// The stage-0 arity census's SITE key, sampled before the return (§5.0a). THROWAWAY.
     ///
     /// The linear just PAST the RETF rather than the RETF's own start: `eip` has already been
@@ -1474,6 +1468,12 @@ impl CpuGsw {
         }
     }
 
+    /// `release` is the RETF imm16 count. The caller still applies it to the
+    /// OUTER stack after this returns (the PRM's second increment); the
+    /// inter-privilege arm in `return_far_body` additionally applies it to the INNER stack
+    /// before popping SS:eSP (386 PRM RET, outer level: "Increment eSP by 8
+    /// plus the immediate offset", the parameter block copied by the call
+    /// gate sits between CS:IP and the saved SS:eSP).
     pub(super) fn return_far<B: CpuBus>(
         &mut self,
         bus: &mut B,
