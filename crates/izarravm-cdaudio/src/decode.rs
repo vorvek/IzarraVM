@@ -15,8 +15,10 @@
 //! backstop, not the mechanism: the decode works from the probe's own frame
 //! count, so the two agree by construction rather than by both being right.
 
-use crate::probe::{CD_SAMPLE_RATE, CdAudioError, SAMPLES_PER_FRAME, TrackInfo, open};
-use crate::sniff::{Container, SNIFF_BYTES, sniff};
+use crate::probe::{
+    CD_SAMPLE_RATE, CdAudioError, SAMPLES_PER_FRAME, TrackInfo, decode_error, open, sniff_file,
+};
+use crate::sniff::Container;
 use izarravm_audio::Resampler;
 use izarravm_core::AUDIO_FRAME_BYTES;
 use std::path::Path;
@@ -140,9 +142,8 @@ pub fn decode_into_cancellable(
         for frame in interleaved[..take * channels].chunks(channels) {
             // A CD has two channels. Mono is duplicated so it is heard on both
             // rather than only on the left; anything past the second is
-            // dropped, which is the same reduction any player does for a
-            // surround source on a stereo device.
-            let left = i32::from(frame[0]);
+            // dropped. The probe logged one warning for such a source.
+            let left = frame.first().map_or(0, |s| i32::from(*s));
             let right = frame.get(1).map_or(left, |s| i32::from(*s));
             pairs.push((left, right));
         }
@@ -209,47 +210,13 @@ pub fn decode_into_cancellable(
     Ok(produced)
 }
 
-fn decode_error(path: &Path, message: impl std::fmt::Display) -> CdAudioError {
-    CdAudioError::Decode {
-        path: path.display().to_string(),
-        message: message.to_string(),
-    }
-}
-
 /// Identify the file again at decode time. The mount deliberately let go of its
 /// handle so the user could still move or delete their own rips, which means
 /// this is a second look at a file that may have changed since -- and a file
 /// that is no longer a container must fail rather than have its new contents
 /// played as audio.
 fn container_of(path: &Path) -> Result<Container, CdAudioError> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).map_err(|source| CdAudioError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let len = file
-        .metadata()
-        .map_err(|source| CdAudioError::Io {
-            path: path.display().to_string(),
-            source,
-        })?
-        .len();
-    let mut head = vec![0u8; SNIFF_BYTES];
-    let mut filled = 0;
-    while filled < head.len() {
-        match file.read(&mut head[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(source) => {
-                return Err(CdAudioError::Io {
-                    path: path.display().to_string(),
-                    source,
-                });
-            }
-        }
-    }
-    head.truncate(filled);
-    sniff(&head, len)
+    sniff_file(path)?
         .ok_or_else(|| decode_error(path, "is no longer an audio container the CD path can read"))
 }
 
