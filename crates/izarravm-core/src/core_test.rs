@@ -701,3 +701,12 @@ fn stripping_reports_nothing_for_a_file_without_the_retired_keys() {
     .unwrap();
     assert!(crate::strip_retired_keys(&mut value).is_empty());
 }
+
+/// The shipped example must not name a host folder: a user starts from it, and
+/// the GUI mounts C: read-write. An absent key keeps the default value.
+#[test]
+fn example_machine_config_names_no_host_folder() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/machine.toml");
+    let config = AppConfig::from_toml_path(path).unwrap();
+    assert_eq!(config.dos.c_drive, PathBuf::from("."));
+}
