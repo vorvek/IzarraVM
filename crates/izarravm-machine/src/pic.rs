@@ -479,8 +479,15 @@ impl Pic8259Pair {
             self.slave.request(irq - 8);
             // The slave INT line is wired to the master IR pin named by the
             // slave's ICW3 id (bits 2-0); the AT default is master IR2.
-            let cascade_pin = self.slave.icw3 & 0x07;
-            self.master.request(cascade_pin);
+            // A line masked in the slave IMR keeps INT low, so it sends no
+            // edge. Unmasking it later runs `sync_cascade`, which sends the edge.
+            // Limit: a request on a lower-priority slave line while a higher
+            // one is in service still pulses the master here. The real slave
+            // keeps INT low until the in-service bit clears.
+            if self.slave.imr & (1 << (irq - 8)) == 0 {
+                let cascade_pin = self.slave.icw3 & 0x07;
+                self.master.request(cascade_pin);
+            }
         }
         // irq >= 16 is not a PC interrupt line; ignore it in release builds.
     }

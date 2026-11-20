@@ -410,6 +410,33 @@ fn slave_line_dropped_before_ack_is_spurious_ir7() {
 }
 
 #[test]
+fn masked_slave_request_does_not_raise_the_master_cascade_pin() {
+    let mut pic = master_initialized();
+    slave_initialized(&mut pic);
+    pic.write_port(0xa1, 0x02); // mask slave line 1
+    pic.request(9);
+    assert_eq!(pic.slave.irr, 0x02);
+    assert_eq!(pic.master.irr, 0x00);
+    assert!(!pic.interrupt_pending());
+    assert_eq!(pic.acknowledge(), None);
+}
+
+#[test]
+fn unmasking_a_latched_slave_request_delivers_it_once() {
+    let mut pic = master_initialized();
+    slave_initialized(&mut pic);
+    pic.write_port(0xa1, 0x02);
+    pic.request(9);
+    pic.write_port(0xa1, 0x00); // unmask: the slave INT line rises
+    assert_eq!(pic.master.irr, 0x04);
+    assert_eq!(pic.acknowledge(), Some(0x71));
+    pic.write_port(0xa0, 0x20);
+    pic.write_port(0x20, 0x20);
+    assert!(!pic.interrupt_pending());
+    assert_eq!(pic.acknowledge(), None);
+}
+
+#[test]
 fn cascade_routing_follows_stored_icw3_id() {
     // Wire the slave onto master IR5 instead of the AT default IR2. Both chips
     // must agree: master ICW3 flags pin 5, slave ICW3 id is 5.
