@@ -206,6 +206,8 @@ pub(super) struct ResolvedStartup {
     /// is the built-in default".
     requested: cmos::RequestedHardware,
     prefs: prefs::GuiPrefs,
+    /// The prefs file existed but its contents were rejected.
+    prefs_rejected: bool,
     prefs_path: PathBuf,
     state_dir: PathBuf,
 }
@@ -283,6 +285,9 @@ impl ResolvedStartup {
         let mut rtc_setup = cmos::RtcSetup::from_c_root(&self.config.dos.c_drive);
         rtc_setup.requested = self.requested;
         let glide_ovl = self.load_global_glide_ovl();
+        if self.prefs_rejected {
+            prefs::GuiPrefs::keep_rejected_copy(&self.prefs_path);
+        }
         GuiLaunch {
             profile: MachineProfile::from_hardware_profile(&self.hardware),
             rom,
@@ -373,7 +378,7 @@ fn resolve_with(
         let _ = std::fs::create_dir_all(&config.dos.c_drive);
     }
     let prefs_path = prefs::prefs_path(&config.dos.c_drive);
-    let saved_prefs = prefs::GuiPrefs::load_with(&prefs_path, &mut read_text);
+    let (saved_prefs, prefs_rejected) = prefs::GuiPrefs::load_checked(&prefs_path, &mut read_text);
     let mut midi_presence = presence.midi;
     midi_presence.backend |= cli.midi_backend.is_some();
     midi_presence.external_port |= cli.midi_port.is_some();
@@ -412,6 +417,7 @@ fn resolve_with(
         host_input,
         requested,
         prefs: saved_prefs,
+        prefs_rejected,
         prefs_path,
         state_dir: locations.state_dir.clone(),
     })

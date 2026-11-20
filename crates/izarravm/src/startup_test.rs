@@ -1023,3 +1023,39 @@ fn a_rom_set_folder_in_the_state_directory_is_discovered() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn rejected_prefs_file_is_copied_aside_only_on_the_gui_path() {
+    let root = startup_test_dir("prefs-rejected");
+    let locations = StartupLocations {
+        state_dir: root.join("state"),
+        executable_dir: root.join("portable"),
+    };
+    let c_drive = root.join("c_drive");
+    std::fs::create_dir_all(&c_drive).unwrap();
+    let prefs_path = prefs::prefs_path(&c_drive);
+    let bad_path = root.join("izarravm.conf.bad");
+    std::fs::write(&prefs_path, "master_volume = \"loud\"\n").unwrap();
+    let cli = Cli::try_parse_from(["izarravm", "--c-drive", c_drive.to_str().unwrap()]).unwrap();
+
+    let resolved = resolve_with(&cli, &locations, |path| std::fs::read_to_string(path)).unwrap();
+    assert!(
+        !bad_path.exists(),
+        "a headless resolve must not touch files"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&prefs_path).unwrap(),
+        "master_volume = \"loud\"\n"
+    );
+
+    let launch = resolved.into_gui(vec![0x42], false);
+    launch.prefs.save(&launch.prefs_path);
+    assert_eq!(
+        std::fs::read_to_string(&bad_path).unwrap(),
+        "master_volume = \"loud\"\n"
+    );
+    assert_ne!(
+        std::fs::read_to_string(&prefs_path).unwrap(),
+        "master_volume = \"loud\"\n"
+    );
+}
