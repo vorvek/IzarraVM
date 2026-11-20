@@ -2196,9 +2196,36 @@ impl Machine {
             .set_vbe_mode_at(request, Some(self.master_ticks()))
         {
             self.vega.legacy_mut().set_dac_component_bits(6);
+            // A guest that saves the mode with AH=0Fh, sets a VBE mode, and
+            // later asks AH=0Fh again must not read the old legacy number.
+            // An installer that sees the saved number does no mode restore,
+            // and the text program it starts then draws below the VBE frame.
+            let display = self.vega.margo_display();
+            if let Some(oem) = Self::vbe_bda_mode_byte(display.mode) {
+                let keep_memory = if request & 0x8000 != 0 { 0x80 } else { 0 };
+                let columns = (display.width / 8) as u16;
+                let rows = (display.height / 16) as u8;
+                self.set_bda_video_mode(oem | keep_memory, columns, rows);
+            }
             self.set_vbe_status(0x004f);
         } else {
             self.set_vbe_status(0x014f);
+        }
+    }
+
+    /// The byte that the BIOS data area holds at 0040:0049 while a VBE mode
+    /// is active. The guest contract is small: the byte is not a legacy mode
+    /// number, each VBE mode has its own byte, and no byte is 7Eh or 7Fh,
+    /// because INT 10h AH=00h reads those two values as Paradise calls. The
+    /// VESA-defined modes use the numbers that are common on S3 boards
+    /// (101h is 69h). The Margo modes above 117h use their low byte. INT 10h
+    /// AH=00h does not accept these numbers.
+    pub(super) fn vbe_bda_mode_byte(vbe_mode: u16) -> Option<u8> {
+        match vbe_mode {
+            0x100..=0x107 => Some((vbe_mode - 0x98) as u8),
+            0x110..=0x117 => Some((vbe_mode - 0xA0) as u8),
+            0x14A..=0x150 => Some(vbe_mode as u8),
+            _ => None,
         }
     }
 

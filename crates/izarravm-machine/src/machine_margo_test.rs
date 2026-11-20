@@ -86,6 +86,100 @@ fn vbe_set_mode_accepts_hi_color_modes() {
     assert_eq!(machine.margo().display().bpp, 16);
 }
 
+/// Runs `4F02h` with the given BX, then `AH=0Fh`, and returns the machine.
+fn machine_after_vbe_set_and_get_mode(bx: u16) -> Machine {
+    let [bl, bh] = bx.to_le_bytes();
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, bl, bh, // mov bx, <request>
+        0xcd, 0x10, // int 10h
+        0xb4, 0x0f, // mov ah, 0Fh
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert_eq!(reason, StopReason::Halted);
+    machine
+}
+
+#[test]
+fn vbe_set_mode_changes_the_mode_that_get_video_mode_reports() {
+    // 640x480 with an 8x16 cell is 80 columns and 30 rows.
+    let mut machine = machine_after_vbe_set_and_get_mode(0x0101);
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x5069);
+    assert_eq!(machine.read_physical_u8(0x449), 0x69);
+    assert_eq!(machine.read_physical_u8(0x484), 29);
+
+    // The linear frame buffer bit is not part of the mode number.
+    let machine = machine_after_vbe_set_and_get_mode(0x4101);
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x5069);
+
+    // BX bit 15 (keep display memory) shows as bit 7, as for a legacy mode.
+    let machine = machine_after_vbe_set_and_get_mode(0x8101);
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x50e9);
+}
+
+#[test]
+fn vbe_set_mode_that_fails_keeps_the_reported_mode() {
+    // 102h (800x600, 16 colors) is not in the Margo mode list.
+    let mut machine = machine_after_vbe_set_and_get_mode(0x0102);
+    assert_eq!(machine.cpu().registers.eax() as u8, 0x03);
+    assert_eq!(machine.read_physical_u8(0x449), 0x03);
+    assert!(!machine.margo_active());
+}
+
+#[test]
+fn guest_that_compares_get_video_mode_restores_text_after_a_vbe_mode() {
+    // The Descent to Undermountain installer saves the mode with AH=0Fh,
+    // sets 101h, and at exit sets the saved mode only if AH=0Fh reports a
+    // different one. Before the VBE mode set wrote the BIOS data area, the
+    // two values were equal and the display stayed on the VBE frame.
+    let rom = rom_with_code(&[
+        0xb4, 0x0f, // mov ah, 0Fh
+        0xcd, 0x10, // int 10h
+        0x88, 0xc2, // mov dl, al (saved mode)
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x01, // mov bx, 0101h
+        0xcd, 0x10, // int 10h
+        0xb4, 0x0f, // mov ah, 0Fh
+        0xcd, 0x10, // int 10h
+        0x38, 0xd0, // cmp al, dl
+        0x74, 0x06, // je done
+        0x88, 0xd0, // mov al, dl
+        0xb4, 0x00, // mov ah, 00h
+        0xcd, 0x10, // int 10h
+        0xb4, 0x0f, // done: mov ah, 0Fh
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    assert_eq!(reason, StopReason::Halted);
+    assert!(!machine.margo_active());
+    assert_eq!(machine.cpu().registers.eax() as u8, 0x03);
+    assert_eq!(machine.read_physical_u8(0x449), 0x03);
+}
+
+#[test]
+fn each_vbe_mode_has_its_own_data_area_mode_byte() {
+    let mut seen = std::collections::BTreeSet::new();
+    for mode in izarravm_video::MARGO_VBE_MODES {
+        let byte = Machine::vbe_bda_mode_byte(mode.number)
+            .unwrap_or_else(|| panic!("mode {:#x} has no byte", mode.number));
+        assert!(byte > 0x13, "mode {:#x} uses a legacy number", mode.number);
+        assert!(
+            byte < 0x80,
+            "mode {:#x} uses the keep-memory bit",
+            mode.number
+        );
+        // INT 10h AH=00h reads AL=7Eh and AL=7Fh as Paradise calls.
+        assert!(!matches!(byte, 0x7e | 0x7f), "mode {:#x}", mode.number);
+        assert!(seen.insert(byte), "mode {:#x} shares a byte", mode.number);
+    }
+}
+
 #[test]
 fn vbe_current_mode_returns_the_set_mode() {
     let rom = rom_with_code(&[
