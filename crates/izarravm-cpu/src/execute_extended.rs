@@ -313,9 +313,9 @@ impl CpuGsw {
         let operand_size = insn.operand_size;
         match insn.opcode {
             0x0f00 => {
-                // Group 6 (SLDT/STR/LLDT/LTR/VERR/VERW). The whole group is invalid outside
-                // protected mode, exactly as the fused handler gated it.
-                if !self.is_protected_mode() {
+                // Group 6 (SLDT/STR/LLDT/LTR/VERR/VERW). The whole group is invalid in real
+                // mode and in V86 mode.
+                if !self.is_protected_mode() || self.is_v86_mode() {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -479,8 +479,8 @@ impl CpuGsw {
                 }
             }
             0x0f02 => {
-                // LAR reg, r/m16: read the descriptor access-rights byte(s). Protected mode only.
-                if !self.is_protected_mode() {
+                // LAR reg, r/m16: read the descriptor access-rights byte(s). Invalid in real mode and V86 mode.
+                if !self.is_protected_mode() || self.is_v86_mode() {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -502,8 +502,8 @@ impl CpuGsw {
                 Ok(self.charge(TimingClass::Lar))
             }
             0x0f03 => {
-                // LSL reg, r/m16: read the descriptor segment limit. Protected mode only.
-                if !self.is_protected_mode() {
+                // LSL reg, r/m16: read the descriptor segment limit. Invalid in real mode and V86 mode.
+                if !self.is_protected_mode() || self.is_v86_mode() {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,

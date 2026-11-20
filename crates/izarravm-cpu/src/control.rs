@@ -1247,7 +1247,10 @@ impl CpuGsw {
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
 
-                if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
+                if self.is_protected_mode()
+                    && self.current_privilege_level() == 0
+                    && flags & FLAG_VM != 0
+                {
                     // 386 PRM STACK-RETURN-TO-V86: "instruction pointer not within code
                     // segment limit THEN #GP(0)" is checked against the popped EIP before
                     // EFLAGS/CS/EIP/ESP or any of the V86 data segments are committed -- the

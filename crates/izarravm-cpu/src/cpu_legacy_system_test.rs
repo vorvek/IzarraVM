@@ -3476,3 +3476,37 @@ fn enter_with_nesting_builds_the_display_in_manual_order() {
 
 
 #[test]
+fn iretd_in_real_mode_ignores_vm_in_the_popped_flags() {
+    let (mut cpu, mut memory) = real_mode_cpu(&[0x66, 0xcf], 0x200);
+    cpu.registers.set_esp(0x80);
+    memory[0x80..0x84].copy_from_slice(&0x20u32.to_le_bytes());
+    memory[0x84..0x88].copy_from_slice(&0u32.to_le_bytes());
+    memory[0x88..0x8c].copy_from_slice(&0x0002_0202u32.to_le_bytes());
+    let mut bus = TestBus::with_memory(memory);
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.registers.esp(), 0x8c, "three dwords popped");
+    assert_eq!(cpu.registers.eip, 0x20);
+    assert_eq!(cpu.registers.eflags & FLAG_VM, 0, "VM is not loaded");
+    assert_eq!(cpu.cpl, 0);
+}
+
+#[test]
+fn group6_lar_and_lsl_raise_ud_in_v86_mode() {
+    let codes: [&[u8]; 4] = [
+        &[0x0f, 0x00, 0xc0],
+        &[0x0f, 0x00, 0xe0],
+        &[0x0f, 0x02, 0xc3],
+        &[0x0f, 0x03, 0xc3],
+    ];
+    for code in codes {
+        let (mut cpu, memory) = protected_cpu_with_gdt(code, &[]);
+        cpu.registers.eflags |= FLAG_VM;
+        assert!(cpu.is_v86_mode());
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, 6, None);
+    }
+}
+
+
+#[test]
