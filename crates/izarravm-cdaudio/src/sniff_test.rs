@@ -93,3 +93,47 @@ fn subchannel_sized_raw_audio_is_not_mp3() {
 fn an_ordinary_binary_file_is_not_a_container() {
     assert_eq!(sniff(&head_of(b"\x00\x01\x02\x03", 4096), 4096), None);
 }
+
+/// Two headers `len` bytes apart in a sniff buffer.
+fn frames_at(first: [u8; 4], len: usize, second: [u8; 4]) -> Vec<u8> {
+    let mut bytes = vec![0u8; SNIFF_BYTES];
+    bytes[0..4].copy_from_slice(&first);
+    bytes[len..len + 4].copy_from_slice(&second);
+    bytes
+}
+
+#[test]
+fn a_bare_mpeg2_layer3_stream_is_mp3() {
+    // MPEG-2 Layer III, 64 kbps, 22.05 kHz: 72 * 64000 / 22050 = 208 bytes.
+    let header = [0xFF, 0xF3, 0x80, 0x00];
+    assert_eq!(
+        sniff(&frames_at(header, 208, header), 4096),
+        Some(Container::Mp3)
+    );
+}
+
+#[test]
+fn a_bare_mpeg25_layer3_stream_is_mp3() {
+    // MPEG-2.5 Layer III, 64 kbps, 11.025 kHz: 72 * 64000 / 11025 = 417 bytes.
+    let header = [0xFF, 0xE3, 0x80, 0x00];
+    assert_eq!(
+        sniff(&frames_at(header, 417, header), 4096),
+        Some(Container::Mp3)
+    );
+}
+
+#[test]
+fn the_reserved_mpeg_version_is_not_a_stream() {
+    let header = [0xFF, 0xEB, 0x80, 0x00];
+    assert_eq!(sniff(&frames_at(header, 208, header), 4096), None);
+}
+
+#[test]
+fn the_second_frame_must_match_the_first_in_version_layer_and_rate() {
+    let mpeg2 = [0xFF, 0xF3, 0x80, 0x00];
+    // MPEG-1 header at the MPEG-2 frame length.
+    assert_eq!(sniff(&frames_at(mpeg2, 208, MPEG_HEADER), 4096), None);
+    // Same version and layer, different sample rate (24 kHz).
+    let other_rate = [0xFF, 0xF3, 0x84, 0x00];
+    assert_eq!(sniff(&frames_at(mpeg2, 208, other_rate), 4096), None);
+}

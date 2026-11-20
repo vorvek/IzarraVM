@@ -91,6 +91,18 @@ pub fn sectors_for(src_frames: u64, src_rate: u32) -> u32 {
 /// Identify `path` and measure it. Ok(None) means it is not an audio container
 /// at all, which the caller mounts as raw bytes exactly as before.
 pub fn probe_info(path: &Path) -> Result<Option<TrackInfo>, CdAudioError> {
+    let Some(container) = sniff_file(path)? else {
+        return Ok(None);
+    };
+    // The handle is dropped by `sniff_file`. Holding it for the mount's life
+    // would stop the user moving or deleting their own rips on Windows while a
+    // disc is mounted; the decode worker reopens the path.
+    measure(path, container).map(Some)
+}
+
+/// Read the head of `path` and identify its container. None means the file is
+/// not an audio container.
+pub(crate) fn sniff_file(path: &Path) -> Result<Option<Container>, CdAudioError> {
     let mut head = vec![0u8; SNIFF_BYTES];
     let mut file = File::open(path).map_err(|source| io_error(path, source))?;
     let read = read_up_to(&mut file, &mut head).map_err(|source| io_error(path, source))?;
@@ -99,23 +111,17 @@ pub fn probe_info(path: &Path) -> Result<Option<TrackInfo>, CdAudioError> {
         .metadata()
         .map_err(|source| io_error(path, source))?
         .len();
-    let Some(container) = sniff(&head, len) else {
-        return Ok(None);
-    };
-    // The handle is dropped at the end of this function. Holding it for the
-    // mount's life would stop the user moving or deleting their own rips on
-    // Windows while a disc is mounted; the decode worker reopens the path.
-    measure(path, container).map(Some)
+    Ok(sniff(&head, len))
 }
 
-fn io_error(path: &Path, source: std::io::Error) -> CdAudioError {
+pub(crate) fn io_error(path: &Path, source: std::io::Error) -> CdAudioError {
     CdAudioError::Io {
         path: path.display().to_string(),
         source,
     }
 }
 
-fn decode_error(path: &Path, message: impl std::fmt::Display) -> CdAudioError {
+pub(crate) fn decode_error(path: &Path, message: impl std::fmt::Display) -> CdAudioError {
     CdAudioError::Decode {
         path: path.display().to_string(),
         message: message.to_string(),
@@ -154,6 +160,15 @@ fn measure(path: &Path, container: Container) -> Result<TrackInfo, CdAudioError>
         .channels
         .as_ref()
         .map_or(2, |c| u16::try_from(c.count()).unwrap_or(u16::MAX));
+    if channels > 2 {
+        // A CD has two channels. The decode takes the first two of each frame
+        // (front left and front right) and drops the rest.
+        tracing::warn!(
+            path = %path.display(),
+            channels,
+            "the source has more than two channels; only the first two are played"
+        );
+    }
 
     let src_frames = match (container, open.num_frames) {
         // For MPEG the container's own count is never trusted. When the encoder

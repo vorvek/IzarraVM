@@ -61,45 +61,81 @@ fn is_bare_mpeg(head: &[u8], len: u64) -> bool {
     if len.is_multiple_of(RAW_FRAME) || len.is_multiple_of(RAW_FRAME_SUBCHANNEL) {
         return false;
     }
-    let Some(first) = mpeg_frame_len(head) else {
+    let Some(first) = mpeg_header(head) else {
         return false;
     };
-    let Some(next) = head.get(first..first + 4) else {
+    let Some(next) = head.get(first.frame_len..first.frame_len + 4) else {
         return false;
     };
-    mpeg_frame_len(next).is_some()
+    // The second header must describe the same stream: same version, layer
+    // and sample rate.
+    mpeg_header(next).is_some_and(|second| {
+        second.version == first.version && second.layer == first.layer && second.rate == first.rate
+    })
 }
 
-/// Length in bytes of the MPEG audio frame whose header leads `bytes`, or None
-/// if that is not a valid header. Only the fields needed for the length are
-/// decoded: the full layer and mode tables belong to the decoder.
-fn mpeg_frame_len(bytes: &[u8]) -> Option<usize> {
+/// The fields of an MPEG Layer III frame header that identify a stream.
+struct MpegHeader {
+    /// Version bits: 0b11 MPEG-1, 0b10 MPEG-2, 0b00 MPEG-2.5.
+    version: u8,
+    layer: u8,
+    /// Sample rate in Hz.
+    rate: usize,
+    /// Frame length in bytes, with padding.
+    frame_len: usize,
+}
+
+/// Parse the Layer III frame header that leads `bytes`, or None if that is not
+/// a valid header. Only the fields needed for the length are decoded: the full
+/// layer and mode tables belong to the decoder.
+fn mpeg_header(bytes: &[u8]) -> Option<MpegHeader> {
     let header: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
     // Sync is eleven set bits.
     if header[0] != 0xFF || header[1] & 0xE0 != 0xE0 {
         return None;
     }
-    // MPEG 1 Layer III only. Other versions and layers exist but never appear
-    // in a CUE-packaged rip, and every one we decline here simply mounts raw.
+    // MPEG-1, MPEG-2 and MPEG-2.5, Layer III only. Version bits 01 are
+    // reserved. Every other layer mounts as raw bytes.
     let version = (header[1] >> 3) & 0x03;
     let layer = (header[1] >> 1) & 0x03;
-    if version != 0b11 || layer != 0b01 {
+    if version == 0b01 || layer != 0b01 {
         return None;
     }
-    /// Layer III bitrates in kbps, indexed by the header's four-bit field. Index
-    /// 0 is "free format" and 15 is reserved; both are refused as a length.
-    const BITRATES: [usize; 16] = [
+    let mpeg1 = version == 0b11;
+    /// MPEG-1 Layer III bitrates in kbps, indexed by the header's four-bit
+    /// field. Index 0 is "free format" and 15 is reserved; both are refused.
+    const BITRATES_V1: [usize; 16] = [
         0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
     ];
-    /// MPEG 1 sample rates in Hz. Index 3 is reserved.
-    const RATES: [usize; 4] = [44100, 48000, 32000, 0];
-    let bitrate = BITRATES[usize::from(header[2] >> 4)];
-    let rate = RATES[usize::from((header[2] >> 2) & 0x03)];
+    /// MPEG-2 and MPEG-2.5 Layer III bitrates in kbps.
+    const BITRATES_V2: [usize; 16] = [
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+    ];
+    /// Sample rates in Hz by version, indexed by the two-bit field. Index 3 is
+    /// reserved.
+    const RATES_V1: [usize; 4] = [44100, 48000, 32000, 0];
+    const RATES_V2: [usize; 4] = [22050, 24000, 16000, 0];
+    const RATES_V25: [usize; 4] = [11025, 12000, 8000, 0];
+    let bitrate = if mpeg1 { BITRATES_V1 } else { BITRATES_V2 }[usize::from(header[2] >> 4)];
+    let rates = match version {
+        0b11 => RATES_V1,
+        0b10 => RATES_V2,
+        _ => RATES_V25,
+    };
+    let rate = rates[usize::from((header[2] >> 2) & 0x03)];
     if bitrate == 0 || rate == 0 {
         return None;
     }
     let padding = usize::from((header[2] >> 1) & 0x01);
-    Some(144 * bitrate * 1000 / rate + padding)
+    // A Layer III frame holds 1152 samples in MPEG-1 and 576 in MPEG-2 and
+    // MPEG-2.5, so the byte count per frame halves.
+    let slot = if mpeg1 { 144 } else { 72 };
+    Some(MpegHeader {
+        version,
+        layer,
+        rate,
+        frame_len: slot * bitrate * 1000 / rate + padding,
+    })
 }
 
 #[cfg(test)]

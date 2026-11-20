@@ -64,7 +64,7 @@ fn materialize_embedded_soundfont_in(cache_root: &Path) -> io::Result<PathBuf> {
 }
 
 fn file_matches(path: &Path, expected: &[u8]) -> io::Result<bool> {
-    let mut file = match fs::File::open(path) {
+    let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
@@ -73,16 +73,24 @@ fn file_matches(path: &Path, expected: &[u8]) -> io::Result<bool> {
         return Ok(false);
     }
 
+    reader_matches(file, expected)
+}
+
+/// Compare the bytes of `reader` with `expected`. A reader that holds more or
+/// fewer bytes than `expected` does not match.
+fn reader_matches(mut reader: impl Read, expected: &[u8]) -> io::Result<bool> {
     let mut offset = 0;
     let mut buffer = [0u8; 64 * 1024];
     while offset < expected.len() {
-        let count = file.read(&mut buffer)?;
+        let want = (expected.len() - offset).min(buffer.len());
+        let count = reader.read(&mut buffer[..want])?;
         if count == 0 || buffer[..count] != expected[offset..offset + count] {
             return Ok(false);
         }
         offset += count;
     }
-    Ok(true)
+    // Any byte past the expected length means the source grew.
+    Ok(reader.read(&mut buffer[..1])? == 0)
 }
 
 #[cfg(test)]

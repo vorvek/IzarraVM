@@ -237,3 +237,55 @@ fn a_decode_that_ends_early_does_not_republish_its_silent_tail() {
         pcm.len()
     );
 }
+
+/// A 44.1 kHz, 16-bit, 6-channel WAVE_FORMAT_EXTENSIBLE file. Channel 0 holds
+/// 1000, channel 1 holds -2000 and the rest hold 30000.
+fn surround_wav(frames: usize) -> Vec<u8> {
+    let channels = 6u16;
+    let block = channels * 2;
+    let data_len = frames as u32 * u32::from(block);
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(4 + 8 + 40 + 8 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&40u32.to_le_bytes());
+    wav.extend_from_slice(&0xFFFEu16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&44_100u32.to_le_bytes());
+    wav.extend_from_slice(&(44_100 * u32::from(block)).to_le_bytes());
+    wav.extend_from_slice(&block.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(&22u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(&0x3Fu32.to_le_bytes());
+    // KSDATAFORMAT_SUBTYPE_PCM
+    wav.extend_from_slice(&[
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B,
+        0x71,
+    ]);
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for _ in 0..frames {
+        for value in [1000i16, -2000, 30000, 30000, 30000, 30000] {
+            wav.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    wav
+}
+
+#[test]
+fn a_surround_source_plays_its_front_left_and_front_right() {
+    let path = std::env::temp_dir().join(format!(
+        "izarravm-cdaudio-surround-{}.wav",
+        std::process::id()
+    ));
+    std::fs::write(&path, surround_wav(4410)).unwrap();
+    let info = crate::probe_info(&path).unwrap().unwrap();
+    assert_eq!(info.channels, 6);
+    let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
+    decode_into(&path, info, &mut pcm, &mut |_ready, _new| {}).unwrap();
+    let first = &pcm[..4];
+    assert_eq!(i16::from_le_bytes([first[0], first[1]]), 1000);
+    assert_eq!(i16::from_le_bytes([first[2], first[3]]), -2000);
+    std::fs::remove_file(&path).ok();
+}

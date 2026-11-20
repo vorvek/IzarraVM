@@ -657,14 +657,7 @@ impl Vga {
         let eff = rel + preset_row;
         let char_row = (eff / rows_per_char) as usize;
         let font_line = (eff % rows_per_char) as usize;
-        #[allow(clippy::if_same_then_else)]
-        let char_width = if cga_text {
-            8
-        } else if self.seq.clocking_mode & 0x01 != 0 {
-            8
-        } else {
-            9
-        };
+        let char_width = self.text_char_width(cga_text);
         // AC 13h Horizontal Pixel Panning shifts the display left by `pan` pels
         // (FreeVGA attrreg.htm 13h). A non-zero pan reveals the right portion of
         // each cell and pulls in the leading pixels of the cell after the last
@@ -810,6 +803,16 @@ impl Vga {
         row
     }
 
+    /// Width of a text cell in dots: 8 for CGA text and for an 8-dot Clocking
+    /// Mode, 9 otherwise.
+    fn text_char_width(&self, cga_text: bool) -> usize {
+        if cga_text || self.seq.clocking_mode & 0x01 != 0 {
+            8
+        } else {
+            9
+        }
+    }
+
     /// One text-mode pixel at column `x` of `counter_line`, byte-identical to
     /// `render_text_row(counter_line)[x]` for every x < hdisp_end: the row
     /// renderer places cell `dc`'s pel `px` at `x = dc*char_width + px - pan`,
@@ -873,14 +876,7 @@ impl Vga {
         let eff = rel + preset_row;
         let char_row = (eff / rows_per_char) as usize;
         let font_line = (eff % rows_per_char) as usize;
-        #[allow(clippy::if_same_then_else)]
-        let char_width = if cga_text {
-            8
-        } else if self.seq.clocking_mode & 0x01 != 0 {
-            8
-        } else {
-            9
-        };
+        let char_width = self.text_char_width(cga_text);
         // AC 13h Horizontal Pixel Panning shifts the display left by `pan` pels
         // (FreeVGA attrreg.htm 13h). A non-zero pan reveals the right portion of
         // each cell and pulls in the leading pixels of the cell after the last

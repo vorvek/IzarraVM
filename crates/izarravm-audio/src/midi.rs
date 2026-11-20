@@ -99,8 +99,9 @@ impl MidiEngine {
         self.gain
     }
 
-    /// How many guest messages this engine handed to the synth and the synth
-    /// did not take -- malformed, or offered while its input queue was full.
+    /// How many guest messages this engine did not deliver: the synth did not
+    /// take them (malformed, or its input queue was full), or this engine's own
+    /// pending queue was full when they arrived.
     ///
     /// A refusal is NOT a failure of the engine: the MPU-401 hands us whatever
     /// the guest wrote, a DOS driver is free to write a byte no synthesiser
@@ -292,13 +293,15 @@ impl MidiEngine {
 
     fn queue(&mut self, message: TimedMidiMessage) {
         if self.pending.len() == MAX_PENDING_MESSAGES {
+            self.rejected = self.rejected.saturating_add(1);
             return;
         }
+        // The queue is sorted by guest tick. A new message goes after every
+        // message with the same or an earlier tick, so equal ticks keep their
+        // arrival order. Most messages belong at the back.
         let index = self
             .pending
-            .iter()
-            .position(|queued| queued.guest_tick > message.guest_tick)
-            .unwrap_or(self.pending.len());
+            .partition_point(|queued| queued.guest_tick <= message.guest_tick);
         self.pending.insert(index, message);
     }
 
