@@ -295,6 +295,137 @@ fn guest_block_keeps_exact_physical_routing_when_a20_is_closed() {
     assert_eq!(perf.device_write_bytes, 2);
 }
 
+fn block_pattern(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| (index.wrapping_mul(7).wrapping_add(3)) as u8)
+        .collect()
+}
+
+/// The behaviour before the page-granular path: one single-byte block per byte.
+fn write_block_per_byte(machine: &mut Machine, address: u32, bytes: &[u8]) {
+    for (offset, &value) in bytes.iter().enumerate() {
+        machine.write_guest_block(address.wrapping_add(offset as u32), &[value]);
+    }
+}
+
+fn read_per_byte(machine: &mut Machine, address: u32, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|offset| machine.read_physical_u8(address.wrapping_add(offset as u32)))
+        .collect()
+}
+
+/// Write `bytes` through the block path on one machine and per byte on a twin, then compare
+/// the bytes over `[probe, probe + probe_len)` and require that no clock moved on either.
+fn assert_block_matches_per_byte(address: u32, bytes: &[u8], probe: u32, probe_len: usize) {
+    let mut fast = coherence_machine();
+    let mut reference = coherence_machine();
+    let clocks = fast.bus_trace().elapsed_clocks();
+    fast.write_guest_block(address, bytes);
+    write_block_per_byte(&mut reference, address, bytes);
+    assert_eq!(
+        read_per_byte(&mut fast, probe, probe_len),
+        read_per_byte(&mut reference, probe, probe_len),
+        "block at {address:#x} len {:#x} differs from the per-byte reference",
+        bytes.len()
+    );
+    assert_eq!(fast.bus_trace().elapsed_clocks(), clocks);
+}
+
+#[test]
+fn guest_block_across_the_vga_aperture_edge_matches_per_byte() {
+    let bytes = block_pattern(0x200);
+    assert_block_matches_per_byte(0x9ff00, &bytes, 0x9fe00, 0x500);
+}
+
+#[test]
+fn guest_block_over_ram_aperture_open_bus_and_rom_matches_per_byte() {
+    let bytes = block_pattern(0xf1000 - 0x9f000);
+    assert_block_matches_per_byte(0x9f000, &bytes, 0x9f000, bytes.len());
+    // ROM, then RAM again above 1 MB.
+    let bytes = block_pattern(0x2000);
+    assert_block_matches_per_byte(0xff000, &bytes, 0xfe000, 0x4000);
+}
+
+#[test]
+fn guest_block_crossing_the_top_of_ram_drops_the_outside_bytes() {
+    let top = coherence_machine().memory.len() as u32;
+    let bytes = block_pattern(0x3000);
+    let address = top - 0x1800;
+    assert_block_matches_per_byte(address, &bytes, top - 0x2000, 0x4000);
+
+    let mut machine = coherence_machine();
+    machine.write_guest_block(address, &bytes);
+    assert_eq!(
+        machine.memory.read_u8(top as usize - 1).unwrap(),
+        bytes[0x17ff]
+    );
+}
+
+#[test]
+fn guest_block_over_one_page_with_a20_closed_lands_at_one_megabyte() {
+    let mut machine = coherence_machine();
+    machine.keyboard.set_a20(false);
+    let bytes = block_pattern(0x2100);
+    let low_before = machine.memory.as_slice()[..bytes.len()].to_vec();
+    machine.write_guest_block(0x10_0000, &bytes);
+
+    assert_eq!(
+        &machine.memory.as_slice()[0x10_0000..0x10_0000 + bytes.len()],
+        &bytes[..]
+    );
+    assert_eq!(&machine.memory.as_slice()[..bytes.len()], &low_before[..]);
+}
+
+#[test]
+fn guest_block_wrapping_the_address_space_matches_per_byte() {
+    let bytes = block_pattern(0x20);
+    let mut fast = coherence_machine();
+    let mut reference = coherence_machine();
+    let rom_before = read_per_byte(&mut fast, 0xffff_fff0, 0x10);
+    fast.write_guest_block(0xffff_fff0, &bytes);
+    write_block_per_byte(&mut reference, 0xffff_fff0, &bytes);
+
+    assert_eq!(
+        read_per_byte(&mut fast, 0, 0x20),
+        read_per_byte(&mut reference, 0, 0x20)
+    );
+    assert_eq!(&fast.memory.as_slice()[..0x10], &bytes[0x10..]);
+    assert_eq!(read_per_byte(&mut fast, 0xffff_fff0, 0x10), rom_before);
+}
+
+#[test]
+fn guest_block_round_trips_through_both_read_paths_without_clocks() {
+    let mut machine = coherence_machine();
+    let bytes = block_pattern(0x1_0000);
+    let address = 0x2_0000u32;
+    let clocks = machine.bus_trace().elapsed_clocks();
+    machine.cpu.reset_perf_counters();
+
+    machine.write_guest_block(address, &bytes);
+
+    let perf = machine.cpu.perf_counters();
+    assert_eq!(perf.device_write_ranges, 1);
+    assert_eq!(perf.device_write_bytes, 0x1_0000);
+    assert_eq!(perf.device_write_coarse_resets, 0);
+    assert_eq!(machine.read_guest_block(address, bytes.len()), bytes);
+    assert_eq!(machine.read_guest_linear_block(address, bytes.len()), bytes);
+    assert_eq!(machine.bus_trace().elapsed_clocks(), clocks);
+}
+
+#[test]
+fn guest_block_read_over_ram_aperture_and_rom_matches_per_byte() {
+    let mut fast = coherence_machine();
+    let mut reference = coherence_machine();
+    let address = 0x9f800u32;
+    let len = 0xf0800 - 0x9f800;
+    let clocks = fast.bus_trace().elapsed_clocks();
+
+    let block = fast.read_guest_block(address, len);
+
+    assert_eq!(block, read_per_byte(&mut reference, address, len));
+    assert_eq!(fast.bus_trace().elapsed_clocks(), clocks);
+}
+
 #[test]
 fn public_scalars_preserve_byte_exact_and_wide_a20_routing() {
     let mut machine = coherence_machine();
