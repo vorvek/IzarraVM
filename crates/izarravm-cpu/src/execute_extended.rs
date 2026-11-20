@@ -1178,8 +1178,8 @@ impl CpuGsw {
                 if self.read_gpr32(1) == MSR_TSC {
                     crate::reflected_call_diag::on_rdtsc_or_rdmsr_tsc();
                 }
+                #[cfg(feature = "reflected-call-memo")]
                 if self.read_gpr32(1) == MSR_TSC {
-                    #[cfg(feature = "reflected-call-memo")]
                     crate::reflected_call_memo::note_rdtsc_or_rdmsr(self);
                 }
                 let value = match self.read_gpr32(1) {

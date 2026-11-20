@@ -40,7 +40,6 @@ pub struct X87 {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeX87Layout {
     pub(crate) st: usize,
@@ -109,7 +108,6 @@ impl X87 {
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    #[allow(dead_code)]
     pub(crate) const fn native_layout() -> NativeX87Layout {
         NativeX87Layout {
             st: core::mem::offset_of!(Self, st),
