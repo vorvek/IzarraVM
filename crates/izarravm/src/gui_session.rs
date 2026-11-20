@@ -1134,7 +1134,7 @@ impl MachineGeneration {
             .machine
             .eject_floppy()
             .expect("mounted floppy has image bytes");
-        if dirty && let Err(err) = std::fs::write(&mounted.source.0, &bytes) {
+        if dirty && let Err(err) = crate::fsutil::write_synced(&mounted.source.0, &bytes) {
             mounted.writeback_pending = true;
             self.machine
                 .mount_floppy(bytes.clone())
@@ -1162,7 +1162,7 @@ impl MachineGeneration {
             let dirty = self.machine.floppy_dirty() || mounted.writeback_pending;
             let bytes = self.machine.eject_floppy()?;
             if dirty {
-                match std::fs::write(&mounted.source.0, &bytes) {
+                match crate::fsutil::write_synced(&mounted.source.0, &bytes) {
                     Ok(()) => mounted.writeback_pending = false,
                     Err(err) => {
                         mounted.writeback_pending = true;

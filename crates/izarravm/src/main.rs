@@ -13,6 +13,7 @@ mod controller_names;
 mod controller_profiles;
 mod crt;
 mod display_transform;
+mod fsutil;
 mod gui;
 mod host_input;
 mod ipe_trace;
@@ -470,7 +471,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
     }
 
     let rom = match cli.bios.as_deref() {
-        Some(path) => std::fs::read(path)?,
+        Some(path) => fsutil::read_file(path)?,
         None => izarravm_firmware::izarra_bios().to_vec(),
     };
     gui::run(startup.into_gui(rom, cli.margo_test_pattern))?;
@@ -778,7 +779,7 @@ fn run_boot_floppy(
     cycles: Option<u64>,
     hardware: &HardwareProfile,
 ) -> Result<(), Box<dyn Error>> {
-    let image = std::fs::read(path)?;
+    let image = fsutil::read_file(path)?;
     let image_len = image.len();
     let mut machine = Machine::new(
         MachineProfile::from_hardware_profile(hardware),
@@ -832,7 +833,7 @@ fn run_boot_hdd(
     cycles: Option<u64>,
     hardware: &HardwareProfile,
 ) -> Result<(), Box<dyn Error>> {
-    let image = std::fs::read(path)?;
+    let image = fsutil::read_file(path)?;
     let image_len = image.len();
     let mut machine = Machine::new(
         MachineProfile::from_hardware_profile(hardware),
@@ -900,7 +901,7 @@ impl Drop for TempDir {
 /// AUTOEXEC overlaid InMemory) via Katea, run the target through RUNNER.COM, and
 /// return its DOS exit code. The screen text is printed for diagnostics.
 fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box<dyn Error>> {
-    let bytes = std::fs::read(prog)?;
+    let bytes = fsutil::read_file(prog)?;
     let name = katea_run_prog_name(prog);
     let autoexec = format!("@echo off\r\nRUNNER {name}\r\n").into_bytes();
     let overrides = vec![
@@ -4974,7 +4975,7 @@ fn print_com1(serial: &str) {
 /// The BIOS ROM to boot: the file passed with --bios, or the built-in test ROM.
 fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
     match bios {
-        Some(path) => Ok(std::fs::read(path)?),
+        Some(path) => Ok(fsutil::read_file(path)?),
         None => Ok(test_rom().to_vec()),
     }
 }

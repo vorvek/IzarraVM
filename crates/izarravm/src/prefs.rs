@@ -588,7 +588,7 @@ impl GuiPrefs {
                 return;
             }
         };
-        if let Err(err) = std::fs::write(path, text) {
+        if let Err(err) = crate::fsutil::atomic_write(path, text.as_bytes()) {
             warn!(%err, path = %path.display(), "could not write izarravm.conf");
         }
     }
