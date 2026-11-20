@@ -1923,40 +1923,157 @@ fn katea_run_prog_name_picks_a_clean_8_3_name() {
     assert_eq!(katea_run_prog_name(Path::new("a.longext")), "PROG.LON");
 }
 
-#[test]
-fn boot_suite_failure_summary_lists_every_failed_record() {
-    let mut results = SuiteResults {
+fn passing_boot_suite_results() -> SuiteResults {
+    let records = BOOT_SUITE_REQUIRED_RECORDS
+        .iter()
+        .map(|&(name, status)| izarravm_firmware::SuiteRecord {
+            status,
+            name: name.to_owned(),
+            value: (status == SuiteRecordStatus::Measure).then(|| "640".to_owned()),
+        })
+        .collect::<Vec<_>>();
+    SuiteResults {
         version: 1,
-        declared_record_count: 3,
+        declared_record_count: records.len() as u16,
         payload_len: 0,
         checksum: 0,
-        records: vec![
-            izarravm_firmware::SuiteRecord {
-                status: SuiteRecordStatus::Begin,
-                name: "suite.boot".to_string(),
-                value: None,
-            },
-            izarravm_firmware::SuiteRecord {
-                status: SuiteRecordStatus::Fail,
-                name: "sound.opl3".to_string(),
-                value: None,
-            },
-            izarravm_firmware::SuiteRecord {
-                status: SuiteRecordStatus::Fail,
-                name: "timer.irq0".to_string(),
-                value: None,
-            },
-        ],
-    };
+        records,
+    }
+}
 
+#[test]
+fn boot_suite_required_records_match_the_result_template() {
+    let template = izarravm_firmware::X86_BOOT_TEST_RESULTS_SOURCE;
+    let names: Vec<&str> = template
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("db '"))
+        .filter_map(|text| text.strip_suffix("', 10"))
+        .filter_map(|text| text.split_once(' ').map(|(_, rest)| rest))
+        .map(|rest| rest.split(' ').next().unwrap())
+        .collect();
+    let required: Vec<&str> = BOOT_SUITE_REQUIRED_RECORDS
+        .iter()
+        .map(|&(name, _)| name)
+        .collect();
+    assert_eq!(names, required);
+}
+
+#[test]
+fn boot_suite_gate_accepts_one_complete_passing_record_set() {
     assert_eq!(
-        boot_suite_failure_summary(&results).as_deref(),
-        Some("boot suite reported FAIL: sound.opl3, timer.irq0")
+        boot_suite_failure_summary(&passing_boot_suite_results()),
+        None
     );
-    results
+}
+
+#[test]
+fn boot_suite_gate_rejects_failed_missing_duplicate_unexpected_and_empty_sets() {
+    let mut failed = passing_boot_suite_results();
+    failed
         .records
-        .retain(|record| record.status != SuiteRecordStatus::Fail);
-    assert_eq!(boot_suite_failure_summary(&results), None);
+        .iter_mut()
+        .find(|record| record.name == "sound.opl3")
+        .unwrap()
+        .status = SuiteRecordStatus::Fail;
+    let message = boot_suite_failure_summary(&failed).unwrap();
+    assert!(message.starts_with("boot suite gate failed: "));
+    assert!(message.contains("failed required record: sound.opl3"));
+
+    let mut missing = passing_boot_suite_results();
+    missing.records.retain(|record| record.name != "timer.irq0");
+    missing.declared_record_count -= 1;
+    assert!(
+        boot_suite_failure_summary(&missing)
+            .unwrap()
+            .contains("missing required record: timer.irq0")
+    );
+
+    let mut duplicate = passing_boot_suite_results();
+    duplicate.records.push(duplicate.records[1].clone());
+    duplicate.declared_record_count += 1;
+    assert!(
+        boot_suite_failure_summary(&duplicate)
+            .unwrap()
+            .contains("duplicate records: boot.sector")
+    );
+
+    let mut unexpected = passing_boot_suite_results();
+    unexpected.records[1].name = "boot.unknown".to_owned();
+    assert!(
+        boot_suite_failure_summary(&unexpected)
+            .unwrap()
+            .contains("unexpected records: boot.unknown")
+    );
+
+    let mut empty = passing_boot_suite_results();
+    empty.records.clear();
+    empty.declared_record_count = 0;
+    assert!(
+        boot_suite_failure_summary(&empty)
+            .unwrap()
+            .contains("missing required record: suite.boot")
+    );
+}
+
+#[test]
+fn guest_exit_code_maps_only_guest_exits() {
+    assert_eq!(guest_exit_code(&StopReason::TestExit { code: 0 }), Some(0));
+    assert_eq!(
+        guest_exit_code(&StopReason::TestExit { code: 0x51 }),
+        Some(0x51)
+    );
+    assert_eq!(guest_exit_code(&StopReason::DosExit { code: 3 }), Some(3));
+    assert_eq!(guest_exit_code(&StopReason::Halted), None);
+    assert_eq!(
+        guest_exit_code(&StopReason::CycleLimit { requested: 1 }),
+        None
+    );
+    assert_eq!(guest_exit_code(&StopReason::CpuError("x".into())), None);
+}
+
+#[test]
+fn expect_test_exit_accepts_only_test_exit_zero() {
+    assert!(expected_test_exit_met(&StopReason::TestExit { code: 0 }));
+    assert!(!expected_test_exit_met(&StopReason::TestExit { code: 1 }));
+    assert!(!expected_test_exit_met(&StopReason::DosExit { code: 0 }));
+    assert!(!expected_test_exit_met(&StopReason::Halted));
+}
+
+fn test_rom_screen() -> String {
+    TEST_ROM_REQUIRED_TEXT.join(
+        "
+",
+    )
+}
+
+#[test]
+fn test_rom_gate_accepts_halt_with_every_pass_line() {
+    assert_eq!(
+        test_rom_failure_summary(&StopReason::Halted, TEST_ROM_POST_CODE, &test_rom_screen()),
+        None
+    );
+}
+
+#[test]
+fn test_rom_gate_rejects_wrong_stop_post_code_and_missing_text() {
+    let screen = test_rom_screen();
+    let limit = StopReason::CycleLimit { requested: 1 };
+    assert!(
+        test_rom_failure_summary(&limit, TEST_ROM_POST_CODE, &screen)
+            .unwrap()
+            .contains("expected Halted")
+    );
+    assert!(
+        test_rom_failure_summary(&StopReason::Halted, 0x42, &screen)
+            .unwrap()
+            .contains("POST code")
+    );
+    let partial = screen.replace("PAGING + B8000 ALIAS PASS", "");
+    assert!(
+        test_rom_failure_summary(&StopReason::Halted, TEST_ROM_POST_CODE, &partial)
+            .unwrap()
+            .contains("PAGING + B8000 ALIAS PASS")
+    );
 }
 
 fn passing_izarra_results() -> SuiteResults {
