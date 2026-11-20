@@ -4919,8 +4919,9 @@ impl DecodeCache {
     ))]
     fn assert_native_watch_consistent(&self) {
         let mut expected = std::collections::HashSet::new();
+        let live = self.live_generations();
         for line in &self.lines {
-            if line.generation != self.generation {
+            if !live.contains(&line.generation) {
                 continue;
             }
             let Some(insn) = line.insn else {
@@ -5085,10 +5086,11 @@ impl DecodeCache {
     /// the cache (fill, narrow kill, eviction, generation bump).
     #[cfg(all(test, feature = "jit"))]
     fn assert_packs_consistent(&self) {
+        let live = self.live_generations();
         for (index, line) in self.lines.iter().enumerate() {
             let pack = &self.packs[index];
-            let line_live = line.generation == self.generation && line.insn.is_some();
-            let pack_live = pack.generation == self.generation && pack.len != 0;
+            let line_live = live.contains(&line.generation) && line.insn.is_some();
+            let pack_live = live.contains(&pack.generation) && pack.len != 0;
             assert_eq!(
                 line_live, pack_live,
                 "slot {index}: line live {line_live} but pack live {pack_live}"
@@ -5198,11 +5200,25 @@ impl DecodeCache {
         }
     }
 
+    /// The generations a line can carry and still be live: the current one plus the generation of
+    /// each occupied ring slot. An empty slot repeats the current generation. Slot generations
+    /// are never 0 and a killed line carries 0, so 0 never matches.
+    #[inline]
+    fn live_generations(&self) -> [u32; 3] {
+        [
+            self.generation,
+            self.contexts[0].map_or(self.generation, |c| c.1),
+            self.contexts[1].map_or(self.generation, |c| c.1),
+        ]
+    }
+
     /// Try to invalidate ONLY the lines covering the written physical byte `physical` (already
-    /// known to be a marked code byte). Returns true when handled narrowly; false means the
-    /// caller must fall back to the whole-cache flush (unknown page, an aliased page, or any other
-    /// reason the physical-to-linear reconstruction is unsound). The mark
-    /// stays set either way: a stale mark only costs a future narrow attempt, never correctness.
+    /// known to be a marked code byte). Returns the number of lines killed; `None` means the
+    /// caller must fall back to the whole-cache flush. The narrow path refuses when the page is
+    /// unknown to `code_page_lin`, or when the page is aliased (a context decoded it through a
+    /// different linear page, so the physical-to-linear reconstruction is unsound). It handles
+    /// both ring contexts: lines of either context are killed. The mark stays set either way: a
+    /// stale mark only costs a future narrow attempt, never correctness.
     #[inline]
     fn narrow_invalidate(&mut self, physical: u32) -> Option<u32> {
         self.narrow_invalidate_span(physical, physical)
@@ -5229,14 +5245,12 @@ impl DecodeCache {
     #[inline]
     fn narrow_invalidate_span(&mut self, physical: u32, last: u32) -> Option<u32> {
         debug_assert!(physical <= last && physical >> 12 == last >> 12);
-        // R4: with two ring contexts live, `code_page_lin`'s one-linear-per-physical entry
-        // belongs to whichever context wrote it last and cannot name a candidate carrying the
-        // OTHER context's generation. Refusing here degrades to the wholesale fallback for
-        // exactly the multi-context case (see `flush_attribution`/`cpu_cr3_flush_test.rs`'s
-        // cross-context SMC row) and costs nothing when only one context is live.
-        if self.contexts_occupied() > 1 {
-            return None;
-        }
+        // `code_page_lin` is one map shared by both ring contexts. `put` sets `aliased` when any
+        // context decodes this physical page through a different linear page, and the map clears
+        // only when every line of every context dies. So for a page that is not aliased, the
+        // candidate window below names every live line of both contexts. Lines of the other
+        // context carry that context's generation, so the kill test uses the whole live set.
+        let live = self.live_generations();
         let info = *self.code_page_lin.get(&(physical >> 12))?;
         if info.aliased {
             return None;
@@ -5252,7 +5266,7 @@ impl DecodeCache {
             let index = (candidate & self.mask) as usize;
             let removed = {
                 let line = &self.lines[index];
-                if line.generation != self.generation || line.tag != candidate {
+                if line.tag != candidate || !live.contains(&line.generation) {
                     false
                 } else {
                     let len = line.insn.map_or(0, |i| u32::from(i.len));
@@ -5287,9 +5301,10 @@ impl DecodeCache {
             return None;
         }
         let written_lin = (info.lin_page << 12) | (physical & 0xfff);
+        let live = self.live_generations();
         for candidate in written_lin.saturating_sub(14)..=written_lin {
             let line = &self.lines[(candidate & self.mask) as usize];
-            if line.generation != self.generation || line.tag != candidate {
+            if !live.contains(&line.generation) || line.tag != candidate {
                 continue;
             }
             let Some(insn) = line.insn else { continue };
@@ -5468,13 +5483,6 @@ impl DecodeCache {
             self.translation_pages_marked = 0;
         }
         RingRetired
-    }
-
-    /// How many ring slots are currently occupied: 0, 1 or 2. R4 reads this to decide whether the
-    /// narrow SMC path may trust `code_page_lin`.
-    #[inline]
-    fn contexts_occupied(&self) -> usize {
-        self.contexts.iter().filter(|c| c.is_some()).count()
     }
 
     /// `MOV CR3`'s code-half decision, R1 through R3 plus the R8 seed. `old_cr3_masked` is the

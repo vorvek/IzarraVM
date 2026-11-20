@@ -33,10 +33,25 @@ const ALT_WITNESS_BYTE: u8 = 0xf4; // HLT
 /// `a_second_directory_gets_its_own_generation` to decode something under B without touching A's
 /// slot at all.
 const WITNESS_B: u32 = 0x0500;
+/// Unrelated NOPs that stay live while the witness dies: one decoded under A, one under B. They
+/// sit in decode slots that collide with neither witness.
+const KEEP_A: u32 = 0x0600;
+const KEEP_B: u32 = 0x0700;
+/// Directory B maps this linear address to physical page 0 through `ALIAS_TABLE`, so page 0 is
+/// reachable through two linear pages (0 and `ALIAS_LIN >> 12`) once A and B both decode it.
+const ALIAS_LIN: u32 = 0x0040_0000;
+const ALIAS_TABLE: u32 = 0xD000;
+/// Present, writable, accessed. A walk through these entries writes nothing back, so a decode
+/// through the alias does not retire the other context's lines.
+const ACCESSED_RW: u32 = 0x23;
 
 fn plant_two_directory_paging(memory: &mut [u8]) {
     plant_identity_paging(memory);
     memory[DIR_B as usize..DIR_B as usize + 4].copy_from_slice(&0x0000_9003u32.to_le_bytes());
+    let alias_pde = DIR_B as usize + ((ALIAS_LIN >> 22) as usize) * 4;
+    memory[alias_pde..alias_pde + 4].copy_from_slice(&(ALIAS_TABLE | ACCESSED_RW).to_le_bytes());
+    memory[ALIAS_TABLE as usize..ALIAS_TABLE as usize + 4]
+        .copy_from_slice(&ACCESSED_RW.to_le_bytes());
     memory[DIR_C as usize..DIR_C as usize + 4].copy_from_slice(&(ALT_TABLE | 3).to_le_bytes());
     let alt_pte = ALT_FRAME | 3;
     memory[ALT_TABLE as usize..ALT_TABLE as usize + 4].copy_from_slice(&alt_pte.to_le_bytes());
@@ -57,6 +72,8 @@ fn cr3_fixture() -> (CpuGsw, TestBus) {
     memory[WRITER as usize..WRITER as usize + writer.len()].copy_from_slice(&writer);
     memory[WITNESS as usize] = 0x90;
     memory[WITNESS_B as usize] = 0x90;
+    memory[KEEP_A as usize] = 0x90;
+    memory[KEEP_B as usize] = 0x90;
     plant_two_directory_paging(&mut memory);
     let mut cpu = real_mode_cr0_cpu(WRITER);
     cpu.control.cr0 |= CR0_PE | CR0_PG;
@@ -334,27 +351,47 @@ fn cross_context_pte_edit_is_observed_on_return() {
     );
 }
 
-/// R4, the row Revision 1 did not have. A store into a byte carrying a live line under context A,
-/// made while B is selected, must not survive: `narrow_invalidate` refuses whenever more than one
-/// context is live, forcing the wholesale fallback that retires BOTH slots. This has nothing to
-/// do with CR3 semantics -- it is an ordinary SMC store -- which is exactly why it was missed.
+/// `cr3_fixture` with the accessed and dirty bits of page 0 already set under both directories,
+/// The first store to a clean page writes its PTE, and that write retires every decode line like
+/// a page-table edit. Setting the bits first lets a later store take the SMC path alone. A data
+/// store outside the code bytes does it. A is selected on return.
+fn dirty_cr3_fixture() -> (CpuGsw, TestBus) {
+    let (mut cpu, mut bus) = cr3_fixture();
+    let store = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        cpu.write_memory_u8(bus, SegmentIndex::Ds, 0x0800, 0, BusAccessKind::DataWrite)
+            .expect("the data store must retire");
+    };
+    store(&mut cpu, &mut bus);
+    write_cr3(&mut cpu, &mut bus, DIR_B);
+    store(&mut cpu, &mut bus);
+    write_cr3(&mut cpu, &mut bus, PAGE_DIRECTORY);
+    (cpu, bus)
+}
+
+/// The narrow SMC path handles both ring contexts. A store into a byte carrying a live line under
+/// context A, made while B is selected, kills A's line without a wholesale flush: the kill test
+/// accepts the generation of either ring slot. This has nothing to do with CR3 semantics -- it is
+/// an ordinary SMC store -- which is exactly why it was missed.
 #[test]
 fn cross_context_smc_store_kills_the_other_context() {
-    let (mut cpu, mut bus) = cr3_fixture();
+    let (mut cpu, mut bus) = dirty_cr3_fixture();
     warm_witness(&mut cpu, &mut bus);
     let d = cpu.registers.cs().default_size_32;
 
     write_cr3(&mut cpu, &mut bus, DIR_B);
+    let before = cpu.perf_counters().clone();
     // Store new bytes over the witness INSTRUCTION while B is selected, through the guest write
     // path (a self-modifying-code store, not a page-table edit).
-    cpu.write_memory_u8(
-        &mut bus,
-        SegmentIndex::Ds,
-        WITNESS,
-        ALT_WITNESS_BYTE,
-        BusAccessKind::DataWrite,
-    )
-    .expect("the SMC store must retire");
+    store_over_witness(&mut cpu, &mut bus);
+    let after = cpu.perf_counters().clone();
+    assert_eq!(
+        after.decode_inval_smc, before.decode_inval_smc,
+        "the store must take the narrow arm, not the wholesale flush"
+    );
+    assert!(
+        after.smc_narrow_kills > before.smc_narrow_kills,
+        "the narrow arm must have killed A's line"
+    );
 
     write_cr3(&mut cpu, &mut bus, PAGE_DIRECTORY);
     assert!(
@@ -363,6 +400,111 @@ fn cross_context_smc_store_kills_the_other_context() {
     );
     cpu.fetch_decoded(&mut bus, WITNESS)
         .expect("re-decode must see the patched byte, not error on stale decode state");
+}
+
+/// A holds the witness and `KEEP_A`, B holds `KEEP_B`, and B is selected.
+fn two_context_smc_fixture() -> (CpuGsw, TestBus) {
+    let (mut cpu, mut bus) = dirty_cr3_fixture();
+    warm_witness(&mut cpu, &mut bus);
+    cpu.fetch_decoded(&mut bus, KEEP_A)
+        .expect("KEEP_A decodes under A");
+    write_cr3(&mut cpu, &mut bus, DIR_B);
+    cpu.fetch_decoded(&mut bus, KEEP_B)
+        .expect("KEEP_B decodes under B");
+    (cpu, bus)
+}
+
+/// One SMC store over the witness byte, through the guest write path.
+fn store_over_witness(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    cpu.write_memory_u8(
+        bus,
+        SegmentIndex::Ds,
+        WITNESS,
+        ALT_WITNESS_BYTE,
+        BusAccessKind::DataWrite,
+    )
+    .expect("the SMC store must retire");
+}
+
+/// Assert that A's witness line is dead and that each context still holds its unrelated line.
+/// This reselects each directory, so call it last.
+fn assert_only_the_witness_died(cpu: &mut CpuGsw, bus: &mut TestBus) {
+    let d = cpu.registers.cs().default_size_32;
+    write_cr3(cpu, bus, PAGE_DIRECTORY);
+    assert!(
+        !cpu.decode_cache.line_live(WITNESS, d),
+        "the witness line must be dead"
+    );
+    assert!(
+        cpu.decode_cache.line_live(KEEP_A, d),
+        "A's unrelated line must survive"
+    );
+    write_cr3(cpu, bus, DIR_B);
+    assert!(
+        cpu.decode_cache.line_live(KEEP_B, d),
+        "B's unrelated line must survive"
+    );
+}
+
+/// The store lands while B is selected, over a line that belongs to the NON-selected context A.
+/// Only that line dies. The wholesale counter stays put, one unrelated line in each context
+/// survives, and the TLB slot generations do not move.
+#[test]
+fn smc_store_over_the_unselected_contexts_line_kills_only_that_line() {
+    let (mut cpu, mut bus) = two_context_smc_fixture();
+    let before = cpu.perf_counters().clone();
+    let tlb_before = cpu.tlb.generations_for_test();
+
+    store_over_witness(&mut cpu, &mut bus);
+
+    let after = cpu.perf_counters().clone();
+    assert_eq!(after.decode_inval_smc, before.decode_inval_smc);
+    assert_eq!(after.smc_narrow_kills, before.smc_narrow_kills + 1);
+    assert_eq!(
+        cpu.tlb.generations_for_test(),
+        tlb_before,
+        "a narrow kill must not touch the TLB slot generations"
+    );
+    assert_only_the_witness_died(&mut cpu, &mut bus);
+}
+
+/// The same store, with the line held by the SELECTED context.
+#[test]
+fn smc_store_over_the_selected_contexts_line_kills_only_that_line() {
+    let (mut cpu, mut bus) = two_context_smc_fixture();
+    write_cr3(&mut cpu, &mut bus, PAGE_DIRECTORY);
+    let before = cpu.perf_counters().clone();
+    let tlb_before = cpu.tlb.generations_for_test();
+
+    store_over_witness(&mut cpu, &mut bus);
+
+    let after = cpu.perf_counters().clone();
+    assert_eq!(after.decode_inval_smc, before.decode_inval_smc);
+    assert_eq!(after.smc_narrow_kills, before.smc_narrow_kills + 1);
+    assert_eq!(cpu.tlb.generations_for_test(), tlb_before);
+    assert_only_the_witness_died(&mut cpu, &mut bus);
+}
+
+/// One physical page decoded through DIFFERENT linear pages in the two contexts: A reaches
+/// physical page 0 at linear page 0, B reaches it again at `ALIAS_LIN`. `put` marks the page
+/// aliased, so the physical-to-linear reconstruction is unsound and the store must take the
+/// wholesale arm.
+#[test]
+fn a_page_decoded_through_two_linear_pages_takes_the_wholesale_arm() {
+    let (mut cpu, mut bus) = dirty_cr3_fixture();
+    warm_witness(&mut cpu, &mut bus);
+    write_cr3(&mut cpu, &mut bus, DIR_B);
+    cpu.fetch_decoded(&mut bus, ALIAS_LIN + WITNESS)
+        .expect("the alias decodes the same physical byte under B");
+    let before = cpu.perf_counters().clone();
+
+    store_over_witness(&mut cpu, &mut bus);
+
+    assert_eq!(
+        cpu.perf_counters().decode_inval_smc,
+        before.decode_inval_smc + 1,
+        "an aliased page must fall back to the wholesale flush"
+    );
 }
 
 /// Finding F11 (blocking): a TLB entry filled by a DATA access is reused by a later CODE
@@ -491,7 +633,8 @@ fn wipes_tlb_flush_counts_every_cr3_write_ring_hit_or_not() {
 //   `range_hits_translation_page` disjunct to `false` now reddens this row (and only this row;
 //   the other ten still pass through `write_page_walk_entry`'s independent unconditional path,
 //   exactly as the original ledger entry for the un-warmed rows described), reverted after. |
-// | `narrow_invalidate` does not refuse with two contexts occupied | `cross_context_smc_store_kills_the_other_context` | by hand |
+// | the narrow kill tests only `self.generation` | `cross_context_smc_store_kills_the_other_context`, `smc_store_over_the_unselected_contexts_line_kills_only_that_line` | by hand |
+// | `put` stops setting `aliased` across contexts | `a_page_decoded_through_two_linear_pages_takes_the_wholesale_arm` | by hand |
 // | mark only on a CODE-producing walk, not every walk | `a_tlb_hit_code_translation_is_still_protected` | by hand |
 // | `translation_pages` cleared on a select (R7) | `pte_edit_under_a_live_cr3_forces_a_redecode` after a prior A/B/A cycle | by hand |
 // | generation allocator not shared between the ring and the plain bump (R6) | flagged by
