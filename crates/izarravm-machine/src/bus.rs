@@ -573,12 +573,30 @@ impl Machine {
         } else {
             RamWriteFootprint::coarse()
         };
-        for (offset, &value) in bytes.iter().enumerate() {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
             let at = address.wrapping_add(offset as u32);
-            // Keep the old per-byte bus lifetime. Dropping the bus completes a Vega direct-write
-            // batch, so widening that lifetime here would change device-visible batching.
-            let mut bus = self.make_bus();
-            let _ = bus.write_memory_byte_recorded(at, value, &mut footprint);
+            let piece = &bytes[offset..][..Self::page_run(at, bytes.len() - offset)];
+            offset += piece.len();
+            let stored = {
+                let mut bus = self.make_bus();
+                bus.write_block_piece_direct(at, piece, &mut footprint)
+            };
+            if stored {
+                continue;
+            }
+            for (index, &value) in piece.iter().enumerate() {
+                // A write through `write_memory_byte_recorded` never sets the Vega direct-write
+                // batch flag. Only `note_direct_write_pages` does that, from the compiled-window
+                // paths. The bus lifetime therefore has no device-visible effect here. Each
+                // device byte still gets its own bus, as it always did.
+                let mut bus = self.make_bus();
+                let _ = bus.write_memory_byte_recorded(
+                    at.wrapping_add(index as u32),
+                    value,
+                    &mut footprint,
+                );
+            }
         }
         footprint.notify(&mut self.cpu);
     }
@@ -652,10 +670,7 @@ impl Machine {
         let mut out = vec![0xffu8; len];
         for (offset, chunk) in Self::linear_pages(linear, len) {
             if let Some(physical) = self.translate_linear_probe(linear.wrapping_add(offset)) {
-                for index in 0..chunk {
-                    out[offset as usize + index] =
-                        self.read_physical_u8(physical.wrapping_add(index as u32));
-                }
+                self.read_guest_block_into(physical, &mut out[offset as usize..][..chunk]);
             }
         }
         out
@@ -674,6 +689,33 @@ impl Machine {
             offset += chunk;
         }
         runs
+    }
+
+    /// Bytes from `at` to the end of its 4 KiB page, capped at `remaining`.
+    fn page_run(at: u32, remaining: usize) -> usize {
+        (RAM_LOOKUP_PAGE_SIZE - (at as usize & RAM_LOOKUP_PAGE_MASK)).min(remaining)
+    }
+
+    /// Fill `out` from guest physical memory starting at `address`, with no clock
+    /// charge and no A20 gating. Plain RAM inside one page copies in one step. Every
+    /// other byte (VGA aperture, ROM, open bus, fallback RAM) keeps the per-byte
+    /// read, because a device read can change device state. Addresses wrap at 4 GiB.
+    pub(super) fn read_guest_block_into(&mut self, address: u32, out: &mut [u8]) {
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let at = address.wrapping_add(offset as u32);
+            let run = Self::page_run(at, out.len() - offset);
+            let piece = &mut out[offset..][..run];
+            offset += run;
+            let range = self.make_bus().direct_ram_bytes(at, run);
+            if let Some((start, end)) = range {
+                piece.copy_from_slice(&self.memory.as_slice()[start..end]);
+                continue;
+            }
+            for (index, slot) in piece.iter_mut().enumerate() {
+                *slot = self.read_physical_u8(at.wrapping_add(index as u32));
+            }
+        }
     }
 
     pub fn bus_trace(&self) -> &BusTrace {
@@ -4979,6 +5021,23 @@ impl MachineBus<'_> {
             // mutation path, then distinguish a rejected device route from fallback RAM there.
             ByteRoute::DeviceOrFallbackRam
         }
+    }
+
+    /// Store `piece` (inside one page) straight into plain RAM and record it once.
+    /// Returns false when any part is not plain RAM, so the caller writes it per byte.
+    /// No clock, wait-state, or data-cycle charge: HLE block copies are free.
+    fn write_block_piece_direct<R: RamWriteRecorder>(
+        &mut self,
+        address: u32,
+        piece: &[u8],
+        recorder: &mut R,
+    ) -> bool {
+        let Some((start, end)) = self.direct_ram_bytes(address, piece.len()) else {
+            return false;
+        };
+        self.memory.as_mut_slice()[start..end].copy_from_slice(piece);
+        recorder.record_ram_write(address, piece.len() as u32);
+        true
     }
 
     fn write_memory_byte_recorded<R: RamWriteRecorder>(

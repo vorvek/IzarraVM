@@ -3377,9 +3377,9 @@ impl Machine {
     }
 
     fn read_guest_block(&mut self, addr: u32, len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|index| self.read_physical_u8(addr + index as u32))
-            .collect()
+        let mut out = vec![0u8; len];
+        self.read_guest_block_into(addr, &mut out);
+        out
     }
 
     /// Switch the active compatibility mode live. The CPU installs the core-table
