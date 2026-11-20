@@ -199,11 +199,10 @@ fn canonical_capture_preserves_register_c_and_full_index_latches() {
 
     let aliased = rtc.read_port(0x71).unwrap();
     assert_eq!(aliased & (REG_C_IRQF | REG_C_PF), 0xc0);
-    assert_eq!(canonical_payload(&rtc)[usize::from(REG_C)] & 0xc0, 0xc0);
+    assert_eq!(canonical_payload(&rtc)[usize::from(REG_C)], 0);
 
     rtc.write_port(0x70, REG_C);
-    assert_eq!(rtc.read_port(0x71).unwrap() & 0xc0, 0xc0);
-    assert_eq!(canonical_payload(&rtc)[usize::from(REG_C)], 0);
+    assert_eq!(rtc.read_port(0x71).unwrap() & 0xc0, 0);
 }
 
 #[test]
@@ -581,4 +580,26 @@ fn writing_register_b_keeps_format_bits_forced() {
     assert_ne!(b & REG_B_PIE, 0); // enable took
     assert_ne!(b & 0x04, 0); // DM still set (binary)
     assert_ne!(b & 0x02, 0); // 24-hour still set
+}
+
+#[test]
+fn high_index_write_lands_in_the_aliased_register() {
+    let mut rtc = Rtc::new();
+    rtc.write_port(0x70, 0x4e);
+    rtc.write_port(0x71, 0x5a);
+    assert_eq!(rtc.ram[0x0e], 0x5a);
+    rtc.write_port(0x70, 0x0e);
+    assert_eq!(rtc.read_port(0x71), Some(0x5a));
+}
+
+#[test]
+fn high_index_read_of_register_c_clears_it() {
+    let mut rtc = Rtc::new();
+    rtc.write_port(0x70, REG_B);
+    rtc.write_port(0x71, REG_B_PIE);
+    let deadline = rtc.ticks_until_periodic_irq().unwrap();
+    assert!(rtc.advance_master_ticks(deadline, 0));
+    rtc.write_port(0x70, 0x4c);
+    assert_ne!(rtc.read_port(0x71).unwrap() & REG_C_PF, 0);
+    assert_eq!(rtc.ram[usize::from(REG_C)], 0);
 }
