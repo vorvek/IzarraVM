@@ -20,9 +20,8 @@ ROM Extensions in the system BIOS at boot, and the BIOS serves drive D:
 
 ## Layout
 
-- `freedos/` vendored FreeDOS source trees plus the permissively licensed
-  SHSUCDX redirector, with upstream revisions and local patches recorded in
-  `freedos/VENDOR.md`.
+- `freedos/` vendored FreeDOS source trees, with upstream revisions and local
+  patches recorded in `freedos/VENDOR.md`.
 - `tools-src/` original (not vendored) Toka-DOS project tools, GPL-3, written
   from documented command-line behavior rather than ported from another
   project. See `tools-src/README.md`.
@@ -32,8 +31,7 @@ ROM Extensions in the system BIOS at boot, and the BIOS serves drive D:
   shell (Open Watcom cross-compile), builds `MOVE.EXE`/`SORT.EXE` from the
   vendored userland sources, assembles `TOKAMOUS.COM` and `TOKAEMM.SYS`, and
   invokes `scripts/build-freedos-hdd-image.py` to assemble the committed disk
-  image. (It still assembles the retired `TOKACD.SYS`/`IZCDEX.COM` binaries
-  for reference; the image script no longer takes them.)
+  image. The BIOS serves the CD-ROM, so the build makes no CD driver.
 
 Small standalone guest `.COM`/`.SYS` tools that aren't vendored FreeDOS source
 (`TOKAEMM.SYS`, `GSWMODE.COM`, and DOS test fixtures like `MOUSETST.COM`) live

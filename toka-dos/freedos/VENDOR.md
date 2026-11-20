@@ -308,7 +308,7 @@ via the hardcoded `dir_entry(name11("DOS"), dos_first, 0, ATTR_SUBDIR)`
 (:470) -- and the current image uses it. The root holds KERNEL.SYS,
 CONFIG.SYS, AUTOEXEC.BAT, LICENSE.TXT, and that DOS subdirectory entry
 itself (5 entries, one cluster). `C:\DOS` holds COMMAND.COM, every
-command-line tool, the two drivers (TOKAEMM.SYS, TOKACD.SYS), and
+command-line tool, the driver (TOKAEMM.SYS), and
 HELLO.TXT -- everything else in the eighteen-plus-file set above, not just
 the command-line tools. `CONFIG.SYS`'s `SHELL=` and `AUTOEXEC.BAT`'s `PATH`
 both point at `C:\DOS` (see `kernel/kernel/config.c`'s built-in `SHELL=`

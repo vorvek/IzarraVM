@@ -42,7 +42,6 @@ debug = "line-tables-only"
 strip = "none"
 
 [workspace.dependencies]
-bitflags = "2.6"
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 cpal = "0.15"
@@ -58,7 +57,6 @@ egui-wgpu = { version = "0.32", features = ["winit"] }
 pollster = "0.4"
 png = "0.17"
 rfd = "0.15"
-softbuffer = "0.4.8"
 # Default features pull in Matroska, AIFF, ADPCM and more; this is only the
 # four containers a CUE sheet realistically names for a CD-DA track.
 symphonia = { version = "0.6.1", default-features = false, features = [
