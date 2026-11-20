@@ -60,6 +60,8 @@ jobs:
           # uncompiled behind a green CI. `cargo check` alone builds no test target.
           cargo check -p izarravm --features int-trace
           cargo test -p izarravm-cpu --features int-trace int_trace
+          cargo check -p izarravm --features watch-write
+          cargo check -p izarravm --features timing-class-histogram
           cargo check -p izarravm --no-default-features --features direct-admission-census
           cargo test -p izarravm-cpu --no-default-features --features direct-admission-census admission_census
           cargo test -p izarravm --no-default-features --features direct-admission-census direct_barrier_census_json_exposes_ordered_zero_admission_declines
@@ -162,3 +164,6 @@ jobs:
 
       - name: Run boot suite
         run: cargo run -p izarravm -- --headless-boot-suite
+
+      - name: Run Izarra BIOS POST
+        run: cargo run -p izarravm -- --headless-izarra-bios
