@@ -57,11 +57,14 @@ param(
     # Rows to run. The safe multi-row spelling is the COMMA string: `-Rows a,b`.
     [string[]]$Rows,
     [string]$Label = "board",
-    [string]$Executable = "D:\dev\IzarraVM\target\release\izarravm.exe",
+    # The release binary of this checkout. CARGO_TARGET_DIR wins when set.
+    [string]$Executable = (Join-Path $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path (Split-Path -Parent $PSScriptRoot) "target" }) "release\izarravm.exe"),
     # The fixture trees. NOT in the repository: the games are commercial installs
     # that cannot be redistributed.
-    [string]$FixtureRoot = "D:\dev\IzarraVM\.bench",
-    [string]$OutRoot = "D:\dev\IzarraVM\compatibility-output",
+    # IZARRAVM_BENCH_ROOT names the folder when it is set. Otherwise the folder
+    # is `.bench` in this checkout.
+    [string]$FixtureRoot = $(if ($env:IZARRAVM_BENCH_ROOT) { $env:IZARRAVM_BENCH_ROOT } else { Join-Path (Split-Path -Parent $PSScriptRoot) ".bench" }),
+    [string]$OutRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) "compatibility-output"),
     # Record the measured values as the new pins instead of grading against them.
     [switch]$RecordInvariants,
     [Parameter(ParameterSetName = "SelfTest")][switch]$SelfTest

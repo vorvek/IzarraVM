@@ -211,7 +211,7 @@ fn glide_compensate_is_monotonic() {
 /// the guest -- without touching `clutData`.
 #[test]
 fn glide_compensate_reproduces_the_sst_gamma_oracle() {
-    // The live anchors dumped in `D:\sstg\base.log`, all 33 of them.
+    // The live anchors dumped from a Tomb Raider run, all 33 of them.
     let anchors: [u8; 33] = [
         0, 25, 40, 53, 64, 74, 84, 93, 101, 110, 118, 125, 133, 140, 147, 154, 161, 168, 174, 181,
         187, 193, 199, 205, 211, 217, 223, 228, 234, 239, 245, 250, 255,

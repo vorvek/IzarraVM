@@ -8,8 +8,11 @@
 memory_mib = 16
 video = "vega"
 
+# C: is mounted read-write. Without a `c_drive` key the emulator uses its own
+# folder (see the README). To mount another folder, add a `c_drive` line to
+# this section with the path of a folder that holds a copy of your files, or
+# pass --c-drive on the command line. Do not point it at files you cannot lose.
 [dos]
-c_drive = "R:\\La Colecci\u00f3n by Neville\\dosroot\\"
 
 [audio]
 

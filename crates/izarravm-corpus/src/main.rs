@@ -6,6 +6,7 @@
 use clap::Parser;
 use serde::Serialize;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -13,8 +14,11 @@ use walkdir::WalkDir;
 #[derive(Debug, Parser)]
 #[command(version, about = "Scan a local DOS games corpus without modifying it.")]
 struct Args {
-    #[arg(long, env = "IZARRAVM_DOSROOT")]
-    dosroot: Option<PathBuf>,
+    /// The corpus root, scanned read-only. Also read from the environment
+    /// variable `IZARRAVM_CORPUS_ROOT`. The flag wins. An empty variable counts
+    /// as unset. The old spelling `--dosroot` still works.
+    #[arg(long, alias = "dosroot")]
+    corpus_root: Option<PathBuf>,
     #[arg(long)]
     output: Option<PathBuf>,
     #[arg(long, default_value_t = 3)]
@@ -52,7 +56,7 @@ enum LauncherKind {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let root = args.dosroot.unwrap_or_else(default_dosroot);
+    let root = resolve_root(args.corpus_root, std::env::var_os("IZARRAVM_CORPUS_ROOT"))?;
     let scan = scan_corpus(&root, args.max_depth, args.limit)?;
     let json = serde_json::to_string_pretty(&scan)?;
 
@@ -68,8 +72,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn default_dosroot() -> PathBuf {
-    PathBuf::from("R:\\La Colecci\u{00f3}n by Neville\\dosroot\\")
+/// The corpus root: the flag, then a non-empty environment value. There is no
+/// default path, because the scanner must not guess which folder to read.
+fn resolve_root(flag: Option<PathBuf>, variable: Option<OsString>) -> Result<PathBuf, String> {
+    flag.or_else(|| {
+        variable
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+    .ok_or_else(|| {
+        "no corpus root: pass --corpus-root or set the environment variable IZARRAVM_CORPUS_ROOT"
+            .to_string()
+    })
 }
 
 fn scan_corpus(

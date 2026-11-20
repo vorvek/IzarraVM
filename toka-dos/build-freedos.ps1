@@ -26,7 +26,7 @@ $kdir  = Join-Path $fd 'kernel'
 $fcdir = Join-Path $fd 'freecom'
 
 # Open Watcom env.
-$env:WATCOM  = 'D:\DevTools\OpenWatcom'
+if (-not $env:WATCOM) { $env:WATCOM = 'D:\DevTools\OpenWatcom' }
 $env:PATH    = "$env:WATCOM\binnt;$env:WATCOM\binw;$env:PATH"
 $env:INCLUDE = "$env:WATCOM\h"
 $env:EDPATH  = "$env:WATCOM\eddat"

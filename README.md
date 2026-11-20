@@ -92,8 +92,8 @@ cargo run -p izarravm -- --headless-boot-suite
 cargo run -p izarravm -- --config examples/machine.toml
 ```
 
-On a host that is not Windows, change the `c_drive` path in
-`examples/machine.toml`. You can also use `--c-drive /path/to/dosroot`.
+The example does not set a C: folder, so the emulator uses its default folder.
+To use another folder, pass `--c-drive /path/to/dosroot`.
 
 By default, the C: drive, `cmos.bin`, and `izarravm.conf` are in the
 `~/.izarravm` directory of the user. Controller profiles are in

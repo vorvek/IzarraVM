@@ -41,16 +41,20 @@
 # checked later, exactly as before.
 [CmdletBinding(PositionalBinding = $false, DefaultParameterSetName = "Run")]
 param(
-    # Corpus root. Read-only.
-    [string]$Corpus = "E:\eXo\eXo\eXoDOS",
+    # Corpus root. Read-only. Defaults to the environment variable
+    # IZARRAVM_EXODOS_ROOT.
+    [string]$Corpus = $env:IZARRAVM_EXODOS_ROOT,
     # Corpus shorts to run, or a file with one per line.
     [string[]]$Games,
     [string]$GameListFile,
     [Parameter(Mandatory, ParameterSetName = "Run")][string]$OutDir,
-    [string]$Executable = "D:\dev\IzarraVM\target\release\izarravm.exe",
-    [string]$Translator = "D:\dev\IzarraVM\target\release\izarravm-exodos.exe",
-    # Scratch lives on D:, which has the free space; C: does not.
-    [string]$ScratchRoot = "D:\dev\exo-sweeps\exo-scratch",
+    # The release binaries of this checkout. CARGO_TARGET_DIR wins when set.
+    [string]$Executable = (Join-Path $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path (Split-Path -Parent $PSScriptRoot) "target" }) "release\izarravm.exe"),
+    [string]$Translator = (Join-Path $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path (Split-Path -Parent $PSScriptRoot) "target" }) "release\izarravm-exodos.exe"),
+    # Extraction scratch space. It needs room for the largest game. The default
+    # is the environment variable IZARRAVM_EXO_SCRATCH, then a folder beside
+    # the checkout: <parent of the checkout>\exo-sweeps\exo-scratch.
+    [string]$ScratchRoot = $(if ($env:IZARRAVM_EXO_SCRATCH) { $env:IZARRAVM_EXO_SCRATCH } else { Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "exo-sweeps\exo-scratch" }),
     # Per-game key schedules, `<short>.json`. Missing files fall back to the
     # translator's generic sequence.
     [string]$RecipeDir,
@@ -278,6 +282,9 @@ $rebootRecurrenceThreshold = 2
 
 foreach ($required in @($Executable, $Translator)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Missing executable: $required" }
+}
+if ([string]::IsNullOrWhiteSpace($Corpus)) {
+    throw "No corpus root. Pass -Corpus or set the environment variable IZARRAVM_EXODOS_ROOT."
 }
 if (-not (Test-Path -LiteralPath $Corpus)) { throw "Missing corpus: $Corpus" }
 $dosRoot = Join-Path $Corpus '!dos'
@@ -668,6 +675,7 @@ foreach ($short in $Games) {
             'translate',
             '--conf', $conf,
             '--extract-root', $scratch,
+            '--exodos-root', $Corpus,
             '--short', $short,
             '--persona', $Persona,
             '--cycles', "$cycleBudget",

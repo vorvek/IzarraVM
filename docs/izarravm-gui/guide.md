@@ -49,8 +49,8 @@ writes. At each start, IzarraVM sets the real-time clock in the file from the
 host clock.
 
 You set the C: drive path at startup, and not in the GUI. Use `--c-drive`,
-`--dosroot`, or the `dos.c_drive` key in a `--config` TOML file, for example
-`examples/machine.toml`. The "Open C: folder" control in the GUI opens the
+`--dosroot`, or the `dos.c_drive` key in a `--config` TOML file. The file
+`examples/machine.toml` shows the layout and leaves the key out. The "Open C: folder" control in the GUI opens the
 host file manager at the configured path. Use it to copy files to the hard
 disk of the guest. It does not change the folder that C: uses.
 
