@@ -3340,3 +3340,53 @@ fn halt_entry_uses_the_active_cpu_charge_and_preserves_carry() {
     assert!(!cpu.halted);
     assert_eq!(cpu.elapsed_clocks, 0);
 }
+
+#[test]
+fn no_wait_fpu_forms_ignore_a_pending_unmasked_exception() {
+    // FNSTCW, FNSTSW m16, FNSTENV, FNSAVE, FNSTSW AX, FNENI, FNDISI and FNSETPM never wait.
+    let forms: [&[u8]; 8] = [
+        &[0xd9, 0x3e, 0x40, 0x00],
+        &[0xdd, 0x3e, 0x40, 0x00],
+        &[0xd9, 0x36, 0x40, 0x00],
+        &[0xdd, 0x36, 0x40, 0x00],
+        &[0xdf, 0xe0],
+        &[0xdb, 0xe0],
+        &[0xdb, 0xe1],
+        &[0xdb, 0xe4],
+    ];
+    for code in forms {
+        let (mut cpu, memory) = real_mode_cpu(code, 0x200);
+        cpu.control.cr0 |= CR0_NE;
+        cpu.fpu.control &= !1;
+        cpu.fpu.status |= 1;
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert!(
+            !matches!(result, Err(InternalFault::Exception { vector: 16, .. })),
+            "{code:02x?} must not raise #MF: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn waiting_fpu_forms_still_raise_mf_on_a_pending_unmasked_exception() {
+    // FLD m32, FLDCW, FLDENV and FRSTOR keep the pending-exception check.
+    let forms: [&[u8]; 4] = [
+        &[0xd9, 0x06, 0x40, 0x00],
+        &[0xd9, 0x2e, 0x40, 0x00],
+        &[0xd9, 0x26, 0x40, 0x00],
+        &[0xdd, 0x26, 0x40, 0x00],
+    ];
+    for code in forms {
+        let (mut cpu, memory) = real_mode_cpu(code, 0x200);
+        cpu.control.cr0 |= CR0_NE;
+        cpu.fpu.control &= !1;
+        cpu.fpu.status |= 1;
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert!(
+            matches!(result, Err(InternalFault::Exception { vector: 16, .. })),
+            "{code:02x?} must raise #MF: {result:?}"
+        );
+    }
+}

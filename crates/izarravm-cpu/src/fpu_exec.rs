@@ -76,15 +76,16 @@ impl CpuGsw {
             .modrm
             .expect("an FPU escape opcode decoded with a ModRM");
         // A pending unmasked exception traps with #MF on the next waiting FPU
-        // instruction. The no-wait control ops (FNINIT, FNCLEX) are exempt so they can
-        // clear the state. Gated on CR0.NE; with NE clear the part would drive FERR#
-        // and IRQ13 instead, which is not modeled.
-        let is_no_wait_clear =
-            opcode == 0xdb && modrm.mode == 3 && modrm.reg == 4 && matches!(modrm.rm, 2 | 3);
-        if !is_no_wait_clear
-            && self.control.cr0 & CR0_NE != 0
-            && self.fpu.pending_unmasked_exception()
-        {
+        // instruction. The no-wait forms never trap: FNINIT, FNCLEX, FNENI, FNDISI, FNSETPM,
+        // FNSTCW, FNSTSW (memory and AX), FNSTENV and FNSAVE. Gated on CR0.NE; with NE clear
+        // the part would drive FERR# and IRQ13 instead, which is not modeled.
+        let is_no_wait = match (opcode, modrm.mode == 3) {
+            (0xdb, true) => modrm.reg == 4 && modrm.rm <= 4,
+            (0xdf, true) => modrm.reg == 4 && modrm.rm == 0,
+            (0xd9 | 0xdd, false) => matches!(modrm.reg, 6 | 7),
+            _ => false,
+        };
+        if !is_no_wait && self.control.cr0 & CR0_NE != 0 && self.fpu.pending_unmasked_exception() {
             return Err(InternalFault::Exception {
                 vector: 16,
                 error_code: None,
