@@ -1266,8 +1266,7 @@ impl CpuGsw {
             return;
         }
         let deferred = core::mem::take(&mut self.deferred_code_writes);
-        for index in 0..usize::from(deferred.count) {
-            let write = deferred.entries[index];
+        for &write in &deferred.entries[..usize::from(deferred.count)] {
             if write.lanes {
                 self.note_code_write_hit(write.physical, write.width);
             } else {

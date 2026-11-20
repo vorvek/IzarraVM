@@ -226,9 +226,9 @@ impl GamePort {
         let state = state.map(JoystickState::sanitized);
         self.state = state;
         if let Some(state) = state {
-            for line in 0..4 {
+            for (line, replay) in self.button_lines.iter_mut().enumerate() {
                 let target = state.button_drive(line);
-                self.button_lines[line] = ButtonReplayLine {
+                *replay = ButtonReplayLine {
                     current: target,
                     target,
                     next_transition_tick: now.saturating_add(BUTTON_MIN_DWELL_TICKS),
@@ -257,10 +257,10 @@ impl GamePort {
             .is_some_and(|old| old.axis_present != state.axis_present);
         self.state = Some(state);
 
-        for line in 0..4 {
+        for (line, replay) in self.button_lines.iter_mut().enumerate() {
             let target = state.button_drive(line);
             if update.reset_replay || profile_changed {
-                self.button_lines[line].reset(target, now, true);
+                replay.reset(target, now, true);
                 continue;
             }
             let transitions = update
@@ -269,7 +269,7 @@ impl GamePort {
                 .copied()
                 .filter(move |transition| usize::from(transition.line) == line)
                 .map(GamePortButtonTransition::drive);
-            self.button_lines[line].update_target(transitions, target, now);
+            replay.update_target(transitions, target, now);
         }
     }
 
@@ -296,8 +296,8 @@ impl GamePort {
         }
 
         let mut axes = !state.axis_present & 0x0f;
-        for axis in 0..4 {
-            if state.axis_present & (1 << axis) != 0 && now < self.discharge_deadlines[axis] {
+        for (axis, &deadline) in self.discharge_deadlines.iter().enumerate() {
+            if state.axis_present & (1 << axis) != 0 && now < deadline {
                 axes |= 1 << axis;
             }
         }

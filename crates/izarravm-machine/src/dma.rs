@@ -370,10 +370,10 @@ impl DmaChip {
                 14 => self.channels.iter_mut().for_each(|c| c.mask = false),
                 15 => {
                     // Write-all-mask: bits 0-3 set each channel's mask.
-                    for ci in 0..4 {
-                        self.channels[ci].mask = value & (1 << ci) != 0;
-                        if self.channels[ci].mask {
-                            self.channels[ci].active = false;
+                    for (ci, channel) in self.channels.iter_mut().enumerate() {
+                        channel.mask = value & (1 << ci) != 0;
+                        if channel.mask {
+                            channel.active = false;
                         }
                     }
                 }

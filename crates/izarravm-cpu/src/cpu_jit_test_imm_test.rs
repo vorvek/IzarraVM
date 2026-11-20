@@ -1328,8 +1328,8 @@ fn arm_neg_reg(cpu: &mut CpuGsw, dst: u8, seed: u32, eflags: u32, pending: Optio
     // Every register gets a non-zero high half. NEG writes the FULL 32 bits, so a fixture that
     // zeroed the destination first could not tell a correct lowering from one that merged into
     // the low 8 or 16 bits, which is the likeliest implementation slip.
-    for index in 0..8usize {
-        cpu.registers.gpr[index] = 0xdead_0000 | index as u32;
+    for (index, gpr) in cpu.registers.gpr.iter_mut().enumerate() {
+        *gpr = 0xdead_0000 | index as u32;
     }
     // Before the seed, not after. ESP is gpr[4], so setting it afterwards would silently discard
     // the seed for dst == 4 and collapse all nine of that destination's cases onto one value.
@@ -1462,8 +1462,8 @@ fn neg_register_form_matches_the_interpreter_in_486_mode() {
 fn arm_group2_reg(cpu: &mut CpuGsw, dst: u8, seed: u32, eflags: u32, pending: Option<(u32, u32)>) {
     cpu.halted = false;
     cpu.interrupt_shadow = false;
-    for index in 0..8usize {
-        cpu.registers.gpr[index] = 0xdead_0000 | index as u32;
+    for (index, gpr) in cpu.registers.gpr.iter_mut().enumerate() {
+        *gpr = 0xdead_0000 | index as u32;
     }
     // ESP BEFORE the seed. ESP is gpr[4], so setting it afterwards silently discards the seed for
     // dst == 4 and collapses that destination's whole case list onto one value. See arm_neg_reg.
@@ -2778,8 +2778,8 @@ fn arm_mul_reg(
     cpu.interrupt_shadow = false;
     // Distinct non-zero filler everywhere first, so a lowering that forgot to write EDX at all is
     // caught by EDX still holding filler rather than by it accidentally already being the answer.
-    for index in 0..8usize {
-        cpu.registers.gpr[index] = 0xfeed_0000 | index as u32;
+    for (index, gpr) in cpu.registers.gpr.iter_mut().enumerate() {
+        *gpr = 0xfeed_0000 | index as u32;
     }
     // ESP FIRST, then the seeds. ESP is gpr[4], so setting it afterwards would silently discard
     // the multiplicand for src == 4 and collapse every one of that source's cases onto one value.
