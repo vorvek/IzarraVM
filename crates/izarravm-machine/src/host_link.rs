@@ -27,14 +27,3 @@ pub(crate) fn make_dir_link(link: &Path, target: &Path) {
     #[cfg(unix)]
     std::os::unix::fs::symlink(target, link).expect("create symlink");
 }
-
-#[test]
-fn a_directory_link_reports_as_a_symlink() {
-    let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("target");
-    std::fs::create_dir(&target).unwrap();
-    let link = dir.path().join("link");
-    make_dir_link(&link, &target);
-    let file_type = std::fs::symlink_metadata(&link).unwrap().file_type();
-    assert!(file_type.is_symlink());
-}

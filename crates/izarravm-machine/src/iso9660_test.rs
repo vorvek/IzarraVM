@@ -332,3 +332,14 @@ fn directory_links_are_skipped_by_the_size_scan_and_the_walk() {
     assert!(find_child(&image, root_lba, b"A.TXT;1").is_some());
     assert!(find_child(&image, root_lba, b"LINK").is_none());
 }
+
+#[test]
+fn a_directory_link_reports_as_a_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link");
+    crate::host_link::make_dir_link(&link, &target);
+    let file_type = std::fs::symlink_metadata(&link).unwrap().file_type();
+    assert!(file_type.is_symlink());
+}
