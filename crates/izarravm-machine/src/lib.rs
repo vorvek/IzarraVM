@@ -145,6 +145,8 @@ mod fdc;
 mod firmware_contract;
 mod floppy;
 mod gameport;
+#[cfg(test)]
+mod host_link;
 mod ide;
 mod iso9660;
 mod katea_names;

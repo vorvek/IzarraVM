@@ -317,3 +317,18 @@ fn a_folder_mount_reopens_a_path_the_lru_evicted() {
         "six distinct files must have been opened at least once each"
     );
 }
+
+#[test]
+fn directory_links_are_skipped_by_the_size_scan_and_the_walk() {
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("x.bin"), vec![1u8; 6000]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.txt"), b"twelve bytes").unwrap();
+    crate::host_link::make_dir_link(&dir.path().join("link"), outside.path());
+
+    assert_eq!(dir_size(dir.path()).unwrap(), 12);
+    let image = CdImage::from_folder(build(dir.path()).unwrap()).unwrap();
+    let root_lba = root_lba_of(&image);
+    assert!(find_child(&image, root_lba, b"A.TXT;1").is_some());
+    assert!(find_child(&image, root_lba, b"LINK").is_none());
+}

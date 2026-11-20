@@ -230,7 +230,10 @@ impl Builder {
             if raw.is_empty() {
                 continue;
             }
-            let meta = match fs::metadata(&path) {
+            // Links are never followed: a link can loop or leave the folder. On
+            // Windows this covers directory junctions as well as symbolic links.
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => continue,
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("fat32: skipping {}: {e}", path.display());

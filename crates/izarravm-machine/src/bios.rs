@@ -186,8 +186,6 @@ impl Machine {
         const KBD_BDA_BASE: usize = 0x400;
         const KBD_HEAD: usize = 0x1a;
         const KBD_TAIL: usize = 0x1c;
-        const KBD_RING_START: u16 = 0x1e;
-        const KBD_RING_END: u16 = 0x3e;
 
         let head = self.memory.read_u16(KBD_BDA_BASE + KBD_HEAD).unwrap_or(0);
         let tail = self.memory.read_u16(KBD_BDA_BASE + KBD_TAIL).unwrap_or(0);
@@ -199,10 +197,7 @@ impl Machine {
             .memory
             .read_u16(KBD_BDA_BASE + usize::from(head))
             .unwrap_or(0);
-        let mut next = head + 2;
-        if next >= KBD_RING_END {
-            next = KBD_RING_START;
-        }
+        let next = crate::dos::kbd_ring_next(head);
         let _ = self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, next);
         self.set_ax(word);
     }

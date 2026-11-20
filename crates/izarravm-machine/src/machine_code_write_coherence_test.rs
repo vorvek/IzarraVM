@@ -740,3 +740,17 @@ fn runtime_hle_modules_do_not_write_memory_behind_cpu_coherence() {
         );
     }
 }
+
+#[test]
+fn lotura_font_bank_word_write_selects_with_the_low_byte() {
+    let mut machine = coherence_machine();
+    machine.set_mode(GswMode::Gsw586);
+    {
+        let mut bus = machine.make_bus();
+        bus.write_io(0x00e7, BusWidth::Word, 0x0100, false).unwrap();
+    }
+    assert_eq!(
+        machine.pending_device_memory_write_range,
+        Some((CODEPAGE_FONT_WINDOW, 4096))
+    );
+}

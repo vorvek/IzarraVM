@@ -94,7 +94,8 @@ pub(super) enum PortBusClass {
     /// control-block registers, and the PCI configuration mechanism (0xCF8-0xCFF).
     PciTarget,
     /// This machine's own host-native chipset window, 0xE0-0xE7 (Lotura): no bus round trip,
-    /// nothing on the metal answers there.
+    /// nothing on the metal answers there. Port 0xE8 (the CD doorbell) is not in this window.
+    /// It is charged as `Unclaimed`, so moving it here would change guest timing.
     ChipsetInternal,
     /// No handler claims the port: 86Box's `io_delay` floor, charged whether or not anything
     /// drives the data lines.
@@ -161,7 +162,8 @@ pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
         0x0040..=0x0043 | 0x0061 | 0x0063 | 0x0070..=0x0071 => PortBusClass::IsaXBus,
         // System Control Port A -- the one port TOKAEMM traps -- is already covered by the
         // 0x0080-0x009F arm above (`IsaXBus` either way), so it needs no arm of its own here.
-        // Lotura: a host-native device, not an ISA peripheral.
+        // Lotura: a host-native device, not an ISA peripheral. The CD doorbell at 0xE8
+        // stays outside this arm on purpose: it keeps the `Unclaimed` charge.
         0x00E0..=0x00E7 => PortBusClass::ChipsetInternal,
         // IDE/ATA command-block and control-block registers.
         0x01F0..=0x01F7 | 0x03F6 | 0x0170..=0x0177 | 0x0376 => PortBusClass::PciTarget,
@@ -3733,7 +3735,7 @@ impl CpuBus for MachineBus<'_> {
             // 0=8x16 (4096 bytes), 1=8x14 (3584 bytes), 2=8x8 (2048 bytes).
             // Valid selectors are 0..14 (five code pages, three sizes each).
             // An out-of-range selector is silently ignored.
-            let sel = value as usize;
+            let sel = usize::from(value as u8);
             let cp = sel / 3;
             let size_index = sel % 3;
             if cp < 5 {

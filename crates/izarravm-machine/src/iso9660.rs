@@ -238,10 +238,14 @@ pub fn build(root: &Path) -> Result<BuiltImage, String> {
 }
 
 /// Recursively sum the byte length of every regular file under `dir`.
+/// Links are skipped, as in `walk_dir`, so the two scans see the same tree.
 fn dir_size(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         let meta = entry.metadata()?;
         if meta.is_dir() {
             total += dir_size(&entry.path())?;
@@ -277,7 +281,10 @@ fn walk_dir(dir: &Path, node_index: usize, nodes: &mut Vec<Vec<Child>>) -> Resul
         if raw.is_empty() {
             continue;
         }
-        let meta = match fs::metadata(&path) {
+        // Links are never followed: a link can loop or leave the folder. On
+        // Windows this covers directory junctions as well as symbolic links.
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => continue,
             Ok(m) => m,
             Err(e) => {
                 eprintln!("iso9660: skipping {}: {e}", path.display());

@@ -1354,7 +1354,7 @@ impl Machine {
     fn int13_cd_parameters(&mut self) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
-        let dst = ds + u32::from(si);
+        let dst = ds.wrapping_add(u32::from(si));
         let size = self.read_guest_linear_block(dst, 2);
         let requested = u16::from_le_bytes([size[0], size[1]]).max(2) as usize;
         let total = u64::from(self.ide.device().image().unwrap().total_sectors());
