@@ -1295,26 +1295,44 @@ impl Machine {
             self.int13_class_result(ELTORITO_CD_DRIVE, 0x04);
             return;
         }
-        let mut sectors = Vec::with_capacity(count as usize);
-        for index in 0..u32::from(count) {
-            sectors.push(
-                self.ide
+        // Read and copy in chunks of 64 sectors. A data read of an audio or Form 2
+        // sector fails, so the transfer stops at the first sector that reads as absent.
+        // AH=44h verifies: it reads but copies nothing.
+        let dst = (u32::from(seg) << 4).wrapping_add(u32::from(off));
+        let mut done: u16 = 0;
+        let mut buffer_unreachable = false;
+        while done < count {
+            let chunk = (count - done).min(64);
+            let mut payload = Vec::new();
+            let mut read = 0u16;
+            for offset in 0..chunk {
+                let sector = lba as u32 + u32::from(done + offset);
+                let Some(bytes) = self
+                    .ide
                     .device()
                     .image()
-                    .unwrap()
-                    .read_data_sector(lba as u32 + index)
-                    .unwrap(),
-            );
-        }
-        let mut done = count;
-        if ah == 0x42 {
-            let dst = (u32::from(seg) << 4).wrapping_add(u32::from(off));
-            for (index, sector) in sectors.iter().enumerate() {
-                let at = dst.wrapping_add(index as u32 * cdimage::DATA_SECTOR as u32);
-                if self.write_guest_linear_block(at, sector) < sector.len() {
-                    done = index as u16;
+                    .and_then(|image| image.read_data_sector(sector))
+                else {
+                    break;
+                };
+                if ah == 0x42 {
+                    payload.extend_from_slice(&bytes);
+                }
+                read += 1;
+            }
+            if ah == 0x42 && read > 0 {
+                let at = dst.wrapping_add(u32::from(done) * cdimage::DATA_SECTOR as u32);
+                let delivered = self.write_guest_linear_block(at, &payload);
+                done += (delivered / cdimage::DATA_SECTOR) as u16;
+                if delivered < payload.len() {
+                    buffer_unreachable = true;
                     break;
                 }
+            } else {
+                done += read;
+            }
+            if read < chunk {
+                break;
             }
         }
         self.set_dap_blocks(dap, done);
@@ -1322,8 +1340,10 @@ impl Machine {
         self.stall_for_master_ticks(ide::sector_transfer_ticks() * u64::from(done));
         let status = if done == count {
             0
-        } else {
+        } else if buffer_unreachable {
             BUFFER_UNREACHABLE_STATUS
+        } else {
+            0x04
         };
         self.int13_class_result(ELTORITO_CD_DRIVE, status);
     }
@@ -1334,7 +1354,7 @@ impl Machine {
     fn int13_cd_parameters(&mut self) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
-        let dst = ds + u32::from(si);
+        let dst = ds.wrapping_add(u32::from(si));
         let size = self.read_guest_linear_block(dst, 2);
         let requested = u16::from_le_bytes([size[0], size[1]]).max(2) as usize;
         let total = u64::from(self.ide.device().image().unwrap().total_sectors());

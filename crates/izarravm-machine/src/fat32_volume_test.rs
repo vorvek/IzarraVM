@@ -223,3 +223,21 @@ fn directory_spanning_multiple_clusters_is_complete() {
         );
     }
 }
+
+#[test]
+fn directory_links_are_skipped() {
+    let outside = temp_dir("link_target");
+    std::fs::write(outside.join("X.BIN"), vec![1u8; 6000]).unwrap();
+    let dir = temp_dir("link_root");
+    std::fs::write(dir.join("A.TXT"), b"twelve bytes").unwrap();
+    crate::host_link::make_dir_link(&dir.join("LINK"), &outside);
+    let vol = build_fat32(&dir, TEST_BYTES, 1).unwrap();
+    // Remove the link before the target so the removal never walks into it.
+    std::fs::remove_dir(dir.join("LINK")).ok();
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&outside).ok();
+
+    let root = read_dir_entries(&vol, vol.geometry().root_cluster);
+    assert!(find_entry(&root, b"A       TXT").is_some());
+    assert!(find_entry(&root, b"LINK       ").is_none());
+}

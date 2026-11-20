@@ -406,9 +406,9 @@ impl Rtc {
     /// Read the byte the index port currently selects. Status and clock reads
     /// return the live values; reading Register C clears its interrupt flags.
     pub fn read_data(&mut self) -> u8 {
-        let idx = usize::from(self.index & 0x3f);
-        let value = self.ram[idx];
-        if self.index & 0x7f == REG_C {
+        let reg = self.index & 0x3f;
+        let value = self.ram[usize::from(reg)];
+        if reg == REG_C {
             // Reading Register C clears the interrupt-request flags.
             self.ram[usize::from(REG_C)] = 0;
         }
@@ -418,7 +418,8 @@ impl Rtc {
     /// Write the byte the index port currently selects. Writes to the clock
     /// fields update the broken-down time; writes to NVRAM land in RAM.
     pub fn write_data(&mut self, value: u8) {
-        let reg = self.index & 0x7f;
+        // The register file has 64 bytes. Index bits 6 and 7 do not select a register.
+        let reg = self.index & 0x3f;
         match reg {
             REG_SECONDS => self.time.second = value.min(59),
             REG_MINUTES => self.time.minute = value.min(59),

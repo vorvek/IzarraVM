@@ -643,6 +643,22 @@ impl Machine {
         }
     }
 
+    /// Remove the oldest word from the BIOS keyboard ring in the BDA, or return
+    /// `None` when the ring is empty.
+    fn kbd_ring_pop(&mut self) -> Result<Option<u16>, BusError> {
+        const KBD_BDA_BASE: usize = 0x400;
+        const KBD_HEAD: usize = 0x1a;
+        const KBD_TAIL: usize = 0x1c;
+        let head = self.memory.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
+        let tail = self.memory.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
+        if head == tail {
+            return Ok(None);
+        }
+        let word = self.memory.read_u16(KBD_BDA_BASE + usize::from(head))?;
+        self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, kbd_ring_next(head))?;
+        Ok(Some(word))
+    }
+
     /// The minimal interrupt surface for a `new_raw_program` machine: INT 20h
     /// and AH=4Ch terminate; AH=01h/02h/06h/09h console I/O; anything else
     /// returns DOS's "invalid function" convention (CF=1, AX=0007h) instead
@@ -651,7 +667,7 @@ impl Machine {
     pub(super) fn handle_raw_program_int(&mut self, vector: u8) -> Result<Option<u8>, BusError> {
         let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
         let sp = self.cpu.registers.esp() as u16;
-        let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
+        let flags_addr = ss.wrapping_add(u32::from(sp.wrapping_add(4))) as usize;
 
         if vector == 0x20 {
             return Ok(Some(0));
@@ -661,32 +677,19 @@ impl Machine {
         match ah {
             0x4c => return Ok(Some(ax as u8)),
             0x01 => {
-                const KBD_BDA_BASE: usize = 0x400;
-                const KBD_HEAD: usize = 0x1a;
-                const KBD_TAIL: usize = 0x1c;
-                const KBD_RING_START: u16 = 0x1e;
-                const KBD_RING_END: u16 = 0x3e;
-                let head = self.memory.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
-                let tail = self.memory.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
-                if head == tail {
+                let Some(word) = self.kbd_ring_pop()? else {
                     // Blocking read with an empty ring: rewind the stacked
                     // return IP by 2 so the IRET stub re-enters the same
                     // `CD 21`, and set IF so IRQ1 can run the keyboard ISR
                     // before the retry (a wait-for-key spin).
-                    let ip_addr = (ss + u32::from(sp)) as usize;
+                    let ip_addr = ss.wrapping_add(u32::from(sp)) as usize;
                     let ret_ip = self.memory.read_u16(ip_addr)?;
                     self.write_guest_ram_u16(ip_addr, ret_ip.wrapping_sub(2))?;
                     let mut flags = self.memory.read_u16(flags_addr)?;
                     flags |= 0x0200; // IF
                     self.write_guest_ram_u16(flags_addr, flags)?;
                     return Ok(None);
-                }
-                let word = self.memory.read_u16(KBD_BDA_BASE + usize::from(head))?;
-                let mut next = head + 2;
-                if next >= KBD_RING_END {
-                    next = KBD_RING_START;
-                }
-                self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
+                };
                 let ch = word as u8;
                 self.program_output.push(ch);
                 self.cpu.registers.set_eax(u32::from(ch));
@@ -700,26 +703,13 @@ impl Machine {
                 if dl == 0xff {
                     // Char-in-no-wait: report "nothing available" via ZF, the
                     // same shape int14_fossil_keyboard_read uses for polling.
-                    const KBD_BDA_BASE: usize = 0x400;
-                    const KBD_HEAD: usize = 0x1a;
-                    const KBD_TAIL: usize = 0x1c;
-                    let head = self.memory.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
-                    let tail = self.memory.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
                     let mut flags = self.memory.read_u16(flags_addr)?;
-                    if head == tail {
-                        flags |= 0x0040; // ZF set: nothing available
-                        self.cpu.registers.set_eax(0);
-                    } else {
-                        let word = self.memory.read_u16(KBD_BDA_BASE + usize::from(head))?;
-                        let mut next = head + 2;
-                        const KBD_RING_START: u16 = 0x1e;
-                        const KBD_RING_END: u16 = 0x3e;
-                        if next >= KBD_RING_END {
-                            next = KBD_RING_START;
-                        }
-                        self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
+                    if let Some(word) = self.kbd_ring_pop()? {
                         flags &= !0x0040; // ZF clear: a char is in AL
                         self.cpu.registers.set_eax(u32::from(word as u8));
+                    } else {
+                        flags |= 0x0040; // ZF set: nothing available
+                        self.cpu.registers.set_eax(0);
                     }
                     self.write_guest_ram_u16(flags_addr, flags)?;
                 } else {
@@ -729,14 +719,15 @@ impl Machine {
             0x09 => {
                 let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
                 let dx = self.cpu.registers.edx() as u16;
-                let mut addr = ds + u32::from(dx);
-                loop {
+                // The offset wraps inside the segment, and the scan covers at most
+                // one segment, so a string with no terminator cannot run on.
+                for step in 0..=u16::MAX {
+                    let addr = ds.wrapping_add(u32::from(dx.wrapping_add(step)));
                     let byte = self.memory.read_u8(addr as usize)?;
                     if byte == b'$' {
                         break;
                     }
                     self.program_output.push(byte);
-                    addr = addr.wrapping_add(1);
                 }
             }
             _ => {
@@ -886,7 +877,10 @@ impl Machine {
             ("AUTOEXEC.BAT", "AUTOEXEC.OLD", &autoexec),
         ] {
             let live = root.join(live_name);
-            if live.exists() {
+            // A live file that already equals the defaults holds nothing to save.
+            // Renaming it would replace the earlier backup with the defaults.
+            let is_default = std::fs::read(&live).is_ok_and(|current| current == *bytes);
+            if live.exists() && !is_default {
                 // Best-effort backup (std::fs::rename replaces an existing .OLD on Windows).
                 let _ = std::fs::rename(&live, root.join(old_name));
             }
@@ -951,5 +945,19 @@ impl Machine {
     /// machine uses the native `program_output` buffer.
     fn console_output(&self) -> &[u8] {
         &self.program_output
+    }
+}
+
+/// The ring index after `head`. The BIOS keyboard ring holds the words from
+/// 0x1E up to, but not including, 0x3E. The add wraps, so a head value set by
+/// the guest cannot overflow.
+pub(crate) fn kbd_ring_next(head: u16) -> u16 {
+    const KBD_RING_START: u16 = 0x1e;
+    const KBD_RING_END: u16 = 0x3e;
+    let next = head.wrapping_add(2);
+    if next >= KBD_RING_END {
+        KBD_RING_START
+    } else {
+        next
     }
 }

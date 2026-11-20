@@ -970,3 +970,50 @@ fn a_text_arm_mode_set_reaches_aperture_code() {
          the same INT 10h must flush nothing"
     );
 }
+
+/// A raw-program machine with DS at 0x2000, ready for a direct INT 21h call.
+fn raw_int21_machine(ax: u16, dx: u16) -> Machine {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xCD, 0x20])
+            .unwrap();
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+    machine.cpu.registers.set_eax(u32::from(ax));
+    machine.cpu.registers.set_edx(u32::from(dx));
+    machine
+}
+
+#[test]
+fn raw_int21_ah09_stops_after_one_segment_without_a_terminator() {
+    let mut machine = raw_int21_machine(0x0900, 0);
+    // A terminator just past the segment end must not be found.
+    machine.write_physical_u8(0x2_0000 + 0x1_0010, b'$');
+    machine.handle_raw_program_int(0x21).unwrap();
+    assert_eq!(machine.program_output().len(), 0x1_0000);
+}
+
+#[test]
+fn raw_int21_ah09_wraps_the_offset_inside_the_segment() {
+    let mut machine = raw_int21_machine(0x0900, 0xFFFE);
+    machine.write_physical_u8(0x2_0000 + 0xFFFE, b'A');
+    machine.write_physical_u8(0x2_0000 + 0xFFFF, b'B');
+    machine.write_physical_u8(0x2_0000, b'C');
+    machine.write_physical_u8(0x2_0001, b'$');
+    // A terminator at the linear byte after the segment end ends an unwrapped scan.
+    machine.write_physical_u8(0x3_0000, b'$');
+    machine.handle_raw_program_int(0x21).unwrap();
+    assert_eq!(machine.program_output(), b"ABC");
+}
+
+#[test]
+fn raw_int21_ah01_with_a_head_pointer_of_ffff_does_not_overflow() {
+    let mut machine = raw_int21_machine(0x0100, 0);
+    machine.write_physical_u8(0x41A, 0xFF);
+    machine.write_physical_u8(0x41B, 0xFF);
+    machine.write_physical_u8(0x41C, 0x00);
+    machine.write_physical_u8(0x41D, 0x00);
+    machine.handle_raw_program_int(0x21).unwrap();
+    assert_eq!(read_u16(&mut machine, 0x41A), 0x0001);
+}

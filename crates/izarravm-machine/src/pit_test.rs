@@ -2320,3 +2320,9 @@ fn pit_bulk_advance_knob_refuses_a_non_utf8_value() {
         std::ffi::OsString::from("on"),
     )));
 }
+
+#[test]
+#[should_panic(expected = "the default, which is ON")]
+fn pit_bulk_advance_help_text_names_on_as_the_default() {
+    let _ = parse_bulk_advance_arm(Ok("yes".to_string()));
+}

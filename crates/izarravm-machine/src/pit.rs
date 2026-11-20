@@ -1286,8 +1286,8 @@ pub(crate) fn bulk_advance_default() -> bool {
 }
 
 const BULK_ADVANCE_SPELLINGS: &str = "accepted spellings are unset or `` (both the default, \
-     which is OFF: the per-input-CLK loop), `0` / `off` (the same OFF arm, stated), and `1` / \
-     `on` (the analytic bulk advance)";
+     which is ON: the analytic bulk advance), `0` / `off` (the per-input-CLK loop), and `1` / \
+     `on` (the same ON arm, stated)";
 
 fn parse_bulk_advance_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
