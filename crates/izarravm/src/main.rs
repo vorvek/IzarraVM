@@ -241,6 +241,8 @@ struct Cli {
     stdin_text: Option<String>,
     #[arg(long)]
     bios: Option<PathBuf>,
+    /// Cycle budget for the headless run. With --headless-test-rom and no --bios,
+    /// a budget too small for the ROM to halt fails the run.
     #[arg(long)]
     cycles: Option<u64>,
     #[arg(long)]
@@ -488,6 +490,80 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     // Report the result block, which holds the runtime outcome (the timer test
     // patches its record here). The serial dump is an earlier static snapshot.
     let results = parse_result_block(machine.memory().as_slice())?;
+    print_suite_records(&results);
+    println!("stop: {stop_reason:?}");
+    print_com1(&machine.serial_text());
+    maybe_report_unit_sim(&mut machine);
+    if stop_reason != StopReason::Halted {
+        return Err(format!("boot suite did not halt: {stop_reason:?}").into());
+    }
+    if let Some(message) = boot_suite_failure_summary(&results) {
+        return Err(message.into());
+    }
+    Ok(())
+}
+
+const BOOT_SUITE_REQUIRED_RECORDS: &[(&str, SuiteRecordStatus)] = &[
+    ("suite.boot", SuiteRecordStatus::Begin),
+    ("boot.sector", SuiteRecordStatus::Pass),
+    ("boot.stage2", SuiteRecordStatus::Pass),
+    ("report.serial", SuiteRecordStatus::Pass),
+    ("report.result_block", SuiteRecordStatus::Pass),
+    ("cpu.real_mode", SuiteRecordStatus::Pass),
+    ("cpu.protected_mode", SuiteRecordStatus::Pass),
+    ("cpu.paging", SuiteRecordStatus::Pass),
+    ("memory.conventional_pattern", SuiteRecordStatus::Pass),
+    ("memory.conventional_kib", SuiteRecordStatus::Measure),
+    ("video.vga_text", SuiteRecordStatus::Pass),
+    ("video.cga_graphics", SuiteRecordStatus::Pass),
+    ("video.ega_planar", SuiteRecordStatus::Pass),
+    ("video.vga_mode13h", SuiteRecordStatus::Pass),
+    ("sound.pc_speaker", SuiteRecordStatus::Pass),
+    ("sound.opl2", SuiteRecordStatus::Pass),
+    ("sound.opl3", SuiteRecordStatus::Pass),
+    ("sound.sb_dsp_reset", SuiteRecordStatus::Pass),
+    ("sound.sb_8bit_dma", SuiteRecordStatus::Pass),
+    ("sound.sb_16bit_dma", SuiteRecordStatus::Pass),
+    ("timer.irq0", SuiteRecordStatus::Pass),
+];
+
+/// Lines the default test ROM prints when every step passes.
+const TEST_ROM_REQUIRED_TEXT: &[&str] = &[
+    "RESET VECTOR + BIOS INT10 PASS",
+    "B8000 DIRECT TEXT PASS",
+    "PROTECTED MODE FLAT SEGMENTS PASS",
+    "PAGING + B8000 ALIAS PASS",
+    "RING0 PAGE FAULT HANDLER PASS",
+];
+
+/// The default test ROM never writes port 0x80, so the port reads its open-bus value.
+const TEST_ROM_POST_CODE: u8 = 0xff;
+
+/// Checks the default test ROM result: a halt, the open-bus POST code and every PASS line.
+fn test_rom_failure_summary(stop: &StopReason, post: u8, screen: &str) -> Option<String> {
+    let mut issues = Vec::new();
+    if *stop != StopReason::Halted {
+        issues.push(format!("expected Halted, got {stop:?}"));
+    }
+    if post != TEST_ROM_POST_CODE {
+        issues.push(format!(
+            "POST code {post:#04x}, expected {TEST_ROM_POST_CODE:#04x}"
+        ));
+    }
+    for text in TEST_ROM_REQUIRED_TEXT {
+        if !screen.contains(text) {
+            issues.push(format!("screen lacks: {text}"));
+        }
+    }
+    (!issues.is_empty()).then(|| format!("test ROM gate failed: {}", issues.join("; ")))
+}
+
+fn boot_suite_failure_summary(results: &SuiteResults) -> Option<String> {
+    suite_failure_summary("boot suite", BOOT_SUITE_REQUIRED_RECORDS, results)
+}
+
+/// Print one line per suite record, then the parsed count.
+fn print_suite_records(results: &SuiteResults) {
     for record in &results.records {
         let status = match record.status {
             SuiteRecordStatus::Begin => "BEGIN",
@@ -501,27 +577,6 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         }
     }
     println!("records: {}", results.records.len());
-    println!("stop: {stop_reason:?}");
-    print_com1(&machine.serial_text());
-    maybe_report_unit_sim(&mut machine);
-    if let Some(message) = boot_suite_failure_summary(&results) {
-        return Err(message.into());
-    }
-    Ok(())
-}
-
-fn boot_suite_failure_summary(results: &SuiteResults) -> Option<String> {
-    let failures: Vec<&str> = results
-        .records
-        .iter()
-        .filter(|record| record.status == SuiteRecordStatus::Fail)
-        .map(|record| record.name.as_str())
-        .collect();
-    if failures.is_empty() {
-        None
-    } else {
-        Some(format!("boot suite reported FAIL: {}", failures.join(", ")))
-    }
 }
 
 /// Boot a BIOS/test ROM headless and print the screen text plus POST code.
@@ -546,9 +601,15 @@ fn run_test_rom(
     );
     println!("{screen_text}");
     print_com1(&machine.serial_text());
-    println!("post: {:#04x}", machine.io_port(0x80).unwrap_or(0));
+    let post = machine.io_port(0x80).unwrap_or(0);
+    println!("post: {post:#04x}");
     println!("stop: {stop_reason:?}");
     maybe_report_unit_sim(&mut machine);
+    if bios.is_none()
+        && let Some(message) = test_rom_failure_summary(&stop_reason, post, &screen_text)
+    {
+        return Err(message.into());
+    }
     Ok(())
 }
 
@@ -587,19 +648,7 @@ fn run_izarra_bios() -> Result<(), Box<dyn Error>> {
     let budget = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     let results = parse_result_block(machine.memory().as_slice())?;
-    for record in &results.records {
-        let status = match record.status {
-            SuiteRecordStatus::Begin => "BEGIN",
-            SuiteRecordStatus::Pass => "PASS",
-            SuiteRecordStatus::Fail => "FAIL",
-            SuiteRecordStatus::Measure => "MEASURE",
-        };
-        match &record.value {
-            Some(value) => println!("{status} {} {value}", record.name),
-            None => println!("{status} {}", record.name),
-        }
-    }
-    println!("records: {}", results.records.len());
+    print_suite_records(&results);
     println!("declared: {}", results.declared_record_count);
     println!("stop: {stop_reason:?}");
     if stop_reason != StopReason::Halted {
@@ -634,6 +683,15 @@ const IZARRA_BIOS_REQUIRED_RECORDS: &[(&str, SuiteRecordStatus)] = &[
 ];
 
 fn izarra_bios_failure_summary(results: &SuiteResults) -> Option<String> {
+    suite_failure_summary("Izarra BIOS", IZARRA_BIOS_REQUIRED_RECORDS, results)
+}
+
+/// Compare a parsed result block with the exact record list a suite must report.
+fn suite_failure_summary(
+    label: &str,
+    required: &[(&str, SuiteRecordStatus)],
+    results: &SuiteResults,
+) -> Option<String> {
     let mut issues = Vec::new();
     if results.version != 1 {
         issues.push(format!("unsupported result version {}", results.version));
@@ -645,10 +703,10 @@ fn izarra_bios_failure_summary(results: &SuiteResults) -> Option<String> {
             results.records.len()
         ));
     }
-    if results.records.len() != IZARRA_BIOS_REQUIRED_RECORDS.len() {
+    if results.records.len() != required.len() {
         issues.push(format!(
             "expected {} required records but parsed {}",
-            IZARRA_BIOS_REQUIRED_RECORDS.len(),
+            required.len(),
             results.records.len()
         ));
     }
@@ -667,16 +725,13 @@ fn izarra_bios_failure_summary(results: &SuiteResults) -> Option<String> {
         ));
     }
 
-    let required_names: BTreeSet<&str> = IZARRA_BIOS_REQUIRED_RECORDS
-        .iter()
-        .map(|(name, _)| *name)
-        .collect();
+    let required_names: BTreeSet<&str> = required.iter().map(|(name, _)| *name).collect();
     let unexpected: Vec<&str> = names.difference(&required_names).copied().collect();
     if !unexpected.is_empty() {
         issues.push(format!("unexpected records: {}", unexpected.join(", ")));
     }
 
-    for &(name, expected_status) in IZARRA_BIOS_REQUIRED_RECORDS {
+    for &(name, expected_status) in required {
         let Some(record) = results.records.iter().find(|record| record.name == name) else {
             issues.push(format!("missing required record: {name}"));
             continue;
@@ -696,7 +751,7 @@ fn izarra_bios_failure_summary(results: &SuiteResults) -> Option<String> {
         }
     }
 
-    (!issues.is_empty()).then(|| format!("Izarra BIOS gate failed: {}", issues.join("; ")))
+    (!issues.is_empty()).then(|| format!("{label} gate failed: {}", issues.join("; ")))
 }
 
 /// Mount a floppy IMG, run the Izarra BIOS so INT 19h bootstraps it, and print
