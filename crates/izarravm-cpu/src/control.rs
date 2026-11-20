@@ -2403,7 +2403,13 @@ impl CpuGsw {
             let dpl = (access >> 5) & 3;
             let cpl = self.current_privilege_level();
             let rpl = (selector & 3) as u8;
-            if dpl < cpl.max(rpl) {
+            // SS needs RPL == CPL and DPL == CPL. The data segments need max(CPL, RPL) <= DPL.
+            let denied = if segment == SegmentIndex::Ss {
+                rpl != cpl || dpl != cpl
+            } else {
+                dpl < cpl.max(rpl)
+            };
+            if denied {
                 return Err(InternalFault::Exception {
                     vector: 13,
                     error_code: Some(selector_error_code(selector, in_ldt, false)),

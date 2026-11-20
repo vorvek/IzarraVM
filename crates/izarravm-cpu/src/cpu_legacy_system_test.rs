@@ -3595,3 +3595,27 @@ fn lgdt_and_lidt_with_a_16_bit_operand_keep_a_24_bit_base() {
 }
 
 #[test]
+fn mov_ss_requires_rpl_and_dpl_equal_to_cpl() {
+    // (descriptor high dword, selector in AX, loads)
+    let dpl3 = 0x00cf_f200;
+    let dpl0 = 0x00cf_9200;
+    let cases: [(u32, u32, bool); 4] = [
+        (dpl3, 0x08, false), // DPL 3 stack at CPL 0
+        (dpl3, 0x0b, false), // RPL 3 and DPL 3 at CPL 0
+        (dpl0, 0x0b, false), // RPL 3 at CPL 0
+        (dpl0, 0x08, true),
+    ];
+    for (high, selector, loads) in cases {
+        let (mut cpu, memory) = protected_cpu_with_gdt(&[0x8e, 0xd0], &[(0x08, 0x0000_ffff, high)]);
+        cpu.registers.set_eax(selector);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        if loads {
+            result.unwrap();
+        } else {
+            assert_exception(result, 13, Some(0x08));
+        }
+    }
+}
+
+#[test]
