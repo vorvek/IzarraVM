@@ -252,9 +252,74 @@ struct WinitApp {
     // Raw mouse motion the Windows WM_INPUT hook accumulates between frames; drained
     // each frame in about_to_wait. Always zero on platforms without the hook.
     raw_mouse: RawMouseAccum,
+    // Set when the window or the GPU cannot start or dies. `run` shows it and
+    // returns it as an error after the event loop ends.
+    fatal: Option<String>,
+}
+
+/// The surface format and alpha mode to configure, taken from what the surface
+/// reports. An empty list is an error, not a panic.
+fn pick_surface_modes(
+    formats: &[wgpu::TextureFormat],
+    alpha_modes: &[wgpu::CompositeAlphaMode],
+) -> Result<(wgpu::TextureFormat, wgpu::CompositeAlphaMode), String> {
+    let format = formats
+        .first()
+        .copied()
+        .ok_or("The display surface reports no texture formats.")?;
+    let alpha = alpha_modes
+        .first()
+        .copied()
+        .ok_or("The display surface reports no alpha modes.")?;
+    Ok((format, alpha))
+}
+
+/// Create the surface, adapter and device for `window`. Every failure comes
+/// back as text for the user.
+fn init_gpu(window: &Arc<Window>) -> Result<WgpuState, String> {
+    let instance = wgpu::Instance::default();
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|err| format!("Cannot create a display surface: {err}"))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+    }))
+    .map_err(|err| format!("No usable graphics adapter was found: {err}"))?;
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .map_err(|err| format!("Cannot open the graphics device: {err}"))?;
+    let size = window.inner_size();
+    let caps = surface.get_capabilities(&adapter);
+    let (format, alpha_mode) = pick_surface_modes(&caps.formats, &caps.alpha_modes)?;
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode,
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+    surface.configure(&device, &config);
+    Ok(WgpuState {
+        surface,
+        device,
+        queue,
+        config,
+    })
 }
 
 impl WinitApp {
+    /// Record a start-up failure and stop the event loop.
+    fn fail(&mut self, event_loop: &ActiveEventLoop, message: String) {
+        error!(%message, "fatal graphics error; exiting");
+        self.fatal = Some(message);
+        event_loop.exit();
+    }
+
     fn resume_controller_input(&mut self) {
         self.gui.resume_controllers();
     }
@@ -304,6 +369,7 @@ impl WinitApp {
             // Fatal: log and exit rather than spin on a dead surface.
             Err(err @ (wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)) => {
                 error!(?err, "fatal surface error; exiting");
+                self.fatal = Some(format!("The display surface failed: {err:?}"));
                 event_loop.exit();
                 return;
             }
@@ -433,39 +499,27 @@ impl ApplicationHandler for WinitApp {
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_fullscreen(fullscreen_mode(self.is_fullscreen));
-        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        let window = match event_loop.create_window(attrs) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                self.fail(event_loop, format!("Cannot create the window: {err}"));
+                return;
+            }
+        };
         self.window = Some(window.clone());
         // Ask winit for raw device input while focused, so the guest keyboard can
         // read DeviceEvent::Key (Win32 Raw Input) instead of the cooked
         // WindowEvent path, and raw mouse motion for capture.
         event_loop.listen_device_events(winit::event_loop::DeviceEvents::WhenFocused);
 
-        // Standard wgpu init for the surface, adapter, and device.
-        let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone()).expect("surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        }))
-        .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("device");
-        let size = window.inner_size();
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats[0];
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+        let wgpu = match init_gpu(&window) {
+            Ok(state) => state,
+            Err(message) => {
+                self.fail(event_loop, message);
+                return;
+            }
         };
-        surface.configure(&device, &config);
+        let format = wgpu.config.format;
 
         let egui_winit = egui_winit::State::new(
             self.egui_ctx.clone(),
@@ -475,19 +529,18 @@ impl ApplicationHandler for WinitApp {
             None,
             None,
         );
-        let mut egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let mut egui_renderer = egui_wgpu::Renderer::new(&wgpu.device, format, None, 1, false);
         egui_renderer
             .callback_resources
-            .insert(crate::crt::CrtResources::new(&device, &queue, format));
+            .insert(crate::crt::CrtResources::new(
+                &wgpu.device,
+                &wgpu.queue,
+                format,
+            ));
 
         self.egui_renderer = Some(egui_renderer);
         self.egui_winit = Some(egui_winit);
-        self.wgpu = Some(WgpuState {
-            surface,
-            device,
-            queue,
-            config,
-        });
+        self.wgpu = Some(wgpu);
         self.focused = window.has_focus();
         if self.focused {
             self.resume_controller_input();
@@ -928,8 +981,13 @@ pub fn run(launch: GuiLaunch) -> Result<(), Box<dyn Error>> {
         next_mouse_flush: Instant::now(),
         next_joystick_poll: Instant::now(),
         raw_mouse,
+        fatal: None,
     };
     event_loop.run_app(&mut app)?;
+    if let Some(message) = app.fatal.take() {
+        crate::preflight::show_error_dialog("IzarraVM", &message);
+        return Err(message.into());
+    }
     Ok(())
 }
 

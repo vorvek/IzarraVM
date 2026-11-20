@@ -644,3 +644,16 @@ fn a_super_key_the_host_hook_swallowed_still_arms_the_hotkey() {
         KeyRoute::Guest { .. }
     ));
 }
+
+#[test]
+fn surface_choice_takes_the_first_entries_and_rejects_empty_lists() {
+    use wgpu::{CompositeAlphaMode, TextureFormat};
+    let formats = [TextureFormat::Bgra8UnormSrgb, TextureFormat::Rgba8Unorm];
+    let alphas = [CompositeAlphaMode::Opaque];
+    assert_eq!(
+        pick_surface_modes(&formats, &alphas),
+        Ok((TextureFormat::Bgra8UnormSrgb, CompositeAlphaMode::Opaque))
+    );
+    assert!(pick_surface_modes(&[], &alphas).is_err());
+    assert!(pick_surface_modes(&formats, &[]).is_err());
+}
