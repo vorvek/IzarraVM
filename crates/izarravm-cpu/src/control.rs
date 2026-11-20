@@ -2539,7 +2539,27 @@ impl CpuGsw {
         )
     }
 
+    /// The task switch loads the LDTR from the new TSS. A bad descriptor there is a #GP.
     pub(super) fn load_ldtr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
+        self.load_ldtr_checked(bus, selector, 13)
+    }
+
+    /// The LLDT instruction. A not-present descriptor is #NP.
+    pub(super) fn load_ldtr_instruction<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+    ) -> ExecResult<()> {
+        self.load_ldtr_checked(bus, selector, 11)
+    }
+
+    /// `not_present_vector` is the vector for a descriptor of the right type with P clear.
+    fn load_ldtr_checked<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+        not_present_vector: u8,
+    ) -> ExecResult<()> {
         if selector & 0x4 != 0 {
             // The LDT descriptor must live in the GDT (TI = 0).
             return Err(InternalFault::Exception {
@@ -2557,10 +2577,16 @@ impl CpuGsw {
         }
         let (low, high) = self.read_gdt_descriptor(bus, selector)?;
         let access = (high >> 8) & 0xff;
-        // Present LDT system descriptor (S = 0, type = 2).
-        if access & 0x80 == 0 || access & 0x1f != 0x02 {
+        // The type check comes first: LDT system descriptor (S = 0, type = 2).
+        if access & 0x1f != 0x02 {
             return Err(InternalFault::Exception {
                 vector: 13,
+                error_code: Some(selector_error_code(selector, false, false)),
+            });
+        }
+        if access & 0x80 == 0 {
+            return Err(InternalFault::Exception {
+                vector: not_present_vector,
                 error_code: Some(selector_error_code(selector, false, false)),
             });
         }
@@ -2568,7 +2594,12 @@ impl CpuGsw {
         Ok(())
     }
 
-    pub(super) fn load_tr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
+    /// The LTR instruction. A wrong type is #GP. A not-present TSS descriptor is #NP.
+    pub(super) fn load_tr_instruction<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+    ) -> ExecResult<()> {
         if selector & 0x4 != 0 || selector & !0x7 == 0 {
             return Err(InternalFault::Exception {
                 vector: 13,
@@ -2578,10 +2609,16 @@ impl CpuGsw {
         let (low, high) = self.read_gdt_descriptor(bus, selector)?;
         let access = (high >> 8) & 0xff;
         let descriptor_type = access & 0x1f;
-        // Present available TSS: type 1 (286) or 9 (386).
-        if access & 0x80 == 0 || (descriptor_type != 0x01 && descriptor_type != 0x09) {
+        // Available TSS: type 1 (286) or 9 (386).
+        if descriptor_type != 0x01 && descriptor_type != 0x09 {
             return Err(InternalFault::Exception {
                 vector: 13,
+                error_code: Some(selector_error_code(selector, false, false)),
+            });
+        }
+        if access & 0x80 == 0 {
+            return Err(InternalFault::Exception {
+                vector: 11,
                 error_code: Some(selector_error_code(selector, false, false)),
             });
         }

@@ -340,7 +340,7 @@ impl CpuGsw {
                         self.require_cpl0()?;
                         let selector =
                             self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
-                        self.load_ldtr(bus, selector)?;
+                        self.load_ldtr_instruction(bus, selector)?;
                         Ok(self.charge(TimingClass::LldtLtr))
                     }
                     3 => {
@@ -348,7 +348,7 @@ impl CpuGsw {
                         self.require_cpl0()?;
                         let selector =
                             self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
-                        self.load_tr(bus, selector)?;
+                        self.load_tr_instruction(bus, selector)?;
                         Ok(self.charge(TimingClass::LldtLtr))
                     }
                     4 | 5 => {
@@ -453,15 +453,10 @@ impl CpuGsw {
                                 Ok(self.charge(TimingClass::LgdtLidt))
                             }
                             7 => {
-                                // INVLPG m: privileged on the 486. The operand supplies an address;
+                                // INVLPG m: privileged (#GP(0) outside CPL 0) on the 486. The operand supplies an address;
                                 // its memory contents are not read.
                                 self.require_isa_generation(IsaGeneration::I486)?;
-                                if self.current_privilege_level() != 0 {
-                                    return Err(InternalFault::Exception {
-                                        vector: 6,
-                                        error_code: None,
-                                    });
-                                }
+                                self.require_cpl0()?;
                                 let linear =
                                     self.segment_linear_byte(memory.segment, memory.offset, false)?;
                                 // The reflected-call memo's control-effect journal

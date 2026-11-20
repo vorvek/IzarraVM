@@ -3510,3 +3510,68 @@ fn group6_lar_and_lsl_raise_ud_in_v86_mode() {
 
 
 #[test]
+fn mov_sreg_encodings_without_a_register_raise_ud() {
+    // MOV CS,AX and the reg 6 and 7 forms of MOV Sreg,r/m and MOV r/m,Sreg are undefined.
+    let codes: [&[u8]; 6] = [
+        &[0x8e, 0xc8],
+        &[0x8e, 0xf0],
+        &[0x8e, 0xf8],
+        &[0x8c, 0xf0],
+        &[0x8c, 0xf8],
+        &[0x8e, 0x0e, 0x40, 0x00],
+    ];
+    for code in codes {
+        let (mut cpu, memory) = real_mode_cpu(code, 0x80);
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, 6, None);
+        assert_eq!(cpu.read_gpr16(0), 0x1234, "{code:02x?} leaves AX alone");
+    }
+}
+
+#[test]
+fn lldt_and_ltr_report_not_present_as_np_after_the_type_check() {
+    // (modrm, descriptor access byte, expected vector; 0 means the load succeeds)
+    let cases: [(u8, u32, u8); 5] = [
+        (0xd0, 0x02, 11), // LLDT: LDT descriptor, not present
+        (0xd8, 0x09, 11), // LTR: available TSS, not present
+        (0xd0, 0x12, 13), // LLDT: data descriptor, wrong type and not present
+        (0xd8, 0x92, 13), // LTR: present data descriptor, wrong type
+        (0xd0, 0x82, 0),  // LLDT: present LDT, loads
+    ];
+    for (modrm, access, vector) in cases {
+        let (mut cpu, memory) =
+            protected_cpu_with_gdt(&[0x0f, 0x00, modrm], &[(0x18, 0x0000_0067, access << 8)]);
+        cpu.registers.set_eax(0x18);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        if vector == 0 {
+            result.unwrap();
+        } else {
+            assert_exception(result, vector, Some(0x18));
+        }
+    }
+}
+
+#[test]
+fn task_switch_ldt_load_keeps_its_fault_vector() {
+    // The new TSS names an LDT descriptor that is not present.
+    let (mut cpu, mut bus) = direct_tss_jmp_fixture(GswMode::Gsw486, 0);
+    bus.memory[0x380 + 96..0x380 + 98].copy_from_slice(&0x28u16.to_le_bytes());
+    bus.memory[0x100 + 0x28..0x100 + 0x30]
+        .copy_from_slice(&[0x67, 0x00, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00]);
+    let result = exec_one_split(&mut cpu, &mut bus);
+    // The switch has committed when the LDT load fails, so the fault is a nested #GP.
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Cpu(CpuError::FaultAfterTaskSwitchCommit {
+                nested_vector: 13
+            }))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]

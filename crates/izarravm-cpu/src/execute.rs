@@ -348,8 +348,12 @@ impl CpuGsw {
                 Ok(self.charge(TimingClass::MovRegMem))
             }
             0x8c => {
-                // MOV r/m16, Sreg. Always a word store regardless of operand size.
+                // MOV r/m16, Sreg. Always a word store regardless of operand size. Register
+                // fields 6 and 7 name no segment register: #UD.
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                if modrm.reg > 5 {
+                    return Err(undefined_opcode());
+                }
                 let value = u32::from(self.segment_from_reg_field(modrm.reg).selector);
                 self.write_operand_sized(bus, operand, OperandSize::Word, value)?;
                 // Named rather than a literal for the reason the `0x8f` arm's charge is: the
@@ -375,9 +379,12 @@ impl CpuGsw {
             0x8e => {
                 // MOV Sreg, r/m16. Reads a word r/m, then loads the segment register through the
                 // shared segment-load path (which can fault and, in protected mode, reload the
-                // descriptor). CS (reg=1) and reg>5 are invalid and #GP, matching the fused handler.
+                // descriptor). CS (reg=1) and reg>5 are invalid: #UD, before the operand read.
                 // Loading SS this way arms the one-instruction interrupt shadow (386 PRM 11-16).
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                if matches!(modrm.reg, 1 | 6 | 7) {
+                    return Err(undefined_opcode());
+                }
                 let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
                 let segment = match modrm.reg {
                     0 => SegmentIndex::Es,
@@ -385,15 +392,7 @@ impl CpuGsw {
                     3 => SegmentIndex::Ds,
                     4 => SegmentIndex::Fs,
                     5 => SegmentIndex::Gs,
-                    _ => {
-                        // Not a bad-descriptor fault (no selector to blame): the illegal
-                        // encoding is the destination register field itself (CS or reg>5),
-                        // so the error code is 0, not a selector index.
-                        return Err(InternalFault::Exception {
-                            vector: 13,
-                            error_code: Some(0),
-                        });
-                    }
+                    _ => return Err(undefined_opcode()),
                 };
                 // Design review 10.1 M5: does a real guest's MOV SS leave the record alone?
                 // Behind the barrier-census gate since the S4 review round, so a plain build pays
