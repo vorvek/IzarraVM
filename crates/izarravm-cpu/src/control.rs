@@ -251,8 +251,11 @@ impl CpuGsw {
             };
             let mut desc = [0u8; 8];
             for (i, b) in desc.iter_mut().enumerate() {
-                if let Ok(phys) = self.translate_linear(bus, base + index + i as u32, false)
-                    && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
+                if let Ok(phys) = self.translate_linear(
+                    bus,
+                    base.wrapping_add(index).wrapping_add(i as u32),
+                    false,
+                ) && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
                 {
                     *b = v as u8;
                 }
@@ -264,11 +267,12 @@ impl CpuGsw {
             // Neighborhood dump: stale-mapping garbage shows as a whole run of
             // non-descriptor bytes, a single clobbered entry as one bad row.
             for row in 0..4u32 {
-                let addr = base + index + row * 8 - 8;
+                let addr = fault_trace_row_address(base, index, row);
                 let mut d = [0u8; 8];
                 let mut phys0 = 0;
                 for (i, b) in d.iter_mut().enumerate() {
-                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false) {
+                    if let Ok(phys) = self.translate_linear(bus, addr.wrapping_add(i as u32), false)
+                    {
                         if i == 0 {
                             phys0 = phys;
                         }
@@ -281,7 +285,7 @@ impl CpuGsw {
                 }
                 eprintln!(
                     "fault trace: {table}[{:#x}] @lin {addr:#010x} phys {phys0:#010x} = {d:02x?}",
-                    index + row * 8 - 8
+                    index.wrapping_add(row * 8).wrapping_sub(8)
                 );
             }
             let cs_sel = u32::from(self.registers.cs().selector);
@@ -291,15 +295,15 @@ impl CpuGsw {
                 (self.gdtr.base, "GDT")
             };
             let targets = [
-                ("IDT gate 13", self.idtr.base + 13 * 8),
-                ("IDT gate 12", self.idtr.base + 12 * 8),
-                ("IDT gate 11", self.idtr.base + 11 * 8),
-                ("CS desc", tb + (cs_sel & 0xFFF8)),
+                ("IDT gate 13", self.idtr.base.wrapping_add(13 * 8)),
+                ("IDT gate 12", self.idtr.base.wrapping_add(12 * 8)),
+                ("IDT gate 11", self.idtr.base.wrapping_add(11 * 8)),
+                ("CS desc", tb.wrapping_add(cs_sel & 0xFFF8)),
             ];
             for (label, addr) in targets {
                 let mut d = [0u8; 8];
                 for (i, b) in d.iter_mut().enumerate() {
-                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false)
+                    if let Ok(phys) = self.translate_linear(bus, addr.wrapping_add(i as u32), false)
                         && let Ok(v) =
                             bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
                     {
@@ -323,10 +327,10 @@ impl CpuGsw {
                 ss_reg.default_size_32,
             );
             let ss_base = self.registers.segment(SegmentIndex::Ss).base;
-            let start = ss_base + (self.registers.esp() & !0xF).saturating_sub(16);
+            let start = ss_base.wrapping_add((self.registers.esp() & !0xF).saturating_sub(16));
             let mut stack = [0u8; 96];
             for (i, b) in stack.iter_mut().enumerate() {
-                if let Ok(phys) = self.translate_linear(bus, start + i as u32, false)
+                if let Ok(phys) = self.translate_linear(bus, start.wrapping_add(i as u32), false)
                     && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
                 {
                     *b = v as u8;
@@ -2717,4 +2721,12 @@ impl CpuGsw {
         // DPL >= max(CPL, RPL).
         conforming_code || dpl >= self.current_privilege_level().max(rpl)
     }
+}
+
+/// The address of one descriptor in the fault trace neighbourhood dump: the row before the
+/// faulting descriptor plus `row` slots. Wraps in u32, so error code 0 does not underflow.
+pub(crate) fn fault_trace_row_address(base: u32, index: u32, row: u32) -> u32 {
+    base.wrapping_add(index)
+        .wrapping_add(row * 8)
+        .wrapping_sub(8)
 }

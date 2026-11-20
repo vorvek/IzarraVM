@@ -3648,3 +3648,11 @@ fn io_permission_needs_a_32_bit_tss_that_holds_the_bitmap() {
         }
     }
 }
+
+#[test]
+fn fault_trace_row_address_wraps_for_error_code_zero() {
+    use crate::control::fault_trace_row_address;
+    assert_eq!(fault_trace_row_address(0x1000, 0, 0), 0x0ff8);
+    assert_eq!(fault_trace_row_address(0, 0, 0), 0xffff_fff8);
+    assert_eq!(fault_trace_row_address(0xffff_fff0, 0x10, 1), 0x0);
+}
