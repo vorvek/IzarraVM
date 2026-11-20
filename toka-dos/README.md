@@ -47,7 +47,9 @@ Authoring only. CI does not build this; `crates/izarravm-firmware/roms/tokados-h
 (and the small `.com`/`.sys` binaries under `crates/izarravm-firmware/roms/dos/`)
 are committed and embedded by the firmware crate, the same way the BIOS `.bin` is.
 
-Requires Open Watcom (`D:\DevTools\OpenWatcom`) and NASM on PATH.
+Requires Open Watcom and NASM on PATH. Set `WATCOM` to the Open Watcom
+install folder. The script names a default folder, which it uses when `WATCOM`
+is not set.
 
     pwsh toka-dos/build-freedos.ps1
 

@@ -15,7 +15,7 @@ files. Design: `dev_docs/exodos-sweep-design.md`.
 
 Classify every `<dos-root>/<short>/dosbox.conf` without extracting anything.
 
-    izarravm-exodos census --dos-root "E:\eXo\eXo\eXoDOS\!dos" --output <dir>
+    izarravm-exodos census --dos-root "<corpus>\!dos" --output <dir>
 
 Writes `census.jsonl`, `census.tsv` and `census-summary.json`, and prints the
 summary. Three classes:
