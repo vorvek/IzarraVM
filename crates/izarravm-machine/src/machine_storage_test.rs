@@ -3244,3 +3244,74 @@ fn host_sector_cache_does_not_change_int13_guest_time() {
         );
     }
 }
+
+/// A disc with three data sectors then three audio frames. Data sector `n`
+/// starts with the byte `0x10 + n`.
+fn data_then_audio_disc() -> CdImage {
+    let cue = "FILE \"disc.bin\" BINARY\n\
+               TRACK 01 MODE1/2048\n\
+               INDEX 01 00:00:00\n\
+               TRACK 02 AUDIO\n\
+               INDEX 01 00:00:03\n";
+    let mut bin = vec![0u8; 3 * cdimage::DATA_SECTOR + 3 * cdimage::RAW_SECTOR];
+    for n in 0..3 {
+        bin[n * cdimage::DATA_SECTOR] = 0x10 + n as u8;
+    }
+    CdImage::from_cue(cue, bin).unwrap()
+}
+
+fn cd_edd_call(m: &mut Machine, ah: u8, lba: u64, count: u16) -> (u8, u16) {
+    prime_dos_int_frame(m);
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+    m.cpu.registers.set_esi(0x1000);
+    let mut dap = [0u8; 16];
+    dap[0] = 16;
+    dap[2..4].copy_from_slice(&count.to_le_bytes());
+    dap[6..8].copy_from_slice(&0x3000u16.to_le_bytes());
+    dap[8..16].copy_from_slice(&lba.to_le_bytes());
+    m.write_guest_block(0x1000, &dap);
+    m.cpu.registers.set_eax(u32::from(ah) << 8);
+    m.cpu.registers.set_edx(0xE0);
+    m.handle_int13();
+    let done = u16::from_le_bytes([m.read_physical_u8(0x1002), m.read_physical_u8(0x1003)]);
+    ((m.cpu.registers.eax() >> 8) as u8, done)
+}
+
+#[test]
+fn cd_edd_read_across_an_audio_track_stops_with_status_04() {
+    let mut m = int15_machine(16);
+    m.mount_cd(data_then_audio_disc());
+    let (status, done) = cd_edd_call(&mut m, 0x42, 1, 4);
+    assert_eq!(status, 0x04);
+    assert_eq!(done, 2);
+    assert_eq!(m.read_physical_u8(0x30000), 0x11);
+    assert_eq!(
+        m.read_physical_u8(0x30000 + cdimage::DATA_SECTOR as u32),
+        0x12
+    );
+    assert_eq!(dos_int_flags(&m) & 1, 1);
+}
+
+#[test]
+fn cd_edd_verify_across_an_audio_track_reports_the_read_count() {
+    let mut m = int15_machine(16);
+    m.mount_cd(data_then_audio_disc());
+    let (status, done) = cd_edd_call(&mut m, 0x44, 0, 5);
+    assert_eq!(status, 0x04);
+    assert_eq!(done, 3);
+}
+
+#[test]
+fn cd_edd_read_inside_the_data_track_succeeds() {
+    let mut m = int15_machine(16);
+    m.mount_cd(data_then_audio_disc());
+    let (status, done) = cd_edd_call(&mut m, 0x42, 0, 3);
+    assert_eq!(status, 0);
+    assert_eq!(done, 3);
+    assert_eq!(
+        m.read_physical_u8(0x30000 + 2 * cdimage::DATA_SECTOR as u32),
+        0x12
+    );
+}
