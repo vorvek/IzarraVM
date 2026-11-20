@@ -2427,7 +2427,58 @@ pub struct InterpretOneRowCounts {
     pub demoted: u64,
     /// The subset of `resync` the suffix-only segment mask would have carried.
     pub resume_refused_prefix_use: u64,
+    /// Resyncs and faults by the first clause that refused the resume, in
+    /// `INTERPRET_ONE_RESYNC_REASON_LABELS` order.
+    pub resync_reasons: [u64; INTERPRET_ONE_RESYNC_REASON_LABELS.len()],
+    /// Segment-clause refusals by the segment register that differed, in
+    /// `INTERPRET_ONE_SEGMENT_LABELS` order. One refusal counts once for each register that differs.
+    pub segment_changed: [u64; INTERPRET_ONE_SEGMENT_LABELS.len()],
+    /// Segment-clause refusals by the field that differs in the first differing data segment
+    /// (ES, DS, FS or GS), in `INTERPRET_ONE_SEGMENT_FIELD_LABELS` order.
+    pub segment_field_changed: [u64; INTERPRET_ONE_SEGMENT_FIELD_LABELS.len()],
+    /// Segment-clause refusals by block code size and CPU mode, in
+    /// `INTERPRET_ONE_SEGMENT_MODE_LABELS` order.
+    pub segment_refusals_by_mode: [u64; INTERPRET_ONE_SEGMENT_MODE_LABELS.len()],
+    /// The reason of the one resync or fault that demoted the site, same order as `resync_reasons`.
+    pub demoting_reasons: [u64; INTERPRET_ONE_RESYNC_REASON_LABELS.len()],
 }
+
+/// Why an `InterpretOne` call-out did not resume its native block. The order is the order the
+/// resume predicate tests its clauses, then the two refusals made outside it, then the fault arm.
+pub const INTERPRET_ONE_RESYNC_REASON_LABELS: [&str; 19] = [
+    "always_resyncs",
+    "eip",
+    "cs",
+    "segment",
+    "cr0",
+    "cr3",
+    "cr4",
+    "vm",
+    "if_edge",
+    "tf",
+    "block_entry_shadow",
+    "step_shadow",
+    "read_epoch",
+    "write_epoch",
+    "deferred_code_writes",
+    "halted",
+    "rep_resume",
+    "interrupt_pending",
+    "fault",
+];
+/// The segment registers, in `SegmentIndex` order.
+pub const INTERPRET_ONE_SEGMENT_LABELS: [&str; 6] = ["es", "cs", "ss", "ds", "fs", "gs"];
+/// The fields of a segment record that the resume predicate compares.
+pub const INTERPRET_ONE_SEGMENT_FIELD_LABELS: [&str; 4] = ["selector", "base", "limit", "access"];
+/// Block code size (CS.D) by CPU mode: 16-bit then 32-bit, each as real, V86, protected.
+pub const INTERPRET_ONE_SEGMENT_MODE_LABELS: [&str; 6] = [
+    "d16_real",
+    "d16_v86",
+    "d16_protected",
+    "d32_real",
+    "d32_v86",
+    "d32_protected",
+];
 
 /// One compile-walk retry cause, named by its census label.
 ///

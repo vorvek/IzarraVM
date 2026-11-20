@@ -4031,6 +4031,17 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
     serde_json::Value::Array(rows)
 }
 
+/// One counter array as a JSON object keyed by its labels.
+fn labeled_counts_json(labels: &[&str], counts: &[u64]) -> serde_json::Value {
+    serde_json::Value::Object(
+        labels
+            .iter()
+            .zip(counts)
+            .map(|(label, count)| ((*label).to_string(), serde_json::Value::from(*count)))
+            .collect(),
+    )
+}
+
 fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json::Value {
     let report = json!({
         "dormant": snapshot
@@ -4130,6 +4141,26 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
                     "resync_fault": counts.resync_fault,
                     "demoted": counts.demoted,
                     "resume_refused_prefix_use": counts.resume_refused_prefix_use,
+                    "resync_reasons": labeled_counts_json(
+                        &izarravm_cpu::INTERPRET_ONE_RESYNC_REASON_LABELS,
+                        &counts.resync_reasons,
+                    ),
+                    "segment_changed": labeled_counts_json(
+                        &izarravm_cpu::INTERPRET_ONE_SEGMENT_LABELS,
+                        &counts.segment_changed,
+                    ),
+                    "segment_field_changed": labeled_counts_json(
+                        &izarravm_cpu::INTERPRET_ONE_SEGMENT_FIELD_LABELS,
+                        &counts.segment_field_changed,
+                    ),
+                    "segment_refusals_by_mode": labeled_counts_json(
+                        &izarravm_cpu::INTERPRET_ONE_SEGMENT_MODE_LABELS,
+                        &counts.segment_refusals_by_mode,
+                    ),
+                    "demoting_reasons": labeled_counts_json(
+                        &izarravm_cpu::INTERPRET_ONE_RESYNC_REASON_LABELS,
+                        &counts.demoting_reasons,
+                    ),
                 })
             })
             .collect::<Vec<_>>(),

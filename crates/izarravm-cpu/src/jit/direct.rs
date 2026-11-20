@@ -31944,6 +31944,187 @@ impl ResumeSnapshot {
         // R7 and R8.
         !cpu.halted && !cpu.rep_resume_active
     }
+
+    /// The first clause of `allows_resume` that refuses, or `None` when it resumes.
+    ///
+    /// COLD. This is the diagnostic twin of `allows_resume`: it tests the same clauses in the same
+    /// order, one at a time, so the answer names a clause. Only the resync arms call it. The
+    /// resume path keeps the one boolean expression, and the `debug_assert`s in
+    /// `interpret_one_step` keep the two in step. A clause added to one belongs in the other.
+    pub(crate) fn resume_refusal_reason(
+        &self,
+        cpu: &CpuGsw,
+        end_eip: u32,
+        row: InterpretOneRow,
+        segment_mask: u8,
+    ) -> Option<ResyncReason> {
+        if cpu.registers.eip != end_eip {
+            return Some(ResyncReason::Eip);
+        }
+        if cpu.registers.cs() != self.cs {
+            return Some(ResyncReason::Cs);
+        }
+        if self.segment_refusal(cpu, row, segment_mask).is_some() {
+            return Some(ResyncReason::Segment);
+        }
+        let arming = row.arms_interrupt_shadow();
+        if cpu.control.cr0 != self.cr0 {
+            return Some(ResyncReason::Cr0);
+        }
+        if cpu.control.cr3 != self.cr3 {
+            return Some(ResyncReason::Cr3);
+        }
+        if cpu.control.cr4 != self.cr4 {
+            return Some(ResyncReason::Cr4);
+        }
+        if (cpu.registers.eflags & FLAG_VM != 0) != self.virtual_mode {
+            return Some(ResyncReason::Vm);
+        }
+        if !row.takes_interrupt_enable_edge()
+            && !self.interrupt_enable
+            && cpu.registers.eflags & FLAG_IF != 0
+        {
+            return Some(ResyncReason::IfEdge);
+        }
+        if cpu.registers.eflags & FLAG_TF != 0 {
+            return Some(ResyncReason::Tf);
+        }
+        if self.block_entry_shadow {
+            return Some(ResyncReason::BlockEntryShadow);
+        }
+        if !arming && cpu.interrupt_shadow && !self.shadow_before_step {
+            return Some(ResyncReason::StepShadow);
+        }
+        if epoch_moved(self.read_mapping_epoch, cpu.data_read_pages.mapping_epoch()) {
+            return Some(ResyncReason::ReadEpoch);
+        }
+        if epoch_moved(
+            self.write_mapping_epoch,
+            cpu.data_write_pages.mapping_epoch(),
+        ) {
+            return Some(ResyncReason::WriteEpoch);
+        }
+        if !cpu.deferred_code_writes.is_empty() {
+            return Some(ResyncReason::DeferredCodeWrites);
+        }
+        if cpu.halted {
+            return Some(ResyncReason::Halted);
+        }
+        if cpu.rep_resume_active {
+            return Some(ResyncReason::RepResume);
+        }
+        None
+    }
+
+    /// The detail of the segment clause (R2), or `None` when the clause passes. COLD. The compare
+    /// mask is the one `allows_resume` builds.
+    pub(crate) fn segment_refusal(
+        &self,
+        cpu: &CpuGsw,
+        row: InterpretOneRow,
+        segment_mask: u8,
+    ) -> Option<SegmentRefusal> {
+        let compare = if row.may_write_segment() {
+            segment_mask | segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)
+        } else {
+            u8::MAX
+        };
+        let mut changed = [false; 6];
+        let mut field = None;
+        for (index, segment) in SEGMENT_ORDER.iter().enumerate() {
+            let now = cpu.registers.segment(*segment);
+            let before = self.segments[index];
+            if compare & segment_bit(*segment) == 0 || now == before {
+                continue;
+            }
+            changed[index] = true;
+            let is_data = !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss);
+            if is_data && field.is_none() {
+                field = Some([
+                    now.selector != before.selector,
+                    now.base != before.base,
+                    now.limit != before.limit,
+                    now.access != before.access,
+                ]);
+            }
+        }
+        if !changed.contains(&true) {
+            return None;
+        }
+        let size = usize::from(self.cs.default_size_32) * 3;
+        let mode = if self.cr0 & crate::CR0_PE == 0 {
+            0
+        } else if self.virtual_mode {
+            1
+        } else {
+            2
+        };
+        Some(SegmentRefusal {
+            changed,
+            field,
+            mode: size + mode,
+        })
+    }
+}
+
+/// Why the resume predicate refused. The order matches `INTERPRET_ONE_RESYNC_REASON_LABELS`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResyncReason {
+    /// The row can never resume, so the predicate is not asked.
+    AlwaysResyncs,
+    Eip,
+    Cs,
+    Segment,
+    Cr0,
+    Cr3,
+    Cr4,
+    Vm,
+    IfEdge,
+    Tf,
+    BlockEntryShadow,
+    StepShadow,
+    ReadEpoch,
+    WriteEpoch,
+    DeferredCodeWrites,
+    Halted,
+    RepResume,
+    /// The predicate allowed the resume, and an interrupt is pending after an arming row.
+    InterruptPending,
+    /// The call-out faulted.
+    Fault,
+}
+
+impl ResyncReason {
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What differed when the segment clause refused. See `ResumeSnapshot::segment_refusal`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentRefusal {
+    /// Per register in `SEGMENT_ORDER`, whether its record differs.
+    changed: [bool; 6],
+    /// Selector, base, limit and access of the first differing data segment, if there is one.
+    field: Option<[bool; 4]>,
+    /// Index into `INTERPRET_ONE_SEGMENT_MODE_LABELS`.
+    mode: usize,
+}
+
+/// Why the call-out at `cell` did not resume. COLD: called only after a resync that is not a
+/// fault. A resync the predicate allows can only come from the pending-interrupt test.
+fn resync_reason(
+    snapshot: &ResumeSnapshot,
+    cpu: &CpuGsw,
+    end_eip: u32,
+    cell: &InterpretOneCell,
+) -> ResyncReason {
+    if cell.row().always_resyncs() {
+        return ResyncReason::AlwaysResyncs;
+    }
+    snapshot
+        .resume_refusal_reason(cpu, end_eip, cell.row(), cell.used_by_others())
+        .unwrap_or(ResyncReason::InterruptPending)
 }
 
 /// Run ONE interpreter instruction at a slot inside a live native block, and answer whether the
@@ -32180,8 +32361,12 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
             publish_flags(cpu);
             if cell.note_execution(true) {
                 note_demotion(cpu, cell);
+                cpu.jit_direct
+                    .note_interpret_one_demoting_reason(cell.row(), ResyncReason::Fault);
             }
             cpu.jit_direct.note_interpret_one_resync_fault(cell.row());
+            cpu.jit_direct
+                .note_interpret_one_resync_reason(cell.row(), ResyncReason::Fault);
             // RESYNC-FAULT is `Continued` on the attribution axis, and the axis is the reason: these
             // three outcomes name WHICH SIDE-EXIT STUB the emitted slot left through, because that is
             // the only thing the two runtime counters the snapshot closes against can see. This arm
@@ -32372,6 +32557,9 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     // front anyway, so the two bound it independently.
     if cell.note_execution(!resume && !always_resyncs) {
         note_demotion(cpu, cell);
+        let reason = resync_reason(&snapshot, cpu, end_eip, cell);
+        cpu.jit_direct
+            .note_interpret_one_demoting_reason(cell.row(), reason);
     }
 
     let clocks = i64::from(outcome.core_clocks);
@@ -32389,6 +32577,24 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
                 .note_interpret_one_resume_refused_prefix_use(cell.row());
         }
         cpu.jit_direct.note_interpret_one_resync(cell.row());
+        // WHY, asked only here. The twin predicate must agree with `allows_resume`. A pending
+        // interrupt after an arming row is the one refusal the predicate does not make, and
+        // `resync_reason` names it.
+        let reason = resync_reason(&snapshot, cpu, end_eip, cell);
+        debug_assert!(
+            always_resyncs
+                || (reason == ResyncReason::InterruptPending)
+                    == snapshot.allows_resume(cpu, end_eip, cell.row(), cell.used_by_others()),
+            "resume_refusal_reason disagrees with allows_resume"
+        );
+        cpu.jit_direct
+            .note_interpret_one_resync_reason(cell.row(), reason);
+        if reason == ResyncReason::Segment
+            && let Some(refusal) = snapshot.segment_refusal(cpu, cell.row(), cell.used_by_others())
+        {
+            cpu.jit_direct
+                .note_interpret_one_segment_refusal(cell.row(), refusal);
+        }
         // `Continued` for the reason the fault arm above states: the axis is the stub, and the
         // `resync` stub is neither of the two the snapshot closes against.
         #[cfg(feature = "direct-callout-attribution")]
@@ -32406,6 +32612,12 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     // decides at the boundary whether anything retired after the arming slot. Clearing it here
     // would deliver an interrupt EARLIER than hardware for every block that ends AT the arming
     // slot, which is design review 10.1's blocker B1.
+    debug_assert!(
+        snapshot
+            .resume_refusal_reason(cpu, end_eip, cell.row(), cell.used_by_others())
+            .is_none(),
+        "allows_resume resumed where resume_refusal_reason refuses"
+    );
     debug_assert!(
         !cpu.interrupt_shadow || cell.row().arms_interrupt_shadow() || snapshot.shadow_before_step,
         "a non-arming row resumed with a shadow no earlier slot had armed"
@@ -34771,6 +34983,13 @@ pub(crate) struct InterpretOneRowTally {
     /// The subset of `resync` that the SUFFIX-only segment mask would have carried. See
     /// `DirectStallTally::callout_interpret_one_resume_refused_prefix_use`.
     pub(crate) resume_refused_prefix_use: u64,
+    /// Indexed by `ResyncReason`.
+    pub(crate) resync_reasons: [u64; crate::INTERPRET_ONE_RESYNC_REASON_LABELS.len()],
+    pub(crate) segment_changed: [u64; 6],
+    pub(crate) segment_field_changed: [u64; 4],
+    pub(crate) segment_refusals_by_mode: [u64; 6],
+    /// Indexed by `ResyncReason`. Counts only the resync or fault that demoted the site.
+    pub(crate) demoting_reasons: [u64; crate::INTERPRET_ONE_RESYNC_REASON_LABELS.len()],
 }
 
 /// The stall tallies, deliberately NOT part of `BlockCacheStats`.
@@ -37163,6 +37382,11 @@ impl crate::jit::JitState {
                         resync_fault: tally.resync_fault,
                         demoted: tally.demoted,
                         resume_refused_prefix_use: tally.resume_refused_prefix_use,
+                        resync_reasons: tally.resync_reasons,
+                        segment_changed: tally.segment_changed,
+                        segment_field_changed: tally.segment_field_changed,
+                        segment_refusals_by_mode: tally.segment_refusals_by_mode,
+                        demoting_reasons: tally.demoting_reasons,
                     }
                 })
                 .collect(),
@@ -37461,6 +37685,40 @@ impl crate::jit::JitState {
     pub(crate) fn note_interpret_one_resync_fault(&mut self, row: InterpretOneRow) {
         self.stalls.callout_interpret_one_resync_fault += 1;
         self.stalls.callout_interpret_one_rows[row.index()].resync_fault += 1;
+    }
+
+    /// The reason columns. COLD: called only on the resync and fault arms.
+    pub(crate) fn note_interpret_one_resync_reason(
+        &mut self,
+        row: InterpretOneRow,
+        reason: ResyncReason,
+    ) {
+        self.stalls.callout_interpret_one_rows[row.index()].resync_reasons[reason.index()] += 1;
+    }
+
+    pub(crate) fn note_interpret_one_demoting_reason(
+        &mut self,
+        row: InterpretOneRow,
+        reason: ResyncReason,
+    ) {
+        self.stalls.callout_interpret_one_rows[row.index()].demoting_reasons[reason.index()] += 1;
+    }
+
+    pub(crate) fn note_interpret_one_segment_refusal(
+        &mut self,
+        row: InterpretOneRow,
+        refusal: SegmentRefusal,
+    ) {
+        let tally = &mut self.stalls.callout_interpret_one_rows[row.index()];
+        for (count, changed) in tally.segment_changed.iter_mut().zip(refusal.changed) {
+            *count += u64::from(changed);
+        }
+        if let Some(fields) = refusal.field {
+            for (count, changed) in tally.segment_field_changed.iter_mut().zip(fields) {
+                *count += u64::from(changed);
+            }
+        }
+        tally.segment_refusals_by_mode[refusal.mode] += 1;
     }
 
     /// No per-row sibling; see the `callout_interpret_one_rows` field for why.
