@@ -24,3 +24,15 @@ fn extraction_is_content_addressed_and_repairs_a_corrupt_cache() {
     assert_eq!(repaired, path);
     assert!(file_matches(&repaired, EMBEDDED_SOUNDFONT).unwrap());
 }
+
+#[test]
+fn a_reader_longer_than_the_expected_bytes_does_not_match_and_does_not_panic() {
+    // A file that grows after the length check yields more bytes than expected.
+    let expected = vec![7u8; 70_000];
+    let mut longer = expected.clone();
+    longer.extend_from_slice(&[1, 2, 3]);
+    assert!(!reader_matches(std::io::Cursor::new(longer), &expected).unwrap());
+    assert!(reader_matches(std::io::Cursor::new(expected.clone()), &expected).unwrap());
+    let shorter = expected[..69_999].to_vec();
+    assert!(!reader_matches(std::io::Cursor::new(shorter), &expected).unwrap());
+}

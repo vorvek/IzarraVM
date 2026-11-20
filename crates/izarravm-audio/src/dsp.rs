@@ -155,7 +155,7 @@ impl AdpcmState {
     }
 }
 
-/// Whether the peak-amplitude instrument is armed (`IZARRAVM_SB_DEBUG`, the same
+/// Whether the environment arms the peak-amplitude instrument (`IZARRAVM_SB_DEBUG`, the same
 /// variable that prints the per-second `[SB]` report the peak is reported in).
 ///
 /// Read once behind a `OnceLock`, and checked at the per-frame call site rather
@@ -256,6 +256,10 @@ pub struct SbDsp {
     /// Only maintained when `IZARRAVM_SB_DEBUG` is set (see [`peak_tracking`]);
     /// it stays 0 otherwise, because its sole consumer is that report.
     peak_abs: i32,
+    /// Whether `peak_abs` is maintained. Set from the environment at
+    /// construction. A future canonical projection of the DSP state must
+    /// exclude this flag and `peak_abs`: both are diagnostics, not guest state.
+    peak_tracking: bool,
 }
 
 /// Which interrupt a pending DSP IRQ is: the 8-bit DMA / SB-MIDI source
@@ -317,11 +321,17 @@ impl Default for SbDsp {
             rendered: VecDeque::new(),
             dropped_frames: 0,
             peak_abs: 0,
+            peak_tracking: peak_tracking(),
         }
     }
 }
 
 impl SbDsp {
+    /// Arm or disarm the peak-amplitude instrument, overriding the environment.
+    pub fn set_peak_tracking(&mut self, enabled: bool) {
+        self.peak_tracking = enabled;
+    }
+
     /// Advance the DSP's reset-settle countdown by `micros` microseconds. When
     /// the countdown elapses the DSP queues 0xAA on read-data.
     pub fn advance_micros(&mut self, micros: u64) {
@@ -793,7 +803,7 @@ impl SbDsp {
             // Per-frame instrument: gated at the call site, not inside a helper.
             // This runs once per produced PCM frame -- 44100 times a second per
             // playing channel -- and its only consumer is the `[SB]` report.
-            if peak_tracking() {
+            if self.peak_tracking {
                 let amplitude =
                     i32::from(frame.0.saturating_abs()).max(i32::from(frame.1.saturating_abs()));
                 self.peak_abs = self.peak_abs.max(amplitude);

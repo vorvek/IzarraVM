@@ -745,11 +745,8 @@ fn dsp_identification_consumes_its_argument_byte() {
 /// Unset, it must not even accumulate.
 #[test]
 fn peak_amplitude_is_not_tracked_unless_the_sb_debug_report_is_armed() {
-    assert!(
-        std::env::var_os("IZARRAVM_SB_DEBUG").is_none(),
-        "this test measures the default-off path"
-    );
     let mut dsp = SbDsp::default();
+    dsp.set_peak_tracking(false);
     write_cmd(&mut dsp, &[0x14, 0x03, 0x00]);
     // Full-scale unsigned 8-bit samples: the loudest the DMA path can produce.
     let mut bytes = [0xFFu8; 4].into_iter();
@@ -1115,4 +1112,14 @@ fn a_command_41h_rate_above_the_floor_is_kept() {
     assert_eq!(dsp.rate_hz(), 44_100);
     write_cmd(&mut dsp, &[0x41, 0x13, 0x88]); // 5000 Hz
     assert_eq!(dsp.rate_hz(), 5_000);
+}
+
+#[test]
+fn peak_amplitude_is_tracked_when_the_instrument_is_armed() {
+    let mut dsp = SbDsp::default();
+    dsp.set_peak_tracking(true);
+    write_cmd(&mut dsp, &[0x14, 0x03, 0x00]);
+    let mut bytes = [0xFFu8; 4].into_iter();
+    assert_eq!(dsp.tick_n_samples(4, || bytes.next(), || None), 4);
+    assert!(dsp.take_peak_abs() > 0);
 }

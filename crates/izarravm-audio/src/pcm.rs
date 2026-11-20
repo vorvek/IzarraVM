@@ -52,17 +52,12 @@ pub(crate) fn sample_u16(word: u16) -> i16 {
 
 /// G.711 mu-law bias added to the magnitude before encoding and subtracted on
 /// decode. The standard fixes it at 33 (0x21).
-#[allow(
-    dead_code,
-    reason = "consumed by the WSS/AD1848 codec path (later phase)"
-)]
 const ULAW_BIAS: i32 = 0x21;
 
 /// Decode one ITU-T G.711 mu-law byte to signed 16-bit linear PCM.
 ///
-/// The AD1848 (WSS) codec expands companded data internally; this decoder is
-/// the expansion the machine-side codec path will pull. It is not yet wired to
-/// a caller, hence the dead-code allow until the WSS integration lands.
+/// The AD1848 (WSS) codec expands companded data internally; the WSS codec
+/// path calls this decoder.
 ///
 /// Mu-law stores a sign bit (bit 7), a 3-bit exponent (bits 6..4), and a 4-bit
 /// mantissa (bits 3..0), all stored complemented on the wire. The decode
@@ -76,10 +71,6 @@ const ULAW_BIAS: i32 = 0x21;
 /// - 0xFF (mu-law digital silence) -> 0, the smallest magnitude.
 /// - 0x80 / 0x00 are the largest-magnitude positive / negative codes
 ///   (the inverted sign bit makes a stored high bit set decode positive).
-#[allow(
-    dead_code,
-    reason = "consumed by the WSS/AD1848 codec path (later phase)"
-)]
 pub(crate) fn sample_ulaw(byte: u8) -> i16 {
     let inverted = !byte;
     let sign = inverted & 0x80;
@@ -111,10 +102,6 @@ pub(crate) fn sample_ulaw(byte: u8) -> i16 {
 /// - 0xD5 (A-law digital silence) -> the smallest positive magnitude (~0).
 /// - 0x55 (silence with the toggled sign cleared) -> the smallest negative.
 /// - 0xAA / 0x2A are the largest-magnitude positive / negative codes.
-#[allow(
-    dead_code,
-    reason = "consumed by the WSS/AD1848 codec path (later phase)"
-)]
 pub(crate) fn sample_alaw(byte: u8) -> i16 {
     let toggled = byte ^ 0x55;
     let sign = toggled & 0x80;
