@@ -2,5 +2,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 [toolchain]
-channel = "stable"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
