@@ -2015,6 +2015,30 @@ fn boot_suite_gate_rejects_failed_missing_duplicate_unexpected_and_empty_sets() 
     );
 }
 
+#[test]
+fn guest_exit_code_maps_only_guest_exits() {
+    assert_eq!(guest_exit_code(&StopReason::TestExit { code: 0 }), Some(0));
+    assert_eq!(
+        guest_exit_code(&StopReason::TestExit { code: 0x51 }),
+        Some(0x51)
+    );
+    assert_eq!(guest_exit_code(&StopReason::DosExit { code: 3 }), Some(3));
+    assert_eq!(guest_exit_code(&StopReason::Halted), None);
+    assert_eq!(
+        guest_exit_code(&StopReason::CycleLimit { requested: 1 }),
+        None
+    );
+    assert_eq!(guest_exit_code(&StopReason::CpuError("x".into())), None);
+}
+
+#[test]
+fn expect_test_exit_accepts_only_test_exit_zero() {
+    assert!(expected_test_exit_met(&StopReason::TestExit { code: 0 }));
+    assert!(!expected_test_exit_met(&StopReason::TestExit { code: 1 }));
+    assert!(!expected_test_exit_met(&StopReason::DosExit { code: 0 }));
+    assert!(!expected_test_exit_met(&StopReason::Halted));
+}
+
 fn test_rom_screen() -> String {
     TEST_ROM_REQUIRED_TEXT.join(
         "

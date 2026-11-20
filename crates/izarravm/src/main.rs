@@ -189,6 +189,8 @@ struct Cli {
     #[arg(long, requires = "hdd_folder")]
     mode_census: Option<PathBuf>,
     /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
+    /// Without this flag the process exits 0 whatever the guest exit code is, so use
+    /// this flag to get a failing exit.
     #[arg(long, requires = "hdd_folder")]
     expect_test_exit: bool,
     /// With --hdd-folder, sample the screen every --screen-dump-interval-ms
@@ -558,6 +560,19 @@ fn test_rom_failure_summary(stop: &StopReason, post: u8, screen: &str) -> Option
     (!issues.is_empty()).then(|| format!("test ROM gate failed: {}", issues.join("; ")))
 }
 
+/// The code a guest program chose to exit with, if the run ended that way.
+fn guest_exit_code(stop: &StopReason) -> Option<i32> {
+    match stop {
+        StopReason::TestExit { code } | StopReason::DosExit { code } => Some(i32::from(*code)),
+        _ => None,
+    }
+}
+
+/// True when the guest ended through the Lotura test exit with code 0.
+fn expected_test_exit_met(stop: &StopReason) -> bool {
+    matches!(stop, StopReason::TestExit { .. }) && guest_exit_code(stop) == Some(0)
+}
+
 fn boot_suite_failure_summary(results: &SuiteResults) -> Option<String> {
     suite_failure_summary("boot suite", BOOT_SUITE_REQUIRED_RECORDS, results)
 }
@@ -913,13 +928,10 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
     let stop = machine.run_until_halt_or_cycles(500_000_000)?;
     print!("{}", machine.screen_text().as_text());
 
-    let code = match stop {
-        StopReason::TestExit { code } | StopReason::DosExit { code } => i32::from(code),
-        other => {
-            eprintln!("katea-run: did not reach a program exit (stop={other:?})");
-            1
-        }
-    };
+    let code = guest_exit_code(&stop).unwrap_or_else(|| {
+        eprintln!("katea-run: did not reach a program exit (stop={stop:?})");
+        1
+    });
     Ok(code)
 }
 
@@ -2140,7 +2152,7 @@ fn run_boot_hdd_folder(
     if let Some((gametics, realtics)) = timedemo {
         println!("timed {} gametics in {} realtics", gametics, realtics);
     }
-    if expect_test_exit && !matches!(stop_reason, StopReason::TestExit { code: 0 }) {
+    if expect_test_exit && !expected_test_exit_met(&stop_reason) {
         return Err(format!("expected TestExit code 0, got {stop_reason:?}").into());
     }
 
