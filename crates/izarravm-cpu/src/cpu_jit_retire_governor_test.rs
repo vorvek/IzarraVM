@@ -1573,7 +1573,7 @@ fn live_data_strict_sixteen_bit_load_is_a_leaf() {
     }
 }
 
-fn protected16_at(entry: u32) -> CpuGsw {
+pub(super) fn protected16_at(entry: u32) -> CpuGsw {
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw586);
     cpu.control.cr0 |= CR0_PE;

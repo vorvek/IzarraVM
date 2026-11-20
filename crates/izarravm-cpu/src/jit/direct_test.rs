@@ -2977,6 +2977,7 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
         scale: 1,
         disp: 4,
         disp_lane: None,
+        ea_wrap: None,
     };
 
     let mut unmasked = Encoder::new();

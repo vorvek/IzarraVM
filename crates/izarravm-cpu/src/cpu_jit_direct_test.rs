@@ -3512,6 +3512,14 @@ mod retire_governor;
 #[path = "cpu_jit_sixteen_bit_test.rs"]
 mod sixteen_bit;
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_addr32_word_block_test.rs"]
+mod addr32_word_block;
+
 #[path = "cpu_jit_width_lift_test.rs"]
 mod width_lift;
 
