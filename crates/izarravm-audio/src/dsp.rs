@@ -172,6 +172,9 @@ fn peak_tracking() -> bool {
 /// loops with bounded poll counts size themselves against the part.
 pub const DSP_RESET_SETTLE_MICROS: u64 = 20;
 
+/// Lowest sample rate the 0x41 command programs, in Hz.
+const MIN_SET_RATE_HZ: u32 = 5_000;
+
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
 #[derive(Debug, Clone, PartialEq)]
@@ -525,7 +528,12 @@ impl SbDsp {
                 // the time constant, this is already the per-channel rate for
                 // stereo (no channel-count pre-multiply), so it is not a byte
                 // rate and must not be halved for SB Pro stereo.
-                self.rate_hz = (u32::from(args[0]) << 8) | u32::from(args[1]);
+                //
+                // A rate of zero would stop the output clock: an armed transfer
+                // would never tick and its block interrupt would never arrive.
+                // The programmed rate has a floor of 5 kHz.
+                self.rate_hz =
+                    ((u32::from(args[0]) << 8) | u32::from(args[1])).max(MIN_SET_RATE_HZ);
                 self.rate_is_byte_rate = false;
                 self.ram_8051[0x13] = args[1];
                 self.ram_8051[0x14] = args[0];

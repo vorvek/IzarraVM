@@ -1091,3 +1091,28 @@ fn copyright_string_is_the_dsp_4_05_reply() {
     }
     assert_eq!(bytes, b"COPYRIGHT (C) CREATIVE TECHNOLOGY LTD, 1992.\0");
 }
+
+#[test]
+fn a_zero_output_rate_from_command_41h_is_raised_to_the_floor() {
+    // A rate of zero would stall an armed transfer: no output tick, no block
+    // interrupt. It would also stretch a 0x80 pause to one second per period.
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0x00, 0x00]);
+    assert_eq!(dsp.rate_hz(), 5_000);
+    assert_eq!(dsp.output_frame_rate(), 5_000);
+    write_cmd(&mut dsp, &[0x80, 0x00, 0x00]); // one period: 200 us at 5 kHz
+    dsp.advance_micros(200);
+    assert!(
+        dsp.take_irq(),
+        "the pause interrupt arrives at the floor rate"
+    );
+}
+
+#[test]
+fn a_command_41h_rate_above_the_floor_is_kept() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x41, 0xAC, 0x44]); // 44100 Hz
+    assert_eq!(dsp.rate_hz(), 44_100);
+    write_cmd(&mut dsp, &[0x41, 0x13, 0x88]); // 5000 Hz
+    assert_eq!(dsp.rate_hz(), 5_000);
+}
