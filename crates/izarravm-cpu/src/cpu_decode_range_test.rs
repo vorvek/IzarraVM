@@ -9,9 +9,6 @@ fn scalar_write(cache: &mut DecodeCache, physical: u32, width: u32) -> Option<u3
         if !cache.is_code_byte(byte) {
             continue;
         }
-        if cache.contexts_occupied() > 1 {
-            return None;
-        }
         let info = *cache.code_page_lin.get(&(byte >> 12))?;
         if info.aliased {
             return None;
@@ -20,7 +17,14 @@ fn scalar_write(cache: &mut DecodeCache, physical: u32, width: u32) -> Option<u3
         for candidate in linear.saturating_sub(14)..=linear {
             let index = (candidate & cache.mask) as usize;
             let line = &cache.lines[index];
-            if line.generation == cache.generation && line.tag == candidate {
+            // Live means the current generation or the generation of an occupied ring slot.
+            let live = line.generation == cache.generation
+                || cache
+                    .contexts
+                    .iter()
+                    .flatten()
+                    .any(|c| c.1 == line.generation);
+            if live && line.tag == candidate {
                 let len = line.insn.map_or(0, |insn| u32::from(insn.len));
                 if line.phys_start <= byte && byte < line.phys_start.wrapping_add(len) {
                     cache.kill_line_at(index);
@@ -138,12 +142,16 @@ fn decode_range_matches_scalar_across_widths_mappings_and_boundaries() {
 
 #[test]
 fn decode_range_preserves_marks_context_and_mapping_refusals() {
-    for variant in 0..7 {
+    for variant in 0..8 {
         for contexts in 0..=2 {
             let prepare = || {
                 let mut cache = filled(0x1240, 0x31, 64);
+                // The real ring never gives two slots one generation: slot 1 owns a fresh one.
+                let other = cache.allocate_generation();
+                let unowned = cache.allocate_generation();
                 for index in 0..contexts {
-                    cache.contexts[index] = Some((index as u32 * 0x1000, cache.generation));
+                    let generation = if index == 0 { cache.generation } else { other };
+                    cache.contexts[index] = Some((index as u32 * 0x1000, generation));
                 }
                 match variant {
                     0 => {}
@@ -159,13 +167,23 @@ fn decode_range_preserves_marks_context_and_mapping_refusals() {
                     4 => {
                         cache.code_bytes[0x1240 >> 6] = 0;
                     }
+                    // The line carries the other slot's generation: it dies when that slot is
+                    // occupied and survives when it is not.
                     5 => {
                         let slot = 0x31240 & cache.mask;
-                        cache.lines[slot as usize].generation = cache.generation.wrapping_add(1);
+                        cache.lines[slot as usize].generation = other;
                         #[cfg(feature = "jit")]
                         {
-                            cache.packs[slot as usize].generation =
-                                cache.lines[slot as usize].generation;
+                            cache.packs[slot as usize].generation = other;
+                        }
+                    }
+                    // The line carries a generation no slot holds: it always survives.
+                    7 => {
+                        let slot = 0x31240 & cache.mask;
+                        cache.lines[slot as usize].generation = unowned;
+                        #[cfg(feature = "jit")]
+                        {
+                            cache.packs[slot as usize].generation = unowned;
                         }
                     }
                     6 => {
@@ -246,5 +264,109 @@ fn decode_range_preserves_current_generation_empty_entries() {
         let index = (0x1241 & range.mask) as usize;
         assert_eq!(range.lines[index].generation, range.generation);
         assert_eq!(format!("{:?}", range.lines), format!("{:?}", scalar.lines));
+    }
+}
+
+/// A small deterministic generator for the property test below.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 32) as u32
+    }
+}
+
+/// `(linear page, physical page)` pairs per context. Physical page 5 sits under the same linear
+/// page in both contexts. Linear page 6 maps to different physical pages. Physical page 9 is
+/// reached through two linear pages, so it becomes aliased on first use from both contexts.
+const CONTEXT_MAPS: [[(u32, u32); 4]; 2] = [
+    [(5, 5), (6, 6), (9, 9), (10, 10)],
+    [(5, 5), (6, 7), (8, 9), (10, 10)],
+];
+
+#[test]
+fn narrow_kill_handles_both_contexts_under_random_traffic() {
+    for seed in 1..=6u64 {
+        let mut rng = XorShift(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut cache = DecodeCache::new(256);
+        let generations = [cache.generation, cache.allocate_generation()];
+        cache.contexts = [Some((0, generations[0])), Some((0x1000, generations[1]))];
+        for _ in 0..200 {
+            for _ in 0..3 {
+                let context = (rng.next() & 1) as usize;
+                let (linear_page, physical_page) = CONTEXT_MAPS[context][(rng.next() & 3) as usize];
+                let offset = rng.next() % 48;
+                let len = 1 + (rng.next() % 15) as u8;
+                // Switch the current generation the way `select_context` does.
+                cache.generation = generations[context];
+                let put = cache.put(
+                    (linear_page << 12) | offset,
+                    instruction(len),
+                    true,
+                    (physical_page << 12) | offset,
+                );
+                assert!(put.inserted);
+            }
+            cache.generation = generations[(rng.next() & 1) as usize];
+
+            let (_, physical_page) =
+                CONTEXT_MAPS[(rng.next() & 1) as usize][(rng.next() & 3) as usize];
+            let physical = (physical_page << 12) | (rng.next() % 64);
+            let width = [1u32, 2, 4][(rng.next() % 3) as usize];
+            let live = cache.live_generations();
+            let before: Vec<DecodeLine> = cache.lines.to_vec();
+
+            match cache.narrow_invalidate_write(physical, width) {
+                Some(kills) => {
+                    let mut expected = 0;
+                    for (index, old) in before.iter().enumerate() {
+                        let len = old.insn.map_or(0, |insn| u32::from(insn.len));
+                        let overlaps = live.contains(&old.generation)
+                            && len != 0
+                            && old.phys_start < physical + width
+                            && physical < old.phys_start + len;
+                        let now = &cache.lines[index];
+                        if overlaps {
+                            expected += 1;
+                            assert_eq!(
+                                now.generation, 0,
+                                "seed {seed}: slot {index} overlaps the write and must die"
+                            );
+                        } else {
+                            assert_eq!(
+                                format!("{old:?}"),
+                                format!("{now:?}"),
+                                "seed {seed}: slot {index} does not overlap the write"
+                            );
+                        }
+                    }
+                    assert_eq!(kills, expected, "seed {seed}: kill count");
+                    #[cfg(feature = "jit")]
+                    cache.assert_packs_consistent();
+                    #[cfg(all(
+                        feature = "jit",
+                        target_arch = "x86_64",
+                        any(target_os = "windows", target_os = "linux")
+                    ))]
+                    cache.assert_native_watch_consistent();
+                }
+                None => {
+                    let refused = (0..width).map(|i| physical + i).any(|byte| {
+                        cache.is_code_byte(byte)
+                            && cache
+                                .code_page_lin
+                                .get(&(byte >> 12))
+                                .is_none_or(|info| info.aliased)
+                    });
+                    assert!(
+                        refused,
+                        "seed {seed}: None needs an unknown or aliased page"
+                    );
+                }
+            }
+        }
     }
 }
