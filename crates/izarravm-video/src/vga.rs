@@ -1557,11 +1557,12 @@ impl Vga {
                 // returns to chained mode 13h. Acting on the write that toggles the
                 // bit is the faithful register-bang entry; the default memory_mode of
                 // 0 cannot trigger it because set_mode13h never writes index 04h.
+                // Both directions change only the CPU write decode and the mode.
                 let chain4_off = value & 0x08 == 0;
                 if chain4_off && self.mode == VideoMode::Mode13h {
                     self.enter_mode_x();
                 } else if !chain4_off && self.mode == VideoMode::ModeX {
-                    self.set_mode13h();
+                    self.enter_chain4_from_registers();
                 }
             }
             _ => {}
@@ -2692,6 +2693,27 @@ impl Vga {
         // it should have kept.
         self.mode = VideoMode::ModeX;
         self.recompute_vertical_timing(); // derives the vertical fields and sizes work
+        self.beam = 0;
+        self.last_line = 0;
+        self.presented = None;
+    }
+
+    /// Return from unchained 256-color to chained mode 13h because the guest set
+    /// chain-4. Only the CPU write decode and the scanout personality change.
+    /// The DAC, attribute and graphics controllers, latches, CRTC registers and
+    /// derived timing, start address and video memory stay as the guest left
+    /// them, as on real silicon.
+    fn enter_chain4_from_registers(&mut self) {
+        // The planes are the store of record in mode X. The chained linear copy
+        // is rebuilt from them on its next use.
+        self.sync_mode13_planar();
+        self.mode13_linear_valid = false;
+        self.mode13_linear_authoritative = false;
+        // The mode is set before the resize, because `resize_work` keeps a
+        // same-size buffer only while the mode is unchanged.
+        self.mode = VideoMode::Mode13h;
+        self.bump_content_gen();
+        self.resize_work();
         self.beam = 0;
         self.last_line = 0;
         self.presented = None;

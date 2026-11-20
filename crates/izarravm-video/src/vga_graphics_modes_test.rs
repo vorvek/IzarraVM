@@ -2165,3 +2165,78 @@ fn a_replayed_register_table_counts_every_replay() {
         "a replay is a count, not a new row"
     );
 }
+
+/// Setting chain-4 again from mode X changes the CPU write decode only. The
+/// guest's palette, graphics controller, CRTC timing, start address and plane
+/// contents stay as the guest left them.
+#[test]
+fn chain4_set_from_mode_x_keeps_the_guest_state() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+    assert_eq!(vga.active_mode(), VideoMode::ModeX);
+
+    // DAC entry 5.
+    vga.write_port(0x3C8, 5);
+    for value in [0x11u8, 0x22, 0x33] {
+        vga.write_port(0x3C9, value);
+    }
+    // Graphics controller bit mask.
+    vga.write_port(0x3CE, 0x08);
+    vga.write_port(0x3CF, 0x5A);
+    // 240-line timing.
+    vga.write_port(0x3D4, 0x11);
+    vga.write_port(0x3D5, 0x0E);
+    for (idx, val) in [
+        (0x06u8, 0x0Du8),
+        (0x07, 0x3E),
+        (0x09, 0x41),
+        (0x10, 0xEA),
+        (0x11, 0xAC),
+        (0x12, 0xDF),
+        (0x15, 0xE7),
+        (0x16, 0x06),
+    ] {
+        vga.write_port(0x3D4, idx);
+        vga.write_port(0x3D5, val);
+    }
+    // Start address 0x0123.
+    vga.write_port(0x3D4, 0x0C);
+    vga.write_port(0x3D5, 0x01);
+    vga.write_port(0x3D4, 0x0D);
+    vga.write_port(0x3D5, 0x23);
+    finish_current_frame(&mut vga);
+    assert_eq!(vga.crtc_start_address(), 0x0123);
+    assert_eq!(vga.crtc.vtotal, 527);
+    // Plane 1, plane offset 2 is linear offset 9 in chained addressing.
+    vga.vram[VGA_PLANE_SIZE + 2] = 0x77;
+    vga.vram[3 * VGA_PLANE_SIZE + 5] = 0x99;
+
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x0E);
+
+    assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+    vga.write_port(0x3C7, 5);
+    let rgb = [
+        vga.read_port(0x3C9),
+        vga.read_port(0x3C9),
+        vga.read_port(0x3C9),
+    ];
+    assert_eq!(
+        rgb,
+        [Some(0x11), Some(0x22), Some(0x33)],
+        "DAC entry survives"
+    );
+    vga.write_port(0x3CE, 0x08);
+    assert_eq!(
+        vga.read_port(0x3CF),
+        Some(0x5A),
+        "graphics controller survives"
+    );
+    assert_eq!(vga.crtc.vtotal, 527, "guest vertical timing survives");
+    assert_eq!(vga.crtc.vdisp_end, 480);
+    assert_eq!(vga.crtc_start_address(), 0x0123, "start address survives");
+    assert_eq!(vga.cpu_read_chain4(9), 0x77);
+    assert_eq!(vga.cpu_read_chain4(5 * 4 + 3), 0x99);
+}
