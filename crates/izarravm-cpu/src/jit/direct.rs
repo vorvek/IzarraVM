@@ -1029,6 +1029,8 @@ pub(crate) struct BlockCache {
     /// successors of a live block that writes data segments. Read once per cache, so one CPU has
     /// one form for its whole life. See `live_data_segments_arm`.
     live_data_segments_arm: u8,
+    /// `IZARRAVM_LIVE_PM_DATA_SEGMENTS`, read once per cache. See `live_pm_data_segments_enabled`.
+    live_pm_data_segments: bool,
     /// How many indexed layout copies `entry_layout` has taken. Mutant M14's only witness: the
     /// entry check must REPLACE the 116-byte fetch, never add a second one, and "this accessor
     /// reads one `Vec`" is not otherwise assertable in Rust. Atomic rather than `Cell` because
@@ -1469,6 +1471,7 @@ impl BlockCache {
             seg_head_last_selector: HashMap::default(),
             chain_entry_check_armed: chain_entry_check_armed(),
             live_data_segments_arm: live_data_segments_arm(),
+            live_pm_data_segments: live_pm_data_segments_enabled(),
             #[cfg(test)]
             entry_layout_fetches: std::sync::atomic::AtomicU32::new(0),
             block_imm_lanes: Vec::new(),
@@ -4139,6 +4142,7 @@ impl Clone for BlockCache {
         cache.admission_heat = self.admission_heat;
         cache.entry_cap = self.entry_cap;
         cache.live_data_segments_arm = self.live_data_segments_arm;
+        cache.live_pm_data_segments = self.live_pm_data_segments;
         #[cfg(test)]
         {
             cache.defer_short_for_test = self.defer_short_for_test;
@@ -4340,6 +4344,12 @@ pub(crate) struct Compilation {
 }
 
 impl Compilation {
+    /// The segments the entry check of this compilation still compares.
+    #[cfg(test)]
+    pub(crate) fn pinned_segments_for_test(&self) -> u8 {
+        self.segment_layout.used_for_test()
+    }
+
     /// How many mutable lanes this compilation registered — **EVERY family, not the immediate
     /// family alone.** The five sibling accessors below (`disp_lane_count`, `imm8_lane_count`,
     /// `count_lane_count`, `disp_store_lane_count`, `disp_load_widen_lane_count`) are SUBSET
@@ -8304,6 +8314,13 @@ fn compile_with_budget(
     // A live block is compiled in real mode or V86 while `IZARRAVM_LIVE_DATA_SEGMENTS` is on.
     // It reads all five data segments from the CPU state and bakes none of them.
     let live_form = live_form_for(cpu);
+    // A 16-bit protected-mode block may take the live form after the walk, if it holds a
+    // `MOV Sreg,r/m16` call-out (`IZARRAVM_LIVE_PM_DATA_SEGMENTS`). This is the part of that
+    // test that the mode and the knob decide. The call-out itself is known only during the walk.
+    let pm_live_candidate = cpu.jit_direct.live_pm_data_segments()
+        && cpu.is_protected_mode()
+        && !cpu.is_v86_mode()
+        && !d;
     let cs = cpu.registers.cs();
     let entry_eip = entry_lin.wrapping_sub(cs.base);
     let mut slots = Vec::with_capacity(MAX_BLOCK_INSTRUCTIONS);
@@ -8836,7 +8853,20 @@ fn compile_with_budget(
                 cpu.perf.jit_direct_word_control_refused += 1;
             }
         }
-        if !control_target_ok || !kind_segment_access_supported(cpu, kind) {
+        // After a `MOV Sreg,r/m16` call-out in a candidate block, the entry descriptors of ES, DS,
+        // FS, and GS say nothing about the later slots: the call-out can load another descriptor
+        // and the live access check decides at run time. A slot before the first such call-out
+        // keeps the entry check, so a block without the call-out ends where it ends today.
+        let live_after_load = if pm_live_candidate
+            && interpret_one_cells
+                .iter()
+                .any(|(_, cell)| cell.row() == InterpretOneRow::MovSreg)
+        {
+            PM_LIVE_BITS
+        } else {
+            0
+        };
+        if !control_target_ok || !kind_segment_access_supported(cpu, kind, live_after_load) {
             // Second producer of `RetryCause::AdmissionMatrix` (design note §0(c)). Same
             // full-length-pass gate as the first producer above, for the same reason.
             #[cfg(feature = "direct-admission-census")]
@@ -9343,6 +9373,35 @@ fn compile_with_budget(
         && interpret_one_cells
             .iter()
             .any(|(_, cell)| cell.row() == InterpretOneRow::MovSreg);
+    // The live protected-mode form: this block holds a `MOV Sreg,r/m16` call-out and reads ES,
+    // DS, FS, and GS from the CPU state, so the call-out can resume after it loads another
+    // descriptor. A block without such a call-out compiles as it did before the knob existed.
+    let pm_live_form = pm_live_candidate && callout_mov_sreg_present;
+    // What the block reads live: the data segments, and the selectors it returns. The real mode
+    // and V86 form reads every data segment and selector live; the protected-mode form reads the
+    // four segments a `MOV Sreg` can load. Both a segment and its selector must be live before
+    // the entry check can stop pinning the segment.
+    let live_selectors = if live_form {
+        ALL_DATA_SEGMENTS
+    } else if pm_live_form {
+        PM_LIVE_BITS
+    } else {
+        0
+    };
+    let protected_not_v86 = cpu.is_protected_mode() && !cpu.is_v86_mode();
+    let mut live_data = if live_form {
+        ALL_DATA_SEGMENTS
+    } else {
+        cpu.jit_direct.live_segments_for_key(key)
+    };
+    // Promotion state survives CS/CPL retirement; user blocks keep SS pinned.
+    if cpu.current_privilege_level() == 3 && !live_form {
+        live_data &= !segment_bit(SegmentIndex::Ss);
+    }
+    // The retire governor may have promoted more (SS), and that stays.
+    if pm_live_form {
+        live_data |= PM_LIVE_BITS;
+    }
     if segment_resume || callout_mov_sreg_present {
         debug_assert_eq!(
             interpret_one_cells.len(),
@@ -9405,8 +9464,16 @@ fn compile_with_budget(
             }
             let cell = Arc::get_mut(cell)
                 .expect("the compile walk owns its cells until install clones them");
+            // A segment the block reads live, data and selector both, is not a record the block
+            // depends on, so the resume predicate must not compare it. Only the protected-mode
+            // live form drops bits here; the real mode and V86 live blocks keep their masks.
+            let live_drop = if pm_live_form {
+                live_data & live_selectors
+            } else {
+                0
+            };
             cell.set_segment_masks(
-                prefix_masks[position] | suffix_masks[position],
+                (prefix_masks[position] | suffix_masks[position]) & !live_drop,
                 suffix_masks[position],
             );
         }
@@ -9448,21 +9515,17 @@ fn compile_with_budget(
     let Some(span) = BlockSpan::new(key, guest_len, slots.len()) else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
-    let Some(segment_layout) =
-        SegmentLayout::capture(cpu, read_segments, write_segments, pinned_segments)
-    else {
+    // A segment the protected-mode live form reads at run time is checked at run time, so an
+    // entry descriptor that is null or unusable must not refuse the compile.
+    let checked_at_entry = if pm_live_form { !PM_LIVE_BITS } else { u8::MAX };
+    let Some(segment_layout) = SegmentLayout::capture(
+        cpu,
+        read_segments & checked_at_entry,
+        write_segments & checked_at_entry,
+        pinned_segments,
+    ) else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
-    let protected_not_v86 = cpu.is_protected_mode() && !cpu.is_v86_mode();
-    let mut live_data = if live_form {
-        ALL_DATA_SEGMENTS
-    } else {
-        cpu.jit_direct.live_segments_for_key(key)
-    };
-    // Promotion state survives CS/CPL retirement; user blocks keep SS pinned.
-    if cpu.current_privilege_level() == 3 && !live_form {
-        live_data &= !segment_bit(SegmentIndex::Ss);
-    }
     // A self-loop block accounts by MULTIPLYING its whole static accounting by the iteration
     // count at exit, so nothing inside the loop body may deposit into the runtime lanes per
     // iteration. A call-out does exactly that (it adds the helper's runtime clocks at the call
@@ -9956,7 +10019,7 @@ fn compile_with_budget(
             segments: segment_layout,
             live_data,
             protected_not_v86,
-            live_form,
+            live_selectors,
             address_wrap: if d {
                 AddressWrap::None
             } else {
@@ -9972,7 +10035,8 @@ fn compile_with_budget(
     let segment_layout = if live_form {
         segment_layout.without_pins(ALL_DATA_SEGMENTS)
     } else if live_data != 0 {
-        segment_layout.without_pins(live_data & !selector_segments)
+        // A pin stays while the block bakes the selector of that segment.
+        segment_layout.without_pins(live_data & (!selector_segments | live_selectors))
     } else {
         segment_layout
     };
@@ -10160,11 +10224,14 @@ fn certainly_exits_on_alignment(cpu: &CpuGsw, kind: DirectKind, d: bool) -> bool
     linear & width.alignment_mask() != 0
 }
 
-fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
+/// Whether the entry descriptors allow every segment access of `kind`. A segment in `live` is
+/// skipped: the block reads it from the CPU state and checks it at run time.
+fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind, live: u8) -> bool {
     SEGMENT_ORDER.into_iter().all(|segment| {
         let read = kind.read_segment() == Some(segment);
         let write = kind.write_segment() == Some(segment);
         (!read && !write)
+            || live & segment_bit(segment) != 0
             || segment_access_supported(cpu, cpu.registers.segment(segment), read, write)
     })
 }
@@ -10249,11 +10316,16 @@ pub(crate) enum SideExitReason {
     /// clocks, so the exit reports `prefix` and adds no clocks of its own. EIP is wherever the
     /// delivery left it, which is normally the handler's first byte.
     CallOutResyncFault = 12,
+    /// The run-time access check of a live protected-mode data segment refused: the segment is
+    /// not present, is a system segment, is expand-down, or is not readable or not writable. Kept
+    /// apart from `UnavailableOrKind`, which also counts fast-map misses. The interpreter
+    /// re-executes the instruction and delivers whatever it delivers.
+    LivePmAccess = 13,
 }
 
 impl SideExitReason {
     /// The largest discriminant emitted code can store, for the `run.rs` bound assertion.
-    pub(crate) const MAX: u32 = Self::CallOutResyncFault as u32;
+    pub(crate) const MAX: u32 = Self::LivePmAccess as u32;
 }
 
 #[repr(u32)]
@@ -10899,6 +10971,12 @@ pub(crate) const LIVE_DATA_BITS: u8 = segment_bit(SegmentIndex::Ds) | segment_bi
 fn live_form_for(cpu: &CpuGsw) -> bool {
     cpu.jit_direct.live_data_segments_arm() != 0 && !(cpu.is_protected_mode() && !cpu.is_v86_mode())
 }
+
+/// ES, DS, FS, and GS: the segments a `MOV Sreg,r/m16` call-out can load. A 16-bit protected-mode
+/// block that holds such a call-out reads all four from the CPU state
+/// (`IZARRAVM_LIVE_PM_DATA_SEGMENTS`). SS and CS stay out.
+const PM_LIVE_BITS: u8 =
+    LIVE_DATA_BITS | segment_bit(SegmentIndex::Fs) | segment_bit(SegmentIndex::Gs);
 
 /// ES, SS, DS, FS, and GS. A live block (`IZARRAVM_LIVE_DATA_SEGMENTS`) loads all of them from the
 /// CPU state.
@@ -15071,6 +15149,59 @@ pub(crate) fn parse_live_data_segments_arm_for_test(
     value: Result<String, std::env::VarError>,
 ) -> u8 {
     parse_live_data_segments_arm(value)
+}
+
+/// `IZARRAVM_LIVE_PM_DATA_SEGMENTS`. Off by default. A 16-bit protected-mode block that holds a
+/// `MOV Sreg,r/m16` call-out reads ES, DS, FS, and GS from the CPU state, so the call-out can
+/// resume after it loads a different descriptor. The value is read once per `BlockCache`.
+pub(crate) fn live_pm_data_segments_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = LIVE_PM_DATA_SEGMENTS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_live_pm_data_segments(std::env::var("IZARRAVM_LIVE_PM_DATA_SEGMENTS")))
+}
+
+/// The `IZARRAVM_LIVE_PM_DATA_SEGMENTS` spelling table. Unset, empty, and `0` name the off arm.
+fn parse_live_pm_data_segments(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` (off) and `1` (on)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_LIVE_PM_DATA_SEGMENTS is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim() {
+        "" | "0" => false,
+        "1" => true,
+        other => panic!(
+            "IZARRAVM_LIVE_PM_DATA_SEGMENTS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a mistyped value that ran the default would look like a change that does nothing"
+        ),
+    }
+}
+
+// Per-thread, like `LIVE_DATA_SEGMENTS_OVERRIDE`. A fixture sets it BEFORE it builds the cache.
+#[cfg(test)]
+thread_local! {
+    static LIVE_PM_DATA_SEGMENTS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the live protected-mode data segment switch on this thread; `None` restores the ambient
+/// reading. Set it BEFORE constructing the `BlockCache` under test.
+#[cfg(test)]
+pub(crate) fn set_live_pm_data_segments_for_test(forced: Option<bool>) {
+    LIVE_PM_DATA_SEGMENTS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_live_pm_data_segments_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_live_pm_data_segments(value)
 }
 
 /// The spelling table, reachable from the fixtures. `chain_entry_check_armed` caches its env
@@ -19544,9 +19675,10 @@ struct MemoryEmitContext {
     /// PE set and V86 clear, baked from the compile-time mode key. Do not recover this from
     /// `address_wrap`: Word wrap is CS.D, and 16-bit PM would take the real/V86 emit.
     protected_not_v86: bool,
-    /// The block is a live block: `PUSH Sreg` and `MOV r16,Sreg` read the selector of ES, SS, DS,
-    /// FS, and GS from the CPU state, not from a baked immediate.
-    live_form: bool,
+    /// The segments whose selector `PUSH Sreg` and `MOV r16,Sreg` read from the CPU state, not
+    /// from a baked immediate: every data segment in a real mode or V86 live block, ES, DS, FS,
+    /// and GS in a protected-mode live block, none otherwise.
+    live_selectors: u8,
     /// The default wrap for an address that carries no wrap of its own.
     ///
     /// `decode` computes `address_size = cs.default_size_32 XOR address_size_override`. A
@@ -19599,6 +19731,9 @@ struct MemorySideExits {
     permission: Label,
     code_watch: Label,
     segment_limit: Option<Label>,
+    /// The run-time access check of a live protected-mode segment. Allocated only for such a
+    /// segment.
+    live_pm_access: Option<Label>,
 }
 
 impl MemorySideExits {
@@ -19612,6 +19747,11 @@ impl MemorySideExits {
                 .filter(|addr| {
                     memory.live_data & segment_bit(addr.segment) != 0
                         || memory.segments.descriptor(addr.segment).limit != u32::MAX
+                })
+                .map(|_| e.label()),
+            live_pm_access: addr
+                .filter(|addr| {
+                    memory.protected_not_v86 && memory.live_data & segment_bit(addr.segment) != 0
                 })
                 .map(|_| e.label()),
         }
@@ -19645,6 +19785,9 @@ impl MemorySideExits {
         }
         if let Some(segment_limit) = self.segment_limit {
             stubs.push((segment_limit, common, SideExitReason::SegmentLimit));
+        }
+        if let Some(live_pm_access) = self.live_pm_access {
+            stubs.push((live_pm_access, common, SideExitReason::LivePmAccess));
         }
     }
 }
@@ -19983,7 +20126,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
             DirectKind::MovSegToReg { dst, segment } => {
-                if memory.live_form && segment != SegmentIndex::Cs {
+                if memory.live_selectors & segment_bit(segment) != 0 {
                     e.movzx_r32_word_disp32(
                         Reg::RDX,
                         Reg::R15,
@@ -23898,7 +24041,14 @@ fn emit_live_segmented_linear_address(
     emit_effective_address(e, addr, wrap, 0);
     let field = segment_field_base(addr.segment);
     if memory.protected_not_v86 {
-        emit_live_pm_access_check(e, field, write, sides.unavailable_or_kind);
+        emit_live_pm_access_check(
+            e,
+            field,
+            write,
+            sides
+                .live_pm_access
+                .expect("a live protected-mode segment allocates an access check label"),
+        );
     }
     let limit_exit = sides
         .segment_limit
@@ -23962,7 +24112,7 @@ fn emit_store(
     // A live block keeps the selector of a data segment as a load from the CPU state; the source
     // reader does that load.
     let source = match source {
-        StoreSource::Selector(segment) if !(memory.live_form && segment != SegmentIndex::Cs) => {
+        StoreSource::Selector(segment) if memory.live_selectors & segment_bit(segment) == 0 => {
             StoreSource::Imm(u32::from(memory.segments.selector(segment)))
         }
         other => other,
@@ -33739,6 +33889,11 @@ impl BlockCache {
         self.live_data_segments_arm
     }
 
+    /// Whether `IZARRAVM_LIVE_PM_DATA_SEGMENTS` is on for this cache.
+    pub(crate) fn live_pm_data_segments(&self) -> bool {
+        self.live_pm_data_segments
+    }
+
     /// Whether the entry check reads the chain requirement. Read once per cache, in
     /// `with_entry_cap_and_decode_slots`; see the field and `env_gates::chain_entry_check_armed`.
     pub(crate) fn chain_entry_check_armed(&self) -> bool {
@@ -34404,6 +34559,15 @@ impl BlockCache {
         })
     }
 
+    /// Make the retire governor's state for `key` read as promoted to live data, and to live SS
+    /// when `stack` is set.
+    #[cfg(test)]
+    pub(crate) fn promote_live_for_test(&mut self, key: BlockKey, stack: bool) {
+        let record = self.data_segment_retires.entry(key).or_default();
+        record.live_data = true;
+        record.live_stack = stack;
+    }
+
     fn live_segments_for_key(&self, key: BlockKey) -> u8 {
         self.data_segment_retires.get(&key).map_or(0, |record| {
             if record.live_data {
@@ -34913,7 +35077,7 @@ fn census_native_suffix(
                 entry_lin.wrapping_sub(cs.base),
                 control_target_limit(insn.operand_size, cs.limit),
             )
-            || !kind_segment_access_supported(cpu, kind)
+            || !kind_segment_access_supported(cpu, kind, 0)
             || (kind.is_memory_alu()
                 && (memory_alu_slots == MAX_MEMORY_ALU_SLOTS
                     || prefix_instructions + 1 + result.instructions
@@ -35115,6 +35279,8 @@ pub(crate) struct DirectStallTally {
     /// The two halves the old `SideExitReason::Other` counter conflated.
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
+    /// Exits taken by the run-time access check of a live protected-mode data segment.
+    pub side_exit_live_pm_access: u64,
     /// Lowered DIV/IDIV guard refusals. Always-on evidence that the guard is COLD: a
     /// divide-by-zero is a crash on a healthy guest, so a nonzero count is either a fault the
     /// guest handles or the conservative divisor == -1 arm, and the ratio against
@@ -37354,6 +37520,7 @@ impl crate::jit::JitState {
             entry_chain_masked_reject: self.stalls.entry_chain_masked_reject,
             side_exit_segment_limit: self.stalls.side_exit_segment_limit,
             side_exit_x87_eligibility: self.stalls.side_exit_x87_eligibility,
+            side_exit_live_pm_access: self.stalls.side_exit_live_pm_access,
             side_exit_divide_guard: self.stalls.side_exit_divide_guard,
             side_exit_callout_step_break: self.stalls.side_exit_callout_step_break,
             side_exit_callout_abnormal: self.stalls.side_exit_callout_abnormal,
@@ -37551,6 +37718,10 @@ impl crate::jit::JitState {
 
     pub(crate) fn note_side_exit_x87_eligibility(&mut self) {
         self.stalls.side_exit_x87_eligibility += 1;
+    }
+
+    pub(crate) fn note_side_exit_live_pm_access(&mut self) {
+        self.stalls.side_exit_live_pm_access += 1;
     }
 
     pub(crate) fn note_side_exit_divide_guard(&mut self) {

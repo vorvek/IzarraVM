@@ -2534,6 +2534,8 @@ pub struct DirectStallSnapshot {
     pub entry_chain_masked_reject: u64,
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
+    /// Exits taken by the run-time access check of a live protected-mode data segment.
+    pub side_exit_live_pm_access: u64,
     /// Lowered DIV/IDIV guard refusals. See `BlockCacheStats`.
     pub side_exit_divide_guard: u64,
     /// Interpreter call-out exits, split by shape. See `BlockCacheStats`.

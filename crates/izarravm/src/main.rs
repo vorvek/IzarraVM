@@ -4098,6 +4098,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "entry_chain_masked_reject": snapshot.entry_chain_masked_reject,
         "side_exit_segment_limit": snapshot.side_exit_segment_limit,
         "side_exit_x87_eligibility": snapshot.side_exit_x87_eligibility,
+        "side_exit_live_pm_access": snapshot.side_exit_live_pm_access,
         "side_exit_divide_guard": snapshot.side_exit_divide_guard,
         "side_exit_callout_step_break": snapshot.side_exit_callout_step_break,
         "side_exit_callout_abnormal": snapshot.side_exit_callout_abnormal,

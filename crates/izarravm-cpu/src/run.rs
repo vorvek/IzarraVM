@@ -4124,6 +4124,9 @@ impl CpuGsw {
                 reason if reason == jit::direct::SideExitReason::X87Eligibility as u32 => {
                     self.jit_direct.note_side_exit_x87_eligibility();
                 }
+                reason if reason == jit::direct::SideExitReason::LivePmAccess as u32 => {
+                    self.jit_direct.note_side_exit_live_pm_access();
+                }
                 reason if reason == jit::direct::SideExitReason::DivideGuard as u32 => {
                     self.jit_direct.note_side_exit_divide_guard();
                 }

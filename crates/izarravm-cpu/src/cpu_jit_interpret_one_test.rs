@@ -37,6 +37,14 @@ use crate::timing_class::TimingClass;
 #[path = "cpu_jit_test_word_helper_test.rs"]
 mod test_word_helper;
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_live_pm_segments_test.rs"]
+mod live_pm_segments;
+
 const ENTRY: u32 = 0x100;
 /// A page the block's code is not on, for the stack and for the POP's destination.
 const DATA_PAGE: u32 = 0x1000;
