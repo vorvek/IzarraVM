@@ -660,6 +660,28 @@ struct PendingSwap {
     interval: u8,
 }
 
+/// The framebuffer, shared with the raster worker through an `Arc` while a
+/// batch runs. A derived `Clone` would copy the `Arc` and make a cloned
+/// `Distira` draw into the original's pixels, so `Clone` here copies the
+/// pixels instead. `Deref` keeps every `FrameStore` call site unchanged.
+/// `PartialEq` compares the pixel contents.
+#[derive(Debug, PartialEq, Eq)]
+struct OwnedFrame(Arc<FrameStore>);
+
+impl Clone for OwnedFrame {
+    fn clone(&self) -> Self {
+        Self(Arc::new((*self.0).clone()))
+    }
+}
+
+impl std::ops::Deref for OwnedFrame {
+    type Target = FrameStore;
+
+    fn deref(&self) -> &FrameStore {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distira {
     /// Every frame size this guest gave Distira, against its count. Distira
@@ -674,7 +696,7 @@ pub struct Distira {
     /// interior mutability this needs is already there, and `Arc` adds one
     /// indirection to an access that is already a load, never a `Mutex` or
     /// `RefCell`. Nothing here is unsafe: `#![forbid(unsafe_code)]` holds.
-    fb: Arc<FrameStore>,
+    fb: OwnedFrame,
     fifo: VecDeque<DistiraFifoEntry>,
     command_fifo: VecDeque<u32>,
     display: DistiraDisplay,
@@ -1181,7 +1203,7 @@ impl Distira {
         let buffer_stride = display.pitch * display.height;
         let mut distira = Self {
             census: DistiraCensus::default(),
-            fb: Arc::new(FrameStore::new(DISTIRA_FB_SIZE)),
+            fb: OwnedFrame(Arc::new(FrameStore::new(DISTIRA_FB_SIZE))),
             fifo: VecDeque::new(),
             command_fifo: VecDeque::new(),
             display,
@@ -1848,7 +1870,7 @@ impl Distira {
              which never calls back into this accessor",
         );
         ViewMemory {
-            fb: self.fb.as_ref(),
+            fb: &self.fb,
             texture: &owned.texture,
             ncc: &owned.ncc,
         }
@@ -2169,7 +2191,7 @@ impl Distira {
             "raster_owned is only None while a batch is in flight, and the \
              join above just cleared any in-flight batch",
         );
-        let fb = Arc::clone(&self.fb);
+        let fb = Arc::clone(&self.fb.0);
         let raster_lanes = self.raster_lanes;
         let (tx, rx) = std::sync::mpsc::channel();
         pool.spawn(move || {

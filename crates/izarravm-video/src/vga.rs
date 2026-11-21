@@ -733,6 +733,14 @@ impl Vga {
     /// Return one directly writable VGA aperture page when the current write
     /// datapath is a transparent byte copy. Mode X points at the sole plane
     /// selected by the map mask. Reads still use the VGA handler and latches.
+    ///
+    /// Pointer lifetime: the `vram` buffer is a heap allocation that is never
+    /// resized or reassigned, so the pointer stays valid while the `Vga` that
+    /// owns it lives. Moving the `Vga` does not move that heap buffer.
+    /// Cloning a `Vga` or assigning a whole new one allocates new buffers, so
+    /// every pointer taken from the old one is stale. Any such change, and any
+    /// future reallocation of the buffer, must advance the direct mapping epoch
+    /// so the direct page caches drop their copies.
     pub fn direct_write_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
         if self.mode13h_direct_page_available() {
             return self.mode13h_direct_page_ptr(offset);
@@ -748,9 +756,14 @@ impl Vga {
         Some(self.vram[plane * VGA_PLANE_SIZE + offset..].as_mut_ptr())
     }
 
-    /// Return one page of the canonical chained Mode 13h aperture. The backing
-    /// buffer is stable for the lifetime of this VGA instance. Callers must use
-    /// `note_mode13h_direct_write` before mutating the returned page.
+    /// Return one page of the canonical chained Mode 13h aperture. Callers must
+    /// use `note_mode13h_direct_write` before mutating the returned page.
+    ///
+    /// Pointer lifetime: the `mode13_linear` heap buffer is never resized or
+    /// reassigned, so the pointer stays valid while the owning `Vga` lives.
+    /// Moving the `Vga` does not move that buffer. Cloning or replacing the
+    /// `Vga`, or any future reallocation of the buffer, must advance the direct
+    /// mapping epoch.
     pub fn mode13h_direct_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
         if !self.mode13h_direct_page_available()
             || offset
@@ -2669,23 +2682,22 @@ impl Vga {
         // seq.memory_mode already holds the chain-4-off value from the write_seq
         // call that triggered this entry, so it is not reseeded here.
         //
-        // The raw CRTC bytes are NOT reseeded either. Clearing chain-4 changes
-        // the CPU write decode, not the display timing, so the CRTC keeps
-        // whatever the guest last wrote. Psycho Pinball programs its whole
-        // 320x370 vertical timing BEFORE it clears the bit, and re-seeding the
-        // canonical 320x200 register set here threw that timing away and cropped
-        // the bottom 170 rows of every frame. The timing table below is the
-        // 320x200 base a guest that wrote nothing still gets: mode 13h's table
-        // is byte-identical to it, and `set_mode13h` is the only way into the
-        // mode this entry comes from, so the recompute below reproduces the base
-        // exactly when the guest has been quiet.
+        // Neither the raw CRTC bytes nor the derived `crtc` timing are
+        // reseeded. Clearing chain-4 changes the CPU write decode, not the
+        // display timing, so the derived fields (start address, offset, line
+        // compare, mode control, underline location, preset row scan) stay as
+        // the guest left them and agree with the raw bytes. Only the vertical
+        // fields are recomputed below, from those raw bytes.
         //
-        // The reseed also cleared the CRTC write protect as a side effect, since
-        // the 320x200 register set carries 11h = 0Eh. Mode 13h's BIOS table
-        // carries 11h = 8Eh, so the protect is SET on entry here, and a guest
-        // that wants to retune registers 00h-07h must clear it first, which is
-        // what it must do on real silicon too.
-        self.crtc = CrtcTiming::mode_x();
+        // Psycho Pinball programs its whole 320x370 vertical timing BEFORE it
+        // clears the bit. Re-seeding the canonical 320x200 set here threw that
+        // timing away and cropped the bottom 170 rows of every frame. The
+        // recompute reproduces the 320x200 base exactly when the guest has been
+        // quiet, because mode 13h's table is the same base.
+        //
+        // Mode 13h's BIOS table carries 11h = 8Eh, so the CRTC write protect
+        // stays SET on entry here, and a guest that wants to retune registers
+        // 00h-07h must clear it first, as it must on real silicon.
         // The mode is set BEFORE the recompute, because the recompute sizes the
         // work raster and `resize_work` keeps a same-size buffer only while the
         // mode is unchanged. Setting it afterwards left the buffer labelled with

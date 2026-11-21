@@ -1224,6 +1224,25 @@ fn raster_worker_pool_follows_selection_and_clones_independently() {
 }
 
 #[test]
+fn cloned_distira_owns_its_framebuffer() {
+    let mut original = Distira::new();
+    original.set_frame_size(4, 4);
+    write_reg(
+        &mut original,
+        SST_LFB_MODE,
+        LFB_FORMAT_RGB565 | LFB_WRITE_FRONT,
+    );
+    let mut cloned = original.clone();
+    cloned.write_lfb_u16(0, 0x07e0);
+    assert_eq!(cloned.scanout_argb()[0], 0x0000_ff00);
+    assert_eq!(
+        original.scanout_argb()[0],
+        0,
+        "a write on the clone must not reach the original"
+    );
+}
+
+#[test]
 fn parallel_raster_output_is_identical_to_single_threaded_output() {
     // The rasteriser splits a large triangle across worker lanes by row.
     // Rows partition the frame store, and every per-pixel test is a pure
