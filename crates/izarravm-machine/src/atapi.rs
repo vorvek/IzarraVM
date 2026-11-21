@@ -22,6 +22,11 @@
 use crate::cdimage::{CdImage, DATA_SECTOR, FRAMES_PER_SEC, lba_to_msf, msf_to_lba};
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
+/// The most sectors one READ command may ask for: the largest READ(10) count,
+/// 128 MiB. Only READ(12) and READ CD can exceed it. The device builds the whole
+/// reply in memory, so the cap bounds that allocation.
+const MAX_READ_SECTORS: u32 = u16::MAX as u32;
+
 /// 12x CD-ROM transfer ceiling reported by MODE SENSE: about 1800 KB/s.
 pub const CD_BYTES_PER_SEC: f64 = 1_800.0 * 1024.0;
 
@@ -676,6 +681,9 @@ impl AtapiDevice {
         if count == 0 || !want_user_data {
             return CmdResult::Data(Vec::new());
         }
+        if count > MAX_READ_SECTORS {
+            return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+        }
         let end = lba.saturating_add(count);
         if end > image.total_sectors() {
             return self.fail_at_lba(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE, lba);
@@ -740,9 +748,21 @@ impl AtapiDevice {
         if count == 0 {
             return CmdResult::Data(Vec::new());
         }
+        if count > MAX_READ_SECTORS {
+            return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+        }
         let end = lba.saturating_add(count);
         if end > image.total_sectors() {
             return self.fail_at_lba(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE, lba);
+        }
+        // Check the whole range for audio tracks and holes before reserving the
+        // buffer, so a read that must fail does not reserve the range first.
+        let mut at = lba;
+        while at < end {
+            match image.track_at_lba(at) {
+                Some(track) if !track.mode.is_audio() => at = end.min(track.end_lba()),
+                _ => return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB),
+            }
         }
         let mut buf = Vec::with_capacity(count as usize * DATA_SECTOR);
         for l in lba..end {
