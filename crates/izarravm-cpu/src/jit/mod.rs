@@ -84,12 +84,6 @@ pub(crate) struct JitState {
     ///
     /// Default FALSE, which is the shipped behaviour this slice does not change.
     pub(crate) word_at_486: bool,
-    /// Emitted memory sites load table bases R15-relative from
-    /// `CpuGsw::native_table_slots` instead of baking imm64s. Always true in
-    /// production — the `IZARRAVM_R15_TABLES` A/B gate retired once the slice
-    /// measured (gate run 4227353445f1, PR #716) — and a FIELD so tests flip it
-    /// per-CPU and both emission arms keep unit coverage (`word_at_486`'s reason).
-    pub(crate) r15_tables: bool,
     /// Emitted stores take the PAGE_WATCHED fast path (watched-page-bit design
     /// D3). Always true in production — the `IZARRAVM_WATCH_PAGE_BIT` gate
     /// retired after #713 soaked — a field for `word_at_486`'s testability
@@ -100,15 +94,14 @@ pub(crate) struct JitState {
     /// Always true at construction. A test sets it to false to get the classify/resolve
     /// emission for each store, which is also the emission of a block whose stub pad did not
     /// build. A FIELD for `word_at_486`'s testability reason, and CARRIED by clone for
-    /// `watch_page_bit`'s lockstep-comparison reason. Requires `r15_tables` — the compile walk
-    /// enforces that at the pad-build site.
+    /// `watch_page_bit`'s lockstep-comparison reason.
     pub(crate) one_lookup_store: bool,
     /// Emitted reads probe the one-lookup load-bias table and route special pages through the
     /// shared read-resolve pad (`dev_docs/2026-08-07-one-lookup-load-design.md` D3a/D3b/D5).
     /// Always true at construction. A test sets it to false to get the classify/resolve read
     /// emission, which is also the emission of a block whose read pad did not build. A FIELD
     /// for `word_at_486`'s testability reason, CARRIED by clone for the lockstep reason.
-    /// Requires `r15_tables`; independent of `one_lookup_store`.
+    /// Independent of `one_lookup_store`.
     pub(crate) one_lookup_load: bool,
     /// Whether the blocks in this cache were emitted WITH the `NativeBlockTrace` append
     /// preamble — i.e. the answer to `!bus.native_fetches_are_uniform()` that every resident
@@ -250,7 +243,6 @@ impl JitState {
             #[cfg(feature = "dynarec-mkii")]
             mkii: crate::mkii::State::default(),
             word_at_486: direct::word_at_486_default(),
-            r15_tables: true,
             watch_page_bit: true,
             one_lookup_store: true,
             one_lookup_load: true,
@@ -299,7 +291,6 @@ impl Clone for JitState {
             // silently reverted to the default arm would compare a lifted CPU against an unlifted
             // one and report the disagreement as agreement.
             word_at_486: self.word_at_486,
-            r15_tables: self.r15_tables,
             watch_page_bit: self.watch_page_bit,
             one_lookup_store: self.one_lookup_store,
             one_lookup_load: self.one_lookup_load,

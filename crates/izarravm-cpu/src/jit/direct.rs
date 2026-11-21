@@ -1013,14 +1013,6 @@ pub(crate) struct BlockCache {
     /// because that struct is pinned at 120 bytes and no reader of this mask is on the per-entry
     /// copy path; every one of them already holds an index.
     written_segments: Vec<u8>,
-    /// L9 stage 0, THROWAWAY. Parallel to `blocks`: `Compilation::seg_head_guard_eligible`.
-    #[cfg(feature = "seg-head-diagnostic")]
-    seg_head_guard_eligible: Vec<bool>,
-    /// L9 stage 0, THROWAWAY: the selector each segment-write head wrote on its PREVIOUS entry,
-    /// keyed by the head's linear rather than by `BlockId` so a recompile at the same address
-    /// keeps the history the question is about. Only ever read by `note_seg_head_diagnostic`.
-    #[cfg(feature = "seg-head-diagnostic")]
-    seg_head_last_selector: HashMap<u32, u16, U32BuildHasher>,
     /// `IZARRAVM_CHAIN_ENTRY_CHECK`, read ONCE here rather than on the entry path. See
     /// `chain_entry_check_armed` for the arm table and the nulling semantics,
     /// and `BlockCache::entry_layout` for what it selects.
@@ -1426,9 +1418,6 @@ pub(crate) struct BlockCache {
     /// the link-refusal census above does: a lockstep clone must not double-count its parent.
     #[cfg(feature = "smc-census")]
     smc_census: Option<Box<SmcCensus>>,
-    /// The stage-0 RETF arity census (§5.0a). THROWAWAY; see `retf_census`.
-    #[cfg(feature = "retf-arity-census")]
-    retf_arity_census: Option<Box<RetfArityCensus>>,
     #[cfg(test)]
     defer_short_for_test: bool,
     #[cfg(test)]
@@ -1468,10 +1457,6 @@ impl BlockCache {
             class_vectors: Vec::new(),
             chain_layouts: Vec::new(),
             written_segments: Vec::new(),
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_guard_eligible: Vec::new(),
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_last_selector: HashMap::default(),
             chain_entry_check_armed: chain_entry_check_armed(),
             live_data_segments_arm: live_data_segments_arm(),
             live_pm_data_segments: live_pm_data_segments_enabled(),
@@ -1557,8 +1542,6 @@ impl BlockCache {
             direct_link_refusal_census: direct_link_refusal_census_default(),
             #[cfg(feature = "smc-census")]
             smc_census: smc_census_default(),
-            #[cfg(feature = "retf-arity-census")]
-            retf_arity_census: retf_arity_census_default(),
             #[cfg(test)]
             defer_short_for_test: false,
             #[cfg(test)]
@@ -1779,9 +1762,6 @@ impl BlockCache {
             self.class_vectors.push(compilation.class_vector.clone());
             self.chain_layouts.push(compilation.segment_layout);
             self.written_segments.push(compilation.written_segments);
-            #[cfg(feature = "seg-head-diagnostic")]
-            self.seg_head_guard_eligible
-                .push(compilation.seg_head_guard_eligible);
             self.block_imm_lanes.push(compilation.imm_lanes);
             self.block_imm_lane_widths.push(compilation.imm_lane_widths);
             if index == self.block_portals.len() {
@@ -1819,10 +1799,6 @@ impl BlockCache {
             // requirement: the new block reaches a different successor set entirely.
             self.chain_layouts[index] = compilation.segment_layout;
             self.written_segments[index] = compilation.written_segments;
-            #[cfg(feature = "seg-head-diagnostic")]
-            {
-                self.seg_head_guard_eligible[index] = compilation.seg_head_guard_eligible;
-            }
             self.block_imm_lanes[index] = compilation.imm_lanes;
             self.block_imm_lane_widths[index] = compilation.imm_lane_widths;
             self.link_cells[index] = compilation.link_cells.clone();
@@ -3976,8 +3952,6 @@ impl BlockCache {
         self.class_vectors.clear();
         self.chain_layouts.clear();
         self.written_segments.clear();
-        #[cfg(feature = "seg-head-diagnostic")]
-        self.seg_head_guard_eligible.clear();
         self.block_imm_lanes.clear();
         self.block_imm_lane_widths.clear();
         self.lane_trial_epochs.clear();
@@ -4270,13 +4244,6 @@ pub(crate) struct Compilation {
     /// pinned at 120 bytes with a full budget. Every reader holds an index or a `Compilation`
     /// already, so the side lane costs nothing the packed byte would have saved.
     pub(crate) written_segments: u8,
-    /// L9 stage 0, THROWAWAY: whether this block has the exact shape the guarded edge would admit.
-    /// One real-mode lowering write, that segment neither CS nor SS, no call-out that could write a
-    /// segment the compiler cannot name, and a plain fallthrough terminal. Without it the tally
-    /// probes a fallthrough linear that a RET- or jump-terminated head never executes, and reads
-    /// the resulting miss as "no successor compiled".
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub(crate) seg_head_guard_eligible: bool,
     #[cfg(feature = "direct-link-refusal-census")]
     pub(crate) emitted_static_targets: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
@@ -9773,9 +9740,9 @@ fn compile_with_budget(
     } else {
         return CompileOutcome::Retry(RetryCause::PostWalk);
     };
-    // Republish the bases this block would bake, BEFORE it can be installed:
-    // any block emitted on the R15 arm only ever runs after its own compile
-    // reached here, so the slots are current whenever such a block is live.
+    // Publish the bases this block loads through R15, BEFORE it can be installed:
+    // the block only runs after its own compile reached here, so the slots are
+    // current whenever it is live.
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
@@ -9796,17 +9763,14 @@ fn compile_with_budget(
         // store-bearing compile (both table sets exist here by construction) and publish its
         // entry addresses. A failed build (F5) leaves the flag off for THIS block only.
         one_lookup_store = cpu.jit_direct.one_lookup_store
-            && cpu.jit_direct.r15_tables
             && match (map_bases, code_watch_tables) {
-                (Some(bases), Some(tables)) => {
-                    match cpu.jit_direct.direct.store_stub_addresses(bases, tables) {
-                        Some(addresses) => {
-                            cpu.native_table_slots.publish_store_stubs(addresses);
-                            true
-                        }
-                        None => false,
+                (Some(_), Some(_)) => match cpu.jit_direct.direct.store_stub_addresses() {
+                    Some(addresses) => {
+                        cpu.native_table_slots.publish_store_stubs(addresses);
+                        true
                     }
-                }
+                    None => false,
+                },
                 // A storeless block never reaches a store emitter; keep the flag off so the
                 // emission arms cannot depend on an unpublished pad even by accident.
                 _ => false,
@@ -9829,9 +9793,8 @@ fn compile_with_budget(
     ))]
     {
         one_lookup_load = cpu.jit_direct.one_lookup_load
-            && cpu.jit_direct.r15_tables
             && match map_bases {
-                Some(bases) => match cpu.jit_direct.direct.read_stub_addresses(bases) {
+                Some(_) => match cpu.jit_direct.direct.read_stub_addresses() {
                     Some(addresses) => {
                         cpu.native_table_slots.publish_read_stubs(addresses);
                         true
@@ -9889,20 +9852,11 @@ fn compile_with_budget(
     // successor is not a later slot in this block, and nothing in the mask says anything about
     // what it bakes.
     let segment_write_block = segment_writes != 0 || callout_segment_writes != 0;
-    // L9 stage 0, THROWAWAY. The shape the guarded edge would admit, decided here where every term
-    // is in scope. The terminal test is the complement of the kinds the `successors` match names
-    // explicitly, so it is true for exactly the plain fallthrough catch-all.
-    #[cfg(feature = "seg-head-diagnostic")]
-    let seg_head_guard_eligible = dirty_segments.count_ones() == 1
-        && dirty_segments & (segment_bit(SegmentIndex::Cs) | segment_bit(SegmentIndex::Ss)) == 0
-        && callout_segment_writes == 0
-        && is_plain_fallthrough_terminal(slots.last().map(|slot| slot.kind));
     // `SEGWRITE-V86-EDGE` (dev_docs/2026-09-01-segwrite-continue-design.md §4.1). The bars a
     // segment-write block must clear to publish its plain static fallthrough anyway, on the
-    // default path -- not gated behind a diagnostic feature, because this is what decides
-    // `successors` below. Scoped identically to `seg_head_guard_eligible` above (one write, not
-    // CS/SS, no call-out write, the plain-fallthrough terminal shape) plus the ONE new term that
-    // diagnostic never needed: V86, the one mode where INV-V86-CANON holds
+    // default path, because this is what decides `successors` below. The bars are: one write,
+    // not CS/SS, no call-out write, the plain-fallthrough terminal shape, and V86, the one mode
+    // where INV-V86-CANON holds
     // (`load_segment_checked`'s V86 arm rebuilds the whole segment record from the selector, so a
     // selector-equality guard suffices for a whole descriptor; `load_segment_real_mode` does not,
     // which is what unreal mode IS and why L9's B1 killed a selector-only guard there).
@@ -10155,7 +10109,6 @@ fn compile_with_budget(
             map: map_bases,
             code_watch_tables,
             cpl3: memory_cpl3,
-            r15_tables: cpu.jit_direct.r15_tables,
             watch_page_bit: cpu.jit_direct.watch_page_bit,
             one_lookup_store,
             one_lookup_load,
@@ -10224,8 +10177,6 @@ fn compile_with_budget(
         } else {
             dirty_segments
         },
-        #[cfg(feature = "seg-head-diagnostic")]
-        seg_head_guard_eligible,
         #[cfg(feature = "direct-link-refusal-census")]
         emitted_static_targets,
         link_cells,
@@ -11063,10 +11014,8 @@ fn segment_access_supported(
 
 /// True for exactly the plain-fallthrough catch-all terminal shape: the complement of every kind
 /// the `successors` match (and `terminal_links` under `direct-link-refusal-census`) names
-/// explicitly. Shared by the L9 stage-0 diagnostic's `seg_head_guard_eligible` and
-/// `SEGWRITE-V86-EDGE`'s `seg_write_edge_eligible`, which both need "this block's last slot ends
-/// on the ordinary fallthrough boundary, not a branch/call/return" and must agree on what that
-/// means.
+/// explicitly. Used by `SEGWRITE-V86-EDGE`'s `seg_write_edge_eligible`, which needs "this block's
+/// last slot ends on the ordinary fallthrough boundary, not a branch/call/return".
 fn is_plain_fallthrough_terminal(kind: Option<DirectKind>) -> bool {
     !matches!(
         kind,
@@ -11125,7 +11074,7 @@ const ALL_DATA_SEGMENTS: u8 = LIVE_DATA_BITS
 /// The inverse of `segment_bit` for a mask holding exactly one bit, `None` for anything else.
 /// Used on the default path since `SEGWRITE-V86-EDGE`: the compile walk turns a single-bit
 /// `dirty_segments` mask back into the segment it names to select the guarded edge's written
-/// segment. `seg-head-diagnostic` also reads it (unchanged use).
+/// segment.
 pub(crate) const fn segment_of_bit(bit: u8) -> Option<SegmentIndex> {
     match bit {
         1 => Some(SegmentIndex::Es),
@@ -11510,8 +11459,7 @@ fn dynamic_counter_fields() -> [(i8, usize); 7] {
 // ---- from jit/direct/table_slots.rs ------------------------------------------------------------
 // The write-once table-base slots emitted code loads R15-relative.
 
-/// The table bases emitted code loads R15-relative when
-/// `JitState::r15_tables` is on: the fast-map SoA arrays
+/// The table bases emitted code loads R15-relative: the fast-map SoA arrays
 /// (`NativeMapBases`) and the two code-watch page tables, in the slot order
 /// `emit::table_slot_offset` indexes. Each source allocation is created once
 /// and never freed for the CPU's life (fast_map.rs storage, code_watch.rs
@@ -19773,12 +19721,6 @@ struct MemoryEmitContext {
     map: Option<NativeMapBases>,
     code_watch_tables: Option<[usize; 2]>,
     cpl3: bool,
-    /// Whether memory sites load table bases from `CpuGsw::native_table_slots`
-    /// (`[r15 + disp32]`, 7 bytes) instead of baking each as a 10-byte imm64.
-    /// From `JitState::r15_tables`. Both arms load the identical pointer — the
-    /// publish site in the compile walk records exactly the values this
-    /// context carries — so the arms differ in encoding only.
-    r15_tables: bool,
     /// Whether store emitters test the fast-map PAGE_WATCHED bit and skip the code-watch guard
     /// on unwatched pages (watched-page-bit design D3). From `JitState::watch_page_bit`. False
     /// reproduces the pre-slice emission byte for byte at the seven Group A sites; the two
@@ -19789,12 +19731,12 @@ struct MemoryEmitContext {
     /// Whether store sites emit the one-lookup probe + shared-stub shape (design D3/D4/D5)
     /// instead of the classify/resolve front. From `JitState::one_lookup_store`, AND-ed at the
     /// construction site with "the stub pad actually built" (review F5: a failed pad build
-    /// falls back to the inline emission for that block) — and it requires `r15_tables`,
-    /// because the stubs read every table through the R15 slots.
+    /// falls back to the inline emission for that block). The stubs read every table through the
+    /// R15 slots.
     one_lookup_store: bool,
     /// Whether read sites emit the one-lookup probe (load design D3a/D3b/D5) instead of the
     /// classify/permission/resolve front. From `JitState::one_lookup_load`, AND-ed at the
-    /// construction site with "the read pad actually built"; requires `r15_tables`. Fully
+    /// construction site with "the read pad actually built". Fully
     /// independent of `one_lookup_store`: disjoint sites, separate pads, so an A/B of either
     /// slice leaves the other's emission untouched.
     one_lookup_load: bool,
@@ -23063,13 +23005,8 @@ fn emit_x87_slot(
         },
     );
     if let Some(access) = access {
-        emit_x87_memory_completion(
-            e,
-            access.direction,
-            x87_memory_width(access),
-            memory.r15_tables,
-            memory.map.expect("x87 memory block has fast-map bases"),
-        );
+        emit_x87_memory_completion(e, access.direction, x87_memory_width(access));
+        memory.map.expect("x87 memory block has fast-map bases");
     }
 }
 
@@ -23103,7 +23040,7 @@ fn emit_x87_memory_pointer(
     // No x87 memory form is byte-wide, so the guard is unconditional here rather than gated on
     // `needs_alignment_guard()` the way `emit_ram_read_pointer_inner` gates it.
     debug_assert!(width.needs_alignment_guard());
-    let map = memory.map.expect("x87 memory block has fast-map bases");
+    memory.map.expect("x87 memory block has fast-map bases");
     emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, write);
     // The width here is what the slice's performance rests on, not its byte identity:
     // `BusCycle::clocks_for` ignores width, so a Word access charged as a Dword costs the same
@@ -23129,13 +23066,7 @@ fn emit_x87_memory_pointer(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -23149,32 +23080,20 @@ fn emit_x87_memory_pointer(
     if write {
         // The same two D3 shapes as `emit_store`'s arms; RCX is the live page index the
         // helper's re-read consumes.
-        emit_store_write_resolve(
-            e,
-            width,
-            map,
-            memory
-                .code_watch_tables
-                .expect("x87 store has code-watch tables"),
-            memory,
-            sides,
-        );
+        memory
+            .code_watch_tables
+            .expect("x87 store has code-watch tables");
+        emit_store_write_resolve(e, width, memory, sides);
     } else {
         emit_read_permission_check(e, memory.cpl3, sides.permission);
-        emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+        emit_read_pointer(e, sides.unavailable_or_kind);
     }
 
     // Preserve the guest address and page kind across the x87 emitter while RDI remains the host
     // memory pointer. This stack slot is no longer needed by the completed code-watch probe.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_KIND_MASK));
     e.shift_r64_imm8(4, Reg::RDX, 32);
@@ -23190,8 +23109,6 @@ fn emit_x87_memory_completion(
     e: &mut Encoder,
     direction: NativeX87MemoryDirection,
     width: MemoryWidth,
-    r15_tables: bool,
-    map: NativeMapBases,
 ) {
     // These dynamic counters MUST name the same width the static registration does. `run.rs`
     // computes `ram_word_reads = word_reads - mode13_word_reads` with a plain subtraction, so a
@@ -23234,7 +23151,7 @@ fn emit_x87_memory_completion(
                     emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES);
                 }
             }
-            emit_mode13_dirty_bit(e, r15_tables, map);
+            emit_mode13_dirty_bit(e);
         }
     }
     e.place(done);
@@ -23276,7 +23193,7 @@ fn emit_ram_read_pointer_inner(
     sides: MemorySideExits,
     wrap: AddressWrap,
 ) {
-    let map = memory.map.expect("native read has fast-map bases");
+    memory.map.expect("native read has fast-map bases");
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap, false);
     if width.needs_alignment_guard() {
         emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
@@ -23294,13 +23211,7 @@ fn emit_ram_read_pointer_inner(
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
 
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -23313,7 +23224,7 @@ fn emit_ram_read_pointer_inner(
     e.place(valid);
     e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RDI);
     emit_read_permission_check(e, memory.cpl3, sides.permission);
-    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, sides.unavailable_or_kind);
 }
 
 #[cfg(all(
@@ -23641,7 +23552,7 @@ fn emit_alu_mem_dest(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    let map = memory.map.expect("memory ALU has fast-map bases");
+    memory.map.expect("memory ALU has fast-map bases");
     if op == 7 {
         emit_ram_read_pointer(e, width, addr, memory, sides, memory.address_wrap);
         match width {
@@ -23665,7 +23576,7 @@ fn emit_alu_mem_dest(
         return;
     }
 
-    let code_watch_tables = memory
+    memory
         .code_watch_tables
         .expect("writing memory ALU has code-watch tables");
     emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, true);
@@ -23675,13 +23586,7 @@ fn emit_alu_mem_dest(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -23708,7 +23613,7 @@ fn emit_alu_mem_dest(
     e.shift_r64_imm8(4, Reg::RDI, 32);
     e.or_r64_r64(Reg::RDI, Reg::RAX);
     e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
-    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
@@ -23723,7 +23628,7 @@ fn emit_alu_mem_dest(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, sides.unavailable_or_kind);
     let skip_guard = e.label();
     if watch_fast {
         // The candidate lives in the pending slots, not RDX, so the pack reload may clobber it.
@@ -23732,21 +23637,14 @@ fn emit_alu_mem_dest(
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
         e.jz(skip_guard);
     }
-    emit_watched_alu_result_guard(
-        e,
-        width,
-        memory.r15_tables,
-        map,
-        code_watch_tables,
-        sides.code_watch,
-    );
+    emit_watched_alu_result_guard(e, width, sides.code_watch);
     e.place(skip_guard);
 
     emit_commit_alu_candidate(e, op, source, width);
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.store_r8_disp8(Reg::RDI, 0, Reg::RDX),
         MemoryWidth::Word => e.store_r16_disp8(Reg::RDI, 0, Reg::RDX),
@@ -23785,7 +23683,7 @@ fn emit_alu_mem_dest(
             unreachable!("ALU memory-dest operands are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, memory.r15_tables, map);
+    emit_mode13_dirty_bit(e);
     e.place(done);
 }
 
@@ -23802,8 +23700,8 @@ fn emit_double_shift_mem(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    let map = memory.map.expect("memory double shift has fast-map bases");
-    let code_watch_tables = memory
+    memory.map.expect("memory double shift has fast-map bases");
+    memory
         .code_watch_tables
         .expect("memory double shift has code-watch tables");
     emit_segmented_linear_address(
@@ -23819,13 +23717,7 @@ fn emit_double_shift_mem(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -23849,7 +23741,7 @@ fn emit_double_shift_mem(
     e.shift_r64_imm8(4, Reg::RDI, 32);
     e.or_r64_r64(Reg::RDI, Reg::RAX);
     e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
-    emit_read_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_read_pointer(e, sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
     e.store_r32_disp32(Reg::RSP, STACK_ALU_OLD_RESULT, Reg::RDX);
     emit_double_shift_candidate(e, left, src, count, Reg::RDX);
@@ -23858,7 +23750,7 @@ fn emit_double_shift_mem(
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, sides.unavailable_or_kind);
     let skip_guard = e.label();
     if watch_fast {
         e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
@@ -23866,21 +23758,14 @@ fn emit_double_shift_mem(
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
         e.jz(skip_guard);
     }
-    emit_watched_alu_result_guard(
-        e,
-        MemoryWidth::Dword,
-        memory.r15_tables,
-        map,
-        code_watch_tables,
-        sides.code_watch,
-    );
+    emit_watched_alu_result_guard(e, MemoryWidth::Dword, sides.code_watch);
     e.place(skip_guard);
 
     emit_commit_double_shift_flags(e, count);
     e.load_r32_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, sides.unavailable_or_kind);
     e.load_r32_disp32(Reg::RDX, Reg::RSP, STACK_ALU_OLD_RESULT + 4);
     e.store_r32_disp8(Reg::RDI, 0, Reg::RDX);
 
@@ -23896,7 +23781,7 @@ fn emit_double_shift_mem(
     e.place(mode13);
     emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
     emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
-    emit_mode13_dirty_bit(e, memory.r15_tables, map);
+    emit_mode13_dirty_bit(e);
     e.place(done);
 }
 
@@ -24267,8 +24152,8 @@ fn emit_store(
         emit_store_fast(e, source, width, addr, memory, sides, wrap);
         return;
     }
-    let map = memory.map.expect("native store has fast-map bases");
-    let code_watch_tables = memory
+    memory.map.expect("native store has fast-map bases");
+    memory
         .code_watch_tables
         .expect("native store has code-watch tables");
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap, true);
@@ -24278,13 +24163,7 @@ fn emit_store(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -24299,12 +24178,12 @@ fn emit_store(
     e.jmp(sides.unavailable_or_kind);
 
     e.place(ram);
-    emit_store_write_resolve(e, width, map, code_watch_tables, memory, sides);
+    emit_store_write_resolve(e, width, memory, sides);
     emit_store_value(e, source, width);
     e.jmp(done);
 
     e.place(mode13);
-    emit_store_write_resolve(e, width, map, code_watch_tables, memory, sides);
+    emit_store_write_resolve(e, width, memory, sides);
     emit_store_value(e, source, width);
     match width {
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES),
@@ -24314,7 +24193,7 @@ fn emit_store(
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, memory.r15_tables, map);
+    emit_mode13_dirty_bit(e);
     e.place(done);
 }
 
@@ -24337,47 +24216,24 @@ fn emit_store(
 fn emit_store_write_resolve(
     e: &mut Encoder,
     width: MemoryWidth,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
     emit_write_permission_check(e, memory.cpl3, sides.permission);
-    emit_write_pointer(e, memory.r15_tables, map, sides.unavailable_or_kind);
+    emit_write_pointer(e, sides.unavailable_or_kind);
     if memory.watch_page_bit {
         // RCX is the page index from the kind classify — the permission check never touches it
         // and the pointer resolve only reads it. RDX is dead (the store value loads later, and
         // the guard re-derives its own scratches).
         let unwatched = e.label();
-        emit_table_base(
-            e,
-            memory.r15_tables,
-            TABLE_SLOT_FLAGS,
-            map.flags(),
-            Reg::RDX,
-        );
+        emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
         e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
         e.jz(unwatched);
-        emit_code_watch_branch(
-            e,
-            width,
-            memory.r15_tables,
-            map,
-            code_watch_tables,
-            sides.code_watch,
-            unwatched,
-        );
+        emit_code_watch_branch(e, width, sides.code_watch, unwatched);
         e.place(unwatched);
     } else {
-        emit_watched_store_guard(
-            e,
-            width,
-            memory.r15_tables,
-            map,
-            code_watch_tables,
-            sides.code_watch,
-        );
+        emit_watched_store_guard(e, width, sides.code_watch);
     }
 }
 
@@ -24759,16 +24615,10 @@ fn emit_dynamic_split_extra(e: &mut Encoder, extra: u32) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_mode13_dirty_bit(e: &mut Encoder, r15_tables: bool, map: NativeMapBases) {
+fn emit_mode13_dirty_bit(e: &mut Encoder) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        r15_tables,
-        TABLE_SLOT_PHYSICAL_PAGES,
-        map.physical_pages(),
-        Reg::RDI,
-    );
+    emit_table_base(e, TABLE_SLOT_PHYSICAL_PAGES, Reg::RDI);
     e.load_r32_sib_scale4(Reg::RDX, Reg::RDI, Reg::RCX);
     e.add_r32_imm32(Reg::RDX, 0u32.wrapping_sub(0x000a_0000));
     e.shift_r32_imm8(5, Reg::RDX, NATIVE_PAGE_SHIFT as u8);
@@ -27026,8 +26876,8 @@ fn emit_rmw_inc_dec(
         return;
     }
     debug_assert!(matches!(width, MemoryWidth::Word));
-    let map = memory.map.expect("native RMW has fast-map bases");
-    let code_watch_tables = memory
+    memory.map.expect("native RMW has fast-map bases");
+    memory
         .code_watch_tables
         .expect("native RMW has code-watch tables");
     emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, true);
@@ -27035,13 +26885,7 @@ fn emit_rmw_inc_dec(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -27067,15 +26911,7 @@ fn emit_rmw_inc_dec(
         e.cmp_r32_imm32(Reg::RCX, 0);
         e.jz(unwatched);
     }
-    emit_code_watch_branch(
-        e,
-        width,
-        memory.r15_tables,
-        map,
-        code_watch_tables,
-        sides.code_watch,
-        unwatched,
-    );
+    emit_code_watch_branch(e, width, sides.code_watch, unwatched);
     e.place(unwatched);
 
     e.shift_r64_imm8(4, Reg::RDI, 32);
@@ -27084,24 +26920,12 @@ fn emit_rmw_inc_dec(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_READ_BIASES,
-        map.read_biases(),
-        Reg::RDI,
-    );
+    emit_table_base(e, TABLE_SLOT_READ_BIASES, Reg::RDI);
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_WRITE_BIASES,
-        map.write_biases(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_WRITE_BIASES, Reg::RDX);
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
@@ -27162,7 +26986,7 @@ fn emit_rmw_inc_dec(
             emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
         }
     }
-    emit_mode13_dirty_bit(e, memory.r15_tables, map);
+    emit_mode13_dirty_bit(e);
     e.place(done);
 }
 
@@ -27177,8 +27001,8 @@ fn emit_rmw_inc_dec_dword(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    let map = memory.map.expect("native RMW has fast-map bases");
-    let code_watch_tables = memory
+    memory.map.expect("native RMW has fast-map bases");
+    memory
         .code_watch_tables
         .expect("native RMW has code-watch tables");
     emit_segmented_linear_address(
@@ -27194,13 +27018,7 @@ fn emit_rmw_inc_dec_dword(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -27218,37 +27036,17 @@ fn emit_rmw_inc_dec_dword(
         e.cmp_r32_imm32(Reg::RCX, 0);
         e.jz(unwatched);
     }
-    emit_code_watch_branch(
-        e,
-        MemoryWidth::Dword,
-        memory.r15_tables,
-        map,
-        code_watch_tables,
-        sides.code_watch,
-        unwatched,
-    );
+    emit_code_watch_branch(e, MemoryWidth::Dword, sides.code_watch, unwatched);
     e.place(unwatched);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_READ_BIASES,
-        map.read_biases(),
-        Reg::RDI,
-    );
+    emit_table_base(e, TABLE_SLOT_READ_BIASES, Reg::RDI);
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_WRITE_BIASES,
-        map.write_biases(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_WRITE_BIASES, Reg::RDX);
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
@@ -27359,8 +27157,8 @@ fn emit_rotate_shift_mem(
         count != 0 && count <= 0x1f,
         "classify masks the count and refuses the zero case"
     );
-    let map = memory.map.expect("native group-2 RMW has fast-map bases");
-    let code_watch_tables = memory
+    memory.map.expect("native group-2 RMW has fast-map bases");
+    memory
         .code_watch_tables
         .expect("native group-2 RMW has code-watch tables");
     emit_segmented_linear_address(e, addr, width, memory, sides, memory.address_wrap, true);
@@ -27371,13 +27169,7 @@ fn emit_rotate_shift_mem(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -27418,15 +27210,7 @@ fn emit_rotate_shift_mem(
         e.cmp_r32_imm32(Reg::RCX, 0);
         e.jz(unwatched);
     }
-    emit_code_watch_branch(
-        e,
-        width,
-        memory.r15_tables,
-        map,
-        code_watch_tables,
-        sides.code_watch,
-        unwatched,
-    );
+    emit_code_watch_branch(e, width, sides.code_watch, unwatched);
     e.place(unwatched);
 
     // The address and the MASKED kind, packed into one slot. The mask matters for the tail's
@@ -27440,24 +27224,12 @@ fn emit_rotate_shift_mem(
     // intermediates in it depending on which path reached the join.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_READ_BIASES,
-        map.read_biases(),
-        Reg::RDI,
-    );
+    emit_table_base(e, TABLE_SLOT_READ_BIASES, Reg::RDI);
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_WRITE_BIASES,
-        map.write_biases(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_WRITE_BIASES, Reg::RDX);
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(sides.unavailable_or_kind);
@@ -27571,7 +27343,7 @@ fn emit_rotate_shift_mem(
             unreachable!("group-2 memory operands are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, memory.r15_tables, map);
+    emit_mode13_dirty_bit(e);
     e.place(done);
 }
 
@@ -27607,8 +27379,8 @@ fn emit_push_mem(
     source_sides: MemorySideExits,
     stack_sides: MemorySideExits,
 ) {
-    let map = memory.map.expect("native push-mem has fast-map bases");
-    let code_watch_tables = memory
+    memory.map.expect("native push-mem has fast-map bases");
+    memory
         .code_watch_tables
         .expect("native push-mem has code-watch tables");
 
@@ -27625,13 +27397,7 @@ fn emit_push_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, source_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     // The masked KIND goes to RDI. RDX must keep the RAW flags byte, because
     // `emit_read_permission_check` below consumes it. Same split `emit_rmw_inc_dec_dword` uses.
@@ -27644,7 +27410,7 @@ fn emit_push_mem(
     // exiting to the page fault. `emit_ram_read_pointer_inner` calls this in exactly this
     // position, between the kind check and the bias lookup.
     emit_read_permission_check(e, memory.cpl3, source_sides.permission);
-    emit_read_pointer(e, memory.r15_tables, map, source_sides.unavailable_or_kind);
+    emit_read_pointer(e, source_sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDI, Reg::RDI, 0);
     // Park it: the stack store's address and kind path clobbers RAX, RCX, RDX and RDI.
     e.store_r64_disp32(Reg::RSP, STACK_PUSH_MEM_VALUE, Reg::RDI);
@@ -27662,13 +27428,7 @@ fn emit_push_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, stack_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -27688,9 +27448,6 @@ fn emit_push_mem(
     emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
-        memory.r15_tables,
-        map,
-        code_watch_tables,
         stack_sides.code_watch,
         stack_unwatched,
     );
@@ -27703,13 +27460,7 @@ fn emit_push_mem(
     // `emit_rmw_inc_dec_dword` recomputes immediately after its own watch join for this reason.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_WRITE_BIASES,
-        map.write_biases(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_WRITE_BIASES, Reg::RDX);
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(stack_sides.unavailable_or_kind);
@@ -27798,8 +27549,8 @@ fn emit_call_mem(
     stack_sides: MemorySideExits,
     cs_limit: Option<(u32, Label)>,
 ) {
-    let map = memory.map.expect("native call-mem has fast-map bases");
-    let code_watch_tables = memory
+    memory.map.expect("native call-mem has fast-map bases");
+    memory
         .code_watch_tables
         .expect("native call-mem has code-watch tables");
 
@@ -27816,13 +27567,7 @@ fn emit_call_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, source_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     // The masked KIND goes to RDI; RDX keeps the RAW flags byte for the permission check.
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
@@ -27832,7 +27577,7 @@ fn emit_call_mem(
     // As in `emit_push_mem`, this is a privilege check and not bookkeeping: without it a ring-3
     // `call dword [supervisor_page]` would read supervisor memory natively.
     emit_read_permission_check(e, memory.cpl3, source_sides.permission);
-    emit_read_pointer(e, memory.r15_tables, map, source_sides.unavailable_or_kind);
+    emit_read_pointer(e, source_sides.unavailable_or_kind);
     e.load_r32_disp8(Reg::RDI, Reg::RDI, 0);
     // BEFORE the store, so a limit refusal leaves the guest byte-for-byte untouched and the
     // interpreter's re-run reproduces the interpreter's own push-then-fault-on-next-fetch order.
@@ -27856,13 +27601,7 @@ fn emit_call_mem(
     emit_wide_page_guard(e, MemoryWidth::Dword, stack_sides.cross_page_or_alignment);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_FLAGS,
-        map.flags(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -27882,9 +27621,6 @@ fn emit_call_mem(
     emit_code_watch_branch(
         e,
         MemoryWidth::Dword,
-        memory.r15_tables,
-        map,
-        code_watch_tables,
         stack_sides.code_watch,
         stack_unwatched,
     );
@@ -27895,13 +27631,7 @@ fn emit_call_mem(
     // here for the same reason.
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        memory.r15_tables,
-        TABLE_SLOT_WRITE_BIASES,
-        map.write_biases(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_WRITE_BIASES, Reg::RDX);
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(stack_sides.unavailable_or_kind);
@@ -27943,14 +27673,8 @@ fn emit_call_mem(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_read_pointer(e: &mut Encoder, r15_tables: bool, map: NativeMapBases, side: Label) {
-    emit_table_base(
-        e,
-        r15_tables,
-        TABLE_SLOT_READ_BIASES,
-        map.read_biases(),
-        Reg::RDI,
-    );
+fn emit_read_pointer(e: &mut Encoder, side: Label) {
+    emit_table_base(e, TABLE_SLOT_READ_BIASES, Reg::RDI);
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(side);
@@ -27961,34 +27685,23 @@ fn emit_read_pointer(e: &mut Encoder, r15_tables: bool, map: NativeMapBases, sid
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_write_pointer(e: &mut Encoder, r15_tables: bool, map: NativeMapBases, side: Label) {
-    emit_table_base(
-        e,
-        r15_tables,
-        TABLE_SLOT_WRITE_BIASES,
-        map.write_biases(),
-        Reg::RDI,
-    );
+fn emit_write_pointer(e: &mut Encoder, side: Label) {
+    emit_table_base(e, TABLE_SLOT_WRITE_BIASES, Reg::RDI);
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
     e.jz(side);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
 }
 
-/// Load a table base into `dst`: R15-relative from `CpuGsw::native_table_slots`
-/// (7 bytes, hot L1) on the R15 arm, the baked 10-byte immediate otherwise.
-/// Identical pointer either way — the compile walk publishes exactly the values
-/// its `MemoryEmitContext` carries, before the block can be installed.
+/// Load a table base into `dst`, R15-relative from `CpuGsw::native_table_slots` (7 bytes, hot
+/// L1). The compile walk publishes the values its `MemoryEmitContext` carries before the block
+/// can be installed.
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_table_base(e: &mut Encoder, r15_tables: bool, slot: usize, value: usize, dst: Reg) {
-    if r15_tables {
-        e.load_r64_disp32(dst, Reg::R15, table_slot_offset(slot));
-    } else {
-        e.mov_r64_imm64(dst, value as u64);
-    }
+fn emit_table_base(e: &mut Encoder, slot: usize, dst: Reg) {
+    e.load_r64_disp32(dst, Reg::R15, table_slot_offset(slot));
 }
 
 /// Offset of `CpuGsw::native_table_slots[slot]` from R15, computed the way
@@ -28008,24 +27721,9 @@ pub(crate) fn table_slot_offset(slot: usize) -> i32 {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_watched_store_guard(
-    e: &mut Encoder,
-    width: MemoryWidth,
-    r15_tables: bool,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-    side: Label,
-) {
+fn emit_watched_store_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     let unwatched = e.label();
-    emit_code_watch_branch(
-        e,
-        width,
-        r15_tables,
-        map,
-        code_watch_tables,
-        side,
-        unwatched,
-    );
+    emit_code_watch_branch(e, width, side, unwatched);
     e.place(unwatched);
 }
 
@@ -28033,24 +27731,9 @@ fn emit_watched_store_guard(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_watched_alu_result_guard(
-    e: &mut Encoder,
-    width: MemoryWidth,
-    r15_tables: bool,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-    side: Label,
-) {
+fn emit_watched_alu_result_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
     let unwatched = e.label();
-    emit_code_watch_branch(
-        e,
-        width,
-        r15_tables,
-        map,
-        code_watch_tables,
-        side,
-        unwatched,
-    );
+    emit_code_watch_branch(e, width, side, unwatched);
     e.place(unwatched);
 }
 
@@ -28058,47 +27741,17 @@ fn emit_watched_alu_result_guard(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_code_watch_branch(
-    e: &mut Encoder,
-    width: MemoryWidth,
-    r15_tables: bool,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-    watched: Label,
-    unwatched: Label,
-) {
+fn emit_code_watch_branch(e: &mut Encoder, width: MemoryWidth, watched: Label, unwatched: Label) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        r15_tables,
-        TABLE_SLOT_PHYSICAL_PAGES,
-        map.physical_pages(),
-        Reg::RDX,
-    );
+    emit_table_base(e, TABLE_SLOT_PHYSICAL_PAGES, Reg::RDX);
     e.load_r32_sib_scale4(Reg::RCX, Reg::RDX, Reg::RCX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     e.store_r64_disp8(Reg::RSP, STACK_WATCH_PAGE, Reg::RCX);
     let second = e.label();
-    emit_code_watch_table_branch(
-        e,
-        width,
-        r15_tables,
-        TABLE_SLOT_CODE_WATCH_STICKY,
-        code_watch_tables[0],
-        watched,
-        second,
-    );
+    emit_code_watch_table_branch(e, width, TABLE_SLOT_CODE_WATCH_STICKY, watched, second);
     e.place(second);
-    emit_code_watch_table_branch(
-        e,
-        width,
-        r15_tables,
-        TABLE_SLOT_CODE_WATCH_NATIVE,
-        code_watch_tables[1],
-        watched,
-        unwatched,
-    );
+    emit_code_watch_table_branch(e, width, TABLE_SLOT_CODE_WATCH_NATIVE, watched, unwatched);
 }
 
 #[cfg(all(
@@ -28108,14 +27761,12 @@ fn emit_code_watch_branch(
 fn emit_code_watch_table_branch(
     e: &mut Encoder,
     width: MemoryWidth,
-    r15_tables: bool,
     table_slot: usize,
-    code_watch_table: usize,
     watched: Label,
     unwatched: Label,
 ) {
     e.load_r64_disp8(Reg::RCX, Reg::RSP, STACK_WATCH_PAGE);
-    emit_table_base(e, r15_tables, table_slot, code_watch_table, Reg::RDX);
+    emit_table_base(e, table_slot, Reg::RDX);
     e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
     e.cmp_r64_imm32(Reg::RDX, 0);
     e.jz(unwatched);
@@ -28283,16 +27934,10 @@ fn x87_width_index(width: MemoryWidth) -> usize {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_store_bias_probe(e: &mut Encoder, map: NativeMapBases) {
+fn emit_store_bias_probe(e: &mut Encoder) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(
-        e,
-        true,
-        TABLE_SLOT_STORE_BIASES,
-        map.store_biases(),
-        Reg::RDI,
-    );
+    emit_table_base(e, TABLE_SLOT_STORE_BIASES, Reg::RDI);
     e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
 }
 
@@ -28335,7 +27980,7 @@ fn emit_store_fast(
     sides: MemorySideExits,
     wrap: AddressWrap,
 ) {
-    let map = memory.map.expect("native store has fast-map bases");
+    memory.map.expect("native store has fast-map bases");
     // HOISTED above the alignment test, because that half below references `slow`. The other
     // three labels move with it so the set stays in one place.
     let aux = e.label();
@@ -28343,7 +27988,7 @@ fn emit_store_fast(
     let done = e.label();
     let fast_join = e.label();
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap, true);
-    emit_store_bias_probe(e, map);
+    emit_store_bias_probe(e);
     // The value is materialized BEFORE the tag branch so the fast arm and both stubs share it
     // (the stubs receive it in RDX; the slow stub spills it across its own front — review F1).
     emit_read_store_value(e, source, width, Reg::RDX);
@@ -28432,7 +28077,7 @@ fn emit_store_fast(
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(e, true, map);
+    emit_mode13_dirty_bit(e);
     e.jmp(done);
 
     e.place(slow);
@@ -28458,8 +28103,8 @@ fn emit_x87_store_pointer_fast(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    let map = memory.map.expect("x87 memory block has fast-map bases");
-    emit_store_bias_probe(e, map);
+    memory.map.expect("x87 memory block has fast-map bases");
+    emit_store_bias_probe(e);
 
     let slow = e.label();
     let done = e.label();
@@ -28517,13 +28162,9 @@ impl BlockCache {
     /// re-entry pad pattern: own executable mapping, never replaced). `None` when the host
     /// cannot provide an executable mapping — the caller then compiles the block with the
     /// inline (gate-off) store emission instead of calling through a zero slot (review F5).
-    pub(crate) fn store_stub_addresses(
-        &mut self,
-        map: NativeMapBases,
-        code_watch_tables: [usize; 2],
-    ) -> Option<[usize; STORE_STUB_COUNT]> {
+    pub(crate) fn store_stub_addresses(&mut self) -> Option<[usize; STORE_STUB_COUNT]> {
         if self.store_stub_pad.is_none() {
-            let pad = emit_store_stub_pad(map, code_watch_tables);
+            let pad = emit_store_stub_pad();
             self.store_stub_pad = crate::jit::exec_mem::ExecutableBuffer::new(&pad.code)
                 .map(|buffer| (buffer, pad.offsets));
         }
@@ -28557,10 +28198,7 @@ pub(crate) struct StoreStubPad {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-pub(crate) fn emit_store_stub_pad(
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-) -> StoreStubPad {
+pub(crate) fn emit_store_stub_pad() -> StoreStubPad {
     // Same compile-time equality the read pad asserts, and for the same reason: the deposit gate
     // encodes `alignment_mask()` while the mode13 refusal encodes `bytes() - 1`, and they agree
     // at every width this pad builds. See `emit_read_stub_pad` for why this is a const assert
@@ -28581,7 +28219,7 @@ pub(crate) fn emit_store_stub_pad(
             &mut offsets,
             &mut cursor,
             store_stub_slot_m13(gpr_width_index(width)) - TABLE_SLOT_STORE_STUBS,
-            emit_m13_stub(width, map),
+            emit_m13_stub(width),
         );
     }
     for width in widths {
@@ -28591,7 +28229,7 @@ pub(crate) fn emit_store_stub_pad(
                 &mut offsets,
                 &mut cursor,
                 store_stub_slot_slow(gpr_width_index(width), cpl3) - TABLE_SLOT_STORE_STUBS,
-                emit_slow_stub(width, cpl3, map, code_watch_tables),
+                emit_slow_stub(width, cpl3),
             );
         }
     }
@@ -28607,7 +28245,7 @@ pub(crate) fn emit_store_stub_pad(
                 &mut offsets,
                 &mut cursor,
                 store_stub_slot_x87(x87_width_index(width), cpl3) - TABLE_SLOT_STORE_STUBS,
-                emit_x87_resolve_stub(width, cpl3, map, code_watch_tables),
+                emit_x87_resolve_stub(width, cpl3),
             );
         }
     }
@@ -28659,7 +28297,7 @@ fn emit_stub_return(e: &mut Encoder) {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_m13_stub(width: MemoryWidth, map: NativeMapBases) -> Vec<u8> {
+fn emit_m13_stub(width: MemoryWidth) -> Vec<u8> {
     let mut e = Encoder::new();
     emit_stub_prologue(&mut e);
     e.and_r64_imm32(Reg::RDI, (NATIVE_STORE_BIAS_TAG_MASK as u32) ^ u32::MAX);
@@ -28680,7 +28318,7 @@ fn emit_m13_stub(width: MemoryWidth, map: NativeMapBases) -> Vec<u8> {
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(&mut e, true, map);
+    emit_mode13_dirty_bit(&mut e);
     emit_stub_return(&mut e);
     e.finish()
 }
@@ -28694,12 +28332,7 @@ fn emit_m13_stub(width: MemoryWidth, map: NativeMapBases) -> Vec<u8> {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_slow_stub(
-    width: MemoryWidth,
-    cpl3: bool,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-) -> Vec<u8> {
+fn emit_slow_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     let mut e = Encoder::new();
     emit_stub_prologue(&mut e);
     // The F1 value spill: the front below clobbers RDX four ways and the scratch set is
@@ -28716,7 +28349,7 @@ fn emit_slow_stub(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(&mut e, true, TABLE_SLOT_FLAGS, map.flags(), Reg::RDX);
+    emit_table_base(&mut e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -28784,8 +28417,8 @@ fn emit_slow_stub(
     // pack staging in RCX only up to the spill above).
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(&mut e, true, map, status_unavailable);
-    emit_watched_store_guard(&mut e, width, true, map, code_watch_tables, status_watch);
+    emit_write_pointer(&mut e, status_unavailable);
+    emit_watched_store_guard(&mut e, width, status_watch);
 
     // Store, then the counters for whichever kind the classify found.
     e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_PUSH_MEM_VALUE);
@@ -28843,7 +28476,7 @@ fn emit_slow_stub(
             unreachable!("GPR stores are never 8- or 10-byte wide")
         }
     }
-    emit_mode13_dirty_bit(&mut e, true, map);
+    emit_mode13_dirty_bit(&mut e);
     e.xor_r64_self(Reg::RCX);
     e.place(counted);
     emit_stub_return(&mut e);
@@ -28867,12 +28500,7 @@ fn emit_slow_stub(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_x87_resolve_stub(
-    width: MemoryWidth,
-    cpl3: bool,
-    map: NativeMapBases,
-    code_watch_tables: [usize; 2],
-) -> Vec<u8> {
+fn emit_x87_resolve_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     let mut e = Encoder::new();
     emit_stub_prologue(&mut e);
 
@@ -28885,7 +28513,7 @@ fn emit_x87_resolve_stub(
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(&mut e, true, TABLE_SLOT_FLAGS, map.flags(), Reg::RDX);
+    emit_table_base(&mut e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -28908,8 +28536,8 @@ fn emit_x87_resolve_stub(
     emit_write_permission_check(&mut e, cpl3, status_permission);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_write_pointer(&mut e, true, map, status_unavailable);
-    emit_watched_store_guard(&mut e, width, true, map, code_watch_tables, status_watch);
+    emit_write_pointer(&mut e, status_unavailable);
+    emit_watched_store_guard(&mut e, width, status_watch);
 
     // Success: move the parked pack into STACK_READ_KIND for the completion, zero the status.
     e.load_r64_disp32(Reg::RDX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
@@ -28969,14 +28597,14 @@ fn emit_x87_resolve_stub(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_load_bias_probe(e: &mut Encoder, map: NativeMapBases, hold_load_bias: bool) {
+fn emit_load_bias_probe(e: &mut Encoder, hold_load_bias: bool) {
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
     if hold_load_bias {
         e.load_r64_sib_scale8(Reg::RDI, Reg::RSI, Reg::RCX);
         e.note_hold_load_bias_probe();
     } else {
-        emit_table_base(e, true, TABLE_SLOT_LOAD_BIASES, map.load_biases(), Reg::RDI);
+        emit_table_base(e, TABLE_SLOT_LOAD_BIASES, Reg::RDI);
         e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
     }
 }
@@ -29042,7 +28670,7 @@ fn emit_ram_read_pointer_fast(
     sides: MemorySideExits,
     wrap: AddressWrap,
 ) {
-    let map = memory.map.expect("native read has fast-map bases");
+    memory.map.expect("native read has fast-map bases");
     // HOISTED above the guard, because the alignment half below targets `slow`. `done` moves with
     // it so the two stay adjacent. Both are still placed on every path: when
     // `emit_segmented_linear_address` takes its `checked_sub` None arm it emits an unconditional
@@ -29062,7 +28690,7 @@ fn emit_ram_read_pointer_fast(
         // `emit_alignment_test`.
         emit_alignment_test(e, width, Reg::RDX, slow);
     }
-    emit_load_bias_probe(e, map, memory.hold_load_bias);
+    emit_load_bias_probe(e, memory.hold_load_bias);
 
     // Jumping past the probe into `slow` is legal, and neither fact is obvious:
     // `emit_counting_read_stub` never reads incoming RDI -- it recomputes the page index from RAX
@@ -29148,8 +28776,8 @@ fn gpr_read_width_index(width: MemoryWidth) -> usize {
     any(target_os = "windows", target_os = "linux")
 ))]
 fn emit_read_probe_parking(e: &mut Encoder, memory: MemoryEmitContext, sides: MemorySideExits) {
-    let map = memory.map.expect("native read has fast-map bases");
-    emit_load_bias_probe(e, map, memory.hold_load_bias);
+    memory.map.expect("native read has fast-map bases");
+    emit_load_bias_probe(e, memory.hold_load_bias);
 
     let aux = e.label();
     let slow = e.label();
@@ -29215,8 +28843,8 @@ fn emit_read_probe_parking(e: &mut Encoder, memory: MemoryEmitContext, sides: Me
     any(target_os = "windows", target_os = "linux")
 ))]
 fn emit_x87_read_pointer_fast(e: &mut Encoder, memory: MemoryEmitContext, sides: MemorySideExits) {
-    let map = memory.map.expect("x87 memory block has fast-map bases");
-    emit_load_bias_probe(e, map, memory.hold_load_bias);
+    memory.map.expect("x87 memory block has fast-map bases");
+    emit_load_bias_probe(e, memory.hold_load_bias);
 
     let slow = e.label();
     let done = e.label();
@@ -29247,12 +28875,9 @@ impl BlockCache {
     /// The read pad's published entry addresses, building it on first use (the store pad's
     /// contract verbatim). `None` -> the caller compiles the block with the inline (gate-off)
     /// read emission instead of calling through a zero slot.
-    pub(crate) fn read_stub_addresses(
-        &mut self,
-        map: NativeMapBases,
-    ) -> Option<[usize; READ_STUB_COUNT]> {
+    pub(crate) fn read_stub_addresses(&mut self) -> Option<[usize; READ_STUB_COUNT]> {
         if self.read_stub_pad.is_none() {
-            let pad = emit_read_stub_pad(map);
+            let pad = emit_read_stub_pad();
             self.read_stub_pad = crate::jit::exec_mem::ExecutableBuffer::new(&pad.code)
                 .map(|buffer| (buffer, pad.offsets));
         }
@@ -29282,7 +28907,7 @@ pub(crate) struct ReadStubPad {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
+pub(crate) fn emit_read_stub_pad() -> ReadStubPad {
     // The deposit gate inside these stubs encodes `alignment_mask()` while the mode13 refusal
     // encodes `bytes() - 1`. For the three widths this pad builds the two are equal, so the two
     // spellings emit the same immediate and the split is a naming change with no byte behind it.
@@ -29308,7 +28933,7 @@ pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
                 &mut offsets,
                 &mut cursor,
                 read_stub_slot_counting(gpr_read_width_index(width), cpl3) - TABLE_SLOT_READ_STUBS,
-                emit_counting_read_stub(width, cpl3, map),
+                emit_counting_read_stub(width, cpl3),
             );
         }
     }
@@ -29318,7 +28943,7 @@ pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
             &mut offsets,
             &mut cursor,
             read_stub_slot_park(cpl3) - TABLE_SLOT_READ_STUBS,
-            emit_park_read_stub(cpl3, map),
+            emit_park_read_stub(cpl3),
         );
     }
     for cpl3 in [false, true] {
@@ -29327,7 +28952,7 @@ pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
             &mut offsets,
             &mut cursor,
             read_stub_slot_x87(cpl3) - TABLE_SLOT_READ_STUBS,
-            emit_x87_read_stub(cpl3, map),
+            emit_x87_read_stub(cpl3),
         );
     }
     ReadStubPad { code, offsets }
@@ -29344,7 +28969,7 @@ pub(crate) fn emit_read_stub_pad(map: NativeMapBases) -> ReadStubPad {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) -> Vec<u8> {
+fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     let mut e = Encoder::new();
     emit_stub_prologue(&mut e);
     let ram = e.label();
@@ -29353,7 +28978,7 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(&mut e, true, TABLE_SLOT_FLAGS, map.flags(), Reg::RDX);
+    emit_table_base(&mut e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -29402,7 +29027,7 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     emit_read_permission_check(&mut e, cpl3, status_permission);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_read_pointer(&mut e, true, map, status_unavailable);
+    emit_read_pointer(&mut e, status_unavailable);
     match width {
         MemoryWidth::Byte => emit_dynamic_increment(&mut e, STACK_MODE13_BYTE_READS),
         MemoryWidth::Word => emit_dynamic_word_increment(&mut e, STACK_MODE13_BYTE_READS),
@@ -29425,7 +29050,7 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     emit_read_permission_check(&mut e, cpl3, status_permission);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_read_pointer(&mut e, true, map, status_unavailable);
+    emit_read_pointer(&mut e, status_unavailable);
     // The misaligned RAM read this stub now SERVES rather than refuses: charge the extra byte
     // cycles it owes beyond the one wide cycle the block's static count already carries.
     //
@@ -29494,12 +29119,12 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool, map: NativeMapBases) 
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_read_stub_classify(e: &mut Encoder, map: NativeMapBases, status_unavailable: Label) {
+fn emit_read_stub_classify(e: &mut Encoder, status_unavailable: Label) {
     let ram = e.label();
     let staged = e.label();
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_table_base(e, true, TABLE_SLOT_FLAGS, map.flags(), Reg::RDX);
+    emit_table_base(e, TABLE_SLOT_FLAGS, Reg::RDX);
     e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     e.mov_r32_r32(Reg::RDI, Reg::RDX);
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
@@ -29525,19 +29150,19 @@ fn emit_read_stub_classify(e: &mut Encoder, map: NativeMapBases, status_unavaila
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_park_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
+fn emit_park_read_stub(cpl3: bool) -> Vec<u8> {
     let mut e = Encoder::new();
     emit_stub_prologue(&mut e);
     let status_unavailable = e.label();
     let status_permission = e.label();
-    emit_read_stub_classify(&mut e, map, status_unavailable);
+    emit_read_stub_classify(&mut e, status_unavailable);
     // A 64-bit store of the 32-bit-materialized kind: the high half is zero, so the
     // completion's `cmp r32` against the low dword reads exactly the classic convention.
     e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RCX);
     emit_read_permission_check(&mut e, cpl3, status_permission);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_read_pointer(&mut e, true, map, status_unavailable);
+    emit_read_pointer(&mut e, status_unavailable);
     e.xor_r64_self(Reg::RCX);
     emit_stub_return(&mut e);
 
@@ -29564,19 +29189,19 @@ fn emit_park_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn emit_x87_read_stub(cpl3: bool, map: NativeMapBases) -> Vec<u8> {
+fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
     let mut e = Encoder::new();
     emit_stub_prologue(&mut e);
     let status_unavailable = e.label();
     let status_permission = e.label();
-    emit_read_stub_classify(&mut e, map, status_unavailable);
+    emit_read_stub_classify(&mut e, status_unavailable);
     e.shift_r64_imm8(4, Reg::RCX, 32);
     e.or_r64_r64(Reg::RCX, Reg::RAX);
     e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RCX);
     emit_read_permission_check(&mut e, cpl3, status_permission);
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
-    emit_read_pointer(&mut e, true, map, status_unavailable);
+    emit_read_pointer(&mut e, status_unavailable);
     e.xor_r64_self(Reg::RCX);
     emit_stub_return(&mut e);
 
@@ -35911,41 +35536,6 @@ pub(crate) struct DirectStallTally {
     /// global figure says directly whether these blocks are short because they cannot chain.
     pub segment_write_block_head_entries: u64,
     pub segment_write_block_head_insns: u64,
-    /// L9 stage 0, THROWAWAY (dev_docs/2026-08-31-l9-segment-chain-design.md, section 6). All five
-    /// are counted at the same site as the pair above and share its denominator caveat, with one
-    /// narrowing: they count only heads whose LOWERINGS wrote a segment, so the `InterpretOne`
-    /// call-out producer is excluded. `seg_head_diagnostic_entries` is that narrowed denominator.
-    ///
-    /// * `seg_head_successor_pins_written` -- a block exists at this head's fallthrough linear and
-    ///   its chain requirement claims the segment the head just wrote. High here means a refusal
-    ///   design would refuse the measured case.
-    /// * `seg_head_successor_absent` -- nothing is compiled at the fallthrough linear yet, so no
-    ///   edge design buys anything at this entry.
-    /// * `seg_head_selector_repeat` -- the selector this entry wrote equals the one the previous
-    ///   entry at this same head wrote. This is the conversion rate of a selector-guarded edge.
-    /// * `seg_head_dirty_multi` -- heads writing more than one segment.
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_diagnostic_entries: u64,
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_successor_pins_written: u64,
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_successor_absent: u64,
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_selector_repeat: u64,
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_dirty_multi: u64,
-    /// The same question asked of the population a guarded edge could actually serve: one
-    /// non-CS, non-SS lowering write, no call-out segment write, and a plain fallthrough terminal.
-    /// The four counters above probe a fallthrough linear even on a head that returns or jumps and
-    /// therefore never reaches it, which reads as a missing successor and is not one.
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_eligible: u64,
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_eligible_successor_pins_written: u64,
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_eligible_successor_absent: u64,
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub seg_head_eligible_selector_repeat: u64,
     /// The x87 TOP-mismatch retire cap (`retire_key_for_top_mismatch`). `suppressed` counts every
     /// retire the cap refused -- one per mismatch on an already-capped key, so on a churning guest
     /// it approaches `jit_direct_reject_x87_top`. The identity
@@ -37792,26 +37382,6 @@ impl crate::jit::JitState {
             callout_governor_io_touching: self.stalls.callout_governor_io_touching,
             segment_write_block_head_entries: self.stalls.segment_write_block_head_entries,
             segment_write_block_head_insns: self.stalls.segment_write_block_head_insns,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_diagnostic_entries: self.stalls.seg_head_diagnostic_entries,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_successor_pins_written: self.stalls.seg_head_successor_pins_written,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_successor_absent: self.stalls.seg_head_successor_absent,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_selector_repeat: self.stalls.seg_head_selector_repeat,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_dirty_multi: self.stalls.seg_head_dirty_multi,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_eligible: self.stalls.seg_head_eligible,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_eligible_successor_pins_written: self
-                .stalls
-                .seg_head_eligible_successor_pins_written,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_eligible_successor_absent: self.stalls.seg_head_eligible_successor_absent,
-            #[cfg(feature = "seg-head-diagnostic")]
-            seg_head_eligible_selector_repeat: self.stalls.seg_head_eligible_selector_repeat,
             lane_trials: self.stalls.lane_trials,
             lane_trial_installs: self.stalls.lane_trial_installs,
             lane_trial_first_grants: self.stalls.lane_trial_first_grants,
@@ -38189,68 +37759,6 @@ impl crate::jit::JitState {
     pub(crate) fn note_segment_write_block_entry(&mut self, is_segment_write: u64, insns: u64) {
         self.stalls.segment_write_block_head_entries += is_segment_write;
         self.stalls.segment_write_block_head_insns += is_segment_write * insns;
-    }
-
-    /// The written mask of an installed block, `0` for a stale id and for the call-out producer.
-    /// Gated for now because the stage-0 tally is its only reader; the guarded-edge slice this
-    /// diagnostic decides is what makes it default-path code.
-    #[cfg(feature = "seg-head-diagnostic")]
-    pub(crate) fn written_segments_of(&self, id: BlockId) -> u8 {
-        self.active_index(id)
-            .map_or(0, |index| self.written_segments[index])
-    }
-
-    /// L9 stage 0, THROWAWAY. Called once per dispatcher entry whose head wrote a segment through
-    /// one of the four real-mode lowerings, AFTER the block ran, so `selector` is the value the
-    /// write installed and is exactly what a selector-guarded edge would compare.
-    ///
-    /// `#[inline(never)]` because the whole point of the feature gate is that the default build
-    /// carries none of this; an armed build is a diagnostic build and pays for the call.
-    #[cfg(feature = "seg-head-diagnostic")]
-    #[inline(never)]
-    pub(crate) fn note_seg_head_diagnostic(
-        &mut self,
-        id: BlockId,
-        span: BlockSpan,
-        mask: u8,
-        selector: u16,
-    ) {
-        if mask == 0 {
-            return;
-        }
-        let eligible = self
-            .active_index(id)
-            .is_some_and(|index| self.seg_head_guard_eligible[index]);
-        self.stalls.seg_head_diagnostic_entries += 1;
-        self.stalls.seg_head_eligible += u64::from(eligible);
-        self.stalls.seg_head_dirty_multi += u64::from(mask.count_ones() > 1);
-        let fallthrough = LinkTarget {
-            linear: span.key.linear.wrapping_add(u32::from(span.guest_len)),
-            mode_key: span.key.mode_key,
-            context: self.link_slot,
-        };
-        match self
-            .linear_blocks
-            .get(&fallthrough)
-            .copied()
-            .and_then(|id| self.active_index(id))
-        {
-            Some(index) => {
-                let pins = u64::from(self.chain_layouts[index].used & mask != 0);
-                self.stalls.seg_head_successor_pins_written += pins;
-                self.stalls.seg_head_eligible_successor_pins_written += pins * u64::from(eligible);
-            }
-            None => {
-                self.stalls.seg_head_successor_absent += 1;
-                self.stalls.seg_head_eligible_successor_absent += u64::from(eligible);
-            }
-        }
-        let previous = self
-            .seg_head_last_selector
-            .insert(span.key.linear, selector);
-        let repeat = u64::from(previous == Some(selector));
-        self.stalls.seg_head_selector_repeat += repeat;
-        self.stalls.seg_head_eligible_selector_repeat += repeat * u64::from(eligible);
     }
 
     pub(crate) fn barrier_census_snapshot(&self) -> Option<DirectBarrierCensusSnapshot> {
@@ -38855,142 +38363,6 @@ impl BlockCache {
     #[cfg(test)]
     pub(crate) fn enable_smc_census_for_test(&mut self, window: Option<(u64, u64)>) {
         self.smc_census = Some(Box::new(SmcCensus::new(window)));
-    }
-}
-
-// ---- from jit/direct/retf_census.rs ------------------------------------------------------------
-// The stage-0 RETF TARGET-ARITY census (design §5.0a). **THROWAWAY.**
-//
-// It exists to answer one question before the far-return ladder runs: what fraction of RETF
-// EXECUTIONS come from a site with at most two distinct targets, which is the two-cell PIC's
-// exact capacity. That fraction (`A2` in the design's §5.1) turns "entries fall" from a hope into
-// a pre-registered number, and it decides whether a large `jit_direct_far_link_refused_cs`
-// reading should be read as the chain being unavailable or as the arity being high.
-//
-// **EXECUTION-WEIGHTED, not site-weighted, and that is the whole point.** A site-weighted
-// histogram answers "how many RETF ADDRESSES are monomorphic", which is the wrong question: one
-// hot epilogue called from twenty sites can dominate a run while being one row.
-//
-// Compiled out unless `--features retf-arity-census`, then armed with
-// `IZARRAVM_RETF_ARITY_CENSUS=1`. It sits on the interpreter's `0xCA`/`0xCB` arm, which on
-// wolf3d-586 fires 274 M times per run, so both gates are load-bearing: the feature keeps a
-// shipped binary from carrying the map at all, and the runtime arm keeps a census BUILD from
-// paying for it on a leg that did not ask.
-//
-// It does not ship. Delete it, or leave it behind this feature, before the slice merges.
-
-#[cfg(feature = "retf-arity-census")]
-/// How many distinct target linears one site records before it saturates. A saturated site reports
-/// "at least 8" and must never be read as exactly 8. Two is the number that matters; eight is
-/// enough shape to tell "three or four" from "a jump table".
-pub(crate) const RETF_TARGET_CENSUS_CAP: usize = 8;
-
-#[cfg(feature = "retf-arity-census")]
-#[derive(Clone, Copy)]
-struct RetfSiteRecord {
-    targets: [u32; RETF_TARGET_CENSUS_CAP],
-    target_count: u8,
-    saturated: bool,
-    executions: u64,
-}
-
-#[cfg(feature = "retf-arity-census")]
-impl Default for RetfSiteRecord {
-    fn default() -> Self {
-        Self {
-            targets: [0; RETF_TARGET_CENSUS_CAP],
-            target_count: 0,
-            saturated: false,
-            executions: 0,
-        }
-    }
-}
-
-#[cfg(feature = "retf-arity-census")]
-#[derive(Default)]
-pub(crate) struct RetfArityCensus {
-    sites: HashMap<u64, RetfSiteRecord>,
-}
-
-#[cfg(feature = "retf-arity-census")]
-impl RetfArityCensus {
-    /// Record one RETF execution.
-    ///
-    /// `site` keys the RETF instruction, `v86` splits real mode from V86 so §6.1's "the `v86` arm
-    /// captures ~100% of wolf3d's population" becomes a number rather than an inference, and
-    /// `target_linear` is `(selector << 4) + ip` -- exactly the quantity the far cell will hold, so
-    /// the arity measured here is the arity the PIC will see.
-    pub(crate) fn note(&mut self, site: u32, v86: bool, target_linear: u32) {
-        let key = u64::from(site) | (u64::from(v86) << 32);
-        let record = self.sites.entry(key).or_default();
-        record.executions += 1;
-        let live = usize::from(record.target_count);
-        if record.targets[..live].contains(&target_linear) {
-            return;
-        }
-        if live == RETF_TARGET_CENSUS_CAP {
-            record.saturated = true;
-            return;
-        }
-        record.targets[live] = target_linear;
-        record.target_count += 1;
-    }
-
-    /// EXECUTION-WEIGHTED histogram: cell `n` holds the number of RETF EXECUTIONS taken at sites
-    /// with exactly `n` distinct targets, and the last cell holds the saturated sites' executions.
-    ///
-    /// Cell 0 is always zero -- a site with a record has executed at least once and therefore has
-    /// at least one target -- and is kept so the index reads as the distinct count.
-    pub(crate) fn histogram(&self) -> [u64; RETF_TARGET_CENSUS_CAP + 2] {
-        let mut histogram = [0u64; RETF_TARGET_CENSUS_CAP + 2];
-        for record in self.sites.values() {
-            let cell = if record.saturated {
-                RETF_TARGET_CENSUS_CAP + 1
-            } else {
-                usize::from(record.target_count)
-            };
-            histogram[cell] += record.executions;
-        }
-        histogram
-    }
-
-    /// How many distinct (site, mode) rows the census holds, so a reader can tell a histogram
-    /// built from four sites from one built from forty thousand.
-    pub(crate) fn sites(&self) -> u64 {
-        self.sites.len() as u64
-    }
-}
-
-#[cfg(feature = "retf-arity-census")]
-/// `Some` only when the feature is compiled in AND `IZARRAVM_RETF_ARITY_CENSUS=1` is exported.
-/// See `direct_link_refusal_census_default` for the shape.
-pub(crate) fn retf_arity_census_default() -> Option<Box<RetfArityCensus>> {
-    std::env::var("IZARRAVM_RETF_ARITY_CENSUS")
-        .is_ok_and(|value| value.trim() == "1")
-        .then(|| Box::new(RetfArityCensus::default()))
-}
-
-#[cfg(feature = "retf-arity-census")]
-impl BlockCache {
-    /// Record one INTERPRETED far return in the stage-0 arity census, when it is armed.
-    ///
-    /// Gated at the CALL SITE as well as here, per `default-off-instruments-tax-hot-path`: this
-    /// fires 274 M times on a wolf3d run and a disarmed build must pay one null test, not a call.
-    pub(crate) fn note_retf_target(&mut self, site: u32, v86: bool, target_linear: u32) {
-        if let Some(census) = self.retf_arity_census.as_mut() {
-            census.note(site, v86, target_linear);
-        }
-    }
-
-    pub(crate) fn retf_arity_census_active(&self) -> bool {
-        self.retf_arity_census.is_some()
-    }
-
-    /// `(execution-weighted histogram, distinct sites)`, or `None` when the census is disarmed.
-    pub(crate) fn retf_arity_snapshot(&self) -> Option<([u64; RETF_TARGET_CENSUS_CAP + 2], u64)> {
-        self.retf_arity_census
-            .as_ref()
-            .map(|census| (census.histogram(), census.sites()))
     }
 }
 

@@ -921,11 +921,7 @@ impl CpuGsw {
                 // RETF, release imm16 bytes. `decode` fetched the count into `imm`; pop CS:IP via the
                 // far-return helper THEN release.
                 let release = insn.imm as u16;
-                #[cfg(feature = "retf-arity-census")]
-                let site = self.retf_census_site();
                 self.return_far(bus, operand_size, release)?;
-                #[cfg(feature = "retf-arity-census")]
-                self.note_retf_target(site);
                 self.release_stack(release);
                 {
                     let class = self.far_transfer_class(TimingClass::RetFar);
@@ -933,11 +929,7 @@ impl CpuGsw {
                 }
             }
             0xcb => {
-                #[cfg(feature = "retf-arity-census")]
-                let site = self.retf_census_site();
                 self.return_far(bus, operand_size, 0)?;
-                #[cfg(feature = "retf-arity-census")]
-                self.note_retf_target(site);
                 {
                     let class = self.far_transfer_class(TimingClass::RetFar);
                     Ok(self.charge(class))

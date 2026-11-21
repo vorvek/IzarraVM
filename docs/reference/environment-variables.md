@@ -89,7 +89,6 @@ diagnostics when you compare timing.
 | `IZARRAVM_DIRECT_LINK_REFUSAL_CENSUS` | `1` | Off | Counts refused block links. Needs the `direct-link-refusal-census` build feature. |
 | `IZARRAVM_SMC_CENSUS` | `1` | Off | Counts self-modifying code invalidations. Needs the `smc-census` build feature. |
 | `IZARRAVM_SMC_CENSUS_WINDOW` | `<start>,<end>`, in retired instructions. | Whole run | Limits the SMC census to a window. Needs the `smc-census` build feature. |
-| `IZARRAVM_RETF_ARITY_CENSUS` | `1` | Off | Counts the targets of far returns. Needs the `retf-arity-census` build feature. |
 | `IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION` | `1` | Off | Attributes native call-outs to helpers and ports. Needs the `direct-callout-attribution` build feature. |
 | `IZARRAVM_VGA_WIPE_CENSUS` | Any value other than `0` turns it on. | Off | Counts which VGA register writes change the direct-write token of the video map. |
 | `IZARRAVM_KATEA_REGION_CENSUS` | `1` | Off | Makes a host-folder volume count its FAT, directory, and free-space sectors. |
