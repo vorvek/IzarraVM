@@ -33,15 +33,16 @@ const COARSE_PUBLISH: u32 = 64;
 /// Sector after which publishing relaxes from fine to coarse.
 const FINE_PUBLISH_UNTIL: u32 = 64;
 
+/// Sectors the decoder stages before it must hand them on. Bounds the scratch
+/// memory of a decode to this many sectors, whatever the length of the track.
+pub const STAGE_SECTORS: u32 = 64;
+
 /// Decode `path` into `pcm`, calling `progress` with the number of whole
 /// sectors that are complete and the bytes that just became complete.
 ///
-/// The callback is handed the new bytes rather than left to read them out of
-/// `pcm`, which it cannot do: `pcm` is borrowed mutably for the length of the
-/// decode. Handing them over also says exactly which bytes are new, so a caller
-/// republishing into a second buffer copies each byte once instead of recopying
-/// the whole prefix at every report -- quadratic in the length of a track, and
-/// a four-minute one reports some 280 times.
+/// The callback is handed the new bytes so it knows exactly which bytes are
+/// new: a caller republishing into a second buffer copies each byte once
+/// instead of recopying the whole prefix at every report.
 ///
 /// Returns the output sample frames actually produced, before padding or
 /// truncation -- the quantity the length-agreement test compares against what
@@ -62,6 +63,59 @@ pub fn decode_into_cancellable(
     path: &Path,
     info: TrackInfo,
     pcm: &mut [u8],
+    progress: &mut dyn FnMut(u32, &[u8]),
+    cancel: &mut dyn FnMut() -> bool,
+) -> Result<u64, CdAudioError> {
+    let total_sectors = (pcm.len() / AUDIO_FRAME_BYTES) as u32;
+    let mut at = 0usize;
+    decode_chunked(
+        path,
+        info,
+        total_sectors,
+        STAGE_SECTORS,
+        &mut |ready, chunk| {
+            if let Some(dst) = pcm.get_mut(at..at + chunk.len()) {
+                dst.copy_from_slice(chunk);
+                at += chunk.len();
+            }
+            progress(ready, chunk);
+        },
+        cancel,
+    )
+}
+
+/// Hand the whole sectors held in `stage` to `progress` and keep the partial
+/// sector after them at the front of `stage`.
+fn flush_stage(
+    stage: &mut Vec<u8>,
+    published_bytes: &mut usize,
+    written: u64,
+    total_bytes: usize,
+    progress: &mut dyn FnMut(u32, &[u8]),
+) -> u32 {
+    let complete = (written / SAMPLES_PER_FRAME) as u32;
+    let upto = (complete as usize * AUDIO_FRAME_BYTES).min(total_bytes);
+    let n = upto.saturating_sub(*published_bytes).min(stage.len());
+    progress(complete, &stage[..n]);
+    stage.drain(..n);
+    *published_bytes += n;
+    complete
+}
+
+/// Decode `path` through a staging buffer of `stage_sectors` sectors instead of
+/// a buffer the size of the track. `progress` gets the number of complete
+/// sectors and the bytes that just became complete, at most `stage_sectors`
+/// sectors per call. The bytes are always whole sectors except in the last
+/// call, where the final partial sector is padded with silence. `total_sectors`
+/// is what the mount published: output past it is dropped.
+///
+/// `cancel` is consulted after each call to `progress`. Returning true stops
+/// the decode. Returns the output sample frames produced, as [`decode_into`].
+pub fn decode_chunked(
+    path: &Path,
+    info: TrackInfo,
+    total_sectors: u32,
+    stage_sectors: u32,
     progress: &mut dyn FnMut(u32, &[u8]),
     cancel: &mut dyn FnMut() -> bool,
 ) -> Result<u64, CdAudioError> {
@@ -95,7 +149,13 @@ pub fn decode_into_cancellable(
     let mut written = 0u64;
     let mut last_published = 0u32;
     let mut published_bytes = 0usize;
-    let total_sectors = (pcm.len() / AUDIO_FRAME_BYTES) as u32;
+    let total_bytes = total_sectors as usize * AUDIO_FRAME_BYTES;
+    let stage_bytes = stage_sectors.max(1) as usize * AUDIO_FRAME_BYTES;
+    // Holds the bytes from `published_bytes` up to the write position. It is
+    // emptied only from the front, so a partial sector survives a flush and
+    // the next flush hands it on whole.
+    let mut stage: Vec<u8> = Vec::with_capacity(stage_bytes);
+    let mut cancelled = false;
     let mut interleaved: Vec<i16> = Vec::new();
     let mut pairs: Vec<(i32, i32)> = Vec::new();
 
@@ -155,17 +215,32 @@ pub fn decode_into_cancellable(
         produced += out.len() as u64;
 
         for (left, right) in &out {
-            let byte = written as usize * 4;
             // The mount already published `total_sectors`, so a decode that
             // runs long loses the surplus rather than writing into the next
             // track's space. It is still counted in `produced`, which is what
             // makes a disagreement visible instead of silently absorbed.
-            let Some(slot) = pcm.get_mut(byte..byte + 4) else {
+            if (written as usize + 1) * 4 > total_bytes {
                 break;
-            };
-            slot[..2].copy_from_slice(&clamp_i16(*left).to_le_bytes());
-            slot[2..].copy_from_slice(&clamp_i16(*right).to_le_bytes());
+            }
+            stage.extend_from_slice(&clamp_i16(*left).to_le_bytes());
+            stage.extend_from_slice(&clamp_i16(*right).to_le_bytes());
             written += 1;
+            if stage.len() >= stage_bytes {
+                last_published = flush_stage(
+                    &mut stage,
+                    &mut published_bytes,
+                    written,
+                    total_bytes,
+                    progress,
+                );
+                if cancel() {
+                    cancelled = true;
+                    break;
+                }
+            }
+        }
+        if cancelled {
+            return Ok(produced);
         }
         if resampler.is_none() {
             // `out` was moved out of `pairs`; give the allocation back so the
@@ -180,33 +255,38 @@ pub fn decode_into_cancellable(
             COARSE_PUBLISH
         };
         if complete >= last_published + step {
-            last_published = complete;
-            let upto = (complete as usize * AUDIO_FRAME_BYTES).min(pcm.len());
-            progress(complete, &pcm[published_bytes..upto]);
-            published_bytes = upto;
+            last_published = flush_stage(
+                &mut stage,
+                &mut published_bytes,
+                written,
+                total_bytes,
+                progress,
+            );
             if cancel() {
                 return Ok(produced);
             }
         }
     }
 
-    // Whatever is left of `pcm` was never written, and a fresh buffer is zeros,
-    // which is silence. Only the sectors that actually hold audio are handed
-    // over: a caller mirroring into its own zeroed buffer would be copying
-    // zeros onto zeros for the rest, and on a decode that ended far short of
-    // the promise -- a file replaced or truncated between mount and play --
-    // that is hundreds of megabytes of memcpy, which `DecodedTrack` performs
-    // while holding the lock the mixer pull takes.
+    // The rest of the track was never written and is silence. Only the sectors
+    // that hold audio are handed over: a caller mirroring into its own zeroed
+    // buffer would copy zeros onto zeros for the rest, and on a decode that
+    // ended far short of the promise -- a file replaced or truncated between
+    // mount and play -- that is hundreds of megabytes of memcpy, which
+    // `DecodedTrack` performs while holding the lock the mixer pull takes.
     //
     // The full sector count still goes out, because it is what tells the caller
-    // the track is whole and the tail is silence rather than pending.
-    let audio_bytes = (written as usize * 4).min(pcm.len());
+    // the track is whole and the tail is silence rather than pending. The last
+    // partial sector is padded here: the stage is reused, so its tail is not
+    // known to be zero.
+    let audio_bytes = (written as usize * 4).min(total_bytes);
     let covered = audio_bytes
         .div_ceil(AUDIO_FRAME_BYTES)
         .saturating_mul(AUDIO_FRAME_BYTES)
-        .min(pcm.len())
+        .min(total_bytes)
         .max(published_bytes);
-    progress(total_sectors, &pcm[published_bytes..covered]);
+    stage.resize(covered - published_bytes, 0);
+    progress(total_sectors, &stage);
     Ok(produced)
 }
 
