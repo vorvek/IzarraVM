@@ -92,7 +92,6 @@ diagnostics when you compare timing.
 | `IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION` | `1` | Off | Attributes native call-outs to helpers and ports. Needs the `direct-callout-attribution` build feature. |
 | `IZARRAVM_VGA_WIPE_CENSUS` | Any value other than `0` turns it on. | Off | Counts which VGA register writes change the direct-write token of the video map. |
 | `IZARRAVM_KATEA_REGION_CENSUS` | `1` | Off | Makes a host-folder volume count its FAT, directory, and free-space sectors. |
-| `IZARRAVM_MKII_CENSUS` | Set to any value. | Off | Counts block events of the second recompiler. Needs the `dynarec-mkii` build feature. |
 | `IZARRAVM_SHADOW_L1_PROBE` | `1` | Off | Turns on the shadow L1 cache probe. |
 | `IZARRAVM_SHADOW_PROBE_SAMPLE` | A positive number. | `64` | Sends every Nth native block entry to the interpreter while the probe is on. |
 
@@ -163,7 +162,6 @@ changes the result.
 | `IZARRAVM_POLL_SKIP_NEG_CACHE` | Empty and `0` turn it off. | On | Turns on the negative cache of the poll skip. |
 | `IZARRAVM_JIT_ARENA_MIB` | A number from `8` to `192`. | `128` | Sets the size of the executable memory for native code, in MiB. Other numbers are clamped. |
 | `IZARRAVM_JIT_UNWIND` | `0` turns it off. | On | On Windows x86-64, registers unwind data for the native code arena. |
-| `IZARRAVM_DYNAREC_MKII` | `1` | Off | Selects the second recompiler. Needs the `dynarec-mkii` build feature. |
 | `IZARRAVM_DIRECT_ENTRY_ATTRIBUTION` | `1`/`on`/`full`, `2`/`coarse`, `0`/`off`/empty. | Off | Times the phases of each native entry. Needs the `direct-entry-attribution` build feature. |
 | `IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE` | A positive number. | `1` | Times one in N entries. Needs the `direct-entry-attribution` build feature. |
 | `IZARRAVM_TEST_ADDRESS_SCRATCH_POISON` | `1` | Off | For tests. Writes a poison value to RDX in emitted address code, so a test finds code that relies on RDX. |

@@ -72,8 +72,6 @@ pub(crate) mod x87_avx2_emit;
 /// surface unchanged.
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
-    #[cfg(feature = "dynarec-mkii")]
-    pub(crate) mkii: crate::mkii::State,
     /// Whether the Direct backend lowers `OperandSize::Word` operands below I586.
     ///
     /// A FIELD rather than a `OnceLock` env read like `sixteen_bit_admission_level`, and the
@@ -240,8 +238,6 @@ impl JitState {
     pub(crate) fn new(direct: direct::BlockCache) -> Self {
         Self {
             direct,
-            #[cfg(feature = "dynarec-mkii")]
-            mkii: crate::mkii::State::default(),
             word_at_486: direct::word_at_486_default(),
             watch_page_bit: true,
             one_lookup_store: true,
@@ -283,8 +279,6 @@ impl Clone for JitState {
     fn clone(&self) -> Self {
         Self {
             direct: self.direct.clone(),
-            #[cfg(feature = "dynarec-mkii")]
-            mkii: crate::mkii::State::default(),
             // CARRIED, unlike the census below, and the asymmetry is deliberate. This is a
             // COMPILE POLICY, not a diagnostic: `CpuGsw::clone` is what the lockstep
             // interpreter-versus-native comparisons build their second role from, so a clone that
@@ -504,17 +498,6 @@ impl JitState {
 
     pub(crate) fn range_hits_compiled_code(&self, physical: u32, width: u32) -> bool {
         self.code_watch.range_watched(physical, width)
-    }
-
-    #[cfg(feature = "dynarec-mkii")]
-    pub(crate) fn acquire_mkii_source(&mut self, physical: u32, len: u32) {
-        let edges = self.code_watch.acquire_range(physical, len);
-        self.pending_watch_edges.extend(edges.0);
-    }
-
-    #[cfg(feature = "dynarec-mkii")]
-    pub(crate) fn release_mkii_source(&mut self, physical: u32, len: u32) {
-        self.code_watch.release_range(physical, len);
     }
 
     /// Retire count only, with the mutable-lane exemption OFF: the pre-lane behaviour of

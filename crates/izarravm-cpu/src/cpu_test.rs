@@ -2428,11 +2428,6 @@ pub(crate) struct TestBus {
 }
 
 impl TestBus {
-    #[cfg(feature = "dynarec-mkii")]
-    pub(crate) fn bus_cycles_for_test(&self) -> Vec<BusCycle> {
-        self.trace.cycles().iter().cloned().collect()
-    }
-
     fn mkii_session_isa_clocks(&self) -> u64 {
         if self.mkii_session_indirect_isa {
             *self.mkii_session_boxed_isa
@@ -2527,16 +2522,6 @@ impl TestBus {
             mode13_dword_writes: 0,
             direct_mapping_epoch: 1,
         }
-    }
-
-    #[cfg(feature = "dynarec-mkii")]
-    pub(crate) fn enable_direct_pages_for_test(&mut self) {
-        self.direct_pages_enabled = true;
-    }
-
-    #[cfg(feature = "dynarec-mkii")]
-    pub(crate) fn memory_byte_for_test(&self, address: u32) -> u8 {
-        self.memory[address as usize]
     }
 
     /// The direct-page dial actually charged, honouring `flat_direct_page_clocks`.
@@ -4317,11 +4302,3 @@ fn range_hits_code_masked_test_matches_the_per_byte_definition_at_both_edges() {
 
 #[path = "cpu_cr0_flush_test.rs"]
 mod cr0_flush;
-
-#[cfg(all(
-    feature = "dynarec-mkii",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
-#[path = "cpu_mkii_test.rs"]
-mod dynarec_mkii;

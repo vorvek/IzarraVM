@@ -348,7 +348,7 @@ impl CpuGsw {
         core_prefix: u64,
     ) -> CpuExecutionResult<CpuCycleOutcome> {
         self.interrupt_shadow = false;
-        // Cold mkII continuations publish the prefix just like cached continuations.
+        // Publish the prefix so a continuation reads the same value as a cached one.
         self.core_clocks_so_far = core_prefix;
 
         if self.rep_resume_active {
@@ -946,13 +946,6 @@ impl CpuGsw {
         bus: &mut B,
         cap: u64,
     ) -> CpuExecutionResult<BudgetedRunOutcome> {
-        #[cfg(feature = "dynarec-mkii")]
-        let result = if self.mkii_enabled() {
-            self.run_mkii(bus, cap)
-        } else {
-            self.run_budgeted_inner(bus, cap)
-        };
-        #[cfg(not(feature = "dynarec-mkii"))]
         let result = self.run_budgeted_inner(bus, cap);
         // The seventh run-end reason: a propagated hard `CpuError` skips every `brk_*` fold
         // inside the loop (see `straight_line_runs`' identity comment), so it is counted here

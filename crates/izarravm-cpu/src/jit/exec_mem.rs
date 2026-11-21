@@ -10,12 +10,6 @@
 pub(crate) struct ExecutableBuffer {
     ptr: *mut u8,
     len: usize,
-    #[cfg(all(
-        feature = "dynarec-mkii",
-        target_os = "windows",
-        target_arch = "x86_64"
-    ))]
-    unwind: Option<super::unwind::ArenaUnwind>,
 }
 
 /// Default virtual memory reserved for direct blocks. Each block owns one host page so completed
@@ -127,11 +121,6 @@ pub(crate) struct ArenaSlot(usize);
 // SAFETY: the buffer owns its mapping, and the mapping holds only code bytes. No other value
 // holds the pointer, so the buffer can move to a different thread with its owner.
 unsafe impl Send for ExecutableBuffer {}
-// SAFETY: a shared reference gives only the address and the length of a sealed mapping. No
-// method changes the buffer through `&self`. The mkII backend needs this impl: it keeps its
-// stub buffers in `static` `OnceLock` values.
-unsafe impl Sync for ExecutableBuffer {}
-
 // SAFETY: the arena owns its mapping. Installing code requires an exclusive borrow, and
 // installed pages are never made writable again. Exposed entry pointers refer only to sealed
 // pages. The type is not `Sync`: no code shares an arena between threads.
@@ -154,58 +143,7 @@ impl ExecutableBuffer {
             unsafe { free(ptr, len) };
             return None;
         }
-        Some(Self {
-            ptr,
-            len,
-            #[cfg(all(
-                feature = "dynarec-mkii",
-                target_os = "windows",
-                target_arch = "x86_64"
-            ))]
-            unwind: None,
-        })
-    }
-
-    #[cfg(feature = "dynarec-mkii")]
-    pub(crate) fn new_with_unwind(code: &[u8], info: &[u8]) -> Option<Self> {
-        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        {
-            if code.is_empty() {
-                return None;
-            }
-            let page = page_size();
-            let code_len = code.len().checked_add(page - 1)? / page * page;
-            let len = code_len.checked_add(page)?;
-            let ptr = alloc_rw(len)?;
-            // SAFETY: both spans are within the new writable allocation.
-            let mut unwind = unsafe {
-                std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
-                super::unwind::ArenaUnwind::new_with_info(
-                    ptr,
-                    code_len,
-                    ptr.add(code_len),
-                    page,
-                    1,
-                    info,
-                )
-            };
-            if unwind.is_none()
-                || !flush_instruction_cache(ptr, code_len)
-                || !make_rx(ptr, code_len)
-            {
-                drop(unwind);
-                // SAFETY: the allocation has no published entry point.
-                unsafe { free(ptr, len) };
-                return None;
-            }
-            unwind.as_mut()?.cover(0, code.len());
-            Some(Self { ptr, len, unwind })
-        }
-        #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-        {
-            let _ = info;
-            Self::new(code)
-        }
+        Some(Self { ptr, len })
     }
 
     /// The buffer's base address, valid to call through as a function pointer of the caller's
@@ -412,14 +350,6 @@ impl ExecutableArena {
 
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
-        #[cfg(all(
-            feature = "dynarec-mkii",
-            target_os = "windows",
-            target_arch = "x86_64"
-        ))]
-        {
-            self.unwind = None;
-        }
         // SAFETY: `self.ptr`/`self.len` were produced together by `alloc_rw` in `new` and never
         // mutated afterward.
         unsafe { free(self.ptr, self.len) };

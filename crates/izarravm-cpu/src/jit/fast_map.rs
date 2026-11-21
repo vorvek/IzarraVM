@@ -368,8 +368,8 @@ const INITIAL_TAG: TableTag = TableTag {
 };
 
 /// Whether the fast map keeps one table for each CR3 ring slot (`IZARRAVM_FAST_MAP_TWO_TABLES`).
-/// Read once per process. On by default: unset and `1` are on, `0` is off. The CPU also needs the TLB slot partition, the R15 table slots and no
-/// mkII before it uses the mode.
+/// Read once per process. On by default: unset and `1` are on, `0` is off. The CPU also needs the TLB slot partition and the R15 table slots
+/// before it uses the mode.
 pub(crate) fn fast_map_two_tables_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = TWO_TABLES_OVERRIDE.with(std::cell::Cell::get) {

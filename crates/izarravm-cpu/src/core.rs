@@ -172,8 +172,6 @@ impl CpuGsw {
     }
 
     fn invalidate_code_caches_uncounted(&mut self) {
-        #[cfg(feature = "dynarec-mkii")]
-        self.jit_direct.mkii.invalidate_code();
         // None of this function's callers (A20 toggle, direct-map change, device DMA, aperture
         // remap) flush the whole TLB in the same operation, so `translation_pages` must not clear
         // here (F11): a stale TLB entry could still serve a code translation with no fresh walk
@@ -201,10 +199,6 @@ impl CpuGsw {
     /// segmentation, and the code page / fetch page are per-fetch translation caches. A mode
     /// change has to drop them whether or not the linear->physical map moved.
     fn invalidate_fetch_frontend(&mut self) {
-        #[cfg(feature = "dynarec-mkii")]
-        {
-            self.jit_direct.mkii.mapping_dirty = true;
-        }
         self.code_page.valid = false;
         self.prefetch.invalidate();
         self.fetch_page.invalidate();
@@ -362,8 +356,7 @@ impl CpuGsw {
     }
     /// Decide once, when the CPU is built, whether the fast map keeps one table for each CR3 ring
     /// slot (`IZARRAVM_FAST_MAP_TWO_TABLES`). The mode needs the TLB slot partition, because it
-    /// trusts the TLB array of a dormant slot to stay intact. It does not run with mkII, which
-    /// bakes the table bases into its code. Direct blocks read the bases through the R15 table
+    /// trusts the TLB array of a dormant slot to stay intact. Direct blocks read the bases through the R15 table
     /// slots, which a switch republishes.
     #[cfg(all(
         feature = "jit",
@@ -371,12 +364,7 @@ impl CpuGsw {
         any(target_os = "windows", target_os = "linux")
     ))]
     pub(crate) fn refresh_fast_map_two_tables_latch(&mut self) {
-        #[cfg(feature = "dynarec-mkii")]
-        let mkii = self.mkii_requested();
-        #[cfg(not(feature = "dynarec-mkii"))]
-        let mkii = false;
-        let on =
-            crate::jit::fast_map::fast_map_two_tables_enabled() && self.tlb.partitioned() && !mkii;
+        let on = crate::jit::fast_map::fast_map_two_tables_enabled() && self.tlb.partitioned();
         self.jit_fast_map.set_two_tables(on);
     }
 
@@ -1377,8 +1365,6 @@ impl CpuGsw {
         lanes: bool,
         page_walk_bits: bool,
     ) -> bool {
-        #[cfg(feature = "dynarec-mkii")]
-        let session_hit = self.jit_direct.mkii.note_write(physical, width);
         // THE CALL-OUT WINDOW. `InterpretOne` runs one interpreter instruction with a native block
         // live on the host stack, and that instruction is allowed to STORE. The proof this
         // function's doc comment rests on -- "no compiled block is mid-execution when this runs" --
@@ -1521,10 +1507,6 @@ impl CpuGsw {
             action.wholesale = true;
             self.perf.translation_page_writes += 1;
             self.perf.code_invalidations += 1;
-            #[cfg(feature = "dynarec-mkii")]
-            {
-                self.jit_direct.mkii.mapping_dirty = true;
-            }
             let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
             self.retire_tlb_slots(retired);
             self.has_aperture_code.0 = false;
@@ -1593,10 +1575,6 @@ impl CpuGsw {
                     action.wholesale = true;
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
-                    #[cfg(feature = "dynarec-mkii")]
-                    {
-                        self.jit_direct.mkii.mapping_dirty = true;
-                    }
                     // `false`: an SMC store does not flush the TLB, so `translation_pages` must
                     // stay set (F11) -- the ring's slots are still retired below via this same
                     // call, only the bitmap survives. SMC has no bearing on any linear->physical
@@ -1678,10 +1656,6 @@ impl CpuGsw {
         #[cfg(feature = "reflected-call-memo")]
         if invalidated && self.reflected_call.is_some() {
             crate::reflected_call_memo::note_code_hit(self);
-        }
-        #[cfg(feature = "dynarec-mkii")]
-        {
-            invalidated |= session_hit;
         }
         invalidated
     }

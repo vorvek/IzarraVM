@@ -119,10 +119,6 @@ pub(crate) struct ArenaUnwind {
 // SAFETY: the table handle and the entry array move with the arena that owns them. The OS
 // reads the array through a pointer that stays valid when the box moves.
 unsafe impl Send for ArenaUnwind {}
-// SAFETY: each method that changes the table takes `&mut self`, so a shared reference cannot
-// change it. An `ExecutableBuffer` holds this type, and the mkII backend keeps such buffers in
-// `static` `OnceLock` values, which need `Sync`.
-unsafe impl Sync for ArenaUnwind {}
 
 impl ArenaUnwind {
     /// Write the shared UNWIND_INFO into `metadata_page` (one host page situated at
