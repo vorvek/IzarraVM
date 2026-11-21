@@ -53,7 +53,7 @@ pub fn embedded_soundfont_path() -> io::Result<PathBuf> {
 }
 
 fn materialize_embedded_soundfont_in(directory: &Path) -> io::Result<PathBuf> {
-    fs::create_dir_all(&directory)?;
+    fs::create_dir_all(directory)?;
     let path = directory.join(FILE_NAME);
     if file_matches(&path, EMBEDDED_SOUNDFONT)? {
         return Ok(path);
