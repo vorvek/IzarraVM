@@ -3481,6 +3481,8 @@ fn interpret_one_mov_sreg_resumes_on_an_unchanged_record() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     // mov ax,0x1111 | mov fs,ax | mov ax,fs | hlt
     let row = [0x8Eu8, 0xE0];
     assert_row_is_a_call_out(&row);
@@ -3607,6 +3609,8 @@ fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resyncs_when_an_earlier_slot_uses_the_segment() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     // mov ax,fs | mov fs,bx | inc ax | hlt: the user is slot 0 and the call-out is slot 1.
     let code = [0x8C, 0xE0, 0x8E, 0xE3, 0x40, 0xF4];
     let starts = [0, 2, 4];
@@ -3679,6 +3683,8 @@ fn an_ss_row_call_out_keeps_the_successors_of_its_block() {
 ))]
 #[test]
 fn the_suffix_mask_reaches_past_the_next_slot() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     // mov fs,bx | inc ax | mov ax,fs | hlt: the call-out is slot 0 and the user is slot 2.
     //
     // BX rather than CX because the record has to MOVE: `arm_fixture` clears CX, and FS starts at
@@ -4802,6 +4808,8 @@ fn interpret_one_executions_are_attributed_to_their_own_row() {
 ))]
 #[test]
 fn interpret_one_resyncs_are_attributed_to_their_own_row() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let (code, starts) = row_program_with_an_fs_user(&[0x8E, 0xE0]);
     let legs = run_both(&code, &starts, no_perturb);
     let counts = row_counts(&legs.native, "0x8e_mov_sreg");

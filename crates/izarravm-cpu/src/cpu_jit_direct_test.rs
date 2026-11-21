@@ -1379,6 +1379,7 @@ fn direct_load_segment_real_writes_the_whole_descriptor() {
 /// the filler, the pre-write load, and the write. The post-write load is the boundary.
 #[test]
 fn direct_load_segment_real_ends_the_block_at_the_next_dependent_slot() {
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let mut memory = vec![0; 0x2000];
     memory[0x100] = 0x90;
     memory[0x101..0x10b].copy_from_slice(&[
@@ -1387,9 +1388,8 @@ fn direct_load_segment_real_ends_the_block_at_the_next_dependent_slot() {
         0x00, // mov bl, [0x1000]   DS-relative, before the write
         0x8e, 0xd8, // mov ds, ax              DS := AX
     ]);
-    // The post-write DS-relative load, which must NOT join the block.
-    memory[0x10b..0x111].copy_from_slice(&[0x8a, 0x0d, 0x00, 0x10, 0x00, 0x00]);
-    memory[0x111] = 0xf4; // hlt
+    // The post-write DS-relative load, which must NOT join the block, and a closing hlt.
+    memory[0x10b..0x112].copy_from_slice(&[0x8a, 0x0d, 0x00, 0x10, 0x00, 0x00, 0xf4]);
     memory[0x1000] = 0x5a;
 
     let arm = |cpu: &mut CpuGsw| {

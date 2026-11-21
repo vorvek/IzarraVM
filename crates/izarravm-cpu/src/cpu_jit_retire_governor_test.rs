@@ -2036,6 +2036,8 @@ fn sixteen_bit_mov_reg_sreg_keeps_the_selector_pin() {
 /// `mov ds, ax` then a DS-relative load still ends the block at the load.
 #[test]
 fn dirty_segment_still_splits_mov_ds_then_load() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let mut memory = vec![0; 0x5000];
     memory[ENTRY as usize..ENTRY as usize + 6].copy_from_slice(&[
         0x89, 0xf6, // mov si, si

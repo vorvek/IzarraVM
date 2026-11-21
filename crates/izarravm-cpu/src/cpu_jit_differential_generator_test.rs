@@ -3524,6 +3524,8 @@ struct SetOutcome {
     callouts_total: u64,
     limit_exits: u64,
     cross_page_exits: u64,
+    /// Call-out resyncs of this measured run that the segment clause caused.
+    segment_resyncs: u64,
     /// Native block entries and linked transfers of this measured run. Their sum is the number
     /// of native blocks that the run executed.
     entries: u64,
@@ -3648,6 +3650,8 @@ fn run_segment_case_primed(
                 .perf_counters()
                 .jit_direct_exit_cross_page_or_alignment
                 - perf_before.jit_direct_exit_cross_page_or_alignment,
+            segment_resyncs: segment_resync_total(&stalls_after)
+                - segment_resync_total(&stalls_before),
             entries: direct.perf_counters().jit_direct_entries - perf_before.jit_direct_entries
                 + direct.perf_counters().jit_direct_linked_transfers
                 - perf_before.jit_direct_linked_transfers,
@@ -3658,6 +3662,19 @@ fn run_segment_case_primed(
         direct,
         direct_bus,
     }
+}
+
+/// The resyncs that the segment clause of the resume check caused, over every call-out row.
+fn segment_resync_total(snapshot: &crate::DirectStallSnapshot) -> u64 {
+    let index = crate::INTERPRET_ONE_RESYNC_REASON_LABELS
+        .iter()
+        .position(|label| *label == "segment")
+        .expect("the segment resync reason exists");
+    snapshot
+        .callout_interpret_one_rows
+        .iter()
+        .map(|counts| counts.resync_reasons[index])
+        .sum()
 }
 
 /// The two measured runs of every case that is not a limit edge probe. The second run uses the
@@ -4834,10 +4851,182 @@ fn a_self_loop_that_writes_a_data_segment_matches_the_interpreter_on_every_arm()
                             set.resyncs, 0,
                             "arm 2 {world:?} {mode:?}: the loop does not resync"
                         );
+                        assert_eq!(
+                            set.entries, 2,
+                            "arm 2 {world:?} {mode:?}: the first pass, then one self-loop block"
+                        );
                     }
                 }
             }
         }
+    });
+}
+
+/// A loop that loads ES with `les` and stores through it. Under arm 2 the loop must run natively
+/// with no resync. Every arm must end in the interpreter state.
+#[test]
+fn an_les_loop_matches_the_interpreter_on_every_arm() {
+    for_each_segment_arm(|arm| {
+        for world in [SegWorld::Real, SegWorld::V86] {
+            for mode in PERSONAS {
+                // mov cx,3
+                let mut code = vec![0xb9, 0x03, 0x00];
+                // L: les ax,[bx+d] / store through ES / dec cx / jnz L
+                let mut body = Vec::new();
+                emit_far_load(&mut body, Seg::Es, 3);
+                emit_access(&mut body, Seg::Es, 7, AccessWidth::Word, true, 0x3d0, false);
+                body.push(0x49);
+                let back = -(body.len() as i32 + 2);
+                body.extend_from_slice(&[0x75, back as u8]);
+                code.extend_from_slice(&body);
+                let case = segment_case_from_body(world, 0x5e60_1e50_0000_0001, &code, false);
+                let outcome = run_segment_case(world, mode, &case, &two_sets(world));
+                if arm == 2 {
+                    for set in &outcome.sets {
+                        let label = format!("arm 2 {world:?} {mode:?}");
+                        assert_eq!(set.resyncs, 0, "{label}: no resync");
+                        assert_eq!(set.callouts, 0, "{label}: les is native");
+                        assert!(set.retired > 0, "{label}: the loop runs natively");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// A V86 `mov fs,ax` call-out and an FS read in the same block. Under arm 2 the block resumes
+/// after the call-out, and the segment clause of the resume check refuses nothing.
+#[test]
+fn a_v86_fs_call_out_then_an_fs_read_resumes_on_arm_two() {
+    for_each_segment_arm(|arm| {
+        for mode in PERSONAS {
+            let asm = probe_fs_load();
+            let world = SegWorld::V86;
+            let case = segment_case_from_body(world, 0x5e60_f5f5_0000_0001, &asm.code, false);
+            let outcome = run_segment_case_primed(world, mode, &case, &two_sets(world), 2);
+            if arm == 2 {
+                for set in &outcome.sets {
+                    let label = format!("arm 2 {mode:?}");
+                    assert_eq!(set.callouts, 1, "{label}: the call-out runs");
+                    assert_eq!(set.resyncs, 0, "{label}: the block resumes");
+                    assert_eq!(set.segment_resyncs, 0, "{label}: no segment refusal");
+                    assert_eq!(set.retired, CASE_PREFIX_INSNS + asm.insns, "{label}");
+                }
+            }
+        }
+    });
+}
+
+/// The ES-writing self-loop with an interrupt raised in the middle of the run. The native role
+/// delivers the interrupt at a block boundary that can differ from the interpreter's. The test
+/// stops the interpreter at the point where the native role delivered it, and compares the
+/// registers, ES and memory there.
+#[test]
+fn an_interrupt_in_an_es_writing_self_loop_is_delivered_at_an_interpreter_state() {
+    const HANDLER: u32 = 0x0520;
+    for_each_segment_arm(|arm| {
+        let world = SegWorld::Real;
+        let mode = GswMode::Gsw586;
+        // mov dx,selector / mov cx,40
+        let mut code = vec![0xba];
+        push_u16(&mut code, SEG_POOL[4]);
+        code.extend_from_slice(&[0xb9, 40, 0x00]);
+        // L: mov es,dx / store through ES / dec cx / jnz L
+        let mut body = vec![0x8e, 0xc2];
+        emit_access(&mut body, Seg::Es, 7, AccessWidth::Word, true, 0x3c0, false);
+        body.push(0x49);
+        let back = -(body.len() as i32 + 2);
+        body.extend_from_slice(&[0x75, back as u8]);
+        code.extend_from_slice(&body);
+        let segment_case = segment_case_from_body(world, 0x5e60_1d9e_0000_0001, &code, false);
+        let case = &segment_case.case;
+        let _scope = SegmentScope::new(world.arming(0, false));
+        let mut pristine = segment_memory(world, case.seed, &case.bytes);
+        put16(&mut pristine, 8 * 4, HANDLER as u16);
+        put16(&mut pristine, 8 * 4 + 2, 0);
+        pristine[HANDLER as usize] = 0xf4;
+        let mut interpreter = world.cpu(mode);
+        let mut direct = world.cpu(mode);
+        let mut interpreter_bus = TestBus::with_memory(pristine.clone());
+        let mut direct_bus = TestBus::with_memory(pristine.clone());
+        for bus in [&mut interpreter_bus, &mut direct_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+            bus.flat_direct_page_clocks = true;
+        }
+        prime_segment_direct(&mut direct, &mut direct_bus, &pristine, case, 12);
+        warm_data_pages(&mut direct, &mut direct_bus);
+
+        restore_bus(&mut direct_bus, &pristine);
+        self::arm(&mut direct, case);
+        let insns_before = direct.perf_counters().jit_direct_insns;
+        let first = direct.run_budgeted(&mut direct_bus, 150).unwrap();
+        assert!(!first.halted, "arm {arm}: the loop is still running");
+        direct_bus.pending_irq = Some(8);
+        // The machine loop takes the interrupt once per batch, at the boundary where the budget
+        // stopped the native run.
+        let taken = direct.service_pending_interrupt(&mut direct_bus).unwrap();
+        assert!(taken.is_some(), "arm {arm}: the interrupt is delivered");
+        let mut halted = false;
+        for _ in 0..64 {
+            if direct
+                .run_budgeted(&mut direct_bus, case.cap)
+                .unwrap()
+                .halted
+            {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "arm {arm}: the handler halts");
+        assert_eq!(
+            direct.registers.eip,
+            HANDLER + 1,
+            "arm {arm}: in the handler"
+        );
+        assert!(
+            direct.perf_counters().jit_direct_insns > insns_before,
+            "arm {arm}: part of the loop ran natively"
+        );
+        let frame = entry_base(0, Seg::Ss) + usize::from(SEG_SP) - 6;
+        let frame_ip = u32::from(u16::from_le_bytes([
+            direct_bus.memory[frame],
+            direct_bus.memory[frame + 1],
+        ]));
+
+        restore_bus(&mut interpreter_bus, &pristine);
+        self::arm(&mut interpreter, case);
+        let mut steps = 0;
+        while !(interpreter.registers.eip == frame_ip
+            && interpreter.registers.ecx() == direct.registers.ecx())
+        {
+            interpreter.cycle(&mut interpreter_bus).unwrap();
+            steps += 1;
+            assert!(
+                steps < 5000,
+                "arm {arm}: the interpreter never reached the frame IP"
+            );
+        }
+        for index in [0usize, 1, 2, 3, 5, 6, 7] {
+            assert_eq!(
+                interpreter.registers.gpr[index], direct.registers.gpr[index],
+                "arm {arm}: register {index} at the delivery point"
+            );
+        }
+        for segment in [SegmentIndex::Es, SegmentIndex::Ds] {
+            assert_eq!(
+                interpreter.registers.segment(segment),
+                direct.registers.segment(segment),
+                "arm {arm}: {segment:?} at the delivery point"
+            );
+        }
+        // The frame is the one place where the roles differ: the native role pushed it.
+        let end = frame + 6;
+        direct_bus.memory[frame..end].copy_from_slice(&interpreter_bus.memory[frame..end]);
+        assert!(
+            direct_bus.memory == interpreter_bus.memory,
+            "arm {arm}: guest RAM at the delivery point"
+        );
     });
 }
 

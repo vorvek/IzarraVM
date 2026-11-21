@@ -1014,3 +1014,74 @@ fn a_linked_live_block_is_entered_after_ds_changed_with_the_chain_entry_check_of
     );
     assert!(cpu.perf_counters().jit_direct_insns > insns_before);
 }
+
+/// On arm 2 a block that writes DS and ends in a jump links to its successor with no selector
+/// guard. The successor is compiled under one selector and entered under another, and it reads
+/// the new one. On arm 0 the same shape in V86 keeps the guard, which refuses the other
+/// selector.
+#[test]
+fn arm_two_links_a_data_segment_write_block_without_a_guard() {
+    const OTHER_SELECTOR: u16 = 0x0050;
+    // `jmp short +0` ends A, so B stays a separate block.
+    let mut body_b = vec![0xeb, 0x00];
+    body_b.extend(block_b_body());
+    for (name, builder) in [
+        ("real mode", real_cpu as fn() -> CpuGsw),
+        ("V86", v86_cpu as fn() -> CpuGsw),
+    ] {
+        let (mut cpu, mut bus, b_start) =
+            stage_under_arm(2, builder, &MOV_DS_AX, &body_b, &[2, 2, 2, 2, 2]);
+        let block_a = install_at(&mut cpu, ENTRY);
+        assert!(
+            !block_a.is_segment_write_block(),
+            "{name}: A publishes a successor"
+        );
+        cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+        install_at(&mut cpu, b_start + 2);
+        cpu.registers.set_eax(u32::from(OTHER_SELECTOR));
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.set_eip(ENTRY);
+        cpu.halted = false;
+        let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+        let mismatches_before = cpu.perf_counters().jit_direct_seg_guard_mismatch_exits;
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block_a)
+                .unwrap()
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+            1,
+            "{name}: A links to B"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_seg_guard_mismatch_exits,
+            mismatches_before,
+            "{name}: no selector guard"
+        );
+        assert_eq!(
+            cpu.registers.eax() & 0xff,
+            u32::from(bus.memory[usize::from(OTHER_SELECTOR) << 4]),
+            "{name}: B reads through the new DS"
+        );
+    }
+
+    // Arm 0 keeps the guard in V86.
+    let (mut cpu, mut bus, b_linear) = stage(v86_cpu, &block_b_body());
+    let block_a = install_at(&mut cpu, ENTRY);
+    cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+    install_at(&mut cpu, b_linear);
+    cpu.registers.set_eax(u32::from(OTHER_SELECTOR));
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+    let mismatches_before = cpu.perf_counters().jit_direct_seg_guard_mismatch_exits;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_seg_guard_mismatch_exits - mismatches_before,
+        1,
+        "arm 0: the guard refuses the other selector"
+    );
+}
