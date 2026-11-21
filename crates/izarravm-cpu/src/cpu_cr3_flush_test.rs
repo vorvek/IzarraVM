@@ -67,7 +67,12 @@ fn plant_two_directory_paging(memory: &mut [u8]) {
 /// (set directly on the struct -- the R8 seed row needs this: lines decoded here are decoded
 /// under a CR3 the ring has never seen selected).
 fn cr3_fixture() -> (CpuGsw, TestBus) {
-    let mut memory = vec![0u8; 0x10000];
+    cr3_fixture_sized(0x10000)
+}
+
+/// `cr3_fixture` with a larger memory, for a row that needs a physical page above 64 KiB.
+fn cr3_fixture_sized(size: usize) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0u8; size];
     let writer = mov_to_cr(3);
     memory[WRITER as usize..WRITER as usize + writer.len()].copy_from_slice(&writer);
     memory[WITNESS as usize] = 0x90;

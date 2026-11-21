@@ -208,6 +208,8 @@ where
 {
     let before = arch_payload(cpu);
     let mut changed = cpu.clone();
+    // A clone starts with an empty TLB, and the rows mutate the entries of the original.
+    changed.tlb = cpu.tlb.verbatim_copy_for_test();
     mutate(&mut changed);
     let after = arch_payload(&changed);
     let changed_offsets: Vec<_> = before
@@ -488,6 +490,8 @@ where
 {
     let before = execution_payload(cpu).unwrap();
     let mut changed = cpu.clone();
+    // A clone starts with an empty TLB, and the rows mutate the entries of the original.
+    changed.tlb = cpu.tlb.verbatim_copy_for_test();
     mutate(&mut changed);
     let after = execution_payload(&changed).unwrap();
     assert_eq!(before.len(), after.len());
@@ -534,19 +538,19 @@ fn every_tlb_entry_field_has_one_declared_span() {
     cpu.tlb.insert(PAGE, 0x1234_5000, false, false, false);
     let slot = Tlb::slot(PAGE);
     assert_only_execution_span_changes(&cpu, 54..58, move |changed| {
-        changed.tlb.entries[slot].tag += TLB_ENTRIES as u32;
+        changed.tlb.live_array_mut()[slot].tag += TLB_ENTRIES as u32;
     });
     assert_only_execution_span_changes(&cpu, 58..62, move |changed| {
-        changed.tlb.entries[slot].phys ^= 0x1000;
+        changed.tlb.live_array_mut()[slot].phys ^= 0x1000;
     });
     assert_only_execution_span_changes(&cpu, 62..63, move |changed| {
-        changed.tlb.entries[slot].writable = true;
+        changed.tlb.live_array_mut()[slot].writable = true;
     });
     assert_only_execution_span_changes(&cpu, 63..64, move |changed| {
-        changed.tlb.entries[slot].user = true;
+        changed.tlb.live_array_mut()[slot].user = true;
     });
     assert_only_execution_span_changes(&cpu, 64..65, move |changed| {
-        changed.tlb.entries[slot].dirty = true;
+        changed.tlb.live_array_mut()[slot].dirty = true;
     });
 }
 
@@ -590,7 +594,7 @@ fn logical_tlb_projection_normalizes_generation_order_and_dead_residue() {
     second.tlb.insert(68, 0x44000, false, true, false);
     second.tlb.insert(3, 0x3000, true, false, true);
     let dead_slot = Tlb::slot(10);
-    second.tlb.entries[dead_slot] = TlbEntry {
+    second.tlb.live_array_mut()[dead_slot] = TlbEntry {
         tag: 10,
         phys: 0xdead_0000,
         generation: second.tlb.generation.wrapping_sub(1),
@@ -598,7 +602,7 @@ fn logical_tlb_projection_normalizes_generation_order_and_dead_residue() {
         user: true,
         dirty: true,
     };
-    second.tlb.entries[12] = TlbEntry {
+    second.tlb.live_array_mut()[12] = TlbEntry {
         tag: 13,
         phys: 0xbeef_0000,
         generation: second.tlb.generation,
@@ -635,7 +639,7 @@ fn logical_tlb_projection_observes_replacement_invalidation_and_entry_bits() {
         |entry: &mut TlbEntry| entry.dirty = true,
     ] {
         changed = baseline.clone();
-        mutate(&mut changed.tlb.entries[slot]);
+        mutate(&mut changed.tlb.live_array_mut()[slot]);
         assert_ne!(execution_payload(&changed).unwrap(), expected);
     }
 }
@@ -840,7 +844,7 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // canonical architectural state. Check the plain-build native layout here;
     // the histogram feature adds a boxed field before this offset.
     #[cfg(not(feature = "timing-class-histogram"))]
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4800);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4840);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
     // The `timing-class-histogram` feature adds one boxed field ahead of this
@@ -848,5 +852,34 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // invariant -- emitted code bakes these offsets and the instrument arm is
     // never the one that ships -- so it is checked where it means something.
     #[cfg(not(feature = "timing-class-histogram"))]
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4800);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4840);
+}
+
+/// With the TLB slot partition on, the export holds the entries of the live array only, and it is
+/// the same bytes a single shared array would give for the same live entries.
+#[test]
+fn partitioned_tlb_exports_only_the_live_array() {
+    let mut shared_b = CpuGsw::default();
+    shared_b.tlb.set_partition_for_test(false);
+    shared_b.tlb.insert(68, 0x44000, false, true, false);
+    let mut shared_a = CpuGsw::default();
+    shared_a.tlb.set_partition_for_test(false);
+    shared_a.tlb.insert(3, 0x3000, true, false, true);
+
+    let mut cpu = CpuGsw::default();
+    cpu.tlb.set_partition_for_test(true);
+    cpu.tlb.insert(3, 0x3000, true, false, true);
+    cpu.tlb.allocate_generation(1);
+    cpu.tlb.insert(68, 0x44000, false, true, false);
+    assert_eq!(
+        execution_payload(&cpu).unwrap(),
+        execution_payload(&shared_b).unwrap(),
+        "slot 1 live: only its entry is exported"
+    );
+    cpu.tlb.select_generation(0);
+    assert_eq!(
+        execution_payload(&cpu).unwrap(),
+        execution_payload(&shared_a).unwrap(),
+        "slot 0 live: only its entry is exported"
+    );
 }

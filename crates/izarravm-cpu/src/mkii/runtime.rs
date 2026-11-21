@@ -1310,13 +1310,18 @@ impl CpuGsw {
             && self.registers.eflags & FLAG_TF == 0
     }
 
-    pub(crate) fn mkii_enabled(&self) -> bool {
+    /// Whether the environment or set_dynarec_mkii_enabled asks for mkII, before the per-run
+    /// conditions below.
+    pub(crate) fn mkii_requested(&self) -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled = self.jit_direct.mkii.enabled.unwrap_or_else(|| {
+        self.jit_direct.mkii.enabled.unwrap_or_else(|| {
             *ENABLED
                 .get_or_init(|| std::env::var_os("IZARRAVM_DYNAREC_MKII").is_some_and(|v| v == "1"))
-        });
-        enabled
+        })
+    }
+
+    pub(crate) fn mkii_enabled(&self) -> bool {
+        self.mkii_requested()
             && cfg!(all(
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
@@ -1423,6 +1428,14 @@ impl CpuGsw {
 
     pub fn set_dynarec_mkii_enabled(&mut self, on: bool) {
         self.jit_direct.mkii.enabled = Some(on);
+        // mkII bakes the table bases into its code, so two fast map tables cannot run beside it.
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if on {
+            self.jit_fast_map.set_two_tables(false);
+        }
     }
 
     #[cfg(test)]

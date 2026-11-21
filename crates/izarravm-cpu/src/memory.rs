@@ -2272,6 +2272,22 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         if let Some(previous) = previous {
+            // Census of cross-context eviction: the displaced entry belongs to another generation
+            // that a ring slot still holds. One compare when the generation is the same.
+            if previous.generation != self.tlb.generation
+                && self.tlb.is_slot_generation(previous.generation)
+            {
+                self.jit_direct
+                    .fast_map_audit
+                    .tlb_insert_evicts_other_generation += 1;
+            }
+            // With the slot partition on, an insert displaces only entries of the live array,
+            // and no entry of that array carries the generation of the dormant slot. The dormant
+            // fast map table relies on this: the hook below reaches the live table only.
+            debug_assert!(
+                !self.tlb.partitioned() || !self.tlb.is_dormant_generation(previous.generation),
+                "a TLB insert displaced an entry of the dormant slot"
+            );
             let same_residency = previous.tag == page
                 && previous.phys == physical_page
                 && previous.writable == writable

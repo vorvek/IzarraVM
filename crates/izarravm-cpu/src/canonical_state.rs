@@ -53,7 +53,7 @@ fn write_segment(
 
 fn live_tlb_entries(cpu: &CpuGsw) -> [Option<TlbEntry>; TLB_ENTRIES] {
     let mut live = [None; TLB_ENTRIES];
-    for (slot, entry) in cpu.tlb.entries.iter().copied().enumerate() {
+    for (slot, entry) in cpu.tlb.live_array().iter().copied().enumerate() {
         if entry.generation == cpu.tlb.generation && Tlb::slot(entry.tag) == slot {
             live[slot] = Some(entry);
         }

@@ -575,18 +575,6 @@ fn compile_under(case: &Case, on: bool) -> jit::direct::Compilation {
     jit::direct::compile(&mut cpu, ENTRY, false).expect("the fixture must compile")
 }
 
-/// The code with every `movabs r64, imm64` operand cleared. Those eight bytes hold the address of a
-/// per-compile link cell, which differs between two compilations of the same program.
-fn without_host_addresses(code: &[u8]) -> Vec<u8> {
-    let mut code = code.to_vec();
-    for at in 0..code.len().saturating_sub(10) {
-        if code[at] & 0xfe == 0x48 && code[at + 1] & 0xf8 == 0xb8 {
-            code[at + 2..at + 10].fill(0);
-        }
-    }
-    code
-}
-
 /// A block without a segment load compiles to the same bytes under both arms.
 ///
 /// The bytes are compared with the link cell addresses cleared, because two compilations of one
@@ -611,8 +599,8 @@ fn a_block_without_a_segment_load_is_the_same_under_both_arms() {
     assert_eq!(off_code.callout_interpret_one_slots, 0);
     assert_eq!(off_code.code.len(), on_code.code.len());
     assert_eq!(
-        without_host_addresses(&off_code.code),
-        without_host_addresses(&on_code.code),
+        super::super::sixteen_bit::code_without_cell_addresses(&off_code),
+        super::super::sixteen_bit::code_without_cell_addresses(&on_code),
         "the knob must not move a byte of a block without a segment load"
     );
     assert_eq!(

@@ -4355,6 +4355,22 @@ impl Compilation {
         self.segment_layout.used_for_test()
     }
 
+    /// The host addresses of the cells that this compilation allocated: the two link cells and
+    /// one cell for each `InterpretOne` slot. The emitted code holds them as 64-bit immediates,
+    /// and they differ between two compilations of the same program.
+    #[cfg(test)]
+    pub(crate) fn cell_addresses_for_test(&self) -> Vec<u64> {
+        self.link_cells
+            .iter()
+            .map(|cell| cell.address() as u64)
+            .chain(
+                self.interpret_one_cells
+                    .iter()
+                    .map(|cell| cell.address() as u64),
+            )
+            .collect()
+    }
+
     /// How many mutable lanes this compilation registered — **EVERY family, not the immediate
     /// family alone.** The five sibling accessors below (`disp_lane_count`, `imm8_lane_count`,
     /// `count_lane_count`, `disp_store_lane_count`, `disp_load_widen_lane_count`) are SUBSET
@@ -11494,14 +11510,16 @@ fn dynamic_counter_fields() -> [(i8, usize); 7] {
 // ---- from jit/direct/table_slots.rs ------------------------------------------------------------
 // The write-once table-base slots emitted code loads R15-relative.
 
-/// The write-once table bases emitted code loads R15-relative when
-/// `JitState::r15_tables` is on: the four fast-map SoA arrays
+/// The table bases emitted code loads R15-relative when
+/// `JitState::r15_tables` is on: the fast-map SoA arrays
 /// (`NativeMapBases`) and the two code-watch page tables, in the slot order
 /// `emit::table_slot_offset` indexes. Each source allocation is created once
-/// and never freed or moved for the CPU's life (fast_map.rs storage,
-/// code_watch.rs `table_base`), which is the same invariant the baked-imm64
-/// emission already depended on; `publish` merely re-states it where a
-/// violation would finally be VISIBLE instead of a silent miscompile.
+/// and never freed for the CPU's life (fast_map.rs storage, code_watch.rs
+/// `table_base`). `publish` is write-once: it re-states that where a
+/// violation would finally be VISIBLE instead of a silent miscompile. The six
+/// fast-map slots have one exception. With two fast-map tables on, a `MOV CR3`
+/// that changes the live ring slot calls `republish_map`, which points them at
+/// the table of the new slot.
 ///
 /// The separate TEST helper pointer follows the live-bus window of `CallOutTable`.
 /// It lives here to preserve the pinned CPU layout, outside the write-once slots.
@@ -11618,6 +11636,61 @@ impl NativeTableSlots {
         self.publish(TABLE_SLOT_PHYSICAL_PAGES, map.physical_pages());
         self.publish(TABLE_SLOT_STORE_BIASES, map.store_biases());
         self.publish(TABLE_SLOT_LOAD_BIASES, map.load_biases());
+    }
+
+    /// Point the six fast-map slots at a different table. Only the CR3 switch of the two-table
+    /// mode calls it, when the live ring slot changes. Emitted code and the stub pads read the
+    /// bases through the slots at each use, so no code is emitted again.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn republish_map(&mut self, map: NativeMapBases) {
+        self.slots[TABLE_SLOT_FLAGS] = map.flags();
+        self.slots[TABLE_SLOT_READ_BIASES] = map.read_biases();
+        self.slots[TABLE_SLOT_WRITE_BIASES] = map.write_biases();
+        self.slots[TABLE_SLOT_PHYSICAL_PAGES] = map.physical_pages();
+        self.slots[TABLE_SLOT_STORE_BIASES] = map.store_biases();
+        self.slots[TABLE_SLOT_LOAD_BIASES] = map.load_biases();
+    }
+
+    /// Whether the fast-map slots hold a table yet.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn map_published(&self) -> bool {
+        self.slots[TABLE_SLOT_FLAGS] != 0
+    }
+
+    /// Whether the six fast-map slots equal map, or are all zero when map is None.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn map_slots_match(&self, map: Option<NativeMapBases>) -> bool {
+        let slots = [
+            self.slots[TABLE_SLOT_FLAGS],
+            self.slots[TABLE_SLOT_READ_BIASES],
+            self.slots[TABLE_SLOT_WRITE_BIASES],
+            self.slots[TABLE_SLOT_PHYSICAL_PAGES],
+            self.slots[TABLE_SLOT_STORE_BIASES],
+            self.slots[TABLE_SLOT_LOAD_BIASES],
+        ];
+        match map {
+            Some(map) => {
+                slots
+                    == [
+                        map.flags(),
+                        map.read_biases(),
+                        map.write_biases(),
+                        map.physical_pages(),
+                        map.store_biases(),
+                        map.load_biases(),
+                    ]
+            }
+            None => slots == [0; 6],
+        }
     }
 
     /// Publish the store-stub pad's entry addresses, in the pad's canonical order. Write-once
@@ -32141,11 +32214,14 @@ impl ResumeSnapshot {
     /// EFLAGS.
     ///
     /// R4 is conservative rather than exact, and the reason is worth stating. The FAST MAP needs
-    /// no clause: emitted code never reads `mapping_epochs` at all, its table bases are stable for
-    /// the process, and an invalidation CLEARS entries in place -- so a wipe mid-block makes the
-    /// next native memory slot probe an unavailable page and side-exit, rather than run against a
-    /// dead pointer. What this pair of epochs catches is the PAGING GENERATION moving under the
-    /// block, which is the event that clearing is driven by.
+    /// no clause: emitted code never reads `mapping_epochs` at all, and an invalidation CLEARS
+    /// entries in place -- so a wipe mid-block makes the next native memory slot probe an
+    /// unavailable page and side-exit, rather than run against a dead pointer. The table bases
+    /// can move, but only at a `MOV CR3` with two tables on (`NativeTableSlots::republish_map`).
+    /// Every emitted base is read through the R15 slots at each use, and the held load-bias
+    /// register (RSI) is reloaded after each call-out, which is where a `MOV CR3` runs. What this
+    /// pair of epochs catches is the PAGING GENERATION moving under the block, which is the event
+    /// that clearing is driven by.
     ///
     /// See `epoch_moved` for why a COLD FILL is not a move.
     pub(crate) fn allows_resume(

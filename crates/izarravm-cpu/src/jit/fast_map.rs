@@ -273,6 +273,18 @@ impl FastMapStorage {
         }
     }
 
+    fn native_bases(&self) -> NativeMapBases {
+        NativeMapBases {
+            read_biases: self.read_biases.as_ptr() as usize,
+            write_biases: self.write_biases.as_ptr() as usize,
+            store_biases: self.store_biases.as_ptr() as usize,
+            load_biases: self.load_biases.as_ptr() as usize,
+            physical_pages: self.physical_pages.as_ptr() as usize,
+            mapping_epochs: self.mapping_epochs.as_ptr() as usize,
+            flags: self.flags.as_ptr() as usize,
+        }
+    }
+
     #[inline]
     fn bit(bits: &[u64], index: usize) -> bool {
         bits[index / u64::BITS as usize] & (1u64 << (index % u64::BITS as usize)) != 0
@@ -301,13 +313,209 @@ impl FastMapStorage {
     }
 }
 
+/// Names the CR3 ring slot and the TLB generation a table's entries were filled under. A table
+/// may serve entries again only when its tag equals the pair the TLB holds for that slot now.
+/// Generation 0 is never minted, so a tag with generation 0 matches nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TableTag {
+    pub(crate) slot: u8,
+    pub(crate) generation: u32,
+}
+
+impl TableTag {
+    pub(crate) const INVALID: Self = Self {
+        slot: 0,
+        generation: 0,
+    };
+}
+
+/// The table of the ring slot that is not live. It keeps its entries across the other context's
+/// run and is swapped in when its context comes back.
+#[derive(Default)]
+struct DormantTable {
+    storage: Option<FastMapStorage>,
+    populated_pages: Vec<u32>,
+    vga_pages: Vec<u32>,
+    tag: TableTag,
+}
+
 /// A 4 GiB linear address-space map with one structure-of-arrays slot per 4 KiB page.
 /// Storage is lazy because accurate-timing 386 modes never consume the lookup arrays.
+///
+/// With two tables on (`IZARRAVM_FAST_MAP_TWO_TABLES`), `storage`, `populated_pages` and
+/// `vga_pages` are the table of the live CR3 ring slot, and `dormant` holds the other one. A
+/// context switch swaps the two. With two tables off, `dormant` stays empty.
 #[derive(Default)]
 pub(crate) struct FastMap {
     storage: Option<FastMapStorage>,
     populated_pages: Vec<u32>,
     vga_pages: Vec<u32>,
+    /// CR3 census buffers, one per decode-ring slot. Empty unless the census is armed.
+    pub(crate) census_saved: [Vec<CensusPage>; 2],
+    /// Whether the two-table mode is in effect for this CPU. Latched when the CPU is built.
+    two_tables: bool,
+    /// The ring slot the live table belongs to. Meaningful only with two tables on.
+    live_slot: u8,
+    /// The slot and TLB generation the live table was filled under.
+    live_tag: TableTag,
+    dormant: DormantTable,
+}
+
+/// The tag of a fresh CPU: ring slot 0 under the first generation a new TLB holds.
+const INITIAL_TAG: TableTag = TableTag {
+    slot: 0,
+    generation: crate::paging::TLB_INITIAL_GENERATION,
+};
+
+/// Whether the fast map keeps one table for each CR3 ring slot (`IZARRAVM_FAST_MAP_TWO_TABLES`).
+/// Read once per process. On by default: unset and `1` are on, `0` is off. The CPU also needs the TLB slot partition, the R15 table slots and no
+/// mkII before it uses the mode.
+pub(crate) fn fast_map_two_tables_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = TWO_TABLES_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_two_tables(std::env::var("IZARRAVM_FAST_MAP_TWO_TABLES")))
+}
+
+/// The `IZARRAVM_FAST_MAP_TWO_TABLES` spelling table.
+fn parse_two_tables(value: Result<String, std::env::VarError>) -> bool {
+    crate::paging::parse_on_off_knob("IZARRAVM_FAST_MAP_TWO_TABLES", value)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TWO_TABLES_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the two-table knob on or off for CPUs built on this thread; `None` restores the
+/// ambient reading.
+#[cfg(test)]
+pub(crate) fn set_fast_map_two_tables_for_test(forced: Option<bool>) {
+    TWO_TABLES_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_two_tables_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_two_tables(value)
+}
+
+/// One live entry of the table, as the debug oracle reads it.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveEntry {
+    pub(crate) linear_page: u32,
+    pub(crate) physical_page: u32,
+    pub(crate) mapping_epoch: u64,
+    pub(crate) read_bias: usize,
+    pub(crate) write_bias: usize,
+    pub(crate) store_bias: usize,
+    pub(crate) load_bias: usize,
+    flags: u8,
+    in_vga_registry: bool,
+}
+
+#[cfg(debug_assertions)]
+impl LiveEntry {
+    pub(crate) fn writable(self) -> bool {
+        self.flags & PAGE_WRITABLE != 0
+    }
+
+    pub(crate) fn user(self) -> bool {
+        self.flags & PAGE_USER != 0
+    }
+
+    pub(crate) fn watched(self) -> bool {
+        self.flags & PAGE_WATCHED != 0
+    }
+
+    pub(crate) fn has_read_bias(self) -> bool {
+        self.flags & HAS_READ_BIAS != 0 && self.read_bias != UNAVAILABLE_BIAS
+    }
+
+    pub(crate) fn has_write_bias(self) -> bool {
+        self.flags & HAS_WRITE_BIAS != 0 && self.write_bias != UNAVAILABLE_BIAS
+    }
+
+    pub(crate) fn is_mode13(self) -> bool {
+        decode_kind(self.flags) == PageKind::Mode13
+    }
+
+    pub(crate) fn in_vga_registry(self) -> bool {
+        self.in_vga_registry
+    }
+
+    /// The store bias the flags and the write bias derive. The stored one must equal it.
+    pub(crate) fn derived_store_bias(self) -> usize {
+        derive_store_bias(self.flags, self.write_bias)
+    }
+
+    pub(crate) fn derived_load_bias(self) -> usize {
+        derive_load_bias(self.flags, self.read_bias)
+    }
+}
+
+/// One live fast-map page as it stood when its directory was left by a `MOV CR3`. Biases are not
+/// saved, only whether each one existed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CensusPage {
+    pub(crate) linear_page: u32,
+    pub(crate) physical_page: u32,
+    /// Saved for a later reader of the buffer. The census itself reads only the write flag.
+    #[allow(dead_code)]
+    pub(crate) read_bias: bool,
+    pub(crate) write_bias: bool,
+}
+
+/// Whether the CR3 census is armed (`IZARRAVM_FAST_MAP_CR3_CENSUS`). Read once per process.
+pub(crate) fn cr3_census_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = CR3_CENSUS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_cr3_census(std::env::var("IZARRAVM_FAST_MAP_CR3_CENSUS")))
+}
+
+/// The `IZARRAVM_FAST_MAP_CR3_CENSUS` spelling table. Unset, empty, and `0` name the off arm.
+fn parse_cr3_census(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` (off) and `1` (on)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_FAST_MAP_CR3_CENSUS is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim() {
+        "" | "0" => false,
+        "1" => true,
+        other => panic!(
+            "IZARRAVM_FAST_MAP_CR3_CENSUS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a mistyped value that ran the default would look like a census that saw nothing"
+        ),
+    }
+}
+
+// Per-thread, so parallel tests can arm the census without touching each other.
+#[cfg(test)]
+thread_local! {
+    static CR3_CENSUS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the census on or off for this thread; `None` restores the ambient reading.
+#[cfg(test)]
+pub(crate) fn set_cr3_census_for_test(forced: Option<bool>) {
+    CR3_CENSUS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_cr3_census_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_cr3_census(value)
 }
 
 /// Stable SoA base addresses for the direct backend. Keeping these behind accessors avoids
@@ -600,18 +808,12 @@ impl FastMap {
         self.storage.is_some()
     }
 
-    /// Return stable array bases for native code generation after the first map fill.
+    /// Return the array bases of the live table for native code generation after the first map
+    /// fill. With two tables on they change at every context switch, and the switch publishes
+    /// the new ones through the R15 table slots.
     #[allow(dead_code)]
     pub(crate) fn native_bases(&self) -> Option<NativeMapBases> {
-        self.storage.as_ref().map(|storage| NativeMapBases {
-            read_biases: storage.read_biases.as_ptr() as usize,
-            write_biases: storage.write_biases.as_ptr() as usize,
-            store_biases: storage.store_biases.as_ptr() as usize,
-            load_biases: storage.load_biases.as_ptr() as usize,
-            physical_pages: storage.physical_pages.as_ptr() as usize,
-            mapping_epochs: storage.mapping_epochs.as_ptr() as usize,
-            flags: storage.flags.as_ptr() as usize,
-        })
+        self.storage.as_ref().map(FastMapStorage::native_bases)
     }
 
     /// `page_watched` is the caller's answer to "does EITHER code-watch table hold an entry for
@@ -794,29 +996,49 @@ impl FastMap {
     ///
     /// Dead listed entries carry `physical_pages == u32::MAX`, which never equals a real page
     /// base, so the physical compare is the liveness filter as well as the match.
+    ///
+    /// With two tables on, the dormant table is swept too: a page that became watched while its
+    /// context was not running must not come back with a clear bit.
     pub(crate) fn clear_unwatched_entries_of_physical_page(
         &mut self,
         physical_page_base: u32,
     ) -> u64 {
-        let Some(storage) = self.storage.as_mut() else {
-            return 0;
-        };
-        let mut cleared = 0;
-        for &page in &self.populated_pages {
-            let index = page as usize;
-            if storage.physical_pages[index] != physical_page_base
-                || storage.flags[index] & PAGE_WATCHED != 0
-            {
-                continue;
-            }
-            storage.clear_entry(index);
-            cleared += 1;
-        }
-        cleared
+        sweep_unwatched(&mut self.storage, &self.populated_pages, physical_page_base)
+            + sweep_unwatched(
+                &mut self.dormant.storage,
+                &self.dormant.populated_pages,
+                physical_page_base,
+            )
     }
 
-    /// Invalidate exactly one linear page. Its list membership remains until the next global
-    /// invalidation so repeated INVLPG/refill cycles do not grow the populated-page list.
+    /// Copy the live pages into the census buffer of ring slot `slot`, replacing what it held.
+    /// Returns how many pages the buffer held before (those never came back) and how many it
+    /// holds now. Reuses the buffer allocation.
+    pub(crate) fn census_save_live_pages(&mut self, slot: usize) -> (u64, u64) {
+        let saved = &mut self.census_saved[slot];
+        let replaced = saved.len() as u64;
+        saved.clear();
+        if let Some(storage) = self.storage.as_ref() {
+            for &page in &self.populated_pages {
+                let index = page as usize;
+                if FastMapStorage::bit(&storage.live_pages, index) {
+                    let flags = storage.flags[index];
+                    saved.push(CensusPage {
+                        linear_page: page,
+                        physical_page: storage.physical_pages[index],
+                        read_bias: flags & HAS_READ_BIAS != 0,
+                        write_bias: flags & HAS_WRITE_BIAS != 0,
+                    });
+                }
+            }
+        }
+        (replaced, saved.len() as u64)
+    }
+
+    /// Invalidate exactly one linear page of the live table. Its list membership remains until the
+    /// next global invalidation so repeated INVLPG/refill cycles do not grow the populated-page
+    /// list. The dormant table is not touched: INVLPG re-mints the dormant TLB generation, and
+    /// the TLB eviction hook only displaces entries of the live array.
     pub(crate) fn invalidate_page(&mut self, linear: u32) {
         let index = (linear >> PAGE_SHIFT) as usize;
         if let Some(storage) = self.storage.as_mut()
@@ -836,51 +1058,216 @@ impl FastMap {
     /// List membership in `populated_pages` is deliberately NOT dropped: an entry cleared here can
     /// be re-populated without being pushed twice, and the next global invalidation still finds it.
     pub(crate) fn invalidate_vga_pages(&mut self) -> WipeExtent {
-        let Some(storage) = self.storage.as_mut() else {
-            return WipeExtent::default();
-        };
-        let mut cleared = 0;
-        for page in self.vga_pages.drain(..) {
-            let index = page as usize;
-            if FastMapStorage::bit(&storage.live_pages, index)
-                && storage.flags[index] & KIND_MASK == PageKind::Mode13 as u8
-            {
-                storage.clear_entry(index);
-                cleared += 1;
-            }
-            FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
-        }
+        let live = sweep_vga(&mut self.storage, &mut self.vga_pages);
+        let dormant = sweep_vga(&mut self.dormant.storage, &mut self.dormant.vga_pages);
         WipeExtent {
-            pages: cleared,
-            vga_pages: cleared,
+            pages: live.pages + dormant.pages,
+            vga_pages: live.vga_pages + dormant.vga_pages,
         }
     }
 
-    /// Clear only pages installed since the previous global invalidation. Returns what it threw
-    /// away, so the audit counters can price a wipe: `pages` is the whole cost, `vga_pages` the
-    /// part a VGA-scoped invalidation would still have had to pay.
+    /// Clear only pages installed since the previous global invalidation, in both tables. Returns
+    /// what it threw away, so the audit counters can price a wipe: `pages` is the whole cost,
+    /// `vga_pages` the part a VGA-scoped invalidation would still have had to pay.
     pub(crate) fn invalidate_all(&mut self) -> WipeExtent {
-        let Some(storage) = self.storage.as_mut() else {
-            return WipeExtent::default();
-        };
-        let mut extent = WipeExtent::default();
-        for page in self.populated_pages.drain(..) {
-            let index = page as usize;
-            // Liveness, not list membership: an index the scoped aperture sweep or an INVLPG
-            // already cleared is still listed here, and charging it again would inflate the very
-            // counter the aperture-scoping work is judged by.
-            if FastMapStorage::bit(&storage.live_pages, index) {
-                extent.pages += 1;
-                if storage.flags[index] & KIND_MASK == PageKind::Mode13 as u8 {
-                    extent.vga_pages += 1;
-                }
-            }
-            storage.clear_entry(index);
-            FastMapStorage::clear_bit(&mut storage.listed_pages, index);
-            FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
+        let live = self.invalidate_live();
+        let dormant = self.invalidate_dormant();
+        WipeExtent {
+            pages: live.pages + dormant.pages,
+            vga_pages: live.vga_pages + dormant.vga_pages,
         }
-        self.vga_pages.clear();
-        extent
+    }
+
+    /// Wipe the live table and keep the dormant one. With two tables off the dormant table is
+    /// always empty, so this is the whole wipe.
+    pub(crate) fn invalidate_live(&mut self) -> WipeExtent {
+        wipe_table(
+            &mut self.storage,
+            &mut self.populated_pages,
+            &mut self.vga_pages,
+        )
+    }
+
+    /// Wipe the dormant table and void its tag.
+    pub(crate) fn invalidate_dormant(&mut self) -> WipeExtent {
+        self.dormant.tag = TableTag::INVALID;
+        wipe_table(
+            &mut self.dormant.storage,
+            &mut self.dormant.populated_pages,
+            &mut self.dormant.vga_pages,
+        )
+    }
+
+    /// Whether the CPU runs with one table for each CR3 ring slot.
+    #[inline]
+    pub(crate) fn two_tables(&self) -> bool {
+        self.two_tables
+    }
+
+    /// Turn the two-table mode on, or off. Turning it off wipes both tables and leaves the
+    /// storage where it is, so the published table bases stay right.
+    pub(crate) fn set_two_tables(&mut self, on: bool) {
+        if !on {
+            self.invalidate_all();
+        }
+        self.two_tables = on;
+        self.live_slot = 0;
+        self.live_tag = if on { INITIAL_TAG } else { TableTag::INVALID };
+    }
+
+    /// The ring slot the live table belongs to.
+    #[inline]
+    pub(crate) fn live_slot(&self) -> u8 {
+        self.live_slot
+    }
+
+    /// Give the live table another ring slot without moving any storage. Only a caller that has
+    /// emptied or voided both tables may use it.
+    pub(crate) fn relabel_live(&mut self, slot: u8) {
+        self.live_slot = slot;
+    }
+
+    #[inline]
+    pub(crate) fn live_tag(&self) -> TableTag {
+        self.live_tag
+    }
+
+    pub(crate) fn set_live_tag(&mut self, tag: TableTag) {
+        self.live_tag = tag;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dormant_tag(&self) -> TableTag {
+        self.dormant.tag
+    }
+
+    /// A retire re-minted every TLB generation and renumbered the ring. The live table keeps
+    /// serving the live context, as it does with one table, but the entries it holds were filled
+    /// under generations that no longer exist, so a later switch must never bring it back. An
+    /// empty table holds nothing to distrust and takes the new tag.
+    pub(crate) fn note_tlb_retired(&mut self, live_slot: u8, tag: TableTag) {
+        self.live_slot = live_slot;
+        self.live_tag = if self.populated_pages.is_empty() {
+            tag
+        } else {
+            TableTag::INVALID
+        };
+    }
+
+    /// Void both tags, after a wipe of both tables.
+    pub(crate) fn void_tags(&mut self) {
+        self.live_tag = TableTag::INVALID;
+        self.dormant.tag = TableTag::INVALID;
+    }
+
+    /// Whether the live table has storage. Published table bases belong to it.
+    #[inline]
+    pub(crate) fn live_has_storage(&self) -> bool {
+        self.storage.is_some()
+    }
+
+    /// Give the dormant table its storage now. The allocation writes sentinels over every array,
+    /// so a switch does it before the live bases change, never in the fill path.
+    pub(crate) fn ensure_dormant_storage(&mut self) {
+        if self.dormant.storage.is_none() {
+            self.dormant.storage = Some(FastMapStorage::new());
+        }
+    }
+
+    /// Exchange the live and the dormant table. Only box and vec headers move: the arrays stay
+    /// where they are.
+    pub(crate) fn swap_tables(&mut self) {
+        std::mem::swap(&mut self.storage, &mut self.dormant.storage);
+        std::mem::swap(&mut self.populated_pages, &mut self.dormant.populated_pages);
+        std::mem::swap(&mut self.vga_pages, &mut self.dormant.vga_pages);
+        std::mem::swap(&mut self.live_tag, &mut self.dormant.tag);
+    }
+
+    /// The linear pages of the live table that hold a live entry, for the debug oracle.
+    #[cfg(debug_assertions)]
+    pub(crate) fn live_entries(&self) -> Vec<LiveEntry> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Vec::new();
+        };
+        self.populated_pages
+            .iter()
+            .filter_map(|&page| {
+                let index = page as usize;
+                FastMapStorage::bit(&storage.live_pages, index).then(|| LiveEntry {
+                    linear_page: page,
+                    physical_page: storage.physical_pages[index],
+                    mapping_epoch: storage.mapping_epochs[index],
+                    read_bias: storage.read_biases[index],
+                    write_bias: storage.write_biases[index],
+                    store_bias: storage.store_biases[index],
+                    load_bias: storage.load_biases[index],
+                    flags: storage.flags[index],
+                    in_vga_registry: FastMapStorage::bit(&storage.listed_vga_pages, index),
+                })
+            })
+            .collect()
+    }
+
+    /// Live entries of the table that is not live, for the tests.
+    #[cfg(test)]
+    pub(crate) fn dormant_live_pages_for_test(&self) -> Vec<u32> {
+        let Some(storage) = self.dormant.storage.as_ref() else {
+            return Vec::new();
+        };
+        self.dormant
+            .populated_pages
+            .iter()
+            .copied()
+            .filter(|&page| FastMapStorage::bit(&storage.live_pages, page as usize))
+            .collect()
+    }
+
+    /// Live entry count of the live table, for the tests.
+    #[cfg(test)]
+    pub(crate) fn live_page_count_for_test(&self) -> usize {
+        let Some(storage) = self.storage.as_ref() else {
+            return 0;
+        };
+        self.populated_pages
+            .iter()
+            .filter(|&&page| FastMapStorage::bit(&storage.live_pages, page as usize))
+            .count()
+    }
+
+    /// The raw store bias of the dormant table for `linear`, for the tests (a dead entry reads the
+    /// poison).
+    #[cfg(test)]
+    pub(crate) fn dormant_store_bias_for_test(&self, linear: u32) -> usize {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.dormant
+            .storage
+            .as_ref()
+            .map_or(STORE_BIAS_POISON, |storage| storage.store_biases[index])
+    }
+
+    /// Whether the dormant table holds a live entry for `linear`, for the tests.
+    #[cfg(test)]
+    pub(crate) fn dormant_has_entry_for_test(&self, linear: u32) -> bool {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.dormant
+            .storage
+            .as_ref()
+            .is_some_and(|storage| FastMapStorage::bit(&storage.live_pages, index))
+    }
+
+    /// Replace the tag of the dormant table, to force a mismatch.
+    #[cfg(test)]
+    pub(crate) fn set_dormant_tag_for_test(&mut self, tag: TableTag) {
+        self.dormant.tag = tag;
+    }
+
+    /// Base address of the live table's flags array, for the tests that compare slots.
+    #[cfg(test)]
+    pub(crate) fn dormant_native_bases_for_test(&self) -> Option<NativeMapBases> {
+        self.dormant
+            .storage
+            .as_ref()
+            .map(FastMapStorage::native_bases)
     }
 
     /// Whether the live entry for `linear` carries `PAGE_WATCHED` — the watched-page-bit
@@ -960,9 +1347,90 @@ impl FastMap {
     }
 }
 
+/// Invalidate the entries of one table that map `physical_page_base` and carry a clear
+/// `PAGE_WATCHED` bit. Returns how many it cleared.
+fn sweep_unwatched(
+    storage: &mut Option<FastMapStorage>,
+    populated_pages: &[u32],
+    physical_page_base: u32,
+) -> u64 {
+    let Some(storage) = storage.as_mut() else {
+        return 0;
+    };
+    let mut cleared = 0;
+    for &page in populated_pages {
+        let index = page as usize;
+        if storage.physical_pages[index] != physical_page_base
+            || storage.flags[index] & PAGE_WATCHED != 0
+        {
+            continue;
+        }
+        storage.clear_entry(index);
+        cleared += 1;
+    }
+    cleared
+}
+
+/// Clear the entries of one table that the aperture registry names. See `invalidate_vga_pages`.
+fn sweep_vga(storage: &mut Option<FastMapStorage>, vga_pages: &mut Vec<u32>) -> WipeExtent {
+    let Some(storage) = storage.as_mut() else {
+        return WipeExtent::default();
+    };
+    let mut cleared = 0;
+    for page in vga_pages.drain(..) {
+        let index = page as usize;
+        if FastMapStorage::bit(&storage.live_pages, index)
+            && storage.flags[index] & KIND_MASK == PageKind::Mode13 as u8
+        {
+            storage.clear_entry(index);
+            cleared += 1;
+        }
+        FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
+    }
+    WipeExtent {
+        pages: cleared,
+        vga_pages: cleared,
+    }
+}
+
+/// Clear every listed entry of one table and empty its lists.
+fn wipe_table(
+    storage: &mut Option<FastMapStorage>,
+    populated_pages: &mut Vec<u32>,
+    vga_pages: &mut Vec<u32>,
+) -> WipeExtent {
+    let Some(storage) = storage.as_mut() else {
+        return WipeExtent::default();
+    };
+    let mut extent = WipeExtent::default();
+    for page in populated_pages.drain(..) {
+        let index = page as usize;
+        // Liveness, not list membership: an index the scoped aperture sweep or an INVLPG
+        // already cleared is still listed here, and charging it again would inflate the very
+        // counter the aperture-scoping work is judged by.
+        if FastMapStorage::bit(&storage.live_pages, index) {
+            extent.pages += 1;
+            if storage.flags[index] & KIND_MASK == PageKind::Mode13 as u8 {
+                extent.vga_pages += 1;
+            }
+        }
+        storage.clear_entry(index);
+        FastMapStorage::clear_bit(&mut storage.listed_pages, index);
+        FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
+    }
+    vga_pages.clear();
+    extent
+}
+
+/// A clone starts with empty tables and keeps only the mode, so it shares nothing with the
+/// original. Its TLB clone starts from `Tlb::default()`, which the initial tag matches.
 impl Clone for FastMap {
     fn clone(&self) -> Self {
-        Self::default()
+        let mut clone = Self::default();
+        if self.two_tables {
+            clone.set_two_tables(true);
+        }
+        clone
     }
 }
 

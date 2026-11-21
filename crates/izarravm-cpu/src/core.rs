@@ -4,6 +4,22 @@
 use super::*;
 use crate::paging::{VGA_APERTURE_END, VGA_APERTURE_START};
 
+/// What the ring decided for a MOV CR3, as the fast map needs it.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cr3FastMapSelect {
+    /// The directory owns this slot already.
+    Reselected(u8),
+    /// The directory took a free slot.
+    Allocated(u8),
+    /// A third directory retired the ring.
+    Taken,
+}
+
 /// Which control-register write drove a `flush_tlb_and_code_caches`. Diagnostic only: the arms
 /// select a counter and nothing else. See `CpuGsw::flush_tlb_and_code_caches`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +188,7 @@ impl CpuGsw {
         // causes are all rare (A20 toggles once at boot; aperture/direct-map track video mode
         // and PCI decode changes, not per-instruction traffic), so the cost is negligible, and it
         // closes the same slot-reoccupation gap D2 names rather than leaving it open.
-        self.tlb.retire_all_slots(retired);
+        self.retire_tlb_slots(retired);
         #[cfg(feature = "jit")]
         self.jit_direct.clear();
     }
@@ -268,6 +284,353 @@ impl CpuGsw {
         self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
     }
 
+    /// CR3 census, save half. Runs BEFORE the fast-map wipe of a `MOV CR3`. When the census is
+    /// armed, paging is on and the directory changes, it copies the live fast-map pages into the
+    /// buffer of the ring slot being left (the TLB's live slot). Returns whether it saved. A
+    /// reload of the same directory saves nothing: it keeps the TLB generation, so it would only
+    /// report a trivial full hit.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_census_save(&mut self, old_cr3_masked: u32, new_cr3_masked: u32) -> bool {
+        if !crate::jit::fast_map::cr3_census_enabled()
+            || self.control.cr0 & CR0_PG == 0
+            || old_cr3_masked == new_cr3_masked
+        {
+            return false;
+        }
+        // The fast map names the live slot itself once it keeps one table for each slot.
+        let slot = if self.jit_fast_map.two_tables() {
+            usize::from(self.jit_fast_map.live_slot())
+        } else {
+            self.tlb.live_slot()
+        };
+        let (replaced, saved) = self.jit_fast_map.census_save_live_pages(slot);
+        let audit = &mut *self.jit_direct.fast_map_audit;
+        audit.cr3_census_switches += 1;
+        audit.cr3_census_saved_pages += saved;
+        audit.cr3_census_not_reselected += replaced;
+        true
+    }
+
+    /// CR3 census, restore half, for a ring hit. Call it after the TLB generation of `slot` is
+    /// selected. Classifies each page saved when `slot` was left against the TLB, then empties
+    /// the buffer and keeps its allocation.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_census_classify(&mut self, slot: u8) {
+        let mut saved = std::mem::take(&mut self.jit_fast_map.census_saved[usize::from(slot)]);
+        let audit = &mut *self.jit_direct.fast_map_audit;
+        for page in &saved {
+            match self.tlb.lookup(page.linear_page) {
+                Some(entry) if entry.phys == page.physical_page => {
+                    audit.cr3_census_tlb_live_same_physical += 1;
+                    if page.write_bias && !entry.dirty {
+                        audit.cr3_census_write_not_dirty += 1;
+                    }
+                }
+                Some(_) => audit.cr3_census_tlb_live_other_physical += 1,
+                None => audit.cr3_census_tlb_absent += 1,
+            }
+        }
+        saved.clear();
+        self.jit_fast_map.census_saved[usize::from(slot)] = saved;
+    }
+
+    /// CR3 census, restore half, for a directory the ring did not hold. Drops the buffer of
+    /// `slot`, or of both slots after a ring retire (`None`), and counts the pages as never
+    /// reselected.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_census_discard(&mut self, slot: Option<u8>) {
+        let mut dropped = 0;
+        for (index, saved) in self.jit_fast_map.census_saved.iter_mut().enumerate() {
+            if slot.is_none_or(|slot| usize::from(slot) == index) {
+                dropped += saved.len() as u64;
+                saved.clear();
+            }
+        }
+        self.jit_direct.fast_map_audit.cr3_census_not_reselected += dropped;
+    }
+    /// Decide once, when the CPU is built, whether the fast map keeps one table for each CR3 ring
+    /// slot (`IZARRAVM_FAST_MAP_TWO_TABLES`). The mode needs the TLB slot partition, because it
+    /// trusts the TLB array of a dormant slot to stay intact. It needs the R15 table slots,
+    /// because they are what a switch republishes. It does not run with mkII, which bakes the
+    /// table bases into its code. Tests that flip `r15_tables` call this again.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn refresh_fast_map_two_tables_latch(&mut self) {
+        #[cfg(feature = "dynarec-mkii")]
+        let mkii = self.mkii_requested();
+        #[cfg(not(feature = "dynarec-mkii"))]
+        let mkii = false;
+        let on = crate::jit::fast_map::fast_map_two_tables_enabled()
+            && self.tlb.partitioned()
+            && self.jit_direct.r15_tables
+            && !mkii;
+        self.jit_fast_map.set_two_tables(on);
+    }
+
+    /// The fast-map half of a `MOV CR3` that happens before the TLB and the ring pick the new
+    /// context. With one table the whole map is wiped, as it always was. With two tables nothing
+    /// is wiped here, unless paging is off: the tables then hold unpaged entries, which no TLB
+    /// generation guards.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_wipe_fast_map(&mut self) {
+        if !self.jit_fast_map.two_tables() || self.control.cr0 & CR0_PG == 0 {
+            self.record_fast_map_wipe_extent();
+        }
+    }
+
+    /// Wipe the live table only and charge the extent to the audit counters.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn record_live_fast_map_wipe_extent(&mut self) {
+        let extent = self.jit_fast_map.invalidate_live();
+        self.jit_direct.fast_map_audit.wipe_pages_cleared += extent.pages;
+        self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
+    }
+
+    /// The tag the TLB gives ring slot `slot` now.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn fast_map_tag_of(&self, slot: u8) -> crate::jit::fast_map::TableTag {
+        crate::jit::fast_map::TableTag {
+            slot,
+            generation: self.tlb.slot_generation(slot),
+        }
+    }
+
+    /// Retire both TLB generations and tell the fast map. A retire renumbers the ring slots and
+    /// makes every generation new. The live table keeps serving the live context as before. Its
+    /// label follows the TLB, and it can come back later only when it holds no older entries.
+    pub(super) fn retire_tlb_slots(&mut self, token: RingRetired) {
+        self.tlb.retire_all_slots(token);
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.jit_fast_map.two_tables() {
+            let live = self.tlb.live_slot() as u8;
+            let tag = self.fast_map_tag_of(live);
+            self.jit_fast_map.note_tlb_retired(live, tag);
+        }
+    }
+
+    /// The fast-map half of a `MOV CR3`, run after the TLB took its step. `leaving` is the TLB's
+    /// live slot before `select_context`. The live table belongs to the slot being left, and the
+    /// dormant table to the other one. A reselect of the other slot swaps them. A table is served
+    /// again only when its tag names the generation its slot holds now, so every event that
+    /// re-mints a generation (INVLPG, a translation-page write, a ring retire) voids the table
+    /// without a visit.
+    ///
+    /// The tables must exist before the six R15 slots point at them: a swap gives the incoming
+    /// table its storage first, and the fill path never allocates a table the slots name.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_select_fast_map(&mut self, leaving: u8, select: Cr3FastMapSelect) {
+        if !self.jit_fast_map.two_tables() {
+            return;
+        }
+        debug_assert_eq!(
+            self.jit_fast_map.live_slot(),
+            leaving,
+            "the live fast map table lost track of the live ring slot"
+        );
+        if self.jit_fast_map.live_slot() != leaving {
+            self.record_fast_map_wipe_extent();
+            self.jit_fast_map.void_tags();
+            self.jit_fast_map.relabel_live(leaving);
+        }
+        // A wrap restarts the generation counter, so an old tag could equal a new generation.
+        // This is the only reader of the flag.
+        if self.tlb.take_wrapped() {
+            self.record_fast_map_wipe_extent();
+            self.jit_fast_map.void_tags();
+        }
+        let live = self.tlb.live_slot() as u8;
+        match select {
+            Cr3FastMapSelect::Reselected(slot) => {
+                debug_assert_eq!(slot, live);
+                if slot != self.jit_fast_map.live_slot() {
+                    self.cr3_swap_fast_map_tables(slot);
+                    let want = self.fast_map_tag_of(slot);
+                    if self.jit_fast_map.live_tag() != want {
+                        self.jit_direct.fast_map_audit.fast_map_two_tables_tag_wipes += 1;
+                        self.record_live_fast_map_wipe_extent();
+                        self.jit_fast_map.set_live_tag(want);
+                    }
+                }
+            }
+            Cr3FastMapSelect::Allocated(slot) => {
+                debug_assert_eq!(slot, live);
+                if slot != self.jit_fast_map.live_slot() {
+                    self.cr3_swap_fast_map_tables(slot);
+                }
+                self.record_live_fast_map_wipe_extent();
+                let tag = self.fast_map_tag_of(slot);
+                self.jit_fast_map.set_live_tag(tag);
+            }
+            Cr3FastMapSelect::Taken => {
+                self.record_fast_map_wipe_extent();
+                self.jit_fast_map.relabel_live(live);
+                let tag = self.fast_map_tag_of(live);
+                self.jit_fast_map.set_live_tag(tag);
+            }
+        }
+        debug_assert_eq!(self.jit_fast_map.live_slot(), live);
+        self.check_fast_map_slots();
+        #[cfg(debug_assertions)]
+        self.debug_verify_live_fast_map();
+    }
+
+    /// Swap the live and the dormant table for a reselect or an allocation of `slot`, and point
+    /// the R15 slots at the table that is live now.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_swap_fast_map_tables(&mut self, slot: u8) {
+        if self.jit_fast_map.live_has_storage() {
+            self.jit_fast_map.ensure_dormant_storage();
+        }
+        self.jit_fast_map.swap_tables();
+        self.jit_fast_map.relabel_live(slot);
+        self.jit_direct.fast_map_audit.fast_map_two_tables_switches += 1;
+        if self.native_table_slots.map_published() {
+            let bases = self
+                .jit_fast_map
+                .native_bases()
+                .expect("the incoming table has storage before the slots name it");
+            self.native_table_slots.republish_map(bases);
+        }
+    }
+
+    /// The six R15 slots name the live table when they are published, and are all zero before.
+    /// Checked after every `MOV CR3` in the two-table mode.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn check_fast_map_slots(&self) {
+        let bases = self.jit_fast_map.native_bases();
+        let published = self.native_table_slots.map_published();
+        debug_assert!(
+            self.native_table_slots
+                .map_slots_match(if published { bases } else { None }),
+            "the R15 table slots do not name the live fast map table"
+        );
+        debug_assert!(!published || bases.is_some());
+    }
+
+    /// Debug oracle for the live table. Every listed entry must still agree with the TLB, the
+    /// watch tables and the derivations it was filled from. Skipped for the watch check while an
+    /// edge is pending, because the sweep that drains it runs at the next native entry.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux"),
+        debug_assertions
+    ))]
+    pub(crate) fn debug_verify_live_fast_map(&self) {
+        let paging = self.is_paging_enabled();
+        let edges_pending = self.decode_cache.has_pending_watch_edges()
+            || self.jit_direct.has_pending_watch_edges();
+        for entry in self.jit_fast_map.live_entries() {
+            let linear = entry.linear_page << 12;
+            if paging {
+                let tlb = self.tlb.lookup(entry.linear_page).unwrap_or_else(|| {
+                    panic!("fast map entry {linear:#x} has no TLB entry in this generation")
+                });
+                assert_eq!(
+                    tlb.phys, entry.physical_page,
+                    "fast map entry {linear:#x} names another physical page than the TLB"
+                );
+                assert_eq!(
+                    entry.writable(),
+                    tlb.writable,
+                    "writable bit of {linear:#x}"
+                );
+                assert_eq!(entry.user(), tlb.user, "user bit of {linear:#x}");
+                assert!(
+                    !entry.has_write_bias() || tlb.dirty,
+                    "write mapping of {linear:#x} without a dirty TLB entry"
+                );
+            }
+            if !edges_pending && self.physical_page_watched(entry.physical_page) {
+                assert!(
+                    entry.watched(),
+                    "page {linear:#x} is code watched but its entry is not marked"
+                );
+            }
+            assert_eq!(
+                entry.store_bias,
+                entry.derived_store_bias(),
+                "store bias of {linear:#x}"
+            );
+            assert_eq!(
+                entry.load_bias,
+                entry.derived_load_bias(),
+                "load bias of {linear:#x}"
+            );
+            // A cached page of the current epoch must give the biases the entry holds.
+            let wanted_bias = |ptr: *mut u8| (ptr as usize).wrapping_sub(linear as usize);
+            if entry.has_read_bias()
+                && entry.mapping_epoch == self.data_read_pages.mapping_epoch()
+                && let Some(cached) = self.data_read_pages.get(entry.physical_page)
+            {
+                assert_eq!(
+                    entry.read_bias,
+                    wanted_bias(cached.ptr),
+                    "read bias of {linear:#x}"
+                );
+            }
+            if entry.has_write_bias()
+                && entry.mapping_epoch == self.data_write_pages.mapping_epoch()
+                && let Some(cached) = self.data_write_pages.get(entry.physical_page)
+            {
+                assert_eq!(
+                    entry.write_bias,
+                    wanted_bias(cached.ptr),
+                    "write bias of {linear:#x}"
+                );
+            }
+            if entry.is_mode13() {
+                assert!(
+                    entry.in_vga_registry(),
+                    "aperture entry {linear:#x} is missing from the aperture registry"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "jit")]
     fn bump_wipes_tlb_flush_counter(&mut self) {
         self.jit_direct.fast_map_audit.wipes_tlb_flush += 1;
@@ -324,7 +687,7 @@ impl CpuGsw {
         // returns. `translation_pages` may clear here (F11): both the TLB and the decode lines it
         // could back are gone by the time this returns.
         let retired = self.invalidate_translation_code_caches(true);
-        self.tlb.retire_all_slots(retired);
+        self.retire_tlb_slots(retired);
     }
 
     /// `MOV CR3, r32`, the ring-gated code half (design `2026-09-02-cr3-code-cache-gate-design.md`
@@ -387,6 +750,15 @@ impl CpuGsw {
         // the EVENT, not the outcome, and is the divergence check against `cr3_code_flush_taken +
         // _skipped`.
         self.bump_wipes_tlb_flush_counter();
+        let old_cr3_masked = self.control.cr3 & 0xffff_f000;
+        let new_cr3_masked = new_cr3 & 0xffff_f000;
+        // The census copies the page list the wipe below is about to discard.
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let census_armed = self.cr3_census_save(old_cr3_masked, new_cr3_masked);
         // T1: the FastMap wipe stays unconditional on both arms (design section (d) point 5); T3,
         // retaining it too, is a later slice. `data_read_pages`/`data_write_pages` are not touched
         // here at all any more.
@@ -395,10 +767,15 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.record_fast_map_wipe_extent();
-        let old_cr3_masked = self.control.cr3 & 0xffff_f000;
+        self.cr3_wipe_fast_map();
+        // The live ring slot before the ring picks the new one. The fast map reads it afterwards.
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let leaving = self.tlb.live_slot() as u8;
         self.control.cr3 = new_cr3;
-        let new_cr3_masked = new_cr3 & 0xffff_f000;
         self.invalidate_fetch_frontend();
         // T2: the TLB is now gated on the SAME ring decision as the decode and JIT halves, so it
         // has to run AFTER `select_context`, not before -- the reverse of the pre-T2 ordering, in
@@ -415,11 +792,25 @@ impl CpuGsw {
                 // `lookup`/`insert`/`is_link_visible` IS the restore. Never mint here: see the
                 // `ContextSelect` doc comment (review finding P1, PR #826).
                 self.tlb.select_generation(slot);
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                if census_armed {
+                    self.cr3_census_classify(slot);
+                }
                 #[cfg(feature = "jit")]
                 {
                     self.jit_direct.select_link_context(slot);
                     self.perf.cr3_link_context_selects += 1;
                 }
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                self.cr3_select_fast_map(leaving, Cr3FastMapSelect::Reselected(slot));
             }
             ContextSelect::Allocated(slot) => {
                 self.perf.cr3_code_flush_skipped += 1;
@@ -434,6 +825,20 @@ impl CpuGsw {
                 // retired -- so this is not a narrower fix, it removes the dependency on every
                 // OTHER caller keeping its own retire paired correctly.
                 self.tlb.allocate_generation(slot);
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                if census_armed {
+                    self.cr3_census_discard(Some(slot));
+                }
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                self.cr3_select_fast_map(leaving, Cr3FastMapSelect::Allocated(slot));
                 #[cfg(feature = "jit")]
                 {
                     self.jit_direct.allocate_link_context(slot);
@@ -452,6 +857,20 @@ impl CpuGsw {
                 // halves mint their own fresh state only after their own retire.
                 self.tlb.retire_all_slots(token);
                 self.tlb.allocate_generation(slot);
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                if census_armed {
+                    self.cr3_census_discard(None);
+                }
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                self.cr3_select_fast_map(leaving, Cr3FastMapSelect::Taken);
                 self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
                 #[cfg(feature = "jit")]
                 {
@@ -530,12 +949,21 @@ impl CpuGsw {
         self.bump_wipes_tlb_flush_counter();
         if new_cr0 & CR0_PG != 0 {
             self.tlb.flush_live_slot();
+            // Only the live context lost its translations. The dormant table keeps its entries
+            // and its tag, which still names the generation its slot holds.
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
             ))]
-            self.record_fast_map_wipe_extent();
+            {
+                self.record_live_fast_map_wipe_extent();
+                if self.jit_fast_map.two_tables() {
+                    let live = self.tlb.live_slot() as u8;
+                    let tag = self.fast_map_tag_of(live);
+                    self.jit_fast_map.set_live_tag(tag);
+                }
+            }
         }
         self.invalidate_fetch_frontend();
     }
@@ -1081,7 +1509,7 @@ impl CpuGsw {
                 self.jit_direct.mkii.mapping_dirty = true;
             }
             let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
-            self.tlb.retire_all_slots(retired);
+            self.retire_tlb_slots(retired);
             self.has_aperture_code.0 = false;
             #[cfg(feature = "jit")]
             self.jit_direct.invalidate_translation();
@@ -1149,7 +1577,7 @@ impl CpuGsw {
                     // stale generation would survive under the wrong directory after the next
                     // `MOV CR3` reoccupies this slot.
                     let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
-                    self.tlb.retire_all_slots(retired);
+                    self.retire_tlb_slots(retired);
                     // The second of the two generation-bump call sites; same clearing rule as
                     // invalidate_decode_frontend, or an SMC wholesale flush would leave the
                     // aperture flag armed with no line behind it.

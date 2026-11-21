@@ -982,3 +982,148 @@ fn classify_reject_follows_lookup_access_ladder_order() {
         );
     }
 }
+
+// ---- The two tables, one for each CR3 ring slot --------------------------------------------------
+
+fn ram_mapping(map: &mut FastMap, bytes: &mut [u8; PAGE_SIZE], linear: u32, write: bool) {
+    let physical = linear & !PAGE_MASK;
+    assert!(map.populate_read(
+        linear,
+        physical,
+        page(bytes, physical, false),
+        PagePermissions::UNPAGED,
+        false,
+    ));
+    if write {
+        assert!(map.populate_write(
+            linear,
+            physical,
+            page(bytes, physical, true),
+            PagePermissions::UNPAGED,
+            false,
+        ));
+    }
+}
+
+/// A map with an entry in the live table, then the tables swapped so that entry is dormant.
+fn map_with_dormant_entry(bytes: &mut [u8; PAGE_SIZE], linear: u32, write: bool) -> FastMap {
+    let mut map = FastMap::default();
+    map.set_two_tables(true);
+    ram_mapping(&mut map, bytes, linear, write);
+    map.ensure_dormant_storage();
+    map.swap_tables();
+    map
+}
+
+#[test]
+fn swap_tables_keeps_the_entries_of_both_tables() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = map_with_dormant_entry(&mut bytes, 0x0000_3000, true);
+    assert!(
+        !map.has_read_mapping(0x0000_3000, 0x0000_3000),
+        "live is empty"
+    );
+    assert!(map.dormant_has_entry_for_test(0x0000_3000));
+    ram_mapping(&mut map, &mut bytes, 0x0000_5000, false);
+    map.swap_tables();
+    assert!(map.has_write_mapping(0x0000_3000, 0x0000_3000));
+    assert!(!map.has_read_mapping(0x0000_5000, 0x0000_5000));
+    assert!(map.dormant_has_entry_for_test(0x0000_5000));
+}
+
+#[test]
+fn invalidate_all_wipes_both_tables_and_voids_the_dormant_tag() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = map_with_dormant_entry(&mut bytes, 0x0000_3000, true);
+    ram_mapping(&mut map, &mut bytes, 0x0000_5000, false);
+    map.set_dormant_tag_for_test(TableTag {
+        slot: 1,
+        generation: 9,
+    });
+    let extent = map.invalidate_all();
+    assert_eq!(extent.pages, 2, "one live and one dormant entry");
+    assert!(!map.has_read_mapping(0x0000_5000, 0x0000_5000));
+    assert!(!map.dormant_has_entry_for_test(0x0000_3000));
+    assert_eq!(map.dormant_tag(), TableTag::INVALID);
+}
+
+#[test]
+fn invalidate_live_keeps_the_dormant_table() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = map_with_dormant_entry(&mut bytes, 0x0000_3000, false);
+    ram_mapping(&mut map, &mut bytes, 0x0000_5000, false);
+    map.invalidate_live();
+    assert!(!map.has_read_mapping(0x0000_5000, 0x0000_5000));
+    assert!(map.dormant_has_entry_for_test(0x0000_3000));
+}
+
+#[test]
+fn invalidate_page_touches_only_the_live_table() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = map_with_dormant_entry(&mut bytes, 0x0000_3000, false);
+    ram_mapping(&mut map, &mut bytes, 0x0000_3000, false);
+    map.invalidate_page(0x0000_3000);
+    assert!(!map.has_read_mapping(0x0000_3000, 0x0000_3000));
+    assert!(map.dormant_has_entry_for_test(0x0000_3000));
+}
+
+#[test]
+fn a_watch_edge_sweep_reaches_the_dormant_table() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = map_with_dormant_entry(&mut bytes, 0x0000_3000, true);
+    assert!(map.dormant_has_entry_for_test(0x0000_3000));
+    assert_eq!(map.clear_unwatched_entries_of_physical_page(0x0000_3000), 1);
+    assert!(!map.dormant_has_entry_for_test(0x0000_3000));
+    assert_eq!(
+        map.dormant_store_bias_for_test(0x0000_3000),
+        STORE_BIAS_POISON
+    );
+}
+
+#[test]
+fn an_aperture_sweep_reaches_the_dormant_table() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let linear = 0x00aa_0000;
+    let mut map = FastMap::default();
+    map.set_two_tables(true);
+    assert!(map.populate_write(
+        linear,
+        MODE13_BASE,
+        page(&mut bytes, MODE13_BASE, true),
+        PagePermissions::UNPAGED,
+        false,
+    ));
+    map.ensure_dormant_storage();
+    map.swap_tables();
+    assert!(map.dormant_has_entry_for_test(linear));
+    let extent = map.invalidate_vga_pages();
+    assert_eq!(extent.vga_pages, 1);
+    assert!(!map.dormant_has_entry_for_test(linear));
+}
+
+#[test]
+fn a_clone_starts_empty_and_keeps_only_the_mode() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = map_with_dormant_entry(&mut bytes, 0x0000_3000, true);
+    ram_mapping(&mut map, &mut bytes, 0x0000_5000, false);
+    let clone = map.clone();
+    assert!(clone.two_tables());
+    assert!(!clone.has_storage());
+    assert!(clone.native_bases().is_none());
+    assert!(clone.dormant_live_pages_for_test().is_empty());
+    assert_eq!(clone.live_slot(), 0);
+    assert_eq!(clone.live_tag(), INITIAL_TAG);
+    assert!(!FastMap::default().clone().two_tables());
+}
+
+#[test]
+fn the_knob_spelling_table_refuses_a_guess() {
+    use std::env::VarError::NotPresent;
+    assert!(parse_two_tables_for_test(Err(NotPresent)));
+    assert!(!parse_two_tables_for_test(Ok("0".into())));
+    assert!(parse_two_tables_for_test(Ok("1".into())));
+    for bad in ["", "yes"] {
+        let refused = std::panic::catch_unwind(|| parse_two_tables_for_test(Ok(bad.into())));
+        assert!(refused.is_err(), "{bad:?} must stop the process");
+    }
+}

@@ -72,6 +72,31 @@ pub(crate) fn sixteen_bit_code_cpu(entry: u32) -> CpuGsw {
     cpu
 }
 
+/// The emitted code of `compilation` with each 64-bit immediate that holds one of its own cell
+/// addresses cleared, and the number of immediates cleared. Two compilations of one program hold
+/// different cell addresses and are otherwise equal. Only the exact addresses are cleared, so a
+/// change in any other immediate stays visible.
+pub(crate) fn code_without_cell_addresses(
+    compilation: &jit::direct::Compilation,
+) -> (Vec<u8>, usize) {
+    let mut code = compilation.code.clone();
+    let mut cleared = 0;
+    for address in compilation.cell_addresses_for_test() {
+        let bytes = address.to_le_bytes();
+        let mut at = 0;
+        while let Some(found) = code[at..]
+            .windows(bytes.len())
+            .position(|window| window == bytes)
+        {
+            let start = at + found;
+            code[start..start + bytes.len()].fill(0);
+            cleared += 1;
+            at = start + bytes.len();
+        }
+    }
+    (code, cleared)
+}
+
 pub(crate) fn sixteen_bit_bus(memory: Vec<u8>) -> TestBus {
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
