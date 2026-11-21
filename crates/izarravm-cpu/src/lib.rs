@@ -23,8 +23,8 @@ mod fpu_exec;
 mod int_trace;
 mod ipe_entry_tally;
 pub use ipe_entry_tally::IpeEntryTargets;
-/// The entry-attribution stamp macros. Compiled in EVERY build -- including
-/// `--no-default-features` -- and a no-op without the feature; see the module for why they cannot
+/// The entry-attribution stamp macros. Compiled in EVERY build (including
+/// `--no-default-features`) and a no-op without the feature; see the module for why they cannot
 /// live beside the instrument. Declared ABOVE `mod jit`'s `#[cfg]`, deliberately: the first
 /// attempt sat between that attribute and its module and inherited the gate, which is the bug
 /// this placement exists to prevent.
@@ -132,7 +132,7 @@ fn ud_trace_enabled() -> bool {
 /// Diagnostic guest-store watchpoint (`IZARRAVM_WATCH_WRITE=<hex addr>[,<hex len>]`).
 /// Packed as `(addr << 32) | len`; zero means off, which is the shipped state. Read with a
 /// Relaxed load on the store path, so when it is off the cost is one load and one
-/// predictable branch -- no syscall, no `OnceLock` acquire. Set once from `main` before the
+/// predictable branch: no syscall, no `OnceLock` acquire. Set once from `main` before the
 /// run loop starts, never mutated after, so the Relaxed ordering carries no publication
 /// hazard. Observation only: the watch never alters a store's value or ordering.
 static WRITE_WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -151,8 +151,8 @@ const WRITE_WATCH_REPORT_LIMIT_DEFAULT: u32 = 200_000;
 /// a test arms the watch, issues a store, and checks the count advanced.
 ///
 /// That matters more here than the counter's own usefulness. This instrument's recorded failure
-/// mode is "silently sees nothing" -- it answers "no writes here" when the writes moved to a path
-/// that has no hook -- so every hook it has needs one execution proving it fires.
+/// mode is "silently sees nothing": it answers "no writes here" when the writes moved to a path
+/// that has no hook, so every hook it has needs one execution proving it fires.
 #[cfg(feature = "watch-write")]
 pub fn write_watch_report_count() -> u32 {
     WRITE_WATCH_REPORTS.load(std::sync::atomic::Ordering::Relaxed)
@@ -248,7 +248,7 @@ pub fn flush_diff_trace() {
 /// per instruction is one unbuffered syscall per line, which throttles a POST-length
 /// trace to a few thousand lines/sec; wrapping stderr in a `BufWriter` amortizes that
 /// to one syscall per buffer flush. Callers MUST call `flush_diff_trace()` after their
-/// run loop returns -- see that function's doc for what silently goes missing without it.
+/// run loop returns. See that function's doc for what silently goes missing without it.
 fn diff_trace_writer() -> &'static Mutex<std::io::BufWriter<std::io::Stderr>> {
     static WRITER: OnceLock<Mutex<std::io::BufWriter<std::io::Stderr>>> = OnceLock::new();
     WRITER.get_or_init(|| {
@@ -289,7 +289,7 @@ const CR0_NE: u32 = 0x0000_0020; // bit 5
 
 // GSW-586 CPUID identity. Leaf 0 returns the maximum basic leaf in EAX and the 12-byte
 // vendor string split across EBX, EDX, ECX in the architectural order (EBX first, then
-// EDX, then ECX -- the order Intel's own "GenuineIntel" is laid out in). The GSW-586 is
+// EDX, then ECX: the order Intel's own "GenuineIntel" is laid out in). The GSW-586 is
 // Izarra's own part, so it reports Izarra's own vendor id rather than a licensed one:
 // "IzarBenetako", Euskara for a genuine star.
 const CPUID_MAX_BASIC_LEAF: u32 = 1;
@@ -329,7 +329,7 @@ const CR4_DEFINED_MASK: u32 = 0x0000_005f; // bits 0-4, 6
 // is BD (an attempt to access a debug register while GD was set), bit 14 is BS (the
 // trap flag caused this #DB), bit 15 is BT (a task switch caused this #DB). 386 PRM
 // ch12 (Debug Registers) documents bits 4-11 and 16-31 as defined-1 on reset and not
-// guaranteed to read as written -- this core stores whatever is written to keep MOV DR6
+// guaranteed to read as written: this core stores whatever is written to keep MOV DR6
 // round-tripping simple, which is sufficient because breakpoint matching (the only thing
 // that would actually set B0-B3/BS/BT/BD) is not implemented yet (ledger row 26,
 // deferred). DR6 reset value per the PRM is 0xFFFF_0FF0.
@@ -337,7 +337,7 @@ const DR6_RESET: u32 = 0xffff_0ff0;
 
 // DR7 (debug control): bits 0-7 are the L0-L3/G0-G3 local/global breakpoint enables,
 // bit 8 LE and bit 9 GE are the (obsolete-by-386) exact-breakpoint-cycle enables, bit 13
-// is GD (general detect -- traps any MOV DR), bits 16-31 are the four LEN/R-W condition
+// is GD (general detect: traps any MOV DR), bits 16-31 are the four LEN/R-W condition
 // fields for DR0-DR3. Bits 10, 12, 14-15 are hardwired: 386 PRM ch12 defines bit 10 as
 // always 1; the others are reserved-as-0 here since this core does not model LE/GE cycle
 // exactness. Reset value per the PRM is 0x0000_0400 (bit 10 set, everything else clear).
@@ -804,13 +804,13 @@ pub struct ControlRegisters {
     // RDTSC outside CPL 0); the rest is plain read/write storage so MOV CR4 round-
     // trips. Reset is all zero.
     pub cr4: u32,
-    // DR0-DR3: linear breakpoint addresses (386 PRM ch12). Storage only -- no
+    // DR0-DR3: linear breakpoint addresses (386 PRM ch12). Storage only: no
     // breakpoint matching or #DB generation is implemented (ledger row 26, deferred).
     pub dr0_3: [u32; 4],
     // DR6 (debug status) and DR7 (debug control). See DR6_RESET/DR7_RESET/DR7_FIXED_ONE
     // above for the bit layout and reset values. DR4/DR5 alias these two on a 386 or on
     // any later part with CR4.DE clear (the default here, since DE is not behaviorally
-    // wired up) -- see the 0x0f21/0x0f23 handlers.
+    // wired up). See the 0x0f21/0x0f23 handlers.
     pub dr6: u32,
     pub dr7: u32,
 }
@@ -856,7 +856,7 @@ pub struct PerfCounters {
     /// Decode-cache probes made by the straight-line continuation path (`run_budgeted_inner`'s
     /// per-iteration `DecodeCache::get`). This is the execution count of the seam the dynarec
     /// refactor moves in Phase 2, and it must be byte-identical across that move on identical
-    /// runs — it is the phase's identity oracle. Accumulated in a run-local and folded once per
+    /// runs: it is the phase's identity oracle. Accumulated in a run-local and folded once per
     /// run, so the hot loop carries no per-instruction counter traffic.
     pub decode_probes: u64,
     /// Continuation-loop dispatcher consultations that DECLINED (the Direct auto-admission
@@ -866,7 +866,7 @@ pub struct PerfCounters {
     /// unaccounted out of 496M probes). On an Accurate persona, or with the Direct backend
     /// disabled, every probe falls through to an uncounted `None` before ever reaching the
     /// Direct dispatch arm, so this counter reads 0 by construction while `decode_probes`
-    /// stays large -- the ledger does not close there. Same fold-per-run discipline and
+    /// stays large: the ledger does not close there. Same fold-per-run discipline and
     /// Phase-2 identity role as `decode_probes`.
     pub jit_direct_dispatch_declines: u64,
     /// Calls to `run_budgeted` (one straight-line RUN, not one machine batch entry). A batch
@@ -896,7 +896,7 @@ pub struct PerfCounters {
     /// longer flush the decode cache: the D bit is in the hit condition and the fetch limit is
     /// re-checked per hit); `decode_inval_smc` counts SMC whole-cache flushes
     /// (`note_code_write`); `decode_inval_other` counts the CONTROL-REGISTER/TLB-flush causes
-    /// (paging/TLB flushes, A20, device DMA writes, ISA-level changes, direct-map changes) --
+    /// (paging/TLB flushes, A20, device DMA writes, ISA-level changes, direct-map changes):
     /// specifically, every wholesale teardown reached through
     /// `flush_tlb_and_code_caches`/`invalidate_translation_code_caches`. Diagnoses an
     /// invalidation storm: the Doom 586 census measured decode_hit pinned at 21% regardless of
@@ -905,7 +905,7 @@ pub struct PerfCounters {
     /// **NOT counted here** (N2): the CR3 code-cache gate's translation-page
     /// write watch (`core.rs`'s `range_hits_translation_page` arm) is a THIRD class of
     /// wholesale decode teardown, reached from an ordinary guest or native STORE with no CR3
-    /// write, no TLB flush, and no `flush_tlb_and_code_caches` call anywhere on its path -- it
+    /// write, no TLB flush, and no `flush_tlb_and_code_caches` call anywhere on its path: it
     /// bumps `translation_page_writes` and `code_invalidations` only. A census that sums
     /// `decode_inval_cs_load + decode_inval_smc + decode_inval_other` and expects the total to
     /// equal every wholesale retire will silently under-count on any workload with page-table
@@ -934,7 +934,7 @@ pub struct PerfCounters {
     /// for every write that goes through the ring-gated path (the pre-gate
     /// `flush_tlb_and_code_caches(Cr3)` entry point, kept for callers with no old/new register
     /// pair to give the ring, bumps `decode_inval_cr3` without moving either split counter, so
-    /// production traffic -- which uses only the ring-gated path -- satisfies the identity exactly
+    /// production traffic, which uses only the ring-gated path, satisfies the identity exactly
     /// while a mixed-caller run would only satisfy it as `<=`).
     pub decode_inval_cr3: u64,
     pub decode_inval_cr0: u64,
@@ -946,14 +946,14 @@ pub struct PerfCounters {
     /// or a fresh allocation into a free slot, R2) with no decode-cache teardown at all.
     pub cr3_code_flush_skipped: u64,
     /// CR3 JIT-half gate (CR3 JIT-half design): `MOV CR3` writes whose
-    /// LINK graph was served by `select_link_context` -- the `Skipped` arm, R1 or R2. Incremented
+    /// LINK graph was served by `select_link_context`: the `Skipped` arm, R1 or R2. Incremented
     /// beside `cr3_code_flush_skipped` in the same match arm, so
     /// `cr3_link_context_selects == cr3_code_flush_skipped` is true by construction and is kept
     /// as documentation rather than a check (J8); the identity with teeth is
     /// `stalls.links_cleared[Flushed]` moving only on the `Taken` arm.
     pub cr3_link_context_selects: u64,
     /// CR3 JIT-half gate: `MOV CR3` writes whose LINK graph was wholesale-retired via
-    /// `allocate_link_context` -- the `Taken` arm, R3. Same construction note as
+    /// `allocate_link_context`: the `Taken` arm, R3. Same construction note as
     /// `cr3_link_context_selects`: `cr3_link_graph_retires == cr3_code_flush_taken` by
     /// construction.
     pub cr3_link_graph_retires: u64,
@@ -999,7 +999,7 @@ pub struct PerfCounters {
     /// Mutable imm32 lanes registered at block install: one per `ADD r32, imm32` slot whose
     /// immediate is read out of guest RAM at execution instead of being baked into host code.
     pub smc_lane_registrations: u64,
-    /// Guest writes classified as a lane patch — exactly four bytes at exactly a live block's
+    /// Guest writes classified as a lane patch: exactly four bytes at exactly a live block's
     /// registered lane start. The owning block survives and contributes no SMC heat; the narrow
     /// decode-line kill still runs.
     pub smc_lane_accepts: u64,
@@ -1136,7 +1136,7 @@ pub struct PerfCounters {
     /// In `PerfCounters` rather than in the stall tally, and that is the point of them: the
     /// per-phase export is built from `PhaseMark::perf`, and the phase block carried no reject
     /// column at all, so a whole-run-only split would leave the loader-phase bars unreadable.
-    /// Counted on EVERY governor arm including OFF -- the split is unmeasured on the shipped arm
+    /// Counted on EVERY governor arm including OFF: the split is unmeasured on the shipped arm
     /// and the OFF leg is where it first reads.
     pub jit_direct_reject_data_segment_strict: u64,
     pub jit_direct_reject_data_segment_masked: u64,
@@ -1270,7 +1270,7 @@ enum PollPortSource {
 ///
 /// * `Immediate` is the `TEST AL,imm8` (`0xA8`) form. The mask is a code byte, so it is
 ///   settled at certification and the `matches!(mask, 0x01 | 0x08)` check is a
-///   code-byte fact -- a failure is `NegativeCacheable` like any other non-shape.
+///   code-byte fact: a failure is `NegativeCacheable` like any other non-shape.
 /// * `Ah` is the D1b `TEST AL,AH` (`84 E0`) form, whose mask is staged by a `MOV AH,imm8`
 ///   OUTSIDE the loop. The certifier checks the ENCODING only (opcode, len, modrm
 ///   mode/reg/rm, and a register rather than memory operand) and never reads AH, so a
@@ -1358,7 +1358,7 @@ impl PollLoop {
     /// The exact analogue of `resolved_port(cpu)`, and a COPY rather than a signature
     /// change on `fresh_iteration_spins`: `PollLoop` is `Copy`, `Found` results are never
     /// cached, and `fresh_iteration_spins`'s parameter is a STATUS BYTE rather than a
-    /// mask -- the interpreter passes a real device status there. Returning a settled
+    /// mask: the interpreter passes a real device status there. Returning a settled
     /// copy means `status_mask()`, `fresh_iteration_spins()` and `fresh_backedge_taken()`
     /// keep their meaning, and the call-out's `req.status_mask` and `spins_when_bit_set`
     /// are derived STRUCTURALLY from one value rather than from two independent
@@ -1486,7 +1486,7 @@ impl Eq for PerfCounters {}
 /// of `PerfCounters` and at the very tail of `CpuGsw` so no pre-existing
 /// field offset moves (growing `PerfCounters` shifted the hot `pending_flags`
 /// field and cost the interpreter measurable wall time; the offset pin in
-/// cpu_test.rs guards it -- see `pending_flags_offset` for the current value).
+/// cpu_test.rs guards it; see `pending_flags_offset` for the current value).
 /// Serialized into the same perf JSON keys by
 /// `perf_counters_json`. Unconditional (not cfg jit) like the other poll
 /// counters in `PerfCounters`, so non-jit consumers can name the type.
@@ -1530,7 +1530,7 @@ impl Eq for ApertureCodeFlag {}
 /// the very tail of `CpuGsw`, following the `PollSkipMemoryCounters` pattern
 /// exactly: these two fields were first added directly to `PerfCounters` and, AT THE TIME, moved
 /// the pinned `pending_flags` offset from 4512 to 4528 (the interpreter's hot-field layout pin in
-/// `cpu_test.rs`/`canonical_state_test.rs`) -- an avoidable layout confound,
+/// `cpu_test.rs`/`canonical_state_test.rs`): an avoidable layout confound,
 /// which is why they moved to the tail instead of staying in
 /// `PerfCounters`. HISTORY: the pin has since moved again (unrelated later changes to
 /// `PerfCounters`/`CpuGsw`); see the pin tests for the current value, not this comment. At the
@@ -1544,8 +1544,8 @@ pub struct FastMapProbeCounters {
     pub hits: u64,
     /// Interpreter direct data accesses that probed the FastMap (`self.fast_map_serve_enabled`
     /// was true) and missed, falling through to the canonical translate/direct-page-cache path
-    /// unchanged. A guaranteed-miss access -- JIT off, or the current persona/admission state
-    /// disables population -- never reaches this counter at all (see
+    /// unchanged. A guaranteed-miss access (JIT off, or the current persona/admission state
+    /// disables population) never reaches this counter at all (see
     /// `CpuGsw::fast_map_serve_enabled`), so it is not "every miss ever", only misses that were
     /// actually probed against a serve-enabled map.
     pub misses: u64,
@@ -1579,7 +1579,7 @@ fn slot_census_default() -> bool {
 }
 
 /// Gate for the slow-read page histogram (`IZARRAVM_SLOW_READ_HISTO=1`). Cached like
-/// `rmw_census_default`, and read ONCE at CPU construction rather than per access -- the per-access
+/// `rmw_census_default`, and read ONCE at CPU construction rather than per access: the per-access
 /// gate is the `Option`'s null test on the slot below, which is the same one relaxed load.
 fn slow_read_histo_default() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1592,15 +1592,15 @@ fn slow_read_histo_default() -> bool {
 ///
 /// The diagnostic behind the wolf3d-586 measurement results (N2): that fixture's demo phase
 /// takes 957.8 M `data_slow_reads` against 17.3 M direct ones, one for one with
-/// `jit_direct_exit_cross_page_or_alignment`, and the two candidate causes -- the mode-Y VGA
+/// `jit_direct_exit_cross_page_or_alignment`, and the two candidate causes (the mode-Y VGA
 /// aperture, which `ram_lookup_page_is_direct` refuses by design, and UMB/EMS RAM the same range
-/// test refuses by accident -- need completely different slices. Only the page split separates
+/// test refuses by accident) need completely different slices. Only the page split separates
 /// them, and nothing in the profile carried it.
 ///
 /// A `HashMap` on a path that already went to the bus is the right cost: the instrument is OFF by
 /// default and the null test on THIS SLOT is the last conjunct at both call sites, so a default
-/// run pays it only on a read that already missed the direct path -- 1,371,552,807 of the
-/// 2,769,793,893 reads reaching those sites on wolf3d-586 -- and never a call. See
+/// run pays it only on a read that already missed the direct path (1,371,552,807 of the
+/// 2,769,793,893 reads reaching those sites on wolf3d-586) and never a call. See
 /// `CpuGsw::slow_read_histo_armed`, whose doc comment owns that ordering rule: it MUST be the last
 /// conjunct, and a call site that hoists it in front of `read.direct` puts this load back on every
 /// direct read. Non-architectural: excluded from CPU equality and cloned off, exactly like
@@ -1608,8 +1608,8 @@ fn slow_read_histo_default() -> bool {
 ///
 /// The `Box` is deliberate for the same reason `smc_trace` boxes its slot: this slot
 /// lives on `CpuGsw`, whose field layout the hot paths depend on (see `FastMapProbeCounters` and
-/// `rmw_census_enabled`), and an inline `Option<SlowReadTally>` would put the whole tally -- a
-/// `HashMap` plus two `u64`s, about 64 bytes -- of a default-OFF diagnostic in that struct where a
+/// `rmw_census_enabled`), and an inline `Option<SlowReadTally>` would put the whole tally (a
+/// `HashMap` plus two `u64`s, about 64 bytes) of a default-OFF diagnostic in that struct where a
 /// nullable pointer needs eight. The armed case pays one extra allocation, once.
 #[derive(Default)]
 pub(crate) struct SlowReadHisto(pub(crate) Option<Box<SlowReadTally>>);
@@ -1617,8 +1617,8 @@ pub(crate) struct SlowReadHisto(pub(crate) Option<Box<SlowReadTally>>);
 /// What an armed [`SlowReadHisto`] accumulates.
 ///
 /// The alignment split is not decoration, and it is the field that turned N2 around. The JIT-side
-/// counter this instrument shadows is `jit_direct_exit_cross_page_or_alignment` -- ONE counter for
-/// two unrelated causes -- and on the machine bus `direct_page_ram_bytes` refuses an access for
+/// counter this instrument shadows is `jit_direct_exit_cross_page_or_alignment` (ONE counter for
+/// two unrelated causes) and on the machine bus `direct_page_ram_bytes` refuses an access for
 /// either `should_split` (a word at an odd address, a dword off a multiple of four) or a page
 /// crossing, before `ram_lookup_page_is_direct` is even consulted. A page table alone therefore
 /// cannot distinguish "this REGION is not direct RAM" from "this ACCESS is not naturally aligned",
@@ -1676,13 +1676,13 @@ impl std::fmt::Debug for SlowReadHisto {
 /// The `wipes_*` half is always on. Every one of them sits on a cold path that already does a
 /// whole-map wipe (a 1 MiB memset plus two direct-page-cache invalidations), so one increment is
 /// unmeasurable beside it. They exist because `PerfCounters::direct_map_invalidations` counts
-/// only TWO of the five call sites that actually wipe `jit_fast_map` -- it is an undercount, not
+/// only TWO of the five call sites that actually wipe `jit_fast_map`: it is an undercount, not
 /// a wipe total, and nothing before this instrument said so.
 ///
 /// The `census_*` half is gated at the call site on `census_enabled`, following the
 /// `barrier_census_active` pattern: the interpreter's per-access data path must not pay for a
 /// disabled instrument. It answers "how often does one guest instruction need BOTH the read and
-/// the write bias for the SAME linear page" -- the only access shape an interleaved
+/// the write bias for the SAME linear page": the only access shape an interleaved
 /// read+write FastMap entry would help, since interleaving halves page density (8 pages per
 /// cache line to 4) for every access that needs only one of the two.
 #[derive(Debug, Clone, Copy)]
@@ -1707,14 +1707,14 @@ pub struct FastMapAuditCounters {
     ///
     /// Counts LIVENESS, not registry membership, so an entry an INVLPG or the aperture sweep
     /// already cleared is not charged again. `wipes_direct_data_map` is deliberately NOT summed in
-    /// here -- see `wipe_aperture_pages_cleared` -- so that each counter divides by its own cause.
+    /// here (see `wipe_aperture_pages_cleared`) so that each counter divides by its own cause.
     pub wipe_pages_cleared: u64,
     /// The subset of `wipe_pages_cleared` backed by the direct VGA aperture. The remainder is the
     /// RAM a scoped invalidation keeps and a whole-map wipe does not.
     pub wipe_vga_pages_cleared: u64,
     /// Live aperture entries discarded by the SCOPED sweep in `note_direct_data_map_changed`.
     /// Divided by `wipes_direct_data_map` this is the average number of `0xA0000..0xAFFFF` pages
-    /// resident when the VGA direct-write token moves -- the part of a token move that is real work
+    /// resident when the VGA direct-write token moves: the part of a token move that is real work
     /// and cannot be scoped away, since those host pointers genuinely re-point.
     pub wipe_aperture_pages_cleared: u64,
     /// Interpreter page-local data reads seen by the census. One per emitted-equivalent FastMap
@@ -1729,7 +1729,7 @@ pub struct FastMapAuditCounters {
     pub census_rmw_pairs: u64,
     /// Whether the census half is armed. Read from `IZARRAVM_RMW_CENSUS` once per process.
     pub census_enabled: bool,
-    /// FastMap slot rejections attributed to the alignment clause ALONE -- the access is page-local
+    /// FastMap slot rejections attributed to the alignment clause ALONE: the access is page-local
     /// and would otherwise have been served. This is the population the interpreter data-path
     /// slice targets, and it is cross-checked against `data_slow_reads`, NOT against
     /// `interp_fast_map_misses`: `call_out_stack_frame_resident` calls `lookup_access` directly
@@ -1743,10 +1743,10 @@ pub struct FastMapAuditCounters {
     /// caller is `read/write_paged_cross_page`, which by construction hands it page-LOCAL
     /// fragments, so it can never reject on this clause. The counter is therefore an exact census
     /// of crossing sized accesses, which is what makes it the measure of the 1 + N probe cost the
-    /// reorder introduced -- and the reason to keep it after the alignment counters go.
+    /// reorder introduced, and the reason to keep it after the alignment counters go.
     pub slot_reject_page_cross: u64,
     /// Rejections attributed to no storage, a dead page, an uncommitted bias, or an unavailable
-    /// physical page -- the ordinary cold miss.
+    /// physical page: the ordinary cold miss.
     pub slot_reject_absent: u64,
     /// Rejections attributed to a stale `mapping_epochs[index]`. Identically zero here is B2b's
     /// gate: it is what says the interpreter may later read the one-word load bias instead of
@@ -1861,13 +1861,13 @@ impl Eq for FastMapAuditCounters {}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodeWatchEdgeCounters {
     /// Sticky decode watch: new precise or coarse page entries. On doom this counts once per
-    /// page per decode generation — the churn the design's E1 skip rule exists to absorb.
+    /// page per decode generation, the churn the design's E1 skip rule exists to absorb.
     pub sticky_page_edges: u64,
     /// Block watch: `active_chunks` 0 -> nonzero transitions (fresh page or inactive-page
     /// reactivation). Refcounted re-acquires on an active page do not count.
     pub block_page_edges: u64,
     /// Block watch: `active_chunks` reaching zero via `release_range` (whole-cache `clear()` is
-    /// deliberately not counted — it is a separate, rarer event with its own counters).
+    /// deliberately not counted: it is a separate, rarer event with its own counters).
     pub block_page_releases: u64,
     /// Fast-map entries the strict-edge sweeps invalidated, both watches summed. Well below the
     /// edge counts when the lazy-edge design is working (bits stay set, sweeps find nothing).
@@ -1921,7 +1921,7 @@ pub struct DirectBarrierCensusRow {
     /// ranking key; `hits` below is compile attempts and must not be used for prioritisation.
     pub unbound_exits: u64,
     /// The DYNAMIC-lane counterpart: computed RET/JMP/CALL targets whose inline cache missed
-    /// into a block this barrier rejected. A row's cost is the two columns together — the static
+    /// into a block this barrier rejected. A row's cost is the two columns together: the static
     /// column alone under-priced the row Slice 4 lowered by 65%.
     pub dynamic_unbound_exits: u64,
     pub opcode: u16,
@@ -1952,7 +1952,7 @@ pub struct DirectBarrierCensusRow {
 /// One block entry parked `Dormant(SpanHot)` by the G1 SMC-heat gate, with the lane-match answer
 /// for the compile walks that started there.
 ///
-/// WALK, not TRIAL, throughout — the two are different mechanisms and conflating them misreads
+/// WALK, not TRIAL, throughout: the two are different mechanisms and conflating them misreads
 /// the column. A `lane trial` is the heat gate's one-per-key-per-epoch exception, which installs
 /// only if the compilation registered a mutable lane. A `compile walk` is any pass of
 /// `compile_with_instruction_limit` from this entry, trial or ordinary. What this record observes
@@ -1960,20 +1960,20 @@ pub struct DirectBarrierCensusRow {
 ///
 /// The three booleans are the §B.4 test:
 ///
-/// * `compile_walked == false` — no walk ever started from this entry. Widening the lane class
+/// * `compile_walked == false`: no walk ever started from this entry. Widening the lane class
 ///   cannot be shown to help this site, because nothing here has ever been offered to a lane
 ///   matcher. See the field's own doc for why this is a WEAK negative.
-/// * `compile_walked && !imm_lane_matched && !disp_lane_matched` — a walk ran and no lane matcher
+/// * `compile_walked && !imm_lane_matched && !disp_lane_matched`: a walk ran and no lane matcher
 ///   fired on any of its slots. THIS is the population the "one-byte imm lane class" slice would
 ///   convert, and its size against the whole is what confirms or refutes the hypothesis that the
 ///   5.1M uncovered one-byte-imm patch events are what the failing lane trials are made of.
-/// * either lane bit set — a lane did match here, so the site's demotions are not a lane-coverage
+/// * either lane bit set: a lane did match here, so the site's demotions are not a lane-coverage
 ///   problem at all.
 #[cfg(feature = "barrier-census-closure")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DirectDormantHeatSite {
     /// Block entry linear. Keyed on linear alone, so two dormant spans sharing a linear across
-    /// mode or physical merge — the same caveat the rejected-span map carries.
+    /// mode or physical merge: the same caveat the rejected-span map carries.
     pub linear: u32,
     /// Static-lane exits that landed on this dormant key.
     pub static_exits: u64,
@@ -1982,7 +1982,7 @@ pub struct DirectDormantHeatSite {
     /// A compile walk started from this entry at least once WHILE THE CENSUS WAS ARMED.
     ///
     /// A ONE-SIDED reading only. `true` is sound: a walk really did run. `false` is NOT proof that
-    /// no walk ever ran, and the reason is the same arming caveat `static_unbound_exits` carries —
+    /// no walk ever ran, and the reason is the same arming caveat `static_unbound_exits` carries:
     /// `enable_direct_barrier_census` can arm mid-run, and `barrier_census_default` only arms at
     /// process start when `IZARRAVM_DIRECT_BARRIER_CENSUS=1`. Every walk before the arm is
     /// invisible, so a site walked only during warm-up reads `false` forever. `JitState::clone`
@@ -2011,20 +2011,20 @@ pub struct DirectBarrierCensusSnapshot {
     /// not name it, which is a capacity answer; anything else means it does not exist yet, which
     /// is a compilation answer. Nothing distinguished the two before.
     pub dynamic_miss_targets: Vec<(&'static str, u64)>,
-    /// Sum of `unbound_targets` — what the census believes it classified on the static lane.
+    /// Sum of `unbound_targets`: what the census believes it classified on the static lane.
     ///
     /// Carried so the run-total identity `classified_static == static_unbound_exits` is readable
     /// inside ONE object instead of by subtracting across two JSON blocks by hand.
     #[cfg(feature = "barrier-census-closure")]
     pub classified_static: u64,
-    /// `PerfCounters::jit_direct_unresolved_static_unbound`, re-emitted here — NOT a new perf key.
+    /// `PerfCounters::jit_direct_unresolved_static_unbound`, re-emitted here, NOT a new perf key.
     ///
     /// Populated at `CpuGsw::direct_barrier_census_snapshot`, the only seam that owns both the
     /// census (on `JitState`) and the counters. It reads zero out of `DirectBarrierCensus`.
     ///
     /// The identity holds only when the census is armed at process start via
     /// `IZARRAVM_DIRECT_BARRIER_CENSUS=1`. `enable_direct_barrier_census` can arm mid-run, and
-    /// then the difference is exactly the pre-arm exits rather than a classifier defect — check
+    /// then the difference is exactly the pre-arm exits rather than a classifier defect. Check
     /// the arm before suspecting the classes.
     ///
     /// Two further ways the two sides can part company, both by construction:
@@ -2048,7 +2048,7 @@ pub struct DirectBarrierCensusSnapshot {
     /// The dynamic-lane twin.
     #[cfg(feature = "barrier-census-closure")]
     pub dynamic_rejected_unattributed: u64,
-    /// Rejections that displaced an existing entry in the linear-keyed rejected-span map — the
+    /// Rejections that displaced an existing entry in the linear-keyed rejected-span map: the
     /// honest signal for stale-hit mis-attribution, which neither residual above can detect.
     #[cfg(feature = "barrier-census-closure")]
     pub rejected_barrier_overwrites: u64,
@@ -2056,7 +2056,7 @@ pub struct DirectBarrierCensusSnapshot {
     ///
     /// The census records addresses for the `Rejected` class alone, so the 141.7M `dormant_heat`
     /// exits on duke3d-486 (35.7% of the static-unbound population, 45.5% at 586) could not be
-    /// told apart as fifty sites or fifty thousand — and the Track B fork between a targeted lane
+    /// told apart as fifty sites or fifty thousand, and the Track B fork between a targeted lane
     /// class and a policy-parameter sweep turns on exactly that. This is the instrument that comes
     /// before the knob.
     #[cfg(feature = "barrier-census-closure")]
@@ -2077,7 +2077,7 @@ pub struct DirectBarrierCensusSnapshot {
     /// `sum(rejected_sites.static_exits) + rejected_truncated_static` equals the `rejected` entry
     /// of `unbound_targets` exactly, at any head size.
     ///
-    /// It locates the largest pool on the board that still has no addresses — 33.64% of
+    /// It locates the largest pool on the board that still has no addresses: 33.64% of
     /// duke-586's static-unbound exits and 40.1% of duke-486's. `rejected_barrier` already
     /// attributes those exits to an opcode SHAPE and carries a residual when it cannot; this says
     /// how many distinct ADDRESSES the class covers, which is the question that decided the
@@ -2104,8 +2104,8 @@ pub struct DirectBarrierCensusSnapshot {
     /// How many distinct block entries a compile walk started from ANYWHERE IN THE RUN, which is
     /// the set the per-site `compile_walked` column is looked up in.
     ///
-    /// RUN-WIDE and named so. It counts every entry the backend ever walked — overwhelmingly
-    /// ordinary, never-dormant, successfully-compiled blocks — so it is a SUPERSET of the walked
+    /// RUN-WIDE and named so. It counts every entry the backend ever walked: overwhelmingly
+    /// ordinary, never-dormant, successfully-compiled blocks, so it is a SUPERSET of the walked
     /// dormant-heat sites and shares no denominator with `dormant_heat_distinct_sites`. Ratioing
     /// the two produces a number that means nothing; the walked share of dormant-heat sites is
     /// `dormant_heat_sites.iter().filter(|s| s.compile_walked).count()`, computed over the head.
@@ -2121,8 +2121,8 @@ pub struct DirectBarrierCensusSnapshot {
     /// not include every route that can return to the interpreter.
     pub admission_declines: Vec<(&'static str, u64)>,
     /// Per-reason split of `RetryCause::AdmissionMatrix`, as (label, count). The cause has TWO
-    /// producers -- `stack_width_kind`'s 2x2 admission matrix, and the `control_target`/
-    /// `segment_access` check that runs after it in the compile walk -- and this is the
+    /// producers: `stack_width_kind`'s 2x2 admission matrix, and the `control_target`/
+    /// `segment_access` check that runs after it in the compile walk, and this is the
     /// instrument that tells them apart (Descent 2 L1 stack-width
     /// design §0(c), §2(H)). Recorded only on the
     /// full-length compile pass, the same gate the word-control counters use, so binary-search
@@ -2219,13 +2219,13 @@ pub struct DirectCallOutAttributionSnapshot {
 }
 
 /// Every Direct call-out helper's attribution label, in `CallOutHelper::attribution_index`
-/// order -- which is the order `DirectCallOutAttributionSnapshot::helpers` is built in and the
+/// order, which is the order `DirectCallOutAttributionSnapshot::helpers` is built in and the
 /// order the `izarravm` JSON writer emits.
 ///
 /// THE SINGLE SOURCE. This list used to exist three times: as a literal inside `snapshot`, as
 /// a second exhaustive match (`attribution_label`, now deleted), and again as
-/// `expected_helpers` in `izarravm`'s writer. It went stale twice -- once when the fourth
-/// helper landed, once across both port-imm8 helpers -- and each staleness aborted an armed
+/// `expected_helpers` in `izarravm`'s writer. It went stale twice (once when the fourth
+/// helper landed, once across both port-imm8 helpers) and each staleness aborted an armed
 /// fixture run rather than a test, because nothing drove the writer with live output. The
 /// array's length is `HELPER_COUNT`, so a seventh helper is a COMPILE error here, not a
 /// runtime one on a two-hundred-second fixture.
@@ -2273,20 +2273,20 @@ pub struct DirectSmcCensusUnits {
     /// elide these too, so `keys_no_kill` alone understates the waste.
     pub keys_surviving_in_kill_calls: u64,
 
-    // Phase (a) / (a') — the `physical_keys` remove-then-insert round trip.
+    // Phase (a) / (a'): the `physical_keys` remove-then-insert round trip.
     pub page_visits: u64,
     pub page_removes: u64,
     pub page_absent: u64,
     pub page_reinserts: u64,
     pub page_dropped_empty: u64,
 
-    // Phase (b) — the two `partition_point`s. M10: BOTH the per-call window
+    // Phase (b): the two `partition_point`s. M10: BOTH the per-call window
     // occupancy and the page key count, or the binary-search question is unanswerable.
     pub window_searches: u64,
     pub page_keys_len_sum: u64,
     pub window_len_sum: u64,
 
-    // Phase (c) — the key scan.
+    // Phase (c): the key scan.
     pub keys_scanned: u64,
     pub entries_get_misses: u64,
     pub keys_killed: u64,
@@ -2306,7 +2306,7 @@ pub struct DirectSmcCensusUnits {
     /// STOP rather than a tuning input.
     ///
     /// Costs the very `entries` probe the pre-filter exists to avoid, once per elided row, so a
-    /// census-armed arm CANNOT be read for the slice's wall effect -- only for its mechanism.
+    /// census-armed arm CANNOT be read for the slice's wall effect, only for its mechanism.
     /// Grade the wall on plain builds, as the campaign's standing rule already says.
     pub probe_divergences: u64,
     /// Leaked `Seen`/`Dormant` rows that reached the scan's point-key arm. MUST read zero after
@@ -2314,19 +2314,19 @@ pub struct DirectSmcCensusUnits {
     /// probe that still files). STOP, same class as `entries_get_misses > 0`.
     pub point_rows_scanned: u64,
 
-    // Phase (d) — survivor compaction and drain.
+    // Phase (d): survivor compaction and drain.
     pub survivors_moved: u64,
     pub drain_calls: u64,
     pub drain_elements: u64,
 
-    // Phase (e) — `remove_waiting_sources`, which retains over the WHOLE waiting map and runs
+    // Phase (e): `remove_waiting_sources`, which retains over the WHOLE waiting map and runs
     // twice per effective unlink.
     pub waiting_retain_calls: u64,
     pub waiting_map_len_sum: u64,
     pub waiting_sources_visited: u64,
     pub waiting_entries_dropped: u64,
 
-    // Phase (f) — retirement work OUTSIDE `remove_waiting_sources` (M8: (e) and
+    // Phase (f): retirement work OUTSIDE `remove_waiting_sources` (M8: (e) and
     // (f) nest, so these rows are disjoint by construction and R6 may add them).
     pub retire_calls: u64,
     pub retire_calls_effective: u64,
@@ -2349,7 +2349,7 @@ pub struct DirectSmcCensusPageCounts {
     pub keys_killed: u64,
     pub keys_surviving: u64,
     pub lane_accepts: u64,
-    /// Page visits whose key scan killed nothing — Q2's per-page question, which the per-call
+    /// Page visits whose key scan killed nothing: Q2's per-page question, which the per-call
     /// split cannot answer because one call can span two pages and kill on only one of them.
     pub no_kill_visits: u64,
     pub page_keys_len_sum: u64,
@@ -2508,7 +2508,7 @@ pub struct DirectStallSnapshot {
     pub ss_load_changed_record: u64,
     /// (label, count) per `LinkRefusal`.
     pub link_refusals: Vec<(&'static str, u64)>,
-    /// (label, count) per `LinkClearCause` — the cause split behind the aggregate
+    /// (label, count) per `LinkClearCause`: the cause split behind the aggregate
     /// `PerfCounters::jit_direct_links_cleared`, which is fed independently and must equal the
     /// sum of these three.
     pub links_cleared: Vec<(&'static str, u64)>,
@@ -2596,7 +2596,7 @@ pub struct DirectStallSnapshot {
     pub heat_demote_trial_spent: u64,
     pub heat_demote_trial_spent_earned: u64,
     /// Task 0's census-gated half: the head-cluster split, the span-gate demote split, and the
-    /// park-length pair. See `DirectStallTally` — the park mean is a LOWER bound and is read with
+    /// park-length pair. See `DirectStallTally`: the park mean is a LOWER bound and is read with
     /// its censoring rate.
     #[cfg(feature = "direct-admission-census")]
     pub heat_demote_trial_spent_earned_head3: u64,
@@ -2608,7 +2608,7 @@ pub struct DirectStallSnapshot {
     pub dormant_heat_park_epochs: u64,
     #[cfg(feature = "direct-admission-census")]
     pub park_lifts: u64,
-    /// Displacement lanes registered at install — the disp share of
+    /// Displacement lanes registered at install: the disp share of
     /// `PerfCounters::smc_lane_registrations`. See `DirectStallTally`.
     pub disp_lane_registrations: u64,
     /// One-byte imm lanes (`0x80 /r`) registered at install, the imm8 share of the aggregate
@@ -2626,8 +2626,8 @@ pub struct DirectStallSnapshot {
     pub disp_load_widen_lane_registrations: u64,
     /// Jcc terminators lowered against the RBP EFLAGS shadow in the blocks this run INSTALLED, by
     /// emission class (`IZARRAVM_JCC_SHADOW`, DEFAULT OFF, so all four are zero on a shipped
-    /// binary). Their job on a ladder leg is the ARM VACUITY check -- a zero ON arm means the leg
-    /// never exported the knob -- and the arena byte delta, which weights the four classes at
+    /// binary). Their job on a ladder leg is the ARM VACUITY check (a zero ON arm means the leg
+    /// never exported the knob) and the arena byte delta, which weights the four classes at
     /// -6 / -4 / 0 / +5 bytes each. They say NOTHING about executed volume. See
     /// `DirectStallTally::jcc_sites_simple`.
     pub jcc_sites_simple: u64,
@@ -2664,7 +2664,7 @@ pub struct DirectStallSnapshot {
     pub far_ret_native: u64,
     /// L8's sibling of `far_ret_native`: the far-CALL ledger. Served from the live
     /// `CpuGsw::far_call_ledger` cell by `CpuGsw::direct_stall_snapshot` (`core.rs`), not from
-    /// `DirectStallTally` -- see `far_call_ledger_offset`'s own doc for why the counter moved
+    /// `DirectStallTally`. See `far_call_ledger_offset`'s own doc for why the counter moved
     /// out of the JIT frame and out of this tally in the 2026-09-01 reprice.
     pub far_call_native: u64,
     /// Stage 0 §5.0c. See `DirectStallTally::blocks_installed_baking_cs`.
@@ -2683,8 +2683,8 @@ pub struct DirectStallSnapshot {
     pub data_segment_link_declines: u64,
     /// First cap hit that rewrites the key as live-data. Zero on the OFF arm.
     pub data_segment_live_promotions: u64,
-    /// Slice (a)'s missing census: how many DISTINCT live descriptor tuples -- masked by the
-    /// rejecting arm's own mask -- each key in the cap map has been rejected against. Index is
+    /// Slice (a)'s missing census: how many DISTINCT live descriptor tuples, masked by the
+    /// rejecting arm's own mask, each key in the cap map has been rejected against. Index is
     /// the distinct count; the last cell counts keys whose census SATURATED and must be read as
     /// "at least 8" rather than exactly 8. Read off the live map, so a key dropped by an
     /// invalidation takes its census with it.
@@ -2702,7 +2702,7 @@ pub struct DirectStallSnapshot {
     /// Always on rather than census-gated, deliberately, against the standing "default-off
     /// instruments tax the hot path" rule: one `u64` increment sits on a path that just saved the
     /// whole admission chain, and a census-gated counter would leave the WALL build unable to say
-    /// whether the memo fired at all — exactly the vacuity trap the campaign keeps paying for.
+    /// whether the memo fired at all, exactly the vacuity trap the campaign keeps paying for.
     pub decline_memo_hits: u64,
     pub decline_memo_advances: u64,
     pub decline_memo_sweeps: u64,
@@ -2722,8 +2722,8 @@ pub struct DirectStallSnapshot {
     pub poll_declined_eligibility: u64,
     /// A 16-bit code segment can never certify a shape (every shape is
     /// 32-bit; `poll_head_possible` requires `d`), so the call-out screens
-    /// it out BEFORE the scan. Tyrian 2000 paid 1.5e9 doomed scans -- ~80%
-    /// of its wall -- before this lane existed (2026-08-29).
+    /// it out BEFORE the scan. Tyrian 2000 paid 1.5e9 doomed scans (~80%
+    /// of its wall) before this lane existed (2026-08-29).
     pub poll_declined_sixteen_bit: u64,
     pub poll_declined_shape: u64,
     pub poll_declined_cap: u64,
@@ -2885,7 +2885,7 @@ impl PartialEq for DirectRuntimeState {
 /// this flag can legitimately differ between two otherwise-architecturally-identical CPUs) and
 /// reset to `false` on clone rather than copied, so a clone starts cold and gets its real value
 /// from whichever call site next runs `refresh_fast_map_serve_gate` (`set_mode`,
-/// `finish_direct_execution_transition`, etc.) -- never a stale copy of the source CPU's value.
+/// `finish_direct_execution_transition`, etc.), never a stale copy of the source CPU's value.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -2974,8 +2974,8 @@ impl Eq for FaultSite {}
 
 /// L8's far-CALL ledger, moved OUT of the JIT stack frame (2026-09-01 reprice).
 ///
-/// Emitted `CallFar16` code increments this cell through R15 -- the same pointer it already
-/// writes CS and the guest GPRs through -- so the ledger costs one load/add/store per RETIRED
+/// Emitted `CallFar16` code increments this cell through R15 (the same pointer it already
+/// writes CS and the guest GPRs through), so the ledger costs one load/add/store per RETIRED
 /// far call and NOTHING per block entry. The frame slot it replaces (`STACK_FAR_CALL_NATIVE`)
 /// cost a prologue zero on every entry and an `emit_return` copy on every exit, and grew
 /// `BASE_STACK_LEN` from 160 to 176; duke3d-586 makes ~384 M entries and ~a few thousand far
@@ -3022,7 +3022,7 @@ pub(crate) struct RetireGates {
     /// same shape as `diff_trace` above. `on_clock_charge`'s
     /// seven (now six) call sites in `run.rs`'s interpreted-retire tails were
     /// each paying `armed()`'s `OnceLock` init check plus a relaxed atomic load
-    /// on EVERY retired instruction under the feature -- two atomic loads and
+    /// on EVERY retired instruction under the feature: two atomic loads and
     /// two branches, not the one predictable branch `barrier_census` two lines
     /// below already gets. Checking this cached field at the call site instead
     /// costs one predictable branch and, when clear, no cross-module call at
@@ -3102,7 +3102,7 @@ pub struct CpuGsw {
     /// it and no stale value can be read. See
     /// `check_io_permission_charging`, the one family wired up.
     pending_faulting_class: Option<timing_class::TimingClass>,
-    /// The class a far transfer's DESCRIPTOR earns -- gate, TSS or plain
+    /// The class a far transfer's DESCRIPTOR earns: gate, TSS or plain
     /// protected-mode segment. Written by `far_system_transfer`, which is the
     /// only place the descriptor type is known, and taken by the `0x9a` /
     /// `0xea` / `0xca` / `0xcb` charge sites. `None` means a real-mode transfer.
@@ -3229,11 +3229,11 @@ pub struct CpuGsw {
     /// layout reason `FastMapProbeCounters` documents. See `SlowReadHisto`.
     slow_read_histo: SlowReadHisto,
     /// Current privilege level. Per the 386 PRM, CPL is a *cached* quantity carried in
-    /// (the hidden part of) CS, updated only at defined transition points -- it is not a
+    /// (the hidden part of) CS, updated only at defined transition points: it is not a
     /// live formula over the current CS selector. Updated at: real mode / PE clear (0);
     /// far JMP/CALL/RETF/IRET same- and inter-privilege transfers; call/task gates and
     /// `task_switch` (to the target DPL); IRET-into-V86 (3); `deliver_exception` (to the
-    /// gate's target level, before the frame-push sequence begins -- see that function);
+    /// gate's target level, before the frame-push sequence begins, see that function);
     /// reset (0). `current_privilege_level` returns this field directly;
     /// see that method for why a live `CS.selector & 3` read is wrong during exception
     /// delivery out of a V86 source (the source CS can carry arbitrary low bits before
@@ -3252,12 +3252,12 @@ pub struct CpuGsw {
     /// must not move `pending_flags` off its pinned offset. See `FarCallLedger`.
     pub(crate) far_call_ledger: FarCallLedger,
     /// Cached mirror of `fast_map_population_enabled()`, refreshed at every state change that
-    /// predicate depends on (`set_mode`, `finish_direct_execution_transition` -- see
+    /// predicate depends on (`set_mode`, `finish_direct_execution_transition`; see
     /// `memory.rs::refresh_fast_map_serve_gate` for the exact call-site inventory). The
     /// interpreter's FastMap serve path gates on this instead of re-deriving the condition (four
     /// predicate calls) or testing `FastMap::has_storage()` (which stays `true` forever once any
     /// population has ever happened, including across a live GSW mode switch into a persona that
-    /// can never repopulate -- see the lever-1 campaign log for the regression that produced this
+    /// can never repopulate. See the lever-1 campaign log for the regression that produced this
     /// field). At the `CpuGsw` tail rather than added to `PerfCounters`, for the same layout
     /// reason as `FastMapProbeCounters` below. See `FastMapServeGate` for why it is a wrapper
     /// struct rather than a plain `bool`: it must be excluded from CPU equality and reset (not
@@ -3278,7 +3278,7 @@ pub struct CpuGsw {
     /// Exact, not approximate: it is cleared by `begin_instruction` in the same breath as
     /// `written_count` / `written_pages_overflow`, so a match can only mean the page was recorded
     /// during THIS instruction and is therefore still present in `written_pages` (nothing removes
-    /// an entry mid-instruction) -- or that the array had already overflowed on it, in which case
+    /// an entry mid-instruction), or that the array had already overflowed on it, in which case
     /// `written_pages_overflow` is already set and re-setting it is a no-op. Either way the
     /// skipped work is work that would have changed nothing.
     ///
@@ -3289,12 +3289,12 @@ pub struct CpuGsw {
     /// byte. This is the only part of the instrument the interpreter's per-access path reads, and
     /// reading it through the box would cost a second dependent load on 1.9 G doom accesses for
     /// an instrument that is off. A `bool` is one byte of alignment 1 and lands in an existing
-    /// padding hole, so it leaves `pending_flags` on its pin -- measured, not assumed.
+    /// padding hole, so it leaves `pending_flags` on its pin, measured, not assumed.
     /// The N5 census gate, and the ONLY part of that instrument with a `CpuGsw` field: it is what
     /// the interpreter's per-access path reads, and reaching it through `jit_direct` (where the
     /// counters live) would cost a dependent load on 1.9 G doom accesses for an instrument that is
     /// off. A `bool` is one byte of alignment 1 and lands in an existing padding hole, so it
-    /// leaves `pending_flags` on its pinned offset -- measured, not assumed. The counters
+    /// leaves `pending_flags` on its pinned offset, measured, not assumed. The counters
     /// themselves are `JitState::fast_map_audit`; see that field for why they are not here.
     rmw_census_enabled: bool,
     /// The slot-reject census gate. Same shape and same reasoning as `rmw_census_enabled`
@@ -3304,14 +3304,14 @@ pub struct CpuGsw {
     /// an instrument that is off on every default run.
     ///
     /// It must be the FIRST conjunct at its call site, with the callee `#[cold] #[inline(never)]`:
-    /// a gate INSIDE the callee still pays for the call. That ordering is not a style preference
-    /// -- a disarmed histogram whose conjunction was written the other way cost +2.2% wall on
+    /// a gate INSIDE the callee still pays for the call. That ordering is not a style preference:
+    /// a disarmed histogram whose conjunction was written the other way cost +2.2% wall on
     /// duke3d-486, and this instrument's disarm was gated on an interleaved A/B/B/A before the
     /// behavioural steps that consume it were allowed to land.
     slot_census_enabled: bool,
     /// Slice1's reflected-call memo journal gate (slice1 plan
     /// Revision 2, section 7.1 / decision 13.3 reversed): a SEPARATE bool from
-    /// `rmw_census_enabled` above, on purpose -- folding it into that gate's recompute would be a
+    /// `rmw_census_enabled` above, on purpose: folding it into that gate's recompute would be a
     /// correctness trap (a missed recompute on a fold drops
     /// journal entries silently, which makes a learned memo unsound rather than merely inert).
     /// One never-taken branch per journal seam when the knob is off, same shape as
@@ -3607,7 +3607,7 @@ enum DecodedOperand {
 /// Which decode/execute path an opcode takes. This is the SINGLE source of truth for routing:
 /// `route_group` classifies an opcode once, and both `decode` (to decide what to pre-parse) and
 /// `execute_decoded` (to decide how to execute) match on the same `DecodeGroup` value. Never
-/// re-derive a routing predicate inline in either function — a one-sided edit would have `decode`
+/// re-derive a routing predicate inline in either function: a one-sided edit would have `decode`
 /// parse a ModRM the executor never consumes (or make a `.expect()` panic).
 ///
 /// Extension pattern for the remaining group-conversion tasks: add ONE variant here, ONE arm in
@@ -3617,9 +3617,9 @@ enum DecodedOperand {
 /// For a two-byte (0F) group there are two extra rules, both because `decode` already folded the
 /// second byte into `insn.opcode` as 0x0F00 | second (see the "two-byte (0F) decode convention"
 /// block in `decode`): (a) the execute arm MUST dispatch off the full `insn.opcode` (u16) BEFORE
-/// any `as u8` narrowing — `0x0Fb6` narrows to `0xb6` and would alias a single-byte opcode (see the
+/// any `as u8` narrowing: `0x0Fb6` narrows to `0xb6` and would alias a single-byte opcode (see the
 /// aliasing note in `execute_datamove_decoded`); and (b) the execute arm must NOT re-read the
-/// second byte and must NOT re-apply the ISA gate — both already happened once in `decode`.
+/// second byte and must NOT re-apply the ISA gate: both already happened once in `decode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeGroup {
     /// The ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across forms 0-5
@@ -3644,13 +3644,13 @@ enum DecodeGroup {
     /// `decode` parses the ModRM + addressing descriptor and then the immediate IF this opcode
     /// carries one: group 1 always (imm8 for 0x80/0x82, imm16/32 for 0x81, sign-extended imm8
     /// for 0x83), group 2's count-by-imm8 forms (0xc0/0xc1) always, but group 3's immediate is
-    /// present ONLY for the TEST sub-op (`reg <= 1`) — NOT/NEG/MUL/IMUL/DIV/IDIV have none, so
+    /// present ONLY for the TEST sub-op (`reg <= 1`): NOT/NEG/MUL/IMUL/DIV/IDIV have none, so
     /// the byte budget changes with `reg`. The executor reuses `self.alu`/`shift_rotate`/`mul`/
     /// `div`/`inc_dec` verbatim so the flag and #DE/#UD fault logic lives in exactly one place.
     /// Group 5 (0xff: indirect CALL/JMP, control flow) is deliberately NOT here.
     Group,
     /// The relative-displacement + loop control-flow block (task A6a): Jcc short (0x70-0x7f, rel8),
-    /// the two-byte Jcc near (0F 80-0F 8F, rel16/32 — folded into `insn.opcode` as 0x0F8x by the
+    /// the two-byte Jcc near (0F 80-0F 8F, rel16/32, folded into `insn.opcode` as 0x0F8x by the
     /// two-byte convention), JMP short (0xeb, rel8), JMP near (0xe9, rel16/32), CALL near (0xe8,
     /// rel16/32), and the loop/JCXZ branches (0xe0-0xe3, rel8). Every one ends in a single
     /// `relative_jump(disp, operand_size)` when taken, so `decode` reads the displacement (sign-
@@ -3658,7 +3658,7 @@ enum DecodeGroup {
     /// `insn.imm`; the executor re-uses it without re-fetching. eip is already at the instruction
     /// end when the executor runs (decode advanced it), so the eip-relative target math is bit-for-
     /// bit identical to the fused path. The far/indirect/RET/INT control flow and 0xFF group 5 stay
-    /// on Fallback/TwoByteFallback (task A6b) — do NOT route them here.
+    /// on Fallback/TwoByteFallback (task A6b). Do NOT route them here.
     Branch,
     /// The far/indirect/RET/INT control-flow block (task A6b): CALL far direct (0x9a) and JMP far
     /// direct (0xea), RET near (0xc3) and RET near imm16 (0xc2), RETF (0xcb) and RETF imm16 (0xca),
@@ -3682,7 +3682,7 @@ enum DecodeGroup {
     /// executor exactly as the fused handler did.
     FlagsMisc,
     /// The string-operation block (task A8): MOVS (0xa4/0xa5), CMPS (0xa6/0xa7), STOS (0xaa/0xab),
-    /// LODS (0xac/0xad), and SCAS (0xae/0xaf). None carry a ModRM or an immediate — the operands are
+    /// LODS (0xac/0xad), and SCAS (0xae/0xaf). None carry a ModRM or an immediate: the operands are
     /// implicit (DS:SI source, ES:DI destination, accumulator), so `decode` pre-parses nothing beyond
     /// the prefixes + opcode it already read (the REP/REPNE prefix and any segment override are
     /// captured in `insn.prefixes` by `read_prefixes`). The executor is a thin call to the existing
@@ -3695,11 +3695,11 @@ enum DecodeGroup {
     /// The port I/O block (task A9): IN AL/AX/EAX from a byte-immediate port (0xe4/0xe5), OUT to a
     /// byte-immediate port (0xe6/0xe7), IN AL/AX/EAX from the DX port (0xec/0xed), and OUT to the DX
     /// port (0xee/0xef). The imm8 forms (0xe4-0xe7) carry a single port-number byte after the opcode;
-    /// `decode` reads and stores it in `insn.imm`. The DX forms (0xec-0xef) carry no extra bytes —
+    /// `decode` reads and stores it in `insn.imm`. The DX forms (0xec-0xef) carry no extra bytes:
     /// the port number comes from the DX register at execute time. None carry a ModRM. The executor
     /// calls `bus.read_io` / `bus.write_io` on the existing port-dispatch path (byte width for the
     /// AL forms, operand-size width for the AX/EAX forms), so `io_touched` is set exactly as before.
-    /// The string I/O ops INS/OUTS (0x6c-0x6f) are NOT here — they route to Misc.
+    /// The string I/O ops INS/OUTS (0x6c-0x6f) are NOT here: they route to Misc.
     PortIo,
     /// The two-byte bit-manipulation block (task A10): BT/BTS/BTR/BTC with a reg bit index
     /// (0F A3/AB/B3/BB), BT/BTS/BTR/BTC with an imm8 bit index (0F BA group 8, /4../7), BSF/BSR
@@ -3708,8 +3708,8 @@ enum DecodeGroup {
     /// the ModRM + addressing descriptor for all of them; only the imm8-count forms (0F BA, and the
     /// SHLD/SHRD imm8 variants 0F A4/AC) carry an immediate after the ModRM, which `decode` fetches
     /// into `insn.imm`. The executor reuses `bit_string_op` (so the classic BT-memory bit-offset
-    /// addressing — a reg bit index that walks past the operand width into an adjacent memory
-    /// element — is computed at execute from the LIVE reg index, never cached at decode),
+    /// addressing, a reg bit index that walks past the operand width into an adjacent memory
+    /// element, is computed at execute from the LIVE reg index, never cached at decode),
     /// `double_shift`, `alu_sub`, and `alu_add` verbatim, so the CF/ZF/flag semantics live in one
     /// place. Folded into `insn.opcode` as 0x0F00 | second by the two-byte convention and dispatched
     /// off the full u16 (the `as u8` low byte of 0x0Fa4/a5/b0/b1/c0/c1 would alias single-byte
@@ -3750,37 +3750,37 @@ enum DecodeGroup {
     /// and 0x63 (ARPL) are routed here too (`route_group` and `execute_system_seg_decoded`).
     SystemSeg,
     /// The x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF plus WAIT/FWAIT (0x9B).
-    /// Each escape opcode carries a ModRM whose `mod` field selects the form — `mod != 3` is a
+    /// Each escape opcode carries a ModRM whose `mod` field selects the form: `mod != 3` is a
     /// memory operand (parsed in `decode` as a normal addressing descriptor, instruction bytes
     /// only) and `mod == 3` operates on the FPU stack registers (the ModRM byte alone, no
     /// addressing descriptor, exactly as the fused handler treated it). The `reg` field (and, for
     /// the register forms, the full ModRM byte) selects the x87 operation. None carry an immediate.
     /// 0x9B WAIT has no ModRM at all. The whole group is a THIN wrapper: the executor reproduces the
     /// fused handler's pending-#MF gate, then calls the EXISTING `execute_fpu_register` /
-    /// `execute_fpu_memory` (for the escapes) or runs the WAIT #MF check (for 0x9B) verbatim — the
+    /// `execute_fpu_memory` (for the escapes) or runs the WAIT #MF check (for 0x9B) verbatim: the
     /// entire x87 stack/control/status logic stays in those leaf helpers. The only change is WHERE
     /// the ModRM is fetched: once, in `decode`.
     Fpu,
     /// The heterogeneous catch-all of every remaining IMPLEMENTED one-off opcode (task A14), a MIX
     /// of single-byte and two-byte (0F) forms that did not fit a themed group. The members are:
-    ///   - BCD adjust: DAA (0x27), DAS (0x2F), AAA (0x37), AAS (0x3F) — no encoded operand.
-    ///   - AAM (0xD4) / AAD (0xD5) — each carries an imm8 base, fetched by `decode` into `insn.imm`.
-    ///   - SALC (0xD6, undocumented) and XLAT (0xD7) — no encoded operand; XLAT reads [seg:BX+AL]
+    ///   - BCD adjust: DAA (0x27), DAS (0x2F), AAA (0x37), AAS (0x3F): no encoded operand.
+    ///   - AAM (0xD4) / AAD (0xD5): each carries an imm8 base, fetched by `decode` into `insn.imm`.
+    ///   - SALC (0xD6, undocumented) and XLAT (0xD7): no encoded operand; XLAT reads [seg:BX+AL]
     ///     from memory at execute time against the live registers.
     ///   - TEST AL,imm8 (0xA8, imm8 into `insn.imm`) and TEST AX/EAX,imm (0xA9, operand-size imm).
-    ///   - three-operand IMUL: IMUL r,r/m,imm16/32 (0x69) and IMUL r,r/m,imm8 (0x6B) — a ModRM r/m
+    ///   - three-operand IMUL: IMUL r,r/m,imm16/32 (0x69) and IMUL r,r/m,imm8 (0x6B): a ModRM r/m
     ///     plus an immediate (`decode` parses the ModRM + addressing descriptor, then fetches the imm).
-    ///   - string port I/O: INSB/INSW (0x6C/0x6D), OUTSB/OUTSW (0x6E/0x6F) — implicit operands; the
+    ///   - string port I/O: INSB/INSW (0x6C/0x6D), OUTSB/OUTSW (0x6E/0x6F): implicit operands; the
     ///     executor is a thin call to the existing `run_string` (REP/DF/segment-override stay there).
-    ///   - HLT (0xF4) — sets the halted state.
+    ///   - HLT (0xF4): sets the halted state.
     ///   - the two-byte system/serializing/CPU-id ops with no encoded operand: INVD/WBINVD
     ///     (0F 08/09), WRMSR (0F 30), RDTSC (0F 31), RDMSR (0F 32),
     ///     CPUID (0F A2), BSWAP r32 (0F C8-CF).
-    ///   - CMPXCHG8B m64 (0F C7 /1) — a ModRM r/m form (`decode` parses the ModRM + descriptor).
+    ///   - CMPXCHG8B m64 (0F C7 /1): a ModRM r/m form (`decode` parses the ModRM + descriptor).
     ///
     /// `decode` parses each form's ModRM + addressing descriptor (instruction bytes only, so it stays
-    /// cacheable) and its immediate exactly as the fused handler did, so the byte budget — and thus the
-    /// fetch clocks — is byte-identical. The executor reuses the existing BCD/`imul_truncated`/
+    /// cacheable) and its immediate exactly as the fused handler did, so the byte budget (and thus the
+    /// fetch clocks) is byte-identical. The executor reuses the existing BCD/`imul_truncated`/
     /// `run_string`/CPUID/RDTSC/halt leaf logic verbatim; the only
     /// change is WHERE the ModRM/immediate is fetched (once, in `decode`). The 0F forms are folded
     /// into `insn.opcode` as 0x0F00 | second and dispatched off the full u16. The genuinely
@@ -3792,7 +3792,7 @@ enum DecodeGroup {
     /// only member is the genuinely-unimplemented 0xF1 (ICEBP), plus, as a decode-bug guard, any
     /// prefix byte `read_prefixes` did not consume. `execute_decoded` raises
     /// `UnsupportedOpcode` for them (via `unsupported_single_byte_opcode`); `decode` parses nothing
-    /// extra. No IMPLEMENTED opcode routes here — `every_implemented_opcode_routes_off_the_legacy_fallback`
+    /// extra. No IMPLEMENTED opcode routes here: `every_implemented_opcode_routes_off_the_legacy_fallback`
     /// locks that invariant.
     Fallback,
     /// A two-byte (0F) opcode handled by `execute_two_byte` rather than a dedicated split group
@@ -4049,7 +4049,7 @@ struct DecodedInsn {
     /// `run_straight_line` is a single flag test. Pure over `(group, opcode, modrm)`,
     /// all captured here. Measured: classifying per continuation instead cost 5-17%
     /// wall from code-layout effects even with identical logic (inline(always) did not
-    /// recover it); resolve admission at decode, never in the run loop — this
+    /// recover it); resolve admission at decode, never in the run loop: this
     /// measurement is the reason.
     continuable: bool,
     /// C1e (D3, M3): the ENCODED byte counts of this instruction's
@@ -4098,8 +4098,8 @@ const REP_BULK_BYTES: usize = 4096;
 /// has no `Default` at all (std's array `Default` stops at 32 elements), and the other four
 /// would be wrong if derived: this is scratch, not guest state, so equality must not distinguish
 /// two otherwise-identical CPUs holding different leftover bytes here (`FarCallLedger`'s reason,
-/// above); a debug dump must not print 4 KiB of stale bytes; and `Clone` -- taken by the
-/// differential and lockstep harnesses on every `CpuGsw` clone -- must ZERO rather than copy, so
+/// above); a debug dump must not print 4 KiB of stale bytes; and `Clone` (taken by the
+/// differential and lockstep harnesses on every `CpuGsw` clone) must ZERO rather than copy, so
 /// a fresh clone never inherits a previous call's residue.
 struct RepBulkScratch(Box<[u8; REP_BULK_BYTES]>);
 
@@ -4183,13 +4183,13 @@ struct RepExecution {
 /// The mechanism is NOT mainly "the interpreter decodes less". The same sweep profiled the decode
 /// tag check directly and found it absorbs only a small part of the wall that moves with this
 /// constant. What dominates is the portal coupling: an eviction hides the portal of every compiled
-/// block on the line, so a smaller table makes compiled blocks churn -- portal rescans and
+/// block on the line, so a smaller table makes compiled blocks churn: portal rescans and
 /// dispatcher entries rise far faster than decode misses do, and each straight-line run covers less
 /// guest work. Read this constant as a JIT-stability knob at least as much as an interpreter one;
 /// both channels push the same way, which is why the ladder is monotone.
 ///
 /// At 56 bytes per line NOW (measured via `size_of::<DecodeLine>()`, not derived: DecodeLine is
-/// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32` -- DecodedInsn
+/// `tag: u32, generation: u32, insn: Option<DecodedInsn>, d: bool, phys_start: u32`; DecodedInsn
 /// itself measures 40 bytes, having grown 36 -> 40 when C1e added the recorded
 /// {disp_len, imm_len} pair) 65536 lines is ~3.5 MB, against ~1.75 MB at 32768
 /// and ~0.22 MB at 4096. `DecodePack` adds a second array of 16 bytes per slot (1 MB here); it is
@@ -4202,7 +4202,7 @@ struct RepExecution {
 /// bytes the line holds 54 bytes of fields, so there are 2 bytes of trailing padding: a u8 or u16
 /// added back lands there and the line stays at 56, while any 4-byte field grows it to 60 and the
 /// cache by 256 KB at this line count. Measure `size_of::<DecodeLine>()` rather than trusting this
-/// sentence -- repr(Rust) ordering is unspecified. 3.5 MB is well past any L2 and into L3
+/// sentence: repr(Rust) ordering is unspecified. 3.5 MB is well past any L2 and into L3
 /// territory, which is the real cost of this size: the table is no longer resident, and the wall
 /// ladder above is what justifies paying it. Do not grow it again without the same wall evidence.
 ///
@@ -4299,7 +4299,7 @@ struct DecodeLine {
 /// `pending_flags` layout pins moved). That is deliberate: the writers have to stay unconditional
 /// or the opt-in arm could not be switched on inside one binary, which is the only way this gets
 /// re-measured without build-to-build variance. If the re-test trigger on `decode_pack_enabled`
-/// fires and refutes the mechanism a second time, delete it — do not keep paying this.
+/// fires and refutes the mechanism a second time, delete it: do not keep paying this.
 #[cfg(feature = "jit")]
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
@@ -4321,7 +4321,7 @@ struct DecodePack {
     jit_direct_hotness: u8,
     /// The sticky-decline memo byte (sticky-decline memo design §1.2):
     /// `[stamp:6][v86:1][ss_d:1]`, stamp 0 meaning "no memo". Renamed from `_pad` in the commit
-    /// that first reads it — a `_`-prefixed field that is
+    /// that first reads it: a `_`-prefixed field that is
     /// load-bearing is a defect waiting to be re-used by the next slice.
     ///
     /// Every writer of a whole `DecodePack` (`publish_line`, and `DecodePack::default` through
@@ -4349,7 +4349,7 @@ const PACK_FLAG_CONTINUABLE: u8 = 1 << 1;
 ///
 /// What a CLEAR bit means, exactly. It is a POLICY answer, not a capability answer: "this opcode is
 /// not one the run loop probes at a break site". It does NOT mean a compile walk could not carry
-/// the instruction, and it must not be reused as if it did -- `walk_admits_non_continuable_entry`
+/// the instruction, and it must not be reused as if it did: `walk_admits_non_continuable_entry`
 /// is still the capability test, it still admits IMUL, word LES/LDS and OUT in the middle of a
 /// block, and this bit is clear for all three. The policy set and the reason it is drawn where it
 /// is live on `non_continuable_break_probe_candidate`; read that before widening this bit.
@@ -4360,7 +4360,7 @@ const PACK_FLAG_CONTINUABLE: u8 = 1 << 1;
 /// decoded `line.insn` it is publishing; `kill_line_at` and `clear_lines` retire slots rather than
 /// editing them. So a pack can never describe an instruction other than the one in its line, and
 /// `assert_packs_consistent` pins that for this bit alongside the other two. The set itself is a
-/// `const fn` of the opcode alone -- no knob, no CPU state, no feature flag -- so it cannot change
+/// `const fn` of the opcode alone: no knob, no CPU state, no feature flag, so it cannot change
 /// at run time either, and growing it is a source edit that recompiles both sides from the one
 /// definition.
 #[cfg(feature = "jit")]
@@ -4497,12 +4497,12 @@ pub(crate) fn poll_neg_cache_policy(value: Option<&str>) -> bool {
 /// 3. Interleaved A/B/B/A on a quiet box, the round that counts
 ///    (`.bench/results/doom486-abba-*.json`, `.bench/results/nascar-abba-*.json`): doom-486 mean
 ///    off 3.7609 vs on 3.7925 (+0.84 percent), nascar-586 off 0.4575 vs on 0.4561 (-0.32
-///    percent). Both inside the spread — doom's two OFF arms alone differ by 3.6 percent.
+///    percent). Both inside the spread: doom's two OFF arms alone differ by 3.6 percent.
 ///
 /// INERT. The lesson is about the profile, not the code: an attribution share names where cycles
 /// are SPENT, not a cost that can be removed. The interpreted majority still fetches the full line
 /// by design, and on the native-dispatch path the pack's own first touch simply replaces the
-/// line's — the miss moved rather than died.
+/// line's: the miss moved rather than died.
 ///
 /// RE-TEST TRIGGER: measure this again if a slice makes native dispatch DOMINATE continuations
 /// (the core-tier interpreter work, or link-bypass so seams stop reaching the dispatcher). That is
@@ -4548,7 +4548,7 @@ pub(crate) fn poll_neg_cache_default() -> bool {
 
 /// Marker `retire_ring` returns (CR3 data-side design T2, D2).
 /// `retire_ring` RENUMBERS ring slots (`contexts = [None, None]`), which invalidates every
-/// per-slot cache keyed by the SAME slot indices -- today only `Tlb::generations` -- independent
+/// per-slot cache keyed by the SAME slot indices (today only `Tlb::generations`), independent
 /// of what caused the retire. `#[must_use]` plus this crate's `-D warnings` clippy gate turns
 /// "retire both `Tlb` generations at every `retire_ring` call site" from a discipline an
 /// implementer can forget into a build failure: `Tlb::retire_all_slots` is the only function that
@@ -4590,7 +4590,7 @@ struct DecodeCache {
     /// The CR3 code-cache gate's write watch (CR3 code-cache gate design
     /// part 2(b)): 1 bit per 4 KiB physical page, set on every page-walk read of a page-directory
     /// or page-table page (`CpuGsw::mark_translation_page`, called from `translate_linear_checked`
-    /// on EVERY walk, not only ones producing a code translation -- a TLB-hit code translation
+    /// on EVERY walk, not only ones producing a code translation: a TLB-hit code translation
     /// never walks, so a code-only rule would miss the pages backing a decode line inserted after
     /// a data access had already filled the TLB entry; see finding F11). Folded into
     /// `CpuGsw::code_write_watched` and `CpuGsw::physical_page_watched` so a guest or native store
@@ -4911,7 +4911,7 @@ impl DecodeCache {
                 continue;
             };
             // Collect the code BYTES, not granule bases. This used to walk `& !0xf` in steps of
-            // 16, which asserted that a specific 16-byte base was watched -- a claim that is both
+            // 16, which asserted that a specific 16-byte base was watched, a claim that is both
             // too strong (it names bases the mark never touched once granules are smaller) and too
             // weak (it never checks the granules that ARE marked). Bytes are the real invariant:
             // every byte of a live decoded instruction must be watched at any granularity.
@@ -4941,7 +4941,7 @@ impl DecodeCache {
 
     /// Whether any byte in `[physical, physical + width)` is a cached code byte.
     ///
-    /// The overwhelmingly common shape -- `code_write_watched` asks this on EVERY guest store --
+    /// The overwhelmingly common shape (`code_write_watched` asks this on EVERY guest store)
     /// is a 1/2/4-byte store that lies wholly inside one 64-byte `code_bytes` word and wholly
     /// inside the byte-granular coverage window. That is one load and one masked test, so it is
     /// answered here directly instead of by `width` separate `is_code_byte` calls, each of which
@@ -4950,7 +4950,7 @@ impl DecodeCache {
     /// The three conditions on the fast arm are all load-bearing. `bit + width <= 64` is the
     /// non-crossing test: a range that straddles a word boundary needs both words, and shifting
     /// a mask by more than the word width is not even defined. `physical <= SMC_BYTE_COVERAGE -
-    /// width` keeps the whole range inside the window `is_code_byte` treats as byte-granular --
+    /// width` keeps the whole range inside the window `is_code_byte` treats as byte-granular:
     /// one byte past it and the answer for that byte comes from the page bitmap instead.
     /// Anything failing either test falls back to the exact per-byte loop, which is also what a
     /// wide (>4-byte) access takes.
@@ -5269,14 +5269,14 @@ impl DecodeCache {
 
     /// Diagnostic (SMC trace only): the live decode line covering physical byte `physical`, as
     /// `(physical start, decoded instruction)`. Uses exactly the reconstruction
-    /// `narrow_invalidate` uses -- same page-info lookup, same alias refusal, same 14-byte
-    /// backward candidate scan -- but mutates nothing, so it can be called BEFORE the
+    /// `narrow_invalidate` uses: same page-info lookup, same alias refusal, same 14-byte
+    /// backward candidate scan, but mutates nothing, so it can be called BEFORE the
     /// invalidation to learn what is about to be killed. `None` whenever the narrow path would
     /// also refuse or find no covering line.
     ///
     /// Returns the FIRST covering line the scan finds. Several cached lines can cover one physical
     /// byte (the same bytes decoded from different entry points) and `narrow_invalidate` kills all
-    /// of them, so this reports one of possibly several -- another reason the trace's site rows
+    /// of them, so this reports one of possibly several, another reason the trace's site rows
     /// are not a per-hit identity claim (see `smc_trace`).
     fn covering_line(&self, physical: u32) -> Option<(u32, DecodedInsn)> {
         let info = *self.code_page_lin.get(&(physical >> 12))?;
@@ -5395,7 +5395,7 @@ impl DecodeCache {
 
     /// Zero every memo byte. The 6-bit era stamp wraps 63 -> 1, and this is what stops it aliasing
     /// back onto a stamp a long-dormant pack still carries (design §1.5). A sweep can never be
-    /// WRONG — clearing a memo only means the full chain runs, which is the reference behaviour —
+    /// WRONG: clearing a memo only means the full chain runs, which is the reference behaviour,
     /// so its only cost is 65,536 byte stores, ~349 times over a duke3d-586 run.
     #[cfg(feature = "jit")]
     fn sweep_decline_memos(&mut self) {
@@ -5473,8 +5473,8 @@ impl DecodeCache {
     /// `new_cr3_masked` is the value being selected. Both already masked with `0xffff_f000`
     /// (advisory 17): PCD/PWT toggles must not allocate spurious contexts.
     fn select_context(&mut self, old_cr3_masked: u32, new_cr3_masked: u32) -> ContextSelect {
-        // R8: the FIRST call ever seeds slot 0 with the context already live -- the boot CR3 and
-        // whatever generation lines decoded under it carry -- so they are not orphaned by the
+        // R8: the FIRST call ever seeds slot 0 with the context already live (the boot CR3 and
+        // whatever generation lines decoded under it carry), so they are not orphaned by the
         // first reload. `self.generation` is left untouched: the seed describes what is already
         // true, it does not create it.
         if !self.ring_seeded {
@@ -5483,7 +5483,7 @@ impl DecodeCache {
         }
         // R1: select. A hit means the requested directory already owns a slot; adopt its
         // generation and clear nothing. `Reselected`, never `Allocated`: the caller's per-slot
-        // state (the `Tlb` generation, the JIT link epoch) must be RESTORED, not re-minted --
+        // state (the `Tlb` generation, the JIT link epoch) must be RESTORED, not re-minted:
         // P1 (PR #826) is exactly a caller that could not tell the difference.
         if let Some(slot) = self
             .contexts
@@ -5498,15 +5498,15 @@ impl DecodeCache {
         // nothing already live is invalidated. `Allocated`, never `Reselected`: this slot's
         // PREVIOUS occupant, if any, may have left per-slot state elsewhere (the `Tlb`
         // generation, the JIT link epoch) that this call site knows nothing about restoring
-        // correctly -- see the `ContextSelect` doc comment and P1 (PR #826).
+        // correctly. See the `ContextSelect` doc comment and P1 (PR #826).
         if let Some(slot) = self.contexts.iter().position(Option::is_none) {
             let slot_gen = self.allocate_generation();
             self.contexts[slot] = Some((new_cr3_masked, slot_gen));
             self.generation = slot_gen;
             return ContextSelect::Allocated(slot as u8);
         }
-        // R3: a third distinct value with both slots occupied retires everything -- today's
-        // behaviour -- then occupies slot 0 with the new value. `translation_pages` clears: this
+        // R3: a third distinct value with both slots occupied retires everything (today's
+        // behaviour), then occupies slot 0 with the new value. `translation_pages` clears: this
         // arm's caller retires the TLB in the same operation (T2), by forwarding the `RingRetired`
         // token below to `Tlb::retire_all_slots`, so no live TLB entry can survive with no marks
         // behind it either.
@@ -5564,7 +5564,7 @@ impl DecodeCache {
 /// **`Reselected` and `Allocated` are not interchangeable, and merging them into one `Skipped`
 /// variant was the P1 defect (PR #826).** `DecodeCache::select_context`'s own ring
 /// (`self.contexts`) is the only thing that renumbers atomically with every other per-slot cache
-/// this ring gates -- the `Tlb`'s `generations` and the JIT link graph's `link_epochs`. A caller
+/// this ring gates: the `Tlb`'s `generations` and the JIT link graph's `link_epochs`. A caller
 /// that cannot tell R1 (`Reselected`: the requested directory already owns a slot, so its saved
 /// state must be RESTORED) from R2 (`Allocated`: a miss took a free slot, so nothing about that
 /// slot's PREVIOUS occupant may be assumed, and its state must be MINTED fresh) can only stay safe
@@ -5576,7 +5576,7 @@ impl DecodeCache {
 /// narrower fix (`retire_dormant_slot`) re-mints only the DORMANT generation, leaving the LIVE
 /// slot's generation untouched. A subsequent R2 allocate into the now-empty ring that RESTORED
 /// that untouched generation, instead of minting a fresh one, served one directory's TLB entries
-/// to a completely different directory that had never been seen before -- silently, no fault, no
+/// to a completely different directory that had never been seen before, silently, no fault, no
 /// counter. Distinguishing the two arms and always minting on `Allocated` closes that without
 /// depending on any caller keeping its own retire paired correctly; see `execute_extended.rs`'s
 /// INVLPG handler and `paging.rs`'s `Tlb::allocate_generation` for the two ends of the fix.
@@ -5683,7 +5683,7 @@ const fn undefined_opcode() -> InternalFault {
 /// by an event external to the currently-executing program (never the case for the
 /// synchronous descriptor/gate/segment-load faults this core raises). `selector`'s own
 /// low 3 bits (RPL and part of TI) are irrelevant here; only the index is folded in,
-/// per the table's "the selector index" wording -- TI is passed separately so callers
+/// per the table's "the selector index" wording. TI is passed separately so callers
 /// resolving against the LDT don't have to reconstruct it from the selector bits.
 const fn selector_error_code(selector: u16, in_ldt: bool, in_idt: bool) -> u32 {
     ((selector as u32) & 0xfff8) | ((in_ldt as u32) << 2) | ((in_idt as u32) << 1)
@@ -5721,7 +5721,7 @@ pub fn linear_address(segment: u16, offset: u16) -> usize {
     (usize::from(segment) << 4) + usize::from(offset)
 }
 
-/// What every `IN` port-read form charges (`0xE4`/`0xE5`/`0xEC`/`0xED`) -- port-class, not
+/// What every `IN` port-read form charges (`0xE4`/`0xE5`/`0xEC`/`0xED`): port-class, not
 /// register-class, named per gp2 in-imm8 callout design rev 3 n18: this constant was
 /// `IN_AL_DX_CORE_CLOCKS` before that slice, but `0xE4` IN AL,imm8's own JIT call-out
 /// (`PortReadAlImm8`) charges it too, and a `_DX_`-named constant shared by a helper that never
@@ -5732,7 +5732,7 @@ pub fn linear_address(segment: u16, offset: u16) -> usize {
 /// notice.
 pub(crate) const IN_PORT_CORE_CLOCKS: u32 = 12;
 
-/// What every `OUT` port-write form charges -- `0xE6`, `0xE7`, `0xEE` and `0xEF`, all four of
+/// What every `OUT` port-write form charges: `0xE6`, `0xE7`, `0xEE` and `0xEF`, all four of
 /// which read this constant, so the sentence is a contract over the family rather than a
 /// description of the one arm the call-out needed. Named for the reason `IN_PORT_CORE_CLOCKS`
 /// above is and NOT equal to it: the write forms charge 10 where the reads charge 12, so a
@@ -5750,18 +5750,18 @@ pub(crate) const OUT_PORT_CORE_CLOCKS: u32 = 10;
 /// The split the two ends of the predicate make is exactly `check_io_permission`'s own: its early
 /// return is `!is_v86_mode() && cpl <= iopl`, which is `Real | ProtectedPrivileged` here, and the
 /// two columns that pay for a bitmap consult are the two it walks. That is not a coincidence to
-/// be maintained by hand -- Intel's `CPL>IOPL` and `vm` counts already INCLUDE the two-byte
+/// be maintained by hand: Intel's `CPL>IOPL` and `vm` counts already INCLUDE the two-byte
 /// bitmap lookup (V3 `:17817-17819`), which is why the design forbids charging those reads
 /// separately once the recalibration zeroes L1-hit data accesses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortIoPrivMode {
     /// CR0.PE clear.
     Real = 0,
-    /// Protected, not V86, `CPL <= IOPL` -- Intel's `pm=` column.
+    /// Protected, not V86, `CPL <= IOPL`: Intel's `pm=` column.
     ProtectedPrivileged = 1,
-    /// Protected, not V86, `CPL > IOPL` -- Intel's `**` column, bitmap consult included.
+    /// Protected, not V86, `CPL > IOPL`: Intel's `**` column, bitmap consult included.
     ProtectedUnprivileged = 2,
-    /// EFLAGS.VM -- Intel's `vm=` column, bitmap consult included.
+    /// EFLAGS.VM: Intel's `vm=` column, bitmap consult included.
     V86 = 3,
 }
 
@@ -5793,8 +5793,8 @@ pub(crate) const OUT_PORT_CORE_CLOCKS_EPOCH2: [u32; 4] = [
 /// Epoch-2 `INS` core clocks for the NON-`REP` singleton, indexed by `PortIoPrivMode`: Intel's
 /// 9 / 6 / 24 / 22, in raw twelfths. Appendix F is column-drifted for the string-I/O rows and
 /// every one was re-anchored against the independent Chapter 25 pages (`INS` V3:33066-33070,
-/// `OUTS` :36058-36063, `REP` :36956-36988) --
-/// V86 port I/O timing research, section 2.1.
+/// `OUTS` :36058-36063, `REP` :36956-36988),
+/// per the V86 port I/O timing research, section 2.1.
 pub(crate) const INS_CORE_CLOCKS_EPOCH2: [u32; 4] = [
     9 * PORT_CORE_CLOCK_TWELFTHS,
     6 * PORT_CORE_CLOCK_TWELFTHS,
@@ -5814,8 +5814,8 @@ pub(crate) const OUTS_CORE_CLOCKS_EPOCH2: [u32; 4] = [
 /// `8 + 3c` / `25 + 3c` / `23 + 3c`, raw twelfths, `c` being the element count.
 ///
 /// **The setup is what the design's blocker (b) turns on.** Intel's 22/25 are the singleton
-/// forms; charging them per element -- which is what a naive reading of "`INS` costs 22" gives
-/// -- would price a `REP INSW` at seven times its real cost. The per-element figure is 3 (`INS`)
+/// forms; charging them per element (which is what a naive reading of "`INS` costs 22" gives)
+/// would price a `REP INSW` at seven times its real cost. The per-element figure is 3 (`INS`)
 /// and 4 (`OUTS`), below.
 pub(crate) const REP_INS_SETUP_CLOCKS_EPOCH2: [u32; 4] = [
     11 * PORT_CORE_CLOCK_TWELFTHS,
@@ -6013,7 +6013,7 @@ impl DeferredCodeWrites {
 /// How many deferred writes one call-out can record before the drain falls back to the coarse
 /// write-page replay. Sized for the worst reachable instruction rather than for the common one: a
 /// memory-form POP stores once (twice if it splits a page), and the FAULT path adds a whole
-/// exception delivery -- up to five pushes plus the accessed-bit write of every page walk they
+/// exception delivery: up to five pushes plus the accessed-bit write of every page walk they
 /// take. Sixteen covers that with room; the overflow arm exists because "covers it with room" is
 /// not a proof.
 #[cfg(feature = "jit")]
@@ -6088,7 +6088,7 @@ pub(crate) const POP_SS_CORE_CLOCKS: u32 = 7;
 ///
 /// `0x6C`-`0x6F` INS/OUTS are NOT priced by this and could not be. They are members of the same
 /// `StringOp` family (`strings.rs`) and would be swept in by any rule phrased as "the string
-/// opcodes", but they do not route through `execute_string_decoded` at all -- its match is
+/// opcodes", but they do not route through `execute_string_decoded` at all: its match is
 /// `unreachable!` outside `0xa4..=0xaf` and they execute in the port block below it, charging 12
 /// (IN) or 10 (OUT), with the REP model charging 15 and 14. Admitting either would raise the fold
 /// past 7 and move `INTERPRET_ONE_MAX_CORE_CLOCKS`, which is the LAST of four independent ways the
@@ -6118,7 +6118,7 @@ pub(crate) const POPF_CORE_CLOCKS: u32 = 4;
 ///
 /// Deliberately NOT a term in `INTERPRET_ONE_MAX_CORE_CLOCKS`, which is the only row on that
 /// allowlist to stay out of the fold. 37 is more than five times the fold's current value of 7, and
-/// `compute_iteration_upper` multiplies that value by the block's interpret-one slot count -- so
+/// `compute_iteration_upper` multiplies that value by the block's interpret-one slot count, so
 /// folding this in would raise the budget bound of every block carrying a CLI, an STI, a segment
 /// load, a string row, a PUSHF or a POPF, none of which can charge anything like it. A raised bound
 /// shrinks `budget_quota`, which changes WHICH blocks are admitted, which is guest-visible. The row
@@ -6139,7 +6139,7 @@ pub(crate) const INT_IMM8_CORE_CLOCKS: u32 = 37;
 ///
 /// **16**, not 19, and the shortfall is stated rather than hidden. A V86 reflection is only
 /// reachable from a task already in V86, and `int_imm8_admitted_here` refuses admission in V86
-/// below IOPL 3 -- which is the state that reflects. At IOPL 3 the interpreter's own arm waves the
+/// below IOPL 3, which is the state that reflects. At IOPL 3 the interpreter's own arm waves the
 /// task through to `software_interrupt`, which takes the real-mode vector path and its five
 /// accesses. So the reachable worst case here is the inter-privilege protected-mode one at 15, and
 /// 16 dominates it with a margin rather than sitting exactly on it.
@@ -6156,7 +6156,7 @@ pub(crate) const INT_IMM8_MAX_DATA_ACCESSES: u64 = 16;
 /// reason stated on that constant: 11 is above the fold's current value of 7, and
 /// `compute_iteration_upper` multiplies that value by the block's interpret-one slot count, so
 /// folding this in would raise the budget bound of every block carrying a CLI, an STI, a segment
-/// load, a string row, a PUSHF or a POPF -- none of which can charge anything like it -- and shrink
+/// load, a string row, a PUSHF or a POPF (none of which can charge anything like it) and shrink
 /// `budget_quota`, changing WHICH blocks are admitted. LAR and LSL take their own slot class
 /// instead; see `jit::direct::CompiledBlock::callout_lar_lsl_slots`. Unlike the INT row they are
 /// NOT terminal and are not bounded at one per block, so the class is a genuine count rather than
@@ -6173,7 +6173,7 @@ pub(crate) const LAR_LSL_CORE_CLOCKS: u32 = 11;
 ///
 /// Neither row writes an accessed bit back (unlike the segment-load rows `MOV Sreg` and `POP SS`
 /// price into `INTERPRET_ONE_MAX_DATA_ACCESSES`): `try_read_descriptor` (control.rs) only reads.
-/// **3**, the memory form's worst case, and it stays under `INTERPRET_ONE_MAX_DATA_ACCESSES`'s 4 --
+/// **3**, the memory form's worst case, and it stays under `INTERPRET_ONE_MAX_DATA_ACCESSES`'s 4:
 /// the row does not need its own bound the way `INT_IMM8_MAX_DATA_ACCESSES` does, it is carried
 /// beside the core-clocks constant anyway so the two travel together and a widened form (a future
 /// row with a bigger footprint) cannot silently start under-pricing this class alone.
@@ -6220,7 +6220,7 @@ const fn larger(a: u32, b: u32) -> u32 {
 /// | 0x9D POPF, Word | execute.rs `0x9d` | `POPF_CORE_CLOCKS` |
 ///
 /// The four string rows share ONE term because they share ONE interpreter arm. That is the shape
-/// this fold was always meant to have -- one term per ARM, not one per opcode -- and it is worth
+/// this fold was always meant to have: one term per ARM, not one per opcode, and it is worth
 /// saying here because the reverse belief (that a class has to enumerate its opcodes before it can
 /// be priced) is what kept the string families out of the allowlist for two design revisions.
 /// Their four terms fold to 4, which is below the seven `MOV_SREG_CORE_CLOCKS` and
@@ -6233,7 +6233,7 @@ const fn larger(a: u32, b: u32) -> u32 {
 ///
 /// The FAULT status is deliberately not in this maximum. There the clocks are charged by
 /// `finish_instruction` straight into `elapsed_clocks`, exactly as they are for an interpreted
-/// instruction that faults at a block boundary, and the helper returns zero -- so nothing on that
+/// instruction that faults at a block boundary, and the helper returns zero, so nothing on that
 /// path reaches the lane this constant bounds. Widening the allowlist means widening this.
 pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
     larger(POP_RM_CORE_CLOCKS, MOV_RM_SREG_CORE_CLOCKS),
@@ -6292,10 +6292,10 @@ pub(crate) const INTERPRET_ONE_MAX_CORE_CLOCKS: u32 = larger(
 /// The string rows are `rep_memory_accesses` (strings.rs) read off the same table the REP model
 /// prices its chunks with: `Movs | Cmps => 2`, everything else `=> 1`. Both are at or below the
 /// two the ordinary memory rows already present, so this bound does not move when they are
-/// admitted -- the protected-mode segment rows are still the only reason it is four.
+/// admitted: the protected-mode segment rows are still the only reason it is four.
 ///
-/// PUSHF and POPF, N2, are one stack access each -- push and pop, respectively, of the flag
-/// image -- at or below the same two, so they do not move this bound either.
+/// PUSHF and POPF, N2, are one stack access each (push and pop, respectively, of the flag
+/// image) at or below the same two, so they do not move this bound either.
 ///
 /// The protected-mode segment rows are why this is FOUR rather than two, and the first of them is
 /// the one the S3 policy widening moved: a protected-mode segment load reads eight bytes of
@@ -6315,7 +6315,7 @@ pub(crate) const INTERPRET_ONE_MAX_DATA_ACCESSES: u64 = 4;
 /// helper with a bigger charge raises it by construction instead of silently under-budgeting the
 /// block that carries it.
 pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
-    // `MAX_PORT_CORE_CLOCKS` -- the cross-mode, cross-epoch maximum, not epoch 1's flat 12. Under
+    // `MAX_PORT_CORE_CLOCKS`: the cross-mode, cross-epoch maximum, not epoch 1's flat 12. Under
     // epoch 2 a port slot's runtime charge depends on the live privilege column, which this
     // COMPILE-TIME ceiling cannot see, so it must dominate the widest column (`OUT`, `CPL>IOPL`,
     // 312 raw). That makes the port class the maximum here for the first time, by a wide margin;
@@ -6349,7 +6349,7 @@ pub(crate) const MAX_CALL_OUT_CORE_CLOCKS: u32 = {
     };
     // LAR/LSL, folded in for the identical reason: their own slot class, deliberately out of
     // `INTERPRET_ONE_MAX_CORE_CLOCKS`, still has to be covered by this GLOBAL ceiling. 11 does not
-    // move the value today -- `INT_IMM8_CORE_CLOCKS` already dominates it -- but the derivation has
+    // move the value today (`INT_IMM8_CORE_CLOCKS` already dominates it), but the derivation has
     // to read the constant rather than assume the ordering, or a future change to either one could
     // silently stop being covered.
     if d > LAR_LSL_CORE_CLOCKS {
@@ -6439,7 +6439,7 @@ const fn two_byte_isa_generation(opcode: u8) -> IsaGeneration {
         // The MMX integer-SIMD block. The GSW-586 is a semi-custom 1997 part, not an Intel
         // flagship, and carries no SIMD extension at all: these encodings name no instruction
         // on ANY persona, so they are invalid everywhere rather than gated to the 586. That is
-        // what the silicon would do -- an absent extension raises #UD -- and it is what correct
+        // what the silicon would do (an absent extension raises #UD) and it is what correct
         // era software expects, because it tests CPUID leaf 1 EDX bit 23 (which this core does
         // not set) before it ever executes one of these bytes.
         0x60..=0x6b
@@ -6561,7 +6561,7 @@ const fn fault_class(vector: u8, is_external: bool) -> FaultClass {
         // Table 9-3 has no row for #DF itself: the PRM handles a fault during
         // the double-fault handler's call with the separate shutdown rule, which
         // `escalate_delivery` tracks directly. Classing 8 as contributory is the
-        // safe fallback if that tracking is ever lost -- the pair then escalates
+        // safe fallback if that tracking is ever lost: the pair then escalates
         // rather than looping.
         8 => FaultClass::Contributory,
         // #DB 1, NMI 2, #BP 3, #OF 4, #BR 5, #UD 6, #NM 7, #MF 16, and every
