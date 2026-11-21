@@ -3555,7 +3555,7 @@ fn rep_legacy_cached_and_profiled_entries_keep_the_invoice() {
                 cpu.profile.enabled = profiling;
                 #[cfg(feature = "timing-class-histogram")]
                 {
-                    cpu.class_histogram = Box::default();
+                    *cpu.class_histogram = Default::default();
                 }
                 // The warmed ordinary prefix reaches the cached REP tail in this run.
                 let first = cpu.run_budgeted(&mut bus, 21).unwrap();
