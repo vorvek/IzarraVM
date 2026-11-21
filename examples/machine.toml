@@ -35,6 +35,3 @@ backend = "off" # P330 receiver: off, external, or munt
 keyboard = true
 mouse = true
 joystick = true
-
-[diagnostics]
-trace_devices = false
