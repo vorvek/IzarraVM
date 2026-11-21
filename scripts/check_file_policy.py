@@ -346,6 +346,21 @@ def check_manifest(files: list[str], data: dict[str, bytes], errors: list[str]) 
     return len(expected)
 
 
+def check_toolchain_pin(errors: list[str]) -> None:
+    """The pinned channel in rust-toolchain.toml must match the CI toolchain."""
+    toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    channel = re.search(r'(?m)^channel\s*=\s*"([^"]+)"', toolchain)
+    ci_versions = set(re.findall(r"(?m)^\s*toolchain:\s*(\S+)\s*$", workflow))
+    if channel is None:
+        errors.append("rust-toolchain.toml: no channel found")
+    elif ci_versions != {channel.group(1)}:
+        errors.append(
+            f"rust-toolchain.toml pins {channel.group(1)} but .github/workflows/ci.yml "
+            f"uses {sorted(ci_versions) or 'no toolchain'}: set both to the same version"
+        )
+
+
 def main() -> int:
     errors: list[str] = []
     files = tracked_files()
@@ -401,6 +416,7 @@ def main() -> int:
             if test_attribute.search(text):
                 errors.append(f"{path}: inline test body belongs in a *_test.rs file")
 
+    check_toolchain_pin(errors)
     manifest_entries = check_manifest(files, data, errors)
     if errors:
         for error in errors:
