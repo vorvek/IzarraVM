@@ -2466,10 +2466,6 @@ fn write_hdd_profile_json(
             machine.cpu().fast_map_probe_counters(),
             machine.cpu().fast_map_audit_counters(),
             machine.cpu().code_watch_edge_counters(),
-            #[cfg(feature = "poll-head-probe")]
-            Some(machine.cpu().poll_head_probe()),
-            #[cfg(not(feature = "poll-head-probe"))]
-            None,
         ),
     });
     #[cfg(feature = "dynarec-mkii")]
@@ -2919,9 +2915,9 @@ fn direct_barrier_census_json(
             .map(|(label, count)| json!({ "kind": label, "count": count }))
             .collect::<Vec<_>>(),
     });
-    // Inserted AFTER the `json!` under cfg, following the poll-head-probe precedent: emitting the
-    // keys as `null` when the feature is off would silently change every profile JSON the campaign
-    // diffs against, which is worse than a broken pin because nothing announces it.
+    // Inserted AFTER the `json!` under cfg. Emitting the keys as `null` when the feature is off
+    // would silently change every profile JSON the campaign diffs against, which is worse than a
+    // broken pin because nothing announces it.
     #[cfg(feature = "barrier-census-closure")]
     let report = {
         let mut report = report;
