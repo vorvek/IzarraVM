@@ -20,6 +20,6 @@ pub use mixer::SbMixer;
 pub use mpu401::{Mpu401, TimedMidiMessage};
 pub use opl::OplChip;
 pub use output::{AudioDebugSnapshot, AudioPlayer, AudioSink};
-pub use resample::Resampler;
+pub use resample::{Resampler, StreamResampler};
 pub use soundfont::{EMBEDDED_SOUNDFONT_SHA256, embedded_soundfont_path, set_soundfont_cache_dir};
 pub use wss::{Ad1848, Ad1848Config, BoardIrqStrobe, trace_enabled as wss_trace_enabled};
