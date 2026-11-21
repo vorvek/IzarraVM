@@ -3201,7 +3201,9 @@ impl CpuBus for MachineBus<'_> {
         }
         if port == WAVETABLE_MPU_BASE {
             let guest_tick = self.guest_tick_now();
-            self.pic.set_irq_level(9, self.midi_mpu.irq_level());
+            // Drop only this part's contribution. The re-assert after the read
+            // is then a fresh edge for this part and for no other source.
+            self.drive_line9(false, true);
             let value = self.wavetable_mpu.read_data_at(guest_tick);
             self.opl_probe.record_mpu_data_read(true, value, guest_tick);
             self.sync_mpu_irq();
@@ -3216,7 +3218,7 @@ impl CpuBus for MachineBus<'_> {
         }
         if port == MIDI_MPU_BASE {
             let guest_tick = self.guest_tick_now();
-            self.pic.set_irq_level(9, self.wavetable_mpu.irq_level());
+            self.drive_line9(true, false);
             let value = self.midi_mpu.read_data_at(guest_tick);
             self.opl_probe
                 .record_mpu_data_read(false, value, guest_tick);
@@ -3690,6 +3692,10 @@ impl CpuBus for MachineBus<'_> {
         }
         if port == 0x61 {
             self.speaker.write_control(value as u8);
+            // The gate edge applies at the batch start state, not at the instant of
+            // this write. PIT port writes carry an in-batch clock offset
+            // (`write_port_at`) and this call does not. The skew is the PIT time
+            // that elapsed inside the batch before the write.
             self.pit.set_gate(2, value & 1 != 0);
             return Ok(());
         }
@@ -4640,10 +4646,18 @@ fn dma_page_register_port(port: u16) -> u16 {
 
 impl MachineBus<'_> {
     fn sync_mpu_irq(&mut self) {
-        self.pic.set_irq_level(
-            9,
-            self.wavetable_mpu.irq_level() || self.midi_mpu.irq_level(),
-        );
+        self.drive_line9(true, true);
+    }
+
+    /// Drive PIC line 9 from the OR of every source that can hold it: the two
+    /// MPU parts and the WSS board strobe when the board routes to line 9. A
+    /// part passed as `false` contributes no level, so the caller can drop that
+    /// part before a data read and see its re-assert as a fresh edge.
+    fn drive_line9(&mut self, wavetable: bool, midi: bool) {
+        let level = (wavetable && self.wavetable_mpu.irq_level())
+            || (midi && self.midi_mpu.irq_level())
+            || self.wss.board_irq_level(9);
+        self.pic.set_irq_level(9, level);
     }
 
     /// Apply the WSS board's IRQ-verify strobe to the interrupt controller.
@@ -4664,8 +4678,14 @@ impl MachineBus<'_> {
         let Some(strobe) = self.wss.take_board_irq_strobe() else {
             return;
         };
+        // Line 9 is shared with the MPU parts, so its level is the OR of all
+        // sources. The board's own state is already updated at this point.
         if let Some(line) = strobe.released {
-            self.pic.set_irq_level(line, false);
+            if line == 9 {
+                self.drive_line9(true, true);
+            } else {
+                self.pic.set_irq_level(line, false);
+            }
         }
         if let Some(line) = strobe.asserted {
             self.pic.set_irq_level(line, true);

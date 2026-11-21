@@ -485,6 +485,11 @@ impl Ad1848 {
         }
     }
 
+    /// Whether the board's IRQ-verify strobe is holding `line` high now.
+    pub fn board_irq_level(&self, line: u8) -> bool {
+        self.board_irq_driven == Some(line)
+    }
+
     /// Take the interrupt-line change the board's IRQ-verify strobe owes the
     /// interrupt controller, if any. The bus write path drains this immediately
     /// after every config-region write, so the strobe lands on the guest's `OUT`

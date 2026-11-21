@@ -252,3 +252,51 @@ fn guest_services_intelligent_track_requests_through_irq9() {
     assert!(end.guest_tick > note.guest_tick);
     assert!(machine.take_midi_message().is_none());
 }
+
+/// Board config byte: IRQ-verify strobe (bit 6), IRQ 9 (select code 2), DMA code 1.
+const WSS_STROBE_IRQ9: u8 = 0x51;
+/// The same selection with the strobe low.
+const WSS_RELEASE_IRQ9: u8 = 0x11;
+
+#[test]
+fn mpu_batch_end_does_not_drop_a_wss_held_line_9() {
+    let mut machine = test_machine();
+    initialize_mpu_pic(&mut machine);
+    write_byte(&mut machine, 0x530, WSS_STROBE_IRQ9);
+    assert!(machine.pic.irr_bit(9), "the strobe raised line 9");
+    acknowledge_irq9(&mut machine);
+    assert!(!machine.pic.interrupt_pending());
+
+    // A batch end with the MPU idle must leave the WSS level alone.
+    machine.advance_devices_ticks(0);
+    // The MPU now raises its own request on the shared line.
+    write_byte(&mut machine, MIDI_MPU_BASE + 1, 0xff);
+    assert!(machine.midi_mpu.irq_level());
+
+    assert!(
+        !machine.pic.irr_bit(9),
+        "the line never fell, so the MPU request is not a second edge"
+    );
+    assert!(!machine.pic.interrupt_pending());
+}
+
+#[test]
+fn wss_strobe_release_does_not_drop_an_mpu_held_line_9() {
+    let mut machine = test_machine();
+    initialize_mpu_pic(&mut machine);
+    write_byte(&mut machine, MIDI_MPU_BASE + 1, 0xff);
+    assert!(machine.midi_mpu.irq_level());
+    assert!(machine.pic.irr_bit(9));
+    acknowledge_irq9(&mut machine);
+
+    write_byte(&mut machine, 0x530, WSS_STROBE_IRQ9);
+    write_byte(&mut machine, 0x530, WSS_RELEASE_IRQ9);
+    machine.advance_devices_ticks(0);
+
+    assert!(machine.midi_mpu.irq_level(), "the MPU still holds the line");
+    assert!(
+        !machine.pic.irr_bit(9),
+        "the release must not make the MPU level a fresh edge"
+    );
+    assert!(!machine.pic.interrupt_pending());
+}
