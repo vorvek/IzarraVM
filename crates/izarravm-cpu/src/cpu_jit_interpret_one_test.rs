@@ -43,14 +43,14 @@ mod test_word_helper;
     any(target_os = "windows", target_os = "linux")
 ))]
 #[path = "cpu_jit_live_pm_segments_test.rs"]
-mod live_pm_segments;
+pub(crate) mod live_pm_segments;
 #[path = "cpu_jit_native_callout_rows_test.rs"]
 mod native_callout_rows;
 
 const ENTRY: u32 = 0x100;
 /// A page the block's code is not on, for the stack and for the POP's destination.
 const DATA_PAGE: u32 = 0x1000;
-const STACK_TOP: u32 = 0x1700;
+pub(crate) const STACK_TOP: u32 = 0x1700;
 const POP_TARGET: u32 = 0x1800;
 /// What the fixture seeds at the top of the stack, so the popped value is identifiable.
 const POPPED: u16 = 0x4321;
@@ -3854,17 +3854,17 @@ fn the_widened_rows_still_refuse_an_address_size_prefix() {
 // argument about which arm was chosen.
 
 /// The GDT and the IDT live on the DATA page, clear of the block's code.
-const GDT_BASE: u32 = 0x1200;
-const IDT_BASE: u32 = 0x1400;
+pub(crate) const GDT_BASE: u32 = 0x1200;
+pub(crate) const IDT_BASE: u32 = 0x1400;
 /// Where the #GP gate points. On the code page but far below `ENTRY`, so the delivery does not
 /// disturb the block and the guest still halts.
 const FAULT_HANDLER: u32 = 0x0800;
 
 /// Index 1: flat 32-bit code, the segment the fixture runs in.
-const SEL_CODE: u16 = 0x08;
+pub(crate) const SEL_CODE: u16 = 0x08;
 /// Index 2: flat 32-bit data. FS starts holding exactly this descriptor's record, so RELOADING it
 /// is the case R2 admits.
-const SEL_DATA: u16 = 0x10;
+pub(crate) const SEL_DATA: u16 = 0x10;
 /// Index 3: data again, but with G clear and a 64 KB limit, so its record DIFFERS from `SEL_DATA`
 /// in the one field R2 compares byte for byte.
 const SEL_OTHER: u16 = 0x18;
@@ -3893,7 +3893,7 @@ fn descriptor(low: u32, high: u32) -> [u8; 8] {
 }
 
 /// A 32-bit interrupt gate: present, DPL 0, through `SEL_CODE`.
-fn interrupt_gate(offset: u32) -> [u8; 8] {
+pub(crate) fn interrupt_gate(offset: u32) -> [u8; 8] {
     let low = (u32::from(SEL_CODE) << 16) | (offset & 0xffff);
     let high = (offset & 0xffff_0000) | (0x8e << 8);
     descriptor(low, high)

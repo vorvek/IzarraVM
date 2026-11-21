@@ -3757,7 +3757,7 @@ const DIRECT_BARRIER: u8 = 0xf5;
     any(target_os = "windows", target_os = "linux")
 ))]
 #[path = "cpu_jit_direct_test.rs"]
-mod jit_direct;
+pub(crate) mod jit_direct;
 
 #[cfg(all(
     feature = "jit",
@@ -3957,7 +3957,15 @@ mod jit_disp_store_lane;
     any(target_os = "windows", target_os = "linux")
 ))]
 #[path = "cpu_jit_jcc_shadow_test.rs"]
-mod jit_jcc_shadow;
+pub(crate) mod jit_jcc_shadow;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_heritage_test.rs"]
+mod jit_heritage;
 
 #[cfg(all(
     feature = "jit",

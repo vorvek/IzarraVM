@@ -53,7 +53,7 @@ const CLASS_NAMES: [&str; 4] = ["simple", "overflow", "signed_xor", "signed_xor_
 
 /// Which emission class a condition takes. Written out here rather than imported so a mutation of
 /// the emitter's own dispatch cannot move the fixture's expectation with it.
-fn expected_class(condition: u8) -> usize {
+pub(crate) fn expected_class(condition: u8) -> usize {
     match condition >> 1 {
         0 => 1,
         6 => 2,
@@ -66,7 +66,7 @@ fn expected_class(condition: u8) -> usize {
 ///
 /// Deliberately not shaped like the emitter. The emitter folds `SF^OF` through a shift chain; this
 /// spells it `sf != of`. Both must agree on every input, which is the whole content of the slice.
-fn predicate(condition: u8, eflags: u32) -> bool {
+pub(crate) fn predicate(condition: u8, eflags: u32) -> bool {
     let cf = eflags & crate::FLAG_CF != 0;
     let pf = eflags & crate::FLAG_PF != 0;
     let zf = eflags & crate::FLAG_ZF != 0;

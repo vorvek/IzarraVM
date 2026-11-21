@@ -15,44 +15,44 @@
 use super::*;
 
 /// Base 0x1900, limit 0xFF.
-const SEL_A: u16 = 0x40;
+pub(crate) const SEL_A: u16 = 0x40;
 /// Base 0x1A00, limit 0xFFFF.
-const SEL_B: u16 = 0x48;
+pub(crate) const SEL_B: u16 = 0x48;
 /// Base 0x1900, limit 0x7F.
-const SEL_SHORT: u16 = 0x50;
+pub(crate) const SEL_SHORT: u16 = 0x50;
 /// Base 0x1900, limit 0x22. A dword at offset 0x20 crosses the limit.
-const SEL_CROSS: u16 = 0x58;
+pub(crate) const SEL_CROSS: u16 = 0x58;
 /// Expand-down data, base 0x1900, limit 0xFF.
-const SEL_EXPAND_DOWN: u16 = 0x60;
+pub(crate) const SEL_EXPAND_DOWN: u16 = 0x60;
 /// Readable code, base 0x1900, limit 0xFF.
-const SEL_CODE_READ: u16 = 0x68;
+pub(crate) const SEL_CODE_READ: u16 = 0x68;
 /// G set, base 0, limit field 1, so the limit is 0x1FFF.
-const SEL_GRAN: u16 = 0x70;
+pub(crate) const SEL_GRAN: u16 = 0x70;
 /// Base 0xFFFFF000, limit 0xFFFF. Offset 0x2A20 wraps to linear 0x1A20.
-const SEL_HIGH: u16 = 0x78;
+pub(crate) const SEL_HIGH: u16 = 0x78;
 /// Data, not present.
-const SEL_NOT_PRESENT_DATA: u16 = 0x80;
+pub(crate) const SEL_NOT_PRESENT_DATA: u16 = 0x80;
 /// Data, base 0x1900, limit 0xFF, Accessed bit clear.
-const SEL_NOT_ACCESSED: u16 = 0x88;
+pub(crate) const SEL_NOT_ACCESSED: u16 = 0x88;
 /// The LDT system descriptor.
-const SEL_LDT: u16 = 0x90;
+pub(crate) const SEL_LDT: u16 = 0x90;
 /// Data, DPL 3, base 0x1900, limit 0xFF. Load it with RPL 3.
-const SEL_DPL3: u16 = 0x98;
+pub(crate) const SEL_DPL3: u16 = 0x98;
 /// Base 0x100, limit 0xFFFF. With offset 0x1920 it reaches linear 0x1A20, as SEL_B does at 0x20.
-const SEL_LOW: u16 = 0xa0;
+pub(crate) const SEL_LOW: u16 = 0xa0;
 /// Index 0 of the LDT: data, base 0x1A00, limit 0xFFFF.
-const SEL_IN_LDT: u16 = 0x04;
-const LDT_BASE: u32 = 0x1300;
+pub(crate) const SEL_IN_LDT: u16 = 0x04;
+pub(crate) const LDT_BASE: u32 = 0x1300;
 
 /// Offset of the first byte of the data pattern. The pattern is the same for every base.
-const PATTERN_START: usize = 0x1900;
+pub(crate) const PATTERN_START: usize = 0x1900;
 
-fn pattern_byte(linear: usize) -> u8 {
+pub(crate) fn pattern_byte(linear: usize) -> u8 {
     ((linear * 7 + 3) & 0xff) as u8
 }
 
 /// One descriptor from its fields. `flags` is the high nibble of byte 6: G, D/B, L, AVL.
-fn desc(base: u32, limit: u32, access: u8, flags: u8) -> [u8; 8] {
+pub(crate) fn desc(base: u32, limit: u32, access: u8, flags: u8) -> [u8; 8] {
     let low = (limit & 0xffff) | (base << 16);
     let high = ((base >> 16) & 0xff)
         | (u32::from(access) << 8)
@@ -62,13 +62,13 @@ fn desc(base: u32, limit: u32, access: u8, flags: u8) -> [u8; 8] {
     descriptor(low, high)
 }
 
-fn put(memory: &mut [u8], at: u32, bytes: [u8; 8]) {
+pub(crate) fn put(memory: &mut [u8], at: u32, bytes: [u8; 8]) {
     let at = at as usize;
     memory[at..at + 8].copy_from_slice(&bytes);
 }
 
 /// The guest memory image: the parent tables, the extra descriptors, the LDT, and the pattern.
-fn image(selector_word: u16) -> Vec<u8> {
+pub(crate) fn image(selector_word: u16) -> Vec<u8> {
     let mut memory = vec![0u8; 0x2000];
     seed_protected_tables(&mut memory);
     put(
@@ -332,7 +332,7 @@ const MIN_ROW_INSNS: usize = 5;
 
 /// A 16-bit protected-mode CPU: a 16-bit code segment, a 16-bit stack segment, flat 4 GiB data
 /// segments, the GDT of the parent file with room for the extra entries, and an LDT.
-fn pm16_cpu(cpl3: bool) -> CpuGsw {
+pub(crate) fn pm16_cpu(cpl3: bool) -> CpuGsw {
     let mut cpu = protected_cpu();
     let (selector, access) = if cpl3 { (0x0b, 0xfb) } else { (SEL_CODE, 0x9b) };
     let mut cs = SegmentRegister::flat(selector, access);
@@ -371,10 +371,10 @@ fn arm(cpu: &mut CpuGsw, bus: &mut TestBus, case: &Case) {
 }
 
 /// The knob, forced for the CPUs built while the guard lives.
-struct Knob;
+pub(crate) struct Knob;
 
 impl Knob {
-    fn set(on: bool) -> Self {
+    pub(crate) fn set(on: bool) -> Self {
         jit::direct::set_live_pm_data_segments_for_test(Some(on));
         Knob
     }

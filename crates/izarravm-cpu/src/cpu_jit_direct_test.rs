@@ -3509,7 +3509,7 @@ mod execution;
 mod retire_governor;
 
 #[path = "cpu_jit_sixteen_bit_test.rs"]
-mod sixteen_bit;
+pub(crate) mod sixteen_bit;
 
 #[cfg(all(
     feature = "jit",
@@ -3523,7 +3523,7 @@ mod addr32_word_block;
 mod width_lift;
 
 #[path = "cpu_jit_interpret_one_test.rs"]
-mod interpret_one;
+pub(crate) mod interpret_one;
 
 #[path = "cpu_jit_int_imm8_admission_test.rs"]
 mod int_imm8_admission;
