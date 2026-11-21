@@ -1238,18 +1238,10 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     // through `callout_segment_writes` rather than through the `LoadSegReal` lowering above --
     // and the bar is what pays for the whole-block segment mask.
     //
-    // It runs on BOTH arms of `IZARRAVM_CALLOUT_SEGMENT_RESUME` and gets OPPOSITE answers, which is
-    // what the knob means at this level: on the ON arm the row bars the block's successors, and on
-    // the OFF arm -- the shipped one since the 2026-08-22 refutation -- nothing feeds
-    // `callout_segment_writes` and the block publishes its fallthrough like any other. The three
-    // rows around it are arm-independent, because a `LoadSegReal` lowering reaches
-    // `segment_writes` and never the call-out accumulator.
-    // `mov fs,ax` is `InterpretOneRow::MovSreg`, which -- since the block-keyed un-demotion
-    // (2026-09-02) -- feeds `callout_segment_writes` UNCONDITIONALLY: neither arm of the knob
-    // changes this row's answer any more, and both rows below are kept, now agreeing, as the
-    // regression pin for that. `IZARRAVM_CALLOUT_SEGMENT_RESUME` still toggles the answer for
-    // `MovSsReg` and `PopSs`, which `the_segment_resume_knob_still_governs_the_ss_rows_successors`
-    // (`cpu_jit_interpret_one_test.rs`) pins.
+    // `mov fs,ax` is `InterpretOneRow::MovSreg`, which feeds `callout_segment_writes` outside
+    // V86. `MovSsReg` and `PopSs` do not feed it, which
+    // `an_ss_row_call_out_keeps_the_successors_of_its_block` (`cpu_jit_interpret_one_test.rs`)
+    // pins.
     let callout = [0x40, 0x41, 0x8e, 0xe0, DIRECT_BARRIER, 0x43, 0x44];
     let control = [0x40, 0x41, 0x42, DIRECT_BARRIER, 0x43, 0x44, 0x45];
     // The OTHER arm that publishes `[None, None]`: a terminal whose successor is dynamic. It is
@@ -1257,44 +1249,32 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     // `successors == [None, None]` alone would count this block and be wrong.
     let ret = [0x40, 0x41, 0x42, 0xc3, 0x43, 0x44, 0x45];
 
-    for (label, code, offsets, expected, segment_resume) in [
+    for (label, code, offsets, expected) in [
         (
             "segment write",
             writes.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
-            false,
         ),
         (
-            "segment-writing call-out, knob on",
+            "segment-writing call-out",
             callout.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
-            true,
-        ),
-        (
-            "segment-writing call-out, knob off",
-            callout.as_slice(),
-            [0, 1, 2, 4, 5, 6].as_slice(),
-            1,
-            false,
         ),
         (
             "fallthrough control",
             control.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
-            false,
         ),
         (
             "dynamic terminal control",
             ret.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
-            false,
         ),
     ] {
-        jit::direct::set_callout_segment_resume_for_test(Some(segment_resume));
         let (mut cpu, mut bus) = fixture(code);
         cpu.registers.set_esp(0x1000);
         let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
@@ -1340,7 +1320,6 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
                 "{label}: control must not deposit into the instruction lane"
             );
         }
-        jit::direct::set_callout_segment_resume_for_test(None);
     }
 }
 

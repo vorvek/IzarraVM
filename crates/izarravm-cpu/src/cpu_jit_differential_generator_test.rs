@@ -3263,7 +3263,6 @@ impl SegmentScope {
         // The loop probes use LOOP (0xE2), so the loop arm is stated as well.
         jit::direct::set_loop_rows_for_test(Some(true));
         jit::direct::set_generic_callout_for_test(Some(true));
-        jit::direct::set_callout_segment_resume_for_test(Some(false));
         jit::direct::set_segment_retire_governor_for_test(Some(
             jit::direct::SegmentRetireGovernor::Cap,
         ));
@@ -3289,7 +3288,6 @@ impl Drop for SegmentScope {
         jit::direct::set_v86_loop_rows_for_test(None);
         jit::direct::set_loop_rows_for_test(None);
         jit::direct::set_generic_callout_for_test(None);
-        jit::direct::set_callout_segment_resume_for_test(None);
         jit::direct::set_segment_retire_governor_for_test(None);
         jit::direct::set_disp_lanes_for_test(None);
         jit::direct::set_disp_store_lanes_for_test(None);

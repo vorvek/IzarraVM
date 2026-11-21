@@ -147,7 +147,6 @@ changes the result.
 | `IZARRAVM_INT_IMM8_ROWS` | `1`/`on`, `0`/`off`, empty is on. | On | Admits `INT imm8` as a call-out. |
 | `IZARRAVM_ROTATE_ROWS` | `1`/`on`, `heat`/`heat_gated`, `0`/`off`, empty is off. | On | Selects how rotate forms run natively. `heat` admits them in hot code only. |
 | `IZARRAVM_RETRY_LIFT` | `1`/`on`, `0`/`off`, empty is off. | Off | Lets a parked block with a clearable compile failure be tried again. |
-| `IZARRAVM_CALLOUT_SEGMENT_RESUME` | `1`/`on`, `0`/`off`, empty is off. | Off | Lets a block continue after a call-out that loads a segment register. |
 | `IZARRAVM_SEGMENT_RETIRE_GOVERNOR` | `cap`, `1`/`on`, `0`/`off`, empty is off. | `cap` | Selects the limit on retired blocks after a data-segment reject. `cap` uses a limit for each key. |
 | `IZARRAVM_CHAIN_ENTRY_CHECK` | `1`/`on`/`chain`, `0`/`off`, empty is on. | On | Makes the block entry check compare only the segments that the block chain needs. |
 | `IZARRAVM_LIVE_DATA_SEGMENTS` | `0`, `1`, `2`, empty is `0`. | `0` | At `1` and `2`, real-mode and virtual-8086 blocks read data segments from the CPU state. `2` also links successors. |
