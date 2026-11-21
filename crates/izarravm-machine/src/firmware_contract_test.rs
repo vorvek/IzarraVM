@@ -141,6 +141,11 @@ fn assert_rom_patch_contract(machine: &Machine, original: &[u8]) {
             ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()],
         &BIOS_MASTER_IRQ_ISR_STUB
     );
+    assert_eq!(
+        &rom[BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET
+            ..BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET + BIOS_SLAVE_IRQ9_ISR_STUB.len()],
+        &BIOS_SLAVE_IRQ9_ISR_STUB
+    );
     for vector in 0..=255usize {
         let offset = BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2;
         assert_eq!(&rom[offset..offset + 2], &[0x90, 0xcf]);
@@ -220,6 +225,11 @@ fn assert_rom_patch_contract(machine: &Machine, original: &[u8]) {
     );
     mark_range(
         &mut owned,
+        BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET
+            ..BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET + BIOS_SLAVE_IRQ9_ISR_STUB.len(),
+    );
+    mark_range(
+        &mut owned,
         BIOS_INT_STUB_TABLE_ROM_OFFSET
             ..BIOS_INT_STUB_TABLE_ROM_OFFSET + BIOS_INT_STUB_TABLE_LEN as usize,
     );
@@ -260,9 +270,8 @@ fn machine_patches_only_the_owned_rom_windows() {
         .collect();
     let machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), &original).unwrap();
     assert_rom_patch_contract(&machine, &original);
-    // 0xda7d_7b97 -> 0xdc41_6399: the IzarraCD device header and its
-    // strategy/interrupt stubs joined the patched windows at 0xF420.
-    assert_eq!(crate::unittester::crc32(&machine.rom), 0xdc41_6399);
+    // The CRC covers the ROM after every patch window, including the IRQ 9 stub.
+    assert_eq!(crate::unittester::crc32(&machine.rom), 0x2d35_58ff);
 }
 
 #[test]
@@ -416,7 +425,11 @@ fn assert_shared_boot_memory(machine: &Machine, equipment: u16) {
     );
     assert_eq!(ivt_pointer(machine, 0x46), (0, 0));
     assert_eq!(ivt_pointer(machine, 0x70), (BIOS_RTC_ISR_ADDRESS as u16, 0));
-    for vector in 0x71..=0x77 {
+    assert_eq!(
+        ivt_pointer(machine, 0x71),
+        (BIOS_SLAVE_IRQ9_ISR_ROM_OFF, BIOS_ROM_IRET_SEG)
+    );
+    for vector in 0x72..=0x77 {
         assert_eq!(
             ivt_pointer(machine, vector),
             (BIOS_SLAVE_IRQ_ISR_ADDRESS as u16, 0)
@@ -524,7 +537,7 @@ fn all_constructors_share_the_firmware_boot_memory_snapshot() {
     let new_snapshot = boot_memory_snapshot(&new_machine);
     let boot_snapshot = boot_memory_snapshot(&boot_machine);
     let raw_snapshot = boot_memory_snapshot(&raw_machine);
-    const SNAPSHOT_CRC32: u32 = 0x2819_74f0;
+    const SNAPSHOT_CRC32: u32 = 0xdfe5_9de9;
     assert_eq!(new_snapshot.crc32(), SNAPSHOT_CRC32);
     assert_eq!(boot_snapshot.crc32(), SNAPSHOT_CRC32);
     assert_eq!(raw_snapshot.crc32(), SNAPSHOT_CRC32);

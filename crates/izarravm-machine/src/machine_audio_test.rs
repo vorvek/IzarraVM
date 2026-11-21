@@ -3673,3 +3673,150 @@ fn armed_audio_clocks_survive_cpu_mode_changes_and_split_advances() {
         }
     }
 }
+
+/// Programs both PICs the way the AT BIOS does (master base 08h, slave base 70h,
+/// cascade on IR2) and sets both interrupt masks.
+fn init_pic_pair(machine: &mut Machine, master_mask: u8, slave_mask: u8) {
+    let mut bus = machine.make_construction_bus();
+    for (port, value) in [
+        (0x20u16, 0x11u32),
+        (0x21, 0x08),
+        (0x21, 0x04),
+        (0x21, 0x01),
+        (0xa0, 0x11),
+        (0xa1, 0x70),
+        (0xa1, 0x02),
+        (0xa1, 0x01),
+        (0x21, u32::from(master_mask)),
+        (0xa1, u32::from(slave_mask)),
+    ] {
+        bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+    }
+}
+
+#[test]
+fn sb_irq2_reaches_the_slave_pic_as_irq9_vector_0x71() {
+    // The card jumper IRQ 2 is wired to slave input IR1 (IRQ 9) on an AT bus.
+    let mut machine = test_machine();
+    for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+        machine.write_physical_u8(0x1_0000 + i as u32, b);
+    }
+    set_mixer_register(&mut machine, 0x80, 0x01);
+    init_pic_pair(&mut machine, 0x00, 0x00);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+        for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    });
+    machine.advance_devices_clocks(200_000);
+    let vector = with_bus(&mut machine, |bus| bus.acknowledge_interrupt());
+    assert_eq!(
+        vector,
+        Some(0x71),
+        "the DSP IRQ on card line 2 must arrive as slave IRQ 9, not as a spurious IRQ 15"
+    );
+}
+
+/// Starts a 0x80 pause with the card on IRQ 2 and returns the wake the run loop offers.
+fn sb_irq2_pause_wake(master_mask: u8, slave_mask: u8) -> Option<u64> {
+    let mut machine = test_machine();
+    machine.cpu.registers.eflags |= 0x0200;
+    set_mixer_register(&mut machine, 0x80, 0x01);
+    init_pic_pair(&mut machine, master_mask, slave_mask);
+    {
+        let mut bus = machine.make_construction_bus();
+        for &b in &[0x41u8, 0x27, 0x10, 0x80, 0x09, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    }
+    let ticks = 1_000 * izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    machine.next_timer_wake(machine.master_ticks() + ticks * 4)
+}
+
+#[test]
+fn sb_irq2_with_slave_ir1_open_wakes_a_halted_cpu() {
+    assert!(sb_irq2_pause_wake(0x00, 0xfd).is_some());
+}
+
+#[test]
+fn sb_irq2_with_slave_ir1_masked_does_not_wake_a_halted_cpu() {
+    // Master IR2 is open, slave IR1 is masked: the interrupt cannot reach the CPU.
+    assert_eq!(sb_irq2_pause_wake(0x00, 0xff), None);
+}
+
+#[test]
+fn sb_irq2_with_master_cascade_masked_does_not_wake_a_halted_cpu() {
+    // Slave IR1 is open, master IR2 (the cascade input) is masked.
+    assert_eq!(sb_irq2_pause_wake(0x04, 0x00), None);
+}
+
+/// Real-mode probe for a Sound Blaster on IRQ 2. It checks that slave IMR bit 1
+/// is clear, hooks INT 0Ah, plays one 8-bit DMA block with the card on IRQ 2,
+/// and exits through the test device. Exit code 0 means INT 0Ah ran, 1 means the
+/// slave mask hid IRQ 9, and 2 means the interrupt never arrived. The code finds
+/// its own load offset, so one image runs as a boot sector and as a COM file.
+///
+/// Source, assembled with `nasm -f bin`:
+///
+/// ```text
+///     cli / call here / here: pop si / sub si, here - start
+///     xor ax,ax / mov ds,ax / in al,0A1h / test al,2 / mov bl,1 / jnz exit
+///     lea ax,[si + isr - start] / mov [28h],ax / mov [2Ah],cs
+///     mixer 224h/225h: register 80h = 01h
+///     DMA channel 1 single read, 16 bytes at 01_0000h
+///     DSP 41h 2Bh 11h 14h 0Fh 00h to 22Ch
+///     mov cx,3000 / sti / wait: hlt / cmp byte [500h],1 / je passed / loop wait
+///     isr: set byte [500h], read 22Eh, EOI to port 20h, iret
+/// ```
+const SB_IRQ2_PROBE: [u8; 149] = [
+    0xfa, 0xe8, 0x00, 0x00, 0x5e, 0x83, 0xee, 0x04, 0x31, 0xc0, 0x8e, 0xd8, 0xe4, 0xa1, 0xa8, 0x02,
+    0xb3, 0x01, 0x75, 0x5a, 0x8d, 0x44, 0x7d, 0xa3, 0x28, 0x00, 0x8c, 0x0e, 0x2a, 0x00, 0xc6, 0x06,
+    0x00, 0x05, 0x00, 0xba, 0x24, 0x02, 0xb0, 0x80, 0xee, 0x42, 0xb0, 0x01, 0xee, 0xb0, 0x49, 0xe6,
+    0x0b, 0x30, 0xc0, 0xe6, 0x02, 0xe6, 0x02, 0xb0, 0x0f, 0xe6, 0x03, 0x30, 0xc0, 0xe6, 0x03, 0xb0,
+    0x01, 0xe6, 0x83, 0xe6, 0x0a, 0xb0, 0x41, 0xba, 0x2c, 0x02, 0xee, 0xb0, 0x2b, 0xee, 0xb0, 0x11,
+    0xee, 0xb0, 0x14, 0xee, 0xb0, 0x0f, 0xee, 0x30, 0xc0, 0xee, 0xb9, 0xb8, 0x0b, 0xfb, 0xf4, 0x80,
+    0x3e, 0x00, 0x05, 0x01, 0x74, 0x06, 0xe2, 0xf6, 0xb3, 0x02, 0xeb, 0x02, 0x30, 0xdb, 0xfa, 0xb0,
+    0x0c, 0xe6, 0xe4, 0x88, 0xd8, 0xe6, 0xe5, 0xb0, 0x03, 0xe6, 0xe6, 0xeb, 0xfe, 0x50, 0x52, 0x1e,
+    0x31, 0xc0, 0x8e, 0xd8, 0xc6, 0x06, 0x00, 0x05, 0x01, 0xba, 0x2e, 0x02, 0xec, 0xb0, 0x20, 0xe6,
+    0x20, 0x1f, 0x5a, 0x58, 0xcf,
+];
+
+#[test]
+fn sb_irq2_reaches_an_int_0ah_hook_on_the_rom_bios() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .unwrap();
+    let mut image = vec![0u8; 1_474_560];
+    image[..SB_IRQ2_PROBE.len()].copy_from_slice(&SB_IRQ2_PROBE);
+    image[510] = 0x55;
+    image[511] = 0xaa;
+    machine.mount_floppy(image).unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(400_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::TestExit { code: 0 });
+}
+
+#[test]
+fn sb_irq2_reaches_an_int_0ah_hook_on_the_hle_boot_path() {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &SB_IRQ2_PROBE)
+            .unwrap();
+    // The HLE boot path leaves both PICs masked, so the host opens every line first.
+    init_pic_pair(&mut machine, 0x00, 0x00);
+
+    let reason = machine.run_until_halt_or_cycles(400_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::TestExit { code: 0 });
+}
