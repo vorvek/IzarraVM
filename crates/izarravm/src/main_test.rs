@@ -818,8 +818,8 @@ fn direct_barrier_census_json_carries_dormant_heat_sites_and_their_lane_match() 
     assert_eq!(
         report["dormant_heat"]["sites"],
         serde_json::json!([{
-            // Hex, per the vga_wipe_census_json precedent: a guest linear is cross-referenced
-            // against a map file or a disassembly, and both are hex.
+            // Hex: a guest linear is cross-referenced against a map file or a disassembly, and both
+            // are hex.
             "linear": "0x00001234",
             "static_exits": 2,
             "dynamic_exits": 1,

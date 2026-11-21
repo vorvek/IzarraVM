@@ -454,7 +454,6 @@ pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus)
         direct_data_map_changed: &mut machine.direct_data_map_changed,
         aperture_content_changed: &mut machine.aperture_content_changed,
         direct_mapping_epoch: &mut machine.direct_mapping_epoch,
-        vga_wipe_census: &mut machine.vga_wipe_census,
         core_clocks_so_far: 0,
         prior_runs_core_clocks: 0,
         timeline_at_batch_start: machine.timeline,
