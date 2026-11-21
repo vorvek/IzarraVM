@@ -3524,6 +3524,9 @@ struct SetOutcome {
     callouts_total: u64,
     limit_exits: u64,
     cross_page_exits: u64,
+    /// Native block entries and linked transfers of this measured run. Their sum is the number
+    /// of native blocks that the run executed.
+    entries: u64,
 }
 
 struct SegmentOutcome {
@@ -3645,6 +3648,9 @@ fn run_segment_case_primed(
                 .perf_counters()
                 .jit_direct_exit_cross_page_or_alignment
                 - perf_before.jit_direct_exit_cross_page_or_alignment,
+            entries: direct.perf_counters().jit_direct_entries - perf_before.jit_direct_entries
+                + direct.perf_counters().jit_direct_linked_transfers
+                - perf_before.jit_direct_linked_transfers,
         });
     }
     SegmentOutcome {
@@ -3720,6 +3726,9 @@ struct ClassProbe {
     name: &'static str,
     body: Vec<u8>,
     native: u64,
+    /// The native count under arm 2 of the live data segment switch, which lets a segment write
+    /// stay inside a block.
+    arm2_native: u64,
     callout: bool,
     exact_run_boundaries: bool,
 }
@@ -3861,6 +3870,8 @@ fn class_probes() -> Vec<ClassProbe> {
     let counted = |name, asm: Asm, callouts: u64, exact_run_boundaries| ClassProbe {
         name,
         native: CASE_PREFIX_INSNS + asm.insns - callouts,
+        // A resumed call-out retires inside the native run under arm 2.
+        arm2_native: CASE_PREFIX_INSNS + asm.insns,
         callout: callouts > 0,
         exact_run_boundaries,
         body: asm.code,
@@ -3870,10 +3881,11 @@ fn class_probes() -> Vec<ClassProbe> {
     probe_access_pairs(&mut byte_word, AccessWidth::Word);
     let mut dword = Asm::new();
     probe_access_pairs(&mut dword, AccessWidth::Dword);
-    let loop_probe = |name, body, native| ClassProbe {
+    let loop_probe = |name, body, native, arm2_native| ClassProbe {
         name,
         body,
         native,
+        arm2_native,
         callout: false,
         exact_run_boundaries: false,
     };
@@ -3911,9 +3923,19 @@ fn class_probes() -> Vec<ClassProbe> {
             false,
         ),
         // 2 filler moves, mov cx, the first mov es, and three rounds of store, add and loop.
-        loop_probe("loop A: load ES, then store through ES", probe_loop_a(), 13),
+        loop_probe(
+            "loop A: load ES, then store through ES",
+            probe_loop_a(),
+            13,
+            15,
+        ),
         // 2 filler moves, mov cx, then one block of store, mov es, add and loop for each round.
-        loop_probe("loop B: store through ES, then load ES", probe_loop_b(), 15),
+        loop_probe(
+            "loop B: store through ES, then load ES",
+            probe_loop_b(),
+            15,
+            15,
+        ),
         counted("load, jmp short, access", probe_chained_edge(), 0, false),
     ]
 }
@@ -3933,18 +3955,23 @@ fn run_class_probes(world: SegWorld) {
             // call-out is asserted on the total over all runs: the site is demoted after it
             // resyncs, so the measured run itself can retire the instruction in the interpreter.
             let first = &outcome.sets[0];
+            let expected = if segment_arm() == 2 {
+                probe.arm2_native
+            } else {
+                probe.native
+            };
             // With the switch on, the second entry set runs natively with the same count.
-            if segment_arm() != 0 && outcome.sets[1].retired != probe.native {
+            if segment_arm() != 0 && outcome.sets[1].retired != expected {
                 mismatches.push(format!(
                     "{world:?} {mode:?} {}: set 2 retired {} (expected {})",
-                    probe.name, outcome.sets[1].retired, probe.native
+                    probe.name, outcome.sets[1].retired, expected
                 ));
             }
-            if first.retired != probe.native || (first.callouts_total > 0) != probe.callout {
+            if first.retired != expected || (first.callouts_total > 0) != probe.callout {
                 mismatches.push(format!(
                     "{world:?} {mode:?} {}: retired {} (expected {}), call-outs {} \
                      (expected call-out: {})",
-                    probe.name, first.retired, probe.native, first.callouts_total, probe.callout
+                    probe.name, first.retired, expected, first.callouts_total, probe.callout
                 ));
             }
         }
@@ -4709,10 +4736,9 @@ fn the_sweeps_agree_with_the_interpreter_under_the_address_scratch_poison() {
 /// the class probe interprets it. This case is primed with two compiled runs only, so the call-out
 /// executes inside the measured run. The deltas are what the block does TODAY: the call-out
 /// executes once and resyncs once, because a segment-writing call-out ends the native run.
-/// Stage 1A step 3 must change them to executed 1 and resync 0.
+/// Under arm 2 of the live data segment switch it executes once and does not resync.
 #[test]
 fn a_segment_call_out_executes_and_resyncs_inside_a_measured_run() {
-    // The call-out rule is the same on every arm of the live data segment switch.
     for_each_segment_arm(|_| a_segment_call_out_case());
 }
 
@@ -4725,10 +4751,94 @@ fn a_segment_call_out_case() {
             let first = &outcome.sets[0];
             let label = format!("{world:?} {mode:?}");
             assert_eq!(first.callouts, 1, "{label}: the call-out executes");
-            assert_eq!(first.resyncs, 1, "{label}: step 3 must change this to 0");
-            assert_eq!(first.retired, 8, "{label}: all but the call-out are native");
+            if segment_arm() == 2 {
+                // A live block resumes after the call-out: no data segment is baked, so the
+                // resume check has nothing to refuse.
+                assert_eq!(
+                    first.resyncs, 0,
+                    "{label}: arm 2 resumes after the call-out"
+                );
+                assert_eq!(
+                    first.retired, 9,
+                    "{label}: arm 2 retires the call-out natively"
+                );
+            } else {
+                assert_eq!(
+                    first.resyncs, 1,
+                    "{label}: a segment write ends the native run"
+                );
+                assert_eq!(first.retired, 8, "{label}: all but the call-out are native");
+            }
         }
     }
+}
+
+/// Two data segment writes and the accesses between them, in one body. Under arm 2 of the live
+/// data segment switch the writes do not end the block, because the block bakes no data segment.
+/// Both roles must end in the same state on every arm, and arm 2 must not resync.
+#[test]
+fn two_data_segment_writes_in_one_block_match_the_interpreter_on_every_arm() {
+    for_each_segment_arm(|arm| {
+        for world in [SegWorld::Real, SegWorld::V86] {
+            for mode in PERSONAS {
+                let mut asm = Asm::new();
+                asm.pad();
+                asm.mov_sreg_imm(Seg::Ds, SEG_POOL[2]);
+                asm.raw(&[0xac], 1);
+                asm.mov_sreg_imm(Seg::Es, SEG_POOL[4]);
+                asm.raw(&[0xaa], 1);
+                asm.access(Seg::Ds, 7, AccessWidth::Word, false, 0x340);
+                asm.pad();
+                let case = segment_case_from_body(world, 0x5e60_2d5e_0000_0001, &asm.code, false);
+                let outcome = run_segment_case(world, mode, &case, &two_sets(world));
+                let label = format!("arm {arm} {world:?} {mode:?}");
+                if arm == 2 {
+                    for set in &outcome.sets {
+                        assert_eq!(set.resyncs, 0, "{label}: no resync");
+                        assert_eq!(set.entries, 1, "{label}: the writes do not split the block");
+                        assert_eq!(
+                            set.retired,
+                            CASE_PREFIX_INSNS + asm.insns,
+                            "{label}: every instruction is native"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// A loop that loads ES in its body. Under arm 2 the loop may run as a native self-loop, and
+/// every iteration must read the segment that the load of that iteration wrote.
+#[test]
+fn a_self_loop_that_writes_a_data_segment_matches_the_interpreter_on_every_arm() {
+    for_each_segment_arm(|arm| {
+        for world in [SegWorld::Real, SegWorld::V86] {
+            for mode in PERSONAS {
+                // mov dx,selector / mov cx,3
+                let mut code = vec![0xba];
+                push_u16(&mut code, SEG_POOL[4]);
+                code.extend_from_slice(&[0xb9, 0x03, 0x00]);
+                // L: mov es,dx / store through ES / dec cx / jnz L
+                let mut body = vec![0x8e, 0xc2];
+                emit_access(&mut body, Seg::Es, 7, AccessWidth::Word, true, 0x3c0, false);
+                body.push(0x49);
+                let back = -(body.len() as i32 + 2);
+                body.extend_from_slice(&[0x75, back as u8]);
+                code.extend_from_slice(&body);
+                let case = segment_case_from_body(world, 0x5e60_51f0_0000_0001, &code, false);
+                let outcome = run_segment_case(world, mode, &case, &two_sets(world));
+                if arm == 2 {
+                    for set in &outcome.sets {
+                        assert_eq!(
+                            set.resyncs, 0,
+                            "arm 2 {world:?} {mode:?}: the loop does not resync"
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// A block compiled under the wide limit 0xFFFF has no byte limit compare. Set A enters it with
