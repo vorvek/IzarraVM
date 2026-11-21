@@ -13712,6 +13712,14 @@ pub(crate) fn set_word_shift_cl_rows_for_test(forced: Option<bool>) {
     WORD_SHIFT_CL_ROWS_OVERRIDE.with(|cell| cell.set(forced));
 }
 
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_word_shift_cl_rows_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_word_shift_cl_rows_arm(value)
+}
+
 /// Whether `classify` admits the **BYTE shift/rotate register rows `0xD0 /4..=7` and
 /// `0xC0 /5,/6,/7`**, and whether `0xC0`/`0xD0` reach the `OperandSize::Word` decode path at all
 /// (`IZARRAVM_BYTE_SHIFT_ROWS`).

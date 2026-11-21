@@ -603,3 +603,247 @@ fn the_shipped_disp_lanes_default_is_the_on_arm() {
 fn an_unrecognised_disp_lanes_spelling_panics() {
     jit::direct::parse_disp_lanes_arm_for_test(Ok("true".to_string()));
 }
+
+/// One row of the spelling table below.
+struct BoolKnobRow {
+    name: &'static str,
+    parse: fn(Result<String, std::env::VarError>) -> bool,
+    /// The arm when the variable is not set.
+    unset: bool,
+    /// The arm when the variable is set to the empty string.
+    empty: bool,
+    /// Whether the parser folds case and accepts `off` and `on`.
+    words: bool,
+    /// Spellings that only this knob accepts, with the arm of each.
+    extra: &'static [(&'static str, bool)],
+}
+
+/// The arm that a parser gives for one value, or `None` when the parser panics.
+fn bool_knob_arm(row: &BoolKnobRow, value: Result<String, std::env::VarError>) -> Option<bool> {
+    let parse = row.parse;
+    std::panic::catch_unwind(move || parse(value)).ok()
+}
+
+/// The spelling table of each boolean environment knob of the Direct backend.
+///
+/// The empty string does not have the same meaning for each knob. For some knobs with a default
+/// of ON it selects OFF, and for the others it selects the default. This test records the
+/// meaning for each knob, so that a change to a parser cannot change it silently.
+///
+/// The knobs that accept each spelling without an error have no row: `IZARRAVM_JIT16`,
+/// `IZARRAVM_JIT16_486`, `IZARRAVM_LANE_FAMILY` and `IZARRAVM_SMC_LANE_TRIAL`.
+#[test]
+fn each_boolean_knob_keeps_its_spelling_table() {
+    use jit::direct as d;
+    type Parse = fn(Result<String, std::env::VarError>) -> bool;
+    type Extra = &'static [(&'static str, bool)];
+    // (unset, empty)
+    const ON_BUT_EMPTY_IS_OFF: (bool, bool) = (true, false);
+    const OFF: (bool, bool) = (false, false);
+    const ON: (bool, bool) = (true, true);
+    const NONE: Extra = &[];
+    let row = |name, parse: Parse, (unset, empty): (bool, bool), extra: Extra| BoolKnobRow {
+        name,
+        parse,
+        unset,
+        empty,
+        words: true,
+        extra,
+    };
+    let rows = [
+        // Default ON, and the empty string selects OFF.
+        row(
+            "DISP_LANES",
+            d::parse_disp_lanes_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        row(
+            "DISP_STORE_LANES",
+            d::parse_disp_store_lanes_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        row(
+            "IMM8_LANES",
+            d::parse_imm8_lanes_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        row(
+            "COUNT_LANES",
+            d::parse_count_lanes_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        row(
+            "FPU_LOOP_ROWS",
+            d::parse_fpu_loop_rows_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        row(
+            "LOOP_ROWS",
+            d::parse_loop_rows_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        row(
+            "LOOPCC_ROWS",
+            d::parse_loopcc_rows_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        row(
+            "V86_LOOP_ROWS",
+            d::parse_v86_loop_rows_arm_for_test,
+            ON_BUT_EMPTY_IS_OFF,
+            NONE,
+        ),
+        // Default OFF.
+        row(
+            "DISP_LOAD_WIDEN",
+            d::parse_disp_load_widen_arm_for_test,
+            OFF,
+            NONE,
+        ),
+        row(
+            "MUL_MEM_ROWS",
+            d::parse_mul_mem_rows_arm_for_test,
+            OFF,
+            NONE,
+        ),
+        row(
+            "ADDR32_WORD_ROWS",
+            d::parse_addr32_word_rows_arm_for_test,
+            OFF,
+            NONE,
+        ),
+        row("RETRY_LIFT", d::parse_retry_lift_arm_for_test, OFF, NONE),
+        row("JCC_SHADOW", d::parse_jcc_shadow_arm_for_test, OFF, NONE),
+        row(
+            "DIRECT_HOLD_LOAD_BIAS",
+            d::parse_hold_load_bias_arm_for_test,
+            OFF,
+            NONE,
+        ),
+        row(
+            "DIRECT_ALIGN_TEST_AL",
+            d::parse_align_test_al_arm_for_test,
+            OFF,
+            NONE,
+        ),
+        // Default ON, and the empty string selects the default.
+        row(
+            "TEST_WORD_ROWS",
+            d::parse_test_word_rows_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "WORD_SHIFT_CL_ROWS",
+            d::parse_word_shift_cl_rows_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "BYTE_SHIFT_ROWS",
+            d::parse_byte_shift_rows_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "GENERIC_CALLOUT",
+            d::parse_generic_callout_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "DIRECT_IN_IMM8_CALLOUT",
+            d::parse_direct_in_imm8_callout_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "OUT_IMM8_ROWS",
+            d::parse_out_imm8_rows_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "INT_IMM8_ROWS",
+            d::parse_int_imm8_rows_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "DIRECT_POLL_SKIP_16",
+            d::parse_direct_poll_skip_16_arm_for_test,
+            ON,
+            NONE,
+        ),
+        row(
+            "CHAIN_ENTRY_CHECK",
+            d::parse_chain_entry_check_arm_for_test,
+            ON,
+            &[("chain", true)],
+        ),
+        row(
+            "DIRECT_POLL_SKIP",
+            d::parse_direct_poll_skip_arm_for_test,
+            ON,
+            &[("poll", true)],
+        ),
+        row(
+            "DIRECT_EAGER_FLAGS",
+            d::parse_eager_flags_arm_for_test,
+            ON,
+            &[("true", true), ("false", false)],
+        ),
+        // Default OFF. This parser does not fold case and accepts only ``, `0` and `1`.
+        BoolKnobRow {
+            name: "LIVE_PM_DATA_SEGMENTS",
+            parse: d::parse_live_pm_data_segments_for_test,
+            unset: false,
+            empty: false,
+            words: false,
+            extra: NONE,
+        },
+    ];
+
+    for row in &rows {
+        let name = row.name;
+        let arm = |value: &str| bool_knob_arm(row, Ok(value.to_string()));
+        assert_eq!(
+            bool_knob_arm(row, Err(std::env::VarError::NotPresent)),
+            Some(row.unset),
+            "{name}: unset"
+        );
+        assert_eq!(arm(""), Some(row.empty), "{name}: the empty string");
+        assert_eq!(arm("  "), Some(row.empty), "{name}: only spaces");
+        assert_eq!(arm("0"), Some(false), "{name}: 0");
+        assert_eq!(arm("1"), Some(true), "{name}: 1");
+        assert_eq!(arm(" 1 "), Some(true), "{name}: 1 with spaces");
+        let word = |arm: bool| row.words.then_some(arm);
+        assert_eq!(arm("off"), word(false), "{name}: off");
+        assert_eq!(arm("on"), word(true), "{name}: on");
+        assert_eq!(arm(" ON "), word(true), "{name}: ON with spaces");
+        assert_eq!(arm("Off"), word(false), "{name}: Off");
+        assert_eq!(arm("yes"), None, "{name}: a typo must panic");
+        assert_eq!(arm("2"), None, "{name}: 2 must panic");
+        for alias in ["true", "false", "chain", "poll"] {
+            let expected = row
+                .extra
+                .iter()
+                .find(|(spelling, _)| *spelling == alias)
+                .map(|(_, arm)| *arm);
+            assert_eq!(arm(alias), expected, "{name}: {alias}");
+        }
+        let not_utf8 = std::env::VarError::NotUnicode(std::ffi::OsString::from("x"));
+        assert_eq!(
+            bool_knob_arm(row, Err(not_utf8)),
+            None,
+            "{name}: a value that is not UTF-8 must panic"
+        );
+    }
+}
