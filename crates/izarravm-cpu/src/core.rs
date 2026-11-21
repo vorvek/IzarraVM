@@ -362,9 +362,9 @@ impl CpuGsw {
     }
     /// Decide once, when the CPU is built, whether the fast map keeps one table for each CR3 ring
     /// slot (`IZARRAVM_FAST_MAP_TWO_TABLES`). The mode needs the TLB slot partition, because it
-    /// trusts the TLB array of a dormant slot to stay intact. It needs the R15 table slots,
-    /// because they are what a switch republishes. It does not run with mkII, which bakes the
-    /// table bases into its code. Tests that flip `r15_tables` call this again.
+    /// trusts the TLB array of a dormant slot to stay intact. It does not run with mkII, which
+    /// bakes the table bases into its code. Direct blocks read the bases through the R15 table
+    /// slots, which a switch republishes.
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -375,10 +375,8 @@ impl CpuGsw {
         let mkii = self.mkii_requested();
         #[cfg(not(feature = "dynarec-mkii"))]
         let mkii = false;
-        let on = crate::jit::fast_map::fast_map_two_tables_enabled()
-            && self.tlb.partitioned()
-            && self.jit_direct.r15_tables
-            && !mkii;
+        let on =
+            crate::jit::fast_map::fast_map_two_tables_enabled() && self.tlb.partitioned() && !mkii;
         self.jit_fast_map.set_two_tables(on);
     }
 

@@ -1029,21 +1029,11 @@ mod partition_and_two_tables {
         }
     }
 
-    /// Row 13: the knob does nothing without the partition and without the R15 table slots.
+    /// Row 13: the knob does nothing without the TLB slot partition.
     #[test]
-    fn the_knob_has_no_effect_without_its_requirements() {
+    fn the_knob_has_no_effect_without_the_partition() {
         let (mut cpu, mut bus) = fixture(false, true);
         assert!(!cpu.jit_fast_map.two_tables(), "no partition");
-        warm_a(&mut cpu, &mut bus);
-        round_trip(&mut cpu, &mut bus);
-        assert!(!served(&cpu, READ_PAGE, false, false, false));
-        assert_eq!(switches(&cpu), 0);
-
-        let (mut cpu, mut bus) = fixture(true, true);
-        assert!(cpu.jit_fast_map.two_tables());
-        cpu.jit_direct.r15_tables = false;
-        cpu.refresh_fast_map_two_tables_latch();
-        assert!(!cpu.jit_fast_map.two_tables(), "no R15 table slots");
         warm_a(&mut cpu, &mut bus);
         round_trip(&mut cpu, &mut bus);
         assert!(!served(&cpu, READ_PAGE, false, false, false));
