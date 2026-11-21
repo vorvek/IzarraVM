@@ -1928,12 +1928,6 @@ pub struct Machine {
     // channel transfers the ATA disk; the secondary bank records legacy IDE
     // interrupts but does not advertise ATAPI DMA.
     bmide: bmide::BusMasterIde,
-    // Synthesized read-only FAT32 volume serving drive C: to the DOS absolute-disk
-    // interface (INT 25h read; INT 26h write is write-protected). Optional and
-    // consulted only by INT 25h/26h for AL=2, so it does not touch the ATA / INT
-    // 13h path. None until one is mounted. The eventual single C: backing (ATA
-    // vs this) remains an install-layout decision.
-    fat32_c: Option<Fat32Volume>,
     cd_accesses: u64,
     // Bytes transferred through the secondary IDE data phases. Unlike
     // cd_accesses, this excludes the legacy INT 2Fh compatibility path and lets
@@ -2395,7 +2389,6 @@ impl Machine {
             cd_driver: cddriver::CdDriverState::default(),
             ata: None,
             bmide: bmide::BusMasterIde::default(),
-            fat32_c: None,
             cd_accesses: 0,
             cd_pio_bytes: 0,
             cd_audio_sample: 0,

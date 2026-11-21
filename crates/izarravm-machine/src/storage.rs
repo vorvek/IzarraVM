@@ -709,13 +709,6 @@ impl Machine {
         self.mount_hdd_folder_with_user_overrides(dir, Vec::new())
     }
 
-    /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
-    /// interface. INT 25h reads its sectors; INT 26h writes are write-protected
-    /// (the volume is read-only). Build one with `build_fat32`.
-    pub fn mount_fat32(&mut self, volume: Fat32Volume) {
-        self.fat32_c = Some(volume);
-    }
-
     /// Eject the hard disk, returning its current image bytes (including any
     /// in-session writes) so the caller can flush them back. None when no disk is
     /// mounted OR when the disk is a read-only host-folder facade (which has no
