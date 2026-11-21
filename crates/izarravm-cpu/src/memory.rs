@@ -121,6 +121,19 @@ impl CpuGsw {
         if mapped {
             return true;
         }
+        // A native store to a page a walk read must leave the block, so the interpreter can retire
+        // the translation caches. An entry with no write mapping sends every store to the side
+        // exit. Read fills stay: loads from a page-table page have no such need.
+        if write
+            && self
+                .decode_cache
+                .translation_page_is_watched(physical >> 12)
+        {
+            self.jit_direct
+                .fast_map_audit
+                .fast_map_write_fill_refused_translation += 1;
+            return false;
+        }
         let Some(permissions) = self.fast_map_permissions(linear, physical, write) else {
             return false;
         };
@@ -2080,7 +2093,7 @@ impl CpuGsw {
         // already consumed by the walk and the bus write above committed the new bytes, so there
         // is no old-byte snapshot to compare, and self-modifying page tables are rare enough that
         // the extra pre-read would not earn its cost.
-        self.note_code_write(physical, BusWidth::Dword.bytes());
+        self.note_page_walk_write(physical, BusWidth::Dword.bytes());
         Ok(())
     }
 
