@@ -2019,7 +2019,7 @@ fn trace_vbe_mode_set(
 ) {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_VBE_TRACE").is_some()) {
+    if !*ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_VBE_TRACE")) {
         return;
     }
     let window = if request & 0x4000 != 0 {

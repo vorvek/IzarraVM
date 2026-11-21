@@ -21,7 +21,7 @@ use crate::jit::direct::{FallbackTag, Phase, Population, compile_site, site};
 /// when unset is one relaxed load per instruction, not a syscall.
 pub(super) fn diff_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
+    *ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_DIFF_TRACE"))
 }
 
 /// The EXACT per-instruction cap test the screens in `run_budgeted_inner` stand in front of:

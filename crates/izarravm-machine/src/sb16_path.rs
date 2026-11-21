@@ -33,7 +33,7 @@ impl SbTrace {
     /// Whether the trace is enabled. Read once at construction: an env lookup
     /// per sample would itself distort what is being measured.
     fn enabled() -> bool {
-        std::env::var_os("IZARRAVM_SB_DEBUG").is_some()
+        izarravm_core::env_flag("IZARRAVM_SB_DEBUG")
     }
 
     fn report(&mut self, dsp: &mut SbDsp, dma8: usize, dma16: usize) {

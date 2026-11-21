@@ -199,7 +199,7 @@ impl Default for Ad1848Config {
 /// which register it programmed, what it selected, and what it read back.
 pub fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_WSS_TRACE").is_some())
+    *ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_WSS_TRACE"))
 }
 
 /// Audio sample format decoded from I8 (FMT + L/C bits).

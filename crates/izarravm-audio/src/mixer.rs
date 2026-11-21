@@ -313,7 +313,7 @@ impl SbMixer {
     /// card end up on" is the question this trace exists to answer.
     fn trace_write(&self, index: u8, value: u8) {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_CMD_TRACE").is_some()) {
+        if !*ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_SB_CMD_TRACE")) {
             return;
         }
         let note = match index {

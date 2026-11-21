@@ -132,7 +132,7 @@ pub use paging::TLB_ENTRIES;
 /// gate is read only on the cold vector-6 delivery path, never per-instruction.
 fn ud_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_FAULT_TRACE").is_some())
+    *ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_FAULT_TRACE"))
 }
 
 /// Diagnostic guest-store watchpoint (`IZARRAVM_WATCH_WRITE=<hex addr>[,<hex len>]`).

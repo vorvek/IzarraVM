@@ -254,3 +254,27 @@ mod dialog_wanted_vectors {
         assert!(dialog_wanted(false, false));
     }
 }
+
+#[cfg(windows)]
+mod no_dialog_value_vectors {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn off_spellings_leave_the_dialog_enabled() {
+        assert!(!no_dialog_requested(None));
+        for value in ["", "0", "off", "False"] {
+            assert!(
+                !no_dialog_requested(Some(OsString::from(value))),
+                "{value:?} must not suppress the dialog"
+            );
+        }
+    }
+
+    #[test]
+    fn other_values_suppress_the_dialog() {
+        for value in ["1", "yes", "true"] {
+            assert!(no_dialog_requested(Some(OsString::from(value))));
+        }
+    }
+}
