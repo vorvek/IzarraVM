@@ -129,8 +129,8 @@ pub(super) const EMITTED_CALL_OUT_SLOT_BYTES: u32 = 592;
 pub(super) const EMITTED_TERMINAL_SLOT_EXTRA_BYTES: u32 = 208;
 pub(crate) const HOT_LOOKUP_LEN: usize = 65_536;
 /// `LinkTarget::context` for a successor published by `compile_with_budget`, before it has ever
-/// been through a rendezvous. The field is meaningless at compile time (S1a, design doc
-/// `2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1): `resolve_successors` overwrites
+/// been through a rendezvous. The field is meaningless at compile time (S1a, Tyrian
+/// unbound-to-compiled design section 4.1): `resolve_successors` overwrites
 /// it with the LIVE ring slot before either the `linear_blocks` lookup or the `waiting` park, so
 /// no reader may ever branch on a successor's stored `context`. `u8::MAX` rather than `0` so the
 /// value can never be mistaken for a real ring slot.
@@ -1303,7 +1303,7 @@ pub(crate) struct BlockCache {
     /// `block_link_epochs[i] == link_epochs[link_slot]` is the "visible under the LIVE context"
     /// test `is_link_visible` reads; `block_link_epochs[i] == link_epochs[1 - link_slot]` is the
     /// "visible under the OTHER, currently-parked context" case `make_link_visible`'s L3 arm
-    /// must catch and clear before rebinding (design doc `2026-09-02-cr3-jit-half-design.md`
+    /// must catch and clear before rebinding (CR3 JIT-half design
     /// (b), L1/L3).
     link_epochs: [u64; 2],
     /// The live index into `link_epochs`, 0 or 1. Seeded to 0 (design doc J7): `select_context`
@@ -2454,7 +2454,7 @@ impl BlockCache {
     ///
     /// Returns which of the three shapes this call took. `StillDormant` is EXACTLY the predicate
     /// the sticky-decline memo encodes — "was Dormant, did not lift"
-    /// (`dev_docs/sticky-decline-memo-design.md` §1.4) — and the entry-state test it needs is one
+    /// (sticky-decline memo design §1.4) — and the entry-state test it needs is one
     /// this function already performs, so reporting it costs nothing.
     pub(crate) fn lift_cold_smc_dormant(
         &mut self,
@@ -2907,7 +2907,7 @@ impl BlockCache {
         // writer. Without this a flushed block keeps demanding a segment nothing live reaches --
         // safe, but permanently over-strict, and it would refuse precisely the class-B edges this
         // mask exists to admit. Wholesale SMC and paging flushes make that the common case, not a
-        // corner. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
+        // corner.
         //
         // ORDER IS LOAD-BEARING, and it is a MISCOMPILE and not merely a cost once the entry check
         // reads this array: reset first and a still-armed cell could reach a body under a
@@ -5420,7 +5420,7 @@ pub(crate) enum DirectKind {
         release: u16,
     },
     /// CALL FAR ptr16:16 (`0x9A`) on a 16-bit stack at Word operand size, in REAL MODE or V86
-    /// only. L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`), gated on L7 Part 1's run-loop
+    /// only. L8 of the corpus lever plan, gated on L7 Part 1's run-loop
     /// reachability fix landing first: without it this kind converts the block ENTRY sites
     /// `rejected -> compiled`, but the run loop never reaches `try_direct_continuation` at a
     /// non-continuable entry, so nothing native ever runs there. With it, the ten `0x9A` sites
@@ -5570,8 +5570,8 @@ pub(crate) enum DirectKind {
     /// block. `0xE0` appears only at Word width there (380 exits), which the address-size gate
     /// refuses anyway.
     ///
-    /// **The wall claim is PRE-DECLARED EXPECTED-NULL** (design doc
-    /// `dev_docs/nascar-loopcc-slice-design-2026-08-30.md` section 1): 2.64 M exits at the
+    /// **The wall claim is PRE-DECLARED EXPECTED-NULL** (NASCAR LOOPcc
+    /// slice design, section 1): 2.64 M exits at the
     /// corrected 101-111 ns/entry is ~0.5% of the nascar run, under that fixture's measured
     /// floor. The slice's case is the mechanism -- census exits removed with zero relocation,
     /// guest identity, clean controls -- not a wall number.
@@ -7589,8 +7589,8 @@ fn pushf_mask(persona: CpuPersona) -> u32 {
 /// One variant per REFUSING arm inside `stack_width_kind`, named for the cell that arm would
 /// have to build to admit it (`PushDwordSs16` etc.), plus `Other` for the `_ => ...` residue --
 /// spelled out rather than folded into a named cell so a non-zero reading there is visible on
-/// its own, per the design note's standing rule (`dev_docs/descent2-l1-stack-width-design-2026-08-30.md`
-/// §2(H)).
+/// its own, per the standing rule of the descent2 L1
+/// stack-width design.
 ///
 /// `ControlTargetLimit` and `SegmentAccess` are NOT produced by this function -- they name the
 /// second `RetryCause::AdmissionMatrix` producer, the `!control_target_ok ||
@@ -8414,9 +8414,9 @@ fn compile_with_budget(
     let Some(key) = key_for(cpu, entry_lin, d) else {
         return CompileOutcome::Retry(RetryCause::NoKey);
     };
-    // The compile-time ring slot is NOT baked into any successor `LinkTarget` below (S1a, design
-    // doc `2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1, correcting
-    // `2026-09-02-cr3-jit-half-design.md` (b) L2's original instruction). Every successor
+    // The compile-time ring slot is NOT baked into any successor `LinkTarget` below (S1a, Tyrian
+    // unbound-to-compiled design section 4.1, correcting
+    // the original instruction of L2 (b) in the CR3 JIT-half design). Every successor
     // published here carries `LINK_CONTEXT_UNSTAMPED` instead: a rendezvous is resolved later, at
     // `resolve_successors` time, against `linear_blocks` / `waiting`, and both of those are
     // partitioned by the LIVE ring slot at THAT instant, which `resolve_successors` reads itself.
@@ -8653,7 +8653,7 @@ fn compile_with_budget(
         // Quake's 586 renderer benefits from native word operations. Doom's 486 self-patching
         // renderer recompiles the wider blocks often enough to lose throughput, so keep word
         // instructions as precise interpreter barriers in that mode.
-        // Follow-up (dev_docs/specs/2026-07-15-smc-hardening-design.md, G1): with heat demotion
+        // Follow-up (SMC hardening design, G1): with heat demotion
         // landed, A/B re-enabling 486 word ops - heat should now bound the churn this defends.
         if insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu) {
             // Attributed since the completeness slice, and expected to read ZERO on both shipped
@@ -8698,7 +8698,7 @@ fn compile_with_budget(
             )),
             other => other,
         };
-        // L1, the third `IZARRAVM_ROTATE_ROWS` arm (dev_docs/duke-reprofile-2026-08-19.md §6.1).
+        // L1, the third `IZARRAVM_ROTATE_ROWS` arm (duke re-profile §6.1).
         //
         // WHY HERE AND NOT IN `classify`. `classify` takes a `&DecodedInsn` and two LINEAR
         // addresses; the heat map is keyed by PHYSICAL and lives behind `cpu`, and neither is in
@@ -9837,8 +9837,8 @@ fn compile_with_budget(
     // links safe as well -- not any argument about snapshots. A block that publishes no
     // successors is where the chain ENDS: its segment write is the last thing that happens before
     // control returns to `run_direct_block`, so there is no downstream body to enter against the
-    // base the write just invalidated. That argument survives the chain-used mask
-    // (dev_docs/plans/2026-08-18-chain-used-link-mask.md), which is about frozen compile-time
+    // base the write just invalidated. That argument survives the chain-used mask,
+    // which is about frozen compile-time
     // capture and says nothing about a value the block is about to overwrite at run time.
     // TWO producers now, not one. `segment_writes` counts the `LoadSegReal`/`PopSegReal`
     // lowerings; `callout_segment_writes` counts the `InterpretOne` slots whose row can call
@@ -9852,7 +9852,7 @@ fn compile_with_budget(
     // successor is not a later slot in this block, and nothing in the mask says anything about
     // what it bakes.
     let segment_write_block = segment_writes != 0 || callout_segment_writes != 0;
-    // `SEGWRITE-V86-EDGE` (dev_docs/2026-09-01-segwrite-continue-design.md §4.1). The bars a
+    // `SEGWRITE-V86-EDGE` (segwrite continue design §4.1). The bars a
     // segment-write block must clear to publish its plain static fallthrough anyway, on the
     // default path, because this is what decides `successors` below. The bars are: one write,
     // not CS/SS, no call-out write, the plain-fallthrough terminal shape, and V86, the one mode
@@ -10690,7 +10690,6 @@ pub(crate) const BAKES_CS_BIT: u8 = 1 << 6;
 /// `chain_layouts[root]` proves exactly the obligation and nothing more -- every segment some
 /// block in the LIVE cone pins. The second is why the requirement must be narrowed when a block's
 /// last outbound edge dies; see `BlockCache::narrow_chain_requirement_if_leaf`.
-/// dev_docs/plans/2026-08-18-chain-used-link-mask.md has the invariant and its proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentLayout {
     cs: SegmentRegister,
@@ -10810,7 +10809,7 @@ impl SegmentLayout {
     }
 
     /// Diagnostic only (`direct-link-refusal-census` scratch instrument, design section 4.3
-    /// slice 0, `dev_docs/2026-09-02-tyrian-s1b-refusals-design.md`): the mask a per-edge
+    /// slice 0 of the Tyrian S1b refusals design): the mask a per-edge
     /// runtime guard would need to bind THIS refused edge under the section 4.2 disposition --
     /// the target's pinned DATA segments this source does not already pin with an agreeing
     /// descriptor. `target.used & guard_mask == guard_mask` holds by construction, matching the
@@ -10912,7 +10911,7 @@ impl SegmentLayout {
     ///    segment has nothing for the guard to compare against, and the edge must fall back to
     ///    today's dispatcher-mediated bar rather than manufacture a value. This is exactly the
     ///    Stage-0 "does the successor's `chain_layouts[..].used` claim the write" measurement
-    ///    (`dev_docs/2026-09-01-measurement-backlog-results.md` §4); a game whose successors
+    ///    (measurement backlog results §4); a game whose successors
     ///    rarely claim the write pays this refusal, unchanged from before the slice, on that
     ///    share.
     ///
@@ -11422,7 +11421,7 @@ const _: () = {
 /// (`far_call_ledger_offset`): a per-`CallFar16` frame mask hits the same two failures above,
 /// just for one lane instead of seven. That lane's escape hatch was to leave the frame alone
 /// and put the counter in `CpuGsw` instead, written through R15 by the one lowering that needs
-/// it — see `dev_docs/2026-09-01-duke-l8-reprice.md` for the worked example.
+/// it.
 fn dynamic_counter_fields() -> [(i8, usize); 7] {
     [
         (
@@ -11788,7 +11787,7 @@ pub(crate) fn set_lane_family_for_test(forced: Option<bool>) {
 /// each other on a fixture whose patch loop never pauses: the gate refuses to compile while the
 /// chunk is hot, so no block exists, so no lanes register, so every patch narrow-kills decode
 /// lines and re-stamps the heat, forever. Duke3d spends 44.8% of its dispatcher seams exiting
-/// into exactly this state (dev_docs/2026-08-08-dispatch-tier-next.md). Doom never hit the
+/// into exactly this state. Doom never hit the
 /// deadlock only because its blocks compiled BEFORE the heat crossed the threshold.
 ///
 /// The trial breaks the cycle with a bounded probe: a compilation per key per heat epoch is
@@ -12066,7 +12065,7 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// patch its displacements registers no lane and pays nothing.
 ///
 /// **AN ORDER OF MAGNITUDE OVER THE PRE-REGISTRATION, and that is stated rather than smoothed
-/// over.** The floor pre-registered in `dev_docs/duke-heat-gate-design-2026-08-21.md` §13 was
+/// over.** The floor pre-registered in the duke heat-gate design §13 was
 /// −2.6% and the bar was −2%. The measured −25% does not come from the pre-registered term: the
 /// counter smoke reads **115 store lanes registered** and BLOCK KILLS FLAT (32,261 off against
 /// 32,263 on). The movement is in HEAT — `smc_heat_chunks_hot` −32.7%, `smc_heat_demotions`
@@ -12075,7 +12074,7 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// handful of laned stores stop a handful of chunks going hot, and those chunks were very hot.
 ///
 /// WHAT IT IS FOR. `disp_lane_for` covers `0x8A` only; the un-laned displacement family that is
-/// left is 89% `0x89` by events (`dev_docs/duke-heat-gate-design-2026-08-21.md` §12.3), and the
+/// left is 89% `0x89` by events (duke heat-gate design §12.3), and the
 /// 2026-08-23 settling census measured that family's block kills still rising at flat event
 /// volume (un-laned `0x89` block kills 15,634 -> 21,178 on duke3d-586-short, 96.8% of all joined
 /// un-laned-disp block kills). The mechanism is `disp_lane_for`'s, one KIND over: a laned write
@@ -12227,7 +12226,7 @@ pub(crate) fn parse_disp_store_lanes_arm_for_test(
 /// `0x8B`'s register form (`MovReg`) and the disp8 / disp16 forms are NOT admitted: the lane is
 /// `IMM_LANE_WIDTH` wide and the write choke matches a patch at exactly that width, and a
 /// sub-4-byte displacement would need sign-extension at load time and a choke rule of its own. No
-/// measured population asks for one (`dev_docs/2026-08-09-disp-lanes-design.md`, "Deliberate
+/// measured population asks for one (disp-lanes design, "Deliberate
 /// scope cuts").
 ///
 /// # THE SPELLING TABLE
@@ -12611,7 +12610,7 @@ pub(crate) fn int_imm8_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// immediate exactly as it did, and the write choke's per-lane width test degenerates to the old
 /// global one because every registered lane is then four bytes wide. Both arms ship in one
 /// executable because this box has measured 6% wall variance between builds of identical source
-/// (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a cross-build comparison would not be
+/// (duke re-profile §6.2), so a cross-build comparison would not be
 /// evidence.
 ///
 /// # THE REFUTATION INVERTED, exactly as `IZARRAVM_ROTATE_ROWS`'s did before it
@@ -12761,7 +12760,7 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// against. On the escape no lane is registered, every `0xC1` and `0xC0` slot bakes its count
 /// exactly as it did, and the emitted code is the compile-time three-way split it has always been.
 /// Both arms ship in one executable because this box has measured 6% wall variance between builds
-/// of identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a cross-build comparison
+/// of identical source (duke re-profile §6.2), so a cross-build comparison
 /// would not be evidence.
 ///
 /// **WHY IT IS ON (2026-08-20).** `.bench/results/duke-l2-count-lane-20260820/`, one binary at
@@ -12922,7 +12921,7 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 /// | `0xF7 /6`,`/7` DIV/IDIV r/m32 | MEMORY | `DirectKind::DivMem` |
 /// | `0x0F90..=0x0F9F` SETcc r/m8 | MEMORY | `DirectKind::SetCcMem` |
 ///
-/// WHY IT EXISTS. `dev_docs/tombraid-reprofile-2026-08-20.md` §4: on tombraid-586 the FMV phase is
+/// WHY IT EXISTS. The tombraid re-profile, section 4: on tombraid-586 the FMV phase is
 /// 77% of the row's wall at rt 0.609, 93.6% of its JIT entries end on a `static_unbound` exit, and
 /// 72.0% of that mass (643.5 M of 893.3 M) is class `rejected` -- the successor block is REFUSED
 /// compilation. `.bench/results/tombraid-reprofile-20260820/census-fmv-summary.json` splits the
@@ -12935,7 +12934,7 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 /// * `0xF7 /7` memory 27,602,949 and `0x0F94 /0` memory 27,602,402 -- one per iteration each.
 ///
 /// **THE DOC'S NAME FOR THE THIRD ROW IS WRONG, and the census says so on its face.** Both
-/// `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1 and the handoff call `0xD9 /7` "FNSTCW". The
+/// the tombraid re-profile §4.1 and the handoff call `0xD9 /7` "FNSTCW". The
 /// row's `operand_form` is `"none"`, and `decode`'s FPU arm sets `insn.operand` for `mod != 3`
 /// ONLY -- so the row is a REGISTER form, and FNSTCW m16 (which is `mod != 3`, and which
 /// `NativeX87Insn::StoreControlWord` has lowered since before this slice) cannot be it. The eight
@@ -13341,7 +13340,7 @@ pub(crate) fn parse_loopcc_rows_arm_for_test(value: Result<String, std::env::Var
 /// plus `0xa3` MOV moffs16,AX and `0xc7 /0` MOV m16,imm16 with a CS override, which the same
 /// straight-line run passes through and which the census measures as rows of their own.
 ///
-/// WHY IT EXISTS. `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1: after the FPU-loop slice
+/// WHY IT EXISTS. The tombraid re-profile, section 4.1: after the FPU-loop slice
 /// (`IZARRAVM_FPU_LOOP_ROWS`) closed loop B, the tombraid-586 FMV window's remaining `rejected`
 /// mass is loop A, a V86 16-bit driver loop at linear `0xC8FDE-0xC9035` (UMB, mode key `0x316`,
 /// ~93M iterations). A decoder probe over the fixture disassembles it as a BIOS-tick watchdog that
@@ -13511,7 +13510,7 @@ pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::V
 /// **DEFAULT ON SINCE THE 2026-08-28 RE-PRICE.** An unset knob admits the Word register-form
 /// TEST row. `0` or `off` is the escape back to the pre-slice refusal, which still ships whole
 /// because it is the base every A/B on this row is read against. Both arms ship in one executable because this box has measured 6% wall variance
-/// between builds of byte-identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a
+/// between builds of byte-identical source (duke re-profile §6.2), so a
 /// cross-build comparison would not be evidence.
 ///
 /// # The row, from the census that ranked it
@@ -13661,8 +13660,7 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
 /// back to the pre-slice refusal (`0xd3` absent from the Word allowlist), which still ships whole
 /// because it is the base any A/B on this row is read against.
 ///
-/// # The rows, from the tyrian-586 no-EMM census (`cenB.json`, cited in
-/// `dev_docs/2026-09-02-tyrian-sb-entry-cut-review.md` finding 4)
+/// # The rows, from the tyrian-586 no-EMM census (`cenB.json`)
 ///
 /// `0xD3 /4` (SHL) register word: 1,247,451 unbound exits, 1,247,714 runtime hits. `/5` (SHR) and
 /// `/7` (SAR) register word land with the same admission because `classify`'s own arm narrows
@@ -14250,7 +14248,7 @@ pub(crate) fn parse_direct_in_imm8_callout_arm_for_test(
 }
 
 /// Whether `0xE6` OUT imm8,AL is admitted as a `PortWriteAlImm8` call-out
-/// (`IZARRAVM_OUT_IMM8_ROWS`, `dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+/// (`IZARRAVM_OUT_IMM8_ROWS`, Option B of the gp2 OUT 0xE6 research).
 ///
 /// **DEFAULT ON.** The census that motivated the row: gp2-586's single `0xE6` site at linear
 /// 0x00532951 takes 59,968,424 static-unbound exits in an 80-second run, which is 97% of that
@@ -14520,7 +14518,7 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// **THREE ARMS SINCE THE 2026-08-19 L1 SLICE**, all shipping in the one executable on the
 /// `IZARRAVM_LANE_FAMILY` / `IZARRAVM_DISP_LANES` contract -- this box has measured 6% wall
 /// variance between builds of identical source, which is larger than the effect, so a cross-build
-/// comparison would not be evidence (`dev_docs/duke-reprofile-2026-08-19.md` §6.2):
+/// comparison would not be evidence (duke re-profile §6.2):
 ///
 /// * `IZARRAVM_ROTATE_ROWS` **unset**, or `1` / `on` -> `On`: unconditional admission of both rows.
 ///   **THE SHIPPED DEFAULT since 2026-08-19/20**, on -5.6% short / -6.3% long. `1` is pinned to
@@ -14603,7 +14601,7 @@ fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRow
         Ok(raw) => raw,
     };
     // Each arm answers to its DESIGN NAME (`off` / `heat_gated` / `on`, the spellings
-    // dev_docs/duke-reprofile-2026-08-19.md §6.2 uses to describe the ladder) as well as to its
+    // the duke re-profile §6.2 uses to describe the ladder) as well as to its
     // numeric one. A ladder leg written from the design doc and a leg written from the shell
     // history must reach the same arm, or the accepted-spelling set is itself a trap.
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -15010,8 +15008,7 @@ pub(crate) fn parse_entry_attribution_sample(value: Result<String, std::env::Var
 /// **DEFAULT ON since the 2026-08-25 flip.** The OFF arm is `main`-before-the-slice's entry check
 /// verbatim: `all_data_matches` for a linked root, `data_matches` for an unlinked one; it is the
 /// ESCAPE and the A/B base. The ON arm runs one `data_matches` over the chain
-/// requirement for both, which is exactly the statement INV-ENTRY needs and nothing more. Design:
-/// `dev_docs/specs/2026-08-25-chain-requirement-entry-check-design.md`.
+/// requirement for both, which is exactly the statement INV-ENTRY needs and nothing more.
 ///
 /// # THE NULLING SEMANTICS, STATED PLAINLY, BECAUSE THE NEIGHBOURING KNOB'S ARE INVERTED
 ///
@@ -15977,7 +15974,7 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 //   sub-4-byte rule in the write choke, which matches a patch at exactly the lane's width. The
 //   2026-08-23 settling census counted the `0x89` disp population at 1,034,337 events with the
 //   whole prize in the disp32 forms; no measured population asks for a narrower lane. This is
-//   the same scope cut `dev_docs/2026-08-09-disp-lanes-design.md` made for `0x8A`.
+//   the same scope cut the disp-lanes design made for `0x8A`.
 // * **No prefixes.** That bar carries the width argument for all three: a `0x66` or `0x67`
 //   instruction is refused outright, and a disp32 requires CS.D = 1, so an admitted `0x8B` or
 //   `0x89` is a DWORD access, an admitted `0x88` is a byte access, and `AddressWrap::Word` can
@@ -16020,7 +16017,7 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 /// The displacement twin of `imm_lane_for`: `0x8A MOV r8, [..disp32..]`, every ModRM memory
 /// form, no prefixes — GATED ON MEASURED PATCH HISTORY. The admitted field is the
 /// instruction's disp32, which duke3d-586's SMC trace measured at 17M of its 19.3M disp-patch
-/// events (dev_docs/2026-08-09-disp-lanes-design.md); each one today either kills the covering
+/// events; each one today either kills the covering
 /// block or keeps its chunk's G1 heat stamped.
 ///
 /// THE HEAT GATE IS THE SLICE'S LOAD-BEARING DECISION, and it was reached by refutation twice
@@ -16480,7 +16477,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // 16-bit workload ranks these ten rows near 19% of block-stopping hits.
     //
     // `0x11`/`0x19` and `0x13`/`0x1b`, ADC and SBB in the same two forms, joined on the L1 width
-    // lift (`dev_docs/2026-08-31-corpus-lever-plan.md`). They used to be the exclusion this
+    // lift. They used to be the exclusion this
     // paragraph named: `emit_alu_preloaded`'s Word branch masked both operands with `and`, which
     // CLEARS host CF, so an admitted carry op would have computed without its carry in.
     // `emit_carry_alu_preloaded` now carries a Word arm that loads host CF from the RBP shadow
@@ -16672,7 +16669,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // `int_imm8_admitted_here` in the compile walk, which is where the V86 IOPL state
                 // is in hand.
                 | 0xcd
-                // CALL FAR ptr16:16, L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`). L7 Part 1
+                // CALL FAR ptr16:16, L8 of the corpus lever plan. L7 Part 1
                 // made the ten `0x9A` block-ENTRY sites on 15-move-hole-puzzle (116.3 M of the
                 // corpus's 186.7 M `absent` class) reachable by the Direct dispatcher; without
                 // this entry they would still never reach the classifier arm at Word, and Part 1
@@ -17049,8 +17046,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             });
         }
     }
-    // `0x0F02` LAR and `0x0F03` LSL, the descent2 L2 lever
-    // (`dev_docs/2026-09-05-586-laggard-board.md`): 20.6 M block-stopping exits on
+    // `0x0F02` LAR and `0x0F03` LSL, the descent2 L2 lever:
+    // 20.6 M block-stopping exits on
     // descent2-3dfx-586, the identical `0x0f02 /1 register dword` row on tombraid-loader-586.
     // Keyed on the full u16 opcode and placed ABOVE the `u8::try_from(insn.opcode).ok()`
     // truncation for the same reason `0x0faf` and the bit-string family are: that truncation
@@ -17533,7 +17530,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // place. That version is still provably negative, and re-deriving it from the census
             // is still the mistake the note was written to stop.
             //
-            // What changed is the helper. `dev_docs/wolf-v86-port-callout-design.md` takes the
+            // What changed is the helper. The wolf V86 port call-out design takes the
             // 08-11 numbers apart into THREE gates rather than the two the earlier reading saw,
             // and shows that the 136.8M call-outs which executed could only have arrived by
             // CHAINED entry (a chained transfer never returns to `run_direct_block`, so its
@@ -17550,7 +17547,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // used to be. Reverting either half alone re-creates exactly the measurement below.
             //
             // The superseded reading, verbatim:
-            // `dev_docs/wolf3d-586-measurement-results.md` ranks this row at
+            // The wolf3d-586 measurement results rank this row at
             // 370,316,594 of 381,560,241 block-stopping hits (97.05%) on wolf3d-586 and recommends
             // exactly one line: `0xec` added to the list above. Built and run (2026-08-11,
             // A/B/B/A at ProcessorIndex 8, 12e9 clocks) it serves ZERO port reads natively, and
@@ -17623,7 +17620,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 });
             }
             // IN AL, imm8 -- gp2's B2 residue, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
-            // (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3). The lean sibling
+            // (in-imm8 call-out design rev 3). The lean sibling
             // of the arm above: same `port_permission_resident` two-phase probe, same shared
             // `port_io_core_clocks(bus, false)` charge, no poll-skip scan (rev 3 §1.4).
             //
@@ -17663,7 +17660,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 });
             }
             // OUT imm8, AL -- gp2's 59,968,424-exit row, behind `IZARRAVM_OUT_IMM8_ROWS`
-            // (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B). The WRITE twin of the arm
+            // (Option B of the gp2 OUT 0xE6 research). The WRITE twin of the arm
             // above: same `port_permission_resident` two-phase probe, same privilege gate, same
             // compile-time port immediate riding the fourth-argument channel, no poll-skip scan.
             //
@@ -18104,8 +18101,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             }
             0x81 | 0x83 => {
                 let m = insn.modrm?;
-                // ADC (/2) and SBB (/3) are admitted at Word size as of the L1 width lift
-                // (`dev_docs/2026-08-31-corpus-lever-plan.md`), for the REGISTER and the MEMORY
+                // ADC (/2) and SBB (/3) are admitted at Word size as of the L1 width lift,
+                // for the REGISTER and the MEMORY
                 // form alike, and the two forms got there by two different routes.
                 //
                 // The MEMORY form needed no emitter change at all: `emit_alu_candidate` /
@@ -19637,7 +19634,7 @@ struct EmitInput<'a> {
     /// numbers the compile walk summed into `raw_clocks` above. It is a
     /// `&'static`, so a block compiled under one epoch cannot silently start
     /// charging another: the epoch is fixed for the life of the machine
-    /// (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4) and a block
+    /// (port I/O repricing design, section 4) and a block
     /// cache outlives no epoch change.
     class_table: &'static ClassTable,
     weighted_fp_clocks: u32,
@@ -27870,7 +27867,7 @@ fn emit_code_watch_table_branch(
 }
 
 // ---- from jit/direct/emit/store_fast.rs --------------------------------------------------------
-// The one-lookup store path (`dev_docs/2026-08-07-one-lookup-store-design.md`): the emitted
+// The one-lookup store path: the emitted
 // fast-store site (D3), the x87 store-pointer probe (D5), and the shared stub pad (D4).
 //
 // The site probes ONE table — `FastMapStorage::store_biases` — whose entries encode, in-band,
@@ -28558,7 +28555,7 @@ fn emit_x87_resolve_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
 }
 
 // ---- from jit/direct/emit/load_fast.rs ---------------------------------------------------------
-// The one-lookup load path (`dev_docs/2026-08-07-one-lookup-load-design.md`): the lean read
+// The one-lookup load path: the lean read
 // site (D3a) replacing `emit_ram_read_pointer`'s classic pair for its ten callers, the parking
 // probe (D3b) for the deferred-completion callers (the Ret/Ret16/JmpMem trio, and DivMem since
 // the FPU-loop-rows slice), the x87 read-pointer probe (D5), and the shared
@@ -29984,7 +29981,7 @@ pub(crate) enum CallOutHelper {
     /// `0xEC` IN AL,DX.
     PortReadAlDx,
     /// `0xE4` IN AL,imm8, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
-    /// (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3).
+    /// (in-imm8 call-out design rev 3).
     ///
     /// The LEAN sibling of `PortReadAlDx`: same two-phase TSS-bitmap probe
     /// (`port_permission_resident`), same shared `port_io_core_clocks(bus, false)` charge, same
@@ -29997,7 +29994,7 @@ pub(crate) enum CallOutHelper {
     /// is no allowlist to consult and the port only has to be carried, never matched against one.
     PortReadAlImm8 { port: u8 },
     /// `0xE6` OUT imm8,AL, behind `IZARRAVM_OUT_IMM8_ROWS`
-    /// (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+    /// (Option B of the gp2 OUT 0xE6 research).
     ///
     /// The WRITE twin of `PortReadAlImm8`: same two-phase TSS-bitmap probe, same compile-time port
     /// immediate on the fourth-argument channel, no poll-skip scan and no cell. It differs in
@@ -30863,7 +30860,7 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
 }
 
 /// `0xE6` OUT imm8,AL through the interpreter's own port path, behind `IZARRAVM_OUT_IMM8_ROWS`
-/// (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+/// (Option B of the gp2 OUT 0xE6 research).
 ///
 /// The WRITE twin of `port_read_al_imm8`: phase P (`port_permission_resident`), phase C's charged
 /// re-reads, the `preview_scale_clocks` remainder carry and the fourth-argument PORT immediate are
@@ -33664,8 +33661,7 @@ impl BlockCache {
 // `BlockCache::chain_layouts` holds, per block, its own pinned segment set plus the union of the
 // masks of everything reachable through live links. `widen_chain_requirement` is the one writer
 // that GROWS a requirement, and it restores the obligation backwards over `inbound` until the
-// graph settles. The invariant and its proof live in
-// `dev_docs/plans/2026-08-18-chain-used-link-mask.md`.
+// graph settles.
 
 impl BlockCache {
     /// The layout the DISPATCHER ENTRY CHECK compares against, and the one place the
@@ -33998,7 +33994,7 @@ impl BlockCache {
 // ---- from jit/direct/retire_governor.rs --------------------------------------------------------
 // The data-segment reject governor: the retire cap, the link decline, and the layout census.
 //
-// Design: `dev_docs/specs/2026-08-23-data-segment-reject-treadmill-design.md` (rev 3).
+// Design: the data-segment reject treadmill design, rev 3.
 //
 // The problem, measured on the tombraid loader phase: 307,798 of 314,318 compile attempts (97.9%)
 // are data-segment rejects, and installs track them one for one. A block bakes six segment
@@ -34960,7 +34956,7 @@ pub(crate) struct BlockCacheStats {
     pub arena_compaction_bytes: u64,
     pub arena_compaction_failures: u64,
     /// Host wall nanoseconds inside `compact_arena`'s successful body. The §2 regression in
-    /// `dev_docs/duke3d-open-area-profile-results.md` INFERRED 7.44 ms per event from interval
+    /// the duke3d open-area profile results INFERRED 7.44 ms per event from interval
     /// wall; this measures it.
     pub arena_compaction_ns: u64,
     pub links: u64,
@@ -35653,7 +35649,7 @@ pub(crate) struct DirectStallTally {
     pub poll_skip_raw_bus_clocks: u64,
     pub poll_skip_max_span: u64,
     pub poll_skip_last_head: u32,
-    /// `make_link_visible`'s L3 arm firing (design doc `2026-09-02-cr3-jit-half-design.md` (b)):
+    /// `make_link_visible`'s L3 arm firing (CR3 JIT-half design (b)):
     /// a block visible under one ring slot is re-touched under the other and its outbound cells
     /// are cleared before rebinding. Near zero on the Tyrian dwell says the slot and `mode_key`
     /// partitions align on that workload; a large value is a decayed win, not a correctness bug.
@@ -36321,7 +36317,7 @@ pub(crate) enum LinkClearCause {
     /// satisfy, so the edge was cut to keep the chain sound. Both blocks stay compiled and the
     /// cell reverts to the zero portal, so the source's exits report `StaticUnbound`; the edge is
     /// NOT re-parked in `waiting`, because the widen is monotone and a retry could only re-derive
-    /// the same conflict. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
+    /// the same conflict.
     ChainWiden,
     /// Stage 2 of the data-segment reject governor cut this source's outbound edges after its
     /// retire cap was spent on a strict-arm reject. The only production path that still
@@ -36332,7 +36328,7 @@ pub(crate) enum LinkClearCause {
     /// re-parked in `waiting`. Reads ZERO on every arm but
     /// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=on`.
     DataSegmentDecline,
-    /// `make_link_visible`'s L3 arm (design doc `2026-09-02-cr3-jit-half-design.md` (b)): a block
+    /// `make_link_visible`'s L3 arm (CR3 JIT-half design (b)): a block
     /// whose stamped link epoch belongs to the OTHER ring slot's live series is still linked
     /// under that context, and its outbound cells are cleared before this context's admission can
     /// rebind them. Deliberately split from `Flushed`, which Bar C's identity requires to move
@@ -36674,8 +36670,8 @@ pub(crate) struct DirectBarrierCensus {
     admission_declines: [u64; AdmissionDecline::COUNT],
     /// Per-reason tally of `RetryCause::AdmissionMatrix`, split between the two producers
     /// `stack_width_kind` and the `control_target`/`segment_access` check that runs after it in
-    /// the compile walk (design note `dev_docs/descent2-l1-stack-width-design-2026-08-30.md`
-    /// §0(c), §2(H)).
+    /// the compile walk (descent2 L1
+    /// stack-width design §0(c), §2(H)).
     ///
     /// Recorded ONLY on the full-length compile pass (`instruction_limit >=
     /// MAX_BLOCK_INSTRUCTIONS`), the same gate the word-control counters use, and for the same
@@ -38798,7 +38794,7 @@ impl crate::jit::JitState {
 // ---- from jit/direct/entry_attribution.rs ------------------------------------------------------
 // Observer-build attribution of the Direct backend's per-entry cost.
 //
-// Implements `dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md` (rev 3, plus the
+// Implements the 16-bit entry-attribution design (rev 3, plus the
 // third review pass's M-R4 / M-R5 / M-R6 corrections). The whole instrument is behind the
 // `direct-entry-attribution` feature, which is excluded from `default`: without the feature the
 // `ea_*!` macros expand to NOTHING, so the plain build is byte-identical in behaviour and carries

@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The watched-page-bit coherence battery (`dev_docs/2026-08-06-watched-page-bit-design.md`,
+//! The watched-page-bit coherence battery (design
 //! tests T1/T2/T3/T6): the strict-edge sweeps, the alias rule, the skip-set rule and the lazy
 //! teardown semantics, asserted at the fast-map entry level through the test inspectors.
 //!

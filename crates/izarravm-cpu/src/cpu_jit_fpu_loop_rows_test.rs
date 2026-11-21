@@ -3,7 +3,7 @@
 
 //! The FIVE dword rows of the tombraid FMV census's loop B, behind `IZARRAVM_FPU_LOOP_ROWS`.
 //!
-//! `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1 and
+//! The 2026-08-20 tombraid re-profile and
 //! `.bench/results/tombraid-reprofile-20260820/census-fmv-summary.json` between them name the
 //! rows and their interpreted-hit counts over the 20e9 boot+FMV prefix:
 //!

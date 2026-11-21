@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The one-lookup store-path battery (`dev_docs/2026-08-07-one-lookup-store-design.md` §5),
+//! The one-lookup store-path battery (store design §5),
 //! split from `cpu_jit_direct_test.rs` for the source-line ceiling; it borrows that battery's
 //! store-driving helpers. The derivation unit tests (T1-T3) live with the map in
 //! `fast_map_test.rs`; the coherence edges ride the watch-bit battery's sweeps

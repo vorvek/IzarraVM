@@ -63,8 +63,8 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         self.single_step_armed = false;
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
-        // Slice 0b of the reflected-call HLE design's trip-shape instrument
-        // (dev_docs/2026-09-04-reflected-call-slice0b-plan.md): the design's
+        // Slice 0b of the reflected-call HLE design's trip-shape instrument:
+        // the design's
         // own hook point, immediately after `interrupt_acknowledge` and
         // before `deliver_interrupt`. Unless built with `--features
         // reflected-call-diagnostic` AND armed via
@@ -674,8 +674,7 @@ impl CpuGsw {
         // its whole IDT off type 6) builds a WORD frame, and its high-offset
         // word is reserved: only the low word reaches EIP.
         let gate_type = (gate_high >> 8) & 0x0f;
-        // 386 PRM, PROTECTED-MODE arm of the INT n / INT 3 / INTO operation
-        // (dev_docs/reference/i386/i386.txt):
+        // 386 PRM, PROTECTED-MODE arm of the INT n / INT 3 / INTO operation:
         //
         //     IF software interrupt (* i.e. caused by INT n, INT 3, or INTO *)
         //     THEN

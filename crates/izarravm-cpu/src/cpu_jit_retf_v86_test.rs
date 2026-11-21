@@ -3,8 +3,7 @@
 
 //! Native RETF (`0xCA` / `0xCB`) in real mode and V86, behind `IZARRAVM_DIRECT_RETF_V86`.
 //!
-//! Design: `dev_docs/specs/2026-08-24-v86-retf-pic-design.md` (rev 3), reviewed to APPROVE in
-//! `dev_docs/specs/2026-08-24-v86-retf-pic-review.md` round 3.
+//! Design: the V86 RETF PIC design, rev 3, approved in review round 3.
 //!
 //! The measured problem, on wolf3d-586 with TOKAEMM resident (so V86):
 //!
@@ -40,8 +39,7 @@
 //! segment" shape it would not be.
 
 // MUTATION EVIDENCE. Each row names the fixture that caught it; a mutation nobody catches is a
-// fixture bug, not a free pass. The full ledger, including the mutants that live in other files,
-// is `dev_docs/MUTANTS-2026-08-24-v86-retf-pic.md`.
+// fixture bug, not a free pass.
 
 use super::*;
 
@@ -1541,7 +1539,7 @@ fn far_returns_match_the_interpreter_across_a_swept_grid() {
 #[test]
 fn far_dynamic_cannot_be_inherited_by_a_recycled_block_slot() {
     // 120 -> 128: the CR3 JIT-half gate's `LinkTarget.context: u8` field
-    // (`2026-09-02-cr3-jit-half-design.md` L2) grows `successors: [Option<LinkTarget>; 2]`,
+    // (CR3 JIT-half design L2) grows `successors: [Option<LinkTarget>; 2]`,
     // measured off a failing-test readout, not derived; see `direct_test.rs`'s twin comment.
     // The LAR/LSL `InterpretOne` allowlist entries add a call-out slot COUNT, packed into
     // `block_flags` (renamed from `dynamic_flags`) bits 2..4 rather than a new field, so the

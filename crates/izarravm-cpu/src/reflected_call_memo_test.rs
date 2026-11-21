@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 1's tests (`dev_docs/2026-09-04-reflected-call-slice1-plan.md`
+//! Slice 1's tests (slice 1 plan
 //! Revision 2, "Revision 2 amendments" item 6): section 8's tests 1, 2, 3, 8,
 //! 13, 14, 15, plus the two new tests item 6 names. Unlike
 //! `reflected_call_diag_test.rs` (which drives private `*_on` functions
@@ -3043,8 +3043,7 @@ fn a_write_whose_bytes_the_trip_never_read_is_not_pinned() {
 }
 
 // ---------------------------------------------------------------------------
-// The learn protocol, option E + D
-// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`).
+// The learn protocol, option E + D.
 //
 // A trip's write MODEL is confirmed on the eight natural samples by PEEK -- no journal,
 // no extra trip, no clock sample spent -- and the period-64 runtime audit stays on as the

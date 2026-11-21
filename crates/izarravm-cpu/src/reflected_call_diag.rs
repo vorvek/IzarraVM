@@ -1,10 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 0b/0c of the reflected-call HLE design
-//! (`dev_docs/2026-09-03-reflected-call-hle-design.md`, `dev_docs/2026-09-03-
-//! reflected-call-hle-review.md`, `dev_docs/2026-09-04-reflected-call-slice0b-
-//! plan.md`, `dev_docs/2026-09-04-reflected-call-slice0b-review.md`): the
+//! Slice 0b/0c of the reflected-call HLE design: the
 //! CORRECTED trip-shape INSTRUMENT. Compiled in only under
 //! `--features reflected-call-diagnostic`; a plain build carries none of this
 //! code and is byte-identical to `main`. Armed by

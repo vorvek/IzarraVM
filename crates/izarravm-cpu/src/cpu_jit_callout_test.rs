@@ -744,7 +744,7 @@ const SPLIT_BITMAP_PAGE: u32 = 3;
 /// a miss costs one interpreted IN and the next one is served natively. Building the entries by
 /// hand would let the fixture pass against a phase P that read the wrong linear.
 ///
-/// A THROWAWAY pass runs first (design `2026-09-02-cr3-data-side-design.md` T2, review D2, plus
+/// A THROWAWAY pass runs first (CR3 data-side design T2, review D2, plus
 /// advisory 12's A/D settling argument). `entry`'s page, the io_base page and (for the split-TSS
 /// lanes) the bitmap page all share ONE page table. The FIRST of the three ever walked marks
 /// that table; each DIFFERENT page walked after it then stores ITS OWN accessed bit into an
@@ -2619,7 +2619,7 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
 // =================================================================================================
 // `0xE4` IN AL,imm8 -- `PortReadAlImm8`, the lean sibling of `PortReadAlDx` above.
 //
-// gp2 in-imm8 callout design rev 3 (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md`),
+// gp2 in-imm8 callout design rev 3,
 // §8.2: the HELPER's contract lives beside `PortReadAlDx`'s equivalent fixtures here; the KNOB and
 // the `classify` arm are covered separately in `cpu_jit_in_imm8_callout_test.rs`.
 //
@@ -3268,7 +3268,7 @@ fn call_out_helper_match_exhaustiveness_is_a_compile_time_property() {
 
 // =================================================================================================
 // `0xE6` OUT imm8,AL -- `PortWriteAlImm8`, the WRITE twin of `PortReadAlImm8` above, behind
-// `IZARRAVM_OUT_IMM8_ROWS` (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+// `IZARRAVM_OUT_IMM8_ROWS` (Option B of the gp2 OUT 0xE6 research).
 //
 // Placement follows the `0xE4` slice: the HELPER's contract lives here beside its read siblings;
 // the KNOB and the `classify` arm are covered in `cpu_jit_out_imm8_callout_test.rs`.
@@ -4556,7 +4556,7 @@ fn out_dx_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_e
 }
 
 // ---------------------------------------------------------------------------------------------
-// The four privilege columns (`dev_docs/2026-09-05-port-io-repricing-design.md` §1.2, slice P1).
+// The four privilege columns (port I/O repricing design §1.2, slice P1).
 //
 // The port charge stopped being a constant: `IN`/`OUT` now cost what Intel's Appendix F says for
 // the column the access executes in, and epoch 1's flat 12/10 survives only as that table's
@@ -4752,7 +4752,7 @@ fn the_word_port_forms_charge_the_same_column_as_the_byte_forms() {
 
 #[test]
 fn the_cross_mode_maximum_dominates_every_column_of_both_epochs() {
-    // F5 (`dev_docs/2026-09-05-port-io-repricing-review.md`): three bounds that used to be sized
+    // F5: three bounds that used to be sized
     // to the flat 12 now take `MAX_PORT_CORE_CLOCKS` instead. What makes them sound is that this
     // constant really is the maximum over the whole table, DERIVED rather than written -- so the
     // property is asserted here against every cell, not against the literal 312.
@@ -4914,8 +4914,8 @@ fn a_rep_string_port_form_charges_intels_setup_plus_three_or_four_per_element() 
 
 #[test]
 fn a_v86_rep_string_port_form_traps_on_its_first_element() {
-    // P3, gap 3. `INS`/`OUTS` never consulted the TSS bitmap
-    // (`dev_docs/2026-09-05-v86-port-io-timing-research.md` section 5): `strings.rs` called
+    // P3, gap 3. `INS`/`OUTS` never consulted the TSS bitmap:
+    // `strings.rs` called
     // `read_io`/`write_io` bare and `check_io_permission` appeared nowhere in the file, so string
     // port I/O could not `#GP` under ANY monitor. Inert under TOKAEMM, which traps only 0x92 --
     // and wrong under any monitor trapping a port a driver reaches with `REP INSW`.

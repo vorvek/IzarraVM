@@ -434,8 +434,8 @@ fn global_invalidation_and_clone_leave_no_live_entries() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The one-lookup store-bias derivation battery (design T1-T3,
-// `dev_docs/2026-08-07-one-lookup-store-design.md`). The CPU-level halves — watch-edge sweeps
+// The one-lookup store-bias derivation battery (store design
+// T1-T3). The CPU-level halves — watch-edge sweeps
 // poisoning through `clear_entry`, and the emitted differential — live in
 // `cpu_jit_store_bias_test.rs`.
 
@@ -626,8 +626,8 @@ fn a_same_mapping_refill_with_dropped_permissions_rederives_the_bias() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The one-lookup LOAD-bias derivation battery (load design L1-L3,
-// `dev_docs/2026-08-07-one-lookup-load-design.md`). The CPU-level halves — the emitted
+// The one-lookup LOAD-bias derivation battery (load design
+// L1-L3). The CPU-level halves — the emitted
 // differential, the counter-identity cells, the trio ordering — live in
 // `cpu_jit_load_bias_test.rs`.
 

@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The one-lookup load-path battery (`dev_docs/2026-08-07-one-lookup-load-design.md` §5),
+//! The one-lookup load-path battery (load design §5),
 //! split from `cpu_jit_direct_test.rs` for the source-line ceiling; it borrows that battery's
 //! read-driving helpers. The derivation unit tests (L1-L3) live with the map in
 //! `fast_map_test.rs`. What lives HERE is the emitted differential set: the fast path consults

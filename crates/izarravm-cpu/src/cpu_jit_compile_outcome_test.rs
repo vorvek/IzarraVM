@@ -73,8 +73,8 @@ fn admission_declines(cpu: &CpuGsw) -> [u64; 4] {
     std::array::from_fn(|index| snapshot.admission_declines[index].1)
 }
 
-/// The `RetryCause::AdmissionMatrix` per-reason split, as a label -> count map. See
-/// `dev_docs/descent2-l1-stack-width-design-2026-08-30.md` §2(H): `stack_width_kind` has two
+/// The `RetryCause::AdmissionMatrix` per-reason split, as a label -> count map.
+/// `stack_width_kind` has two
 /// producers, and this is the instrument that tells them apart.
 #[cfg(feature = "direct-admission-census")]
 fn stack_width_declines(cpu: &CpuGsw) -> std::collections::HashMap<&'static str, u64> {
@@ -147,7 +147,7 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
     assert_eq!(compilation.span.guest_len, 3);
 }
 
-/// Design test 4 (`2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1): the compile
+/// Design test 4 (Tyrian unbound-to-compiled design, section 4.1): the compile
 /// side of S1a, exercised through the REAL `compile_with_budget` (via `jit::direct::compile`)
 /// rather than a hand-built `direct_test.rs` fixture -- this is the only level that can drive the
 /// five successor-baking sites the defect actually lived in. `compile_with_budget` must never
@@ -593,7 +593,7 @@ fn census_row_for(code: &[u8], warm_offsets: &[u32], opcode: u16) -> crate::Dire
 /// inaccuracy: it appears only at PATCHED sites, so its size is proportional to `(1 - u)` — and
 /// `u`, the unpatched share, is the single number the arm exists to measure. A suffix column that
 /// moved with `(1 - u)` would corrupt the heat-vs-off census difference the ladder's non-vacuity
-/// check reads (dev_docs/duke-reprofile-2026-08-19.md §6.2).
+/// check reads.
 ///
 /// One fixture, two legs, differing ONLY in whether the count byte carries a record:
 ///

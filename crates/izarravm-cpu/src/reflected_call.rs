@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! Shared, always-compiled primitives for the reflected-call HLE work
-//! (`dev_docs/2026-09-03-reflected-call-hle-design.md` Revision 2,
-//! `dev_docs/2026-09-04-reflected-call-slice1-plan.md` Revision 2, section
-//! 2's module-layout table, orchestrator decision 13.1). Extracted out of
+//! (design and slice 1 plan, both Revision 2). Extracted out of
 //! `reflected_call_diag.rs` (the slice 0/0b/0c diagnostic) so the slice 1
 //! memo (`reflected_call_memo.rs`) does not duplicate the page walker or the
 //! entry-image capture. **No state, no `Mutex`, no env read** -- every item

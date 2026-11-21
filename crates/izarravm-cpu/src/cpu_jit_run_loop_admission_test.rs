@@ -323,7 +323,7 @@ fn break_site_admission_does_not_change_the_guest_visible_outcome() {
 /// original assertions here pinned that zero-gain outcome -- `jit_direct.len() == 1`, the class
 /// staying `absent` rather than moving to `rejected`.
 ///
-/// **L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`) gives `0x9a` a `classify` arm** --
+/// **L8 of the corpus lever plan gives `0x9a` a `classify` arm** --
 /// `DirectKind::CallFar16`, admitted by `call_far_admitted_here` and folded into
 /// `walk_admits_non_continuable_entry`'s disjunction with NO edit to this predicate itself, which
 /// is exactly the self-opening behaviour the OLD doc comment on this fixture predicted ("at which

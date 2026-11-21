@@ -3037,8 +3037,8 @@ fn a_dynamic_miss_into_a_rejected_block_is_attributed_to_its_barrier() {
     );
 }
 
-/// The chain-used link mask, at the machine rather than at `BlockCache`
-/// (dev_docs/plans/2026-08-18-chain-used-link-mask.md). Two blocks compiled under DIFFERENT ES
+/// The chain-used link mask, at the machine rather than at `BlockCache`.
+/// Two blocks compiled under DIFFERENT ES
 /// descriptors, neither of which touches ES: whole-array snapshot equality refused this edge, the
 /// source exited `StaticUnbound` on every iteration, and prince-586 paid a dispatcher round trip
 /// per 1.58 guest instructions for it.

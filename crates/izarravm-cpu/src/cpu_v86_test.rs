@@ -2242,7 +2242,7 @@ fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
 
 // ---------------------------------------------------------------------------
 // IDT gate DPL / P-bit conformance (386 PRM, PROTECTED-MODE arm of the
-// INT n / INT 3 / INTO operation, dev_docs/reference/i386/i386.txt):
+// INT n / INT 3 / INTO operation):
 //
 //     IF software interrupt (* i.e. caused by INT n, INT 3, or INTO *)
 //     THEN

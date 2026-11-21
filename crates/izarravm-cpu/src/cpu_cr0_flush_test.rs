@@ -9,7 +9,7 @@
 //! real<->protected thunk writes CR0 464 times a guest second and paid a whole-cache flush for
 //! each one.
 //!
-//! The rows below are the design's red-first list (dev_docs/specs/2026-08-29-flush-storm-design.md
+//! The rows below are the flush-storm design's red-first list (its
 //! section 7). Three families:
 //!
 //! 1. the KEEP rows (`cr0_pe_toggle_*`, `lmsw_never_flushes_for_any_operand`,
@@ -264,8 +264,7 @@ fn cr0_wp_change_without_paging_keeps_the_decode_cache() {
 #[test]
 fn mov_cr3_still_flushes() {
     // **Updated for the CR3 code-cache gate**: `MOV CR3` no longer always tears the decode cache
-    // down (that is the whole point of the gate, see `dev_docs/2026-09-02-cr3-code-cache-gate-
-    // design.md`). What survives from this row's original claim is that the OBSERVER-visible
+    // down (that is the whole point of the gate). What survives from this row's original claim is that the OBSERVER-visible
     // result is unchanged: the witness line, decoded before the write, is never live afterward,
     // whether the ring serves the write (R1/R2, no teardown) or forces one (R3). This fixture's
     // write is the CPU's first-ever `MOV CR3` with an empty ring, so it takes R2; the exhaustive
@@ -625,9 +624,9 @@ mod links {
 //
 // `flush_tlb_keep_code_caches` (the TLB and the FastMap) is the successor slice
 // `cr0_write_moves_code_translation`'s doc comment names: "the DATA-SIDE successor slice".
-// Design: `dev_docs/2026-09-01-tyrian-transition-diag.md` section 7, S2.
+// Design: the Tyrian transition diagnosis, section 7, S2.
 //
-// SUPERSEDED IN PART by `dev_docs/2026-09-02-cr3-data-side-design.md` T1: `data_read_pages` /
+// SUPERSEDED IN PART by the CR3 data-side design, T1: `data_read_pages` /
 // `data_write_pages` are keyed by PHYSICAL page and a BUS mapping epoch alone, with no CR3, CPL
 // or PG-dependent bit in the entry (`DirectPageCacheEntry { physical_page, ptr }`), so they are
 // no longer wiped by ANY control-register write -- not only the PG-stays-0 case this section
@@ -802,8 +801,8 @@ mod data_caches {
         );
     }
 
-    /// Renamed from `cr0_pg_set_still_wipes_the_data_read_page_cache` (design
-    /// `2026-09-02-cr3-data-side-design.md` T1): a write that moves the map (PG set) routes
+    /// Renamed from `cr0_pg_set_still_wipes_the_data_read_page_cache` (CR3 data-side
+    /// design T1): a write that moves the map (PG set) routes
     /// through the CODE-side `flush_tlb_and_code_caches` arm, which since T1 no longer touches
     /// `data_read_pages`/`data_write_pages` at all -- they have no CR0/CR3/CPL-dependent bit to
     /// stale, PG-moving write or not. Can-it-fail control: this row and its clearing partner
@@ -943,7 +942,7 @@ mod data_caches {
 // |---|---|---|
 // | M1: `if new_cr0 & CR0_PG != 0` -> `if true \|\| ...` (restore the unconditional wipe) | 3 failed | the three `cr0_pe_toggle_keeps_*` survival rows |
 // | M2: `if new_cr0 & CR0_PG != 0` -> `if false && ...` (always skip the wipe) | 1 failed | `cr0_ts_change_under_paging_still_flushes_the_tlb` -- the ONLY row that reaches the gate with PG=1; before this row was added M2 was a NON-GATE (18/18 green) |
-// | M3: `flush_tlb_and_direct_pages` stops calling `wipe_tlb_and_direct_pages` (ungated arm stops wiping) | HISTORICAL, pre-T1: caught by the two `cr0_pg_*_still_wipes_the_data_read_page_cache` rows this slice renamed to `cr0_pg_*_no_longer_wipes_the_data_read_page_cache`. T1 (`2026-09-02-cr3-data-side-design.md`) deleted the code this mutation targeted (`data_read_pages`/`data_write_pages` are no longer touched by any control-register flush), so the mutation no longer applies; kept for the historical record. |
+// | M3: `flush_tlb_and_direct_pages` stops calling `wipe_tlb_and_direct_pages` (ungated arm stops wiping) | HISTORICAL, pre-T1: caught by the two `cr0_pg_*_still_wipes_the_data_read_page_cache` rows this slice renamed to `cr0_pg_*_no_longer_wipes_the_data_read_page_cache`. T1 (CR3 data-side design) deleted the code this mutation targeted (`data_read_pages`/`data_write_pages` are no longer touched by any control-register flush), so the mutation no longer applies; kept for the historical record. |
 //
 // THE ARGUMENT SWAP IS INERT AT BOTH SITES, and this corrects the design's expectation that the
 // MOV CR0 swap would be caught by the PG rows. It is not, and it cannot be: `delta = old ^ new`
@@ -965,7 +964,7 @@ mod data_caches {
 
 // ---- 8. the control-register attribution split -------------------------------------------------
 
-/// Sub-task 0 of slice S-A (`dev_docs/2026-09-02-tyrian-586-specs-diag.md` sections 4.1 and 9).
+/// Sub-task 0 of slice S-A (Tyrian 586 diagnosis, sections 4.1 and 9).
 ///
 /// `decode_inval_other` aggregates every whole-cache code-translation teardown, so it cannot say
 /// which control-register write caused one. The Tyrian 586 diagnosis reached "the 155,144 events
@@ -982,8 +981,8 @@ mod flush_attribution {
 
     /// RED when the `TranslationFlushReason::Cr3` arm's increment is deleted.
     ///
-    /// **Updated for the CR3 code-cache gate**
-    /// (`dev_docs/2026-09-02-cr3-code-cache-gate-design.md`): `decode_inval_cr3` still counts
+    /// **Updated for the CR3 code-cache gate**:
+    /// `decode_inval_cr3` still counts
     /// every `MOV CR3` WRITE unconditionally (it is bumped at the top of
     /// `flush_tlb_and_code_caches_for_cr3_write`, above the ring decision), but it no longer
     /// implies a teardown. This fixture's `MOV CR3` is the FIRST one this `CpuGsw` executes, with

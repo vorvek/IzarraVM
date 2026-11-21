@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Gate N of `dev_docs/sticky-decline-memo-design.md`: the sticky-decline memo's non-vacuity
+//! Gate N of the sticky-decline memo design: the sticky-decline memo's non-vacuity
 //! battery.
 //!
 //! The memo short-circuits the admission chain for a decline it can prove repeatable, so the only

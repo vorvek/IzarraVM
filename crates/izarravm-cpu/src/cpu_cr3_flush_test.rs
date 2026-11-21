@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The CR3 code-cache gate (`dev_docs/2026-09-02-cr3-code-cache-gate-design.md`): a two-slot ring
+//! The CR3 code-cache gate: a two-slot ring
 //! of `(cr3 & 0xffff_f000, generation)` that lets `MOV CR3` retain decode lines across a reselect
 //! (R1/R2) instead of flushing the whole decode cache on every write, while a third distinct
 //! value (R3) or any edit to the structures a walk read (R4/R5, the `translation_pages` watch)
@@ -224,7 +224,7 @@ fn pte_edit_under_a_live_cr3_forces_a_redecode() {
     );
 }
 
-/// The #820 non-gate, diagnosed and fixed (design doc `2026-09-02-cr3-jit-half-design.md` (e)).
+/// The #820 non-gate, diagnosed and fixed (CR3 JIT-half design (e)).
 ///
 /// The original row ran the warm-up BEFORE the witness was decoded. That put the fixture's own
 /// order backwards: the warm-up's walk (translating linear page 9 to store page 14's throwaway
@@ -626,7 +626,7 @@ fn wipes_tlb_flush_counts_every_cr3_write_ring_hit_or_not() {
 // |---|---|---|
 // | force the fast arm unconditionally (never retire on R3) | `a_third_directory_retires_everything` | by hand |
 // | drop `range_hits_translation_page` from `code_write_watched` | **FIXED, no longer a
-//   non-gate** (design doc `2026-09-02-cr3-jit-half-design.md` (e)). The original
+//   non-gate** (CR3 JIT-half design (e)). The original
 //   `pte_edit_with_a_tlb_warm_target_still_retires` ran its warm-up BEFORE the witness decode,
 //   so `warm_witness`'s own walk (not the store under test) did the only retire the row ever
 //   observed -- the row's final assertion was satisfied by an ORDERING accident, not by the

@@ -616,7 +616,7 @@ fn assert_measured_pair_with_split(
     pristine: &[u8],
     case: &GeneratedCase,
     exact_run_boundaries: bool,
-    // SIGNED (design `2026-09-02-cr3-code-cache-gate-design.md`): the CR3 code-cache gate can now
+    // SIGNED (CR3 code-cache gate design): the CR3 code-cache gate can now
     // make the INTERPRETED role costlier than native (a translation-page retire forces a cold
     // decode on the interpreter's next fetch, and native's post-compile continuation does not pay
     // that same charge), so the split is no longer guaranteed non-negative the way it was when
@@ -699,8 +699,8 @@ fn assert_measured_pair_with_split(
 /// live CR3, not a fixture artifact. Both roles retire the ring at the same instruction, so every
 /// invariant `assert_measured_pair_with_split` checks still holds EXCEPT the bus-trace
 /// `elapsed_clocks` equality: the interpreted role's next fetch after the retire is a cold decode,
-/// which legitimately charges more bus cycles than native's compiled continuation (design part
-/// 2(f), `dev_docs/2026-09-02-cr3-code-cache-gate-design.md`). Pinning that residual as an exact
+/// which legitimately charges more bus cycles than native's compiled continuation (CR3 code-cache gate
+/// design part 2(f)). Pinning that residual as an exact
 /// number, the way `SPLIT_BUS_CLOCKS` does for the misaligned-access case, would tie this row to
 /// the fetch-charge constant rather than to the WP/supervisor semantics it actually tests, so it
 /// is dropped here instead of pinned.
@@ -740,7 +740,7 @@ fn assert_measured_pair_ignoring_translation_watch_split(
     let mut interpreter_settled = interpreter.clone();
     direct_settled.materialize_flags();
     interpreter_settled.materialize_flags();
-    // T2 (design `2026-09-02-cr3-data-side-design.md`) makes a same-directory `MOV CR3` retain
+    // T2 (CR3 data-side design) makes a same-directory `MOV CR3` retain
     // the TLB across an R1 reselect -- that is the whole slice. `direct` is pre-warmed by
     // `prime_direct`, called by every caller of this function BEFORE the measured comparison, so
     // its TLB already holds a live entry for the linear page this fixture's LAST instruction
@@ -764,7 +764,7 @@ fn assert_measured_pair_ignoring_translation_watch_split(
         cpu.written_pages_overflow = false;
     }
     assert_eq!(direct_settled, interpreter_settled, "{case:#?}");
-    // T2 (design `2026-09-02-cr3-data-side-design.md`) makes a same-directory `MOV CR3` retain
+    // T2 (CR3 data-side design) makes a same-directory `MOV CR3` retain
     // the TLB across an R1 reselect (that is the whole slice), so `direct` -- pre-warmed by
     // `prime_direct` before this function's OWN `restore_bus` reset `direct_bus.memory` back to
     // `pristine` -- now legitimately SERVES the low-memory page-directory/page-table bytes this
@@ -1293,7 +1293,7 @@ fn generated_native_prefix_preserves_fault_outcome_and_charged_clocks() {
     let mut interpreter_settled = interpreter.clone();
     direct_settled.materialize_flags();
     interpreter_settled.materialize_flags();
-    // T2 (design `2026-09-02-cr3-data-side-design.md`) extends the SAME loosening
+    // T2 (CR3 data-side design) extends the SAME loosening
     // `assert_measured_pair_ignoring_translation_watch_split` already needs to the data side: the
     // priming loop's `restore_bus`-then-rerun pattern makes `direct`'s TLB end up warmer than
     // `interpreter`'s by the time this comparison runs (T2 retains the TLB across a
@@ -1341,8 +1341,8 @@ fn generated_native_prefix_preserves_fault_outcome_and_charged_clocks() {
          bus clocks than interpreter, and may charge fewer by at most one skipped walk -- \
          {case:#?}"
     );
-    // **Loosened for the CR3 code-cache gate** (`dev_docs/2026-09-02-cr3-code-cache-gate-
-    // design.md`): the priming loop above calls `restore_bus` before every run, which resets the
+    // **Loosened for the CR3 code-cache gate**:
+    // the priming loop above calls `restore_bus` before every run, which resets the
     // PDE's accessed bit to its pristine (clear) value each time. Under paging (this case sets
     // `CR3 = 0x3000`), the walk that follows re-stores it, and that store now lands on a page the
     // gate's write watch marks as translation structure (`translation_pages`), so it retires the
@@ -2983,7 +2983,7 @@ fn group_three_and_group_two_legs_agree_on_both_personas_and_epochs() {
 // clocks. Each case is measured two times after priming: with the entry segments of the priming
 // runs, and with a second set. A change that lets a block run with segments that differ from its
 // compile time must keep both measurements equal. The harness rules are in
-// `dev_docs/dynarec-plan-2026-11-10/stage1-design.md`, section 10.
+// section 10 of the stage 1 dynarec design.
 // ---------------------------------------------------------------------------
 
 /// Where the case code starts.

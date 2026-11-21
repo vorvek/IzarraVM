@@ -546,8 +546,8 @@ impl CpuGsw {
             StringOp::Ins => {
                 // INS: [ES:DI] <- port[DX]. ES cannot be overridden.
                 let port = self.read_gpr16(2);
-                // P3, gap 3. String port I/O never consulted the TSS bitmap
-                // (`dev_docs/2026-09-05-v86-port-io-timing-research.md` section 5), so it could
+                // P3, gap 3. String port I/O never consulted the TSS bitmap,
+                // so it could
                 // not `#GP` under ANY monitor -- wrong under one trapping a port a driver reaches
                 // with `REP INSW`. Ordered BEFORE the access and before any index adjustment, so
                 // a denied element faults with the string state untouched and `CX` still counting

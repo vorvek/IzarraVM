@@ -3010,7 +3010,7 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
 /// goes through `entry_ptr_for`, which reads the one field that resolve needs (see
 /// `entry_ptr_for_matches_block_and_misses_after_retirement` below).
 ///
-/// The CR3 JIT-half gate (`2026-09-02-cr3-jit-half-design.md`, L2) adds a `context: u8` field to
+/// The CR3 JIT-half gate (CR3 JIT-half design, L2) adds a `context: u8` field to
 /// `LinkTarget`, and `successors: [Option<LinkTarget>; 2]` is a `CompiledBlock` field, so the
 /// struct grows with it -- 120 -> 128, measured off a failing-test readout, not derived. The
 /// added byte is read only at link-resolution time (`resolve_successors`,
@@ -3177,7 +3177,7 @@ fn census_bucket(buckets: &[(&'static str, u64)], label: &str) -> u64 {
 }
 
 /// `SegmentLayout::guard_mask`, design section 4.3 slice 0
-/// (`dev_docs/2026-09-02-tyrian-s1b-refusals-design.md`): pure logic, no OS/arch gate needed,
+/// (Tyrian S1b refusals design): pure logic, no OS/arch gate needed,
 /// only the census feature that compiles the method in at all.
 ///
 /// Feeds a known mask set -- ES and DS pinned by the target, source agrees on ES only, and CS is
@@ -4077,8 +4077,8 @@ fn link_clear_causes_close_on_the_aggregate() {
         "the decline cuts exactly the one live outbound cell, under its own cause"
     );
 
-    // ContextRebind: `make_link_visible`'s L3 arm (design doc
-    // `2026-09-02-cr3-jit-half-design.md` (b)), a block made link-visible under one CR3 ring
+    // ContextRebind: `make_link_visible`'s L3 arm (CR3 JIT-half
+    // design (b)), a block made link-visible under one CR3 ring
     // slot re-touched under the other. Fresh blocks for the same reason the reset/chain-widen
     // sections above need them.
     let rebind_source = key(0x1b00);
@@ -4111,7 +4111,7 @@ fn link_clear_causes_close_on_the_aggregate() {
 }
 
 // =================================================================================================
-// CR3 JIT-half gate (design doc `2026-09-02-cr3-jit-half-design.md`): the link graph's own
+// CR3 JIT-half gate (CR3 JIT-half design): the link graph's own
 // two-slot ring. `link_epochs`, `link_slot`, `select_link_context`, `allocate_link_context` and
 // `LinkTarget.context` are exercised directly at the `BlockCache` level here (rather than through
 // a full guest `MOV CR3` write, `DecodeCache`'s ring, as `cpu_cr3_flush_test.rs` does for the
@@ -4592,8 +4592,8 @@ fn linear_blocks_holds_separate_entries_per_slot_for_the_same_linear() {
 }
 
 // =================================================================================================
-// S1a, the live rendezvous key (design doc `2026-09-02-tyrian-unbound-to-compiled-design.md`
-// section 4.1, review `2026-09-02-cr3-code-cache-gate-review.md` "Review of S1a"). The JIT-half
+// S1a, the live rendezvous key (Tyrian unbound-to-compiled design
+// section 4.1). The JIT-half
 // battery above pins that the RESOLVE side already reads the LIVE slot (`make_link_visible`,
 // `bind_dynamic_successor`). What it never covered was the COMPILE side: `compile_with_budget`
 // baked the ring slot live AT COMPILE TIME into every published successor, and `resolve_successors`
@@ -4756,7 +4756,7 @@ fn a_park_is_drained_only_by_an_install_under_the_slot_it_parked_in() {
 /// first) and S1-8 (name the test-only reachable state). What actually stands between a bound
 /// cross-context edge and a wrong-context jump is NOT the key partition `LinkTarget.context`
 /// adds -- it is `try_link_inner`'s pre-existing `stale_epoch` arm, compared against the LIVE
-/// slot's epoch alone (design doc `2026-09-02-cr3-jit-half-design.md` L4). S1a enlarges the
+/// slot's epoch alone (CR3 JIT-half design L4). S1a enlarges the
 /// population that reaches this barrier; it does not weaken it.
 #[test]
 fn an_edge_whose_ends_are_stamped_under_different_slots_refuses_stale_epoch() {
@@ -4981,7 +4981,7 @@ fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Chain-used link mask (dev_docs/plans/2026-08-18-chain-used-link-mask.md, NON-ADOPTING slice)
+// Chain-used link mask (NON-ADOPTING slice)
 //
 // The contract these rows pin: a static edge is refused over a frozen `data` descriptor only when
 // some block in the CHAIN — the source's requirement or the target's — actually pins that
@@ -5742,7 +5742,6 @@ fn the_block_state_payload_stayed_the_same_width() {
 
 // ---------------------------------------------------------------------------------------------
 // The chain-requirement entry check: the knob, the narrowing, and the two arms of `entry_layout`.
-// dev_docs/specs/2026-08-25-chain-requirement-entry-check-design.md
 // ---------------------------------------------------------------------------------------------
 
 /// Restores the ambient `IZARRAVM_CHAIN_ENTRY_CHECK` arm when it drops, so a fixture that asserts

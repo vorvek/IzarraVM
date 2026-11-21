@@ -2,16 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! Slice 1 of the reflected-call HLE design
-//! (`dev_docs/2026-09-03-reflected-call-hle-design.md` Revision 2,
-//! `dev_docs/2026-09-04-reflected-call-slice1-plan.md` Revision 2, "Revision 2
+//! (Revision 2, and the slice 1 plan Revision 2, "Revision 2
 //! amendments" item 6): **the RECORD-AND-MEASURE commit**. This module learns
 //! whether a reflected `INT` round trip is deterministic enough to be worth
 //! memoising, and measures the raw-clock stability and write-classification
 //! shape that decide it -- but it has **no answer path**: nothing here ever
 //! skips guest execution, applies an epilogue, gates on a bus predicate or
 //! clamps against a batch cap. Those land in a later slice, once this
-//! commit's measurement (`dev_docs/2026-09-04-reflected-call-slice1-measure-
-//! first.md`) has graded the three pre-registered NO-GOs.
+//! commit's measurement has graded the three pre-registered NO-GOs.
 //!
 //! Unlike `reflected_call_diag` (the `#[cfg(feature =
 //! "reflected-call-diagnostic")]` instrument, process-global `Mutex` state),
@@ -61,8 +59,8 @@
 //!
 //! Because nothing here answers, a key that finishes a successful learn
 //! cycle immediately restarts at Warm rather than staying "armed": this is
-//! what lets the measure-first pass in
-//! `dev_docs/2026-09-04-reflected-call-slice1-measure-first.md` collect
+//! what lets the measure-first pass
+//! collect
 //! thousands of independent samples per key from one ordinary run.
 //!
 //! # Deliberate scope cuts against the plan's fuller design (documented, not
@@ -138,7 +136,7 @@ pub(crate) const MEMO_MAX_REPLAY_WRITES: usize = 192;
 /// which is the shape that cost a measured run 99.4% interpretation.
 pub(crate) const MEMO_LEARN_BATCH_WINDOW: u32 = 256;
 /// Runtime-audit `write_value` strikes a key may take before the bounded disarm
-/// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`, option D as
+/// (learn protocol design, option D as
 /// recommended). Two, not one: with option E confirming the write model across eight
 /// natural samples, a single strike is most likely a cadence longer than that window, and
 /// the next learn cycle's demotion may capture it.
@@ -1023,7 +1021,7 @@ pub(crate) struct KeyState {
 ///
 /// The earlier shape carried only `(phys, predicted, observed, hits, provenance)`, and
 /// `provenance == 2` -- "the trip wrote it, the memo does not replay it" -- was read in
-/// `dev_docs/2026-09-05-reflected-call-slice1-answer-result.md` section 3 as "the memo
+/// the slice 1 answer result as "the memo
 /// classified it Class R". That is an inference, not an observation: a dword can reach
 /// `provenance == 2` from the Class R ranges, from a Class D dword the audit trip's own
 /// (shallower) low-water mark failed to exclude, or from a dword no learn trip ever saw.
@@ -3328,7 +3326,7 @@ fn ranges_contain(ranges: &[(u32, u32)], dword: u32) -> bool {
 
 /// One address of the WRITE CHECK SET: the union of Class W and Class R, which is what the
 /// eight natural samples confirm the write MODEL against
-/// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`, option E).
+/// (learn protocol design, option E).
 ///
 /// Class D never enters it -- a dead-stack write is unobservable by construction -- which
 /// is why the set is ~42 dwords rather than the ~250 the raw write set holds.

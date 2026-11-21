@@ -3174,8 +3174,8 @@ fn pushf_then_popf_round_trip_natively_in_v86_at_iopl_3() {
     // (`SS:SP` = 0x0900:0x1000), which forces a fresh walk that stores the PTE's D bit -- and
     // that PTE lives inside the same low-memory table page (0x2000) the CR3 code-cache gate's
     // write watch already marked as translation structure while decoding V86_BASE. Without the
-    // warm-up, PUSHF's D-bit store legitimately retires the ring from inside the call-out (design
-    // `2026-09-02-cr3-code-cache-gate-design.md`, advisory 12), which the deferred-write window
+    // warm-up, PUSHF's D-bit store legitimately retires the ring from inside the call-out (CR3 code-cache
+    // gate design, advisory 12), which the deferred-write window
     // then reports as non-empty and `allows_resume`'s R5 correctly refuses -- a real, accepted
     // side exit, just not the one this fixture exists to isolate.
     let translation_page_writes_before = cpu.perf_counters().translation_page_writes;
@@ -4207,7 +4207,7 @@ const fn imm32(value: u16) -> [u8; 4] {
     ]
 }
 
-/// The pyramid site itself, byte for byte against `dev_docs/2026-09-02-sreg-undemotion-design.md`
+/// The pyramid site itself, byte for byte against the sreg un-demotion design,
 /// section 1.1: `mov eax,0x10 / mov ds,ax / mov eax,0x20 / mov fs,ax`, here loading `SEL_OTHER` and
 /// `SEL_UNACCESSED` so both writes actually move the record `protected_cpu` seeded. Neither
 /// selector is read back by a later slot, in either channel `pinned_segments` unions: no memory
@@ -7171,7 +7171,7 @@ fn interpret_one_closes_the_callout_attribution_ledger() {
 // 7. LAR / LSL (`0x0F02` / `0x0F03`), the descent2 L2 lever.
 // ---------------------------------------------------------------------------
 //
-// `dev_docs/2026-09-05-586-laggard-board.md` L2: 20.6 M block-stopping exits on
+// The 586 laggard board's L2: 20.6 M block-stopping exits on
 // descent2-3dfx-586, the identical `0x0f02 /1 register dword` row on tombraid-loader-586. Both
 // rows share one interpreter shape (`try_read_descriptor` plus `descriptor_accessible`,
 // `execute_extended.rs` `0x0f02`/`0x0f03`) and are exercised together here.

@@ -632,7 +632,7 @@ fn les_lds_match_the_interpreter_in_real_mode_and_v86() {
 }
 
 /// The selector address at the top of a 16-bit segment WRAPS mod 0x10000, matching 86Box's
-/// `opLDS_w_a16` (`src/cpu/x86_ops_mov_seg.h`, `dev_docs/reference/86box`) and this codebase's
+/// `opLDS_w_a16` (86Box `src/cpu/x86_ops_mov_seg.h`) and this codebase's
 /// own `far_call_via_memory_wraps_selector_offset_at_64k` (`cpu_strings_segments_test.rs`), which
 /// already pinned the identical shape for `CALL FAR [m]` against a SingleStepTests 80386
 /// conformance vector.

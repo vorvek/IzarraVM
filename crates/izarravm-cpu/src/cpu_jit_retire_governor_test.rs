@@ -3,7 +3,7 @@
 
 //! The data-segment reject governor (`IZARRAVM_SEGMENT_RETIRE_GOVERNOR`).
 //!
-//! Design: `dev_docs/specs/2026-08-23-data-segment-reject-treadmill-design.md` (rev 3), section 6.
+//! Design: the data-segment reject treadmill design, rev 3, section 6.
 //! Every fixture here is named for the mutant it kills, and the mutant is stated in its own doc
 //! comment rather than left to be inferred from the assertions.
 //!

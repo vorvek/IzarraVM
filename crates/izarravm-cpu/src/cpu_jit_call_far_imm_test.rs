@@ -3,7 +3,7 @@
 
 //! Native CALL FAR ptr16:16 (`0x9A`) in real mode and V86, behind `IZARRAVM_DIRECT_RETF_V86`.
 //!
-//! L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`, "L7 verdict" and "L8" sections). L7 Part 1
+//! L8 of the corpus lever plan. L7 Part 1
 //! made the Direct dispatcher reachable at a non-continuable block entry; this is Part 2, the
 //! `classify` arm and emitter that let those reachable `0x9A` sites actually compile.
 //!

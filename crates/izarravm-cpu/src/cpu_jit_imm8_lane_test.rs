@@ -528,7 +528,7 @@ fn byte_write_at_a_dword_lane_start_still_rejects_on_width() {
 /// value-aware door unconditionally is the obvious simplification and it is WRONG: the permitting
 /// door also runs the lane-rejection accounting, so a byte store landing on a DWORD lane would
 /// start counting in `smc_lane_reject_width` on the SHIPPED arm — a counter
-/// `dev_docs/duke-reprofile-2026-08-19.md` reads as a baseline ("reads 0 today") and compares the
+/// the 2026-08-19 duke re-profile reads as a baseline ("reads 0 today") and compares the
 /// 08-16 census against. The kill is identical either way; only the counters and the choke's
 /// per-block lane walk differ, which is exactly what makes the mistake invisible without this
 /// fixture.

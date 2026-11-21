@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! Differential cover for the lowerings added by the runtime-weighted reject sweep
-//! (`dev_docs/2026-07-30-dispatch-architecture-audit.md` §5d).
+//! (dispatch architecture audit §5d).
 //!
 //! Every case runs the same guest bytes natively and interpreted from identical state and
 //! compares registers, lazy flags, EFLAGS, core clocks and bus clocks. The tested opcode is

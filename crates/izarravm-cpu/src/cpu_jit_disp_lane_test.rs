@@ -5,8 +5,8 @@
 //! every execution instead of being baked into the emitted address arithmetic, so a guest patch
 //! of those four bytes keeps the compiled block.
 //!
-//! The fixture is duke3d's shape (the 0x2AFxxx patch loops in
-//! dev_docs/2026-08-08-dispatch-tier-next.md): `8a 1d dd dd dd dd`, `MOV BL, [disp32]`, ModRM
+//! The fixture is duke3d's shape (the 0x2AFxxx patch loops):
+//! `8a 1d dd dd dd dd`, `MOV BL, [disp32]`, ModRM
 //! mod 0 reg 3 rm 5, six bytes, displacement at offset 2.
 //!
 //! The load sits at slot 1, never at the block's entry, for the reason the imm-lane fixture

@@ -117,7 +117,7 @@ macro_rules! timing_classes {
         /// `I386` has to be a `static` for its address to be stable.
         const I386_ENTRIES: [u16; N_CLASSES] = [ $( $i386, )+ ];
 
-        /// The I486 epoch-2 column (`dev_docs/2026-09-05-486-timing-audit.md` §5).
+        /// The I486 epoch-2 column (486 timing audit §5).
         pub(crate) static I486: ClassTable = ClassTable([ $( $i486, )+ ]);
 
         /// The I586 epoch-2 column (design §3.2 as amended by §9).
@@ -278,8 +278,8 @@ timing_classes! {
     /// `INT imm8` taken from **V86** through a trap or interrupt gate to a
     /// different level -- the mode `IntN` used to serve from one flat 37.
     ///
-    /// This is the row `dev_docs/2026-09-05-v86-port-io-timing-research.md`
-    /// section 1.2 re-anchored: Intel's Interrupt Clock Counts Table gives the
+    /// This is the row the V86 port I/O timing research
+    /// re-anchored: Intel's Interrupt Clock Counts Table gives the
     /// V86 / trap gate, different level entry as **54**, plus **12** on a cache
     /// miss, so 66 clocks and raw 792. The 486's own V86 gate row is 86.
     IntNV86 = (37, 1032, 792, "F2 INT table, V86/trap gate different level 54 +12 miss / 486 §5 (86 clk)"),
@@ -459,7 +459,7 @@ timing_classes! {
     OutsString = (14, 240, 156, "F3 (OUTS 13 real) / T10.2 DX2 (20 real; base i486 17). The bus term is P1's"),
     /// `IN AL/eAX, imm8` and `IN AL/eAX, DX`, today's `IN_PORT_CORE_CLOCKS`.
     ///
-    /// P1 (`dev_docs/2026-09-05-port-io-repricing-design.md`) owns the epoch-2
+    /// P1 of the port I/O repricing design owns the epoch-2
     /// port charge and applies it on the BUS side, not here; this row keeps the
     /// core term so a port access does not lose its core cost when the bus term
     /// moves. 486 §5's 168/192 are recorded, not yet reconciled with P1.
@@ -480,7 +480,7 @@ timing_classes! {
     /// Delivering a V86 monitor trip -- the reflected-call path, and census row
     /// 7: **16.7x under**, the worst row in its group.
     ///
-    /// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 1.2
+    /// The V86 port I/O timing research
     /// re-anchored it: Intel's V86 / trap gate, different level row is 54 plus
     /// 12 on a cache miss, so 66 clocks, and a reflected V86 `IN` costs that
     /// plus the instruction's own class -- the ~88-100 the research quotes,

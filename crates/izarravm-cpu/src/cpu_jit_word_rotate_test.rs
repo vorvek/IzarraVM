@@ -3,7 +3,7 @@
 
 //! `vorvek/direct-word-rot1`: the sixteen-bit REGISTER rotate lane, `0xC1`/`0xD1 /0,/1`.
 //!
-//! `dev_docs/2026-08-31-corpus-lever-plan.md`'s L3: `123-talk-shareware`'s `0xD1 word memory /1`
+//! The corpus lever plan's L3: `123-talk-shareware`'s `0xD1 word memory /1`
 //! and `0xD0 word register /1` rows are 29,698,883 + 24,856,330 runtime hits, its #1 and #3 census
 //! rows and 3.4% of everything it executes; `21-for-1-to-4`'s `0xD0 word register /1` is
 //! 13,496,909. The census names are the by-one encoding and the decoded segment default width, not

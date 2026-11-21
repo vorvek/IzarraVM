@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! `0xE4` IN AL,imm8 -- the `PortReadAlImm8` call-out, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
-//! (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3, gp2's B2 residue).
+//! (in-imm8 call-out design rev 3, gp2's B2 residue).
 //!
 //! This file covers the KNOB and the `classify` ARM: whether `0xE4` reaches the compile walk at
 //! all, and with what `port` baked into the slot. The HELPER's own contract (status encoding,

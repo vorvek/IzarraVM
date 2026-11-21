@@ -4,7 +4,7 @@
 //! The non-direct data-read page histogram (`IZARRAVM_SLOW_READ_HISTO=1`).
 //!
 //! The instrument exists to answer one question the profile could not:
-//! `dev_docs/wolf3d-586-measurement-results.md` measures 957,768,897 `data_slow_reads` against
+//! The wolf3d-586 measurement results show 957,768,897 `data_slow_reads` against
 //! 17,257,014 direct ones in that fixture's demo phase, one for one with
 //! `jit_direct_exit_cross_page_or_alignment`, and the two candidate causes -- the mode-Y VGA
 //! aperture (which `ram_lookup_page_is_direct` refuses BY DESIGN) and UMB/EMS RAM (which the same

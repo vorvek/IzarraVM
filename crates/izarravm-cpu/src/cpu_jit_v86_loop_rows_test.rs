@@ -3,7 +3,7 @@
 
 //! The SIX 16-bit rows of the tombraid FMV census's loop A, behind `IZARRAVM_V86_LOOP_ROWS`.
 //!
-//! `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1 names the loop and
+//! The 2026-08-20 tombraid re-profile names the loop and
 //! `.bench/results/tomb-fmv-admission-20260819/census-fpu-loop-rows-1-summary.json` carries the
 //! rows. Interpreted hits over the 20e9 boot+FMV prefix, and the static unbound exits behind them:
 //!

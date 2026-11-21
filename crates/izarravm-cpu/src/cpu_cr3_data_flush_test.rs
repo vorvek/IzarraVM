@@ -1,9 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The CR3 DATA-side gate, T1+T2 (`dev_docs/2026-09-02-cr3-data-side-design.md`, amended by
-//! `dev_docs/2026-09-02-cr3-code-cache-gate-review.md`'s "Review of the data-side design"
-//! section, findings D1 through D5, and by that same document's "Review of PR #826", finding P1).
+//! The CR3 DATA-side gate, T1+T2 (the CR3 data-side design, amended by findings D1
+//! through D5 of its review and by finding P1 of the review of PR #826).
 //!
 //! P1 (PR #826, BLOCKING, fixed in the same PR): `ContextSelect::Skipped(slot)` used to cover
 //! both R1 (reselect: an occupied slot's saved generation/epoch must be RESTORED) and R2

@@ -250,8 +250,7 @@ fn resident_chain_crosses_three_blocks_with_one_root_entry() {
     // one block and the chain never overshot the budget. That guarantee came from pricing every
     // hop at `global_block_upper` (32 four-clock instructions plus RET plus 32 worst-case bus
     // accesses), which is sound and 10-40x above the 6.4-instruction average, so it also cut
-    // chains far short of budgets they were entitled to spend. See
-    // dev_docs/2026-07-30-dispatch-architecture-audit.md.
+    // chains far short of budgets they were entitled to spend.
     //
     // The chain is now priced from the entry block's ACTUAL cost, so a tight cap can overshoot by
     // a bounded number of hops. What still has to hold is that a tight cap STOPS the chain early

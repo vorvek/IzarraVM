@@ -90,14 +90,14 @@ pub(crate) struct JitState {
     /// reason, and CARRIED by clone for its lockstep-comparison reason.
     pub(crate) watch_page_bit: bool,
     /// Emitted stores probe the one-lookup store-bias table and route special pages through
-    /// the shared stub pad (`dev_docs/2026-08-07-one-lookup-store-design.md` D3/D4/D5).
+    /// the shared stub pad (store design D3/D4/D5).
     /// Always true at construction. A test sets it to false to get the classify/resolve
     /// emission for each store, which is also the emission of a block whose stub pad did not
     /// build. A FIELD for `word_at_486`'s testability reason, and CARRIED by clone for
     /// `watch_page_bit`'s lockstep-comparison reason.
     pub(crate) one_lookup_store: bool,
     /// Emitted reads probe the one-lookup load-bias table and route special pages through the
-    /// shared read-resolve pad (`dev_docs/2026-08-07-one-lookup-load-design.md` D3a/D3b/D5).
+    /// shared read-resolve pad (load design D3a/D3b/D5).
     /// Always true at construction. A test sets it to false to get the classify/resolve read
     /// emission, which is also the emission of a block whose read pad did not build. A FIELD
     /// for `word_at_486`'s testability reason, CARRIED by clone for the lockstep reason.
@@ -134,7 +134,7 @@ pub(crate) struct JitState {
     /// so a fixture cannot exercise both arms, and the level-0 early-out in `try_direct_continuation`
     /// would have lost its only cover the moment the default moved off 0.
     pub(crate) sixteen_bit_level: u8,
-    /// Sticky-decline memo era state (`dev_docs/sticky-decline-memo-design.md` §1.5 plus review
+    /// Sticky-decline memo era state (design §1.5 plus review
     /// BLOCKER B1). The memo byte in each `DecodePack` carries a 6-bit era stamp; a memo answers
     /// only while `decline_memo_stamp` still reads the value it was written under, so one advance
     /// invalidates all 65,536 of them at once.

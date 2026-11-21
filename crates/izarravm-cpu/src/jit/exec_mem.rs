@@ -27,7 +27,7 @@ pub(crate) struct ExecutableBuffer {
 /// 95.9%: each rebuild copied 14.7 MB of live code to reclaim ~4% of the slots, and the next ~335
 /// installs refilled it. Compaction cost scales with LIVE bytes copied, not with arena size, so
 /// capacity is the cheap dial. Two independent A/B/B/A rounds against `IZARRAVM_JIT_ARENA_MIB`,
-/// one binary, `dev_docs/duke3d-open-area-profile-results.md` §9:
+/// one binary, duke3d open-area profile results §9:
 ///
 /// | | compactions | `arena_compaction_ns` | installs | min wall |
 /// |---|---|---|---|---|

@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 0b's tests (`dev_docs/2026-09-04-reflected-call-slice0b-plan.md` §10).
+//! Slice 0b's tests (slice 0b plan §10).
 //! Drives the module's PRIVATE `*_on` functions against a LOCALLY constructed
 //! `State`, exactly as slice 0's test file did -- see `reflected_call_diag.rs`'s
 //! "Hooks" section comment for why: this crate's test suite runs many tests
@@ -741,7 +741,7 @@ fn one_production_write_seam_reaches_the_instrument() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice 0c tests (dev_docs/2026-09-04-reflected-call-slice0b-review.md, D1-D6)
+// Slice 0c tests (D1-D6)
 // ---------------------------------------------------------------------------
 
 /// D1: a far RETURN that lands exactly on the entry's own CS:EIP:SS, but with

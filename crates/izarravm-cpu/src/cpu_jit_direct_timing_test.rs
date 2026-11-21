@@ -1716,7 +1716,7 @@ fn grp3_imul_memory_form_is_lowered() {
 // ---------------------------------------------------------------------------
 // `0xF7 /4` MUL r/m32, MEMORY form (`DirectKind::MulMemAcc`), behind
 // `IZARRAVM_MUL_MEM_ROWS`. The gp2-586 census's second rejected-class head, 13.1 M interpreted
-// hits (2026-08-29 evening sweep at `4e7a2d7c`; `dev_docs/gp2-mul-mem-slice-design-2026-08-29.md`).
+// hits (2026-08-29 evening sweep at `4e7a2d7c`).
 //
 // Deliberately the `grp3_imul_*` family above, case for case. That family is the SIGNED sibling of
 // this exact shape and it is what makes the address handling, the side exits, the segment
@@ -2279,7 +2279,7 @@ fn mul_mem_rows_spelling_table_names_both_arms() {
 // ---------------------------------------------------------------------------
 // `0xE2` LOOP as a native terminal (`DirectKind::Loop`), behind `IZARRAVM_LOOP_ROWS`.
 // The gp2-586 census's LARGEST rejected head: 20,918,551 runtime_hits, 18,374,120 unbound exits,
-// 294 sites. Design: dev_docs/gp2-loop-slice-design-2026-08-29.md.
+// 294 sites.
 //
 // WHAT THESE CATCH THAT A JCC FIXTURE CANNOT:
 //  * a published host flag. LOOP touches NO guest flag, and the emitter clobbers host flags with
@@ -2581,7 +2581,7 @@ fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
 // ---------------------------------------------------------------------------
 // The Word/Word `0xE2` cell (`DirectKind::Loop { counter_word: true, .. }`). Every corpus guest
 // is 16-bit, so the Dword lane above never fires on it: the L0 lever
-// (dev_docs/2026-08-31-corpus-lever-plan.md) widens `classify` to the matched Word cell while the
+// of the corpus lever plan widens `classify` to the matched Word cell while the
 // mixed cells stay refused (`loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on`
 // above already covers those, unchanged).
 //
@@ -3093,8 +3093,8 @@ fn loop_rows_spelling_table_names_both_arms() {
 // `0xE0`/`0xE1` LOOPNE/LOOPE as native terminals (`DirectKind::LoopCc`), behind
 // `IZARRAVM_LOOPCC_ROWS`. nascar-586's `0xE1` dword row at merged main: 2,639,630 hits /
 // 2,638,564 exits / NINE sites -- hits equal exits to 99.96%, every execution a termination.
-// Design: dev_docs/nascar-loopcc-slice-design-2026-08-30.md. The WALL claim is pre-declared
-// expected-null there; these fixtures carry the slice's whole case.
+// The NASCAR LOOPcc slice design pre-declares the WALL claim
+// expected-null; these fixtures carry the slice's whole case.
 //
 // WHAT THE DIFFERENTIAL COVERS IN ONE FIXTURE, by construction: slot 0 is an ADD that both
 // STAGES the guest ZF (the seeds choose whether the sum is zero) and leaves a LIVE PENDING

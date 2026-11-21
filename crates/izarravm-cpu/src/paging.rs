@@ -129,8 +129,8 @@ impl TlbEntry {
 /// #PF. The permissive direction -- the guest tightened a PTE and skipped its flush -- is still
 /// live, and is the one this capacity note is about.
 ///
-/// Per-slot generation, mirroring `DecodeCache`'s two-slot ring (design
-/// `2026-09-02-cr3-data-side-design.md` T2). `generation` stays the HOT field every `lookup` and
+/// Per-slot generation, mirroring `DecodeCache`'s two-slot ring (CR3 data-side
+/// design T2). `generation` stays the HOT field every `lookup` and
 /// `insert` compares -- unchanged from the single-slot form -- and is kept in sync with
 /// `generations[live]` by every method below; nothing on the hot path reads `generations` or
 /// `live` directly. Capacity stays shared (1024 entries for both directories together); only
@@ -244,8 +244,8 @@ impl Tlb {
     ///
     /// Reports `previous` whenever `previous.generation != 0` (D3: 0 is `TlbEntry::EMPTY`'s own
     /// sentinel and is never a live generation), NOT only when `previous.generation ==
-    /// self.generation`. The narrower, generation-matching check was sound before T2 (design
-    /// `2026-09-02-cr3-data-side-design.md`): every generation bump was ALSO a wholesale FastMap
+    /// self.generation`. The narrower, generation-matching check was sound before T2 (CR3 data-side
+    /// design): every generation bump was ALSO a wholesale FastMap
     /// wipe (`record_fast_map_wipe_extent`, tied to the same CR3/CR0 flush), so a displaced entry
     /// from an OLDER generation was already covered by that wipe and reporting it again would
     /// have been redundant work, not a correctness gap. T2 breaks that pairing: the translation-

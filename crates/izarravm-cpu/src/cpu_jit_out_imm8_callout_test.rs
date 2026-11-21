@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! `0xE6` OUT imm8,AL -- the `PortWriteAlImm8` call-out, behind `IZARRAVM_OUT_IMM8_ROWS`
-//! (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B, gp2's 59,968,424-exit row).
+//! (Option B of the gp2 OUT 0xE6 research, gp2's 59,968,424-exit row).
 //!
 //! This file covers the KNOB and the `classify` ARM: whether `0xE6` reaches the compile walk at
 //! all, and with what `port` baked into the slot. The HELPER's own contract (the UNCONDITIONAL

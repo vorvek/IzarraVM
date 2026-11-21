@@ -5,8 +5,8 @@
 //! guarded at the exit by a three-instruction selector compare against the target's frozen
 //! requirement.
 //!
-//! Design: `dev_docs/2026-09-01-segwrite-continue-design.md`. Companion refutation this must not
-//! repeat: `dev_docs/2026-08-31-l9-segment-chain-design.md` §9 (B1 -- the selector-purity lemma is
+//! Design: the segwrite continue design. Companion refutation this must not
+//! repeat: the L9 segment-chain design §9 (B1 -- the selector-purity lemma is
 //! false in plain real mode).
 //!
 //! Three red proofs (design §7.1 items 1-3), in order:

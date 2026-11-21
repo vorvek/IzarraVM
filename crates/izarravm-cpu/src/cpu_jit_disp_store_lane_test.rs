@@ -35,7 +35,7 @@
 //!
 //! # Mutation record
 //!
-//! Recorded in `dev_docs/2026-08-23-option-d-step-3-log.md` alongside the results, so the log and
+//! Recorded in the option D step 3 log alongside the results, so the log and
 //! the record cannot drift apart.
 
 use super::*;

@@ -19,8 +19,7 @@ dynarec-mkii = ["jit"]
 # Partial Direct admission attribution. The dispatcher hooks are compiled out unless this
 # diagnostic feature is selected, then armed with IZARRAVM_DIRECT_BARRIER_CENSUS=1.
 direct-admission-census = ["jit"]
-# Per-entry Direct attribution observer
-# (dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md). Compiled out unless
+# Per-entry Direct attribution observer. Compiled out unless
 # selected -- the `ea_*!` macros expand to nothing -- then armed with
 # IZARRAVM_DIRECT_ENTRY_ATTRIBUTION=1 (full) or =2 (coarse), strided by
 # IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE=N.
@@ -57,8 +56,7 @@ watch-write = []
 # conversation with a driver (this is how the TOKAEMM shared-pool defect was
 # found). Armed by IZARRAVM_INT_TRACE=<hex vectors, comma separated>.
 int-trace = []
-# Slice 0 of the reflected-call HLE design (dev_docs/2026-09-03-reflected-
-# call-hle-design.md, dev_docs/2026-09-03-reflected-call-hle-review.md): the
+# Slice 0 of the reflected-call HLE design: the
 # trip-shape INSTRUMENT. NO BEHAVIOUR CHANGE on the OFF arm or on a plain
 # build -- compiled out entirely unless this feature is selected. Armed by
 # IZARRAVM_REFLECTED_CALL_DIAGNOSTIC=shape or =journal; see
@@ -66,21 +64,21 @@ int-trace = []
 # `journal` mode forces the native backend off for the run, on the design's
 # own precondition for guest-memory-access journaling.
 reflected-call-diagnostic = ["jit"]
-# S1d slice 2 of dev_docs/2026-09-05-s2-cache-differentiation-design.md: the JIT
+# S1d slice 2 of the cache-differentiation design: the JIT
 # native-entry sampling hook (diverts every Kth compiled-block entry to the
 # interpreter while izarravm-machine's shadow probe is armed) plus the
 # `shadow_probe_should_sample_entry` CpuBus method it needs from izarravm-bus.
 # NOT in `default`.
 shadow-cache-probe = ["jit", "izarravm-bus/shadow-cache-probe"]
-# Slice 1 of the reflected-call HLE design (`dev_docs/2026-09-04-reflected-call-slice1-plan.md`):
+# Slice 1 of the reflected-call HLE design:
 # the record-and-measure memo. Gate the whole module under this
 # feature (not merely the runtime knob) so a plain build carries none of it -- byte-identical
 # `CpuGsw` layout and binary to a plain `main` build. `IZARRAVM_REFLECTED_CALL_MEMO` arms it
 # only when this feature is compiled in.
 reflected-call-memo = ["jit"]
 
-# The per-class retire histogram (design section 9.1 of
-# dev_docs/2026-09-05-586-recalibration-design.md). A `[u64; N_CLASSES]` on the CPU plus one
+# The per-class retire histogram (section 9.1 of the 586
+# recalibration design). A `[u64; N_CLASSES]` on the CPU plus one
 # sparse add per compiled-block entry, reported in the profile JSON. Compiled out unless
 # selected -- there is NO env knob, deliberately: a default-off instrument that costs a
 # hot-path branch is exactly what the campaign's own rule

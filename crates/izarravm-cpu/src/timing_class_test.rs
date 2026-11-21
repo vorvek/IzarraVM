@@ -282,7 +282,7 @@ fn class_names_are_unique() {
 /// A class whose provenance says `UNSOURCED x12` has NO reference count behind
 /// its epoch-2 entry: it is the epoch-1 literal times twelve, a default that
 /// preserves today's relative cost and errs slow. Slice 1a shipped 78 of them.
-/// `dev_docs/2026-09-05-class-table-sources.md` sourced every one against
+/// The class-table source survey checked every one against
 /// Intel's Pentium Table F-2/F-3/F-5, the Optimization Manual's Table A-1 for
 /// the pairing letters, and the i486 DX2 Data Book's Tables 10.1-10.3, so the
 /// count is now 0 and a row that reappears has to say why in the diff.

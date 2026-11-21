@@ -1,8 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Fixtures for the 16-bit entry-attribution observer
-//! (`dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md`).
+//! Fixtures for the 16-bit entry-attribution observer.
 //!
 //! What each one is able to FAIL on, which is the only reason to write it:
 //!

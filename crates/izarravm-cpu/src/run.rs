@@ -8,7 +8,6 @@ use crate::timing_class::TimingClass;
 // The entry-attribution observer's phase, population and site names. The `ea_*!` macros
 // themselves are `#[macro_use]`-imported from `crate::entry_attribution_macros`, which is compiled
 // in EVERY build: three of the call sites below are outside the `jit` gate.
-// See `dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md` section 4b.
 #[cfg(all(feature = "jit", feature = "direct-entry-attribution"))]
 use crate::jit::direct::{FallbackTag, Phase, Population, compile_site, site};
 
@@ -1719,7 +1718,7 @@ impl CpuGsw {
         }
     }
 
-    /// Sticky-decline memo read side (`dev_docs/sticky-decline-memo-design.md`).
+    /// Sticky-decline memo read side.
     ///
     /// Answers "is this slot's decline provably repeatable in this era", and answers it out of
     /// one byte of the 16-byte `DecodePack` the line above already brought into L1.
@@ -1882,7 +1881,7 @@ impl CpuGsw {
             ea_end!(Population::Refused);
             return Ok(None);
         }
-        // Sticky-decline memo (`dev_docs/sticky-decline-memo-design.md`). Exactly where §1.3 puts
+        // Sticky-decline memo. Exactly where design §1.3 puts
         // it: AFTER `direct_hot_at`, so the pack load is shared and the hotness byte still
         // increments, and BEFORE `key_for_phys`, which is the first of the six symbols a hit
         // removes — `key_for_phys`, both `probe` entry points and `probe`'s closure,
@@ -2093,7 +2092,7 @@ impl CpuGsw {
                         return Ok(None);
                     }
                 };
-                // G4 guarantee (dev_docs/specs/2026-07-15-smc-hardening-design.md): a block only
+                // G4 guarantee (SMC hardening design): a block only
                 // installs when a real RAM direct page covers its whole physical span. The kind
                 // MUST stay InstructionPrefetch: the production bus yields a direct page under that
                 // kind ONLY for true RAM, so video/MMIO windows (the mode-13 window answers Data

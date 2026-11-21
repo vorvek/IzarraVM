@@ -21,7 +21,7 @@ use super::*;
 
 /// The array's reason to exist is that it is small. 65536 slots at this width is 1 MB against the
 /// line table's 3.5 MB; a grown entry buys back the miss the slice was measured to remove
-/// (11.75 percent of duke3d-586's wall, dev_docs/2026-08-08-dispatch-tier-next.md).
+/// (11.75 percent of duke3d-586's wall).
 #[test]
 fn packed_entry_stays_sixteen_bytes() {
     assert_eq!(

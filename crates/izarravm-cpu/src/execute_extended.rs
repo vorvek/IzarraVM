@@ -616,7 +616,7 @@ impl CpuGsw {
                             CpuPersona::I386 => 0xffff_f000,
                             CpuPersona::I486 | CpuPersona::I586 => 0xffff_f018,
                         };
-                        // Ring-gated (design `2026-09-02-cr3-code-cache-gate-design.md`): the
+                        // Ring-gated (CR3 code-cache gate design): the
                         // function reads the OLD register value to seed/select the ring, so it
                         // owns the assignment -- do not set `self.control.cr3` here.
                         self.flush_tlb_and_code_caches_for_cr3_write(value & mask);
@@ -1733,7 +1733,7 @@ pub(crate) fn iret_class(
 /// rows are far apart: real mode 11, a protected-mode trap gate to a different
 /// level 40, and V86 through a trap gate to a different level **54 plus 12 on a
 /// cache miss** -- the row
-/// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 1.2 re-anchored
+/// the V86 port I/O timing research re-anchored
 /// when it found the reflected-trip figure of 45 was taken from the unreachable
 /// real-mode row.
 pub(crate) fn int_n_class(protected: bool, v86: bool) -> TimingClass {

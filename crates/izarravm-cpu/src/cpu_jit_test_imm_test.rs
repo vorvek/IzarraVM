@@ -2413,7 +2413,7 @@ fn the_heat_gated_arm_refuses_a_patched_count_byte() {
 /// census row by measured patch history and nothing else.
 ///
 /// The unpatched share of the `0xC1 /0` row is the number the whole slice exists to measure
-/// (`u`, dev_docs/duke-reprofile-2026-08-19.md §5 L1); this fixture pins that the share is
+/// (`u`, duke re-profile L1); this fixture pins that the share is
 /// reachable at all.
 #[test]
 fn the_heat_gated_arm_admits_an_unpatched_count_byte() {

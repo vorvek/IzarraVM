@@ -3,8 +3,7 @@
 
 //! G1 self-modifying-code heat map. A separate structure from the refcounted watch pages: the
 //! review proved a counter living in a refcounted page ping-pongs (demotion zeroes refcounts, the
-//! page resets, the heat is lost, the code re-admits). See
-//! dev_docs/specs/2026-07-15-smc-hardening-design.md.
+//! page resets, the heat is lost, the code re-admits).
 //!
 //! Ownership (Track C C1a-pre hoist): the map is a PLAIN FIELD on `CpuGsw`, reached through SPLIT
 //! BORROWS so a future backend could share it the way the (now-removed) clif backend once did.

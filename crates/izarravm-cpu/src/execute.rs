@@ -1529,9 +1529,8 @@ impl CpuGsw {
 ///
 /// The interpreter serves all six ALU forms from one arm and one
 /// `Ok(clocks(2))`, so the class has to be recovered here from the form number
-/// and the decoded operand. Both references split them three ways
-/// (`dev_docs/2026-09-05-86box-pentium-timing-comparison.md` section 3 rows 1,
-/// 3 and 4): a register-only form is 1 clock, a memory SOURCE is the 2-clock
+/// and the decoded operand. Both references split them three ways:
+/// a register-only form is 1 clock, a memory SOURCE is the 2-clock
 /// load form, and a memory DESTINATION that writes back is the 3-clock
 /// read/modify/write. `CMP`/`TEST` against memory write nothing, so they are a
 /// load however the operand is addressed.

@@ -6,7 +6,7 @@
 //! `LinkTarget`, `BlockPortal` (plus `zero_portal`), `LinkCell`, and `LinkSource` moved out of
 //! `jit::direct` VERBATIM (field-for-field, method-for-method): none of the four referenced
 //! anything Direct-specific in their own definitions, and the extraction is behavior-preserving
-//! for Direct (see `dev_docs/plans/2026-07-19-track-c1d-design.md` section 5.1). `LinkSource` is
+//! for Direct. `LinkSource` is
 //! generic over its own `SourceId` type parameter so a future backend can
 //! instantiate it over its own unit-index type without pulling in Direct's `BlockId` (which stays
 //! in `direct.rs`, since it carries Direct's generational-slot semantics and is not itself
