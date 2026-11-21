@@ -509,6 +509,7 @@ pub fn prefs_path(c_root: &Path) -> PathBuf {
 
 impl GuiPrefs {
     /// A missing, unreadable, or unparseable file yields defaults.
+    #[cfg(test)]
     pub(super) fn load_with(
         path: &Path,
         read_text: impl FnMut(&Path) -> std::io::Result<String>,
