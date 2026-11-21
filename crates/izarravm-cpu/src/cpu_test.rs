@@ -108,9 +108,10 @@ fn cpu_registers_field_offset_is_stable() {
     // instruction's stores plus a whole exception delivery's; see `MAX_DEFERRED_CODE_WRITES`.
     // The CR3 code-cache gate grows `DecodeCache` (which sits ahead of `registers`) with the
     // two-slot ring and the `translation_pages` bitmap, moving this pin from 520 to 576 --
-    // measured, not derived.
+    // measured, not derived. The TLB entries moved to the heap (one `Box` in `Tlb`), and the
+    // field order changed with it, moving this pin from 576 to 616 -- measured, not derived.
     assert_eq!(
-        off, 576,
+        off, 616,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -2010,7 +2011,7 @@ fn pending_flags_offset() {
     // architectural state. Native code still requires this plain-build layout;
     // the histogram feature adds a boxed field before the pinned offset.
     #[cfg(not(feature = "timing-class-histogram"))]
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 37600);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4840);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and

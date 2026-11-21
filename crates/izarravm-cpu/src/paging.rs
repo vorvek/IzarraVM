@@ -50,11 +50,19 @@ use crate::SegmentRegister;
 /// gate's existing bands, with frames and gametics unchanged. That is the "timing approx" half of
 /// the contract, not a correctness change.
 ///
-/// Two costs to know before raising this further. `Tlb` is an inline array inside `CpuGsw`, which is
-/// itself inline in `Machine` and threaded by value, so 8192 entries overflows the main thread's
-/// stack during construction (4096 was measured working). And the canonical execution payload
-/// serializes every live entry, so its maximum grows with this constant.
+/// One cost to know before raising this further: the canonical execution payload serializes every
+/// live entry, so its maximum grows with this constant. The entries live on the heap, because
+/// `CpuGsw` is inline in `Machine` and a large inline array overflows the main thread's stack in
+/// a debug build.
 pub const TLB_ENTRIES: usize = 1024;
+
+/// An empty TLB array on the heap, built without a stack temporary.
+fn empty_tlb_entries() -> Box<[TlbEntry; TLB_ENTRIES * 2]> {
+    vec![TlbEntry::EMPTY; TLB_ENTRIES * 2]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("the length is TLB_ENTRIES * 2"))
+}
 // `Tlb::slot` masks with `TLB_ENTRIES - 1`, and jit/block.rs emits that same mask into native code.
 // Both are silently wrong for a non-power-of-two, and the sweep table above invites tuning this.
 const _: () = assert!(TLB_ENTRIES.is_power_of_two());
@@ -131,7 +139,7 @@ pub(crate) struct Tlb {
     /// Two arrays of `TLB_ENTRIES` entries. With the slot partition off, only the first array is
     /// ever used (`base` stays 0). With it on, `base` is `live * TLB_ENTRIES`, so each ring slot
     /// owns one array and a context cannot overwrite the entries of the other.
-    entries: [TlbEntry; TLB_ENTRIES * 2],
+    entries: Box<[TlbEntry; TLB_ENTRIES * 2]>,
     /// Offset of the live array inside `entries`: 0 or `TLB_ENTRIES`. Changes only when the live
     /// ring slot changes and the partition is on.
     base: usize,
@@ -208,7 +216,7 @@ pub(crate) const TLB_INITIAL_GENERATION: u32 = 1;
 impl Default for Tlb {
     fn default() -> Self {
         Self {
-            entries: [TlbEntry::EMPTY; TLB_ENTRIES * 2],
+            entries: empty_tlb_entries(),
             base: 0,
             partition: tlb_slot_partition_enabled(),
             generation: TLB_INITIAL_GENERATION,
@@ -287,7 +295,7 @@ impl Tlb {
     /// pre-wrap generation can alias a freshly-minted one.
     fn mint_generation(&mut self) -> u32 {
         if self.next_generation == 0 {
-            self.entries = [TlbEntry::EMPTY; TLB_ENTRIES * 2];
+            self.entries.fill(TlbEntry::EMPTY);
             self.next_generation = 1;
             self.wrapped = true;
         }
@@ -341,7 +349,7 @@ impl Tlb {
     #[cfg(test)]
     pub(crate) fn set_partition_for_test(&mut self, on: bool) {
         self.partition = on;
-        self.entries = [TlbEntry::EMPTY; TLB_ENTRIES * 2];
+        self.entries.fill(TlbEntry::EMPTY);
         self.base = if on {
             usize::from(self.live) * TLB_ENTRIES
         } else {
@@ -378,7 +386,7 @@ impl Tlb {
     #[cfg(test)]
     pub(crate) fn verbatim_copy_for_test(&self) -> Self {
         Self {
-            entries: self.entries,
+            entries: self.entries.clone(),
             base: self.base,
             partition: self.partition,
             generation: self.generation,
