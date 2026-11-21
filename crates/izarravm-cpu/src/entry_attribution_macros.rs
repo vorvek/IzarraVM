@@ -5,13 +5,13 @@
 //!
 //! They live at the CRATE ROOT rather than beside the instrument (`jit::direct`) for one reason:
 //! `jit::direct` is compiled only under `feature = "jit"`, while the call sites in `run.rs` are
-//! not all inside a `jit` gate -- the `ea_begin!` that opens a traversal and the P13 pair
+//! not all inside a `jit` gate: the `ea_begin!` that opens a traversal and the P13 pair
 //! (`ea_mark!(Phase::InterpretFallback)` + `ea_end!(Population::Fallback)`) sit in
 //! `run_budgeted_inner`'s interpreted arm, which every build compiles. With the macros defined
 //! down there, `--no-default-features` could not resolve them and the crate did not build.
 //!
 //! Defined here they are always in scope and always expand to NOTHING unless
-//! `direct-entry-attribution` is selected -- which implies `jit`, so the armed bodies can name
+//! `direct-entry-attribution` is selected, which implies `jit`, so the armed bodies can name
 //! `jit::direct` freely.
 //!
 //! `unused_macros` is allowed for the module: most of the call sites are inside `run.rs`'s own
@@ -34,7 +34,7 @@ macro_rules! ea_mark {
 
 /// Close one phase against the cursor in BOTH armed modes.
 ///
-/// The two native-window boundaries in `run_direct_block` use this -- `Phase::NativePreamble`
+/// The two native-window boundaries in `run_direct_block` use this: `Phase::NativePreamble`
 /// immediately before the `entry(..)` call and `Phase::NativeBody` immediately after it. They are
 /// what makes COARSE's four-mark total comparable with FULL's (A6): on an entered traversal COARSE
 /// stamps exactly `ea_begin!`, those two, and `ea_end!`.
@@ -82,7 +82,7 @@ macro_rules! ea_end {
 /// `note_reject_callout_privileged` lands in `DirectStallTally`, not in `perf`, so it is absent
 /// from the perf JSON the boards are graded on.
 ///
-/// (The two `run.rs` LINE citations this note used to carry were wrong when they were written --
+/// (The two `run.rs` LINE citations this note used to carry were wrong when they were written:
 /// at the commit that added them one pointed into a doc comment and the other at the
 /// `jit_direct_deferred_short` bump itself. Named sites cannot drift; do not reintroduce line
 /// numbers here.)

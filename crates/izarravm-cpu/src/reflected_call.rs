@@ -5,7 +5,7 @@
 //! (design and slice 1 plan, both Revision 2). Extracted out of
 //! `reflected_call_diag.rs` (the slice 0/0b/0c diagnostic) so the slice 1
 //! memo (`reflected_call_memo.rs`) does not duplicate the page walker or the
-//! entry-image capture. **No state, no `Mutex`, no env read** -- every item
+//! entry-image capture. **No state, no `Mutex`, no env read**: every item
 //! here is a pure function or a plain data type, safe to call from
 //! production code with no feature gate.
 //!
@@ -17,7 +17,7 @@ use super::*;
 
 /// The legacy VGA aperture, physical `0xA0000..=0xBFFFF`. The CRTC reads
 /// guest memory every scanline with no arming step, so a write here is never
-/// eligible for the "restored, so skip it" disposition -- an intermediate
+/// eligible for the "restored, so skip it" disposition: an intermediate
 /// value is observable on screen even if the final value matches the entry
 /// value.
 // Consumed today only by `reflected_call_diag` (`#[cfg(feature =
@@ -40,7 +40,7 @@ pub(crate) const EFLAGS_ARCH_MASK: u32 = 0x0003_7fd5 | (1 << 18);
 /// A masked, sign-agnostic compare at the write's own width: `latest` and
 /// `pre` are full 32-bit storage, but a byte or word write only ever
 /// changed the low N bytes, so classification (Class R: "restored") must
-/// compare only those bytes -- comparing the full dword would report a
+/// compare only those bytes: comparing the full dword would report a
 /// byte write as "not restored" merely because the untouched high bytes of
 /// the two 32-bit reads/writes happened to differ (they didn't move; they
 /// were simply never part of this access).
@@ -61,7 +61,7 @@ pub(crate) fn mask_to_width(v: u32, width_bytes: u32) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// One cached segment descriptor's selector plus the base/limit/access
-/// triple already resident in the CPU's segment-register cache -- reading
+/// triple already resident in the CPU's segment-register cache: reading
 /// this costs nothing beyond the field load `SegmentRegister` already is.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub(crate) struct CachedSegment {
@@ -72,7 +72,7 @@ pub(crate) struct CachedSegment {
     /// The descriptor's D/B bit as the CPU caches it. Part of the closure rule for
     /// the same reason the base is: `SS.B` decides the stack width every push and pop
     /// inside the trip uses, and `CS.D` decides the default operand and address size
-    /// of every instruction it executes -- so two entries agreeing on selector, base,
+    /// of every instruction it executes, so two entries agreeing on selector, base,
     /// limit and access but not on this bit are NOT the same architectural state, and
     /// an epilogue that restores the other five fields and not this one leaves the
     /// guest running at the wrong width.
@@ -114,7 +114,7 @@ impl CachedSegment {
 /// Every CPU-state input that can reach the DATA of a journaled write, per
 /// slice1 plan Revision 2 R2.1's closure rule: *the read set covers memory
 /// only, so every CPU-state input that can reach the data of a journaled
-/// write must be in the entry image* -- otherwise two calls that differ only
+/// write must be in the entry image*; otherwise two calls that differ only
 /// in, say, `DS` produce the same `MemoKey`, the same image, the same read
 /// set and the same answer, while the trip's own code stores `DS` into
 /// memory the read set never covers.
@@ -125,7 +125,7 @@ impl CachedSegment {
 /// LDTR and TR (selector plus the non-blocking R2.10/R2.14 amendment's
 /// cached limit and access), CR4 and DR7. `FIELD_NAMES` in the diagnostic
 /// module deliberately did NOT grow with this struct (plan section 2: "Do
-/// not change `reflected_call_diag.rs`'s behaviour" -- its own 22-name
+/// not change `reflected_call_diag.rs`'s behaviour": its own 22-name
 /// variance table stays scoped to the 22 fields it always tracked).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct EntryImage {
@@ -180,8 +180,8 @@ impl EntryImage {
             // flags lazily, so `registers.eflags` alone is a REPRESENTATION of the
             // flags and not the architectural value (`CpuGsw::settled`'s doc says so
             // in as many words). Capturing the base would let two trips whose
-            // architectural flags genuinely differ -- one with the difference still
-            // living in `pending_flags` -- compare EQUAL here, which is precisely the
+            // architectural flags genuinely differ (one with the difference still
+            // living in `pending_flags`) compare EQUAL here, which is precisely the
             // closure-rule violation R2.1 exists to close, one level below the
             // register file.
             eflags_masked: cpu.eflags() & EFLAGS_ARCH_MASK,
@@ -229,7 +229,7 @@ pub(crate) enum AddressClass {
     Tss,
     PageTable,
     /// The legacy VGA aperture, physical `0xA0000..=0xBFFFF`. Never eligible
-    /// for the "restored" write disposition -- see `FRAMEBUFFER_APERTURE_*`.
+    /// for the "restored" write disposition. See `FRAMEBUFFER_APERTURE_*`.
     FramebufferAperture,
     /// A byte-wise `peek_direct_ram` failed at this physical address: either
     /// a genuine device window, or an unmapped page. Never eligible for the
@@ -257,7 +257,7 @@ impl AddressClass {
     }
 
     /// Design R2/slice1 plan section 4.3: device windows and the
-    /// framebuffer aperture are never Class R ("restored, so skip it") --
+    /// framebuffer aperture are never Class R ("restored, so skip it"):
     /// the CRTC (and, for a device window, the device itself) observes
     /// every intermediate value, not merely the final one an entry-vs-exit
     /// compare would see.
@@ -327,7 +327,7 @@ pub(crate) struct Walk {
 
 /// TLB-independent linear-to-physical resolution for a DATA READ probe.
 /// Never fills the TLB, never charges a bus access, never sets an
-/// accessed/dirty bit -- it uses only `CpuBus::peek_direct_ram`, which by
+/// accessed/dirty bit: it uses only `CpuBus::peek_direct_ram`, which by
 /// contract does none of those things.
 ///
 /// 1. Paging off: identity map, no walk.

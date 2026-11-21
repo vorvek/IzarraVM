@@ -4,19 +4,19 @@
 use super::*;
 use crate::timing_class::TimingClass;
 
-/// The SECOND word of a far-pointer memory operand -- LES/LDS/LSS/LFS/LGS's selector, which sits
+/// The SECOND word of a far-pointer memory operand: LES/LDS/LSS/LFS/LGS's selector, which sits
 /// `operand_size_bytes` past the offset word this instruction family reads first.
 ///
 /// WRAPS MOD 64K at `AddressSize::Word`, rather than adding into a flat `u32` offset. 86Box's
 /// `opLDS_w_a16` (`src/cpu/x86_ops_mov_seg.h`) is the citation: `cpu_state.eaa16[0]` is a
 /// `uint16_t`, so `cpu_state.eaa16[0] += 2` wraps in C's unsigned 16-bit arithmetic, and the
 /// following `CHECK_READ` bounds it with `& 0xffff` too. A 16-bit EA of `0xFFFE` therefore reads
-/// its selector back at `0x0000`, not at the linear `0x10000` a bare `u32` add would reach --
+/// its selector back at `0x0000`, not at the linear `0x10000` a bare `u32` add would reach:
 /// `resolve_memory_addr_mode`'s own Word arm masks the FIRST word's EA the same way
 /// (`(sum as u16) as u32`), so the second word has to be masked too or the two halves of one
 /// instruction disagree about how their segment wraps. `AddressSize::Dword`'s 32-bit forms
 /// (`opLDS_w_a32` et al.) add without any such mask, because their EA register (`eaaddr`) is a
-/// `u32` and the whole segment is flat -- which is why this only special-cases `Word`.
+/// `u32` and the whole segment is flat, which is why this only special-cases `Word`.
 ///
 /// The far CALL/JMP-through-memory arm (`0xFF /3`, `/5`) already got this right, independently,
 /// against a SingleStepTests 80386 conformance vector (FF.3 "call far [ds:bx+di]" with
@@ -84,7 +84,7 @@ impl CpuGsw {
 
     /// The two-byte bit-manipulation block (BT/BTS/BTR/BTC reg+imm8, BSF/BSR, SHLD/SHRD, CMPXCHG,
     /// XADD) through the decode/execute split. Each arm mirrors the former `execute_two_byte`
-    /// handler verbatim — same operand wiring, same read/write order, same clocks — but consumes the
+    /// handler verbatim: same operand wiring, same read/write order, same clocks, but consumes the
     /// ModRM/operand `decode` pre-parsed and the imm8 `decode` pre-fetched (for 0F BA/A4/AC). Memory
     /// operands resolve from the pre-decoded descriptor, so the effective address is recomputed
     /// against the live registers each call; for the BT-memory reg form the live reg bit index can
@@ -177,7 +177,7 @@ impl CpuGsw {
                 Ok(self.charge(TimingClass::DoubleShift))
             }
             0x0fa5 | 0x0fad => {
-                // SHLD (A5) / SHRD (AD) r/m, r, CL. No immediate — the count is the low byte of CL.
+                // SHLD (A5) / SHRD (AD) r/m, r, CL. No immediate: the count is the low byte of CL.
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let src = self.read_gpr_sized(modrm.reg, operand_size);
                 let count = (self.registers.ecx() & 0xff) as u8;
@@ -293,9 +293,9 @@ impl CpuGsw {
     }
 
     /// The system / descriptor-table / segment-load block (task A12) through the decode/execute
-    /// split. Each arm mirrors the former fused handler verbatim — the same /ext dispatch off
+    /// split. Each arm mirrors the former fused handler verbatim: the same /ext dispatch off
     /// `modrm.reg`, the same privilege (`require_cpl0`) and protected-mode gates, the same descriptor
-    /// loads and TLB/code-cache flushes, the same #BR/#UD faults, and the same clocks — but consumes
+    /// loads and TLB/code-cache flushes, the same #BR/#UD faults, and the same clocks, but consumes
     /// the ModRM/operand pre-decoded by `decode` instead of re-fetching. Crucially the state-changing
     /// leaf helpers (`load_segment`, `load_ldtr`, `load_tr`, `verify_segment`, `store_descriptor_table`,
     /// `flush_tlb_and_code_caches`, `try_read_descriptor`/`descriptor_accessible`) are reused
@@ -394,7 +394,7 @@ impl CpuGsw {
                             self.flush_tlb_for_cr0_write(old_cr0, cr0);
                             // LMSW can only set PE (never clear it, masked out of
                             // `switchable` above), and require_cpl0 above already forced
-                            // cpl == 0 -- entering protected mode this way starts at ring 0
+                            // cpl == 0, entering protected mode this way starts at ring 0
                             // per the PRM, and cpl was already 0, so no assignment needed.
                         }
                         Ok(self.charge(TimingClass::Lmsw))
@@ -426,7 +426,7 @@ impl CpuGsw {
                                 // 386 PRM 5.1 ("Privilege Levels"): LGDT/LIDT reload the
                                 // descriptor-table base/limit registers that the whole
                                 // protection model rests on, so like LLDT/LTR/LMSW/CLTS above
-                                // they are privileged instructions -- #GP(0) outside CPL 0.
+                                // they are privileged instructions: #GP(0) outside CPL 0.
                                 // Real mode has no protection, so CPL is always 0 there and
                                 // this gate is a no-op for real-mode boot code.
                                 self.require_cpl0()?;
@@ -550,7 +550,7 @@ impl CpuGsw {
                 self.require_cpl0()?;
                 // 386 PRM 12.2.4 / table 12-1: only CR0, CR2, CR3 (and, on the P55C
                 // persona, CR4) are architecturally defined. CR1/CR5/CR6/CR7 have no backing
-                // register at all -- referencing one is an invalid encoding (#UD), not a
+                // register at all: referencing one is an invalid encoding (#UD), not a
                 // silent read of 0.
                 let value = match modrm.reg {
                     0 => self.control.cr0,
@@ -577,7 +577,7 @@ impl CpuGsw {
                     return Err(undefined_opcode());
                 }
                 // 386 PRM 12.2.4 / table 12-1: same undefined-register check as MOV reg,CR
-                // above -- CR1/CR5/CR6/CR7 have no backing store, so writing one is #UD, not
+                // above: CR1/CR5/CR6/CR7 have no backing store, so writing one is #UD, not
                 // a silent no-op.
                 if !matches!(modrm.reg, 0 | 2 | 3 | 4) {
                     return Err(undefined_opcode());
@@ -589,10 +589,10 @@ impl CpuGsw {
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
                     0 => {
-                        // 386 PRM 5.2.1 / 12.3.1: PG (bit 31) requires PE (bit 0) -- paged
+                        // 386 PRM 5.2.1 / 12.3.1: PG (bit 31) requires PE (bit 0): paged
                         // linear addressing only makes sense once protection (and with it
                         // segment/privilege checking) is active. Setting PG while PE is (or
-                        // would remain) clear is an invalid combination -- #GP(0), the
+                        // would remain) clear is an invalid combination: #GP(0), the
                         // register is left unmodified. This also rejects the "set both PE
                         // and PG at once with PE=0 in the new value" case, since PE is taken
                         // from the value being written, not the old CR0.
@@ -618,7 +618,7 @@ impl CpuGsw {
                         };
                         // Ring-gated (CR3 code-cache gate design): the
                         // function reads the OLD register value to seed/select the ring, so it
-                        // owns the assignment -- do not set `self.control.cr3` here.
+                        // owns the assignment. Do not set `self.control.cr3` here.
                         self.flush_tlb_and_code_caches_for_cr3_write(value & mask);
                     }
                     4 => {
@@ -639,12 +639,12 @@ impl CpuGsw {
             }
             0x0f21 => {
                 // MOV reg, DR: whole-32-bit read of the selected debug register. Same shape as
-                // MOV reg,CR above -- ModRM register form only (`mode == 3`; any other mode is
+                // MOV reg,CR above: ModRM register form only (`mode == 3`; any other mode is
                 // #UD), privileged (386 PRM ch12: debug-register access is CPL-0-only, #GP(0)
                 // otherwise), `reg` selects the DR number, `rm` the destination GPR.
                 //
                 // DR4/DR5 alias DR6/DR7 by default (CR4.DE clear, which this core never sets
-                // behaviorally -- see CR4_TSD/CR4_DEFINED_MASK above) per 386 PRM ch12 and the
+                // behaviorally, see CR4_TSD/CR4_DEFINED_MASK above) per 386 PRM ch12 and the
                 // 486/586 successors; a guest that references DR4/DR5 expecting DR6/DR7 (as
                 // DOS/32A's exception reporter does) gets the alias instead of #UD.
                 //
@@ -804,7 +804,7 @@ impl CpuGsw {
                 Ok(self.charge(TimingClass::LesLds))
             }
             0x0fb2 | 0x0fb4 | 0x0fb5 => {
-                // LSS (0F B2) / LFS (0F B4) / LGS (0F B5): 386 PRM 17-56 -- same far-pointer
+                // LSS (0F B2) / LFS (0F B4) / LGS (0F B5): 386 PRM 17-56: same far-pointer
                 // shape as LES/LDS above (mod=3 is #UD, the offset is read first, then the
                 // selector word right after it, both against the LIVE registers), loading the
                 // offset into the reg operand and the selector into SS/FS/GS through the
@@ -861,8 +861,8 @@ impl CpuGsw {
     }
 
     /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
-    /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
-    /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
+    /// Each arm mirrors the former fused handler verbatim: same far-pointer reconstruction, same
+    /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks,
     /// but consumes what `decode` pre-parsed (the far-pointer offset/selector in `imm`/`imm2`, the
     /// imm16 release in `imm`, the imm8 vector in `imm`, or the ModRM/descriptor) so the executor
     /// re-fetches no instruction byte. The protected-mode descriptor loads, gates, faults, the
@@ -959,7 +959,7 @@ impl CpuGsw {
                 }
                 // In V86 a below-IOPL `INT n` faults to the monitor, but the emulator's HLE
                 // BIOS/DOS services (INT 10h video, INT 13h disk, …) are driven from
-                // `interrupt_acknowledge`, which the fault path would otherwise skip — so the
+                // `interrupt_acknowledge`, which the fault path would otherwise skip, so the
                 // guest's console output would never render under a V86 monitor. Notify the bus
                 // first, exactly as real-mode `software_interrupt` does, then raise the #GP.
                 if self.is_v86_mode() && self.iopl() < 3 {
@@ -1222,7 +1222,7 @@ impl CpuGsw {
                 }
                 bus.note_cache_flush();
                 // Sourced apart, not together: `INVD` is 15 P5 clocks and
-                // `WBINVD` is Intel's printed "2000+" (a floor, not a count) --
+                // `WBINVD` is Intel's printed "2000+" (a floor, not a count),
                 // a 133x spread that shared one `clocks(4)` until the manual
                 // pass. The 486's own 4-vs-5 could never have shown it.
                 Ok(self.charge(if opcode & 1 == 0 {
@@ -1301,7 +1301,7 @@ impl CpuGsw {
                 )?;
                 Ok(self.charge(TimingClass::PushSeg))
             }
-            // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f) -- pop a
+            // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f): pop a
             // selector off the stack, then run it through the same `load_segment`
             // descriptor-load path (which raises the identical #GP/#SS a bad or null selector
             // would on POP DS). 386 PRM: a 32-bit operand size pops a full dword and loads the
@@ -1387,7 +1387,7 @@ impl CpuGsw {
         }
     }
     /// The heterogeneous one-off block (task A14) through the decode/execute split. Each arm mirrors
-    /// the former fused handler verbatim — same flag effects, same memory access, same clocks — but
+    /// the former fused handler verbatim: same flag effects, same memory access, same clocks, but
     /// consumes the ModRM/operand/immediate `decode` pre-parsed (so the executor never re-fetches an
     /// instruction byte). CMPXCHG8B resolves its pre-decoded ModRM here; the
     /// no-operand 0F system/serializing/CPU-id ops (INVD/WBINVD/WRMSR/RDTSC/RDMSR/
@@ -1704,7 +1704,7 @@ pub(crate) fn bit_string_class(op: u8) -> TimingClass {
 ///
 /// Real mode (`CR0.PE` clear) keeps `Iret`. Inside V86 the instruction is
 /// `IretV86`. A protected-mode return that LANDS in V86, or that drops to a
-/// lower privilege level, is `IretPmToV86` -- Intel gives those the same count.
+/// lower privilege level, is `IretPmToV86`: Intel gives those the same count.
 /// Everything else is `IretPm`.
 pub(crate) fn iret_class(
     protected: bool,
@@ -1732,7 +1732,7 @@ pub(crate) fn iret_class(
 /// `INT` of Table F-2 through the Interrupt Clock Counts Table, and the three
 /// rows are far apart: real mode 11, a protected-mode trap gate to a different
 /// level 40, and V86 through a trap gate to a different level **54 plus 12 on a
-/// cache miss** -- the row
+/// cache miss**: the row
 /// the V86 port I/O timing research re-anchored
 /// when it found the reflected-trip figure of 45 was taken from the unreachable
 /// real-mode row.

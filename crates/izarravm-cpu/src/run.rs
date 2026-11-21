@@ -297,7 +297,7 @@ impl CpuGsw {
                 });
             }
             // Was a bare `61`. The INTA cycles the 8259A drives are still not
-            // modelled anywhere -- the census lists them as missing entirely --
+            // modelled anywhere (the census lists them as missing entirely)
             // so this is the CPU's own entry cost and nothing else.
             let charged = self.scale_clocks(
                 self.class_table()
@@ -665,7 +665,7 @@ impl CpuGsw {
     /// Prototype-only note: writes go through a process-wide buffered, mutex-guarded
     /// stderr handle (`diff_trace_writer`) rather than a bare `eprintln!`. An unbuffered
     /// `eprintln!` here cost one syscall per retired instruction, which measured at only
-    /// ~3300 lines/sec against a redirected file -- far too slow to trace even a single
+    /// ~3300 lines/sec against a redirected file, far too slow to trace even a single
     /// BIOS POST, let alone anything DOS4GW-shaped. This is a diagnostic tool, not a hot
     /// path, so a mutex per line is an acceptable cost; the buffering is what actually
     /// matters for throughput.
@@ -699,7 +699,7 @@ impl CpuGsw {
 
     /// Retire-time IP wrap for 16-bit code (stage-1 defect E7, SpacPlum). In
     /// a CS with D=0 the instruction pointer is the 16-bit IP in EVERY mode
-    /// -- real, V86, and 16-bit protected alike -- so an instruction whose
+    /// (real, V86, and 16-bit protected alike) so an instruction whose
     /// last byte sits exactly at offset 0xFFFF resumes at IP 0 (real-mode
     /// .COM wrap tricks depend on it) and raises no fault; only an
     /// instruction that STRADDLES the limit #GPs, at its own fetch. The
@@ -707,7 +707,7 @@ impl CpuGsw {
     /// unwrapped 0x10000, and 0x10000 is the ONLY over-limit value a legal
     /// advance can produce (the start and the last byte are both bounded by
     /// the 0xFFFF limit), so every call site guards on that exact value and
-    /// anything larger -- an o32 transfer target -- stays on the fetch-limit
+    /// anything larger (an o32 transfer target) stays on the fetch-limit
     /// #GP path. The wrap runs at the retire/boundary seams, never inside
     /// `fetch_decoded`: placed there it fired AFTER the boundary snapshots
     /// (`start_eip`/`lin`), so the fault rewind, the fault dossier, the
@@ -807,7 +807,7 @@ impl CpuGsw {
                 // Both reads are INSIDE the arm, so the success path pays for
                 // neither. `deliver_exception` clears VM on the way into a
                 // ring-0 monitor handler, and this sits above the delivery
-                // call, so it still sees the mode the fault was RAISED in --
+                // call, so it still sees the mode the fault was RAISED in,
                 // which is exactly what census row 7 is about.
                 let faulted_in_v86 = self.is_v86_mode();
                 let faulting_class = self.pending_faulting_class.take();
@@ -1044,8 +1044,8 @@ impl CpuGsw {
         //
         // The dispatch gates are part of the CONDITION, not a tidy-up. The packed screens pay for
         // themselves only when a native dispatch can consume them and leave the instruction
-        // unread; a run that cannot dispatch natively — the interpreter switch, a disabled
-        // backend, the accurate-timing persona class — interprets every continuation and would
+        // unread; a run that cannot dispatch natively (the interpreter switch, a disabled
+        // backend, the accurate-timing persona class) interprets every continuation and would
         // read the packed entry and THEN the line, strictly more than the unpacked arm does. Such
         // a run takes the unpacked path.
         //
@@ -1100,7 +1100,7 @@ impl CpuGsw {
                 // cache's insn copy rests on (`.bench/results/decodecache-20260731/RESULTS.md`):
                 // a borrow would be unsound because lines get refilled, a copy simply commits to
                 // the instruction the probe saw. Nothing on the path between here and the consumers
-                // can invalidate this line anyway — admission only READS the decode cache (its
+                // can invalidate this line anyway: admission only READS the decode cache (its
                 // compile walk uses `get`, never `put`), and every arm that returns to the
                 // interpreter does so before any guest instruction executes. That property is what
                 // lets the packed arm defer the line fetch past dispatch; it is not assumed, it is
@@ -1306,12 +1306,12 @@ impl CpuGsw {
             // rather than lowered by it, which corrects design section 10.1 M6.
             //
             // It also bounds the one hazard the row's own pendency rule does not cover. That rule
-            // is a premise about PORTS -- devices advance after the batch and no admitted
-            // `InterpretOne` row writes one -- and an `InterpretOne` row whose operand read lands
+            // is a premise about PORTS: devices advance after the batch and no admitted
+            // `InterpretOne` row writes one, and an `InterpretOne` row whose operand read lands
             // on an MMIO aperture is outside it. Such a read could make an interrupt pending inside
             // the block; this re-check is what still ends the run at the transition when it does.
             // (The two DEDICATED port call-outs, `0xEC` and `0xE4` (gp2 in-imm8 callout design),
-            // are a separate case with their own pendency proof -- `jit/direct.rs`'s `classify`
+            // are a separate case with their own pendency proof: `jit/direct.rs`'s `classify`
             // arm for `0xE4` carries the per-port-class table; this clause is about `InterpretOne`
             // rows only and does not cover them.)
             #[cfg(feature = "jit")]
@@ -1391,15 +1391,15 @@ impl CpuGsw {
             // Rounding and overflow both resolve toward "screen passes", i.e. toward asking the
             // exact question: `F` is a CEILING (rounding the bound up keeps it an upper bound),
             // and if either the product or the sum overflows u64 the screen is treated as passed
-            // rather than wrapped. `F == 0` means the bus offers no bound at all — then there is
+            // rather than wrapped. `F == 0` means the bus offers no bound at all: then there is
             // no screen and every ask goes to the exact test, which is the pre-screen behaviour.
             //
             // `F == 1` is not a special case of the arithmetic, it is the ONLY case in this tree
-            // (386 23/31, 486 1/3, 586 16/105 -- every ratio is below 1, and `F` is
+            // (386 23/31, 486 1/3, 586 16/105: every ratio is below 1, and `F` is
             // `ceil(num/den).max(1)`), so the general arm's `checked_mul` is a multiply by one
             // that every interpreted instruction pays. `unit_cap_screen_scale` is resolved once
             // at run entry from the same batch-constant `F`, and its arm is the general arm with
-            // `checked_mul(1)` -- exact for every input, so nothing else can be dropped -- folded
+            // `checked_mul(1)` (exact for every input, so nothing else can be dropped) folded
             // away. The general arm stays for any future `F > 1`; the two arms are the same
             // predicate.
             let hit_cap = if total >= cap {
@@ -1485,7 +1485,7 @@ impl CpuGsw {
     /// Enable or disable the SMC trace (diagnostic, off by default). Enabling installs a fresh
     /// recorder; disabling drops what it collected. The trace only observes the invalidation
     /// choke and never influences execution, so toggling it leaves architectural state and every
-    /// perf counter unchanged -- the campaign protocol pins that with a trace-off probe.
+    /// perf counter unchanged: the campaign protocol pins that with a trace-off probe.
     pub fn set_smc_trace_enabled(&mut self, on: bool) {
         self.smc_trace.0 = on.then(|| Box::new(smc_trace::SmcTrace::default()));
     }
@@ -1516,7 +1516,7 @@ impl CpuGsw {
     /// retired (a near branch never changes either, but capturing before execution is
     /// unconditionally correct).
     /// Split guard/body on purpose. The body below is far too large for the inliner to take at
-    /// the call site, so a plain `#[inline]` left a real call on the interpreted-retire path —
+    /// the call site, so a plain `#[inline]` left a real call on the interpreted-retire path:
     /// a RIP profile of Quake/586 still showed `unit_sim_observe` as its own 0.645% symbol with
     /// the sim disabled, which is ~507M calls that do nothing but test one `Option` and return.
     /// `#[inline(always)]` here folds that test into the caller and keeps the body out of line.
@@ -1601,7 +1601,7 @@ impl CpuGsw {
     /// Override the GP2 call-out-site poll skip's `IZARRAVM_DIRECT_POLL_SKIP` reading for this
     /// CPU (`None` restores the ambient env-cached reading). A per-CPU field rather than a
     /// process-wide knob so an `izarravm-machine` integration fixture can drive both arms in one
-    /// process without racing the env-backed `OnceLock` -- see `BlockCache::direct_poll_skip_
+    /// process without racing the env-backed `OnceLock`. See `BlockCache::direct_poll_skip_
     /// override`'s doc for why it has to be reachable from outside `izarravm-cpu` at all.
     #[cfg(feature = "jit")]
     pub fn set_direct_poll_skip_override(&mut self, forced: Option<bool>) {
@@ -1724,7 +1724,7 @@ impl CpuGsw {
     /// one byte of the 16-byte `DecodePack` the line above already brought into L1.
     ///
     /// Review M1's LAZY form. `direct_hot_at` saturates at the threshold and returns true at
-    /// exact equality forever after, so EVERY `BlockProbe::Ready` ask reaches this site too —
+    /// exact equality forever after, so EVERY `BlockProbe::Ready` ask reaches this site too:
     /// roughly 6.1 G asks on duke3d-586, of which about 2.6 G collect nothing. Building the
     /// comparand needs `is_v86_mode()` (CR0 plus EFLAGS) and SS's B bit, three loads from three
     /// structures; testing the already-loaded byte against zero first keeps all of that off the
@@ -1742,7 +1742,7 @@ impl CpuGsw {
             return false;
         }
         // An advance invalidates every memo in the array at once, so an ask that triggers one is
-        // a miss by construction — including the wrap case, where the sweep the advance performs
+        // a miss by construction, including the wrap case, where the sweep the advance performs
         // has just zeroed the byte read above. Returning here rather than comparing is what makes
         // that ordering unobservable instead of a one-in-63-eras alias.
         if self.advance_decline_memo_era() {
@@ -1784,7 +1784,7 @@ impl CpuGsw {
     /// ONLY `jit_mode_key` inputs no existing invalidation covers: CS.D is in the pack's own hit
     /// condition, CR0.PE/PG bump the decode generation, and a persona change reaches
     /// `BlockCache::clear`. Folding them in makes the mode check exact rather than probabilistic,
-    /// for two bits of stamp — and V86 in particular is load-bearing rather than paranoia,
+    /// for two bits of stamp, and V86 in particular is load-bearing rather than paranoia,
     /// because V86 forces CS.D = 0, so a V86 key and a non-V86 16-bit key at one linear address
     /// share one decode line and one pack that `PACK_FLAG_D` cannot separate.
     #[cfg(feature = "jit")]
@@ -1823,7 +1823,7 @@ impl CpuGsw {
     ) -> Result<Option<jit::direct::CompiledBlock>, CpuError> {
         // With the 16-bit level at 0 a 16-bit code segment can never produce a block (`key_for`
         // then refuses on `!d`), so this function would return Interpret for every such boundary
-        // anyway -- but only after a decode-cache line lookup, a hotness mutation and the probe
+        // anyway, but only after a decode-cache line lookup, a hotness mutation and the probe
         // itself. This early-out removes that bookkeeping. Since `IZARRAVM_JIT16` defaulted to 1
         // the level-0 arm is the OPT-OUT path rather than the shipped behaviour; the reasoning
         // below is unchanged because it never depended on which arm is the default.
@@ -1841,8 +1841,8 @@ impl CpuGsw {
         //
         // IZARRAVM_JIT16 (default 1 since the 486 measurement) gates this; see
         // `jit::direct::sixteen_bit_admission_level`. `key_for_phys` refuses `!d` wherever
-        // `word_operands_admitted` refuses Word lowering -- since the same measurement that is
-        // NEITHER 486 nor 586 by default, only the 386 class -- and `jit_mode_key` bit 0 is CS.D,
+        // `word_operands_admitted` refuses Word lowering, since the same measurement that is
+        // NEITHER 486 nor 586 by default, only the 386 class, and `jit_mode_key` bit 0 is CS.D,
         // so a 16-bit block and a 32-bit block at one linear address can never collide on a key.
         if !d && self.jit_direct.sixteen_bit_level == 0 {
             ea_mark!(Phase::Refused);
@@ -1884,7 +1884,7 @@ impl CpuGsw {
         // Sticky-decline memo. Exactly where design §1.3 puts
         // it: AFTER `direct_hot_at`, so the pack load is shared and the hotness byte still
         // increments, and BEFORE `key_for_phys`, which is the first of the six symbols a hit
-        // removes — `key_for_phys`, both `probe` entry points and `probe`'s closure,
+        // removes: `key_for_phys`, both `probe` entry points and `probe`'s closure,
         // `BlockKey::eq`, `sync_smc_heat` and `lift_cold_smc_dormant`, plus the two hashbrown
         // lookups those drive.
         //
@@ -1892,7 +1892,7 @@ impl CpuGsw {
         // replay the counters too. `jit_direct_dispatch_declines` needs nothing here: returning
         // `Interpret` makes `dispatch_continuation` yield `ContinuationDispatch::Declined` and the
         // run loop folds it, byte for byte as before. The census arm does need the explicit
-        // increment, behind the identical call-site gate the full chain uses — and note the full
+        // increment, behind the identical call-site gate the full chain uses, and note the full
         // chain classifies BEFORE it lifts, so `DormantProbe` is the class a still-Dormant entry
         // produces whether or not the lift would have fired.
         if self.decline_memo_hit(screen.slot) {
@@ -2022,7 +2022,7 @@ impl CpuGsw {
             jit::direct::BlockProbe::Compile => {
                 // COARSE-inclusive, unlike the other `mark(P2)`: it is what BOUNDS P14, and P14
                 // has to be subtractable from `total_entered` in both arms (B3). It fires on the
-                // compile arm alone -- 2.5% of traversals on the loader -- so the four-mark
+                // compile arm alone (2.5% of traversals on the loader) so the four-mark
                 // COARSE shape is unchanged for the other 97.5%.
                 ea_mark_coarse!(Phase::Probe);
                 // G1 pre-compile gate (cheap, entry chunk only): if the block's first 16-byte
@@ -2034,11 +2034,11 @@ impl CpuGsw {
                 // Lane-trial exception (`lane_trial_enabled` carries the full rationale): one
                 // compilation per key per heat epoch is allowed through this gate, so a
                 // steadily-patching region gets the chance to compile with mutable lanes. The
-                // pre-install span gate below is where a trial without lanes dies — the entry
+                // pre-install span gate below is where a trial without lanes dies: the entry
                 // chunk is inside the span, so a hot entry ALWAYS reaches that check. One
                 // acknowledged deviation from the Dormant-only rule above: a trial whose
                 // compilation is STRUCTURALLY rejected reaches `reject(span)` on a churning
-                // chunk and acquires watch ranges — one-shot per span per epoch, accepted as
+                // chunk and acquires watch ranges: one-shot per span per epoch, accepted as
                 // the cost of learning the region's shape at all.
                 let heat_epoch = self.smc_heat_epoch();
                 self.sync_smc_heat();
@@ -2051,7 +2051,7 @@ impl CpuGsw {
                         // Task 0's F2 split, before the demote and on the demote's own arm: this
                         // key was refused because it had ALREADY spent a trial this epoch, and the
                         // `_earned` half says whether that trial's block installed and was then
-                        // killed — the only population an earned re-grant can convert.
+                        // killed: the only population an earned re-grant can convert.
                         self.jit_direct
                             .direct
                             .note_heat_demote_trial_spent(key, heat_epoch);
@@ -2123,7 +2123,7 @@ impl CpuGsw {
                 // compilation registered at least one mutable lane AND this continuation holds
                 // the key's trial (taken at the entry gate, or spent here for the
                 // entry-cold-but-span-hot case). A trial compilation with NO lanes lands in the
-                // demote arm exactly as before — it spent the epoch's attempt learning the
+                // demote arm exactly as before: it spent the epoch's attempt learning the
                 // region is not lane-shaped, which is the bound on churn.
                 if self.jit_direct.smc_heat.span_hot(
                     key.physical,
@@ -2208,8 +2208,8 @@ impl CpuGsw {
                         );
                 }
                 // The `IZARRAVM_JCC_SHADOW` site classes, charged HERE and not at compile for the
-                // reason every counter above is: a walk that never installs -- a `Retry`, a
-                // `StructuralReject`, or one of the prefixes the recovery search discards --
+                // reason every counter above is: a walk that never installs (a `Retry`, a
+                // `StructuralReject`, or one of the prefixes the recovery search discards)
                 // contributes nothing, so the denominator stays "blocks this run installed".
                 let jcc_shadow_sites = compilation.jcc_shadow_sites();
                 if jcc_shadow_sites != [0; 4] {
@@ -2511,7 +2511,7 @@ impl CpuGsw {
         // shape: an `IN AL,DX` charges three times that, and the charge is deposited at runtime
         // rather than baked into `raw_clocks`. Without it `iteration_upper` can legitimately
         // exceed this "global maximum" on a bus whose cost dials are all zero (the `CpuBus` trait
-        // defaults), where the bus terms that normally swamp the core term vanish -- and the
+        // defaults), where the bus terms that normally swamp the core term vanish, and the
         // chain-pricing `debug_assert` that `per_hop_estimate <= global_block_upper` would trip
         // on a bound that is supposed to dominate by construction.
         // `MAX_CALL_OUT_CORE_CLOCKS`, not the IN column: this bound cannot see which
@@ -2522,8 +2522,8 @@ impl CpuGsw {
         let callout_core =
             u64::from(jit::direct::MAX_BLOCK_CALLOUT_SLOTS).saturating_mul(u64::from(terms.max));
         // THE EPOCH'S OWN MAXIMUM CLASS, not the literal 4 this term used to carry
-        // (review B3). `4` was already an under-bound at epoch 1 -- `RetFar` charges
-        // 17 -- and at epoch 2 it is 3x to 138x too small, so the ceiling stopped
+        // (review B3). `4` was already an under-bound at epoch 1 (`RetFar` charges
+        // 17) and at epoch 2 it is 3x to 138x too small, so the ceiling stopped
         // dominating exactly where its `debug_assert` was supposed to catch it.
         //
         // The maximum is taken over the WHOLE table rather than over the classes a
@@ -2531,8 +2531,8 @@ impl CpuGsw {
         // hand-maintained mirror of `DirectKind::timing_class`'s codomain that
         // drifts silently the first time a variant moves class, and this bound's
         // entire job is to dominate: a looser ceiling weakens no invariant, where a
-        // stale one breaks the assert it exists for. It costs nothing either way --
-        // see the note at the chain-pricing site: in a release build this function's
+        // stale one breaks the assert it exists for. It costs nothing either way.
+        // See the note at the chain-pricing site: in a release build this function's
         // result is dead except for the memo.
         let integer_core = scale_core(
             u64::from(table.max_raw()).saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
@@ -2592,7 +2592,7 @@ impl CpuGsw {
         // `INT_IMM8_MAX_DATA_ACCESSES` and not `INTERPRET_ONE_MAX_DATA_ACCESSES` is what this term
         // must carry since the `0xCD` row joined. The two classes share the generic helper but not
         // their budget terms, and this bound cannot see which of them a block holds, so it prices
-        // every slot at the LARGER -- 16 against 4. That is the opposite of the choice
+        // every slot at the LARGER: 16 against 4. That is the opposite of the choice
         // `compute_iteration_upper` makes, and deliberately so: that one is a per-class term whose
         // over-pricing would change block admission, while this one is a ceiling whose whole job is
         // to dominate, and a ceiling that failed to cover the INT class would trip the
@@ -2600,7 +2600,7 @@ impl CpuGsw {
         //
         // LAR/LSL folds into the SAME `per_slot` maximum for the identical reason: their own class
         // shares this generic ceiling too. `LAR_LSL_MAX_DATA_ACCESSES` (3) does not move the value
-        // today -- it is under both of the other two -- but it has to be read here rather than
+        // today (it is under both of the other two) but it has to be read here rather than
         // assumed dominated, the same argument `MAX_CALL_OUT_CORE_CLOCKS` makes for its own fold.
         let callout_interpret_one_bus = if has_x87 {
             0
@@ -2626,8 +2626,8 @@ impl CpuGsw {
         // and a PUSHAD or POPAD slot makes `CALL_OUT_STACK_FRAME_DWORDS` accesses in a single
         // instruction. Four of them in a 32-instruction block present 32 accesses where the other
         // 28 instructions leave only 8 unclaimed, so the old bound no longer dominated
-        // `compute_iteration_upper`. That is a correctness bug -- the chain-pricing
-        // `debug_assert!(per_hop_estimate <= global_block_upper)` would trip on a zero-dial bus --
+        // `compute_iteration_upper`. That is a correctness bug: the chain-pricing
+        // `debug_assert!(per_hop_estimate <= global_block_upper)` would trip on a zero-dial bus,
         // and not a perf question.
         //
         // Why ONCE and not per instruction: `MAX_BLOCK_CALLOUT_SLOTS` bounds the slots per BLOCK,
@@ -2636,14 +2636,14 @@ impl CpuGsw {
         // `memory_slots * CALL_OUT_STACK_FRAME_DWORDS * dword_data_upper` term by construction
         // (`memory_slots <= MAX_BLOCK_CALLOUT_SLOTS`, and `max_store` is the max over every width
         // and both the RAM and Mode13h dials, so it is `>= dword_data_upper`). Per instruction
-        // would multiply it by `MAX_BLOCK_INSTRUCTIONS` -- 256 store-costs of headroom rather than
-        // 32 -- for a term whose whole job is to be the smallest value that still dominates.
+        // would multiply it by `MAX_BLOCK_INSTRUCTIONS`: 256 store-costs of headroom rather than
+        // 32, for a term whose whole job is to be the smallest value that still dominates.
         //
         // What that choice does NOT buy, corrected by review because the first version of this
         // comment claimed it did: this bound does not throttle anything. `global_block_upper` is
         // read at exactly two places (`run_direct_block`), the memo store and the
         // `debug_assert!(per_hop_estimate <= global_block_upper)` beside it. The chain quota's
-        // DIVISOR is `per_hop_estimate`, which is `iteration_upper` -- the block's own cost -- and
+        // DIVISOR is `per_hop_estimate`, which is `iteration_upper` (the block's own cost) and
         // has been since the per-hop re-pricing landed. So in a release build inflating this eight
         // times over would change no guest-visible behaviour at all; it would only make the debug
         // assertion weaker. Keeping it tight is hygiene, not throughput: the assertion is the only
@@ -2726,8 +2726,8 @@ impl CpuGsw {
             // The FIFTH class, `0x0F02`/`0x0F03` LAR/LSL. Shares the generic helper too, but not
             // the budget term: 11 against the interpret-one class's 7, so folding it in would have
             // raised the same CLI/STI/segment/string blocks' bound for a row none of them carries.
-            // Unlike the INT class its count is NOT bounded at one -- LAR/LSL is not terminal, so
-            // a block can carry several -- which is why it is a genuine `u8` counter rather than a
+            // Unlike the INT class its count is NOT bounded at one: LAR/LSL is not terminal, so
+            // a block can carry several, which is why it is a genuine `u8` counter rather than a
             // packed flag; see `CompiledBlock::callout_lar_lsl_slots`.
             .saturating_add(
                 u64::from(block.callout_lar_lsl_slots()).saturating_mul(u64::from(terms.lar_lsl)),
@@ -2756,7 +2756,7 @@ impl CpuGsw {
         // against the Mode 13h dial (`video_wait_states_approx` is 45 on I486 and 147 on I586,
         // against `cache.cost.l1` = 2 / 0), so all three are 47 / 149 while the worst split charge
         // is 16 / 8. That is a margin nobody had written down. The Accurate class, where it would
-        // vanish, never reaches here -- `run_direct_block` returns `Skipped` unless the mode uses
+        // vanish, never reaches here: `run_direct_block` returns `Skipped` unless the mode uses
         // approximate timing.
         //
         // Assert the relation rather than inflate the bound. Inflating would shrink `budget_quota`
@@ -2800,14 +2800,14 @@ impl CpuGsw {
         // PORT: ONE access, a byte-wide port read. There is deliberately no TSS-probe term. The
         // helper refuses `is_v86_mode() || CPL > IOPL` as its first statement
         // (jit/direct/callout.rs), which is exactly the condition under which `check_io_permission`
-        // would leave its early return and touch memory -- so the probe's word and byte reads are
+        // would leave its early return and touch memory, so the probe's word and byte reads are
         // not in the call-out's reachable set at all, and pricing them here would inflate every
         // call-out block's bound for traffic that cannot happen. If that refusal is ever relaxed,
         // this term comes back with it.
         //
         // MEMORY: exactly `CALL_OUT_STACK_FRAME_DWORDS` dword accesses, no more and no fewer.
         // `call_out_stack_frame_resident` refuses the frame unless all eight resolve through the
-        // FastMap, so there is no page-walk traffic to price either -- the same shape of argument,
+        // FastMap, so there is no page-walk traffic to price either, the same shape of argument,
         // from the same kind of pre-check. `dword_data_upper` is reused rather than
         // `jit_data_cost_clocks(Dword)` alone so a Mode13h dial that exceeds the RAM dial cannot
         // make this an under-estimate; the aperture itself is refused by the pre-check, so the
@@ -2815,8 +2815,8 @@ impl CpuGsw {
         //
         // INTERPRET-ONE: `INTERPRET_ONE_MAX_DATA_ACCESSES` worst-width accesses per slot, and that
         // constant is derived row by row beside the allowlist rather than restated here. It was
-        // TWO while every admitted row was a one-operand memory form -- one implicit stack access
-        // plus one explicit operand access, which is what POP r/m does -- and the S3 policy
+        // TWO while every admitted row was a one-operand memory form: one implicit stack access
+        // plus one explicit operand access, which is what POP r/m does, and the S3 policy
         // widening raised it to FOUR when `0x8E` joined: a protected-mode segment load reads two
         // descriptor dwords out of the GDT or LDT and writes an accessed bit back, on top of its
         // own operand read. A row that wants five widens the constant, and both bounds follow.
@@ -2829,8 +2829,8 @@ impl CpuGsw {
         // No PAGE-WALK term, and that one is NOT a proof, it is ACCEPTED OVERSHOOT. The step's own
         // stack read and operand write go through the interpreter's ordinary memory path, which
         // walks the page table on a TLB miss, and each walk is bus traffic this bound does not
-        // contain. It is bounded -- at most two translations per access, so at most
-        // `2 * INTERPRET_ONE_MAX_DATA_ACCESSES` walks per slot -- and it is the same
+        // contain. It is bounded: at most two translations per access, so at most
+        // `2 * INTERPRET_ONE_MAX_DATA_ACCESSES` walks per slot, and it is the same
         // class of overshoot the owner's ruling of 2026-07-30 accepted for the chain quota, quoted
         // at the chain-pricing note in `run_direct_block`: sub-perceptual timing exactness is not
         // worth pricing every worst case, real parts of one stepping vary between packages, and
@@ -2843,7 +2843,7 @@ impl CpuGsw {
         // worse than a stated overshoot. The revision before THIS one said "two accesses, so at
         // most two walks per slot", which was false twice over as of the string-call-out rows:
         // the access count is `INTERPRET_ONE_MAX_DATA_ACCESSES` and has been four since `0x8E`
-        // joined, and ONE access can need TWO translations -- a MOVS dword whose source or
+        // joined, and ONE access can need TWO translations: a MOVS dword whose source or
         // destination straddles a page boundary is the shape, and the string rows are what put it
         // on this path. The class and the ruling are unchanged; only the arithmetic in the
         // parenthesis was wrong, and a budget derivation that leans on this sentence would have
@@ -2930,7 +2930,7 @@ impl CpuGsw {
         let d = self.registers.cs().default_size_32;
         // The `key_for` refusal is CLASSIFIED, not dropped. Returning early here would make the
         // class totals fall short of `jit_direct_unresolved_static_unbound` by an unknown amount,
-        // and the whole point of the table is that it closes on that counter — see
+        // and the whole point of the table is that it closes on that counter. See
         // `unbound_target_classes_are_exhaustive` (jit/direct_test.rs).
         let (kind, linear, key) = match jit::direct::key_for(self, lin, d) {
             Some(key) => (
@@ -2959,7 +2959,7 @@ impl CpuGsw {
         //
         // The entry linear is now recovered alongside the class, exactly as the static lane has
         // always done. Discarding it left every dynamic miss into a REJECTED block attributed to
-        // no row at all -- 2.86M exits on quake, larger than its whole attributed static row set,
+        // no row at all: 2.86M exits on quake, larger than its whole attributed static row set,
         // and the lane Slice 4 found was 65% the size of the static one for the row it lowered.
         let (kind, linear) = match jit::direct::key_for(self, lin, d) {
             Some(key) => (self.jit_direct.classify_unbound_target(key), key.linear()),
@@ -2975,7 +2975,7 @@ impl CpuGsw {
     ///
     ///   * `true -> false` (a uniform-fetch bus arrives, blocks carry the append) is SAFE for
     ///     resident code. Such a bus hands out `trace_ptr == 0`, the emitted preamble finds it
-    ///     and jumps over its own body — which is exactly the pre-slice behaviour. So the
+    ///     and jumps over its own body, which is exactly the pre-slice behaviour. So the
     ///     field moves, later compiles get the smaller shape, and the cache is LEFT ALONE.
     ///   * `false -> true` (a trace-observing bus arrives, blocks have no append) would drop
     ///     fetch observations silently. The cache is cleared, and every block recompiles with
@@ -3009,7 +3009,7 @@ impl CpuGsw {
         // INV-W backstop drain (watched-page-bit design D4): no native code runs while strict
         // watch edges are pending their fast-map sweep. The production chokes drain inline
         // (install/reject and every decode insert), so both sweeps are no-op reads here; any
-        // OTHER path that marks or installs — test helpers drive several — self-heals at this
+        // OTHER path that marks or installs (test helpers drive several) self-heals at this
         // boundary instead of executing against a stale clear bit. Mid-block callouts never
         // re-enter here and rely on the decode-insert sweep alone, which is why that one must
         // stay synchronous.
@@ -3044,7 +3044,7 @@ impl CpuGsw {
         // S1d slice 2 (shadow-cache-probe feature): while the shadow probe is
         // armed, every Kth entry is diverted here to the interpreter instead
         // of running native, so the interpreter's existing per-address probe
-        // seam sees that iteration's data accesses -- the JIT's own compiled
+        // seam sees that iteration's data accesses; the JIT's own compiled
         // body never carries them (see izarravm-machine's shadow_cache
         // module doc). `should_sample_entry` itself is the ONE predictable
         // branch this costs when the feature is compiled in but unarmed
@@ -3063,7 +3063,7 @@ impl CpuGsw {
         // already synchronised this ahead of the probe, so the production path never sees it;
         // it is here for the test seams that call `run_direct_block` directly
         // (`try_run_direct_block_for_test`) and so bypass that synchronisation. The converse
-        // combination — a block that CARRIES the append under a uniform-fetch bus — is not a
+        // combination (a block that CARRIES the append under a uniform-fetch bus) is not a
         // hazard and is not checked: `trace_ptr` is 0, so the preamble jumps over itself.
         if !self.jit_direct.native_fetch_trace && !bus.native_fetches_are_uniform() {
             self.sync_native_fetch_trace(bus);
@@ -3075,7 +3075,7 @@ impl CpuGsw {
         let span = block.span();
         // NO SECOND MODE-KEY COMPARE. The probe that produced this block matched the full
         // `BlockKey`, mode key included, and nothing between that probe and here moves CS.D,
-        // SS.B, CR0, EFLAGS.VM or the GSW mode -- every instruction that can is non-continuable
+        // SS.B, CR0, EFLAGS.VM or the GSW mode: every instruction that can is non-continuable
         // and ends the run before a dispatch. Re-deriving `jit_mode_key()` (about six loads and
         // five branches) per entry therefore asked a question the probe had already answered.
         // `perf.jit_direct_reject_mode_key` read identically zero on duke3d-586-short,
@@ -3105,7 +3105,7 @@ impl CpuGsw {
         //
         // WHICH layout this is depends on `IZARRAVM_CHAIN_ENTRY_CHECK`: the block's own frozen
         // snapshot on the OFF arm, its transitive CHAIN REQUIREMENT on the armed one. One indexed
-        // copy either way -- `entry_layout` REPLACES the old `segment_layout` fetch here rather
+        // copy either way: `entry_layout` REPLACES the old `segment_layout` fetch here rather
         // than adding a second, which the 2026-08-18 plan pinned as a requirement. `cs_matches`
         // below shares it and is unaffected, because `chain.cs == own.cs` always.
         ea_mark!(Phase::EntryGuards);
@@ -3132,7 +3132,7 @@ impl CpuGsw {
         // is what makes the helper's zero-partial-effects property hold on its own terms.
         //
         // Correctness is settled by the helper. What this site buys is COST. Without it, a paged
-        // V86 or CPL>IOPL guest -- EMM386 and VCPI DOS, first-class targets here -- would pay, on
+        // V86 or CPL>IOPL guest (EMM386 and VCPI DOS, first-class targets here) would pay, on
         // every single execution of a compiled IN: the whole-set spill, the scratch frame, the
         // indirect call, the guard's refusal, the whole-set reload, the abnormal side exit, AND
         // then the dispatcher trip back to the interpreter it would have taken anyway. Strictly
@@ -3142,7 +3142,7 @@ impl CpuGsw {
         // Two field reads at a site that already reads privilege state for the check above, and
         // both are behind `callout_slots() != 0`, so a block without a slot pays one compare.
         // NOT retired: the state is transient (a V86 task returns to ring 0 and back), and the
-        // block is perfectly good -- it is the privilege level that is wrong, like the alignment
+        // block is perfectly good: it is the privilege level that is wrong, like the alignment
         // and budget refusals below rather than the layout ones above.
         // Keyed on the PORT class alone as of the memory class. The reason a call-out block is
         // refused here is the TSS bitmap probe that `check_io_permission` would take, and PUSHAD
@@ -3152,8 +3152,8 @@ impl CpuGsw {
         // here would cost every ring-3 protected-mode guest the lowering for nothing.
         //
         // GOVERNED, as of the round-2 slice. The refusal above is right for the class it was
-        // written against -- a serve that touches device state ends the run at the serving
-        // instruction anyway, so the whole spill/call/reload is bought for nothing -- but it is
+        // written against; a serve that touches device state ends the run at the serving
+        // instruction anyway, so the whole spill/call/reload is bought for nothing, but it is
         // wrong for the class that does not: a LAZY serve (0x3DA on wolf3d, the gameport once its
         // one-shots are idle) lets the block complete and take its static link, and refusing it
         // costs a dispatcher round trip per poll iteration.
@@ -3168,7 +3168,7 @@ impl CpuGsw {
         // Classification is TRIAL-ONLY, with ONE exception below. Demoting a `Lazy` block on a
         // later STEP-BREAKING serve is not implementable: `NativeExit` carries no block id, so
         // once a chain is running the exit reports the chain's outcome and not which hop produced
-        // it. And a classification is TERMINAL for the block's lifetime -- the epoch key is a
+        // it. And a classification is TERMINAL for the block's lifetime: the epoch key is a
         // safety key against a persona change, not a refresh: it is `active_mode + 1`, its only
         // writer clears every compiled block first, so it cannot roll inside a run and bounds
         // nothing. The only reclassification that exists is a fresh compile into a recycled slot.
@@ -3213,12 +3213,12 @@ impl CpuGsw {
         // TWO ARMS, and they answer the same obligation two different ways.
         //
         // OFF (`main`, verbatim): the strict arm proves all six of the ROOT's own descriptors.
-        // That is sound but far stronger than needed -- it is a proxy for the chain's requirement,
+        // That is sound but far stronger than needed: it is a proxy for the chain's requirement,
         // chosen because the requirement was not readable here. It is also where prince-486's
         // 12,791x reject amplification lives.
         //
         // ARMED: one masked compare against the block's CHAIN REQUIREMENT, which is exactly
-        // INV-ENTRY -- every segment pinned by any block reachable through a live link holds the
+        // INV-ENTRY: every segment pinned by any block reachable through a live link holds the
         // descriptor that block baked. Both `has_link` states take the same predicate, because a
         // block with no live outbound edge carries its own layout as its requirement (the
         // narrowing in `narrow_chain_requirement_if_leaf` is what makes that true, and it is a
@@ -3244,7 +3244,7 @@ impl CpuGsw {
         };
         // Census-only, and on the SUCCESS path, which is why it is gated at the call site rather
         // than merely defaulting to zero: a second six-descriptor compare per admitted entry is
-        // 10^8 compares a fixture. It is the engagement proof -- entries the chain arm admitted
+        // 10^8 compares a fixture. It is the engagement proof: entries the chain arm admitted
         // that `main`'s strict arm would have refused.
         #[cfg(feature = "direct-link-refusal-census")]
         if chain_entry_check && data_descriptors_match && !segments.all_data_matches(self) {
@@ -3266,12 +3266,12 @@ impl CpuGsw {
                 self.perf.jit_direct_reject_data_segment_pm32 += 1;
             }
             // The ARM split, promoted from the 2026-08-23 throwaway instrument. It is the only
-            // way the strict/masked share is readable on the shipped arm -- one counter served
+            // way the strict/masked share is readable on the shipped arm: one counter served
             // both arms before this, and the design could bound the strict half at <=32% from
             // `links_cleared[retired]` but not measure it.
             //
             // ON THE ARMED ARM BOTH NAMES MEAN SOMETHING NEW, and neither is a renaming.
-            // `_strict` becomes "linked root, CHAIN mask failed" -- the population (A) is here to
+            // `_strict` becomes "linked root, CHAIN mask failed": the population (A) is here to
             // remove. `_masked` becomes "unlinked root, CHAIN mask failed", which is a genuinely
             // NEW population and CAN RISE: a block whose successor is merely portal-hidden keeps
             // its wide requirement, and narrowing on that state would be a miscompile. The census
@@ -3298,17 +3298,17 @@ impl CpuGsw {
             // inputs are built INSIDE this branch rather than above it: the second
             // `data_matches` is a six-descriptor compare and `live` is a 96-byte copy, and
             // neither is work `main` does at this site. The knob read is a `OnceLock` load, so
-            // an OFF leg pays one load and one branch here and nothing else -- which is what
+            // an OFF leg pays one load and one branch here and nothing else, which is what
             // makes it a reproduction of `main` rather than a close relative of one.
             if jit::direct::segment_retire_governor().cap_armed() {
                 // Only on the strict arm, and only on this cold path. It separates "rejected
-                // BECAUSE it is linked" -- the block's own masked check would have passed, so
-                // cutting its edges lets it run -- from "rejected on a record it uses itself",
+                // BECAUSE it is linked" (the block's own masked check would have passed, so
+                // cutting its edges lets it run) from "rejected on a record it uses itself",
                 // where cutting the edges buys nothing because the masked check refuses too.
                 //
                 // IT MUST READ THE BLOCK'S OWN MASK, so the armed arm fetches `segment_layouts`
                 // explicitly: `segments` is the CHAIN layout there, and asking it would ask
-                // "would the chain check have passed?" -- which is the question this reject just
+                // "would the chain check have passed?", which is the question this reject just
                 // answered NO to. `own_mask_matches` would be identically false, the governor's
                 // `on`-arm decline would never fire at all, and the decline is the only shipped
                 // mechanism that reaches the `own_pass - chain_pass` residual. The extra 116-byte
@@ -3335,8 +3335,8 @@ impl CpuGsw {
                 self.jit_direct.retire_key_for_recompile(span.key);
             }
             // P12 closes AFTER the governor, deliberately. Everything in this branch is
-            // entry-check refusal work -- the second six-descriptor `data_matches`, the 96-byte
-            // `live` copy and `retire_key_for_data_segment` -- and it is work only a refusal
+            // entry-check refusal work: the second six-descriptor `data_matches`, the 96-byte
+            // `live` copy and `retire_key_for_data_segment`, and it is work only a refusal
             // pays. Marking above the governor would leave its cost inside `total_refused` with
             // no phase holding it, which is an A1 closure hole; marking below charges it to the
             // bucket section 8's P12(b) lever is aimed at, which is where a reader looking to
@@ -3535,8 +3535,8 @@ impl CpuGsw {
         ea_mark!(Phase::TraceAlloc);
         self.begin_instruction();
         self.core_clocks_so_far = total;
-        // E1, THE ENTRY CLEAR. This used to be a bare `let flags = self.materialized_eflags();`
-        // -- a PURE read (`core.rs:18-22` returns `registers.eflags` untouched when no descriptor
+        // E1, THE ENTRY CLEAR. This used to be a bare `let flags = self.materialized_eflags();`:
+        // a PURE read (`core.rs:18-22` returns `registers.eflags` untouched when no descriptor
         // is live, and recomputes without clearing when one is). A descriptor the interpreter
         // left standing therefore SURVIVED into native execution, and every later reader
         // recomputed the six arithmetic bits from it over whatever emitted code had published in
@@ -3554,7 +3554,7 @@ impl CpuGsw {
         // does not materialise after every instruction either, and `flag_materializations` is a
         // measure of the interpreter's settling, not of this boundary's.
         //
-        // NOT UNDER A KNOB. It is architecturally invisible -- it changes the REPRESENTATION of
+        // NOT UNDER A KNOB. It is architecturally invisible: it changes the REPRESENTATION of
         // the flags and never `eflags()`, because `registers.eflags = materialized_eflags()` is
         // precisely what a later `materialized_eflags()` would have computed. Arming it would make
         // the two eager-flags arms differ in Rust as well as in emitted code, doubling the surface
@@ -3595,7 +3595,7 @@ impl CpuGsw {
         // GP2 poll-skip seam (design obligation 3): the RUN's remaining guest-clock budget,
         // published beside the shadow above on the same matched-pair model, and cleared beside
         // its clear below. `cap` is this call's own parameter, and it is RUN-remaining (already
-        // net of the batch's core AND scaled-bus clocks so far) -- NOT the same quantity
+        // net of the batch's core AND scaled-bus clocks so far). NOT the same quantity
         // `run.rs`'s batch loop bounds the interpreter's `try_poll_skip` against, which is the
         // batch-absolute cap (BLOCKER 2's fix; an earlier revision's comment here claimed the two
         // were the same quantity, and that misreading was the proximate cause of the defect).
@@ -3655,15 +3655,15 @@ impl CpuGsw {
             && exit.side_exit_reason == jit::direct::SideExitReason::CallOutAbnormal as u32
         {
             // The one post-trial transition, and it is deliberately one-way. A block classified
-            // `Lazy` that later meets a DENIED or undecoded port -- a V86 task whose monitor
-            // revoked the bitmap bit, most plainly -- would otherwise pay
+            // `Lazy` that later meets a DENIED or undecoded port (a V86 task whose monitor
+            // revoked the bitmap bit, most plainly) would otherwise pay
             // spill/call/refuse/side-exit on every execution of that IN, unbounded in count. This
             // bounds it at one.
             //
             // HONESTLY UNATTRIBUTABLE, and shipped anyway: `NativeExit` carries no block id, so
             // inside a chain the abnormal may have come from a HOP rather than from this head
             // block, and the head is then demoted for its successor's port. The false direction
-            // is toward `Denied`, which is refusal at head -- today's behaviour, and the safe
+            // is toward `Denied`, which is refusal at head, today's behaviour, and the safe
             // resting state. That asymmetry is the whole argument for taking this edge while the
             // step-break one, whose false direction would COST fidelity nothing but would churn
             // classifications, stays unimplemented.
@@ -3688,8 +3688,8 @@ impl CpuGsw {
         //
         // `final_eip != armed_at` means at least one instruction retired after the STI, so the
         // one-instruction shadow was consumed INSIDE the block and the flag must not survive the
-        // boundary. Equal means nothing retired after it -- the STI was the block's last slot, or
-        // the slot behind it side-exited before retiring -- and the flag stays armed for the
+        // boundary. Equal means nothing retired after it: the STI was the block's last slot, or
+        // the slot behind it side-exited before retiring, and the flag stays armed for the
         // interpreter to consume on the next instruction, which is what hardware does and what
         // keeps `sti; hlt` from taking its interrupt one instruction early.
         //
@@ -3697,8 +3697,8 @@ impl CpuGsw {
         // chaining: `exit.instructions` counts the whole chain from its head, while a slot index
         // is relative to the block that holds the slot, so comparing the two is only correct when
         // the STI is in the head block. EIP is the one quantity both ends agree on. It has one
-        // ambiguous shape -- a loop whose body starts immediately after the STI can exit with EIP
-        // back at `armed_at` having run the body -- and that shape resolves to LEAVING THE FLAG
+        // ambiguous shape: a loop whose body starts immediately after the STI can exit with EIP
+        // back at `armed_at` having run the body, and that shape resolves to LEAVING THE FLAG
         // ARMED, which costs at most one instruction of extra interrupt latency and one refused
         // native entry. The opposite error would deliver early, which is the thing B1 bars.
         if let Some((armed_at, arms)) = self.jit_direct.take_interrupt_shadow_armed()
@@ -3756,7 +3756,7 @@ impl CpuGsw {
         // Leaving the lane unmasked anywhere downstream is the quiet failure of this design: the
         // mode13 subset assert below, the subtraction that follows it, and the `reads` total that
         // feeds `data_direct_reads`, `jit_native_load_hits` and `direct_data_pointer_reads` would
-        // all absorb the split bytes and inflate by roughly 1.4 G on the payload fixture -- and
+        // all absorb the split bytes and inflate by roughly 1.4 G on the payload fixture, and
         // inflate them PLAUSIBLY, so it would read as the slice working.
         //
         // One access still counts ONCE. `split_extra_bytes` is a CLOCK quantity, never an access
@@ -3770,9 +3770,9 @@ impl CpuGsw {
         let total_word_stores = exit.ram_byte_writes >> 32;
         // The same carry guard the `dword_reads` lane carries above, for the same reason: the
         // block's static total dword-store count must not reach the half a second quantity now
-        // lives in. It cannot -- both halves are bounded by the chain bounds `NativeExit`'s own
+        // lives in. It cannot: both halves are bounded by the chain bounds `NativeExit`'s own
         // comment relies on, `MAX_CHAIN_BLOCKS` = 256 for the far returns and the per-block store
-        // counts for the writes -- and this is what makes that checkable rather than argued.
+        // counts for the writes, and this is what makes that checkable rather than argued.
         debug_assert!(
             exit.ram_dword_writes & u64::from(u32::MAX) <= u64::from(u32::MAX) / 2,
             "static total dword stores must not carry into the far-return half"
@@ -3788,7 +3788,7 @@ impl CpuGsw {
         // PLAUSIBLY, and read as the slice working. Leaving it unmasked in the Dword bus-clock
         // charge is loud and guest-visible: every far return would add
         // `2^32 * jit_data_cost_clocks(Dword)` to `raw_bus_clocks`, `scaled_bus_clocks` and
-        // `elapsed_clocks` -- landing in exactly the quantities this slice already declines to pin
+        // `elapsed_clocks`, landing in exactly the quantities this slice already declines to pin
         // as equalities, so it would be MISREAD as the timing change the slice admits to.
         let total_dword_stores = exit.ram_dword_writes & u64::from(u32::MAX);
         // The reflected-call memo's NATIVE-STORE refusal (defect F1).
@@ -3796,8 +3796,8 @@ impl CpuGsw {
         // in bulk right here; none of them passes `write_linear_*`, so none reaches the
         // journal's `note_write`. A journaled trip whose block stored anything therefore has
         // an INCOMPLETE write set, and a memo built from it would skip guest writes it never
-        // saw. Refusing is sound by construction -- it needs no argument about which stores
-        // were missed -- and it costs one test on a path that already holds the counts.
+        // saw. Refusing is sound by construction: it needs no argument about which stores
+        // were missed, and it costs one test on a path that already holds the counts.
         //
         // The batch loop's interpreter forcing (`reflected_call_wants_interpreter`) is what
         // keeps this rare; this is the belt that makes the forcing's timing a HIT-RATE
@@ -3878,7 +3878,7 @@ impl CpuGsw {
         // trace names every block this entry ran and `block_for_trace` EXPECTS each one to still
         // be live. Draining first retires exactly the block a self-modifying store hit, which is
         // the block the trace is most likely to name. Nothing between the return and here can run
-        // guest code or enter native code -- it is fetch and clock accounting -- so the guest
+        // guest code or enter native code (it is fetch and clock accounting) so the guest
         // cannot observe the stale window, which is the property the placement has to preserve.
         self.drain_deferred_code_writes();
         debug_assert!(
@@ -3941,12 +3941,12 @@ impl CpuGsw {
             // The misaligned split's EXTRA byte cycles, beyond the one wide cycle each access has
             // already been charged above. Priced at the RAM byte dial for both reads and stores,
             // which is what makes one shared pool exact: `ram_byte_reads` and `ram_byte_writes`
-            // take the same dial three and nine lines up. Never the Mode 13h dial -- both stubs
+            // take the same dial three and nine lines up. Never the Mode 13h dial: both stubs
             // refuse misaligned aperture traffic, so nothing in this pool came from an aperture.
             //
             // The result is the charge equality this slice rests on: a misaligned N-byte RAM
             // access costs one wide cycle plus N-1 byte cycles, and `BusCycle::clocks_for` ignores
-            // width, so that is exactly N byte cycles -- the same number the interpreter's own
+            // width, so that is exactly N byte cycles, the same number the interpreter's own
             // splitting path charges for the same access.
             .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Byte)
@@ -4015,7 +4015,7 @@ impl CpuGsw {
         // that is an expectation and not a measurement. `note_entry` is `#[inline(never)]` so
         // the armed body stays out of
         // this function. The armed leg's cost is stated in `crate::ipe_entry_tally`. Keyed on the
-        // ENTRY block's linear -- a chained transfer runs successor blocks without returning
+        // ENTRY block's linear: a chained transfer runs successor blocks without returning
         // here, which is the property that makes this "where did the dispatcher re-enter", not
         // "which blocks ran".
         if let Some(tally) = self.jit_direct.ipe_entry_targets.as_mut() {
@@ -4023,7 +4023,7 @@ impl CpuGsw {
         }
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
         // The far-return ledger, out of the high half of the RAM dword-write lane. NON-ZERO on a
-        // shipped binary since the 2026-08-24 flip -- 273.4 M on the wolf3d-586 ladder row; zero
+        // shipped binary since the 2026-08-24 flip: 273.4 M on the wolf3d-586 ladder row; zero
         // only on the `0` escape.
         self.jit_direct.note_far_returns(far_returns);
         // L8's sibling ledger takes no per-exit fold at all since the 2026-09-01 reprice: it is
@@ -4144,7 +4144,7 @@ impl CpuGsw {
         // The governor demoted a slot in a block this entry ran. Retiring that block's key makes
         // the recompile consult the demoted-site map and end its block BEFORE the slot. Left
         // un-retired, the block keeps a slot whose only behaviour is
-        // `test byte [cell], 0x80; jnz abnormal` -- a dispatcher round trip per execution to reach
+        // `test byte [cell], 0x80; jnz abnormal`: a dispatcher round trip per execution to reach
         // a boundary the walk can reach for free, plus the slots after it that the exit guarantees
         // are unreachable.
         //
@@ -4153,12 +4153,12 @@ impl CpuGsw {
         // `BlockCache::callout_retire_pending`.
         //
         // TAKEN HERE, above the `callout_error` return, and ACTED ON above it too. That return
-        // leaves this function, and a latch left set on it is read by the NEXT entry -- which
+        // leaves this function, and a latch left set on it is read by the NEXT entry, which
         // would retire a block on a demotion that happened inside a different one.
         let retire = self.jit_direct.take_callout_retire_pending();
         // ACTED ON BEFORE the error return, and the ordering is the point rather than a detail.
         // `retire_key_for_recompile` frees the block's metadata slot, so it has to come after
-        // every counter and every charge -- but the error return is not one of those, it is a way
+        // every counter and every charge, but the error return is not one of those, it is a way
         // OUT. With the retire below it, a stopping error swallowed the demotion for good: the
         // machine stops, the GUI resumes it, and the block comes back with the demoted slot still
         // in place, paying `test byte [cell], 0x80; jnz abnormal` and a dispatcher round trip on
@@ -4182,7 +4182,7 @@ impl CpuGsw {
             .expect("native outcome core exceeded u64");
         // A machine-stopping error an `InterpretOne` slot's fault delivery produced. The helper
         // returns an `i64` and cannot carry one, so it parks it and this is the boundary that
-        // propagates it -- the same boundary `run_budgeted_inner` would have propagated it from
+        // propagates it, the same boundary `run_budgeted_inner` would have propagated it from
         // had the instruction run interpreted. Taken LAST, after every counter, every charge and
         // the demotion retire, so a stopping run accounts for the work it actually did and leaves
         // behind the same block cache a non-stopping one would have.
@@ -4212,8 +4212,8 @@ impl CpuGsw {
     /// class. See `run_direct_block`'s G2 for why the classification is trial-only.
     ///
     /// The rule is WHOLE-TRIAL, not per-slot, and that is load-bearing. One block may hold up to
-    /// `MAX_BLOCK_CALLOUT_SLOTS` call-outs at different ports -- nascar reads 0x201 and COM1 0x3FD
-    /// in the same loop -- so a lazy first serve followed by an io-touching second one must NOT
+    /// `MAX_BLOCK_CALLOUT_SLOTS` call-outs at different ports: nascar reads 0x201 and COM1 0x3FD
+    /// in the same loop, so a lazy first serve followed by an io-touching second one must NOT
     /// read as `Lazy`. It cannot: the second slot's step break is the exit reason for the whole
     /// entry, and that is what this reads.
     ///
@@ -5024,7 +5024,7 @@ impl CpuGsw {
                     )?;
                 }
                 // CMP (`op == 7`) writes nothing back, so its memory form is
-                // Intel's 2-clock load and not the 3-clock read/modify/write --
+                // Intel's 2-clock load and not the 3-clock read/modify/write,
                 // the same split `alu_class` makes in `execute.rs` and
                 // `DirectKind::timing_class` makes for `AluMemDest { op: 7 }`.
                 Ok(Some(self.charge(if write_back {
@@ -5054,7 +5054,7 @@ impl CpuGsw {
                     )?;
                 }
                 // CMP (`op == 7`) writes nothing back, so its memory form is
-                // Intel's 2-clock load and not the 3-clock read/modify/write --
+                // Intel's 2-clock load and not the 3-clock read/modify/write,
                 // the same split `alu_class` makes in `execute.rs` and
                 // `DirectKind::timing_class` makes for `AluMemDest { op: 7 }`.
                 Ok(Some(self.charge(if write_back {

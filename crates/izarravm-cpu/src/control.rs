@@ -18,8 +18,8 @@ enum TaskSwitchKind {
 ///
 /// This is deliberately NOT the same distinction as the `is_external: bool`
 /// the older delivery signatures carry. That bool separates a
-/// processor-detected exception from everything else -- it decides the
-/// error-code push and the double-fault class -- and so lumps a software
+/// processor-detected exception from everything else (it decides the
+/// error-code push and the double-fault class) and so lumps a software
 /// `INT n` in with an external IRQ. The PRM's two gate checks need the finer
 /// split: a software interrupt contributes `EXT = 0` like an exception does,
 /// yet it is the ONLY source the gate-DPL comparison applies to. Threading the
@@ -71,14 +71,14 @@ impl CpuGsw {
         // `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC`, this compiles to a check of a
         // couple of cheap relaxed atomic loads and returns (N6: an earlier
         // revision of this comment said "one relaxed atomic load", which
-        // undercounted -- `armed()` touches both the `ARMED_INIT` OnceLock's
+        // undercounted: `armed()` touches both the `ARMED_INIT` OnceLock's
         // own state check and the `ARMED` flag itself).
         #[cfg(feature = "reflected-call-diagnostic")]
         crate::reflected_call_diag::on_int_entry(self, bus, vector);
         // The memo's answer path (slice1 plan section 5). An `Answered` outcome means
-        // the whole trip has ALREADY been applied -- nested acks re-issued, Class W
+        // the whole trip has ALREADY been applied: nested acks re-issued, Class W
         // writes replayed, control effects reproduced, epilogue installed, clocks
-        // charged -- so this returns WITHOUT `deliver_interrupt`, which is what elides
+        // charged, so this returns WITHOUT `deliver_interrupt`, which is what elides
         // the trip's dispatcher entries. `NotAnswered` (the knob off, no memo, or any
         // screen missing) leaves guest execution bit-identical to a build without the
         // feature.
@@ -198,7 +198,7 @@ impl CpuGsw {
         // reusing whatever the decoder buffered) so this covers BOTH #UD
         // origins uniformly: the decoder's unimplemented-opcode fallback and a
         // semantic #UD raised after decode. Best-effort: stop at the first
-        // unreadable byte (e.g. a page boundary fault) rather than erroring --
+        // unreadable byte (e.g. a page boundary fault) rather than erroring:
         // this is a diagnostic read, it must never itself fault the guest.
         const MAX_BYTES: u32 = 12;
         let mut bytes = Vec::with_capacity(MAX_BYTES as usize);
@@ -383,8 +383,8 @@ impl CpuGsw {
     /// The escalation loop shared by the two entry points above. `attempt` is the
     /// result of the first delivery; on a nested exception this decides, from the
     /// PRM's class table, whether to hand the guest the nested vector instead
-    /// (handle the two serially), to abandon both and raise #DF, or -- when the
-    /// fault landed while the double-fault handler was being called -- to stop.
+    /// (handle the two serially), to abandon both and raise #DF, or (when the
+    /// fault landed while the double-fault handler was being called) to stop.
     ///
     /// Handling two faults serially needs no bookkeeping here: the aborted
     /// delivery unwound to the interrupted state (see `deliver_exception_inner`)
@@ -406,7 +406,7 @@ impl CpuGsw {
     /// a short IDT AND a real #DF handler, which no DOS-era guest does". That
     /// skipped a step. The FIRST escalation from an out-of-limit vector is #GP,
     /// not #DF, so a short IDT with a real #GP handler is enough to change the
-    /// outcome -- and Zone 66 is one: it enters protected mode through VCPI,
+    /// outcome, and Zone 66 is one: it enters protected mode through VCPI,
     /// builds a 49-vector IDT, runs a V86 task of its own under it and issues
     /// `INT 0FDh`, which its own vector-13 handler exists to take. Under the old
     /// stop the machine died three guest seconds in. Every layout that really is
@@ -415,7 +415,7 @@ impl CpuGsw {
     ///
     /// One known wart, inherited rather than introduced: in REAL mode
     /// `deliver_exception` routes through `software_interrupt`, which posts
-    /// `bus.interrupt_acknowledge` -- the software-`INT n` device hook. An
+    /// `bus.interrupt_acknowledge`: the software-`INT n` device hook. An
     /// escalated re-delivery therefore posts an acknowledge that `hardware_interrupt`
     /// deliberately suppresses for the first attempt. What keeps that harmless is
     /// the vector range, not the hook's contents: the machine's side-effecting set
@@ -470,7 +470,7 @@ impl CpuGsw {
             // double-fault handler, the processor enters shutdown mode." The
             // emulator's equivalent of shutdown is the hard stop: the machine
             // reports the error and executes nothing further. The cap arm lands
-            // in the same terminal state -- see MAX_FAULT_ESCALATIONS.
+            // in the same terminal state. See MAX_FAULT_ESCALATIONS.
             if calling_double_fault_handler || escalations == MAX_FAULT_ESCALATIONS {
                 return Err(CpuError::TripleFault {
                     original_vector,
@@ -601,7 +601,7 @@ impl CpuGsw {
         // to leave behind and what a post-mortem needs to read.
         //
         // Keyed on the label, which covers every PROCESSOR EXCEPTION out of the
-        // commit but not a `CpuError` from a bus access inside it -- that one
+        // commit but not a `CpuError` from a bus access inside it, that one
         // still gets the restore and still leaves a hybrid dump. Narrower than it
         // looks, and deliberately left: inside `load_task_state` the highest
         // address touched is the LDTR selector at TSS+96, read before anything is
@@ -656,7 +656,7 @@ impl CpuGsw {
             // harmless because escalating "would change the outcome only for a
             // guest that keeps a short IDT AND a real #DF handler". That skips a
             // step: the FIRST escalation is #GP, not #DF, so a short IDT with a
-            // real #GP handler is enough. Zone 66 is one -- it runs a V86 task
+            // real #GP handler is enough. Zone 66 is one: it runs a V86 task
             // under its own 49-vector IDT and issues INT 0FDh from it, which its
             // own vector-13 handler is there to take.
             let ext = u32::from(source == DeliverySource::External);
@@ -686,7 +686,7 @@ impl CpuGsw {
         //
         // Both run here: after the gate has been read, and BEFORE the task-gate
         // branch, the target CS descriptor read and every stack switch below.
-        // That position is the observable part -- when a DPL-0 gate is reached
+        // That position is the observable part: when a DPL-0 gate is reached
         // from CPL 3 with no valid inner stack behind it, the guest must see
         // this #GP with the gate's own selector-style error code, not the
         // #GP(0) the later stack-switch path would raise.
@@ -694,7 +694,7 @@ impl CpuGsw {
         // The DPL comparison is a SOFTWARE-interrupt rule only. An external
         // interrupt and a processor exception are both exempt (the PRM guards
         // it with `IF software interrupt`), which is what lets one DPL-0 gate
-        // serve IRQs and faults while refusing a ring-3 `INT n` -- the ordinary
+        // serve IRQs and faults while refusing a ring-3 `INT n`, the ordinary
         // posture for a kernel that does not want user code forging system
         // calls. The P-bit line sits OUTSIDE that guard, so it applies to every
         // source; only the EXT term in its error code varies.
@@ -712,7 +712,7 @@ impl CpuGsw {
         // A descriptor of any other type is still decoded as an interrupt gate
         // here. Adding the P check sharpens that divergence rather than
         // introducing it, and moves where it shows: a non-gate descriptor with
-        // P = 0 -- a zeroed IDT entry being the common case -- now reports
+        // P = 0 (a zeroed IDT entry being the common case) now reports
         // #NP(vector*8+2) from the check below, where metal reports
         // #GP(vector*8+2) from the type check this emulator omits. Before this
         // commit the same entry fell through to the interrupt-gate arm and
@@ -721,7 +721,7 @@ impl CpuGsw {
         // descriptor still falls through exactly as it always did. Closing this
         // properly means adding the type check ahead of both, at which point
         // the zeroed-entry case becomes #GP(vector*8+2) and two escalation
-        // tests move back to vector 13 -- on purpose, and with the error code
+        // tests move back to vector 13, on purpose, and with the error code
         // right this time.
         let gate_dpl = ((gate_high >> 13) & 3) as u8;
         let idt_error_code =
@@ -760,8 +760,8 @@ impl CpuGsw {
         // Task gate (type 0x5): the gate's selector names a TSS, not a code
         // segment, and delivery is a CALL-style hardware task switch (386 PRM
         // 9.5): back-link written, NT set, the interrupted TSS stays busy. No
-        // frame is pushed -- the outgoing state, VM flag included, is saved
-        // into the outgoing TSS by the switch -- so this branch runs BEFORE the
+        // frame is pushed: the outgoing state, VM flag included, is saved
+        // into the outgoing TSS by the switch, so this branch runs BEFORE the
         // V86 drop below. Only the error code lands on the NEW task's stack.
         // DOS/4GW 1.97 points #PF at one of these.
         if (gate_high >> 8) & 0x1f == 0x05 {
@@ -781,8 +781,8 @@ impl CpuGsw {
         let saved_eflags = self.registers.eflags;
         let saved_cs = self.registers.cs().selector;
         let source_v86 = self.is_v86_mode();
-        // In 16-bit code -- V86, real-derived, or a 16-bit protected segment
-        // (CS.D = 0) -- the instruction pointer is the 16-bit IP at every
+        // In 16-bit code (V86, real-derived, or a 16-bit protected segment
+        // (CS.D = 0)) the instruction pointer is the 16-bit IP at every
         // architectural point, so real silicon can never push a frame EIP with
         // a nonzero high word from such a source. Emulator-side EIP arithmetic
         // can still leak one (an o32 transfer target past the limit is only
@@ -791,7 +791,7 @@ impl CpuGsw {
         // TOKAEMM reflected such a frame until its own return IRETD #GP(0)'d
         // at ring 0 (the stage-1 G1 storm, fed by exactly this push). Mask to
         // the only image silicon could produce. Keyed on the SOURCE CS width
-        // -- the same predicate `wrap_16bit_sequential_run_off` uses -- so a
+        // (the same predicate `wrap_16bit_sequential_run_off` uses) so a
         // 16-bit pmode client's monitor (DPMI16 hosts do the same word-sized
         // frame arithmetic) is protected identically.
         let saved_eip = if source_v86 || !self.registers.cs().default_size_32 {
@@ -820,7 +820,7 @@ impl CpuGsw {
         // level is set here, BEFORE the frame-push sequence begins, not after CS is
         // loaded at the end of this function. Every push below (the outer SS:ESP, the
         // V86 data segments, EFLAGS/CS/EIP, the error code) must execute as the level
-        // the handler is entering, not as whatever the source CS's selector bits say --
+        // the handler is entering, not as whatever the source CS's selector bits say:
         // for a V86 source those bits are the guest's own real-mode-style CS (arbitrary
         // low bits, e.g. the DOS HMA stub at 0xFFFF) and are never the CPL the monitor's
         // own stack accesses run under. Setting the cache here, ahead of `push`, is what
@@ -853,16 +853,16 @@ impl CpuGsw {
         self.push(bus, u32::from(saved_cs), frame_size)?;
         self.push(bus, saved_eip, frame_size)?;
         // The error code is pushed only for a CPU exception on a vector that carries one
-        // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
+        // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC), never for an external
         // hardware interrupt or software `INT n`, even when it lands on such a vector.
         if source.pushes_error_code() && vector_pushes_error_code(vector) {
             // TOKAEMM's vec13 discriminator (emulator contract) only ever inspects a
             // V86-ORIGIN vector-13 delivery: a V86 sensitive-instruction #GP (always
-            // error code 0 -- there is no selector to blame, the fault is on the
+            // error code 0: there is no selector to blame, the fault is on the
             // instruction itself) or a real IRQ5 reflected onto the same vector. It is
             // never reached by a PROTECTED-MODE selector #GP, which is delivered through
-            // the CURRENT IDT -- the guest's own (e.g. DOS4GW's), not TOKAEMM's monitor
-            // -- and can legitimately carry a nonzero selector-index error code (Batch
+            // the CURRENT IDT (the guest's own (e.g. DOS4GW's), not TOKAEMM's monitor)
+            // and can legitimately carry a nonzero selector-index error code (Batch
             // A's descriptor/gate/segment-load sweep). So the tripwire is scoped to
             // `source_v86`: a V86-origin #GP must still push exactly 0, but a pmode
             // selector #GP is free to carry a real code. Update tokaemm.asm's
@@ -874,7 +874,7 @@ impl CpuGsw {
             // whose delivery nests a #GP(selector) is handled serially, and that
             // re-delivery reaches here with a nonzero code and `source_v86` restored.
             // It needs a malformed gate or CS descriptor in the ACTIVE monitor's own
-            // tables, which TOKAEMM's are not, so this has never been observed -- but
+            // tables, which TOKAEMM's are not, so this has never been observed, but
             // the invariant now rests on the monitor's tables being well formed, not
             // on an enumeration of raise sites.
             //
@@ -884,8 +884,8 @@ impl CpuGsw {
             // TOKAEMM's vec13_entry, and the reason is structural rather than
             // observational: TOKAEMM's own IDT carries all 256 gates, so a
             // vector outside its limit does not exist. Such a #GP can only be
-            // raised while some OTHER IDT is loaded -- a VCPI client's, or the
-            // one a guest built for a V86 task of its own -- and it is delivered
+            // raised while some OTHER IDT is loaded (a VCPI client's, or the
+            // one a guest built for a V86 task of its own) and it is delivered
             // through that IDT, never TOKAEMM's. The predicate below says
             // exactly that: the code names a vector THIS IDT does not cover, so
             // THIS IDT is not TOKAEMM's.
@@ -1004,7 +1004,7 @@ impl CpuGsw {
     /// pre-resolved to physical at RECORD time, which is what makes them
     /// CR3-independent. Re-walking a linear address here would use the POST-trip CR3
     /// (the control-effect replay has already run, or is about to), i.e. a different
-    /// mapping from the one the original write went through -- reopening the very
+    /// mapping from the one the original write went through, reopening the very
     /// hazard the physical representation closes.
     ///
     /// It deliberately does NOT journal (`note_write`): a replay is the answer's own
@@ -1039,7 +1039,7 @@ impl CpuGsw {
     /// The `InterpretOne` call-out is where that second omission stopped being merely exotic.
     /// `load_protected_segment` writes the Accessed bit from inside the helper, with a native
     /// block live on the host stack, and R5 decides whether the block may resume by reading the
-    /// deferred list -- which `note_code_write` is the only thing that fills. A GDT entry on the
+    /// deferred list, which `note_code_write` is the only thing that fills. A GDT entry on the
     /// running block's own page was therefore invisible to R5, and the block resumed over code the
     /// descriptor write had just changed. Reporting it here puts that store on the same footing as
     /// every other write the guest can make: deferred while the window is open, drained after.
@@ -1150,7 +1150,7 @@ impl CpuGsw {
     }
 
     /// Restartability wrapper: a fault raised after the frame pops committed
-    /// (typically #NP on the target CS -- Borland RTM returns into swapped-out
+    /// (typically #NP on the target CS: Borland RTM returns into swapped-out
     /// overlay segments and re-executes after its handler loads them) must
     /// leave (E)SP exactly pre-instruction, or the restarted pop reads above
     /// the real frame. `finish_instruction` rewinds only EIP/CS.
@@ -1246,8 +1246,8 @@ impl CpuGsw {
                 self.set_eip(ip & 0xffff);
                 self.load_flags(flags, OperandSize::Word, false);
                 // Same-privilege / real-mode / V86 word return; the target level is
-                // exactly the just-loaded CS's RPL, or 3 if that load landed in V86
-                // -- but real mode is unconditionally CPL 0 regardless of the
+                // exactly the just-loaded CS's RPL, or 3 if that load landed in V86,
+                // but real mode is unconditionally CPL 0 regardless of the
                 // selector's low bits (a real-mode CS is not a descriptor selector,
                 // so those bits carry no RPL).
                 self.cpl = if !self.is_protected_mode() {
@@ -1270,13 +1270,13 @@ impl CpuGsw {
                 {
                     // 386 PRM STACK-RETURN-TO-V86: "instruction pointer not within code
                     // segment limit THEN #GP(0)" is checked against the popped EIP before
-                    // EFLAGS/CS/EIP/ESP or any of the V86 data segments are committed -- the
+                    // EFLAGS/CS/EIP/ESP or any of the V86 data segments are committed: the
                     // pseudocode gates on it ahead of every `Pop()` in the V86-tail sequence.
                     // A V86 CS is always a real-mode-style segment (fixed 0xffff limit via
                     // `load_segment_real`/`SegmentRegister::real`), so an EIP with a nonzero
-                    // high word is always out of range. Faulting here -- with the monitor's
+                    // high word is always out of range. Faulting here (with the monitor's
                     // pre-IRET CS:EIP still live and the V86-tail dwords (ESP/SS/ES/DS/FS/GS)
-                    // still on the stack -- keeps the #GP(0) frame correct; committing the
+                    // still on the stack) keeps the #GP(0) frame correct; committing the
                     // V86 state first and letting the next fetch discover the limit violation
                     // would push a fabricated V86 return address (this exact IRET's popped
                     // CS:EIP) into the fault frame instead of resuming the monitor right after
@@ -1330,7 +1330,7 @@ impl CpuGsw {
                     // against the wrong privilege level. See `load_segment_system`.
                     self.load_segment_system(bus, SegmentIndex::Ss, ss)?;
                     self.set_eip(eip);
-                    // 386 PRM 17-80: "Load SS:eSP from stack" -- eSP is B-keyed (17-12).
+                    // 386 PRM 17-80: "Load SS:eSP from stack": eSP is B-keyed (17-12).
                     // Onto a B=0 (16-bit) outer stack, only SP takes the popped value;
                     // ESP's high word carries over from the inner stack untouched (the
                     // documented real-silicon ESP-high-word leak on a 16-bit ring
@@ -1400,8 +1400,8 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         // A protected-mode far call to a system descriptor goes through a call gate,
         // which supplies its own CS:offset (the instruction's offset is ignored).
-        // A V86 task (PE=1 but VM=1) uses 8086 far-call semantics — its selector is a
-        // real-mode segment, never a descriptor — so it falls through to the direct path.
+        // A V86 task (PE=1 but VM=1) uses 8086 far-call semantics: its selector is a
+        // real-mode segment, never a descriptor, so it falls through to the direct path.
         if self.is_protected_mode() && !self.is_v86_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
@@ -1442,7 +1442,7 @@ impl CpuGsw {
         // No DPL/CPL check is enforced on this direct (non-gate) path today (a
         // pre-existing limitation, out of scope here); the cache just tracks whatever
         // level the load landed at, matching the historical live formula exactly. Real
-        // mode is unconditionally CPL 0 -- a real-mode CS is not a descriptor selector,
+        // mode is unconditionally CPL 0: a real-mode CS is not a descriptor selector,
         // so its low bits carry no RPL and must not leak into the cache.
         self.cpl = if !self.is_protected_mode() {
             0
@@ -1544,7 +1544,7 @@ impl CpuGsw {
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset & operand_size.mask());
         // Same-privilege return; the cache tracks the loaded CS's RPL, or 3 if this
-        // landed back in V86 -- real mode forces CPL 0 (see `far_call`'s comment on
+        // landed back in V86: real mode forces CPL 0 (see `far_call`'s comment on
         // why the selector's low bits don't apply there).
         self.cpl = if !self.is_protected_mode() {
             0
@@ -1773,7 +1773,7 @@ impl CpuGsw {
             }
             let (old_ss, old_esp) = self.switch_to_inner_stack(bus, target_dpl)?;
             // PRM transition point: the call gate crosses to the inner ring here, before
-            // the return frame is built on the new stack -- the pushes below execute at
+            // the return frame is built on the new stack: the pushes below execute at
             // the target level, not the caller's.
             self.cpl = target_dpl;
             self.push(bus, u32::from(old_ss), op)?;
@@ -1897,7 +1897,7 @@ impl CpuGsw {
         // the caller sets it to `target_dpl` only after this call returns. See
         // `load_segment_system`.
         self.load_segment_system(bus, SegmentIndex::Ss, new_ss)?;
-        // 386 PRM 17-43/17-74: "Load new SS:eSP value from TSS" -- eSP is B-keyed
+        // 386 PRM 17-43/17-74: "Load new SS:eSP value from TSS": eSP is B-keyed
         // (17-12), not always the full ESP. The just-loaded SS's B bit governs: a
         // 16-bit (B=0) ring-0 stack takes the TSS value into SP only, and ESP's
         // high word carries over from the interrupted context untouched (the same
@@ -1926,7 +1926,7 @@ impl CpuGsw {
         // The reflected-call memo's `task_switch` refusal (slice1 plan section 4.5), at
         // the one function every task gate, TSS `CALL`/`JMP` and `IRET` back-link return
         // passes through. A task switch replaces the whole architectural context, and a
-        // memo's epilogue -- registers, segments, CPL -- cannot reproduce a TSS load.
+        // memo's epilogue (registers, segments, CPL) cannot reproduce a TSS load.
         #[cfg(feature = "reflected-call-memo")]
         crate::reflected_call_memo::note_task_switch(self);
         // An IRET task return faults with #TS, not #GP, on every back-link
@@ -1995,8 +1995,8 @@ impl CpuGsw {
         }
         // Everything above still leaves the outgoing task whole, so its faults are
         // ordinary restartable exceptions. The tail below is not: it commits the
-        // incoming task piece by piece -- CR3 first, then LDTR, the GPRs, EFLAGS
-        // and every segment including CS -- and nothing snapshots what it
+        // incoming task piece by piece: CR3 first, then LDTR, the GPRs, EFLAGS
+        // and every segment including CS, and nothing snapshots what it
         // overwrites. A fault past that point therefore cannot be delivered from
         // the interrupted task, because there is no interrupted task left, so it
         // is reported as terminal instead of being handed to a caller that would
@@ -2029,8 +2029,8 @@ impl CpuGsw {
     /// come from the INCOMING TSS's contents (a bad SS, CS or LDT selector) are
     /// raised by `load_task_state`'s own segment loads, so a JMP/CALL/IRET to a
     /// malformed TSS now stops instead of vectoring #TS the way a 386 does. The
-    /// honest fix is Intel's order -- validate every incoming selector, then load
-    /// any of them -- which would move those checks back above this boundary.
+    /// honest fix is Intel's order: validate every incoming selector, then load
+    /// any of them, which would move those checks back above this boundary.
     /// (The descriptor-level #TS/#GP checks in `task_switch` itself are still
     /// pre-commit and still deliverable; a further pre-existing gap is that these
     /// loads raise #GP/#NP rather than #TS at all.) And the boundary is one read
@@ -2127,13 +2127,13 @@ impl CpuGsw {
             // A null data segment (ES/DS/FS/GS) is legal and just unusable; CS and SS
             // must be loadable.
             //
-            // "Unusable" is a PROTECTED-MODE statement. The incoming EFLAGS -- VM included --
+            // "Unusable" is a PROTECTED-MODE statement. The incoming EFLAGS (VM included)
             // was committed above, before this loop, so `is_v86_mode` here already answers for
             // the task being switched TO: if it is a V86 task, selector 0 is not the null
             // descriptor at all but an ordinary 8086 segment at base 0, and it must be built
             // like every other V86 segment (limit 0xFFFF, real-mode access). Leaving it at
             // `Default::default()` gave such a task a limit-0 DS that faults on its first
-            // access -- and, since `load_segment_real_mode` no longer re-stamps the limit,
+            // access, and, since `load_segment_real_mode` no longer re-stamps the limit,
             // the JIT's `LoadSegReal` lowering would no longer paper over it either.
             if selector & !0x7 == 0
                 && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss)
@@ -2198,11 +2198,11 @@ impl CpuGsw {
     /// NMI, and single-step traps until the next instruction boundary, so a pointer's offset and
     /// stack segment can be loaded as one atomic unit even if an interrupt lands between the two
     /// halves. This is the SAME one-instruction shadow STI arms (`interrupt_shadow`); reused here
-    /// rather than duplicated. Only armed on success -- a faulting load (null selector, bad
+    /// rather than duplicated. Only armed on success: a faulting load (null selector, bad
     /// descriptor) must not suppress the interrupt check. Every OTHER `load_segment(.., Ss, ..)`
     /// call site (IRET's outer-stack pop, the inner-stack switch on a privilege-level change, the
     /// TSS register-restore loop) reloads SS as a side effect of a control transfer, not as the
-    /// direct target of one of these three opcodes, and must not arm the shadow -- callers use the
+    /// direct target of one of these three opcodes, and must not arm the shadow. Callers use the
     /// plain `load_segment` for those.
     pub(super) fn load_segment_arming_ss_shadow<B: CpuBus>(
         &mut self,
@@ -2232,8 +2232,8 @@ impl CpuGsw {
     /// A segment reload that is itself the mechanical side effect of a privilege
     /// transition the caller has already validated by its own rules: IRET's outer-stack
     /// SS pop, the call-gate inner-stack switch, and the TSS register-restore loop.
-    /// `self.cpl` at the point of this call is mid-transition (still the old level, or
-    /// -- for the TSS loop's ES, loaded before CS -- not yet meaningful at all), so the
+    /// `self.cpl` at the point of this call is mid-transition (still the old level, or,
+    /// for the TSS loop's ES, loaded before CS, not yet meaningful at all), so the
     /// ordinary CPL-vs-DPL check does not apply; the descriptor type/writability check
     /// still does (a system-managed load must still resolve to a legal data/stack
     /// segment, just not one gated on the stale CPL).
@@ -2272,10 +2272,10 @@ impl CpuGsw {
     /// `SegmentRegister::real`, including `limit = 0xFFFF`.
     ///
     /// This is the right form only where the architecture really does rebuild the whole
-    /// descriptor cache: V86 entry and V86 segment loads (386 PRM 26.3.1 -- a V86 task
+    /// descriptor cache: V86 entry and V86 segment loads (386 PRM 26.3.1: a V86 task
     /// addresses memory like the 8086, 64 KB, no exceptions), the V86-exit data-segment
     /// clear, and the boot/reset paths. An ordinary REAL-MODE `MOV Sreg, r16` must NOT
-    /// come here -- see `load_segment_real_mode`.
+    /// come here. See `load_segment_real_mode`.
     pub(super) fn load_segment_real(&mut self, segment: SegmentIndex, selector: u16) {
         self.registers
             .set_segment(segment, SegmentRegister::real(selector));
@@ -2286,7 +2286,7 @@ impl CpuGsw {
 
     /// A segment load taken with CR0.PE clear and VM clear: plain real mode.
     ///
-    /// Real mode does not re-derive a descriptor -- there is no table to read. The 386
+    /// Real mode does not re-derive a descriptor: there is no table to read. The 386
     /// recomputes only what the selector determines (base = selector << 4) and the access
     /// rights; the cached LIMIT is left exactly as the last protected-mode load left it.
     /// That single omission is what "unreal"/flat-real mode IS: software enters protected
@@ -2335,8 +2335,8 @@ impl CpuGsw {
         // legal: it installs a null/unusable segment with no fault at load time. A later
         // memory access through it faults with #GP(0) (via the base=0/limit=0 default
         // segment failing the limit check in `segment_linear_byte`). CS and SS must still
-        // #GP on a null selector -- CS reaches here via RETF/IRET/interrupt-gate delivery,
-        // not just far-jump/call -- mirroring the TSS segment-load precedent above
+        // #GP on a null selector: CS reaches here via RETF/IRET/interrupt-gate delivery,
+        // not just far-jump/call, mirroring the TSS segment-load precedent above
         // (`selector & !0x7 == 0 && !matches!(segment, Cs | Ss)`). The mask must also require
         // TI=0: `selector & 0xfffc` folds in the index bits only, so a TI=1 index-0 selector
         // (0x0004, LDT[0]) is correctly excluded from this null short-circuit and falls
@@ -2355,7 +2355,7 @@ impl CpuGsw {
             (self.gdtr.base, u32::from(self.gdtr.limit))
         };
         // Index 0 is reserved only in the GDT (the processor never uses GDT[0], per the PRM);
-        // an LDT selector with index 0 (TI=1, e.g. 0x0004) is an ordinary, resolvable entry --
+        // an LDT selector with index 0 (TI=1, e.g. 0x0004) is an ordinary, resolvable entry:
         // the null-selector short-circuit above already handled the true null case (index 0,
         // TI 0), so an in_ldt selector reaching here is never null. A bad/out-of-limit
         // selector is #GP regardless of which segment is being loaded (386 PRM 9.3): there is
@@ -2375,12 +2375,12 @@ impl CpuGsw {
         let is_code = is_segment && descriptor_type & 0x8 != 0;
         // 386 PRM 5.2/6.2 (table 5-1's code/data type matrix): a segment register may
         // only be loaded with a code or data descriptor of the kind it can hold. A
-        // system-segment or gate descriptor (S clear -- LDT, TSS, call/task/trap/
+        // system-segment or gate descriptor (S clear: LDT, TSS, call/task/trap/
         // interrupt gate) is never legal in a segment register load; #GP regardless of
         // which register. Otherwise CS accepts only a code descriptor; SS accepts only
         // a writable data descriptor (a stack must be read/write, PRM 5-12); DS/ES/FS/GS
         // accept a readable code descriptor or any data descriptor. This is the plain
-        // MOV Sreg/POP Sreg/LDS-family data-segment-load path -- CS loads through a
+        // MOV Sreg/POP Sreg/LDS-family data-segment-load path: CS loads through a
         // call gate or a conforming/non-conforming far transfer are already checked by
         // `far_call_gate`/`far_jump_gate`/`return_far` and are not duplicated here.
         let type_legal = match segment {
@@ -2423,7 +2423,7 @@ impl CpuGsw {
         if access & 0x80 == 0 {
             // A present-bit-clear descriptor: #NP (vector 11) for every segment except SS,
             // which is #SS (vector 12) instead (386 PRM 9.3's "the SS register is being
-            // loaded" carve-out -- the same vector `segment_limit_fault` uses for a stack
+            // loaded" carve-out: the same vector `segment_limit_fault` uses for a stack
             // limit violation).
             let vector = if segment == SegmentIndex::Ss { 12 } else { 11 };
             return Err(InternalFault::Exception {
@@ -2433,8 +2433,8 @@ impl CpuGsw {
         }
         // Mark the descriptor Accessed (bit 0 of the type field, PRM 5-12/5-13) on a
         // successful load, same read-modify-write shape as `set_tss_busy`'s busy-bit
-        // toggle. Skipped when already set -- the common case once a segment has been
-        // touched once -- to avoid a write-back on every reload of a hot selector.
+        // toggle. Skipped when already set (the common case once a segment has been
+        // touched once) to avoid a write-back on every reload of a hot selector.
         if access & 0x01 == 0 {
             self.write_system_linear(
                 bus,

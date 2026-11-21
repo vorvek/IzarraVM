@@ -20,14 +20,14 @@ dynarec-mkii = ["jit"]
 # diagnostic feature is selected, then armed with IZARRAVM_DIRECT_BARRIER_CENSUS=1.
 direct-admission-census = ["jit"]
 # Per-entry Direct attribution observer. Compiled out unless
-# selected -- the `ea_*!` macros expand to nothing -- then armed with
+# selected (the `ea_*!` macros expand to nothing) then armed with
 # IZARRAVM_DIRECT_ENTRY_ATTRIBUTION=1 (full) or =2 (coarse), strided by
 # IZARRAVM_DIRECT_ENTRY_ATTRIBUTION_SAMPLE=N.
 #
 # NOT in `default`. It IS in `--all-features`, because cargo has no way for a feature to opt out
 # of that flag, and the design's claim that it is "excluded from --all-features" was therefore
 # never enforceable. Stating the truth instead: a `--all-features` build CARRIES this instrument,
-# and that is acceptable because the instrument is zero-cost while DISARMED -- the knob defaults
+# and that is acceptable because the instrument is zero-cost while DISARMED: the knob defaults
 # to off, and a disarmed traversal pays one `OnceLock` load and a not-taken branch per stamp site
 # rather than an rdtsc. What must never happen is GRADING a wall number on an ARMED build: the
 # full arm measured +24.5% on the loader. Grade on plain builds, per the standing rule.
@@ -58,7 +58,7 @@ watch-write = []
 int-trace = []
 # Slice 0 of the reflected-call HLE design: the
 # trip-shape INSTRUMENT. NO BEHAVIOUR CHANGE on the OFF arm or on a plain
-# build -- compiled out entirely unless this feature is selected. Armed by
+# build: compiled out entirely unless this feature is selected. Armed by
 # IZARRAVM_REFLECTED_CALL_DIAGNOSTIC=shape or =journal; see
 # reflected_call_diag.rs for what each mode measures. Requires `jit`: the
 # `journal` mode forces the native backend off for the run, on the design's
@@ -72,7 +72,7 @@ reflected-call-diagnostic = ["jit"]
 shadow-cache-probe = ["jit", "izarravm-bus/shadow-cache-probe"]
 # Slice 1 of the reflected-call HLE design:
 # the record-and-measure memo. Gate the whole module under this
-# feature (not merely the runtime knob) so a plain build carries none of it -- byte-identical
+# feature (not merely the runtime knob) so a plain build carries none of it: byte-identical
 # `CpuGsw` layout and binary to a plain `main` build. `IZARRAVM_REFLECTED_CALL_MEMO` arms it
 # only when this feature is compiled in.
 reflected-call-memo = ["jit"]
@@ -80,7 +80,7 @@ reflected-call-memo = ["jit"]
 # The per-class retire histogram (section 9.1 of the 586
 # recalibration design). A `[u64; N_CLASSES]` on the CPU plus one
 # sparse add per compiled-block entry, reported in the profile JSON. Compiled out unless
-# selected -- there is NO env knob, deliberately: a default-off instrument that costs a
+# selected: there is NO env knob, deliberately: a default-off instrument that costs a
 # hot-path branch is exactly what the campaign's own rule
 # (`default-off-instruments-tax-hot-path`) forbids, so the gate is the feature and nothing else.
 #
