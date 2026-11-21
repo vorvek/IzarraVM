@@ -1311,6 +1311,57 @@ fn clearing_chain4_in_mode13h_enters_and_leaves_mode_x() {
     assert_eq!(vga.active_mode(), VideoMode::Mode13h);
 }
 
+fn write_crtc_reg(vga: &mut Vga, index: u8, value: u8) {
+    vga.write_port(0x3D4, index);
+    vga.write_port(0x3D5, value);
+}
+
+/// Clearing chain-4 changes the CPU write decode, not the display timing. The
+/// derived timing must keep what the guest programmed in mode 13h, so it
+/// agrees with the raw CRTC bytes.
+#[test]
+fn clearing_chain4_keeps_the_guest_crtc_state_in_the_derived_timing() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    write_crtc_reg(&mut vga, 0x11, 0x0E); // write protect off
+    write_crtc_reg(&mut vga, 0x0C, 0x01);
+    write_crtc_reg(&mut vga, 0x0D, 0x23);
+    write_crtc_reg(&mut vga, 0x18, 0x55);
+    write_crtc_reg(&mut vga, 0x07, 0x10);
+    write_crtc_reg(&mut vga, 0x09, 0x40);
+    write_crtc_reg(&mut vga, 0x13, 0x50);
+    write_crtc_reg(&mut vga, 0x14, 0x40);
+    write_crtc_reg(&mut vga, 0x17, 0xC3);
+    write_crtc_reg(&mut vga, 0x08, 0x05);
+    // The start address latches at the next vertical retrace.
+    vga.advance(vga.frame_dots());
+
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+
+    assert_eq!(vga.active_mode(), VideoMode::ModeX);
+    assert_eq!(vga.crtc.start_address, 0x0123);
+    assert_eq!(vga.crtc.line_compare, 0x155 | 0x200);
+    assert_eq!(vga.crtc.offset, 0x50);
+    assert_eq!(vga.crtc.underline_loc, 0x40);
+    assert_eq!(vga.crtc.mode_control, 0xC3);
+    assert_eq!(vga.crtc.preset_row_scan, 0x05);
+}
+
+/// A start address still waiting for the vertical retrace latch when chain-4
+/// clears must latch as written.
+#[test]
+fn clearing_chain4_keeps_a_pending_start_address() {
+    let mut vga = Vga::default();
+    vga.set_mode13h();
+    write_crtc_reg(&mut vga, 0x0C, 0x02);
+    write_crtc_reg(&mut vga, 0x0D, 0x34);
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+    vga.advance(vga.frame_dots());
+    assert_eq!(vga.crtc.start_address, 0x0234);
+}
+
 /// A CRTC write that leaves the raster the same size must not erase the
 /// scanlines the beam has already drawn.
 ///
