@@ -4,6 +4,9 @@
 //! Minimal direct-byte x86-64 encoder for emitted region chains. It is not a
 //! general assembler. Each supported instruction form has a byte-level test.
 //! The region compiler uses only the subset it needs for a given host path.
+
+// The encoder forms have users in the mkii backend, in feature-gated code and in non-Windows arms,
+// so a default Windows build sees some of them as unused.
 #![allow(dead_code)]
 
 /// A host x86-64 general-purpose register, numbered 0-15 in the standard encoding order
@@ -22,9 +25,7 @@ impl Reg {
     // Not read by the strcpy block's emitter (it passes SI/DI as plain GPR indices to the
     // inc_gpr16 callback rather than addressing the host's own RSI/RDI), but kept and unit-tested
     // as part of the encoder's register-name completeness for whatever block a future slice adds.
-    #[allow(dead_code)]
     pub const RSI: Reg = Reg(6);
-    #[allow(dead_code)]
     pub const RDI: Reg = Reg(7);
     pub const R8: Reg = Reg(8);
     pub const R9: Reg = Reg(9);
@@ -118,7 +119,6 @@ enum PatchKind {
     // this; the strcpy block's emitter never calls `jmp` (its non-fallthrough control flow is
     // all conditional: `ja`/`jnz`/`jz`), so this variant is presently unused outside `jmp`'s own
     // unit test. Kept for a future block with an unconditional branch.
-    #[allow(dead_code)]
     Rel32AfterJmp,
 }
 
@@ -378,7 +378,6 @@ impl Encoder {
     /// `add dst, src` (REX.W + 01 /r, ADD r/m64, r64: dst += src). Same register/ModRM pattern as
     /// `mov_r64_r64` with opcode 0x01. Used by the native cap check to sum the scaled-core and
     /// bus-growth terms.
-    #[allow(dead_code)]
     pub(crate) fn add_r64_r64(&mut self, dst: Reg, src: Reg) {
         self.rex(true, src.ext(), false, dst.ext());
         self.bytes.push(0x01);
@@ -394,7 +393,6 @@ impl Encoder {
 
     /// `sub dst, src` (REX.W + 29 /r, SUB r/m64, r64: dst -= src). Mirrors `add_r64_r64` with
     /// opcode 0x29.
-    #[allow(dead_code)]
     pub(crate) fn sub_r64_r64(&mut self, dst: Reg, src: Reg) {
         self.rex(true, src.ext(), false, dst.ext());
         self.bytes.push(0x29);
@@ -403,7 +401,6 @@ impl Encoder {
 
     /// `imul dst, src` (REX.W + 0F AF /r, IMUL r64, r/m64: dst *= src, signed). Used by the
     /// native cap check to multiply by the scale denominator.
-    #[allow(dead_code)]
     pub(crate) fn imul_r64_r64(&mut self, dst: Reg, src: Reg) {
         self.rex(true, dst.ext(), false, src.ext());
         self.bytes.push(0x0F);
@@ -609,7 +606,6 @@ impl Encoder {
 
     /// `mov [base + disp32], imm32` (REX.W + C7 /0 id, the store-immediate-to-memory form). Used
     /// to initialize ctx fields from native code.
-    #[allow(dead_code)]
     pub(crate) fn store_imm32_disp32(&mut self, base: Reg, disp32: i32, imm: u32) {
         self.rex(true, false, false, base.ext());
         self.bytes.push(0xC7);
@@ -640,7 +636,6 @@ impl Encoder {
     /// strcpy block's emitter (its u32 args are all compile-time constants, emitted via
     /// `mov_r32_imm32` instead) -- kept for a future block that needs to move a 32-bit value
     /// between registers.
-    #[allow(dead_code)]
     pub(crate) fn mov_r32_r32(&mut self, dst: Reg, src: Reg) {
         if src.ext() || dst.ext() {
             self.rex(false, src.ext(), false, dst.ext());
@@ -962,7 +957,6 @@ impl Encoder {
 
     /// `cmp r32, imm32` (81 /7 id, no REX.W). Byte-exact tested; used by the paged TLB probe
     /// for cpl==3 and similar small-imm checks without needing a 64-bit form.
-    #[allow(dead_code)]
     pub(crate) fn cmp_r32_imm32(&mut self, r: Reg, imm: u32) {
         if r.ext() {
             self.rex(false, false, false, r.ext());
@@ -990,7 +984,6 @@ impl Encoder {
 
     /// `or r32, r32` (09 /r, no REX.W) -- dst |= src. Byte-exact tested for the paged probe's
     /// physical = (entry.phys | (linear & 0xfff)).
-    #[allow(dead_code)]
     pub(crate) fn or_r32_r32(&mut self, dst: Reg, src: Reg) {
         if dst.ext() || src.ext() {
             self.rex(false, src.ext(), false, dst.ext());
@@ -1000,7 +993,6 @@ impl Encoder {
     }
 
     /// `or r32, imm32` (81 /1 id) for completeness with the TLB phys combine path.
-    #[allow(dead_code)]
     pub(crate) fn or_r32_imm32(&mut self, dst: Reg, imm: u32) {
         if dst.ext() {
             self.rex(false, false, false, dst.ext());
@@ -2043,7 +2035,6 @@ impl Encoder {
     /// emitter: its one runtime comparison is against `cap_clocks` (not a compile-time constant),
     /// which uses `cmp_r64_r64` + `ja` instead (see that method's doc comment). Kept for a future
     /// block that compares against a fixed immediate.
-    #[allow(dead_code)]
     pub(crate) fn cmp_r64_imm32(&mut self, r: Reg, imm: u32) {
         self.rex(true, false, false, r.ext());
         self.bytes.push(0x81);
@@ -2085,7 +2076,6 @@ impl Encoder {
     /// around call/ret and BUILT on the pop/jmp-through-slot mechanism instead (which keeps
     /// RSP at the frame level inside the stub), so this is kept for a future caller exactly
     /// as `cmp_r64_imm32` is.
-    #[allow(dead_code)]
     pub(crate) fn ret_near(&mut self) {
         self.bytes.push(0xC3);
     }
@@ -2230,7 +2220,6 @@ impl Encoder {
     /// `jmp label` (near, rel32; E9 cd). Unit-tested but not called by the strcpy block's emitter
     /// (every exit from its loop body is a conditional branch -- `ja`/`jnz`/`jz` -- never an
     /// unconditional one). Kept for a future block whose control flow needs it.
-    #[allow(dead_code)]
     pub(crate) fn jmp(&mut self, target: Label) {
         let instr_start = self.bytes.len();
         self.bytes.push(0xE9);

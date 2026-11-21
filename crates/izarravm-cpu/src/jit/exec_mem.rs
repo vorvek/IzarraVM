@@ -93,6 +93,13 @@ fn arena_len_from_env(value: Option<&str>) -> usize {
     mib * 1024 * 1024
 }
 
+/// Whether new arenas register unwind data. `IZARRAVM_JIT_UNWIND=0` turns it off. The variable is
+/// read once per process.
+fn unwind_registration_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("IZARRAVM_JIT_UNWIND").map_or(true, |v| v != "0"))
+}
+
 /// A bounded collection of one-page executable-code spans, installed through `install`. Only
 /// span BASES are valid entries; the registry records every span as `(offset, page_len)` in
 /// offset order.
@@ -222,9 +229,7 @@ impl ExecutableArena {
             return None;
         }
         let unwind_enabled = cfg!(all(target_os = "windows", target_arch = "x86_64"))
-            && std::env::var("IZARRAVM_JIT_UNWIND")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            && unwind_registration_enabled();
         let alloc_len = if unwind_enabled { len + page_len } else { len };
         let ptr = alloc_rw(alloc_len)?;
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -253,7 +258,7 @@ impl ExecutableArena {
         })
     }
 
-    /// Test seam: a small arena so fill-then-compact paths run without 32MB of installs.
+    /// Test seam: a small arena so fill-then-compact paths run without installing into a full-size arena.
     #[cfg(test)]
     pub(crate) fn with_len_for_test(total_len: usize) -> Option<Self> {
         Self::with_len(total_len)
