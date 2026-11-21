@@ -225,8 +225,8 @@ impl GuiApp {
                 // Volume row: the classic ascending-bars icon and a slider that
                 // stretches to fill the remaining width.
                 //
-                // This is the HOST's level -- the powered speakers the machine's
-                // line-out feeds -- applied to the finished mix on its way to the
+                // This is the HOST's level: the powered speakers the machine's
+                // line-out feeds, applied to the finished mix on its way to the
                 // sound device. The levels inside the machine are the guest's,
                 // on the card's own mixer, and SNDMIXER.COM sets them.
                 //
@@ -234,7 +234,7 @@ impl GuiApp {
                 // speaker's knob does: a title that maxes its own mixer can still
                 // arrive 14 dB down (see `volume_gain`). The value box reads in
                 // percent so the neutral point is named, and the 0.01 step means
-                // every position the knob can hold is a whole percent -- keyboard
+                // every position the knob can hold is a whole percent: keyboard
                 // arrows and typed values land on one, and 100% is reachable
                 // exactly rather than approached.
                 //
@@ -625,7 +625,7 @@ impl GuiApp {
                                         |ui| {
                                             // "On (original)" samples exactly as
                                             // the guest's texture_mode register
-                                            // asks -- today's only behaviour.
+                                            // asks, today's only behaviour.
                                             // "Disabled" forces nearest (point)
                                             // sampling for every TMU regardless.
                                             // Takes effect on the next power-on,

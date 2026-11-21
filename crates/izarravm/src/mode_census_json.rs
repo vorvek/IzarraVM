@@ -34,7 +34,7 @@ fn drain_nanos_json(nanos: &DistiraDrainNanos) -> Value {
 }
 
 // One parameter per independent census source, mirroring the JSON's own flat
-// section list -- a struct wrapper would just move the eight fields one level
+// section list: a struct wrapper would just move the eight fields one level
 // out without changing what a caller has to gather. `distira_swap_to_next_drain`
 // is the eighth (slice 0 of the async-overlap review).
 #[allow(clippy::too_many_arguments)]
@@ -170,7 +170,7 @@ pub fn mode_census_json(
                 // is how many batches were handed to the raster pool
                 // instead of drawn on the calling thread; `joins_by_cause`
                 // is how many of THOSE joins actually waited, broken down
-                // by which call forced the wait -- a `register_write_uncovered`
+                // by which call forced the wait: a `register_write_uncovered`
                 // entry here answers finding 2's fastfill-after-swap
                 // question directly; `overlap_ns` is the summed wall-clock
                 // nanoseconds every join spent blocked, the direct
@@ -193,16 +193,16 @@ pub fn mode_census_json(
                 // The first cut of `overlap_ns` measured flush-to-join-COMPLETE
                 // elapsed on every join, which on every join point but the
                 // swap (flush and join adjacent) is the batch's own raster
-                // time, not overlap -- a run with zero overlap and one with
+                // time, not overlap: a run with zero overlap and one with
                 // perfect overlap both reported a large number. `overlap_ns`
                 // is now `window_ns - blocked_ns` summed across every join
                 // (`blocked_ns` is a fresh `Instant` taken immediately before
                 // `Receiver::recv`, so it is ONLY the time that call spent
                 // waiting); `blocked_ns` is the same split's other half.
                 // `window_ns_by_cause`/`blocked_ns_by_cause`/`overlap_ns_by_cause`
-                // break the same three numbers out per `DrainCause` -- keyed
+                // break the same three numbers out per `DrainCause` (keyed
                 // on the cause of the CALL that performed the join, same as
-                // `joins_by_cause` -- because "one accumulator cannot
+                // `joins_by_cause`) because "one accumulator cannot
                 // distinguish 'the guest gave us a frame' from 'the fastfill
                 // joined immediately'":
                 // a `register_write_uncovered` entry here (the

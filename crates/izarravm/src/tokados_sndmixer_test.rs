@@ -137,7 +137,7 @@ fn sndmixer_lists_the_levels_the_card_powers_on_with() {
         // Two bits, and the card powers on at position 2 of 4. The listing
         // reports the step that position IS, not a step it rounded from.
         "SPEAKER      7   -7 dB",
-        // Two bits as well, and the card powers on at position 0 -- which on
+        // Two bits as well, and the card powers on at position 0, which on
         // this fader is 0 dB and not a mute, because it is the card's output
         // amplifier and 0 dB is an amplifier passing its input through.
         "AMP          0   0 dB",
@@ -159,7 +159,7 @@ fn sndmixer_lists_the_levels_the_card_powers_on_with() {
 
 /// The whole point of the tool: a level named on the command line reaches the
 /// register. Read back through the mixer's own register file, not through the
-/// tool's report -- a tool that printed the right number and wrote nothing
+/// tool's report: a tool that printed the right number and wrote nothing
 /// would pass a screen-scrape and fail this.
 ///
 /// `/P 2` is the PC speaker's snap-up rule in the same run: two bits give four
@@ -206,7 +206,7 @@ fn sndmixer_command_line_levels_reach_the_mixer_registers() {
 /// The boot line the image's AUTOEXEC carries: restore from a file, silently.
 ///
 /// Both halves are load-bearing and both are checked here, because they fail
-/// independently -- a tool that restored correctly but printed a line would
+/// independently: a tool that restored correctly but printed a line would
 /// break the boot screen's row budget, and a tool that printed nothing but
 /// restored nothing would look identical from the screen alone.
 #[test]
@@ -402,7 +402,7 @@ fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
     );
 
     // Right moves the selection off MASTER and onto FMSYNTH; Down twice takes
-    // it from 10 to 8. One scancode per run slice -- a batched injection is
+    // it from 10 to 8. One scancode per run slice: a batched injection is
     // delivered faster than the guest's INT 16h loop consumes it.
     // 0x4D Right, 0x50 Down, 0x44 F10, each make then break.
     for code in [0x4Du8, 0xCD, 0x50, 0xD0, 0x50, 0xD0] {
@@ -449,8 +449,8 @@ fn sndmixer_full_screen_fader_keys_move_the_register_and_f10_saves() {
 
 /// Esc is a real undo, not a no-op.
 ///
-/// Because levels are applied as the fader moves -- a mixer you cannot hear
-/// while you set it is not a mixer -- "cancel" has to put the hardware back
+/// Because levels are applied as the fader moves (a mixer you cannot hear
+/// while you set it is not a mixer) "cancel" has to put the hardware back
 /// rather than merely decline to write it. The run below moves a fader, leaves
 /// with Esc, and the register has to read what it read before the mixer opened.
 #[test]
@@ -581,9 +581,9 @@ fn sndmixer_accept_button_leaves_the_levels_applied() {
 /// The Cancel button is the Esc path with a face on it: the same restore, the
 /// same message, reached with Tab and a keypress instead.
 ///
-/// Pressed with SPACE, not Enter. Both keys press a button -- that is the
-/// sibling tool's model for an input, and the `/?` text and the manuals say so
-/// -- and a fixture that only ever pressed Enter would let the Space arm rot.
+/// Pressed with SPACE, not Enter. Both keys press a button: that is the
+/// sibling tool's model for an input, and the `/?` text and the manuals say so,
+/// and a fixture that only ever pressed Enter would let the Space arm rot.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndmixer_cancel_button_restores_the_levels_the_mixer_opened_on() {
@@ -624,7 +624,7 @@ fn sndmixer_cancel_button_restores_the_levels_the_mixer_opened_on() {
 ///
 /// This is the failure the button ring makes possible: the two extra stops have
 /// no channel record behind them, so a level key that skipped the check would
-/// write through whatever SI was last left pointing at -- which is a string in
+/// write through whatever SI was last left pointing at, which is a string in
 /// the data area, not a channel. The whole screen and the whole mixer register
 /// file are compared, not a chosen few of each, because the address that stray
 /// write lands on depends on which routine painted last: with the check removed
@@ -634,7 +634,7 @@ fn sndmixer_cancel_button_restores_the_levels_the_mixer_opened_on() {
 /// That is why the oracle is "NOTHING moved" and not "`0x41`/`0x42` are still
 /// zero", which is what it used to be. Those two registers are the card's
 /// output gain, and since the AMP fader they are a pair this tool owns and
-/// writes on purpose -- so their staying at zero is no longer evidence of
+/// writes on purpose, so their staying at zero is no longer evidence of
 /// anything, and a fixture that asserted it would pass on a build where the
 /// stray write had simply moved one record further along. The companion
 /// fixture below is the other half: the same keys, with a FADER selected, must
@@ -739,7 +739,7 @@ fn sndmixer_level_keys_on_the_amp_fader_move_the_output_gain_pair() {
 /// The PC speaker set to step 3 in the full-screen mixer has to SAVE as step 3.
 ///
 /// The owner's report: the fader was moved to 3, F10 written, and the file came
-/// back saying 7. Both halves are asserted, and they fail independently -- a
+/// back saying 7. Both halves are asserted, and they fail independently: a
 /// tool that wrote the right register and the wrong number, or the wrong
 /// register and the right number, are different bugs.
 ///
@@ -831,7 +831,7 @@ fn sndmixer_speaker_set_to_three_saves_as_three() {
 /// step they want, so the number that reaches the file comes from the request
 /// and the decode table is never read; transposing that table leaves them green.
 /// Here the second command names a DIFFERENT channel, so the SPEAKER line it
-/// writes can only have come from reading `0x3B` back -- which is exactly the
+/// writes can only have come from reading `0x3B` back, which is exactly the
 /// shape that would turn a speaker set to 3 into a file that says 7.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
@@ -867,7 +867,7 @@ fn sndmixer_speaker_read_back_off_the_register_is_the_step_that_was_set() {
 
 /// The same shape on the command line: `/P 3` then a save, and the round trip
 /// back through the file. A step the file carries has to survive being restored
-/// to the register and read back off it -- position 1 reads as step 3, so a
+/// to the register and read back off it: position 1 reads as step 3, so a
 /// second save of an untouched machine writes the same number the first did.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
@@ -908,7 +908,7 @@ fn sndmixer_speaker_step_three_survives_the_cli_save_and_restore_round_trip() {
 /// `/?` still fits on the screen it is printed to.
 ///
 /// DOS does not page this text and the tool does not either, so a usage screen
-/// one line too long scrolls its own first line away -- which is exactly what
+/// one line too long scrolls its own first line away, which is exactly what
 /// adding the seventh switch and AMP's explanation did before the prose below
 /// them was cut to pay for it. Both ends are asserted: the title, which is what
 /// scrolls off first, and the last line, which is what proves the text was
@@ -916,8 +916,8 @@ fn sndmixer_speaker_step_three_survives_the_cli_save_and_restore_round_trip() {
 ///
 /// The screen holds 24 lines of it, measured by adding filler lines here until
 /// this fails: 24 passes and 25 does not. The text is 22, so there are two
-/// spare. That margin is why this fixture is worth having rather than obvious
-/// -- the overflowing version was 25 and looked fine in the source.
+/// spare. That margin is why this fixture is worth having rather than obvious:
+/// the overflowing version was 25 and looked fine in the source.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndmixer_usage_text_fits_an_eighty_by_twentyfive_screen() {
@@ -990,7 +990,7 @@ fn sndmixer_amp_switch_drives_both_output_gain_registers() {
 /// to move it back down and cannot pass on a run where the restore did nothing.
 /// The second save names MASTER rather than AMP, so its `AMP` line is written
 /// from reading `0x41` back off the card rather than from anything requested on
-/// that command line -- which is what makes it a round trip and not an echo.
+/// that command line, which is what makes it a round trip and not an echo.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn sndmixer_amp_survives_the_cli_save_and_restore_round_trip() {
@@ -1029,7 +1029,7 @@ fn sndmixer_amp_survives_the_cli_save_and_restore_round_trip() {
 /// card half-configured.
 ///
 /// 65536 and 65546 are the interesting ones. The tail parser accumulates into
-/// a 16-bit register, so before it saturated they wrapped to 0 and to 10 -- a
+/// a 16-bit register, so before it saturated they wrapped to 0 and to 10: a
 /// typo that MUTED the master and exited 0, and a typo that quietly set it to
 /// full. Both are in range after the wrap and neither could be caught by the
 /// bounds check that follows.

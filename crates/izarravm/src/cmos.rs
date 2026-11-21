@@ -63,7 +63,7 @@ pub fn cmos_path(c_root: &Path) -> PathBuf {
 /// The hardware settings a command-line flag asked for THIS run, for the
 /// settings CMOS also owns.
 ///
-/// These flags set power-on values, and a saved `cmos.bin` overrides them --
+/// These flags set power-on values, and a saved `cmos.bin` overrides them,
 /// which is correct (NVRAM is what the machine boots from) but invisible. A
 /// user who types `--sb-irq 5` and hears the card answer on 7 has no way to
 /// tell that a saved assignment beat them, so `apply` says so. Only flags that
@@ -152,7 +152,7 @@ impl RtcSetup {
             None => {
                 // No saved CMOS: persist the defaulted image (with its fresh
                 // checksum) so the file exists for next run. Nothing overrode
-                // the flags here -- this is the run where they set the machine
+                // the flags here: this is the run where they set the machine
                 // up, and the image just written is what they set it to.
                 save_cmos_file(&self.cmos_path, &machine.cmos_bytes());
             }

@@ -9,7 +9,7 @@
 //! targets `x86-64-v3` (`.cargo/config.toml`'s `[build] rustflags`). That
 //! makes the old `--interpreter` fallback unreachable: a non-AVX2 host
 //! takes `STATUS_ILLEGAL_INSTRUCTION` during CRT startup, before `main`'s
-//! own code -- including `requested_execution_backend`'s error string --
+//! own code (including `requested_execution_backend`'s error string)
 //! ever runs. AVX2 is now a hard requirement, and this module is the
 //! replacement contract: report the requirement in a message the user can
 //! read, then exit cleanly, instead of crashing silently.
@@ -22,7 +22,7 @@
 //! [`require_avx2`] MUST be the first statement of every user-facing
 //! `fn main` this module gates. Nothing may run ahead of it: no argument
 //! parsing, no logging setup, no eframe/winit setup. Its body is
-//! deliberately minimal -- a single runtime feature test -- because until
+//! deliberately minimal (a single runtime feature test) because until
 //! that test has run, we do not yet know whether the host can execute a
 //! VEX-encoded instruction at all. Under `-C target-cpu=x86-64-v3` the
 //! compiler is free to lower an ordinary 32-byte (or larger) copy, a
@@ -37,13 +37,13 @@
 //! those fault on a non-AVX host exactly like the bug this module exists
 //! to fix. `main` must therefore be a locals-free shim that calls
 //! [`require_avx2`] and then an `#[inline(never)]` `real_main` that holds
-//! everything else -- verified by disassembly, not assumed.
+//! everything else, verified by disassembly, not assumed.
 //!
 //! This does NOT use `std::is_x86_feature_detected!("avx2")`. That macro
 //! special-cases the case where the CURRENT crate is itself compiled with
 //! the feature statically enabled (`#[cfg(target_feature = "avx2")]`) and
 //! expands straight to the constant `true`, skipping the runtime `cpuid`
-//! check entirely -- exactly this crate's situation under
+//! check entirely, exactly this crate's situation under
 //! `-C target-cpu=x86-64-v3`. Confirmed empirically: with the macro, the
 //! whole `if` folded away at compile time (proven false to LLVM), and
 //! `require_avx2`/`report_and_exit` vanished from the release PDB with no
@@ -61,7 +61,7 @@
 //! with AVX2 in silicon but a masked or absent BMI2/LZCNT leaf (a
 //! partially-featured microarchitecture, or a hypervisor CPUID mask) would
 //! pass an AVX2-only probe and then take `#UD` on the first such
-//! instruction, with no message -- the same failure this module exists to
+//! instruction, with no message, the same failure this module exists to
 //! replace. [`AVX2_REQUIRED_MESSAGE`] keeps the owner-approved wording,
 //! which names AVX2 as the user-facing shorthand for this requirement;
 //! nothing here changes that text.
@@ -106,7 +106,7 @@ static AVX2_REQUIRED_TITLE_W: [u16; AVX2_REQUIRED_TITLE.len() + 1] =
 
 /// Exit the process now if this host lacks the full `x86-64-v3` feature
 /// set this build was compiled for. Must run before anything else in
-/// `main` -- and `main` itself must be a locals-free shim; see the module
+/// `main`, and `main` itself must be a locals-free shim; see the module
 /// comment for both halves of that contract.
 #[inline(never)]
 pub fn require_avx2() {
@@ -117,7 +117,7 @@ pub fn require_avx2() {
 
 /// Pure decision: does this CPUID/XCR0 evidence show AVX2? Split out of
 /// the `cpuid`/`xgetbv`-issuing code so it can be driven with synthetic
-/// vectors in tests -- a mutation that always returns `true`, or that
+/// vectors in tests: a mutation that always returns `true`, or that
 /// drops the `xgetbv` gate, is otherwise invisible to the test suite. Bit
 /// numbers per Intel SDM / AMD APM, `CPUID.1:ECX`:
 /// - bit 27: `OSXSAVE` (the OS enabled `xsave`/`xgetbv`).
@@ -172,8 +172,8 @@ fn x86_64_v3_present_at_runtime() -> bool {
     // (baseline since long before AVX2 existed); calling it carries no
     // precondition beyond running on x86_64, which this module is
     // `cfg`-gated to by virtue of `core::arch::x86_64` existing in the
-    // target at all. `xgetbv` is different -- it faults with `#UD` unless
-    // `CR4.OSXSAVE` is set -- so it is called only after `leaf1.ecx` bit
+    // target at all. `xgetbv` is different: it faults with `#UD` unless
+    // `CR4.OSXSAVE` is set, so it is called only after `leaf1.ecx` bit
     // 27 (`OSXSAVE`) has been checked; on a host without it, `xcr0` here
     // is left `0`, which correctly fails every downstream bit test rather
     // than reading real state.
@@ -218,7 +218,7 @@ unsafe fn xgetbv0() -> u64 {
 }
 
 /// Split out of [`require_avx2`] so the compiler has no reason to hoist any
-/// of this -- formatting, the message box call, process teardown -- into
+/// of this (formatting, the message box call, process teardown) into
 /// `require_avx2`'s own prologue, ahead of the feature test. Everything
 /// here runs only after we already know the host lacks the required
 /// feature set, and every operation in it is either a call into
@@ -229,7 +229,7 @@ unsafe fn xgetbv0() -> u64 {
 /// The `stderr` write is deliberately infallible: `eprintln!` panics on a
 /// write error (a closed handle, a broken pipe on the other end of a
 /// redirect), which would unwind out of a `-> !` function and skip both
-/// the dialog and `process::exit(1)` -- the host would see nothing at all
+/// the dialog and `process::exit(1)`: the host would see nothing at all
 /// instead of at least the intended non-zero exit. `writeln!`'s `Result`
 /// is discarded on purpose: there is no better fallback for a stderr
 /// write that failed than to still show the dialog (if one is wanted) and
@@ -253,7 +253,7 @@ fn report_and_exit() -> ! {
 /// one half) is otherwise invisible to the test suite. The binary is
 /// `IMAGE_SUBSYSTEM_WINDOWS_CUI`: it always has a console, either its own
 /// or one it inherited from the launching shell. A modal `MessageBoxW` is
-/// only the right move when nobody is positioned to read stderr --
+/// only the right move when nobody is positioned to read stderr:
 /// launched from Explorer by double-click, where no console is attached.
 /// With a console attached (an interactive shell, a CI runner, a
 /// scoreboard harness), stderr already reached someone; showing a dialog

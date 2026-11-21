@@ -4,13 +4,13 @@
 //! The one function this whole feature turns on.
 //!
 //! Every video path in IzarraVM hands the presenter a byte that means DAC
-//! output level -- linear in analog video voltage. The host panel instead
+//! output level, linear in analog video voltage. The host panel instead
 //! treats that byte as an sRGB code, which lifts near-blacks (the sRGB toe).
 //! `display_transform` corrects it: decode with the period CRT's assumed EOTF
 //! to get the light the tube actually emitted, then re-encode with the exact
 //! sRGB OETF so the host panel emits that same light.
 //!
-//! `gamma == None` ("Raw") is the identity, byte for byte -- today's
+//! `gamma == None` ("Raw") is the identity, byte for byte, today's
 //! behaviour before this existed.
 
 /// The sRGB OETF's piecewise knee, in light (not code) units.
@@ -21,7 +21,7 @@ pub(crate) const SRGB_LOW_SLOPE: f32 = 12.92;
 pub(crate) const SRGB_A: f32 = 1.055;
 /// The OETF's power-segment offset above the knee.
 pub(crate) const SRGB_B: f32 = 0.055;
-/// The OETF's power-segment exponent's reciprocal base -- also the sRGB
+/// The OETF's power-segment exponent's reciprocal base, also the sRGB
 /// curve's own gamma, and the special `monitor_gamma` value at which the
 /// whole correction collapses to an affine black-level offset (design
 /// section 4.3).
@@ -66,8 +66,8 @@ pub fn display_transform(code: u8, gamma: Option<f32>) -> u8 {
 /// The exponent the "Compatible" Glide gamma setting applies to Distira's
 /// presented output.
 ///
-/// The Voodoo era's Glide runtimes lifted the picture with a gamma CLUT --
-/// about 1.7 on a Voodoo 1, about 1.3 on a Voodoo 2 -- because the period CRTs
+/// The Voodoo era's Glide runtimes lifted the picture with a gamma CLUT
+/// (about 1.7 on a Voodoo 1, about 1.3 on a Voodoo 2) because the period CRTs
 /// they were authored on were darker than the artists wanted. 1.5 is the
 /// geometric mean of that band, so it is the constant that minimises the
 /// worst-case residual lift in the log domain (bounded by 1.5/1.7 = 0.88 on one
@@ -81,8 +81,8 @@ pub const GLIDE_COMPAT_EXPONENT: f32 = 1.5;
 ///
 /// This is a fixed exponent, deliberately: composed with the guest's own gamma
 /// CLUT it leaves the net exponent at `exponent / g_programmed`, so every
-/// relative change the guest makes to its CLUT -- including the gamma ramps
-/// games fade the screen with -- survives, merely scaled. Cancelling the
+/// relative change the guest makes to its CLUT (including the gamma ramps
+/// games fade the screen with) survives, merely scaled. Cancelling the
 /// *current* CLUT instead would pin the picture and destroy those fades, which
 /// is the `SST_GAMMA` behaviour. The design measurement covers
 /// both arms on a real fade.

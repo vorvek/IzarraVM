@@ -188,7 +188,7 @@ struct Cli {
     /// plain in this one: measured on Psycho Pinball, the re-render read 80.8%
     /// non-black while the screen was black.
     ///
-    /// Writes nothing and says so when no frame has completed yet -- between a
+    /// Writes nothing and says so when no frame has completed yet, between a
     /// mode set and the first raster of the new mode there is genuinely no
     /// published frame, and a substitute would read as a measurement.
     #[arg(long, requires = "hdd_folder")]
@@ -299,7 +299,7 @@ fn empty_tolerant_path(value: &str) -> Result<PathBuf, std::convert::Infallible>
 /// Arm the diagnostic guest-store watchpoint from `IZARRAVM_WATCH_WRITE=<hex>[,<hex len>]`
 /// (PHYSICAL addresses, default length 0x100). Reports go to stderr, capped, naming the
 /// store route and the guest CS:IP that issued it. Answers "who wrote here?" for a memory
-/// corruption whose writer is not the obvious owner of the range -- the reason it exists is
+/// corruption whose writer is not the obvious owner of the range: the reason it exists is
 /// a guest that scribbled PCM over the DOS INT 21h dispatch stub. Off unless the variable
 /// is set, and the store path then pays one Relaxed load.
 fn arm_write_watch_from_env() {
@@ -342,7 +342,7 @@ fn requested_execution_backend(
         // already exited the process before `main` reached this point on a host
         // that would land here. This branch stays as defense in depth for a
         // native-compiled, non-x86_64/Windows/Linux target where the compiled-in
-        // check differs from the runtime one -- it is not a reachable path on the
+        // check differs from the runtime one: it is not a reachable path on the
         // hosts this build ships for, and there is no `--interpreter` escape left
         // to point at.
         Err("this IzarraVM build requires an AVX2-capable x86-64 CPU")
@@ -351,8 +351,8 @@ fn requested_execution_backend(
 
 /// Locals-free shim. `require_avx2` must be the first thing this process
 /// does, and it must run before `main`'s own prologue can execute a single
-/// instruction that assumes the feature set it is about to check for --
-/// see `preflight`'s module comment. That is a source-order property
+/// instruction that assumes the feature set it is about to check for.
+/// See `preflight`'s module comment. That is a source-order property
 /// ONLY if `main` has no locals of its own: a `main` with any local that
 /// forces callee-save xmm spills gets a prologue of VEX `vmovapd` moves
 /// before the first statement runs on a build compiled `-C
@@ -824,8 +824,8 @@ fn run_boot_floppy(
     let budget = cycles.unwrap_or(DEFAULT_BOOT_FLOPPY_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
-    // that the run loop returned, or its last partial buffer's worth of lines -- most
-    // often exactly the tail we care about -- is silently lost at process exit.
+    // that the run loop returned, or its last partial buffer's worth of lines (most
+    // often exactly the tail we care about) is silently lost at process exit.
     izarravm_cpu::flush_diff_trace();
 
     let cs = machine.cpu().registers.cs().selector;
@@ -904,7 +904,7 @@ fn katea_run_prog_name(prog: &std::path::Path) -> String {
     format!("PROG.{ext}")
 }
 
-/// A temp directory that removes itself (and any contents) when dropped — on
+/// A temp directory that removes itself (and any contents) when dropped: on
 /// success, an early `?` return, or a panic.
 struct TempDir(std::path::PathBuf);
 
@@ -985,10 +985,10 @@ enum InjectionEvent {
 enum MouseAction {
     /// Drive the pointer hard into the driver's minimum corner. The INT 33h
     /// driver clamps to its own `min_x`/`min_y`, so where this lands is exact no
-    /// matter where the pointer started -- which is what lets a following `move`
+    /// matter where the pointer started, which is what lets a following `move`
     /// address a known pixel without the harness tracking any state.
     Home,
-    /// Relative motion in MICKEYS -- raw PS/2 counts, y positive downward --
+    /// Relative motion in MICKEYS, raw PS/2 counts, y positive downward,
     /// not pixels. The harness cannot convert: how far a mickey moves the
     /// pointer is the INT 33h driver's mickey-to-pixel ratio, which the guest
     /// may change at any time through function 0Fh. At TOKAMOUS's defaults one
@@ -1012,8 +1012,8 @@ const MOUSE_PACKET_SPACING_MS: u64 = 5;
 /// the INT 33h driver scales by its mickey-to-pixel ratio: at TOKAMOUS's
 /// defaults that is 255 px per packet horizontally and 127 vertically, but a
 /// game may set a coarser ratio through function 0Fh and homing has to overshoot
-/// under the worst one it plausibly picks. At a ratio of 64 -- four times
-/// coarser than the default vertical -- a packet is worth 31 pixels, so covering
+/// under the worst one it plausibly picks. At a ratio of 64 (four times
+/// coarser than the default vertical) a packet is worth 31 pixels, so covering
 /// a 480-line screen needs 16. Twenty leaves margin and costs 100 ms of guest
 /// time, which is nothing against a schedule measured in guest seconds.
 const MOUSE_HOME_PACKETS: usize = 20;
@@ -1029,8 +1029,8 @@ const MOUSE_PACKET_MAX_DELTA: i32 = 255;
 /// A press and a release one packet apart is 5 ms, and that is NOT enough. A
 /// menu that samples the button once a frame simply never sees it: Grand Prix 2
 /// swallowed exactly that click on its startup menu, with the pointer verified
-/// to be on the button. Nothing repeats during the hold -- a real PS/2 mouse
-/// sends one packet per state change and the driver latches it -- so this is
+/// to be on the button. Nothing repeats during the hold (a real PS/2 mouse
+/// sends one packet per state change and the driver latches it) so this is
 /// purely how long the two packets are separated by. 100 ms is a human click
 /// and clears any per-frame poll.
 const MOUSE_CLICK_HOLD_MS: u64 = 100;
@@ -1087,7 +1087,7 @@ fn text_to_scancode_groups(text: &str) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
             // HELD across the steps between them. `{right}` is a tap and cannot
             // express "keep running": the guest tracks key-down state from the
             // scancode stream, so holding means a make with no break until the
-            // release is scheduled. Prince of Persia is the case in hand --
+            // release is scheduled. Prince of Persia is the case in hand:
             // `{shift}` to start the game, then `{+right}` so the prince runs
             // instead of standing in the first room.
             let (name, edge) = match name.strip_prefix('+') {
@@ -1310,8 +1310,8 @@ const AUDIO_CAPTURE_DAC_HZ: u32 = 44_100;
 
 /// Where the headless observer sends the mix it pulled.
 ///
-/// `render_audio` -- OPL3 synthesis and its resample, the SB16 DSP drain, the
-/// AD1848/WSS leg, the CD pull, the speaker drain and the CT1745 sum -- is
+/// `render_audio` (OPL3 synthesis and its resample, the SB16 DSP drain, the
+/// AD1848/WSS leg, the CD pull, the speaker drain and the CT1745 sum) is
 /// reached headlessly from exactly one place, and until now only when
 /// `IZARRAVM_AUDIO_WAV` named a file. That made every wall this project has ever
 /// recorded a wall with no audio mixing in it, and made the WAV path unusable as
@@ -1413,7 +1413,7 @@ fn parse_audio_cost_slice_ms(value: Option<String>) -> Result<u64, String> {
 /// cannot decide the mix is dead and sink it.
 ///
 /// Two integer ops per frame over ~7M frames is single-digit milliseconds against
-/// a ~139 s run, i.e. below 0.01%, and it is paid by the armed leg only -- so it
+/// a ~139 s run, i.e. below 0.01%, and it is paid by the armed leg only, so it
 /// biases the measured share UPWARD. `S` is a conservative bound on the mix's own
 /// cost, which is the direction to err in; do not correct for it.
 ///
@@ -1437,13 +1437,13 @@ fn fold_audio_frames(seed: u64, frames: &[(i16, i16)]) -> u64 {
 /// point: `render_audio` returns the machine's line-out, decided entirely by
 /// CT1745 registers the guest owns. `HostAudioGains` lived here because the GUI
 /// used to push two host-only multipliers into the machine before every render
-/// and a capture that skipped them recorded something the user never heard --
+/// and a capture that skipped them recorded something the user never heard:
 /// an instrument 21.6 dB out from the thing it was pointed at. Both multipliers
 /// are gone from the machine, so the capture and the GUI agree by construction
 /// rather than by remembering to copy a staging step.
 /// Headless capture of the host audio mix: an OBSERVER of a run, not a run mode.
 ///
-/// It owns two things only -- how finely the run has to be sliced so the DSP's
+/// It owns two things only: how finely the run has to be sliced so the DSP's
 /// render ring never overflows between drains, and the growing PCM buffer. Every
 /// path that advances the guest goes through [`run_sliced`], so the capture
 /// composes with whatever else that path is doing (key and mouse injection, in
@@ -1458,7 +1458,7 @@ fn fold_audio_frames(seed: u64, frames: &[(i16, i16)]) -> u64 {
 /// the pair `count` vs `off` a measurement of AUDIO rather than a measurement of
 /// slicing.
 struct AudioCapture {
-    /// What happens to the mix once it has been rendered -- and, for `Skip`,
+    /// What happens to the mix once it has been rendered, and, for `Skip`,
     /// whether it is rendered at all. Resolved ONCE at construction so the run
     /// loop never reads an environment variable.
     mode: AudioSinkMode,
@@ -1521,7 +1521,7 @@ impl AudioCapture {
             render_ns: 0,
             // The GUI derives its OPL sample count from WALL time; pacing it from
             // GUEST time instead models a host that keeps up exactly, which is
-            // the condition to test first -- a mix that is silent even there is
+            // the condition to test first: a mix that is silent even there is
             // broken independently of how fast the emulator runs.
             opl_samples_per_cycle: AUDIO_CAPTURE_OPL_HZ
                 / clock.clocks_for_fraction_floor(1, 1).max(1) as f64,
@@ -1566,9 +1566,9 @@ impl AudioCapture {
                 self.pcm.extend(frames);
             }
             AudioSinkMode::Count => {
-                // The `Instant` pair is TWO clock reads per window -- ~16k windows
-                // on a duke3d-486 run, a few hundred microseconds against ~139 s
-                // -- and only the ARMED leg pays them. Like the fold below, that
+                // The `Instant` pair is TWO clock reads per window (~16k windows
+                // on a duke3d-486 run, a few hundred microseconds against ~139 s)
+                // and only the ARMED leg pays them. Like the fold below, that
                 // biases the measured share UPWARD: `S` comes out a conservative
                 // bound on the mix's own cost rather than an under-statement.
                 let started = std::time::Instant::now();
@@ -1582,7 +1582,7 @@ impl AudioCapture {
     }
 
     /// End of run. Mode-aware, and it must stay that way: this runs BEFORE the
-    /// wall reading, and the cost modes have no path to write to -- an earlier
+    /// wall reading, and the cost modes have no path to write to: an earlier
     /// shape would have serialized an empty WAV to a path it did not have.
     fn finish(&self) -> Result<(), Box<dyn Error>> {
         match &self.mode {
@@ -1621,7 +1621,7 @@ impl AudioCapture {
 /// `run_until_halt_or_cycles` call it has always been, so a run without
 /// `IZARRAVM_AUDIO_WAV` keeps its exact device-servicing boundaries.
 ///
-/// Returns the stop reason and the cycles actually spent -- a terminal stop ends
+/// Returns the stop reason and the cycles actually spent: a terminal stop ends
 /// the run partway through the request, and the caller's own pacing has to know.
 fn run_sliced(
     machine: &mut Machine,
@@ -1778,8 +1778,8 @@ fn run_boot_hdd_folder(
     // Headless capture of the HOST audio mix (`IZARRAVM_AUDIO_WAV=<path>`).
     // Everything else headless observes the guest SIDE of the sound card: the
     // per-second `[SB]` trace proves the DSP is programmed and that DMA is
-    // handing it real PCM, but `render_audio` -- the OPL + DSP + WSS + CD +
-    // speaker sum with the CT1745 gains applied -- only ever runs in the GUI,
+    // handing it real PCM, but `render_audio` (the OPL + DSP + WSS + CD +
+    // speaker sum with the CT1745 gains applied) only ever runs in the GUI,
     // so "the guest is producing audio" and "audio reaches the speakers" could
     // not be distinguished without a person and a pair of ears. This pumps the
     // same call the GUI's `pump_audio` does, paced by GUEST time (i.e. the
@@ -1829,7 +1829,7 @@ fn run_boot_hdd_folder(
         // One short slice per scancode, as `inject_command` does: the guest has
         // to poll INT 16h and consume each key before the next arrives, or the
         // type-ahead buffer swallows it. Mouse packets carry their own dwell,
-        // which is longer -- paced by the 8042's aux byte rate, and longer still
+        // which is longer, paced by the 8042's aux byte rate, and longer still
         // for a click, which has to outlast a frame.
         let per_key = guest_ms(2);
         let mut spent = 0u64;
@@ -1930,8 +1930,8 @@ fn run_boot_hdd_folder(
         dumper.finish();
     }
     // The wall reading comes FIRST. `record_host_phase_mark` routes to the full mark, which
-    // takes a `cpu_profile` snapshot when profiling is armed -- the untruncated hot-address sort
-    // that is at its largest exactly here, at end of run -- and a run with both the sampler and
+    // takes a `cpu_profile` snapshot when profiling is armed (the untruncated hot-address sort
+    // that is at its largest exactly here, at end of run) and a run with both the sampler and
     // `IZARRAVM_CPU_PROFILE` armed would otherwise absorb that snapshot into its headline wall.
     let wall = start_wall.elapsed();
     // Close the last periodic interval. Placed AFTER the run returns, so it cannot move a run
@@ -2052,8 +2052,8 @@ fn run_boot_hdd_folder(
     maybe_report_smc_trace(&mut machine);
     maybe_report_slow_read_histo(&machine);
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
-    // that the run loop returned, or its last partial buffer's worth of lines -- most
-    // often exactly the tail we care about -- is silently lost at process exit. This
+    // that the run loop returned, or its last partial buffer's worth of lines (most
+    // often exactly the tail we care about) is silently lost at process exit. This
     // is the path extender/game repros run through, so the flush matters most here.
     izarravm_cpu::flush_diff_trace();
 
@@ -2063,7 +2063,7 @@ fn run_boot_hdd_folder(
     println!("stop: {stop_reason:?}");
     // Ports nothing decoded. Silent when a run touches only modelled hardware,
     // so a line here means the guest went looking for something that is not
-    // there -- which used to be a fatal stop and is now just a note.
+    // there, which used to be a fatal stop and is now just a note.
     let open_bus = machine.open_bus_ports();
     if open_bus.reads() > 0 || open_bus.writes() > 0 {
         let ports: Vec<String> = open_bus.ports().map(|p| format!("{p:#06x}")).collect();
@@ -2108,7 +2108,7 @@ fn run_boot_hdd_folder(
         // this used to read `distira_scanout_state` first
         // because THAT call happened to drain Distira's triangle queue and
         // every other accessor below was `&self` and silently read whatever
-        // was left over -- an ordering that worked by luck, not by
+        // was left over, an ordering that worked by luck, not by
         // construction. `distira_census`/`distira_register_writes`/
         // `distira_register_reads`/`distira_aperture_traffic` are now
         // `&mut self` and each joins the raster queue itself
@@ -2243,7 +2243,7 @@ fn katea_counters_json(k: &izarravm_machine::KateaStorageCounters) -> serde_json
         "blocked_projection_keys": k.blocked_projection_keys,
         // The mount instrument. Levels, written once before the guest ran, so
         // unlike everything above them they are not a function of this session's
-        // guest activity at all -- they price the folder.
+        // guest activity at all: they price the folder.
         "mount_prime_ns": k.mount_prime_ns,
         "mount_seed_ns": k.mount_seed_ns,
         "mount_total_ns": k.mount_total_ns,
@@ -2360,7 +2360,7 @@ fn write_hdd_profile_json(
         // F14's `VL_WaitVBL` exit-rate instrument: vertical-retrace bit edges the guest observed
         // through its OWN 0x3DA/0x3BA reads, i.e. the number of times a retrace poll loop
         // EXITED. At mode 13h's 70.086 Hz both rows must read ~70.086 per guest second BY
-        // CONSTRUCTION, whatever the polls-per-frame figure is -- which is why this, and not the
+        // CONSTRUCTION, whatever the polls-per-frame figure is, which is why this, and not the
         // poll count, is the port repricing's self-certifying anchor. Diagnostic only.
         "retrace_poll_exits": {
             "reads": retrace_poll_reads,
@@ -2509,7 +2509,7 @@ fn write_hdd_profile_json(
             reflected_call_diagnostic_json(machine.cpu().reflected_call_diagnostic_snapshot());
     }
     // Slice 1 (record-and-measure): additive, unconditional on both arms of the KNOB within
-    // this build (plan section 7.4) -- all-zero / `{"armed":false}` when
+    // this build (plan section 7.4): all-zero / `{"armed":false}` when
     // `IZARRAVM_REFLECTED_CALL_MEMO` is unset. Gated under `feature = "reflected-call-memo"`
     // (not only the runtime knob), same shape as `reflected_call_diagnostic` above: a plain
     // build carries neither the key nor the module.
@@ -2618,7 +2618,7 @@ fn opl_diagnostics_json(
 /// (8 KiB, 4-way, 16-byte lines, 128 sets, pseudo-LRU), charging nothing. `enabled` is false
 /// unless `IZARRAVM_SHADOW_L1_PROBE=1`; every count is 0 when disabled, and `hit_ratio`
 /// reports 0.0 on an empty class rather than dividing by zero. Coverage is the interpreter /
-/// FastMap-direct access stream only -- see the `shadow_cache` module doc in
+/// FastMap-direct access stream only. See the `shadow_cache` module doc in
 /// `izarravm-machine` for what the JIT's bulk per-block charges leave uncovered.
 #[cfg(not(feature = "shadow-cache-probe"))]
 fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Value {
@@ -2647,7 +2647,7 @@ fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Va
 /// dividing by zero. Coverage: the interpreter / FastMap-direct access stream, PLUS (S1b) the
 /// JIT's per-block code-fetch stream once armed, PLUS (S1d slice 2) the DATA accesses of every
 /// Kth JIT block entry diverted to the interpreter (`sample_k`/`total_entries`/
-/// `sampled_entries`/`sampled_fraction`) -- see the `shadow_cache` module doc in
+/// `sampled_entries`/`sampled_fraction`). See the `shadow_cache` module doc in
 /// `izarravm-machine` for what remains unprobed (the un-sampled 1-1/K of JIT data accesses).
 #[cfg(feature = "shadow-cache-probe")]
 fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Value {
@@ -2704,7 +2704,7 @@ fn timer_json(machine: &izarravm_machine::Machine) -> serde_json::Value {
 /// access trace. Which part carries traffic says which music device the game
 /// drives; the trace's tick spacing says the tempo it drives it at.
 /// `output_messages`/`output_bytes` count at the GUI drain and read 0 in a
-/// headless profile -- see `MpuDiagnostics::output_messages`.
+/// headless profile. See `MpuDiagnostics::output_messages`.
 fn mpu_json(
     (wavetable, midi): (
         izarravm_machine::MpuDiagnostics,
@@ -2761,7 +2761,7 @@ fn sb_dsp_json(sb: izarravm_machine::SbDspDiagnostics) -> serde_json::Value {
 /// (`ticks_raw - overhead x marks`, allowed to go NEGATIVE and reported as such), because the
 /// aggregate subtraction is a modelling step and the reader has to be able to undo it. A phase
 /// whose corrected value lands within one `resolution_floor_ns` per mark of zero is reported
-/// `below_resolution: true` and never as "0" — design section 4 prices two phases at or under the
+/// `below_resolution: true` and never as "0": design section 4 prices two phases at or under the
 /// floor, and the instrument must say so rather than report them free.
 ///
 /// The section 6 fit is NOT computed here: the bins are exported and
@@ -2782,8 +2782,8 @@ fn direct_entry_attribution_json(
     };
     let tsc_hz = snapshot.tsc_hz as f64;
     // `tsc_hz` is derived from an `Instant` pair across the run and is zero only if the run was
-    // too short to measure or the TSC did not advance. `serde_json` cannot encode a NaN -- it
-    // serialises as `null` and every downstream ratio becomes unreadable -- so an unusable clock
+    // too short to measure or the TSC did not advance. `serde_json` cannot encode a NaN (it
+    // serialises as `null` and every downstream ratio becomes unreadable) so an unusable clock
     // yields 0.0 and the `tsc_hz: 0` field is what tells the reader the ns columns are void.
     let ns_of = |ticks: f64| {
         if tsc_hz > 0.0 {
@@ -2920,7 +2920,7 @@ fn direct_entry_attribution_json(
         // identity, or it over-counts by exactly this many. Emitted here so the report does not
         // have to reach into another object for it.
         "decode_pack_late_view_miss": decode_pack_late_view_miss,
-        // The `run.rs` line the P0 mark sits on -- the line `above_p0_mark` partitions the
+        // The `run.rs` line the P0 mark sits on, the line `above_p0_mark` partitions the
         // refusal sites by, published so the reader is not left inferring it.
         "p0_mark_line": P0_MARK_LINE,
         "phase_names": PHASE_NAMES,
@@ -3106,7 +3106,7 @@ fn direct_barrier_census_json(
     // The `RetryCause::AdmissionMatrix` per-reason split:
     // the two `stack_width_kind`
     // producers of that cause, told apart. `NEW BLOCK`, not folded into `admission_declines`
-    // above -- that array means something else (dispatcher-entry declines) and the corpus already
+    // above: that array means something else (dispatcher-entry declines) and the corpus already
     // carries legs on disk that read it.
     #[cfg(feature = "direct-admission-census")]
     let report = {
@@ -3453,7 +3453,7 @@ fn smc_census_assert_phase_closed(phase: &izarravm_cpu::DirectSmcCensusPhase) {
     assert_eq!(totals.lane_accepts, units.lane_accept_keys);
     assert_eq!(totals.page_keys_len_sum, units.page_keys_len_sum);
     // `no_kill_visits` has no independent counter to close against, which is exactly how it sat
-    // dead — declared, summed and exported as a false zero — through the first review. Bound it
+    // dead (declared, summed and exported as a false zero) through the first review. Bound it
     // on both sides instead. Killing page VISITS are `page_removes - no_kill_visits`; every
     // killing CALL contains at least one of them, and each one kills at least one key. A dead
     // counter reads `page_removes - 0`, which blows the upper bound by orders of magnitude.
@@ -3619,9 +3619,9 @@ fn direct_callout_attribution_json(
     let Some(snapshot) = snapshot else {
         return serde_json::Value::Null;
     };
-    // EVERY structural check this writer used to restate -- row count, row order and labels,
+    // EVERY structural check this writer used to restate (row count, row order and labels,
     // per-row closure, totals, port ordering, and the ports-table identity over the port-class
-    // helpers -- now lives once, on the producer's own type
+    // helpers) now lives once, on the producer's own type
     // (`DirectCallOutAttributionSnapshot::assert_closed` in izarravm-cpu). The duplicated
     // versions are exactly what went stale: a four-name label list survived two helpers landing,
     // and the ports identity was written as a literal `{0, 4}` index sum in both crates and
@@ -3672,7 +3672,7 @@ fn direct_callout_attribution_json(
 /// a 512-byte call paid three times more latency than transfer, so the effective
 /// rate was a property of the call SIZE rather than of the modelled 16.7 MB/s,
 /// and 98.7% of a Duke Nukem 3D load was single-sector. That latency is now ZERO,
-/// so the histogram no longer predicts a rate — read it as the call-size shape of
+/// so the histogram no longer predicts a rate: read it as the call-size shape of
 /// the workload, and read `stall_ticks` against `read_sectors - cache_hits` for
 /// the charge.
 ///
@@ -3727,7 +3727,7 @@ fn device_timing_json(machine: &izarravm_machine::Machine) -> serde_json::Value 
     serde_json::Value::Object(map)
 }
 
-/// Slice 9A: the 8259A INTA instrument -- always-on, never gated by
+/// Slice 9A: the 8259A INTA instrument, always-on, never gated by
 /// `IZARRAVM_DEVICE_TIMING`. `histogram` buckets are
 /// `[0], [1,2), [2,4), [4,8), [8,16), [16,32), [32,64), [64,128), [128,256),
 /// [256,512), [512, inf)` in guest clocks (`InterruptEntryDiagnostics`).
@@ -3830,7 +3830,7 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 // per device advance that carried bytes) and must never be
                 // graded on; it is here so the ratio against `cd_pio_bytes` can
                 // be read as batch shape. `atapi_packet_commands` is the
-                // batch-invariant command count -- one per 2048-byte sector
+                // batch-invariant command count, one per 2048-byte sector
                 // under TOKACD, i.e. the sector rate, which is what a per-sector
                 // assertion needs and what the 2026-08-20 disk-read audit had to
                 // infer from `brk_step` for want of this column.
@@ -3908,7 +3908,7 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 // dip window. Absolute, like everything else here.
                 // Bytes written into device (VGA aperture) memory. In Duke's
                 // 320x200 screen-buffered mode one presented frame is a 64,000-byte
-                // blit to 0xA0000, so this is a real per-interval FRAME COUNTER --
+                // blit to 0xA0000, so this is a real per-interval FRAME COUNTER,
                 // the thing a min-FPS hitch has to be found in. `smc_lane_accepts`
                 // is NOT a substitute: it counts lane admissions, which stop once a
                 // lane is established, and it varies 80x across a steady demo.
@@ -4091,7 +4091,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         // The `0xE6` row's RECONCILIATION NUMERATOR, and the only always-on one it has: the
         // per-port `direct_callout_attribution` table is behind a feature and is keyed by port
         // rather than by helper, so it cannot answer "did the OUT arm serve anything" on a plain
-        // census build -- which is the acceptance question for a default-OFF row whose ON arm is
+        // census build, which is the acceptance question for a default-OFF row whose ON arm is
         // supposed to make a barrier census row disappear.
         "jit_direct_callout_port_out_imm8_served": snapshot.callout_port_out_imm8_served,
         // `0xEE`'s reconciliation numerator, the DX-port twin of the row above. Unlike `0xE6` this
@@ -4190,7 +4190,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         // reason the six lane counters above are: the ON and OFF legs of that slice share ONE
         // binary, so the ARM has to be readable out of the run's own JSON rather than out of which
         // binary ran. All four are zero on the OFF arm by construction, which makes a zero ON
-        // reading a VACUOUS leg -- the knob was not exported -- and not an inert result.
+        // reading a VACUOUS leg (the knob was not exported) and not an inert result.
         "jcc_sites_simple": snapshot.jcc_sites_simple,
         "jcc_sites_overflow": snapshot.jcc_sites_overflow,
         "jcc_sites_signed_xor": snapshot.jcc_sites_signed_xor,
@@ -4211,7 +4211,7 @@ fn direct_stall_json(snapshot: &izarravm_cpu::DirectStallSnapshot) -> serde_json
         "smc_disp_load_widen_lane_cap_refusals": snapshot.disp_load_widen_lane_cap_refusals,
         "decode_pack_late_view_miss": snapshot.decode_pack_late_view_miss,
         // The far-transfer slice's ledger and its three refusal cells, shared by native RETF
-        // (`far_ret_native`) and, since L8, native CALL FAR ptr16:16 (`far_call_native`) --
+        // (`far_ret_native`) and, since L8, native CALL FAR ptr16:16 (`far_call_native`):
         // one knob, `IZARRAVM_DIRECT_RETF_V86` (default `v86` since the 2026-08-24 ladder), gates
         // both. All zero on the `0` ESCAPE, which is the cheapest check that a ladder leg named
         // the arm it meant to, and all live on a default binary. Unconditional here for the
@@ -4448,8 +4448,8 @@ const SLOW_READ_REGIONS: [(&str, u32, u32); 6] = [
 /// `slow_read_page` lines, then one `slow_read_total` line carrying the histogram's own sum
 /// against `data_slow_reads`.
 ///
-/// The total line is not decoration. One `data_slow_reads` contributor -- the REP CMPS destination
-/// read in `strings.rs` -- is deliberately not bucketed because it holds a PHYSICAL address, so
+/// The total line is not decoration. One `data_slow_reads` contributor (the REP CMPS destination
+/// read in `strings.rs`) is deliberately not bucketed because it holds a PHYSICAL address, so
 /// the two numbers agreeing is what licenses reading the region split as the whole story.
 fn slow_read_histo_lines(
     pages: &[(u32, u64)],

@@ -32,7 +32,7 @@ fn source_is_object_safe_behind_arc() {
 #[test]
 fn frame_past_the_decoded_region_is_absent() {
     // None means "not decoded yet", which the mixer renders as silence. It is
-    // deliberately not distinguishable from "no such frame" -- see the spec's
+    // deliberately not distinguishable from "no such frame". See the spec's
     // "What the listener actually loses".
     let source = PartialSource;
     assert!(source.frame(2).is_none());
@@ -43,7 +43,7 @@ fn frame_past_the_decoded_region_is_absent() {
 fn a_source_survives_the_move_to_a_worker_thread() {
     // This is what pins `Send + Sync`. `Arc<dyn AudioTrackSource>` builds with or
     // without those supertraits, so the test above it would keep passing if they
-    // were dropped -- and they are exactly what looks removable to someone
+    // were dropped, and they are exactly what looks removable to someone
     // reading this file before the decoder's worker thread exists to need them.
     // Sending the Arc across a thread boundary requires both, so removing either
     // one fails here instead of much later.

@@ -375,8 +375,8 @@ impl Sampler {
         let mut beyond_samples = 0u64;
         // (samples, rip, name, displacement, recorded size) for every address
         // past its symbol's extent. These stay in the main tables under the
-        // preceding symbol's name — the 2026-08-06 doom-586 report is only
-        // comparable if attribution semantics hold still — and are ALSO listed
+        // preceding symbol's name (the 2026-08-06 doom-586 report is only
+        // comparable if attribution semantics hold still) and are ALSO listed
         // raw so a hot symbol-poor gap can be seen instead of inferred.
         let mut beyond_rows: Vec<(u64, u64, String, u64, u32)> = Vec::new();
         // Physical conservation: every address is resolved by the OLD
@@ -532,7 +532,7 @@ impl Sampler {
         }
 
         // The raw-sample sidecar: written last, after the report, and never
-        // read back by anything in this run -- see the module doc.
+        // read back by anything in this run. See the module doc.
         let samples_path = sidecar_path(out_path);
         match write_sidecar(&samples_path, module_base, &per_phase) {
             Ok(()) => eprintln!(
@@ -556,7 +556,7 @@ struct Frame {
 ///
 /// `physical_new` is the physical (never-inlined) symbol, re-derived through
 /// `SymFromInlineContextW(..., INLINE_FRAME_CONTEXT_IGNORE, ...)` rather than
-/// carried over from `resolve_symbol`'s `SymFromAddrW` call -- that
+/// carried over from `resolve_symbol`'s `SymFromAddrW` call: that
 /// independence is what gives the conservation check (see
 /// [`conservation_mismatch`]) any power at all. It is not rendered in the
 /// report; the report's physical tables come from the untouched
@@ -647,7 +647,7 @@ fn render_inline_views(
             continue;
         };
         *depth_hist.entry(res.chain.len()).or_default() += n;
-        // chain[0] is the INNERMOST frame -- see InlineResolution's doc.
+        // chain[0] is the INNERMOST frame. See InlineResolution's doc.
         if let Some(innermost) = res.chain.first() {
             *exclusive
                 .entry((innermost.name.as_str(), innermost.site.as_str()))
@@ -797,7 +797,7 @@ fn beyond_extent(displacement: u64, size: u32) -> bool {
 /// (`SymFromInlineContextW(..., IGNORE, ...)`) one for the same address.
 /// `None` when they agree on name and on beyond-extent status; `Some(reason)`
 /// describing the disagreement otherwise. A resolver that kept the old value
-/// forward for the "new" column would make this tautological -- see the
+/// forward for the "new" column would make this tautological. See the
 /// module doc's "physical conservation" paragraph.
 fn conservation_mismatch(
     old: Option<&(String, u64, u32)>,
@@ -858,11 +858,11 @@ fn resolve_line_at_context(process: HANDLE, rip: u64, ctx: u32) -> Option<String
 /// deepest frame, the one actually executing at that address; `chain.last()`
 /// is the shallowest inline site, nearest the physical function. This is
 /// `SymQueryInlineTrace`'s own context-walk order (`ctx, ctx+1, ...`), not an
-/// assumption -- the design this instrument implements explicitly flagged the
+/// assumption: the design this instrument implements explicitly flagged the
 /// direction as unsettled by its precondition spike, and it was settled here
 /// empirically against a real multi-level chain (see [`InlineResolution`]).
 /// Empty when `SymAddrIncludeInlineTrace` reports no inline records for this
-/// address, which is the ordinary case for code nothing was inlined into --
+/// address, which is the ordinary case for code nothing was inlined into,
 /// NOT an error, and not evidence either way about whether inlining happened
 /// elsewhere in the binary.
 fn resolve_inline_chain(process: HANDLE, rip: u64) -> Vec<Frame> {
@@ -903,7 +903,7 @@ fn resolve_inline_chain(process: HANDLE, rip: u64) -> Vec<Frame> {
 /// resolution: a loaded PDB (`SymType == SymPdb`, 3) carrying line numbers. A
 /// stripped export-only fallback, a deferred load that never found its PDB, or
 /// a mismatched PDB all resolve zero inline frames, which reads as "nothing is
-/// inlined" when it means "nothing was loaded" -- see the
+/// inlined" when it means "nothing was loaded". See the
 /// `SYMOPT_DEFERRED_LOADS` comment in `stop_and_report`.
 fn symbols_are_trustworthy(sym_type: i32, line_numbers: i32) -> bool {
     sym_type == SYM_PDB && line_numbers != 0
@@ -917,7 +917,7 @@ fn achieved_interval(sample_count: usize, window: Duration) -> Option<Duration> 
 }
 
 /// The report header's sample-count line, stating the ACHIEVED sampling rate
-/// beside the nominal `SAMPLE_INTERVAL` requested -- see the module doc for
+/// beside the nominal `SAMPLE_INTERVAL` requested. See the module doc for
 /// why they differ by about 2x on this platform. Every report before this
 /// change printed only the nominal figure, which was never the true rate.
 fn sample_rate_line(total: u64, window: Option<Duration>, interval: Option<Duration>) -> String {

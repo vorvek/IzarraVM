@@ -98,7 +98,7 @@ fn missing_keys_fall_back_to_defaults() {
 }
 
 /// `monitor_gamma = None` ("Raw") must round-trip as itself, not fall back to
-/// the default the way an absent key does -- an explicit choice to go raw
+/// the default the way an absent key does: an explicit choice to go raw
 /// must stick across a save/load cycle.
 #[test]
 fn raw_monitor_gamma_round_trips_as_none() {
@@ -332,7 +332,7 @@ fn retired_glide_render_threads_key_is_ignored_and_not_written() {
 ///
 /// Dropping beats carrying over. `amp_gain` was retired once already, and its
 /// persisted values were calibrated against a chain with a 12.0x compensator in
-/// it -- the loader only ever CLAMPED, so every file written before that fix
+/// it: the loader only ever CLAMPED, so every file written before that fix
 /// kept running the output stage at +21.6 dB into the clamp. `output_gain`
 /// replaced it and shipped for one branch. There is no factor that is right for
 /// both a default nobody chose and a level a user picked by ear, so the file
@@ -398,7 +398,7 @@ master_volume = 0.25
 /// This is the whole compatibility story for `master_volume` going above 1.0:
 /// the accepted interval only grew, so every value an older build could have
 /// written is still inside it and still means the level it always meant. That is
-/// why there is no new retired key and no rescale -- unlike `amp_gain` above,
+/// why there is no new retired key and no rescale, unlike `amp_gain` above,
 /// which changed what its numbers MEANT and had to be dropped. Assert the
 /// legacy values load untouched, that an above-unity value survives the round
 /// trip, and that the ceiling still catches a hand-edited file.
@@ -470,8 +470,8 @@ fn prefs_path_sits_beside_c_root() {
 }
 
 /// The Glide gamma toggle must round-trip both settings, and a preferences
-/// file written before the key existed must load as `Compatible` -- the
-/// owner-specified default -- rather than as the hardware-faithful setting.
+/// file written before the key existed must load as `Compatible` (the
+/// owner-specified default) rather than as the hardware-faithful setting.
 #[test]
 fn glide_gamma_round_trips_and_defaults_to_compatible() {
     assert_eq!(GuiPrefs::default().glide_gamma, GlideGamma::Compatible);

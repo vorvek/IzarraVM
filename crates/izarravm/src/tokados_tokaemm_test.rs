@@ -41,8 +41,8 @@ impl TokaEmmScenario {
 /// the CPU in V86, and stopping early once `done` is satisfied or the guest
 /// exits.
 ///
-/// Sampling `in_v86()` is the only way to observe V86 residency -- nothing
-/// counts it -- and it has two biases that make a coarse sample useless:
+/// Sampling `in_v86()` is the only way to observe V86 residency (nothing
+/// counts it) and it has two biases that make a coarse sample useless:
 ///
 /// * A burst ends where the timing model puts a seam, and seams cluster on
 ///   device deadlines and interrupt entries, which is exactly where the CPU is
@@ -106,7 +106,7 @@ const MIN_V86_SAMPLES: u32 = 5;
 
 /// Sample budget for a whole-boot row. At `sample_v86_while_busy`'s 200k-cycle
 /// burst this is ~800M emulated cycles, which is the same ceiling the
-/// non-sampled boot rows pass to `run_until_halt_or_cycles` — enough for
+/// non-sampled boot rows pass to `run_until_halt_or_cycles`, enough for
 /// `LH TOKAMOUS + MEM` (or a VCPISW round trip) to reach its verdict with room
 /// to spare, and bounded so a wedged machine fails instead of hanging.
 const SAMPLE_BUDGET: u32 = 4_000;
@@ -165,7 +165,7 @@ fn tokaemm_scenario_owns_mounted_machine_and_scratch() {
 
 /// `DEVICE=C:\DOS\TOKAEMM.SYS` puts the running kernel into V86
 /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
-/// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
+/// booting to C:\>: every instruction and hardware IRQ from the DEVICE= line
 /// onward runs virtualized. The gate: the DOS prompt reaches the screen.
 ///
 /// CONFIG.SYS and TOKAEMM.SYS are both passed as `mount_hdd_folder_with`
@@ -204,7 +204,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     let prompts_before = text.to_ascii_lowercase().matches("c:\\>").count();
 
     // Run a command at the virtualized prompt: type `VER` and confirm the shell
-    // executes it and returns to a fresh prompt — interactive DOS in V86.
+    // executes it and returns to a fresh prompt: interactive DOS in V86.
     for ch in "ver\r".chars() {
         for code in ascii_to_set1(ch) {
             machine.inject_key_scancodes(&[code]);
@@ -232,7 +232,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// What the whole TSS geometry of a live TOKAEMM monitor is, measured rather than read off the
 /// assembler source.
 #[derive(Debug, Clone, Copy)]
-// Every field is read, but only through `Debug` -- which dead-code analysis does not count. They
+// Every field is read, but only through `Debug`, which dead-code analysis does not count. They
 // are here to be PRINTED: the design owes a measured TR.base/io_base, not a boolean.
 #[allow(dead_code)]
 struct TssIoProbe {
@@ -254,7 +254,7 @@ struct TssIoProbe {
 /// geometry the guest chooses:
 ///
 /// * `TR.base + 0x66` must be EVEN, or `should_split` rejects the word and the pure peek returns
-///   `None` on every single call -- the helper would refuse always and the slice would be inert;
+///   `None` on every single call: the helper would refuse always and the slice would be inert;
 /// * the word must be page-local, which is phase P's own P2 test;
 /// * the bitmap byte for the polled port must be inside `TR.limit` and clear, or the interpreter
 ///   raises `#GP(0)` and there is nothing to serve;
@@ -266,7 +266,7 @@ struct TssIoProbe {
 #[test]
 #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
 fn tokaemm_tss_io_bitmap_is_readable_by_a_pure_preflight_probe() {
-    // 0x3DA is wolf3d's VL_WaitVBL poll -- the address the whole lever exists for.
+    // 0x3DA is wolf3d's VL_WaitVBL poll, the address the whole lever exists for.
     const PROBE_PORT: u16 = 0x03da;
 
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
@@ -474,7 +474,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
             // could not fail. It read
             //     cr3 + TABLES_BYTES <= base + tables_off + TABLES_BYTES + SLACK
             // in which TABLES_BYTES CANCELS. Whatever value it held, the test
-            // only ever asserted that CR3's page-rounding stayed under 0xFF0 --
+            // only ever asserted that CR3's page-rounding stayed under 0xFF0,
             // never that the tables fit the reservation, which is what its
             // message claimed. Deriving the reservation end from the same
             // formula the driver uses cannot check that the driver's formula is
@@ -520,7 +520,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
 
 /// A guest program install-checks XMS, allocates a 64 KB EMB,
 /// locks it, moves a pattern conventional->EMB->conventional, verifies it, then
-/// unlocks and frees — all in V86 under TOKAEMM's monitor (block MOVE traps to
+/// unlocks and frees, all in V86 under TOKAEMM's monitor (block MOVE traps to
 /// the monitor's flat memcpy). XMSTEST.COM signals 0xA5 (success) via the
 /// unit-tester exit port; any other code names the step that broke, and the
 /// fixture's own failure-label block is the key.
@@ -531,7 +531,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
 ///
 /// The config is NOEMS so host EMS reserves no extended RAM and the guest XMS
 /// driver owns all of it. EMS coexistence is covered separately.
-/// XMSTEST runs from AUTOEXEC, so the machine stops as soon as it signals — no
+/// XMSTEST runs from AUTOEXEC, so the machine stops as soon as it signals: no
 /// interactive settling needed.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
@@ -626,7 +626,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// With DEVICE=TOKAEMM.SYS + DOS=UMB, a guest program sets
 /// the high-first allocation strategy and AH=48h-allocates a block that lands in
 /// upper memory (segment >= 0xC800) with real RAM behind it (write/read a
-/// pattern) — proving TOKAEMM page-mapped extended RAM into the upper holes and
+/// pattern), proving TOKAEMM page-mapped extended RAM into the upper holes and
 /// FreeDOS's DOS=UMB linked our region. UMBTEST signals 0xA5 via the exit port;
 /// a 0xEn code names the failed step.
 #[test]
@@ -669,8 +669,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 /// Drives TOKAEMM's XMS 10h/11h/12h directly (no
-/// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach — the
-/// too-big probe, alloc, grow, release, reuse-after-free — plus a write/read of
+/// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach: the
+/// too-big probe, alloc, grow, release, reuse-after-free, plus a write/read of
 /// the paged RAM. UMBMECH signals 0xA5; a 0xEn code names the failed step.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
@@ -712,7 +712,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 /// With DEVICE=TOKAEMM.SYS RAM, a guest program drives the
-/// LIM EMS 4.0 API — version, frame segment, page counts, allocate — then maps
+/// LIM EMS 4.0 API (version, frame segment, page counts, allocate) then maps
 /// logical pages through the frame slots, writing distinct patterns and reading
 /// them back through OTHER slots: the runtime page remap through the paged
 /// frame, serviced by the monitor's INT 0xC0 'PM' PTE-rewrite. EMSTEST signals
@@ -758,7 +758,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 
 /// With DEVICE=TOKAEMM.SYS RAM and DOS=UMB, the UMB
 /// window ends below the EMS page frame (umb_win_end = 0xE000) and DOS=UMB
-/// still links and allocates upper memory from the carved window — the frame
+/// still links and allocates upper memory from the carved window: the frame
 /// and the UMBs share the upper area under the guest driver's own bookkeeping.
 /// Reuses the UMBTEST fixture (seg >= 0xC800 + write/read pattern).
 #[test]
@@ -801,7 +801,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 /// DEVICE=TOKAEMM.SYS NOEMS
-/// presents a FRAMELESS manager — INT 67h answers present/version 4.0, the
+/// presents a FRAMELESS manager: INT 67h answers present/version 4.0, the
 /// frame query returns 80h, page counts are zero, and allocation is refused
 /// with 87h (the EMM386 NOEMS contract). EMSNONE signals 0xA5 / 0xEn.
 #[test]
@@ -844,7 +844,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 /// VCPI presence under DEVICE=TOKAEMM.SYS NOEMS (frameless mode,
-/// no EMS pool — the stock-boot shape), INT 67h AX=DE00h answers VCPI 1.0
+/// no EMS pool, the stock-boot shape), INT 67h AX=DE00h answers VCPI 1.0
 /// present (AH=0, BX=0100h), a not-yet-implemented DExx subfunction
 /// answers 8Fh, untouched registers survive the call, and the plain EMS
 /// interface keeps working on the shared vector. VCPIDET signals
@@ -1001,11 +1001,11 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// stub waits: the request latches in the IRR and the ISR stays empty. The
 /// client then requires, on the far side, that IS0 is clear and that the chip
 /// still acknowledges (an OCW3 poll, since the PM leg runs with IF=0). A
-/// monitor that strands the interrupt fails here with 0xED (`pm_f_held`) -- the
+/// monitor that strands the interrupt fails here with 0xED (`pm_f_held`), the
 /// state Tomb Raider and Grand Prix 2 froze in, their clocks stopped by a stuck
 /// highest-priority ISR bit. 0xEE (`pm_f_dead`) is the softer variant: IS0
 /// cleared, but nothing is acknowledgeable any more. 0xD1 says no request ever
-/// became visible, so the fixture would have proved nothing -- a guard against
+/// became visible, so the fixture would have proved nothing: a guard against
 /// the test silently becoming vacuous.
 ///
 /// The precondition used to be read from the ISR (OCW3 0x0B) instead: the
@@ -1049,7 +1049,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         // `vcpi_pm_to_v86`'s `mov dword [esp+0x10], 0x00023002` is the second
         // of tokaemm.asm's two
         // sites that stamp IOPL into a V86 EFLAGS image, and the boot-sampling
-        // rows never reach it -- a plain `LH TOKAMOUS + MEM` boot only ever
+        // rows never reach it: a plain `LH TOKAMOUS + MEM` boot only ever
         // enters V86 through `pm_init`. Asserting IOPL 3 here is what closes
         // that gap: a regression that dropped IOPL only on the VCPI re-entry
         // path would leave every other row in the suite green.
@@ -1087,7 +1087,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// A V86 program hooks INT 0Dh and
 /// executes a privileged instruction the monitor does not emulate (the
 /// literal DOS16M o32 LGDT startup shape) receives its own reflected
-/// fault with fault-IP semantics and can skip-and-resume — instead of
+/// fault with fault-IP semantics and can skip-and-resume, instead of
 /// the old signal32 diagnostic abort. GPREFLCT signals 0xA5 / 0xEn.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
@@ -1130,8 +1130,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 
 /// VCPI privileged-0F emulation for the 386MAX GP_ESCOD surface: a V86
 /// task executes MOV r32,CR0/CR3/CR2, MOV CR0,r32 (with PE|PG cleared in
-/// the source — the monitor must force them back on), CLTS, and LMSW —
-/// all #GP at CPL 3 — and the monitor must EMULATE them transparently
+/// the source: the monitor must force them back on), CLTS, and LMSW
+/// (all #GP at CPL 3) and the monitor must EMULATE them transparently
 /// (the extender CR0-probe path) instead of reflecting a fault.
 /// GPEMUL signals 0xA5 / 0xEn.
 #[test]
@@ -1176,7 +1176,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// A ring-0 #GP inside the monitor itself must end in the monitor's named
 /// diagnostic exit (0xD3), never in a fault storm. GPSTORM is a minimal
 /// VCPI client whose PM->V86 DE0C return frame carries an EIP above
-/// 0xFFFF: the monitor's own IRETD then faults #GP(0) at ring 0 -- the
+/// 0xFFFF: the monitor's own IRETD then faults #GP(0) at ring 0, the
 /// stage-1 corpus triage's finding G1, iteration 0 (baroll, SpacPlum,
 /// MontyNrm). The unfixed vec13_entry classified that frame by error-code
 /// VALUE, misparsed it, and re-faulted 615 times while ESP walked through
@@ -1225,7 +1225,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 
 /// A fresh empty user folder gets the current defaults seeded
 /// (`ensure_user_config`): DEVICE=TOKAEMM.SYS RAM + DOS=HIGH,UMB + LH
-/// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
+/// TOKAMOUS, and the boot reaches a C:\> prompt RUNNING IN V86 under the
 /// TOKAEMM monitor, with the driver's signon banner on screen.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
@@ -1596,7 +1596,7 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
 }
 
 /// MS-DOS 6.22's MEM does not print an `Expanded (EMS)` row when the manager
-/// simulates EMS out of extended memory -- it prints one starred extended row
+/// simulates EMS out of extended memory: it prints one starred extended row
 /// and a footnote, because there is one pool and a second row would
 /// double-count it. TOKAEMM is that kind of manager now, so MEM must say so.
 #[test]
@@ -1835,7 +1835,7 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
 ///
 /// Why that class is now impossible: there is no monitor-stamped image. The
 /// guest runs at real IOPL 3, its CLI/STI/PUSHF/POPF/IRET execute for real, and
-/// real IF simply IS the guest's IF -- so IF=0 in V86 is the CORRECT state
+/// real IF simply IS the guest's IF, so IF=0 in V86 is the CORRECT state
 /// whenever the guest has disabled interrupts, and the old assertion would now
 /// fire on healthy behaviour. Deleting it outright is how the PoP class comes
 /// back, though, so it is replaced rather than removed.
@@ -1843,21 +1843,21 @@ fn tokaemm_mem_p_summary_restores_memory_map() {
 /// What THIS guards: any V86 entry point that forgets to put IOPL 3 in the
 /// frame. If one does, the sensitive set silently starts trapping again and the
 /// monitor quietly reverts to emulating what it no longer has code to emulate.
-/// `signal32 0xD6` catches that loudly -- but only on a path the guest actually
+/// `signal32 0xD6` catches that loudly, but only on a path the guest actually
 /// executes; this catches it on every path the sampler observes, whether or not
 /// the guest happens to run a CLI there.
 ///
 /// COVERAGE BOUNDARY, stated because it is not obvious: tokaemm.asm stamps IOPL
-/// into a V86 EFLAGS image at exactly two sites -- `pm_init`'s
+/// into a V86 EFLAGS image at exactly two sites (`pm_init`'s
 /// `push dword 0x00023202` and `vcpi_pm_to_v86`'s
 /// `mov dword [esp+0x10], 0x00023002` (both unique on grep, which is how to
-/// find them; line numbers here have gone stale twice) -- and this row's
+/// find them; line numbers here have gone stale twice)) and this row's
 /// `LH TOKAMOUS +
 /// MEM` boot only ever enters V86 through the first, so it cannot see a
 /// regression confined to the VCPI re-entry path. That second site is covered
 /// by `tokaemm_vcpi_m3_de0c_switch_round_trip`, which samples the same
 /// assertion across a real DE0C round trip; between them both sites are
-/// sampled. Keep it that way -- dropping the sampling from either row reopens
+/// sampled. Keep it that way: dropping the sampling from either row reopens
 /// half the invariant.
 ///
 /// Cheap: reuses the MEM harness's boot (LH TOKAMOUS + MEM reaches a prompt in
@@ -1882,7 +1882,7 @@ fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
     let machine = &mut scenario.machine;
 
     // Every sample point that lands in V86 is one check of the invariant, so
-    // the fine sampling is not only what makes the test reliable -- it is what
+    // the fine sampling is not only what makes the test reliable: it is what
     // gives it teeth. The old 20M-cycle bursts got roughly one V86 sample per
     // run, when they got one at all.
     let (in_v86_samples, _, _) = sample_v86_while_busy(
@@ -1915,8 +1915,8 @@ fn tokaemm_v86_iopl_is_always_three_across_a_boot() {
 /// real IF actually moves with the guest, by requiring at least one V86 sample
 /// with IF=0 and at least one with IF=1 across a boot.
 ///
-/// Without this, a monitor that regressed to pinning real IF open forever --
-/// exactly the pre-IOPL-3 behaviour this design removed -- would still satisfy
+/// Without this, a monitor that regressed to pinning real IF open forever
+/// (exactly the pre-IOPL-3 behaviour this design removed) would still satisfy
 /// every other row in the suite, including the IOPL-3 invariant above. DOS
 /// brackets its IRQ-sensitive regions with CLI/STI constantly, so both states
 /// are reached many times over during a normal boot; seeing only one of them is
@@ -1983,9 +1983,9 @@ fn tokaemm_real_if_tracks_the_guest_across_a_boot() {
 }
 
 /// Audit items 3+10 external tool batch (toka-dos/freedos/VENDOR.md): smoke
-/// tests three of the newly-vendored tools in one boot -- ATTRIB (set +
+/// tests three of the newly-vendored tools in one boot: ATTRIB (set +
 /// query the read-only flag), CHOICE (piped default answer), and FIND
-/// (string match against a text file) -- each producing assertable screen
+/// (string match against a text file), each producing assertable screen
 /// output. The rest of the batch (MORE, LABEL, DELTREE) are covered by "the
 /// image builds and boots" (the default-boot e2e test above stays green).
 #[test]
@@ -2059,7 +2059,7 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
 }
 
 /// XCOPY (toka-dos/tools-src/xcopy/xcopy.c, an original Toka-DOS project
-/// tool, not vendored -- see toka-dos/msdos4/VENDOR.md): builds a small
+/// tool, not vendored; see toka-dos/msdos4/VENDOR.md): builds a small
 /// source tree (a top-level file plus a subdirectory with its own file),
 /// copies it recursively with `/S /Y`, then verifies the copy landed at
 /// the right depth (TYPE on the nested file) and that DIR + the XCOPY
@@ -2244,7 +2244,7 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
 /// that, with IP == 0 as the historically hostile case.
 ///
 /// IRQ5IP0 makes IP == 0 the common case with SB16 auto-init DMA (NOT the
-/// one-shot DSP 0xF2, whose re-arm races the ISR -- see the fixture header):
+/// one-shot DSP 0xF2, whose re-arm races the ISR; see the fixture header):
 /// once armed, the DMA block boundary raises IRQ5 continuously on the card's
 /// own schedule while the guest simply parks on a `jmp $` at offset 0 of a
 /// segment, so deliveries land at IP == 0 with no re-arm. This test is RED
@@ -2293,7 +2293,7 @@ fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
 /// DOS/16M decides whether XMS shares a pool with the other memory interfaces
 /// by taking every free XMS kilobyte and re-reading their free counts. TOKAEMM
 /// must answer honestly in both directions or a DOS/4GW client keeps the XMS
-/// block and finds the VCPI pool empty -- the `DOS/16M error: [23] no memory
+/// block and finds the VCPI pool empty: the `DOS/16M error: [23] no memory
 /// for VCPI page table` that this whole change exists to fix. EMS enabled: the
 /// NOEMS path was always honest because it probes VCPI DE03 instead.
 #[test]
@@ -2341,7 +2341,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// handle's logical pages need not land in one contiguous run. This fixture
 /// proves that against a deliberately fragmented pool: it reads the pool's
 /// actual free count (`AH=42h`; there is no fixed-192-page partition to pin a
-/// baseline to any more, and the pool need not even start fully free -- the
+/// baseline to any more, and the pool need not even start fully free: the
 /// shell's own XMS-swap block for running this child may already hold part
 /// of it, which is now normal since EMS and XMS share one pool), derives a
 /// uniform hole size from that total split across 32 handles, drains the
@@ -2350,7 +2350,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// single hole then doubles as a discriminator rather than a hard gate: on
 /// the non-contiguous allocator it always succeeds (satisfying it only costs
 /// one free page at a time, not a run), so the fixture releases that probe
-/// handle and moves on to a fresh, larger request -- proved to succeed by
+/// handle and moves on to a fresh, larger request, proved to succeed by
 /// writing and reading back a per-page signature through the frame after
 /// mapping each of its logical pages.
 #[test]
@@ -2399,7 +2399,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 
 /// Run one guest .COM from AUTOEXEC under a bare `DEVICE=C:\DOS\TOKAEMM.SYS`
 /// and return the stop reason and the screen text. Every fixture in the
-/// INTA-invariant block below has the same shape -- one COM, one exit code --
+/// INTA-invariant block below has the same shape (one COM, one exit code)
 /// and differs only in which COM it runs and what its codes mean.
 fn run_tokaemm_com(label: &str, name: &str, com: &[u8]) -> (StopReason, String) {
     let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
@@ -2473,19 +2473,19 @@ fn tokaemm_pic_isr_is_empty_while_the_v86_guest_has_interrupts_disabled() {
 
 /// The other half of the E10 rule, and a REGRESSION GUARD rather than a red
 /// fixture: whatever the monitor does while the guest has interrupts disabled,
-/// once the guest's own IVT[8] handler is running the chip must show IS0 SET --
+/// once the guest's own IVT[8] handler is running the chip must show IS0 SET,
 /// the state a real 8259A is in between INTA and EOI. DJGPP's shared
 /// hardware-IRQ wrapper probes exactly that (OCW3 0x0B + IN 0x20) to tell a real
 /// IRQ from a spurious entry; the 0 the old early-EOI path left there sent it
 /// down its not-my-line branch, indexed a 16-entry table with 16, and RETF'd
-/// through the pair it found -- MonikaTT's #GP(0) at 0xAF:78A3.
+/// through the pair it found: MonikaTT's #GP(0) at 0xAF:78A3.
 ///
 /// What it guards now that the rebuild has happened: the monitor issues no EOI
 /// of its own, anywhere. Under IOPL 3 the INTA is real (the guest had IF=1, or
 /// the line would never have been taken) and the EOI is the guest handler's, so
 /// the handler necessarily finds its own line in service. Two deleted
-/// revisions each broke that -- the early EOI-then-hold, and
-/// `vip_release_to_chip`'s specific EOIs at the VCPI DE0C boundary -- and this
+/// revisions each broke that (the early EOI-then-hold, and
+/// `vip_release_to_chip`'s specific EOIs at the VCPI DE0C boundary) and this
 /// row is what makes a third attempt fail loudly instead of silently
 /// reproducing MonikaTT.
 #[test]
@@ -2504,9 +2504,9 @@ fn tokaemm_guest_irq_handler_runs_with_its_own_line_in_service() {
 
 /// Routing row 1 (design section 3.5). A guest `INT 0Dh` is a SOFTWARE
 /// interrupt and must reach the guest's IVT[0x0D] whatever the 8259A's vector
-/// bases are. Vector 13 is doubly loaded on this monitor -- it is the #GP a
+/// bases are. Vector 13 is doubly loaded on this monitor: it is the #GP a
 /// V86 `INT n` traps through, and, while the master sits at the DOS-default
-/// base 8, it is also IRQ5 -- so a discriminator lives there.
+/// base 8, it is also IRQ5, so a discriminator lives there.
 ///
 /// The discriminating half moves the master off base 8 with a VCPI DE0B first
 /// (with the chip masked and the guest CLI'd, so no tick can be reflected at a
@@ -2538,7 +2538,7 @@ fn tokaemm_guest_int0d_reflects_vector_13_not_irq5() {
 /// The monitor's default-gate arm re-derives the line by consulting the chip's
 /// own ISR, so it is self-correcting for the software-INT case, and the software
 /// INT itself is reflected straight out of the #GP body without consulting the
-/// PIC bookkeeping at all -- so this is expected to pass today. It is here to
+/// PIC bookkeeping at all, so this is expected to pass today. It is here to
 /// hold the identity down while the routing around it is rebuilt.
 ///
 /// The precondition that makes it non-vacuous is that IRQ0 is genuinely IN
@@ -2547,7 +2547,7 @@ fn tokaemm_guest_int0d_reflects_vector_13_not_irq5() {
 /// constrain how INT88RMP gets there, and both are worth knowing before editing
 /// it.
 ///
-/// It must obtain that state THE LEGAL WAY -- from inside the guest's own
+/// It must obtain that state THE LEGAL WAY, from inside the guest's own
 /// interrupt handler, where the chip really has IS0 set because the guest's own
 /// tick was acknowledged for it (0xD3 if the handler looks and it is not). A
 /// fixture that instead CLI'd and spun waiting for IS0 to appear would be
@@ -2556,7 +2556,7 @@ fn tokaemm_guest_int0d_reflects_vector_13_not_irq5() {
 /// own setup step the moment the monitor is fixed.
 ///
 /// And the remap has to come FIRST. DE0B reprograms the 8259A with a full ICW
-/// sequence, and ICW1 resets the chip, in-service state included -- so there is
+/// sequence, and ICW1 resets the chip, in-service state included, so there is
 /// no "hold a line in service, then remap". The only reachable form of the
 /// state is "remap, then take a tick at the new base", which is also the shape a
 /// real VCPI client's clock lives in. That leaves IVT[0x88] serving both the
@@ -2592,7 +2592,7 @@ fn tokaemm_guest_int88_after_remap_is_not_converted_to_irq0() {
 /// PICSTALE.COM: DE0B the master to 0x88 (cache and chip both move), then a
 /// direct `OUT 0x20/0x21` ICW sequence puts the CHIP back to base 8 (cache now
 /// stale), then let a real IRQ0 fire. The right answer is that the ARRIVING
-/// VECTOR decides -- a request that entered through IDT vector 8 is IVT[8]'s.
+/// VECTOR decides: a request that entered through IDT vector 8 is IVT[8]'s.
 /// IVT[0x88] carries a decoy handler so the wrong answer is reported rather
 /// than crashing the guest through whatever was in that slot.
 ///
@@ -2629,13 +2629,13 @@ fn tokaemm_hardware_irq_after_a_direct_port_remap_reflects_the_arriving_vector()
 /// (OCW3 0x0A; 0xD1 if that never happened, so the switch would have crossed
 /// the boundary with nothing outstanding), requires IS0 clear on the far side
 /// (0xED), and then requires the chip to still be ALIVE by hand-polling it with
-/// OCW3 P=1 (0xEE) -- "clear" alone is also what a dead chip looks like.
+/// OCW3 P=1 (0xEE): "clear" alone is also what a dead chip looks like.
 ///
 /// The precondition reads the IRR because under the IOPL-3 monitor the client's
 /// own `CLI` clears the real IF, so nothing acknowledges the chip while it
 /// waits: the tick latches in the IRR and the ISR stays empty. It used to read
 /// the ISR, back when the monitor pinned the real IF open, acknowledged the
-/// line immediately and parked it in `vip` -- that queue is what could strand a
+/// line immediately and parked it in `vip`: that queue is what could strand a
 /// line across DE0C, and the interim release at 203efaae existed to hand it
 /// back. Both the queue and the release are deleted; there is nothing to
 /// release once the guest's CLI drives the real IF, and this fixture is what

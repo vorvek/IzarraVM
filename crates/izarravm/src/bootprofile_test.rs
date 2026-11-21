@@ -180,7 +180,7 @@ fn run_with_mount(mount: Option<KateaStorageCounters>) -> BootProfileRun {
 }
 
 /// The mount summary line is the only place mount cost appears in the human
-/// report -- mount finishes before `RUN_START`, so it can never be a phase row.
+/// report: mount finishes before `RUN_START`, so it can never be a phase row.
 #[test]
 fn the_mount_summary_line_splits_mount_into_its_two_terms() {
     let line = mount_summary_line(

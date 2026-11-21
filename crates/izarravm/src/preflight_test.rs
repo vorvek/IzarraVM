@@ -6,7 +6,7 @@ use super::*;
 /// The rustflags in `.cargo/config.toml` apply to test builds too (they are
 /// not release-only), so a test binary built on this branch already targets
 /// `x86-64-v3`. If this ever fails, either the flag stopped applying (CI's
-/// build fingerprint should have caught that -- see
+/// build fingerprint should have caught that; see
 /// `scripts/run-realtime-gate.ps1`) or someone narrowed the target back down,
 /// and either way `require_avx2` no longer matches what the binary needs.
 #[test]
@@ -44,7 +44,7 @@ fn require_avx2_returns_normally_on_this_host() {
 /// one flips exactly one gate closed and checks the whole thing reads
 /// `false`; the last opens every gate and checks `true`. This is the test
 /// that a mutant (`avx2_from_cpuid` returning `true` unconditionally, or
-/// dropping the `xgetbv`/`XCR0` check) cannot survive -- unlike comparing
+/// dropping the `xgetbv`/`XCR0` check) cannot survive, unlike comparing
 /// against `std::is_x86_feature_detected!`, which folds to the same
 /// answer as the code under test whenever this crate is itself compiled
 /// with `-C target-cpu=x86-64-v3`, so a test built on it can never fail.
@@ -225,7 +225,7 @@ fn wide_strings_round_trip_the_ascii_source() {
     );
 }
 
-/// Plain-value vectors for the pure [`dialog_wanted`] decision -- no
+/// Plain-value vectors for the pure [`dialog_wanted`] decision: no
 /// `std::env::set_var`, no process-wide state, no fixture for an
 /// attached/detached console. Each of the four `(no_dialog_env_set,
 /// has_console)` combinations is checked; the one place the dialog is

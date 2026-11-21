@@ -11,7 +11,7 @@ use std::time::Duration;
 
 /// Parses [`write_sidecar`]'s format back into `(rip, phase, count)` triples.
 /// Test-only: exists to give the sidecar its OWN round-trip test, independent
-/// of any other guard in this module -- no production code reads a sidecar
+/// of any other guard in this module: no production code reads a sidecar
 /// back today (see the module doc's "Raw-sample sidecar" paragraph).
 fn parse_sidecar(text: &str) -> Vec<(u64, u32, u64)> {
     text.lines()
@@ -65,7 +65,7 @@ fn resolve_symbol_reports_a_nonzero_extent_for_a_live_function() {
     // In a CHILD PROCESS with one test thread: `SymInitializeW(fInvadeProcess
     // = 1)` walks every loaded module under the loader lock while the parent
     // harness's other threads load and unload DLLs (the audio-backend tests
-    // do), and dbghelp is not thread-safe — CI took a STATUS_ACCESS_VIOLATION
+    // do), and dbghelp is not thread-safe: CI took a STATUS_ACCESS_VIOLATION
     // with this test in flight beside the gui::session battery. The profiler
     // itself never has this problem: it initializes dbghelp at report time,
     // after the emulation thread has stopped.
@@ -96,7 +96,7 @@ fn resolve_symbol_reports_a_nonzero_extent_for_a_live_function() {
 /// release codegen destroyed it two ways at once: nothing in the test binary
 /// reads `ACTIVE_PHASE`, so its store optimized down to a bare `ret`, and the
 /// linker's identical-code folding then merged that `ret` with every other
-/// empty function — `SymFromAddrW` answered with a ThinLTO-promoted
+/// empty function: `SymFromAddrW` answered with a ThinLTO-promoted
 /// tracing_core symbol at displacement 0. The anchor mixes constants nothing
 /// else in the binary uses, so no build can make it byte-identical to another
 /// function, and `#[inline(never)]` pins a standalone body to resolve.
@@ -193,7 +193,7 @@ fn anything_but_a_loaded_pdb_with_lines_is_refused() {
     assert!(!symbols_are_trustworthy(5, 0));
     // SymNone: no symbols loaded.
     assert!(!symbols_are_trustworthy(0, 1));
-    // SymType claims Pdb but no line numbers -- a stripped or mismatched PDB.
+    // SymType claims Pdb but no line numbers: a stripped or mismatched PDB.
     // This is the exact "plausible empty answer" the module doc warns about:
     // SymType=3 alone is not enough to trust inline resolution.
     assert!(!symbols_are_trustworthy(3, 0));
@@ -204,7 +204,7 @@ fn anything_but_a_loaded_pdb_with_lines_is_refused() {
 #[test]
 fn achieved_interval_matches_the_nascar_anchor() {
     // nascar-586, 2026-08-25: 33,499 samples over a 34.952s steady-state
-    // window is 1.0434 ms/sample, 2.09x the nominal 500us -- see the module
+    // window is 1.0434 ms/sample, 2.09x the nominal 500us. See the module
     // doc. `n` samples span `n-1` gaps, so the window divides by 33,498.
     let window = Duration::from_secs_f64(34.952);
     let interval = achieved_interval(33_499, window).expect("more than one sample");
@@ -330,7 +330,7 @@ fn conservation_mismatch_catches_a_name_disagreement() {
 
 #[test]
 fn conservation_mismatch_catches_a_resolved_state_disagreement() {
-    // One side found a symbol, the other did not -- e.g. a fabricated frame
+    // One side found a symbol, the other did not, e.g. a fabricated frame
     // on an unresolvable address, or a swallowed BOOL failure.
     let old = ("run_until_tick".to_string(), 0x10, 0x100);
     assert!(conservation_mismatch(Some(&old), None).is_some());
@@ -340,7 +340,7 @@ fn conservation_mismatch_catches_a_resolved_state_disagreement() {
 #[test]
 fn conservation_mismatch_catches_a_beyond_extent_disagreement() {
     // Same name, but one side reports the address inside the symbol's
-    // recorded extent and the other reports it past the end -- e.g. a wrong
+    // recorded extent and the other reports it past the end, e.g. a wrong
     // context base shifting the displacement.
     let old = ("f".to_string(), 0x40, 0x40); // at the boundary: beyond
     let new = ("f".to_string(), 0x3f, 0x40); // one byte short: in-extent
@@ -432,7 +432,7 @@ fn conservation_check_in_this_process() {
 /// linker/PDB symbols. This is the scan's extent: the batch loop is the
 /// function everything hot gets inlined into, so it always carries inline
 /// sites, and the test asks only that SOME inlined callee resolves where the
-/// old resolver collapses it -- not that one named callee does.
+/// old resolver collapses it, not that one named callee does.
 ///
 /// Locating a NAMED callee's inline sites (`SymEnumSymbolsExW` +
 /// `SYMENUM_OPTIONS_INLINE`) was tried and does not work with the inline-trace
@@ -616,7 +616,7 @@ fn inline_chain_check_in_this_process() {
     // Walk the function's whole extent the way the profiler walks a sample:
     // every address dbghelp reports an inline trace at is resolved through the
     // NEW chain and the OLD `SymFromAddrW` path. The example is any address
-    // where the chain names a frame the old path does not -- an inlined callee
+    // where the chain names a frame the old path does not: an inlined callee
     // the old resolver collapsed into its physical parent. Which callee it is
     // does not matter and is not pinned: ThinLTO of an unrelated hot path may
     // move or remove any ONE inline site, but it cannot leave the batch loop

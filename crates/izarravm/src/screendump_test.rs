@@ -159,7 +159,7 @@ fn a_ppm_is_written_only_when_the_hash_moves() {
 //
 // `Vga::presented` holds the last FINALIZED frame, and every mode set clears it
 // on purpose so a consumer cannot be handed a frame with the previous mode's
-// geometry. It stays empty until the beam finishes the next frame — up to one
+// geometry. It stays empty until the beam finishes the next frame, up to one
 // frame period, about 14 ms at 70 Hz. A sample landing in that window has no
 // frame to write.
 //
@@ -196,7 +196,7 @@ fn a_sample_before_the_first_frame_writes_no_ppm() {
 }
 
 /// The sample still reports itself. The index line is the sweep's only liveness
-/// signal — its watchdog kills a run whose index stops growing — so a guest that
+/// signal (its watchdog kills a run whose index stops growing) so a guest that
 /// wedges its CRTC and never finalizes another frame must not read as a dead
 /// process. The line says there was no frame instead of inventing one.
 #[test]

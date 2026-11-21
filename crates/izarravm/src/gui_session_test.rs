@@ -185,7 +185,7 @@ fn cue_file_names_sees_the_first_file_line_behind_a_utf8_bom() {
     // The loader used to run its own FILE scanner, and it was blind to a BOM in
     // its own way: `trimmed[..4]` over a BOM'd first line is the three marker
     // bytes plus one 'F', which is not "FILE", so the line was skipped and the
-    // file it names never read from disk -- while `parse_cue`, which strips the
+    // file it names never read from disk, while `parse_cue`, which strips the
     // marker, listed it. Two readings of one sheet, and only the quieter one
     // decided what got read.
     //
@@ -209,7 +209,7 @@ fn cue_file_names_sees_the_first_file_line_behind_a_utf8_bom() {
 fn cue_file_names_reads_a_line_whose_fourth_byte_is_mid_character() {
     // The retired scanner matched a four-byte prefix, and a REM comment written
     // with an em-dash right after the keyword puts a three-byte sequence across
-    // byte 4 -- slicing there panicked and took the whole mount down over a
+    // byte 4: slicing there panicked and took the whole mount down over a
     // comment carrying nothing the loader wanted. The shared scanner splits on
     // whitespace and compares whole words, so there is no byte index left to
     // land inside a character.
@@ -226,7 +226,7 @@ fn cue_file_names_reads_a_line_whose_fourth_byte_is_mid_character() {
 #[test]
 fn a_file_line_that_names_nothing_refuses_the_sheet() {
     // The retired scanner dropped these lines silently and the mount then died
-    // in `parse_cue` anyway, so the sheet always failed -- just twice over, with
+    // in `parse_cue` anyway, so the sheet always failed, just twice over, with
     // the loader's half of the answer never visible. One scanner means one
     // refusal, raised where the sheet is read.
     for cue in ["FILE\n", "FILE   \n", "FILE \"\" BINARY\n"] {
@@ -245,9 +245,9 @@ fn cue_file_names_is_empty_when_the_sheet_has_no_file_line() {
 #[test]
 fn load_cd_image_from_path_mounts_every_file_the_cue_names() {
     // A two-FILE sheet: a MODE1/2048 data track in one file, an AUDIO track
-    // in another. This exercises the actual user-facing path end to end --
+    // in another. This exercises the actual user-facing path end to end:
     // directory joining relative to the CUE, one read per named file, and
-    // the hand-off to `CdImage::from_cue_files` -- not just `cue_file_names`
+    // the hand-off to `CdImage::from_cue_files`, not just `cue_file_names`
     // in isolation.
     const DATA_SECTOR: usize = 2048;
     const RAW_SECTOR: usize = 2352;
@@ -357,8 +357,8 @@ fn generation_installs_initial_media_before_its_first_guest_tick() {
     generation.finalize();
 }
 
-/// The GUI's Glide texture filtering pref has three hops -- `GuiPrefs` ->
-/// `SessionSpec::glide_force_point_sampling` -> `Machine` -- and the middle
+/// The GUI's Glide texture filtering pref has three hops (`GuiPrefs` ->
+/// `SessionSpec::glide_force_point_sampling` -> `Machine`) and the middle
 /// two are otherwise untested: nothing exercises `MachineGeneration::build`
 /// actually applying the field it carries. Deleting the
 /// `machine.set_glide_force_point_sampling(...)` call in `build` passes
@@ -1166,7 +1166,7 @@ fn live_mode_switch_debits_credit_in_master_ticks() {
 ///
 /// This link had no test, for a structural
 /// reason: the level lives in CT1745 registers `0x50`/`0x51`, the only way to
-/// move them is a guest `OUT`, and both registers power on at unity -- so a
+/// move them is a guest `OUT`, and both registers power on at unity, so a
 /// test driving a real `Machine` reads (1.0, 1.0) whether the pump wires them
 /// up or not, and passes on a deleted line. The `AudioMachine` seam exists to
 /// make the wiring observable: this fake reports a level no register default
@@ -1300,7 +1300,7 @@ fn the_host_volume_knob_scales_the_finished_mix_only() {
 ///
 /// The multiply is the last thing in the host chain and it is the one place a
 /// gain above 1.0 can leave full scale. A narrowing integer multiply would wrap:
-/// 20000 * 5 is 100000, which truncated to 16 bits is -31072 -- a loud passage's
+/// 20000 * 5 is 100000, which truncated to 16 bits is -31072: a loud passage's
 /// positive peaks would come back out inverted and near the negative rail, which
 /// is a far uglier noise than the clipping it is pretending not to be. Drive it
 /// well past the rail in both directions and require saturation.
@@ -1345,8 +1345,8 @@ fn the_host_volume_knob_saturates_instead_of_wrapping_above_unity() {
 ///
 /// The engines add themselves INTO the machine's buffer, so a knob applied
 /// before that call would play the synths at a level nobody set. There is no way
-/// to make a `MidiEngine` produce a sample in a test -- an adapter needs a real
-/// synth behind it -- so this pins the seam the other way round: everything the
+/// to make a `MidiEngine` produce a sample in a test (an adapter needs a real
+/// synth behind it) so this pins the seam the other way round: everything the
 /// pump queues has been through `apply_speaker_gain`, whoever put it there.
 #[test]
 fn the_pump_applies_the_knob_after_the_midi_legs_have_been_added() {
@@ -1419,7 +1419,7 @@ fn load_cd_image_from_path_mounts_a_cue_naming_an_ogg() {
 
     assert_eq!(image.track_count(), 2);
     // The ogg is a 0.2 s tone: 15 Red Book sectors, taken from its duration and
-    // not from its byte length, which is 5114 bytes -- two sectors' worth, and
+    // not from its byte length, which is 5114 bytes, two sectors' worth, and
     // the number this used to mount.
     assert_eq!(image.tracks()[1].sectors, 15);
     assert_eq!(image.total_sectors(), 17);

@@ -12,7 +12,7 @@ fn identity_when_gamma_is_none() {
 }
 
 /// Exact bytes from the design doc's anchor table,
-/// gamma 2.4 --
+/// gamma 2.4,
 /// the default. Independently recomputed and confirmed to match before being
 /// pinned here.
 #[test]
@@ -207,7 +207,7 @@ fn glide_compensate_is_monotonic() {
 /// pushing
 /// Tomb Raider's measured gamma-1.491 CLUT anchors through the compensation
 /// lands them on the identity ramp, i.e. on what `SST_GAMMA=1.0` produces in
-/// the guest -- without touching `clutData`.
+/// the guest, without touching `clutData`.
 #[test]
 fn glide_compensate_reproduces_the_sst_gamma_oracle() {
     // The live anchors dumped from a Tomb Raider run, all 33 of them.

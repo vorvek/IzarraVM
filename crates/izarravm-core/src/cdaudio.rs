@@ -39,7 +39,7 @@ pub const AUDIO_FRAME_BYTES: usize = 2352;
 /// frame that is still decoding from one belonging to a file that is corrupt and
 /// will never yield anything. The disc model does not need the difference, since
 /// both reach the listener as silence, so carrying it would be weight for one
-/// side only. A caller that does need it -- a mount-time diagnostic, say -- has
+/// side only. A caller that does need it (a mount-time diagnostic, say) has
 /// to ask the concrete decoder rather than the trait object.
 pub trait AudioTrackSource: std::fmt::Debug + Send + Sync {
     /// Red Book frames this track contributes to the disc timeline.

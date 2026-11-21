@@ -54,7 +54,7 @@ pub(super) struct SessionSpec {
     pub(super) test_pattern: bool,
     /// The "Glide texture filtering: Disabled" GUI setting, resolved to the
     /// bool Distira's own setter takes. Applied once, when
-    /// `MachineGeneration::build` constructs the machine -- like `profile`,
+    /// `MachineGeneration::build` constructs the machine. Like `profile`,
     /// this is a boot-time setting: changing it in the configuration dialog
     /// takes effect on the next power-on, the same as a CPU, memory, or video
     /// card change.
@@ -305,8 +305,8 @@ impl SessionSnapshot {
 /// applied the publication before it. `update_from`/`update_to` are what let one
 /// say so: the worker numbers publications 1, 2, 3, ... and a consumer may apply
 /// the runs only when `update_from` is exactly one past the last publication it
-/// applied. Anything else -- a frame dropped between the poll and the paint, a
-/// consumer that starts late -- and the frame must be taken whole.
+/// applied. Anything else (a frame dropped between the poll and the paint, a
+/// consumer that starts late) and the frame must be taken whole.
 ///
 /// The two numbers differ only where a consumer FOLDS an unpainted frame into
 /// the next one (see `GuiApp::poll_session`): the merged frame carries the older
@@ -323,7 +323,7 @@ pub(super) struct SessionFrame {
     pub(super) update_to: u64,
     pub(super) generation: u64,
     /// The engine that produced these words. Presentation settings that apply
-    /// to one engine only -- the Glide gamma toggle -- read this rather than
+    /// to one engine only (the Glide gamma toggle) read this rather than
     /// asking the machine at paint time, which would describe a later instant
     /// than the pixels do.
     pub(super) owner: ActiveDisplay,
@@ -1510,8 +1510,8 @@ fn run_worker(
             should_publish_frame(seq, published_seq, consumed_seq, frame_gen, last_frame_gen);
         // `presented_frame_argb` is empty for up to a frame period after every
         // mode set. Publishing then would put a frame nobody drew on the screen
-        // -- before this was an Option it was a single black pixel, which the
-        // window stretched to full size -- so the publication waits instead.
+        // (before this was an Option it was a single black pixel, which the
+        // window stretched to full size) so the publication waits instead.
         let rendered = new_frame
             .then(|| generation.machine.presented_frame_update())
             .flatten();
@@ -1721,8 +1721,8 @@ const SCRIPTED_KEY_SPACING_TICKS: u64 = MASTER_CLOCK_HZ * 2 / 1000;
 
 /// Deterministic scripted keystrokes for the GUI worker, armed by
 /// `IZARRAVM_GUI_INJECT_KEYS`. Profiling the window needs the same reach that
-/// `--inject-keys` gives the headless path -- the workloads worth profiling are
-/// games whose play sits behind a title screen -- and a human pressing a key
+/// `--inject-keys` gives the headless path: the workloads worth profiling are
+/// games whose play sits behind a title screen, and a human pressing a key
 /// cannot be replayed. Steps are `<guest_ms>:<text>` separated by `;`, offsets
 /// strictly increasing, and the text spelling is `--inject-keys`'s, `{shift}`
 /// and all.
@@ -1849,7 +1849,7 @@ struct RuntimeProfileMetrics {
     presentation_partial_uploads: u64,
     /// The ATA/ATAPI poll-skip counters, sampled at the end of the last slice.
     ///
-    /// **AN ABSOLUTE LEVEL, NOT AN INTERVAL DELTA** -- unlike every other field
+    /// **AN ABSOLUTE LEVEL, NOT AN INTERVAL DELTA**, unlike every other field
     /// here, which accumulates per slice and is reset at each interval
     /// boundary. Differencing consecutive reports gives the interval.
     ///
@@ -2000,7 +2000,7 @@ struct RuntimeProfileReport {
     wall_master_ticks: u64,
     guest_realtime_factor: f64,
     /// What the window's speed readout shows: executed ticks over wall ticks, capped
-    /// at 1.0. Compare it against `guest_realtime_factor` -- when the machine is on
+    /// at 1.0. Compare it against `guest_realtime_factor`: when the machine is on
     /// time this reads `1 - halted_share`, so an idling guest looks slow when it is not.
     speed_indicator_ratio: f64,
     halted_share_of_guest_time: f64,
@@ -2047,7 +2047,7 @@ struct RuntimeProfileReport {
     audio_late_callbacks: u64,
     audio_callback_lateness_us: u64,
     audio_lifetime_max_callback_lateness_us: u64,
-    // ATA/ATAPI poll skip. ABSOLUTE LEVELS -- difference two reports for an
+    // ATA/ATAPI poll skip. ABSOLUTE LEVELS: difference two reports for an
     // interval. `_deadline_clamped` is the interactive-path counter no headless
     // leg can move: it must be non-zero here only as the sub-floor tail of a
     // slice, and `ata_poll_skip_blocks` must NOT track it. If blocks tracks
@@ -2411,9 +2411,9 @@ fn tick_machine_ticks(machine: &mut Machine, master_ticks: u64) -> Option<StopRe
 
 /// What the audio pump needs from the machine, and nothing else.
 ///
-/// The pump's job is a wiring job -- take the guest's own wavetable level to
+/// The pump's job is a wiring job (take the guest's own wavetable level to
 /// the MIDI engines, mix them into the machine's frame, apply the host playback
-/// level, queue it -- and wiring is exactly what a `Machine` cannot be asked
+/// level, queue it) and wiring is exactly what a `Machine` cannot be asked
 /// about in a unit test: reaching `0x50`/`0x51` from outside means booting DOS
 /// and running SNDMIXER. `set_gain` here stayed untested
 /// for that reason. Behind this seam a fake reports a known gain and a
@@ -2444,7 +2444,7 @@ impl AudioMachine for Machine {
 
 /// Render one wall-clock window and queue it for the sound device.
 ///
-/// `gain` is the HOST playback level -- the volume knob, which stands for the
+/// `gain` is the HOST playback level: the volume knob, which stands for the
 /// powered speakers the machine's line-out feeds. It is applied last, to the
 /// finished mix, and it is the only level the host owns: everything inside the
 /// chain (the card's output stage, the PC speaker's leg, the balance between
@@ -2492,8 +2492,8 @@ fn pump_audio(
 /// The knob goes above unity, so this multiply can leave full scale, and what
 /// happens then is the whole point of the function: it SATURATES. A sample that
 /// wants to be louder than the sink can carry is pinned at the rail, which is
-/// what a driven amplifier does. Letting the value wrap instead -- which is what
-/// a plain narrowing multiply in integer arithmetic gives -- would turn a loud
+/// what a driven amplifier does. Letting the value wrap instead (which is what
+/// a plain narrowing multiply in integer arithmetic gives) would turn a loud
 /// passage's peaks inside out and read as violent distortion rather than as the
 /// clipping it is.
 ///
@@ -2581,8 +2581,8 @@ pub(crate) fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFai
         // A CUE that names the same file across two separate FILE sections is
         // rejected by `CdImage::from_cue_files` (a repeated section is not the
         // legitimate two-tracks-one-file layout, which uses a single FILE
-        // section instead). So this dedup is not load-bearing for correctness
-        // -- the mount would already fail if this loop read the file twice
+        // section instead). So this dedup is not load-bearing for correctness:
+        // the mount would already fail if this loop read the file twice
         // and handed in two entries. It stays because it is still correct and
         // still cheap: it saves the redundant disk read/copy for a large
         // image before `from_cue_files` ever sees the list.
@@ -2642,8 +2642,8 @@ pub(crate) fn load_cd_image_from_path(path: &Path) -> Result<CdImage, SessionFai
 /// Rippers do not preserve case between the sheet and the files beside it, and
 /// they do not have to: the sheets in circulation were written on Windows,
 /// where the filesystem does not care. Betrayal at Krondor's CD1.cue names
-/// `CD1.iso` and `track02.ogg` for files stored as `cd1.iso` and `Track02.ogg`
-/// -- both of its shapes differ, so on any case-sensitive filesystem the disc
+/// `CD1.iso` and `track02.ogg` for files stored as `cd1.iso` and `Track02.ogg`:
+/// both of its shapes differ, so on any case-sensitive filesystem the disc
 /// does not mount at all. `from_cue_sources` already matches sheet names to
 /// supplied names case-insensitively; this is the same tolerance one layer
 /// down, where the name meets the host.

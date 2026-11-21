@@ -85,8 +85,8 @@ impl ScreenDumper {
         });
         // No completed frame: the run has not drawn its first raster, or a mode
         // set just dropped the last one. The sample still reports itself, so the
-        // index keeps growing at the sampling cadence -- it is the sweep's only
-        // liveness signal -- but it reports the absence rather than inventing a
+        // index keeps growing at the sampling cadence (it is the sweep's only
+        // liveness signal) but it reports the absence rather than inventing a
         // picture. `last_hash` is untouched, so the frame that comes back is
         // compared against the last one that actually existed.
         let hash = frame.as_ref().map(|(pixels, _, _)| fnv1a(pixels));

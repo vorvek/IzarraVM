@@ -261,7 +261,7 @@ impl FromStr for SbIrq {
 ///
 /// **Defaults to 11 and yields 7 to the Sound Blaster.** WSS's own standard
 /// default is 7, and this used to take it precisely because `SbIrq` defaulted to
-/// 5 -- but that is the wrong way round for a DOS library. Far more titles hardwire
+/// 5, but that is the wrong way round for a DOS library. Far more titles hardwire
 /// the SB on 7 than hardwire the codec, and the two cannot share a line (see
 /// `ConfigError::WssSbIrqCollision`; real combo cards jumper them apart). 11 is
 /// chosen over 9 because IRQ 9 is the cascaded IRQ 2 and still catches software
@@ -671,7 +671,7 @@ impl AppConfig {
             // On a real multi-standard combo card the AD1848 (WSS) and the SB16
             // are jumpered to distinct IRQ/DMA resources; two devices cannot share
             // an 8237 channel or a PIC line. Reject a config that points them at
-            // the same one (the defaults -- WSS IRQ7/DMA0 vs SB16 IRQ5/DMA1 -- are
+            // the same one (the defaults, WSS IRQ7/DMA0 vs SB16 IRQ5/DMA1, are
             // disjoint). The 16-bit SB16 channel cannot collide with the WSS 8-bit
             // channel (SbDma16 is 5/6/7, SbDma8 is 0/1/3), so only the 8-bit DMA
             // and the IRQ line need checking.
@@ -735,7 +735,7 @@ impl AppConfig {
 pub struct MachineConfig {
     /// Power-on CPU speed class.
     ///
-    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`]. It seeds
+    /// **Not read from the config file**: see [`RETIRED_CMOS_KEYS`]. It seeds
     /// CMOS on a machine that has never been configured; after that the BIOS
     /// setup panel (Del) and the Tab boot menu own it, and `GSWMODE` changes it
     /// for the running session. `--cpu` still overrides this for headless runs,
@@ -791,7 +791,7 @@ pub struct SoundBlasterConfig {
     pub enabled: bool,
     /// Power-on IRQ line the CT1745 mixer selects (register 0x80).
     ///
-    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`]. The value
+    /// **Not read from the config file**: see [`RETIRED_CMOS_KEYS`]. The value
     /// here is the power-on default that seeds CMOS on a machine that has never
     /// been configured; after that, CMOS is what the machine boots with and
     /// `SNDCTRL.COM` is what changes it. `--sb-irq` still overrides this for
@@ -837,14 +837,14 @@ pub struct WssConfig {
     /// Power-on IRQ line read back from the board config region. Defaults to IRQ11,
     /// leaving IRQ7 to the Sound Blaster, which many DOS titles hardwire.
     ///
-    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`] and
+    /// **Not read from the config file**: see [`RETIRED_CMOS_KEYS`] and
     /// [`SoundBlasterConfig::irq`].
     #[serde(skip)]
     pub irq: WssIrq,
     /// Power-on 8-bit DMA channel read back from the board config region. Defaults
     /// to DMA0, chosen to avoid the SB16 default (DMA1).
     ///
-    /// **Not read from the config file** — see [`RETIRED_CMOS_KEYS`]. Note that
+    /// **Not read from the config file**: see [`RETIRED_CMOS_KEYS`]. Note that
     /// the container-level `#[serde(default)]` is load-bearing here: this field's
     /// default has to come from `WssConfig::default()` (DMA0), not from
     /// `SbDma8::default()` (DMA1), which is the channel the Sound Blaster holds.
@@ -854,7 +854,7 @@ pub struct WssConfig {
 
 impl Default for WssConfig {
     fn default() -> Self {
-        // base 0x530, IRQ11, DMA0 -- IRQ11 rather than the WSS standard IRQ7 so
+        // base 0x530, IRQ11, DMA0: IRQ11 rather than the WSS standard IRQ7 so
         // the Sound Blaster keeps 7, which far more DOS titles hardwire; DMA0
         // avoids the SB16 default (DMA1).
         Self {
@@ -1017,7 +1017,7 @@ pub enum MidiStatus {
     RomControlMissing,
     /// Same, for the PCM image.
     RomPcmMissing,
-    /// Both images were found but the synthesiser would not open on them --
+    /// Both images were found but the synthesiser would not open on them:
     /// on real ROM sets this is a control and a PCM image from different
     /// machines (an MT-32 control ROM with a CM-32L PCM ROM, say).
     RomsNotPairable,
