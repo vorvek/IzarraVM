@@ -263,6 +263,7 @@ impl Machine {
     pub(super) fn make_bus(&mut self) -> MachineBus<'_> {
         // Captured before the struct literal below since VEGA and trace are also
         // mutably borrowed by other fields in that same literal.
+        self.note_audio_live_at_batch_start();
         let beam_at_batch_start = self.scanout_beam_dots();
         let margo_scanout_at_batch_start = self.vega.margo_scanout().is_some();
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
@@ -357,6 +358,7 @@ impl Machine {
             ata_poll_skip: &mut self.ata_poll_skip,
             ata_hdd_poll_skip_armed: &mut self.ata_hdd_poll_skip_armed,
             isa_io_clocks: &mut self.port_bus_batch_clocks,
+            audio_start: &mut self.audio_start,
             port_accesses_by_class: &mut self.port_accesses_by_class,
             pit_observer_fine_until: &mut self.pit_observer_fine_until,
             opl_probe: &mut self.opl_probe,
@@ -3614,6 +3616,15 @@ impl CpuBus for MachineBus<'_> {
         // offset and returns (), so the range is checked first (mirrors read_io).
         if let Some(offset) = self.wss_offset(port) {
             self.wss.write_port(offset, value as u8);
+            // A write that takes the sample clock from idle to running inside this
+            // batch starts it now, not at the batch start. See `AudioStart`.
+            if self.charge_port_timing
+                && !self.audio_start.wss_live
+                && self.audio_start.wss_origin.is_none()
+                && crate::timing::effective_wss_rate_hz(self.wss_enabled, self.wss) != 0
+            {
+                self.audio_start.wss_origin = Some(self.guest_tick_now());
+            }
             self.sync_wss_board_irq();
             return Ok(());
         }
@@ -3657,6 +3668,15 @@ impl CpuBus for MachineBus<'_> {
             if self.charge_port_timing && port == 0x22C {
                 let pending = self.pending_device_micros();
                 self.sb16.arm_pause_at(pending);
+            }
+            // Same rule for the DSP sample clock: a write that starts it inside
+            // this batch starts it at this write. See `AudioStart`.
+            if self.charge_port_timing
+                && !self.audio_start.sb_live
+                && self.audio_start.dsp_origin.is_none()
+                && self.sb16.timeline_rate_hz() != 0
+            {
+                self.audio_start.dsp_origin = Some(self.guest_tick_now());
             }
             // Bytes the DSP took as MIDI leave with the tick of this write. The
             // wire time (31250 baud) is not modeled.

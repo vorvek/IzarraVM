@@ -664,7 +664,7 @@ fn sb_pro_stereo_auto_init_keeps_every_frame_in_a_large_batch() {
     for (i, byte) in [0x00u8, 0x40, 0x80, 0xC0].into_iter().enumerate() {
         machine.write_physical_u8(0x1_0000 + i as u32, byte);
     }
-    with_bus(&mut machine, |bus| {
+    with_settled_bus(&mut machine, |bus| {
         bus.write_io(0x0B, BusWidth::Byte, 0x59, false).unwrap();
         bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
         bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
@@ -705,7 +705,7 @@ fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
             machine.write_physical_u8(0x2_0000 + (i * 4 + j) as u32, b);
         }
     }
-    with_bus(&mut machine, |bus| {
+    with_settled_bus(&mut machine, |bus| {
         // Slave ch5 (local ch1): word addr 0, page 0x8B=0x02, count 15 (16
         // words), auto-init read.
         bus.write_io(0xD6, BusWidth::Byte, 0x59, false).unwrap(); // slave ch1 mode: auto-init, read
@@ -2018,7 +2018,7 @@ fn event_batch_cap_reaches_a_near_due_stereo_dsp_edge_in_every_mode() {
     ] {
         let mut machine = test_machine();
         machine.set_mode(mode);
-        with_bus(&mut machine, |bus| {
+        with_settled_bus(&mut machine, |bus| {
             // One 8-bit stereo frame reaches the block-completion edge.
             for &byte in &[0x41u8, 0x2B, 0x11, 0xC0, 0x20, 0x01, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
@@ -2052,7 +2052,9 @@ fn event_batch_cap_reaches_a_near_due_wss_edge_in_every_mode() {
         let mut machine = test_machine();
         machine.set_mode(mode);
         machine.write_physical_u8(0x1_0000, 0x80);
-        with_bus(&mut machine, |bus| wss_arm_8bit_mono(bus, 1));
+        // Uncharged writes: the codec clock starts at tick 0, so the frame count
+        // below is measured from a known origin.
+        wss_arm_8bit_mono(&mut machine.make_construction_bus(), 1);
 
         // Retire the first frame and stop one master tick before the underflow.
         machine.advance_devices_ticks(2 * WSS_FRAME_TICKS - 1);
@@ -3470,7 +3472,6 @@ fn arm_audio_at_pending_prefix(machine: &mut Machine, port: u16, value: u32) -> 
 }
 
 #[test]
-#[ignore = "PCM startup currently consumes the prewrite batch prefix"]
 fn pcm_startup_owns_only_the_postwrite_span() {
     let suffix = izarravm_core::MASTER_CLOCK_HZ / 100_000;
     let mut observations = Vec::new();
@@ -3542,7 +3543,6 @@ fn wss_calibration_machine(mode: GswMode, invalid_rate: bool) -> Machine {
 }
 
 #[test]
-#[ignore = "WSS autocalibration currently consumes the prewrite batch prefix"]
 fn wss_calibration_starts_at_the_mce_clear_write() {
     let duration = 128 * (izarravm_core::MASTER_CLOCK_HZ / 8000);
     let suffix = izarravm_core::MASTER_CLOCK_HZ / 100_000;
@@ -3583,6 +3583,63 @@ fn wss_calibration_starts_at_the_mce_clear_write() {
         }
     }
     assert!(observations.into_iter().all(|equal| equal));
+}
+
+#[test]
+fn dsp_start_inside_an_idle_batch_sets_one_origin_at_the_write() {
+    let mut machine = pcm_origin_machine(GswMode::Gsw586, false);
+    let at = machine.master_ticks();
+    let origin = with_bus(&mut machine, |bus| {
+        CpuBus::write_io(bus, 0x22c, BusWidth::Byte, 0, 17, false).unwrap();
+        let first = bus.audio_start.dsp_origin;
+        // A later command write in the same batch must not move the origin.
+        CpuBus::write_io(bus, 0x22c, BusWidth::Byte, 0xd1, 40, false).unwrap();
+        assert_eq!(bus.audio_start.dsp_origin, first);
+        assert!(!bus.audio_start.sb_live);
+        first
+    });
+    assert!(origin.is_some_and(|tick| tick > at));
+    // The batch-end clear is what keeps the origin from outliving the batch.
+    machine.clear_audio_start_origins();
+    assert_eq!(machine.audio_start.dsp_origin, None);
+}
+
+#[test]
+fn dsp_resume_in_a_batch_that_started_live_gets_no_origin() {
+    let mut machine = pcm_origin_machine(GswMode::Gsw586, false);
+    machine
+        .make_construction_bus()
+        .write_io(0x22c, BusWidth::Byte, 0, false)
+        .unwrap();
+    assert!(machine.sb16.is_producing());
+    with_bus(&mut machine, |bus| {
+        assert!(bus.audio_start.sb_live);
+        // D0h halts the DMA, D4h resumes it: the rate is non-zero again after
+        // the write, but the clock was running when the batch began.
+        CpuBus::write_io(bus, 0x22c, BusWidth::Byte, 0xd0, 17, false).unwrap();
+        CpuBus::write_io(bus, 0x22c, BusWidth::Byte, 0xd4, 40, false).unwrap();
+        assert_eq!(bus.audio_start.dsp_origin, None);
+    });
+}
+
+#[test]
+fn wss_start_inside_an_idle_batch_sets_an_origin_and_a_live_batch_does_not() {
+    let mut idle = pcm_origin_machine(GswMode::Gsw586, true);
+    with_bus(&mut idle, |bus| {
+        CpuBus::write_io(bus, 0x535, BusWidth::Byte, 9, 17, false).unwrap();
+        assert!(!bus.audio_start.wss_live);
+        assert!(bus.audio_start.wss_origin.is_some());
+    });
+    let mut live = pcm_origin_machine(GswMode::Gsw586, true);
+    live.make_construction_bus()
+        .write_io(0x535, BusWidth::Byte, 9, false)
+        .unwrap();
+    with_bus(&mut live, |bus| {
+        assert!(bus.audio_start.wss_live);
+        CpuBus::write_io(bus, 0x534, BusWidth::Byte, 9, 17, false).unwrap();
+        CpuBus::write_io(bus, 0x535, BusWidth::Byte, 9, 40, false).unwrap();
+        assert_eq!(bus.audio_start.wss_origin, None);
+    });
 }
 
 #[test]

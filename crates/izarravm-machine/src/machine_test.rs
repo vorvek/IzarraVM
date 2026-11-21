@@ -352,12 +352,31 @@ fn load_asymmetric_stereo(machine: &mut Machine, frames: u32) {
 }
 
 // Run one closure against a freshly-borrowed bus over the whole machine.
+/// `with_bus`, then settle the batch's in-batch time into the devices the way the
+/// run loop does at a batch end, and drop the audio start origins. Use it where a
+/// test programs a device through charged port writes and then measures device
+/// time from the write.
+pub(crate) fn with_settled_bus<R>(
+    machine: &mut Machine,
+    f: impl FnOnce(&mut MachineBus) -> R,
+) -> R {
+    let (result, bill) = with_bus(machine, |bus| {
+        let result = f(bus);
+        (result, bus.in_batch_master_ticks())
+    });
+    machine.port_bus_batch_clocks = 0;
+    machine.advance_devices_ticks(bill);
+    machine.clear_audio_start_origins();
+    result
+}
+
 pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
     // Captured before the struct literal below since VEGA and trace are also
     // mutably borrowed by other fields in that same literal.
     // `scanout_beam_dots`, not `vega.beam_dots()`: this helper is a hand copy of
     // `Machine::make_bus`, and a copy that captured the legacy raster's beam
     // would silently hand every Margo-mode test a beam from the wrong clock.
+    machine.note_audio_live_at_batch_start();
     let beam_at_batch_start = machine.scanout_beam_dots();
     let margo_scanout_at_batch_start = machine.vega.margo_scanout().is_some();
     let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
@@ -444,6 +463,7 @@ pub(crate) fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus)
         ata_poll_skip: &mut machine.ata_poll_skip,
         ata_hdd_poll_skip_armed: &mut machine.ata_hdd_poll_skip_armed,
         isa_io_clocks: &mut machine.port_bus_batch_clocks,
+        audio_start: &mut machine.audio_start,
         port_accesses_by_class: &mut machine.port_accesses_by_class,
         pit_observer_fine_until: &mut machine.pit_observer_fine_until,
         opl_probe: &mut machine.opl_probe,

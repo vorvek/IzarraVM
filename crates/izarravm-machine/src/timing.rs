@@ -128,6 +128,22 @@ pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 /// not vary with the CPU mode.
 pub(crate) const PIT_OBSERVER_FINE_WINDOW_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 200;
 
+/// The WSS sample-clock rate the timeline runs at, 0 when the clock is idle.
+/// Playback or the post-MCE autocalibration window runs it. An autocalibration
+/// under an unsupported programmed rate falls back to the lowest documented rate.
+pub(super) fn effective_wss_rate_hz(wss_enabled: bool, wss: &Ad1848) -> u64 {
+    if wss_enabled && (wss.is_playing() || wss.autocal_active()) {
+        let programmed = wss.output_frame_rate();
+        u64::from(if programmed > 0 {
+            programmed
+        } else {
+            WSS_AUTOCAL_FALLBACK_HZ
+        })
+    } else {
+        0
+    }
+}
+
 impl Machine {
     pub(super) fn stall_for_micros(&mut self, micros: u64) {
         let master_ticks = (u128::from(micros) * u128::from(izarravm_core::MASTER_CLOCK_HZ)
@@ -546,21 +562,30 @@ impl Machine {
     }
 
     fn device_rates(&mut self) -> DeviceRates {
-        let programmed_wss = self.wss.output_frame_rate();
         DeviceRates {
             dsp_hz: self.sb16.timeline_rate_hz(),
-            wss_hz: if self.wss_enabled && (self.wss.is_playing() || self.wss.autocal_active()) {
-                u64::from(if programmed_wss > 0 {
-                    programmed_wss
-                } else {
-                    WSS_AUTOCAL_FALLBACK_HZ
-                })
-            } else {
-                0
-            },
+            wss_hz: effective_wss_rate_hz(self.wss_enabled, &self.wss),
             cd_playing: self.ide.device().playback().playing,
             vga_dot_hz: self.vega.dot_clock_hz(),
         }
+    }
+
+    /// Record which audio sample clocks already run at the start of a batch.
+    /// A write that starts a clock inside the batch then gets an origin; see
+    /// `AudioStart`.
+    pub(super) fn note_audio_live_at_batch_start(&mut self) {
+        self.audio_start = timeline::AudioStart {
+            sb_live: self.sb16.is_producing(),
+            wss_live: effective_wss_rate_hz(self.wss_enabled, &self.wss) != 0,
+            dsp_origin: None,
+            wss_origin: None,
+        };
+    }
+
+    /// Forget the start origins once the batch-end advance has used them.
+    pub(super) fn clear_audio_start_origins(&mut self) {
+        self.audio_start.dsp_origin = None;
+        self.audio_start.wss_origin = None;
     }
 
     fn finish_tsc_advance(&mut self, before: u64, executed_clocks: u64) {
@@ -601,7 +626,17 @@ impl Machine {
             let advance = if io_stall {
                 self.timeline.advance_io_stall_ticks(step, rates)
             } else {
-                self.timeline.advance_master_ticks(step, rates)
+                // A clock started by a write inside this batch idles until that
+                // write. Measured from the live time before each step, so a
+                // step split keeps the same total.
+                let now = self.timeline.now_ticks();
+                let idle = |origin: Option<u64>| origin.map_or(0, |at| at.saturating_sub(now));
+                let skips = (
+                    idle(self.audio_start.dsp_origin),
+                    idle(self.audio_start.wss_origin),
+                );
+                self.timeline
+                    .advance_master_ticks_skipping(step, rates, skips)
             };
             self.apply_device_advance(advance);
             remaining -= step;

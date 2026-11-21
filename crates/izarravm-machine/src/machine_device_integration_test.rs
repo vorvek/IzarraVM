@@ -251,7 +251,7 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_its_irq() {
     for i in 1..16u32 {
         machine.write_physical_u8(0x1_0000 + i, 0x50);
     }
-    with_bus(&mut machine, |bus| {
+    with_settled_bus(&mut machine, |bus| {
         // DMA ch1: page 0x01, byte addr 0, count 15 (16 bytes), single read.
         bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
         bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();

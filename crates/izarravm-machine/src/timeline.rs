@@ -97,6 +97,22 @@ impl RatePhase {
     }
 }
 
+/// Where a guest port write started an audio sample clock inside the batch in
+/// flight. Devices advance once at the batch end, so without this the whole batch
+/// span, including the part before the write, would count as playing time.
+///
+/// `*_live` records whether the clock already ran when the batch began. Only a
+/// batch that starts idle can start a clock, and the origin is the absolute
+/// master tick of the starting write. The batch-end advance skips the span before
+/// the origin and then clears it, so the origin never outlives one batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AudioStart {
+    pub sb_live: bool,
+    pub wss_live: bool,
+    pub dsp_origin: Option<u64>,
+    pub wss_origin: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DeviceRates {
     pub dsp_hz: u64,
@@ -349,6 +365,18 @@ impl Timeline {
         requested_ticks: u64,
         rates: DeviceRates,
     ) -> DeviceAdvance {
+        self.advance_master_ticks_skipping(requested_ticks, rates, (0, 0))
+    }
+
+    /// Like `advance_master_ticks`, but the DSP and WSS sample clocks idle for the
+    /// first `(dsp, wss)` ticks of the step. A clock at rate 0 keeps its phase, so
+    /// this equals running the step in two parts with the old rate of 0 first.
+    pub(crate) fn advance_master_ticks_skipping(
+        &mut self,
+        requested_ticks: u64,
+        rates: DeviceRates,
+        (dsp_skip, wss_skip): (u64, u64),
+    ) -> DeviceAdvance {
         let master_ticks = requested_ticks.min(u64::MAX - self.now_ticks);
         self.now_ticks += master_ticks;
         let quantum = self.ticks_per_cpu_clock;
@@ -392,8 +420,12 @@ impl Timeline {
             pit_remainder_before,
             microseconds: self.microseconds.advance(master_ticks, MICROSECOND_HZ),
             pit_clocks: self.pit.advance(master_ticks, u64::from(PIT_INPUT_HZ)),
-            dsp_frames: self.dsp.advance(master_ticks, rates.dsp_hz),
-            wss_frames: self.wss.advance(master_ticks, rates.wss_hz),
+            dsp_frames: self
+                .dsp
+                .advance(master_ticks - dsp_skip.min(master_ticks), rates.dsp_hz),
+            wss_frames: self
+                .wss
+                .advance(master_ticks - wss_skip.min(master_ticks), rates.wss_hz),
             cd_frames: self
                 .cd
                 .advance(master_ticks, if rates.cd_playing { 75 } else { 0 }),
