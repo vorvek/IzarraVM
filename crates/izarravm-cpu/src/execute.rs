@@ -868,15 +868,13 @@ impl CpuGsw {
                 Ok(self.charge(group2_class(opcode)))
             }
             0xf6 => {
-                // Group 3 byte. /0 TEST (AND-for-flags, no write-back) takes the imm8 `decode`
-                // fetched for reg==0; the other sub-ops carry no immediate. NOT (/2) touches no
-                // flags; NEG (/3) sets flags like 0 - operand; MUL/IMUL (/4,/5) and DIV/IDIV
-                // (/6,/7) reuse `mul`/`div` (DIV raises #DE on divide-by-zero / quotient overflow).
-                // reg==1 is undefined in the fused reference: it consumes no immediate and faults as
-                // UnsupportedGroupOpcode, preserved here.
+                // Group 3 byte. /0 TEST and its alias /1 (AND for flags, no write-back) take the imm8
+                // that `decode` fetched. The other sub-ops carry no immediate. NOT (/2) touches no
+                // flags. NEG (/3) sets flags like 0 - operand. MUL/IMUL (/4,/5) and DIV/IDIV
+                // (/6,/7) reuse `mul`/`div` (DIV raises #DE on divide-by-zero or quotient overflow).
                 let value = u32::from(self.read_operand_u8(bus, operand)?);
                 match modrm.reg {
-                    0 => {
+                    0 | 1 => {
                         self.alu(4, value, insn.imm, BusWidth::Byte);
                     }
                     2 => self.write_operand_u8(bus, operand, !(value as u8))?, // NOT: no flags
@@ -899,7 +897,7 @@ impl CpuGsw {
                 // Group 3 word/dword. Same sub-op layout as 0xf6 at the operand width.
                 let value = self.read_operand_sized(bus, operand, operand_size)?;
                 match modrm.reg {
-                    0 => {
+                    0 | 1 => {
                         self.alu(4, value, insn.imm, operand_size.bus_width());
                     }
                     2 => {

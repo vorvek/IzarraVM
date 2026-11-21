@@ -684,13 +684,10 @@ impl CpuGsw {
                 //     matching the fused handler which sign-extended at fetch time).
                 //   - group 2 count-by-imm8 (0xc0/0xc1): always one imm8 count byte. The 1/CL forms
                 //     (0xd0-0xd3) and group 4 (0xfe) carry NO immediate.
-                //   - group 3 (0xf6/0xf7): an immediate ONLY for the TEST sub-op. The fused
-                //     reference implements TEST as `reg == 0` alone (the `reg == 1` alias is NOT a
-                //     TEST there — it falls through to UnsupportedGroupOpcode and consumes no
-                //     immediate), so we match it exactly: fetch the immediate only for `reg == 0`.
-                //     NOT/NEG/MUL/IMUL/DIV/IDIV (and the undefined reg==1) have none, so the byte
-                //     budget here depends on `reg`. Getting this conditional wrong mis-charges the
-                //     fetch and diverges from the fused path.
+                //   - group 3 (0xf6/0xf7): an immediate only for the TEST sub-ops. Sub-op 0 is TEST.
+                //     Sub-op 1 is the undocumented alias of TEST on the 386, 486 and Pentium, so it
+                //     also carries an immediate. NOT, NEG, MUL, IMUL, DIV and IDIV have none, so the
+                //     byte count depends on `reg`. The fetch clocks follow the bytes fetched.
                 let modrm = self.fetch_modrm(bus)?;
                 let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
                 insn.modrm = Some(modrm);
@@ -700,9 +697,9 @@ impl CpuGsw {
                     0x81 => insn.imm = self.fetch_immediate(bus, operand_size)?,
                     0x83 => insn.imm = sign_extend_u8(self.fetch_u8(bus)?),
                     0xc0 | 0xc1 => insn.imm = u32::from(self.fetch_u8(bus)?),
-                    0xf6 if modrm.reg == 0 => insn.imm = u32::from(self.fetch_u8(bus)?),
-                    0xf7 if modrm.reg == 0 => insn.imm = self.fetch_immediate(bus, operand_size)?,
-                    // 0xd0-0xd3 (count 1/CL), 0xfe (INC/DEC), and 0xf6/0xf7 with reg!=0 carry no
+                    0xf6 if modrm.reg <= 1 => insn.imm = u32::from(self.fetch_u8(bus)?),
+                    0xf7 if modrm.reg <= 1 => insn.imm = self.fetch_immediate(bus, operand_size)?,
+                    // 0xd0-0xd3 (count 1/CL), 0xfe (INC/DEC), and 0xf6/0xf7 with reg >= 2 carry no
                     // immediate after the ModRM.
                     _ => {}
                 }
