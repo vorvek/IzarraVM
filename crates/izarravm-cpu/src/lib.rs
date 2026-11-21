@@ -1804,6 +1804,9 @@ pub struct FastMapAuditCounters {
     /// Switches that found the incoming table tagged for another generation of its slot and
     /// wiped it.
     pub fast_map_two_tables_tag_wipes: u64,
+    /// Write fills the fast map refused because the physical page is a translation page (a page a
+    /// walk read). A native store to such a page must leave the block so the interpreter retires.
+    pub fast_map_write_fill_refused_translation: u64,
 }
 
 impl Default for FastMapAuditCounters {
@@ -1840,6 +1843,7 @@ impl Default for FastMapAuditCounters {
             tlb_insert_evicts_other_generation: 0,
             fast_map_two_tables_switches: 0,
             fast_map_two_tables_tag_wipes: 0,
+            fast_map_write_fill_refused_translation: 0,
         }
     }
 }

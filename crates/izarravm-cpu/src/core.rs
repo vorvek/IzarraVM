@@ -582,6 +582,13 @@ impl CpuGsw {
                     "write mapping of {linear:#x} without a dirty TLB entry"
                 );
             }
+            assert!(
+                !entry.has_write_bias()
+                    || !self
+                        .decode_cache
+                        .translation_page_is_watched(entry.physical_page >> 12),
+                "write mapping of {linear:#x} names a translation page"
+            );
             if !edges_pending && self.physical_page_watched(entry.physical_page) {
                 assert!(
                     entry.watched(),
@@ -1242,7 +1249,13 @@ impl CpuGsw {
         // or HLE range, a page-walk A/D-bit store, and the string-op translate-time invalidation
         // all arrive here. None of them is the guest patching its own instruction stream through
         // its own store path, so none of them may keep a block alive.
-        self.note_code_write_inner(physical, width, false)
+        self.note_code_write_inner(physical, width, false, false)
+    }
+
+    /// The page-walk accessed or dirty bit store. It retires like any other store to a page-table
+    /// page. It changes no mapping, so the fast map keeps its entries.
+    pub(super) fn note_page_walk_write(&mut self, physical: u32, width: u32) -> bool {
+        self.note_code_write_inner(physical, width, false, true)
     }
 
     /// Host address of `len` guest bytes at `physical`, from a page this CPU has already FETCHED
@@ -1316,7 +1329,7 @@ impl CpuGsw {
     /// diagnostic mirrors the post-elision production invalidation path exactly.
     #[inline]
     pub(super) fn note_code_write_hit(&mut self, physical: u32, width: u32) -> bool {
-        self.note_code_write_inner(physical, width, true)
+        self.note_code_write_inner(physical, width, true, false)
     }
 
     /// A CHANGED one-byte guest store onto a direct RAM page, routed to whichever of the two doors
@@ -1357,7 +1370,13 @@ impl CpuGsw {
     /// interpreter then replays the instruction. So no compiled block is mid-execution when this
     /// runs, and a block cannot patch its own lane from under itself.
     #[inline]
-    fn note_code_write_inner(&mut self, physical: u32, width: u32, lanes: bool) -> bool {
+    fn note_code_write_inner(
+        &mut self,
+        physical: u32,
+        width: u32,
+        lanes: bool,
+        page_walk_bits: bool,
+    ) -> bool {
         #[cfg(feature = "dynarec-mkii")]
         let session_hit = self.jit_direct.mkii.note_write(physical, width);
         // THE CALL-OUT WINDOW. `InterpretOne` runs one interpreter instruction with a native block
@@ -1512,6 +1531,17 @@ impl CpuGsw {
             #[cfg(feature = "jit")]
             self.jit_direct.invalidate_translation();
             self.fetch_page.invalidate();
+            // The TLB retire above leaves the fast map entries behind. Drop both tables so no
+            // entry outlives the translation it was built from. A walker store only sets the
+            // accessed or dirty bit, so it keeps the entries.
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            if !page_walk_bits {
+                self.record_fast_map_wipe_extent();
+            }
         }
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
@@ -2229,8 +2259,14 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map
-            .clear_unwatched_entries_of_physical_page(physical & 0xffff_f000);
+        {
+            self.jit_fast_map
+                .clear_unwatched_entries_of_physical_page(physical & 0xffff_f000);
+            // The sweep above skips an entry that is already watched, and a code-watched page
+            // keeps its write mapping. A translation page must have none in either table.
+            self.jit_fast_map
+                .clear_write_mappings_of_physical_page(physical & 0xffff_f000);
+        }
     }
 
     /// Drain and apply the sticky watch's strict E1 edges (watched-page-bit design D4): every
