@@ -13,7 +13,7 @@ pub const DAC_HZ: u32 = 44_100;
 /// in bursts as the emulation thread runs, while the window size comes from the
 /// OPL resampler under smooth host pacing. The two never agree frame-for-frame,
 /// so each source queues its surplus rather than discarding it and repeating a
-/// frame to cover the shortfall. 4410 frames is 100 ms at 44100 Hz -- far above
+/// frame to cover the shortfall. 4410 frames is 100 ms at 44100 Hz, far above
 /// ordinary jitter, so reaching it means the guest is genuinely outrunning the
 /// host drain, which is worth reporting rather than absorbing silently.
 pub const DAC_PENDING_FRAME_CAP: usize = 4410;
@@ -24,7 +24,7 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// The CT1745 powers on with master, voice, FM and CD all at level 31 (0 dB),
 /// matching DOSBox-X's `CTMIXER_Reset` and 86Box. Every one of those legs is
 /// therefore unity, and they SUM: a title playing digital effects over FM music
-/// -- Duke Nukem 3D, the common case -- drives the summing node past full scale
+/// (Duke Nukem 3D, the common case) drives the summing node past full scale
 /// with both legs at their defaults and nothing misprogrammed. Saturating that
 /// at `clamp_i16` is not just loud, it is destructive in a way a level control
 /// cannot undo: symmetric clipping squashes a panned image toward the centre
@@ -33,14 +33,14 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// pair reported against the volume-decode fix.
 ///
 /// Reserving the headroom here, once, after the legs are summed, is the only
-/// placement that leaves the hardware register semantics untouched -- guest
+/// placement that leaves the hardware register semantics untouched (guest
 /// reads, writes and read-modify-write round-trips of `0x30`-`0x37`/`0x41`/`0x42`
-/// are unchanged -- and preserves the RELATIVE balance the decode fix
+/// are unchanged) and preserves the RELATIVE balance the decode fix
 /// established (FM against voice against CD) exactly, since a single scalar
 /// divides out of every ratio.
 ///
-/// Making the mix quieter is the point: SNDMIXER.COM owns amplification (see
-/// `dev_docs/sndmixer-spec.md`), and its faders have nothing to raise if the
+/// Making the mix quieter is the point: SNDMIXER.COM owns amplification,
+/// and its faders have nothing to raise if the
 /// defaults already sit on the clamp.
 ///
 /// The shape is not novel: 86Box reserves headroom for the same reason. Its
@@ -48,7 +48,7 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// is the whole argument for one post-sum scalar.
 ///
 /// 86Box attenuates PER LEG, ahead of the sum, and by DIFFERENT amounts
-/// (`src/sound/snd_sb.c`, read as study only under `dev_docs/reference/86box`;
+/// (`src/sound/snd_sb.c`, read as study only;
 /// the concept is cited, no code taken):
 ///
 /// - digital voice, `sb_get_buffer_sb16_awe32`: `dsp * voice_l / 3.0` (-9.54 dB)
@@ -71,7 +71,7 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// ## The fourth leg
 ///
 /// The node sums four sources, not three: FM + voice (as one CT1745 bus), the
-/// WSS codec, CD-in, and -- since the PC-SPK register (`0x3B`) was wired up --
+/// WSS codec, CD-in, and, since the PC-SPK register (`0x3B`) was wired up,
 /// the PC speaker. The speaker is the one that does NOT power on at unity: the
 /// card's own PC-SPK level starts at position 2 of 4, which is -7 dB, so the
 /// beeper contributes about a fifth of a full-scale leg before the reserve is
@@ -85,7 +85,7 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 ///
 /// 86Box is the reference for the speaker's staging as much as for the rest.
 /// The comparable number is the beeper against a full-scale DIGITAL VOICE leg
-/// through each emulator's own chain, at both cards' defaults -- an absolute
+/// through each emulator's own chain, at both cards' defaults: an absolute
 /// level means nothing across two different output stages, and voice is what
 /// the 6.02 dB above is already anchored to.
 ///
@@ -99,7 +99,7 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 ///   common and cancel, leaving `swing * 0.4467 / 65534`.
 ///
 /// That measurement is now taken, and it closed the gap. `SPEAKER_AMPLITUDE`
-/// was 8000 -- a 16000 peak-to-peak swing, giving `16000 * 0.4467 / 65534` =
+/// was 8000, a 16000 peak-to-peak swing, giving `16000 * 0.4467 / 65534` =
 /// **-19.25 dB**, which rested 9.88 dB hotter than 86Box's -29.13. The whole of
 /// that gap was the constant: 20*log10(16000/5120) is 9.90 dB. It is now 2560,
 /// so the swing is 5120 peak-to-peak, the same number 86Box's is, and the two
@@ -122,8 +122,8 @@ pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 /// grain. See `MachineBus::note_pit_observer`.
 ///
 /// 5 ms is chosen to cover the "compute" leg of a latch-compute-latch
-/// calibration -- BIOS and game delay-loop calibrations time windows well under
-/// a millisecond -- without pinning a machine to the fine grain because
+/// calibration (BIOS and game delay-loop calibrations time windows well under
+/// a millisecond) without pinning a machine to the fine grain because
 /// something read a counter once. It is guest time, not host time, so it does
 /// not vary with the CPU mode.
 pub(crate) const PIT_OBSERVER_FINE_WINDOW_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 200;
@@ -198,7 +198,7 @@ impl Machine {
     /// that wants the other arm cannot get it from the environment inside a
     /// running test binary. The arm is per-MACHINE state for exactly that
     /// reason, and the differential tests state it in BOTH directions rather
-    /// than inheriting the ambient default -- so they keep meaning what they say
+    /// than inheriting the ambient default, so they keep meaning what they say
     /// the day the default moves.
     #[doc(hidden)]
     pub fn set_pit_bulk_advance_enabled(&mut self, enabled: bool) {
@@ -227,7 +227,7 @@ impl Machine {
         }
 
         // AD1848 / Windows Sound System playback, clock-driven exactly like the
-        // SB16 DSP above but on the codec's own base/IRQ/DMA -- no cross-talk with
+        // SB16 DSP above but on the codec's own base/IRQ/DMA: no cross-talk with
         // the SB16's mixer-selected IRQ/DMA. The codec pulls 1/2/4 byte-wide DMA
         // reads per output frame internally (8/16-bit, mono/stereo), so a single
         // byte fetcher feeds tick_sample. advance_autocal retires the post-MCE ACI
@@ -241,7 +241,7 @@ impl Machine {
             // its ~128-sample window regardless of the *programmed* sample rate, so
             // when ACI is draining while I8 selects one of the two unsupported XTAL1
             // selects (rate_hz()==0) we fall back to the lowest documented WSS rate
-            // (8000 Hz) just to clock the ACI countdown -- otherwise a guest that
+            // (8000 Hz) just to clock the ACI countdown: otherwise a guest that
             // clears MCE under an invalid rate would leave ACI asserted forever.
             // DMA render is still gated on a *valid* programmed rate below, so no
             // audio is produced at the fallback cadence.
@@ -260,8 +260,8 @@ impl Machine {
             // either playback is armed (and the rate is valid), or the post-MCE ACI
             // window is still retiring (a driver clears MCE and polls ACI before
             // setting PEN). Gating on work mirrors the DSP path's `is_playing()`
-            // check so an idle codec -- the default state on every machine at
-            // power-on (rate 8000 Hz, not playing, no autocal) -- skips the
+            // check so an idle codec (the default state on every machine at
+            // power-on (rate 8000 Hz, not playing, no autocal)) skips the
             // accumulation entirely instead of spinning ~8000 times/sec.
             let playing_at_valid_rate = programmed_rate > 0 && self.wss.is_playing();
             if wss_rate > 0 && (playing_at_valid_rate || autocal_active) {
@@ -272,7 +272,7 @@ impl Machine {
                     //
                     // This used to pre-fetch a whole HLE block first. That block
                     // was sized at the codec's entire remaining count, so a
-                    // single advance ran the 8237 all the way around -- and the
+                    // single advance ran the 8237 all the way around, and the
                     // 8237's current address and count are guest-visible
                     // registers. Tomb Raider's HMI sound engine polls channel
                     // 0's current count to follow the play position: with the
@@ -286,7 +286,7 @@ impl Machine {
                     // iteration, never surviving an advance, while still issuing
                     // the same one `read_byte` per byte plus a `Vec` allocation
                     // and a full clone per iteration. So the buffer is gone and
-                    // the fetch closure reads straight through -- fewer moving
+                    // the fetch closure reads straight through: fewer moving
                     // parts for the same guest-visible behaviour.
                     if playing_at_valid_rate {
                         let Machine {
@@ -1011,7 +1011,7 @@ impl Machine {
     ///   `Pit::out_after` peek on bits 4/5 is taken in both timing classes (see
     ///   `MachineBus::read_io`), so batch length does not bound how stale a
     ///   0x61 poll can be in EITHER class. That matters because this term never
-    ///   covered the case that needed it most -- the classic no-sound PIT
+    ///   covered the case that needed it most: the classic no-sound PIT
     ///   timing technique (GATE2 high, data enable LOW: 0x61 bit 0 set, bit 1
     ///   clear) polls bit 5 with `data_enabled()` false, and the observer
     ///   window below arms only on 0x40-0x43, so a guest that programs channel
@@ -1025,7 +1025,7 @@ impl Machine {
     ///   all, and no longer load-bearing for counter VALUES: `Counter::count_after`
     ///   now peeks the counting element at the in-batch instant of every 0x40-0x43
     ///   access, so a latch-compute-latch measurement is exact at any batch grain.
-    ///   The window is kept as the one case the peek declines -- a BCD-programmed
+    ///   The window is kept as the one case the peek declines: a BCD-programmed
     ///   counter, where `count_after` returns None and the read falls back to the
     ///   live (batch-start) field, exactly as the 0x61 arm falls back for a BCD
     ///   `out_after`. Removing the term is a measurable batch-length change and
@@ -1033,7 +1033,7 @@ impl Machine {
     ///
     ///   COVERAGE AUDITED, because the original 5 ms figure was chosen to span a
     ///   latch-compute-latch pair and does NOT span a once-per-frame (>5 ms)
-    ///   latch cadence -- so if the window were still load-bearing for values,
+    ///   latch cadence, so if the window were still load-bearing for values,
     ///   that pattern would fall through it. Every 0x40-0x43 path in BOTH classes
     ///   now peeks at the in-batch instant, so it is not:
     ///     * read 0x40-0x42 -> `Pit::read_port_at` -> `Counter::read(clocks)`,
@@ -1048,7 +1048,7 @@ impl Machine {
     ///   remaining surface.
     ///
     /// NOT a term, deliberately: the sample producers' own fidelity. The original
-    /// cap (2026-06-21) existed so "the per-clock fine-samplers ... never alias" --
+    /// cap (2026-06-21) existed so "the per-clock fine-samplers ... never alias":
     /// at that time the speaker sampled channel-2 OUT once per advance. Five days
     /// later the speaker was rebuilt to integrate PIT transitions at their exact
     /// sub-sample instants, and the timeline gives every producer a persistent
@@ -1058,7 +1058,7 @@ impl Machine {
     ///
     /// ALSO not a term, and the reason this is a gate and not a wider one: the
     /// Margo blit engine. Its BUSY poll is the sharpest batch-granularity
-    /// consumer in the machine, but a gate cannot serve it -- the arming MMIO
+    /// consumer in the machine, but a gate cannot serve it: the arming MMIO
     /// write happens INSIDE the batch whose cap was already chosen, so the gate
     /// would always be read too early. It is handled as a real deadline in
     /// `event_batch_cap` instead.
@@ -1082,15 +1082,15 @@ impl Machine {
     ///
     /// Why the fine fallback is gated rather than unconditional: at 22 MHz a
     /// DAC period is ~500 clocks, so an idle 386 guest paid a floor of ~44,000
-    /// batch iterations per guest second -- each one a fresh pull-scan of the
-    /// device deadline queries below -- to protect consumers that were not
+    /// batch iterations per guest second (each one a fresh pull-scan of the
+    /// device deadline queries below) to protect consumers that were not
     /// running. Gating it leaves the protected cases exactly as fine as before
     /// and gives the idle case the same 1 ms ceiling the Approximate class uses.
     ///
     /// CAVEAT CLOSED (was: time-derived port reads with no in-batch peek). The PIT
     /// counter latch on 0x40/0x42 used to return the counting element as of BATCH
-    /// START, so the FIRST latch of a "latch, compute, latch" measurement -- the one
-    /// that lands in a batch nothing had shortened yet -- could sit up to a full
+    /// START, so the FIRST latch of a "latch, compute, latch" measurement (the one
+    /// that lands in a batch nothing had shortened yet) could sit up to a full
     /// coarse batch (1 ms) early, and the PIT-observer window only covered the
     /// touches after it. The principled fix named here has since been taken:
     /// `Counter::count_after` peeks the counting element the way `Pit::out_after`
@@ -1130,7 +1130,7 @@ impl Machine {
     /// rather than of the skip:
     ///
     /// * It contains `next_ata_deadline()` UNGATED, which chains `ata`, `bmide`
-    ///   and `ide` together -- so a skip armed by the secondary channel cannot
+    ///   and `ide` together, so a skip armed by the secondary channel cannot
     ///   outrun the primary's boundary or a DMA transfer's.
     /// * It contains every PIT / DSP / WSS / RTC / timed-I/O edge, so NO DEVICE
     ///   EDGE IS EVER CROSSED INSIDE A SKIP. Nothing can coalesce, nothing can
@@ -1141,7 +1141,7 @@ impl Machine {
     ///
     /// **DO NOT SUBSTITUTE `next_timer_wake`**, even though the halt
     /// fast-forward uses it. Its ATA and ATAPI terms are gated on IRQ
-    /// deliverability -- `atapi_wake` requires `self.ide.irq_enabled()` -- and
+    /// deliverability (`atapi_wake` requires `self.ide.irq_enabled()`) and
     /// TOKACD sets nIEN on the channel before every single command
     /// (`tokacd.asm:1464-1466`). So on the exact workload the skip exists for,
     /// `atapi_wake` is `None` and `next_timer_wake` would skip STRAIGHT PAST THE
@@ -1158,7 +1158,7 @@ impl Machine {
     /// same `remaining`) come from a DEVICE EDGE rather than from the mode-class
     /// fallback grain? `compose_batch_cap` is `min(fallback, edge_cap, remaining)`, so
     /// a cap strictly below `min(fallback, remaining)` can only have been produced by
-    /// the optional edge term -- exact, and it costs two integer divisions rather than
+    /// the optional edge term: exact, and it costs two integer divisions rather than
     /// the full uncached device scan `next_device_edge_ticks` is.
     ///
     /// Used ONLY to name the reflected-call memo's refusal lane (`DeviceEdge` vs
@@ -1171,8 +1171,8 @@ impl Machine {
     ///
     /// Split out of `event_batch_cap` so the cached path can keep paying it per
     /// batch. It is two integer divisions and, on the Accurate class, the
-    /// `fine_batch_grain_required` gate -- all live-field tests, nothing that
-    /// walks a device queue -- so there is nothing here worth caching, and the
+    /// `fine_batch_grain_required` gate (all live-field tests, nothing that
+    /// walks a device queue) so there is nothing here worth caching, and the
     /// gate is LEVEL state that a cache would have to invalidate on every
     /// consumer edge anyway.
     fn batch_grain_fallback(&self) -> u64 {
@@ -1204,7 +1204,7 @@ impl Machine {
     /// The two Margo terms, deliberately kept OUT of the deadline cache.
     ///
     /// Both are armed by a memory write, and NO Margo MMIO write sets
-    /// `io_touched` -- a DISPLAY_START or COMMAND store returns
+    /// `io_touched`: a DISPLAY_START or COMMAND store returns
     /// `VideoWrite::Accepted`/`ArmedBlit` and batches on like any framebuffer
     /// store. There is therefore no cheap seam that could invalidate a cached
     /// Margo deadline, and caching one would violate the "never later than a
@@ -1220,7 +1220,7 @@ impl Machine {
     /// answers a mid-batch poll at the READ instant, and `Margo::busy_credit_ns`
     /// makes the batch-end drain measure from the ARM instant, so the clause
     /// "software cannot observe the engine as idle until the modeled time has
-    /// passed" holds no matter where the batch ends -- the same way
+    /// passed" holds no matter where the batch ends, the same way
     /// `Counter::count_after` retired the PIT's need for a fine batch grain.
     /// That is what licensed dropping the arming-edge `io_touched` break, and it
     /// is what licenses dropping this term for every guest that is not using the
@@ -1233,7 +1233,7 @@ impl Machine {
     /// consumes commands" and that software feeding the pusher "as a producer to
     /// its consumer behaves as it would on the real part". Without this deadline
     /// a ring drains at batch cadence rather than at the modeled completion
-    /// cadence -- up to a 1 ms cap per ~740 ns glyph expand, ~1350x slow, which
+    /// cadence, up to a 1 ms cap per ~740 ns glyph expand, ~1350x slow, which
     /// would also make the pusher slower than the direct register writes it
     /// exists to replace. So the term is kept EXACTLY while the pusher has work
     /// (`Vega::pusher_has_queued_work`) and dropped otherwise. Unconditional
@@ -1251,7 +1251,7 @@ impl Machine {
     /// inert, the pair moves things" reading that two rounds of measurement
     /// disproved. The dependency is structural and visible right below: the blit
     /// term arms only when `blitter_busy_ns() > 0` AT BATCH ENTRY. The
-    /// `VideoWrite::ArmedBlit` `io_touched` break is what put it there -- it
+    /// `VideoWrite::ArmedBlit` `io_touched` break is what put it there: it
     /// ended the batch on the arming write, so the NEXT batch started with the
     /// engine busy. With the break gone a 200-740 ns blit is armed and drained
     /// inside one ~1 ms batch, no batch ever starts busy, and this term stops
@@ -1259,13 +1259,13 @@ impl Machine {
     /// both-halves-off machine; removing this term afterwards is a no-op
     /// wherever the pusher is idle.
     ///
-    /// MEASURED, not argued: the two binaries -- break removed, and break plus
-    /// this term removed -- produce BYTE-IDENTICAL deterministic counters on
+    /// MEASURED, not argued: the two binaries (break removed, and break plus
+    /// this term removed) produce BYTE-IDENTICAL deterministic counters on
     /// prince-486. All 128 perf fields agree; the only two that differ are
     /// `jit_direct_compile_ns` and `jit_direct_arena_compaction_ns`, which are
     /// host-nanosecond measurements rather than counters.
     ///
-    /// THE OLD COST TABLE IS STALE -- DO NOT QUOTE IT AS A LIVE LEVER. It was
+    /// THE OLD COST TABLE IS STALE. DO NOT QUOTE IT AS A LIVE LEVER. It was
     /// measured on the 2026-08-10 stack and read:
     ///
     ///   | fixture    | entries          | wall s          |
@@ -1383,9 +1383,9 @@ impl Machine {
     }
 
     /// Test seam: the cache's raw state. A cap comparison cannot see every
-    /// invalidation -- the mode-class fallback is 1 ms of guest time, so a device
+    /// invalidation (the mode-class fallback is 1 ms of guest time, so a device
     /// edge further out than that is invisible in the cap however wrong the cache
-    /// is -- so the invalidation-site tests assert on this directly.
+    /// is) so the invalidation-site tests assert on this directly.
     #[cfg(test)]
     pub(super) fn device_edge_cache_state(&self) -> DeviceEdgeCache {
         self.device_edge_cache
@@ -1410,8 +1410,8 @@ impl Machine {
     /// once per instruction instead of asking every device how far away its next
     /// event is (86Box is GPL-2 and study-only for this tree: the idea is
     /// attributed here, no code was copied). The adaptation to this codebase is
-    /// deliberately coarser than a sorted list -- one cached MINIMUM rather than a
-    /// full ordering -- because the batch loop only ever needs the earliest edge,
+    /// deliberately coarser than a sorted list (one cached MINIMUM rather than a
+    /// full ordering) because the batch loop only ever needs the earliest edge,
     /// and a single `Option<u64>` needs no per-device arm/disarm plumbing.
     ///
     /// The cache holds an ABSOLUTE master tick, which is sound because every term
@@ -1424,17 +1424,17 @@ impl Machine {
     /// INVALIDATION IS CONSERVATIVE by construction. The one-sided SAFETY
     /// argument is that an edge EARLIER than a fresh scan only shortens a batch
     /// (a shorter batch is strictly more observable), while a LATER one would
-    /// let a device edge land mid-batch -- so every path that can move a device
+    /// let a device edge land mid-batch, so every path that can move a device
     /// schedule drops the cache. Those paths are:
-    ///   * batch entry, when the cached edge is already due -- the device fired
+    ///   * batch entry, when the cached edge is already due: the device fired
     ///     inside its own advance and rearmed or went idle;
     ///   * batch end, whenever the batch was not provably quiet: any guest port
     ///     access (`io_touched`), a bus-side DMA write to guest RAM, any
     ///     serviced HLE / mode / Toka / BIOS32 / unittester step, or a HLT
     ///     fast-forward;
     ///   * `run_until_tick` entry, which covers EVERY host-side mutator in one
-    ///     place -- keyboard/mouse/joystick injection, media mount and eject,
-    ///     CMOS and RTC seeding, audio rendering -- since those can only run
+    ///     place (keyboard/mouse/joystick injection, media mount and eject,
+    ///     CMOS and RTC seeding, audio rendering) since those can only run
     ///     between run calls on the machine thread. The individually risky ones
     ///     also invalidate at their own site, so the property does not silently
     ///     depend on that scheduling fact.
@@ -1442,7 +1442,7 @@ impl Machine {
     /// A MARGO BLIT ARM IS NOT ON THAT LIST, and does not need to be. It used to
     /// be, via `io_touched`, only as a side effect of the batch break that has
     /// since been replaced by the lazy STATUS peek. Arming a blit does move a
-    /// device schedule -- but the Margo terms are the ones `vega_edge_ticks`
+    /// device schedule, but the Margo terms are the ones `vega_edge_ticks`
     /// keeps OUT of the cache (see its doc, and the exclusion pinned by
     /// `machine_deadline_cache_test.rs`'s `arm_every_cached_device`), so there is
     /// no cached Margo deadline for it to make stale. That soundness rests on the
@@ -1469,7 +1469,7 @@ impl Machine {
     pub(super) fn event_batch_cap_cached(&mut self, remaining: u64) -> u64 {
         // Hit-rate instrumentation, GATED AT THE CALL SITE on the same flag that
         // decides whether anything will ever read it (`--machine-phase-timing`,
-        // the only consumer -- see the print in `run_boot_hdd_folder`). An
+        // the only consumer; see the print in `run_boot_hdd_folder`). An
         // ungated pair of `u64` increments on the batch-entry path is exactly the
         // default-off instrument tax this repo has been bitten by before: the
         // whole point of the cache is that the common batch entry is one compare
@@ -1560,7 +1560,7 @@ impl MachineBus<'_> {
         // hypothetical: `Distira::display_enabled` moves on a plain FBIINIT0 /
         // FBIINIT1 MMIO write, which is a bus-side write in the middle of a
         // batch, so a guest can hand the display from Margo to Distira without
-        // ever reaching a batch boundary -- tomb-raider-3dfx probes 101h and
+        // ever reaching a batch boundary: tomb-raider-3dfx probes 101h and
         // then does exactly that. Fall back to the VGA's own beam, which is
         // still exactly its batch-start value because devices advance only at
         // batch end; the whole-dot term below is the same either way.
@@ -1625,7 +1625,7 @@ impl MachineBus<'_> {
         (self.opl.status_after(remaining), micros)
     }
 
-    /// The un-applied batch time at the current instant, in microseconds —
+    /// The un-applied batch time at the current instant, in microseconds,
     /// the same quantity `predicted_opl_status` predicts with, exposed for
     /// the SB DSP's reset-settle service (`SbDsp::service_reset_at`).
     pub(super) fn pending_device_micros(&self) -> u64 {
@@ -1677,7 +1677,7 @@ impl MachineBus<'_> {
     ///
     /// The exact analogue of `elapsed_pit_clocks`, and it converts the SAME
     /// in-batch clock total `T` through the SAME `RatePhase` the real batch-end
-    /// `advance_master_ticks` will use for `margo_nanoseconds` -- carry included,
+    /// `advance_master_ticks` will use for `margo_nanoseconds`, carry included,
     /// which is why `Timeline::preview_margo_nanoseconds` clones the accumulator
     /// rather than recomputing ns from a rate. A divergence here would show as
     /// STATUS.BUSY clearing a nanosecond early or late against a real

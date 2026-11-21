@@ -240,7 +240,7 @@ fn no_spill_file_without_eviction() {
 ///
 /// NON-VACUOUS: the sweep covers spans that straddle chunk boundaries, start and
 /// end inside untouched chunks, and cross chunks that exist but hold no written
-/// bit in range -- the three shapes a chunk-granular short-circuit gets wrong.
+/// bit in range: the three shapes a chunk-granular short-circuit gets wrong.
 /// Returning `self.chunks.contains_key(&chunk_id(first))` fails it immediately.
 #[test]
 fn was_written_span_agrees_with_the_per_sector_loop() {

@@ -11,8 +11,8 @@ fn line_addr(line: u32) -> u32 {
 }
 
 /// Known-pattern proof of the 4-way pseudo-LRU replacement: fill one set,
-/// evict its pseudo-LRU victim, and confirm the victim -- not just "a"
-/// miss -- is exactly the one Intel's 3-bit tree algorithm predicts. Every
+/// evict its pseudo-LRU victim, and confirm the victim (not just "a"
+/// miss) is exactly the one Intel's 3-bit tree algorithm predicts. Every
 /// access here is a READ, so every miss allocates (no-write-allocate is
 /// exercised separately below).
 ///
@@ -28,7 +28,7 @@ fn line_addr(line: u32) -> u32 {
 /// 6. probe(L512) MISS  bits 0b011 -> victim way2 (L128 evicted) -> bits 0b110
 /// 7. probe(L256) HIT   (way1, untouched by the eviction) -> bits 0b101
 /// 8. probe(L128) MISS  (evicted at step 6, so this proves the eviction
-///    target -- not merely that some slot missed)
+///    target, not merely that some slot missed)
 #[test]
 fn four_way_pseudo_lru_matches_hand_traced_sequence() {
     let mut tags = ShadowTags::new();
@@ -73,7 +73,7 @@ fn write_miss_does_not_allocate() {
 /// `four_way_pseudo_lru_matches_hand_traced_sequence` (l0/l128/l256/l384 land
 /// in ways 0/2/1/3 from cold, ending with PLRU bits `0b000`), but the
 /// protecting touch here is a WRITE HIT on line 0 rather than a read, and a
-/// 5th line then evicts way 2 (line 128) rather than way 0 -- proving the
+/// 5th line then evicts way 2 (line 128) rather than way 0, proving the
 /// write hit moved the PLRU state exactly like a read hit would have.
 #[test]
 fn write_hit_touches_lru_like_a_read_hit() {

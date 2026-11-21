@@ -258,7 +258,7 @@ fn config_region_reads_the_wss_signature_at_every_offset() {
     // A real MSS board answers all four low ports with the same presence
     // signature in bits 5:0. HMI's detect probe reads base+3 specifically and
     // requires `(value & 0x3f) == 0x04`, so an offset that reports something
-    // else -- a board ID at 0, a jumper readback at 1, zeroes at 2/3 -- makes
+    // else (a board ID at 0, a jumper readback at 1, zeroes at 2/3) makes
     // the card undetectable at that offset.
     let mut dev = Ad1848::new(Ad1848Config { irq: 7, dma: 0 });
     for offset in 0..=3 {
@@ -325,7 +325,7 @@ fn the_irq_verify_strobe_drives_the_selected_line_on_its_edges() {
     dev.write_port(0, 0x61);
     assert_eq!(dev.take_board_irq_strobe(), None, "no edge, no change");
 
-    // Falling edge releases -- and only the line the board actually raised.
+    // Falling edge releases, and only the line the board actually raised.
     dev.write_port(3, 0x21);
     assert_eq!(
         dev.take_board_irq_strobe(),
@@ -376,7 +376,7 @@ fn board_config_write_selects_irq_and_dma_by_the_mss_encoding() {
 
 #[test]
 fn every_config_code_names_a_real_line_and_a_real_channel() {
-    // The tables are closed, so no byte -- not one of the 256 -- can select an
+    // The tables are closed, so no byte (not one of the 256) can select an
     // out-of-range 8237 channel (the old unchecked path could produce channel
     // 11, which panicked the machine's channel lookup) or IRQ 0.
     const IRQS: [u8; 8] = [5, 7, 9, 10, 11, 12, 14, 15];
@@ -403,7 +403,7 @@ fn every_config_code_names_a_real_line_and_a_real_channel() {
 fn repointing_the_board_re_steers_resources_and_touches_nothing_else() {
     // The config register is board glue: an ISA-side latch with no wire into
     // the codec at base+4. A re-point moves which DRQ/DACK/INT lines the codec
-    // is on and leaves an in-flight transfer running on the new ones -- I9 PEN,
+    // is on and leaves an in-flight transfer running on the new ones: I9 PEN,
     // the Current Count and the sticky R2 INT are all codec state and all
     // guest-readable, so inventing a quiesce here would be a guest-visible lie.
     let mut dev = Ad1848::new(Ad1848Config { irq: 11, dma: 0 });
@@ -593,8 +593,8 @@ fn stereo_8bit_orders_left_before_right_and_counts_one_period() {
 
 #[test]
 fn rate_table_decodes_every_cfs_css_cell() {
-    // Data-driven over all 16 (cfs, css) combinations so every table cell --
-    // including both XTAL1 "Not Supported" codes (CFS4 and CFS5) -- is pinned.
+    // Data-driven over all 16 (cfs, css) combinations so every table cell,
+    // including both XTAL1 "Not Supported" codes (CFS4 and CFS5), is pinned.
     const XTAL1: [u32; 8] = [8000, 16000, 27429, 32000, 0, 0, 48000, 9600];
     const XTAL2: [u32; 8] = [5512, 11025, 18900, 22050, 37800, 44100, 33075, 6615];
     let mut dev = Ad1848::default();

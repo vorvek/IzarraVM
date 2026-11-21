@@ -96,7 +96,7 @@ EXPECTED RUNTIME. Per-leg walls are taken from the newest scoreboard artifacts u
 .bench/results/ (`scoreboard.json`, field `wall_seconds`), rounded up:
   wolf3d-586    66 s  (68.979 arm0-g2 / 65.017 arm1-g2, 2026-08-26; 65.288 / 64.568 on 2026-08-25)
   duke3d-586   205 s  (201.075 arm0-g5 / 249.732 arm1-g5, 2026-08-26; 202.357 / 197.472 on 2026-08-25
-                       -- the 249.7 leg is the outlier this ladder's contamination bar exists to reject)
+                      : the 249.7 leg is the outlier this ladder's contamination bar exists to reject)
   duke3d-586-short 96 s (96.567 / 95.562, 2026-08-26)   -- with -DukeShort
   tombraid-586 128 s  (128.734 arm0-g3 / 118.528 arm1-g3, 2026-08-26; 129.932 / 124.994 on 2026-08-25)
   quake-586     21 s  (21.897, scoreboard-20260826-081213-armon-inline-verify; review NOTE 5)
@@ -104,8 +104,6 @@ plus a per-leg fixture copy charged from the tree sizes (wolf3d 2.3 MB, quake 18
 tombraid 15.0 MB, duke3d 46.1 MB). The estimate is printed at start and is a LOWER
 bound: discarded contaminated legs are not in it.
 
-See dev_docs/specs/2026-08-27-c2-podkey-links-design.md section 6 and
-dev_docs/specs/2026-08-27-c2-podkey-links-review.md MAJOR-2 through MAJOR-4.
 Modelled on .bench/scripts/ladder-d-elision-b.ps1 (review MINOR-9: that script is
 untracked, so this is a copy under its own name with its own lock path, not a
 reference to it).
@@ -212,7 +210,7 @@ function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
 
 # Half drives Resolve-RowSelection directly. The other half spawns this very
 # script under `pwsh -File` with the mangled two-token shape, because that
-# failure happens in the parameter binder -- before any function here runs --
+# failure happens in the parameter binder (before any function here runs)
 # and only a real child invocation can prove the guard fires there. The
 # campaign rule applies: the guard must go RED on the broken input, and a green
 # control must show the child harness works.
@@ -517,7 +515,7 @@ function Set-LadderEnvironment {
     $env:IZARRAVM_DIRECT_HOLD_LOAD_BIAS = "0"
     $env:IZARRAVM_DIRECT_ALIGN_TEST_AL = "0"
     # Every observer OFF. A default-off instrument still taxes the hot path once
-    # armed, and several of them only do work when the JIT is active -- i.e. they
+    # armed, and several of them only do work when the JIT is active, i.e. they
     # tax exactly the runs this is trying to time.
     foreach ($observer in @(
             "IZARRAVM_CPU_PROFILE", "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_RIP_PROFILE",

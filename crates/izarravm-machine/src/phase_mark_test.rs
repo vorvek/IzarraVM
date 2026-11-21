@@ -111,7 +111,7 @@ fn periodic_marks_are_evenly_spaced_in_master_ticks() {
 ///
 /// That is the property a consumer needs: entries at the same guest instant separated by no wall
 /// read as infinite rate to anything that divides. It is weaker than "a multi-interval jump fires
-/// exactly once" -- see the module note on why that stronger claim has no cover here.
+/// exactly once". See the module note on why that stronger claim has no cover here.
 #[test]
 fn a_jump_past_several_intervals_fires_one_mark() {
     let mut machine = spinning_machine();

@@ -269,7 +269,7 @@ pub fn multihlt_com() -> &'static [u8] {
 
 /// The XMS round-trip fixture: install-check, get entry, version,
 /// alloc a 64 KB EMB, lock, move a pattern conventional->EMB->conventional, verify,
-/// unlock, free — then signal 0xA5 (success) via the unit-tester exit port. Runs in
+/// unlock, free, then signal 0xA5 (success) via the unit-tester exit port. Runs in
 /// V86 under TOKAEMM; a non-0xA5 exit code names the step that broke.
 pub fn xmstest_com() -> &'static [u8] {
     XMSTEST_COM
@@ -286,7 +286,7 @@ pub fn xmsarena_com() -> &'static [u8] {
 
 /// The UMB fixture: with DOS=UMB, set the high-first allocation
 /// strategy, AH=48h-allocate a block, assert it landed in upper memory (segment
-/// 0xC800 or above) with real RAM behind it (write/read a pattern) — proving
+/// 0xC800 or above) with real RAM behind it (write/read a pattern), proving
 /// TOKAEMM page-mapped extended RAM into the upper holes and DOS=UMB consumed it.
 /// Runs in V86; signals 0xA5 (or a 0xEn step code) via the unit-tester exit port.
 pub fn umbtest_com() -> &'static [u8] {
@@ -296,21 +296,21 @@ pub fn umbtest_com() -> &'static [u8] {
 /// The EMS fixture, which needs TOKAEMM loaded with the RAM argument:
 /// version, frame segment, page counts, allocate, then map logical pages
 /// through the frame slots writing distinct patterns and reading them back
-/// through other slots — proving the runtime page remap through the paged
+/// through other slots, proving the runtime page remap through the paged
 /// frame. Signals 0xA5 (or a 0xEn step code) via the unit-tester exit port.
 pub fn emstest_com() -> &'static [u8] {
     EMSTEST_COM
 }
 
 /// The mouse-under-V86 fixture: after LH TOKAMOUS, polls the INT 33h
-/// wheel counter for a host-injected detent — proving slave IRQ12 -> vector
+/// wheel counter for a host-injected detent, proving slave IRQ12 -> vector
 /// 0x74 -> INT 74h reflection under the monitor. Signals 0xA5 / 0xEn.
 pub fn mousetst_com() -> &'static [u8] {
     MOUSETST_COM
 }
 
 /// The SB16-IRQ5-under-V86 fixture: hooks INT 0Dh, resets the DSP,
-/// and requests immediate 8-bit IRQs (DSP 0xF2) inside a CLI/STI-dense loop —
+/// and requests immediate 8-bit IRQs (DSP 0xF2) inside a CLI/STI-dense loop:
 /// IRQ5 deliveries interleave with #GPs on the shared vector 13, exercising
 /// the monitor's discriminator. Signals 0xA5 / 0xEn.
 pub fn sndtst_com() -> &'static [u8] {
@@ -328,7 +328,7 @@ pub fn irq5ip0_com() -> &'static [u8] {
 }
 
 /// The default-off EMS fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): the
-/// manager must answer INT 67h frameless — present, version 4.0, zero pages,
+/// manager must answer INT 67h frameless: present, version 4.0, zero pages,
 /// 41h returns 80h, allocation refused with 87h. Signals 0xA5 / 0xEn.
 pub fn emsnone_com() -> &'static [u8] {
     EMSNONE_COM
@@ -344,7 +344,7 @@ pub fn vcpidet_com() -> &'static [u8] {
 }
 
 /// The VCPI query/page-pool fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS):
-/// exercises DE02-DE0B — pool count/alloc/free round-trip with 12-LSB
+/// exercises DE02-DE0B: pool count/alloc/free round-trip with 12-LSB
 /// masking, bad-free and double-free rejection, the V86 page-table query,
 /// CR0, the debug-register array, and the 8259 report/record round-trip.
 /// Signals 0xA5 / 0xEn.
@@ -368,7 +368,7 @@ pub fn vcpilow_com() -> &'static [u8] {
 }
 
 /// The VCPI DE01 fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): validates the
-/// Get Protected Mode Interface call's V86-observable outputs — the 0x110-
+/// Get Protected Mode Interface call's V86-observable outputs: the 0x110-
 /// entry page-table copy (identity mappings, software bits 9-11 cleared,
 /// exact write extent, DI advance), the three furnished GDT descriptors,
 /// and the in-segment PM entry offset. Signals 0xA5 / 0xEn.
@@ -412,15 +412,15 @@ pub fn gpstorm_com() -> &'static [u8] {
 
 /// The no-INTA-under-a-guest-CLI fixture: a V86 guest CLIs, polls the master
 /// IRR through OCW3 0x0A until IR0 is REQUESTED (so the read below cannot be
-/// early), then reads the ISR. Signals 0xA5 when the ISR is empty -- the
-/// request outstanding, unacknowledged -- 0xE1 when something INTA'd on the
+/// early), then reads the ISR. Signals 0xA5 when the ISR is empty, the
+/// request outstanding, unacknowledged; 0xE1 when something INTA'd on the
 /// guest's behalf, 0xD1 when no request ever appeared.
 pub fn nointa_com() -> &'static [u8] {
     NOINTA_COM
 }
 
 /// The E10 rule as a regression guard: the guest's own IVT[8] handler must see
-/// its line IN SERVICE (master ISR bit 0 set) when it runs, before any EOI --
+/// its line IN SERVICE (master ISR bit 0 set) when it runs, before any EOI,
 /// the state DJGPP's shared IRQ wrapper probes. Signals 0xA5 / 0xE1, with
 /// 0xD1/0xD2 for the two setup steps.
 pub fn isrset_com() -> &'static [u8] {
@@ -506,8 +506,8 @@ pub fn sndmixer_com() -> &'static [u8] {
 }
 
 /// The direct UMB mechanism fixture: drives XMS 10h/11h/12h without
-/// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach — the
-/// too-big probe (B0h + largest), alloc, grow, release, and reuse-after-free —
+/// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach: the
+/// too-big probe (B0h + largest), alloc, grow, release, and reuse-after-free,
 /// plus a write/read of the paged RAM. Signals 0xA5 (or a 0xEn step code).
 pub fn umbmech_com() -> &'static [u8] {
     UMBMECH_COM
@@ -516,7 +516,7 @@ pub fn umbmech_com() -> &'static [u8] {
 /// TOKAEMM.SYS is a bespoke memory-manager character device. Its INIT runs
 /// at SYSINIT, builds a load-relative protected-mode + paging + ring-0 monitor
 /// environment in its own resident memory, then IRETDs the running kernel into
-/// virtual-8086 mode — so the rest of DOS boots and runs virtualized under the
+/// virtual-8086 mode, so the rest of DOS boots and runs virtualized under the
 /// monitor. It stays resident permanently. Overlaid into C:\DOS and loaded via
 /// `DEVICE=C:\DOS\TOKAEMM.SYS`.
 pub fn tokaemm_sys() -> &'static [u8] {

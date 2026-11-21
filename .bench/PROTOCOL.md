@@ -13,9 +13,9 @@ invariants. Carry forward verbatim into future JIT sessions.
   jit_direct_entries 70,851,041,
   direct_native_coverage 0.6049873453760855, decode_probes 1,933,174,593.
   A VGA direct-write-token move used to wipe the WHOLE linear FastMap and both
-  direct-page caches. Doom moves that token 3,425,430 times per timedemo — all
+  direct-page caches. Doom moves that token 3,425,430 times per timedemo (all
   of them the Mode X map mask (port 0x3C5, sequencer index 2, cycling planes
-  0-3), MEASURED, not inferred — and the global form destroyed 42,046,095 live
+  0-3), MEASURED, not inferred) and the global form destroyed 42,046,095 live
   page entries doing it, **89.30% of them RAM whose host pointers had not
   moved**. The fix scopes the invalidation to physical 0xA0000..0xAFFFF and,
   inseparably, stops advancing the global direct-mapping epoch for that cause;
@@ -36,7 +36,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   geomean 1.0569, median 1.0583, min-wall 1.0576, **lower95 1.0485**, all three
   estimators within 0.0014, 12 of 12 ratios above 1, both roles' absolute walls
   in band (base 104.695-107.489 s, cand 98.989-102.296 s), `contaminated` false.
-  That is **+5.69%, IMPROVED class** — the first since the SMC lane campaign.
+  That is **+5.69%, IMPROVED class**, the first since the SMC lane campaign.
   QUAKE IS A COUNTER-IDENTICAL NULL CONTROL HERE (it never moves the token), so
   its ladder reading of +1.07% IS this binary pair's layout confound, measured
   rather than assumed. No derived number is claimed from dividing the two.
@@ -44,7 +44,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   CAVEAT, disclosed: the wall ladder ran on binaries built from the source
   BEFORE a diagnostic-counter correction that `1d560fda` also carries. The
   corrected rebuild is identical to the laddered binary on every behavioural
-  field — all 120 perf counters, both timedemo values, all bus and tick totals —
+  field: all 120 perf counters, both timedemo values, all bus and tick totals,
   differing only in the three wipe counters whose definition changed and in
   `jit_direct_compile_ns`. Evidence:
   .bench/results/fastmap-wipe-20260803/README.md.
@@ -55,7 +55,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   jit_direct_entries 115,658,430,
   direct_native_coverage 0.5837080594866788, decode_probes 2,079,452,776.
   doom `instructions` and `executed_cpu_core_clocks` are BYTE-IDENTICAL to
-  the Slice 2 pin — verified cross-role across 24 observations, not assumed.
+  the Slice 2 pin, verified cross-role across 24 observations, not assumed.
   Slice 3 reached the sixteen-bit MEMORY forms (MOVZX, MOV imm, the 0x83 ALU
   group); Slice 3b built the sixteen-bit register SHIFT lane. They are pinned
   together because Slice 3 alone REGRESSED quake -1.10% by relocating exits
@@ -63,29 +63,29 @@ invariants. Carry forward verbatim into future JIT sessions.
   toward its pre-Slice-3 baseline and its wall returned to +0.75% (neutral).
   **NO WALL CLAIM IS MADE FOR EITHER FIXTURE HERE.** doom read +1.56%
   (`positive_but_inconclusive`) but its own mechanism predicts ~+0.06%, and
-  the excess was traced to the confound on the BASE side across rounds — a
+  the excess was traced to the confound on the BASE side across rounds: a
   wall number that outruns its mechanism by an order of magnitude is not
   banked. Quake's lower95 grazes unity at 0.999953, which is neutrality, not
   a win. Evidence:
   .bench/results/rejected-rows-20260802/paired-3-3b/VERDICT.md.
-  CONFOUND CALIBRATION: SUPERSEDED — see the block below, which measured it
+  CONFOUND CALIBRATION: SUPERSEDED. See the block below, which measured it
   directly and found TWO regimes. The figures once quoted here (~2.4% unequal
   path, ~1.6% path-controlled) understate the dominant one.
   DRIFT SINCE THIS PIN (Slices 4-7 of the rejected-row campaign, none of which
   was accepted on a ladder, so none re-pins): the GUEST-VISIBLE halves are
-  intact and are what an identity check must use — doom realtics 826 /
+  intact and are what an identity check must use: doom realtics 826 /
   gametics 2134 and quake 969 frames are EXACT at every slice. The COUNTER
   halves above are stale and must NOT be used as a determinism gate:
   at slice 7 (`c014f8e7`) doom reads instr 4,768,524,931 (+1,124 from Slice 4,
   disclosed and reconciled there), jit_direct_entries 112,489,342,
   direct_native_coverage 0.5962176409, decode_probes 2,016,631,905; quake
-  reads instr 3,501,073,158 (-553, reconciled to the unit — core clocks -931
+  reads instr 3,501,073,158 (-553, reconciled to the unit: core clocks -931
   reappear as +930 scaled bus, budget -1), jit_direct_entries 24,536,481,
   direct_native_coverage 0.8670187885, decode_probes 483,107,376.
   Evidence: .bench/results/rejected-rows-20260802/slice7/README.md §4.
   ABSOLUTE WALLS on the slice-7 binary, recorded per regime (b) below and NOT
   a result: doom 105.337 s, quake 28.237 s, against Slice 6's 112.372 /
-  29.775 and Slice 5's 118.345 / 31.217 — both fixtures ~5-6% faster against
+  29.775 and Slice 5's 118.345 / 31.217: both fixtures ~5-6% faster against
   a mechanism predicting 0.05%, i.e. a lucky code-placement draw for one
   build. Do not read it as a trend.
 
@@ -96,9 +96,9 @@ invariants. Carry forward verbatim into future JIT sessions.
   `.bench/results/layout-confound-20260802/README.md`.
 
   **(a) Same build tree, small source edit: <= 1.2% geomean, <= 2.0%
-  min-wall.** Five varied perturbations — dead code at two sites in two
+  min-wall.** Five varied perturbations (dead code at two sites in two
   files, a PURE PERMUTATION of byte-identical `.text`, and a 64 KiB `.rdata`
-  displacement — moved quake by -1.24%..+0.11% geomean. Sign is NOT
+  displacement) moved quake by -1.24%..+0.11% geomean. Sign is NOT
   predictable from the edit.
 
   **(b) Independent rebuild of the SAME SOURCE: up to 6%.** One build in
@@ -113,7 +113,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   - Compare binaries built in the SAME session and tree wherever possible.
   - RECORD ABSOLUTE WALLS per binary, and treat any role whose absolute wall
     sits outside the round's normal band as a suspect BUILD before
-    interpreting any ratio. This is the only way to catch regime (b) — no
+    interpreting any ratio. This is the only way to catch regime (b): no
     amount of statistical tightness inside a ladder can, because the ladder
     is faithfully measuring that binary.
   - Rig floor: a null control (byte-identical `.text` and `.data`) reads
@@ -131,14 +131,14 @@ invariants. Carry forward verbatim into future JIT sessions.
   realtics 826, gametics 2134, instr 4,768,523,807,
   jit_direct_entries 117,249,301,
   direct_native_coverage 0.5824073487738802, decode_probes 2,087,246,117.
-  Slice 2 lowered the F7 REGISTER group natively — `/5` IMUL, `/6` DIV,
-  `/7` IDIV — with no call-out: a call-out frame prices at ~29 ns and these
+  Slice 2 lowered the F7 REGISTER group natively (`/5` IMUL, `/6` DIV,
+  `/7` IDIV) with no call-out: a call-out frame prices at ~29 ns and these
   run 4.15M times, ~60 ms of pure overhead, against a native guard of one
   not-taken branch. DIV/IDIV faults are kept out of the HOST by guards that
   side-exit BEFORE any architectural effect, so the interpreter re-executes
   and faults by its own rules; the unsigned guard (`cmp edx,ecx / jae`) is
   EXACTLY the host fault set, and the signed path divides at 64 bits so that
-  after the 0 and -1 guards no dividend — `i64::MIN` included — can trap.
+  after the 0 and -1 guards no dividend (`i64::MIN` included) can trap.
   `side_exit_divide_guard` reads 0 on both fixtures: neither fixture ever
   divides by zero or overflows a quotient. A CLEAN census deletion, unlike
   Slice 1: the rejected class fell by exactly the three rows' total
@@ -148,7 +148,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   ACCEPTED on a six-pair ladder vs `00a7ae4f`: geomean 1.0244, lower95
   1.0190, min-wall 1.0236, estimators within 0.0009, faster in 23 of 24
   observations; quake +0.70% (inside the relayout confound, not
-  load-bearing). That is **+2.44%, positive_but_inconclusive class — lower95
+  load-bearing). That is **+2.44%, positive_but_inconclusive class: lower95
   1.0190 is just BELOW the 1.02 IMPROVED bar, do not quote it as IMPROVED**.
   Evidence: .bench/results/rejected-rows-20260802/slice2/README.md and
   ladder/VERDICT.md.
@@ -157,12 +157,12 @@ invariants. Carry forward verbatim into future JIT sessions.
   gametics 2134, instr 4,768,523,807, jit_direct_entries 120,859,985,
   direct_native_coverage 0.58000063519448, decode_probes 2,102,333,272.
   REALTICS 826 IS THE DOOM ORACLE at 8G/586. Slice 1 lowered the coupled
-  prologue/epilogue family off the barrier list — `0x60` PUSHAD and `0x61`
+  prologue/epilogue family off the barrier list: `0x60` PUSHAD and `0x61`
   POPAD as MEMORY-class call-out slots (eight inline stores would blow the
   one-host-page block budget; a call-out is a fixed cost that fits), and
   `0x83 /5` word natively via the classify Word allowlist. The three rows
   are gone from the census with no neighbour absorbing them. **The
-  instruction count did NOT move** — unusual and the slice's distinguishing
+  instruction count did NOT move**, unusual and the slice's distinguishing
   property, verified 12/12 per role across the acceptance ladder; only the
   JIT accounting moved: entries -7.64%, unresolved_static_unbound -23.39%,
   decode_probes -3.27%, coverage +1.28pp. Conformance exact
@@ -170,15 +170,15 @@ invariants. Carry forward verbatim into future JIT sessions.
   counter byte-identical (no lane give-back). ACCEPTED on a six-pair ladder
   vs `8ac01d9f`: geomean 1.0135, lower95 1.0056, min-wall 1.0083, all three
   within 0.0052, quake noise_only. That is **+1.35%, positive_but_
-  inconclusive class, BELOW the 1.02 lower95 IMPROVED bar — do not quote it
+  inconclusive class, BELOW the 1.02 lower95 IMPROVED bar: do not quote it
   as IMPROVED**. Evidence: .bench/results/rejected-rows-20260802/slice1/
   README.md and ladder/VERDICT.md.
   KNOWN PROPERTY, not a defect: 10.19% of memory call-outs fail closed
-  (1,934,940 of 18,983,022) because the frame's page is not FastMap-resident
-  — doom wipes the whole map 3,425,432 times per run in BOTH roles, so this
+  (1,934,940 of 18,983,022) because the frame's page is not FastMap-resident:
+ doom wipes the whole map 3,425,432 times per run in BOTH roles, so this
   is pre-existing workload behaviour. The mechanism self-heals (the
   pre-check is `&self` and never populates; the interpreter's re-execution
-  does). Priced at ~56 ms, ~0.05% of wall — not the lever.
+  does). Priced at ~56 ms, ~0.05% of wall, not the lever.
 - HISTORY (the `b2b26add` pin, superseded by Slice 1 above; the Phase 5
   call-out arc, whose wall result and mechanism still stand): 8G/586:
   realtics 826, gametics 2134, instr 4,768,523,807,
@@ -186,7 +186,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   direct_native_coverage 0.5671845741924803, decode_probes 2,173,445,068.
   REALTICS 826 IS THE DOOM ORACLE at 8G/586, and it did NOT move here.
   THIS IS A RE-PIN. The five commits between this and the `94b8b8e7` block
-  below are the dynarec Phase 5 call-out slot arc — `24bcb52c` (the Phase 3
+  below are the dynarec Phase 5 call-out slot arc: `24bcb52c` (the Phase 3
   merge, guest-invisible), then `fd874711` "Execute port reads through a
   block call-out slot", `295bc9c2` "Refuse call-outs that would probe the
   TSS", `62a05642` "Keep call-out blocks off the privileged path" and
@@ -201,35 +201,35 @@ invariants. Carry forward verbatim into future JIT sessions.
   instructions. ACCEPTED on a six-pair ladder against a `24bcb52c` build:
   geomean 1.0141, median 1.0148, min-wall 1.0143, lower95 1.0067, all
   three estimators within 0.0007, quake noise_only. That is a +1.4%
-  result, BELOW the 1.02 lower95 bar for an IMPROVED-class claim — do not
+  result, BELOW the 1.02 lower95 bar for an IMPROVED-class claim: do not
   quote it as one. Evidence:
   .bench/results/refactor-phase5-20260801/README.md and task3/README.md.
   CAVEAT: `b2b26add` fixed a +2-raw-clock-per-completed-call-out
   double-charge that the three preceding commits carried, so any number
   measured on an `fd874711`..`62a05642` build is NOT this identity.
-- HISTORY (the `94b8b8e7` re-anchor, 2026-08-01 — superseded by the
+- HISTORY (the `94b8b8e7` re-anchor, 2026-08-01, superseded by the
   Phase 5 call-out block above): 8G/586: realtics 826, gametics 2134,
   instr 4,768,519,342, jit_direct_entries 151,407,546,
   direct_native_coverage 0.5542079239824546, decode_probes 2,255,872,004.
   This block is also what a build of `24bcb52c` (the merged Phase 3 tip)
   reproduces byte-for-byte, verified 12/12 as the base role of the Phase 5
-  acceptance ladder — Phase 3 was guest-invisible.
+  acceptance ladder: Phase 3 was guest-invisible.
   THIS WAS A RE-ANCHOR, NOT A RE-PIN: every value is byte-identical to the
   `dd4db734` block below. The seventeen commits between the two (PRs #661
-  through #668, plus `ab947dd6` #661) are a non-CPU domain refactor — GUI
+  through #668, plus `ab947dd6` #661) are a non-CPU domain refactor (GUI
   session/runtime split, startup resolution, host-input policy, firmware
   contract, Toka-DOS scratch and TokaEMM scenario setup, and the SB16
-  device-path extraction — and they moved NOTHING guest-visible on either
+  device-path extraction) and they moved NOTHING guest-visible on either
   fixture. All 179 non-wall json fields are identical across the boundary,
   doom and quake alike. Verified over 4 recorded observations per fixture
   plus warm-ups and profiled runs, all byte-identical within each fixture
   (the gate for this round was DETERMINISM, and it passed with zero drift).
   CAVEAT, do not over-read this: the headless fixtures do not exercise the
   GUI or the audio-synthesis path (trap 4 below), so this demonstrates the
-  CPU/timing core is untouched — it is not evidence about the GUI, audio,
+  CPU/timing core is untouched: it is not evidence about the GUI, audio,
   or startup surfaces those commits actually rewrote.
   Evidence: .bench/results/baseline-94b8b8e7/README.md.
-- HISTORY (the `dd4db734` pin, 2026-07-31, PR #660 and PR #659 combined —
+- HISTORY (the `dd4db734` pin, 2026-07-31, PR #660 and PR #659 combined,
   superseded in its commit label only, every value carries forward to the
   block above unchanged): 8G/586: realtics 826, gametics 2134,
   instr 4,768,519,342, jit_direct_entries 151,407,546,
@@ -238,24 +238,24 @@ invariants. Carry forward verbatim into future JIT sessions.
   `166490e8` (all of #660, none of #659) all eight counters below reproduce
   the lane-campaign pin bit-for-bit on BOTH fixtures, so 100% of the drift
   from that pin is #659's nine BIOS/RTC/CMOS/boot commits. #659 and #660
-  were concurrent — `e32ecd08` vs `796f8a0e` is NOT a valid isolation (it
+  were concurrent: `e32ecd08` vs `796f8a0e` is NOT a valid isolation (it
   reads realtics 828 because it lacks the whole dynarec campaign); the
   valid one is `166490e8` vs `dd4db734`. Root cause inside #659 is NOT
   bisected: intermediate commits of that branch are WIP and not safe A/B
   points (a midpoint build at `2df46d53` reads realtics 828). Leading
   hypotheses are the boot-path commits (`2df46d53`, `dc7a507c`), which fits
-  realtics/gametics/frames being EXACT while instruction counts moved — the
+  realtics/gametics/frames being EXACT while instruction counts moved: the
   demo phase is untouched and the delta is boot-time. Gameport/joystick
   (`db39d26f`, `0f02416d`) are ruled out with no host joystick configured.
   OPEN ODDITY worth a look if quake JIT numbers ever matter: quake's
   `jit_direct_entries` moved +3.07% and `decode_probes` +0.34% for only
-  +5,788 guest instructions — disproportionate for a boot-only delta, and
+  +5,788 guest instructions, disproportionate for a boot-only delta, and
   the shape of a decode-cache aliasing shift (BIOS ISRs that run during the
   demo landing on different lines). Evidence:
   .bench/results/postmerge-dd4db734/ and, for a four-observation
   re-measurement of the same commit, .bench/results/baseline-dd4db734/.
 - HISTORY (the lane-campaign pin, superseded by the line above only in its
-  counter values — the mechanism and the wall result below still stand):
+  counter values: the mechanism and the wall result below still stand):
   8G/586 at 796f8a0e: realtics 826, gametics 2134, instr 4,768,483,859,
   jit_direct_entries 151,403,859,
   direct_native_coverage 0.5542105373833037, decode_probes 2,255,840,538.
@@ -287,7 +287,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   Evidence: .bench/results/refactor-phase2-20260731/README.md.
 - HISTORY (superseded by the lines above). The guest-visible pair through
   phases 0-1 was realtics 828, instr 4,759,944,877 on BOTH eras below, but
-  the JIT accounting differs per era — label them, do not mix:
+  the JIT accounting differs per era. Label them, do not mix:
   phase 0 (93f62e88 era): jit_direct_entries 294,228,126, coverage 0.5095;
   phase 1 final (f087b858): jit_direct_entries 293,566,164, coverage
   0.509914735090324 (measured 12/12 in refactor-phase2-20260731/task6/
@@ -295,7 +295,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   on the phase-0 value against phase-1 binaries).
   HISTORY (region JIT REMOVED as of the dynarec-refactor Task 2 commit):
   the GUEST-VISIBLE pair (realtics 828, instr 4,759,944,877) was
-  byte-identical armed and unarmed; the JIT accounting was NOT —
+  byte-identical armed and unarmed; the JIT accounting was NOT:
   arming (IZARRAVM_JIT_REGION=473DF8, a variable that no longer exists)
   used to force region admission (jit_region_entries 0 -> 30,042,234) and
   Direct ceded to it: jit_direct_entries 252,219,369, coverage 0.4608
@@ -307,7 +307,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   instr 3,501,073,158, jit_direct_entries 24,536,481,
   direct_native_coverage 0.86701878852884, decode_probes 483,107,376,
   969 frames. FRAMES 969 IS THE QUAKE ORACLE. Every one of these values is
-  BYTE-IDENTICAL to the slice-7 drift figures — quake records ZERO
+  BYTE-IDENTICAL to the slice-7 drift figures: quake records ZERO
   direct-write-token moves, so the aperture-scoping slice cannot touch it, and
   it does not. Across the whole gate JSON the ONLY field that differs is
   `jit_direct_compile_ns`, which is a host-nanosecond measurement and not a
@@ -319,21 +319,21 @@ invariants. Carry forward verbatim into future JIT sessions.
   a PAIR): 6.2G/586, instr 3,501,073,711, jit_direct_entries 24,681,797,
   direct_native_coverage 0.867053891628276, decode_probes 483,130,038,
   969 frames. FRAMES 969 IS THE QUAKE ORACLE and did not move. The
-  instruction count moved +562 across the pair — exactly Slice 3's -616 then
+  instruction count moved +562 across the pair, exactly Slice 3's -616 then
   Slice 3b's +1,178, verified constant across 12 observations per role, not
   assumed. Coverage rises +0.0126 pp, the FIRST coverage gain in the 16-bit
   work (Slice 3 alone was flat to seven decimals). Quake is the fixture that
   drove this pair: it took the regression and it took the repair. Wall
-  +0.75%, lower95 0.999953 — NEUTRAL, no positive claim.
+  +0.75%, lower95 0.999953, NEUTRAL, no positive claim.
 - HISTORY (the `ca10d4f0` quake pin, superseded by the pair above):
   6.2G/586, instr 3,501,073,149, jit_direct_entries 24,829,319,
   direct_native_coverage 0.8669281194158791, decode_probes 483,717,835,
   969 frames. FRAMES 969 IS THE QUAKE ORACLE and did not move. The
-  instruction count moved +336 (+0.0000096%) across Slices 1-2 — formation
+  instruction count moved +336 (+0.0000096%) across Slices 1-2, formation
   margin against a fixed budget, verified CONSTANT across 24 ladder
   observations, two orders below the +4,465 the `b2b26add` block already
   records. Quake carries the same three F7 rows doom does (33,830 exits);
-  its larger Slice 2 story is formation — `blocks_installed` -14.98%,
+  its larger Slice 2 story is formation: `blocks_installed` -14.98%,
   `arena_compactions` -42.22%, `dormant_other` 1,772,771 -> 912,391.
   `smc_lane_accepts` is 0 in BOTH roles (quake's standing control property:
   it registers lanes and never accepts a patch), so any movement in
@@ -345,7 +345,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   6.2G/586, instr 3,501,072,813, jit_direct_entries 25,632,357,
   direct_native_coverage 0.866582453165335, decode_probes 485,731,064,
   969 frames (22.3 seconds, 43.5 fps). The FRAMES oracle is exact and the
-  INSTRUCTION COUNT IS BYTE-IDENTICAL to the `94b8b8e7` block below —
+  INSTRUCTION COUNT IS BYTE-IDENTICAL to the `94b8b8e7` block below:
   quake's 2,395,648 call-outs all STEP-BREAK, so each one converts a
   dispatcher unbound exit into a native side exit at the SAME guest
   boundary rather than deleting it (jit_direct_side_exits +66.71%,
@@ -356,20 +356,20 @@ invariants. Carry forward verbatim into future JIT sessions.
   1.0043).
   ANY drift in either fixture = investigate before measuring wall.
   Evidence: .bench/results/refactor-phase5-20260801/README.md.
-- HISTORY (the `94b8b8e7` re-anchor, 2026-08-01 — superseded by the
+- HISTORY (the `94b8b8e7` re-anchor, 2026-08-01, superseded by the
   Phase 5 call-out block above in its JIT accounting only; the instruction
   count and the frames oracle carry forward unchanged): 6.2G/586,
   instr 3,501,072,813, jit_direct_entries 25,637,518,
   direct_native_coverage 0.8652165198484834, decode_probes 490,518,457,
   969 frames (22.3 seconds, 43.5 fps). Same story as doom: that was a
-  RE-ANCHOR, not a re-pin — byte-identical to the `dd4db734` block below
+  RE-ANCHOR, not a re-pin, byte-identical to the `dd4db734` block below
   across all 178 non-wall json fields, because PRs #661-#668 are a non-CPU
   domain refactor. It is also what a build of `24bcb52c` reproduces
   byte-for-byte, verified 12/12 as the base role of the Phase 5 ladder.
   Same caveat: headless says nothing about the GUI/audio surfaces those
   commits rewrote.
   Evidence: .bench/results/baseline-94b8b8e7/README.md.
-- HISTORY (the `dd4db734` pin, superseded in its commit label only — every
+- HISTORY (the `dd4db734` pin, superseded in its commit label only, every
   value carries forward to the block above unchanged): 6.2G/586,
   instr 3,501,072,813, jit_direct_entries 25,637,518,
   direct_native_coverage 0.8652165198484834, decode_probes 490,518,457,
@@ -419,7 +419,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   and `insns/run=`. The guest prints `timed <gametics> gametics in <realtics>
   realtics` (the determinism oracle; realtics 826 at 8G since the SMC
   mutable-imm32-lane campaign, and STILL 826 at the current pin
-  `b2b26add` — the oracle moved neither across PRs #661-#668 nor across
+  `b2b26add`: the oracle moved neither across PRs #661-#668 nor across
   the Phase 5 call-out slot arc. HISTORY: 827 from the Phase-2
   decode-memo resize `e0f3ac97`; 828 through phases 0-1).
 - Identity check: realtics + instr count + jit_direct_entries must match the
@@ -439,7 +439,7 @@ invariants. Carry forward verbatim into future JIT sessions.
       guest_seconds                   48.193
 
   The pin was recorded before the 166 MHz/64 MB 586 respec, so a fixed 8e9
-  cycle budget no longer buys the same amount of guest work — the run is now
+  cycle budget no longer buys the same amount of guest work: the run is now
   ~48 guest seconds instead of the ~85 the old tier gave, which is the whole
   discrepancy. Coverage really is 0.967 now, not 0.605.
 
@@ -447,11 +447,11 @@ invariants. Carry forward verbatim into future JIT sessions.
   enforced was touched: the scoreboard and the realtime gate key on the guest
   oracle, and it matches. What is dead is the practice of eyeballing
   `instructions` / `jit_direct_entries` / `decode_probes` against the numbers
-  in this section — an agent doing that on current main will conclude every
+  in this section: a reader who does that on current main will conclude every
   build is confounded. Compare those fields CROSS-ROLE inside one ladder, as
   the sixpair summary already does, and treat the block above as the current
-  reading rather than a new pin. `realtics` remains session-local (see the
-  doom-realtics note in the campaign memory) and 979 is not a pin either.
+  reading rather than a new pin. `realtics` remains session-local
+  and 979 is not a pin either.
 
 ### Quake (the calibration anchor, NOT the wall target)
 
@@ -487,7 +487,7 @@ invariants. Carry forward verbatim into future JIT sessions.
 - Invocation: `--cpu 586 --memory-mib 64 --hdd-folder .bench/nascar1_c
   --cycles 4980000000 --result-ppm <path>`.
 - Output: NO timedemo line. The game never prints a result, so the oracle is
-  the FRAMEBUFFER — but no longer the end-of-budget frame's hash.
+  the FRAMEBUFFER, but no longer the end-of-budget frame's hash.
 - GRADING IS A FRAME CONTRACT (2026-08-18). The 4.98G frame lands mid-attract
   with the camera in flight, so its hash was a sample of the demo's PHASE and
   moved on any cadence-adjacent change: the IOPL-3 follow-up moved 12.41% of its
@@ -495,12 +495,12 @@ invariants. Carry forward verbatim into future JIT sessions.
   (`.bench/results/postiopl-nascar-attribution/`). What grades the row now: an
   EXACT frame hash at 0.445G, the game's static startup logo, whose frame is
   bit-identical across a measured 0.395-0.495G window bounded on both sides by
-  an all-black transition — 50M cycles of margin either way, 77x the phase shift
+  an all-black transition, 50M cycles of margin either way, 77x the phase shift
   the IOPL-3 change produced; plus bands at the budget on non-black coverage
   ([84.0, 100.0]%) and distinct colours ([45, 256]); plus the display class
   (Margo LFB 640x480 8bpp mode 0x0101), the `cycle_limit` stop, and retired
   instructions to ±5%. The end-of-budget hash is still RECORDED, as
-  `final_frame_sha256`, and never graded — it is what an attribution cycle
+  `final_frame_sha256`, and never graded: it is what an attribution cycle
   starts from. Derivations for every band are in `New-FrameContract` in
   `scripts/run-fixture-scoreboard.ps1`.
 - Historical invariants at 586, measured 2026-08-05 (kept as the
@@ -536,7 +536,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   `TOKAEMM: XMS/UMB/EMS memory manager; system running in V86.`
 - THE TWO MANAGERS WERE GUEST-EQUIVALENT HERE, measured on the OLD 586/20G
   schedule: byte-identical framebuffer under TokaEMM and under JEMMEX. PoP is
-  the only one of the three game fixtures where that held -- NASCAR 1 and GP2
+  the only one of the three game fixtures where that held: NASCAR 1 and GP2
   both moved by a frame on the same swap. The difference is that PoP's schedule
   ends at a settled point while the racers animate continuously. Do not
   generalise from this; re-measure per fixture.
@@ -546,8 +546,8 @@ invariants. Carry forward verbatim into future JIT sessions.
   and halt fast-forward makes RTF meaningless (386 once read 18.3). A no-input
   run is not a workload; it is a screensaver. Frames do change across budgets,
   so "the screen is moving" does NOT prove the fixture is measuring anything.
-- Shift is the action key -- chosen by the game because as a modifier it had
-  better keyboard rollover -- and it is what advances the title screens. There
+- Shift is the action key (chosen by the game because as a modifier it had
+  better keyboard rollover) and it is what advances the title screens. There
   is no menu. In game, Shift alone does nothing, so extra Shifts are harmless
   and the schedule can over-provision them safely.
 - RUN IT AT 486, NOT 586. A 1989 game does not need a 166 MHz persona, and 486
@@ -576,7 +576,7 @@ invariants. Carry forward verbatim into future JIT sessions.
 - Budget: ~60 s of wall, so an A/B/B/A set is ~4 minutes. The cheapest of the
   game fixtures by a wide margin.
 - 586 USED TO DIE HERE at 6.28 guest seconds on `unsupported I/O port 0x7421`.
-  That was never a 586 bug -- see the open-bus policy change. It now plays.
+  That was never a 586 bug. See the open-bus policy change. It now plays.
 - PoP writes 0x7420-0x7423 continuously (~17,000 per 1G cycles in the intro).
   Nothing is known to live there. `IZARRAVM_PORT_FATAL=7420` names the CS:IP.
 
@@ -605,11 +605,11 @@ invariants. Carry forward verbatim into future JIT sessions.
   runs), so the fixture does not drift between runs.
 - THE DEFAULT CIRCUIT IS DETERMINISTIC. Quickrace always lands on Select
   Circuit with Italy/Monza already ticked, so the schedule does NOT need to
-  click a track -- just OK. Verified by byte-comparing the Select Circuit PPM
+  click a track, just OK. Verified by byte-comparing the Select Circuit PPM
   from two runs that reached it by DIFFERENT input paths (an explicit
   `down`/`up` pair and a `click`): identical. The headless machine seeds no
-  entropy -- `--hdd-folder` never calls `seed_rtc`, so the RTC sits at
-  2026-01-01 00:00:00 every run -- which is why a menu that looks randomised to
+  entropy: `--hdd-folder` never calls `seed_rtc`, so the RTC sits at
+  2026-01-01 00:00:00 every run, which is why a menu that looks randomised to
   a player replays exactly here.
 - Menu-phase invariants at 586 (`--cpu 586 --memory-mib 64`):
   - credits box, no input: 298,655 non-zero (97.2%), 171 colours
@@ -619,7 +619,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   produced BYTE-IDENTICAL framebuffers, AI cars and all. The intuition that a
   race full of AI drivers cannot be reproduced does not hold headless: nothing
   here varies between runs. That makes a fixed-cycle A/B equal-work by
-  construction, so PROTOCOL trap 1 (idle-tail confounding) does not apply --
+  construction, so PROTOCOL trap 1 (idle-tail confounding) does not apply:
   both legs execute the same guest instruction stream.
 - SHIPPING SCHEDULE, ~30 guest seconds of race in 13.28G cycles:
 
@@ -632,9 +632,9 @@ invariants. Carry forward verbatim into future JIT sessions.
 - Race invariant at 16G under TOKAEMM: Margo LFB 640x480, 307,152 non-zero
   (100.0%), 199 distinct colours, sha256 `1006e75142cc83f3...`. Two runs
   BYTE-IDENTICAL. The cockpit dashboard reads POS 26, LAP 1 OF 3, CAR 27,
-  RUNNERS 26 -- a human-readable check to eyeball a screenshot against.
+  RUNNERS 26, a human-readable check to eyeball a screenshot against.
 - THIS FIXTURE IS WHY THE HASH IS RECORDED. Under JEMMEX the same schedule gives
-  307,152 non-zero and 199 colours -- THE SAME AGGREGATES -- from a DIFFERENT
+  307,152 non-zero and 199 colours (THE SAME AGGREGATES) from a DIFFERENT
   frame (sha256 `1e594bdfc99ee529...`). Counts alone cannot tell the two apart,
   so a count-only invariant would have passed a real change silently. Compare
   the hash.
@@ -644,8 +644,8 @@ invariants. Carry forward verbatim into future JIT sessions.
   budget, ~0.6 ms guest) on an UNCHANGED binary moved the hash to a new value
   with the same one-band signature: one contiguous ~28-row band carries the
   adjacent frame's content, everything else byte-identical, HUD readout
-  unchanged. So the hash IS deterministic per binary (two runs byte-identical
-  -- that part of the invariant is real and stays) but any timing-model change
+  unchanged. So the hash IS deterministic per binary (two runs byte-identical:
+ that part of the invariant is real and stays) but any timing-model change
   that shifts cycle charging by ppm moves it legitimately: expect a reviewed
   re-pin on timing slices, same as nascar's animation-phase sample. Judge a
   moved hash by the band signature + the POS/LAP/CAR dashboard text, not by
@@ -666,7 +666,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   a preference: DUKEMARK is a modified Atomic build and its CON parser rejects
   the 1.3D `USER.CON` outright (`gamestartup` takes more parameters in 1.4+),
   which stalls the boot on a "use internal defaults (Y/N)?" prompt.
-- Config: CONFIG.SYS loads JEMMEX.EXE (NOT TOKAEMM — a TokaEMM image change
+- Config: CONFIG.SYS loads JEMMEX.EXE (NOT TOKAEMM: a TokaEMM image change
   cannot move this fixture). **The whole run is guest-driven**, and the
   AUTOEXEC is the entire protocol:
 
@@ -676,9 +676,9 @@ invariants. Carry forward verbatim into future JIT sessions.
       C:\EXITVM.COM
 
   No `goto loop`, no injected keys or mouse. The demo needs no input, DOS
-  redirection captures the report, and `EXITVM.COM` — the house 15-byte Lotura
+  redirection captures the report, and `EXITVM.COM` (the house 15-byte Lotura
   unit-tester exit poke, the same file the bench16 fixture carries and the one
-  the Doom fixture's AUTOEXEC already names — ends the VM.
+  the Doom fixture's AUTOEXEC already names) ends the VM.
 - Invocation (as embedded in `scripts/run-fixture-scoreboard.ps1`):
   `--cpu 486 --memory-mib 64 --video vega --cycles 26400000000`, or
   `--cpu 586` with `--cycles 79680000000`.
@@ -692,7 +692,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   FAT-chain walking out of the load phase; the guards were sized against those
   and are now generous rather than merely adequate. They were deliberately left
   alone, since a guard that is too large costs nothing on a run that finishes.
-- **REDIRECTION CAPTURES THE REPORT — verified, and it was the design's one
+- **REDIRECTION CAPTURES THE REPORT, verified, and it was the design's one
   real risk.** DUKEMARK prints its report through ordinary DOS stdout, so
   `> C:\DUKEMARK.TXT` catches all of it; the 80x25 text page is BLANK on a
   redirected run, which is the proof. If a future build ever painted that
@@ -720,7 +720,7 @@ invariants. Carry forward verbatim into future JIT sessions.
      DOS on its own and the batch reached `EXITVM.COM`. Completely
      timing-insensitive, and it is what replaced the framebuffer hash.
   2. **`DUKEMARK.TXT` exists and parses.** Guards the redirection path itself.
-  3. **Info String `2,320,200,2,0,1,1,1`** — DUKEMARK's config fingerprint,
+  3. **Info String `2,320,200,2,0,1,1,1`**: DUKEMARK's config fingerprint,
      `Demo,Width,Height,Mode,Hud,Detail,Sound,Music` read out of DUKE3D.CFG.
      320x200, ScreenMode 2 (screen-buffered), ScreenSize 0, Detail 1, and the
      trailing `1,1` is sound and music both ENABLED, so a regression that
@@ -731,7 +731,7 @@ invariants. Carry forward verbatim into future JIT sessions.
      This is DUKEMARK's stall detector.
 - **The extrapolation count is not machine-independent, whatever the DUKEMARK
   docs say.** Same demo, same config, same fixture, and the two personas read
-  materially different counts — reproducibly, two runs each. It is a function
+  materially different counts, reproducibly, two runs each. It is a function
   of emulated timing, so an exact pin would rebuild the re-pin treadmill this
   fixture was rewritten to escape. ±2% is far tighter than the "stalls very
   hard" case it exists to catch: a multi-second stall inside a ~131 s demo
@@ -742,7 +742,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   treadmill under a new name, so the question was asked with the largest lever
   the harness has: `-Arm off`, which turns off both halves of the JIT and takes
   duke3d-486's native coverage from 0.7235 to 0.5932 and its wall from 141.1 s
-  to 155.2 s. **The sample count moved by ONE — 919 to 920, 0.11% of the pin,
+  to 155.2 s. **The sample count moved by ONE: 919 to 920, 0.11% of the pin,
   against an allowance of 18.** The band survives its worst available stress
   with a factor of 18 in hand, so it stays at ±2%.
 - The reason it survives is worth writing down, because it is what makes the
@@ -750,13 +750,13 @@ invariants. Carry forward verbatim into future JIT sessions.
   Guest seconds went 163.150 → 163.103, three parts in ten thousand, and the
   instruction count moved by 0.02%. Cycle charging is per-instruction and does
   not care which backend retired the instruction, so changing the JIT mix
-  changes wall and leaves the emulated clock — which is what DUKEMARK samples
-  against — very nearly where it was.
+  changes wall and leaves the emulated clock (which is what DUKEMARK samples
+  against) very nearly where it was.
 - **So the band covers JIT-mix work and deliberately does NOT cover timing-model
   work.** The storage-charge and HDD-geometry slices earlier the same day moved
   the 486 count 580 → 919 (+58%) and the 586 count 962 → 1026 (+6.7%), which no
   sane band absorbs. That is the correct outcome: a change to what the emulated
-  machine charges for I/O SHOULD land on a reviewer's desk as a pin move with a
+  machine charges for I/O SHOULD be read as a pin move with a
   stated cause, and a change to how fast we execute the same charged work should
   not. Widening the band until timing-model changes fit would only hide the one
   class of move that is worth reading.
@@ -772,7 +772,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   assert on them.
 - The Info String does NOT identify the demo: its first field reads `2` for
   BENCH1, BENCH2 and BENCH3 alike (measured). The extrapolation count is the
-  only field that tells them apart — 880, 573 and 1248 samples respectively at
+  only field that tells them apart: 880, 573 and 1248 samples respectively at
   486 under the earlier screen-scraped shape. **BENCH2 was chosen because it is
   the shortest**, and this fixture is already the most expensive in the set.
 - Shape of the guest run at 486: about 32 guest seconds of LOADING (CON
@@ -797,7 +797,7 @@ invariants. Carry forward verbatim into future JIT sessions.
 - RETIRED 2026-08-09: the framebuffer-PPM sha256 invariant and its
   cutoff-phase acceptance test. The end-of-budget frame was cutoff-phase
   sensitive (the fixed-cycle axe landed mid-render in an animating demo), so
-  every JIT-mix change that shifted cycle charging moved it legitimately — six
+  every JIT-mix change that shifted cycle charging moved it legitimately: six
   benign moves in three days, each one a failed sweep plus a manual re-pin,
   and the automated re-pin that replaced the manual one turned main red three
   times over the LICENSE_MANIFEST sha it also had to move. Nothing about the
@@ -824,15 +824,15 @@ duke3d-586 before any merge decision.**
 - Location: `.bench/duke3d_short_c`, built by
   `scripts/make-duke-short-fixture.ps1` (idempotent, `-Force` to rebuild). It is
   `.bench/duke3d_c` with exactly two files changed:
-  - `DUKE3D\BENCH2S.DMO` — BENCH2.DMO with its record count lowered from 3909
+  - `DUKE3D\BENCH2S.DMO`: BENCH2.DMO with its record count lowered from 3909
     to **1560**. sha256
     `b3dbe8313b51d16cb4e4ba9bf7473cfe80b530340d057b83c9b7feaf1a35dce4`.
-  - `AUTOEXEC.BAT` — `DUKEMARK.EXE /bqBENCH2S` instead of `/bqBENCH2`.
+  - `AUTOEXEC.BAT`: `DUKEMARK.EXE /bqBENCH2S` instead of `/bqBENCH2`.
 - **WHY A RECORD COUNT AND NOT A CYCLE BUDGET.** The duke row is guest-driven:
   DUKEMARK plays the demo to its end, prints its report through DOS stdout and
   the batch pokes `EXITVM.COM`. Cutting `--cycles` would stop the run before any
-  of that, so all four DUKEMARK invariants — the `test_exit` 0x51 stop, the
-  result file, the Info String, the sample count — would be destroyed at once,
+  of that, so all four DUKEMARK invariants (the `test_exit` 0x51 stop, the
+  result file, the Info String, the sample count) would be destroyed at once,
   and what replaced them would be the cutoff-phase-sensitive framebuffer hash
   this fixture was rewritten in 2026-08-09 to escape. The budget is still only a
   guard here (33.2e9 = 200 guest seconds against the ~60 where EXITVM fires).
@@ -857,7 +857,7 @@ duke3d-586 before any merge decision.**
   | | value |
   |---|---|
   | stop | `test_exit`, code 0x51 |
-  | Info String | `2,320,200,2,0,1,1,1` (unchanged — DUKE3D.CFG is copied byte-exact) |
+  | Info String | `2,320,200,2,0,1,1,1` (unchanged: DUKE3D.CFG is copied byte-exact) |
   | DUKEMARK samples | **404** ±2% (sidecar `duke3d-586-short`) |
   | guest seconds | **59.97** |
   | instructions | **9,816,023,763** |
@@ -871,19 +871,19 @@ duke3d-586 before any merge decision.**
   is the same property the long row has and it is what makes the row usable.
 - A/A FLOOR, 2026-08-16, six legs, one binary, host load 1.5–3.4%, pinned to
   processor 8: **min 142.12 s, max 144.97 s, geomean 143.490 s, spread 2.01%,
-  sd/mean 0.77%.** Rolling daily floor per the cost-scaling protocol — re-floor
+  sd/mean 0.77%.** Rolling daily floor per the cost-scaling protocol: re-floor
   before reading any effect off this row on another day.
 - COST. 143.5 s against the long row's 341.9 s measured the same night: a
   **2.38x** cut, so an A/B/B/A set falls from 23 minutes to 9.6 minutes.
   **It is not 3x, and it cannot be made 3x at 60 guest seconds.** The run has a
-  FIXED load phase — 8.05 guest / 20.01 wall seconds of CON compile and 44 MB
-  GRP read that no demo trim touches — so wall is `20.01 + 0.082334 * records`
+  FIXED load phase (8.05 guest / 20.01 wall seconds of CON compile and 44 MB
+  GRP read that no demo trim touches) so wall is `20.01 + 0.082334 * records`
   and guest is `8.05 + 0.033293 * records` (two measured points: 200 records ran
   14.707 guest / 36.473 wall, 3909 ran 138.19 / 341.851). A 3.00x cut needs 1141
   records and 46 guest seconds. 1560 was chosen over 1141 because it holds the
   load phase to 13% of the row's guest time instead of 17% (the long row is 6%),
   and representativeness is the thing that would make a cheap row worthless.
-- REPRESENTATIVENESS — MEASURED, NOT ASSUMED. Both rows were run under
+- REPRESENTATIVENESS: MEASURED, NOT ASSUMED. Both rows were run under
   `IZARRAVM_DIRECT_BARRIER_CENSUS=1` on a census-feature build of the SAME
   commit (`.bench/results/duke-short-row-20260816/run-census.ps1`; the census
   taxes the run ~1.35x, so those walls are not board numbers).
@@ -893,7 +893,7 @@ duke3d-586 before any merge decision.**
   | dormant_probe | 67.12% | 70.27% | 0.955x |
   | rejected_probe | 20.22% | 17.47% | 1.157x |
   | heat_refusal | 12.61% | 12.24% | 1.030x |
-  | key_failure | 0.05% | 0.02% | 2.511x — see below |
+  | key_failure | 0.05% | 0.02% | 2.511x, see below |
 
   Every major fraction is within 1.16x; the row is the same workload class.
   Declines per guest instruction: 0.2038 short against 0.2180 long, 0.935x, so
@@ -915,7 +915,7 @@ duke3d-586 before any merge decision.**
 
   Two side results worth keeping. The long row's split at `89dc3a69` is
   70.27 / 17.47 / 12.24 / 0.02, **identical to the 2026-08-15 measurement at
-  `365668ac`** — the sticky-decline memo did not move the decline mix, so the
+  `365668ac`**: the sticky-decline memo did not move the decline mix, so the
   20260815 baseline is still live. And the census build reproduces the plain
   build's instruction count to the digit on both rows, which says the census
   perturbs wall and nothing else.
@@ -930,14 +930,14 @@ duke3d-586 before any merge decision.**
   `<cycles>:<text>` and the text here is the Enter CHARACTER, so the argument
   as the script holds it is the eleven bytes `2000000000:` followed by one
   control byte (historically 0x0D; as of the 2026-08-10 hardening commit the
-  script's byte is 0x0A — `ascii_key` maps both `'\r'` and `'\n'` to the same
+  script's byte is 0x0A: `ascii_key` maps both `'\r'` and `'\n'` to the same
   Enter scancode 0x1c, so the two spellings are functionally identical, and
   `.gitattributes` keeps 0x0A checkout-stable). This matters because the failure is SILENT: a step with an empty text
   still parses, expands to zero scancode groups and injects nothing, so a
   hand-copied `--inject-keys "2000000000:"` leaves the run sitting on the
   signon screen and produces a plausible-looking wall number for a game that
   never started. That is the shape every pre-2026-08-08 wolf3d number had.
-- **Two spellings ARE representable, and either reproduces the run** —
+- **Two spellings ARE representable, and either reproduces the run**:
   `--inject-keys "2000000000:\r"` (the flag rewrites the two-character escape
   `\r` to 0x0D precisely because a bare CR does not survive a shell argument)
   or `--inject-keys "2000000000:{enter}"` (the named key, scancode 0x1c). Use
@@ -945,7 +945,7 @@ duke3d-586 before any merge decision.**
   `scripts/run-fixture-scoreboard.ps1` is only there because the string is
   inside a script file rather than on a command line.
 - **Every wolf3d number recorded before 2026-08-08 measured an out-of-memory
-  CRASH LOOP, not the game** — the full post-mortem is in `HARNESS.md`; do
+  CRASH LOOP, not the game**: the full post-mortem is in `HARNESS.md`; do
   not compare against pre-fix history.
 - Budgets: 4e9 at 486 (61 s guest), 12e9 at 586 (72 s, so the end frame
   lands inside demo playback). Framebuffer sha256 pinned per persona in
@@ -976,12 +976,12 @@ duke3d-586 before any merge decision.**
 - Oracle: a FRAME CONTRACT, not the end-of-budget hash (2026-08-18). The 28G
   frame is mid-demo by design, which is exactly where a hash cannot survive a
   cadence change: the IOPL-3 V86 monitor moved 84.31% of its pixels while
-  rendering stayed perfect — the camera a beat further along plus the blinking
+  rendering stayed perfect: the camera a beat further along plus the blinking
   "Demo Mode" caption in its other phase
   (`.bench/results/iopl3-tombraid-attribution/`). The exact-frame invariant now
   sits at 0.5G, the DOS/4GW banner page, pinned as a SET of two hashes because
-  the only moving thing there is the DOS underline cursor — measured as exactly
-  18 pixels, a 9x2 block at x0-8/y334-335 toggling #000000/#AAAAAA — and that
+  the only moving thing there is the DOS underline cursor (measured as exactly
+  18 pixels, a 9x2 block at x0-8/y334-335 toggling #000000/#AAAAAA) and that
   frame is byte-identical across the pre-IOPL-3, IOPL-3 and post-PR-725 builds.
   At the budget the row is graded on bands instead: non-black coverage
   ([89.0, 100.0]%), distinct colours ([79, 256], where 256 is the 8bpp palette
@@ -999,16 +999,15 @@ Margo. They exist because nothing else on either board exercises a single
 triangle of hardware 3D: before them, Distira had register-level unit tests and
 no game had ever driven it.
 
-**CORRECTED 2026-09-01** (`dev_docs/2026-09-01-tr-rush-investigation.md`,
-section 2): this used to claim both rows "ship the BYTE-IDENTICAL `glide2x.ovl`"
+**CORRECTED 2026-09-01**: this used to claim both rows "ship the BYTE-IDENTICAL `glide2x.ovl`"
 and drew an attribution rule from that. False for the Tomb Raider row. The
 fixture's `AUTOEXEC.BAT` runs `TOMB.EXE`, which STATICALLY LINKS Glide 2.1.1
-and never opens an overlay at all -- the `glide2x.ovl` sitting in
+and never opens an overlay at all: the `glide2x.ovl` sitting in
 `.bench/tombraid3d_c/GAMES/TOMB3D/` is dead weight, nothing loads it. Descent
 II's `D2_3DFX.EXE` genuinely DYNAMICALLY LINKS and loads its `glide2x.ovl`
 (2.42, md5 `341b8f5d82daa46fd1ce2363...`). So the two rows exercise different
 Glide versions (2.1.1 vs 2.42) through different code paths, not a shared
-library -- the old "same library, so the game is the variable" rule is
+library: the old "same library, so the game is the variable" rule is
 WITHDRAWN. A defect that moves one row and not the other no longer isolates
 anything by itself; check which linkage path each row actually takes before
 attributing.
@@ -1016,14 +1015,14 @@ attributing.
 Two things fall out of that investigation, useful if either row ever needs a
 second data point:
 
-- `tomb_.exe`, in the same `TOMB3D` package, IS the dynamic-linkage variant --
+- `tomb_.exe`, in the same `TOMB3D` package, IS the dynamic-linkage variant:
   it loads `glide2x.ovl` at runtime and exercises `grLfbLock`, a path
   `TOMB.EXE` never takes. If a future defect needs "same game, different
   library" separation, swapping `AUTOEXEC.BAT` to run `tomb_.exe` is the
   cheapest way to get a second Glide row for Tomb Raider.
 - The SDK's `Vrush` (SST-96) overlay REFUSES Distira outright, with a legible
   `_GlideInitEnvironment: glide2x.dll expected Voodoo Rush, none detected`
-  message -- a ready-made KNOWN-RED control for any test that needs to prove a
+  message, a ready-made KNOWN-RED control for any test that needs to prove a
   board-detection gate can actually fail. Refusal frame archived at
   `.bench/tomb-raider-3dfx/rush-investigation/C_text.png`.
 
@@ -1032,7 +1031,7 @@ FPU, exactly like the software `tombraid-586` row.
 
 #### Tomb Raider Gold, 3dfx build
 
-- Location: `.bench/tombraid3d_c`. Disc: `.bench/tombraid_cd/tombeng.cue` --
+- Location: `.bench/tombraid3d_c`. Disc: `.bench/tombraid_cd/tombeng.cue`,
   the SAME image `tombraid-586` mounts, because it is the same game and the
   same pressing. Mounted read-only, never copied per run.
 - Invocation: `--cpu 586 --memory-mib 64 --video vega --hdd-folder <fresh copy>
@@ -1042,7 +1041,7 @@ FPU, exactly like the software `tombraid-586` row.
   packagers' `TOMB3D`, Windows `.dll` files removed. `TOMBPATH.TXT` in `C:\`
   holds `C:\GAMES\TOMB3D` with NO trailing newline; CONFIG.SYS and AUTOEXEC.BAT
   are the software row's, with LF line endings, and carry NO CD driver or
-  `IZCDEX` line -- see that row's entry for why.
+  `IZCDEX` line. See that row's entry for why.
 - Measured timeline: boot 0-4 guest seconds, Glide splash 5-9, a BLACK WAIT
   9-24, title 35-50, attract DEMO 50-85, title 85-100, DEMO 100-130, and so on
   in that rhythm. The 19e9 budget is 114.5 guest seconds and lands 14 seconds
@@ -1056,7 +1055,7 @@ FPU, exactly like the software `tombraid-586` row.
   --cd-image .bench/descent2_cd/DESCENT_II.cue --cycles 9000000000
   --inject-keys "3000000000:{esc};4000000000:{esc}" --presented-ppm <path>`.
 - AUTOEXEC runs `D2_3DFX.EXE -nomovies -autodemo`. `-autodemo` plays the
-  shipped `DEMOS\DESCENT2.DEM`, so the row needs no gameplay input schedule --
+  shipped `DEMOS\DESCENT2.DEM`, so the row needs no gameplay input schedule,
   only the two keys that clear the release-notice screen.
 - The tree does NOT carry the three `.MVL` movie files. They are 220 MB of the
   source tree's 266 MB, `-nomovies` never opens them, and the scoreboard
@@ -1092,7 +1091,7 @@ measured rather than chosen.
 - Tomb Raider ignores input until somewhere between 3.5e9 and 4e9 cycles, and
   any key from 4e9 to at least 6e9 works. 5e9 keeps roughly a quarter of the
   window in hand on the early side. A SECOND key lands on the title screen,
-  opens the ring menu, and the attract demo then never starts at all -- the row
+  opens the ring menu, and the attract demo then never starts at all: the row
   would pin a still picture and look perfectly healthy doing it.
 - Descent II needs two Escapes to clear its notice screen. A THIRD lands after
   the demo has started and raises "ABORT AUTODEMO?", which the demo survives
@@ -1108,7 +1107,7 @@ block for the general argument and the measurement behind it.
 Both use a FRAME CONTRACT rather than an end-of-budget hash, for the reason
 `tombraid-586` lost its own: the end frame is mid-demo, where a cadence change
 moves it legitimately. The anchor is the Toka-DOS boot text at 0.5e9, two
-phases for the cursor blink -- the same anchor as the software row, because the
+phases for the cursor blink, the same anchor as the software row, because the
 two trees boot the same DOS and their first four guest seconds are
 byte-identical to each other.
 
@@ -1177,11 +1176,9 @@ the copy redistributed today as bitsundbolts' `mojo_dos.zip` is byte-identical,
 which is the cross-check the recorded hash encodes. **3dfx shipped no licence
 text with the diagnostics and the redistribution terms are unclear**, so the
 binary stays in the git-ignored fixture tree, never enters git history, and
-never ships with IzarraVM -- the same posture as `dev_docs/reference/` and as
+never ships with IzarraVM, the same posture as the local hardware reference library and as
 `.bench/glide243-tests` itself. The full account, including the oracle
-comparison and the gap list this row came out of, is in
-`dev_docs/2026-09-01-mojo-fixture.md` (local to the main checkout;
-`dev_docs/` is git-ignored) and in the header of
+comparison and the gap list this row came out of, is in the header of
 `scripts/make-mojo-fixture.ps1`.
 
 **Grading is an exact sha256 per file, with ONE line masked, and the mask was
@@ -1190,8 +1187,8 @@ end-of-budget frame hashes because those hashes sampled a demo's PHASE, and the
 first version of this row walked into the same trap: `MOJOV.TXT` prints
 `vRetrace`, which Distira synthesises from the LIVE beam position rather than
 storing, so it reports whatever scanline the raster was on when the program
-asked. Rebuilding this fixture tree with two unused binaries removed -- a change
-that cannot touch the SST-1 at all -- moved that line 0x29 -> 0x14 and moved
+asked. Rebuilding this fixture tree with two unused binaries removed (a change
+that cannot touch the SST-1 at all) moved that line 0x29 -> 0x14 and moved
 nothing else in the file. `MOJO.TXT` was byte-identical across the same change.
 
 So `MOJO.TXT` is pinned raw, and `MOJOV.TXT` is pinned with `^\s*vRetrace:`
@@ -1202,7 +1199,7 @@ the profile. MEASURED, not argued: the two-extra-binaries tree produces
 `vRetrace: 0x2c` against the pinned tree's `0x14` and the row PASSES, while
 every other byte is still graded exactly.
 
-The stop is graded the way Duke3D's is -- `test_exit` code `0x51` from
+The stop is graded the way Duke3D's is: `test_exit` code `0x51` from
 EXITVM.COM, so a `cycle_limit` stop fails the row instead of quietly hashing a
 partial file.
 
@@ -1233,7 +1230,7 @@ part at P300, and keeps a single-cycle SB DSP block chain (command 0x14, 384
 samples at 10989 Hz) re-armed off the same clock. The 2026-08-28 PIT
 write-edge bug (a control word that raises OUT low-to-high produced no IRQ0
 edge; fixed in `854237ed`) silenced all of it while every scoreboard row
-stayed green — no other fixture drives the timer that way.
+stayed green: no other fixture drives the timer that way.
 
 - Location: `.bench/tyrian_setup_c` (SETUP.EXE) and `.bench/tyrian_c`
   (TYRIAN.EXE, the launcher for `file0001.exe`, Borland DPMI16). Both trees
@@ -1244,7 +1241,7 @@ stayed green — no other fixture drives the timer that way.
   `tyrian-586`). Key/mouse offsets are CPU cycles: 66 M/guest-second at 486,
   166 M at 586.
   - `tyrian-setup-486`, 4.7e9 (~71 guest s): sit on the settings menu (music
-    must KEEP PLAYING there — that silence was the owner's first symptom),
+    must KEEP PLAYING there: that silence was the owner's first symptom),
     five {down} to Jukebox at ~25 s, {enter}, jukebox to ~59 s, {esc} back.
     End frame = the static settings menu, exact hash in the sidecar.
   - `tyrian-486`, 3.2e9 (~48.5 guest s): title -> Start New Game -> 1 Player
@@ -1268,15 +1265,13 @@ stayed green — no other fixture drives the timer that way.
 A FOURTH Tyrian fixture, `.bench/tyrian_specs_c`, and a fourth row,
 `tyrian-specs-586`. It exists because `tyrian-586` above polls 62x less than
 the Ship Specs screen and cannot show the lever the 09-02/03 CR3-gate and
-reflected-call campaigns work on
-(`dev_docs/2026-09-02-tyrian-586-specs-diag.md`,
-`dev_docs/2026-09-02-tyrian-586-reprofile.md`). This is a DIFFERENT tree from
+reflected-call campaigns work on. This is a DIFFERENT tree from
 `tyrian_c`: the owner's install, TOKAEMM loaded, with save slot 1 preloaded,
 not the plain launcher.
 
 - Location: `.bench/tyrian_specs_c`. `GAMES\TYRIAN2K\TYRIAN.SAV` (4,722
   bytes, save slot 1 = MicroCorp Stalker-B) and `GAMES\TYRIAN2K\TYRIAN.CFG`
-  must be COPIED from the fixture tree, never regenerated -- the graded frame
+  must be COPIED from the fixture tree, never regenerated: the graded frame
   hash is a picture OF that save, and nothing reconstructs it from a fresh
   install. The three top-level files: `CONFIG.SYS` (`DEVICE=C:\DOS\TOKAEMM.SYS
   RAM /T` + `DOS=HIGH,UMB`, so DOS loads high the way the owner's box does),
@@ -1297,19 +1292,19 @@ not the plain launcher.
   confirmed by eye against the Stalker-B ship-data page before it was
   recorded, plus `expected_display`/`expected_video_mode`/`expected_width`/
   `expected_height` and the `cycle_budget`/`elapsed_budget_clocks` pair (not
-  `stop.requested`, which an injection schedule slices -- see the trap this
+  `stop.requested`, which an injection schedule slices; see the trap this
   row hit in `Invoke-Fixture`, same fix as the frame-contract block's own).
   No rt anchor: recorded on a box that was not quiet, so `realticsMinimum`/
   `Maximum` are `$null` and nothing wall-clock is asserted. Reference rates
-  from the campaign's own re-profile -- 159.7 M guest instructions/gs, 17.7 M
-  dispatcher entries/gs during the dwell -- are in the row's own comment, not
+  from the campaign's own re-profile (159.7 M guest instructions/gs, 17.7 M
+  dispatcher entries/gs during the dwell) are in the row's own comment, not
   asserted by this row.
 
 ## Traps (these bit prior rounds)
 
 0. COUNT-ONLY FRAMEBUFFER INVARIANTS DO NOT DISCRIMINATE. Grand Prix 2 under
    JEMMEX and under TokaEMM produces the SAME non-zero pixel count (307,152)
-   and the SAME colour count (199) from DIFFERENT frames -- the sha256 values
+   and the SAME colour count (199) from DIFFERENT frames: the sha256 values
    are `1e594bdf...` and `1006e751...`. A fixture pinned on counts alone would
    have passed a real change silently. Every graphics-mode fixture here records
    a sha256 of the result PPM; compare that, and keep the counts only as the
@@ -1351,7 +1346,7 @@ The kill gate. v2 must WIN wall vs merged main (origin/main), not tie.
 2. Confirm determinism on the candidate exe against the CURRENT pinned
    identity at the top of this file. If any value drifts, STOP and
    investigate before trusting wall numbers. Do not copy literals from this
-   recipe into gates — the top-of-file block is the single source of truth,
+   recipe into gates: the top-of-file block is the single source of truth,
    and this step deliberately no longer quotes it (it has gone stale here
    twice: once at the phase-1/phase-2 boundary and once at the lane
    campaign's re-pin).
@@ -1364,7 +1359,7 @@ The kill gate. v2 must WIN wall vs merged main (origin/main), not tie.
    from ~2-3x on the loop). A result inside the noise floor is a TIE:
    the JIT thesis for this loop shape is refuted; record and pivot.
 
-## Kill-if-it-loses rule (HISTORICAL — this call was already made)
+## Kill-if-it-loses rule (HISTORICAL: this call was already made)
 
 The region JIT (v1 and v2 both) is REMOVED as of the dynarec-refactor
 Task 2 commit; this whole rule describes a decision already taken, kept

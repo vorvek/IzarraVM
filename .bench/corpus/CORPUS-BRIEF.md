@@ -1,6 +1,6 @@
 <!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
-# Per-game agent brief
+# Per-game profiling brief
 
 You profile ONE game from `R:\La Colección by Neville\dosroot`. Your goal has
 three parts: reach gameplay, record a deep profile, and leave a replayable
@@ -31,7 +31,7 @@ The runner: `pwsh D:\dev\IzarraVM\.bench\corpus\scripts\run-corpus-game.ps1`
 Results: `D:\dev\IzarraVM\.bench\corpus\results\<slug>\<stamp>-<label>\` with
 `profile.json`, `emulator.log`, `run-meta.json`, `end-frame.ppm`, `screens/`.
 
-View a screen: `magick <file>.ppm <file>.png`, then Read the PNG.
+View a screen: `magick <file>.ppm <file>.png`, then open the PNG.
 
 ## Procedure
 
@@ -85,7 +85,7 @@ From the deep run's `profile.json`, top level unless noted:
   `stop.kind`
 * `perf.instructions` if present, else the instruction count you find
 * `timer.pit_writes`, `timer.irq0_edges` (pit_writes per guest second above
-  ~300,000 flags a latch-poll storm — report it)
+  ~300,000 flags a latch-poll storm: report it)
 * `perf.brk_cont_not_continuable`
 * If `-BarrierCensus` ran: the top 3 census rows by `unbound_exits`
 * The video mode fields (`mode`, `legacy_video_mode`, `active_display`)

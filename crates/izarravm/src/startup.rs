@@ -123,7 +123,7 @@ const MUNT_ROM_FOLDERS: &[&str] = &["mt32", "cm32l", "roms", "mt32-roms"];
 /// Two layouts, and neither depends on the files being NAMED anything: the
 /// canonical pair sitting loose in the state directory, or a folder that looks
 /// like it holds a ROM set. A folder hint is handed to the loader whole, which
-/// is what lets it identify the images by content and merge split halves --
+/// is what lets it identify the images by content and merge split halves:
 /// the pair of names below is only how a loose set is recognised as one.
 fn discover_munt_roms(config: &mut MidiConfig, state_dir: &Path) {
     if config.mt32_control_rom.is_some() || config.mt32_pcm_rom.is_some() {
@@ -215,7 +215,7 @@ impl fmt::Display for StartupError {
 }
 
 /// Deliberately not derived. `fn main() -> Result<_, E>` reports the error with
-/// `Debug`, so a derived one prints the struct and hides the message -- and
+/// `Debug`, so a derived one prints the struct and hides the message, and
 /// every one of these messages exists to tell the user which file to fix.
 impl fmt::Debug for StartupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -16,7 +16,7 @@ pub(crate) const RENDER_RING_CAP: usize = 8192;
 /// Push one rendered stereo frame, dropping the oldest frame once the ring
 /// holds [`RENDER_RING_CAP`] entries. Single-sourced so the per-device DACs
 /// cannot drift on the cap/drop policy. Returns true when a frame was evicted,
-/// so the caller can count the loss -- a silent drop here is audible as a click.
+/// so the caller can count the loss: a silent drop here is audible as a click.
 pub(crate) fn push_frame_capped(ring: &mut VecDeque<(i16, i16)>, frame: (i16, i16)) -> bool {
     let dropped = ring.len() >= RENDER_RING_CAP;
     if dropped {

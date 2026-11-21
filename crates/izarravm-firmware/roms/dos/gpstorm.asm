@@ -24,7 +24,7 @@
 ;   1. DE00 presence.
 ;   2. DE01: page-table buffer + the three server GDT slots.
 ;   3. Client context: PD, GDT (code16/data16/TSS + server trio), the DE0C
-;      switch structure -- the vcpisw.asm scaffolding, minus everything not
+;      switch structure: the vcpisw.asm scaffolding, minus everything not
 ;      needed to reach protected mode once.
 ;   4. INT 67h AX=DE0Ch: the server far-jumps to pm_landing at CPL 0.
 ;   5. Far-call the server PM entry with AX=DE0Ch and a 9-dword frame whose
@@ -159,7 +159,7 @@ pm_landing:
     mov es, ax
     mov ss, ax
     mov esp, pmstack_top          ; FULL ESP load (see vcpisw.asm)
-    ; DE0C back to V86, 9-dword frame -- but the EIP slot carries bit 16.
+    ; DE0C back to V86, 9-dword frame, but the EIP slot carries bit 16.
     ; The monitor rebuilds its own context and IRETDs off this frame; the
     ; out-of-limit EIP makes that IRETD #GP(0) at ring 0 under the server
     ; IDT. Everything else in the frame is well-formed, so the ONLY defect

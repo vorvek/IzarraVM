@@ -310,7 +310,7 @@ impl CrtcTiming {
     /// R8=02h R9=03h; seasip.info "Hercules Graphics Card Plus Notes"). 16-dot
     /// characters (R1=2Dh -> 45 char columns * 16 = 720 active dots); 4 scanlines
     /// per character row (R9=03h) with R6=57h (87 rows) giving 348 active
-    /// scanlines, and R4/R5 giving 370 scanlines total -- matching the card's
+    /// scanlines, and R4/R5 giving 370 scanlines total, matching the card's
     /// well-documented ~50 Hz refresh at its 16.257 MHz dot clock (864 dots/line
     /// * 370 lines). 90 bytes/scanline (720 pixels / 8, 1bpp).
     pub fn hgc_720x348() -> Self {
@@ -663,8 +663,8 @@ pub fn beam_vretrace(t: &CrtcTiming, dots: u64) -> bool {
 /// `display_forced_inactive` is the caller's own "the display is not refreshing
 /// at all" verdict, which is where the two callers differ: the VGA core folds in
 /// its sequencer / attribute-controller / CGA gates, while Margo's VBE modes have
-/// none of those registers in their path and pass `false`. Everything else --
-/// which is to say all of the timing -- comes from `t`.
+/// none of those registers in their path and pass `false`. Everything else
+/// (which is to say all of the timing) comes from `t`.
 ///
 /// SHARED ON PURPOSE. `Vga::status1_bits` and `MargoScanTiming::status1_bits`
 /// both call this, so a guest that polls 0x3DA cannot see two different notions
@@ -691,8 +691,8 @@ pub fn status1_geometry_bits(t: &CrtcTiming, beam: u64, display_forced_inactive:
 /// this is the ONE implementation, shared by the VGA core and by Margo
 /// (`status1_geometry_bits` is its companion, and the pair has to agree: this
 /// returns `None` exactly when the bit already has the target value, so a caller
-/// that sees `None` knows the state is settled, not that the geometry is unusable
-/// -- the unusable cases return `None` too, and both mean "do not schedule").
+/// that sees `None` knows the state is settled, not that the geometry is unusable:
+/// the unusable cases return `None` too, and both mean "do not schedule").
 ///
 /// `display_forced_inactive` carries the same meaning as in
 /// `status1_geometry_bits`; when it is set, bit 0 never transitions and this
@@ -774,7 +774,7 @@ pub fn dots_until_status1_bit_change(
 /// If the beam sits at or past the edge on this frame (on the edge, inside the
 /// retrace window, or in the bottom border below it), the result is the NEXT
 /// frame's edge, up to a full frame ahead, so the returned distance is never
-/// zero -- which is what makes a caller that loops "advance to the edge, run a
+/// zero, which is what makes a caller that loops "advance to the edge, run a
 /// little, repeat" terminate. `None` when the geometry is unusable (zero-dot
 /// frame, or a retrace edge outside the frame), so callers skip edge-aware
 /// scheduling. Shared by the VGA core and Margo for the same reason as
@@ -802,7 +802,7 @@ pub fn dots_until_vretrace_start(t: &CrtcTiming, beam: u64) -> Option<u64> {
 /// past the active dots on the current scan line. `CrtcTiming` does not carry
 /// a separate horizontal retrace start/width (only the CGA/MDA/VGA personalities
 /// this core hosts need it, and none of their timing tables model it finer than
-/// "past hdisp_end"), so this is the whole non-active portion of the line --
+/// "past hdisp_end"), so this is the whole non-active portion of the line,
 /// good enough for a status bit a detection loop polls for a toggle, which is
 /// its only consumer (`read_hgc_status`).
 pub fn beam_hsync(t: &CrtcTiming, dots: u64) -> bool {

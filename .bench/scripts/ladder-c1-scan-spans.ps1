@@ -11,7 +11,7 @@ inline in the per-page scan vectors).
 Two PINNED binaries, no knob. The arms differ by BINARY ONLY: C1 ships
 default-ON and unconditional, because a knob would mean carrying both the
 `Vec<BlockKey>` and the SoA layout plus a branch selecting between them inside
-the hot loop -- the "default-off instruments tax the hot path" failure the
+the hot loop, the "default-off instruments tax the hot path" failure the
 campaign has already recorded (design section 2.4).
 
 Pass the two pins with -BaseSha256 / -ArmSha256. Both are verified before ANY
@@ -32,7 +32,7 @@ five this ladder carries):
                                  SMC-FRAGILE: small write-side deltas flip it
                                  +/-5% (`sb16-dsp-merge-duke-regression`), so a
                                  duke regression is REVIEW, never STOP.
-  SECONDARY doom-486     n = 4   73.1 M keys at 3.51 M keys/wall-second --
+  SECONDARY doom-486     n = 4   73.1 M keys at 3.51 M keys/wall-second,
                                  nascar's RATE on a third of nascar's wall.
                                  Carries the campaign's strongest identity pin.
   SECONDARY doom-586     n = 4   69.7 M keys at 4.01 M keys/wall-second.
@@ -50,7 +50,7 @@ inert controls (quake-586 30 calls, prince-486 16, gp2-586 115, tombraid-586
 126) and defines the wall bar `F` as the largest absolute min-wall delta across
 all four, measured in the same session. This ladder carries ONE of them. `F` is
 therefore computed from quake-586 alone and is recorded as
-`measured_floor_F_one_row` -- a one-row estimate of the floor, NOT the design's
+`measured_floor_F_one_row`, a one-row estimate of the floor, NOT the design's
 four-row bar. Widen it with prince-486, gp2-586 and tombraid-586 legs on the
 same binary pair before quoting `F` as the design's bar. The last measured set
 spanned -1.20% to +1.93%, 3.13 points, which is why "+/-1.5%" was once a bar
@@ -68,15 +68,15 @@ bands, and cheaper than an extra anchor run per leg. Run the scoreboard for the
 contract; run this for the A/B.
 
 IDENTITY, and it is a STOP. Every row runs its own identity pair FIRST (one BASE
-leg, one ARM leg). C1 is a pure host-side data-structure change -- the function's
+leg, one ARM leg). C1 is a pure host-side data-structure change (the function's
 return value, its counters and its side effects are bit-identical by
-construction (design section 3.5) -- so COUNTER MOVEMENT IS A DEFECT, not a
+construction (design section 3.5)) so COUNTER MOVEMENT IS A DEFECT, not a
 tolerance or a tuning question. An identity failure STOPS THAT ROW LOUDLY and
 the script continues with the other rows, recording STOPPED in the summary.
 
 ONE identity field has a SPECIFIC diagnosis and the script prints it:
 `perf.smc_scan_keys`. Today an `entries`-miss row takes `continue` WITHOUT being
-written back as a survivor, so it falls in the drain range and is removed -- the
+written back as a survivor, so it falls in the drain range and is removed: the
 scan SELF-HEALS stale rows. Under the pre-filter a stale row whose `lens` says
 "no overlap" is skipped BEFORE the probe and is compacted as a survivor, so it
 stays on the page and every later scan of that page counts it. Therefore
@@ -84,7 +84,7 @@ stays on the page and every later scan of that page counts it. Therefore
 hole means the self-heal was load-bearing: STOP and re-derive section 3.1. These
 are ONE predicate, not two independent confirmations (design section 6.2).
 
-MECHANISM, and it is the ACCEPT -- not the wall (design section 6.5 item 3).
+MECHANISM, and it is the ACCEPT, not the wall (design section 6.5 item 3).
 The identity legs' profile JSONs are mined for the smc-census units at
 `smc_census.phases[<whole>].units` and every closure the design names is
 evaluated and recorded per row:
@@ -106,7 +106,7 @@ survivor that never reached the probe, so (INV) makes the skipped set a SUBSET
 of the surviving set. `probes_elided / keys_scanned` is REPORTED, never a bar.
 
 NONE of this aborts the script. `probes_elided`, `entries_get_calls` and
-`probe_divergences` do not exist on a plain release build -- they are
+`probe_divergences` do not exist on a plain release build: they are
 `#[cfg(feature = "smc-census")]` fields (design section 6.3), and
 `entries_get_calls` does not exist in the tree at all yet. When a field is
 absent the closure records `not_evaluated` with the missing field named. The
@@ -165,7 +165,7 @@ EXPECTED RUNTIME. Per-leg walls are taken from the newest scoreboard artifacts
 under .bench/results/ (`scoreboard.json`, field `wall_seconds`), rounded up:
   nascar-586    65 s  (64.737 arm0-g2 / 61.510 arm1-g2, 2026-08-26)
   duke3d-586   205 s  (201.075 arm0-g5 / 249.732 arm1-g5, 2026-08-26; 202.357 /
-                       197.472 on 2026-08-25 -- the 249.7 leg is the outlier
+                       197.472 on 2026-08-25: the 249.7 leg is the outlier
                        this ladder's contamination bar exists to reject)
   doom-486      21 s  (20.775 arm0-g1 / 19.662 arm1-g1, 2026-08-26)
   doom-586      18 s  (17.436 arm0-g1 / 16.562 arm1-g1, 2026-08-26)
@@ -175,7 +175,6 @@ plus a per-leg fixture copy charged from the tree sizes (nascar1_c 27.2 MB over
 estimate is printed at start and is a LOWER bound: discarded contaminated legs
 are not in it.
 
-See dev_docs/specs/2026-08-27-c1-presence-filter-design.md sections 6.1-6.5.
 Adapted from .bench/scripts/ladder-c2-podkey.ps1 (PR #742), which is itself a
 copy of the untracked .bench/scripts/ladder-d-elision-b.ps1 under its own name
 and its own lock path.
@@ -289,7 +288,7 @@ function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
 
 # Half drives Resolve-RowSelection directly. The other half spawns this very
 # script under `pwsh -File` with the mangled two-token shape, because that
-# failure happens in the parameter binder -- before any function here runs --
+# failure happens in the parameter binder (before any function here runs)
 # and only a real child invocation can prove the guard fires there. The
 # campaign rule applies: the guard must go RED on the broken input, and a green
 # control must show the child harness works.
@@ -515,9 +514,9 @@ $occupancyFields = @("perf.jit_direct_entries")
 # The smc-census units the design's closures read. All live under
 # `smc_census.phases[<whole>].units` (crates/izarravm/src/main.rs:2760-2824,
 # emitted from main.rs:2115 under `--features smc-census`). The last three do
-# NOT exist on a plain build -- probes_elided / entries_get_calls /
+# NOT exist on a plain build: probes_elided / entries_get_calls /
 # probe_divergences are design section 6.3's NEW fields, and entries_get_calls
-# is not in the tree at all yet -- so every one is read defensively and a
+# is not in the tree at all yet, so every one is read defensively and a
 # missing field turns its closures into `not_evaluated`.
 # ---------------------------------------------------------------------------
 
@@ -653,7 +652,7 @@ function Set-LadderEnvironment {
     $env:IZARRAVM_DIRECT_HOLD_LOAD_BIAS = "0"
     $env:IZARRAVM_DIRECT_ALIGN_TEST_AL = "0"
     # Every observer OFF. A default-off instrument still taxes the hot path once
-    # armed, and several only do work when the JIT is active -- i.e. they tax
+    # armed, and several only do work when the JIT is active, i.e. they tax
     # exactly the runs this is trying to time.
     foreach ($observer in @(
             "IZARRAVM_CPU_PROFILE", "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_RIP_PROFILE",
@@ -704,7 +703,7 @@ function Measure-Ladder([double[]]$Ratios, [double[]]$BaseWalls, [double[]]$ArmW
     $armMean = ($ArmWalls | Measure-Object -Average).Average
     $minRatio = $baseMin / $armMin
     # Design section 6.5 item 5: the PROTOCOL agreement set. Point estimators
-    # disagreeing by more than 0.005 means the ladder is contaminated -- re-run,
+    # disagreeing by more than 0.005 means the ladder is contaminated: re-run,
     # do not pick.
     $agreement = @($geomean, $median, $minRatio, $lower95)
     $spread = ($agreement | Measure-Object -Maximum).Maximum - ($agreement | Measure-Object -Minimum).Minimum
@@ -1342,7 +1341,7 @@ try {
     $contaminated = @($gates | Where-Object { $null -ne $_.estimators -and -not $_.estimators.estimators_agree })
 
     # The measured floor, from whatever control rows this run carried. ONE row
-    # here, against the design's four -- see the DEVIATION note in the header.
+    # here, against the design's four. See the DEVIATION note in the header.
     $controls = @($gates | Where-Object { $_.role -eq "control" -and $null -ne $_.estimators })
     $floorF = $null
     if ($controls.Count -gt 0) {

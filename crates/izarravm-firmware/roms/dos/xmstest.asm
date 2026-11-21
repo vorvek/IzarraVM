@@ -106,7 +106,7 @@ start:
     cmp dx, 128
     jne f_resize
 
-    ; 5. lock the block (0Ch) — exercises lock and arms the free-locked guard
+    ; 5. lock the block (0Ch): exercises lock and arms the free-locked guard
     mov ah, 0x0C
     mov dx, [handle]
     call far [entry]
@@ -309,7 +309,7 @@ f_large:    mov al, 0xEE
 ; alone falls through into sig. 0xE0-0xEE were all claimed before the
 ; arena-shape steps arrived, so those continue at 0xEF. The exit code is a
 ; plain byte and 0xA5 (success) is the only reserved value, so the next step
-; added takes 0xF3. Never recycle a code -- a stale one makes the harness name
+; added takes 0xF3. Never recycle a code: a stale one makes the harness name
 ; the wrong step, and 0xEF-0xF2 stay retired here because xmsarena.com still
 ; uses them.
 f_free:     mov al, 0xE8

@@ -5,7 +5,7 @@
 //!
 //! With the CD consolidation the BIOS is the CD driver, so the request
 //! packets that used to reach TOKACD's Strategy/Interrupt entries reach this
-//! module instead — through INT 2Fh AX=1510h, or through the ROM device
+//! module instead, through INT 2Fh AX=1510h, or through the ROM device
 //! header's stubs and the Lotura doorbell. The dispatcher, the length/unit
 //! gates, every IOCTL control block, and the audio state machine are a
 //! faithful transcription of TOKACD.SYS's source (formerly
@@ -104,7 +104,7 @@ impl CdDriverState {
 /// the high byte is MASKED (not validated), out-of-range seconds/frames are
 /// accepted numerically, and only an address inside the 150-frame lead-in
 /// fails. Syntax validation (frames < 75, seconds < 60, high byte zero) was
-/// a separate check TOKACD performed at the PLAY site only —
+/// a separate check TOKACD performed at the PLAY site only:
 /// `play_msf_syntax_ok` below carries that part.
 fn packed_msf_to_lba(packed: u32) -> Option<u32> {
     let frame = packed as u8;
@@ -131,7 +131,7 @@ fn lba_to_packed_msf(lba: u32) -> u32 {
 impl Machine {
     /// Execute one CD device-driver request whose header begins at guest
     /// linear `header`. Both the header and every pointer inside it (the
-    /// IOCTL control block, the read buffer — real-mode far pointers, offset
+    /// IOCTL control block, the read buffer: real-mode far pointers, offset
     /// word then segment word) belong to the caller and are accessed through
     /// its mapping.
     pub(crate) fn cd_device_request(&mut self, header: u32) {

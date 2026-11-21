@@ -71,8 +71,8 @@ pub(crate) fn parse_dir(bytes: &[u8]) -> Vec<DirEntry> {
 /// A directory entry is guest bytes: nothing stops a guest from writing `A\..\..\`
 /// into one, and the reconcile pass turns a short name straight into a host path
 /// under the mounted folder. `Path::join` on such a name walks out of the mount,
-/// so the illegal bytes are rejected here -- at the one point every host path in
-/// this engine is derived from -- rather than at each of the join sites.
+/// so the illegal bytes are rejected here (at the one point every host path in
+/// this engine is derived from) rather than at each of the join sites.
 /// Rejecting these can never orphan a name Katea itself synthesized: `fat_name`
 /// builds every mounted short name from a strict allowlist that shares no byte
 /// with this set, so only a name the guest invented can land here.
@@ -118,7 +118,7 @@ pub(crate) fn classify(e: &DirEntry, system: &HashSet<[u8; 11]>) -> EntryAction 
 
 /// Follow a cluster chain `first -> EOC` using `fat_entry`. Returns the ordered
 /// clusters, or `None` if the chain hits a free/reserved entry or fails to
-/// terminate within `max` clusters (corrupt/cyclic FAT) — the caller then holds.
+/// terminate within `max` clusters (corrupt/cyclic FAT): the caller then holds.
 /// A `first` below 2 yields an empty chain (a legitimately empty file).
 /// `FnMut`, not `Fn`: the reconcile path resolves entries through a per-walk FAT
 /// sector cursor (`katea_tree::FatWalk`), which the closure has to be able to

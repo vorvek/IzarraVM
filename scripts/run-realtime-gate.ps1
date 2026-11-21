@@ -42,20 +42,20 @@ $ErrorActionPreference = "Stop"
 # and the day's invariant re-pins, so its JIT mix is the shipped one. The
 # campaign now commits directly to main (PR-less, owner brief 2026-08-08), so
 # the pin is a direct commit rather than a merge commit; the reachability
-# requirement it exists for -- the TREE must stay resolvable on main -- holds
+# requirement it exists for (the TREE must stay resolvable on main) holds
 # for any pushed main commit as long as main is never rewritten. Whoever
 # re-pins this next must recalibrate the per-workload floors in
-# Get-WorkloadPolicy in the same commit -- they are ratchets derived from what
+# Get-WorkloadPolicy in the same commit: they are ratchets derived from what
 # the pinned tree measures, and a pin moved without them silently stops
 # asserting anything.
 #
 # Floors: derived from this pin's accepted gate run
 # fdfc809c72be-20260808-152349-ca4cd8c6 (six pairs, quiet box, processor 8,
-# verdict passed) -- each workload's rt floor sits ~4% under the minimum of
+# verdict passed): each workload's rt floor sits ~4% under the minimum of
 # its twelve samples, and every recorded sample clears the tightened floors.
 # See the per-workload comments in Get-WorkloadPolicy for the numbers.
 #
-# 2026-08-18, Doom realtics bands split by era -- NOT a re-pin. The
+# 2026-08-18, Doom realtics bands split by era, NOT a re-pin. The
 # 2026-08-10 storage-charge changes cut Doom's charged I/O stall over these
 # budgets (0.996 -> 0.171 guest seconds on the 486 row), so the timedemo now
 # completes in fewer realtics while gametics stays 2134. The fixture
@@ -64,7 +64,7 @@ $ErrorActionPreference = "Stop"
 # preserved). This script's bands were the pin-era ones and were never moved,
 # so every candidate since 2026-08-10 died on the doom-486 warmup: measured
 # here today, the pinned tree's build reports 2969 / 998 and a current main
-# build reports 2883 / 979 -- the shift exactly, on the same fixture.
+# build reports 2883 / 979, the shift exactly, on the same fixture.
 #
 # The pin does NOT move for this. The baseline exists to reconstruct a
 # known-good comparator from tree 5aabe720 via git archive; that tree is still
@@ -72,7 +72,7 @@ $ErrorActionPreference = "Stop"
 # MASTER_CLOCK-sensitive ratchets that a re-pin would oblige a full
 # re-measurement of (see the standing rule above). What broke is only the
 # realtics identity check, which asserts that a build ran the SAME demo in the
-# environment it was built for -- and the two roles now legitimately belong to
+# environment it was built for, and the two roles now legitimately belong to
 # two different eras. So the band is per-era: minimum/maximum_realtics carry
 # the current (post-storage-charge) band, baseline_minimum/maximum_realtics
 # carry the pin-era band, and Invoke-Observation picks by role. Both stay as
@@ -3304,7 +3304,7 @@ $summary = [ordered]@{
     scope = "Headless Doom and Quake throughput only. GUI pacing and audio require separate validation."
     acceptance = [ordered]@{
         accepted_baseline_tree = $acceptedBaselineTree
-        # Derived, not literal — see the matching comment in the bakeoff
+        # Derived, not literal. See the matching comment in the bakeoff
         # branch's acceptance block.
         workload_real_time_factor_floors = [ordered]@{
             doom_486 = (Get-WorkloadPolicy "doom-486").minimum_real_time_factor

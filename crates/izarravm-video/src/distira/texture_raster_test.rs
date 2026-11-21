@@ -247,7 +247,7 @@ fn samples_masked_matches_the_unmasked_sample_on_the_needed_slot() {
     //
     // TMU0 and TMU1 get distinct, non-zero S/T planes on purpose. A
     // `TextureIteratorState::default()` oracle makes every plane zero,
-    // which makes every sample equal `TextureSample::UNUSED` -- the
+    // which makes every sample equal `TextureSample::UNUSED`: the
     // assertions below would then compare the placeholder to itself and
     // pass no matter what `samples_masked` actually indexed. The
     // `assert_ne!` guards make that failure mode impossible to reintroduce

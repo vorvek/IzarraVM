@@ -19,17 +19,16 @@ pub(super) fn lanes_for_cores(cores: usize) -> usize {
 }
 
 /// The upper bound both the pool size and `Distira::set_raster_lanes`
-/// clamp to. Not a hardware limit -- `render_band`'s `y % lanes`
-/// partition works for any lane count -- just a sanity ceiling on the
+/// clamp to. Not a hardware limit: `render_band`'s `y % lanes`
+/// partition works for any lane count, just a sanity ceiling on the
 /// number of OS threads a single Distira instance will ask the process
 /// for.
 pub(super) const MAX_LANES: usize = 32;
 
 /// `IZARRAVM_DISTIRA_LANES`, read and clamped ONCE per process and cached:
 /// the A/B knob for the raised-lane-cap lever
-/// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 5, lever
-/// B). Unset (or unparsable, or zero) keeps today's `lanes_for_cores`
-/// policy. This is the single read site -- both the pool's thread count
+/// (lever B). Unset (or unparsable, or zero) keeps today's `lanes_for_cores`
+/// policy. This is the single read site: both the pool's thread count
 /// and `Distira::new`'s default `raster_lanes` go through it, so the pool
 /// always has at least as many OS threads as any instance's default asks
 /// for.
@@ -129,10 +128,10 @@ impl FrameStore {
     }
 
     /// A masked offset of exactly `len - 1` still drops the whole write
-    /// instead of wrapping its high byte to offset 0 -- a residual
+    /// instead of wrapping its high byte to offset 0, a residual
     /// one-byte hole in the FBI write path's otherwise unconditional
-    /// "wrap, never drop" contract (`dev_docs/2026-09-01-fb4mb-review.md`
-    /// section 4). Every caller in this codebase computes an even offset
+    /// "wrap, never drop" contract.
+    /// Every caller in this codebase computes an even offset
     /// (`color_start`/`aux_base` are multiples of 8192, `pitch` a multiple
     /// of 128, and the column term is always `x * 2`), and `len` (aliased
     /// to `DISTIRA_FB_SIZE`) is a power of two and therefore even, so

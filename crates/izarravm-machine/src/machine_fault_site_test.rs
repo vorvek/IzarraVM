@@ -305,7 +305,7 @@ fn a_split_vga_word_out_reconciles_its_data_map_before_a_later_fatal() {
 }
 
 /// An access to an undecoded port USED TO BE fatal by default. It is not any
-/// more -- real hardware floats an unclaimed read and swallows an unclaimed
+/// more: real hardware floats an unclaimed read and swallows an unclaimed
 /// write, and stopping on the first one hid every later probe (see
 /// `bus::OpenBusPorts`). The fatal path survives as an opt-in, which is exactly
 /// what these tests need and what they arm with `set_fatal_ports`: it is the
@@ -758,7 +758,7 @@ fn the_fault_report_latches_per_site_not_per_run() {
 /// and the machine merely hit the cycle limit.
 #[test]
 fn a_run_that_did_not_fault_records_no_fault_site() {
-    // mov ax,0x4c00; int 21h -- exits cleanly, touches no port.
+    // mov ax,0x4c00; int 21h: exits cleanly, touches no port.
     const PROG: &[u8] = &[0xB8, 0x00, 0x4C, 0xCD, 0x21];
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();

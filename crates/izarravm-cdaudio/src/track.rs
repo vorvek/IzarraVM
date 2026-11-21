@@ -63,7 +63,7 @@ struct Shared {
     finished: AtomicBool,
     /// Workers actually spawned for this track. `started` is meant to hold this
     /// at one for the track's whole life, and nothing about the audio would
-    /// look wrong if it did not -- every worker decodes the same file to the
+    /// look wrong if it did not: every worker decodes the same file to the
     /// same bytes. What would go wrong is the machine: `frame` starts a worker
     /// on each miss, and a four-minute track is eighteen thousand misses before
     /// the first sector lands, so the failure is thousands of threads each
@@ -76,7 +76,7 @@ struct Shared {
     /// mean every read rather than every decode start. A track being played
     /// from a buffer it already holds serves nothing but hits, so it would
     /// never refresh its place, and the next admission would find it looking
-    /// like the oldest resident and take the buffer out from under the mixer --
+    /// like the oldest resident and take the buffer out from under the mixer,
     /// which then re-decodes the song from its beginning, mid-play.
     last_touch: AtomicU64,
 }
@@ -179,8 +179,8 @@ impl DecodedTrack {
             // nothing takes it back out. `finished` stays false for a worker
             // that never existed, so the registry holds a full-size buffer it
             // can never evict, for the life of the mount. The residency guard
-            // in `evict_excess` raises the price of it -- two such zombies pin
-            // three residents where they used to pin two -- but it is not the
+            // in `evict_excess` raises the price of it (two such zombies pin
+            // three residents where they used to pin two) but it is not the
             // cause and reverting the guard would not fix it. The fix is to
             // withdraw the admission on this path; filed as a follow-up.
             self.shared.workers.fetch_sub(1, Ordering::Relaxed);
@@ -223,7 +223,7 @@ fn decode_worker(path: &Path, info: TrackInfo, shared: &Arc<Shared>, registry: O
     );
     if let Err(err) = result {
         // A partial track plays what it has and falls silent for the rest. The
-        // device path stays up either way -- the same posture a folder mount
+        // device path stays up either way, the same posture a folder mount
         // takes when a host file disappears under it.
         tracing::warn!("cd audio decode failed for {}: {err}", path.display());
     }
@@ -243,8 +243,8 @@ fn decode_worker(path: &Path, info: TrackInfo, shared: &Arc<Shared>, registry: O
 
 /// How many tracks may hold decoded PCM at once.
 ///
-/// Two, because that is what boundary prefetch needs -- the track being played
-/// and the one being read ahead of it -- not because two is a good cache size.
+/// Two, because that is what boundary prefetch needs: the track being played
+/// and the one being read ahead of it, not because two is a good cache size.
 /// A full CD is roughly 750 MB decoded and a front-panel play walks the whole
 /// disc, so something has to bound it, while a general LRU would be more
 /// machinery than this access pattern asks for.
@@ -293,8 +293,8 @@ impl Registry {
         let mut resident = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         while resident.len() > MAX_RESIDENT {
             // Only a track that has stopped decoding can be evicted. Taking the
-            // buffer from a live worker is safe in itself -- it copies under the
-            // same lock and checks the length -- but clearing `started`
+            // buffer from a live worker is safe in itself (it copies under the
+            // same lock and checks the length) but clearing `started`
             // underneath one would let a second worker begin on the same track.
             let evictable = resident
                 .iter()
@@ -302,7 +302,7 @@ impl Registry {
                 .count();
             // Never take the last one. `last_touch` orders the candidates
             // against each other, but it cannot say which track the mixer is
-            // drawing from right now -- and when only one candidate is left, it
+            // drawing from right now, and when only one candidate is left, it
             // is the track being played that gets taken, because a track being
             // read is by definition finished while the ones still decoding are
             // not. That is the exact shape: an idle track decoded far enough to
@@ -310,7 +310,7 @@ impl Registry {
             // candidate, so the song under the play head becomes the only one,
             // and evicting it restarts that song from sector 0 mid-play. It is
             // an audible dropout in a Quake or Tomb Raider track, and the price
-            // of refusing is one extra decoded track -- a few megabytes, held
+            // of refusing is one extra decoded track, a few megabytes, held
             // for as long as it takes the older worker to store its flag, after
             // which its own tail call clears the backlog. The bound is a memory
             // ceiling; the music is the product.

@@ -12,14 +12,14 @@
 //! Sound Blaster DSP); everything else here is independent of `SbDsp`.
 //!
 //! Built from the AD1848K datasheet:
-//! - R0 Index Address (INIT/MCE/TRD/IXA3:0) -- datasheet "Index Register".
-//! - R2 Status (INT sticky bit, cleared by any write) -- "Status Register".
-//! - I8 Clock and Data Format (FMT/L/C/S/M/CFS2:0/CSS) -- IXA3:0 = 8.
-//! - I9 Interface Configuration (ACAL/SDC/CEN/PEN) -- IXA3:0 = 9.
-//! - I10 Pin Control (IEN gates the external INT pin) -- IXA3:0 = 10.
-//! - I11 ACI (autocalibrate-in-progress, read-only bit5) -- IXA3:0 = 11.
-//! - I12 Revision ID (K-grade = "1010") -- IXA3:0 = 12.
-//! - I14/I15 Upper/Lower Base Count -- IXA3:0 = 14 & 15.
+//! - R0 Index Address (INIT/MCE/TRD/IXA3:0): datasheet "Index Register".
+//! - R2 Status (INT sticky bit, cleared by any write): "Status Register".
+//! - I8 Clock and Data Format (FMT/L/C/S/M/CFS2:0/CSS): IXA3:0 = 8.
+//! - I9 Interface Configuration (ACAL/SDC/CEN/PEN): IXA3:0 = 9.
+//! - I10 Pin Control (IEN gates the external INT pin): IXA3:0 = 10.
+//! - I11 ACI (autocalibrate-in-progress, read-only bit5): IXA3:0 = 11.
+//! - I12 Revision ID (K-grade = "1010"): IXA3:0 = 12.
+//! - I14/I15 Upper/Lower Base Count: IXA3:0 = 14 & 15.
 
 use std::collections::VecDeque;
 use std::sync::LazyLock;
@@ -103,7 +103,7 @@ const REVISION_K_GRADE: u8 = 0b1010;
 /// Presence signature returned in bits 5:0 of every read of the board config
 /// region. This is a *board* property, not a codec one: a Windows Sound System
 /// card answers its four low ports with this constant, and MSS detection code
-/// keys off exactly that -- e.g. the HMI Sound Operating System's `ms8md`
+/// keys off exactly that, e.g. the HMI Sound Operating System's `ms8md`
 /// detect probe (shipped with Tomb Raider) reads `base+3` and requires
 /// `(value & 0x3f) == 0x04` before it will even look at the codec. Returning
 /// anything else makes the card undetectable.
@@ -114,8 +114,8 @@ const WSS_CONFIG_SIGNATURE: u8 = 0x04;
 ///
 /// It is not scratch. Writing it 0->1 drives the interrupt line the low bits
 /// just selected; writing it 1->0 releases that line. That is how an MSS
-/// install routine proves it picked a line that actually reaches the CPU --
-/// write the config byte, strobe, check the handler ran, release -- and it is
+/// install routine proves it picked a line that actually reaches the CPU
+/// (write the config byte, strobe, check the handler ran, release) and it is
 /// why a write-mostly register has a readable bit at all.
 ///
 /// The AD1848 is not involved: this is the board latch driving the ISA INT pin
@@ -124,7 +124,7 @@ const WSS_CONFIG_SIGNATURE: u8 = 0x04;
 /// it drives is the *currently selected* one, so re-selecting while the strobe
 /// is held moves the assertion with it.
 ///
-/// Prior art: `dev_docs/reference/86box/src/sound/snd_azt2316a.c:303-331`, a
+/// Prior art: 86Box `src/sound/snd_azt2316a.c:303-331`, a
 /// board whose own header (`:80-86`) records that "the WSS was completely
 /// cloned here". Plain `snd_wss.c` returns the bit on read and never uses it,
 /// which is what left it looking like scratch.
@@ -155,7 +155,7 @@ const AUTOCAL_SAMPLES: u32 = 128;
 /// This is the device-init config; the user-facing `WssConfig` lives in
 /// `izarravm-core` and is the single authority for what a machine powers on
 /// with. The `Default` here exists only so `Ad1848::default()` works in tests
-/// and MUST agree with `WssConfig::default()` -- two "defaults" that disagree
+/// and MUST agree with `WssConfig::default()`: two "defaults" that disagree
 /// meant the shipped machine ran on one line while every unit test asserted
 /// another. `izarravm-machine`'s `wss_device_default_matches_the_profile_default`
 /// pins the two together.
@@ -169,7 +169,7 @@ pub struct Ad1848Config {
 /// interrupt controller.
 ///
 /// The codec core has no interrupt controller of its own, so a config write
-/// records the delta here and the machine's bus write path applies it -- the
+/// records the delta here and the machine's bus write path applies it, the
 /// same shape `Mpu401` uses for its own line (`MachineBus::sync_mpu_irq`).
 /// `released` names a line the board has stopped driving, `asserted` a line it
 /// has started driving; a re-selection while the strobe is held carries both.
@@ -183,7 +183,7 @@ pub struct BoardIrqStrobe {
 
 impl Default for Ad1848Config {
     fn default() -> Self {
-        // base 0x530, IRQ11, DMA0 -- mirrors `WssConfig::default()`: IRQ 11
+        // base 0x530, IRQ11, DMA0. Mirrors `WssConfig::default()`: IRQ 11
         // rather than the WSS standard IRQ 7 so the Sound Blaster keeps 7,
         // which far more DOS titles hardwire; DMA 0 avoids the SB16's DMA 1.
         Self { irq: 11, dma: 0 }
@@ -195,7 +195,7 @@ impl Default for Ad1848Config {
 /// Patterned on `DmaChip::trace_dma_mode`: the check is a single relaxed load of
 /// a `OnceLock` at the call site, and every formatting cost sits behind it, so a
 /// plain run pays nothing beyond that load on a path that is already a guest
-/// port access. Turn it on to see a driver's whole init sequence in order --
+/// port access. Turn it on to see a driver's whole init sequence in order:
 /// which register it programmed, what it selected, and what it read back.
 pub fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -275,7 +275,7 @@ impl Ad1848 {
         Self {
             regs,
             index: R0_INDEX_IDLE,
-            // Datasheet: R0 reads "0100 0000 (40h)" after reset -- MCE set.
+            // Datasheet: R0 reads "0100 0000 (40h)" after reset: MCE set.
             mce: true,
             trd: false,
             status: R2_RESET,
@@ -332,7 +332,7 @@ impl Ad1848 {
     ///   across all four ports); reads the presence signature plus bit 6.
     /// - 4: R0 Index Address (INIT/MCE/TRD/index).
     /// - 5: R1 Indexed Data (the selected indirect register, with read-only
-    ///   bits resolved -- e.g. I11 ACI, I12 revision).
+    ///   bits resolved, e.g. I11 ACI, I12 revision).
     /// - 6: R2 Status. Only the INT bit (bit0) is dynamic; PRDY/SOUR/PL-R/PU-L
     ///   are static reset-value stubs in this DMA-only playback scope.
     /// - 7: R3 PIO Data (stub).
@@ -417,8 +417,8 @@ impl Ad1848 {
     ///
     /// The selection is NOT readable: bits 5:0 always report the presence
     /// signature, and only bit 6 comes back as written. Detection code relies
-    /// on precisely this -- HMI's MSS probe masks with `0x3f` and compares
-    /// against `0x04` -- so a card that reported its own IRQ/DMA here would be
+    /// on precisely this (HMI's MSS probe masks with `0x3f` and compares
+    /// against `0x04`) so a card that reported its own IRQ/DMA here would be
     /// undetectable. Host code that needs the live routing calls
     /// [`Ad1848::irq`] / [`Ad1848::dma`]; guest code that needs to remember it
     /// keeps its own copy (SNDCTRL.COM keeps it in CMOS).
@@ -444,9 +444,9 @@ impl Ad1848 {
     /// range-safe by construction: the previous unchecked path could produce
     /// `dma = 11` and panic the machine's channel lookup.
     ///
-    /// This register RE-STEERS and does nothing else. It is board glue -- an
+    /// This register RE-STEERS and does nothing else. It is board glue: an
     /// ISA-side latch that points the codec's DRQ/DACK/INT pins at the selected
-    /// lines -- with no wire into the AD1848 at base+4, so it cannot touch I9
+    /// lines, with no wire into the AD1848 at base+4, so it cannot touch I9
     /// PEN, the Current Count, or the R2 INT status, and a transfer in flight
     /// keeps running across a re-point on the new resources. Both prior-art
     /// models agree (`snd_wss.c:67-75`, `snd_azt2316a.c:316-320`: set the DMA,
@@ -457,7 +457,7 @@ impl Ad1848 {
     /// guest-readable codec state (a driver that re-points and reads I9 back
     /// would see PEN clear where hardware shows it set), and the skip made one
     /// identical `OUT` behave two different ways depending on hidden prior
-    /// state, which no board does because no board compares -- and it swallowed
+    /// state, which no board does because no board compares, and it swallowed
     /// the bit-6 strobe, whose assert and release name the same resources by
     /// construction.
     ///
@@ -476,7 +476,7 @@ impl Ad1848 {
         if held != self.board_irq_driven {
             self.board_irq_strobe = Some(BoardIrqStrobe {
                 // Release only a line this board actually raised, and only when
-                // the strobe has left it -- lines are shared, so lowering one
+                // the strobe has left it: lines are shared, so lowering one
                 // the board never drove would clear another device's level.
                 released: self.board_irq_driven.filter(|line| Some(*line) != held),
                 asserted: held,
@@ -530,7 +530,7 @@ impl Ad1848 {
     /// I11 ACI reports the real state of the modeled autocalibrate window, and
     /// deliberately does NOT adopt 86Box's read-toggle (`ret ^= 0x20` on every
     /// read of I11). That toggle exists because 86Box models no autocal window
-    /// at all -- its I11 would otherwise be a constant, so a driver polling for
+    /// at all: its I11 would otherwise be a constant, so a driver polling for
     /// either polarity would spin forever, and flipping the bit terminates both
     /// polls at the cost of never reporting the truth. We do model the window:
     /// ACI asserts on the MCE 1->0 edge and retires over ~128 output sample
@@ -649,7 +649,7 @@ impl Ad1848 {
     /// fixed divide table.
     ///
     /// Returns `0` for the two XTAL1 "Not Supported" combinations (CFS4/CFS5 with
-    /// CSS=0), matching the datasheet's "Not Supported" table entries — real
+    /// CSS=0), matching the datasheet's "Not Supported" table entries: real
     /// hardware in those combos has no defined sample clock. **`0` means "invalid
     /// rate": callers MUST NOT use it as a divisor.** The machine integration
     /// guards with `.max(1)` (mirroring the SB DSP resampler path) before
@@ -704,7 +704,7 @@ impl Ad1848 {
     ///
     /// The AD1848 Current Count drains one sample period per output frame, and
     /// the underflow that latches the IRQ happens the period *after* the count
-    /// reaches zero -- so a count of `current_count` reaches the interrupt in
+    /// reaches zero, so a count of `current_count` reaches the interrupt in
     /// `current_count + 1` output frames (the same N+1 cadence `advance_count`
     /// enforces).
     ///
@@ -716,7 +716,7 @@ impl Ad1848 {
     /// sticky INT bit is still pending the host's ack, `advance_count` freezes the
     /// Current Count (datasheet: "the DMA Current Counter will not decrement while
     /// both the TRD bit is set and the INT bit is a one"), so no further underflow
-    /// -- hence no new IRQ -- is generated until the host acks. The estimator must
+    /// (hence no new IRQ) is generated until the host acks. The estimator must
     /// mirror that gate and return `None`, or the run loop would fast-forward a
     /// halted CPU to a wake the producer never actually generates.
     pub fn frames_until_next_irq(&self) -> Option<u64> {
@@ -760,8 +760,8 @@ impl Ad1848 {
     /// count auto-reloads (WSS playback is inherently auto-init).
     ///
     /// Underrun contract: `fetch` advances the DMA read pointer as a side effect,
-    /// so it MUST supply a *whole* frame atomically -- all 1/2/4 bytes for the
-    /// current format/channel selection -- or none of them. If it returns `Some`
+    /// so it MUST supply a *whole* frame atomically: all 1/2/4 bytes for the
+    /// current format/channel selection, or none of them. If it returns `Some`
     /// for the first byte(s) of a frame and `None` partway through (e.g. the
     /// 16-bit low byte present but the high byte absent), those already-fetched
     /// bytes are consumed and the partial frame is dropped (`None` returned, the
@@ -901,7 +901,7 @@ impl Ad1848 {
     /// stalling it (`timing.rs`, the `autocal_active` arms of the advance gate
     /// and of `device_rates`). That is what makes an ACI poll terminate for
     /// every format, which in turn is why this model can report the bit
-    /// truthfully instead of toggling it -- see `read_indexed_data`.
+    /// truthfully instead of toggling it. See `read_indexed_data`.
     pub fn advance_autocal(&mut self) {
         if let Some(n) = self.aci_remaining {
             if n <= 1 {

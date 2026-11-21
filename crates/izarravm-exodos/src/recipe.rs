@@ -30,8 +30,8 @@ pub struct KeyStep {
 /// The deltas are MICKEYS, not pixels, and the emulator's flag documents why
 /// the harness cannot convert between them: the ratio belongs to the INT 33h
 /// driver and the guest may change it. A recipe is therefore derived once
-/// against a screenshot -- `home` to drive the pointer into the driver's own
-/// minimum corner, then a `move` from that known origin -- and replays exactly.
+/// against a screenshot (`home` to drive the pointer into the driver's own
+/// minimum corner, then a `move` from that known origin) and replays exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MouseStep {
     pub guest_ms: u64,

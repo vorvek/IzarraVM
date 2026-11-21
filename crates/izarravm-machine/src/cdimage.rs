@@ -98,7 +98,7 @@ impl TrackMode {
     /// None for a mode that has no logical payload at all. MODE1/2352 wraps the
     /// payload in 12 sync + 4 header bytes; MODE2/2352 adds an 8-byte subheader
     /// on top of that; MODE2/2336 carries the subheader alone; the /2048 forms
-    /// store the payload bare. An AUDIO track returns None -- a data read of
+    /// store the payload bare. An AUDIO track returns None: a data read of
     /// audio fails on hardware too.
     pub fn payload_offset(self) -> Option<usize> {
         match self {
@@ -135,7 +135,7 @@ pub struct Track {
     pub mode: TrackMode,
     /// First user LBA of this track on the disc timeline. Equal to this track's
     /// INDEX 01 address only when no PREGAP precedes it (on this track or any
-    /// earlier one) -- a PREGAP shifts this LBA forward without changing the
+    /// earlier one): a PREGAP shifts this LBA forward without changing the
     /// INDEX 01 address itself.
     pub start_lba: u32,
     /// Sector count in this track.
@@ -172,7 +172,7 @@ const MAX_CD_READ_HANDLES: usize = 4;
 /// HDD clears its handles on every host mutation because the guest writes
 /// through it and a replaced file must not keep reading its pre-write bytes. A
 /// mounted disc is read-only to the guest, and the ISO metadata the mount
-/// synthesized -- the extent table this cache is keyed by -- was computed once
+/// synthesized (the extent table this cache is keyed by) was computed once
 /// at mount time. If a host file is replaced underneath a live mount, that
 /// extent table is ALREADY stale about its length and layout, so a stale handle
 /// tells the guest nothing the mount was not telling it anyway. Adding
@@ -181,8 +181,8 @@ const MAX_CD_READ_HANDLES: usize = 4;
 struct FolderReadCache {
     handles: std::cell::RefCell<Vec<(std::path::PathBuf, std::fs::File)>>,
     /// Host `File::open` calls served by this mount. The mechanism this cache
-    /// exists for is invisible to a value comparison -- the bytes are identical
-    /// either way -- so this counter is what a test can actually grade.
+    /// exists for is invisible to a value comparison (the bytes are identical
+    /// either way) so this counter is what a test can actually grade.
     host_file_opens: std::cell::Cell<u64>,
     /// Handle slots. `MAX_CD_READ_HANDLES` in production; a test sets it to 0
     /// to get the UNCACHED arm out of the same binary, which is what makes the
@@ -343,7 +343,7 @@ impl CdImage {
     /// Mount from a CUE sheet and a single BIN. Convenience wrapper over
     /// [`CdImage::from_cue_files`] for the common one-file sheet: every track
     /// is bound to `bin`, whatever the sheet's one FILE line names it. The
-    /// byte order comes from the sheet -- that FILE line's type token, or
+    /// byte order comes from the sheet: that FILE line's type token, or
     /// BINARY when the sheet declares no FILE at all.
     ///
     /// A sheet naming two or more files is an error here, not a best effort:
@@ -367,7 +367,7 @@ impl CdImage {
         }
         // One BIN: every track binds to it, whatever the sheet's FILE line
         // names it. Past the check above this loop cannot actually change a
-        // track -- `parse_cue` indexes tracks by `files.len().saturating_sub(1)`
+        // track: `parse_cue` indexes tracks by `files.len().saturating_sub(1)`
         // and a sheet with at most one FILE gives 0 for every track either
         // way. It stays because that is a fact about a formula in another
         // function, and what `build`'s contract needs is the property itself:
@@ -383,7 +383,7 @@ impl CdImage {
         // reached only when the sheet named no file at all, and a single-BIN
         // `FILE "d.bin" MOTOROLA` sheet arrives through `from_cue_files`,
         // which has read the token all along. It is the API surface that was
-        // wrong -- a caller handing this function a sheet and the bytes that
+        // wrong: a caller handing this function a sheet and the bytes that
         // sheet describes got BINARY imposed on it whatever the sheet said,
         // and MOTOROLA is the one token no amount of sniffing can recover. A
         // sheet naming no file leaves nothing to read, so the fallback stays
@@ -400,7 +400,7 @@ impl CdImage {
             tracks,
             &[BuildFile {
                 // This entry point takes bytes, not a path, so there is no file
-                // name to report -- and the checks that would name one are the
+                // name to report, and the checks that would name one are the
                 // encoded-audio ones, which a `Raw` source cannot reach anyway.
                 name: "the CUE's BIN",
                 source: &source,
@@ -421,7 +421,7 @@ impl CdImage {
     ///
     /// `files` must correspond exactly to the sheet's FILE lines, in any
     /// order. A name the sheet declares and `files` omits is an error, and so
-    /// is the reverse -- a file supplied that the sheet never named means the
+    /// is the reverse: a file supplied that the sheet never named means the
     /// caller and this parser disagree about what the sheet says, which is not
     /// a disagreement to resolve by mounting one side's reading in silence.
     ///
@@ -438,7 +438,7 @@ impl CdImage {
         // resolves each section to its own `file_index` and always starts a
         // new file_index's cursor at 0, so a second section for the same
         // name would silently read back byte 0 of the file instead of that
-        // section's own INDEX 01 offset -- a wrong-data mount, not an error.
+        // section's own INDEX 01 offset: a wrong-data mount, not an error.
         // No mainstream ripper emits this layout, so reject it loudly instead
         // of trying to make it work.
         let mut seen = std::collections::HashSet::with_capacity(files_in_sheet.len());
@@ -470,7 +470,7 @@ impl CdImage {
         // Every FILE the sheet names now has bytes behind it, but the reverse
         // was never asked: a file the caller supplied and the sheet did not
         // name simply vanished here. That silence is why the BOM bug went
-        // unnoticed -- the loader read two files off disk, `parse_cue` listed
+        // unnoticed: the loader read two files off disk, `parse_cue` listed
         // one because the marker had fused onto the first FILE keyword, and
         // the extra went nowhere while a track bound to the wrong file's
         // bytes. Two scanners disagreed about what the sheet said and only the
@@ -513,7 +513,7 @@ impl CdImage {
         Self::build(tracks, &build_files)
     }
 
-    /// Mount from a CUE sheet and the raw bytes its FILEs name -- the all-raw
+    /// Mount from a CUE sheet and the raw bytes its FILEs name: the all-raw
     /// case of [`CdImage::from_cue_sources`], which see for the rules on how
     /// `files` must line up with the sheet.
     ///
@@ -567,7 +567,7 @@ impl CdImage {
         //
         // Only raw files have bytes to concatenate. An audio-sourced file
         // occupies no space in the backing, so its `file_base` entry is the
-        // same offset as its successor's -- harmless, because nothing ever
+        // same offset as its successor's: harmless, because nothing ever
         // reads a source-backed track's `image_offset`.
         let mut cursors = vec![0usize; files.len()];
         let total_bytes = files.iter().map(|f| f.raw_bytes().len()).sum();
@@ -587,7 +587,7 @@ impl CdImage {
             // index 0 against a one-element `files`, and `from_cue_files`
             // builds one `files` entry per FILE that `parse_cue` drew
             // `file_index` from, in the same order. This is a
-            // `.get()`-over-index habit, not a live ambiguity -- same as the
+            // `.get()`-over-index habit, not a live ambiguity, same as the
             // bounds check in `read_data_sector`. It is also now the *only*
             // per-file lookup in this loop: bytes and type token arrive
             // together, so there is no second `.get()` left to answer a
@@ -624,8 +624,8 @@ impl CdImage {
                     // there is no byte offset at which a second track inside it
                     // would begin and nothing to divide. This is asked of
                     // encoded files alone: many tracks sharing one raw BIN is
-                    // an ordinary layout -- Tomb Raider Gold's sheet puts 60 on
-                    // one -- and it stays supported.
+                    // an ordinary layout (Tomb Raider Gold's sheet puts 60 on
+                    // one) and it stays supported.
                     if tracks_in.iter().filter(|t| t.file_index == fi).count() > 1 {
                         return Err(format!(
                             "{} is an encoded audio file named by more than one TRACK; \
@@ -634,7 +634,7 @@ impl CdImage {
                         ));
                     }
                     // A decoded file's length comes from the decoder, and the
-                    // byte accounting is skipped entirely -- not as an
+                    // byte accounting is skipped entirely, not as an
                     // optimization, but because the file has no bytes here. The
                     // span, the "runs past its file" bounds check and the cursor
                     // advance would all be measured against a length of zero:
@@ -642,9 +642,9 @@ impl CdImage {
                     // sector derivation would make the track zero-length,
                     // collapsing every later track onto one LBA.
                     if audio_sources.insert(p.number, audio.clone()).is_some() {
-                        // Unreachable through either entry point today --
-                        // `parse_cue` would have to emit two tracks with one
-                        // number -- but silently replacing a source is a
+                        // Unreachable through either entry point today
+                        // (`parse_cue` would have to emit two tracks with one
+                        // number) but silently replacing a source is a
                         // wrong-data mount, which is the class this whole
                         // change exists to remove. Say so instead.
                         return Err(format!("CUE declares track {} twice", p.number));
@@ -717,7 +717,7 @@ impl CdImage {
     /// then the head is already there, advancing in real time whether or not
     /// anything has caught up.
     ///
-    /// Cheap and idempotent -- a source already decoding ignores the touch --
+    /// Cheap and idempotent (a source already decoding ignores the touch)
     /// so the mixer can call it on every frame it renders.
     pub fn warm_upcoming(&self, lba: u32) {
         // The next track by position, which is not the same as the track after
@@ -726,7 +726,7 @@ impl CdImage {
         // giving them to either neighbour, so during a pregap `track_at_lba`
         // finds nothing, and afterwards the next track does not begin where the
         // previous one ended. Matching on exact adjacency made this function
-        // inert for any sheet with a pregap -- which is the ordinary layout,
+        // inert for any sheet with a pregap, which is the ordinary layout,
         // and includes Fatal Racing's, one of the discs this was written for.
         //
         // Tracks are in ascending `start_lba` order, so the first one starting
@@ -744,7 +744,7 @@ impl CdImage {
             // Asking for frame 0 is what starts a decode, and the frame itself
             // is thrown away. There is no separate "start" on the contract
             // because the disc model has no business knowing that a source
-            // decodes at all -- only that its frames may not be ready yet.
+            // decodes at all, only that its frames may not be ready yet.
             let _ = source.frame(0);
         }
     }
@@ -772,7 +772,7 @@ impl CdImage {
     pub fn read_data_sector(&self, lba: u32) -> Option<[u8; DATA_SECTOR]> {
         let track = self.track_at_lba(lba)?;
         // An AUDIO track has no logical payload; hardware fails a data read of
-        // one too. This is the only audio guard -- it covers both backings.
+        // one too. This is the only audio guard: it covers both backings.
         let payload_offset = track.mode.payload_offset()?;
         match &self.backing {
             Backing::Bytes(bytes) => {
@@ -780,7 +780,7 @@ impl CdImage {
                 let frame_off = track.image_offset + (lba - track.start_lba) as usize * raw;
                 // Form is a per-sector property: an XA track may mix Form 1 and
                 // Form 2. A Form 2 sector carries a 2324-byte streaming payload,
-                // not a 2048-byte logical sector, so it reads as absent -- the
+                // not a 2048-byte logical sector, so it reads as absent, the
                 // same answer hardware gives for a data read of an audio track.
                 // The `bytes.get(..)?` below would also return None for a frame
                 // truncated mid-track, indistinguishable from a real Form 2
@@ -817,7 +817,7 @@ impl CdImage {
         // A decoded track's frames never live in the backing. The index is
         // relative to the track's own start, so the pregap that `build` counted
         // into `start_lba` is already off the number by the time the decoder
-        // sees it -- an encoded file holds the audio alone and knows nothing
+        // sees it: an encoded file holds the audio alone and knows nothing
         // about gaps.
         //
         // None from here is not an error: it is a frame the worker has not
@@ -838,7 +838,7 @@ impl CdImage {
         out.copy_from_slice(slice);
         if track.byte_swapped {
             // Big-endian samples: swap the two bytes of each 16-bit sample. The
-            // stereo pairing is unaffected -- L and R stay where they are, only
+            // stereo pairing is unaffected: L and R stay where they are, only
             // each sample's own byte order changes. A Red Book frame is 588
             // stereo pairs of two 16-bit samples, so 2352 bytes divide into
             // exactly 1176 whole samples and no partial one can be left over.
@@ -853,8 +853,8 @@ impl CdImage {
     /// never opens a file (a resident ISO or CUE+BIN reads from memory).
     ///
     /// The grading instrument for the folder read cache. The cache is invisible
-    /// to a value comparison — the sectors are byte-identical with it and
-    /// without it — so the open count is the only thing that can show it works.
+    /// to a value comparison (the sectors are byte-identical with it and
+    /// without it) so the open count is the only thing that can show it works.
     pub fn host_file_opens(&self) -> Option<u64> {
         match &self.backing {
             Backing::Bytes(_) => None,
@@ -935,7 +935,7 @@ fn read_folder_sector(
 /// already-open handle when this mount has one.
 ///
 /// This is the whole slice. Before it, every 2048-byte sector of a folder mount
-/// paid a `File::open`, a `seek`, a `Vec` allocation and a copy -- so a game
+/// paid a `File::open`, a `seek`, a `Vec` allocation and a copy, so a game
 /// streaming an FMV from a folder-mounted disc opened the same file thousands of
 /// times a second. The HDD path solved exactly this with a handle LRU; this is
 /// the same fix one device over.
@@ -1037,13 +1037,13 @@ type CueFile = (String, CueFileType);
 
 /// One FILE the sheet named, paired with the bytes standing behind it.
 ///
-/// `build` needs several facts per file -- the bytes, the declared type token,
-/// and more to come as the audio formats land -- and the obvious way to pass
+/// `build` needs several facts per file (the bytes, the declared type token,
+/// and more to come as the audio formats land) and the obvious way to pass
 /// them is one slice per fact, indexed in lockstep by a track's `file_index`.
 /// That shape cannot state its own invariant: nothing makes the slices the same
 /// length, and the two out-of-range readings disagreed in the dangerous
 /// direction. A missing entry in the bytes slice raised an error, while a
-/// missing entry in the type slice read as "not MOTOROLA" -- so a desync would
+/// missing entry in the type slice read as "not MOTOROLA", so a desync would
 /// not have failed the mount, it would have served a big-endian disc as noise
 /// without a complaint. Carrying one slice of *this* means a file's facts are
 /// one value that cannot come apart, and the next per-file fact is a field here
@@ -1076,8 +1076,8 @@ impl BuildFile<'_> {
 /// at all, which a loader may treat as a single-BIN sheet named after the CUE.
 ///
 /// This exists so that a caller which must know the sheet's files *before* it
-/// can supply them -- a loader deciding what to read off disk, and what to
-/// merely measure -- asks the same scanner the mount will use rather than
+/// can supply them (a loader deciding what to read off disk, and what to
+/// merely measure) asks the same scanner the mount will use rather than
 /// writing a second one. Two scanners is how the UTF-8 BOM bug survived: the
 /// loader's own four-byte prefix test read a BOM'd `FILE` as three marker bytes
 /// and an `F`, so it handed over one file while `parse_cue` listed two, and a
@@ -1110,7 +1110,7 @@ fn parse_cue(cue: &str) -> Result<(Vec<CueFile>, Vec<CueTrack>), String> {
     // through the catch-all. Dropping a line silently is harmless for the
     // comment keywords this parser ignores anyway, but a dropped *first* FILE
     // line shifts every later FILE down one slot while tracks keep binding by
-    // `files.len().saturating_sub(1)` -- so the sheet mounts, raises nothing,
+    // `files.len().saturating_sub(1)`, so the sheet mounts, raises nothing,
     // and serves the wrong file's bytes. Stripping it once here, rather than
     // per line, is deliberate: a BOM is a stream marker and only the first
     // line can legitimately carry one.

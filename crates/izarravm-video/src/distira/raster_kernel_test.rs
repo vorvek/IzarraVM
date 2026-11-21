@@ -5,7 +5,7 @@
 //! `RasterView::raster_row`, the unspecialized oracle every kernel body was
 //! copied from. Two independently allocated frame stores rasterise the SAME
 //! triangle through the two paths and the byte contents, not just the
-//! counters, must come out identical — a kernel that skipped a write the
+//! counters, must come out identical: a kernel that skipped a write the
 //! oracle makes would still get the counters right but paint the wrong
 //! pixel, and only the frame comparison catches that.
 
@@ -18,7 +18,7 @@ fn frame_store() -> FrameStore {
 /// Read back only the bytes the 8x8 scene can possibly touch: the colour
 /// buffer's and the depth buffer's first 8 rows. Reading the whole 2 MB
 /// frame store with one atomic load per byte, times two arms times twelve
-/// mode combinations, would make this test slow for no extra coverage —
+/// mode combinations, would make this test slow for no extra coverage:
 /// nothing outside these two windows is reachable from an 8x8 triangle at
 /// the origin.
 fn read_frame(fb: &FrameStore, display: &DistiraDisplay, aux_base: u32) -> Vec<u8> {
@@ -50,8 +50,8 @@ fn scene(
         // scenes use positive depth codes, so LESSTHAN against an
         // uninitialized zero would reject every pixel and defeat the
         // "the scene must actually paint" check below. The depth TEST
-        // path is exercised regardless — `depth_test_passes` still runs,
-        // still reads the buffer, still writes it back — only the
+        // path is exercised regardless: `depth_test_passes` still runs,
+        // still reads the buffer, still writes it back. Only the
         // comparison result changes.
         fbz_mode |= FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT);
     }
@@ -63,7 +63,7 @@ fn scene(
         // RGB_SELECT_TEXTURE, not just FBZCP_TEXTURE_ENABLED: the combine
         // unit's own colour-select bits decide whether `combined_texture`'s
         // RESULT reaches the output pixel at all. `FBZCP_TEXTURE_ENABLED`
-        // alone only gates whether it is CALLED — with the iterated colour
+        // alone only gates whether it is CALLED, with the iterated colour
         // still selected downstream, a kernel that skipped the call
         // entirely would be observationally identical to one that made it,
         // which would make this scene unable to tell a correct kernel from
@@ -141,7 +141,7 @@ fn scene(
     // A REAL `TextureRaster`, not `None`, when textured: `None` takes the
     // procedural-affine branch in the raster loop, which never calls
     // `TextureRaster::samples_masked` and so never reads `tmu_need` at
-    // all — hoist #1 (`tmu_need`'s `if TEXTURED` gate) would be dead code
+    // all: hoist #1 (`tmu_need`'s `if TEXTURED` gate) would be dead code
     // in this sweep with `None` here, exactly the gap N1 in the review
     // found. Built the same way `texture_raster_test.rs`'s own
     // `samples_masked` test builds one: a `TextureIteratorState` fed
@@ -157,7 +157,7 @@ fn scene(
         // `RegisterPlane::as_f64`'s divide by 2^32): `value << 18` puts a
         // whole-number texel coordinate at the far side of that math. Small
         // integer registers (as `texture_raster_test.rs` uses) land well
-        // under 1.0 after the same conversion — a real, non-`UNUSED` sample,
+        // under 1.0 after the same conversion: a real, non-`UNUSED` sample,
         // but one that rounds to texel (0, 0), the SAME texel the `UNUSED`
         // placeholder decodes to. That would make this scene just as blind
         // to hoist #1 as `texture: None` was, only for a subtler reason.
@@ -186,7 +186,7 @@ fn scene(
 }
 
 /// RED PROOFS, all applied to the branch, run, and reverted (`git status`
-/// clean afterwards) — recorded here as the evidence the harness actually
+/// clean afterwards), recorded here as the evidence the harness actually
 /// discriminates a wrong kernel from a merely-different one, rather than
 /// always agreeing by construction.
 ///
@@ -198,13 +198,13 @@ fn scene(
 /// **B (hoist #1, added for review nit N1).** An earlier version of this
 /// sweep used `texture: None` in every scene, which takes the
 /// procedural-affine branch and never calls `TextureRaster::samples_masked`
-/// at all — `tmu_need`'s `if TEXTURED { self.tmu_need() } else { [false,
+/// at all: `tmu_need`'s `if TEXTURED { self.tmu_need() } else { [false,
 /// false] }` hoist was dead code in the test, invisible to any mutation of
 /// it. `scene()` now builds a real `TextureRaster` when `textured` is set,
 /// and the sweep fills TMU memory with a position-varying gradient rather
-/// than a uniform fill, so sampling the WRONG texel — in particular the
+/// than a uniform fill, so sampling the WRONG texel (in particular the
 /// `UNUSED` placeholder's fixed (0, 0), which `tmu_need` reporting a TMU
-/// unneeded produces — decodes to a different colour than the real
+/// unneeded produces) decodes to a different colour than the real
 /// interpolated position.
 ///
 /// Two mutations of that line were tried:
@@ -214,9 +214,9 @@ fn scene(
 ///   colour combine only ever reads the TMU slot(s) `texture_combine_target`
 ///   says it needs, so a slot sampled but never read cannot reach the
 ///   output no matter what it contains. This is the same fact section 2 of
-///   the review used to call hoist #1 "exact by construction" — the test
+///   the review used to call hoist #1 "exact by construction": the test
 ///   confirms it rather than missing it.
-/// - Replacing it with unconditional `[false, false]` (under-sampling —
+/// - Replacing it with unconditional `[false, false]` (under-sampling,
 ///   reporting every TMU unneeded) goes RED on `depth=false wbuffer=false
 ///   textured=true blend=false`: `color_written_nonblack` diverges (36 vs
 ///   0), because the specialized path now decodes the `UNUSED` placeholder
@@ -225,7 +225,7 @@ fn scene(
 ///
 /// **C.** Swapping `alpha_blend_color`'s call for a no-op skip at the
 /// `if BLEND {` site fails at the FRAME-STORE assertion, not the stats one,
-/// on `blend=true` — independent evidence for the half of the harness that
+/// on `blend=true`, independent evidence for the half of the harness that
 /// exists to catch a kernel skipping a write while still getting every
 /// counter right.
 #[test]
@@ -244,9 +244,9 @@ fn every_kernel_matches_the_generic_oracle_across_the_mode_space() {
                     // A GRADIENT, not a uniform fill: uniform texture memory
                     // decodes to the same colour no matter which texel offset
                     // gets read, which would make a kernel that samples the
-                    // wrong position — in particular, the `UNUSED` placeholder
+                    // wrong position (in particular, the `UNUSED` placeholder
                     // at texel (0, 0) instead of `scene`'s real interpolated
-                    // position — look identical to a correct one. The
+                    // position) look identical to a correct one. The
                     // gradient makes offset 0 decode differently from every
                     // other offset the triangle's real texture coordinates
                     // reach, so hoist #1 (`tmu_need`) has something to lose

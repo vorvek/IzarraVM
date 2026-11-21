@@ -8,7 +8,7 @@
 # fixtures, which cannot say what fraction of the DOS library a lever covers.
 # This runs corpus titles one at a time and archives everything each run
 # produced, so the classification can be recomputed later without running
-# anything again. Design: dev_docs/exodos-sweep-design.md.
+# anything again.
 #
 # WHAT IT IS NOT. No wall figure from this sweep may enter an A/B or a
 # scoreboard claim. It runs under variable load, with phase marks armed, with
@@ -31,7 +31,7 @@
 
 # POSITIONAL BINDING IS OFF for the whole param block. Under `pwsh -File`, a
 # [string[]] parameter takes exactly ONE argument token; a second token becomes
-# a POSITIONAL argument and lands in the next unbound parameter -- here
+# a POSITIONAL argument and lands in the next unbound parameter: here
 # `-Games a b` would bind 'b' to -Corpus and sweep ONE game against the wrong
 # corpus root. Measured 2026-08-27 on scripts/run-fixture-scoreboard.ps1: the
 # same shape ran ONE row of a two-row sweep and EXITED 0. With positional
@@ -141,7 +141,7 @@ function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
 
 # Half drives Resolve-GameSelection directly. The other half spawns this very
 # script under `pwsh -File` with the mangled two-token shape, because that
-# failure happens in the parameter binder -- before any function here runs --
+# failure happens in the parameter binder (before any function here runs)
 # and only a real child invocation can prove the guard fires there. The
 # campaign rule applies: the guard must go RED on the broken input, and a green
 # control must show the child harness works.
@@ -235,8 +235,8 @@ $personaClockHz = @{ "586" = 166000000; "486" = 66000000; "386" = 22000000 }
 # fails the row loudly, which is the point: an unknown stderr line is a finding.
 #
 # Katea does NOT get a blanket prefix. Almost everything it writes is a failure
-# or a data-loss hold -- a failed materialize, a held rename, a sector that
-# could not be read back -- and swallowing those as routine is exactly how a
+# or a data-loss hold (a failed materialize, a held rename, a sector that
+# could not be read back) and swallowing those as routine is exactly how a
 # corpus row would report RAN while the guest's writes went nowhere. Only the
 # one genuinely routine line is allowed, and it is allowed by its whole text.
 # The timestamped form carries its level too: an ISO-stamped ERROR is an error.

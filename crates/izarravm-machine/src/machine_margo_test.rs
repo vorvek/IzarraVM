@@ -247,7 +247,7 @@ fn vretrace_period_ticks(
 /// THE BUG THIS SLICE FIXES. `4F02h` never touched the legacy VGA CRTC, so while
 /// a Margo mode was on screen 0x3DA reported the STALE legacy mode's retrace
 /// rate while `Margo::advance_frames` latched page flips at 60 Hz. A guest that
-/// paced on 0x3DA and flipped with `4F07h` -- which both VESA fixtures do -- ran
+/// paced on 0x3DA and flipped with `4F07h` (which both VESA fixtures do) ran
 /// two display clocks well over 10% apart.
 ///
 /// The test measures the rate a guest can actually observe, before and after the
@@ -297,7 +297,7 @@ fn margo_3da_reports_the_margo_frame_rate_not_the_stale_legacy_mode() {
 /// that latches `DISP_START` are ONE clock, in the right order.
 ///
 /// A guest queues a page flip during vertical blanking and expects it to take
-/// effect at the start of the next frame -- so from the instant 0x3DA first
+/// effect at the start of the next frame, so from the instant 0x3DA first
 /// reports retrace, the latch must land STRICTLY INSIDE the remaining blanking,
 /// never a whole frame later and never before the retrace it was queued in.
 /// Nothing enforced that before this slice, because the retrace edge came off
@@ -533,7 +533,7 @@ fn margo_display_start_wait_stalls_exactly_to_the_frame_boundary() {
 
 /// The batch cap owes the same edge. `Machine::vega_edge_ticks` arms a deadline
 /// on a pending `DISP_START` so no batch can run past the boundary that applies
-/// it -- otherwise a guest that flips and then polls would see the origin move
+/// it: otherwise a guest that flips and then polls would see the origin move
 /// up to a whole batch cap late, which on the coarse 1 ms cap is a sixteenth of
 /// a frame.
 #[test]
@@ -584,7 +584,7 @@ fn margo_pending_display_start_caps_the_batch_at_the_frame_boundary() {
 }
 
 /// GUARANTEE 2: the palette is sampled ONCE per scanout, so a frame is decoded
-/// entirely under one DAC state -- no tearing between the top and bottom of the
+/// entirely under one DAC state: no tearing between the top and bottom of the
 /// screen, and no stale palette carried across frames.
 ///
 /// BE PRECISE ABOUT WHAT THIS CAN AND CANNOT SHOW. The "once per scanout" half
@@ -595,8 +595,8 @@ fn margo_pending_display_start_caps_the_batch_at_the_frame_boundary() {
 ///
 /// What the assertions actually pin is the pair of properties that WOULD break
 /// if that structure were dismantled: every pixel of a capture decodes through
-/// the correct entry for its own index -- so a scanout that re-mapped part of
-/// the surface through anything else is caught -- and the next capture picks up
+/// the correct entry for its own index, so a scanout that re-mapped part of
+/// the surface through anything else is caught, and the next capture picks up
 /// a palette change, so a cached or stale snapshot is caught. Mutations N5 and
 /// N6 are the two shapes, and both fail here.
 #[test]
@@ -651,11 +651,11 @@ fn margo_scanout_decodes_a_whole_frame_under_one_palette_snapshot() {
     );
 }
 
-/// T6 -- THE PROBE/COPY AGREEMENT INVARIANT, which the whole mechanism rests on.
+/// T6: THE PROBE/COPY AGREEMENT INVARIANT, which the whole mechanism rests on.
 ///
 /// `direct_vga_bytes` decides `bulk_direct`; `direct_write_page` produces the
 /// pointer. If the first says yes where the second says no, every REP run builds a
-/// 4 KiB buffer, issues a full bulk source read, then abandons -- and because the
+/// 4 KiB buffer, issues a full bulk source read, then abandons, and because the
 /// loop re-enters at L-1 the waste repeats at L, L-1, ..., 1. QUADRATIC. That is
 /// what makes partial admission unshippable rather than merely wasteful, and
 /// nothing pinned it before this slice.
@@ -696,11 +696,11 @@ fn banked_probe_and_copy_agree_for_every_page_of_the_window() {
     );
 }
 
-/// T2 -- a bank switch must move which BYTES the pointer means.
+/// T2: a bank switch must move which BYTES the pointer means.
 ///
 /// The previous version of this test asserted `margo_banked_window_key()` changed,
 /// which re-derives the very arithmetic under test: making the key ignore the
-/// offset entirely -- every bank aliasing bank 0 -- passed it. That is the single
+/// offset entirely (every bank aliasing bank 0) passed it. That is the single
 /// most important property the slice has, and it was unpinned.
 ///
 /// This writes THROUGH the pointer and reads the frame store back, so the only way
@@ -748,15 +748,15 @@ fn the_banked_direct_page_points_at_the_bank_it_names() {
     );
 }
 
-/// T5a -- the BULK COPY into the banked window must land in the bank it names.
+/// T5a: the BULK COPY into the banked window must land in the bank it names.
 ///
 /// WHY THIS TEST CHANGED, because the previous version proved less than it read
-/// as. It probed admission with `direct_memory_bytes` -- which returns a COUNT
-/// and never dereferences anything -- and then wrote its bytes with
+/// as. It probed admission with `direct_memory_bytes` (which returns a COUNT
+/// and never dereferences anything) and then wrote its bytes with
 /// `write_physical_u8`. That is the ORDINARY path, and it does not touch the
 /// granted pointer at all: `bus.rs`'s `write_memory_byte_recorded` routes the
 /// byte to `Vega::write_memory_u8`, which derives the bank offset for itself in
-/// `margo_banked_window_offset` -- an INDEPENDENT second computation of
+/// `margo_banked_window_offset`, an INDEPENDENT second computation of
 /// `bank * 64K + offset`. So the bytes landed in the right bank by a route the
 /// aliasing mutation cannot reach, and S6 (`margo_banked_direct_page` drops the
 /// bank base, every bank aliasing bank 0) survived it.
@@ -856,7 +856,7 @@ fn a_bulk_copy_into_the_linear_framebuffer_takes_the_direct_path() {
 /// row in seven lands like this; at 1024 bytes per row it is one in two. Margo's
 /// frame store is a single contiguous allocation and the aperture probe bounds-
 /// checks the whole run against it, so a page boundary inside the run means
-/// nothing here -- the page-crossing clause that guards the RAM and legacy-VGA
+/// nothing here: the page-crossing clause that guards the RAM and legacy-VGA
 /// probes would have sent the common case back to the per-byte path.
 #[test]
 fn a_page_crossing_scanline_copy_still_takes_the_direct_path() {
@@ -968,7 +968,7 @@ fn margo_frame_publication_reports_stable_generation_and_row_damage() {
     assert_ne!(machine.presented_frame_generation(), Some(generation));
 }
 
-/// T5b -- and a real REP MOVS must REACH that bulk pair.
+/// T5b: and a real REP MOVS must REACH that bulk pair.
 ///
 /// T5a proves the copy lands correctly once someone calls it. This proves the
 /// string path is who calls it, which is the slice's actual claim: 99.97% of
@@ -1038,12 +1038,12 @@ fn a_rep_movs_into_the_banked_window_takes_the_bulk_path() {
     );
 }
 
-/// T3 -- THE C1 REGRESSION. Banked VESA, then `INT 10h AX=0003h`, must move the
+/// T3: THE C1 REGRESSION. Banked VESA, then `INT 10h AX=0003h`, must move the
 /// compared identity.
 ///
 /// `select_legacy` clears `margo_active` and touches nothing else. The token is 0
 /// before and 0 after (the VGA reports 0 for text), and bank and linear do not
-/// move -- so the design's original `(token, bank, linear)` tuple was INVARIANT
+/// move, so the design's original `(token, bank, linear)` tuple was INVARIANT
 /// across a transition that flips the mapping, leaving a live pointer into Margo
 /// VRAM serving legacy VGA writes. That is the shutdown path of both measured
 /// fixtures.
@@ -1072,7 +1072,7 @@ fn leaving_a_banked_mode_for_text_moves_the_direct_write_identity() {
     );
 }
 
-/// T4a -- banked from TEXT. Without the Margo arm this trips
+/// T4a: banked from TEXT. Without the Margo arm this trips
 /// `debug_assert_ne!(direct_write_token(), 0)` at `vga.rs:747`.
 #[test]
 fn a_banked_write_from_text_does_not_notify_the_vga() {
@@ -1087,13 +1087,13 @@ fn a_banked_write_from_text_does_not_notify_the_vga() {
     assert!(!machine.vega.legacy().mode13_linear_authoritative());
 }
 
-/// T4b -- banked from MODE 13h, which is the branch that matters and which the
+/// T4b: banked from MODE 13h, which is the branch that matters and which the
 /// previous single test never reached: `for pre_mode in [0x03, 0x13]` panicked on
 /// the text state first, so this one never ran.
 ///
 /// Here `Vga::direct_write_token()` is 1, so the assert PASSES and `vga.rs:777-781`
 /// sets `mode13_linear_authoritative` from Margo offsets instead. Silent
-/// corruption, not a loud assert -- and the old test's only assertion
+/// corruption, not a loud assert, and the old test's only assertion
 /// (`key.is_some()`) could not have seen it either way.
 #[test]
 fn a_banked_write_from_mode13_does_not_make_the_vga_authoritative() {
@@ -1114,7 +1114,7 @@ fn a_banked_write_from_mode13_does_not_make_the_vga_authoritative() {
     );
 }
 
-/// R-4a -- the identity guard must fire through the REAL `INT 10h` entry point.
+/// R-4a: the identity guard must fire through the REAL `INT 10h` entry point.
 ///
 /// T2 and T3 call `Vega` methods directly, so reverting the `handle_int10`
 /// token-compare wrapper to the bare token survives them. For 4F05 that revert
@@ -1123,7 +1123,7 @@ fn a_banked_write_from_mode13_does_not_make_the_vga_authoritative() {
 ///
 /// This pins the `video.rs` wrapper ONLY. The port-write wrapper in `bus.rs` is
 /// a second, independent comparison of the same identity, and no INT 10h reaches
-/// it -- see `a_bank_move_through_the_segsel_port_invalidates_the_data_map`,
+/// it. See `a_bank_move_through_the_segsel_port_invalidates_the_data_map`,
 /// which is the test that pins it. Both reverts were run against this test: it
 /// catches the `video.rs` one and does NOT catch the `bus.rs` one, which is
 /// exactly the coverage boundary a reader should not have to guess at.
@@ -1169,12 +1169,12 @@ fn a_guest_bank_switch_through_int10_invalidates_the_data_map() {
     );
 }
 
-/// R-4b / S7 -- the OTHER identity wrapper, the one on the port-write path.
+/// R-4b / S7: the OTHER identity wrapper, the one on the port-write path.
 ///
 /// `bus.rs` compares `direct_write_identity` across every accepted device-port
 /// write, and that is a separate comparison from `handle_int10`'s. A guest moves
 /// the Margo window through the SEGSEL extension registers as well as through
-/// 4F05 -- `izbios-vbepm.inc`'s protected-mode stub uses exactly this pair -- so
+/// 4F05 (`izbios-vbepm.inc`'s protected-mode stub uses exactly this pair) so
 /// this path carries live bank moves and reverting it to the bare token is the
 /// same live bug as reverting the other one.
 ///
@@ -1182,7 +1182,7 @@ fn a_guest_bank_switch_through_int10_invalidates_the_data_map() {
 /// the observation has to separate "the wrapper compared the BANK" from "the
 /// wrapper compared only the token". A bank move is precisely the transition
 /// where the bare token does NOT move (`0xff` while banked, whatever the bank),
-/// so the test asserts BOTH halves at once -- the key moved, the bare token did
+/// so the test asserts BOTH halves at once: the key moved, the bare token did
 /// not, and the data map was still marked. Under the revert the third assertion
 /// is the only one that can fail, and it must.
 ///
@@ -1232,7 +1232,7 @@ fn a_bank_move_through_the_segsel_port_invalidates_the_data_map() {
 
 /// Pins the recon instrument behind `IZARRAVM_VBE_TRACE`: the counters must
 /// separate a LINEAR 4F02 request (bit 0x4000) from a banked one, and must
-/// count only ACCEPTED mode sets. A rejected mode leaves both alone -- otherwise
+/// count only ACCEPTED mode sets. A rejected mode leaves both alone: otherwise
 /// a guest that probes the mode list would inflate whichever column it probed
 /// with, and the answer this instrument exists to give ("does GP2 run the LFB
 /// linearly or banked") would be read off noise.
@@ -1246,7 +1246,7 @@ fn vbe_mode_set_window_counters_separate_linear_from_banked() {
         0xbb, 0x03, 0x01, // mov bx, 0103h (banked)
         0xcd, 0x10, // int 10h
         0xb8, 0x02, 0x4f, // mov ax, 4F02h
-        0xbb, 0xff, 0x41, // mov bx, 01FFh | 4000h -- not in the table, rejected
+        0xbb, 0xff, 0x41, // mov bx, 01FFh | 4000h: not in the table, rejected
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
@@ -1607,7 +1607,7 @@ fn vbe_controller_info_fills_the_block() {
 
     // VideoModePtr (seg:off) must point at the mode list. Modes are listed in
     // ascending numeric order, VESA-defined first and the OEM 320x240 mode
-    // (0x150) last, as a real VBE BIOS does -- then the 0xffff terminator.
+    // (0x150) last, as a real VBE BIOS does, then the 0xffff terminator.
     let ptr = read_u32(&mut machine, base + 0x0e);
     let list = (((ptr >> 16) & 0xffff) << 4) + (ptr & 0xffff);
     let expected = [
@@ -2207,7 +2207,7 @@ fn margo_ext_dispctl_without_bit0_does_not_latch() {
 
 /// A test ROM that keeps the real BIOS image and only replaces its reset entry
 /// with `code`. `rom_with_code`'s all-zero image cannot be used by anything that
-/// reads a fixed ROM structure -- the VBE 2.0 protected-mode block lives at
+/// reads a fixed ROM structure: the VBE 2.0 protected-mode block lives at
 /// 0xF100 and would be 176 bytes of zeros there.
 fn izbios_rom_with_code(code: &[u8]) -> Vec<u8> {
     let mut rom = izarravm_firmware::IZARRA_BIOS.to_vec();
@@ -2286,7 +2286,7 @@ fn vbe_pm_stub_drives_the_margo_registers() {
     // going back through INT 10h. So this test does exactly that: it asks for
     // the block, far-calls SetWindow out of it, and then checks the real window
     // moved by storing through A000h and reading Margo's VRAM. Nothing here is
-    // emulated on the host side -- if the assembled stub or the port decode is
+    // emulated on the host side: if the assembled stub or the port decode is
     // wrong, the byte lands in the wrong bank.
     let rom = izbios_rom_with_code(&[
         0x31, 0xc0, // xor ax, ax
@@ -2362,8 +2362,8 @@ fn vbe_pm_stub_set_display_start_latches_through_the_ports() {
 #[test]
 fn vbe_pm_stub_set_palette_writes_the_dac() {
     // The third routine in the block, and the one an 8bpp game leans on hardest.
-    // Entry order is blue, green, red, pad -- the reverse of the DAC's own write
-    // order -- so a stub that loaded the three bytes sequentially would produce
+    // Entry order is blue, green, red, pad (the reverse of the DAC's own write
+    // order) so a stub that loaded the three bytes sequentially would produce
     // a plausible palette with red and blue swapped, which no smoke test would
     // notice. Hence distinct values per channel.
     let mut code = vec![
@@ -2480,7 +2480,7 @@ pub(super) fn unmap_guest_page(machine: &mut Machine, page: u32) {
 const PT: u32 = 0x2000;
 
 /// Corpus row MonikaTT (eXoDOS "Monika's Tic Tac Toe", stage-1 pass B): a DJGPP
-/// program that asks for 640x480 in 65536 colours -- VBE mode 111h -- and gave
+/// program that asks for 640x480 in 65536 colours (VBE mode 111h) and gave
 /// up with "The video card isn't handling 640x480x16, or haven't VESA 1.2
 /// support" before it ever issued a 4F02h. The row was filed as a refused mode;
 /// mode 111h has been in the Margo table all along. What failed is one address.
@@ -2488,7 +2488,7 @@ const PT: u32 = 0x2000;
 /// The program is a DPMI client. CWSDPMI takes its transfer buffer from DOS,
 /// TOKAEMM supplies upper memory out of extended memory, and the buffer landed
 /// in a UMB at segment C8C6h. Guest linear 000C8C60h is not physical 000C8C60h
-/// there -- the measured run mapped it to 00110C60h -- and the VBE handler
+/// there (the measured run mapped it to 00110C60h) and the VBE handler
 /// deposited the 4F00h controller block at the linear address as though it were
 /// physical. That address is the unbacked upper-memory hole, so the write went
 /// nowhere and the program read back 0xFF where the "VESA" signature belongs.
@@ -2663,7 +2663,7 @@ fn vbe_set_mode_accepts_111h_and_selects_640x480x16() {
 // not in ring-0 protected mode, which includes a V86 task under TOKAEMM with
 // paging on, so the caller's buffer can be wherever its page tables say.
 
-/// The identity address the fixture's caller buffer occupies -- the unbacked
+/// The identity address the fixture's caller buffer occupies: the unbacked
 /// upper-memory hole a handler that ignores paging writes to and reads from.
 const UMB_BUFFER_IDENTITY: u32 = 0x000c_8c60;
 

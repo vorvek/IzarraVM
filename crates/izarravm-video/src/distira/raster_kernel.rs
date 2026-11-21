@@ -14,20 +14,20 @@
 //! [`ModeKey`] packs the four flags a triangle's [`RasterParams`] and
 //! [`TriangleContext`] decide before the first pixel is touched.
 //! [`select_kernel`] turns a key into a monomorphized instantiation of
-//! [`RasterView::raster_row_specialized`] — a `fn` item, coerced to a plain
+//! [`RasterView::raster_row_specialized`], a `fn` item, coerced to a plain
 //! function pointer, so `render_band` picks it ONCE per triangle and the row
 //! loop underneath never branches on the key again.
 //!
 //! Per the L2 handoff's binary-size guard, only single-bit flags that gate a
-//! WHOLE per-pixel code path are keyed here. Multi-bit fields — the depth
+//! WHOLE per-pixel code path are keyed here. Multi-bit fields (the depth
 //! comparison function, the blend source/dest functions, the colour combine
-//! unit's mode bits — stay data, read out of `RasterParams` exactly as
+//! unit's mode bits) stay data, read out of `RasterParams` exactly as
 //! `raster_row` already reads them, so the kernel table cannot drift out of
 //! sync with them.
 //!
 //! `ModeKey`'s four booleans are a total description of a (depth, wbuffer,
 //! textured, blend) tuple, and `select_kernel`'s match is exhaustive over
-//! that tuple — every key this module can construct maps to a real kernel.
+//! that tuple: every key this module can construct maps to a real kernel.
 //! There is no "unlisted key" case to fall back from: correctness does not
 //! depend on which combinations Tomb Raider or Descent II happen to hit.
 //! `RasterView::raster_row`, the unspecialized function every kernel body

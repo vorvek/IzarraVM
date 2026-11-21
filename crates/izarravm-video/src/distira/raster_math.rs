@@ -126,7 +126,7 @@ fn fixed_color_value(raw: u32) -> f32 {
 /// point depth code. This ports the *behavior* of 86Box's `vid_voodoo_render.c`
 /// wfloat encode (itself the real SST-1 hardware algorithm: a
 /// leading-zero-count exponent plus a 12-bit inverted mantissa, producing a
-/// code where a larger 1/w — i.e. a nearer vertex — yields a SMALLER code,
+/// code where a larger 1/w (i.e. a nearer vertex) yields a SMALLER code,
 /// the same "smaller code wins under DEPTHOP_LESSTHAN" convention the
 /// fixed-point Z path already uses). 86Box represents the iterated W as a
 /// 48-bit `.32` fixed-point accumulator (`state->w`, built from

@@ -16,10 +16,10 @@
 //!
 //! FORMAT v2 adds three things v1's IPE column could not answer, one per consumer:
 //!
-//!   * `retired` and `coverage` -- total guest instructions retired in the window and the share
+//!   * `retired` and `coverage`: total guest instructions retired in the window and the share
 //!     of them the direct backend ran. A low-IPE window that is 30% covered and one that is 99%
 //!     covered are different defects; v1 reported both as one number.
-//!   * `distinct_targets` and `top_targets` -- how many different entry linears the dispatcher
+//!   * `distinct_targets` and `top_targets`: how many different entry linears the dispatcher
 //!     re-entered in the window, and the heaviest eight by name. This is the only part of the
 //!     instrument that costs anything while armed; `izarravm_cpu::IpeEntryTargets` states the
 //!     price, and an armed run is a MAP of a workload rather than a timing of one.
@@ -47,8 +47,8 @@ pub(crate) fn requested_path() -> Option<PathBuf> {
 ///
 /// QUOTED, and the quotes are belt-and-braces rather than load-bearing: the field's alphabet is
 /// `[0-9a-fx:;]`, so it can contain neither a comma nor a quote and needs no escaping. It is
-/// quoted anyway so that a reader using a real CSV parser and one using `split(',')` -- the sweep
-/// script does the latter -- agree on the column count, and so that a future widening of the
+/// quoted anyway so that a reader using a real CSV parser and one using `split(',')` (the sweep
+/// script does the latter) agree on the column count, and so that a future widening of the
 /// separator cannot silently shift every column to its right.
 fn render_top_targets(top: &[(u32, u64)]) -> String {
     let mut field = String::from("\"");

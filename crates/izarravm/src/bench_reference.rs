@@ -95,13 +95,13 @@ pub fn historical_band_for(payload: &str, mode: GswMode) -> Option<&'static Benc
 /// tier sits inside the same 0.98-1.05 window.
 ///
 /// RECORDED FINDING, not a fit: these sit BELOW the SpeedSys-era figures the
-/// epoch-1 bands carry -- the 586 goes 2160 / 299.5 / 242.9 -> 332 / 188 / 116
+/// epoch-1 bands carry: the 586 goes 2160 / 299.5 / 242.9 -> 332 / 188 / 116
 /// MB/s, and the 486 198 / 50.0 / 40.5 -> 132 / 81 / 52.8 (the 486's lower tiers
 /// go UP, because its epoch-1 `tier_cost` priced a miss at 191/250 wait states).
 /// The L1 shortfall is structural and predates this slice: the model charges one
 /// non-burst 2-clock bus cycle per dword and has no line fill, so L1 bandwidth
 /// cannot exceed `2 * clock_hz` bytes/s whatever the wait state is. Epoch 1 hid
-/// that behind `bus_timing`'s 0.152 multiplier -- exactly the dial the fold
+/// that behind `bus_timing`'s 0.152 multiplier, exactly the dial the fold
 /// removes. Restoring era L1 bandwidth needs a burst/line-fill model, which is
 /// nobody's slice yet.
 pub const EPOCH2_BENCH_BANDS: &[BenchBand] = &[

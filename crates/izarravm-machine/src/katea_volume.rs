@@ -6,9 +6,9 @@
 //! `crates/izarravm-firmware/roms/tokados-hdd.img`.
 //!
 //! The live host-folder disk is `katea_tree::KateaTreeVolume`. This module owns the
-//! shared geometry and on-disk-format helpers it builds on — `sectors_per_cluster`,
+//! shared geometry and on-disk-format helpers it builds on: `sectors_per_cluster`,
 //! `fat_size_sectors`, `lba_to_chs`, `stamp_fat32_bpb`, the 8.3 name codec
-//! (`decode_83`), the `FileSource` enum, and the FAT32 BPB constants — together with
+//! (`decode_83`), the `FileSource` enum, and the FAT32 BPB constants, together with
 //! `extract_system_payload`, which reads the MBR, the partition VBR, and the root
 //! files out of the embedded image so every mount can overlay the real KERNEL.SYS /
 //! COMMAND.COM without re-vendoring them.
@@ -77,7 +77,7 @@ impl FileSource {
     }
 }
 
-/// `sectors_per_cluster` per the fatgen103 DskTableFAT32 cutoffs — the same table
+/// `sectors_per_cluster` per the fatgen103 DskTableFAT32 cutoffs, the same table
 /// `build-freedos-hdd-image.py::sectors_per_cluster` and `fat32.rs` use. Re-derived
 /// here (rather than calling `fat32.rs`, whose function is private) so this module
 /// owns its geometry. Panics below the FAT32 floor; the 48 MiB partition is well
@@ -108,7 +108,7 @@ pub(crate) fn fat_size_sectors(total_sectors: u32, spc: u8) -> u32 {
 
 /// Pack an LBA into the 3-byte CHS field of an MBR partition entry, using the
 /// 16x63 geometry `AtaDisk` derives. Cylinders above 1023 clamp to the all-ones
-/// `0xFE 0xFF 0xFF` "use LBA" marker — the standard MBR convention and exactly
+/// `0xFE 0xFF 0xFF` "use LBA" marker, the standard MBR convention and exactly
 /// what the Python `lba_to_chs` does.
 pub(crate) fn lba_to_chs(lba: u32) -> [u8; 3] {
     let cyl = lba / (HEADS * SPT);
@@ -137,13 +137,13 @@ pub struct SystemPayload {
     pub vbr: [u8; SECTOR],
     /// Every file on the volume as `(8.3 name, contents)`: the root files, then
     /// each subdirectory's files (the `C:\DOS` system folder). Flattened by bare
-    /// name — names are unique across the layout, and the overlay re-derives
+    /// name: names are unique across the layout, and the overlay re-derives
     /// placement from [`crate::katea_tree`]'s system-binary list.
     pub files: Vec<(String, Vec<u8>)>,
 }
 
 /// Pull the system payload back out of a whole-disk FAT32 image laid out exactly
-/// like `tokados-hdd.img` — the inverse of the Python image builder. Returns the
+/// like `tokados-hdd.img`, the inverse of the Python image builder. Returns the
 /// MBR (LBA 0), the partition's VBR (the sector at `PART_START`), and every file,
 /// walking the root and descending one level into subdirectories (`C:\DOS`).
 ///
@@ -171,7 +171,7 @@ pub fn extract_system_payload(image: &[u8]) -> SystemPayload {
     mbr.copy_from_slice(sector(0));
 
     // The partition start is in the MBR partition entry (RelSect); fall back to the
-    // constant only as a sanity check — they must agree for our own image.
+    // constant only as a sanity check: they must agree for our own image.
     let part_start = le32(&mbr, 0x1BE + 8);
     debug_assert_eq!(part_start, PART_START, "MBR partition start != PART_START");
 
@@ -259,7 +259,7 @@ pub fn extract_system_payload(image: &[u8]) -> SystemPayload {
     SystemPayload { mbr, vbr, files }
 }
 
-/// Decode an 11-byte 8.3 directory field ("KERNEL  SYS") into "KERNEL.SYS" — the
+/// Decode an 11-byte 8.3 directory field ("KERNEL  SYS") into "KERNEL.SYS", the
 /// inverse of `fold_83`. A blank extension yields just the base name. Re-folding
 /// the result through `fold_83` reproduces the original 11 bytes exactly.
 pub(crate) fn decode_83(raw: &[u8]) -> String {

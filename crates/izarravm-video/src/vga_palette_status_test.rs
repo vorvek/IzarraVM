@@ -172,12 +172,12 @@ fn status_mux_single_pixel_sample_matches_the_full_row_render() {
 
     // 9-dot text with a nonzero pel pan: kills a pan-dropped-from-inversion
     // mutation in text_pixel that the pan-free text fixture cannot see
-    // (spec-review finding; that mutation survived the whole video suite).
+    // (that mutation survived the whole video suite).
     let mut text_pan = text_fixture();
     text_pan.attr.pixel_pan = 3;
     fixtures.push(("text 9-dot+pan3", text_pan));
 
-    // Mismatched geometry (spec-review finding): 8-dot Sequencer clocking
+    // Mismatched geometry: 8-dot Sequencer clocking
     // under the unchanged 720-dot mode-3 CRTC, with pan 5. The renderer's
     // cell loop then covers only dots 0..(text_columns+1)*8 - 5 = 643; dots
     // 643..719 stay at the row Vec's initialized 0, and the sampler's

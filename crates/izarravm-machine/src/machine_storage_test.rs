@@ -256,7 +256,7 @@ fn apply_overrides_replaces_by_name_and_appends_new() {
     assert_eq!(autoexec.1, b"new");
     // A replace updates bytes in place but keeps the original key's case
     // (KateaTreeVolume folds names case-insensitively, so the stored case is
-    // cosmetic — pinned here so the intent is explicit).
+    // cosmetic, pinned here so the intent is explicit).
     assert_eq!(
         autoexec.0, "AUTOEXEC.BAT",
         "original key case preserved on replace"
@@ -1381,7 +1381,7 @@ fn int2f_stands_down_when_a_guest_dpmi_host_hooks_the_vector() {
 fn program_runtime_reintercepts_dos_vectors_for_the_raw_program_loader() {
     // The raw-program runtime (new_raw_program) still services INT 20h/21h/27h
     // itself (terminate + minimal console I/O), so interrupt_acknowledge must
-    // record those vectors when program_runtime is set — even though the
+    // record those vectors when program_runtime is set, even though the
     // retired HLE no longer intercepts them for a normal boot. This pins the
     // corresponding branch in interrupt_acknowledge.
     let prog: &[u8] = &[0xcd, 0x20]; // int 20h
@@ -1859,7 +1859,7 @@ fn a_repeat_read_keeps_guest_time_and_a_write_is_never_served_stale() {
         "the census must agree with the machine's own charge"
     );
 
-    // Write sector 7 the way the guest would -- INT 13h AH=03 -- then read it
+    // Write sector 7 the way the guest would (INT 13h AH=03) then read it
     // back through the same service.
     for i in 0..512u32 {
         machine.write_physical_u8(0x20000 + i, if i == 0 { 0x5E } else { 0xC7 });
@@ -2057,9 +2057,9 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
 
 /// A TRANSIENT HOST READ FAILURE MUST NEVER BE CACHED.
 ///
-/// The reviewer's reproduction, made permanent. The Katea read path answers an
+/// The reproduction of the defect, made permanent. The Katea read path answers an
 /// unreadable host file with ZEROS so a vanished or shrunk file cannot panic the
-/// guest, and it drops its cached host handle so the next sector re-opens -- a
+/// guest, and it drops its cached host handle so the next sector re-opens, a
 /// deliberate retry design. The host-side sector cache sits above all of that
 /// and remembers whatever the backing returned, so without a degraded signal
 /// those zeros become the sector's permanent content: every later read hits the
@@ -2071,7 +2071,7 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
 ///
 /// NON-VACUOUS: deleting the `if !served.degraded` guard in `AtaDisk::read_lba`
 /// (i.e. always filling the cache, which is what the code did before this test
-/// existed) fails the restored-bytes assertion -- the restored sector still
+/// existed) fails the restored-bytes assertion: the restored sector still
 /// reads back as zeros. Removing the `degraded = true` assignment from
 /// `read_source_span`'s read-error arm fails it identically.
 #[test]
@@ -2156,7 +2156,7 @@ fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
 /// A batched command reads up to 64 contiguous sectors of one host file in one
 /// operation and answers the rest of the span out of that buffer. The buffer is
 /// filled from the HOST FILE, so it physically contains pre-write bytes for
-/// every sector in the span -- including any sector the guest has overwritten.
+/// every sector in the span, including any sector the guest has overwritten.
 /// This pins that the guest never sees them.
 ///
 /// Two layers stand between the window and the guest, and the assertions below
@@ -2170,8 +2170,8 @@ fn a_failed_host_read_is_served_as_zeros_but_never_cached() {
 /// NON-VACUOUS: the third sector's LBA is inside the one coalesced host read
 /// this command issues (`host_read_operations == 1` over a four-sector span),
 /// so the window holds 0x42 for it throughout. Serving the window ahead of both
-/// layers -- deleting the `put` in `AtaDisk::write_lba` and hoisting
-/// `read_command_window_sector` above the store match -- reads back 0x42.
+/// layers (deleting the `put` in `AtaDisk::write_lba` and hoisting
+/// `read_command_window_sector` above the store match) reads back 0x42.
 #[test]
 fn a_batched_read_still_resolves_the_guest_write_overlay_per_sector() {
     let dir = katea_scratch("batch-overlay");
@@ -2317,15 +2317,15 @@ fn a_chs_verify_coalesces_its_run_like_the_edd_form() {
 ///
 /// A one-sector command has a one-sector span, so it takes `read_host_span`'s
 /// unbatched `read_exact` arm. `read_exact` leaves its buffer UNSPECIFIED when
-/// it fails, and it fails only after copying what it did get -- so a host file
+/// it fails, and it fails only after copying what it did get, so a host file
 /// truncated mid-sector fills part of the buffer and then errors. The degraded
 /// contract is "no content at all": serving the surviving prefix with a zero
 /// tail hands the guest a sector that is half real and half invented, and does
 /// it without any signal that differs from a clean failure.
 ///
 /// NON-VACUOUS: dropping the `out = [0u8; SECTOR]` reset from the `Err` arm of
-/// `read_host_span` reads back `0x42` -- the 476 bytes that survived the
-/// truncation -- instead of `0x00`. Verified by mutation.
+/// `read_host_span` reads back `0x42` (the 476 bytes that survived the
+/// truncation) instead of `0x00`. Verified by mutation.
 #[test]
 fn a_failed_unbatched_read_does_not_leak_the_bytes_that_arrived_before_the_error() {
     let dir = katea_scratch("partial-sector");
@@ -2362,7 +2362,7 @@ fn a_failed_unbatched_read_does_not_leak_the_bytes_that_arrived_before_the_error
 ///
 /// Those 476 bytes must not be padded out and served. A served sector is a
 /// CACHED sector, and the sector cache would then pin a half-real sector for the
-/// life of the mount even after the host file is restored -- the same failure
+/// life of the mount even after the host file is restored, the same failure
 /// `a_failed_host_read_is_served_as_zeros_but_never_cached` exists to prevent.
 /// The remainder is dropped and the sector re-resolves through the degraded
 /// path, which is what makes the restore below observable.
@@ -2413,7 +2413,7 @@ fn a_partial_trailing_sector_in_a_batched_read_is_never_served_as_content() {
 // protected mode, which includes a V86 task under TOKAEMM. DOS loaded with
 // DOS=HIGH,UMB puts drivers and their buffers in upper memory that TOKAEMM
 // supplies out of extended memory, so a Disk Address Packet, an EDD result
-// buffer or a sector transfer target can all sit outside the identity map --
+// buffer or a sector transfer target can all sit outside the identity map,
 // the same defect the VBE information blocks had. The fixture is the one from
 // the VBE fix: guest pages C8h and C9h mapped to two non-adjacent frames.
 
@@ -2430,7 +2430,7 @@ fn poison_identity_range(machine: &mut Machine, len: usize) {
 
 /// EDD AH=42h with both the Disk Address Packet and its transfer buffer in
 /// non-identity-mapped upper memory. The packet is read, the sector is
-/// delivered, and the packet's block count is rewritten -- all three have to
+/// delivered, and the packet's block count is rewritten: all three have to
 /// address the caller's pages.
 #[test]
 fn int13_edd_transfer_uses_the_non_identity_mapped_packet_and_buffer() {
@@ -2477,7 +2477,7 @@ fn int13_edd_transfer_uses_the_non_identity_mapped_packet_and_buffer() {
 /// count to 0 THROUGH THE MAPPING: byte dap+2 in the low frame's last byte,
 /// byte dap+3 in the high frame's first. A rewrite through the physical
 /// address leaves the planted 4 in the mapped frame, which is exactly the
-/// vacuity the first version of this suite had -- the success-path fixtures
+/// vacuity the first version of this suite had: the success-path fixtures
 /// rewrote the same value the test planted.
 #[test]
 fn int13_edd_short_transfer_rewrites_the_straddling_packet_count() {

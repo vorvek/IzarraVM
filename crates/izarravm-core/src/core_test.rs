@@ -281,7 +281,7 @@ fn sound_blaster_config_defaults_when_absent_or_partial() {
         }
     );
 
-    // `enabled` is still the file to set -- whether the card is fitted is a
+    // `enabled` is still the file to set: whether the card is fitted is a
     // property of the machine, not something the guest can change. The routing
     // beside it is not: CMOS owns that now, so the key parses and is dropped.
     let directory = tempfile::tempdir().unwrap();
@@ -309,7 +309,7 @@ fn sound_blaster_config_defaults_when_absent_or_partial() {
 #[test]
 fn wss_config_defaults_when_absent_or_partial() {
     // No [audio.wss] table: the codec is always present (enabled), at the
-    // WSS standard base 0x530 with IRQ11/DMA0 -- IRQ11 rather than the WSS
+    // WSS standard base 0x530 with IRQ11/DMA0: IRQ11 rather than the WSS
     // standard IRQ7, which is yielded to the Sound Blaster, and DMA0 to dodge
     // the SB16 DMA1.
     let directory = tempfile::tempdir().unwrap();
@@ -368,7 +368,7 @@ fn wss_config_defaults_when_absent_or_partial() {
 fn wss_config_parses_overrides_when_present() {
     // The two fields the file still owns: whether the codec is fitted and where
     // its config region decodes. The IRQ and DMA keys beside them are retired,
-    // so a file carrying all four still loads -- and moves only the first two.
+    // so a file carrying all four still loads, and moves only the first two.
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("izarravm.toml");
     fs::write(
@@ -655,8 +655,8 @@ fn the_guis_own_preferences_file_is_recognised_and_named() {
         "and say what to pass instead: {message}"
     );
 
-    // All three audio-level keys are RETIRED -- the machine's own mixer owns
-    // those levels now -- and every one of them still has to be recognised
+    // All three audio-level keys are RETIRED (the machine's own mixer owns
+    // those levels now) and every one of them still has to be recognised
     // here. A file old enough to carry any of them is still unmistakably the
     // GUI's prefs file, and pointing --config at it deserves this message
     // rather than an unknown-field error naming one key and explaining nothing.
@@ -675,8 +675,8 @@ fn the_guis_own_preferences_file_is_recognised_and_named() {
     }
 }
 
-/// The detector keys off fields a machine config cannot have, so a real one --
-/// even a complete one -- must never be mistaken for GUI preferences.
+/// The detector keys off fields a machine config cannot have, so a real one,
+/// even a complete one, must never be mistaken for GUI preferences.
 #[test]
 fn a_real_machine_config_is_not_mistaken_for_gui_preferences() {
     let value = toml::from_str::<toml::Value>(

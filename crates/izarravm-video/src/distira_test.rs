@@ -69,24 +69,24 @@ fn changing_workers_settles_queued_and_in_flight_raster_work() {
     assert_eq!(scene(false), scene(true));
 }
 
-/// Reproduces the latent aliasing defect recorded in
-/// `dev_docs/2026-09-01-tr-mipmap-diag.md` section 5: Distira advertises a
+/// Reproduces a latent aliasing defect:
+/// Distira advertises a
 /// dual-TMU board (`DISTIRA_TMU_CONFIG` sets both TMU-count bits, matching
 /// DOSBox-X's `VOODOO_1_DTMU`), and a real dual-TMU Voodoo 1 board carries
 /// 4 MB of texture RAM per TMU. `write_texture_u32` and every texture fetch
 /// mask the aperture/fetch offset with `DISTIRA_TEX_SIZE - 1`. While that
 /// constant stays at 2 MB, an upload whose address lands one 2 MB stride
-/// above a live texel silently wraps and clobbers it -- Tomb Raider's own
+/// above a live texel silently wraps and clobbers it: Tomb Raider's own
 /// uploads reach 0x40255c (4.01 MB) and wrap 2,396 times in the diagnosed
 /// session.
 ///
 /// This test writes a distinctive byte at TMU0 offset 0 (a "low" texel a
 /// triangle has already sampled), then writes a different byte at the
 /// address exactly the single-TMU board's 2 MB budget above it (a "high"
-/// upload -- the stride at which Tomb Raider's own uploads, which reach
+/// upload, the stride at which Tomb Raider's own uploads, which reach
 /// 0x40255c on the real fixture, wrap against a 2 MB-per-TMU allocation).
 /// It reads the low texel back both as raw storage and through the real
-/// sampling path (`sample_tmu_u8`, s=0 t=0 lod=0 -- the same coordinates
+/// sampling path (`sample_tmu_u8`, s=0 t=0 lod=0, the same coordinates
 /// the low write targeted). On a 2 MB-per-TMU board the high write aliases
 /// onto the low address and clobbers it (RED here, on `main`). Once
 /// `DISTIRA_TEX_SIZE` matches the advertised 4 MB per TMU, 2 MB above the
@@ -120,8 +120,7 @@ fn high_texture_upload_does_not_alias_a_low_texel_within_tmu_budget() {
     distira.write_texture_u32(0, 0x22_22_22_22);
 
     // Both writes ride the raster queue now (slice 1 of the texture-queue
-    // lever, `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section
-    // 6): the STORE into texture memory is deferred to `drain_raster_queue`,
+    // lever): the STORE into texture memory is deferred to `drain_raster_queue`,
     // so a direct read of `distira.texture` must drain first, the same as
     // any real consumer (an LFB access, a scanout, a statistics read) would.
     distira.drain_raster_queue(DrainCause::Config);
@@ -153,8 +152,8 @@ fn high_texture_upload_does_not_alias_a_low_texel_within_tmu_budget() {
     );
 }
 
-/// THE WRAP-VS-DROP DIVERGENCE
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8): before this fix, the
+/// THE WRAP-VS-DROP DIVERGENCE:
+/// before this fix, the
 /// FBI pixel-offset path (`RasterView::framebuffer_pixel_offset`) dropped
 /// any pixel whose computed address landed at or past `DISTIRA_FB_SIZE`
 /// instead of wrapping, unlike the texture-memory path (which has always
@@ -162,13 +161,13 @@ fn high_texture_upload_does_not_alias_a_low_texel_within_tmu_budget() {
 /// path, which indexes every store as `fb_mem[write_addr & fb_mask]` with
 /// no bounds check first (`vid_voodoo_fb.c`, `voodoo_fb_writew`/`writel`).
 /// The FBI address decode has no more address lines than it has RAM to
-/// back them, so a bit above that boundary is simply not routed -- a
+/// back them, so a bit above that boundary is simply not routed: a
 /// modulo-2^n wrap, not an aborted write.
 ///
 /// This test writes one pixel through the real LFB write path
 /// (`write_lfb_u16`, the same call a guest's pixel-pipeline write goes
 /// through) at raw byte offset 0, then a second, different pixel exactly
-/// `DISTIRA_FB_SIZE` bytes above it -- a real row address the FBI's own
+/// `DISTIRA_FB_SIZE` bytes above it, a real row address the FBI's own
 /// row/tile math can reach at a large enough configured pitch (the
 /// machine-level `glide_destructive_framebuffer_probe_reports_four_megabytes`
 /// fixture reaches an address in this shape through `SST_FBI_INIT2`'s
@@ -190,7 +189,7 @@ fn lfb_write_above_the_fbi_limit_wraps_instead_of_dropping() {
     assert_eq!(distira.read_lfb_u16(0), 0x1111);
 
     // aperture_offset with bit 11 set decodes to position (x=0, y=1): raw
-    // byte offset `front_base + 1 * pitch` = `DISTIRA_FB_SIZE` exactly --
+    // byte offset `front_base + 1 * pitch` = `DISTIRA_FB_SIZE` exactly,
     // one whole framebuffer above the low write.
     distira.write_lfb_u16(1 << 11, 0x2222);
 
@@ -202,8 +201,8 @@ fn lfb_write_above_the_fbi_limit_wraps_instead_of_dropping() {
     );
 }
 
-/// The graduated lane split (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md`
-/// section 5, lever B): raising the cap must not force a small batch out to
+/// The graduated lane split (lever B):
+/// raising the cap must not force a small batch out to
 /// every lane the cap allows. `lanes_for_rows` grants a batch only as many
 /// lanes as its own row span is worth (`rows / MIN_ROWS_PER_LANE`, capped at
 /// `cap`), so a ten-row batch gets the same 2 lanes whether the cap is 4, 8,
@@ -236,10 +235,10 @@ fn lane_split_is_graduated_by_row_span_not_forced_to_the_cap() {
     }
 }
 
-/// Slice 0b of `dev_docs/2026-09-05-distira-async-overlap-review.md`
-/// section 3: `raster_owned` is `None` only inside `drain_raster_queue`'s own
+/// Slice 0b of the async-overlap review:
+/// `raster_owned` is `None` only inside `drain_raster_queue`'s own
 /// batch, and nothing outside that method ever re-enters while the box is
-/// out -- there is no async yet to make that observable directly, so this
+/// out: there is no async yet to make that observable directly, so this
 /// pins the invariant at every accessor's boundary instead: after ANY call
 /// that could plausibly take the box (a queued texture write, a drain, the
 /// `&mut self` census accessors this slice added the door to), the box is
@@ -257,7 +256,7 @@ fn raster_owned_is_present_after_every_call_that_could_take_it() {
     );
 
     // A queued texture write: `write_texture_u32` pushes a `TextureWrite`
-    // command and may itself force a drain if the queue is full -- both
+    // command and may itself force a drain if the queue is full: both
     // paths touch `raster_owned` (the queue-off store goes through
     // `raster_owned_mut` directly; a forced drain takes the box out for the
     // batch and hands it back before returning).
@@ -318,8 +317,8 @@ fn read_reg(distira: &mut Distira, reg: usize) -> u32 {
 }
 
 /// Queue one small, non-degenerate, non-textured triangle through the guest
-/// register path (`SST_TRIANGLE_CMD`) -- the same path `run_triangle_command`
-/// drives -- so it defers onto `raster_queue` instead of drawing at
+/// register path (`SST_TRIANGLE_CMD`), the same path `run_triangle_command`
+/// drives, so it defers onto `raster_queue` instead of drawing at
 /// submission (`draw_triangle`, by contrast, always draws immediately: see
 /// its `defer: false` argument to `draw_triangle_inner`).
 fn queue_triangle(distira: &mut Distira, red: u32) {
@@ -340,12 +339,12 @@ fn queue_triangle(distira: &mut Distira, red: u32) {
     write_reg(distira, SST_TRIANGLE_CMD, 1);
 }
 
-/// Slice 1 of `dev_docs/2026-09-05-distira-async-overlap-review.md`: a
+/// Slice 1 of the async-overlap review: a
 /// batch flushed at the guest's `swapbufferCMD` write (`write_mmio_u8`'s
 /// `SST_SWAPBUFFER_CMD` arm calls `flush_raster_queue` alone, never
-/// `drain_raster_queue` -- see `dev_docs/2026-09-05-distira-async-overlap-design.md`
-/// section 2, item 2) is left running on the raster pool, and the next call
-/// that could observe its pixels -- here, an LFB read -- joins it first.
+/// `drain_raster_queue`)
+/// is left running on the raster pool, and the next call
+/// that could observe its pixels (here, an LFB read) joins it first.
 /// The result must be byte-identical to the fully synchronous
 /// (queue-disabled) path: async changes WHEN the batch runs, never WHAT it
 /// computes.
@@ -353,7 +352,7 @@ fn queue_triangle(distira: &mut Distira, red: u32) {
 fn a_batch_flushed_at_swap_is_joined_by_the_next_lfb_read_with_identical_pixels_to_the_synchronous_path()
  {
     // The synchronous reference: the queue off, so every triangle draws at
-    // submission -- the exact pre-async (and pre-#840) behaviour.
+    // submission, the exact pre-async (and pre-#840) behaviour.
     let mut sync = Distira::new();
     sync.set_frame_size(8, 8);
     sync.set_raster_queue_enabled(false);
@@ -437,11 +436,10 @@ fn raster_owned_is_absent_exactly_while_a_batch_is_in_flight_and_present_after_e
     );
 }
 
-/// Slice 1, depth one, deliberately
-/// (`dev_docs/2026-09-05-distira-async-overlap-design.md` section 2): at
+/// Slice 1, depth one, deliberately: at
 /// most one batch is ever in flight. A second `flush_raster_queue` call
 /// while one is still outstanding must join it FIRST, and that forced join
-/// is attributed to whichever cause forced it -- the caller that pays for
+/// is attributed to whichever cause forced it: the caller that pays for
 /// the wait, not the flush that originally started the batch it waited on.
 #[test]
 fn a_second_flush_while_one_is_in_flight_joins_it_first() {
@@ -482,14 +480,14 @@ fn a_second_flush_while_one_is_in_flight_joins_it_first() {
     assert!(distira.in_flight.is_none());
 }
 
-/// **B1 of `dev_docs/2026-09-05-distira-async-slice1-review.md`.** The OLD
+/// **B1 of the slice 1 review.** The OLD
 /// `overlap_ns` stored `flushed_at.elapsed()` measured AFTER `recv`
-/// returned -- the whole flush-to-join-complete window -- so a join
+/// returned, the whole flush-to-join-complete window, so a join
 /// immediately following its own flush (every join point but the swap, and
 /// the whole run under `IZARRAVM_DISTIRA_ASYNC=0`) reported the batch's own
 /// raster time as if it were overlap. This drives `flush_raster_queue`
-/// straight into `join_raster` with NOTHING run in between -- the exact
-/// synchronous shape -- and pins that `overlap_ns` reads (almost) zero
+/// straight into `join_raster` with NOTHING run in between (the exact
+/// synchronous shape) and pins that `overlap_ns` reads (almost) zero
 /// regardless of how long the batch itself took on the pool. `blocked_ns`
 /// is asserted nonzero and comfortably larger than the `overlap_ns` slack,
 /// which is what proves the batch really ran and this is not passing by
@@ -497,7 +495,7 @@ fn a_second_flush_while_one_is_in_flight_joins_it_first() {
 #[test]
 fn a_flush_immediately_joined_reports_approximately_zero_overlap() {
     let mut distira = Distira::new();
-    // Large enough that the batch takes measurable wall time on the pool --
+    // Large enough that the batch takes measurable wall time on the pool:
     // under the OLD bug this is exactly what would have leaked into
     // `overlap_ns`.
     distira.set_frame_size(512, 512);
@@ -541,7 +539,7 @@ fn a_flush_immediately_joined_reports_approximately_zero_overlap() {
     );
 }
 
-/// S3 (`dev_docs/2026-09-05-distira-async-slice1-review.md` section 5),
+/// S3,
 /// design test 1: every [`DrainCause`] that can join a swap-flushed batch
 /// must apply it identically to the fully synchronous model, not just the
 /// `LfbRead` case
@@ -635,7 +633,7 @@ fn a_join_at_every_cause_leaves_the_frame_identical_to_the_synchronous_model() {
 }
 
 /// S3, design test 2: a statistics-register read mid-batch must report the
-/// batch's OWN contribution, not the pre-batch epoch -- the counter-epoch
+/// batch's OWN contribution, not the pre-batch epoch: the counter-epoch
 /// guard `register_read_needs_raster` exists for.
 #[test]
 fn a_statistics_read_mid_batch_reports_the_joined_epoch() {
@@ -666,13 +664,13 @@ fn a_statistics_read_mid_batch_reports_the_joined_epoch() {
     );
 }
 
-/// S3, review finding 2's guard: `fastfillCMD` must still join a batch the
-/// swap left in flight -- unlike the swap itself, it reads and clears the
-/// SAME shared colour/depth buffer that batch may still be drawing into
-/// (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2). Queue
+/// S3, the fastfill-after-swap guard: `fastfillCMD` must still join a batch the
+/// swap left in flight: unlike the swap itself, it reads and clears the
+/// SAME shared colour/depth buffer that batch may still be drawing into.
+/// Queue
 /// a triangle that paints the whole clip window, swap (flush only, leaves
 /// it in flight), then fastfill: if fastfill joined first as it must, the
-/// triangle's colour is fully overwritten -- nothing of it survives. A
+/// triangle's colour is fully overwritten: nothing of it survives. A
 /// fastfill that regressed to a flush-only path like the swap's would race
 /// the triangle's still-in-flight write instead.
 #[test]
@@ -689,7 +687,7 @@ fn a_fastfill_after_an_unjoined_swap_clears_the_finished_frame() {
 
     // The triangle drew with FBZ_DRAW_BACK|FBZ_DRAW_FRONT both set, which
     // `run_fastfill`'s `match ... & FBZ_DRAW_MASK` treats as "back" (only
-    // FBZ_DRAW_FRONT alone selects the front buffer) -- but the SWAP has
+    // FBZ_DRAW_FRONT alone selects the front buffer), but the SWAP has
     // since rotated front/back, so the triangle's paint is now sitting in
     // what is CURRENTLY the front buffer. Select FBZ_DRAW_FRONT explicitly
     // so the fastfill clears the SAME buffer the read below checks;
@@ -713,7 +711,7 @@ fn a_fastfill_after_an_unjoined_swap_clears_the_finished_frame() {
     );
 }
 
-/// S3, review section 1's last paragraph -- "the one counter that is not
+/// S3, review section 1's last paragraph: "the one counter that is not
 /// order-independent": `merge_pixel_stats` writes `self.stipple` back from
 /// `jobs.last()`, safe only because a ROTATING stipple triangle
 /// (`FBZ_STIPPLE` set, `FBZ_STIPPLE_PATT` clear) always takes the immediate
@@ -760,7 +758,7 @@ fn a_moved_batch_boundary_leaves_the_rotating_stipple_register_alone() {
     );
 
     // SST_STIPPLE is one of the statistics-shaped registers
-    // (`register_read_needs_raster`) -- reading it joins first.
+    // (`register_read_needs_raster`): reading it joins first.
     let stipple_after = read_reg(&mut distira, SST_STIPPLE);
     assert!(
         distira.in_flight.is_none(),

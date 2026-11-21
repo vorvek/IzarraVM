@@ -7,7 +7,7 @@
 ; WHY THIS IS REAL CODE. Every other VBE function in this machine is host-side
 ; HLE reached through INT 10h. Function 4F0Ah cannot be: it hands the client the
 ; ADDRESS of three routines that the client then far-calls directly, with no
-; interrupt involved. That is the entire point of the function -- a protected-
+; interrupt involved. That is the entire point of the function: a protected-
 ; mode client asks for it precisely so it can bank and flip without paying a
 ; v86 round trip per call. So these three routines have to be genuine x86 that
 ; pokes genuine device registers.
@@ -148,7 +148,7 @@ vbe_pm_setdisplay:
 ; BL = 00h now / 80h at the next vertical retrace, CX = entry count,
 ; DX = first entry, ES:DI = table of 4-byte entries.
 ;
-; Entry order is blue, green, red, alignment -- the same order the INT 10h
+; Entry order is blue, green, red, alignment, the same order the INT 10h
 ; path reads (see `vbe_palette_data`), and the reverse of the DAC's own
 ; red-green-blue write order, which is why the loads below are not sequential.
 vbe_pm_setpalette:
@@ -180,8 +180,8 @@ vbe_pm_setpalette:
 ; ---- the port and memory list --------------------------------------------
 ; A DPMI client reads this to learn which locations the routines above touch,
 ; so it can grant I/O access to exactly those and no more. Word-sized port
-; numbers terminated by FFFFh, then the memory-location list -- empty here,
-; because every register these routines reach is an I/O port -- terminated by
+; numbers terminated by FFFFh, then the memory-location list (empty here,
+; because every register these routines reach is an I/O port) terminated by
 ; its own FFFFh.
 vbe_pm_portlist:
     dw  VBEPM_EXT_INDEX
@@ -194,7 +194,7 @@ vbe_pm_block_end:
 
 ; OemStringPtr's target, placed immediately after the block so the host can find
 ; it at (block + length) without a second fixed offset to keep in step. It is
-; OUTSIDE the block, so a client that copies CX bytes does not carry it along --
+; OUTSIDE the block, so a client that copies CX bytes does not carry it along,
 ; which is correct, because the pointer it is given is a ROM address.
 vbe_oem_string:
     db  "Izarra3000 VEGA/Margo VBE", 0

@@ -1340,7 +1340,7 @@ fn a_same_size_crtc_write_keeps_the_scanlines_already_drawn() {
     assert!(full > 0, "the pattern reaches the raster at all");
 
     // Draw all but the last line of the next frame, then rewrite a vertical
-    // CRTC register with the value it already holds -- the guest's own table
+    // CRTC register with the value it already holds, the guest's own table
     // replay. Only one line is left for the finalize to draw, so a wipe here
     // costs the whole picture.
     let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
@@ -1378,7 +1378,7 @@ fn a_same_size_crtc_write_keeps_the_scanlines_already_drawn() {
 /// personality's mode-control path (port 3D8h) sets the mode and resizes the
 /// work raster WITHOUT resetting the render cursor. Reusing a same-size buffer
 /// there would carry the old mode's rows into the first published frame of the
-/// new one -- the classic flash of the previous screen. Keeping the raster is
+/// new one, the classic flash of the previous screen. Keeping the raster is
 /// right for a timing recompute at a CONSTANT mode; it is wrong across a mode
 /// change, and the two predicates are not the same.
 #[test]
@@ -1421,7 +1421,7 @@ fn a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows() {
     let frame = vga.last_presented().expect("a text frame");
     // Rows 0-99 are the ones the beam drew in the OLD mode. They must not reach
     // the published frame. Rows 100 upwards were drawn after the switch and are
-    // the new mode's own output -- lit here because B8000 is shared between the
+    // the new mode's own output, lit here because B8000 is shared between the
     // CGA framebuffer and the text page, so the fill above is now text.
     let width = frame.width as usize;
     let stale: Vec<usize> = (0..100)
@@ -1516,7 +1516,7 @@ fn every_reachable_mode() -> Vec<ModeEntry> {
 /// mode's rows. `a_mode_change_at_the_same_raster_size_does_not_publish_the_old_rows`
 /// is the end-to-end case for the pair that was found by being bitten by it;
 /// this sweep computes the colliding pairs instead of naming them, so a
-/// collision nobody has met yet -- including one a future mode introduces --
+/// collision nobody has met yet (including one a future mode introduces)
 /// is covered too.
 #[test]
 fn no_mode_change_reuses_the_previous_modes_raster() {
@@ -1543,7 +1543,7 @@ fn no_mode_change_reuses_the_previous_modes_raster() {
             // Drive the beam a hundred lines into a frame, so the render cursor
             // is NOT at zero when the mode changes. Without this the cursor arm
             // of the assertion below is vacuously true for every pair and the
-            // sweep passes with the guard removed -- measured, not assumed.
+            // sweep passes with the guard removed, measured, not assumed.
             vga.advance(vga.frame_dots());
             let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
             vga.advance(line_dots * 100);

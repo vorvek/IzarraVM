@@ -3,7 +3,7 @@
 
 //! The monitor presentation pass: a wgpu shader that stretches the guest
 //! framebuffer to fill the 4:3 rect (correct pixel aspect for every mode) and,
-//! when enabled, adds a faithful high-resolution-CRT look — sharp upscale, a
+//! when enabled, adds a faithful high-resolution-CRT look: sharp upscale, a
 //! faint gaussian scanline beam, a barely-there shadow mask, and light halation.
 //!
 //! `tools/crt-tuner.html` is a browser page with the same style presets and sliders for the
@@ -284,7 +284,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 ///
 /// `changed_rows` is a delta against the frame BEFORE this one, so applying it
 /// to a texture that never received that frame leaves the untouched rows stale
-/// forever -- there is no later frame that repairs them, because every later
+/// forever: there is no later frame that repairs them, because every later
 /// frame reports only its own changes. `update_from`/`update_to` carry the
 /// publication numbers the runs span so `prepare` can notice the gap and upload
 /// the frame whole instead. Nothing acknowledges a paint, and nothing needs to:
@@ -301,7 +301,7 @@ pub struct CrtFrame {
 /// Whether the texture must take the frame whole rather than by its runs.
 ///
 /// `last_update` is the publication number this texture last had applied, or
-/// `u64::MAX` for "nothing yet" -- publications start at 1, so the wrap makes
+/// `u64::MAX` for "nothing yet": publications start at 1, so the wrap makes
 /// the very first frame answer `true` here on its own merits rather than by
 /// coincidence.
 pub(crate) fn upload_is_full(frame_update_from: u64, last_update: u64, recreated: bool) -> bool {
@@ -351,8 +351,8 @@ pub(crate) fn pack_argb_rows(words: &[u32], width: usize, rows: Range<usize>, ou
     }
 }
 
-/// Pack the shader's uniform block: 8 floats (32 bytes, std140-safe) --
-/// `src_size.xy, style, srgb, time, monitor_gamma, glide_gamma, pad1` --
+/// Pack the shader's uniform block: 8 floats (32 bytes, std140-safe):
+/// `src_size.xy, style, srgb, time, monitor_gamma, glide_gamma, pad1`,
 /// little-endian, matching WGSL struct `U` in `SHADER`. Pulled out of
 /// `prepare` so the byte layout (buffer size, and which offsets the two gamma
 /// terms land at) is a plain unit-testable function.

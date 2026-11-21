@@ -20,7 +20,7 @@ fn transfer_status(complete: bool, unreachable_buffer: bool) -> u8 {
 /// INT 13h status 09h, "data boundary error": the transfer could not be carried
 /// out across the whole of the caller's buffer. On real hardware that is a DMA
 /// segment crossing; here it is a page the caller's own tables do not map, which
-/// is the same thing from the caller's side -- the BIOS could reach part of the
+/// is the same thing from the caller's side: the BIOS could reach part of the
 /// buffer and not the rest. Reported with the count that actually moved, never
 /// as a success and never as 04h, which claims the MEDIA was at fault.
 const BUFFER_UNREACHABLE_STATUS: u8 = 0x09;
@@ -100,10 +100,10 @@ pub struct Int13Profile {
     pub read_buf_conv: u64,
     pub read_buf_uma: u64,
     pub read_buf_hma: u64,
-    /// Slice 9D call-pattern extension (`dev_docs/2026-09-05-device-9d-result.md`):
+    /// Slice 9D call-pattern extension:
     /// every field below is aggregated over ALL data calls (read, write and
     /// verify alike, matching `stall_ticks`'s own scope), and every field is
-    /// computed from `AtaDisk::pio_transfer_breakdown` -- the SAME formula
+    /// computed from `AtaDisk::pio_transfer_breakdown`, the SAME formula
     /// `charge_pio_transfer` charges, never a second guess at it. All zero
     /// unless `DeviceTimingProfile::ata` is armed alongside the census: with
     /// the family unarmed there is no seek/rotation/buffer model to report on.
@@ -183,8 +183,8 @@ const STOCK_MPU_PORTS: &[u16] = &[WAVETABLE_MPU_BASE, MIDI_MPU_BASE];
 
 /// The routing a `SET BLASTER=` line advertises: the SB16's IRQ and two DMA
 /// channels, plus the MPU-401 port named in `P`. The MPU port is not part of
-/// `SoundBlasterConfig` because it is not a Sound Blaster property -- both
-/// MPU ports stay decoded regardless -- but it is part of the string, and
+/// `SoundBlasterConfig` because it is not a Sound Blaster property (both
+/// MPU ports stay decoded regardless) but it is part of the string, and
 /// SNDCTRL.COM can change it, so it travels alongside.
 type BlasterRouting = (u8, usize, usize, u16);
 
@@ -509,7 +509,7 @@ impl Machine {
 
     /// Force the `ata` family arm for one machine, in either direction, the
     /// same shape as `set_ata_poll_skip_enabled` but for the whole-family
-    /// flag rather than a dedicated enable bool -- there is no
+    /// flag rather than a dedicated enable bool: there is no
     /// `IZARRAVM_ATA_HDD_POLL_SKIP` knob, by design.
     #[doc(hidden)]
     pub fn set_device_timing_ata_for_test(&mut self, enabled: bool) {
@@ -565,7 +565,7 @@ impl Machine {
     ///
     /// The shipped gate is per-MACHINE state read once at construction, not a
     /// process-wide `OnceLock` like the CPU lane knobs, so the fixtures need no
-    /// thread-local override to run both arms in one process -- they state the
+    /// thread-local override to run both arms in one process: they state the
     /// arm on the machine they built. Every poll-skip fixture states it in BOTH
     /// directions rather than inheriting the ambient environment, so the OFF
     /// fixtures keep meaning what they say the day the default moves.
@@ -712,7 +712,7 @@ impl Machine {
     /// Eject the hard disk, returning its current image bytes (including any
     /// in-session writes) so the caller can flush them back. None when no disk is
     /// mounted OR when the disk is a read-only host-folder facade (which has no
-    /// flushable image — returning its empty `bytes()` would persist a 0-byte file).
+    /// flushable image: returning its empty `bytes()` would persist a 0-byte file).
     /// Clears the BDA fixed-disk count.
     pub fn eject_hdd(&mut self) -> Option<Vec<u8>> {
         self.bmide.reset_primary();
@@ -1913,7 +1913,7 @@ impl Machine {
     }
 
     /// Slice 9D call-pattern census: the `AtaDisk::pio_transfer_breakdown` for
-    /// this request, or `None` if `IZARRAVM_INT13_PROFILE` is off -- in which
+    /// this request, or `None` if `IZARRAVM_INT13_PROFILE` is off, in which
     /// case nothing runs, per `default-off-instruments-tax-hot-path`.
     ///
     /// Callers MUST call this before the matching `stall_for_hdd_sectors`
@@ -2003,7 +2003,7 @@ impl Machine {
         // (`int13_breakdown_if_profiled`, taken BEFORE the mutating
         // `AtaDisk::charge_pio_transfer` ran for the same request), so
         // `breakdown.total()` is exactly what `stall_for_hdd_sectors`
-        // charged -- one formula, never recomputed.
+        // charged: one formula, never recomputed.
         p.stall_ticks = p.stall_ticks.saturating_add(breakdown.total());
         // Slice 9D: the call-pattern breakdown, split into its components.
         if breakdown.charged_sectors > 0 {
@@ -2126,7 +2126,7 @@ impl Machine {
         // Slice 9D: computed BEFORE the mutating charge below, per
         // `int13_breakdown_if_profiled`'s ordering contract.
         let breakdown = self.int13_breakdown_if_profiled(start_lba, u32::from(done));
-        // Slice 9C: the ONE authoritative charge for this transfer -- see
+        // Slice 9C: the ONE authoritative charge for this transfer. See
         // `stall_for_hdd_sectors`'s doc comment. Every other consumer
         // below takes its return rather than recomputing.
         let wait_ticks = self.stall_for_hdd_sectors(start_lba, u32::from(done));

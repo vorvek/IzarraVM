@@ -45,8 +45,8 @@ fn write_reg(machine: &mut Machine, reg: usize, value: u32) {
 /// `write_reg`/`write_physical_u*`, taken through the same two-step
 /// handshake a real Glide driver's startup does before touching anything
 /// else: unlock initEnable (PCI config offset 0x40, real hardware and this
-/// codebase's PCI function both keep it there rather than the MMIO window --
-/// see `distira_guest_dac_detect_ics_probe_reaches_fbi_init2_through_pci_init_enable`),
+/// codebase's PCI function both keep it there rather than the MMIO window.
+/// See `distira_guest_dac_detect_ics_probe_reaches_fbi_init2_through_pci_init_enable`),
 /// then set FBIINIT0 bit 0, the display mux itself (86Box
 /// `vid_voodoo.c:744-761`, DOSBox-X `voodoo_emu.cpp:1764-1775`: both derive
 /// it purely from that bit, bit 0 SET routing the Voodoo onto the cable).
@@ -67,7 +67,7 @@ fn distira_display_enabled_machine(profile: MachineProfile) -> Machine {
     write_reg(&mut machine, SST_FBI_INIT0, FBIINIT0_VGA_PASS);
     // The unlock program above ran real CPU cycles, which advanced the
     // frame-phase/retrace timeline along with them. Pulse VIDEO_RESET (a
-    // timing reset only -- see `write_fbi_init1` -- it does not touch the
+    // timing reset only, see `write_fbi_init1`: it does not touch the
     // FBIINIT0-derived mux this helper just set) to bring the timeline back
     // to a clean, deterministic baseline for tests that measure exact
     // retrace deadlines from machine construction.
@@ -230,14 +230,13 @@ fn write_texture_texel(machine: &mut Machine, tmu: usize, byte_address: u32, tex
 /// register's field is 19 bits (`(val & 0x0007_ffff) << 3`,
 /// `raster_view.rs::tex_base_addr_for_tmu`), matching 86Box's non-Banshee
 /// `SST_texBaseAddr` handler. One qword short of 4 MB.
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 1.)
 const TEX_BASE_ADDR_MAX: u32 = 0x7_ffff << 3;
 
 /// Writes one R5G6B5 texel at an absolute byte `address` that may sit at or
 /// beyond `TEX_BASE_ADDR_MAX`, which `write_texture_texel` cannot reach
 /// (the base register alone would silently truncate it). Parks the base
 /// register at the largest representable address at or below `address` and
-/// crosses the remaining distance through the aperture's own row offset --
+/// crosses the remaining distance through the aperture's own row offset,
 /// the same `base + mip_offset + row_offset` sum `texture_write_offset`
 /// computes for a real triangle's upload. Only exact for a target `address`
 /// that is a multiple of 2 bytes and within one texel row of
@@ -446,11 +445,11 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
 }
 
 /// Pins the guest-visible half of the FBI board-identity decision
-/// (`dev_docs/2026-09-01-mojo-fixture.md` section 5.1: MOJO reported a 2 MB
+/// (MOJO reported a 2 MB
 /// FBI on a dual-TMU board, a config that never shipped). Renamed from
 /// `glide_destructive_framebuffer_probe_reports_two_megabytes`, which
-/// pinned the OLD 2 MB size and went red the moment `DISTIRA_FB_SIZE` grew
-/// -- this is the guest-facing half of that decision, not incidental
+/// pinned the OLD 2 MB size and went red the moment `DISTIRA_FB_SIZE` grew:
+/// this is the guest-facing half of that decision, not incidental
 /// breakage, the same shape as PR #814's texture-memory probe rename.
 #[test]
 fn glide_destructive_framebuffer_probe_reports_four_megabytes() {
@@ -600,18 +599,18 @@ fn distira_texture_aperture_keeps_tmu_stores_independent() {
     assert_eq!(draw_texture_sample(&mut machine, 1), 0x00ff_00ff);
 }
 
-/// Pins the wrap boundary at the NEW 4 MB-per-TMU budget
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 7), covering both TMUs.
+/// Pins the wrap boundary at the NEW 4 MB-per-TMU budget,
+/// covering both TMUs.
 /// Renamed from `distira_glide_probe_detects_two_megabytes_on_each_tmu`
 /// (landed in #509), which asserted the OLD 2 MB wrap and went red the
-/// moment `DISTIRA_TEX_SIZE` grew -- this is the guest-facing half of that
+/// moment `DISTIRA_TEX_SIZE` grew: this is the guest-facing half of that
 /// board-identity decision, not incidental breakage.
 ///
 /// Each pass proves both directions of the boundary by write ORDER, not by
 /// reading at the candidate address directly: `SST_TEX_BASE_ADDR` cannot
 /// itself name 0x40_0000 (see `TEX_BASE_ADDR_MAX`), so "does a write here
 /// alias offset 0" is read back by writing a victim to offset 0 first, then
-/// the candidate, then sampling offset 0 -- if the candidate aliases, its
+/// the candidate, then sampling offset 0: if the candidate aliases, its
 /// value wins.
 #[test]
 fn distira_glide_probe_detects_four_megabytes_on_each_tmu() {
@@ -624,7 +623,7 @@ fn distira_glide_probe_detects_four_megabytes_on_each_tmu() {
         write_reg(&mut machine, chip | SST_TREX_INIT0, 0x5000);
         assert_eq!(read_reg(&mut machine, chip | SST_TREX_INIT0), 0x5000);
 
-        // A write at 4 MB -- the new advertised per-TMU budget -- must still
+        // A write at 4 MB (the new advertised per-TMU budget) must still
         // wrap and clobber offset 0.
         write_texture_texel(&mut machine, tmu, 0, 0x001f); // blue, victim at offset 0
         write_texture_texel_at(&mut machine, tmu, 0x0040_0000, 0xf800); // red, the wrapping write
@@ -641,7 +640,7 @@ fn distira_glide_probe_detects_four_megabytes_on_each_tmu() {
         write_reg(&mut machine, chip | SST_TREX_INIT0, 0x2000);
         assert_eq!(read_reg(&mut machine, chip | SST_TREX_INIT0), 0x2000);
 
-        // A write at 2 MB -- the OLD budget's full width -- must NOT alias
+        // A write at 2 MB (the OLD budget's full width) must NOT alias
         // offset 0 any more: that is exactly the wrap this PR removed.
         write_texture_texel(&mut machine, tmu, 0, 0x07e0); // green, victim at offset 0
         write_texture_texel(&mut machine, tmu, 0x0020_0000, 0xf800); // red, must land elsewhere
@@ -940,7 +939,7 @@ fn distira_retrace_start_ticks() -> u64 {
 /// The textbook `distira_retrace_start_ticks()` assumes a machine whose
 /// master-tick clock starts at zero. `machine_with_pending_retrace_swap` no
 /// longer does: unlocking initEnable through PCI config space (required
-/// under the corrected FBIINIT0 mux model -- initEnable is reachable only
+/// under the corrected FBIINIT0 mux model: initEnable is reachable only
 /// through port I/O, so a few real CPU cycles run before any test gets its
 /// machine) nudges the machine's absolute master-tick position, and the
 /// master-tick-to-scanline rounding is sensitive to that absolute position,
@@ -953,7 +952,7 @@ fn distira_retrace_start_ticks() -> u64 {
 /// contract the test exists to check.
 ///
 /// CAVEAT: the predicate this bisects (`SST_STATUS` bit 0x40, the vertical
-/// retrace flag) is PERIODIC -- it reasserts every frame -- so bisection is
+/// retrace flag) is PERIODIC (it reasserts every frame) so bisection is
 /// only guaranteed to land on the first edge because `hi` starts at (and
 /// then only doubles past) `distira_retrace_start_ticks()`, which is close
 /// to the true edge. A search that drifted onto a later period would still
@@ -990,7 +989,7 @@ fn distira_retrace_swap_deadline_is_identical_in_every_cpu_mode() {
     // Independent oracle: the calibrated edge must still sit close to the
     // textbook formula, not just be self-consistent across modes. This is
     // what catches the calibration silently locking onto a later period (or
-    // the device's retrace timing model moving) -- either would blow well
+    // the device's retrace timing model moving): either would blow well
     // past this bound, while the small, fixed nudge the initEnable-unlock
     // program leaves in the master-tick position stays comfortably inside
     // it (measured: tens of thousands of ticks against an ~83-million-tick

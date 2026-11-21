@@ -43,7 +43,7 @@ start:
 
     ; 3. page counts (42h): EMS now shares the arena with XMS/VCPI (Task 6),
     ; so the total is no longer the fixed 192-page partition, and free is not
-    ; guaranteed to equal total even at the top of this program -- something
+    ; guaranteed to equal total even at the top of this program: something
     ; else (e.g. the shell's own XMS-swap block for running this child) may
     ; already hold part of the pool, which is expected now that they share
     ; one. Record both as this run's baseline instead of pinning a constant;
@@ -93,7 +93,7 @@ start:
     jne f_map1
 
     ; 7. map logical 0 -> slot 1: pattern A must be visible at E400 (the
-    ;    remap proof — the backing page moved to a different frame window)
+    ;    remap proof: the backing page moved to a different frame window)
     mov ah, 0x44
     mov al, 1
     xor bx, bx
@@ -125,7 +125,7 @@ start:
     jnz f_save
 
     ; 10. unmap slot 1 (44h, logical 0xFFFF): E400 falls back to the dormant
-    ;     UMB backing — pattern B must no longer be visible there
+    ;     UMB backing: pattern B must no longer be visible there
     mov ah, 0x44
     mov al, 1
     mov bx, 0xFFFF
@@ -342,7 +342,7 @@ start:
     jne f_merr
 
     ; 11k. partial application: 50h applies pairs IN ORDER and stops at the
-    ;      first bad one, leaving the earlier pairs mapped -- EMM386/DOSBox
+    ;      first bad one, leaving the earlier pairs mapped, EMM386/DOSBox
     ;      semantics, and 1830's streaming decoder depends on it: it maps
     ;      4-page batches whose tail overshoots the asset's last page,
     ;      ignores the 8Ah, and decodes from the pages that DID map. An
@@ -447,7 +447,7 @@ nm_zero:
     jne f_name4
 
     ; 11i. the name dies with the handle: release handle2, reallocate, and
-    ;      5300h on the fresh handle must return 8 ZERO bytes -- this read is
+    ;      5300h on the fresh handle must return 8 ZERO bytes: this read is
     ;      the step's red proof (the dup scan skips free slots and a handle's
     ;      own entry, so a stale name could never answer A1h here). Then take
     ;      name_b again, and release so steps 12-14 see only the main handle.
@@ -487,7 +487,7 @@ nm_zero2:
     jnz f_name5
 
     ; 11j. hardware info (59h, LIM 4.0 OS/E). Subfn 01: unallocated/total RAW
-    ;      pages -- raw pages ARE 16 KB pages here, so both counts must equal
+    ;      pages: raw pages ARE 16 KB pages here, so both counts must equal
     ;      42h's. 1830's streaming module sizes its EMS pool from 5901h's BX
     ;      WITHOUT checking AH; an 84h answer left BX stale and the pool came
     ;      out 50 pages instead of ~1900. Subfn 00: the 5-word hardware array

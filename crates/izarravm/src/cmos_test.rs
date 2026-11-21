@@ -105,8 +105,8 @@ fn flags_set_the_machine_when_there_is_no_saved_cmos() {
 }
 
 /// The case the warning exists for: a saved CMOS beats the flags, correctly but
-/// invisibly. Every flag the load did not honour must be named, and only those
-/// -- a flag that happens to agree with the saved value is not news.
+/// invisibly. Every flag the load did not honour must be named, and only those:
+/// a flag that happens to agree with the saved value is not news.
 #[test]
 fn a_saved_cmos_overrides_the_flags_and_every_ignored_one_is_named() {
     let dir = std::env::temp_dir().join(format!("izarra_cmos_override_{}", std::process::id()));

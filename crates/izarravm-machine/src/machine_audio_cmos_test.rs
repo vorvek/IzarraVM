@@ -57,8 +57,8 @@ fn a_saved_block_repoints_both_devices_on_load() {
 }
 
 /// The profile follows the block too, not just the devices. Everything that
-/// *describes* the card -- the BLASTER line written into an emulator-owned
-/// AUTOEXEC.BAT, the environment injected on the HLE path -- is derived from
+/// *describes* the card (the BLASTER line written into an emulator-owned
+/// AUTOEXEC.BAT, the environment injected on the HLE path) is derived from
 /// the profile, and a profile left on the old value is how the card ends up
 /// answering on one IRQ while BLASTER advertises another.
 #[test]
@@ -133,7 +133,7 @@ fn a_block_with_the_two_devices_on_one_line_is_reseeded() {
 
 /// A cmos.bin written before this block existed carries zeros there. Zero is a
 /// legal DMA channel, so only the magic byte distinguishes "never configured"
-/// from "configured to zero" -- without it, an old image would silently route
+/// from "configured to zero": without it, an old image would silently route
 /// the card to channel 0.
 #[test]
 fn an_image_predating_the_block_is_reseeded_rather_than_believed() {
@@ -182,7 +182,7 @@ fn an_autoexec_the_tool_rewrote_is_still_emulator_stock() {
     std::fs::write(dir.join("AUTOEXEC.BAT"), &tool_output).unwrap();
 
     // Mounting again with the profile the tool persisted must leave it alone
-    // in content terms -- it is regenerated, but to the same bytes.
+    // in content terms: it is regenerated, but to the same bytes.
     crate::storage::ensure_user_config(&dir, b"FILES=40\r\n", &base, &moved, 0x330).unwrap();
     assert_eq!(
         std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(),

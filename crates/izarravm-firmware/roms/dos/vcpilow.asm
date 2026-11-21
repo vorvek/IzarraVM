@@ -43,7 +43,7 @@ start:
     call far [xms_entry]
     cmp ax, dx
     ja f_xms                      ; largest run cannot exceed the total
-    ; The pool must fit inside installed RAM -- which is what this fixture is
+    ; The pool must fit inside installed RAM, which is what this fixture is
     ; for. It used to assert `dx <= 2048`, i.e. the old hard 2 MB XMS_EMB_BYTES
     ; cap; with XMS and VCPI sharing the whole extended category that ceiling is
     ; gone, and encoding it here only re-asserted the defect being removed.

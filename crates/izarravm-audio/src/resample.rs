@@ -50,7 +50,7 @@ impl Resampler {
     pub fn new(input_hz: u32, output_hz: u32) -> Self {
         let step = f64::from(input_hz) / f64::from(output_hz);
         // Cutoff at the lower (output) Nyquist when downsampling, expressed as a
-        // fraction of the input rate — the anti-alias band limit.
+        // fraction of the input rate, the anti-alias band limit.
         let cutoff = (f64::from(output_hz) / f64::from(input_hz)).min(1.0);
         let mut table = vec![0f32; PHASES * TAPS];
         for p in 0..PHASES {

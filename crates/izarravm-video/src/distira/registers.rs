@@ -10,16 +10,16 @@
 /// `texture_size`, `vid_voodoo.c:1165-1166`), so it does not force this
 /// pairing, but both agree a real dual-TMU card ships 4 MB of FBI RAM. MOJO,
 /// 3dfx's own DOS diagnostic, reported this exact 2 MB-FBI/dual-TMU
-/// inconsistency as a mismatched board identity
-/// (`dev_docs/2026-09-01-mojo-fixture.md` section 5.1) -- no SST-1 was ever
+/// inconsistency as a mismatched board identity:
+/// no SST-1 was ever
 /// built that way.
 ///
 /// 4 MB is also the first size at which `SST_FBI_INIT2`'s buffer-offset
 /// field cannot name an address outside its own RAM: the field is 9 bits
 /// of 8 KB pages (`distira.rs::recalculate_fbi_layout`, `n << 13`), so its
 /// maximum is `511 << 13` = 4,186,112, inside a 4 MB store but past a 2 MB
-/// one -- the same argument #814's review made for `SST_TEX_BASE_ADDR` at
-/// 4 MB (`dev_docs/2026-09-01-tex4mb-review.md` section 1).
+/// one, the same argument #814's review made for `SST_TEX_BASE_ADDR` at
+/// 4 MB.
 pub const DISTIRA_FB_SIZE: usize = 4 * 1024 * 1024;
 pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
 /// Bytes of texture RAM per TMU. `DISTIRA_TMU_CONFIG` (`distira.rs`)
@@ -30,21 +30,19 @@ pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
 /// advertised board: every texture-aperture write and every texture fetch
 /// masks its address with `DISTIRA_TEX_SIZE - 1`, so a value narrower than
 /// what the guest was told it has lets legitimate high uploads wrap and
-/// silently overwrite unrelated low texels. See
-/// `dev_docs/2026-09-01-tr-mipmap-diag.md` section 5.
+/// silently overwrite unrelated low texels.
 ///
 /// 4 MB is also the size at which the mask stops disagreeing with the
 /// hardware it is masking: `SST_TEX_BASE_ADDR` (`raster_view.rs`,
-/// `tex_base_addr_for_tmu`/`_lod`) is itself only 19 bits wide --
+/// `tex_base_addr_for_tmu`/`_lod`) is itself only 19 bits wide:
 /// `(val & 0x0007_ffff) << 3`, the same field 86Box's non-Banshee
 /// `SST_texBaseAddr` handler masks (`vid_voodoo_reg.c`,
-/// `params.texBaseAddr[0] = (val & 0x7ffff) << 3`) -- so the register can
+/// `params.texBaseAddr[0] = (val & 0x7ffff) << 3`), so the register can
 /// name addresses only up to `0x3FFFF8`, one qword short of 4 MB. At the old
 /// 2 MB size that top register bit was being silently folded away by the
 /// (narrower) texture mask before the register's own width ever mattered;
 /// at 4 MB the two finally agree, and only `base + mip_offset + row_offset`
-/// can still cross the top, exactly as it does in 86Box and DOSBox-X. See
-/// `dev_docs/2026-09-01-tex4mb-review.md` section 1.
+/// can still cross the top, exactly as it does in 86Box and DOSBox-X.
 pub const DISTIRA_TEX_SIZE: usize = 4 * 1024 * 1024;
 pub const DISTIRA_FIFO_CAPACITY: usize = 65_536;
 pub const DISTIRA_ID_VALUE: u32 = 0x4454_0100; // 'D''T', version 1.00

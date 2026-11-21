@@ -16,8 +16,8 @@ fn controller_config(name: &str) -> ControllerConfig {
 }
 
 /// A saved screenshot must match the window. The shader corrects for
-/// monitor_gamma only in CrtStyle::Off; every other style -- including the
-/// shipped default, Subtle -- must save raw bytes even when monitor_gamma is
+/// monitor_gamma only in CrtStyle::Off; every other style (including the
+/// shipped default, Subtle) must save raw bytes even when monitor_gamma is
 /// set, or the screenshot darkens while the window it is supposed to match
 /// does not.
 #[test]
@@ -167,8 +167,8 @@ fn volume_gain_amplifies_above_unity_up_to_the_ceiling() {
 /// egui's stock parser is a plain float parse. Against a box that displays
 /// "80%" it fails twice: it rejects the string the box seeded itself with, so
 /// Enter on unedited text does nothing, and it takes a typed `100` at face
-/// value. That second one used to be harmless -- 100 clamped to the old ceiling
-/// of 1.0, which is what the user meant anyway -- and stopped being harmless the
+/// value. That second one used to be harmless (100 clamped to the old ceiling
+/// of 1.0, which is what the user meant anyway) and stopped being harmless the
 /// moment the ceiling moved to 5.0, because now typing the neutral setting jumps
 /// the knob to five times it. Pin the divide, the suffix, and the rejection.
 #[test]
@@ -364,7 +364,7 @@ fn star_icon_is_red_in_the_centre_and_clear_in_the_corner() {
 
 /// Accept must be able to RETRY a MIDI engine, not only change it.
 ///
-/// A user whose P330 failed to open -- bad ROM path, missing port -- had no way
+/// A user whose P330 failed to open (bad ROM path, missing port) had no way
 /// to ask for another attempt: the request was sent only when the configuration
 /// differed, so fixing the problem outside the emulator and pressing Accept did
 /// nothing. Worse, an engine that failed while running latched its error, and
@@ -416,7 +416,7 @@ fn accepting_the_panel_retries_a_midi_engine_that_is_not_ready() {
     // With nothing running there is no engine to RETRY: a status can only be
     // stale, and an engine can only be re-opened, when a worker is holding one.
     // An unpowered machine reports `MidiStatus::default()` (Ready) for both
-    // legs anyway, so this pair cannot arise from a real snapshot -- it is
+    // legs anyway, so this pair cannot arise from a real snapshot: it is
     // written out to pin that the retry half is gated on `powered` and not on
     // the statuses happening to be Ready.
     assert!(!midi_request_needed(
@@ -430,12 +430,12 @@ fn accepting_the_panel_retries_a_midi_engine_that_is_not_ready() {
 /// A configuration changed while the machine is OFF must still be sent.
 ///
 /// There is no engine to reconfigure, which is why the RETRY half of this
-/// decision is gated on `powered` -- but the session is not idle. With no
+/// decision is gated on `powered`, but the session is not idle. With no
 /// worker it applies the change to its own spec and snapshot and emits the
 /// `Applied` event, and that event is the only thing that writes `prefs.midi`.
 /// So refusing to send while powered off lost the setting three times over: the
 /// next power-on booted the old configuration, `izarravm.conf` never learned
-/// the new one, and the panel -- which reseeds from the snapshot -- showed the
+/// the new one, and the panel (which reseeds from the snapshot) showed the
 /// old values back with no error. Accept looked like it had worked.
 ///
 /// The two links after this one are pinned next door:
@@ -473,7 +473,7 @@ fn a_midi_change_made_while_the_machine_is_off_is_still_sent() {
 /// The MT-32 ROM boxes take a FOLDER as readily as a file.
 ///
 /// The loader identifies ROM images by content, and a set whose images are
-/// split halves cannot be named as two files at all -- the halves have to be
+/// split halves cannot be named as two files at all: the halves have to be
 /// found together. Requiring `is_file` here greyed the Munt entry out for a
 /// user with a perfectly good ROM set in a folder.
 #[test]
@@ -509,7 +509,7 @@ fn the_mt32_rom_boxes_accept_a_folder_a_file_or_neither() {
 /// Every ROM failure the loader can report must read as a different sentence.
 ///
 /// The owner's MT-32 set failed with "The MIDI output could not be
-/// initialized." and nothing else -- no file name, no requirement, no hint that
+/// initialized." and nothing else: no file name, no requirement, no hint that
 /// a folder would have worked. A status that cannot say what went wrong is a
 /// status that sends the user back to guessing.
 ///
@@ -579,7 +579,7 @@ fn an_unpainted_frame_folds_its_damage_into_the_next_one() {
 
 /// A merge is only sound while the two frames describe the same screen. A
 /// worker generation change republishes from a fresh machine, so the older
-/// frame's rows mean nothing against it -- and the resulting publication gap is
+/// frame's rows mean nothing against it, and the resulting publication gap is
 /// what makes the consumer take the new frame whole.
 #[test]
 fn frames_from_different_generations_do_not_fold() {

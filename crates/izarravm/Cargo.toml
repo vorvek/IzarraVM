@@ -52,7 +52,7 @@ shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-machin
 # `izarravm-machine`'s arm is NOT optional and never was "CI symmetry": the batch loop's
 # interpreter forcing (F1) and the HLE soft-int SERVICE refusal (F2) both live behind it,
 # in `izarravm-machine/src/run.rs`. Without it a feature build of this crate carries the
-# memo module and neither of its two soundness fixes -- measured on `tyrian-specs-586`
+# memo module and neither of its two soundness fixes, measured on `tyrian-specs-586`
 # 2026-09-04: `learn_batches` 0, `learn_refused[native_store]` 363,377 on the dominant key,
 # `answered` 0 over 1,459,467 trips.
 reflected-call-memo = [

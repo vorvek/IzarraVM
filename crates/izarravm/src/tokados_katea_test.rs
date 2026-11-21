@@ -85,7 +85,7 @@ fn katea_static_hdd_boots() {
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn katea_host_folder_boots_and_lists_a_host_file() {
     // A unique scratch folder under the system temp dir, holding one host file
-    // whose 8.3 name (GREETING.TXT — already a valid 8.3 name, no ~n fold) is
+    // whose 8.3 name (GREETING.TXT, already a valid 8.3 name, no ~n fold) is
     // distinct from the system files, so spotting it in DIR proves the host
     // folder reached the volume.
     let scratch = TokaScratch::new("katea_folder");
@@ -131,7 +131,7 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
 
     // TYPE the host file: this drives the kernel to READ the file's data, which
     // the facade serves lazily (open+seek+read) straight from the host file on
-    // disk — proving the data path, not just the synthesized directory entry.
+    // disk, proving the data path, not just the synthesized directory entry.
     // The host folder must still exist while the read happens, so the cleanup
     // waits until after both screens are captured.
     for ch in "type c:\\greeting.txt\r".chars() {
@@ -168,7 +168,7 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
 /// GUI stays frozen on the POST splash while the booted OS writes to the hidden
 /// VGA text buffer. Boot a host folder with `set_fast_post(false)` (so the
 /// graphical POST runs and activates Margo) and assert the display latch is
-/// cleared — i.e. the BIOS handed the screen back to VGA text — by the C:\>
+/// cleared (i.e. the BIOS handed the screen back to VGA text) by the C:\>
 /// prompt. The headless `screen_text()` rasterizes the VGA core regardless of
 /// the latch, so the `margo_active()` check (not the screen text) is what
 /// guards the GUI-visible bug.
@@ -270,7 +270,7 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
 
     // TYPE the file at depth: the kernel reads its data clusters, which the
     // tree facade serves lazily (open+seek+read) straight from the host file
-    // under GAMES\HELLO — proving the lazy data path at depth, not just the
+    // under GAMES\HELLO, proving the lazy data path at depth, not just the
     // synthesized directory entry. The host tree must still exist while the
     // read happens, so cleanup waits until both screens are captured.
     for ch in "type readat.txt\r".chars() {
@@ -302,8 +302,8 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
 }
 
 /// Real FreeDOS, booted from a host folder, creates a
-/// new file, overwrites an existing one, and grows one — all in a subfolder,
-/// plus MKDIR a host subdir with a file at depth — and the changes appear
+/// new file, overwrites an existing one, and grows one (all in a subfolder,
+/// plus MKDIR a host subdir with a file at depth) and the changes appear
 /// correctly in the host folder (verified by host-side read-back), with the
 /// read tree + boot intact.
 #[test]
@@ -416,7 +416,7 @@ echo deep>SUB\\DEEP.TXT\r\n";
 
 /// Real FreeDOS deletes a file, renames a file in place, moves
 /// a file into a subdir, RMDIRs an emptied dir, renames a subdir, and deletes a
-/// PRE-EXISTING host file — all reflected in the host folder, read back.
+/// PRE-EXISTING host file, all reflected in the host folder, read back.
 #[test]
 #[ignore = "boots a full DOS image and mutates host files via Katea (slow); run with --ignored"]
 fn katea_host_folder_delete_rename_move_rmdir() {
@@ -430,7 +430,7 @@ fn katea_host_folder_delete_rename_move_rmdir() {
     std::fs::write(ops.join("KEEP.TXT"), b"rename me\r\n").unwrap();
     std::fs::write(ops.join("MOVEME.TXT"), b"move me\r\n").unwrap();
     std::fs::write(ops.join("PREEXIST.TXT"), b"existed first\r\n").unwrap();
-    // Only built-in FreeCOM commands (MOVE.EXE is not on the Katea C: drive —
+    // Only built-in FreeCOM commands (MOVE.EXE is not on the Katea C: drive:
     // the boot payload carries only KERNEL/COMMAND/CONFIG/AUTOEXEC). The file
     // move is COPY+DEL; the directory rename is REN, which this FreeCOM's
     // cmd_rename accepts on directories (its findfirst mask includes FA_DIREC).
@@ -522,7 +522,7 @@ del PREEXIST.TXT\r\n";
 }
 
 /// The katea-run gate: a program that exits 42, run through real FreeDOS via
-/// --katea-run, makes `katea_run` return 42 — proving boot -> AUTOEXEC -> RUNNER
+/// --katea-run, makes `katea_run` return 42, proving boot -> AUTOEXEC -> RUNNER
 /// -> EXEC -> AH=4Dh -> unit-tester exit -> TestExit, end to end.
 #[test]
 #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
@@ -539,8 +539,8 @@ fn katea_run_captures_a_program_exit_code() {
 }
 
 /// The kernel's .EXE relocation loop reads the fixup table in 32-entry spans
-/// (task.c, RELOC_SPAN). RELOCCHK.EXE carries 130 fixups — four full spans
-/// plus a 2-entry remainder — each pointing at a slot the program verifies
+/// (task.c, RELOC_SPAN). RELOCCHK.EXE carries 130 fixups (four full spans
+/// plus a 2-entry remainder) each pointing at a slot the program verifies
 /// against its own load segment, plus an unlisted canary word that must not
 /// move. Exit 42 = every fixup applied exactly once; 1 = a slot is missing
 /// or doubled; 2 = the canary was patched (a span applied one entry too
@@ -626,12 +626,12 @@ fn katea_run_repeated_guest_hlt_resumes_and_exits_under_tokaemm() {
 /// arrive on the host through the Katea folder.
 ///
 /// Root-caused a real, if rare, phantom-Alt bug (not the startup
-/// `EV_ALT_TAP` a prior investigation suspected -- that edge detector is
+/// `EV_ALT_TAP` a prior investigation suspected: that edge detector is
 /// fine, and a live COM1 trace showed it never fired here). The actual
 /// mechanism, isolated with a `dispatch()`-side COM1 trace: a single
-/// `_bios_keybrd(_KEYBRD_SHIFTSTATUS)` (`int 16h ah=02h`) call -- and even
+/// `_bios_keybrd(_KEYBRD_SHIFTSTATUS)` (`int 16h ah=02h`) call (and even
 /// a direct peek of the BDA `KB_FLAGS` byte (0x417) itself, bypassing INT
-/// 16h entirely -- can occasionally read the Alt bit set for exactly one
+/// 16h entirely) can occasionally read the Alt bit set for exactly one
 /// poll iteration coinciding with an ordinary keystroke (observed: 'h',
 /// scancode 0x23), with no sustained held key behind it and nothing
 /// visible to external host-side sampling even at 2500-cycle granularity.
@@ -639,7 +639,7 @@ fn katea_run_repeated_guest_hlt_resumes_and_exits_under_tokaemm() {
 /// the Alt+H menu hotkey, opening Help instead of typing the letter. This
 /// reproduces deterministically with the committed image (fails 8/8,
 /// passed with an earlier image build whose embedded FreeDOS
-/// kernel-build timestamp shifted every downstream byte offset) -- a
+/// kernel-build timestamp shifted every downstream byte offset): a
 /// genuine timing-sensitive glitch in the keyboard delivery path, not a
 /// logic bug in the BIOS assembly (`kbd-bios-core.inc`'s `.flags` handler
 /// is a plain `mov al,[KB_FLAGS]`), the CPU's INT/IRET/IRQ dispatch
@@ -716,7 +716,7 @@ fn tokaedit_edits_and_saves_a_file() {
     }
 
     // File > Save: Alt+F opens the File menu, then 's' picks "&Save".
-    // Each scancode gets its own run slice -- see the root-cause note
+    // Each scancode gets its own run slice. See the root-cause note
     // above for why a single batched injection can't deliver this chord.
     for code in [0x38u8, 0x21, 0xa1, 0xb8] {
         machine.inject_key_scancodes(&[code]);

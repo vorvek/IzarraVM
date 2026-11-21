@@ -14,7 +14,7 @@ command exec, and disk load.
 This is a PROFILER, NOT AN A/B LADDER. It runs each persona once, with no
 pairing, no interleaving, no measurement lock and no determinism check, and its
 phase slicing perturbs the run loop. Never make an accept/reject decision from
-these numbers -- that is scripts/run-realtime-gate.ps1's job.
+these numbers: that is scripts/run-realtime-gate.ps1's job.
 
 .EXAMPLE
 ./scripts/run-boot-profile.ps1

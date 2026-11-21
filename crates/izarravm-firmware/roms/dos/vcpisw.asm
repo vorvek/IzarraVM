@@ -23,7 +23,7 @@
 ;
 ; Signals 0xA5 (success) via the unit-tester exit port; 0xEn names the step.
 ; Any fault inside PM (bad switch, bad entry) never reaches sig: the run
-; times out or the machine crashes -- both fail the e2e loudly.
+; times out or the machine crashes: both fail the e2e loudly.
 ;
 ; Build: nasm -f bin vcpisw.asm -o vcpisw.com
 cpu 386
@@ -70,7 +70,7 @@ start:
 
     ; Keep a 64 KB XMS block locked throughout the VCPI mode switch. XMS and
     ; VCPI now share ONE pool (see tokaemm.asm), so the allocation MUST show up
-    ; in the VCPI free count -- it used to assert the count was unchanged, which
+    ; in the VCPI free count: it used to assert the count was unchanged, which
     ; was the disjoint-pool contract. `free_v86` is then rebased to the
     ; with-block-held count, which is the baseline every later DE03 compares to.
     ; A page DE04 hands out still must not overlap the block: one pool, but
@@ -202,14 +202,14 @@ do_switch:
     ; never acknowledged while we sit here: the timer's request latches in the
     ; IRR and stays there, unacknowledged, with the ISR untouched. Wait until
     ; the chip actually shows IR0 set, so the switch below is guaranteed to
-    ; cross the boundary with a request outstanding -- a fixture that switched
+    ; cross the boundary with a request outstanding: a fixture that switched
     ; before the tick landed would prove nothing.
     ;
     ; This probe used to read the ISR (OCW3 0x0B) because the pre-IOPL-3
     ; monitor kept the real IF open and virtualized IF as VIF: it acknowledged
     ; the line immediately and parked it in `vip`, so IS0 was the observable.
     ; That monitor could then be left holding a line it could never deliver
-    ; across DE0C -- the wedge this fixture exists to catch. With no early
+    ; across DE0C, the wedge this fixture exists to catch. With no early
     ; INTA there is no held line to observe, and the IRR is where an
     ; undelivered request now lives. The wedge assertions after the switch are
     ; unchanged; only the way the precondition is established moved.
@@ -246,7 +246,7 @@ pm_landing:
     mov esp, pmstack_top          ; FULL ESP load: the server left its own
                                   ; ring-0 ESP here (high word nonzero), and
                                   ; the DE0C-back frame is read with 32-bit
-                                  ; addressing -- a bare `mov sp` would leave
+                                  ; addressing: a bare `mov sp` would leave
                                   ; garbage in the high word (the spec's
                                   ; SS:ESP-in-first-MB contract implies a
                                   ; clean full ESP)
@@ -262,7 +262,7 @@ pm_landing:
     ; with VIF forced 0, so `maybe_deliver` will never drain `vip` again. A line
     ; still in service is therefore in service forever, and per the 8259A's
     ; fully nested rule ("While the IS bit is set all further interrupts of the
-    ; same or lower priority are inhibited") a stuck IS0 -- the highest level --
+    ; same or lower priority are inhibited") a stuck IS0 (the highest level)
     ; inhibits the whole chip: this client's clock stops. That was E10's
     ; regression in the field (Tomb Raider frozen on the FMV's first frame,
     ; Grand Prix 2 frozen mid-race at LAP 0).
@@ -271,7 +271,7 @@ pm_landing:
     in al, 0x20
     test al, 0x01
     jnz pm_f_held                 ; IS0 survived the switch: the chip is wedged
-    ; Not merely clear -- still ALIVE. Interrupts are off here (DE0C hands over
+    ; Not merely clear: still ALIVE. Interrupts are off here (DE0C hands over
     ; with IF=0 and we never STI), so poll the chip by hand: OCW3 P=1 performs
     ; the acknowledge a real INTA would. On a monitor that stranded the line
     ; this spins out; on a correct one the re-latched timer request is taken

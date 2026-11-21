@@ -908,8 +908,8 @@ fn wss_16bit_stereo_dma_plays_and_irqs_through_the_machine() {
 /// The driver's very first write is the board config register, and it derives
 /// the PIC vector and mask it hooks from the same IRQ number it encoded there.
 /// So the terminal-count interrupt has to land on the line the config byte
-/// named, not on the profile's. Dropping that write -- which is what we used to
-/// do -- left the codec interrupting IRQ 11 while the guest waited on IRQ 7,
+/// named, not on the profile's. Dropping that write (which is what we used to
+/// do) left the codec interrupting IRQ 11 while the guest waited on IRQ 7,
 /// and the setup utility's card test spun forever.
 #[test]
 fn wss_hmi_start_sequence_selects_irq7_and_interrupts_on_that_line() {
@@ -1030,7 +1030,7 @@ fn the_board_irq_verify_strobe_asserts_the_selected_line() {
         );
     });
 
-    // Releasing it lowers the line. The IRR stays latched -- an edge-triggered
+    // Releasing it lowers the line. The IRR stays latched: an edge-triggered
     // 8259 holds the request until it is acknowledged, which is the hardware
     // behaviour, not a shortcut.
     with_bus(&mut machine, |bus| {
@@ -1087,8 +1087,8 @@ fn a_board_config_write_does_not_clear_another_devices_level() {
     // one input level per line, not a wired-OR of per-device levels, so if the
     // board *does* raise and release a line another device holds, that device's
     // level goes with it. Two devices driving one ISA interrupt line is a bus
-    // conflict on real hardware -- which is why `AppConfig::validate` refuses to
-    // put the WSS and the SB16 on the same line in the first place -- so the
+    // conflict on real hardware (which is why `AppConfig::validate` refuses to
+    // put the WSS and the SB16 on the same line in the first place) so the
     // guarantee worth having, and the one asserted above, is that the board
     // never lowers a line it did not raise.
 }
@@ -1178,7 +1178,7 @@ fn wss_dma_position_advances_with_the_frames_the_guest_hears() {
     );
 
     // Advance a fraction of the buffer and watch the counter move with it. At
-    // 8000 Hz, 10 guest ms is 80 frames -- well short of the 256-frame buffer,
+    // 8000 Hz, 10 guest ms is 80 frames, well short of the 256-frame buffer,
     // so the count must land strictly inside it rather than back at the reload.
     let clocks = GswMode::Gsw386
         .clock_rate()
@@ -1190,8 +1190,8 @@ fn wss_dma_position_advances_with_the_frames_the_guest_hears() {
         "the guest-visible DMA position must advance as frames play (start {start}, now {mid})"
     );
     // 80 frames of a 256-frame buffer leaves ~175. Anything at or below half the
-    // buffer means the advance consumed far more than it played -- the shape of
-    // the defect -- so the bound sits there rather than just above zero.
+    // buffer means the advance consumed far more than it played (the shape of
+    // the defect) so the bound sits there rather than just above zero.
     assert!(
         mid > 128,
         "and it must NOT have run ahead of what it played inside one advance \
@@ -1688,7 +1688,7 @@ fn fine_batch_fallback_is_gated_on_an_active_audio_consumer() {
     // the 1 ms fallback; arming a consumer that can observe batch granularity
     // pulls the cap down to one DAC period. Every arming path below leaves its
     // own event deadline far outside 1 ms, so the DAC period is the ONLY thing
-    // that can produce the fine value -- an ungated cap would fail the idle
+    // that can produce the fine value: an ungated cap would fail the idle
     // assertions, and a gate stuck off would fail the armed ones.
     type ArmConsumer = fn(&mut Machine);
     let consumers: [(&str, ArmConsumer); 5] = [
@@ -1802,7 +1802,7 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge_for_the_push
     // it consumes at most ONE command per batch. Section 9 promises PUSH_GET
     // "advances through the ring as it consumes commands"; without a batch
     // boundary at each modeled completion the ring would drain at batch cadence
-    // instead -- a whole cap per ~740 ns operation. STATUS.BUSY does NOT need
+    // instead, a whole cap per ~740 ns operation. STATUS.BUSY does NOT need
     // the boundary (the analytic peek answers it at the read instant), which is
     // why the term is conditional rather than unconditional now.
     for mode in [
@@ -1828,7 +1828,7 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge_for_the_push
 
         // 2. A 5x4 PATCOPY is 100 ns setup + 20 pixels * 5 ns = 200 ns, well
         //    inside every fallback, so only the deadline term can produce this
-        //    value -- which makes the two arms below distinguishable.
+        //    value, which makes the two arms below distinguishable.
         let busy_ns = machine.vega.blitter_busy_ns();
         assert_eq!(busy_ns, 200, "{mode:?}");
         let blit_edge = machine
@@ -1841,7 +1841,7 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge_for_the_push
         );
 
         // 3. With NO pusher work the batch is NOT cut at the completion edge.
-        //    The guest can still see BUSY drop on time -- through the peek, not
+        //    The guest can still see BUSY drop on time, through the peek, not
         //    through the batch boundary.
         assert_ne!(
             machine.event_batch_cap(u64::MAX),
@@ -1875,8 +1875,8 @@ fn event_batch_cap_ends_the_batch_at_the_margo_blit_completion_edge_for_the_push
 #[test]
 fn no_margo_write_ends_the_batch_while_a_long_blit_drains() {
     // No video-aperture write ends a batch, the arming one included. A blit can
-    // outlast a batch -- this 640x480 PATCOPY models ~1.54 ms against a 1 ms
-    // coarse cap -- and a guest that overlaps CPU rendering with one must keep
+    // outlast a batch (this 640x480 PATCOPY models ~1.54 ms against a 1 ms
+    // coarse cap) and a guest that overlaps CPU rendering with one must keep
     // batching its framebuffer writes. This used to be an argument about the
     // arming break being EDGE- and not level-triggered; the break is gone, but
     // the edge survives it (`VideoWrite::ArmedBlit` now stamps the arm-time
@@ -2119,7 +2119,7 @@ fn wss_irq7_wakes_a_halted_cpu_via_fast_forward() {
     // Mirror sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward for the WSS wake
     // branch in next_device_wake: a guest arms WSS playback with IEN set and
     // IRQ7 unmasked, then sti;hlt. The run loop must fast-forward across the
-    // codec's terminal-count window and deliver IRQ7 -- proving the wss_wake
+    // codec's terminal-count window and deliver IRQ7, proving the wss_wake
     // estimator drives the machine, not just the wss.rs unit test.
     // WSS pinned to IRQ7 rather than taken from the default, which is now IRQ11.
     // This fixture's guest code programs the MASTER PIC and unmasks bit 7; IRQ11
@@ -2210,7 +2210,7 @@ fn wss_masked_irq7_does_not_wake_the_cpu() {
     // The IRQ-masked path: with IRQ7 masked, next_device_wake's wss branch must
     // be None (it gates on pic.deliverable), so sti;hlt is a genuine halt the
     // codec cannot wake. We mask EVERY line (IMR = 0xFF) so the WSS is the only
-    // armed device and no other source can confound the wake -- the run loop
+    // armed device and no other source can confound the wake: the run loop
     // therefore halts at the first hlt and the handler never runs, even with
     // interrupts enabled. (The sticky Status INT bit is proven separately in
     // wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge.)
@@ -2268,8 +2268,8 @@ fn wss_masked_irq7_does_not_wake_the_cpu() {
 fn wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge() {
     // Underflow sets the codec's *internal* sticky Status INT bit regardless of
     // IEN (datasheet: the internal INT bit becomes one on counter underflow even
-    // if IEN is zero), but the external INT *pin* -- and hence the PIC forward in
-    // advance_devices -- is gated by IEN. Arm with IEN CLEAR and drive the codec
+    // if IEN is zero), but the external INT *pin* (and hence the PIC forward in
+    // advance_devices) is gated by IEN. Arm with IEN CLEAR and drive the codec
     // to terminal count directly (advance_devices, no CPU); the sticky bit must
     // be set while no edge ever reaches the PIC, proving the two are distinct.
     const R2_INT: u8 = 0x01;
@@ -2317,7 +2317,7 @@ fn wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge() {
 fn wss_disabled_leaves_its_ports_undecoded() {
     // With the codec disabled, its config/codec ports must NOT decode at all:
     // 0x530-0x537 is not in known_passive_ports(), so the bus must send both
-    // reads and writes to open bus -- not to a stale latched value. Reading
+    // reads and writes to open bus, not to a stale latched value. Reading
     // 0xFF is not enough on its own to show that, since a decoded stub answers
     // 0xFF too, so each check also asks whether the port floated. Contrast with
     // the enabled machine, which
@@ -2373,8 +2373,8 @@ fn wss_disabled_advance_and_render_run_cleanly_and_stay_silent() {
     // by the port-decode disabled test, which exits before any audio work. Run a
     // disabled machine through advance_devices AND render_audio to prove those
     // branches execute cleanly (no panic) and the WSS contributes silence. We
-    // arm DMA/codec ports first to confirm a disabled codec ignores them entirely
-    // -- but the ports do not decode, so the writes that would land on the codec
+    // arm DMA/codec ports first to confirm a disabled codec ignores them entirely,
+    // but the ports do not decode, so the writes that would land on the codec
     // are skipped; only the DMA programming (separate decoder) is set up.
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.wss = WssConfig {
@@ -2502,7 +2502,7 @@ fn ct1745_fm_level_attenuates_the_opl_through_render_audio() {
         (ratio - expected).abs() < 0.01,
         "level 19 is -24 dB on the FM bus: expected ratio {expected}, got {ratio} ({quiet}/{full})"
     );
-    // And a hard-muted FM bus silences the OPL entirely -- proof the leg is the
+    // And a hard-muted FM bus silences the OPL entirely, proof the leg is the
     // only thing standing between the synthesiser and the DAC here.
     assert_eq!(opl_peak_at_fm_level(0), 0, "level 0 on 0x34/0x35 is a mute");
 }
@@ -2516,7 +2516,7 @@ fn wss_is_summed_raw_bypassing_the_ct1745_master_gain() {
     let mut machine = test_machine();
     load_asymmetric_stereo(&mut machine, 64);
     with_bus(&mut machine, |bus| {
-        // Hard-mute the CT1745 master (0x30/0x31 = 0) -- this scales OPL+DSP to
+        // Hard-mute the CT1745 master (0x30/0x31 = 0): this scales OPL+DSP to
         // exactly zero but, per the contract, must NOT touch the WSS stream.
         bus.write_io(0x224, BusWidth::Byte, 0x30, false).unwrap();
         bus.write_io(0x225, BusWidth::Byte, 0x00, false).unwrap();
@@ -2534,7 +2534,7 @@ fn wss_is_summed_raw_bypassing_the_ct1745_master_gain() {
     );
 
     // Control: the SAME muted master with the OPL tone but WSS disabled yields
-    // silence -- confirming the master mute really does zero the OPL/DSP path,
+    // silence, confirming the master mute really does zero the OPL/DSP path,
     // so the non-silence above is the raw WSS sum and not a leaking OPL tone.
     let mut control = test_machine();
     with_bus(&mut control, |bus| {
@@ -2625,7 +2625,7 @@ fn wss_port_window_edges_and_config_region_decode_through_the_bus() {
 /// mix window comes from the host-paced OPL resampler, so the two disagree
 /// every call. `render_audio` reads the codec stream positionally, so anything
 /// past the window used to be dropped on the floor and the next short window
-/// covered with a repeated frame -- the same defect measured on the SB16 path,
+/// covered with a repeated frame, the same defect measured on the SB16 path,
 /// where a Quake capture showed ~14k frames discarded and ~14k repeated per
 /// second.
 #[test]
@@ -2830,7 +2830,7 @@ fn opl_trace_is_off_by_default_and_respects_its_cap() {
 }
 
 /// Program the SB16 for 22050 Hz 16-bit signed stereo auto-init output on DMA5
-/// -- what Duke Nukem 3D and its SETUP utility play through -- looping over an
+/// (what Duke Nukem 3D and its SETUP utility play through) looping over an
 /// 8-frame buffer of the given (left, right) sample pair. The CT1745 is left at
 /// its power-on defaults: the point of these tests is what the DEFAULTS do.
 fn play_16bit_stereo_pair(machine: &mut Machine, left: i16, right: i16) {
@@ -2881,7 +2881,7 @@ fn host_mix_peaks(machine: &mut Machine) -> (i32, i32) {
 ///
 /// Duke Nukem 3D's SETUP left/right speaker test was reported as CENTERED but
 /// quieter on both sides. Nothing in the voice path sums or averages the
-/// channels -- the collapse is symmetric hard clipping. With enough gain ahead
+/// channels: the collapse is symmetric hard clipping. With enough gain ahead
 /// of the final `clamp_i16`, BOTH channels rail at full scale no matter how far
 /// apart they started, which is a centred image made of square waves: the
 /// "peaked and muffled" half of the same bug report.
@@ -2947,8 +2947,8 @@ fn the_default_output_stage_preserves_a_panned_stereo_source() {
 /// One full-scale source at power-on defaults must not reach the clamp.
 ///
 /// A real SB16 does not clip its own full-scale DAC at its reset mixer
-/// settings, and SNDMIXER.COM -- which owns amplification per the owner
-/// directive -- needs somewhere to go UP to. Three dB is the floor.
+/// settings, and SNDMIXER.COM (which owns amplification per the owner
+/// directive) needs somewhere to go UP to. Three dB is the floor.
 #[test]
 fn a_full_scale_voice_at_power_on_defaults_keeps_its_headroom() {
     let mut machine = test_machine();
@@ -3027,7 +3027,7 @@ fn speaker_peak(machine: &mut Machine) -> i32 {
 ///
 /// This register used to be a pure store: a guest could write any of its four
 /// positions and the beeper never moved. The consequence was not only a missing
-/// control -- it was a level error, because the beeper was also summed AFTER
+/// control: it was a level error, because the beeper was also summed AFTER
 /// the node where every card leg gives up 6 dB of headroom, so it arrived
 /// louder than a full-scale card source instead of quieter.
 ///
@@ -3085,7 +3085,7 @@ fn pc_speaker_mixer_level_attenuates_the_beeper_through_render_audio() {
 /// the level tests above cannot see: the PC-SPK register would decode
 /// identically whether its output joined the mix before or after the node, and
 /// `MIX_HEADROOM` is the node's remaining scalar. A beeper added AFTER the node
-/// -- which is what it used to be -- reaches the output at the cardless level
+/// (which is what it used to be) reaches the output at the cardless level
 /// on both machines, and the comparison below fails by exactly 6 dB.
 #[test]
 fn a_machine_with_no_card_keeps_its_beeper_outside_the_card_stage() {
@@ -3163,7 +3163,7 @@ fn the_wavetable_registers_drive_the_midi_gain_and_not_the_fm_bus() {
 /// `gui_session::pump_audio` hands this one gain to BOTH engines, so it would
 /// take the external MIDI receiver down with the wavetable.
 ///
-/// The mutation this guards is the obvious implementation -- decoding the pair
+/// The mutation this guards is the obvious implementation: decoding the pair
 /// with the same `VOL5_STEPS[level]` every other register uses, where level 0
 /// is 0.0.
 #[test]
@@ -3265,7 +3265,7 @@ fn masked_sb16_line_does_not_offer_the_pause_wake() {
 
 #[test]
 fn pause_dac_holds_dma_across_the_batch_that_ends_at_its_deadline() {
-    // Codex on #734: `Sb16Path::advance` applied the countdown before it
+    // Found on #734: `Sb16Path::advance` applied the countdown before it
     // ticked the batch's frames, so a batch ending at the pause deadline
     // cleared the pause and then consumed every frame of the pause window.
     let mut machine = test_machine();

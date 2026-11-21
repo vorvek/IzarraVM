@@ -15,7 +15,7 @@
 ;     needs a reboot to move.
 ;   * CMOS NVRAM 0x1B-0x21, so the assignment survives a power cycle. Those
 ;     bytes sit inside the 0x10..0x2D checksum window, so 0x2E/0x2F are
-;     refreshed too -- without that the next POST discards the whole NVRAM as
+;     refreshed too: without that the next POST discards the whole NVRAM as
 ;     corrupt, taking the keyboard layout and CPU speed down with it.
 ;   * BLASTER and SETSOUND in the shell's MASTER environment, so a program
 ;     started after this tool sees the new routing without a reboot.
@@ -33,7 +33,7 @@
 ;   SNDCTRL /?                  usage
 ;
 ; /T only styles the /B summary. Used alone, or paired with anything other
-; than /B, it is accepted and simply has nothing to style -- a no-op, not an
+; than /B, it is accepted and simply has nothing to style: a no-op, not an
 ; error, the same way /S with no value switches is a no-op on the hardware.
 ;
 ; Build: nasm -f bin sndctrl.asm -o sndctrl.com
@@ -57,10 +57,10 @@ WSS_BASE       equ 0x530
 ; WRITE:  bits 5:3 select the IRQ, bits 1:0 the DMA channel, by the two fixed
 ;         board tables (see wss_config_byte). Bit 6 is the IRQ-verify strobe:
 ;         raising it drives the selected interrupt line, lowering it releases
-;         the line. This tool never raises it -- it moves the routing and leaves
-;         the verifying to whoever wants it -- so every byte it writes has bit 6
+;         the line. This tool never raises it (it moves the routing and leaves
+;         the verifying to whoever wants it) so every byte it writes has bit 6
 ;         clear, which is also what keeps the write free of side effects.
-; READ:   the presence signature plus the strobe -- bits 5:0 read 0x04 on a card
+; READ:   the presence signature plus the strobe: bits 5:0 read 0x04 on a card
 ;         that is there, bit 6 reads back the last strobe, and the SELECTION is
 ;         not readable at all. So this tool cannot ask the card what routing it
 ;         is on; CMOS is the record, the same way the MPU port is. Open bus
@@ -218,8 +218,8 @@ start:
 ;
 ; The codec cannot be asked. A Microsoft Sound System board's configuration
 ; register reads back a presence signature, not the selection that was written
-; into it -- that is a property of the real hardware, and detection code depends
-; on it -- so the WSS IRQ and DMA come from CMOS, along with the MPU port (which
+; into it (that is a property of the real hardware, and detection code depends
+; on it) so the WSS IRQ and DMA come from CMOS, along with the MPU port (which
 ; has no hardware register at all; both MPU ports stay decoded either way and the
 ; setting only decides which one BLASTER advertises). A game that re-points the
 ; codec for itself therefore will not show up here, which is correct: it moved
@@ -282,7 +282,7 @@ read_hardware:
     ; Everything below comes from CMOS, so one magic check covers all of it. A
     ; bad magic means the block has never been written (or the host is about to
     ; reseed it), and the field defaults in `fields` already hold the machine's
-    ; power-on assignment -- so leaving them alone is the right answer.
+    ; power-on assignment, so leaving them alone is the right answer.
     mov al, CM_MAGIC
     call cmos_read
     cmp al, CM_MAGIC_VALUE
@@ -321,7 +321,7 @@ read_hardware:
 ;
 ; The wait is bounded by the BIOS tick counter, not by an iteration count. The
 ; DSP needs ~100us of settle time to answer, and how many poll instructions fit
-; into 100us depends entirely on the CPU persona -- a count tuned on the 166 MHz
+; into 100us depends entirely on the CPU persona: a count tuned on the 166 MHz
 ; part reports "not installed" on the 22 MHz one, and vice versa. Three ticks
 ; (~165ms) is far longer than any real settle and still instant to a person. The
 ; iteration cap underneath it is a backstop for a machine whose timer interrupt
@@ -365,7 +365,7 @@ probe_sb:
 
 ; The board's presence signature, the same check every MSS driver makes: bits
 ; 5:0 of the configuration register read 0x04 on a card that is there. Bit 6 is
-; the IRQ-verify strobe -- it reads back whatever the last write left there, so
+; the IRQ-verify strobe: it reads back whatever the last write left there, so
 ; it is masked off here along with undefined bit 7. An absent card leaves the
 ; port on open bus (0xFF), which fails the compare.
 probe_wss:
@@ -447,7 +447,7 @@ parse_tail:
     mov [cur_kind], al
     mov al, [bx + 3]
     mov [cur_field], al
-    ; Kinds 2-3 are the value switches and MUST stay contiguous here -- this
+    ; Kinds 2-3 are the value switches and MUST stay contiguous here: this
     ; is the range test that routes them; every other kind is a flag and
     ; falls through to the .flag chain below, which must give it an explicit
     ; arm (see the guard note at sw_table).
@@ -1196,7 +1196,7 @@ copy_str:
 ;
 ; The list offered is the hardware's own option list minus whatever the peer
 ; device currently holds, so an assignment that would collide is not merely
-; rejected -- it is never presented. An absent peer cannot collide, so its value
+; rejected: it is never presented. An absent peer cannot collide, so its value
 ; is not withheld.
 ; =============================================================================
 open_menu:
@@ -1633,15 +1633,15 @@ apply_hw:
 ; The two board tables are fixed by the hardware, not by us:
 ;   IRQ  bits 5:3 -> 5, 7, 9, 10, 11, 12, 14, 15   (codes 0..7)
 ;   DMA  bits 1:0 -> 0, 0, 1, 3                    (codes 0..3)
-; Only the lines and channels this tool offers are encoded here -- opt_wssirq is
-; {7, 9, 10, 11} and opt_dma8 is {0, 1, 3}, both proper subsets -- so every
+; Only the lines and channels this tool offers are encoded here (opt_wssirq is
+; {7, 9, 10, 11} and opt_dma8 is {0, 1, 3}, both proper subsets) so every
 ; selection the menus and the command line can produce has an exact encoding.
 ; Channel 0 uses code 1 rather than code 0; the two are equivalent on the board,
 ; and code 1 is what real MSS drivers emit. Bit 6 (the IRQ-verify strobe) is left
 ; clear, so applying a routing never drives an interrupt line.
 ;
 ; COUPLED TO opt_wssirq: the fall-through below encodes IRQ 11. Adding a line to
-; that list without adding a case here would silently encode it as 11 -- the
+; that list without adding a case here would silently encode it as 11: the
 ; menu would show one line and the board would be on another.
 wss_config_byte:
     mov ah, 0x20                ; IRQ 11 (code 4), the fall-through default
@@ -2314,7 +2314,7 @@ report:
 ; /B boot summary: exactly two rows, no more (hard 25-row screen budget).
 ; Row 1 is the heading, printed straight from its own CRLF-terminated string.
 ; Row 2 is built in `linebuf` the same way report() builds its rows, reusing
-; the same probed fields report() reads -- read_hardware has already run by
+; the same probed fields report() reads: read_hardware has already run by
 ; the time start: gets here, same as it has for /S. Nothing here writes to
 ; the hardware, CMOS, the environment, or AUTOEXEC.BAT.
 ; =============================================================================
@@ -2383,7 +2383,7 @@ boot_report:
     mov si, msg_boot_gap
     call copy_str
     ; ---- MIDI ----
-    ; The MPU IRQ is fixed at 9, same as s_rep_mpu_tail in report() -- there is
+    ; The MPU IRQ is fixed at 9, same as s_rep_mpu_tail in report(): there is
     ; no field for it, so it is a literal here too, not a u8dec of anything.
     mov si, msg_boot_midi
     call copy_str
@@ -2607,7 +2607,7 @@ msg_wss_absent:  db '  Windows Sound System  not installed', 13, 10, 0
 
 ; ---- /B boot summary ---------------------------------------------------
 ; Tree glyphs match TOKAEMM/TOKAMOUS/IZCDEX's /T bytes exactly (0xC3 0xC4
-; '>' ' ' for the heading, 0xB3 for the gutter) -- duplicated here per the
+; '>' ' ' for the heading, 0xB3 for the gutter), duplicated here per the
 ; family's deliberate per-tool policy rather than shared.
 msg_boot_tree:     db 0xC3, 0xC4, '>', ' ', 0
 msg_boot_gut:      db 0xB3, 0
@@ -2621,7 +2621,7 @@ msg_boot_absent:   db 'absent', 0
 msg_boot_gap:      times 3 db ' '     ; 3-space gap between device groups
                    db 0
 ; The space precedes the letter; the letter itself sits directly against its
-; digit (I7, not I 7) -- see boot_report, which appends the digits with u8dec.
+; digit (I7, not I 7). See boot_report, which appends the digits with u8dec.
 msg_boot_irq:      db ' I', 0
 msg_boot_dmal:     db ' D', 0
 msg_boot_dmah:     db ' H', 0

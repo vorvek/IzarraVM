@@ -12,7 +12,7 @@
 //!  * `disarmed_run_records_nothing` FAILS if the sentinel is ever initialised to anything but
 //!    `u64::MAX`, which is the one way a default-off instrument turns itself on. It also asserts
 //!    the CPU-side entry tally is absent, which is the v2 way for a default-off instrument to
-//!    turn itself on -- and the expensive way.
+//!    turn itself on, and the expensive way.
 //!  * `armed_short_run_records_windows` additionally pins the v2 columns: `retired` must SUM to
 //!    the machine's own `perf.instructions` (so deleting the retired capture, or capturing it
 //!    once and never advancing the window start, fails), `coverage` must equal

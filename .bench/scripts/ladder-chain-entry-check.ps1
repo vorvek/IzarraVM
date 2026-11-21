@@ -36,8 +36,8 @@ DO NOT baseline against `.bench/results/retire-governor-blast-20260825/`. That
 survey was measured on `main` and ranks the effect; it does not grade it. All three
 cells come fresh from this binary and the two sets are never quoted across.
 
-CONTAMINATION IS MEASURED, NOT ASSUMED. The 2026-08-24 board was contaminated by an
-agent and read four rows 8-16% slow; the PIT ladder of the same night came back
+CONTAMINATION IS MEASURED, NOT ASSUMED. The 2026-08-24 board was contaminated by a
+concurrent session and read four rows 8-16% slow; the PIT ladder of the same night came back
 24/24 dirty on one row with a 2x outlier. Every leg records whether a builder was
 alive in its window.
 #>
@@ -129,7 +129,7 @@ $fixtures = @{
         arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega"); injection = @()
     }
     # The LONG duke row. Excluded from the exploratory ladder at ~205 s a leg, but
-    # the standing rule is that it runs before any merge decision -- the short row
+    # the standing rule is that it runs before any merge decision: the short row
     # ladders candidates, it does not replace this one. It scores itself through
     # DUKEMARK, so its report is an invariant in its own right.
     "duke3d-586"          = @{ folder = "duke3d_c"; cycles = "79680000000"
@@ -196,7 +196,7 @@ function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
 
 # Half drives Resolve-RowSelection directly. The other half spawns this very
 # script under `pwsh -File` with the mangled two-token shape, because that
-# failure happens in the parameter binder -- before any function here runs --
+# failure happens in the parameter binder (before any function here runs)
 # and only a real child invocation can prove the guard fires there. The
 # campaign rule applies: the guard must go RED on the broken input, and a green
 # control must show the child harness works.
@@ -304,7 +304,7 @@ function Get-BuilderCount {
 }
 
 # The builder check above only sees OUR OWN toolchain. It is blind to everything
-# else on the machine -- a browser, a mail client, an indexer, anything the person
+# else on the machine: a browser, a mail client, an indexer, anything the person
 # at the keyboard happens to open. That gap was found the hard way on 2026-08-25,
 # when the owner checked email during a leg and the leg came back 5.5 s slow with
 # `dirty = false`.
@@ -411,7 +411,7 @@ function Invoke-Leg([string]$Row, [string]$Cell, [int]$Round) {
         dirty      = ($before -gt 0 -or $after -gt 0)
         # The emulator is single-threaded, so on a 32-core host its own share is
         # ~3%. Anything much above that is somebody else's work. Recorded, not
-        # acted on -- min-wall already discards a slow leg, and a leg flagged
+        # acted on: min-wall already discards a slow leg, and a leg flagged
         # here is a prompt to look, not a verdict.
         cpu_before = $cpuBefore
         cpu_after  = $cpuAfter

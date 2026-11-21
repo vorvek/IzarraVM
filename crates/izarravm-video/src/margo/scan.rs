@@ -13,7 +13,7 @@
 //!   is why `dot_clock_hz` is derived here instead of being a table column.
 //! * A guest may poll that rate through Input Status 1 (0x3DA) while a VBE mode
 //!   is on screen. Before this module existed, 0x3DA answered from the legacy
-//!   VGA CRTC, which a `4F02h` mode set never touches -- so a guest that paced
+//!   VGA CRTC, which a `4F02h` mode set never touches, so a guest that paced
 //!   on 0x3DA and flipped with `4F07h` ran two clocks about 17% apart.
 //! * Frame phase zero is the FIRST ACTIVE DISPLAY DOT, which is the instant a
 //!   queued `DISP_START` becomes the origin being scanned out. That is not a
@@ -21,8 +21,8 @@
 //!   frame boundary that latches a page flip" the same clock, one whole
 //!   blanking interval apart, in that order, the way real hardware behaves.
 //!
-//! The geometry helpers themselves are the VGA core's -- literally the same
-//! functions, not a parallel implementation -- so the two display owners cannot
+//! The geometry helpers themselves are the VGA core's (literally the same
+//! functions, not a parallel implementation) so the two display owners cannot
 //! drift on what "in retrace" means or on when the next edge falls.
 
 use super::MargoDisplay;
@@ -33,8 +33,8 @@ use crate::vga::{CrtcTiming, dots_until_status1_bit_change, dots_until_vretrace_
 /// few tenths of a percent off the VESA DMT figures they are otherwise taken
 /// from (640x480 runs 25.200 MHz here against DMT's 25.175 MHz at 59.94 Hz).
 ///
-/// THE SINGLE SOURCE. `Timeline` drives `Margo::advance_frames` -- the
-/// `DISP_START` and `4F09h/80h` palette latch -- off this same constant, and the
+/// THE SINGLE SOURCE. `Timeline` drives `Margo::advance_frames` (the
+/// `DISP_START` and `4F09h/80h` palette latch) off this same constant, and the
 /// beam this module reports is derived from that same phase accumulator. Two
 /// copies of this number is exactly the bug class this module was written to
 /// close.
@@ -43,7 +43,7 @@ pub const MARGO_FRAME_HZ: u64 = 60;
 /// The scanout geometry and pixel clock in force for a Margo display mode.
 ///
 /// Cheap to construct (a `match` and a struct literal) and carries no state, so
-/// callers build it per query rather than caching it next to the mode -- there
+/// callers build it per query rather than caching it next to the mode: there
 /// is then no cache to invalidate when a mode set moves the geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MargoScanTiming {
@@ -133,7 +133,7 @@ impl MargoScanTiming {
 /// Scanout geometry for a displayed resolution.
 ///
 /// The four listed shapes are the industry timings for those resolutions at
-/// 60 Hz -- 640x480 and 640x400 are the IBM VGA's own (and 640x480's row is
+/// 60 Hz: 640x480 and 640x400 are the IBM VGA's own (and 640x480's row is
 /// character-for-character `CrtcTiming::mode_12h`, which is the same monitor
 /// signal); 800x600 and 1024x768 are VESA DMT's totals and sync positions. Only
 /// the pixel clock differs from those standards, because Margo runs them all at

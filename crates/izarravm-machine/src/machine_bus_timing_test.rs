@@ -425,7 +425,7 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
                     // instruction's own fetch), at zero wait-states, then read
                     // back the actual raw clocks the trace charged for it so
                     // the real-machine side below combines the exact same
-                    // total (not an assumed one) --
+                    // total (not an assumed one):
                     // record_instruction_fetch_run's per-byte cost is an
                     // internal BusCycle detail this test must not hardcode.
                     let before = bus.trace.elapsed_clocks();
@@ -490,8 +490,8 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
 ///
 /// The sweep deliberately reaches past one 60 Hz frame (`420_000` dots at
 /// 640x480, and a 386 at 16 MHz covers that in ~1.1M clocks), so the
-/// frame-crossing case -- the one where a wrong formula drifts instead of merely
-/// being offset -- is really exercised; `any_wrap` fails the test if it is not.
+/// frame-crossing case (the one where a wrong formula drifts instead of merely
+/// being offset) is really exercised; `any_wrap` fails the test if it is not.
 #[test]
 fn margo_predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() {
     let mut any_wrap = false;
@@ -546,8 +546,8 @@ fn margo_predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_sam
 /// The peek's OTHER half: `dots_until_status1_bit_change_from` must name the
 /// exact edge, not an approximate one. One dot short of the answer the bit still
 /// reads its old value; at the answer it reads the target. That is the property
-/// the JIT poll-skip search leans on -- it skips iterations up to but not across
-/// this distance -- so an off-by-one here is a guest that oversleeps a retrace.
+/// the JIT poll-skip search leans on (it skips iterations up to but not across
+/// this distance) so an off-by-one here is a guest that oversleeps a retrace.
 #[test]
 fn margo_status1_edge_peek_names_the_exact_dot() {
     let machine = margo_test_machine();
@@ -599,13 +599,13 @@ fn margo_status1_edge_peek_names_the_exact_dot() {
 /// what made that matter. `beam_at_batch_start` is captured in the dot unit of
 /// whichever engine owns the display at batch entry, and a Margo dot and a VGA
 /// dot are both a bare `u64`. `Distira::display_enabled` moves on a plain MMIO
-/// write to FBIINIT0, which is a bus-side write in the MIDDLE of a batch -- so a
+/// write to FBIINIT0, which is a bus-side write in the MIDDLE of a batch, so a
 /// guest can hand the display from Margo to Distira with no batch boundary in
 /// between, and tomb-raider-3dfx does precisely that after probing 101h.
 ///
 /// Without the owner snapshot, `predicted_beam` would spend the rest of that
 /// batch folding in-batch VGA dots onto a MARGO anchor (up to 1,083,263 at mode
-/// 0x105) and reducing it modulo the LEGACY frame -- a wrong beam, and therefore
+/// 0x105) and reducing it modulo the LEGACY frame: a wrong beam, and therefore
 /// wrong 0x3DA / 0x3C2 bits, for every read until the batch ended.
 ///
 /// Differential form, the same discipline as the peek twin above: the predicted
@@ -664,7 +664,7 @@ fn predicted_beam_survives_a_mid_batch_handover_of_the_display() {
     // WHY THE OPPOSITE MUTATION IS UNDETECTABLE, stated rather than left as a
     // hole in the ledger. Hardwiring the owner flag TRUE changes nothing on a
     // batch that started VGA-owned, because the fallback does not compute a
-    // DIFFERENT anchor there -- it re-derives the same one. Devices advance only
+    // DIFFERENT anchor there: it re-derives the same one. Devices advance only
     // at batch end, so the VGA raster's beam is constant for the life of a bus
     // and equals what was captured. The flag chooses between two values that are
     // equal whenever it is false, which is exactly why it is safe.
@@ -714,7 +714,7 @@ fn enable_distira_display(bus: &mut MachineBus<'_>) {
     .unwrap();
 }
 
-/// A 386 test machine sitting in VBE mode 0x101 (640x480x8, BANKED -- the window
+/// A 386 test machine sitting in VBE mode 0x101 (640x480x8, BANKED, the window
 /// GP2 was measured asking for). The mode is set through `Vega::set_vbe_mode`,
 /// the same host-side entry point `INT 10h 4F02h` funnels into, rather than by
 /// running guest code: these tests are about the beam formula, and driving a ROM
@@ -860,7 +860,7 @@ fn ring0_monitor_port_access_does_not_set_io_touched_in_approximate_class() {
     // V86 trap tax, Part 1: a port access made by the ring-0 monitor
     // (cpu_is_ring0_pm = true, the TOKAEMM monitor's remapped_pic_line PIC OCW3
     // probe being the motivating case) must NOT end the batch in the
-    // Approximate class (486/586) -- the io_touched flag stays false on
+    // Approximate class (486/586): the io_touched flag stays false on
     // both the read AND the write half of the OCW3 select-then-read idiom.
     // A guest (non-monitor) access to the same port keeps the old
     // unconditional-set behavior, both timing classes.
@@ -909,7 +909,7 @@ fn ring0_monitor_port_access_still_sets_io_touched_in_accurate_class() {
 #[test]
 fn guest_port_access_still_sets_io_touched_regardless_of_ring0_pm_flag() {
     // A false cpu_is_ring0_pm (the ordinary guest/V86 case) must keep the
-    // exact pre-Part-1 behavior in BOTH timing classes -- the exemption is
+    // exact pre-Part-1 behavior in BOTH timing classes: the exemption is
     // opt-in per access, never a global relaxation.
     for mode in [GswMode::Gsw386, GswMode::Gsw486] {
         let mut machine = test_machine();
@@ -954,7 +954,7 @@ fn lazy_pit_counter_read_does_not_set_io_touched_in_approximate_class_but_does_i
     // `lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate` exactly,
     // for the PIT counter ports. Before the L5 fix, EVERY 0x40-0x42 read fell through to the
     // "all remaining reads are exact" catch-all and set io_touched for a guest access in BOTH
-    // timing classes -- the counter's own peek arm ran too late to matter. `cpu_is_ring0_pm` is
+    // timing classes: the counter's own peek arm ran too late to matter. `cpu_is_ring0_pm` is
     // `false` throughout, the ordinary V86/real-mode guest case every corpus game runs under:
     // this is the read-side gap the plan's brk_step evidence points at, and the fix is the same
     // class-based shape 0x3DA/0x61 already use, not a widening of `skip_io_touched`.
@@ -986,14 +986,14 @@ fn lazy_pit_counter_read_does_not_set_io_touched_in_approximate_class_but_does_i
 
 #[test]
 fn v86_pit_counter_read_falls_back_to_the_non_lazy_path_for_a_bcd_channel() {
-    // The BCD leg the reviewer's fold caught: `count_after` declines for a
+    // The BCD leg: `count_after` declines for a
     // BCD-programmed counter and `Counter::read` (via `read_port_at`) silently
-    // falls back to `masked_count()` -- the frozen batch-start CE, not a live
+    // falls back to `masked_count()`, the frozen batch-start CE, not a live
     // one. The lazy exemption above is only sound because the peek is live
     // across the batch (see
     // `a_mid_batch_unlatched_pit_read_moves_with_the_in_batch_offset_in_the_approximate_class`);
     // for a BCD counter that premise is false, so the read must take the exact
-    // non-lazy path -- io_touched set -- exactly like
+    // non-lazy path (io_touched set) exactly like
     // `lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter`'s own BCD
     // fallback, in EITHER timing class (`counter_is_bcd` is checked unconditionally,
     // not gated on `lazy_port_reads`, matching 0x61's `!skip_io_touched` alone).
@@ -1055,7 +1055,7 @@ fn v86_pit_counter_read_falls_back_to_the_non_lazy_path_for_a_bcd_channel() {
 #[test]
 fn v86_status_and_pit_polls_leave_a_pending_interrupt_visible_at_the_same_boundary() {
     // L5's composite ask: a V86 fixture that reads 0x3DA and 0x40 with a PIC request already
-    // pending must still see that interrupt exactly where it was before -- these two ports'
+    // pending must still see that interrupt exactly where it was before: these two ports'
     // read-side exemption from `io_touched` must not hide or delay delivery. `io_touched`
     // only decides when a BATCH ends; `interrupt_pending()` is driven purely by `self.pic`
     // and is untouched by either read, so this is true by construction, but it is the
@@ -1108,7 +1108,7 @@ fn lazy_3da_read_still_resets_the_attribute_flip_flop_and_calls_catch_up() {
         // write, deliberately: `write_attr` toggles the flip-flop on EVERY
         // write, so a second "re-arm" write would itself consume the data
         // phase and put the flip-flop back at "index" regardless of whether
-        // the 3DA reset fires -- which would make this test pass even with
+        // the 3DA reset fires, which would make this test pass even with
         // the reset deleted (a mutation the spec review actually ran).
         bus.write_io(0x3C0, BusWidth::Byte, 0x05, false).unwrap();
         // Reading 0x3C0 returns `attr.index | pas << 5` and does NOT touch
@@ -1192,13 +1192,13 @@ fn lazy_reads_chain_into_far_fewer_batches_than_poll_iterations_with_monotone_ob
     // End-to-end no-time-travel test: a real mode-13h guest tightly polls
     // 0x3DA in a loop and
     // maintains, in guest memory, a running sample count and a toggle count
-    // of the vretrace bit (0x08) across every sample it has ever taken --
+    // of the vretrace bit (0x08) across every sample it has ever taken,
     // not just a bounded ring, so the toggle observation cannot be an
     // artifact of a capture window that happens to miss an edge. Asserts (a)
     // the Approximate-class run collapses many poll iterations into far
     // fewer `run_straight_line` calls (each 0x3DA IN no longer ends the
     // batch), and (b) the vretrace bit toggled at least once across the
-    // whole run -- proving the lazy per-read prediction actually tracked
+    // whole run, proving the lazy per-read prediction actually tracked
     // beam motion across many samples rather than reading a frozen value.
     //
     // Guest memory layout: [0x7000] sample count, [0x7004] toggle count,
@@ -1276,7 +1276,7 @@ fn lazy_reads_chain_into_far_fewer_batches_than_poll_iterations_with_monotone_ob
     // 13h runs ~70 frames/s, so ~3.5 frames, and the vretrace bit toggles
     // exactly twice per frame (set at retrace start, clear at its end) =
     // ~7 toggles. Plus the 50_000-clock warm-up (< 1ms, at most one edge
-    // pair -- the counter accumulates from boot) and +1 from the guest's
+    // pair; the counter accumulates from boot) and +1 from the guest's
     // 0xFF last-bit sentinel mismatching the first real sample. Total
     // expected <= ~10; 20 leaves generous slack while still failing on any
     // per-read jitter (which would produce hundreds of spurious toggles
@@ -1295,7 +1295,7 @@ fn lazy_read_after_an_interrupt_service_charge_sees_the_batch_scoped_total() {
     // Carried-forward review note: the first lazy read of a batch that opened
     // with an interrupt-service charge (the once-per-batch IRQ dispatch cost
     // added to batch_core before the first run_straight_line call) must see a
-    // clock total that includes that charge -- prior_runs_core_clocks is
+    // clock total that includes that charge: prior_runs_core_clocks is
     // republished from batch_core before every run, and the very first
     // publish (before run 1) already carries the service charge. Observable
     // via the cfg(test) log seam: the FIRST prior-runs push of a batch that
@@ -1415,7 +1415,7 @@ fn predicted_pit_out_after_n_clocks_matches_a_real_advance_devices_of_the_same_n
     // build two identically-driven machines, snapshot one into a MachineBus,
     // compute predicted_pit_out for a given in-batch clock total, and call
     // advance_devices for real on the other with the same total (expressed
-    // in the same core+scaled-bus units) -- the two must agree exactly.
+    // in the same core+scaled-bus units): the two must agree exactly.
     // Mode-2 (channel 1, the AT refresh timer, pre-seeded at power-on) and
     // mode-3 (channel 2, PC speaker) channels are both covered, including
     // totals crossing several OUT edges, so the sweep exercises both this
@@ -1561,7 +1561,7 @@ fn a_mid_batch_counter_latch_matches_a_real_advance_devices_of_the_same_clocks()
 fn a_mid_batch_counter_latch_moves_with_the_in_batch_offset() {
     // Non-vacuity for the test above: without the peek every latch in a batch
     // returns the same batch-start value, so the two offsets below would be equal.
-    // 450_000 clocks is ~20 ms at the 386 tier -- far more than one coarse batch --
+    // 450_000 clocks is ~20 ms at the 386 tier (far more than one coarse batch)
     // and the mode-2 counter must have visibly walked in between.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw386);
@@ -1576,7 +1576,7 @@ fn a_mid_batch_counter_latch_moves_with_the_in_batch_offset() {
 }
 
 /// Read channel 0's LSB byte with no preceding latch command, at a given
-/// prior/in-batch offset -- the plain unlatched path `Counter::read` takes
+/// prior/in-batch offset: the plain unlatched path `Counter::read` takes
 /// (`self.latch` is `None`, so `live = count_after(clocks)`), which is exactly
 /// what `MachineBus::read_io`'s 0x40-0x42 arm exempts from `io_touched` in the
 /// Approximate class. Deliberately NOT `latch_and_read_channel0`: that helper
@@ -1594,7 +1594,7 @@ fn a_mid_batch_unlatched_pit_read_moves_with_the_in_batch_offset_in_the_approxim
     // L5 (corpus-lever campaign, 2026-08-31): the property that makes it safe to
     // exempt an Approximate-class 0x40-0x42 read from io_touched is that the
     // unlatched read is a LIVE peek across an unbroken batch, not a frozen
-    // batch-start value -- otherwise a guest polling the counter after the
+    // batch-start value: otherwise a guest polling the counter after the
     // exemption would spin on the same stale byte for a whole coarse batch. That
     // property previously lived only in a comment (`read_port_at`'s doc, and the
     // io_touched arm's own). This is its pin, the unlatched-read counterpart of
@@ -1740,7 +1740,7 @@ fn a_mid_batch_3da_read_matches_a_real_advance_devices_of_the_same_clocks() {
     //
     // The 386 (Accurate) tier is the case that needed it: `lazy_ports_386` is
     // DEFAULT OFF, so this arm sets io_touched and ends the batch exactly as it
-    // always has, and before the beam peek it read the LIVE beam -- the beam as
+    // always has, and before the beam peek it read the LIVE beam, the beam as
     // of BATCH START. Nothing bounds that staleness once
     // `fine_batch_grain_required` gates the fine fallback off (no term in that
     // gate is armed by a display poll, and `vega_edge_ticks` carries the Margo
@@ -1767,7 +1767,7 @@ fn a_mid_batch_3da_read_matches_a_real_advance_devices_of_the_same_clocks() {
                 // The step is exactly the in-batch offset, with NO term for the
                 // access's own bus time. Unlike the PIT ports, a VGA status read
                 // is charged video wait states, and that charge is recorded
-                // before the peek on BOTH machines -- so it is already inside
+                // before the peek on BOTH machines, so it is already inside
                 // each read's own `in_batch_clocks` and cancels. Adding it to the
                 // step would advance the oracle by it twice, which bit 0
                 // (display enable, one toggle per ~700 clocks at this tier) is
@@ -1803,7 +1803,7 @@ fn a_mid_batch_3da_read_moves_with_the_in_batch_offset_on_the_accurate_class() {
     // The STEP matters and is why this is not a 10k-clock sweep: vertical
     // retrace is only a couple of scanlines (~64 us, ~1400 clocks at this
     // tier), so a coarse sweep can stride over the retrace window entirely and
-    // report a constant bit 3 whether or not the peek is being taken -- a
+    // report a constant bit 3 whether or not the peek is being taken: a
     // fixture that cannot fail. 250 clocks is well inside both the retrace
     // window and one ~700-clock scanline.
     let mut machine = test_machine();
@@ -1834,7 +1834,7 @@ fn a_mid_batch_3da_read_moves_with_the_in_batch_offset_on_the_accurate_class() {
 fn the_accurate_3da_arm_still_ends_the_batch() {
     // The beam peek changes the VALUE only. `lazy_ports_386` is default OFF, so
     // the Accurate class must still set io_touched on a 3DA read exactly as it
-    // did before the peek -- otherwise this would silently become the lazy
+    // did before the peek: otherwise this would silently become the lazy
     // behavior the `IZARRAVM_LAZY_PORT_386` switch exists to keep opt-in, and
     // every 386 fixture's batch shape would move.
     let mut machine = test_machine();
@@ -1857,8 +1857,8 @@ fn the_accurate_3da_arm_still_ends_the_batch() {
 fn lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter() {
     // `out_after` conservatively declines for a
     // BCD-programmed counter, so the lazy 0x61 arm must fall all the way
-    // back to the exact non-lazy path -- io_touched set, today's live read
-    // -- rather than a second implementation of the bit composition.
+    // back to the exact non-lazy path (io_touched set, today's live read)
+    // rather than a second implementation of the bit composition.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path would
     // otherwise apply.
@@ -1914,9 +1914,9 @@ fn opl_status_read_sets_io_touched_in_every_cpu_mode() {
 #[test]
 fn opl_status_read_matches_the_live_byte_when_no_device_time_is_pending() {
     // The Approximate class predicts the status byte from un-applied device
-    // time (see `predicted_opl_status`). With NOTHING pending -- which is the
-    // case here, because run_cycles below commits the advance before the read
-    // -- the prediction must reduce exactly to the live byte: `expired_after(0)`
+    // time (see `predicted_opl_status`). With NOTHING pending (which is the
+    // case here, because run_cycles below commits the advance before the read)
+    // the prediction must reduce exactly to the live byte: `expired_after(0)`
     // is the live `expired` flag, since `advance` leaves `accumulated_us` below
     // one step. Pin that equality, and the batch-ending behaviour with it.
     let mut machine = test_machine();
@@ -2006,7 +2006,7 @@ fn sb_dsp_reset_probe_sees_the_ack_within_a_hundred_polls_at_586() {
     // 0x22E a bounded number of times for data-available and read the
     // acknowledge off 0x22A. The whole loop runs inside one batch with no
     // device advance, so the acknowledge must come from the read-time
-    // settle service plus the charged ISA time — exactly what the guest's
+    // settle service plus the charged ISA time, exactly what the guest's
     // loop provides on the metal.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
@@ -3150,7 +3150,7 @@ fn the_misaligned_split_charge_stays_inside_the_per_access_budget_bound_on_every
 /// * Interpreted: `lookup_access` refuses a misaligned width, `should_split` fires, and the access
 ///   becomes N byte reads each charged the RAM wait states.
 ///
-/// The two are equal for exactly one reason -- `BusCycle::clocks_for` ignores width -- and that is
+/// The two are equal for exactly one reason (`BusCycle::clocks_for` ignores width) and that is
 /// what this asserts. Make `clocks_for` width-dependent and the equality breaks silently: the JIT
 /// would over- or under-charge every misaligned access by `wide - byte` clocks, with no fault, no
 /// counter, and no differential fixture able to see it, because the CPU crate's `TestBus` models a
@@ -3414,7 +3414,7 @@ fn speaker_peak_at_divisor(low: u32, high: u32) -> i32 {
 /// leg's full swing.
 ///
 /// The bound is taken FROM the leg rather than written as a constant, because
-/// the leg's ceiling moves whenever its staging does -- it just moved 13 dB
+/// the leg's ceiling moves whenever its staging does: it just moved 13 dB
 /// when the beeper started passing through the card's PC-SPK level and the
 /// summing node's reserve, at which point a fixed `peak < 1200` had stopped
 /// being a two-thirds bound on anything and become a bound the aliasing case
@@ -3489,7 +3489,7 @@ fn opl_status_read_predicts_the_timer_from_un_applied_batch_time() {
     // read taken mid-batch used to report the state the chip had when the batch
     // STARTED. AdLib detection starts timer 1 (one 80us step), runs a fixed
     // delay loop that never ends the batch because it is pure computation, then
-    // reads status ONCE -- and always saw the pre-delay flags.
+    // reads status ONCE, and always saw the pre-delay flags.
     //
     // The third read_io argument is the CPU's in-batch core clocks, which is
     // what the prediction converts to elapsed microseconds.
@@ -3537,7 +3537,7 @@ fn opl_status_read_predicts_the_timer_from_un_applied_batch_time() {
 #[test]
 fn opl_status_read_stays_live_in_the_accurate_class() {
     // The 386 class advances devices per instruction, so there is never
-    // un-applied time to predict from and the byte must stay exactly live --
+    // un-applied time to predict from and the byte must stay exactly live:
     // the prediction is an Approximate-class path only. A control for the test
     // above: same sequence, same in-batch clocks, no overflow conjured.
     let mut machine = test_machine();
@@ -3589,8 +3589,8 @@ fn the_386_lazy_port_switch_can_never_arm_the_approximate_class() {
             }
         }
     }
-    // The loop above is the whole test. `lazy_ports_386_for` -- the env-composed
-    // wrapper the bus actually calls -- is deliberately NOT asserted on here:
+    // The loop above is the whole test. `lazy_ports_386_for` (the env-composed
+    // wrapper the bus actually calls) is deliberately NOT asserted on here:
     // its only added term is `lazy_port_reads_386_enabled()`, and with the
     // switch off by default every assertion about it passes for the wrong reason
     // (a mutation deleting the mode test still returns false), while forcing the
@@ -3650,7 +3650,7 @@ fn the_386_lazy_switch_stops_the_poll_ports_ending_the_batch() {
 /// Q2b, both directions of the one gate that decides them. A charged one-shot
 /// is genuinely time-dependent, so its read must keep ending the batch; an idle
 /// one is a constant function of state, so its read must not. The gate is
-/// device state, so the assertion is made on BOTH personas -- the Approximate
+/// device state, so the assertion is made on BOTH personas: the Approximate
 /// class is where wolf3d runs and the Accurate class must not diverge.
 #[test]
 fn a_gameport_read_ends_the_batch_only_while_a_one_shot_is_charged() {
@@ -3770,7 +3770,7 @@ fn a_lazy_gameport_read_matches_a_real_advance_devices_of_the_same_clocks() {
         assert_eq!(predicted_machine.timeline, real_machine.timeline);
 
         // The RC one-shots are armed by the 0x201 WRITE, in the batch before
-        // the reads -- exactly as a guest arms them, and the reason the read
+        // the reads, exactly as a guest arms them, and the reason the read
         // never observes a mid-batch mutation of its own inputs.
         for machine in [&mut predicted_machine, &mut real_machine] {
             with_bus(machine, |bus| {
@@ -3832,7 +3832,7 @@ fn a_lazy_gameport_read_moves_with_the_in_batch_offset() {
 // ---------------------------------------------------------------------------
 
 /// Program a Margo FILL whose modeled busy time spans a coarse batch, WITHOUT
-/// issuing the COMMAND that arms it. 640x480 at 5 ns/pixel is 1,536,100 ns --
+/// issuing the COMMAND that arms it. 640x480 at 5 ns/pixel is 1,536,100 ns,
 /// ~33,794 clocks at the 386 tier, so an in-batch offset sweep can straddle the
 /// instant BUSY drops.
 fn program_large_margo_fill(machine: &mut Machine) {
@@ -4147,7 +4147,7 @@ fn read_margo_status_at(machine: &mut Machine, prior: u64, core: u64) -> (u8, u6
 
 /// Issue the four COMMAND bytes at a given in-batch offset, the way a guest that
 /// has been computing for most of a batch does. Returns the elapsed Margo
-/// nanoseconds at that instant -- the credit the arm just stamped.
+/// nanoseconds at that instant, the credit the arm just stamped.
 fn arm_margo_fill_at(machine: &mut Machine, prior: u64, command: u32) -> u64 {
     with_bus(machine, |bus| {
         bus.prior_runs_core_clocks = prior;
@@ -4266,7 +4266,7 @@ fn a_blit_armed_mid_batch_is_not_idle_early_at_the_next_batch_entry() {
     // blit always started at in-batch offset ~0 and that was exactly right.
     // Without the break, a blit armed 20,000 clocks (~909 us) into a batch would
     // be billed all 909 us against its 200 ns of work and read IDLE at the next
-    // batch entry -- an idle-early violation of section 9's first clause,
+    // batch entry, an idle-early violation of section 9's first clause,
     // observable through the deadline term as well, since `vega_edge_ticks`
     // reads the drained `busy_ns` at batch entry.
     const ARM_OFFSET: u64 = 20_000;
@@ -4318,7 +4318,7 @@ fn an_overlapping_write_does_not_restamp_the_blit_origin() {
     // `io_touched` in `no_margo_write_ends_the_batch_while_a_long_blit_drains`.
     // `VideoWrite::ArmedBlit` now stamps the instant the busy time is measured
     // FROM, so a level-triggered test would re-stamp that origin on every
-    // framebuffer store a guest overlaps with a running blit -- and the
+    // framebuffer store a guest overlaps with a running blit, and the
     // operation would never finish. The 200 ns fill armed at offset 0 must be
     // drained to idle by a batch that also contains writes at offset 10,000.
     let mut machine = test_machine();
@@ -4360,7 +4360,7 @@ fn an_overlapping_write_does_not_restamp_the_blit_origin() {
 fn a_batch_is_not_cut_at_blit_completion_but_the_read_is_still_exact_across_it() {
     // The phase-2 property: with no pusher work the blit completion instant is
     // no longer a batch boundary, so a whole blit begins AND ends inside one
-    // batch -- and STATUS.BUSY must still flip at exactly the modeled instant,
+    // batch, and STATUS.BUSY must still flip at exactly the modeled instant,
     // read from inside that same batch. This is what licenses dropping the
     // deadline term: section 9 constrains what software can OBSERVE, and the
     // peek keeps that exact without help from batch geometry.
@@ -4384,7 +4384,7 @@ fn a_batch_is_not_cut_at_blit_completion_but_the_read_is_still_exact_across_it()
 
     // Sweep in-batch offsets ACROSS the completion instant, all inside that one
     // uncapped batch. BUSY must be set strictly before the modeled instant and
-    // clear from it onward -- one transition, at the right clock.
+    // clear from it onward: one transition, at the right clock.
     let mut transitions = Vec::new();
     let mut previous = None;
     for core in 0..=(blit_edge + 8) {
@@ -4436,7 +4436,7 @@ fn a_second_identical_blit_in_one_batch_restamps_the_origin() {
     // so `busy_ns` before and after the second COMMAND are EQUAL, the write
     // reports `Accepted` instead of `ArmedBlit`, and the credit still names the
     // FIRST arm's offset. The second operation then reads idle for its entire
-    // length -- a section 9 idle-early violation that scales with operation
+    // length, a section 9 idle-early violation that scales with operation
     // size, not a rounding error.
     //
     // This is not a contrived shape: izbios' lfb_text draws every glyph with a
@@ -4504,7 +4504,7 @@ fn a_second_identical_blit_in_one_batch_restamps_the_origin() {
 /// Personas are looped because the value is the only thing that distinguishes them here: a
 /// snapshot taken from the wrong model, or not refreshed on a mode change, shows up as one
 /// persona charging another's constant. (`Machine::set_mode` rewrites `cache_model`, and a bus
-/// cannot outlive it -- `make_bus` borrows the machine mutably -- which is what makes the
+/// cannot outlive it: `make_bus` borrows the machine mutably, which is what makes the
 /// snapshot sound; the `debug_assert` in the fast arm is the standing check.)
 #[test]
 fn cached_icache_fetch_cost_matches_the_live_model_in_every_persona() {
@@ -4553,7 +4553,7 @@ fn cached_icache_fetch_cost_matches_the_live_model_in_every_persona() {
 /// charge that drifts fails here rather than as an unexplained frame-hash move six fixtures later.
 ///
 /// The `Full`-mode cycle vector is compared element by element on purpose. `elapsed_clocks` alone
-/// would pass a charge that folded N byte cycles into one wide cycle of the same total clocks --
+/// would pass a charge that folded N byte cycles into one wide cycle of the same total clocks,
 /// which is precisely the mutation this test has to catch.
 #[test]
 fn charge_direct_ram_split_is_bit_identical_to_the_byte_splitting_loop() {
@@ -4642,7 +4642,7 @@ fn charge_direct_ram_split_is_bit_identical_to_the_byte_splitting_loop() {
                         assert_eq!(a.clocks, b.clocks, "{case}: cycle {i} clocks");
                     }
                     assert_eq!(got_cycles.len(), ref_cycles.len(), "{case}: cycle count");
-                    // A split really did happen -- otherwise every equality above is vacuous.
+                    // A split really did happen: otherwise every equality above is vacuous.
                     if mode.uses_approximate_timing() {
                         assert_eq!((ref_clocks, ref_accesses), (0, 0));
                         assert!(ref_cycles.is_empty());
@@ -4665,14 +4665,14 @@ fn charge_direct_ram_split_is_bit_identical_to_the_byte_splitting_loop() {
 ///
 /// Why this matters more than a timing detail: `write_wide_memory`'s LFB arm SWALLOWS byte writes
 /// (`BusWidth::Byte => {}` while still returning `true`), so a byte-split write into the BAR is
-/// DROPPED where the wide write would have stored -- silent data loss, not a re-timing. The
+/// DROPPED where the wide write would have stored: silent data loss, not a re-timing. The
 /// unaligned admission is only safe because `ram_lookup_page_is_direct` refuses every page the
 /// BAR overlaps, page-granularly.
 ///
 /// The test has two halves and needs both:
 ///
 /// 1. **Unmutated (this test).** With the BAR decoding over a RAM page, the admission must
-///    DECLINE that page -- unreachable by construction -- while an ordinary RAM page is still
+///    DECLINE that page (unreachable by construction) while an ordinary RAM page is still
 ///    admitted. Proving the decline alone would be the fixtures-that-cannot-fail shape, hence the
 ///    positive control.
 /// 2. **Mutated (recorded in the branch's mutation ledger).** Forcing `ram_lookup_page_is_direct`
@@ -4680,7 +4680,7 @@ fn charge_direct_ram_split_is_bit_identical_to_the_byte_splitting_loop() {
 ///    `claims_no_byte_in`'s `debug_assert` then fires. That is what gives half 1 its teeth.
 #[test]
 fn a_distira_bar_page_is_refused_the_unaligned_direct_admission() {
-    // 64 MiB so a 16 MiB-aligned BAR can be parked at 32 MiB, INSIDE guest RAM -- which is the
+    // 64 MiB so a 16 MiB-aligned BAR can be parked at 32 MiB, INSIDE guest RAM, which is the
     // only way to build the overlap this guard exists for.
     let mut machine = Machine::new(
         MachineProfile::gsw_386(64, VideoCard::Vega),
@@ -4713,7 +4713,7 @@ fn a_distira_bar_page_is_refused_the_unaligned_direct_admission() {
     );
 
     with_bus(&mut machine, |bus| {
-        // A MISALIGNED read of ordinary RAM: admitted, `direct: true`. The positive control -- it
+        // A MISALIGNED read of ordinary RAM: admitted, `direct: true`. The positive control: it
         // is what makes the refusal below a statement about the BAR and not about the width.
         let plain = bus
             .read_memory_direct(PLAIN + 1, BusWidth::Dword, BusAccessKind::DataRead)
@@ -4840,7 +4840,7 @@ fn a_bus_master_base_over_the_status_port_keeps_its_decode() {
 ///
 /// This pins that equality at the widths the system-read family uses (Byte and Word for
 /// selectors, access bytes and the I/O bitmap; Dword for descriptor halves), aligned and
-/// misaligned -- misaligned matters because a TSS base is arbitrary, so the Word read of
+/// misaligned: misaligned matters because a TSS base is arbitrary, so the Word read of
 /// TSS+0x66 lands on an odd address whenever the base is odd.
 ///
 /// The `direct` assertion is what stops this from being vacuous: without it a fallthrough to
@@ -4849,13 +4849,13 @@ fn a_bus_master_base_over_the_status_port_keeps_its_decode() {
 /// `data_access_wait_states` consults the data-cache tag array, which is STATEFUL: the first
 /// touch of a line is a miss and costs more than every later one. A plain A-then-B pair reads
 /// that miss as a difference between the two paths (it charged 5 against 2 while this test was
-/// being written). So each address is warmed first and then measured A/B/A/B -- both repeats
+/// being written). So each address is warmed first and then measured A/B/A/B: both repeats
 /// must agree, which also catches a path that only looks equal on its first call.
 ///
 /// BOTH timing classes, because they do not share a misaligned arm: the Approximate class
 /// (`flat_data_cost`) folds a split into one `record_memory_run`, while the Accurate class
 /// records N byte cycles. `access_count` is asserted alongside `elapsed_clocks` for the same
-/// reason -- a future fold that collapsed N cycles into one run of equal total cost would keep
+/// reason: a future fold that collapsed N cycles into one run of equal total cost would keep
 /// the clocks equal and still change what the trace reports.
 #[test]
 fn a_direct_system_read_charges_exactly_what_the_general_read_charges() {
@@ -4935,11 +4935,11 @@ fn a_direct_system_read_charges_exactly_what_the_general_read_charges() {
 }
 
 /// T16 (code-smell batch 2, S3, rung A). `CpuBus::charge_direct_ram_read`'s whole purpose is to
-/// be the charge half of `read_memory_direct`'s aligned direct-RAM arm with the load deleted --
+/// be the charge half of `read_memory_direct`'s aligned direct-RAM arm with the load deleted,
 /// on `TestBus`, the port call-out fixtures' default bus, the trait's DEFAULT implementation
 /// (`read_memory_direct(..).map(|_| ())`) covers this and the code being replaced is
 /// indistinguishable from the code replacing it, so a test built on `TestBus` cannot fail no
-/// matter what `MachineBus`'s override does -- exactly the vacuity already named in-tree at
+/// matter what `MachineBus`'s override does, exactly the vacuity already named in-tree at
 /// `machine_direct_poll_skip_test.rs:6-11` about a sibling defaulted method. This lives on a real
 /// `Machine` instead, and follows `a_direct_system_read_charges_exactly_what_the_general_read_charges`'s
 /// warm-then-A/B/A/B discipline for the same reason that test states: `data_access_wait_states`
@@ -4960,7 +4960,7 @@ fn charge_direct_ram_read_charges_exactly_what_the_direct_read_charges() {
             for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
                 // Both offsets are aligned for every width tested (BASE and BASE+4 are both
                 // divisible by 4). `charge_direct_ram_read`'s precondition, like
-                // `peek_direct_ram`'s, is the ALIGNED direct-RAM arm only -- a misaligned access
+                // `peek_direct_ram`'s, is the ALIGNED direct-RAM arm only: a misaligned access
                 // never reaches phase C at all, because `port_permission_resident`'s phase-P
                 // peek already returns `None` for it (`direct_page_ram_bytes`'s `should_split`
                 // term), so the interpreter's ordinary `check_io_permission` path runs instead.
@@ -5007,9 +5007,9 @@ fn charge_direct_ram_read_charges_exactly_what_the_direct_read_charges() {
     }
 }
 
-/// Review finding 17 (code-smell batch 2, S3, rung A). Phase C used to assert, per served
+/// Code-smell batch 2, S3, rung A. Phase C used to assert, per served
 /// call-out, that its charged re-read returned the SAME VALUE `peek_direct_ram` had already
-/// seen -- the only in-tree evidence that `peek_direct_ram`'s doc promise ("a `Some` result
+/// seen, the only in-tree evidence that `peek_direct_ram`'s doc promise ("a `Some` result
 /// promises `read_memory_direct` will take its ALIGNED direct-RAM arm and return the same
 /// value") held on `MachineBus`. `charge_direct_ram_read` has no value left to compare, so that
 /// promise is pinned here instead, once, over the matrix it actually depends on: aligned RAM in
@@ -5075,7 +5075,7 @@ fn peek_direct_ram_agrees_with_read_memory_direct_on_every_aligned_ram_address()
 
 /// THE FOUR TESTS BELOW PIN THE DEFAULT (`IZARRAVM_EXTENDED_RAM_SCREEN` unset,
 /// i.e. ON). Run the suite with the knob at `0` and exactly these four fail and
-/// nothing else does -- verified 2026-08-29, 1693 passed / 4 failed. That is not
+/// nothing else does, verified 2026-08-29, 1693 passed / 4 failed. That is not
 /// a defect to paper over with a skip: it IS the OFF-arm verification, and it
 /// says two things at once. The screen changes nothing any other test can see,
 /// and the knob really does restore the old path rather than merely renaming it.
@@ -5084,14 +5084,14 @@ fn peek_direct_ram_agrees_with_read_memory_direct_on_every_aligned_ram_address()
 /// A 32-bit game runs its code and keeps its data ABOVE 1 MB, and the bus's only
 /// screen against the device-window gauntlet was `< 0x000A_0000`. So every
 /// instruction-fetch run and every data access such a game makes used to walk
-/// the whole gauntlet -- `rom_offset`, then Vega's ten aperture predicates --
+/// the whole gauntlet (`rom_offset`, then Vega's ten aperture predicates)
 /// to be told what the address range already guarantees: nothing claims it.
 ///
 /// This pins the screen that answers it directly. The counter is the only way to
 /// see it: `is_device_window` returns false either way, and a wait-state
 /// comparison cannot separate "answered cheaply" from "answered expensively".
 /// Both entry points are covered, because they are separate screens on separate
-/// callers -- `is_device_window` serves the fetch and data-access classification,
+/// callers: `is_device_window` serves the fetch and data-access classification,
 /// `memory_wait_states_device` serves the byte-cost path.
 #[test]
 fn extended_ram_is_classified_without_entering_the_device_window_gauntlet() {
@@ -5135,7 +5135,7 @@ fn extended_ram_is_classified_without_entering_the_device_window_gauntlet() {
 /// conventional memory and the VGA aperture are below the 1 MB floor, the Margo
 /// LFB and MMIO block and the BIOS alias at the top of the address space are at
 /// or above the ceiling, and the byte before `MARGO_LFB_BASE` is the last
-/// address the screen may accept -- a Dword there straddles the boundary, which
+/// address the screen may accept: a Dword there straddles the boundary, which
 /// is what the width term in the screen is for.
 #[test]
 fn the_screen_declines_every_address_a_window_can_claim() {
@@ -5189,7 +5189,7 @@ fn the_screen_declines_every_address_a_window_can_claim() {
 #[test]
 fn relocating_the_distira_bar_lowers_the_device_free_ceiling() {
     // BAR0 decodes its top byte only (`pci_write_config_byte` offset 0x13), so
-    // 0x40 places the 16 MB BAR at 0x4000_0000 -- well below MARGO_LFB_BASE and
+    // 0x40 places the 16 MB BAR at 0x4000_0000, well below MARGO_LFB_BASE and
     // inside what the default configuration screens as plain RAM.
     const RELOCATED: u32 = 0x4000_0000;
     let mut machine = test_machine();
@@ -5226,8 +5226,8 @@ fn relocating_the_distira_bar_lowers_the_device_free_ceiling() {
 
 /// The fetch-charging fast path had one screen, `end < 0x000A_0000`, and a
 /// 32-bit game's code is nowhere near it. Every fetch run such a game makes fell
-/// through to `charge_classified_instruction_fetch_run` -- two A20 folds, two
-/// wait-state lookups through the device gauntlet, and a uniformity test -- to
+/// through to `charge_classified_instruction_fetch_run` (two A20 folds, two
+/// wait-state lookups through the device gauntlet, and a uniformity test) to
 /// reach the conclusion the address range already guarantees.
 ///
 /// The signal is the QUESTION counter, not the gauntlet counter. The screen in
@@ -5273,7 +5273,7 @@ fn an_extended_ram_fetch_run_skips_the_cold_classification_tail() {
 /// conventional memory, where a window can claim it.
 ///
 /// `A20_MASK` clears bit 20 and nothing else, so `0x001A_0000` folds to
-/// `0x000A_0000` -- the VGA aperture. That is not a hypothetical: a run there
+/// `0x000A_0000`, the VGA aperture. That is not a hypothetical: a run there
 /// must be charged as a device window, per byte, and the fast arm would charge
 /// it as one I-cache access out of cacheable RAM. The clock delta is asserted,
 /// not just the counter, because the counter alone would not say the charge
@@ -5331,7 +5331,7 @@ fn a_masked_a20_folds_a_fetch_run_into_the_vga_aperture_and_must_not_take_the_fa
 /// summary of `may_own_memory` plus `rom_offset`, and a hand-derived claim is
 /// only as good as the thing that re-checks it. Add an aperture above 1 MB to
 /// `may_own_memory` and forget the floor, and the screen starts answering "plain
-/// RAM" for a window -- which charges the wrong wait-state, silently, on a path
+/// RAM" for a window, which charges the wrong wait-state, silently, on a path
 /// that runs millions of times a second.
 ///
 /// The comparison is against `device_window_uncached`, the gauntlet with the
@@ -5341,7 +5341,7 @@ fn a_masked_a20_folds_a_fetch_run_into_the_vga_aperture_and_must_not_take_the_fa
 ///
 /// BOTH BAR configurations, and the first draft of this test got that wrong in a
 /// way worth recording. It relocated Distira's BAR low in order to exercise the
-/// variable half of the floor -- and by doing so took the `distira_mem_base` arm
+/// variable half of the floor, and by doing so took the `distira_mem_base` arm
 /// on EVERY probe, so the constant `MARGO_LFB_BASE` arm was never evaluated at
 /// all. Breaking that arm deliberately (returning `HIGH_ROM_BASE`, which makes
 /// the screen swallow Margo's whole framebuffer) left the test GREEN. A sweep

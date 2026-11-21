@@ -4,8 +4,8 @@
 ; int88rmp.com: routing row 2 (design section 3.5). Once a VCPI client has moved
 ; the master's base to 0x88, vector 0x88 means two different things: it is where
 ; IRQ0 now arrives, and it is still an ordinary software-interrupt vector the
-; guest may call. A guest `INT 88h` must reach IVT[0x88] as a software interrupt
-; -- it must NOT be converted into "IRQ line 0" and it must not make anything
+; guest may call. A guest `INT 88h` must reach IVT[0x88] as a software interrupt:
+; it must NOT be converted into "IRQ line 0" and it must not make anything
 ; EOI the chip on the guest's behalf.
 ;
 ; This is a PIN of the round-trip identity rather than a red fixture: the
@@ -19,7 +19,7 @@
 ; INT 88h executes: that is the only state in which a line-number derivation
 ; could plausibly claim the vector. Two things constrain how to get there.
 ;
-; First, it must be obtained THE LEGAL WAY -- by being inside the guest's own
+; First, it must be obtained THE LEGAL WAY, by being inside the guest's own
 ; interrupt handler, where the chip really has IS0 set because the guest's own
 ; tick was acknowledged for it. A fixture that instead CLI'd and spun waiting
 ; for IS0 to appear would be relying on the monitor pinning the real IF open and
@@ -27,7 +27,7 @@
 ; start failing on its own setup step the moment the monitor is fixed.
 ;
 ; Second, the remap has to come FIRST. DE0B reprograms the 8259A with a full ICW
-; sequence, and an ICW1 resets the chip -- in-service state included. So there
+; sequence, and an ICW1 resets the chip, in-service state included. So there
 ; is no "hold a line in service, then remap"; the only reachable form of the
 ; state is "remap, then take a tick at the new base", which is also the shape a
 ; real VCPI client's clock lives in. The fixture therefore hooks IVT[0x88],
@@ -36,7 +36,7 @@
 ;
 ; That leaves IVT[0x88] serving both entries, so a `phase` byte tells them
 ; apart, and the ambiguity cannot bite: the hardware entry runs with IF clear
-; (an IVT dispatch clears it) and with IS0 -- the highest priority level --
+; (an IVT dispatch clears it) and with IS0 (the highest priority level)
 ; inhibiting the chip until the EOI the chained DOS handler issues on the way
 ; out, so nothing but the fixture's own `INT 88h` can re-enter during the body.
 ;

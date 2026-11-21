@@ -95,7 +95,6 @@ fn glide_tmu_memory_probe_reads_the_selected_texture_base() {
     // register's field is 19 bits (`(val & 0x0007_ffff) << 3`,
     // `raster_view.rs::tex_base_addr_for_tmu`), matching 86Box's
     // non-Banshee `SST_texBaseAddr` handler. One qword short of 4 MB.
-    // (`dev_docs/2026-09-01-tex4mb-review.md` section 1.)
     const TEX_BASE_ADDR_MAX: u32 = 0x7_ffff << 3;
 
     fn sense(distira: &mut Distira, tmu: usize, memory_offset: u32) -> u32 {
@@ -113,9 +112,9 @@ fn glide_tmu_memory_probe_reads_the_selected_texture_base() {
     /// `TEX_BASE_ADDR_MAX`), so this proves the alias by write ORDER
     /// instead of by reading at the candidate address: write a victim to
     /// offset 0, then write the candidate at `TEX_BASE_ADDR_MAX` plus the
-    /// remaining 8 bytes crossed through the aperture's own row offset --
+    /// remaining 8 bytes crossed through the aperture's own row offset,
     /// the same `base + mip_offset + row_offset` sum `texture_write_offset`
-    /// computes for a real triangle's upload -- then sample offset 0. If
+    /// computes for a real triangle's upload, then sample offset 0. If
     /// the candidate aliases, its value wins.
     fn sense_at_four_megabytes(distira: &mut Distira, tmu: usize) -> u32 {
         write_reg(distira, SST_TEX_BASE_ADDR, 0);
@@ -653,7 +652,7 @@ fn fbi_init_layout_and_reset_select_physical_buffers() {
 
     // VIDEO_RESET is video timing reset, not the mux (86Box: only `line`,
     // `swap_count`, `retrace_count`; DOSBox-X names the bit
-    // `FBIINIT1_VIDEO_TIMING_RESET`) -- it must leave `display_enabled`
+    // `FBIINIT1_VIDEO_TIMING_RESET`): it must leave `display_enabled`
     // alone. Only FBIINIT0 bit 0 does, and nothing has set it here.
     assert!(!distira.display_enabled());
     assert_eq!(distira.display().width, 640);
@@ -694,7 +693,7 @@ fn voodoo_texture_detail_register_round_trips() {
 
 #[test]
 fn clear_back_buffer_and_swap_presents_rgb565_words() {
-    // The mux is FBIINIT0 bit 0, read continuously -- not a latch that a
+    // The mux is FBIINIT0 bit 0, read continuously, not a latch that a
     // swap or a rasterised triangle can arm. Reference: 86Box
     // `vid_voodoo.c:744-761` and DOSBox-X `voodoo_emu.cpp:1764-1775` both
     // drive the override purely from that bit.
@@ -1303,8 +1302,7 @@ fn parallel_raster_output_is_identical_to_single_threaded_output() {
     let serial = draw_scene(1);
     // Lanes 4 is today's default cap; 8 and 16 are the raised-cap A/B arms
     // (`IZARRAVM_DISTIRA_LANES`) the raster-lane-cap lever grades
-    // (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 5, lever
-    // B). Rows partition the frame store the same way at any lane count, so
+    // (lever B). Rows partition the frame store the same way at any lane count, so
     // this must stay byte-identical whether the cap is today's 4 or the
     // raised 8/16.
     for lanes in [4usize, 8, 16] {
@@ -1452,17 +1450,17 @@ fn lfb_aperture_wraps_its_unused_high_address_bit() {
 }
 
 /// Renamed from `lfb_physical_addresses_past_two_megabytes_are_open_bus`
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8's rename shape,
+/// (the rename shape of the 4 MB texture change,
 /// applied to the FBI probe growing FB_SIZE now surfaces): the SAME 800x600
 /// register configuration this test always used put the auxiliary buffer's
-/// origin at raw byte offset 4,186,112 -- past the OLD 2 MB FBI budget, so
+/// origin at raw byte offset 4,186,112, past the OLD 2 MB FBI budget, so
 /// the write there used to vanish (open bus, `0xffff`). Under the NEW 4 MB
 /// budget that same origin is a real, in-bounds address (`DISTIRA_FB_SIZE`
-/// is 4,194,304; 4,186,112 < that), so it now round-trips -- see the first
+/// is 4,194,304; 4,186,112 < that), so it now round-trips. See the first
 /// assertion below.
 ///
-/// THE WRAP-VS-DROP DIVERGENCE
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8): the FBI address
+/// THE WRAP-VS-DROP DIVERGENCE:
+/// the FBI address
 /// decode wraps modulo its RAM size, the same rule the texture path uses
 /// and the rule 86Box's own FBI write path uses unconditionally
 /// (`vid_voodoo_fb.c`, see `RasterView::framebuffer_pixel_offset`'s doc
@@ -1472,7 +1470,7 @@ fn lfb_aperture_wraps_its_unused_high_address_bit() {
 /// pushed to their maximum field width): a write at raw byte offset 1,408
 /// (reached with `buffer_offset=0`, so the aux buffer starts at 0) is
 /// aliased by a second write at aux-buffer offset `9,600` under
-/// `buffer_offset=511, tiles=15` -- an address whose aux-buffer origin
+/// `buffer_offset=511, tiles=15`, an address whose aux-buffer origin
 /// alone (4,186,112) plus that offset (9,600) totals 4,195,712, exactly
 /// `DISTIRA_FB_SIZE` (4,194,304) + 1,408. The high write must land on top
 /// of the low one, not vanish.
@@ -1487,7 +1485,7 @@ fn lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode() {
     );
 
     // buffer_offset=0 puts the aux buffer's origin at raw offset 0, so
-    // aperture (x=704, y=0) -- aperture_offset 1408 -- writes raw offset
+    // aperture (x=704, y=0), aperture_offset 1408, writes raw offset
     // 1408 directly.
     write_reg(&mut distira, SST_FBI_INIT2, 0);
     let low_aperture_offset = 704 << 1;
@@ -1499,7 +1497,7 @@ fn lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode() {
     );
 
     // Push both register fields to their maximum width: tiles=15 (pitch
-    // 1920) and buffer_offset=511 (aux-buffer origin 4,186,112 -- inside
+    // 1920) and buffer_offset=511 (aux-buffer origin 4,186,112, inside
     // the new 4 MB budget by only 8,192 bytes, and the old test's own
     // "near the end of installed memory" address, now valid instead of
     // dropped). Aperture (x=0, y=5) then reaches raw offset
@@ -1526,12 +1524,12 @@ fn lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode() {
 
 /// The counterpart to `lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode`,
 /// and the read-side contract `lfb_physical_addresses_past_two_megabytes_are_open_bus`
-/// used to pin before its rename discarded it
-/// (`dev_docs/2026-09-01-fb4mb-review.md` section 1): the FBI *write*
+/// used to pin before its rename discarded it:
+/// the FBI *write*
 /// decode wraps, but neither reference wraps the *read* decode. 86Box's
 /// `voodoo_fb_readw`/`readl` return `0xffff`/`0xffffffff` for any
 /// `read_addr > fb_mask`, checked BEFORE the mask is applied at all
-/// (`vid_voodoo_fb.c:91-95,132-136` -- the trailing `& fb_mask` there is
+/// (`vid_voodoo_fb.c:91-95,132-136`: the trailing `& fb_mask` there is
 /// therefore redundant for memory safety, so the guard is a deliberate
 /// behavioural choice, not a bounds check standing in for one), and
 /// DOSBox-X's `lfb_r` returns `0xffffffff` the same way
@@ -1541,7 +1539,7 @@ fn lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode() {
 /// Same register configuration and the same two raw offsets as the write
 /// test above: a sentinel is written at raw offset 1408 (`buffer_offset=0`,
 /// so the aux buffer's origin is 0), then the register fields are pushed to
-/// their maximum width so an aperture READ reaches raw offset 4,195,712 --
+/// their maximum width so an aperture READ reaches raw offset 4,195,712,
 /// one whole `DISTIRA_FB_SIZE` above the sentinel. If the read decode
 /// wrapped like the write decode, this would return the sentinel; it must
 /// instead return `0xffff`, open bus.
@@ -1627,7 +1625,7 @@ fn the_census_records_the_video_dimensions_register_a_real_driver_writes() {
     // interface and no period Glide driver writes them; videoDimensions is the
     // SST-1 register a real one uses. Hooking only the private path made the
     // census read EMPTY for Tomb Raider Gold's 3dfx build while its presented
-    // frame was 640x480 -- an instrument that answers the same way whether the
+    // frame was 640x480: an instrument that answers the same way whether the
     // guest reached Distira or not is not evidence.
     let mut distira = Distira::new();
     write_reg(&mut distira, SST_VIDEO_DIMENSIONS, (480 << 16) | 639);
@@ -1679,7 +1677,7 @@ fn swapbuffer_and_triangles_never_move_the_mux() {
     // `vid_voodoo_reg.c:139-159` and its retrace consumer touch only
     // `front_offset`/counters; DOSBox-X `swapbuffer()` rotates indices) and a
     // rasterised triangle is a framebuffer write, not a register write.
-    // Neither can move the mux -- that is FBIINIT0 bit 0 alone. This
+    // Neither can move the mux: that is FBIINIT0 bit 0 alone. This
     // replaces #802's `content_drawn_since_yield` activity latch, deleted
     // along with the yield machinery it hung off.
     let mut distira = Distira::new();

@@ -1252,8 +1252,8 @@ impl Machine {
     /// followed by the Izarra fallback order. Power-on reaches this same planner.
     pub(super) fn handle_int19(&mut self) {
         // POST is over the moment the BIOS asks to boot. This is the one phase
-        // boundary the guest cannot place for us -- no code of ours runs inside
-        // the BIOS -- and it costs nothing: INT 19h fires once per boot.
+        // boundary the guest cannot place for us (no code of ours runs inside
+        // the BIOS) and it costs nothing: INT 19h fires once per boot.
         self.note_post_phase_mark();
         // A boot ends any earlier OS's IzarraCD claim: the redirector disarms
         // and the driver state resets, so a foreign booter after a warm

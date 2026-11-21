@@ -5,8 +5,6 @@
 
 //! Decoding the OGG, MP3, WAV, and FLAC files a CUE sheet may name for its
 //! AUDIO tracks into the raw Red Book frames the disc model serves.
-//!
-//! See `dev_docs/2026-08-14-cd-audio-decoding-design.md`.
 
 mod decode;
 mod probe;

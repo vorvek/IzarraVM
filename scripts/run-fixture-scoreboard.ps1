@@ -39,10 +39,10 @@ INVARIANT HISTORY
 
             The two motivating incidents are both from that day. tombraid-586's
             hash moved 84.31% of its pixels under the IOPL-3 V86 monitor
-            (.bench/results/iopl3-tombraid-attribution/) -- the attract camera a
+            (.bench/results/iopl3-tombraid-attribution/): the attract camera a
             beat further along and the blinking "Demo Mode" caption in its other
             phase, with rendering perfect. nascar-586's moved 12.41% under the
-            same day's follow-up (.bench/results/postiopl-nascar-attribution/) --
+            same day's follow-up (.bench/results/postiopl-nascar-attribution/):
             the camera a beat along the trackside banner. Both re-pins were
             justified; both cost a full attribution cycle to prove that nothing
             was wrong; and both anchors would have moved again on the next
@@ -56,7 +56,7 @@ INVARIANT HISTORY
             This is NOT the duke3d answer applied literally. duke3d could drop
             its frame invariant outright because DUKEMARK scores itself; these
             two rows print no score, so dropping it would leave them graded on
-            counts alone -- and PROTOCOL.md trap 0 records that count-only
+            counts alone, and PROTOCOL.md trap 0 records that count-only
             framebuffer invariants DO NOT DISCRIMINATE. The early anchor exists
             to keep an exact-pixel invariant on the row after the fragile one is
             gone.
@@ -114,14 +114,14 @@ param(
     # every value except exactly "0".
     [ValidateSet("on", "off", "jit16", "word486")]
     [string]$Arm = "on",
-    # The one-lookup store emission arm (dev_docs/2026-08-07-one-lookup-store-design.md D8):
+    # The one-lookup store emission arm:
     # "1" is the shipped default, "0" restores the classic classify/resolve store emission.
     # Set explicitly on every run for the same inherit-hazard reason as the JIT16 pair -
     # IZARRAVM_ONE_LOOKUP_STORE is on for every value except exactly "0", so a stray "0" left
     # in the caller's environment would silently turn an "on" observation into an "off" one.
     [ValidateSet("1", "0")]
     [string]$OneLookupStore = "1",
-    # The one-lookup LOAD emission arm (dev_docs/2026-08-07-one-lookup-load-design.md D7):
+    # The one-lookup LOAD emission arm:
     # same contract and the same inherit hazard as the store knob above; independent of it so
     # either slice A/Bs alone.
     [ValidateSet("1", "0")]
@@ -141,7 +141,7 @@ param(
     # This exists so a knob slice can ladder ON against OFF with THIS harness
     # instead of a fresh one-off direct-invocation script per slice. Four such
     # scripts accumulated in .bench/scripts/ before this parameter existed and
-    # rewriting them produced real errors -- one invented a counter name that
+    # rewriting them produced real errors: one invented a counter name that
     # does not exist, another paraphrased a fixture's key injection and would
     # have graded a crash loop as if it were the game.
     #
@@ -163,13 +163,13 @@ param(
     # So the two states are spelled differently and neither is ever silently
     # turned into the other:
     #
-    #   NAME=       sets NAME to the EMPTY STRING in the child -- present,
+    #   NAME=       sets NAME to the EMPTY STRING in the child: present,
     #               and readable by var_os()/is_some().
     #   (omitted)   leaves NAME REMOVED from the child by the scrub.
     #
     # A bare NAME with no `=` is rejected rather than assumed, because it is
     # ambiguous between those two and they mean OPPOSITE things depending on
-    # which knob is named. Values are passed through byte for byte -- never
+    # which knob is named. Values are passed through byte for byte: never
     # trimmed, never case-folded, never re-quoted.
     #
     # Names the board sets itself (IZARRAVM_JIT, the JIT16 pair, the one-lookup
@@ -196,8 +196,8 @@ $ErrorActionPreference = "Stop"
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 
 # The benchmark workspace: fixtures, results and pinned binaries. It is NOT in the
-# repository -- ~115 GB across ~450,000 files, and the game fixtures are commercial
-# installs that cannot be redistributed -- so only this harness is tracked and the
+# repository (~115 GB across ~450,000 files, and the game fixtures are commercial
+# installs that cannot be redistributed) so only this harness is tracked and the
 # data lives wherever the machine has room for it.
 #
 # IZARRAVM_BENCH_ROOT overrides the location. Nulling follows the campaign's
@@ -1054,7 +1054,7 @@ function Invoke-ScoreboardSelfTest {
     Assert-ScoreboardSelfTestEqual $json.rows[0].native_insns 80 "legacy native_insns alias"
     Assert-ScoreboardSelfTestEqual $json.rows[0].native_coverage 0.8 "legacy native_coverage alias"
     Assert-ScoreboardSelfTestEqual $json.rows[0].insns_per_entry 8.0 "legacy IPE alias"
-    # A profile with no governor keys -- every pre-B2 baseline -- must read zeros rather than
+    # A profile with no governor keys (every pre-B2 baseline) must read zeros rather than
     # throw, or a governed run could not be compared against the baseline it is measured against.
     Assert-ScoreboardSelfTestEqual $json.rows[0].governor_backoffs 0 "absent governor counter"
 
@@ -1141,7 +1141,7 @@ $maximumBackgroundLoadPercent = 30.0
 #             cutoff-phase framebuffer hash.
 #   resultFile the redirected report exists and parses. It also guards the one
 #             real risk in this design: DUKEMARK's report goes through DOS
-#             stdout today (verified -- the text page is blank on a redirected
+#             stdout today (verified: the text page is blank on a redirected
 #             run and the file holds the whole report), and if that ever became
 #             direct-video output the file would be empty rather than wrong.
 #   info      the Info String, a config fingerprint of
@@ -1149,8 +1149,8 @@ $maximumBackgroundLoadPercent = 30.0
 #             DUKE3D.CFG. Also timing-insensitive. `1,1` at the tail is sound and
 #             music both ENABLED, so an audio regression that silences the game
 #             cannot quietly present itself as a speedup. The first field does
-#             NOT identify the demo -- it reads 2 for BENCH1, BENCH2 and BENCH3
-#             alike (measured) -- so the sample count is the only field that does.
+#             NOT identify the demo (it reads 2 for BENCH1, BENCH2 and BENCH3
+#             alike (measured)) so the sample count is the only field that does.
 #   samples   the extrapolation count, DUKEMARK's own stall detector, held to a
 #             TOLERANCE rather than an exact value. Its docs call the count
 #             constant per demo across machines, and it is not: BENCH2 reads 919
@@ -1168,16 +1168,16 @@ $maximumBackgroundLoadPercent = 30.0
 #             determinism bug rather than drift.
 #
 #             THE BAND IS SIZED AGAINST A MEASUREMENT (2026-08-10). Under the
-#             largest lever this harness has, `-Arm off` -- both JIT halves off,
-#             duke3d-486 coverage 0.7235 -> 0.5932, wall 141.1 s -> 155.2 s --
+#             largest lever this harness has, `-Arm off` (both JIT halves off,
+#             duke3d-486 coverage 0.7235 -> 0.5932, wall 141.1 s -> 155.2 s)
 #             the count moved from 919 to 920, one count against an allowance
 #             of 18. It survives because arm off moves GUEST time by three parts
 #             in ten thousand (163.150 -> 163.103 s): charging is per
 #             instruction and does not care which backend retired it. So +/-2%
 #             covers JIT-mix work with a factor of 18 in hand and deliberately
-#             does NOT cover timing-model work -- the same day's storage-charge
-#             slices moved this count 580 -> 919 -- which is the class of change
-#             that SHOULD reach a reviewer as a pin move. See .bench/PROTOCOL.md.
+#             does NOT cover timing-model work: the same day's storage-charge
+#             slices moved this count 580 -> 919, which is the class of change
+#             that SHOULD be read as a pin move. See .bench/PROTOCOL.md.
 #
 #             The count and its band live in the SIDECAR JSON beside the frame
 #             hashes, not here, and go through the same -RecordInvariants /
@@ -1215,8 +1215,8 @@ function New-DukemarkPins {
 # (.bench/results/postiopl-nascar-attribution/), the camera a beat along the
 # trackside banner. Both re-pins were justified and both cost a full attribution
 # cycle to establish that nothing was wrong. That is the duke3d situation
-# exactly -- see the DUKEMARK block above, whose frame hash "moved six times in
-# three days for entirely benign reasons" -- and this is the duke3d answer,
+# exactly. See the DUKEMARK block above, whose frame hash "moved six times in
+# three days for entirely benign reasons", and this is the duke3d answer,
 # adapted to two fixtures that print no score of their own.
 #
 # The evidence that the OLD invariant was measuring phase and not rendering: at
@@ -1244,13 +1244,13 @@ function New-DukemarkPins {
 #             here: sweep the anchor budget across a window and keep a point
 #             whose frame is bit-identical across a window far wider than any
 #             cadence-induced phase shift. A cadence change moves the guest by a
-#             small offset -- 0.13-0.15% of retired instructions across the
-#             IOPL-3 change -- so a frame that survives a +/-10% sweep of the
+#             small offset (0.13-0.15% of retired instructions across the
+#             IOPL-3 change) so a frame that survives a +/-10% sweep of the
 #             budget cannot be moved by one.
 #
 #             tombraid-586, 0.5e9: the DOS/4GW banner text page. Measured
 #             bit-identical at 0.45e9, 0.50e9 and 0.60e9, and at 0.40e9 and
-#             0.55e9 it takes a SECOND value differing in exactly 18 pixels --
+#             0.55e9 it takes a SECOND value differing in exactly 18 pixels:
 #             a 9x2 block at x0-8, y334-335, the DOS underline cursor in
 #             character cell (0,20), toggling between #000000 and #AAAAAA. The
 #             cursor blink is the only moving thing on that page, so the anchor
@@ -1259,13 +1259,13 @@ function New-DukemarkPins {
 #             under -Force. Everything outside those 18 pixels is bit-exact.
 #             GROUND TRUTH: the 0.5e9 frame is byte-identical on the pre-IOPL-3
 #             build, the IOPL-3 build (both in the attribution artifacts) and
-#             on a393404e, which also carries PR 725's Katea write-through --
+#             on a393404e, which also carries PR 725's Katea write-through:
 #             three builds spanning both an interrupt-cadence change and a
 #             storage-path change.
 #
 #             nascar-586, 0.445e9: the game's own startup logo screen, a static
 #             4-colour Margo LFB frame. Measured bit-identical at 0.395, 0.400,
-#             0.450, 0.470, 0.490 and 0.495e9 -- a 100e6-cycle window, bounded
+#             0.450, 0.470, 0.490 and 0.495e9: a 100e6-cycle window, bounded
 #             on BOTH sides by an all-black transition frame (0.385e9 and
 #             0.498e9), which is why the anchor sits at the window's centre with
 #             50e6 cycles of margin each way. That margin is 77x the phase shift
@@ -1281,8 +1281,8 @@ function New-DukemarkPins {
 #
 #             HOW THE BANDS WERE DERIVED. Not from round numbers and not from one
 #             run. Each row was sampled at several budgets either side of the
-#             graded one -- a PHASE SPREAD, which moves the camera far further
-#             than any cadence change can -- and the band was opened outward from
+#             graded one (a PHASE SPREAD, which moves the camera far further
+#             than any cadence change can) and the band was opened outward from
 #             the envelope of those samples until it cleared the wrong-scene
 #             frames the same fixture produces at other budgets.
 #
@@ -1295,7 +1295,7 @@ function New-DukemarkPins {
 #             spread of the same kind of render swings 4.3 points, so 10 is about
 #             2.3x the largest such swing measured anywhere in this harness.
 #             FAILS, as it must: an all-black frame (0.0%), and the wrong-scene
-#             frames this fixture itself produces -- the FMV at 5e9 (24.837%) and
+#             frames this fixture itself produces: the FMV at 5e9 (24.837%) and
 #             at 15e9 (17.450%), and the boot text page (19.168%, which the
 #             geometry check rejects too, at 720x400). Clearance over the worst of
 #             those is 3.58x. The 100.0 ceiling is the physical maximum
@@ -1306,7 +1306,7 @@ function New-DukemarkPins {
 #             160, 173, 174, 158 over the same four budgets. Floor is half the
 #             lowest sample, which is 4.9 envelopes below it. FAILS: a black frame
 #             or any single-colour palette wipeout (1), the boot text page (8).
-#             The ceiling is not an arbitrary number -- 256 is the palette bound
+#             The ceiling is not an arbitrary number: 256 is the palette bound
 #             of the 8bpp mode this fixture renders in, so it can never fire on a
 #             legitimate frame, and it DOES fire on the fixture's own FMV frames,
 #             which come through a deeper mode and read 564, 986 and 994.
@@ -1315,7 +1315,7 @@ function New-DukemarkPins {
 #             samples: 95.722% at 4.88e9, 99.748% at 4.93e9, 99.995% and 99.996%
 #             at the graded 4.98e9 (pre and post the change that re-pinned it),
 #             99.996% at 5.03e9, 99.992% at 5.08e9. Envelope 4.274 points wide,
-#             so the floor sits 2.74 envelopes under the lowest sample -- 11.72
+#             so the floor sits 2.74 envelopes under the lowest sample, 11.72
 #             points of room. FAILS: the all-black transition frames measured at
 #             0.385e9 and 0.498e9 (0.000%), the startup logo (6.112%), the boot
 #             text page (20.048%, 720x400), and the mid-load screen at 0.5e9
@@ -1328,8 +1328,8 @@ function New-DukemarkPins {
 #
 #             THE TWO BANDS ARE COMPLEMENTARY AND NEITHER IS SUFFICIENT ALONE,
 #             which is the direct answer to PROTOCOL.md trap 0. nascar's mid-load
-#             screen carries 121 distinct colours -- inside the colour band, and
-#             a colour-only invariant would pass it -- and is rejected only by its
+#             screen carries 121 distinct colours (inside the colour band, and
+#             a colour-only invariant would pass it) and is rejected only by its
 #             32.8% coverage. A solid-colour palette wipeout is 100% covered and
 #             is rejected only by the colour floor. Both are pinned for that
 #             reason, and the display class is pinned beside them because a guest
@@ -1339,7 +1339,7 @@ function New-DukemarkPins {
 #   class     The display path, depth, mode and frame geometry, and the stop
 #             reason. Fixture constants, graded in Invoke-Fixture rather than
 #             from the sidecar because they are not measurements: they are what
-#             the fixture IS. They draw the one line the pixel bands cannot --
+#             the fixture IS. They draw the one line the pixel bands cannot:
 #             a guest that fell out of the game onto a DOS text page paints a
 #             screen that is neither black nor single-coloured.
 #
@@ -1350,7 +1350,7 @@ function New-DukemarkPins {
 #   the last thing a gate should trust.
 #
 #   `entries`, and every other coverage counter. They are JIT-ARM dependent by
-#   construction -- `-Arm off` is meant to move them -- so asserting them would
+#   construction (`-Arm off` is meant to move them) so asserting them would
 #   fail every off-arm board. `instructions` is the exception and the reason it
 #   is the guest-progress counter chosen here: charging is per instruction and
 #   does not care which backend retired it, the same fact the DUKEMARK sample
@@ -1369,7 +1369,7 @@ function New-DukemarkPins {
 # largest legitimate move this class of change has produced; it is also arm-safe,
 # because charging is per instruction (arm off moved duke's guest time by 3 parts
 # in 10,000). The failing side: it is not vacuous, because the count at a fixed
-# budget is a rate, and the rate is a function of WHICH PHASE the run is in --
+# budget is a rate, and the rate is a function of WHICH PHASE the run is in:
 # tombraid retires 0.697 instructions per cycle over the graded budget but only
 # 0.625-0.644 over budgets that end inside the FMV (measured at 5e9 and 15e9), so
 # a run that failed to get out of the intro is 8-10% low and fails. A run that
@@ -1379,7 +1379,7 @@ $frameInstructionTolerance = 0.05
 #
 # Probed by name and guarded, exactly like `cdImage`: under StrictMode
 # `$Fixture.PSObject.Properties['frameContract']` is $null on a row without the
-# field and reading `.Value` off that THROWS. Doing it inline cost a board run --
+# field and reading `.Value` off that THROWS. Doing it inline cost a board run:
 # the two contract rows passed and wolf3d-486 died on the property access.
 function Get-FrameContract($Fixture) {
     $property = $Fixture.PSObject.Properties['frameContract']
@@ -1440,7 +1440,7 @@ function Test-ProfileBands($Profile, $Bands, [bool]$CompareCalibration = $true) 
         # The cast throws under the script's Stop preference when the path
         # resolves to a non-numeric node (a typo'd path that stops one segment
         # short lands on an object). That must be one RED row, not a dead
-        # sweep -- a gate that can only crash is a gate that cannot fail.
+        # sweep: a gate that can only crash is a gate that cannot fail.
         $number = $null
         try { $number = [double]$value } catch {
             $failures += "profile band '$($band.path)': the value is not numeric"
@@ -1507,28 +1507,28 @@ function Get-FixtureTable {
             qconsole = $false; resultPpm = $true; dukemark = $null
             # 2026-09-02 re-pin, e312f8f3 -> 6cc0d354 (the SAME hash this row pinned before the
             # 2026-08-27 entry below, `90c5e41d` "Re-pin prince-486 and tombraid-loader-586 to
-            # the PR 736 kernel", moved back to it). The CR3 data-side gate's PR #826 (T1+T2,
-            # `dev_docs/2026-09-02-cr3-data-side-design.md`) shifts the fixed 4e9-cycle budget one
-            # torch-flame frame earlier -- the same class of drift `90c5e41d` describes for the
+            # the PR 736 kernel", moved back to it). The CR3 data-side gate's PR #826 (T1+T2)
+            # shifts the fixed 4e9-cycle budget one
+            # torch-flame frame earlier, the same class of drift `90c5e41d` describes for the
             # opposite direction (156 of 128000 pixels, all inside the two torch sprites). Content
             # is verified by hash identity to that already-inspected frame, not by a fresh read.
             #
-            # CAUSE, HONESTLY: T1 alone (`dev_docs/2026-09-02-cr3-data-side-design.md` T1)
+            # CAUSE, HONESTLY: T1 alone
             # reproduces the prior `e312f8f3` hash and the prior instruction count UNCHANGED, so
             # T1 is cleared. T1+T2 together move both. Inside T2, three internal mechanisms were
-            # tested as the specific cause, individually and in combination -- reverting
+            # tested as the specific cause, individually and in combination (reverting
             # `Tlb::insert`'s eviction-report predicate to its pre-T2 form, forcing every `MOV
             # CR3` to fully re-flush the TLB instead of retaining it (`ContextSelect::Reselected`
             # forced through `retire_all_slots`), and forcing `flush_tlb_keep_code_caches`'s PG=1
-            # arm to fully flush instead of `flush_live_slot` -- and NONE of them, alone or
+            # arm to fully flush instead of `flush_live_slot`) and NONE of them, alone or
             # together, moved the hash or the instruction count off `6cc0d354` /
             # `2079676716`. The earlier claim in this row ("T2's retention behavior itself") is
             # RETRACTED as unsupported: the experiment that should have refuted it (forcing full
             # re-flush on the CR3-write gate) left the shifted hash exactly in place, which
             # contradicts that claim rather than confirming it. The specific mechanism inside T2
-            # responsible for the shift was not isolated. This does not change the merge decision
-            # -- the content question is settled independently by hash identity to a previously
-            # shipped, hand-verified frame -- but the causal sentence itself is not asserted.
+            # responsible for the shift was not isolated. This does not change the merge decision:
+            # the content question is settled independently by hash identity to a previously
+            # shipped, hand-verified frame, but the causal sentence itself is not asserted.
             #
             # irq0_edges (independent confirmation the shift is a phase shift, not a different
             # execution path): main and T1-only both read 4064 (pit_writes 23); T1+T2 reads 4069
@@ -1540,11 +1540,11 @@ function Get-FixtureTable {
             # 2026-08-30 re-pin, 04fd8558 -> 802e9d4f. The ISA I/O wait-state
             # flip: prince issues only 43 PIT writes all run, so the charge
             # moves it by ppm and the 4e9 budget lands one torch-flame frame
-            # off -- the SAME class as this row's two previous re-pins below.
+            # off, the SAME class as this row's two previous re-pins below.
             # The frame was READ before pinning: level-1 dungeon, torches lit,
             # the injected run in progress. (A first capture WITHOUT the key
             # schedule showed the intro and briefly read as an input bug; the
-            # schedule is load-bearing -- see the injection comment below.)
+            # schedule is load-bearing; see the injection comment below.)
             #
             # 2026-08-29 re-pin, e312f8f3 -> 04fd8558. PR #760 (Tier B B3)
             # rebuilt KERNEL.SYS inside tokados-hdd.img (73071 -> 73487 bytes),
@@ -1629,8 +1629,8 @@ function Get-FixtureTable {
         [pscustomobject]@{
             # The CHEAP duke3d-586 row: the same guest workload as duke3d-586,
             # stopped early. `.bench/duke3d_short_c` is duke3d_c with one dword
-            # rewritten -- BENCH2S.DMO is BENCH2.DMO with its record count cut
-            # from 3909 to 1140 -- so the records that play are byte-for-byte
+            # rewritten (BENCH2S.DMO is BENCH2.DMO with its record count cut
+            # from 3909 to 1140) so the records that play are byte-for-byte
             # the long row's first 1140 and the short row is a PREFIX of the
             # long row's workload rather than a different one. Built by
             # `scripts/make-duke-short-fixture.ps1`; see PROTOCOL.md.
@@ -1677,7 +1677,7 @@ function Get-FixtureTable {
         }
         [pscustomobject]@{
             # Tyrian 2000 SETUP.EXE: the settings menu, then the jukebox. The
-            # row exists for the guest's 70 Hz audio clock -- the Loudness
+            # row exists for the guest's 70 Hz audio clock: the Loudness
             # driver paces music (MPU-401 MIDI at P300) and its DSP re-arm
             # chain off a PIT channel 0 it reprograms every video frame, and
             # the 2026-08-28 write-edge bug silenced exactly this screen.
@@ -1761,12 +1761,10 @@ function Get-FixtureTable {
         }
         [pscustomobject]@{
             # The Tyrian 2000 Ship Specs dwell, the recipe the 09-02/03 CR3-gate
-            # and reflected-call campaigns are graded on
-            # (dev_docs/2026-09-02-tyrian-586-specs-diag.md,
-            # dev_docs/2026-09-02-tyrian-586-reprofile.md,
-            # dev_docs/2026-09-03-morning-handoff.md). `tyrian-586` above polls
+            # and reflected-call campaigns are graded on.
+            # `tyrian-586` above polls
             # 62x less than this screen and cannot show the lever the campaign
-            # works on -- this row exists to be graded on instead.
+            # works on: this row exists to be graded on instead.
             #
             # The owner's install tree, not the plain `tyrian_c` fixture: the
             # owner's CONFIG.SYS (`DEVICE=C:\DOS\TOKAEMM.SYS RAM /T`,
@@ -1793,14 +1791,14 @@ function Get-FixtureTable {
             # guest second after the #825/#826 CR3 gate. Measured on this row
             # at main 29a7b6dd (this branch's parent): 160.6 M instructions/gs
             # and 18.48 M entries/gs over the same t=21-31s window (phase marks,
-            # IZARRAVM_PHASE_INTERVAL_MS=500) -- the same ballpark, moved by the
+            # IZARRAVM_PHASE_INTERVAL_MS=500), the same ballpark, moved by the
             # commits between #825 and 29a7b6dd. These are NOT asserted by this
             # row (no periodic phase sampling runs on a board leg); they are the
             # reason the row exists and are recorded here so a future slice can
             # compare its own dwell rate against this baseline.
             #
             # PROVISIONAL: no rt anchor. `realticsMinimum`/`Maximum` are $null
-            # below and nothing wall-clock is asserted, on purpose -- the box
+            # below and nothing wall-clock is asserted, on purpose: the box
             # was not quiet while this row was built (background load 61-66%
             # on two of the three legs that measured it), and a wall-clock
             # anchor recorded under load is not a final pin. Re-anchor rt once
@@ -1814,10 +1812,10 @@ function Get-FixtureTable {
             injection = @("--inject-keys", ("2324000000:{down};2407000000:{enter};" +
                 "2739000000:{enter};3154000000:{down};3237000000:{enter}"))
             # The Ship Specs screen is READ, not assumed: the picture behind
-            # this hash is MicroCorp Stalker-B's data page -- wireframe ship,
+            # this hash is MicroCorp Stalker-B's data page: wireframe ship,
             # the "MicroSol continues the Stalker line..." body text, the stat
             # block, and the "Press a key" prompt the screen always shows while
-            # it dwells -- confirmed by eye against `--presented-ppm` before the
+            # it dwells, confirmed by eye against `--presented-ppm` before the
             # hash was recorded. Two fresh runs from the fixture tree are
             # frame-identical (this hash, twice) and read the identical pixel
             # stats printed to stdout: 29,000 non-zero pixels (22.7%), 19
@@ -1896,7 +1894,7 @@ function Get-FixtureTable {
             # starts the demo itself), level load 142-144, demo 145-179. The
             # end frame lands MID-DEMO on purpose: it is where the fixture's
             # real work is, and 30e9 would land on the demo-to-menu transition
-            # second. It is graded on BANDS, not on a hash -- mid-demo is
+            # second. It is graded on BANDS, not on a hash: mid-demo is
             # precisely where a hash cannot survive a cadence change.
             cycles = [uint64]28000000000
             realticsMinimum = $null; realticsMaximum = $null; gametics = $null
@@ -1938,7 +1936,7 @@ function Get-FixtureTable {
             injection = @("--inject-keys", "5000000000:{esc}")
             # A Glide row MUST grade the PUBLISHED frame. Distira's scanout is
             # the only path that shows it, and a re-render reports what video
-            # memory holds -- which on a double-buffered Voodoo is the buffer
+            # memory holds, which on a double-buffered Voodoo is the buffer
             # nobody is looking at.
             gradePresentedFrame = $true
             # No end-of-budget hash, for the reason tombraid-586 lost its own:
@@ -1947,7 +1945,7 @@ function Get-FixtureTable {
             # bit-identical (99.57% non-black, 365 colours, 19,864,778,122
             # instructions), so the determinism is real; it is robustness to CODE
             # change that a hash would lack. The anchor is the Toka-DOS boot text
-            # at 0.5e9, whose only moving part is the two-state cursor -- the
+            # at 0.5e9, whose only moving part is the two-state cursor, the
             # same anchor and the same two phases as the software row, because
             # both trees boot the same DOS and their first four guest seconds are
             # byte-identical to each other.
@@ -1982,7 +1980,7 @@ function Get-FixtureTable {
             # DEMOS\DESCENT2.DEM from the title with no further input.
             #
             # The two Escapes clear the release-notice screen. A THIRD key would
-            # land after the demo starts and raise "ABORT AUTODEMO?" -- measured,
+            # land after the demo starts and raise "ABORT AUTODEMO?", measured,
             # not guessed.
             injection = @("--inject-keys", "3000000000:{esc};4000000000:{esc}")
             gradePresentedFrame = $true
@@ -2054,8 +2052,8 @@ function Get-FixtureTable {
             # indirect witness to what the board says it IS: Tomb Raider and
             # Descent II would render identically whether the SST-1 reports one
             # TMU or two, 2 MB or 4 MB, and neither would notice if the vendor
-            # ID moved. MOJO.EXE is 3dfx's own DOS diagnostic for the SST-1 --
-            # `usage: mojo [-v]`, no menus, no keypress, no graphics -- and it
+            # ID moved. MOJO.EXE is 3dfx's own DOS diagnostic for the SST-1
+            # (`usage: mojo [-v]`, no menus, no keypress, no graphics) and it
             # reads exactly those facts out of the hardware and prints them.
             # Bare MOJO prints the board report (vendor/device ID, FBI revision
             # and memory, FBI and TMU power-on sense, DAC colour format, SLI
@@ -2070,14 +2068,14 @@ function Get-FixtureTable {
             # which nothing else in the table touches. The TMU config byte is
             # read the way real silicon delivers it, by setting trexInit1's
             # sendConfig bit and reading the config byte back as a rendered
-            # pixel through the LFB -- a path with no other coverage here.
+            # pixel through the LFB, a path with no other coverage here.
             #
             # The fixture tree is built by scripts/make-mojo-fixture.ps1, which
             # hard-fails on the sha256 of mojo.exe: the pins below are pins on
             # ONE build of one diagnostic, and a different build would fail the
             # row for a reason that has nothing to do with Distira.
             arguments = @("--cpu", "586", "--memory-mib", "64", "--video", "vega")
-            # A GUARD, not the length of the run -- EXITVM.COM ends the VM once
+            # A GUARD, not the length of the run: EXITVM.COM ends the VM once
             # both reports are written, at roughly 0.55e9 clocks. 4e9 is 24 guest
             # seconds and about seven times the headroom needed.
             cycles = [uint64]4000000000
@@ -2091,7 +2089,7 @@ function Get-FixtureTable {
             # and never waits for input. A DOS diagnostic that needs no schedule
             # is the rare case; see dos-3d-title-waiting-looks-hung for the rule
             # it is the exception to.
-            # MOJO.TXT is pinned raw -- every line of it is a board-identity
+            # MOJO.TXT is pinned raw: every line of it is a board-identity
             # fact and none of them may drift benignly. MOJOV.TXT needs the
             # beam-phase lines masked, and the mask was earned rather than
             # assumed: Distira synthesises `vRetrace` from the live beam
@@ -2100,7 +2098,7 @@ function Get-FixtureTable {
             # two unused binaries removed moved it 0x29 -> 0x14 and moved
             # NOTHING else in the file.
             #
-            # 2026-09-04 (dev_docs/2026-09-04-red-pins-bisect.md): the same
+            # 2026-09-04: the same
             # beam phase also leaked through `status:` (distira.rs
             # status_value() clears bit 0x40 while in_vretrace(), so
             # 0ffff07f <-> 0ffff03f tracks vRetrace exactly) and through
@@ -2255,8 +2253,8 @@ line matching one of `$Masks` is replaced by `<masked>` before hashing.
 THE MASK IS NOT A CONVENIENCE. It was earned: MOJO's `-v` register dump prints
 `vRetrace`, which on Distira is a LIVE beam position rather than a stored
 register, so it reads whatever scanline the raster happened to be on when the
-program asked. Rebuilding the fixture tree with two unused binaries removed --
-a change that cannot touch the SST-1 at all -- moved that one line from 0x29 to
+program asked. Rebuilding the fixture tree with two unused binaries removed
+(a change that cannot touch the SST-1 at all) moved that one line from 0x29 to
 0x14 and nothing else in the file. Pinned raw, `MOJOV.TXT` would be a
 phase-sensitive hash of exactly the kind Duke3D, Tomb Raider and NASCAR each
 had to give up; masked, the other 40 lines of the register file stay under an
@@ -2301,7 +2299,7 @@ pure black, and how many distinct colours it carries.
 
 Computed HERE, from the PPM, rather than scraped from the emulator's stdout
 summary, for two reasons. The numbers have to be produced by the same code the
-negative probe runs against -- a band graded on a line of stdout cannot be tested
+negative probe runs against: a band graded on a line of stdout cannot be tested
 against a synthetic corrupt frame without also faking the stdout. And the stdout
 summary is a human-readable diagnostic whose format is free to move; an invariant
 that silently stops parsing is an invariant that silently stops failing.
@@ -2353,7 +2351,7 @@ function Get-PpmFrameStats([string]$Path) {
         $at = $cursor + $i * 3
         # [int] casts, and they are load-bearing. PowerShell's shift operators
         # keep the LEFT OPERAND'S TYPE, so `[byte]65 -shl 16` is not 4259840, it
-        # is 0 -- the result wraps back into a byte. Packing the channels without
+        # is 0: the result wraps back into a byte. Packing the channels without
         # these casts silently collapses every colour key to its blue channel,
         # and the count becomes "distinct blue values": 49 where the frame holds
         # 174 colours. Caught 2026-08-18 by the tombraid row FAILING its own new
@@ -2374,12 +2372,12 @@ function Get-PpmFrameStats([string]$Path) {
 }
 
 # Frame-stats self-test. It exists because the colour counter was WRONG on its
-# first outing in a way no reviewer caught and no crash reported: the channel
+# first outing in a way no review caught and no crash reported: the channel
 # packing dropped red and green (see the [int] casts above), so it counted
 # distinct BLUE values and read 49 where the frame held 174. What found it was
 # the tombraid row failing its own new band on a perfectly good frame. These
 # cases make that failure mode a test rather than an incident, and they are also
-# the negative probe in permanent form -- a black screen, a solid fill and a
+# the negative probe in permanent form: a black screen, a solid fill and a
 # two-colour wipeout are the three shapes the bands exist to reject.
 function New-SelfTestPpm([string]$Path, [int]$Width, [int]$Height, [scriptblock]$Pixel) {
     $header = [Text.Encoding]::ASCII.GetBytes("P6`n$Width $Height`n255`n")
@@ -2480,7 +2478,7 @@ the stop reason was, so the file is on the host by the time this reads it.
 VERIFIED, because it was the design's one real risk: DUKEMARK's final report DOES
 go through DOS stdout and lands in the file intact. Redirection would have caught
 nothing if the Build engine had painted that screen directly, and the check is
-cheap to repeat -- the text page is BLANK on a redirected run, so a regression to
+cheap to repeat: the text page is BLANK on a redirected run, so a regression to
 direct-video output shows up as an empty file rather than as silently wrong
 numbers.
 
@@ -2551,7 +2549,7 @@ function Read-Invariants {
 #
 # CORRECTION to the claim made when this helper landed: it said the CRLF bug WAS
 # the cause of the three red mains the comment below counts. It was not. Those
-# three commits carried the PREVIOUS commit's (LF) sha in the manifest row --
+# three commits carried the PREVIOUS commit's (LF) sha in the manifest row:
 # the manifest was simply not updated at all, which is the omission the
 # auto-sync below now closes. The CRLF defect is real and is fixed here, but it
 # was LATENT: `Set-Content -Encoding utf8` writes CRLF on Windows, so the sha
@@ -2975,7 +2973,7 @@ function Write-Invariants($Table) {
 # The emulator's command line for one run of a fixture. Factored out of
 # Invoke-Fixture because the frame-contract rows (see New-FrameContract) launch
 # the SAME fixture a second time at the anchor budget, and an anchor run assembled
-# from a second, hand-kept copy of this list would drift from the graded one --
+# from a second, hand-kept copy of this list would drift from the graded one:
 # a different persona or a missing --cd-image would move the anchor hash and read
 # as a regression.
 function Get-FixtureArguments($Fixture, [string]$WorkingCopy, [uint64]$Cycles,
@@ -2995,7 +2993,7 @@ function Get-FixtureArguments($Fixture, [string]$WorkingCopy, [uint64]$Cycles,
         # `resize_work` raster wipe restored. A row that grades CONTENT bands
         # wants the published frame; the rows that pin a re-render keep it,
         # because their pins were taken that way. Same path either way, so every
-        # consumer downstream -- hash, bands, width and height -- is unchanged.
+        # consumer downstream (hash, bands, width and height) is unchanged.
         $presentedProperty = $Fixture.PSObject.Properties['gradePresentedFrame']
         if ($null -ne $presentedProperty -and $presentedProperty.Value) {
             $arguments += @("--presented-ppm", $PpmPath)
@@ -3023,7 +3021,7 @@ function Get-FixtureArguments($Fixture, [string]$WorkingCopy, [uint64]$Cycles,
 # Everything the BOARD itself owns, in one table, values included. Two callers
 # read it: Get-RowEnvironment applies it, and the -Knobs passthrough takes its
 # RESERVED NAME LIST from `.Keys` here. That is why it is one table rather than
-# a run of assignments plus a hand-copied list of names somewhere else -- a
+# a run of assignments plus a hand-copied list of names somewhere else: a
 # hand-copied list drifts the moment a knob is added, and the way it drifts is
 # that the passthrough silently starts accepting a name the board also sets,
 # with the winner decided by assignment order that nobody is looking at.
@@ -3105,14 +3103,14 @@ function Resolve-KnobPassthrough([string[]]$Specification, $ReservedNames) {
     # SPLIT ON COMMA OURSELVES, and do it before anything else looks at an entry.
     #
     # `pwsh -File script.ps1 -Knobs A=1,B=2` binds ONE string "A=1,B=2" to a
-    # [string[]] parameter -- measured 2026-08-24, quoted and unquoted alike, and
+    # [string[]] parameter, measured 2026-08-24, quoted and unquoted alike, and
     # `-Knobs A=1 -Knobs B=2` is a binder error rather than two values. Without
     # this split the first knob would silently be armed to the value
     # "1,B=2" and the second would never be armed at all: a board that ran an arm
     # nobody asked for and labelled it one that nobody ran.
     #
     # -Fixtures does NOT survive the same binder quirk on its own. The old claim
-    # here -- that its known-name check throws on the mangled value -- was true
+    # here (that its known-name check throws on the mangled value) was true
     # for the comma shape only. For the two-token shape the extra token never
     # reaches -Fixtures at all: it binds POSITIONALLY to a later [string]
     # parameter, measured 2026-08-27 (see the note above the param block). So
@@ -3181,7 +3179,7 @@ it directly, and a typo fails before the first row rather than after it.
 It splits on the comma ITSELF because `pwsh -File ... -Fixtures a,b` binds ONE
 string "a,b" to the [string[]] parameter; without the split, the known-name
 check would reject the documented comma shape instead of running two rows.
-The two-token shape (`-Fixtures a b`) never gets here -- PositionalBinding is
+The two-token shape (`-Fixtures a b`) never gets here: PositionalBinding is
 off for the whole script, so the binder rejects the second token first.
 
 Every element is then checked against the fixture table. Whitespace around an
@@ -3229,7 +3227,7 @@ function Select-ScoreboardFixtures([string[]]$Specification) {
 # The child environment for one row: scrub, then the board's own table, then the
 # caller's explicit -Knobs passthrough.
 #
-# The passthrough goes LAST, but it can never overwrite a board-owned name --
+# The passthrough goes LAST, but it can never overwrite a board-owned name:
 # Resolve-KnobPassthrough rejects those outright, using this very table's keys
 # as the reserved set. Order is therefore cosmetic, and deliberately so: there
 # is no assignment race here to reason about.
@@ -3264,7 +3262,7 @@ function Get-RowEnvironment {
 Read a CHILD PROCESS's own environment block back.
 
 This exists because asserting about the hashtable Get-RowEnvironment returns
-would be a test that cannot fail for the only thing that matters -- whether the
+would be a test that cannot fail for the only thing that matters: whether the
 value reaches the emulator. The campaign's standing rule after seven instruments
 read green regardless: prove the mechanism goes RED on a broken input.
 
@@ -3314,7 +3312,7 @@ function Get-ChildEnvironmentSnapshot($Environment) {
 <#
 The arm-passthrough self-test.
 
-Half of it drives Resolve-KnobPassthrough directly -- that half is about which
+Half of it drives Resolve-KnobPassthrough directly: that half is about which
 inputs are REFUSED. The other half spawns a real child and reads the real
 environment block, because that is the half that would otherwise pass whether
 or not the passthrough was wired up at all.
@@ -3435,7 +3433,7 @@ function Assert-ScoreboardKnobPassthroughSelfTest {
             "a knob armed to the empty string, as the child sees it"
 
         # 4. ... and the other direction. A real knob sitting in the PARENT
-        #    shell, not named in -Knobs, must arrive ABSENT -- never inherited,
+        #    shell, not named in -Knobs, must arrive ABSENT, never inherited,
         #    and never downgraded to empty-but-set.
         if ($armed.ContainsKey($realKnob)) {
             throw ("scoreboard self-test failed: $realKnob was not named in -Knobs but " +
@@ -3456,8 +3454,8 @@ The -Fixtures selection self-test.
 
 Half of it drives Resolve-FixtureSelection directly. The other half spawns this
 very script under `pwsh -File` with the MANGLED two-token shape from the
-2026-08-27 incident, because that failure happens in the parameter binder --
-before any function in this file runs -- and only a real child invocation can
+2026-08-27 incident, because that failure happens in the parameter binder
+(before any function in this file runs) and only a real child invocation can
 prove the guard fires there. The campaign rule applies: a new guard must be
 shown to go RED on the broken input, and a green control must show the child
 harness itself works, so the red row cannot pass by being unable to run.
@@ -3570,7 +3568,7 @@ frame-contract row still keeps.
 
 It is a SECOND emulator invocation because the only way to get an intermediate
 frame out of one run is `--screen-dump-dir`, whose own help says it slices the
-run -- a diagnostic path, not a benchmark path, and this row's wall is a
+run: a diagnostic path, not a benchmark path, and this row's wall is a
 published metric. Running it AFTER the graded run rather than before is
 deliberate for the same reason: the graded numbers are already captured by then,
 so nothing the anchor run does to the host's caches can reach them.
@@ -3579,7 +3577,7 @@ It is cheap relative to what it protects: 7 s against tombraid-586's ~250 s,
 5 s against nascar-586's ~60 s.
 
 Nothing here is timed. The anchor run contributes NO wall, NO real-time factor
-and NO coverage counters to the row -- only a frame hash.
+and NO coverage counters to the row, only a frame hash.
 #>
 function Get-ScoreboardAffinity($Process) {
     if (-not ('ScoreboardAffinity' -as [type])) {
@@ -3867,7 +3865,7 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
         $result.dukemark_demo = $pins.demo
 
         # 1. The guest ended the VM itself. A cycle_limit stop means the budget
-        #    ran out first, i.e. the run never got to C:\EXITVM.COM -- the budget
+        #    ran out first, i.e. the run never got to C:\EXITVM.COM: the budget
         #    on this fixture is a guard, not the thing that ends the run.
         $stopKind = $profile.stop.kind
         $result.stop_kind = $stopKind
@@ -3927,7 +3925,7 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     #
     # This is the third grading shape in the table and it exists because the
     # other two cannot see what this row is for. A framebuffer hash grades
-    # PIXELS, and MOJO draws none worth grading -- it prints text and exits. The
+    # PIXELS, and MOJO draws none worth grading: it prints text and exits. The
     # DUKEMARK path grades a report too, but it parses ONE known report format
     # for three named fields; here the whole file IS the invariant, because
     # every line of it is a board-identity fact (vendor and device ID, FBI
@@ -4131,8 +4129,8 @@ if ($failed.Count -gt 0) {
 }
 
 # Say 0 explicitly. Falling off the end leaves $LASTEXITCODE holding whatever
-# the last NATIVE command set, and the last native command here is the emulator
-# -- so a board on which every fixture passed reported exit 1 on 2026-08-12
+# the last NATIVE command set, and the last native command here is the emulator,
+# so a board on which every fixture passed reported exit 1 on 2026-08-12
 # purely because a guest had exited non-zero. That is the dangerous direction
 # for a gate: the obvious repair is to stop trusting this script's status, which
 # would also silence the real `exit 1` above and turn the gate into decoration.

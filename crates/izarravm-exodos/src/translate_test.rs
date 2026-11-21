@@ -132,7 +132,7 @@ fn a_title_with_its_own_memory_manager_gets_no_tokaemm() {
 
 #[test]
 fn the_confs_own_ems_key_names_the_titles_that_host_their_own_manager() {
-    // eXo writes `[dos] ems=false` on 106 confs -- ultima71 among them -- which
+    // eXo writes `[dos] ems=false` on 106 confs, ultima71 among them, which
     // is the conf SAYING what the jemm/cwsdpmi name-sniff was guessing at.
     let dir = doom_extraction();
     let conf = DosboxConf::parse(

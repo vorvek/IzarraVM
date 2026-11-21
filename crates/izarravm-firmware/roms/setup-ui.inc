@@ -269,7 +269,7 @@ su_take_latched_hotkey:
 ; ASCIIZ on entry. It overwrites the two key-hint rows with the note, ink on the
 ; field. Preserves the caller's registers (the hotkey path re-sets the CF/AL it
 ; returns after this call). The BIOS is in the LFB mode here, so this must use
-; lfb_* primitives -- mode-13h gfx_* writes would be invisible.
+; lfb_* primitives: mode-13h gfx_* writes would be invisible.
 su_post_note:
     pusha
     mov bp, si                      ; BP = note string pointer (survives the wipe)
@@ -906,7 +906,7 @@ su_service_note:
 
 ; su_row_colors: BL = selectable-row index on entry; returns BL = foreground,
 ; BH = background for that row's label (ink-on-field normally, field-on-ink
-; inverse when it is the highlighted row -- the same focused-band look the Tab
+; inverse when it is the highlighted row, the same focused-band look the Tab
 ; boot menu uses). When focused, also paints the ink highlight band under the
 ; row before returning, so the caller's lfb_text lands on top of it. The
 ; caller sets DI/AX (x/y) *before* calling this, for its own following
@@ -1083,7 +1083,7 @@ su_draw_time_value:
     ret
 
 ; su_time_row_colors: return BL=fg, BH=bg for the Time row's value glyphs,
-; matching su_row_colors' highlighted-vs-plain look, but WITHOUT touching DS --
+; matching su_row_colors' highlighted-vs-plain look, but WITHOUT touching DS:
 ; su_row_colors always hands back DS=CS for a CS-relative label, which is wrong
 ; for these callers' segment-0 BIOS_VALBUF/colon-buffer strings. The highlight
 ; band itself is already painted by the Time row's own su_row_colors call in
@@ -1515,7 +1515,7 @@ su_time_sep_common:
 ; su_periph_page: re-run each POST probe live (they are non-destructive) and list
 ; its PASS/FAIL as a boxed table with an aligned status column. Esc returns. The
 ; probe handlers follow the POST contract: AL = HRES_PASS/FAIL/MEASURE on return;
-; MEASURE leaves SI = a segment-0 ASCIIZ value offset (unused here -- none of
+; MEASURE leaves SI = a segment-0 ASCIIZ value offset (unused here: none of
 ; these seven probes return MEASURE in practice). We enter each with DS = BDA_SEG
 ; to match that contract.
 su_periph_page:
@@ -1539,7 +1539,7 @@ su_periph_page:
     mov bh, SU_C_INK
     call lfb_box
     ; A thin rule under the header band separating the title row from the probes
-    ; would need another box primitive call; skipped to keep this lean -- the row
+    ; would need another box primitive call; skipped to keep this lean: the row
     ; color contrast already reads as a table.
 
     ; One row per probe. SU_PROBE macro: name string, handler label, row index.

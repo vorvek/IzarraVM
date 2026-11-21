@@ -130,7 +130,7 @@ fn xa_form2_sectors_are_not_readable_as_data() {
     bin[24] = 0x01; // sector 0: Form 1 (submode bit 5 clear)
     bin[RAW_SECTOR + 18] = 0x20; // sector 1: Form 2
     bin[RAW_SECTOR + 24] = 0x02;
-    // Sector 2: Form 1 with EOF (0x80) set. Only bit 5 selects Form 2 -- other
+    // Sector 2: Form 1 with EOF (0x80) set. Only bit 5 selects Form 2: other
     // submode bits (EOF 0x80, real-time 0x40, ...) are routine on real XA
     // discs and must not be mistaken for the Form 2 flag.
     bin[2 * RAW_SECTOR + 18] = 0x80;
@@ -285,7 +285,7 @@ fn cue_refuses_a_supplied_file_the_sheet_never_named() {
     // file went nowhere without a word while a track bound to the wrong bytes.
     // The two sides disagreed about what the sheet said, and only the quieter
     // side got to decide. Nobody has to know what a BOM is to be told the
-    // counts do not match -- whatever the next cause of a dropped FILE line
+    // counts do not match, whatever the next cause of a dropped FILE line
     // turns out to be, this refuses the mount instead of guessing.
     let cue = "FILE \"named.bin\" BINARY\n\
                TRACK 01 AUDIO\n\
@@ -360,7 +360,7 @@ fn cue_shares_one_file_across_two_tracks_then_a_third_in_another() {
     // Track 1's span is bounded by track 2's INDEX 01 *within FILE A* (the
     // `n.file_index == fi` comparison the per-file rework added actually
     // evaluates true here); track 2 then runs to FILE A's own end, and
-    // track 3 runs to FILE B's end -- three different file-boundary cases
+    // track 3 runs to FILE B's end: three different file-boundary cases
     // in one sheet.
     let cue = "FILE \"a.bin\" BINARY\n\
                TRACK 01 MODE1/2048\n\
@@ -396,7 +396,7 @@ fn cue_with_a_utf8_bom_still_binds_each_track_to_its_own_file() {
     // and `str::trim` does not remove it: U+FEFF is a `Cf` format character,
     // not `White_Space`. So the first line's keyword arrives as
     // "\u{FEFF}FILE", misses every arm of the keyword match, and falls through
-    // the catch-all -- the whole line is dropped.
+    // the catch-all: the whole line is dropped.
     //
     // Dropping the *first* FILE line is not a cosmetic loss. Tracks bind to a
     // file by `files.len().saturating_sub(1)`, so with the first FILE gone
@@ -572,7 +572,7 @@ fn from_cue_refuses_a_sheet_that_names_several_files() {
     // origins, and this entry point lays every track out sequentially against
     // the single blob it was handed: track 2 would be read at track 1's end
     // rather than at the head of its own file. That is not an approximation of
-    // the disc, it is a different disc -- served without an error, which is the
+    // the disc, it is a different disc, served without an error, which is the
     // failure mode this whole line of work exists to remove.
     let cue = "FILE \"t1.bin\" BINARY\n\
                TRACK 01 AUDIO\n\
@@ -622,7 +622,7 @@ fn motorola_data_track_payload_is_left_alone() {
     assert!(!img.tracks()[0].byte_swapped);
     // The read below is a forward guard, not a second proof. `read_data_sector`
     // never consults `byte_swapped`, so no change to the swap alone can make it
-    // fail -- it would take someone teaching the data path to swap as well. It
+    // fail: it would take someone teaching the data path to swap as well. It
     // stays because that is exactly the change worth catching, but do not read
     // it as independent coverage of the line above.
     assert_eq!(
@@ -689,7 +689,7 @@ fn parse_one_file_line(file_line: &str) -> Result<CueFile, String> {
 fn cue_file_line_parsing_handles_quoting_and_whitespace() {
     // The name and the type token share one line, so reading the token means
     // resuming the scan at whatever follows the name. When the name is quoted,
-    // that is the text after the *closing* quote -- a position the earlier
+    // that is the text after the *closing* quote, a position the earlier
     // `rest.split('"').next()` could never report, because splitting on the
     // quote and taking the first piece yields the name and discards the rest of
     // the line by construction. It parsed names correctly and would keep doing
@@ -728,7 +728,7 @@ fn cue_file_line_without_a_name_is_rejected() {
     // Reaching past the closing quote gave the quoted branch a second way to
     // come back empty-handed, so pin the message and not merely `is_err`: a
     // FILE line that yields no name has to fail *as* a missing name, whichever
-    // branch consumed it. An unterminated quote lands here too -- there is no
+    // branch consumed it. An unterminated quote lands here too: there is no
     // closing quote to end the name at, so the line names nothing.
     for line in ["FILE \"\" BINARY", "FILE", "FILE \"unterminated"] {
         let err = parse_one_file_line(line).unwrap_err();
@@ -844,8 +844,8 @@ fn frames_the_source_has_not_decoded_yet_read_as_absent() {
 #[test]
 fn an_audio_sourced_track_is_addressed_from_its_own_start_not_the_discs() {
     // The index handed to the source is relative to the track, so a source
-    // preceded by other tracks -- and by a PREGAP, which advances the disc
-    // timeline with no bytes behind it -- still starts at its own frame 0.
+    // preceded by other tracks (and by a PREGAP, which advances the disc
+    // timeline with no bytes behind it) still starts at its own frame 0.
     let cue = "FILE \"a.bin\" BINARY\n\
                TRACK 01 MODE1/2048\n\
                INDEX 01 00:00:00\n\
@@ -1101,7 +1101,7 @@ fn a_pregap_between_tracks_does_not_stop_the_next_one_being_warmed() {
     // the head crosses the gap it is inside no track at all.
     //
     // Matching the next track on exact adjacency made warming inert for every
-    // sheet with a pregap, which is the ordinary layout -- Fatal Racing's real
+    // sheet with a pregap, which is the ordinary layout: Fatal Racing's real
     // sheet opens its audio with PREGAP 00:02:00.
     let cue = "FILE \"a.ogg\" WAVE\n\
                TRACK 01 AUDIO\n\

@@ -419,7 +419,7 @@ gfx_blit_1bpp:
 ; the RAM test paces. Drawing is done into VRAM before lfb_set_mode (activate
 ; last): Margo's set_mode does not clear VRAM, so flipping the order would make
 ; the mode switch visible while VRAM still holds stale pixels (a flash of
-; garbage). Do NOT move lfb_set_mode earlier -- the screen would no longer reveal
+; garbage). Do NOT move lfb_set_mode earlier: the screen would no longer reveal
 ; atomically.
 gfx_post_screen:
     call lfb_load_palette           ; shared art palette -> VGA DAC (Margo reads it)
@@ -511,7 +511,7 @@ gfx_bar_frame:
     ret
 
 ; gfx_bar_fill: AX = percent (0..100). The graphical POST art has no progress bar
-; -- the grey->colour icon reveal is the progress indicator -- so this is a no-op.
+; (the grey->colour icon reveal is the progress indicator) so this is a no-op.
 ; The RAM test (ramtest_draw) still calls it by name; keep the label and just
 ; return. This is a stub, not dead code; ramtest-core owns its call site.
 gfx_bar_fill:

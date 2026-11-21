@@ -198,11 +198,11 @@ impl MidiEngine {
             let message = self.pending.pop_front().expect("front message exists");
             match send_native(&mut self.adapter, &message.bytes) {
                 NativeSend::Delivered => {}
-                // The synth did not take this message -- a byte it will not
+                // The synth did not take this message: a byte it will not
                 // accept, or a queue that is full right now. Drop THAT
                 // MESSAGE and keep playing. Failing the engine here is what
-                // made a single stray `0xF7`/`0xF4`/`0xF9` -- all of which the
-                // MPU-401 parser forwards verbatim as one-byte messages -- kill
+                // made a single stray `0xF7`/`0xF4`/`0xF9` (all of which the
+                // MPU-401 parser forwards verbatim as one-byte messages) kill
                 // the P300 for the rest of the session, silently and with no way
                 // back short of a restart.
                 NativeSend::Rejected => {
@@ -238,7 +238,7 @@ impl MidiEngine {
     /// The second half is not a nicety. `fail_native` is a LATCH: it drops the
     /// adapter to `Silent` and leaves the status at `InitializationFailed`, and
     /// the only thing that used to clear it was a settings change this engine's
-    /// role cares about -- for the wavetable, a different SoundFont, and nothing
+    /// role cares about: for the wavetable, a different SoundFont, and nothing
     /// else. So a P300 that died mid-session stayed dead, and the config panel
     /// kept showing "The MIDI output could not be initialized." no matter what
     /// the user did to it, including switching the P330 receiver off. Anything
@@ -315,9 +315,9 @@ impl MidiEngine {
     /// Judge one external-port send failure: the MESSAGE or the PORT.
     ///
     /// `midir::SendError` has exactly two variants and they mean different
-    /// things. `InvalidData` is about the bytes -- midir's own backends raise it
+    /// things. `InvalidData` is about the bytes: midir's own backends raise it
     /// for an empty message and for a non-SysEx message longer than three bytes,
-    /// before the OS is touched at all -- so the port is untouched and healthy.
+    /// before the OS is touched at all, so the port is untouched and healthy.
     /// `Other` is the platform call failing, which for a MIDI OUT handle means
     /// the destination is gone; that one is worth the adapter, and latching to
     /// `MissingPort` is right because the port has to be re-selected (or
@@ -472,7 +472,7 @@ fn send_native(adapter: &mut MidiAdapter, bytes: &[u8]) -> NativeSend {
 /// be made to return a full queue by filling one, and only a real ROM set opens
 /// one at all.
 ///
-/// `mt32emu_play_msg` and `mt32emu_play_sysex` return exactly two failures --
+/// `mt32emu_play_msg` and `mt32emu_play_sysex` return exactly two failures:
 /// `MT32EMU_RC_QUEUE_FULL` when the synth is open and momentarily full, and
 /// `MT32EMU_RC_NOT_OPENED` when there is no synth behind the context. Only the
 /// second is terminal. Treating both as terminal (which the bare `NativeCall`

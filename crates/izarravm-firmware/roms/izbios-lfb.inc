@@ -102,7 +102,7 @@ lfb_pixel_addr:
 ;
 ; An opaque engine color expand: FG/BG latched, COLOR_EXPAND_DATA issued, then
 ; the eight font rows streamed through MONO_DATA (one dword per row, bits in
-; the high byte, MSB first -- each row starts on a word boundary).
+; the high byte, MSB first; each row starts on a word boundary).
 lfb_glyph:
     pushad
     call margo_wait

@@ -1,8 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Boot-screen fixtures for the styled Toka-DOS init screen
-//! (`dev_docs/2026-08-07-tokados-init-screen-design.md`).
+//! Boot-screen fixtures for the styled Toka-DOS init screen.
 //!
 //! Two different boot mechanisms prove two different things, and each test
 //! below picks the one that actually proves its claim:
@@ -22,7 +21,7 @@
 //!   screen itself: the rainbow TOKA art actually painted (attribute
 //!   diversity, not just characters), every owner's `/T`-styled tree line,
 //!   the two-row ReSonique II summary, the closed double-line footer box, and
-//!   the shell prompt landing on the last row with zero scroll -- exactly
+//!   the shell prompt landing on the last row with zero scroll, exactly
 //!   what a user sees on a stock boot.
 
 use super::*;
@@ -44,16 +43,16 @@ fn dump_rows(lines: &[String]) -> String {
 /// Boot from a host-folder facade with AUTOEXEC.BAT overridden, for tests
 /// that need to control exactly what the boot script runs rather than prove
 /// what the shipped one does. `mount_hdd_folder_with` still serves every
-/// OTHER system binary from the committed image -- only AUTOEXEC.BAT is
-/// swapped -- so this is the right tool for isolating batch-file mechanics,
+/// OTHER system binary from the committed image (only AUTOEXEC.BAT is
+/// swapped) so this is the right tool for isolating batch-file mechanics,
 /// never for proving what the stock boot actually looks like (`boot_hdd`
 /// does that; see `stock_boot_paints_the_styled_init_screen` below).
 ///
 /// Returns the `TokaScratch` guard alongside the machine (same shape as
 /// `TokaEmmScenario::_scratch` in `tokados_tokaemm_test.rs`): Katea's
 /// host-folder facade (`katea_tree.rs`) reads files under the scratch
-/// directory lazily, on demand, while the machine keeps running -- not just
-/// once at mount time -- so a caller that drops the guard at boot-return and
+/// directory lazily, on demand, while the machine keeps running (not just
+/// once at mount time) so a caller that drops the guard at boot-return and
 /// then keeps driving the machine (e.g. injecting more keystrokes) would be
 /// reading a deleted directory. The guard's lifetime in the CALLER, not a
 /// comment in here, is what actually keeps the boot's backing files alive.
@@ -120,7 +119,7 @@ GOTO END\r\n\
     // jumps straight to its label via "IF NOT %1==... GOTO %1", skipping past
     // ECHO MARK-SETUP entirely. If it printed once per FOR token instead of
     // once for the top-level invocation, the dispatch would not actually be
-    // short-circuiting -- it would be falling through and re-running setup.
+    // short-circuiting: it would be falling through and re-running setup.
     // (Named MARK-SETUP, matching the MARK-ALPHA/MARK-BETA convention below,
     // so this assertion is never coupled to unrelated on-screen "SETUP" text.)
     assert_eq!(
@@ -155,7 +154,7 @@ GOTO END\r\n\
 /// The styled stock boot end-to-end: rainbow art actually painted (attribute
 /// diversity, not just characters), every owner's tree line with its prefix,
 /// the two-row ReSonique II block, the closed footer box, the prompt on the
-/// last row with ZERO scroll. Boots the committed image with no overrides --
+/// last row with ZERO scroll. Boots the committed image with no overrides,
 /// exactly what a user sees.
 #[test]
 #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
@@ -185,9 +184,9 @@ fn stock_boot_paints_the_styled_init_screen() {
 
     // Rainbow: the top art rows must show real attribute diversity on their
     // non-space cells, not just the right characters sitting at the default
-    // 0x07 attribute -- that would prove the ASCII art shape but not that
+    // 0x07 attribute: that would prove the ASCII art shape but not that
     // the color ramp write in signon() actually executed.
-    // TOKA_LOGO_ROWS (toka-dos/freedos/kernel/kernel/main.c) is 10 -- the
+    // TOKA_LOGO_ROWS (toka-dos/freedos/kernel/kernel/main.c) is 10: the
     // rainbow ramp in signon() only ever writes rows 0..TOKA_LOGO_ROWS, so
     // that fixed row count (not frame.rows, which is the whole 25-row
     // screen) is the only region worth scanning for attribute diversity.
@@ -257,7 +256,7 @@ fn stock_boot_paints_the_styled_init_screen() {
     // so reordering the FOR list can never orphan the closer. Bytes must
     // track scripts/build-freedos-hdd-image.py:330-336 (footer_top/
     // footer_middle/footer_bottom), the generator that actually writes
-    // these rows into AUTOEXEC.BAT -- reconstructed here rather than
+    // these rows into AUTOEXEC.BAT, reconstructed here rather than
     // hand-typed so the padding can't silently drift out of sync with it.
     let footer_bar = "\u{CD}".repeat(76);
     let footer_top = format!("\u{C6}{footer_bar}\u{B8}");
@@ -300,7 +299,7 @@ fn stock_boot_paints_the_styled_init_screen() {
     // On its own this negative match could pass vacuously (e.g. if it were
     // pushed off-screen by unrelated scrolling); it stays a real proof only
     // together with the zero-scroll assert just above, which already pins
-    // the logo to row 0 -- an extra startup banner would have scrolled that
+    // the logo to row 0: an extra startup banner would have scrolled that
     // away first, so "logo still at row 0" plus "no XMS_Swap" together mean
     // FreeCOM really did stay silent, not just that the banner scrolled out.
     assert!(

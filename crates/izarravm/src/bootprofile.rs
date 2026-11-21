@@ -6,8 +6,8 @@
 //!
 //! The realtime gate answers "how fast does Doom run"; it overwrites AUTOEXEC to
 //! jump straight into the game, so POST, driver load, shell start and idle never
-//! happen. This answers the complementary question -- where does the wall time
-//! go before and around the game -- by cutting one run into five phases:
+//! happen. This answers the complementary question (where does the wall time
+//! go before and around the game) by cutting one run into five phases:
 //!
 //!   post      machine start        -> first INT 19h        (host-placed)
 //!   boot      first INT 19h        -> end of AUTOEXEC.BAT  (guest MARK 1)
@@ -34,12 +34,12 @@
 //! and `/N` both take the escape hatch away from the user in practice.
 //!
 //! The real defect is the WINDOW'S UNIT, not the wait. The kernel sets
-//! `SkipConfigSeconds db 2` (`kernel.asm:67`), i.e. two GUEST seconds -- but a
+//! `SkipConfigSeconds db 2` (`kernel.asm:67`), i.e. two GUEST seconds, but a
 //! human waits in WALL seconds, and the two diverge by exactly this emulator's
 //! interpretation overhead: 1.77 s of wall at 486 against 8.32 s at 586. The
 //! pause therefore grows the FASTER the emulated machine is, which is backwards,
 //! and is why 586 feels broken here while 486 feels fine. The byte cannot fix
-//! it -- whole seconds only, and any value that reads well on one persona reads
+//! it: whole seconds only, and any value that reads well on one persona reads
 //! badly on the other. What would is making the wait cheap, so guest time tracks
 //! real time through it: FreeDOS's `GetBiosKey` spins on INT 16h where the same
 //! `sti; hlt` its own `dosidle.asm` uses for `IDLEHALT` would serve. That is a
@@ -48,7 +48,7 @@
 //!
 //! This is a profiler, NOT an A/B ladder. It runs once per persona, has no
 //! pairing, ordering or lock discipline, and its slicing perturbs the run loop.
-//! Never build an acceptance decision on it -- that is the realtime gate's job.
+//! Never build an acceptance decision on it: that is the realtime gate's job.
 
 use izarravm_core::{GswMode, HardwareProfile, MASTER_CLOCK_HZ};
 use izarravm_machine::{
@@ -375,7 +375,7 @@ pub fn run(
     }
     // IZARRAVM_DIRECT_BARRIER_CENSUS=1 ranks what stopped block formation. The
     // `--hdd-folder` path already emitted this into its JSON; a boot profile
-    // needs it too, because on a 16-bit workload the ranking IS the question --
+    // needs it too, because on a 16-bit workload the ranking IS the question:
     // `classify`'s Word allowlist was built for 32-bit game code, so what it
     // refuses here is a different population entirely.
     print_barrier_census(machine.cpu().direct_barrier_census_snapshot());
@@ -487,7 +487,7 @@ fn print_phase_census(rows: &[PhaseRow]) {
 
 /// Which side of the Direct JIT's admission gates an address sits on.
 /// `key_for_phys` refuses 0xA0000..0x100000 outright, so labelling it here is
-/// what makes an address row legible against the coverage column beside it --
+/// what makes an address row legible against the coverage column beside it:
 /// a hot row in a refused region can never be helped by block admission.
 fn address_region(lin: u32) -> &'static str {
     match lin {
@@ -874,8 +874,8 @@ fn is_plain_83(name: &str) -> bool {
 /// The mount line for the summary block: what mounting the folder cost in host
 /// time, split into its two O(folder) terms, as a share of the run's wall.
 ///
-/// Mount is not a phase and cannot become one -- it finishes before `RUN_START`,
-/// so no mark pair brackets it -- which is exactly why it needs a line of its
+/// Mount is not a phase and cannot become one: it finishes before `RUN_START`,
+/// so no mark pair brackets it, which is exactly why it needs a line of its
 /// own here. Without it the profile's phase table sums to less than the wall
 /// clock with no visible reason.
 ///
@@ -954,7 +954,7 @@ fn print_report(run: &BootProfileRun, wall: std::time::Duration, reached_boot: b
     // chain walk served from that memo resolves none. `run_scan_steps` is bumped
     // only in `data_sector`, which a chain walk never reaches, so this ratio has
     // always been "run-table steps per DATA sector" over a denominator that also
-    // counted FAT sectors -- and the memo shrank the denominator by 78-96% on the
+    // counted FAT sectors, and the memo shrank the denominator by 78-96% on the
     // measured rows without touching the numerator. It is a directional
     // diagnostic, not a quantity to compare across builds.
     for row in &run.rows {

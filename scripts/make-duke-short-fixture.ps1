@@ -9,8 +9,8 @@ long one (`.bench/duke3d_c`).
 .DESCRIPTION
 The duke3d-586 board row costs ~470 s of wall a leg, which makes an A/B/B/A set
 over half an hour and a six-leg floor the better part of an evening. The row is
-guest-driven -- DUKEMARK plays BENCH2 to its end, prints its report and the
-batch pokes EXITVM -- so the cycle budget is a guard and CANNOT be used to
+guest-driven (DUKEMARK plays BENCH2 to its end, prints its report and the
+batch pokes EXITVM) so the cycle budget is a guard and CANNOT be used to
 shorten the run without destroying every one of the four DUKEMARK invariants.
 
 What CAN be shortened is the demo itself. A Duke3D .DMO carries its record count
@@ -27,7 +27,7 @@ in the first little-endian dword of the header:
 Playback counts records down from `reccnt` and ends the demo when it reaches
 zero, so LOWERING that dword ends playback early at a record boundary with the
 rest of the file untouched. Nothing is truncated, nothing is re-encoded, and the
-records that do play are byte-for-byte the ones the long row plays -- the short
+records that do play are byte-for-byte the ones the long row plays: the short
 row is a PREFIX of the long row's workload, not a different one.
 
 The fixture this writes differs from `.bench/duke3d_c` in exactly two files:
@@ -98,7 +98,7 @@ if ($Records -lt 1 -or $Records -ge $original) {
 [Array]::Copy([BitConverter]::GetBytes([uint32]$Records), 0, $bytes, 0, 4)
 [IO.File]::WriteAllBytes($shortDemo, $bytes)
 
-# CRLF, ASCII, no BOM -- byte-for-byte the long fixture's AUTOEXEC with BENCH2
+# CRLF, ASCII, no BOM, byte-for-byte the long fixture's AUTOEXEC with BENCH2
 # changed to BENCH2S. Written through WriteAllBytes rather than Set-Content
 # because Set-Content -Encoding utf8 emits a BOM the guest shell would execute.
 $autoexec = "@echo off`r`ncd \DUKE3D`r`nDUKEMARK.EXE /bqBENCH2S > C:\DUKEMARK.TXT`r`nC:\EXITVM.COM`r`n"

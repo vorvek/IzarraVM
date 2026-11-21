@@ -90,7 +90,7 @@ fn render_voice_serves_a_dry_window_from_carry_over_not_a_held_frame() {
 }
 
 /// Arm the SB16 for 22050 Hz 16-bit signed stereo auto-init output (DSP 0xB6,
-/// mode 0x30) -- exactly what Duke Nukem 3D programs -- and push `frames`
+/// mode 0x30) (exactly what Duke Nukem 3D programs) and push `frames`
 /// stereo frames of `(left, right)` through the DMA word fetch.
 fn feed_16bit_stereo(path: &mut Sb16Path, frames: usize, left: i16, right: i16) {
     for byte in [0x41u8, 0x56, 0x22, 0xB6, 0x30, 0xFF, 0x00] {
@@ -111,7 +111,7 @@ fn feed_16bit_stereo(path: &mut Sb16Path, frames: usize, left: i16, right: i16) 
 }
 
 /// Drain one steady-state window of the voice path, mixed through the CT1745
-/// snapshot with a silent OPL leg -- i.e. the DSP-only signal as the final mix
+/// snapshot with a silent OPL leg, i.e. the DSP-only signal as the final mix
 /// in `render_audio` sees it. The first window is discarded so the resampler's
 /// startup transient does not contaminate the reading.
 fn steady_voice_window(path: &mut Sb16Path) -> Vec<(i32, i32)> {
@@ -188,7 +188,7 @@ fn right_only_16bit_stereo_leaves_the_left_output_silent() {
 /// The CT1745 legs must stay at unity through this path.
 ///
 /// The headroom that keeps the summed mix off the clamp is reserved once on the
-/// machine's summing node (`MIX_HEADROOM`), NOT here -- putting it in a per-leg
+/// machine's summing node (`MIX_HEADROOM`), NOT here: putting it in a per-leg
 /// gain would shift the FM/voice/CD balance the volume-decode fix established.
 /// This pins that placement: the voice leg alone still arrives at full scale,
 /// and `machine_audio_test` asserts the headroom downstream.
@@ -264,15 +264,15 @@ fn the_headroom_placement_leaves_the_fm_voice_cd_balance_untouched() {
     );
 }
 
-/// What the reserve is worth, in legs -- the policy stated instead of implied.
+/// What the reserve is worth, in legs: the policy stated instead of implied.
 ///
 /// `MIX_HEADROOM` is 0.5, exactly one bit, and every CT1745 leg powers on at
 /// 0 dB. So the reserve is worth exactly ONE full-scale source, and the
 /// behaviour at the summing node falls out of that:
 ///
 /// - one leg at full scale lands at half scale, 6 dB of room left over
-/// - TWO legs at full scale -- digital voice over FM music, which is Duke Nukem
-///   3D's exact case and the report this branch came from -- land on the rail
+/// - TWO legs at full scale (digital voice over FM music, which is Duke Nukem
+///   3D's exact case and the report this branch came from) land on the rail
 ///   EXACTLY: nothing to spare, and nothing clipped
 /// - THREE legs at full scale clip, by design
 ///

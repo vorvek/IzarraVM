@@ -506,7 +506,7 @@ pub struct Margo {
     command: u32,
     busy_ns: u64,
     /// Nanoseconds of the CURRENT batch that had already elapsed when the last
-    /// write moved `busy_ns` -- the ORIGIN the busy time is measured from.
+    /// write moved `busy_ns`, the ORIGIN the busy time is measured from.
     ///
     /// It exists because the machine drains busy time once, at batch end, with
     /// the whole batch's nanoseconds. A blit armed partway into a batch was not
@@ -519,7 +519,7 @@ pub struct Margo {
     /// BATCH-SCOPED SCRATCH, not device state: the host sets it only from a
     /// mid-batch offset and `advance_busy` consumes it as the batch's device
     /// time is delivered. It is zero once a batch's time has been delivered in
-    /// FULL -- but NOT necessarily at every intermediate point, because
+    /// FULL, but NOT necessarily at every intermediate point, because
     /// `Machine::advance_master_time` can deliver one batch in several
     /// FDC-bounded steps and a blit armed late in the batch can outlast the
     /// first of them. Canonical capture runs between run calls, after full
@@ -531,7 +531,7 @@ pub struct Margo {
     /// It exists because the bus cannot infer an arm from the busy VALUE. Every
     /// setter below is an assign and nothing drains mid-batch, so two operations
     /// of identical modeled duration armed in the same batch leave `busy_ns`
-    /// unchanged across the second one -- and a value comparison would report it
+    /// unchanged across the second one, and a value comparison would report it
     /// as an ordinary write, leaving the drain credit naming the FIRST arm's
     /// instant. The second operation would then read idle for its whole length.
     /// That is not a corner case: izbios' `lfb_text` draws every glyph with a
@@ -653,7 +653,7 @@ impl Margo {
     /// Every routine byte a guest writes arrives through `write_vram_u8`, the
     /// direct-access slice, or a blit, and each of those reports its rows. A
     /// caller that reaches for the raw store instead is stepping outside that
-    /// and owes the tracker an answer -- otherwise its pixels are converted
+    /// and owes the tracker an answer: otherwise its pixels are converted
     /// once and then never again, because no row ever looks dirty. Use
     /// [`Self::vram_mut_noted`] unless the write is provably already covered.
     pub fn vram_mut(&mut self) -> &mut [u8] {
@@ -1206,8 +1206,8 @@ impl Margo {
     /// peeked, OR the armed-but-unfed color-expand term, which is not
     /// time-derived at all (it waits on guest MONO_DATA writes) and so passes
     /// through untransformed. `Vega::blitter_busy_ns` deliberately excludes that
-    /// second term from the DEADLINE for the same reason -- it would never come
-    /// due -- so the two must not be unified.
+    /// second term from the DEADLINE for the same reason (it would never come
+    /// due) so the two must not be unified.
     pub fn status_busy_after(&self, elapsed_ns: u64) -> bool {
         self.busy_ns_after(elapsed_ns) > 0 || self.expand.is_some()
     }
@@ -1463,7 +1463,7 @@ impl Margo {
     /// is a different thing entirely: the engine still writes, it just writes
     /// every row on top of the first, and the rectangle this would compute is
     /// empty for a store that is not. Say "everything" there rather than
-    /// "nothing" -- the alternative silently freezes whatever the guest drew.
+    /// "nothing": the alternative silently freezes whatever the guest drew.
     fn note_blit_rect(&mut self, base: u32, pitch: u32, y: u32, height: u32) {
         if height == 0 {
             return;
@@ -1485,7 +1485,7 @@ impl Margo {
     ///
     /// Any arm-time credit is spent FIRST: those nanoseconds elapsed before the
     /// current operation was armed, so they are not time it was running. The
-    /// `min` matters -- `advance_master_time` can deliver one batch here in
+    /// `min` matters: `advance_master_time` can deliver one batch here in
     /// several FDC-bounded steps, and the credit has to survive being consumed
     /// across them rather than being written off whole on the first call.
     pub fn advance_busy(&mut self, ns: u64) {

@@ -4,16 +4,16 @@
 ; isrset.com: the OTHER half of the E10 rule, and a REGRESSION GUARD rather than
 ; a red fixture. Whatever the monitor does while the guest has interrupts
 ; disabled, once the guest's own IVT handler is finally running for line N, the
-; 8259A must show IS_N SET -- the state a real chip is in between INTA and EOI.
+; 8259A must show IS_N SET, the state a real chip is in between INTA and EOI.
 ; DJGPP's shared hardware-IRQ wrapper reads exactly this (OCW3 0x0B + IN 0x20)
 ; to tell a real IRQ from a spurious entry; the 0 the old early-EOI path left
 ; there sent it down its not-my-line branch, into a 16-entry table indexed with
-; 16 and a RETF through the pair it found -- E10, MonikaTT's #GP(0) at 0xAF:78A3.
+; 16 and a RETF through the pair it found: E10, MonikaTT's #GP(0) at 0xAF:78A3.
 ;
 ; Structure: hook IVT[8] with a handler that reads the ISR BEFORE any EOI and
 ; stashes it, then chains to the previous handler (which owns the EOI and the
-; IRET). CLI, poll the IRR through OCW3 0x0A until IR0 is requested -- proving a
-; tick is genuinely outstanding rather than waiting on nothing -- then STI and
+; IRET). CLI, poll the IRR through OCW3 0x0A until IR0 is requested (proving a
+; tick is genuinely outstanding rather than waiting on nothing) then STI and
 ; wait for the stash.
 ;
 ; Signals 0xA5 when the stashed byte has bit 0 SET. 0xE1 is the assertion
@@ -33,14 +33,14 @@ org 0x100
 ; emulated time per iteration, so they get separate bounds rather than one
 ; copied constant:
 ;
-;   IO_SPIN  -- OUT + IN + TEST + DEC + JNZ. The port accesses force a step
+;   IO_SPIN : OUT + IN + TEST + DEC + JNZ. The port accesses force a step
 ;               break each time round, so ~40 cycles/iteration: ~30k iterations
 ;               per tick, and the bound covers ~66 ticks.
-;   MEM_SPIN -- CMP mem,imm + DEC + JNZ, ~10 cycles/iteration: ~120k iterations
+;   MEM_SPIN: CMP mem,imm + DEC + JNZ, ~10 cycles/iteration: ~120k iterations
 ;               per tick, and the bound covers ~66 ticks.
 ;
 ; Both are sized so that exhaustion means "the thing waited for never happened",
-; not "the fixture was impatient" -- which is what makes the 0xDn markers below
+; not "the fixture was impatient", which is what makes the 0xDn markers below
 ; worth reporting.
 %define IO_SPIN  2000000
 %define MEM_SPIN 8000000

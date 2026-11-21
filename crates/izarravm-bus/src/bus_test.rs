@@ -308,8 +308,8 @@ fn io_bus_tracks_claimed_ports() {
 }
 
 /// The one-lookup store table's tag-bit precondition (design D7): every buffer that backs a
-/// `DirectPage` hands out 4096-aligned page pointers. Correctness never depends on this — a
-/// misaligned backing degrades to the CPU's slow store path — but a silently unaligned
+/// `DirectPage` hands out 4096-aligned page pointers. Correctness never depends on this (a
+/// misaligned backing degrades to the CPU's slow store path) but a silently unaligned
 /// allocation would devacuate the whole fast-path fixture suite, so the contract is pinned
 /// here at the allocation.
 #[test]

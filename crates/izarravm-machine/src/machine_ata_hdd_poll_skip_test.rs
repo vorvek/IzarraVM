@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6): the
+//! Slice 9C-pre of the device-timing design: the
 //! primary-channel (fixed-disk) analogue of `machine_atapi_poll_skip_test.rs`.
 //!
 //! **THE BAR THIS FILE CERTIFIES.** 9C-pre is "pure plumbing": the whole
@@ -56,8 +56,8 @@ fn counters(machine: &Machine) -> AtaHddPollSkipCounters {
 // ---------------------------------------------------------------------------
 
 /// A real ATA command (EXECUTE DEVICE DIAGNOSTIC) schedules through the
-/// production `COMMAND_LATENCY_TICKS = 0` path -- `schedule()` floors it to
-/// one master tick, far under the 20 us floor -- so the hook must never arm
+/// production `COMMAND_LATENCY_TICKS = 0` path (`schedule()` floors it to
+/// one master tick, far under the 20 us floor) so the hook must never arm
 /// no matter how long the guest polls.
 #[test]
 fn ata_hdd_poll_skip_never_fires_at_command_latency_zero() {
@@ -119,7 +119,7 @@ fn ata_hdd_poll_skip_never_fires_with_the_family_unarmed() {
 
 /// A test-injected latency stands in for the non-zero `COMMAND_LATENCY_TICKS`
 /// slice 9C will one day ship, so this fixture proves the mechanism itself
-/// -- not merely its inertness -- ports correctly.
+/// (not merely its inertness) ports correctly.
 #[test]
 fn ata_hdd_poll_skip_lands_exactly_on_the_completion() {
     let mut machine = hdd_machine(true);
@@ -176,7 +176,7 @@ fn ata_hdd_poll_skip_lands_exactly_on_the_completion() {
 }
 
 /// N alt-status reads elide to exactly ONE projection, and the projected
-/// advance equals the deadline exactly -- the same contract the ATAPI
+/// advance equals the deadline exactly, the same contract the ATAPI
 /// mechanism's `spans`/`ticks` pair certifies.
 #[test]
 fn ata_hdd_poll_skip_n_polls_elide_to_one_projection_of_exactly_the_deadline() {
@@ -189,7 +189,7 @@ fn ata_hdd_poll_skip_n_polls_elide_to_one_projection_of_exactly_the_deadline() {
         .schedule_test_pending(injected);
 
     // More than the threshold: the extra reads before the arm fires must not
-    // change the shape of the result -- one committed span, exactly the
+    // change the shape of the result: one committed span, exactly the
     // deadline's worth of ticks.
     poll_alt_status(&mut machine, ata::ATA_POLL_RUN + 40);
     assert!(machine.ata_hdd_poll_skip_armed);
@@ -260,14 +260,14 @@ fn ata_hdd_poll_skip_resets_on_a_control_write() {
 }
 
 /// The DEVICE-bounded target under the floor is the only decline that
-/// latches, and a new `schedule()` clears the latch again -- mirroring the
+/// latches, and a new `schedule()` clears the latch again, mirroring the
 /// ATAPI file's floor-and-latch fixture.
 #[test]
 fn ata_hdd_poll_skip_declines_below_the_floor_and_blocks_one_command() {
     // Schedule comfortably above the floor, then let most of it elapse before
     // polling, so the arm-time check (evaluated against the REMAINING
     // deadline) still passes while the device-bounded target at actuation
-    // time is sub-floor -- the DEVICE cause, and the one that latches.
+    // time is sub-floor: the DEVICE cause, and the one that latches.
     let mut machine = hdd_machine(true);
     let deadline = ata::ATA_POLL_FLOOR_TICKS * 4;
     machine
@@ -278,7 +278,7 @@ fn ata_hdd_poll_skip_declines_below_the_floor_and_blocks_one_command() {
     machine.advance_devices_ticks(deadline - ata::ATA_POLL_FLOOR_TICKS / 2);
 
     // The arm-time floor also declines here and does so WITHOUT latching, so
-    // drop it to isolate the batch-end check that does -- mirroring the
+    // drop it to isolate the batch-end check that does, mirroring the
     // ATAPI fixture this ports.
     machine
         .ata
@@ -415,7 +415,7 @@ fn ata_hdd_poll_skip_and_spinning_reach_the_same_device_state() {
 // ---------------------------------------------------------------------------
 
 /// Guest program: poll the primary alt-status port and spin while BSY is set,
-/// then halt -- the fixed-disk analogue of the ATAPI file's `poll_machine`
+/// then halt, the fixed-disk analogue of the ATAPI file's `poll_machine`
 /// guest loop.
 fn poll_program_machine() -> Machine {
     const PROGRAM: &[u8] = &[
@@ -473,7 +473,7 @@ fn ata_hdd_poll_skip_carries_a_guest_poll_loop_through_the_run_loop() {
 }
 
 /// Program a real LBA28 READ SECTORS (0x20) through the task-file ports, the
-/// way a driver actually would -- no test seam.
+/// way a driver actually would, no test seam.
 fn issue_real_read_sectors(machine: &mut Machine, lba: u32) {
     out(machine, ata::PRIMARY_CMD_BASE + 2, 1); // sector count
     out(machine, ata::PRIMARY_CMD_BASE + 3, lba as u8);

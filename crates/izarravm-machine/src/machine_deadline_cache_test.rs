@@ -5,7 +5,7 @@
 //!
 //! `event_batch_cap` (the fresh pull-scan) is the oracle throughout: the cache
 //! is correct exactly when it agrees with it, and its correctness contract is
-//! one-sided -- an earlier answer only shortens a batch, a LATER one lets a
+//! one-sided: an earlier answer only shortens a batch, a LATER one lets a
 //! device edge land mid-batch. Every assertion below is therefore an equality
 //! against a fresh scan taken at the same instant.
 //!

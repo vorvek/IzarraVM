@@ -52,7 +52,7 @@ static OUTGAIN_STEPS: LazyLock<[f32; 4]> = LazyLock::new(|| {
 /// 32768, i.e. -46.0, -14.0, -7.0 and 0 dB; the spacing is ~7 dB, which is why
 /// the table carries that name. The emulator-side attenuation is taken from
 /// those dB figures rather than from a 2-bit shift, so the leg is finer than
-/// its control -- but the CONTROL stays as coarse as the hardware's, because a
+/// its control, but the CONTROL stays as coarse as the hardware's, because a
 /// guest that reads `0x3B` back must see the same four positions a real card
 /// offers. SNDMIXER.COM's PC-SPEAKER fader therefore has four stops, not ten.
 ///
@@ -268,8 +268,8 @@ impl SbMixer {
     ///
     /// Two rules make this pair different from `0x30`-`0x37`, and both exist
     /// because this leg has NO second owner. Every other source can be found
-    /// again from somewhere else -- the GUI's card-amp slider, its PC-speaker
-    /// slider, a game's own setup screen -- but nothing else in the machine
+    /// again from somewhere else (the GUI's card-amp slider, its PC-speaker
+    /// slider, a game's own setup screen) but nothing else in the machine
     /// touches the wavetable. Silence here is unexplainable and unrecoverable
     /// from inside the guest, so silence has to be asked for:
     ///
@@ -282,7 +282,7 @@ impl SbMixer {
     ///   `0x00` here as collateral; without the floor that one stray byte
     ///   silences the machine's MIDI for the rest of the session, with nothing
     ///   on screen to say so. With it, the same stray byte is a channel that
-    ///   went very quiet -- a symptom you can hear and undo.
+    ///   went very quiet, a symptom you can hear and undo.
     ///
     /// The cost is that "level 0" and "muted" are no longer the same thing on
     /// this pair alone. SNDMIXER.COM writes D0 for its step 0, so the fader's
@@ -420,7 +420,7 @@ impl SbMixer {
                 self.master_r = r;
             }
             // The FM/MIDI bus has the same alias pair as master and voice, and it
-            // is the one an SB Pro-era title actually uses -- the 0x34/0x35 SB16
+            // is the one an SB Pro-era title actually uses: the 0x34/0x35 SB16
             // registers did not exist on the CT1345. Leaving 0x26 in the inert
             // store meant such a title got NO music attenuation at all (stuck at
             // the 0 dB power-on level), the same defect 0x34/0x35 had.
@@ -463,7 +463,7 @@ impl SbMixer {
             // Reading the low five bits instead is not an off-by-a-few-dB
             // rounding error: every level that is a multiple of four writes a
             // byte whose low five bits are zero, so `& 0x1F` HARD-MUTED the
-            // channel. Duke Nukem 3D writes `FXVolume * 31 / 255 << 3` -- 228
+            // channel. Duke Nukem 3D writes `FXVolume * 31 / 255 << 3`: 228
             // becomes level 27, byte 0xD8, which the old decode read as 24.
             0x30 => self.master_l = value >> 3,
             0x31 => self.master_r = value >> 3,
@@ -505,8 +505,8 @@ impl SbMixer {
     /// (-14 dB) the Guide documents. This is a deliberate, and not a novel,
     /// deviation: DOSBox-X's `CTMIXER_Reset` sets `master/dac/fm/cda = 31` and
     /// 86Box's reset block carries the comment "Changed defaults from -14dB to
-    /// 0dB". The reason is that a DOS title which never touches the mixer -- the
-    /// common case, since BLASTER tells it nothing about volume -- would
+    /// 0dB". The reason is that a DOS title which never touches the mixer (the
+    /// common case, since BLASTER tells it nothing about volume) would
     /// otherwise play 14 dB down, and a title that sets only its own voice level
     /// stacks a second 14 dB on top of that. The mixer should start out of the
     /// way; a title that wants less turns it down itself, and a user who wants
@@ -515,9 +515,9 @@ impl SbMixer {
     /// The CD level (`0x36`/`0x37`, in the inert store) follows the same rule and
     /// for the same reason: DOSBox-X's `CTMIXER_Reset` sets `cda` to 31 and 86Box
     /// resets `0x36`/`0x37` to `0xF8`. It used to power on hard-muted, which meant
-    /// a CD-audio title that never programmed the mixer -- the usual case, since
-    /// the drive plays Red Book through the card's CD-in with no guest involvement
-    /// -- got silence from a working drive. The GUI front panel and `set_cd_levels`
+    /// a CD-audio title that never programmed the mixer (the usual case, since
+    /// the drive plays Red Book through the card's CD-in with no guest involvement)
+    /// got silence from a working drive. The GUI front panel and `set_cd_levels`
     /// remain the host's control over this line.
     ///
     /// The wavetable extension (`0x50`/`0x51`) powers on at level 31 for the
@@ -597,7 +597,7 @@ fn decode_wavetable(register: u8) -> f32 {
 ///
 /// The hardware mapping sets the low bit: 86Box writes the 5-bit register as
 /// `(nibble << 4) | 0x8`, i.e. level `(nibble << 1) | 1`. Dropping that `| 1`
-/// (a plain `nibble << 1`) is not a rounding detail at the top of the scale --
+/// (a plain `nibble << 1`) is not a rounding detail at the top of the scale:
 /// it makes the loudest value a compat register can express level 30, which is
 /// -2 dB, so an SB Pro-era title asking for FULL volume is quietly attenuated
 /// and its read-back of the 5-bit register disagrees with what the same level
@@ -681,7 +681,7 @@ fn default_inert() -> [u8; 256] {
     regs[0x3A] = 0x18; // Mic volume, (0 << 5) | 0x18
     // PC Speaker volume, 2-bit field in D7-D6 (86Box: "steps of 64"). LIVE, not
     // inert: `speaker_gain` decodes it. The store stays here because the whole
-    // byte round-trips -- D5-D0 are don't-care on the card and are neither
+    // byte round-trips: D5-D0 are don't-care on the card and are neither
     // masked on the way in nor cleared on the way out, matching 86Box, so a
     // guest's read-modify-write sees its own byte back.
     regs[0x3B] = 0x80;

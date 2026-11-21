@@ -67,12 +67,12 @@
 ; summing node, so a single full-scale source cannot clip), which is what makes
 ; it safe for every leg to sit at 0 dB. The faders own the range below that.
 ; Reading a register back rounds to the nearest stop, so a level some game left
-; behind -- 24, say, the Guide's own -14 dB default -- shows as the step it is
+; behind (24, say, the Guide's own -14 dB default) shows as the step it is
 ; closest to (7) instead of refusing to display.
 ;
 ; WAVE drives two devices. The CT1745 voice pair (0x32/0x33) is the SB16 DSP's
 ; level; the AD1848 output attenuators (I6/I7) are the WSS codec's. They are
-; the same thing to a listener -- digital audio playback -- and no title uses
+; the same thing to a listener (digital audio playback) and no title uses
 ; both at once, so one fader moves both and the CT1745 side is what the fader
 ; READS back, because the codec powers on muted and would otherwise drag the
 ; display to 0 the moment a machine booted. The codec's attenuators are 1.5 dB
@@ -81,8 +81,8 @@
 ;
 ; PC-SPEAKER is TWO BITS on the CT1745 (register 0x3B), not five: four stops,
 ; not eleven. Rather than pretend otherwise by offering ten positions that
-; produce four distinct loudnesses -- the exact failure this fader law exists
-; to avoid -- the speaker fader stops at 0, 3, 7 and 10, which is where its
+; produce four distinct loudnesses, the exact failure this fader law exists
+; to avoid, the speaker fader stops at 0, 3, 7 and 10, which is where its
 ; four hardware positions actually sit. A value from the command line snaps up
 ; to the nearest stop at or above it (any non-zero request stays audible).
 ;
@@ -98,8 +98,8 @@
 ;       10     3  +18 dB
 ;
 ; so its BOTTOM stop is unity and its travel is gain the card did not have
-; before. Step 0 on this fader is therefore not a mute -- there is nothing to
-; mute, only an amplifier turned off -- which is why it is the step the record
+; before. Step 0 on this fader is therefore not a mute: there is nothing to
+; mute, only an amplifier turned off, which is why it is the step the record
 ; opens on and the step a fresh card reads back as.
 ;
 ; It shares the speaker's four UI positions because it has the same number of
@@ -110,7 +110,7 @@
 ; WARNING, and it is the user's to take, exactly as it is on the hardware: the
 ; mix reserves 6 dB after the mixer, which is enough to absorb one full-scale
 ; leg. +6 dB spends that reserve. +12 and +18 dB are past it, and a hot source
-; -- a full-scale digital voice leg, or several legs at once -- will clip. The
+; (a full-scale digital voice leg, or several legs at once) will clip. The
 ; card offers those positions, so this fader offers them; it does not refuse
 ; them and it does not quietly limit them.
 ;
@@ -122,8 +122,8 @@
 ; scale. That is a ReSonique II extension, not a CT1745 register.
 ;
 ; That pair alone has a mute BIT, D0, and this fader is the reason. The
-; wavetable is the one source in the machine with no second control anywhere --
-; no GUI slider, no other register, no game setup screen reaches it -- so the
+; wavetable is the one source in the machine with no second control anywhere
+; (no GUI slider, no other register, no game setup screen reaches it) so the
 ; card refuses to read a level of 0 there as silence and floors it at the
 ; quietest audible step instead; a guest clearing a block of mixer registers
 ; would otherwise silence the machine's MIDI for the session with nothing on
@@ -159,8 +159,8 @@ A_FIELD   equ 0x0F       ; white on black: an editable value, drawn as an input
 A_SEL     equ 0x4F       ; white on red: the selected input
 A_SHADOW  equ 0x80       ; dark grey block under and beside the box
 
-; The box holds seven tracks at a pitch of 10 -- five columns of track and five
-; of air, the air being where the names are drawn -- so it is as wide as an
+; The box holds seven tracks at a pitch of 10 (five columns of track and five
+; of air, the air being where the names are drawn) so it is as wide as an
 ; 80-column screen and its two-column shadow leave room for: BOX_COL + BOX_W + 2
 ; = 80 exactly, and the shadow's own row runs BOX_COL + 2 for BOX_W columns,
 ; which ends on 79. Six faders fitted in 72 columns at a pitch of 11; seven need
@@ -215,7 +215,7 @@ K_AMP equ 4               ; the CT1745 2-bit output-gain PAIR, 0x41/0x42
 
 ; D0 of 0x50/0x51. The wavetable leg is the only source in the machine with no
 ; other control anywhere, so a level of 0 there is floored to the quietest
-; audible step rather than taken as silence -- a guest clearing a block of mixer
+; audible step rather than taken as silence: a guest clearing a block of mixer
 ; registers would otherwise silence the machine's MIDI for the session with
 ; nothing to show for it. This bit is how silence is asked for on purpose, and
 ; it is what step 0 on the MIDI fader writes.
@@ -428,7 +428,7 @@ mixer_write:
 
 ; AH = AD1848 register index, AL = value. The index port also carries INIT,
 ; MCE and TRD, so the other four bits are read back and put in front of the
-; index rather than assumed clear -- clearing MCE behind a driver's back would
+; index rather than assumed clear: clearing MCE behind a driver's back would
 ; start an autocalibrate it did not ask for.
 wss_write:
     push dx
@@ -580,7 +580,7 @@ apply_channel:
     cmp byte [si + CH_KIND], K_AMP
     je .amp
     ; The 5-bit pair: one byte, both channels. The mixer is mono per channel
-    ; here on purpose -- a balance control is a separate idea from a level, and
+    ; here on purpose: a balance control is a separate idea from a level, and
     ; this tool does not offer one, so the two registers always agree.
     mov al, [step_level + di]
     shl al, 3
@@ -675,7 +675,7 @@ index_enabled:
 ; Clamp AL into 0..10 and, for the two 2-bit faders, snap it to the nearest stop
 ; at or ABOVE it. Snapping up is what keeps `/P 1` audible: a request for a
 ; little is a request for some, and the nearest stop downwards from 1 is
-; silence. `/A 1` snaps by the same rule and for the matching reason -- a
+; silence. `/A 1` snaps by the same rule and for the matching reason: a
 ; request for a little gain is a request for some, and the stop below it is no
 ; gain at all.
 ; SI -> channel record. Clobbers BX.
@@ -1112,7 +1112,7 @@ merge_pending:
 ; =============================================================================
 
 ; Read cfg_path into the channel steps. CF=1 when the file could not be read,
-; which is not an error -- see the `.restore` arm.
+; which is not an error. See the `.restore` arm.
 cfg_load:
     mov ax, 0x3D00
     mov dx, cfg_path
@@ -1196,7 +1196,7 @@ cfg_parse:
     inc bx
     inc si
     jmp .name
-; The name ended on a blank, so the '=' is still ahead of it -- unless the line
+; The name ended on a blank, so the '=' is still ahead of it, unless the line
 ; is something else entirely, in which case it is skipped like any other line
 ; the parser does not recognise.
 .name_end:
@@ -1344,7 +1344,7 @@ cfg_save:
 ; Levels are applied to the hardware as the fader moves, not on F10: a mixer
 ; you cannot hear while you set it is not a mixer. F10 therefore SAVES (and
 ; leaves), Accept leaves with the levels standing, and Cancel puts back the
-; levels the run opened on -- which is a real undo precisely because the writes
+; levels the run opened on, which is a real undo precisely because the writes
 ; already happened.
 ;
 ; The two buttons are the last two stops on the Tab ring the faders already sit
@@ -1412,8 +1412,8 @@ interactive:
     jmp .loop
 ; Up and Down move one POSITION, which for five of the faders is one step and
 ; for the PC speaker and AMP is one of their four hardware stops. Stepping one
-; of those by one and then snapping would not move at all -- from a stop, the
-; nearest stop at or above step+1 is the stop you started on -- so they count in
+; of those by one and then snapping would not move at all (from a stop, the
+; nearest stop at or above step+1 is the stop you started on) so they count in
 ; register positions and convert back.
 .louder:
     call selected_channel       ; a button has no level to move
@@ -1474,8 +1474,8 @@ interactive:
     jmp .loop
 .save:
     ; Always the default path. The full-screen mixer is only ever reached with
-    ; no /CFG on the line -- /CFG alone restores and exits, /CFG with a channel
-    ; switch saves and exits -- so a branch here on `have_cfg` was code that
+    ; no /CFG on the line (/CFG alone restores and exits, /CFG with a channel
+    ; switch saves and exits) so a branch here on `have_cfg` was code that
     ; could not run. Writing a different file is the command line's job.
     mov si, s_default_cfg
     mov di, cfg_path
@@ -2216,7 +2216,7 @@ step_level: db 0, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31
 ; AD1848 output attenuation for the same steps: the codec moves in 1.5 dB, so
 ; each stop takes the count nearest the same dB figure. Reading the table below
 ; from step 10 down to step 1, counts 0, 3, 5, 8, 11, 13, 16, 19, 21, 24 are
-; -0, -4.5, -7.5, -12, -16.5, -19.5, -24, -28.5, -31.5, -36 dB -- ten counts and
+; -0, -4.5, -7.5, -12, -16.5, -19.5, -24, -28.5, -31.5, -36 dB: ten counts and
 ; ten figures. Step 0 sets the register's own mute bit rather than counting all
 ; the way down to it.
 wss_atten:  db WSS_DAC_MUTE, 24, 21, 19, 16, 13, 11, 8, 5, 3, 0
@@ -2228,8 +2228,8 @@ wss_atten:  db WSS_DAC_MUTE, 24, 21, 19, 16, 13, 11, 8, 5, 3, 0
 ; the four canonical steps are fixed points of it.
 ;
 ; One ladder serves both faders because both registers are two bits wide and
-; both put their field in D7-D6. What the four positions MEAN differs -- the
-; speaker's are attenuations, AMP's are gains -- and that difference lives in
+; both put their field in D7-D6. What the four positions MEAN differs (the
+; speaker's are attenuations, AMP's are gains) and that difference lives in
 ; the two dB tables below, not here.
 q4_level:   db 0, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3
 q4_snap:    db 0, 3, 3, 3, 7, 7, 7, 7, 10, 10, 10
@@ -2238,8 +2238,8 @@ q4_step:    db 0, 3, 7, 10
 ; kind, reg, col, namecol, step, saved, dev, spare / name, key, desc, pad
 ;
 ; Track columns are 7, 17, ... at a pitch of 10: five columns of track and five
-; of air. The air is what the names are drawn into -- a seven-character label on
-; a five-column track overhangs it by one at each end -- so it is not slack to
+; of air. The air is what the names are drawn into (a seven-character label on
+; a five-column track overhangs it by one at each end) so it is not slack to
 ; be reclaimed. The name column is the track's, offset so the label centres on
 ; it: one to the left for a six or seven character name, level for a four, one
 ; to the right for AMP's three.
@@ -2324,7 +2324,7 @@ s_p18:  db '+18 dB', 0
 ; path), argument (the channel index for kind 3).
 ; Routing rule enforced in parse_tail: kinds 3 and 4 are tested for by name and
 ; every other kind is a flag that MUST get an explicit, guarded arm in the
-; .flag chain -- an unrouted kind is refused, not quietly treated as /S.
+; .flag chain: an unrouted kind is refused, not quietly treated as /S.
 sw_table:
     dw sw_question
     db 0, 0
@@ -2452,7 +2452,7 @@ msg_usage:
     db '  SNDMIXER /S             suppress all output', 13, 10
     db '  SNDMIXER /?             usage', 13, 10, 13, 10
     ; Twenty-two lines. The screen holds 24 of them once the command that asked
-    ; for them and the prompt that follows are counted -- measured, not guessed;
+    ; for them and the prompt that follows are counted, measured, not guessed;
     ; see the fixture that pins it. The seventh switch line and AMP's
     ; explanation were paid for out of the prose below rather than added to it,
     ; because the version that added them came to 25 and scrolled its own title

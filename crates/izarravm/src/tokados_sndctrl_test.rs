@@ -73,7 +73,7 @@ fn sndctrl_moves_both_devices_and_records_the_choice() {
         "the codec must answer on IRQ 9 after the tool wrote its config register\n{screen}"
     );
 
-    // The CMOS block, and -- just as load-bearing -- its checksum: leaving that
+    // The CMOS block, and, just as load-bearing, its checksum: leaving that
     // stale would make the next POST discard the keyboard layout and CPU speed
     // along with the audio bytes.
     let cmos = machine.cmos_bytes();
@@ -115,7 +115,7 @@ fn sndctrl_moves_both_devices_and_records_the_choice() {
 }
 
 /// The collision the menus make unreachable is still reachable from a command
-/// line, and it has to be refused before anything is written -- a card with
+/// line, and it has to be refused before anything is written: a card with
 /// both devices on one line is worse than one that ignored you.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
@@ -152,8 +152,8 @@ fn sndctrl_refuses_to_put_both_devices_on_one_line() {
 /// presence signature, not the selection, so the tool reports the CMOS record
 /// instead (the same treatment the MPU port already had).
 ///
-/// This leg cannot tell those two sources apart for the codec -- CMOS and the
-/// card agree at power-on, both saying 11 -- so what it pins is that `/S`
+/// This leg cannot tell those two sources apart for the codec (CMOS and the
+/// card agree at power-on, both saying 11) so what it pins is that `/S`
 /// reports the right value and moves nothing. That the CMOS record is what
 /// SNDCTRL actually writes to the board is pinned by
 /// `sndctrl_moves_both_devices_and_records_the_choice`, which drives
@@ -184,7 +184,7 @@ fn sndctrl_status_reads_the_hardware_and_changes_nothing() {
 
 /// `/B /T`: exactly two rows, matched as whole lines (not substrings) since
 /// the kernel's own boot banner uses the same 0xC3/0xC4 bytes decoratively
-/// ("ÃÄ> Kernel compatibility: ...") -- a substring check for the tree prefix
+/// ("ÃÄ> Kernel compatibility: ..."): a substring check for the tree prefix
 /// would pass even if SNDCTRL never emitted it. Row 1 is the tree-styled
 /// heading prefix (bytes 0xC3 0xC4 '>' ' ', which `screen_text` renders as
 /// U+00C3 U+00C4 '>' ' '); row 2 is the gutter byte 0xB3 (U+00B3) plus the
@@ -196,7 +196,7 @@ fn sndctrl_status_reads_the_hardware_and_changes_nothing() {
 /// Like every fixture in this file, `boot_with_sndctrl` serves SNDCTRL.COM out
 /// of the *committed* `tokados-hdd.img` (`mount_hdd_folder` -> Katea's system
 /// payload), not the freshly assembled `sndctrl.com` sitting next to the
-/// source -- this test needs the committed image's SNDCTRL to already
+/// source: this test needs the committed image's SNDCTRL to already
 /// support `/B`, permanently, since that is the only binary it boots.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
@@ -228,7 +228,7 @@ fn sndctrl_boot_summary_tree_prints_two_rows_and_changes_nothing() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Plain `/B` (no `/T`): the same two rows, but with no tree glyphs at all --
+/// Plain `/B` (no `/T`): the same two rows, but with no tree glyphs at all:
 /// the prefix and gutter are opt-in, not default. Matched as whole lines, for
 /// the same reason as the /T case: the kernel's own boot banner already
 /// contains 0xC3/0xC4 bytes elsewhere on screen, so only an exact-line match

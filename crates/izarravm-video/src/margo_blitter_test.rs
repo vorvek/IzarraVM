@@ -2261,7 +2261,7 @@ fn read_reg_u32_at(margo: &Margo, offset: usize, elapsed_ns: u64) -> u32 {
 ///
 /// CAVEAT: this stamps the credit BY HAND and therefore does not exercise the
 /// bus's arming-edge detection at all. That gap is what let the same-duration
-/// re-arm defect through review -- a second identical operation left `busy_ns`
+/// re-arm defect through review: a second identical operation left `busy_ns`
 /// unchanged, so the edge was missed and the credit was never re-stamped. The
 /// edge itself is covered at machine level by
 /// `a_second_identical_blit_in_one_batch_restamps_the_origin`; keep it that way,
@@ -2308,7 +2308,7 @@ fn analytic_busy_ns_after_matches_a_step_simulation() {
 fn analytic_busy_ns_after_zero_elapsed_is_the_live_field() {
     // A zero-elapsed peek is what every non-batched caller takes (the pusher,
     // the deadline term, `read_mmio_u8`), so it must reduce EXACTLY to the live
-    // field -- including while a credit is outstanding, which subtracts from
+    // field, including while a credit is outstanding, which subtracts from
     // the elapsed time and so cannot make a zero-elapsed read report longer.
     let idle = Margo::default();
     assert_eq!(idle.busy_ns_after(0), idle.busy_ns());
@@ -2362,7 +2362,7 @@ fn an_armed_but_unfed_color_expand_reads_busy_at_any_elapsed() {
 #[test]
 fn a_reset_clears_the_arm_time_credit_with_the_busy_time() {
     // CONTROL.RESET drops the operation, so the credit that named its start
-    // instant has to go with it -- a leftover credit would shield the NEXT
+    // instant has to go with it: a leftover credit would shield the NEXT
     // batch-end drain from nanoseconds no operation is entitled to.
     let mut margo = arm_fill_at(5_000);
     write_reg(&mut margo, REG_CONTROL, 0x1);

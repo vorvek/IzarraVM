@@ -5,8 +5,8 @@
 //!
 //! The output shape is fixed: 44.1 kHz, 16-bit, stereo, interleaved
 //! little-endian, which is what `read_audio_frame` hands the mixer. Everything
-//! a container might carry instead -- a different rate, one channel, more than
-//! two, a wider sample format -- is converted here rather than rejected,
+//! a container might carry instead (a different rate, one channel, more than
+//! two, a wider sample format) is converted here rather than rejected,
 //! because a rip that plays in every other emulator should play in this one.
 //!
 //! The destination buffer is sized by the probe and never grows. A decode that
@@ -45,7 +45,7 @@ pub const STAGE_SECTORS: u32 = 64;
 /// instead of recopying the whole prefix at every report.
 ///
 /// Returns the output sample frames actually produced, before padding or
-/// truncation -- the quantity the length-agreement test compares against what
+/// truncation, the quantity the length-agreement test compares against what
 /// the mount published.
 pub fn decode_into(
     path: &Path,
@@ -135,7 +135,7 @@ pub fn decode_chunked(
     // Counted in source sample frames, and from the probe. Nothing is skipped
     // at the head: an MPEG stream does carry the encoder's delay ahead of the
     // audio, but the reader has already applied it by the time a decoded buffer
-    // reaches here -- the first packet of a LAME file arrives stamped
+    // reaches here: the first packet of a LAME file arrives stamped
     // `ts = -1105` and yields 47 of its 1152 frames, and the last is trimmed
     // to its padding the same way. Skipping again here would take the delay off
     // twice and cut the track short, which is what it did until measured.
@@ -184,7 +184,7 @@ pub fn decode_chunked(
         };
 
         // `copy_to_vec_interleaved` converts whatever sample format the codec
-        // produced -- u8 through f64 -- into 16-bit for us, so only the channel
+        // produced (u8 through f64) into 16-bit for us, so only the channel
         // count is left to deal with here.
         let channels = decoded.spec().channels().count().max(1);
         interleaved.clear();
@@ -271,8 +271,8 @@ pub fn decode_chunked(
     // The rest of the track was never written and is silence. Only the sectors
     // that hold audio are handed over: a caller mirroring into its own zeroed
     // buffer would copy zeros onto zeros for the rest, and on a decode that
-    // ended far short of the promise -- a file replaced or truncated between
-    // mount and play -- that is hundreds of megabytes of memcpy, which
+    // ended far short of the promise (a file replaced or truncated between
+    // mount and play) that is hundreds of megabytes of memcpy, which
     // `DecodedTrack` performs while holding the lock the mixer pull takes.
     //
     // The full sector count still goes out, because it is what tells the caller
@@ -292,7 +292,7 @@ pub fn decode_chunked(
 
 /// Identify the file again at decode time. The mount deliberately let go of its
 /// handle so the user could still move or delete their own rips, which means
-/// this is a second look at a file that may have changed since -- and a file
+/// this is a second look at a file that may have changed since, and a file
 /// that is no longer a container must fail rather than have its new contents
 /// played as audio.
 fn container_of(path: &Path) -> Result<Container, CdAudioError> {

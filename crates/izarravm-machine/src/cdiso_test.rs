@@ -6,7 +6,7 @@ use crate::cdimage::CdImage;
 use std::fs;
 
 /// Build a folder disc: root/README.TXT, root/GAME/DATA.BIN,
-/// root/GAME/LEVELS/E1M1.MAP. The TempDir must outlive the image — file
+/// root/GAME/LEVELS/E1M1.MAP. The TempDir must outlive the image: file
 /// extents read lazily from the host folder.
 fn folder_disc() -> (tempfile::TempDir, CdImage) {
     let dir = tempfile::tempdir().unwrap();

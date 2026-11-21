@@ -43,8 +43,8 @@ pub const MAX_VOLUME: f32 = 5.0;
 /// back by any program that asks. A second copy of those controls in the host
 /// GUI could not be seen by the guest, was not saved with the machine, and had
 /// to be kept in step with a mixer that had every right to disagree with it.
-/// The host's own level -- the volume knob, standing for the powered speakers
-/// the line-out feeds -- is `master_volume`, and it stays.
+/// The host's own level (the volume knob, standing for the powered speakers
+/// the line-out feeds) is `master_volume`, and it stays.
 ///
 /// They are IGNORED, not rejected, and never written back: an existing
 /// `izarravm.conf` keeps loading and quietly loses them on the next save. One
@@ -196,14 +196,14 @@ impl CrtStyle {
 /// How the Voodoo era's gamma lift is presented.
 ///
 /// The Glide runtimes of the period brightened their output through the
-/// SST-1's gamma CLUT -- about 1.7 on a Voodoo 1, about 1.3 on a Voodoo 2 --
+/// SST-1's gamma CLUT (about 1.7 on a Voodoo 1, about 1.3 on a Voodoo 2)
 /// because the CRTs the content was authored on were darker than the artists
 /// wanted. On a modern panel that lift greys the blacks and washes the colour.
 ///
 /// This selects only how the *presented* picture is shaped. The guest's
 /// `clutData` register is untouched under either setting, so a game that reads
 /// its gamma table back, or fades the screen by reprogramming it, behaves
-/// identically. See `dev_docs/2026-09-01-glide-gamma-toggle-design.md`.
+/// identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GlideGamma {
@@ -229,8 +229,8 @@ impl GlideGamma {
 /// guest's `texture_mode` register asks, or forces nearest (point) sampling
 /// regardless.
 ///
-/// "Improved" texture filtering -- something better than the SST-1's own
-/// bilinear filter -- was considered for a third option here and left out.
+/// "Improved" texture filtering (something better than the SST-1's own
+/// bilinear filter) was considered for a third option here and left out.
 /// A feasibility measurement against the in-progress renderer work is still
 /// pending, and this codebase's convention is to leave a feature off the
 /// board until it exists rather than show a disabled option for it (there is
@@ -284,8 +284,7 @@ impl GlideWorkers {
 
 /// Default assumed CRT gamma: the midpoint of the 2.2-2.5 desktop-SVGA band,
 /// and the analytically special value at which the correction collapses to a
-/// pure black-level offset above the sRGB knee (see
-/// `dev_docs/2026-09-01-display-gamma-design.md` section 4.3).
+/// pure black-level offset above the sRGB knee.
 pub const DEFAULT_MONITOR_GAMMA: f32 = 2.4;
 
 /// Accepted range for a free-entry monitor gamma, matching the design's band
@@ -331,7 +330,7 @@ pub struct GuiPrefs {
     /// `Some(DEFAULT_MONITOR_GAMMA)`.
     ///
     /// Unlike this struct's other `Option` fields, the default here is
-    /// `Some`, not `None` -- so an explicitly chosen `None` ("Raw") cannot be
+    /// `Some`, not `None`, so an explicitly chosen `None` ("Raw") cannot be
     /// told apart from an absent key by the usual "omit `None`, fill missing
     /// keys from the default" TOML round trip: both would come back `Some`.
     /// `serialize_monitor_gamma` writes the sentinel `0.0` for `None` instead
@@ -626,8 +625,8 @@ impl GuiPrefs {
 
 /// Which [`RETIRED_KEYS`] a parsed prefs document still carries.
 ///
-/// The struct deserializer drops unknown fields silently -- that is what lets an
-/// older file keep loading -- so the document has to be inspected before it is
+/// The struct deserializer drops unknown fields silently (that is what lets an
+/// older file keep loading) so the document has to be inspected before it is
 /// deserialized or a retired key leaves no trace at all.
 fn retired_keys_present(value: &toml::Value) -> Vec<&'static str> {
     let Some(table) = value.as_table() else {

@@ -49,7 +49,7 @@ pub(crate) const MARGO_EXT_DISPCTL: u8 = 0x06;
 /// What a video-aperture byte write did, reported to `MachineBus::write_memory`.
 ///
 /// `ArmedBlit` comes ONLY from a write that MOVED the Margo blitter's modeled
-/// busy time -- never from a write that merely happened while the engine was
+/// busy time, never from a write that merely happened while the engine was
 /// already busy. That distinction is load-bearing: a blit can outlast a batch (a
 /// 640x480 FILL models ~1.54 ms of busy time against a 1 ms cap), and a guest
 /// overlapping CPU rendering with a long blit must not re-stamp the origin on
@@ -61,8 +61,8 @@ pub(crate) const MARGO_EXT_DISPCTL: u8 = 0x06;
 /// write, but the machine drains Margo once per batch, with the whole batch's
 /// nanoseconds. So the bus answers `ArmedBlit` by crediting the in-batch offset
 /// (`Margo::credit_busy_ns`); see `MachineBus::write_memory_byte_recorded`. The
-/// EDGE is tested in both directions -- a RESET that lowers busy time while an
-/// earlier blit drains is also a new origin -- which is why this says "moved"
+/// EDGE is tested in both directions: a RESET that lowers busy time while an
+/// earlier blit drains is also a new origin, which is why this says "moved"
 /// and not "increased".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VideoWrite {
@@ -167,7 +167,7 @@ pub(crate) struct Vega {
     margo_ext_disp_y: u16,
     // Recon instrument (2026-08-12): how many accepted 4F02 mode sets asked for
     // the LINEAR framebuffer (request bit 0x4000) versus the banked 64 KB
-    // window. Diagnostic only -- deliberately OUTSIDE `canonical_projection`,
+    // window. Diagnostic only, deliberately OUTSIDE `canonical_projection`,
     // like every other counter, so a capture cannot differ over it.
     //
     // WHY IT IS HERE: the LFB and the banked window are served by two different
@@ -610,7 +610,7 @@ impl Vega {
     /// PROBE/COPY AGREEMENT: this is what `direct_vga_bytes` consults to decide
     /// `bulk_direct`, while `direct_write_page` produces the pointer. If this said
     /// yes where that says no, every bulk attempt would be a wasted 4 KiB source
-    /// read followed by a fallback -- and because the REP loop re-enters at L-1,
+    /// read followed by a fallback, and because the REP loop re-enters at L-1,
     /// that waste repeats at L, L-1, ..., 1. Quadratic, not incidental. The banked
     /// arm below is what keeps the two in step; `T6` pins it.
     pub(crate) fn direct_write_token(&self) -> u8 {
@@ -636,7 +636,7 @@ impl Vega {
         // STRUCTURAL: while Margo owns the window the VGA never serves it, even if
         // the Margo arm above declined (an out-of-store bank, say). Without this
         // line that case falls through to the VGA, which is unreachable today only
-        // because every caller pre-validates -- a guarantee downgraded to a caller
+        // because every caller pre-validates, a guarantee downgraded to a caller
         // contract. One line keeps it a guarantee.
         if self.margo_banked_window_at(VGA_MODE13H_BASE) {
             return None;
@@ -655,12 +655,12 @@ impl Vega {
     /// address range historically belonged to.
     ///
     /// `Vga::note_direct_write` opens with `debug_assert_ne!(direct_write_token(),
-    /// 0)`, and that token is 0 by construction while Margo is banked -- so once
+    /// 0)`, and that token is 0 by construction while Margo is banked, so once
     /// the banked window is admitted, routing every aperture write into the VGA
     /// fires that assert on the FIRST write in any debug build. In release it is
     /// worse: legacy mode13 dirty state gets mutated from Margo offsets, and if the
     /// guest was in mode 13h before the 4F02 the token is 1, the assert passes, and
-    /// `mode13_linear_authoritative` is set from Margo offsets -- silent corruption.
+    /// `mode13_linear_authoritative` is set from Margo offsets: silent corruption.
     ///
     /// While Margo owns the window its writes are Margo's business. Nothing is
     /// forwarded to the VGA, which is also what keeps `arm_graphics_settle` off
@@ -731,7 +731,7 @@ impl Vega {
     /// commands" and that software feeding it "as a producer to its consumer
     /// behaves as it would on the real part". Draining at batch cadence instead
     /// of at the modeled completion cadence would stretch a ~740 ns glyph expand
-    /// to a whole batch cap -- up to ~1350x -- and that is visible in PUSH_GET.
+    /// to a whole batch cap (up to ~1350x) and that is visible in PUSH_GET.
     /// So `Machine::vega_edge_ticks` keeps the busy deadline exactly while this
     /// is true, and drops it otherwise.
     pub(crate) fn pusher_has_queued_work(&self) -> bool {
@@ -816,7 +816,7 @@ impl Vega {
     }
 
     /// The legacy VGA raster's beam. NOT the scanout beam while a VBE mode is on
-    /// screen -- that one lives in the timeline's Margo frame phase, not in a
+    /// screen: that one lives in the timeline's Margo frame phase, not in a
     /// device, and reaches this module as the `beam` argument. See
     /// `Machine::scanout_beam_dots`.
     pub(crate) fn beam_dots(&self) -> u64 {
@@ -848,7 +848,7 @@ impl Vega {
     /// The VGA arm ignores `beam` and reads its own live raster beam instead.
     /// That is only correct because every caller sources `beam` from
     /// `Machine::scanout_beam_dots`, whose non-Margo arm returns exactly that
-    /// same value -- a silent coupling between two functions in different
+    /// same value, a silent coupling between two functions in different
     /// modules, so the debug assertion below states it rather than leaving the
     /// next reader to rediscover it.
     pub(crate) fn dots_until_vretrace_start(&self, beam: u64) -> Option<u64> {
@@ -912,7 +912,7 @@ impl Vega {
         self.margo.advance_frames(margo_frames);
         self.distira.advance_frame_phase(distira_lines);
         // A real SST-1's pass-through cable switches the monitor to the
-        // Voodoo, not the VGA -- the VGA's dot clock keeps running (beam
+        // Voodoo, not the VGA: the VGA's dot clock keeps running (beam
         // timing, retrace bits, the CRTC status the guest polls all stay
         // exact) but nothing of its raster is ever shown, so painting it is
         // dead work. `display_enabled` is exactly that cable fact.
@@ -946,7 +946,7 @@ impl Vega {
             },
             // Margo scans out at exactly MARGO_FRAME_HZ in every mode, which is
             // the same constant its frame phase (and now its 0x3DA retrace)
-            // runs at -- not a coincidence and not a second number. Distira's
+            // runs at, not a coincidence and not a second number. Distira's
             // own 60 Hz scanout is unrelated and unchanged.
             ActiveDisplay::MargoLfb => MARGO_FRAME_HZ as f64,
             ActiveDisplay::Distira => 60.0,
@@ -969,7 +969,7 @@ impl Vega {
     /// nothing that records observations reads this. Its callers are the unit
     /// tester's `frame_crc32` and in-tree tests, all of which set a mode before
     /// looking, so the stand-in is unreachable rather than merely unlikely. Do
-    /// not route an observer through here — use `presented_frame_argb`, which
+    /// not route an observer through here: use `presented_frame_argb`, which
     /// says `None` when there is no frame.
     pub(crate) fn frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
         match self.active_display() {
@@ -1009,7 +1009,7 @@ impl Vega {
     ///
     /// **`None` is a real answer and callers must handle it.** Two moments have
     /// no completed frame: before the first raster of the run, and between a
-    /// mode set and the first raster of the new mode — every mode set drops the
+    /// mode set and the first raster of the new mode: every mode set drops the
     /// presented frame on purpose, so nobody is handed a frame carrying the
     /// previous mode's geometry. The second window is up to a whole frame
     /// period, about 14 ms at 70 Hz, and a DOS title crosses it on every
@@ -1064,7 +1064,7 @@ impl Vega {
     /// the VGA index raster and DAC) instead of from `presented_frame_argb`, so
     /// each one is admitted only where it provably agrees.
     ///
-    /// Margo has no second definition -- `presented_frame_argb` reaches
+    /// Margo has no second definition: `presented_frame_argb` reaches
     /// `frame_argb`, which scans out exactly what `margo_frame_update` scans
     /// out, row by row.
     ///
@@ -1072,7 +1072,7 @@ impl Vega {
     /// cached ARGB frame, not from the index raster, and it accepts a SHORT
     /// raster by truncating where a row-diff would have to reject it. Both of
     /// those go to the generic branch, which is `presented_frame_argb` verbatim
-    /// with a row diff on top -- one presentation, two ways of costing it.
+    /// with a row diff on top: one presentation, two ways of costing it.
     pub(crate) fn presented_frame_update(&mut self) -> Option<PresentedFrameUpdate> {
         let owner = self.active_display();
         if owner == ActiveDisplay::MargoLfb {
@@ -1088,7 +1088,7 @@ impl Vega {
         let mut cache = self.presented_argb_cache.borrow_mut();
         // `changed_frame_rows` indexes `row * width .. + width` for every row
         // below `height`, so a frame whose word count is not exactly
-        // `width * height` cannot be diffed at all -- it must be published
+        // `width * height` cannot be diffed at all: it must be published
         // whole. `presented_frame_argb` produces one on the truncating short-
         // raster path, and the cropping arms of `frame_argb` can too.
         let full = !cache.valid
@@ -1133,7 +1133,7 @@ impl Vega {
     /// bytes against the cached ARGB words through the DAC, so an unchanged row
     /// costs a compare and no conversion. Admitted only from
     /// [`Self::presented_frame_update`], and only where it agrees with
-    /// `presented_frame_argb` -- see that function for the two exclusions.
+    /// `presented_frame_argb`. See that function for the two exclusions.
     /// `None` means "not answerable here", never "no frame".
     fn vga_frame_update(&self) -> Option<PresentedFrameUpdate> {
         let raster = self.vga.last_presented()?;
@@ -1604,7 +1604,7 @@ impl Vega {
             // The ONLY arming path in this function: COMMAND (and the final
             // MONO_DATA word of a color-expand stream) is what charges the
             // blitter modeled busy time; CONTROL.RESET is what drops it. Detect
-            // the EDGE -- an operation was armed by THIS write -- rather than
+            // the EDGE (an operation was armed by THIS write) rather than
             // the level, so a write landing while an earlier blit is still
             // draining is an ordinary accepted write and does not re-stamp the
             // origin.
@@ -1612,8 +1612,8 @@ impl Vega {
             // The edge is the arm STAMP, not the busy VALUE. A value comparison
             // is blind to the case that matters most: every setter in margo.rs
             // is an assign and nothing drains mid-batch, so a second operation
-            // of identical modeled duration -- every glyph in izbios' `lfb_text`,
-            // which fixes MG_DIM at 0x00080008 -- leaves `busy_ns` unchanged and
+            // of identical modeled duration (every glyph in izbios' `lfb_text`,
+            // which fixes MG_DIM at 0x00080008) leaves `busy_ns` unchanged and
             // would be read as an ordinary write. The drain credit would then
             // still name the FIRST arm's instant and the second operation would
             // report idle for its entire length, breaking section 9 by a whole
@@ -1690,7 +1690,7 @@ impl Vega {
     /// claimant placed ABOVE `MARGO_LFB_BASE` costs nothing: the screen already
     /// declines everything up there and hands it to the gauntlet. That covers
     /// the top-of-4GB BIOS alias (0xFFFF_0000) and would equally cover an APIC
-    /// at 0xFEC0_0000 or 0xFEE0_0000 if this machine ever modelled one -- it
+    /// at 0xFEC0_0000 or 0xFEE0_0000 if this machine ever modelled one: it
     /// does not today (no SMP, PIC-only interrupts), and it would not matter
     /// here if it did. The ONLY dangerous addition is a claimant BETWEEN 1 MB
     /// and `MARGO_LFB_BASE`, which is exactly the window the sweep covers.
@@ -1748,9 +1748,9 @@ impl Vega {
     /// True iff NO byte in `address .. address + bytes` is claimed by any Vega aperture.
     ///
     /// Asked byte by byte ON PURPOSE, and the reason is the whole point of the query. Every
-    /// `*_offset` predicate above requires the WHOLE access to be in range --
-    /// `distira_lfb_offset` tests `offset + width <= DISTIRA_PCI_TEX_OFFSET`,
-    /// `distira_texture_offset` tests `offset + width <= DISTIRA_PCI_BAR_SIZE` -- so a Word
+    /// `*_offset` predicate above requires the WHOLE access to be in range
+    /// (`distira_lfb_offset` tests `offset + width <= DISTIRA_PCI_TEX_OFFSET`,
+    /// `distira_texture_offset` tests `offset + width <= DISTIRA_PCI_BAR_SIZE`) so a Word
     /// straddling a window's end DECLINES WIDE while its base byte is still claimed. A wide
     /// "declines" is therefore strictly WEAKER than "claims nothing here", and would not pin the
     /// behaviour of a split loop that asks the question once per byte.
@@ -1904,8 +1904,8 @@ impl Vega {
         Some(offset)
     }
 
-    /// THE SHARED PREDICATE. Every question about the banked window -- "is a host
-    /// pointer available", "which bytes does it mean", "has the mapping changed" --
+    /// THE SHARED PREDICATE. Every question about the banked window ("is a host
+    /// pointer available", "which bytes does it mean", "has the mapping changed")
     /// is answered from this one function, so the three cannot disagree.
     ///
     /// `Some(bank)` exactly when a banked Margo window owns the legacy aperture.
@@ -1916,14 +1916,14 @@ impl Vega {
     ///
     /// THE INVARIANT THIS EXISTS FOR: anything that can change the return of
     /// `margo_banked_direct_page` changes the return of this function, and
-    /// `direct_write_identity` is built from it -- so a mapping change cannot be
+    /// `direct_write_identity` is built from it, so a mapping change cannot be
     /// invisible to the cached-pointer guard. That is provable here rather than by
     /// enumerating call sites, which is what the previous design got wrong.
     pub(crate) fn margo_banked_window_key(&self) -> Option<u32> {
         // `margo_banked_direct_page` derives a window base by multiplying the bank
         // by the window size and requires the result to lie in the frame store. It
-        // is page-independent -- the same key answers for every page of the
-        // window -- only because the store divides evenly by the window.
+        // is page-independent (the same key answers for every page of the
+        // window) only because the store divides evenly by the window.
         const { assert!(MARGO_VRAM_SIZE.is_multiple_of(VGA_PLANAR_WINDOW_SIZE as usize)) };
         if !self.margo_active || self.margo_linear {
             return None;

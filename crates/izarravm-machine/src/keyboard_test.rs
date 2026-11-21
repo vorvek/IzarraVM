@@ -132,7 +132,7 @@ fn keyboard_reread_is_not_hijacked_by_a_pending_mouse_byte() {
     // scancode back (see reread_returns_stale_byte_until_next_arrives).
     // If a mouse packet happens to be queued behind it at that exact
     // moment (e.g. mid-flick), the second read must not see a freshly
-    // latched mouse byte instead -- that corrupts the BIOS's
+    // latched mouse byte instead: that corrupts the BIOS's
     // shift-state handling and desyncs the mouse driver's own packet
     // framing.
     let mut kbd = Keyboard8042::default();
@@ -141,7 +141,7 @@ fn keyboard_reread_is_not_hijacked_by_a_pending_mouse_byte() {
     kbd.push_scancodes(&[0x1e]); // 'A' make starts crossing the device wire
     advance_wire(&mut kbd);
     // A mouse packet queues up behind the held keyboard byte. It cannot
-    // latch yet -- the output register is occupied -- so no IRQ12 arms.
+    // latch yet (the output register is occupied) so no IRQ12 arms.
     assert!(
         !kbd.inject_mouse(5, -3, 0x01),
         "the mouse byte is queued but not yet latched"
@@ -155,7 +155,7 @@ fn keyboard_reread_is_not_hijacked_by_a_pending_mouse_byte() {
         "the byte just consumed was the keyboard's"
     );
     // ...then the chained BIOS handler re-reads 0x60, expecting the
-    // same stale scancode -- not the mouse byte waiting right behind it.
+    // same stale scancode, not the mouse byte waiting right behind it.
     assert_eq!(
         kbd.read_port(0x60),
         Some(0x1e),

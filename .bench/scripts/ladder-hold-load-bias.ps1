@@ -11,7 +11,6 @@ Identity first (one OFF, one ON), then 8 interleaved A/B/B/A pairs. Pairing is
 index-matched-within-arm in leg order, declared before the run. Contamination
 cpu_before > 8 or cpu_after > 8 discards that leg and re-runs it.
 
-See dev_docs/specs/2026-08-29-memory-path-slice-design.md section 7.5.
 #>
 
 param(

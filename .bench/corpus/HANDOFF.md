@@ -7,7 +7,7 @@ main 0885da4c rebased in, exe sha 4f3381cf0b7d.
 
 ## Where to resume
 
-Game 13, '1869', is HALF DONE. The discovery agent parked at the
+Game 13, '1869', is HALF DONE. The discovery run stopped at the
 player-name prompt with this verified schedule (486, `-Mouse`, entry
 `1869.EXE`):
 
@@ -47,18 +47,18 @@ subdirectories.
 ## Protocol reminders
 
 * BOX PROTOCOL: hold all builds/runs on "BENCH START (WALL)" from the
-  perf session; resume on "BENCH DONE". They send advance notice; drain
-  agents rather than killing them.
+  perf session; resume on "BENCH DONE". They send advance notice; let
+  running jobs finish rather than killing them.
 * LEDGER.md is TWO-WAY: the perf session appends write-backs; this
   session commits them.
 * rt targets: 486 -> 5.0, 586 -> 2.0. Below target = FLAGGED + census.
 * Census: rank non_continuable rows by unbound_exits; hits counts a row
   SHAPE (no addresses); `-NoEmm` is the F1 attribution control, and it
   measures attribution, NOT cost (removing TOKAEMM makes guests SLOWER).
-* Subagent claims of JIT divergence need an equal-schedule A/B before
+* Unverified claims of JIT divergence need an equal-schedule A/B before
   they enter the ledger (game 4 precedent).
-* Spawn one Sonnet agent per game with AGENT-BRIEF.md; tell it to run
-  emulator calls FOREGROUND and never park on background notifications.
+* Profile one game at a time with CORPUS-BRIEF.md; run
+  emulator calls FOREGROUND and never wait on background notifications.
 * Every new recipe JSON needs a LICENSE_MANIFEST.tsv row (class
   `test-fixture`, origin `IzarraVM project`, GPL-3.0-only, sha256),
   and the manifest is PATH-SORTED. CI's file policy fails without it.

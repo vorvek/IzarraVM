@@ -58,8 +58,8 @@ fn cache_model_reset_goes_cold() {
 #[test]
 fn measure_read_bandwidth_returns_a_finite_sample_in_every_mode() {
     // Small block (fits every mode's L1) and a large block (exceeds every L2).
-    // Both must move bytes and take clocks; we do NOT assert tier ordering here
-    // -- the tier costs are calibrated and a separate ordering test covers the
+    // Both must move bytes and take clocks; we do NOT assert tier ordering here:
+    // the tier costs are calibrated and a separate ordering test covers the
     // descending L1/L2/RAM curve.
     const TOTAL: u64 = 4 * 1024 * 1024;
     let modes = [
@@ -533,7 +533,7 @@ fn halt_fast_forward_survives_a_batch_that_overshot_the_run_deadline() {
     // always retires at least one instruction, the batch-entry interrupt
     // service is charged before any cap test, and the ISA I/O charge is added
     // to the batch-end step without ever having been counted against the cap.
-    // So `now_ticks()` can sit PAST `deadline_ticks` when the batch ends -- and
+    // So `now_ticks()` can sit PAST `deadline_ticks` when the batch ends, and
     // when that same batch ended on a HLT with IF clear, `next_timer_wake`
     // returns None and the halt fast-forward computes the ticks it may still
     // consume. That subtraction used to be plain and panicked in debug
@@ -547,7 +547,7 @@ fn halt_fast_forward_survives_a_batch_that_overshot_the_run_deadline() {
     // already a clock or two behind.
     //
     // "Did not panic" is all this test can assert directly, and under the fix
-    // that would pass even if nothing overshot -- so count the clamps that
+    // that would pass even if nothing overshot, so count the clamps that
     // actually fired and require at least one. Without that, a future change to
     // the batch grant or cap arithmetic could stop reaching the branch and
     // hollow this test out silently. Bursts 1..=7 all overshoot today, so the

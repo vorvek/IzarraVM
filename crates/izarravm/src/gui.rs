@@ -933,7 +933,7 @@ fn midi_request_needed(
     // to be told: with no worker it applies the change to the spec and the
     // snapshot itself and emits the Applied event that carries it into
     // izarravm.conf, so the next power-on boots what the user chose. Swallowing
-    // it here lost the setting in total silence -- the panel reseeds from the
+    // it here lost the setting in total silence: the panel reseeds from the
     // snapshot, so Accept looked like it had worked.
     //
     // The RETRY half is what needs the machine running: a status can only be
@@ -1288,8 +1288,8 @@ impl GuiApp {
                 frame.owner == ActiveDisplay::Distira,
             ));
             // FOLD, do not overwrite. The frame already sitting here was polled
-            // and never painted -- egui may have discarded the pass, or two
-            // polls may fall between two paints -- and its scanline runs are the
+            // and never painted (egui may have discarded the pass, or two
+            // polls may fall between two paints) and its scanline runs are the
             // only record that those rows moved. Dropping it would leave them
             // stale on the texture until something happened to repaint them.
             self.session_frame = Some(match self.session_frame.take() {
@@ -1434,7 +1434,7 @@ impl Drop for GuiApp {
 /// The newer frame's pixels are already the whole current picture, so only the
 /// damage has to be carried: the result spans both publications and reports the
 /// union of their runs. Frames from different worker generations do not compose
-/// -- a machine reset republishes from a fresh screen -- so those take the newer
+/// (a machine reset republishes from a fresh screen) so those take the newer
 /// frame alone, and the publication gap makes the consumer upload it whole.
 fn merge_session_frames(unpainted: SessionFrame, newer: SessionFrame) -> SessionFrame {
     if unpainted.generation != newer.generation
@@ -1472,7 +1472,7 @@ fn merge_row_runs(
 
 /// The gamma to bake into a saved screenshot. The shader applies the display
 /// gamma correction only on the `CrtStyle::Off` path (`crt.rs`'s
-/// `u.style < 0.5 && u.monitor_gamma > 0.0` branch) -- every other style
+/// `u.style < 0.5 && u.monitor_gamma > 0.0` branch): every other style
 /// keeps the pre-existing `to_linear` cancellation and shows the guest bytes
 /// uncorrected. A saved screenshot must match what the window actually
 /// shows, not what the preference says in the abstract, so any style other
@@ -2113,8 +2113,8 @@ impl GuiApp {
     }
 
     /// Build and mount the folder at `dir` as a CD-ROM, and remember it in
-    /// prefs so it is restored (rebuilt) next launch. Errors -- including the
-    /// ~650 MB CD-ROM capacity guard -- are logged the same way a bad ISO/CUE
+    /// prefs so it is restored (rebuilt) next launch. Errors (including the
+    /// ~650 MB CD-ROM capacity guard) are logged the same way a bad ISO/CUE
     /// mount is, and leave the drive unchanged. Used by the Load folder button
     /// and the prefs restore on startup.
     fn mount_cd_from_folder(&mut self, dir: &Path) {

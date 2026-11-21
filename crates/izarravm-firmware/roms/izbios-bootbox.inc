@@ -9,8 +9,8 @@
 ; The box (art_bootbox_rle, BOOTBOX_X/Y/W/H = 19,57,181,177) is too narrow for the
 ; old side-by-side panes, so the menu is a single stacked column: three device
 ; rows, four CPU-speed rows, and an Accept row, walked by a flat focus index 0..7
-; (0..2 device, 3..6 speed, 7 Accept). The menu is modal -- there is no Cancel
-; button -- but Esc restores the persisted primary so an accidental Tab is not a
+; (0..2 device, 3..6 speed, 7 Accept). The menu is modal (there is no Cancel
+; button) but Esc restores the persisted primary so an accidental Tab is not a
 ; trap. F10 or Enter-on-Accept commits.
 ;
 ; Drawing uses the lfb_* primitives, which share the mode-13h gfx_* register

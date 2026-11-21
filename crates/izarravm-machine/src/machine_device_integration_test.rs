@@ -173,7 +173,7 @@ fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
     // A guest arms 8-bit single-cycle DMA + IRQ5, then `sti;hlt`. The run loop
     // must fast-forward across the DSP sample window (the new IRQ5 wake) and
     // deliver the block-completion IRQ5, so the handler runs and real emulated time
-    // advances -- not a genuine no-wake halt. Setup mirrors the 8-bit probe.
+    // advances, not a genuine no-wake halt. Setup mirrors the 8-bit probe.
     // Pinned to IRQ5 EXPLICITLY: the default is now IRQ7, and this fixture's
     // guest code hooks vector 0x0D / unmasks master bit 5 by hand. Following the
     // default would leave it asserting nothing while still passing.
@@ -342,7 +342,7 @@ fn pit_channel0_raises_irq0_while_running() {
 #[test]
 #[ignore]
 fn batch_throughput() {
-    // cli; jmp $ — a tight interrupt-free loop with no port I/O, the case the
+    // cli; jmp $: a tight interrupt-free loop with no port I/O, the case the
     // batch fully amortizes (one bus build + device fan-out per ~thousands of
     // instructions instead of per instruction).
     let mut machine = Machine::new(
@@ -1500,7 +1500,7 @@ fn dsp_dc_playback_has_no_per_pump_dropouts_slightly_behind_real_time() {
 /// VBE information blocks had: the segment base plus BX went onto the bus as a
 /// physical address. `run.rs` dispatches INT 2Fh for any caller outside ring-0
 /// protected mode, so a program running in V86 under TOKAEMM reaches this with
-/// a buffer its page tables put outside the identity map -- and a DJGPP program
+/// a buffer its page tables put outside the identity map, and a DJGPP program
 /// calls MSCDEX through DPMI with a transfer buffer DOS took from upper memory.
 ///
 /// The fixture is the VBE one: guest pages C8h and C9h mapped to two
@@ -1624,7 +1624,7 @@ fn icdex_drive_letters_use_the_non_identity_mapped_caller_buffer() {
 }
 
 /// AX=150Fh carries TWO caller pointers with two different conventions: the
-/// ASCIZ path comes IN at ES:BX, and the directory record goes OUT at SI:DI --
+/// ASCIZ path comes IN at ES:BX, and the directory record goes OUT at SI:DI,
 /// a real-mode segment:offset pair in registers that are not segment registers,
 /// so it is built by shifting SI, not from a descriptor base. Each is a
 /// separate address and each needs its own proof; this one puts the path in the
@@ -2146,8 +2146,7 @@ fn izarracd_doorbell_refuses_stray_rings() {
 }
 
 // ---------------------------------------------------------------------------
-// The B3 FAT-position hypercall (Lotura doorbell commands 3/4). Design:
-// dev_docs/tier-b-b3-a2-design-2026-08-28.md sections 2.2-2.4.
+// The B3 FAT-position hypercall (Lotura doorbell commands 3/4).
 
 use crate::dos::{HDD_MAP_RESULT, HDD_MAP_START, HDD_MAP_STEPS, HDD_MAP_UNIT};
 
@@ -2184,7 +2183,7 @@ fn read_map_result(machine: &mut Machine, block: u32) -> u32 {
 }
 
 /// Mount `dir` as C: through Katea, the way `machine_storage_test.rs`'s
-/// `machine_with_hdd_folder` does — a fresh machine plus a host-folder mount,
+/// `machine_with_hdd_folder` does: a fresh machine plus a host-folder mount,
 /// so `map_fat_chain` has a real Katea volume to answer from.
 fn hdd_map_machine(dir: &std::path::Path) -> Machine {
     let mut machine = test_machine();
@@ -2203,7 +2202,7 @@ fn hdd_map_scratch(tag: &str) -> std::path::PathBuf {
 
 // Free conventional RAM for the tests' request block: below
 // `BIOS_BOOT_CHOICE_ADDR` (0x0537) and clear of the firmware scratch block
-// (0x600-0x63F, which the CD mailbox itself sits inside) -- nothing else in
+// (0x600-0x63F, which the CD mailbox itself sits inside): nothing else in
 // a test machine claims this range.
 const HDD_MAP_TEST_BLOCK: u32 = 0x0520;
 
@@ -2226,7 +2225,7 @@ fn hdd_map_probe_with_null_mailbox_parks_fe_and_registers_nothing() {
 /// Exercises all three doorbell-4 outcomes against a real Katea host-folder
 /// volume: the zero-step success at the root cluster, a step count past the
 /// chain cap (Refused), and a step count comfortably under the cap but past
-/// the root directory's own (tiny, empty-folder) chain length -- the only
+/// the root directory's own (tiny, empty-folder) chain length, the only
 /// case here that proves `HDD_MAP_STEPS` is actually read rather than
 /// ignored, since 0 and u32::MAX cannot tell "read" from "not read".
 ///
@@ -2257,7 +2256,7 @@ fn hdd_map_lookup_maps_root_refuses_past_cap_and_reports_end_of_chain() {
     assert_eq!(read_map_result(&mut machine, HDD_MAP_TEST_BLOCK), 2);
 
     // A step count past the chain cap is refused (design §2.4's Refused
-    // path — the guest falls back to its native walk). The host writes
+    // path: the guest falls back to its native walk). The host writes
     // nothing on a refusal; the stale zero `write_map_request` planted
     // stays.
     write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 2, 2, u32::MAX);
@@ -2267,8 +2266,8 @@ fn hdd_map_lookup_maps_root_refuses_past_cap_and_reports_end_of_chain() {
 
     // 4096 is comfortably under `max_chain()` (tens of thousands of
     // clusters, sized from the volume's floor partition size) but far past
-    // the root directory's own chain -- a handful of system files fit in
-    // its first cluster -- so this deterministically walks off the end and
+    // the root directory's own chain (a handful of system files fit in
+    // its first cluster) so this deterministically walks off the end and
     // proves the field at HDD_MAP_STEPS drove the walk. The host writes
     // nothing here either.
     write_map_request(&mut machine, HDD_MAP_TEST_BLOCK, 2, 2, 4096);

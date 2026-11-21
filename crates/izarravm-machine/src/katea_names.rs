@@ -4,7 +4,7 @@
 //! Per-directory 8.3 name table for the Katea host-folder facade. One instance
 //! per directory (FAT 8.3 uniqueness is per-directory). It owns the folding (via
 //! `fat_name`) and a bidirectional record so a folded name maps back to its host
-//! path — the read side uses the folded name for the directory entry, the write
+//! path: the read side uses the folded name for the directory entry, the write
 //! side uses the reverse map.
 
 use crate::fat_name;

@@ -183,7 +183,7 @@ monitor:
     ; Pop the guest's flags word from the V86 stack and split it: VIF (bit 9)
     ; goes to the virtual-IF byte; the monitor's OWN exception-frame EFLAGS at
     ; [esp+12] (real EFLAGS, restored by this handler's trailing iretd) is left
-    ; untouched -- real IF must stay 1 in V86 regardless of the guest's virtual
+    ; untouched: real IF must stay 1 in V86 regardless of the guest's virtual
     ; view, exactly like .cli/.sti/.intn never touch it either.
     mov ebx, [esp+20]
     shl ebx, 4
@@ -232,7 +232,7 @@ monitor:
     ; guest was attempting) and load IP/CS into the monitor's own exception
     ; frame so its trailing iretd resumes the guest there. FLAGS splits like
     ; POPF: VIF (bit 9) goes to the virtual-IF byte; the monitor's OWN frame
-    ; EFLAGS at [esp+12] is left untouched -- real IF must stay 1 in V86.
+    ; EFLAGS at [esp+12] is left untouched: real IF must stay 1 in V86.
     mov ebx, [esp+20]
     shl ebx, 4
     movzx ecx, word [esp+16]

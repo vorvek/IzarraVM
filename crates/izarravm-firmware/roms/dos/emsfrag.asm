@@ -19,8 +19,8 @@
 ;
 ; Draining the pool used to mean 32 handles of a fixed 6 pages (32*6 ==
 ; EMS_MAX_PAGES == 192, chosen so the drain empties the pool with nothing left
-; over). Post-fix, EMS draws from the WHOLE shared arena -- about 1456 pages on
-; the 24 MB profile, not 192 -- and that total is no longer a compile-time
+; over). Post-fix, EMS draws from the WHOLE shared arena (about 1456 pages on
+; the 24 MB profile, not 192) and that total is no longer a compile-time
 ; constant: the pool is not even guaranteed to start fully free (COMMAND.COM's
 ; own XMS-swap block for running this child, if the shell was built with
 ; XMS-Swap support, legitimately holds part of it, and that is now NORMAL
@@ -29,7 +29,7 @@
 ; from a hardcoded 192:
 ;   hole_pages = free / EMS_HANDLES (32), remainder = free mod EMS_HANDLES.
 ;   Handle 0 (an EVEN index, so the punch below never frees it) also carries
-;   the remainder, so every ODD-indexed "hole" handle is exactly hole_pages --
+;   the remainder, so every ODD-indexed "hole" handle is exactly hole_pages:
 ;   uniform hole sizes are what let a single "hole_pages + 1" probe below mean
 ;   anything.
 ;
@@ -39,7 +39,7 @@
 ; non-contiguous that stops being true: EMS only ever takes pages one at a
 ; time now (ems_page_alloc, 16 granules per call), so "hole_pages + 1 pages"
 ; is satisfiable the instant hole_pages+1 free 16 KB units exist ANYWHERE in
-; the pool -- which they do, since the 16 punched holes total far more than
+; the pool, which they do, since the 16 punched holes total far more than
 ; that. So the probe is a DISCRIMINATOR, not a gate:
 ;   fails (0x88)  -> the driver still demands contiguity; a bigger want_pages
 ;                    request cannot possibly do better, so signal the defect
@@ -51,7 +51,7 @@
 ;
 ; Signals 0xA5 (success) via the unit-tester exit port; 0xEn names the step.
 ; 0xEA is the headline code: EMS refused a request while enough total pages
-; were free, because none of them were contiguous -- the defect Task 6 fixes.
+; were free, because none of them were contiguous, the defect Task 6 fixes.
 ;
 ; Build: nasm -f bin emsfrag.asm -o emsfrag.com
 cpu 386
@@ -90,7 +90,7 @@ start:
 
     ; --- drain: EMS_DRAIN_HANDLES handles. Index 0 (even, so the punch below
     ; never frees it) also carries the remainder, so every ODD index is
-    ; exactly hole_pages -- the uniform hole size the discriminator needs. ---
+    ; exactly hole_pages, the uniform hole size the discriminator needs. ---
     xor si, si
 .drain:
     mov bx, [hole_pages]

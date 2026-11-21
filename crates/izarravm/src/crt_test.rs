@@ -89,7 +89,7 @@ fn glide_gamma_lands_at_uniform_offset_24_without_growing_the_block() {
 /// The Glide compensation must sit on the shader's ONLY texture read.
 ///
 /// `glow()`'s 8 halation taps used to sample the texture directly, so under
-/// `Subtle` and `Ye Olde` -- the default style -- an uncompensated halation
+/// `Subtle` and `Ye Olde` (the default style) an uncompensated halation
 /// term was added to a compensated base. Funnelling every read through
 /// `sample_signal` is what makes "the compensation happens before anything
 /// else looks at a pixel" true rather than nearly true, so this test pins the

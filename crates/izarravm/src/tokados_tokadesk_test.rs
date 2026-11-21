@@ -7,10 +7,10 @@
 //! in that root listing, failing 0xEB otherwise (`dir_init`/`has_tokadesk` in
 //! `dir.c`). That check is `/T`-only: interactive use never looks at its
 //! result, so the workbench itself opens normally wherever it lives. But
-//! `/T`'s own assumption -- that TOKADESK.EXE ships at the root -- is wrong
+//! `/T`'s own assumption (that TOKADESK.EXE ships at the root) is wrong
 //! now that it ships at `C:\DOS\TOKADESK.EXE` like every other Toka-DOS tool,
 //! so the self-test itself always reports 0xEB on the real image. Known
-//! defect, recorded in `dev_docs/2026-09-02-tokadesk-ship.md`. This fixture
+//! defect. This fixture
 //! runs TOKADESK from its real shipped path and asserts the CURRENT outcome:
 //! VBE mode 0x117 is set (that happens in the stub before the self-check
 //! runs), then TOKADESK exits 0xEB without drawing any chrome.

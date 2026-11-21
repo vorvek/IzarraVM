@@ -6,8 +6,8 @@
 Runs the four entry-attribution observer legs on the Tomb Raider DOS/4GW loader fixture.
 
 .DESCRIPTION
-Mirrors `scripts/run-tombraid-loader-gate.ps1`'s leg mechanics -- exact fixture copy, pinned
-processor affinity, every IZARRAVM_* variable removed before the arm's own are set -- but runs the
+Mirrors `scripts/run-tombraid-loader-gate.ps1`'s leg mechanics (exact fixture copy, pinned
+processor affinity, every IZARRAVM_* variable removed before the arm's own are set) but runs the
 observer's own legs rather than the gate's A/B: one disarmed, one FULL, one SAMPLE=N, one COARSE.
 
 This is the OBSERVER's smoke and acceptance harness, not a performance gate: it makes no wall

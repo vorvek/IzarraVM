@@ -68,7 +68,7 @@ pub(super) const HGC_MODE_PAGE1: u8 = 0x80;
 // allows the Mode Control register's graphics bit to take effect and unlocks
 // the B1000h-B7FFFh half of the first page; bit 1 pages the second 32K bank
 // in at B8000h. A real HGC's graphics mode is refused (stays text) unless the
-// guest has first unlocked it here -- this is the two-step "configure then
+// guest has first unlocked it here: this is the two-step "configure then
 // switch" sequence Hercules software issues before painting graphics.
 const HGC_CONFIG_ALLOW_GRAPHICS: u8 = 0x01;
 const HGC_CONFIG_ENABLE_PAGE1: u8 = 0x02;

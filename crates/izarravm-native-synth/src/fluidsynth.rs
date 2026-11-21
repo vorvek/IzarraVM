@@ -203,7 +203,7 @@ impl FluidSynth {
     /// implement, such as a truncated or bad-checksum GS `DT1`.
     ///
     /// Mapping those onto a generic native-call failure made the CALLER treat
-    /// them as a dead synthesiser -- and the caller latches. A single redundant
+    /// them as a dead synthesiser, and the caller latches. A single redundant
     /// note-off silenced the P300 for the rest of the session.
     pub fn send(&mut self, message: &[u8]) -> Result<(), Error> {
         let (code, operation) = match midi::validate(message)? {

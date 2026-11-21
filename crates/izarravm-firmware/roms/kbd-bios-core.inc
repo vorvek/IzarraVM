@@ -355,7 +355,7 @@ int16:
     ; INT 16h must preserve every register but AX/FLAGS (IBM AT BIOS contract).
     ; BX is this handler's ring-pointer scratch, so save the caller's copy: a
     ; leaked BX bit real code (Watcom kept a local in BX across INT 16h AH=01h
-    ; and read back the ring head offset -- the TokaEdit phantom-Alt bug).
+    ; and read back the ring head offset, the TokaEdit phantom-Alt bug).
     push bx
 .read_wait:
     push ds
@@ -372,20 +372,20 @@ int16:
     ; check. IRQ1 -> INT 09h enqueues the key and wakes this directly, so a
     ; keystroke is served no later than the spin served it; IRQ0 wakes it
     ; harmlessly and the check simply repeats. `sti` at the entry above is what
-    ; makes the halt safe -- a HLT with interrupts masked is a hang.
+    ; makes the halt safe: a HLT with interrupts masked is a hang.
     ;
     ; Real AT BIOSes differ on this and both are period-plausible, so it is a
     ; free choice for a clean-room ROM, and the emulator makes it lopsided: a
     ; spinning wait is interpreted guest code, and DOS programs block here
-    ; constantly -- every menu, every "press any key". The kernel's own idle
+    ; constantly: every menu, every "press any key". The kernel's own idle
     ; halt (dosidle.asm, on by default in Toka-DOS) covers DOS input, INT 21h
     ; AH=01/07/08; this covers everything that calls the BIOS directly, which
     ; the kernel path never sees.
     ;
     ; Divergence worth knowing: a guest that masks IRQ0 AND IRQ1 and then blocks
     ; here used to spin forever and now halts with nothing left to wake it, which
-    ; the emulator reports as a halt. Both are hung -- such a program can never
-    ; receive the key it is waiting for -- but the halt says so instead of
+    ; the emulator reports as a halt. Both are hung (such a program can never
+    ; receive the key it is waiting for) but the halt says so instead of
     ; burning a core to hide it.
     hlt
     jmp .read_wait

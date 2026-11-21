@@ -269,7 +269,7 @@ fn failed_external_send_enters_missing_port_state_without_hardware() {
     // its backends raise this for an empty message and for a non-SysEx message
     // over three bytes long. The guest is free to write either, and neither is
     // evidence about the port. Costing the receiver for one of them is the same
-    // mistake the synthesiser triage exists to avoid -- and the same symptom:
+    // mistake the synthesiser triage exists to avoid, and the same symptom:
     // a P330 that goes quiet mid-game and stays quiet.
     assert!(
         midi.record_external_send_result(Err(midir::SendError::InvalidData("too long")))
@@ -330,8 +330,8 @@ fn p300_soundfont_changes_do_not_reset_p330_messages() {
 /// (`0x50`/`0x51`) arriving here as a linear gain.
 ///
 /// This leg is the one source in the machine that joins the mix outside
-/// `render_audio` -- native synthesis runs on the host clock and is added by
-/// the frontend afterwards -- so the card's summing node cannot attenuate it
+/// `render_audio` (native synthesis runs on the host clock and is added by
+/// the frontend afterwards) so the card's summing node cannot attenuate it
 /// and the scalar has to be applied at the point it adds itself. Unity is an
 /// exact identity, so an engine nobody has set a gain on is byte-for-byte what
 /// it was before the control existed.
@@ -393,7 +393,7 @@ fn the_wavetable_gain_attenuates_what_the_engine_adds_to_the_mix() {
 ///
 /// The MPU-401 parser forwards `0xF4`, `0xF5`, `0xF7`, `0xF9` and `0xFD` to us
 /// as one-byte messages, verbatim, because that is what the guest wrote to the
-/// port -- a lone `0xF7` is what a driver emits when it abandons a SysEx, and
+/// port: a lone `0xF7` is what a driver emits when it abandons a SysEx, and
 /// undefined real-time bytes come from any program that pokes the port. None of
 /// them is a message a synthesiser accepts, so `validate` refuses them.
 ///
@@ -411,7 +411,7 @@ fn a_message_the_synth_refuses_does_not_silence_the_engine() {
     assert!(matches!(midi.adapter, MidiAdapter::Fluid(_)));
 
     // A note on, then every byte the MPU can hand us that no synth will take,
-    // then a second note on -- all inside one staging window.
+    // then a second note on, all inside one staging window.
     midi.send(&message(0, &[0x90, 60, 110]));
     for (index, refused) in [0xF4_u8, 0xF5, 0xF7, 0xF9, 0xFD].into_iter().enumerate() {
         midi.send(&message(index as u64 + 1, &[refused]));
@@ -460,7 +460,7 @@ fn an_unmatched_note_off_does_not_silence_the_engine() {
 
     // A note-off on a channel that has never played a note: nothing to match.
     midi.send(&message(0, &[0x80, 60, 0x40]));
-    // A note played and released properly, then released AGAIN -- the duplicate
+    // A note played and released properly, then released AGAIN: the duplicate
     // has no voice left to find.
     midi.send(&message(1, &[0x90, 67, 110]));
     midi.send(&message(2, &[0x80, 67, 0x40]));
@@ -496,8 +496,8 @@ fn an_unmatched_note_off_does_not_silence_the_engine() {
 
 /// An engine that failed must be re-openable, and Accept is what re-opens it.
 ///
-/// `fail_native` is a latch by design -- a broken synth cannot be played
-/// through -- but the only thing that used to clear it was a settings change
+/// `fail_native` is a latch by design (a broken synth cannot be played
+/// through) but the only thing that used to clear it was a settings change
 /// the engine's own role cares about, and the wavetable's role cares about
 /// exactly one setting: the SoundFont path. So a P300 that died stayed dead and
 /// the config panel kept showing its error no matter what was changed there,
@@ -536,8 +536,8 @@ fn reconfiguring_reopens_an_engine_that_failed_even_with_identical_settings() {
 
 /// A synth whose queue is momentarily full is not a broken synth.
 ///
-/// `mt32emu_play_msg` has exactly two failure answers -- the queue is full, or
-/// there is no open synth behind the context -- and until now both arrived here
+/// `mt32emu_play_msg` has exactly two failure answers (the queue is full, or
+/// there is no open synth behind the context) and until now both arrived here
 /// as an opaque `NativeCall`, which `send_native` treats as terminal. A P330
 /// that got ahead of its own event queue for one audio window would therefore
 /// latch itself Silent and stay there, the same permanent death a stray `0xF7`
@@ -576,7 +576,7 @@ fn a_full_synth_queue_costs_the_message_and_a_closed_synth_costs_the_engine() {
 /// owner's report was precisely that every one of these arrived as the same
 /// generic sentence.
 ///
-/// Two of the five need a real Roland ROM set to reach -- a PCM image cannot be
+/// Two of the five need a real Roland ROM set to reach: a PCM image cannot be
 /// "the missing one" until a control image has loaded, and a mismatched pair
 /// needs two genuine images from different machines. Those are asserted at the
 /// mapping instead, and the loader sites that raise them are named in the
@@ -620,7 +620,7 @@ fn open_munt_reports_which_rom_requirement_failed() {
     // The two that need real ROMs. `RomNotFound { kind: Pcm }` comes from
     // `RomSet::require(Pcm, ..)` once a control image has loaded, and
     // `MissingRoms` from `MuntSynth::open` when `mt32emu_open_synth` answers
-    // MISSING_ROMS or FAILED -- the latter being a control and a PCM image from
+    // MISSING_ROMS or FAILED, the latter being a control and a PCM image from
     // different machines.
     assert_eq!(
         munt_rom_status(&SynthError::RomNotFound {

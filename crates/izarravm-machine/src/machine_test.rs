@@ -16,7 +16,7 @@ const BIOS_TEXT_WHITE: u8 = 0x3F;
 ///
 /// The epoch is the "every cached host pointer is void" signal. A token move voids exactly the
 /// `0xA0000..0xAFFFF` aperture, and `CpuGsw::note_direct_data_map_changed` invalidates that range
-/// by hand — but it can only keep the surviving RAM entries if the epoch they are stamped with
+/// by hand, but it can only keep the surviving RAM entries if the epoch they are stamped with
 /// still matches. Advance the epoch here and the scoping is silently undone: every RAM entry stops
 /// matching on the next interpreter probe and the direct-page caches empty on their next insert.
 #[test]

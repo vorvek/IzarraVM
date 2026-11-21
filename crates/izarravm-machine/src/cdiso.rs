@@ -46,7 +46,7 @@ impl IsoEntry {
 #[derive(Debug, Default)]
 pub(crate) struct IsoDir {
     pub entries: Vec<IsoEntry>,
-    /// First LBA of this directory's own extent — the redirector's FindNext
+    /// First LBA of this directory's own extent: the redirector's FindNext
     /// cursor names its directory by this value.
     pub extent_lba: u32,
 }
@@ -99,8 +99,8 @@ impl IsoIndex {
         index.dir_by_lba.insert(root_lba, 0);
         // Depth-first over (dir index, extent LBA, extent size). Every
         // directory is entered through exactly one parent record on a valid
-        // disc. A directory entry whose extent is already known — `.`, `..`,
-        // or a doubly-referenced extent on a malformed disc — is listed but
+        // disc. A directory entry whose extent is already known (`.`, `..`,
+        // or a doubly-referenced extent on a malformed disc) is listed but
         // not recursed into, which is also what keeps the walk finite.
         let mut queue = vec![(0u32, root_lba, root_size)];
         while let Some((dir_idx, lba, size)) = queue.pop() {
@@ -177,7 +177,7 @@ fn normalized_components(path: &str) -> Vec<String> {
 }
 
 /// Parse one directory extent. `dot_entries` selects whether the ISO self
-/// and parent records (ids 00h/01h) become `.` and `..` entries — a
+/// and parent records (ids 00h/01h) become `.` and `..` entries: a
 /// subdirectory lists them, the way DOS and the IZCDEX redirector did; the
 /// root does not.
 fn parse_directory(image: &CdImage, lba: u32, size: u32, dot_entries: bool) -> Vec<IsoEntry> {

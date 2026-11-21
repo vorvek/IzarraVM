@@ -383,7 +383,7 @@ impl RasterParams {
         // (`vid_voodoo_fb.c`: every store indexes
         // `fb_mem[write_addr & fb_mask]`, no bounds check first). A
         // triangle or an LFB write that lands past the end of FBI RAM does
-        // not vanish on real hardware -- the address lines that would
+        // not vanish on real hardware: the address lines that would
         // select a higher byte are simply not routed, so the write lands
         // on a lower byte instead. `DISTIRA_FB_SIZE` is a power of two, so
         // masking is exact modulo arithmetic, not an approximation.
@@ -572,7 +572,7 @@ impl RasterView<'_> {
     /// pixel with one `select_kernel` already resolved for the whole
     /// triangle, and `if WBUF`/`!WBUF` replaces `TriangleDepth`'s own enum
     /// match the same way. Every one of those conditions was already
-    /// constant for the triangle before this function existed — this
+    /// constant for the triangle before this function existed: this
     /// changes how the compiler generates the loop, never what it computes.
     ///
     /// The `debug_assert!`s are the safety net: `select_kernel` is the only
@@ -679,7 +679,7 @@ impl RasterView<'_> {
                 // a rayon lane, where a panic takes down a worker thread
                 // rather than failing loudly and safely, so a mis-selection
                 // degrades to computing the depth from whichever variant
-                // `depths` actually holds (still correct — WBUF only
+                // `depths` actually holds (still correct: WBUF only
                 // exists to skip the enum match, not to change the
                 // formula) instead of crashing the lane. The
                 // `debug_assert!` still makes the drift loud in any

@@ -20,7 +20,7 @@
 ;
 ;   1. Scans PCI configuration mechanism 1 (ports 0xCF8/0xCFC) on bus 0,
 ;      device 0..31, function 0, looking for vendor 0x121a / device 0x0001
-;      (3dfx Voodoo Graphics — see crates/izarravm-machine/src/lib.rs
+;      (3dfx Voodoo Graphics; see crates/izarravm-machine/src/lib.rs
 ;      DISTIRA_PCI_VENDOR_ID/DISTIRA_PCI_DEVICE_ID).
 ;   2. Programs BAR0 (config offset 0x10) with a chosen 32-bit base and sets
 ;      the memory-space-enable bit in the command register (offset 0x04).

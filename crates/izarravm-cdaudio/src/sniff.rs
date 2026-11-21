@@ -33,7 +33,7 @@ pub enum Container {
 }
 
 /// Identify `head` (the first [`SNIFF_BYTES`] of a file `len` bytes long), or
-/// None when it is not one of the containers we decode -- which the caller
+/// None when it is not one of the containers we decode, which the caller
 /// treats as "mount it as raw bytes", not as an error.
 pub fn sniff(head: &[u8], len: u64) -> Option<Container> {
     if head.starts_with(b"OggS") {

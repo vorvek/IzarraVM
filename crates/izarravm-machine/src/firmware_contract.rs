@@ -51,7 +51,7 @@ pub(crate) mod address {
     /// deliberately skips 0x19/0x1A, which are the AT extended drive types.
     ///
     /// Every byte here sits inside the 0x10..=0x2D checksum window, so anything
-    /// writing them -- host or guest -- has to refresh the checksum at 0x2E/0x2F
+    /// writing them (host or guest) has to refresh the checksum at 0x2E/0x2F
     /// or the next boot discards the whole NVRAM as corrupt.
     ///
     /// `CMOS_AUDIO_MAGIC` distinguishes "never configured" from "configured to

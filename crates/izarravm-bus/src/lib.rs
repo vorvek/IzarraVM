@@ -34,21 +34,21 @@ pub struct Memory {
 }
 
 /// Guest RAM's backing bytes, windowed to host-page (4096) alignment inside a deliberately
-/// over-allocated `Vec` — `align_offset` finds the boundary and every accessor sees only the
+/// over-allocated `Vec`: `align_offset` finds the boundary and every accessor sees only the
 /// aligned window, so the allocation and alignment use safe Rust.
 ///
 /// The alignment is a PERFORMANCE contract, not a correctness one: the CPU's one-lookup store
-/// table (`dev_docs/2026-08-07-one-lookup-store-design.md` D7) steals the low bits of each
+/// table steals the low bits of each
 /// per-page host bias for its poison/tag encoding, which is only possible when every
 /// `DirectPage::ptr` handed out of this buffer is 4096-aligned; a misaligned backing silently
 /// degrades every page to the slow store path.
 ///
-/// The window never moves: the `Vec` is sized once and never grown, so its allocation — and
-/// therefore `start` — is stable for the buffer's life, which is the same write-once contract
+/// The window never moves: the `Vec` is sized once and never grown, so its allocation (and
+/// therefore `start`) is stable for the buffer's life, which is the same write-once contract
 /// the CPU's fast-map bias tables already lean on. `Clone` re-derives the offset in the fresh
 /// allocation rather than copying it.
 ///
-/// Public because every buffer that backs a `DirectPage` needs it — guest RAM here, and both
+/// Public because every buffer that backs a `DirectPage` needs it: guest RAM here, and both
 /// VGA buffers (`vram` for the Mode X path, `mode13_linear` for chained 13h) in
 /// izarravm-video, which would otherwise silently degrade doom's aperture stores.
 pub struct PageAlignedBytes {
@@ -65,8 +65,8 @@ impl PageAlignedBytes {
         let start = raw.as_ptr().align_offset(Self::ALIGN);
         // `align_offset` is PERMITTED to return usize::MAX ("not possible to align"). No real
         // allocator does that for a byte buffer, but this type's whole contract is "degrade,
-        // never fail" — a misaligned window is only a slow store path, while an out-of-range
-        // one would panic on first deref — so fall back to offset 0 rather than lean on the
+        // never fail" (a misaligned window is only a slow store path, while an out-of-range
+        // one would panic on first deref) so fall back to offset 0 rather than lean on the
         // allocator's goodwill.
         let start = if start >= Self::ALIGN { 0 } else { start };
         Self { raw, start, len }
@@ -88,7 +88,7 @@ impl Default for PageAlignedBytes {
 }
 
 impl From<Vec<u8>> for PageAlignedBytes {
-    /// Re-home plain bytes into an aligned window — the copy is the cost of the alignment
+    /// Re-home plain bytes into an aligned window: the copy is the cost of the alignment
     /// guarantee, so this is for construction-time use (test harnesses, one-shot loads), not
     /// steady-state paths.
     fn from(bytes: Vec<u8>) -> Self {
@@ -240,7 +240,7 @@ impl BusWidth {
         }
     }
 
-    /// True when `address` is not naturally aligned for this width -- the single spelling of a
+    /// True when `address` is not naturally aligned for this width, the single spelling of a
     /// predicate that used to be written four ways (`FastMap::lookup_access`'s two `matches!`
     /// clauses, `CpuGsw::direct_access_page_local`'s `match`, and `MachineBus`'s free
     /// `should_split`).
@@ -836,7 +836,7 @@ impl BusTrace {
 ///
 /// **Not shared with `izarravm-cpu`'s own callers** (GP2 poll-skip revision review N1):
 /// `CpuGsw::preview_scale_clocks` and `poll_skip_core_projection` each carry their OWN copy of
-/// this same long division rather than calling this function -- `izarravm-cpu` cannot depend on
+/// this same long division rather than calling this function: `izarravm-cpu` cannot depend on
 /// `izarravm-bus` for it without an actual crate wire-up that does not exist today. The three
 /// copies are identical arithmetic as of this writing (verified by direct comparison, GP2
 /// poll-skip revision review §5), but nothing enforces that identity mechanically: a mutant that
@@ -866,7 +866,7 @@ pub struct CalloutPollSkipRequest {
     /// The one bit the shape's status test reads: `0x01` or `0x08`, never any other
     /// value (`exact_poll_test_branch` refuses every other mask).
     pub status_mask: u8,
-    /// `PollLoop::fresh_iteration_spins(status_mask)` -- i.e. "does the shape spin
+    /// `PollLoop::fresh_iteration_spins(status_mask)`, i.e. "does the shape spin
     /// while the tested bit is SET". Precomputed on the `izarravm-cpu` side, which
     /// still holds the shape's real fields; the machine side only ever needs this one
     /// derived bool plus the live status byte's bit to answer "is this iteration still
@@ -874,7 +874,7 @@ pub struct CalloutPollSkipRequest {
     pub spins_when_bit_set: bool,
     /// The shape's own certified per-iteration raw core-clock charge (17 / 21 / 28).
     pub raw_core_clocks: u64,
-    /// `CpuGsw::core_clocks_so_far` as the running block set it at entry -- constant
+    /// `CpuGsw::core_clocks_so_far` as the running block set it at entry, constant
     /// for the whole block, and the base `now_at(n)` is computed from.
     pub core_clocks_at_block_entry: u64,
     /// This slot's own `prefix_raw_clocks + scale_weighted_fp_clocks(..).clocks`,
@@ -889,7 +889,7 @@ pub struct CalloutPollSkipRequest {
     pub core_num: u32,
     pub core_den: u32,
     pub timing_rem: u64,
-    /// The RUN's remaining guest-clock budget (`BlockCache::block_batch_cap`) -- NOT the
+    /// The RUN's remaining guest-clock budget (`BlockCache::block_batch_cap`), NOT the
     /// batch-absolute cap the interpreter's `try_poll_skip` bounds against (BLOCKER 2's fix; see
     /// `BlockCache::block_batch_cap`'s doc for the derivation). Zero means "no cap published" and
     /// refuses every skip (obligation 3).
@@ -901,10 +901,10 @@ pub struct CalloutPollSkipRequest {
     /// run-scoped budget against a batch-absolute spend, silently subtracting the batch's prior
     /// bus clocks from the budget a second time (BLOCKER 2).
     pub bus_scaled_at_run_entry: u64,
-    /// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`, default 2 -- matches `try_poll_skip`'s
+    /// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`, default 2; matches `try_poll_skip`'s
     /// own `low = 2` binary-search floor.
     pub min_iterations: u64,
-    /// `IZARRAVM_DIRECT_POLL_MAX_RAW`, default `u32::MAX - IN_PORT_CORE_CLOCKS` -- the
+    /// `IZARRAVM_DIRECT_POLL_MAX_RAW`, default `u32::MAX - IN_PORT_CORE_CLOCKS`, the
     /// 32-bit return-lane bound (obligation 4): `raw_core_clocks * iterations` must fit
     /// under this or the low-32-bit clock lane the emitted call-out returns through
     /// would collide with the step-break / resync status bits above it.
@@ -942,7 +942,7 @@ pub struct CalloutPollSkipOutcome {
     /// own single end-of-block batch call scales it exactly once, together with the
     /// block's other raw clocks. The seam must NEVER scale this itself.
     pub skipped_raw_core_clocks: u64,
-    /// The bus clocks the commit added to `trace.elapsed_clocks()` -- reported for the
+    /// The bus clocks the commit added to `trace.elapsed_clocks()`, reported for the
     /// I2 identity and the `jit_direct_poll_skip_raw_bus_clocks` counter; already
     /// applied by the seam, not something the caller must apply again.
     pub committed_raw_bus_clocks: u64,
@@ -1072,7 +1072,7 @@ pub trait CpuBus {
     /// PURITY PRIMITIVE FOR CALL-OUT PREFLIGHT ONLY. NOT A DATA PATH.
     ///
     /// Reads `width` bytes of plain guest RAM and charges NOTHING: no wait states, no
-    /// `trace.record`, no counter, no device. It exists for one caller shape -- a native call-out
+    /// `trace.record`, no counter, no device. It exists for one caller shape: a native call-out
     /// helper that must decide whether it may proceed BEFORE it is allowed to commit any effect,
     /// and that then re-reads the same bytes through the charged path so the charge order matches
     /// the interpreter's exactly (`jit/direct.rs`'s port call-out helpers, phase P).
@@ -1087,7 +1087,7 @@ pub trait CpuBus {
     /// `&mut self` is by construction doing something this must not do.
     ///
     /// A `Some` result additionally promises that `read_memory_direct(address, width, _)` will
-    /// take its ALIGNED direct-RAM arm and return the same value -- so the caller may pair the
+    /// take its ALIGNED direct-RAM arm and return the same value, so the caller may pair the
     /// probe with a charged re-read and know which charge it will pay.
     fn peek_direct_ram(&self, _address: u32, _width: BusWidth) -> Option<u32> {
         None
@@ -1118,8 +1118,8 @@ pub trait CpuBus {
     /// `in_batch_scaled_bus_clocks() >= target`, for implementations that can answer the
     /// comparison more cheaply than they can produce the value.
     ///
-    /// The straight-line run loop asks this once per retired instruction — 553.6M times in a
-    /// Quake/586 6.2G run — to test a cap that fires 22,903 times. `MachineBus`'s scaled figure
+    /// The straight-line run loop asks this once per retired instruction (553.6M times in a
+    /// Quake/586 6.2G run) to test a cap that fires 22,903 times. `MachineBus`'s scaled figure
     /// is `(raw * num + rem) / den`, so answering it by value put a 64-bit DIVIDE in that loop;
     /// a RIP profile attributed 2.99% of wall to the accessor once an inline barrier made it
     /// visible separately. Comparing instead of dividing is exact, not approximate: for integers
@@ -1128,21 +1128,21 @@ pub trait CpuBus {
         self.in_batch_scaled_bus_clocks() >= target
     }
 
-    /// RAW (unscaled) bus clocks this batch has accumulated so far — the `raw` that
+    /// RAW (unscaled) bus clocks this batch has accumulated so far, the `raw` that
     /// `in_batch_scaled_bus_clocks` divides down. Must be monotone non-decreasing within a batch.
     /// Only meaningful together with a non-zero `in_batch_scaled_bus_clocks_screen_scale`.
     ///
     /// **Trap, named for whoever reaches for this across a trip that spans more than one
     /// machine batch**: it resets at every batch re-entry (`izarravm-machine`'s `run.rs`
     /// re-snapshots the subtrahend at the top of each batch, including the plain IF-edge
-    /// break — not just a cap/deadline/fault boundary), so subtracting two samples taken on
+    /// break, not just a cap/deadline/fault boundary), so subtracting two samples taken on
     /// either side of ANY batch re-entry can go negative or under-count. Use
     /// `cumulative_raw_bus_clocks` below for a span that must survive a batch boundary.
     fn in_batch_raw_bus_clocks(&self) -> u64 {
         0
     }
 
-    /// RAW (unscaled) bus clocks since the bus was constructed — monotone non-decreasing for
+    /// RAW (unscaled) bus clocks since the bus was constructed, monotone non-decreasing for
     /// the whole run, NEVER reset at a batch boundary (unlike `in_batch_raw_bus_clocks` above).
     /// A caller that needs a raw bus-clock delta across a span that might cross one or more
     /// machine batches (a reflected-call trip, which crosses 6-8 IF-edge batch re-entries per
@@ -1190,7 +1190,7 @@ pub trait CpuBus {
     /// `MachineBus` and `TestBus` override this trait, and both also override
     /// `charge_direct_memory`, so nothing currently reaches this default. But nothing links the
     /// pair, and a future bus that overrides one and forgets the other would otherwise charge
-    /// ZERO clocks on every FastMap hit -- a silent timing divergence with no test, no assert, no
+    /// ZERO clocks on every FastMap hit: a silent timing divergence with no test, no assert, no
     /// compile error (this campaign has shipped exactly that "missing arm invisible to every
     /// other assertion" bug class more than once). Delegating makes the failure mode "correct but
     /// pays the redundant aperture compare this method exists to skip" instead of "silently
@@ -1210,13 +1210,13 @@ pub trait CpuBus {
     ///
     /// That doubling (a misaligned word costs `2 x (2 + ws)` against an aligned word's
     /// `1 x (2 + ws)`, because `BusCycle::clocks_for` ignores width entirely) is a SIDE EFFECT of
-    /// the splitting mechanism, not a modelled penalty -- nothing in tree says a misaligned access
+    /// the splitting mechanism, not a modelled penalty: nothing in tree says a misaligned access
     /// costs two bus cycles. Reproducing it here is a requirement of the caller that stopped
     /// splitting, not an endorsement of it: the point of admitting misaligned accesses to the
     /// interpreter's fast path is to remove a slow-path excursion, bit-identically.
     ///
     /// Callers must have established RAM backing and page-locality, and the Mode13h aperture must
-    /// NOT come here -- its split has different DATA semantics, not merely different timing (a
+    /// NOT come here: its split has different DATA semantics, not merely different timing (a
     /// byte write into the Distira LFB is swallowed where a wide write would have stored).
     ///
     /// The default DELEGATES, per byte, for the reason `charge_direct_ram_memory` above spells
@@ -1248,7 +1248,7 @@ pub trait CpuBus {
     /// override is charge-identical to this one's. Two reasons: `charge_direct_ram_memory`'s doc
     /// scopes it to the interpreter's FastMap serve path, a different caller with a different
     /// precondition (`PageKind::Ram` classified at population time, not `peek_direct_ram`'s
-    /// aligned-arm promise); and on `TestBus` the two are NOT interchangeable -- `TestBus`'s
+    /// aligned-arm promise); and on `TestBus` the two are NOT interchangeable: `TestBus`'s
     /// override of `charge_direct_ram_memory` charges nothing at all unless its
     /// `direct_page_clocks` test knob is armed, which would silently zero this method's charge on
     /// every existing fixture that never had a reason to set that knob. The default below reads
@@ -1268,7 +1268,7 @@ pub trait CpuBus {
     /// direct-page cache hit; `None` keeps the ordinary instruction path.
     ///
     /// **This bounds ONE bus cycle, not one guest access, and the two stopped being the same
-    /// thing.** `BusCycle::clocks_for` ignores `width` entirely -- it is `2 + wait_states` -- so
+    /// thing.** `BusCycle::clocks_for` ignores `width` entirely (it is `2 + wait_states`) so
     /// every implementation of this method returns the same number for Byte, Word and Dword. A
     /// MISALIGNED access is split into `width.bytes()` byte cycles by every charging path that
     /// serves one, so its true cost is `width.bytes()` times what this returns: 2x for a Word, 4x
@@ -1277,7 +1277,7 @@ pub trait CpuBus {
     /// That was invisible while the direct JIT side-exited on every misaligned access. It no
     /// longer does at its two lean one-lookup sites, and the interpreter's own direct-RAM path
     /// serves misaligned accesses as a byte run. **A caller certifying a budget, a step break or a
-    /// batch cap against this value owes the `width.bytes()` multiplier itself** -- this method
+    /// batch cap against this value owes the `width.bytes()` multiplier itself**: this method
     /// cannot apply it, because it does not know the access's alignment.
     ///
     /// There is no production caller in the tree as this is written; the two that exist are tests
@@ -1416,7 +1416,7 @@ pub trait CpuBus {
     /// carries per-access addresses; see `izarravm-machine`'s `shadow_cache` module
     /// doc). Called once per compiled-block ENTRY attempt, never per instruction. The
     /// default never diverts, so a bus without this feature (or with the probe
-    /// unarmed) runs every block native, unchanged -- one predictable branch on the
+    /// unarmed) runs every block native, unchanged: one predictable branch on the
     /// call site's side, zero cost here.
     #[cfg(feature = "shadow-cache-probe")]
     fn shadow_probe_should_sample_entry(&mut self) -> bool {
@@ -1665,7 +1665,7 @@ pub trait CpuBus {
     fn publish_core_clocks(&mut self, _now: u64) {}
 
     /// The reflected-call memo's answer-time clamp (slice1 plan section 6, rule R4.2).
-    /// Answer `Ok(())` only when the whole lump -- scaled core plus scaled bus --
+    /// Answer `Ok(())` only when the whole lump (scaled core plus scaled bus)
     /// fits strictly inside `cap - spent`, where `cap` is the batch cap the machine's
     /// own loop computed from `compose_batch_cap(next_device_edge_ticks(), remaining)`.
     /// That is what makes "no device edge is ever inside an answered lump" a property
@@ -1695,7 +1695,7 @@ pub trait CpuBus {
 
     /// Answer-time observer test (slice1 plan section 5 step 7, design review A.4):
     /// is any byte of the inclusive physical range `[lo, hi]` visible to something
-    /// other than the CPU -- a device window, the framebuffer aperture, or an armed
+    /// other than the CPU: a device window, the framebuffer aperture, or an armed
     /// DMA region? A memo SKIPS its Class R writes, so an intermediate value inside
     /// such a range would be observed in the real world and not in the answered one.
     ///
@@ -1742,17 +1742,17 @@ pub trait CpuBus {
     /// that only runs one way: `izarravm-cpu` depends on `izarravm-bus`, and
     /// `izarravm-bus` depends on neither `izarravm-cpu` nor `izarravm-machine`. A
     /// call-out helper generic over `B: CpuBus` therefore cannot name `PollLoop`, call
-    /// any `izarravm-machine`-side accessor, or receive one back — the only channel
+    /// any `izarravm-machine`-side accessor, or receive one back: the only channel
     /// available is a `Copy` POD declared in THIS crate, which is what
     /// `CalloutPollSkipRequest` / `CalloutPollSkipOutcome` are.
     ///
     /// Defaulted to always decline: a bus with no device-poll machinery (every test
-    /// double in `izarravm-cpu` — `TestBus`, `A20Bus`, `FlatBus`, and any bus a future
+    /// double in `izarravm-cpu`: `TestBus`, `A20Bus`, `FlatBus`, and any bus a future
     /// backend adds) inherits this and pays nothing beyond the four screens the caller
     /// runs before ever reaching here. **`TestBus` must not override this.** Doing so
     /// would let `jit_direct_poll_skip_spans` rise from a stub that always hits,
     /// reinstating the vacuity every fixture in the GP2 poll-skip mutant table exists
-    /// to rule out — see that design's BLOCKER D.
+    /// to rule out. See that design's BLOCKER D.
     fn callout_poll_skip(
         &mut self,
         _req: &CalloutPollSkipRequest,

@@ -63,7 +63,7 @@ pub enum Error {
     /// The synthesiser is not open, so nothing can be played through it. Unlike
     /// [`Self::SynthQueueFull`] this is terminal for the adapter holding it.
     SynthNotOpened,
-    /// The synthesiser declined this message. The synth is HEALTHY -- a decline
+    /// The synthesiser declined this message. The synth is HEALTHY: a decline
     /// is an answer about the MESSAGE, and every entry point that can return one
     /// is a per-message call.
     ///

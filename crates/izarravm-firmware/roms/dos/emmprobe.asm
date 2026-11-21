@@ -7,7 +7,7 @@
 ; memory interfaces share one pool by measuring: read a free count, allocate
 ; EVERY free XMS kilobyte, read the count again, release. If the second reading
 ; did not move it concludes the pools are disjoint and KEEPS the XMS block,
-; leaving the VCPI pool empty -- which is exactly how DOOM died with
+; leaving the VCPI pool empty, which is exactly how DOOM died with
 ; "DOS/16M error: [23] no memory for VCPI page table".
 ;
 ; This fixture asserts the manager tells the truth in both directions: both the
@@ -56,8 +56,8 @@ start:
     ; This is the check that was missing, not a nice-to-have: every existing
     ; assertion in this fixture derives its own baseline from whatever EMS/
     ; VCPI report and only checks that the SAME number moves and recovers, so
-    ; a manager that reports a consistently WRONG figure -- corrupted but
-    ; internally self-consistent -- passes every one of them. A real instance
+    ; a manager that reports a consistently WRONG figure (corrupted but
+    ; internally self-consistent) passes every one of them. A real instance
     ; of exactly this shipped and was caught only by an unrelated benchmark:
     ; a register clobber made EMS's `AH=42h` answer 26 pages (416 KB) against
     ; an actual pool near 22,000 KB, and both this fixture and emsfrag passed
@@ -74,7 +74,7 @@ start:
     ; the fixture to one profile, the trap emsfrag's own baseline just
     ; escaped): arena_query32 rounds each free SPAN's usable region up to the
     ; type's boundary at the start and down to a multiple of it at the end,
-    ; so a coarser type can under-report a finer one -- never over-report --
+    ; so a coarser type can under-report a finer one (never over-report)
     ; by up to 2*(boundary-1) KB PER FREE SPAN (boundary in KB: VCPI 4, EMS
     ; 16). At this point in the program at most the shell's own startup usage
     ; has touched the pool, so more than a handful of spans would be
@@ -88,7 +88,7 @@ start:
     VCPI_TOL_KB equ 2 * (4  - 1) * 8   ; = 48  KB (6 KB/span  * 8 spans)
     EMS_TOL_KB  equ 2 * (16 - 1) * 8   ; = 240 KB (30 KB/span * 8 spans)
     mov ah, 0x08                  ; DX = total free KB (AX = largest, unused
-    call far [xms_entry]          ; here -- this check only needs the total)
+    call far [xms_entry]          ; here: this check only needs the total)
     movzx edx, dx
     mov [xms_total0], edx
     mov eax, [vcpi_free0]
@@ -129,20 +129,20 @@ start:
 
     ; --- both counts must now read (near) zero ----------------------------
     ; Absolute page-count ceilings, not a proportion of the baseline (Task 6
-    ; step 12). A "drop below 1/16 of baseline" bar scales the WRONG way --
+    ; step 12). A "drop below 1/16 of baseline" bar scales the WRONG way:
     ; tolerance grows with installed RAM, so on a big enough machine a
     ; regression that leaves a real megabyte of pool unshared would still
     ; read as a pass. Measured directly with the tracer against the Task 6
     ; driver, 2026-08-05, 24 MB profile (IZARRAVM_INT_TRACE=67, one XMS grab
     ; that empties the arena's one remaining contiguous run per the guard
-    ; above): EMS post-grab BX and VCPI post-grab EDX both read EXACTLY 0 --
+    ; above): EMS post-grab BX and VCPI post-grab EDX both read EXACTLY 0:
     ; a single grab of the one free run leaves nothing behind at any
     ; granularity, which is what the shared bitmap makes possible now. The
     ; ceilings below are that measured 0 plus a small fixed margin, matched
     ; in KB across the two units (8 EMS pages = 128 KB, 32 VCPI pages = 128
     ; KB) rather than scaled by pool size, so growing the arena cannot loosen
     ; this test. An INT 67h status failure here is an EMM error, not the
-    ; defect -- keep it out of the codes that name the defect.
+    ; defect: keep it out of the codes that name the defect.
     EMS_RESIDUE_MAX  equ 8         ; 16 KB pages;  128 KB margin above the 0
     VCPI_RESIDUE_MAX equ 32        ; 4 KB pages;   measured residue (see above)
     mov ah, 0x42

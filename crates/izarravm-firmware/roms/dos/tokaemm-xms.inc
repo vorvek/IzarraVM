@@ -12,7 +12,7 @@
 ; ============================================================================
 cpu 386
 
-; INT 15h hook: AH=88h answers 0 KB free extended with CF clear -- this driver
+; INT 15h hook: AH=88h answers 0 KB free extended with CF clear: this driver
 ; owns all of it (see the hook-install comment in tokaemm.asm). Everything
 ; else chains to the BIOS.
 i15_handler:
@@ -105,7 +105,7 @@ xf_version:
 ; and reported the whole category free with 0 K used. 'TK' with DX=0 is the
 ; only answer this function gives now: MEM reads it as toka_shared_pool, folds
 ; the Expanded (EMS) row into one starred Extended (XMS) row, and reports that
-; row from the XMS free count alone -- the honest figure, and the same one
+; row from the XMS free count alone, the honest figure, and the same one
 ; function 08h/88h return.
 xf_toka_pools:
     mov ax, 0x544B               ; 'TK'
@@ -383,7 +383,7 @@ xf_info:
     jmp xms_fail
 
 ; 0Fh resize EMB: BX=new KB, DX=handle. Release and re-place atomically.
-; Re-places without copying the old contents to the new base — data is
+; Re-places without copying the old contents to the new base: data is
 ; preserved only when the allocator returns the same base (no fragmentation). This
 ; mirrors the retired FlatEmbAllocator::resize; a
 ; copy-on-relocate (via the INT 0xC0 memcpy) is a future-milestone fidelity item.
@@ -556,8 +556,8 @@ slot_of:
 ; keep the ABI their callers already use, and convert arena_svc_fail back to CF
 ; once, here, where the callers expect it.
 ;
-; INT 0xC0 preserves every guest GPR -- both entry paths pushad on the way in
-; and popad on the way out -- so only DX, which carries the cookie, needs
+; INT 0xC0 preserves every guest GPR (both entry paths pushad on the way in
+; and popad on the way out) so only DX, which carries the cookie, needs
 ; saving. The 'TQ' caller in arena_query relies on the same property.
 
 ; Allocate CX granules for allocation type BX. out: AX = first granule, CF
@@ -609,7 +609,7 @@ arena_release:
 ;
 ; Served from the per-type cache RIGHT HERE on a hit. arena_gen and the cache
 ; (arena_qc_gen/arena_qc_largest/arena_qc_total) are plain cs:-relative words,
-; exactly as readable from V86 as from the monitor -- same bytes, cs: here and
+; exactly as readable from V86 as from the monitor: same bytes, cs: here and
 ; fs: there, the same trick the arena_bmp bitmap itself already relies on. A
 ; hit costs a handful of compares and never enters the monitor: no int 0xC0,
 ; so no round trip through the IDT for the case D1's memo exists to make
@@ -619,7 +619,7 @@ arena_release:
 ; No cli guard: unlike XMS's far-called entry points (xf_query_free's cli
 ; guards against a caller whose own IF is still set when it calls in), this is
 ; reached through INT 67h, and INT 67h delivery already clears VIF before any
-; handler runs -- including this one. No guest ISR can interleave with an EMS
+; handler runs, including this one. No guest ISR can interleave with an EMS
 ; call the way one could interleave with a far call, so there is nothing here
 ; for cli to protect against. Preserves BX/CX/SI/DI.
 arena_query:
@@ -635,7 +635,7 @@ arena_query:
                                    ; still needed UNTOUCHED on a miss (it is
                                    ; the monitor cookie's type argument), and
                                    ; an earlier version of this routine
-                                   ; clobbered it here first -- BX doubles as
+                                   ; clobbered it here first: BX doubles as
                                    ; BL, so "type*2" silently became the type
                                    ; byte arena_q_type was set to, corrupting
                                    ; every VCPI/EMS miss into an out-of-range

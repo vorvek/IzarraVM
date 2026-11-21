@@ -195,8 +195,8 @@ fn two_file_tree() -> tempfile::TempDir {
 /// folder-mounted disc opened the same file thousands of times a second. The
 /// HDD path solved this with a handle LRU; this is the same fix one device over.
 ///
-/// The cache is invisible to a value comparison — the sectors are byte-identical
-/// with it and without it — so the open COUNT is the only thing that can show it
+/// The cache is invisible to a value comparison (the sectors are byte-identical
+/// with it and without it) so the open COUNT is the only thing that can show it
 /// works. A count on its own is not evidence either: "K sequential sectors cost
 /// one open" reads the same whether the cache works or the read path never ran.
 /// So this takes the count TWICE from one binary, one flag apart, and the

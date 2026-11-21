@@ -581,7 +581,7 @@ fn a_dma_read_coalesces_its_contiguous_request_into_one_host_read() {
 /// The contract this pins: the transfer still COMPLETES (a short host file is
 /// served as zeros, not an ABRT), the surviving sectors keep their real bytes,
 /// the failed ones are zeros, and the reported sector count and wait are the
-/// full request -- the same registers the per-sector path produced.
+/// full request: the same registers the per-sector path produced.
 ///
 /// NON-VACUOUS, both directions, each applied and observed:
 ///
@@ -591,7 +591,7 @@ fn a_dma_read_coalesces_its_contiguous_request_into_one_host_read() {
 /// - Discarding a short coalesced answer wholesale instead of keeping its
 ///   complete leading sectors (guarding `read_host_span`'s success arm with
 ///   `read_bytes >= read_len`) reads back `[0, 0, 0, 0]` instead of
-///   `[64, 65, 0, 0]` -- the surviving sectors are lost.
+///   `[64, 65, 0, 0]`: the surviving sectors are lost.
 #[test]
 fn a_dma_span_that_fails_part_way_reports_what_the_per_sector_path_did() {
     let (mut disk, dir) = host_folder_disk_with("dma_short", ("BIG.DAT", &patterned_ata(4)));
@@ -689,15 +689,15 @@ fn image_backed_drive_refuses_fat_chain_mapping() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice 9C (`dev_docs/2026-09-05-device-timing-slice9-design.md`, the 9C row
-// and §5 risk 2): the ATA seek / rotational / drive-buffer / sustained-media
+// Slice 9C of the device-timing design (the 9C row
+// and risk 2): the ATA seek / rotational / drive-buffer / sustained-media
 // model, `charge_pio_transfer`. Every fixture states its `DeviceTimingProfile`
 // arm explicitly, the same discipline the 9C-pre poll-skip fixtures follow.
 // ---------------------------------------------------------------------------
 
 /// UNARMED must be byte-identical to the pre-9C `pio_transfer_ticks`
 /// formula, and must touch neither the modelled head nor the sequential-run
-/// state -- the knob-unset identity bar every slice-9 family holds.
+/// state: the knob-unset identity bar every slice-9 family holds.
 #[test]
 fn pio_transfer_charge_is_inert_while_the_ata_family_is_unarmed() {
     let mut disk = marked_disk(64);
@@ -718,7 +718,7 @@ fn pio_transfer_charge_is_inert_while_the_ata_family_is_unarmed() {
 
 /// A request whose start LBA continues immediately where the previous
 /// charged transfer left off costs only the command-latency floor plus a
-/// cable-burst transfer -- no seek, no rotation. This is design §5 risk 2's
+/// cable-burst transfer: no seek, no rotation. This is design §5 risk 2's
 /// "a sequential single-sector stream... costs 50 us + cable transfer and no
 /// seek", the property the ≤25%/≤15% Duke bar depends on (98.7% of its reads
 /// are single-sector).
@@ -750,7 +750,7 @@ fn sequential_pio_transfer_costs_the_buffer_price_not_a_seek() {
 }
 
 /// A sequential run longer than the drive's read-ahead buffer falls back to
-/// the sustained media rate for the overflow -- the buffer only hides
+/// the sustained media rate for the overflow: the buffer only hides
 /// latency, it does not raise the drive's throughput ceiling.
 #[test]
 fn a_sequential_run_beyond_the_buffer_falls_back_to_the_media_rate() {
@@ -776,7 +776,7 @@ fn a_sequential_run_beyond_the_buffer_falls_back_to_the_media_rate() {
 
 /// A random (non-continuing) LBA pays both the seek and the rotational
 /// latency, and costs strictly more than a sequential access of the same
-/// size -- design §5 risk 2's other half.
+/// size: design §5 risk 2's other half.
 #[test]
 fn random_lba_pio_transfer_costs_seek_and_rotation() {
     let mut disk = marked_disk(1_000_000);
@@ -804,7 +804,7 @@ fn random_lba_pio_transfer_costs_seek_and_rotation() {
 }
 
 /// A fully host-cache-served transfer (every sector a hit) touches the
-/// modelled drive at all: no charge, no head move -- design §5 risk 1, the
+/// modelled drive at all: no charge, no head move. Design §5 risk 1, the
 /// host cache stays a pure host-time avoider.
 #[test]
 fn a_transfer_updates_the_modeled_head_even_with_cached_backing() {
@@ -822,10 +822,10 @@ fn a_transfer_updates_the_modeled_head_even_with_cached_backing() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice 9D (`dev_docs/2026-09-05-device-9d-result.md`): the `pio_transfer_
+// Slice 9D: the `pio_transfer_
 // breakdown` diagnostic and the `IZARRAVM_INT13_PROFILE` call-pattern census
 // it feeds. `pio_transfer_breakdown` must never drift from `charge_pio_
-// transfer` -- both are backed by the same private computation, and this is
+// transfer`: both are backed by the same private computation, and this is
 // the test that would catch a fork between them.
 // ---------------------------------------------------------------------------
 

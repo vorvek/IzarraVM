@@ -50,7 +50,7 @@ const MISSING_ROMS: c_int = -4;
 const OPEN_FAILED: c_int = -100;
 /// `MT32EMU_RC_NOT_OPENED`: the context has no open synth. `mt32emu_play_msg`
 /// and `mt32emu_play_sysex` return this or `QUEUE_FULL` and nothing else, so the
-/// two have to be told apart HERE -- the caller decides whether a failed send
+/// two have to be told apart HERE: the caller decides whether a failed send
 /// costs the message or the engine, and only one of these two costs the engine.
 const NOT_OPENED: c_int = -5;
 /// `MT32EMU_RC_QUEUE_FULL`: the synth is open and healthy, its event queue is
@@ -78,7 +78,7 @@ impl MuntSynth {
     ///
     /// Both arguments are HINTS, not a fixed layout. Either may name a single
     /// ROM file or the folder a ROM set lives in, the two may name the same
-    /// place, and neither has to be the kind of image its name suggests -- the
+    /// place, and neither has to be the kind of image its name suggests: the
     /// library identifies every file by SHA-1, so the set is found by content
     /// and the order the user picked them in does not matter. When the hints
     /// alone are not enough, the folders they sit in are scanned as well, which
@@ -136,7 +136,7 @@ impl MuntSynth {
     /// Offer `candidates` to the library, first one at a time and then, for the
     /// ones it could not identify alone, in pairs. A pair that merges is a ROM
     /// image split into halves, which `mt32emu_add_rom_file` cannot recognise on
-    /// its own -- it matches against FULL images only.
+    /// its own: it matches against FULL images only.
     fn offer(&mut self, candidates: &[PathBuf], set: &mut RomSet, tried: &mut Vec<PathBuf>) {
         let mut unpaired: Vec<PathBuf> = Vec::new();
         for path in candidates {
@@ -181,7 +181,7 @@ impl MuntSynth {
                 // to conclude "your two halves are from different dumps". It
                 // cannot mean that: `addROMFiles` answers it whenever
                 // `makeROMImage` returns NULL, which is every pair of files
-                // that are not halves of one image -- including two files that
+                // that are not halves of one image, including two files that
                 // are not ROMs at all. A folder of junk produces it on every
                 // pair, so trusting it told a user with no ROMs whatsoever that
                 // their ROM set was mismatched. The unpairable verdict comes
@@ -251,8 +251,8 @@ impl MuntSynth {
             MISSING_ROMS => Err(Error::MissingRoms),
             // `Synth::open` refused a pair this loader had already identified as
             // one control and one PCM image. On a real ROM set that is the two
-            // coming from different machines -- an MT-32 control ROM with a
-            // CM-32L PCM ROM -- which is exactly the case `MissingRoms` says out
+            // coming from different machines: an MT-32 control ROM with a
+            // CM-32L PCM ROM, which is exactly the case `MissingRoms` says out
             // loud ("a matching control and PCM ROM pair is required") and the
             // generic native-call message did not.
             OPEN_FAILED => Err(Error::MissingRoms),

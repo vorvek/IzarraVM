@@ -8,7 +8,7 @@
 ; It used to be runtime-only, on the grounds that the BIOS setup speed menu
 ; owned the boot default. That left the speed as the one machine setting with
 ; no way to change it permanently from DOS, which stopped making sense once
-; CMOS became the machine's single record of its own configuration -- the
+; CMOS became the machine's single record of its own configuration: the
 ; config file no longer carries a CPU speed at all. `/T` keeps the old
 ; behaviour for the case it was actually good at: running one program slower
 ; without committing to it.
@@ -97,7 +97,7 @@ start:
     je .skip_trailing
     cmp al, 9
     je .skip_trailing
-    ; A switch after the mode name is fine -- scan_temp_switch has already read
+    ; A switch after the mode name is fine: scan_temp_switch has already read
     ; it. Anything else is a typo, and saying so beats acting on half a line.
     cmp al, '/'
     je .eat_switch
@@ -276,7 +276,7 @@ scan_temp_switch:
     ret
 
 ; AL = mode code. Persist it in CMOS and refresh the NVRAM checksum, which the
-; write invalidates -- leaving it stale would make the next POST throw away the
+; write invalidates: leaving it stale would make the next POST throw away the
 ; keyboard layout and the sound card's resources along with the speed.
 save_mode:
     push ax

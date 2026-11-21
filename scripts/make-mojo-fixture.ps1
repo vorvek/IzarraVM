@@ -21,7 +21,7 @@ redistributed today as `mojo_dos.zip` by bitsundbolts.com; the two copies are
 byte-identical, which is the cross-check this script's expected hashes encode.
 3dfx released no licence text with the diagnostics and the redistribution
 terms are UNCLEAR, so nothing here is committed to git and nothing here ships
-with IzarraVM. See `dev_docs/2026-09-01-mojo-fixture.md`.
+with IzarraVM.
 
 .EXAMPLE
 pwsh scripts/make-mojo-fixture.ps1
@@ -109,8 +109,8 @@ $configSys = @(
     "SHELL=C:\DOS\COMMAND.COM C:\DOS /E:2048 /P=C:\AUTOEXEC.BAT"
 )
 
-# MOJO is fully non-interactive -- `usage: mojo [-v]` is its entire command
-# line -- so this row needs no key injection at all. Bare MOJO prints the board
+# MOJO is fully non-interactive (`usage: mojo [-v]` is its entire command
+# line) so this row needs no key injection at all. Bare MOJO prints the board
 # report; `-v` prints the SST-1 register dump INSTEAD of it, so both are run and
 # both are pinned.
 $autoexec = @(
