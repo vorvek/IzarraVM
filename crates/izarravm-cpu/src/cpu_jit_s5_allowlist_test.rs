@@ -642,7 +642,7 @@ fn word_size_load_segment_forms_are_lowered() {
 /// Every `0x8e` shape that is NOT the real-mode register lowering, and the answer each gets.
 ///
 /// `/1`, `/6` and `/7` are the ones that matter most and they stay REFUSED: they are not segment
-/// loads at all, the interpreter raises #GP(0) for each, and compiling a block around an
+/// loads at all, the interpreter raises #UD for each, and compiling a block around an
 /// instruction that can only fault burns a call-out on every execution.
 ///
 /// `/2` SS was refused beside them over the one-instruction interrupt shadow until S4 part 2,
@@ -665,9 +665,9 @@ fn word_size_load_segment_forms_are_lowered() {
 fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
     // (label, bytes, call-out slots; `None` means the shape must end the block)
     let cases: &[(&str, &[u8], Option<u8>)] = &[
-        ("/1 mov cs,ax is #GP", &[0x66, 0x8e, 0xc8], None),
-        ("/6 mov ?,ax is #GP", &[0x66, 0x8e, 0xf0], None),
-        ("/7 mov ?,ax is #GP", &[0x66, 0x8e, 0xf8], None),
+        ("/1 mov cs,ax is #UD", &[0x66, 0x8e, 0xc8], None),
+        ("/6 mov ?,ax is #UD", &[0x66, 0x8e, 0xf0], None),
+        ("/7 mov ?,ax is #UD", &[0x66, 0x8e, 0xf8], None),
         ("/2 mov ss,ax calls out", &[0x66, 0x8e, 0xd0], Some(1)),
         ("/4 mov fs,ax calls out", &[0x66, 0x8e, 0xe0], Some(1)),
         ("/5 mov gs,ax calls out", &[0x66, 0x8e, 0xe8], Some(1)),

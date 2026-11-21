@@ -25,9 +25,9 @@
 //! Stack WALKS (RIP chains) — the point of this module — are unaffected.
 //!
 //! Known, accepted gap: five emitted `pushfq`/`popfq` (or `push`/`popfq`) pairs move RSP by
-//! 8 for the span of one instruction each -- `emit_capture_flags` and `emit_load_host_flags`
-//! (`jit/direct/emit.rs`), plus the three inlined `pushfq`/`pop rax` sequences in the ALU,
-//! double-shift, and count-shift paths (`jit/direct/emit.rs` around lines 3614, 4141, 4212)
+//! 8 for the span of one instruction each -- `emit_capture_flags` and `emit_load_host_flags`,
+//! plus the three inlined `pushfq`/`pop rax` sequences in `emit_alu_candidate`,
+//! `emit_double_shift_candidate` and `emit_shift_cl` (all five are in `jit/direct.rs`)
 //! -- while the UNWIND_INFO above asserts a constant RSP for the whole block body. A sample
 //! landing inside one of those narrow windows walks the frame one slot short: it reads a
 //! fabricated "return address" out of the saved-RBX slot instead of the honest,
@@ -71,7 +71,8 @@ unsafe extern "system" {
 /// The shared UNWIND_INFO image. Layout (little-endian u16 unwind codes, reverse
 /// program order):
 ///   header: version 1, flags 0; SizeOfProlog 0x12; CountOfCodes 9; no frame register.
-///   prologue bytes it must mirror (emit.rs block prologue, byte offsets):
+///   prologue bytes it must mirror (the block prologue that `emit` in `jit/direct.rs` writes,
+///   byte offsets):
 ///     0: push rbx   1: push rbp   2: push rdi   3: push r12   5: push r13
 ///     7: push r14   9: push r15  11: sub rsp, imm32 (7 bytes) -> prologue ends at 0x12
 ///   codes: ALLOC_LARGE(form 0) of NATIVE_STACK_LEN at offset 0x12 (2 slots), then

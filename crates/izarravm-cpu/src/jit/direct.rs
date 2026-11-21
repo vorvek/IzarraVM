@@ -14259,13 +14259,12 @@ pub(crate) fn parse_direct_in_imm8_callout_arm_for_test(
 /// Whether `0xE6` OUT imm8,AL is admitted as a `PortWriteAlImm8` call-out
 /// (`IZARRAVM_OUT_IMM8_ROWS`, `dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
 ///
-/// **DEFAULT OFF.** No ladder has priced this row: what is measured is the census, where gp2-586's
-/// single `0xE6` site at linear 0x00532951 takes 59,968,424 static-unbound exits in an 80-second
-/// run -- 97% of that fixture's `brk_cont_not_continuable` -- and where no other fixture on the
-/// board carries a non-trivial `0xE6` row at all. The OFF arm is therefore byte-identical to the
-/// pre-slice tree by construction (this predicate gates BOTH edits: the `jit_admits_non_continuable`
-/// term and the `classify` arm), which is what makes the census row PRESENT off / ABSENT on the
-/// pair that proves the admission took.
+/// **DEFAULT ON.** The census that motivated the row: gp2-586's single `0xE6` site at linear
+/// 0x00532951 takes 59,968,424 static-unbound exits in an 80-second run, which is 97% of that
+/// fixture's `brk_cont_not_continuable`. No other fixture on the board carries a non-trivial
+/// `0xE6` row. The OFF arm emits the code of a tree without the row: this predicate gates both
+/// edits, the `jit_admits_non_continuable` term and the `classify` arm. The census row is
+/// therefore present on the OFF arm and absent on the ON arm.
 ///
 /// THE CONVENTION: unset and `""` name the SAME (default) arm, `0`/`off` state it, `1`/`on` name
 /// the admission, and anything else panics rather than silently running the base.
@@ -14466,7 +14465,7 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 ///
 /// **STATUS 2026-08-19: the width class EXISTS and its first user shipped.** `IMM8_LANE_WIDTH` is
 /// one, every lane carries its own width, and `imm8_lane_for` admits the `0x80 /r` third of the
-/// trigger behind `IZARRAVM_IMM8_LANES` (default off). `0xC1`/`0xC0` and `0x0FA4` are NOT admitted
+/// trigger behind `IZARRAVM_IMM8_LANES` (default on). `0xC1`/`0xC0` and `0x0FA4` are NOT admitted
 /// and are still blocked on THE DESIGN COST below, which is untouched by that slice — the plumbing
 /// is no longer the obstacle, the flag-capture split is.
 ///
@@ -18500,7 +18499,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // pass after the compile walk.
             //
             // `/1` (CS), `/6` and `/7` are refused HERE rather than left off the allowlist,
-            // because they are not loads at all: the interpreter raises #GP(0) for each
+            // because they are not loads at all: the interpreter raises #UD for each
             // (`execute.rs`, the 0x8e arm). Compiling a block around an instruction that can only
             // fault burns a call-out and a governor execution on every execution, and 0x8c is NOT
             // the symmetric case to copy -- `MOV r16, CS` is legal where `MOV CS, r16` is not.
@@ -30851,7 +30850,7 @@ fn port_permission_resident<B: CpuBus>(
 /// attempted first on a ring-0, non-V86 read.
 ///
 /// `slot_delta` is this slot's guest offset from the block's ENTRY eip, baked as a compile-time
-/// immediate exactly the way `InterpretOneCell::slot_delta` is (`emit.rs`'s one caller has both
+/// immediate exactly the way `InterpretOneCell::slot_delta` is (`emit`, the one caller, has both
 /// `slot.lin` and `span.key.linear` in scope). It is what lets the poll-skip classifier scan from
 /// the SLOT's own linear EIP rather than `cpu.linear_eip()`, which inside a native block is the
 /// block-ENTRY value throughout (see `build_poll_loop_from`'s doc) -- GP2 poll-skip design
@@ -35097,7 +35096,7 @@ struct SuffixSeed {
 /// the admitted ones (`LoadSegReal`) and this covers the rest, so the two are complements rather
 /// than duplicates.
 ///
-/// `0x8e /1` is absent deliberately. `MOV CS, r/m16` raises #GP(0) rather than loading anything
+/// `0x8e /1` is absent deliberately. `MOV CS, r/m16` raises #UD rather than loading anything
 /// (execute.rs, the 0x8e arm), so it writes no segment and seeding one would model a transfer the
 /// guest never performs.
 fn barred_segment_write(insn: &DecodedInsn) -> u8 {
