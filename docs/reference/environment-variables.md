@@ -123,7 +123,7 @@ changes the result.
 | Name | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `IZARRAVM_JIT` | `0` or empty turn it off. Other values turn it on. | On | Controls whether the machine admits native blocks on its own. |
-| `IZARRAVM_JIT16` | `0`, `1`, `2` | `1` | `0` refuses 16-bit code segments. `1` admits them in ordinary RAM. `2` also admits the ROM and BIOS window. |
+| `IZARRAVM_JIT16` | `0`, `1` | `1` | `0` refuses 16-bit code segments. `1` admits them in ordinary RAM. Each other value has the effect of `1`. |
 | `IZARRAVM_JIT16_486` | `0` turns it off. | On | Lets 486 mode compile 16-bit word operands. |
 | `IZARRAVM_LANE_FAMILY` | `0` turns it off. | On | Admits the whole `0x81` register-immediate dword group, not only ADD. |
 | `IZARRAVM_SMC_LANE_TRIAL` | `0` turns it off. | On | Lets a hot self-modifying code chunk try a compile once for each key in each heat epoch. |
@@ -148,7 +148,6 @@ changes the result.
 | `IZARRAVM_INT_IMM8_ROWS` | `1`/`on`, `0`/`off`, empty is on. | On | Admits `INT imm8` as a call-out. |
 | `IZARRAVM_ROTATE_ROWS` | `1`/`on`, `heat`/`heat_gated`, `0`/`off`, empty is off. | On | Selects how rotate forms run natively. `heat` admits them in hot code only. |
 | `IZARRAVM_RETRY_LIFT` | `1`/`on`, `0`/`off`, empty is off. | Off | Lets a parked block with a clearable compile failure be tried again. |
-| `IZARRAVM_CALLOUT_SEGMENT_RESUME` | `1`/`on`, `0`/`off`, empty is off. | Off | Lets a block continue after a call-out that loads a segment register. |
 | `IZARRAVM_SEGMENT_RETIRE_GOVERNOR` | `cap`, `1`/`on`, `0`/`off`, empty is off. | `cap` | Selects the limit on retired blocks after a data-segment reject. `cap` uses a limit for each key. |
 | `IZARRAVM_CHAIN_ENTRY_CHECK` | `1`/`on`/`chain`, `0`/`off`, empty is on. | On | Makes the block entry check compare only the segments that the block chain needs. |
 | `IZARRAVM_LIVE_DATA_SEGMENTS` | `0`, `1`, `2`, empty is `0`. | `0` | At `1` and `2`, real-mode and virtual-8086 blocks read data segments from the CPU state. `2` also links successors. |
@@ -160,8 +159,6 @@ changes the result.
 | `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` | `1`/`on`, `0`/`off`, empty is off. | Off | Keeps the load biases in a host register in integer blocks. |
 | `IZARRAVM_DIRECT_ALIGN_TEST_AL` | `1`/`on`, `0`/`off`, empty is off. | Off | Uses `test al,mask` for the alignment test in emitted code. |
 | `IZARRAVM_DIRECT_EAGER_FLAGS` | `1`/`on`/`true`, `0`/`off`/`false`, empty is on. | On | Writes the flags straight to the CPU state and not to a lazy flags record. |
-| `IZARRAVM_ONE_LOOKUP_STORE` | `0` turns it off. | On | Makes emitted stores use the one-lookup store bias table. |
-| `IZARRAVM_ONE_LOOKUP_LOAD` | `0` turns it off. | On | Makes emitted loads use the one-lookup table. |
 | `IZARRAVM_DECODE_CACHE_LINES` | A power of two. | `65536` | Sets the number of lines in the instruction decode cache. A bad value gives the default. |
 | `IZARRAVM_DECODE_PACK` | Any value other than `0` turns it on. | Off | Takes the first touch of a decode line from a packed side array. |
 | `IZARRAVM_POLL_SKIP_NEG_CACHE` | Empty and `0` turn it off. | On | Turns on the negative cache of the poll skip. |

@@ -3558,10 +3558,6 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
 ///
 /// MUTATION: drop `used_by_others` from the mask (compare all six) and this resyncs, reporting two
 /// instructions instead of three.
-///
-/// STATES ITS ARM. `IZARRAVM_CALLOUT_SEGMENT_RESUME` defaulted OFF on 2026-08-22 after the loader
-/// measured the ON arm 10.5% slower, and a fixture that inherited the ambient reading would have
-/// started testing the refusal while claiming to test the relaxation.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -3569,11 +3565,9 @@ fn interpret_one_mov_sreg_resyncs_on_a_changed_record() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
-    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov ax,0x1111 | mov fs,ax | inc ax | hlt
     let (code, starts) = row_program(&[0x8E, 0xE0]);
     let mut legs = run_both(&code, &starts, no_perturb);
-    jit::direct::set_callout_segment_resume_for_test(None);
     assert_eq!(legs.exit_reason, None, "the block should have completed");
     assert_eq!(
         legs.native_insns,
@@ -3600,15 +3594,11 @@ fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
 /// recompile, every visit.
 ///
 /// `callout_interpret_one_resume_refused_prefix_use` is the other side of that trade, and it is
-/// asserted here rather than merely exported: it is the number the `IZARRAVM_CALLOUT_SEGMENT_RESUME`
-/// A/B is read against, so a counter that never fired would make the two arms look free.
+/// asserted here rather than merely exported: a counter that never fired would make the prefix
+/// half of the mask look free.
 ///
 /// MUTATION: mask with `suffix_used` instead of `used_by_others` and this resumes, reporting three
 /// instructions and leaving the counter at zero.
-///
-/// STATES ITS ARM. `IZARRAVM_CALLOUT_SEGMENT_RESUME` defaulted OFF on 2026-08-22 after the loader
-/// measured the ON arm 10.5% slower, and a fixture that inherited the ambient reading would have
-/// started testing the refusal while claiming to test the relaxation.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -3616,12 +3606,10 @@ fn interpret_one_mov_sreg_resumes_on_a_changed_record_no_slot_uses() {
 ))]
 #[test]
 fn interpret_one_mov_sreg_resyncs_when_an_earlier_slot_uses_the_segment() {
-    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov ax,fs | mov fs,bx | inc ax | hlt -- the user is slot 0 and the call-out is slot 1.
     let code = [0x8C, 0xE0, 0x8E, 0xE3, 0x40, 0xF4];
     let starts = [0, 2, 4];
     let mut legs = run_both(&code, &starts, no_perturb);
-    jit::direct::set_callout_segment_resume_for_test(None);
     assert_eq!(
         legs.exit_reason,
         Some(jit::direct::SideExitReason::CallOutResync as u32),
@@ -3642,80 +3630,33 @@ fn interpret_one_mov_sreg_resyncs_when_an_earlier_slot_uses_the_segment() {
     assert_legs_agree(&mut legs);
 }
 
-/// The knob's REMAINING scope, after the block-keyed un-demotion (2026-09-02): `MovSreg` no longer
-/// reads `IZARRAVM_CALLOUT_SEGMENT_RESUME` at all (section 6a above), and this row is where the
-/// knob's OWN behaviour used to be pinned before that slice. `MovSsReg` still needs it, so this
-/// test now proves the knob restores the pre-S4f successor rule for the row that is still gated,
-/// not for `MovSreg`.
+/// A `MovSsReg` call-out does not bar the successors of its block.
 ///
-/// Why the RESUME/RESYNC half of the old test does not carry over: R2 compares `segment_bit(Ss)`
-/// UNCONDITIONALLY for any row that can write a segment (`direct.rs`'s R2 note), so a `MovSsReg`
-/// slot's own write is compared whether or not the knob's mask ever reaches it. Reloading the SAME
-/// selector resumes and a DIFFERENT one resyncs on EITHER arm; the section-11 SS-row tests already
-/// pin both. What the knob still decides, and the only thing left for it to decide on this row, is
-/// whether the block PUBLISHES its successors -- `is_segment_write_block`, fed by
-/// `callout_segment_writes`, which still requires `segment_resume` for every row but `MovSreg`.
+/// Only a `MovSreg` row outside V86 feeds `callout_segment_writes`. A `MovSsReg` cell keeps the
+/// strict mask, so R2 compares all six records for it, and the block publishes its fallthrough
+/// like a block without a segment write.
 ///
-/// The arm is read ONCE PER COMPILE, so the override has to be set before `build_native` runs, not
-/// before the entry.
-///
-/// MUTATION: widen the `row == InterpretOneRow::MovSreg` exclusion in `callout_segment_writes`'s
-/// accumulator to also admit `MovSsReg`, and the OFF arm's assertion goes red: the block would then
-/// bar its successors unconditionally, which is the migration this slice must confine to `MovSreg`
-/// alone.
+/// MUTATION: widen the `row == InterpretOneRow::MovSreg` test in the accumulator of
+/// `callout_segment_writes` to also admit `MovSsReg`, and this fails: the block then bars its
+/// successors.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn the_segment_resume_knob_still_governs_the_ss_rows_successors() {
+fn an_ss_row_call_out_keeps_the_successors_of_its_block() {
     let (code, starts) = row_program(MOV_SS_SAME);
-
-    jit::direct::set_callout_segment_resume_for_test(Some(false));
     let (cpu, _, block) = build_native(&code, &starts);
     assert!(
         !block.is_segment_write_block(),
-        "off arm: MovSsReg still needs the knob to bar its successors"
+        "MovSsReg must not bar the successors of its block"
     );
     assert_eq!(
         cpu.jit_direct.waiting_len_for_test(),
         1,
-        "off arm: and queue its fallthrough"
+        "the block must queue its fallthrough"
     );
-    jit::direct::set_callout_segment_resume_for_test(None);
-
-    // Control: the SAME program on the ON arm bars the successors, exactly as it did before this
-    // slice -- `MovSsReg` is untouched by the block-keyed relaxation.
-    jit::direct::set_callout_segment_resume_for_test(Some(true));
-    let (cpu, _, block) = build_native(&code, &starts);
-    assert!(
-        block.is_segment_write_block(),
-        "on arm: unchanged from before this slice"
-    );
-    assert_eq!(cpu.jit_direct.waiting_len_for_test(), 0);
-    jit::direct::set_callout_segment_resume_for_test(None);
-}
-
-/// The knob's spelling table, unset included. DEFAULT OFF since the 2026-08-22 refutation, so
-/// unset, `0`, `off` and the empty string all name the shipped arm and `1` / `on` is the opt-in.
-///
-/// The empty string is asserted beside unset on purpose. It is the PowerShell nulling trap, and
-/// flipping the default inverted which leg it damages rather than removing it: an ON leg now has
-/// to EXPORT `1`, and a leg that merely nulls the variable measures the default.
-#[test]
-fn the_segment_resume_knob_spellings() {
-    use jit::direct::parse_callout_segment_resume_arm_for_test as parse;
-    assert!(
-        !parse(Err(std::env::VarError::NotPresent)),
-        "unset is OFF since the refutation"
-    );
-    for on in ["1", "on", "ON", " on "] {
-        assert!(parse(Ok(on.to_string())), "{on}");
-    }
-    for off in ["0", "off", "OFF", "", "  "] {
-        assert!(!parse(Ok(off.to_string())), "{off}");
-    }
 }
 
 /// The mask is built by SLOT INDEX and covers the whole suffix, not just the next slot.
@@ -3737,7 +3678,6 @@ fn the_segment_resume_knob_spellings() {
 ))]
 #[test]
 fn the_suffix_mask_reaches_past_the_next_slot() {
-    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov fs,bx | inc ax | mov ax,fs | hlt -- the call-out is slot 0 and the user is slot 2.
     //
     // BX rather than CX because the record has to MOVE: `arm_fixture` clears CX, and FS starts at
@@ -3755,7 +3695,6 @@ fn the_suffix_mask_reaches_past_the_next_slot() {
         "FS is baked two slots later, so the moved record must RESYNC"
     );
     assert_legs_agree(&mut legs);
-    jit::direct::set_callout_segment_resume_for_test(None);
 }
 
 /// The three illegal reg fields stay refused, from the side that can see them.
@@ -4244,11 +4183,9 @@ fn interpret_one_protected_mode_segment_change_resyncs() {
 }
 
 // ---------------------------------------------------------------------------
-// 6a. The block-keyed un-demotion (2026-09-02 slice): `MovSreg`'s R2 mask relaxation is keyed on
-// the block's own prefix-plus-suffix `used` mask, not on `IZARRAVM_CALLOUT_SEGMENT_RESUME`, so
-// none of these three touch the knob at all. `MovSsReg` and `PopSs` are untouched by this slice --
-// they still need the knob -- and that is what the SS-row section and
-// `the_segment_resume_knob_restores_the_strict_rule_and_the_successors` (below) still pin.
+// 6a. The block-keyed relaxation: `MovSreg`'s R2 mask is keyed on the block's own
+// prefix-plus-suffix `used` mask. `MovSsReg` and `PopSs` keep the strict mask, and that is what
+// the SS-row section and `an_ss_row_call_out_keeps_the_successors_of_its_block` pin.
 // ---------------------------------------------------------------------------
 
 /// Selector for the DS load: differs from `SEL_DATA`, which is what `protected_cpu` seeds every
@@ -4274,20 +4211,19 @@ const fn imm32(value: u16) -> [u8; 4] {
 /// `SEL_UNACCESSED` so both writes actually move the record `protected_cpu` seeded. Neither
 /// selector is read back by a later slot, in either channel `pinned_segments` unions: no memory
 /// slot addresses through DS or FS, and no slot bakes either selector. That is the shape the design
-/// document's option (i) exists for, and the knob is never touched.
+/// document's option (i) exists for.
 ///
-/// MUTATION: revert the accumulator at `callout_segment_writes += ...` and the mask gate `if
-/// segment_resume || callout_mov_sreg_present` to `if segment_resume` alone, and this fixture's
-/// resume assertions go red: with the knob at its ambient default (unset, OFF), both cells keep
-/// their `u8::MAX` default, R2 compares all six records for each, and the DS write -- which just
-/// moved DS's own record -- resyncs instead of resuming.
+/// MUTATION: make the per-cell loop behind `if callout_mov_sreg_present` skip each cell, and this
+/// fixture's resume assertions go red: both cells keep their `u8::MAX` default, R2 compares all
+/// six records for each, and the DS write -- which just moved DS's own record -- resyncs instead
+/// of resuming.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn a_pmode_two_write_prologue_resumes_and_is_never_demoted_without_the_knob() {
+fn a_pmode_two_write_prologue_resumes_and_is_never_demoted() {
     const CODE: &[u8] = &[
         0xB8,
         imm32(SEL_UNDEMOTE_DS)[0],
@@ -4400,7 +4336,7 @@ fn a_pmode_two_write_prologue_resumes_and_is_never_demoted_without_the_knob() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn a_downstream_slot_addressing_through_ds_refuses_the_resume_without_the_knob() {
+fn a_downstream_slot_addressing_through_ds_refuses_the_resume() {
     const CODE: &[u8] = &[
         0xB8,
         imm32(SEL_UNDEMOTE_DS)[0],
@@ -4485,7 +4421,7 @@ fn a_downstream_slot_addressing_through_ds_refuses_the_resume_without_the_knob()
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn a_downstream_store_through_ds_refuses_the_resume_without_the_knob() {
+fn a_downstream_store_through_ds_refuses_the_resume() {
     const CODE: &[u8] = &[
         0xB8,
         imm32(SEL_UNDEMOTE_DS)[0],
@@ -4568,7 +4504,7 @@ fn a_downstream_store_through_ds_refuses_the_resume_without_the_knob() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn a_downstream_selector_bake_of_ds_refuses_the_resume_without_the_knob() {
+fn a_downstream_selector_bake_of_ds_refuses_the_resume() {
     const CODE: &[u8] = &[
         0xB8,
         imm32(SEL_UNDEMOTE_DS)[0],
@@ -6948,7 +6884,6 @@ fn a_block_that_resumes_past_the_sti_breaks_the_run_where_the_interpreter_does()
 ))]
 #[test]
 fn segment_writing_callout_block_publishes_no_successors() {
-    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov ax,0x1111; mov fs,ax; inc ax; hlt -- the HLT is the barrier, so the block would
     // otherwise publish its fallthrough.
     let (code, starts) = row_program(&[0x8E, 0xE0]);
@@ -6975,7 +6910,6 @@ fn segment_writing_callout_block_publishes_no_successors() {
         1,
         "control: and it must queue its fallthrough"
     );
-    jit::direct::set_callout_segment_resume_for_test(None);
 }
 
 /// The chained shape, which is the one the bar exists for.
@@ -6995,7 +6929,6 @@ fn segment_writing_callout_block_publishes_no_successors() {
 ))]
 #[test]
 fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
-    jit::direct::set_callout_segment_resume_for_test(Some(true));
     const CODE: &[u8] = &[
         0x40, 0x40, 0x40, // A: inc eax x3                    +0 +1 +2
         0xEB, 0x00, // jmp +0, static link into B             +3
@@ -7078,7 +7011,6 @@ fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
             .expect("C must not stop the machine")
     );
     assert_eq!(cpu.registers.eip, ENTRY + 15);
-    jit::direct::set_callout_segment_resume_for_test(None);
 }
 
 /// SS is in the mask ALWAYS, however empty the suffix is.
@@ -7096,12 +7028,10 @@ fn a_resumed_segment_write_ends_the_chain_at_its_own_block() {
 ))]
 #[test]
 fn a_stack_width_change_resyncs_even_with_an_empty_suffix() {
-    jit::direct::set_callout_segment_resume_for_test(Some(true));
     // mov eax,0x1111; mov ss,dx; inc eax; hlt
     const CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xD2, 0x40, 0xF4];
     const STARTS: &[u32] = &[0, 5, 7];
     let mut legs = run_both_protected_program(CODE, STARTS, SEL_SS16, no_perturb);
-    jit::direct::set_callout_segment_resume_for_test(None);
     assert_eq!(
         legs.exit_reason,
         Some(jit::direct::SideExitReason::CallOutResync as u32),

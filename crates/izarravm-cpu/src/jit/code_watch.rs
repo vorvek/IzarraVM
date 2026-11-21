@@ -281,8 +281,9 @@ impl StickyDecodeCodeWatch {
                     .map(|owner| std::ptr::from_ref(&**owner).expose_provenance()),
                 Some(pointer)
             );
-            // `precise` owns this box. Native execution and cache mutation are serialized, and
-            // the owner check precedes construction of the mutable raw borrow.
+            // SAFETY: `precise` owns the box behind this published pointer, and the assertion
+            // above checks the owner. `&mut self` excludes each other borrow of the box, and
+            // native execution does not overlap cache mutation.
             let mask = unsafe { &mut *std::ptr::with_exposed_provenance_mut::<ChunkMask>(pointer) };
             mask[word] |= bit;
             return None;
@@ -519,8 +520,9 @@ impl NativeCodeWatch {
                         .map(|owner| std::ptr::from_ref(&**owner).expose_provenance()),
                     Some(pointer)
                 );
-                // `pages` owns this boxed allocation. Native execution and cache mutation are
-                // serialized, so the published address can be borrowed mutably here.
+                // SAFETY: `pages` owns the box behind this published pointer, and the assertion
+                // above checks the owner. The closure holds the only `&mut` to the watch, and
+                // native execution does not overlap cache mutation.
                 let page_watch =
                     unsafe { &mut *std::ptr::with_exposed_provenance_mut::<WatchPage>(pointer) };
                 Self::acquire_chunk(page_watch, index);
@@ -604,7 +606,9 @@ impl NativeCodeWatch {
                         .map(|owner| std::ptr::from_ref(&**owner).expose_provenance()),
                     Some(pointer)
                 );
-                // The raw borrow ends before a final owner removes and recycles the box.
+                // SAFETY: `pages` owns the box behind this published pointer, and the assertion
+                // above checks the owner. The closure holds the only `&mut` to the watch. The
+                // borrow ends before the code below removes or recycles the box.
                 let page_watch =
                     unsafe { &mut *std::ptr::with_exposed_provenance_mut::<WatchPage>(pointer) };
                 Self::release_chunk(page_watch, index)
@@ -871,8 +875,11 @@ impl NativeCodeWatch {
             if pointer == 0 {
                 return 0;
             }
-            // `pages` owns boxed masks whose addresses stay fixed until their table entry is
-            // cleared. Native execution and watch mutation never overlap.
+            // SAFETY: each non-zero table entry is the address of a box that `pages` owns.
+            // `acquire_range` and `table_base` are the only writers of such an entry.
+            // `release_range` and `clear` set the entry to zero before they release the box.
+            // A change to the box needs `&mut self`, which this `&self` borrow excludes, and
+            // native execution does not overlap watch mutation.
             let page_watch = unsafe { &*std::ptr::with_exposed_provenance::<WatchPage>(pointer) };
             return page_watch.mask[word];
         }

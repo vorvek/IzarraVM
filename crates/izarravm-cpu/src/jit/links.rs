@@ -279,8 +279,9 @@ impl LinkCell {
         if portal == zero_portal().address() {
             return false;
         }
-        // A live cache owns every published portal in stable Arc storage. BlockCache::drop clears
-        // every cell to the permanent sentinel before releasing that storage.
+        // SAFETY: a live cache owns every published portal in stable Arc storage.
+        // BlockCache::drop clears every cell to the permanent sentinel before it releases that
+        // storage, so a portal address that a cell holds points to a live `BlockPortal`.
         unsafe { &*(portal as *const BlockPortal) }.visible()
     }
 

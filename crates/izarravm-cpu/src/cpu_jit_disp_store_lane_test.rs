@@ -81,7 +81,7 @@ type CapRefusals = [u64; jit::direct::LANE_CAP_FAMILIES];
 /// would corrupt an unrelated test.
 struct ArmOverride {
     /// The STORE-PATH arm, which is not an environment knob but a per-`JitState` field
-    /// (`IZARRAVM_ONE_LOOKUP_STORE` only seeds its default). It rides on this struct rather than
+    /// (`JitState::one_lookup_store`, true by default). It rides on this struct rather than
     /// being set ad hoc so that `flat_cpu` CANNOT build a CPU without a fixture having stated it:
     /// the two store emitters are different code (`emit_store` classifies the page kind itself,
     /// `emit_store_fast` goes through the bias table), they both consume the lane through
@@ -119,15 +119,14 @@ fn force_arms(store: bool, load_widen: bool, one_lookup_store: bool) -> ArmOverr
 }
 
 /// The store path the fixtures that are not about the store path itself run on: the SHIPPED
-/// default (`one_lookup_store` seeds ON from `IZARRAVM_ONE_LOOKUP_STORE`). Named rather than
+/// default (`JitState::new` sets `one_lookup_store` to true). Named rather than
 /// spelled `true` at twelve call sites so a reader can see at a glance which fixtures state an
 /// arm and which take the shipped one.
 const SHIPPED_STORE_PATH: bool = true;
 
 fn flat_cpu(arms: &ArmOverride) -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    // Pinned rather than left at `one_lookup_store_default()`, so a suite run with
-    // `IZARRAVM_ONE_LOOKUP_STORE=0` exported reads the same as one without it.
+    // Each fixture states its store path. No fixture takes the value from `JitState::new`.
     cpu.jit_direct.one_lookup_store = arms.one_lookup_store;
     cpu.set_fast_map_enabled_for_test(true);
     cpu.set_mode(GswMode::Gsw486);
