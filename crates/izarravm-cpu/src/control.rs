@@ -1128,12 +1128,26 @@ impl CpuGsw {
             CpuPersona::I586 => 0,
         };
         merged = (merged & !fixed) | (old & fixed);
-        self.registers.eflags = merged;
-        // The loaded image is the new truth for every flag bit; any deferred descriptor would
-        // otherwise override the arithmetic bits we just wrote.
+        // The loaded image is the new truth for every flag bit. The dword form can change
+        // EFLAGS.AC (the word form keeps the high half).
+        self.load_eflags(merged);
+    }
+
+    /// Replace the whole EFLAGS image. Bit 1 reads as one. Any deferred arithmetic descriptor
+    /// is dropped, because it would otherwise override the arithmetic bits written here.
+    /// Every writer of a full EFLAGS value, in the CPU or in a host service, goes through this.
+    pub fn load_eflags(&mut self, value: u32) {
+        self.registers.eflags = value | 0x2;
         self.pending_flags = PendingFlags::default();
-        // The dword form can change EFLAGS.AC (the word form keeps the high half).
         self.recompute_alignment_armed();
+    }
+
+    /// Set or clear CF from outside the instruction stream, for example in a host service that
+    /// reports success or failure. The pending flags are settled first, so a later
+    /// materialization cannot overwrite the new value.
+    pub fn set_carry_flag(&mut self, carry: bool) {
+        self.materialize_flags();
+        self.set_flag(FLAG_CF, carry);
     }
 
     /// Restartability wrapper: a fault raised after the frame pops committed
@@ -2131,10 +2145,8 @@ impl CpuGsw {
             let value = self.read_system_linear_u32(bus, base.wrapping_add(40 + i * 4))?;
             self.write_gpr32(i as u8, value);
         }
-        self.registers.eflags = eflags | 0x2;
         // The incoming task's eflags is the new truth; drop any stale arithmetic descriptor.
-        self.pending_flags = PendingFlags::default();
-        self.recompute_alignment_armed();
+        self.load_eflags(eflags);
         self.set_eip(eip);
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
             let selector =

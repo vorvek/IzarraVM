@@ -105,7 +105,8 @@ impl Machine {
         r.set_segment(SegmentIndex::Ss, SegmentRegister::real(entry.ss));
         r.eip = u32::from(entry.ip);
         r.set_esp(u32::from(entry.sp));
-        r.eflags = 0x0000_0202; // IF set: DOS programs start with interrupts on
+        // IF set: DOS programs start with interrupts on.
+        self.cpu.load_eflags(0x0000_0202);
     }
 
     /// Install the resident keyboard BIOS for the DOS machine: point IVT[09h] and

@@ -4379,7 +4379,7 @@ fn boot_sector_cpu() -> CpuGsw {
         cpu.registers.set_segment(segment, SegmentRegister::real(0));
     }
     cpu.registers.eip = BOOT_SECTOR_ADDRESS as u32;
-    cpu.registers.eflags = 0x0000_0002;
+    cpu.load_eflags(0x0000_0002);
     cpu.registers.set_edx(0x80);
     cpu
 }
