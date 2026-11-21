@@ -1,9 +1,9 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 ;
-; LOTCRC.COM - guest-authored fixed-golden coverage for legacy VEGA scanout.
+; lotura_crc.com - guest-authored fixed-golden coverage for legacy VEGA scanout.
 ;
-; Assemble: nasm -f bin lotura_crc.asm -o LOTCRC.COM
+; Assemble: nasm -f bin lotura_crc.asm -o lotura_crc.com
 
     bits 16
     cpu 386

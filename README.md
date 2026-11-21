@@ -186,6 +186,10 @@ The headless checks are quick tests of the whole machine. Run them with
 See the [command-line reference](docs/reference/command-line.md) for all
 switches.
 
+An optional check rebuilds each guest binary from its NASM source and compares
+it with the committed file. It needs NASM 3.01:
+`python scripts/check_guest_binaries.py`.
+
 ## License
 
 GNU GPL version 3 only (`GPL-3.0-only`; see [LICENSE](LICENSE)).
