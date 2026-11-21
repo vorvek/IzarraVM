@@ -522,7 +522,7 @@ fn byte_write_at_a_dword_lane_start_still_rejects_on_width() {
     );
 }
 
-/// THE OFF ARM'S COUNTERS DO NOT MOVE, and this is the fixture the adversarial review demanded.
+/// THE OFF ARM'S COUNTERS DO NOT MOVE, and this is the fixture that proves it.
 ///
 /// The slow byte path's door is arm-selected (`note_code_byte_write_hit`, core.rs). Taking the
 /// value-aware door unconditionally is the obvious simplification and it is WRONG: the permitting

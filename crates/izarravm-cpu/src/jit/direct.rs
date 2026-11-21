@@ -133,7 +133,7 @@ pub(crate) const HOT_LOOKUP_LEN: usize = 65_536;
 /// `2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1): `resolve_successors` overwrites
 /// it with the LIVE ring slot before either the `linear_blocks` lookup or the `waiting` park, so
 /// no reader may ever branch on a successor's stored `context`. `u8::MAX` rather than `0` so the
-/// value can never be mistaken for a real ring slot (review finding S1-11).
+/// value can never be mistaken for a real ring slot.
 pub(crate) const LINK_CONTEXT_UNSTAMPED: u8 = u8::MAX;
 pub(crate) const MAX_CHAIN_BLOCKS: usize = 256;
 pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
@@ -1165,7 +1165,7 @@ pub(crate) struct BlockCache {
     interrupt_shadow_armed_at: Option<(u32, u32)>,
     /// How many arming call-out steps in this run left the shadow set. The latch above carries the
     /// value this counter had when it was written, and the boundary asserts the two agree, which
-    /// is the invariant review finding F1 broke: a latch from an EARLIER arming slot than the last
+    /// is the invariant defect F1 broke: a latch from an EARLIER arming slot than the last
     /// one is exactly the state in which the boundary clears a shadow it should have left alone.
     ///
     /// The stamp and the latch take the SAME predicate at the one site that writes them
@@ -1510,7 +1510,7 @@ impl BlockCache {
             block_decode_slots: Vec::new(),
             decode_slot_mask: decode_slot_count - 1,
             block_link_epochs: Vec::new(),
-            // [1, 2], NOT [1, 0] (review finding N1): 0 is the unstamped-block sentinel
+            // [1, 2], NOT [1, 0] (N1): 0 is the unstamped-block sentinel
             // (`block_link_epochs.push(0)` on install, the reset on retire, the wrap fill),
             // and slot 1's epoch must never equal it. A virgin cache's first `MOV CR3` to a
             // second directory takes R2 (`select_link_context`, no `allocate_link_context`
@@ -2533,7 +2533,7 @@ impl BlockCache {
     /// returned. Deliberately separate from the latch below: the two are written from the same
     /// place today, and a future edit that guards the latch on one status while leaving this
     /// count on every step makes the boundary's assertion fire instead of silently comparing
-    /// against a stale address. That is the shape review finding F1 found.
+    /// against a stale address. That is the shape of defect F1.
     pub(crate) fn note_interrupt_shadow_arm(&mut self) {
         self.interrupt_shadow_arms = self.interrupt_shadow_arms.wrapping_add(1);
     }
@@ -3237,7 +3237,7 @@ impl BlockCache {
                         }
                     };
                     if !overlaps {
-                        // Review finding M7: THIS is the quantity a per-page presence filter would
+                        // M7: THIS is the quantity a per-page presence filter would
                         // elide, and it is the denominator R2's W is defined against. What reaches
                         // here after the pre-filter is the CONSERVATIVE remainder: a row whose
                         // `lens` overlapped but whose current state does not.
@@ -3966,7 +3966,7 @@ impl BlockCache {
         self.retry_lift_spent.clear();
         // The three interrupt-shadow latches. A reset drops every block, so a latch surviving it
         // would be read at the next boundary by an entry that did not set it -- the reason
-        // `callout_retire_pending` is cleared on the line above (review finding F5).
+        // `callout_retire_pending` is cleared on the line above (F5).
         self.interrupt_shadow_armed_at = None;
         self.interrupt_shadow_arms = 0;
         self.interrupt_shadow_consumed = false;
@@ -4024,7 +4024,7 @@ impl BlockCache {
             // rendezvous silently stop agreeing the first time this block is re-stamped under the
             // other slot (the defect this slice fixes).
             //
-            // Enforced, not just documented (review finding N3): a real ring slot leaking into a
+            // Enforced, not just documented (N3): a real ring slot leaking into a
             // successor at compile time is exactly the defect class this slice fixes, so a future
             // site that re-bakes one here should fail loudly rather than silently reopen it.
             debug_assert_eq!(
@@ -4745,7 +4745,7 @@ pub(crate) enum DirectKind {
     /// **32-bit byte ALU, and only that.** The slice's first write-up justified this kind as
     /// "ubiquitous in DOS-era software — text-mode tools, byte blitters, character loops",
     /// explicitly discounting both benchmarks. That describes a population the arm CANNOT REACH,
-    /// and an adversarial review caught it. Two independent gates put 16-bit code out of range:
+    /// and a later check caught it. Two independent gates put 16-bit code out of range:
     /// `try_direct_continuation` returns `Interpret` at every `!d` boundary, so no block is ever
     /// compiled in a 16-bit code segment on any persona; and a `66`-prefixed byte ALU is refused
     /// because none of `0x00`/`0x02`/…/`0x38`/`0x3A` is in `classify`'s `OperandSize::Word`
@@ -7416,7 +7416,7 @@ fn compile_with_page_len(
             CompileOutcome::Retry(cause) => return CompileOutcome::Retry(cause),
             // A structural barrier the SEARCH found and the full walk did not, which is not a
             // host-page failure however it arrives here. It was reported as `HostPageLen` until
-            // review finding F7, which mislabelled the one arm on this path that has nothing to
+            // fix F7; that label mislabelled the one arm on this path that has nothing to
             // do with the arena page. It is its own cause; whether it is reachable at all is a
             // question the counter now answers instead of the label pre-judging it.
             CompileOutcome::StructuralReject(_) => {
@@ -9455,7 +9455,7 @@ fn compile_with_budget(
             // `Boundary` with NO slots at all is not the min-length rule. The walk ended cleanly
             // before it could form a single slot -- the block-page budget or the instruction
             // limit refusing the first instruction -- and calling that `TooShort` files a budget
-            // refusal under a rule that never looked at it. Review finding F7; a cause of its own
+            // refusal under a rule that never looked at it. Fix F7; a cause of its own
             // so the two can be told apart in a census that is used to price a retry policy.
             CompileStop::Boundary if slots.is_empty() => {
                 CompileOutcome::Retry(RetryCause::BudgetFirstSlot)
@@ -9885,7 +9885,7 @@ fn compile_with_budget(
     // The one segment this edge would guard. `None` whenever `seg_write_edge_eligible` is false,
     // in which case nothing reads it.
     //
-    // `expect`, NOT `.flatten()` (review finding N2). `count_ones() == 1` in
+    // `expect`, NOT `.flatten()` (N2). `count_ones() == 1` in
     // `seg_write_edge_eligible` is what makes `segment_of_bit` total here, and that is an
     // invariant of THIS predicate, not a fact `segment_of_bit` can defend on its own. A `.flatten()`
     // here would fail OPEN: if `seg_write_edge_eligible` were ever relaxed to admit a multi-bit
@@ -10916,7 +10916,7 @@ impl SegmentLayout {
     ///    rarely claim the write pays this refusal, unchanged from before the slice, on that
     ///    share.
     ///
-    /// `used` does NOT carry `dirty` (review finding N3). An earlier revision OR'd it in on the
+    /// `used` does NOT carry `dirty` (N3). An earlier revision OR'd it in on the
     /// theory that a later widen re-deriving this edge needs to see the segment as part of
     /// `self`'s own requirement -- that theory is wrong: `widen_chain_requirement` selects THIS
     /// method for a predecessor by testing `written_segments[predecessor]` directly
@@ -29259,7 +29259,7 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 //
 // # The helper contract
 //
-// Written down before a byte was emitted, and the thing an adversarial review should attack.
+// Written down before a byte was emitted, and the first thing to check.
 //
 // **Synced IN (emitted code, before the call):** the whole `GUEST_HOMES` set, stored to
 // `CpuGsw.registers.gpr` by `emit_store_homes`. Nothing else, and each omission is deliberate:
@@ -29923,7 +29923,7 @@ impl InterpretOneRow {
     /// * **LSS ARMS the interrupt shadow.** Carried as a non-arming row it would leave
     ///   `cpu.interrupt_shadow` set; R3's `(!arming && shadow && !shadow_before_step)` clause would
     ///   resync, and the boundary would then clear a shadow an EARLIER `Sti` slot latched --
-    ///   delivering an interrupt ONE INSTRUCTION EARLY, which is review finding F1's exact shape
+    ///   delivering an interrupt ONE INSTRUCTION EARLY, which is defect F1's exact shape
     ///   and outside the caveat the owner approved. The `debug_assert_eq!` on the arming counts at
     ///   the boundary cannot see it, because `note_interrupt_shadow_arm` only runs for arming rows,
     ///   so both counts stay equal while the state diverges.
@@ -31714,7 +31714,7 @@ pub(crate) struct ResumeSnapshot {
     /// (`run_direct_block` refuses on `interrupt_shadow`), so the clause costs nothing and does
     /// not depend on that refusal staying put, which is design review 10.1 B3.
     ///
-    /// PER RUN and not per slot, and the difference is the whole of review finding F2. Read live,
+    /// PER RUN and not per slot, and the difference is the whole of defect F2. Read live,
     /// this field would be true for every call-out slot BEHIND an arming one -- the helper does
     /// not clear the shadow and no native slot consumes it -- so `sti; pop word [bx]` would resync
     /// at the POP, and three of those in the governor's first eight executions would demote a slot
@@ -32481,7 +32481,7 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
             && bus.interrupt_pending());
 
     // THE ARMING LATCH (design section 10.1, B1), on EVERY path a row that armed the shadow can
-    // leave by, and review finding F1 is what moved it here from the resume path alone.
+    // leave by, and defect F1 is what moved it here from the resume path alone.
     //
     // The boundary decides whether the shadow survives by comparing the block's final EIP against
     // this latch. Written only on resume, the latch went stale the moment a SECOND arming slot in
@@ -33315,7 +33315,7 @@ impl BlockCache {
                     self.link_cells[source_index][slot].clear();
                     self.outbound[source_index][slot] = None;
                     if let Some(successor) = self.blocks[source_index].successors[slot] {
-                        // Review finding M9: `link.block` is the SOURCE, so a self-linking block
+                        // M9: `link.block` is the SOURCE, so a self-linking block
                         // re-parks a waiting entry naming `id` right here. That is why the second
                         // `remove_waiting_sources` below is load-bearing and R6's "drop the second
                         // pass" arm cannot be proved. This counter measures how often it happens.
@@ -33856,8 +33856,8 @@ impl BlockCache {
         // `written_segments[source_index]` cannot have changed between admission and this call
         // (nothing in between recompiles `source`), so this reproduces the identical merge.
         //
-        // ASYMMETRY WITH `try_link_inner`, noted rather than silently carried (review finding
-        // N7): the dirty branch there guards this exact call with
+        // ASYMMETRY WITH `try_link_inner`, noted rather than silently carried
+        // (N7): the dirty branch there guards this exact call with
         // `source_layout.cs == target_layout.cs` before trying `seg_write_merge`, because
         // `seg_write_merge` -- unlike `link_merge` -- does not check `cs` itself. This call omits
         // that guard. It is harmless: `cs` is immutable for a block's whole life, and the edge's
@@ -33958,7 +33958,7 @@ impl BlockCache {
                 // POST-write one for the written segment and refuses on every widen -- L9's own
                 // finding, reproduced here as the exact failure this arm exists to prevent.
                 //
-                // A far predecessor DOES still reach this line (review finding N7): the cut above
+                // A far predecessor DOES still reach this line (N7): the cut above
                 // only `continue`s when `requirement` itself carries a CS bit, so a far
                 // predecessor whose downstream widen never touches CS falls through to here like
                 // any other. The `far_dynamic() -> 0` guard immediately below is therefore
@@ -34594,7 +34594,7 @@ struct SuffixSeed {
     /// x87 slots the block had already committed when the barrier stopped it. Non-zero arms BOTH
     /// x87 gates in the compile walk -- the loop-top cap at `MAX_X87_BLOCK_INSTRUCTIONS` and the
     /// x87/call-out mixing `Retry` -- and both are PREFIX-armed, so the scan's own refusal of x87
-    /// KINDS does not make them unreachable. Leaving this out was the review finding: a barrier
+    /// KINDS does not make them unreachable. Leaving this out was the defect: a barrier
     /// whose prefix held one `FLD` over-reported its suffix by up to 20 instructions against the
     /// 12-instruction x87 ceiling, on exactly the x87-adjacent population (Quake) the campaign is
     /// trying to rank.
@@ -35777,13 +35777,13 @@ pub(crate) enum RetryCause {
     HostPageLen,
     /// A search step in `compile_with_page_len` hit a STRUCTURAL barrier the full walk did not,
     /// so the prefix cannot be compiled and cannot be parked as a rejected span either.
-    /// Deterministic. Split out of `HostPageLen` at review finding F7, which is the label it wore
+    /// Deterministic. Split out of `HostPageLen` at fix F7, which is the label it wore
     /// while having nothing to do with the arena page; whether the arm is reachable at all is now
     /// a question the counter answers rather than one the label pre-judges.
     SearchStructural,
     /// The walk ended cleanly with NO slots at all: the block-page budget or the instruction
     /// limit refused the very first instruction. Deterministic in the key. Split out of
-    /// `TooShort` at review finding F7 -- the min-length rule never looked at this block, so
+    /// `TooShort` at fix F7 -- the min-length rule never looked at this block, so
     /// filing a budget refusal under it made the one cause a retry policy most wants to trust
     /// mean two different things.
     BudgetFirstSlot,
@@ -37746,7 +37746,7 @@ impl crate::jit::JitState {
     /// add and neither can mispredict.
     ///
     /// **`SEGWRITE-V86-EDGE`'s counter-run expectation is a LARGE drop here, not a modest one**
-    /// (review finding, PR #809 §6/§7 item 13 -- corrects the segwrite continue design's own
+    /// (PR #809 §6/§7 item 13 -- corrects the segwrite continue design's own
     /// pre-registration, which predates this predicate's change). The `is_segment_write` predicate
     /// this counts is `CompiledBlock::is_segment_write_block()`, and that predicate now reads
     /// FALSE for the entire population this slice makes eligible (see its doc comment): an
@@ -37773,10 +37773,9 @@ impl crate::jit::JitState {
 }
 
 // ---- from jit/direct/smc_census.rs -------------------------------------------------------------
-// Stage A of the SMC census (`dev_docs/smc-census-design.md` §3, §4, §8 layer 1, cut to a
-// stage A by the adversarial review of 2026-08-15).
+// Stage A of the SMC census (layer 1 of its design, cut to a stage A on 2026-08-15).
 //
-// Scope, verbatim from the review's cut: Q1 (top-pages table), Q2 (no-kill versus killing scan
+// Scope, verbatim from that cut: Q1 (top-pages table), Q2 (no-kill versus killing scan
 // split) and Q6 layer 1 (per-phase UNIT counters). `memory.rs` is not touched, there is no
 // per-block row vector and there is no sampled timer, so the store hot path and the install path
 // are outside this instrument's blast radius entirely. Stage A decides R0, R1, R2 and R6.
@@ -37795,15 +37794,15 @@ impl crate::jit::JitState {
 // - Scan calls and narrow decode kills have different denominators (design §1). The choke 2x2 is
 //   the only licensed way to relate them.
 // - Phases (e) and (f) NEST (`retire_block` -> `unlink_block` -> `remove_waiting_sources`), which
-//   is review finding M8. The unit rows below are therefore disjoint BY CONSTRUCTION: every (f)
+//   is M8. The unit rows below are therefore disjoint BY CONSTRUCTION: every (f)
 //   row counts work done in `retire_block`/`unlink_block` OUTSIDE `remove_waiting_sources`, and
 //   every (e) row counts work inside it. R6 may add them; it may not add a timed `retire_block`
 //   to a timed `remove_waiting_sources`.
 //
 // # The page table
 //
-// Space-Saving with 64 counters, keyed on `keys_killed` — the quantity R1 ranks (review finding
-// M1). The other six per-page accumulators carry their OWN inherited error fields, so every
+// Space-Saving with 64 counters, keyed on `keys_killed` — the quantity R1 ranks
+// (M1). The other six per-page accumulators carry their OWN inherited error fields, so every
 // reported column has an honest `[count - error, count]` bound rather than borrowing the ranked
 // column's bound.
 //
@@ -37813,13 +37812,13 @@ impl crate::jit::JitState {
 // `k`-counter guarantee sound (a zero-increment item is simply not in the stream) and is also
 // what keeps the table from thrashing on the many pages that are written but never kill.
 //
-// Lookup is an open-addressed `page -> row` side index (review finding M3), not a linear scan
+// Lookup is an open-addressed `page -> row` side index (M3), not a linear scan
 // per fold: a resident page costs one multiply and one probe. The O(64) minimum search and the
 // index rebuild run only on a displacement, which by construction requires a NON-resident page
 // that killed at least one key.
 //
 // Reported error bound: for the ranked column, `error <= N / 64` where `N` is total
-// `keys_killed` (review finding M2). The snapshot carries `N` and `N / 64` so the reader does
+// `keys_killed` (M2). The snapshot carries `N` and `N / 64` so the reader does
 // not re-derive it.
 
 #[cfg(feature = "smc-census")]
@@ -38170,7 +38169,7 @@ impl SmcCensus {
             if killed != 0 {
                 phase.units.scan_calls_kill += 1;
                 phase.units.keys_kill += keys_scanned;
-                // Review finding M7: the waste a presence filter would elide lives here too, not
+                // M7: the waste a presence filter would elide lives here too, not
                 // only in calls that killed nothing.
                 phase.units.keys_surviving_in_kill_calls += surviving;
             } else if lane_accepts != 0 {

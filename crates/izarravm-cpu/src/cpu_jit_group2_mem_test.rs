@@ -54,7 +54,7 @@
 //! slot never meets a live descriptor. It is a blind spot the register lanes share, not a hole
 //! this kind opened.
 //!
-//! ## N1 (review finding, closed): the aperture's misaligned tail
+//! ## N1 (closed): the aperture's misaligned tail
 //!
 //! `a_misaligned_mode13_group_two_memory_form_side_exits` closes a gap the review found: before
 //! it, `emit_rotate_shift_mem` admitted a misaligned Mode 13h access at every width, dropping

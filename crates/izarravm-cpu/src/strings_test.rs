@@ -23,7 +23,7 @@ const ALL_PERSONAS: [(GswMode, CpuPersona); 3] = [
     (GswMode::Gsw586, CpuPersona::I586),
 ];
 
-/// T11 (code-smell batch 2, S2), corrected per the adversarial review's finding 9: the oracle
+/// T11 (code-smell batch 2, S2), corrected per finding 9: the oracle
 /// calls `level_timing_for_test`, never a hardcoded copy of its literals, so this is blind to
 /// nothing -- a future change to `level_timing` that `rep_core_upper`'s match does not follow
 /// makes this fail, rather than comparing two copies of the same numbers written by the same
@@ -66,7 +66,7 @@ fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
     }
 }
 
-/// Review finding 11: the 21 `rep_resume_active = true` cases in the identity test above all
+/// The 21 `rep_resume_active = true` cases in the identity test above all
 /// collapse to `0 == 0` and exercise no divide at all. Restated as its own assertion so a reader
 /// does not have to notice that on their own; the 21 `false` cases are the ones that matter for
 /// mutation coverage.

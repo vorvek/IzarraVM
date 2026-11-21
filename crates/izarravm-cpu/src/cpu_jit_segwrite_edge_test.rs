@@ -23,8 +23,7 @@
 //!    disagrees with the target's frozen requirement exits through `SegmentSelectorMismatch`, not
 //!    `StaticUnbound`, and does not spend a linked transfer.
 //!
-//! Plus three fixtures added in response to adversarial review (PR #809,
-//! `dev_docs/2026-09-01-segwrite-edge-review.md`), closing coverage holes the review's own
+//! Plus three fixtures added in PR #809, closing coverage holes a
 //! mutation sweep found (N1, N2) and red-proving what dropping `seg_write_merge`'s `| dirty` term
 //! changes (N3):
 //!
@@ -687,7 +686,7 @@ fn a_write_only_segment_never_gates_reentry_into_its_own_source_block() {
 /// Before the block-keyed un-demotion's V86 exclusion, `MovSreg` fed `callout_segment_writes`
 /// unconditionally in every mode, so this FS call-out would have failed `seg_write_edge_eligible`'s
 /// `callout_segment_writes == 0` term and cost block A the guarded edge it has without the call-out
-/// (the fixture above). That is exactly the regression review finding N1 measured on `duke3d-486`:
+/// (the fixture above). That is exactly the regression N1 measured on `duke3d-486`:
 /// `jit_direct_linked_transfers` falling and `jit_direct_unresolved_static_unbound` rising by a
 /// real, if small, amount. This fixture is the unit-level red proof for the fix.
 ///

@@ -391,7 +391,7 @@ fn straddling_write_over_the_disp_lane_retires_the_block() {
 /// the OPCODE byte — a 4-byte guest write rewriting the instruction itself would then be
 /// absorbed as a lane accept while the block keeps running the old code. A 3-byte disp8 form
 /// (the first version of this fixture) never reaches that state, because `checked_sub(4)`
-/// underflows and refuses for the wrong reason; the adversarial review's mutation run proved
+/// underflows and refuses for the wrong reason; a mutation run proved
 /// the term untested that way.
 #[test]
 fn a_disp8_form_takes_no_lane() {

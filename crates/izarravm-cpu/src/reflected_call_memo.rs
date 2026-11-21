@@ -48,7 +48,7 @@
 //!    hot path**) and from `CpuBus::cumulative_raw_bus_clocks` (whole-run cumulative, NEVER
 //!    reset at a machine-batch boundary -- unlike `CpuBus::in_batch_raw_bus_clocks`, which
 //!    resets at every batch re-entry INCLUDING the plain IF-edge break a trip's own nested
-//!    `IRET`s cause 6-8 times per trip; a Fable review on 2026-09-03 caught this module using
+//!    `IRET`s cause 6-8 times per trip; this module once used
 //!    the wrong one, producing a `raw_bus` delta that went negative on `INT 33h`). If all 8
 //!    triples agree, the key's `learned` counter increments; otherwise
 //!    `learn_refused[clocks_unstable]`.
@@ -117,9 +117,8 @@ pub(crate) const MEMO_MAX_TRIP_INSNS: u64 = 12_608;
 /// 4.5, corrected to count CONSECUTIVE failures by R2.9(i)).
 pub(crate) const MEMO_LEARN_BUDGET: u32 = 4;
 /// Trips a disarmed key must be SEEN (not learned -- `KeyState::trips_seen`) before it is
-/// re-armed (Fable re-review, 2026-09-03, campaign verdict 2c): a budget spent entirely inside
-/// a menu phase must not blind the dwell for the rest of the run. `2^16`, the review's own
-/// figure.
+/// re-armed: a budget spent entirely inside
+/// a menu phase must not blind the dwell for the rest of the run. `2^16`.
 pub(crate) const MEMO_REARM_TRIPS_SEEN: u64 = 65_536;
 /// Natural warm trips whose raw-clock triple must agree before a learn is
 /// counted (plan section 4.2 point 4).
@@ -145,13 +144,13 @@ pub(crate) const MEMO_LEARN_BATCH_WINDOW: u32 = 256;
 /// the next learn cycle's demotion may capture it.
 pub(crate) const MEMO_WRITE_VALUE_STRIKES: u32 = 2;
 /// Default audit period: one answer in 64 is refused and run NATURALLY so its real end
-/// state can be compared with what the memo would have produced (measure-first review,
-/// campaign verdict (2c)). Chosen, not tuned: it bounds the charged-clock error a regime
+/// state can be compared with what the memo would have produced.
+/// Chosen, not tuned: it bounds the charged-clock error a regime
 /// shift can accumulate to `64 x delta` before the audit catches it, and costs 1.6% of the
 /// answer rate.
 pub(crate) const MEMO_AUDIT_PERIOD_DEFAULT: u64 = 64;
 /// The band, in RAW bus clocks, inside which an audited trip's bus total must land.
-/// Exact bus conservation is unattainable in principle (measure-first re-review (1)): an
+/// Exact bus conservation is unattainable in principle: an
 /// answered trip touches no cache line, so the cache model's answer to the next access
 /// stream differs from the real one whatever is charged. The observed jitter on the
 /// dominant key is +38/-4 raw at 0.007% of samples; 64 is 5x that, and ~0.0007% of an
@@ -454,8 +453,8 @@ impl RetireCause {
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct WriteObs {
     linear: u32,
-    /// The `SS` selector IN FORCE at the moment of this write (Fable review 2026-09-03,
-    /// finding 5): needed at tally time to pick the RIGHT stack tracker (the trip may carry
+    /// The `SS` selector IN FORCE at the moment of this write:
+    /// needed at tally time to pick the RIGHT stack tracker (the trip may carry
     /// several concurrent stack segments -- client, host, V86 excursion) rather than always
     /// comparing against the entry segment's own tracker regardless of which segment the
     /// write actually fell in.
@@ -951,7 +950,7 @@ struct JournalSnapshot {
     /// JournalB's entry image -- two occurrences of the same `MemoKey` whose entry states
     /// genuinely differ (say, DS) must never silently agree just because the read set
     /// happened not to expose the difference; this is the same closure-rule concern
-    /// BLOCKING finding 1 fixed for the image fields, applied to the A-vs-B compare itself.
+    /// already fixed for the image fields, applied to the A-vs-B compare itself.
     entry_image: EntryImage,
     reads: HashMap<u32, (u32, u32)>,
     translations: HashMap<u32, (u32, u32)>,
@@ -973,16 +972,16 @@ pub(crate) struct KeyState {
     confirmed: Option<ConfirmedTrip>,
     natural_samples: Vec<(u64, u64, u64)>,
     /// Every `INT` occurrence `on_int` identified as this key, whether it opened a trip or was
-    /// dropped because the key is disarmed (Fable review 2026-09-03, finding 6(iii): without
+    /// dropped because the key is disarmed (without
     /// this the JSON cannot show that a key was seen 727,000 times while only 44 of them ever
     /// became a tracked trip).
     pub trips_seen: u64,
     /// Of `trips_seen`, how many were dropped specifically because `disarmed` was already true.
     pub disarmed_returns: u64,
     /// `trips_seen` at the moment this key was last disarmed; `on_int` re-arms once
-    /// `trips_seen` has advanced by `MEMO_REARM_TRIPS_SEEN` past this (Fable re-review,
-    /// 2026-09-03: "the disarm is never permanent... a budget spent in a menu cannot blind
-    /// the dwell").
+    /// `trips_seen` has advanced by `MEMO_REARM_TRIPS_SEEN` past this, so the disarm is
+    /// never permanent and a budget spent in a menu cannot blind
+    /// the dwell.
     disarmed_at_trips_seen: u64,
     /// Times this key has been re-armed after a permanent-looking disarm.
     pub rearms: u64,
@@ -1120,12 +1119,12 @@ impl KeyState {
         }
     }
 
-    /// Plan section 4.2 point 2, restored by the Fable review (2026-09-03): "`journal_mismatch`
+    /// Plan section 4.2 point 2: "`journal_mismatch`
     /// is NOT structurally cached (it can become learnable)" -- only `ClocksUnstable` counts
     /// toward `MEMO_LEARN_BUDGET`'s CONSECUTIVE-failure disarm. Every other refusal reason
     /// (a structural journal mismatch, a boundary/cap refusal, a hazard) resets the key to
     /// `Warm` and re-learns on the next matching trip, exactly like a success, without ever
-    /// touching the budget. This is the fix for the defect the review's traced counters
+    /// touching the budget. This is the fix for the defect the traced counters
     /// found: the dwell's own dominant keys were disarming after 4 attempts on
     /// `journal_mismatch`/`clocks_unstable` mixed reasons and then dropping ~1.46 M returns
     /// for the rest of the run.
@@ -1144,9 +1143,9 @@ impl KeyState {
         self.natural_samples.clear();
     }
 
-    /// Fable re-review, 2026-09-03, campaign verdict (2c): "disarm is never permanent -- re-arm
+    /// The disarm is never permanent: re-arm
     /// after `trips_seen` advances by 2^16, so a budget spent in a menu cannot blind the
-    /// dwell." Called from `on_int` before the disarmed-drop check; a no-op unless the key is
+    /// dwell. Called from `on_int` before the disarmed-drop check; a no-op unless the key is
     /// both disarmed and has seen `MEMO_REARM_TRIPS_SEEN` more trips since it was disarmed.
     fn maybe_rearm(&mut self) {
         if self.disarmed
@@ -1216,7 +1215,7 @@ pub(crate) struct ReflectedCallMemoState {
     pub(crate) fell_through_clock_projection: u64,
     pub(crate) fell_through_soft_int_posted: u64,
     /// Memos retired because a guest write landed on a physical range one of their trips
-    /// fetched code from (plan R2.4 / BLOCKING finding 4).
+    /// fetched code from (plan R2.4).
     pub(crate) code_watch_retires: u64,
     /// Memos retired because the decode cache cleared its SMC marks wholesale, so the
     /// marks the overlap retire above depends on no longer stand.
@@ -2227,7 +2226,7 @@ pub(crate) fn on_far_transfer<B: CpuBus>(cpu: &mut CpuGsw, bus: &B) {
 /// Production seam: `CpuGsw::note_code_write_inner` (`core.rs`), on the tail where
 /// `invalidated` is known -- i.e. exactly when a guest write hit a compiled block, a
 /// cached decode line or a marked translation page. Retires the WHOLE memo cache (plan
-/// R2.4 / BLOCKING finding 4: a slice that answers with no code-write retirement answers
+/// R2.4: a slice that answers with no code-write retirement answers
 /// from stale code forever -- a TSR chaining `INT 21h`, a DPMI host rewriting its own
 /// hook, ordinary self-modifying code -- and no screen can see it, because the read set
 /// covers DATA and never instruction fetch).
@@ -2257,8 +2256,7 @@ pub(crate) fn note_code_hit(cpu: &mut CpuGsw) {
 /// ever reaches `write_linear_*`, so none reaches `note_write`. This module's own scope-cut
 /// note used to assert the opposite ("the journal seams already fire uniformly from both
 /// the interpreter and the Direct backend, verified by inspection"); that assertion was
-/// FALSE for exactly the accesses a JIT exists to inline, and it is what the Fable review
-/// of 2026-09-05 named as BLOCKING finding F1.
+/// FALSE for exactly the accesses a JIT exists to inline (defect F1).
 ///
 /// A journaled trip whose block stored anything therefore has an incomplete write set, and
 /// a memo built from it would skip guest writes it never saw. This refuses it. The refusal
@@ -2309,7 +2307,7 @@ pub(crate) fn native_stores_refuse(journal: bool, byte: u64, word: u64, dword: u
 /// writing registers and guest memory outside every CPU seam, and is gone before
 /// `finish_trip` asks `CpuBus::reflected_call_soft_int_posted`. The answer-time screen has
 /// the same blind spot, and the memo's re-issued ack never posts -- so an answered trip
-/// would skip the service entirely. Fable review 2026-09-05, BLOCKING finding F2.
+/// would skip the service entirely (defect F2).
 ///
 /// This is the seam that actually sees it: one call on a cold path, at the instant the
 /// service happens. The close-time check and the answer screen stay as belt-and-braces.
@@ -2581,7 +2579,7 @@ fn classify_write<B: CpuBus>(
     ss_selector: u16,
     entry_ss_selector: u16,
 ) -> AddressClass {
-    // Fable review 2026-09-03, finding 5: the classifier already resolves `physical` (its
+    // The classifier already resolves `physical` (its
     // caller just walked it) and already has a bus handle, so the two never-restored device
     // classes cost the four lines below rather than staying permanently unreachable
     // (`write_class_w_other` silently vacuous, a framebuffer write wrongly eligible as
@@ -2632,7 +2630,7 @@ fn classify_write<B: CpuBus>(
 /// delta around ONE key rather than a scan of the map: `finish_trip` is per tracked trip,
 /// not per answer, but the map holds every key the run has ever seen.
 /// Wrapper around the real close, owning the interpreter-forcing window (plan section
-/// 4.2, restored after the Fable review's BLOCKING F1).
+/// 4.2, restored after defect F1).
 ///
 /// ARMED the moment a key is in a journal slot -- which is set by the WARM trip's own
 /// close, so the JournalA trip's batch is already interpreted when it opens -- and
@@ -2689,7 +2687,7 @@ fn finish_trip_inner<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, open: OpenTrip, is_ma
     let state = cpu.reflected_call.as_mut().expect("checked by callers");
     let key_state = state.keys.entry(key).or_default();
 
-    // Fable re-review, 2026-09-03, nit (i): checked BEFORE `open.hazard` -- a hardware
+    // Checked BEFORE `open.hazard` -- a hardware
     // interrupt taken inside the trip (its EOI is an `OUT`) used to be reported as `port_io`
     // (447 of them on one recipe-A run) because the port-I/O hazard was set first and this
     // check ran second, so `hardware_interrupt` read 0 on every key even when IRQs were the
@@ -3586,7 +3584,7 @@ fn tally_write_classes(key_state: &mut KeyState, open: &OpenTrip, writes: &HashM
             key_state.write_class_w_other += 1;
             continue;
         }
-        // Fable review 2026-09-03, finding 5: pick the tracker by the SS selector IN FORCE at
+        // Pick the tracker by the SS selector IN FORCE at
         // the write (recorded on `WriteObs`), not unconditionally the entry segment's own --
         // a trip can carry several concurrent stack segments (client, host, a V86 excursion),
         // and the design's Class D rule is per SEGMENT, no constant cap.
@@ -3643,8 +3641,8 @@ fn recover_raw_core_clocks(
 }
 
 /// Raw bus clock recovery: a plain delta over `CpuBus::cumulative_raw_bus_clocks`, which is
-/// monotone for the WHOLE run (never reset at a machine-batch boundary). Fable review
-/// 2026-09-03, finding 1: the previous version sampled `CpuBus::in_batch_raw_bus_clocks`,
+/// monotone for the WHOLE run (never reset at a machine-batch boundary).
+/// The previous version sampled `CpuBus::in_batch_raw_bus_clocks`,
 /// which resets at every batch re-entry (a trip's own nested `IRET`s cause 6-8 of these), so
 /// `open_bus_raw` could be larger than `close_bus_raw` even on a perfectly healthy trip --
 /// `checked_sub` then returned `None` and the trip was refused as `clocks_unstable` for a
@@ -3685,8 +3683,8 @@ pub(crate) fn run_compare_bench(r: usize) -> (f64, f64) {
     let start = std::time::Instant::now();
     let mut sink = 0u64;
     for _ in 0..ITERS {
-        // `black_box` on both operands of the comparison (Fable re-review, 2026-09-03, nit
-        // (v)): without it the optimizer can prove `buf[idx]` is always 0 and `expect` is
+        // `black_box` on both operands of the comparison:
+        // without it the optimizer can prove `buf[idx]` is always 0 and `expect` is
         // always non-zero (both come from a compile-time-transparent `vec![0; r]` and an XOR
         // with a constant) and fold the whole inner loop to nothing, which is exactly the
         // "meaningless" result the implementer's own caveat warned about.

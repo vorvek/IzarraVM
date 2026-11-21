@@ -77,8 +77,8 @@ struct FlatMemBus {
     /// machine with no HLE poster at all, so it answers `false` -- and the field lets one
     /// test flip it to prove the refusal is live.
     soft_int_posted: bool,
-    /// Test-controllable cumulative raw bus clock counter (Fable review 2026-09-03, finding
-    /// 1's regression test): unlike `in_batch_raw_bus_clocks`, this must NEVER reset, even
+    /// Test-controllable cumulative raw bus clock counter (the
+    /// cumulative-clock regression test): unlike `in_batch_raw_bus_clocks`, this must NEVER reset, even
     /// across a simulated machine-batch re-entry -- the test drives it directly to prove the
     /// memo samples `cumulative_raw_bus_clocks`, not the batch-relative figure.
     bus_clock: u64,
@@ -805,7 +805,7 @@ fn the_off_arm_is_bit_identical() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 1: raw bus clocks must be recovered from
+// Raw bus clocks must be recovered from
 // a cumulative (whole-run) counter, never a per-batch one that resets at
 // every IF-edge machine-batch re-entry.
 // ---------------------------------------------------------------------------
@@ -851,7 +851,7 @@ fn open_trip_samples_the_cumulative_bus_accessor() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 2 (plan section 4.2 point 2): only
+// Plan section 4.2 point 2: only
 // `clocks_unstable` counts toward the consecutive-failure disarm budget.
 // ---------------------------------------------------------------------------
 
@@ -901,7 +901,7 @@ fn journal_mismatch_and_boundary_refusals_do_not_disarm_only_clocks_unstable_doe
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 5: Class D must be tested against the SS
+// Class D must be tested against the SS
 // selector actually in force at the write, and HostStack writes are
 // eligible for Class D exactly like ClientStack ones.
 // ---------------------------------------------------------------------------
@@ -1068,7 +1068,7 @@ fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 5 (the aperture/device-window classes):
+// The aperture/device-window classes:
 // classify_write must actually return them.
 // ---------------------------------------------------------------------------
 
@@ -1101,7 +1101,7 @@ fn classify_write_returns_the_two_never_restored_device_classes() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 6(iii): trips_seen/disarmed_returns must
+// trips_seen/disarmed_returns must
 // be visible per key.
 // ---------------------------------------------------------------------------
 
@@ -1123,15 +1123,15 @@ fn disarmed_key_still_counts_trips_seen_and_disarmed_returns() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable re-review 2026-09-03, nit (i): a hardware interrupt inside a trip
+// A hardware interrupt inside a trip
 // must report as `hardware_interrupt`, not whatever hazard its own EOI
 // (an `OUT`) happens to also set.
 // ---------------------------------------------------------------------------
 
 /// **Mutation bite**: swap the order back (test `open.hazard` before
 /// `open.hw_interrupt_seen`) and this test fails: the trip reports
-/// `port_io` instead of `hardware_interrupt`, exactly the defect the
-/// re-review traced (447 misattributed refusals on one recipe-A run).
+/// `port_io` instead of `hardware_interrupt`, exactly the defect that
+/// produced 447 misattributed refusals on one recipe-A run.
 #[test]
 fn a_hardware_interrupt_inside_a_trip_reports_as_hardware_interrupt_not_port_io() {
     let (mut cpu, bus) = synthetic_reflected_client();
@@ -1153,7 +1153,7 @@ fn a_hardware_interrupt_inside_a_trip_reports_as_hardware_interrupt_not_port_io(
 }
 
 // ---------------------------------------------------------------------------
-// Fable re-review 2026-09-03, campaign verdict (2c): a disarmed key must
+// A disarmed key must
 // re-arm after MEMO_REARM_TRIPS_SEEN more trips are seen, so a budget spent
 // entirely in a menu phase cannot blind the dwell for the rest of the run.
 // ---------------------------------------------------------------------------
@@ -1825,7 +1825,7 @@ fn public_reflected_int_answers_once_from_cycle_and_cached_head() {
 
 /// **Mutation bites, four, each verified red on its own**: (a) drop the epilogue's
 /// segment restore -- DS keeps the caller's selector and the next reflected call runs
-/// the DOS half against the wrong data segment (BLOCKING finding 1's shape); (b) drop
+/// the DOS half against the wrong data segment; (b) drop
 /// the `ESP` restore -- the `RETF`-with-flags SP delta is lost and the client stack
 /// walks; (c) drop the EFLAGS restore -- the answer returns the wrong carry, which
 /// `AH=0Bh` uses as its result; (d) drop the `set_eip` -- the guest re-executes the
@@ -1890,7 +1890,7 @@ fn the_answer_reproduces_the_epilogue_registers_flags_segments_and_sp() {
 
 /// **Mutation bite**: delete the `bus.interrupt_acknowledge` loop in `apply_answer` --
 /// the trip's nested `INT 16h`/`INT 28h` acks vanish, so the bus trace, its I/O wait
-/// states and `last_int_vector` all diverge from the real trip (BLOCKING finding 6).
+/// states and `last_int_vector` all diverge from the real trip.
 /// A second bite: replay the list in reverse -- the ORDER assertion below fails.
 #[test]
 fn nested_acks_are_re_issued_in_trip_order() {
@@ -1944,7 +1944,7 @@ fn a_class_w_write_is_replayed_at_its_own_address_and_width() {
 /// **Mutation bite**: drop `memo.control_effects` from the apply path -- an answered
 /// trip leaves CR3 (and therefore the TLB and the decode ring) where the CALLER left
 /// it, so a guest that edits a page table and relies on the reflected call's own mode
-/// switch to publish the edit reads through a stale translation (BLOCKING finding 5).
+/// switch to publish the edit reads through a stale translation.
 #[test]
 fn an_answered_trip_replays_the_cr3_writes() {
     let (mut cpu, mut bus) = synthetic_reflected_client();
@@ -1973,7 +1973,7 @@ fn an_answered_trip_replays_the_cr3_writes() {
 }
 
 /// **Mutation bite**: feed `commit_reflected_call_core` a pre-scaled delta instead of
-/// the RAW total (BLOCKING finding 2's double-scale). With `raw = 1,000` and
+/// the RAW total (a double-scale). With `raw = 1,000` and
 /// `den = 12` the charge is `1000/12 = 83` and the carry left behind is `1000 % 12 =
 /// 4`; a double-scale charges 6 and leaves 11, and both halves of this assertion move.
 /// The raw total is deliberately not a multiple of `den`, or the carry check is vacuous
@@ -2210,7 +2210,7 @@ fn a_nested_int_outside_the_opening_window_is_still_recorded_as_an_ack() {
 }
 
 // ---------------------------------------------------------------------------
-// Amendment 4: the code-watch retire (plan R2.4 / BLOCKING finding 4).
+// Amendment 4: the code-watch retire (plan R2.4).
 // ---------------------------------------------------------------------------
 
 /// **Mutation bite**: delete the `note_code_hit` call from the tail of
@@ -2431,8 +2431,8 @@ fn an_agreeing_audit_leaves_the_memo_standing() {
 
 /// **Mutation bite**: let a core-clock or instruction-count disagreement pass. The memo
 /// then goes on charging a constant the real trip no longer costs, and the accumulated
-/// error slips an `irq0` edge -- the exact failure the measure-first review's section 2
-/// derived (a persistent one-clock error moves `irq0_edges` on a 31 s row with ~22%
+/// error slips an `irq0` edge -- the exact failure the measure-first
+/// estimate derived (a persistent one-clock error moves `irq0_edges` on a 31 s row with ~22%
 /// probability).
 #[test]
 fn a_core_clock_disagreement_retires_the_memo_and_relearns() {
@@ -3594,7 +3594,7 @@ fn a_byte_moving_outside_the_claimed_mask_widens_the_claim_and_is_confirmed() {
 }
 
 // ---------------------------------------------------------------------------
-// The Fable review's two BLOCKING findings (2026-09-05).
+// The two BLOCKING defects: native stores (F1) and the HLE seam (F2).
 // ---------------------------------------------------------------------------
 
 /// F1. A journaled trip whose compiled block STORED anything has an incomplete write set:

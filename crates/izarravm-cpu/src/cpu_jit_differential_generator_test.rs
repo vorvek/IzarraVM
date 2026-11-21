@@ -789,7 +789,7 @@ fn assert_measured_pair_ignoring_translation_watch_split(
         }
     }
     assert_eq!(direct_masked, interpreter_masked, "{case:#?}");
-    // Review finding N3: a DROPPED equality is a lost gate, not a neutral one. The exact split
+    // N3: a DROPPED equality is a lost gate, not a neutral one. The exact split
     // is legitimately case-dependent (a cold decode's fetch charge varies with instruction
     // length and alignment), so this cannot be `SPLIT_BUS_CLOCKS`'s exact-pin shape, but a
     // regression that changed the split's ORDER OF MAGNITUDE -- a second retire slipping in, a

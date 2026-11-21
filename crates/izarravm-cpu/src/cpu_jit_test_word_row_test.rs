@@ -480,7 +480,7 @@ fn the_word_test_immediate_row_flips_with_the_gate() {
     jit::direct::set_test_word_rows_for_test(None);
 }
 
-/// The 32-bit-segment twin (review finding 9): `66 A9 imm16` in a 32-bit segment reaches the same
+/// The 32-bit-segment twin: `66 A9 imm16` in a 32-bit segment reaches the same
 /// gated Word arm as the 16-bit-segment row, not the ungated Dword one.
 #[test]
 fn a_prefixed_word_test_immediate_in_a_32bit_segment_also_flips_with_the_gate() {
@@ -884,7 +884,7 @@ fn test_ax_imm16_matches_the_interpreter_in_a_sixteen_bit_segment() {
     jit::direct::set_test_word_rows_for_test(None);
 }
 
-/// The 32-bit-segment twin: `66 A9 imm16` in a 32-bit segment, the case review finding 9 calls
+/// The 32-bit-segment twin: `66 A9 imm16` in a 32-bit segment, the case that is
 /// load-bearing rather than decorative -- it reaches the same gated Word arm from the OTHER
 /// segment default, which `test_ax_imm16_66` sweeps for the compile-only question and this row
 /// sweeps for state.

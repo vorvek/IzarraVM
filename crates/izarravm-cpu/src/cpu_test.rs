@@ -1898,7 +1898,7 @@ fn accurate_timing_personas_never_take_the_interpreter_fast_path() {
     }
 }
 
-/// BLOCKING regression test (adversarial review of the lever-1 slice): a LIVE mode switch away
+/// BLOCKING regression test (lever-1 slice): a LIVE mode switch away
 /// from an Approximate persona -- e.g. `OUT 0xE1` selecting 386-slow mid-run, izarravm-machine
 /// `bus.rs`/`run.rs` -- must stop the interpreter's FastMap serve path immediately, both the hits
 /// AND the probe itself (misses), proving `fast_map_serve_enabled` gates ENTRY to

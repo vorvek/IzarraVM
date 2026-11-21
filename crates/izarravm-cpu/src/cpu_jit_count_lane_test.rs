@@ -51,7 +51,7 @@
 //! first version of this file got wrong.** The 2..31 rotate arm's contract is that it captures CF
 //! and FREEZES every other bit of RBP, because a rotate architecturally preserves SF, ZF, PF and
 //! AF and the live descriptor still owns them. With nothing downstream reading the shadow, that
-//! freeze is unobservable: an adversarial review widened the capture mask to `CF|ZF|SF` and the
+//! freeze is unobservable: a mutation run widened the capture mask to `CF|ZF|SF` and the
 //! whole suite stayed green, because RBP is never published wholesale at block exit.
 //!
 //! Slot 3 is therefore `ror edi, 1` — the `0xD1 /1` two-byte form, which takes NO lane (no

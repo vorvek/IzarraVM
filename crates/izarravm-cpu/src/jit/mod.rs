@@ -178,7 +178,7 @@ pub(crate) struct JitState {
     ///     fold away, measured at 1.19% of gp2's wall executed once per continuation.
     ///     `CpuGsw::mode` is the other, and `CpuGsw::set_mode` is its only writer THAT CAN
     ///     REACH `key_for_phys` — two canonical-state test closures poke the crate-private
-    ///     field directly without ever keying a block, which the adversarial review proved
+    ///     field directly without ever keying a block, which a check proved
     ///     harmless by forcing a stale cache there and watching nothing fire
     ///     (the field is private to the crate root, and canonical restore goes through
     ///     `set_mode` like everything else). Both writers refresh this field; there is no third

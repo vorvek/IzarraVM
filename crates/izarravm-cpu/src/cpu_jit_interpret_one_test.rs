@@ -3187,7 +3187,7 @@ fn pushf_then_popf_round_trip_natively_in_v86_at_iopl_3() {
         BusAccessKind::DataWrite,
     )
     .expect("stack warm-up write");
-    // Review finding N4: the same discipline the fixed `(e)` row
+    // N4: the same discipline the fixed `(e)` row
     // (`pte_edit_with_a_tlb_warm_target_still_retires`) now carries, applied here. This
     // warm-up exists specifically so PUSHF's LATER stack write does not retire the ring; if the
     // warm-up itself silently opened `code_write_watched`'s translation-page door (an ordering
@@ -6016,7 +6016,7 @@ fn the_sti_row_resyncs_while_an_interrupt_is_pending() {
 /// on an instruction that never consumed it.
 ///
 /// The clause reads the shadow `run_direct_block` PUBLISHED at the entry rather than the live
-/// flag, which is review finding F2: read live it would also refuse every call-out sitting behind
+/// flag (F2): read live it would also refuse every call-out sitting behind
 /// an arming one in the same block, and the governor would demote those slots for it.
 #[test]
 fn an_entry_interrupt_shadow_refuses_resume_for_every_row() {

@@ -4206,7 +4206,7 @@ fn a_second_directory_gets_its_own_link_graph() {
     assert!(cache.is_link_visible(target_a_id));
 }
 
-/// N1 (review finding). RED against the pre-fix seed `link_epochs: [1, 0]`: 0 is the
+/// N1. RED against the pre-fix seed `link_epochs: [1, 0]`: 0 is the
 /// unstamped-block sentinel (`block_link_epochs.push(0)` on install), so a VIRGIN cache's
 /// first `MOV CR3` to a second directory -- which, in production, ALWAYS reaches
 /// `select_link_context`, never `allocate_link_context` (`core.rs`'s `Skipped` arm covers
@@ -4478,7 +4478,7 @@ fn a_retained_link_is_never_entered_from_the_other_context() {
     );
 }
 
-/// N6 (review finding), the complement of A-3: `BlockKey` does NOT carry the ring context, and
+/// N6, the complement of A-3: `BlockKey` does NOT carry the ring context, and
 /// this pins that on purpose rather than leaving it an implicit property a future refactor could
 /// silently change. A block admitted under one ring slot is still ENTERED (`probe` returns
 /// `Ready`, a genuine cache hit) under the OTHER slot when the physical matches -- entry is

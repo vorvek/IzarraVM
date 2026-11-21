@@ -702,7 +702,7 @@ fn every_string_opcode_is_admitted_by_the_gate_and_by_nothing_else() {
 /// The first run of this fixture had LES/LDS pinned at `hard_boundary` and went red on exactly
 /// that row. The expectation was corrected against `route_group`, not against the failure message.
 ///
-/// The set is the one an adversarial reviewer attacks first: the port-string hole this design
+/// The set is the one most likely to break first: the port-string hole this design
 /// found (`0x6C`-`0x6F`), the far-pointer segment loads that break both the interrupt-shadow latch
 /// and the four-access budget proof, POPF's IOPL hazard, and a control transfer.
 #[cfg(all(

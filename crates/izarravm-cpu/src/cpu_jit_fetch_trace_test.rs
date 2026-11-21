@@ -119,7 +119,7 @@ fn a_trace_observing_bus_reinstates_the_preamble_over_an_elided_cache() {
     // synchronises ahead of its own probe, so any fuller drive would have refilled the cache by
     // the time the assertion ran. Asserting only the field flip and the recompiled shape below
     // would be VACUOUS for the clear — deleting `jit_direct.clear()` from
-    // `sync_native_fetch_trace` passes both (verified by mutation, review finding).
+    // `sync_native_fetch_trace` passes both (verified by mutation).
     //
     // MUTATION-VERIFIED, and worth recording which guard wins the race. With the clear deleted,
     // the resident elided block is still Ready, so this continuation ENTERS it and

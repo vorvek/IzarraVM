@@ -1309,7 +1309,7 @@ fn a_cached_line_is_not_served_past_a_shrunken_cs_limit() {
 
 #[test]
 fn smc_above_the_byte_bitmap_coverage_invalidates_via_page_marks() {
-    // Stage-2 review finding 12: extended-memory code (where DOS-extender workloads live,
+    // Extended-memory code (where DOS-extender workloads live,
     // e.g. Quake's self-patching renderer) sits above SMC_BYTE_COVERAGE. The byte bitmap
     // does not reach there; the 4 KiB page marks must catch the write, or - now that CS
     // loads no longer flush - a stale line replays FOREVER. Same shape as

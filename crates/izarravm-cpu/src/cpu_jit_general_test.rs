@@ -253,7 +253,7 @@ fn unit_sim_feed_is_state_neutral() {
     );
 }
 
-/// Coverage invariant (review finding B2): every retired interpreter instruction is observed
+/// Coverage invariant (B2): every retired interpreter instruction is observed
 /// exactly once, so `retired_in_units` equals the run's `perf.instructions` delta. Each `observe`
 /// accrues exactly once, so `retired_in_units` is the total observed count.
 ///
@@ -336,7 +336,7 @@ fn unit_sim_self_loop_keeps_entry_open() {
     );
 }
 
-/// Adversarial review F2: `finish_fast_map_write`'s fast BYTE-write path must feed the unit-sim
+/// F2: `finish_fast_map_write`'s fast BYTE-write path must feed the unit-sim
 /// diagnostic (`note_code_write_hit`'s unconditional first action) on every real change, exactly
 /// like the slow byte path (`write_linear_u8`'s `if changed { self.note_code_write(..) }`) --
 /// even when the changed byte hits no watched code at all. The sim tracks unit ownership at PAGE

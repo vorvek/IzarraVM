@@ -1006,7 +1006,7 @@ impl CpuGsw {
             // than here beside `skip_direct_once`, because this struct sits ahead of the CPU
             // offsets emitted code bakes.
             //
-            // BOTH latches, since review finding F5. The consumed flag is read once per iteration
+            // BOTH latches, since fix F5. The consumed flag is read once per iteration
             // below and taken there, but a run that ends between the set and the take would
             // otherwise hand the next run a transition that happened inside the previous one.
             self.jit_direct.take_interrupt_shadow_armed();
@@ -1299,7 +1299,7 @@ impl CpuGsw {
             // would be used and a transition the interpreter breaks on would be missed.
             //
             // THIS FIRES ON EVERY BLOCK THAT RESUMES PAST AN ARMING ROW, and the comment that
-            // used to stand here said the opposite (review finding F3). `can_take_interrupt`
+            // used to stand here said the opposite. `can_take_interrupt`
             // never consults the bus, so the break below is about the TRANSITION and not about
             // pendency: interpreted, the instruction after the arming one consumes the shadow and
             // ends the run there; natively, this fold is the only thing that reproduces it. The
@@ -3587,7 +3587,7 @@ impl CpuGsw {
             self.native_callout,
             self.native_table_slots.interpret_test_word,
         ) = jit::direct::CallOutTable::publish(bus);
-        // R3's entry-shadow clause reads THIS, not the live flag (review finding F2). Published
+        // R3's entry-shadow clause reads THIS, not the live flag (F2). Published
         // once per entry and cleared after the return, so a shadow an arming slot leaves behind
         // mid-block does not refuse every call-out sitting behind it. The refusal above means it
         // is always false in production; the clause exists so that it does not have to be.
@@ -3708,7 +3708,7 @@ impl CpuGsw {
             // The latch must be the LAST arming slot's, or the comparison below is against the
             // wrong address and can clear a shadow a later slot armed. The helper writes it on
             // every path an arming row can leave by, so the counts always agree; they did not
-            // before review finding F1, and this is what says so.
+            // before fix F1, and this is what says so.
             debug_assert_eq!(
                 arms,
                 self.jit_direct.interrupt_shadow_arms(),
@@ -3792,8 +3792,8 @@ impl CpuGsw {
         // `elapsed_clocks` -- landing in exactly the quantities this slice already declines to pin
         // as equalities, so it would be MISREAD as the timing change the slice admits to.
         let total_dword_stores = exit.ram_dword_writes & u64::from(u32::MAX);
-        // The reflected-call memo's NATIVE-STORE refusal (Fable review 2026-09-05, BLOCKING
-        // F1). A compiled block emits its stores through the store-stub pad and reports them
+        // The reflected-call memo's NATIVE-STORE refusal (defect F1).
+        // A compiled block emits its stores through the store-stub pad and reports them
         // in bulk right here; none of them passes `write_linear_*`, so none reaches the
         // journal's `note_write`. A journaled trip whose block stored anything therefore has
         // an INCOMPLETE write set, and a memo built from it would skip guest writes it never

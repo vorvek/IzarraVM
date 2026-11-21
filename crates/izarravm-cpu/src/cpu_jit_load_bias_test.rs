@@ -517,7 +517,7 @@ fn an_x87_load_from_a_dead_entry_resolves_through_the_read_stub() {
     }
 }
 
-/// Round-2 review finding 1a: the counting stub's WORD variant was the one untested lane
+/// The counting stub's WORD variant was the one untested lane
 /// branch — the classic emission shared one `emit_mode13_read_completion`, so the trio's word
 /// cells covered the word lane for every site, but the counting stubs re-implement the
 /// width -> lane choice per stub and a wrong-lane mutation (word charged as dword) underflows
@@ -586,7 +586,7 @@ fn a_word_aperture_load_charges_the_word_lane_through_the_counting_stub() {
     );
 }
 
-/// Round-2 review finding 1c: the trio's PARK-ONLY stub was never entered by any cell. A RET
+/// The trio's PARK-ONLY stub was never entered by any cell. A RET
 /// through a DEAD stack entry (INVLPG between runs) drives it: probe -> poison -> park stub ->
 /// classify reads a cleared flags byte -> status 1 -> unavailable exit -> the interpreter
 /// re-runs the RET and heals the entry. The healed re-run then completes natively, which is

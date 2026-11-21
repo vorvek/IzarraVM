@@ -223,7 +223,7 @@ fn structural_reject_boundary_sits_at_exactly_three_slots() {
 #[test]
 fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
     // Not 0xFC (CLD, natively lowered already) and not 0x99/CDQ (the CHOICE THIS TEST USED TO
-    // MAKE, until the adversarial review on the PreciseHelper-scaffolding deletion caught that
+    // MAKE, until the work on the PreciseHelper-scaffolding deletion found that
     // Task 4 -- the very next slice in this phase -- teaches `classify` to admit 0x98/0x99,
     // which would silently turn this fixture's span from 4 instructions to 8, drop its census
     // row, and panic the `.expect` below. That is the exact 0xFC failure class the sibling
