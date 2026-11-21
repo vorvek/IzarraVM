@@ -10,7 +10,7 @@ fn group11_mov_rm_imm_with_nonzero_reg_faults_without_consuming_the_immediate() 
     // reg != 0 and the executor re-raises the error. Drive it through the split (which returns
     // the raw fault without eip rewind) and assert two things:
     //   1. the fault is a deliverable #UD (vector 6, no error code), and
-    //   2. eip advanced to exactly 2 (opcode + ModRM) — proving decode did NOT over-consume the
+    //   2. eip advanced to exactly 2 (opcode + ModRM), proving decode did NOT over-consume the
     //      trailing imm8 (0x55) on the fault path, so the bytes charged match the fused handler.
     let (mut cpu, memory) = real_mode_cpu(&[0xc6, 0xc9, 0x55], 0x20);
     let mut bus = TestBus::with_memory(memory);
@@ -747,7 +747,7 @@ fn push_gs_pushes_the_selector_in_real_mode() {
 
 #[test]
 fn push_fs_gs_zero_extend_under_the_32_bit_operand_size_prefix() {
-    // 66 0F A0 / 66 0F A8: 386 PRM -- PUSH sreg with a 32-bit operand size decrements
+    // 66 0F A0 / 66 0F A8: 386 PRM: PUSH sreg with a 32-bit operand size decrements
     // ESP by 4 and writes the 16-bit selector zero-extended to a dword (the SDM PUSH
     // operation note). Same rule as the one-byte PUSH ES/CS/SS/DS arms.
     for (code, segment, value) in [
@@ -774,7 +774,7 @@ fn push_fs_gs_zero_extend_under_the_32_bit_operand_size_prefix() {
 
 #[test]
 fn pop_fs_gs_discard_the_upper_word_under_the_32_bit_operand_size_prefix() {
-    // 66 0F A1 / 66 0F A9: 386 PRM -- POP sreg with a 32-bit operand size pops a full
+    // 66 0F A1 / 66 0F A9: 386 PRM: POP sreg with a 32-bit operand size pops a full
     // dword, loads the low 16 bits into the segment register, and discards the upper 16.
     // Same rule as the one-byte POP ES/SS/DS arms.
     for (code, segment) in [
@@ -890,7 +890,7 @@ fn push_pop_ss_zero_extends_under_the_32_bit_operand_size_prefix() {
 #[test]
 fn push_pop_one_byte_sreg_unchanged_at_16_bit_operand_size() {
     // Without a 66h prefix, PUSH/POP ES/CS/SS/DS (and FS/GS) stay the classic 2-byte
-    // real-mode DOS behavior -- this is the frozen-class-sensitivity check: no bench or
+    // real-mode DOS behavior: this is the frozen-class-sensitivity check: no bench or
     // real-mode DOS code observes a behavior change from the operand_size fix.
     for code in [
         [0x06u8, 0x90], // PUSH ES; NOP pad
@@ -948,7 +948,7 @@ fn pop_gs_loads_the_selector_in_real_mode() {
 #[test]
 fn pop_fs_gs_load_a_valid_descriptor_in_protected_mode() {
     // Data segment access 0x92 (present, data, writable), byte-granular limit 0xffff,
-    // base 0 -- the same descriptor shape `verr_sets_zf_for_a_readable_segment` and
+    // base 0, the same descriptor shape `verr_sets_zf_for_a_readable_segment` and
     // `lar_and_lsl_read_descriptor_fields` use. Selector 0x0008 (GDT index 1, RPL 0).
     for (code, segment) in [
         ([0x0fu8, 0xa1].as_slice(), SegmentIndex::Fs), // POP FS
@@ -982,7 +982,7 @@ fn pop_fs_gs_load_a_valid_descriptor_in_protected_mode() {
 fn pop_fs_gs_fault_on_a_bad_selector_in_protected_mode() {
     // Selector 0x0028 (index 5, byte offset 40) is past the GDT limit of 0x1f (31), which
     // only covers offsets 0 (null) and 8 (the one installed descriptor), so the descriptor
-    // load must #GP -- the same fault a bad POP DS selector raises.
+    // load must #GP, the same fault a bad POP DS selector raises.
     for (code, name) in [
         ([0x0fu8, 0xa1].as_slice(), "POP FS"),
         ([0x0f, 0xa9].as_slice(), "POP GS"),
@@ -1050,7 +1050,7 @@ fn null_selector_loads_into_data_segments_without_fault() {
 #[test]
 fn access_through_a_null_data_segment_faults() {
     // MOV DS, AX (8E D8) with AX = 0 loads DS as null (no fault); a following memory
-    // access through DS (MOV AL, [SI], opcode 8A 04) must then #GP -- the null segment's
+    // access through DS (MOV AL, [SI], opcode 8A 04) must then #GP: the null segment's
     // base=0/limit=0 default fails the segment-limit check for any nonzero offset.
     let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd8, 0x8a, 0x04], 0x0000_ffff, 0x0000_9200);
     cpu.write_reg16(Reg16::Ax, 0x0000);
@@ -1073,7 +1073,7 @@ fn access_through_a_null_data_segment_faults() {
 #[test]
 fn null_selector_into_ss_still_faults() {
     // MOV SS, AX (8E D0) with AX = 0. Unlike the data segments, a null selector loaded
-    // into SS must still #GP -- the stack segment can never be null.
+    // into SS must still #GP: the stack segment can never be null.
     let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd0], 0x0000_ffff, 0x0000_9200);
     cpu.write_reg16(Reg16::Ax, 0x0000);
     let mut bus = TestBus::with_memory(memory);
@@ -1192,7 +1192,7 @@ fn retf_popping_a_null_selector_into_cs_faults() {
 #[test]
 fn ti_bit_set_index_zero_selector_resolves_against_the_ldt_not_treated_as_null() {
     // Selector 0x0004: index 0, TI=1. This is NOT a null selector (only index 0 AND TI 0
-    // is null) -- it must resolve against LDT offset 0, not short-circuit into the
+    // is null): it must resolve against LDT offset 0, not short-circuit into the
     // null/unusable path. Install an LDT (via LLDT, GDT selector 0x08) whose first entry
     // (offset 0) is a normal data descriptor, then load DS from selector 0x0004 and check
     // the resulting base/limit came from that LDT descriptor.
@@ -1266,7 +1266,7 @@ fn lar_and_lsl_read_descriptor_fields() {
 #[test]
 fn lar_and_lsl_succeed_on_a_not_present_descriptor() {
     // 386 PRM: LAR and LSL check descriptor TYPE and privilege, never the
-    // present bit -- the returned access rights carry P as stored. Borland's
+    // present bit: the returned access rights carry P as stored. Borland's
     // RTM keeps unloaded segments as not-present descriptors and its #NP
     // handler probes them with LAR before servicing the fault; ZF=0 here made
     // it declare the exception unhandled (the Tyrian loader abort).
@@ -1529,7 +1529,7 @@ fn call_gate_inter_privilege_switches_stack() {
 #[test]
 fn call_gate_inter_privilege_reads_params_from_a_16bit_outer_stack_with_esp_high_garbage() {
     // The DOS4GW/VCPI scenario: the outer (caller's) stack is SS.B=0 with garbage
-    // in ESP's high word. Per PRM 17-42 the old stack's top is SS:SP -- the param
+    // in ESP's high word. Per PRM 17-42 the old stack's top is SS:SP: the param
     // read must use the wrapped 16-bit SP, not outer_esp + k*psize on the full
     // (garbage-laden) ESP, which would read from a bogus linear address entirely
     // outside the intended stack page.
@@ -1561,7 +1561,7 @@ fn call_gate_inter_privilege_reads_params_from_a_16bit_outer_stack_with_esp_high
         },
     );
     // SP = 0xfffe, but ESP's high word carries garbage that a full-ESP add would
-    // corrupt into a wrong linear address entirely -- the wrapped SP is the only
+    // corrupt into a wrong linear address entirely: the wrapped SP is the only
     // correct read point. The single param sits at SP=0xfffe, well clear of the
     // 5-byte CALL instruction at offset 0.
     cpu.registers.set_esp(0xbeef_fffe);
@@ -1973,8 +1973,8 @@ fn indirect_tss_transfers_keep_their_far_memory_outer_tariff() {
 #[test]
 fn exception_through_an_idt_task_gate_switches_tasks_and_pushes_the_error_code() {
     // DOS/4GW 1.97 points IDT vector 14 (#PF) at a TASK GATE (type 0x5) whose
-    // selector names a 386 TSS. Delivery must be a CALL-style task switch --
-    // back-link written, NT set, the old TSS stays busy -- and the error code
+    // selector names a 386 TSS. Delivery must be a CALL-style task switch:
+    // back-link written, NT set, the old TSS stays busy, and the error code
     // is pushed on the NEW task's stack. Loading the TSS selector into CS
     // (the pre-fix behavior) is #GP(sel) and killed Descent II in DOS/4GW init.
     let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
@@ -2056,7 +2056,7 @@ fn exception_through_an_idt_task_gate_switches_tasks_and_pushes_the_error_code()
 fn hardware_interrupt_through_a_task_gate_pushes_no_error_code() {
     // `is_external` (a hardware IRQ or software INT n landing on the gate):
     // the task switch still happens, but nothing is pushed on the new task's
-    // stack -- only a genuine CPU exception carries an error code.
+    // stack: only a genuine CPU exception carries an error code.
     let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
     let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
     let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
@@ -2295,7 +2295,7 @@ fn public_fault_after_a_task_gate_switch_commits_keeps_the_run_prefix() {
     // A task switch commits the WHOLE incoming task inside `load_task_state`:
     // CR3, LDTR, TR, CS:EIP, every GPR. `deliver_exception_inner`'s unwind can
     // only put back five fields of the OUTGOING task, so a fault after that
-    // commit must not be escalated -- re-delivering from the mixture would hand
+    // commit must not be escalated: re-delivering from the mixture would hand
     // the guest a state belonging to no task at all. Here the incoming task's SS
     // has a 0xff limit and its ESP is 0, so the error-code push runs off the
     // stack segment. The core must stop, and must leave the committed state
@@ -2689,7 +2689,7 @@ fn v86_segment_load_uses_real_mode_base() {
 #[test]
 fn v86_far_call_uses_real_mode_segments() {
     // CALL FAR 0x8FA9:0x1234 (9A off16 seg16) in a V86 task must be an 8086-style
-    // far call (CS = 0x8FA9, base 0x8FA90), never a GDT descriptor lookup — 0x8FA9
+    // far call (CS = 0x8FA9, base 0x8FA90), never a GDT descriptor lookup: 0x8FA9
     // is not a valid selector and would #GP. Regression for the V86 boot:
     // real FreeDOS makes far calls to high segments while virtualized.
     let (mut cpu, memory) = real_mode_cpu(&[0x9a, 0x34, 0x12, 0xa9, 0x8f], 0x200);
@@ -2780,7 +2780,7 @@ fn iret_runs_in_v86_at_iopl3() {
 fn iret_in_v86_at_iopl3_cannot_drop_iopl() {
     // The JEMMEX/TOKAEMM root cause: a V86 client is deliberately run at IOPL 3 so its
     // own native (same-privilege, CPL 3) IRET never traps to the monitor. Per the 386
-    // PRM (section 9.7.1.2), "The IOPL field ... is restored only if the CPL is 0" -- at
+    // PRM (section 9.7.1.2), "The IOPL field ... is restored only if the CPL is 0": at
     // CPL 3 a stale/zeroed IOPL field in the popped image must never reach real EFLAGS.
     let (mut cpu, memory) = real_mode_cpu(&[0xcf], 0x40);
     cpu.control.cr0 |= CR0_PE;
@@ -2790,7 +2790,7 @@ fn iret_in_v86_at_iopl3_cannot_drop_iopl() {
     let mut bus = TestBus::with_memory(memory);
     bus.memory[0x20..0x22].copy_from_slice(&0x1234u16.to_le_bytes());
     bus.memory[0x22..0x24].copy_from_slice(&0x0050u16.to_le_bytes());
-    // Popped image carries IOPL=0 (bits 12-13 clear) -- exactly the stale flags word
+    // Popped image carries IOPL=0 (bits 12-13 clear): exactly the stale flags word
     // traced in the field: a JEMM-internal in-V86 IRET popping 0x200.
     let popped_flags = (0x2 | FLAG_VM | FLAG_IF) as u16;
     bus.memory[0x24..0x26].copy_from_slice(&popped_flags.to_le_bytes());
@@ -2893,7 +2893,7 @@ fn cpl0_popfd_still_loads_iopl_and_if_fully() {
 
 #[test]
 fn popfd_can_never_set_vm_at_any_cpl() {
-    // POPF/POPFD can never alter VM (bit 17) at any CPL -- real mode here is CPL 0,
+    // POPF/POPFD can never alter VM (bit 17) at any CPL: real mode here is CPL 0,
     // the most permissive case, and even it must not let VM turn on via a flags pop.
     let (mut cpu, memory) = real_mode_cpu(&[0x66, 0x9d], 0x40); // POPFD
     cpu.registers.set_esp(0x20);
@@ -2936,12 +2936,12 @@ fn real_mode_segment_load_preserves_a_protected_mode_limit() {
     // subsequent >64 KB access into #GP (SpeedSys 4.78 hung in exactly this shape).
     let (mut cpu, memory) = unreal_world(&[
         0xb8, 0x10, 0x00, // mov ax, 0x10
-        0x8e, 0xd8, // mov ds, ax        -- protected-mode load, limit 4 GB
+        0x8e, 0xd8, // mov ds, ax: protected-mode load, limit 4 GB
         0x0f, 0x20, 0xc0, // mov eax, cr0
         0x24, 0xfe, // and al, 0xfe
-        0x0f, 0x22, 0xc0, // mov cr0, eax     -- PE 1 -> 0
+        0x0f, 0x22, 0xc0, // mov cr0, eax: PE 1 -> 0
         0xb8, 0x00, 0x00, // mov ax, 0
-        0x8e, 0xd8, // mov ds, ax        -- REAL-mode load
+        0x8e, 0xd8, // mov ds, ax: REAL-mode load
         0x67, 0x66, 0x8b, 0x05, 0x00, 0x00, 0x11, 0x00, // mov eax, [dword 0x110000]
     ]);
     let mut bus = TestBus::with_memory(memory);
@@ -2962,7 +2962,7 @@ fn real_mode_segment_load_preserves_a_protected_mode_limit() {
     );
 
     cpu.cycle(&mut bus).unwrap(); // mov ax, 0
-    cpu.cycle(&mut bus).unwrap(); // mov ds, ax  -- the real-mode load under test
+    cpu.cycle(&mut bus).unwrap(); // mov ds, ax: the real-mode load under test
     let ds = cpu.registers.segment(SegmentIndex::Ds);
     assert_eq!(ds.selector, 0, "the selector IS recomputed");
     assert_eq!(ds.base, 0, "base = selector << 4 IS recomputed");
@@ -2985,7 +2985,7 @@ fn real_mode_segment_load_preserves_a_protected_mode_limit() {
 fn real_mode_cs_load_recanonicalizes_the_limit() {
     // CS is the documented exception: a real-mode CS load rebuilds the whole descriptor,
     // so a far jump out of protected mode really does give back a 64 KB code segment.
-    // DS, loaded in the same breath, keeps its big limit -- that split is the hardware's.
+    // DS, loaded in the same breath, keeps its big limit: that split is the hardware's.
     let (mut cpu, memory) = unreal_world(&[]);
     let mut bus = TestBus::with_memory(memory);
     let big = SegmentRegister::flat(0x10, 0x93);
@@ -3089,7 +3089,7 @@ fn a_real_mode_only_guest_never_sees_a_limit_other_than_0xffff() {
 
 /// A hardware task switch INTO a V86 task with a null DS selector.
 ///
-/// Selector 0 in a V86 task's DS is not the protected-mode null descriptor -- it is an
+/// Selector 0 in a V86 task's DS is not the protected-mode null descriptor: it is an
 /// ordinary 8086 segment at base 0, and the task-switch restore loop must build it the way
 /// every other V86 segment load does: base 0, limit 0xFFFF, the real-mode access byte. The
 /// loop's null-selector short-circuit used to install `Default::default()` (limit 0, access
@@ -3125,7 +3125,7 @@ fn task_switch_into_v86_builds_a_null_data_selector_as_a_real_mode_segment() {
     put16(&mut memory, 0x380 + 72, 0x0a00); // ES
     put16(&mut memory, 0x380 + 76, 0x0a00); // CS
     put16(&mut memory, 0x380 + 80, 0x0900); // SS
-    put16(&mut memory, 0x380 + 84, 0x0000); // DS -- null, and perfectly ordinary in V86
+    put16(&mut memory, 0x380 + 84, 0x0000); // DS: null, and perfectly ordinary in V86
     put16(&mut memory, 0x380 + 88, 0x0000); // FS
     put16(&mut memory, 0x380 + 92, 0x0000); // GS
     let mut bus = TestBus::with_memory(memory);
@@ -3151,7 +3151,7 @@ fn task_switch_into_v86_builds_a_null_data_selector_as_a_real_mode_segment() {
 #[test]
 fn task_switch_into_protected_mode_still_builds_a_null_data_selector_as_unusable() {
     // The companion to the case above, and the reason the repair must be VM-gated: outside
-    // V86 a null selector really is the null descriptor -- loadable without fault, base 0,
+    // V86 a null selector really is the null descriptor: loadable without fault, base 0,
     // limit 0, and #GP on the first access through it (386 PRM 6.3.3).
     let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
     let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
@@ -3177,7 +3177,7 @@ fn task_switch_into_protected_mode_still_builds_a_null_data_selector_as_unusable
     put16(&mut memory, 0x380 + 72, 0x10); // ES
     put16(&mut memory, 0x380 + 76, 0x08); // CS
     put16(&mut memory, 0x380 + 80, 0x10); // SS
-    put16(&mut memory, 0x380 + 84, 0x0000); // DS -- the null descriptor
+    put16(&mut memory, 0x380 + 84, 0x0000); // DS: the null descriptor
     let mut bus = TestBus::with_memory(memory);
 
     cpu.cycle(&mut bus).unwrap();
@@ -3271,7 +3271,7 @@ fn ring3_software_int_through_a_dpl0_gate_general_protection_faults() {
 
 #[test]
 fn ring3_into_through_a_dpl0_gate_general_protection_faults() {
-    // "INT n, INT 3, or INTO" -- the overflow trap takes the same rule.
+    // "INT n, INT 3, or INTO": the overflow trap takes the same rule.
     let (mut cpu, memory) = protected_cpu_with_idt_gate(4, 0x8e); // P, DPL 0
     let mut bus = TestBus::with_memory(memory);
     descend_to_ring3(&mut cpu);

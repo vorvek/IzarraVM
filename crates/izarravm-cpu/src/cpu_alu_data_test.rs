@@ -10,13 +10,13 @@ use super::*;
 fn seam_matches_fused_path_across_addressing_forms() {
     // Historically this diffed a *still-on-Fallback* memory-read opcode through cycle()
     // (decode/execute split) against execute_instruction_legacy (fused) to guard the seam.
-    // After task A14 there is no longer any IMPLEMENTED opcode on Fallback to diff this way —
+    // After task A14 there is no longer any IMPLEMENTED opcode on Fallback to diff this way:
     // every implemented opcode is converted to the split, so the fused executor for each was
     // deleted. `inc word [bx]` (0xff), `test [bx],cx` (0x85), then `xlat` (0xd7) each served as
     // the exemplar in turn and were converted away (`ControlFlow`/`FlagsMisc`/`Misc`). The seam's
     // memory-read + single-fetch-charge behaviour is now covered by the per-group golden
     // batteries (which assert eip, the memory write/read, AND `seam_fetch_count` == golden). Run
-    // XLAT — the last memory-read exemplar, now `DecodeGroup::Misc` — through the split and assert
+    // XLAT (the last memory-read exemplar, now `DecodeGroup::Misc`) through the split and assert
     // it both reads the right table byte AND charges each instruction-fetch byte exactly once.
     let mut mem = vec![0u8; 0x200];
     mem[0] = 0xd7; // XLAT
@@ -407,8 +407,8 @@ struct DataMoveGolden {
 }
 
 /// The data-movement differential battery: MOV/LEA/XCHG across forms and addressing modes, plus the
-/// moffs / immediate / Sreg variants, each with its golden end-state. The two-byte MOVZX/MOVSX forms —
-/// also in `DecodeGroup::DataMove` — have their own battery (`movzx_movsx_golden_cases`), so they are
+/// moffs / immediate / Sreg variants, each with its golden end-state. The two-byte MOVZX/MOVSX forms
+/// (also in `DecodeGroup::DataMove`) have their own battery (`movzx_movsx_golden_cases`), so they are
 /// absent here.
 ///
 /// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
@@ -715,7 +715,7 @@ fn regen_datamove_goldens() {
 
 /// One golden end-state for a MOVZX/MOVSX case run from `movzx_seed` (a real-mode register set with
 /// sentinel bytes/words in memory). The opcode bytes plus expected end gpr, eflags (MOVZX/MOVSX never
-/// touch flags, so this must stay the seed's `0x02`), eip, memory writes (always empty — these are pure
+/// touch flags, so this must stay the seed's `0x02`), eip, memory writes (always empty: these are pure
 /// loads), and InstructionPrefetch fetch count.
 struct MovzxMovsxGolden {
     name: &'static str,

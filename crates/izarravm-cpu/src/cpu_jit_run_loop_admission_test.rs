@@ -44,7 +44,7 @@ const RETF: [u8; 1] = [0xcb];
 const CALL_FAR: [u8; 5] = [0x9a, 0x00, 0x04, 0x20, 0x00];
 /// `JMP FAR 0020:0400`: non-continuable, and (unlike `0x9a`/`0xcb` above) has NO `classify` arm
 /// anywhere in `jit/direct.rs` and is absent from `non_continuable_walk_candidate`'s `matches!`
-/// set -- confirmed by grep, not assumed. This is the negative control the walk-admission gate
+/// set, confirmed by grep, not assumed. This is the negative control the walk-admission gate
 /// needs: an opcode the walk genuinely cannot carry, so a break-site probe at this address must
 /// stay `rejected`/`absent` rather than being wrongly admitted. `0x9a` served this role before L8
 /// gave it a `classify` arm (see `a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled`'s
@@ -53,7 +53,7 @@ const CALL_FAR: [u8; 5] = [0x9a, 0x00, 0x04, 0x20, 0x00];
 const JMP_FAR: [u8; 5] = [0xea, 0x00, 0x04, 0x20, 0x00];
 /// `IMUL BX, [0x0600], 0x0010`, the word form. Non-continuable for the interpreter, IN
 /// `non_continuable_walk_candidate`, and admitted by `jit_admits_non_continuable`, so a compile
-/// walk carries it -- but it is NOT in `non_continuable_break_probe_candidate`, so the run loop
+/// walk carries it, but it is NOT in `non_continuable_break_probe_candidate`, so the run loop
 /// must not probe it at a break site. It also does not transfer control, which is why the fixture
 /// below drives to the self-loop rather than to `TARGET_LINEAR`.
 const IMUL_WORD: [u8; 6] = [0x69, 0x1e, 0x00, 0x06, 0x10, 0x00];
@@ -62,7 +62,7 @@ const IMUL_WORD: [u8; 6] = [0x69, 0x1e, 0x00, 0x06, 0x10, 0x00];
 /// (step two) refuses it anyway. The single `0x66` byte moves TWO of its conjuncts at once:
 /// `operand_size` is `default_32 XOR override`, so it reads `Dword` in this 16-bit segment, and
 /// `insn.prefixes.operand_size_override` is the same bit, so `insn.prefixes != Prefixes::default()`
-/// too -- this shape does not isolate the two terms, and either alone still refuses it. Pins that
+/// too: this shape does not isolate the two terms, and either alone still refuses it. Pins that
 /// the pack bit passing is not sufficient: the run loop must still refuse to key this entry at all,
 /// the same `absent`-forever outcome the `IMUL_WORD` fixture pins for a different reason (an opcode
 /// the probe policy never admits in the first place).
@@ -81,10 +81,10 @@ const STACK_ESP: u32 = 0xdead_0000 | STACK_SP;
 
 const MEMORY_LEN: usize = 0x1_0000;
 
-/// How many times the fixture walks the predecessor. Six is the floor the mechanism needs -- one
+/// How many times the fixture walks the predecessor. Six is the floor the mechanism needs (one
 /// visit to seed `Seen` at the predecessor, one to compile it, one for its first static-unbound
 /// exit, one for the break-site probe to reach `BlockProbe::Compile` at the `RETF`, and one for
-/// the bound link to be taken -- and the extra visits make the "later visits stop growing the
+/// the bound link to be taken) and the extra visits make the "later visits stop growing the
 /// absent class" assertion non-vacuous.
 const VISITS: usize = 10;
 
@@ -101,7 +101,7 @@ fn program(fallthrough: &[u8]) -> Vec<u8> {
     memory[FALLTHROUGH as usize..FALLTHROUGH as usize + fallthrough.len()]
         .copy_from_slice(fallthrough);
     // Self-loops, not `HLT`: this fixture is V86 at CPL 3, where `HLT` is a #GP and the run
-    // would never reach the far transfer at all. Neither self-loop is ever RETIRED -- the driver
+    // would never reach the far transfer at all. Neither self-loop is ever RETIRED: the driver
     // stops the moment EIP arrives.
     memory[taken..taken + 2].copy_from_slice(&[0xeb, 0xfe]);
     memory[TARGET_LINEAR as usize..TARGET_LINEAR as usize + 2].copy_from_slice(&[0xeb, 0xfe]);
@@ -205,7 +205,7 @@ fn class(cpu: &CpuGsw, label: &str) -> u64 {
 /// Every `unbound_targets` row except `absent`, summed structurally off the snapshot's own row
 /// list rather than a hand-maintained label enumeration. `UnboundTarget::ALL` is what backs
 /// `unbound_targets`, and `unbound_target_classes_are_exhaustive` pins that every member appears
-/// there -- so a future ninth variant shows up in this sum automatically instead of needing an
+/// there, so a future ninth variant shows up in this sum automatically instead of needing an
 /// edit here to stay caught, which is the exact failure mode a hand-listed sum would reintroduce.
 fn every_class_but_absent(cpu: &CpuGsw) -> u64 {
     cpu.direct_barrier_census_snapshot()
@@ -320,16 +320,16 @@ fn break_site_admission_does_not_change_the_guest_visible_outcome() {
 /// **UPDATED FOR L8.** This fixture used to be the CONTROL for the RETF fixture above: `0x9a` had
 /// no `classify` arm anywhere in `jit/direct.rs`, so the break-site probe (admitted by
 /// `walk_admits_non_continuable_entry`) would still walk into a structural reject, and the
-/// original assertions here pinned that zero-gain outcome -- `jit_direct.len() == 1`, the class
+/// original assertions here pinned that zero-gain outcome: `jit_direct.len() == 1`, the class
 /// staying `absent` rather than moving to `rejected`.
 ///
-/// **L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`) gives `0x9a` a `classify` arm** --
+/// **L8 of the corpus lever plan gives `0x9a` a `classify` arm**:
 /// `DirectKind::CallFar16`, admitted by `call_far_admitted_here` and folded into
 /// `walk_admits_non_continuable_entry`'s disjunction with NO edit to this predicate itself, which
 /// is exactly the self-opening behaviour the OLD doc comment on this fixture predicted ("at which
 /// point the same predicate admits it with no edit here"). The CALL FAR entry now compiles the
 /// same way the RETF entry above does, so this fixture is rewritten to assert THAT instead of the
-/// old refusal -- it is now the CALL FAR mirror of
+/// old refusal: it is now the CALL FAR mirror of
 /// `a_non_continuable_block_entry_is_admitted_at_the_run_loop_break`, not its control.
 #[test]
 fn a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled() {
@@ -376,7 +376,7 @@ fn a_non_continuable_entry_the_walk_can_now_carry_is_admitted_and_compiled() {
 /// `walk_admits_non_continuable_entry` (`non_continuable_walk_candidate(insn.opcode) && ...` for
 /// each admitted family) must still say NO to an opcode that is genuinely inadmissible: one with
 /// no `classify` arm and absent from `non_continuable_walk_candidate`'s set. Without this test the
-/// gate mechanism has no proof it can ever refuse -- a future bug that made the predicate
+/// gate mechanism has no proof it can ever refuse: a future bug that made the predicate
 /// always-true, or a future non-continuable opcode added to the walk-candidate set without ever
 /// getting a `classify` arm, would go undetected by every other fixture in this file, because they
 /// all exercise opcodes the gate is SUPPOSED to admit.
@@ -424,7 +424,7 @@ fn a_genuinely_inadmissible_non_continuable_entry_stays_absent() {
 /// `Dormant` is the transient half: a heat demote or a clearable compile retry parks a key there
 /// expecting a later probe to lift it back to `Seen`. Break-site probes are the ONLY probes a
 /// non-continuable entry ever gets, so a break-site short circuit on that arm would strand such a
-/// key parked for the life of the process -- the same never-revisited defect this whole file is
+/// key parked for the life of the process, the same never-revisited defect this whole file is
 /// about, narrowed to the entries that lose a first-touch race.
 ///
 /// `TranslationMismatch` is one of the two causes `RetryCause::clearable_by_retry` admits, and the
@@ -480,7 +480,7 @@ fn a_transient_dormant_park_at_a_break_site_entry_still_recovers() {
 /// automatically an opcode the run loop probes at a break site.
 ///
 /// `walk_admits_non_continuable_entry` is a capability test and it says yes to word `IMUL`, word
-/// `LES`/`LDS` and `OUT` -- all three have `classify` arms and all three are in
+/// `LES`/`LDS` and `OUT`: all three have `classify` arms and all three are in
 /// `jit_admits_non_continuable`. Reaching the break-site probe through that test alone priced
 /// duke3d-586 at -5.7%: 2.79 M probes across those three families bought 92 blocks, and the block
 /// keys and rejected watch spans they minted moved `jit_direct_blocks_installed` 200,711 ->
@@ -525,13 +525,13 @@ fn a_walk_admissible_non_probe_opcode_is_never_probed_at_a_break_site() {
 
 /// STEP TWO of the break-probe gate, pinned separately from step one (the previous fixture).
 /// `PACK_FLAG_NONCONT_BREAK_PROBE` is written from `non_continuable_break_probe_candidate`, which
-/// reads the opcode alone -- so a `0x66`-prefixed `RETF` sets the same pack bit a bare `RETF` does.
+/// reads the opcode alone, so a `0x66`-prefixed `RETF` sets the same pack bit a bare `RETF` does.
 /// The run loop still must not key this entry: `walk_admits_non_continuable_entry` also runs
 /// `retf_admitted_here`, and the `0x66` byte moves two of its conjuncts at once (see
-/// `RETF_OPSIZE_OVERRIDE`'s doc) -- `insn.operand_size == OperandSize::Word` and
+/// `RETF_OPSIZE_OVERRIDE`'s doc): `insn.operand_size == OperandSize::Word` and
 /// `insn.prefixes == Prefixes::default()` each independently refuse this shape, so removing either
 /// one alone still leaves the fixture green; the red-proof below drops both. Without step two the
-/// entry would be KEYED and PARKED (`seen` 1, `dormant_other` 7) rather than staying absent --
+/// entry would be KEYED and PARKED (`seen` 1, `dormant_other` 7) rather than staying absent,
 /// never compiled, since the lowering itself still refuses the Dword width one step later, but the
 /// key and its watch-span residue are the permanent cost the gate exists to avoid.
 #[test]
@@ -539,7 +539,7 @@ fn a_0x66_prefixed_retf_still_refuses_the_break_probe() {
     let (mut cpu, mut bus) = staged_with(true, &RETF_OPSIZE_OVERRIDE);
     // `program()` lays down a far-return frame sized for a 16-bit RETF: a word offset then a word
     // selector. This opcode pops a 32-bit offset then a 16-bit selector, so the frame is widened
-    // to match -- `TARGET_OFFSET` fits in 16 bits, so its top half is zero and the selector moves
+    // to match: `TARGET_OFFSET` fits in 16 bits, so its top half is zero and the selector moves
     // out two bytes to make room for it.
     let sp = STACK_SP as usize;
     bus.memory[sp..sp + 4].copy_from_slice(&u32::from(TARGET_OFFSET).to_le_bytes());

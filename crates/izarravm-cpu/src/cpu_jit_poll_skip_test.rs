@@ -9,7 +9,7 @@
 use super::*;
 
 /// **M-28.** The `IZARRAVM_DIRECT_POLL_SKIP` spelling table: unset and `""` name the SAME arm
-/// (the default, ON since the 2026-08-27 owner approval) -- the `IZARRAVM_CHAIN_ENTRY_CHECK` /
+/// (the default, ON since the 2026-08-27 owner approval), the `IZARRAVM_CHAIN_ENTRY_CHECK` /
 /// `IZARRAVM_JCC_SHADOW` shape, deliberately NOT `IZARRAVM_ATA_POLL_SKIP`'s (design §6).
 #[test]
 fn direct_poll_skip_spelling_table() {
@@ -32,7 +32,7 @@ fn direct_poll_skip_spelling_table() {
     }
 }
 
-/// A mistyped ladder leg must PANIC rather than silently run the default -- the one wrong
+/// A mistyped ladder leg must PANIC rather than silently run the default: the one wrong
 /// conclusion an arm ladder exists to avoid.
 #[test]
 #[should_panic(expected = "IZARRAVM_DIRECT_POLL_SKIP")]
@@ -40,7 +40,7 @@ fn a_mistyped_direct_poll_skip_arm_panics() {
     let _ = jit::direct::parse_direct_poll_skip_arm_for_test(Ok("yes".to_string()));
 }
 
-/// Non-UTF-8 is not a spelling of either arm -- reaches the panic, not the unset silence.
+/// Non-UTF-8 is not a spelling of either arm: it reaches the panic, not the unset silence.
 #[test]
 #[should_panic(expected = "IZARRAVM_DIRECT_POLL_SKIP")]
 fn non_utf8_direct_poll_skip_arm_panics() {
@@ -63,7 +63,7 @@ fn direct_poll_skip_ships_on_by_default() {
         "the process-wide reading must agree with the spelling table applied to \
          IZARRAVM_DIRECT_POLL_SKIP={ambient:?}"
     );
-    // GP2 poll-skip revision review N5: `ambient.is_err()` alone is imprecise here -- it reads as
+    // GP2 poll-skip revision review N5: `ambient.is_err()` alone is imprecise here: it reads as
     // covering every `VarError`, but `NotUnicode` would already have panicked one line up (inside
     // `parse_direct_poll_skip_arm_for_test`, pinned by `non_utf8_direct_poll_skip_arm_panics`
     // above), so this branch is only ever reached for `NotPresent` in practice. Spell that out
@@ -261,7 +261,7 @@ fn a_sixteen_bit_shape_over_a_big_limit_segment_is_volatile() {
 /// The second half drives the INTERPRETER's own entry point rather than the raw scanner,
 /// and it is the row that catches a hardcoded `true` at `build_poll_loop`'s call: a
 /// 32-bit D1b shape must NOT certify there. That is also D1b-6's scope decision as an
-/// assertion -- the `0x84` test slot is not inherently 16-bit, and admitting it for
+/// assertion: the `0x84` test slot is not inherently 16-bit, and admitting it for
 /// 32-bit code would move gp2-586, which is this slice's control. A control that moves
 /// is not a control.
 #[test]
@@ -284,10 +284,10 @@ fn the_sixteen_bit_parameter_gates_the_three_slot_shape() {
 
 /// **T-D3.** D1 opened exactly ONE shape family. The 5-slot setup shape and the M1
 /// memory shape stay refused in a 16-bit segment even with `sixteen_bit_ok`, and they
-/// refuse CACHEABLY -- their `Dword` operand/address-size terms are code-byte facts.
+/// refuse CACHEABLY: their `Dword` operand/address-size terms are code-byte facts.
 #[test]
 fn sixteen_bit_admission_opens_exactly_one_shape_family() {
-    // `mov edx,ecx / sub eax,eax / in al,dx / test al,8 / jnz -9` -- the 5-slot form.
+    // `mov edx,ecx / sub eax,eax / in al,dx / test al,8 / jnz -9`: the 5-slot form.
     let setup = [0x89u8, 0xca, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x75, 0xf7];
     let (cpu, _bus) = warm_poll_code(&setup, &[0, 2, 4, 5, 7], false, 0x0000_ffff, 0);
     let outcome = build_poll_loop_from(&cpu, POLL16_ENTRY, true);
@@ -297,7 +297,7 @@ fn sixteen_bit_admission_opens_exactly_one_shape_family() {
         outcome_name(&outcome)
     );
 
-    // `cmp ecx,[disp32] / jnz -8` -- the M1 memory form's 32-bit bytes.
+    // `cmp ecx,[disp32] / jnz -8`: the M1 memory form's 32-bit bytes.
     let memory = [0x3bu8, 0x0d, 0x00, 0x20, 0x00, 0x00, 0x75, 0xf8];
     let (cpu, _bus) = warm_poll_code(&memory, &[0, 6], false, 0x0000_ffff, 0);
     let outcome = build_poll_loop_from(&cpu, POLL16_ENTRY, true);
@@ -373,8 +373,8 @@ fn the_two_test_encodings_charge_and_flag_identically() {
     }
 }
 
-/// **T-D1b-1.** The register-mask variant of the 3-slot shape -- `IN AL,DX` /
-/// `TEST AL,AH` (`84 E0`) / `Jcc rel8` -- certifies in a 16-bit code segment with the
+/// **T-D1b-1.** The register-mask variant of the 3-slot shape (`IN AL,DX` /
+/// `TEST AL,AH` (`84 E0`) / `Jcc rel8`) certifies in a 16-bit code segment with the
 /// SAME descriptor as the immediate form: `raw_core_clocks == 17`, three fetches. Its
 /// mask is recorded SYMBOLICALLY (`PollMaskSource::Ah`) and is not read at
 /// certification. This is 81.68% of tyrian's declines, including the single hottest
@@ -407,7 +407,7 @@ fn the_register_mask_poll_shape_certifies_with_a_symbolic_mask() {
 /// CACHEABLY, because each rejection is a pure code-byte fact.
 ///
 /// `84 C4` (`TEST AH,AL`) is included deliberately. AND is commutative, so it is the
-/// SAME test with identical flags -- and it is still refused. The accepted set is
+/// SAME test with identical flags, and it is still refused. The accepted set is
 /// exactly one encoding, on purpose and fail-closed; a future site using the mirrored
 /// form is a coverage gap to be diagnosed, not a bug to be hunted.
 #[test]
@@ -439,7 +439,7 @@ fn every_other_register_mask_encoding_refuses_cacheably() {
 /// from the "every shape slot opcode is in the set" rule instead.
 ///
 /// Adding it would have widened the INTERPRETER's cheap early-out on a common
-/// instruction -- `TEST r/m8,r8` -- turning a free prefilter reject into a negative-cache
+/// instruction, `TEST r/m8,r8`, turning a free prefilter reject into a negative-cache
 /// probe and, once per page generation, a full ten-probe scan, on a path no ladder arm
 /// exercises. The exemption is sound because `poll_head_possible` is reachable only with
 /// `sixteen_bit_ok == false`, under which the D1b arm cannot produce a shape at all.
@@ -473,7 +473,7 @@ fn the_register_mask_test_slot_is_exempt_from_the_head_prefilter_set() {
 ///
 /// **The `""` row moves WITH the default arm, deliberately, and that is why it is written
 /// as "the same arm as unset" rather than as a literal.** The invariant it defends is the
-/// AGREEMENT between the two spellings -- what stops a nulled PowerShell variable (present
+/// AGREEMENT between the two spellings: what stops a nulled PowerShell variable (present
 /// and empty) from naming a different arm than an unset one. The flip moves both together;
 /// it does not weaken the row. The cost is that the nulling trap now points at the OFF
 /// leg: an OFF leg must export `0`.
@@ -505,7 +505,7 @@ fn a_mistyped_direct_poll_skip_16_arm_panics() {
     let _ = jit::direct::parse_direct_poll_skip_16_arm_for_test(Ok("yes".to_string()));
 }
 
-/// Non-UTF-8 is not a spelling of either arm -- it reaches the panic, not the unset
+/// Non-UTF-8 is not a spelling of either arm: it reaches the panic, not the unset
 /// silence.
 #[test]
 #[should_panic(expected = "IZARRAVM_DIRECT_POLL_SKIP_16")]
@@ -544,8 +544,8 @@ fn direct_poll_skip_16_ships_on_by_default() {
 /// be load-bearing: a changed AH, an SMC restamp (page insert generation), or a different
 /// slot must each re-enter the scan rather than inherit a stale refusal.
 ///
-/// The memo exists because a `Found` is never written to the negative cache -- positives
-/// are rebuilt on every call so an SMC restamp replaces the descriptor -- so a site whose
+/// The memo exists because a `Found` is never written to the negative cache: positives
+/// are rebuilt on every call so an SMC restamp replaces the descriptor, so a site whose
 /// shape certifies structurally but whose live AH is not `0x01`/`0x08` would otherwise pay
 /// a full ten-probe backward scan on EVERY read. There is no scan counter to assert
 /// against, so the mechanism is pinned here structurally and its RATE is pinned at runtime
@@ -602,7 +602,7 @@ fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
 //      => every_other_register_mask_encoding_refuses_cacheably RED.
 //      This row needed the fixture fixed before it could fire. With `mod == 3`
 //      also required, `84 27` was refused by the ModRM triple and the operand
-//      term could never be load-bearing -- a gate that cannot fail. The check is
+//      term could never be load-bearing, a gate that cannot fail. The check is
 //      now `reg == 4` plus `DecodedOperand::Reg(0)`, and the `84 20` row
 //      (`TEST [BX+SI],AH`, whose reg/rm fields match `84 E0`'s exactly) is what
 //      the operand term alone refuses.
@@ -615,7 +615,7 @@ fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
 //      This row also needed the fixture strengthened. Driving the raw scanner
 //      with `false` cannot see a mutated call site, and a 16-bit head is refused
 //      by poll_head_possible's `!d` first, so the row that fires is the 32-bit
-//      D1b shape refusing through `cpu.poll_loop()` -- which is D1b-6's
+//      D1b shape refusing through `cpu.poll_loop()`, which is D1b-6's
 //      gp2-stays-a-control decision as an assertion.
 //   6. Change raw_core_clocks 17 -> 16 on the 3-slot arm
 //      => both 16-bit certification rows RED.
@@ -636,7 +636,7 @@ fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
 //   * Feeding `fresh_iteration_spins` and `req.status_mask` independently-derived
 //     masks. Not expressible any more: with_resolved_mask returns a settled COPY
 //     and both fields read `poll.status_mask()`, so there is exactly ONE
-//     derivation by construction -- which is the obligation, obtained
+//     derivation by construction, which is the obligation, obtained
 //     structurally. A mutation that substitutes an arbitrary CONSTANT at one of
 //     the two uses is a different defect, and it survives: it inverts
 //     spins_when_bit_set, the seam declines NotSpinning while the guest is
@@ -658,8 +658,8 @@ fn the_mask_decline_memo_keys_on_the_slot_the_mask_and_the_page_generation() {
 /// epoch 2 that one term becomes Intel's column for the mode the CPU is actually in, so an
 /// elided iteration advances the guest clock by exactly what the executed `IN` would have.
 ///
-/// The four expected values are written as literals -- Intel's `IN` 7 / 4 / 21 / 19 times the
-/// I586 `level_timing` denominator 12 -- rather than read back from the table under test.
+/// The four expected values are written as literals (Intel's `IN` 7 / 4 / 21 / 19 times the
+/// I586 `level_timing` denominator 12) rather than read back from the table under test.
 ///
 /// Epoch 1 must return the shape's own 17 in every column, byte-identically: that is the
 /// knob-unset merge bar.

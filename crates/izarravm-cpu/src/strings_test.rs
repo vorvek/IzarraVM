@@ -23,9 +23,9 @@ const ALL_PERSONAS: [(GswMode, CpuPersona); 3] = [
     (GswMode::Gsw586, CpuPersona::I586),
 ];
 
-/// T11 (code-smell batch 2, S2), corrected per the adversarial review's finding 9: the oracle
+/// T11 (code-smell batch 2, S2), corrected per finding 9: the oracle
 /// calls `level_timing_for_test`, never a hardcoded copy of its literals, so this is blind to
-/// nothing -- a future change to `level_timing` that `rep_core_upper`'s match does not follow
+/// nothing: a future change to `level_timing` that `rep_core_upper`'s match does not follow
 /// makes this fail, rather than comparing two copies of the same numbers written by the same
 /// change.
 ///
@@ -66,7 +66,7 @@ fn rep_core_upper_matches_the_pre_slice_divide_for_every_reachable_input() {
     }
 }
 
-/// Review finding 11: the 21 `rep_resume_active = true` cases in the identity test above all
+/// The 21 `rep_resume_active = true` cases in the identity test above all
 /// collapse to `0 == 0` and exercise no divide at all. Restated as its own assertion so a reader
 /// does not have to notice that on their own; the 21 `false` cases are the ones that matter for
 /// mutation coverage.
@@ -104,7 +104,7 @@ fn rep_core_upper_uses_the_live_epoch_two_port_setup_tariff() {
 /// (code-smell batch 2, S4; the other two, DF=1 and overlap, are pinned in
 /// cpu_strings_segments_test.rs, which has the bus access this one does not need).
 /// `string_forward_chunk_iterations` clamps `max_bytes` to `0x1000 - (linear & 0x0fff)`, so its
-/// result can never exceed one page (4096 bytes) regardless of how large CX is -- exactly the
+/// result can never exceed one page (4096 bytes) regardless of how large CX is, exactly the
 /// bound RepBulkScratch's fixed 4 KiB size assumes. Swept across every byte offset within a page
 /// and every width, with CX large enough that the clamp, not CX, is always what binds.
 #[test]

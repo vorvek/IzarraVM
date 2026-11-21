@@ -3,7 +3,7 @@
 
 //! Native CALL FAR ptr16:16 (`0x9A`) in real mode and V86, behind `IZARRAVM_DIRECT_RETF_V86`.
 //!
-//! L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`, "L7 verdict" and "L8" sections). L7 Part 1
+//! L8 of the corpus lever plan. L7 Part 1
 //! made the Direct dispatcher reachable at a non-continuable block entry; this is Part 2, the
 //! `classify` arm and emitter that let those reachable `0x9A` sites actually compile.
 //!
@@ -148,7 +148,7 @@ fn filler() -> Vec<u8> {
 }
 
 /// `call far selector:offset` (`0x9A imm16 imm16`), or the 0x66-prefixed Dword form
-/// (`0x9A imm32 imm16` -- a 4-byte offset followed by a 2-byte selector, six operand bytes in
+/// (`0x9A imm32 imm16`: a 4-byte offset followed by a 2-byte selector, six operand bytes in
 /// all, NOT four: a `0x66`-prefixed `CALL FAR` widens the offset half only, and the selector
 /// stays a 16-bit far pointer's word regardless of operand size).
 fn call_far(selector: u16, offset: u16, dword: bool) -> Vec<u8> {
@@ -484,7 +484,7 @@ fn a_far_call_in_plain_real_mode_leaves_cpl_at_zero() {
 
 /// SP = 0x0002: the CLEAN wrap, the push-side mirror of `RetFar16`'s own SP = 0xFFFE fixture.
 /// CS is pushed at SS:0x0000 (no wrap: bytes 0x0000-0x0001), and the return IP wraps CLEANLY to
-/// SS:0xFFFE (bytes 0xFFFE-0xFFFF) -- a 16-bit BASE wrap with neither 2-byte access itself
+/// SS:0xFFFE (bytes 0xFFFE-0xFFFF): a 16-bit BASE wrap with neither 2-byte access itself
 /// straddling the 0xFFFF/0x0000 boundary, exactly the shape `RetFar16`'s SP = 0xFFFE fixture
 /// exercises for its two pops. SP ends at 0xFFFE with its high half intact.
 #[test]
@@ -523,10 +523,10 @@ fn sp_zero_retires_natively_and_byte_correct() {
 
 /// SP = 0x0001, named explicitly in the task brief and the genuinely HARD row: the FIRST push
 /// (CS, at `(SP-2)&0xFFFF = 0xFFFF`) is a 2-byte access whose two bytes straddle the
-/// 0xFFFF/0x0000 boundary itself -- byte 0 physically in the top fast-map page, byte 1 in the
+/// 0xFFFF/0x0000 boundary itself: byte 0 physically in the top fast-map page, byte 1 in the
 /// bottom one. **Measured, not assumed**: this DOES side-exit rather than retire (the emitted
 /// guard correctly refuses a genuinely cross-page-after-wrap access instead of writing the second
-/// byte to the wrong physical location), which is the SAFE outcome -- the interpreter then serves
+/// byte to the wrong physical location), which is the SAFE outcome: the interpreter then serves
 /// the instruction from where the block stopped, exactly the fallback every other wide native
 /// access in this file relies on for an ordinary cross-page word. This is a REFUSAL boundary
 /// worth pinning explicitly rather than a defect: `RetFar16`'s own wrap fixture (SP = 0xFFFE) was
@@ -578,7 +578,7 @@ fn native_call_far_charges_exactly_what_the_interpreter_charges() {
 }
 
 /// The far-CALL ledger reaches Rust, once per native far call, and inflates neither the write
-/// counters nor the bus clocks on the way -- the identical shape RETF's own F15 fixture checks
+/// counters nor the bus clocks on the way: the identical shape RETF's own F15 fixture checks
 /// for `far_ret_native`.
 #[test]
 fn the_far_call_ledger_reaches_rust_and_inflates_neither_writes_nor_clocks() {
@@ -615,7 +615,7 @@ fn the_far_call_ledger_reaches_rust_and_inflates_neither_writes_nor_clocks() {
 /// The ledger is MONOTONIC and the deposit COMMITS with the far call itself, not with some later
 /// exit-time copy-out. `direct_stall_snapshot` just reads the live `CpuGsw` cell (see
 /// `far_call_ledger_offset`'s own doc), so nothing about reading it after the first retirement may
-/// drain or reset it -- a second retirement through the identical compiled block must ADD to the
+/// drain or reset it: a second retirement through the identical compiled block must ADD to the
 /// first count. The 2026-08-31 frame-lane design happened to get this right too (its own
 /// `emit_return` copy ran unconditionally on every exit), but it needed that unconditional copy to
 /// get there; this design has no copy step to get wrong in the first place.
@@ -639,8 +639,8 @@ fn far_call_ledger_accumulates_across_repeated_entries_without_draining() {
         "the first entry must retire exactly one far call"
     );
 
-    // Put the role back at the block's entry precondition -- CS the original flat selector, ESP
-    // the pre-call value, EIP at ENTRY -- and run the SAME compiled block a second time.
+    // Put the role back at the block's entry precondition: CS the original flat selector, ESP
+    // the pre-call value, EIP at ENTRY, and run the SAME compiled block a second time.
     roles.native.halted = false;
     roles.native.interrupt_shadow = false;
     roles.native.load_segment_real(SegmentIndex::Cs, 0);
@@ -665,7 +665,7 @@ fn far_call_ledger_accumulates_across_repeated_entries_without_draining() {
 }
 
 /// A block that never lowers a `CallFar16` must never touch the ledger cell at all, and the OFF
-/// arm's escape block -- built to stop BEFORE the CALL FAR entirely -- is the same claim from the
+/// arm's escape block (built to stop BEFORE the CALL FAR entirely) is the same claim from the
 /// other direction. Byte-level rather than counter-level: a stray unconditional touch (the shape
 /// of the bug L8's original frame slot had, before the 2026-09-01 reprice) would still show up
 /// here even if it happened to write zero.
@@ -832,7 +832,7 @@ fn a_fault_on_the_first_far_push_leaves_the_instruction_unstarted() {
 /// instruction un-started, even though the first push's word (CS) may already be physically in
 /// memory: SP is reverted, so nothing architectural ever reads it back. Forced with an unmapped
 /// page rather than a segment limit, because the two pushes' addresses DECREASE (unlike RETF's
-/// two pops, which increase), so an upper-bound SS limit can never separate them -- if the
+/// two pops, which increase), so an upper-bound SS limit can never separate them: if the
 /// higher address (CS) is in bounds, the lower one (the IP) necessarily is too.
 #[test]
 fn a_fault_on_the_second_far_push_leaves_the_instruction_unstarted() {

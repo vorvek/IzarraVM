@@ -170,7 +170,7 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
         // `emit_load_physical` has already excluded NaN and infinity, so the interpreter's two
         // special-pattern branches are unreachable and what remains is its zero branch and its
         // normal branch. Those two are exactly `biased == 0 && fraction == 0` and `biased != 0`,
-        // and the gap between them -- `biased == 0 && fraction != 0`, a subnormal -- is the one
+        // and the gap between them (`biased == 0 && fraction != 0`, a subnormal) is the one
         // input this refuses, because that is where the interpreter stops being exact.
         //
         // Register budget is the reason for the shape rather than the order. RDI holds the host
@@ -213,7 +213,7 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
 
             e.place(sign_and_emit);
             // The sign comes off VALUE0 rather than off a saved copy: the normal path clobbered
-            // RCX with the integer-bit constant, and -0.0 makes this load-bearing -- it is a
+            // RCX with the integer-bit constant, and -0.0 makes this load-bearing: it is a
             // zero whose stored sign-exponent word is 0x8000, not 0.
             e.vmovq_r64_xmm(Reg::RCX, VALUE0);
             e.shift_r64_imm8(5, Reg::RCX, 63);
@@ -224,8 +224,8 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
             e.store_r16_disp32(memory, 8, Reg::RAX);
             emit_pop(e, top);
         }
-        // FISTP m64. The i32 arm above with a wider conversion, a wider store and -- the part
-        // that is not a widening -- a strict low bound; see `emit_fistp_chop_guard`.
+        // FISTP m64. The i32 arm above with a wider conversion, a wider store and (the part
+        // that is not a widening) a strict low bound; see `emit_fistp_chop_guard`.
         NativeX87Insn::StoreI64 { .. } => {
             let memory = context.memory.expect("FISTP m64 needs a host pointer");
             emit_load_physical(e, top, VALUE0, context.side_exit);
@@ -254,7 +254,7 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
         // packed-double mask in an XMM: there is no `vandpd`/`vxorpd`-with-constant helper in the
         // encoder, and a 64-bit round trip is the same instruction count as building the mask
         // would be. `emit_store_physical` re-derives the tag from the stored value, which is what
-        // keeps FCHS on a zero correct -- the interpreter's `set` tags -0.0 as Zero, and so does
+        // keeps FCHS on a zero correct: the interpreter's `set` tags -0.0 as Zero, and so does
         // the `vucomisd` against zero inside `emit_store_physical`.
         NativeX87Insn::SignOp { negate } => {
             emit_load_physical(e, top, VALUE0, context.side_exit);
@@ -285,7 +285,7 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
         // WAIT/FWAIT. The body is EMPTY on purpose: the whole instruction is the gate above, and
         // when `check_gate` is false the gate has already run earlier in this block and still
         // holds (see `NativeX87Insn::Wait` for why that is exact rather than optimistic). No
-        // register, no status bit, no TOP movement -- an emitted WAIT that touched any of them
+        // register, no status bit, no TOP movement: an emitted WAIT that touched any of them
         // would be wrong, because the interpreter's 0x9b arm returns straight out of
         // `execute_fpu_decoded` without reaching `execute_fpu_register` or the FPU state at all.
         NativeX87Insn::Wait => {}
@@ -293,8 +293,8 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Avx
         // runtime value and `vroundsd` takes its mode as an immediate, so the four modes are four
         // emitted instructions with three compares in front of them.
         //
-        // The immediates are `fpu_round_rc`'s four arms in `fpu_round_rc`'s order --
-        // 0 round-to-nearest-even, 1 floor, 2 ceil, 3 truncate -- which is also the RC encoding's
+        // The immediates are `fpu_round_rc`'s four arms in `fpu_round_rc`'s order:
+        // 0 round-to-nearest-even, 1 floor, 2 ceil, 3 truncate, which is also the RC encoding's
         // own order, so the mapping is the identity and there is no translation to get wrong.
         // Bit 3 (0x08) suppresses the precision exception, matching an interpreter that does not
         // model one; without it a host MXCSR flag would move where no guest state does.
@@ -609,7 +609,7 @@ fn emit_condition(e: &mut Encoder, set: u32) {
 ///
 /// `low_exit_cc` is the parameter that is easy to get wrong, and it is genuinely different
 /// between the two widths rather than a copy. For m32 the bound is `-2^31 - 1`, which is exactly
-/// representable, and `trunc(v) >= -2^31` holds for every `v` strictly above it -- so the exit is
+/// representable, and `trunc(v) >= -2^31` holds for every `v` strictly above it, so the exit is
 /// JBE (6), refusing `v <= -2^31 - 1`. For m64 the same reasoning would want `-2^63 - 1`, which
 /// is NOT representable: at that magnitude f64 steps by 2048, so no double lies strictly between
 /// `-2^63 - 1` and `-2^63` and `trunc(v) >= -2^63` collapses to `v >= -2^63`. The exit is

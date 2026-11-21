@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! Differential cover for the lowerings added by the runtime-weighted reject sweep
-//! (`dev_docs/2026-07-30-dispatch-architecture-audit.md` §5d).
+//! (dispatch architecture audit §5d).
 //!
 //! Every case runs the same guest bytes natively and interpreted from identical state and
 //! compares registers, lazy flags, EFLAGS, core clocks and bus clocks. The tested opcode is
@@ -95,7 +95,7 @@ fn differential_full(
     ] {
         // ESP must be live BEFORE compiling, not only before running: a stack-touching slot
         // resolves its store page at compile time, and the default ESP of 0 makes that page
-        // 0xFFFFFFFC, which cannot resolve and returns the whole block as Retry --
+        // 0xFFFFFFFC, which cannot resolve and returns the whole block as Retry,
         // indistinguishable from the opcode still being a barrier.
         cpu.registers.set_esp(STACK_TOP);
         for &linear in &starts {
@@ -315,7 +315,7 @@ fn direction_flag_matches_the_interpreter_from_both_polarities() {
 
 #[test]
 fn shift_by_cl_matches_the_interpreter_for_every_count_class() {
-    // The classes that matter are MASK classes, not magnitudes: 0 (no flag may move at all -- the
+    // The classes that matter are MASK classes, not magnitudes: 0 (no flag may move at all: the
     // merge must be skipped entirely), 1 (OF defined), 2..=31 (OF preserved from the seed), and
     // 32/33 which mask back to 0 and 1. The two garbage seeds carry bits above CL and above the
     // five-bit mask that the host masks away and the lowering must not react to.
@@ -475,7 +475,7 @@ fn cdq_matches_the_interpreter_across_both_sign_boundaries_and_widths() {
     }
 }
 
-/// `0x83 /op r16, imm8` at Word operand size -- the native half of the rejected-row campaign's
+/// `0x83 /op r16, imm8` at Word operand size: the native half of the rejected-row campaign's
 /// Slice 1, and the first WRITING word ALU form the emitter carries.
 ///
 /// The census ranks `0x83 /5` SUB word at 9,776,289 doom dispatcher exits, forty-seven from
@@ -497,7 +497,7 @@ fn word_alu_immediate_forms_match_the_interpreter_for_every_admitted_sub_op() {
     // pairs run below, not two: `differential_full`'s `cpu.alu` priming call leaves CF clear, and
     // `flag(FLAG_CF)` (`core.rs`) routes CF through that live descriptor rather than through
     // `seed_eflags` whenever one exists, so `(0x8d5, true)` alone would never deliver a real CF=1
-    // to a carry reader. `(0x8d7, false)` is what does -- no descriptor in the way, CF comes
+    // to a carry reader. `(0x8d7, false)` is what does: no descriptor in the way, CF comes
     // straight out of `registers.eflags`. `(0x202, false)` and `(0x8d5, true)` are still both run
     // for the pending-descriptor-replacement coverage every op needs, carry or not.
     let ops: [(u8, &str); 8] = [
@@ -578,7 +578,7 @@ fn word_mov_immediate_matches_the_interpreter_for_every_destination() {
 /// operation. ADC (/2) and SBB (/3) joined on the L1 width lift, the same `emit_carry_alu_preloaded`
 /// Word lane that admitted `0x83`'s carry sub-ops; see `word_alu_immediate_forms_match_the_
 /// interpreter_for_every_admitted_sub_op`'s doc for why the `(eflags, live_pending)` loop below runs
-/// THREE pairs rather than two -- `(0x8d7, false)` is the one that actually delivers a live CF=1 to
+/// THREE pairs rather than two: `(0x8d7, false)` is the one that actually delivers a live CF=1 to
 /// a carry reader, since a live pending descriptor routes CF through itself instead.
 #[test]
 fn word_alu_register_forms_match_the_interpreter_for_every_admitted_op() {

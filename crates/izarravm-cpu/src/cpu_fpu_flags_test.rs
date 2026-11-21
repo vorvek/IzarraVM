@@ -408,8 +408,8 @@ fn fpu_split_matches_golden_across_ops() {
     // The x87 FPU opcodes (0xD8-0xDF) and WAIT (0x9B) are converted to the decode/execute split,
     // so their fused arms are deleted and they can no longer be diffed against a fused executor
     // in-tree. Run each case through the split (`exec_one_split`) and assert the architectural
-    // end-state — GPRs, eflags, the FPU control/status/tag words, and the architectural stack
-    // ST(0)..ST(7) — against goldens captured from the pre-split fused path (parent 0b928034)
+    // end-state (GPRs, eflags, the FPU control/status/tag words, and the architectural stack
+    // ST(0)..ST(7)) against goldens captured from the pre-split fused path (parent 0b928034)
     // via `regen_fpu_goldens`. eip + fetch prove decode consumed and charged every byte (opcode +
     // ModRM + displacement) exactly once; the memory deltas prove the store path.
     for g in fpu_golden_cases() {
@@ -880,7 +880,7 @@ fn misc_seed(cpu: &mut CpuGsw) {
     cpu.registers.set_ebp(0x0000_0010);
     cpu.registers.eflags = 0x13; // CF=1, AF=1 (bit 4) on top of the always-1 bit 1
     // Seed a non-trivial x87 tag word. No surviving Misc opcode touches the FPU, so the tag is
-    // an INVARIANT across the whole battery rather than a per-case end-state -- but it is only
+    // an INVARIANT across the whole battery rather than a per-case end-state, but it is only
     // worth pinning if the seeded value is distinctive. Left at the FINIT default the tag would
     // be 0xffff, and a stray `finit()` inside a Misc executor would reproduce it exactly and go
     // unnoticed. Three pushes covering all three non-empty tag encodings (0b01 zero, 0b10
@@ -895,7 +895,7 @@ fn misc_seed(cpu: &mut CpuGsw) {
 /// seed for why this is one shared constant instead of a per-case `MiscGolden` column: the Misc
 /// block is BCD/IMUL/TEST/XLAT/SALC/HLT/CPUID/RDTSC/CMPXCHG8B, none of which reads or writes x87
 /// state, so a per-case column would be the same literal 28 times. Pinning it once still catches
-/// the regression that matters -- a Misc executor that disturbs the FPU -- and additionally
+/// the regression that matters (a Misc executor that disturbs the FPU) and additionally
 /// catches a broken tag computation in the seed path itself.
 /// Derivation: FINIT leaves 0xffff (all eight empty) and TOP 0; the three pushes land on physical
 /// 7, 6 and 5 and rewrite those tag fields to 0b01, 0b10 and 0b00, clearing bits 15-10 to
@@ -1059,8 +1059,8 @@ const MISC_GOLDEN_CASES: &[MiscGolden] = &[
 fn misc_split_matches_golden_across_ops() {
     // The Misc one-off opcodes are converted to the decode/execute split, so their fused arms
     // are deleted and they can no longer be diffed against a fused executor in-tree. Run each
-    // case through the split (`exec_one_split`) and assert the architectural end-state — GPRs,
-    // eflags, the x87 tag word and the memory writes — against goldens captured from the
+    // case through the split (`exec_one_split`) and assert the architectural end-state (GPRs,
+    // eflags, the x87 tag word and the memory writes) against goldens captured from the
     // pre-split fused path (parent f1d65e0f) via `regen_misc_goldens`. eip + fetch prove decode
     // consumed and charged every byte (opcode + ModRM + displacement + immediate) exactly once.
     for g in misc_golden_cases() {
@@ -1098,7 +1098,7 @@ fn misc_split_matches_golden_across_ops() {
     }
 }
 
-/// AAM with a base of 0 is a divide error (#DE) — the only Misc op that faults on its operand,
+/// AAM with a base of 0 is a divide error (#DE), the only Misc op that faults on its operand,
 /// so it is asserted here (through the split) rather than carried as a golden end-state.
 /// (`aam_zero_divisor_is_divide_error` covers the same via `cycle`; this pins the split decode
 /// path specifically: decode fetches the imm8 base, the executor raises #DE on base 0.)
@@ -1433,7 +1433,7 @@ fn fp_timing_identity_does_not_change_fpu_clocks() {
     // The FPU executor charges 20 raw clocks for a register-form arithmetic op
     // (fpu_reg_arith_st0 returns clocks(20)). With fp_timing==(1,1) the identity
     // scale_fp_clocks call must return 20 unchanged, so elapsed_clocks after one cycle
-    // at I486 must equal elapsed_clocks at I586 — proving the FP factor is truly identity
+    // at I486 must equal elapsed_clocks at I586, proving the FP factor is truly identity
     // and does not disturb the existing level_timing scaling.
     //
     // We also push 1.0 into ST0 and ST1 first so FADD does not trap on an empty stack;

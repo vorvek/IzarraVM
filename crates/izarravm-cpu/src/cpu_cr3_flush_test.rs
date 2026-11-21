@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The CR3 code-cache gate (`dev_docs/2026-09-02-cr3-code-cache-gate-design.md`): a two-slot ring
+//! The CR3 code-cache gate: a two-slot ring
 //! of `(cr3 & 0xffff_f000, generation)` that lets `MOV CR3` retain decode lines across a reselect
 //! (R1/R2) instead of flushing the whole decode cache on every write, while a third distinct
 //! value (R3) or any edit to the structures a walk read (R4/R5, the `translation_pages` watch)
@@ -15,7 +15,7 @@
 use super::*;
 
 /// The second directory: points at the SAME table `plant_identity_paging` builds, so A and B map
-/// every identity page -- including the witness's -- to the SAME physical byte. This is what the
+/// every identity page (including the witness's) to the SAME physical byte. This is what the
 /// headline row needs: the property under test is the RING, not a difference in what the two
 /// directories mean.
 const DIR_B: u32 = 0xA000;
@@ -29,7 +29,7 @@ const ALT_FRAME: u32 = 0x5000;
 const ALT_WITNESS_BYTE: u8 = 0xf4; // HLT
 /// A second NOP, at a linear address that does not collide with `WITNESS`'s decode-cache slot
 /// (the cache is direct-mapped, so decoding `WITNESS` itself under B would simply EVICT A's
-/// entry -- an ordinary cache collision, nothing to do with the ring). Used by
+/// entry, an ordinary cache collision, nothing to do with the ring). Used by
 /// `a_second_directory_gets_its_own_generation` to decode something under B without touching A's
 /// slot at all.
 const WITNESS_B: u32 = 0x0500;
@@ -64,7 +64,7 @@ fn plant_two_directory_paging(memory: &mut [u8]) {
 }
 
 /// A paged fixture: `MOV CR3, eax` at `WRITER`, the witness NOP at `WITNESS`, CR3 already `DIR_A`
-/// (set directly on the struct -- the R8 seed row needs this: lines decoded here are decoded
+/// (set directly on the struct: the R8 seed row needs this: lines decoded here are decoded
 /// under a CR3 the ring has never seen selected).
 fn cr3_fixture() -> (CpuGsw, TestBus) {
     cr3_fixture_sized(0x10000)
@@ -98,14 +98,14 @@ fn write_cr3(cpu: &mut CpuGsw, bus: &mut TestBus, value: u32) {
 /// RED on the branch before the ring exists (a second `MOV CR3` write always fully flushed).
 /// The property the ring delivers, and the one a VCPI round trip needs: RETURNING to a directory
 /// restores the lines decoded under it, without a re-decode. `line_live` compares against the
-/// CURRENT generation, so this can only pass by the ring giving A its OWN slot and generation back
-/// -- there is no way to make "B still sees A's line" true without the walk option 2 (design part
+/// CURRENT generation, so this can only pass by the ring giving A its OWN slot and generation back:
+/// there is no way to make "B still sees A's line" true without the walk option 2 (design part
 /// 2(b)) was rejected for, which is why this is stated as "returning restores", not "B sees A".
 ///
 /// This also pins R8 (finding F12): the witness is decoded BEFORE any `MOV CR3` executes (CR3 is
 /// set directly by `cr3_fixture`), so the first write below is the ring's first-ever
 /// `select_context` call. Without the seed rule, that call allocates fresh for B and orphans A's
-/// line -- the SAME line the second write is trying to restore -- so this row is exactly what F12
+/// line: the SAME line the second write is trying to restore, so this row is exactly what F12
 /// named as still red in a ring lacking R8.
 #[test]
 fn returning_to_a_directory_restores_its_decode_lines() {
@@ -163,7 +163,7 @@ fn a_second_directory_gets_its_own_generation() {
     );
 }
 
-// ---- Anti-regression rows, green today (option 1 -- same-value-as-full-flush -- fails these) ---
+// ---- Anti-regression rows, green today (option 1: same-value-as-full-flush, fails these) ---
 
 /// A directory that maps the witness's page to a DIFFERENT physical frame must MISS, and a
 /// re-decode must read the frame's bytes, not merely find the line dead.
@@ -224,12 +224,12 @@ fn pte_edit_under_a_live_cr3_forces_a_redecode() {
     );
 }
 
-/// The #820 non-gate, diagnosed and fixed (design doc `2026-09-02-cr3-jit-half-design.md` (e)).
+/// The #820 non-gate, diagnosed and fixed (CR3 JIT-half design (e)).
 ///
 /// The original row ran the warm-up BEFORE the witness was decoded. That put the fixture's own
 /// order backwards: the warm-up's walk (translating linear page 9 to store page 14's throwaway
 /// PTE at `0x9038`) sets A on the directory's PDE and A+D on page 9's OWN PTE (`0x9024`), each
-/// store landing before F11's mark, so nothing retires there -- but the walk THEN marks `0x8000`
+/// store landing before F11's mark, so nothing retires there, but the walk THEN marks `0x8000`
 /// and `0x9000` as translation structure. `warm_witness` ran next and its OWN code walk touched
 /// page 0's PTE at `0x9000`, which the warm-up had JUST marked, so the ring retired right there,
 /// before the witness line was ever inserted. The final assertion under test was then satisfied
@@ -240,7 +240,7 @@ fn pte_edit_under_a_live_cr3_forces_a_redecode() {
 ///
 /// Fixed by ORDER: run the throwaway store FIRST, before any decode has run, so its walk's marks
 /// land with nothing live to retire. Decode the witness next (its own walk DOES retire against
-/// the now-marked table page -- F11's placement correction doing its job, not a bug; the line is
+/// the now-marked table page: F11's placement correction doing its job, not a bug; the line is
 /// inserted afterward and `warm_witness`'s own assertion is the proof it survived). Only THEN
 /// take the store under test, on an ALREADY-WARM translation for linear page 9 (the throwaway
 /// store's own walk set the page's TLB/FastMap entry dirty), so `translation_a_stores` /
@@ -260,7 +260,7 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
     // that follows the walk lands in the table page the walk just marked, so it is itself a
     // `code_write_watched`-caught translation-page write (measured, not assumed: this table is
     // one of the identity-mapped low pages, so "write into the page holding your own PTE" is a
-    // self-referential shape and cannot avoid marking itself first) -- which is fine; nothing
+    // self-referential shape and cannot avoid marking itself first), which is fine; nothing
     // downstream depends on this store staying silent, only on the STORE UNDER TEST below doing
     // so.
     let throwaway_pte = 0x9000 + 14 * 4;
@@ -275,14 +275,14 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
     )
     .expect("the warm-up store must retire");
 
-    // NOW decode the witness -- AFTER the warm-up, so its walk touches an ALREADY-marked table
+    // NOW decode the witness: AFTER the warm-up, so its walk touches an ALREADY-marked table
     // page and retires there, and the line inserted afterward is the one the store under test
     // must kill.
     warm_witness(&mut cpu, &mut bus);
 
     // The store under test: page 0's PTE at 0x9000, rewritten to ALT_FRAME | 3. Its own
     // translation (linear page 9) reuses the warm-up's already-dirty TLB/FastMap entry for that
-    // page, so it takes no walk of its own -- proved by `translation_a_stores` /
+    // page, so it takes no walk of its own, proved by `translation_a_stores` /
     // `translation_d_stores` not moving across it, below.
     let a_stores_before = cpu.perf_counters().translation_a_stores;
     let d_stores_before = cpu.perf_counters().translation_d_stores;
@@ -328,7 +328,7 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
 }
 
 /// The VCPI server's exact shape: edit A's table while B is selected, then return to A. Option 1
-/// passes every row above and fails this one -- editing under a DIFFERENT live directory is
+/// passes every row above and fails this one: editing under a DIFFERENT live directory is
 /// exactly what same-value elision cannot see.
 #[test]
 fn cross_context_pte_edit_is_observed_on_return() {
@@ -375,8 +375,8 @@ fn dirty_cr3_fixture() -> (CpuGsw, TestBus) {
 
 /// The narrow SMC path handles both ring contexts. A store into a byte carrying a live line under
 /// context A, made while B is selected, kills A's line without a wholesale flush: the kill test
-/// accepts the generation of either ring slot. This has nothing to do with CR3 semantics -- it is
-/// an ordinary SMC store -- which is exactly why it was missed.
+/// accepts the generation of either ring slot. This has nothing to do with CR3 semantics: it is
+/// an ordinary SMC store, which is exactly why it was missed.
 #[test]
 fn cross_context_smc_store_kills_the_other_context() {
     let (mut cpu, mut bus) = dirty_cr3_fixture();
@@ -550,7 +550,7 @@ fn a_tlb_hit_code_translation_is_still_protected() {
     );
 }
 
-/// A third distinct CR3 value with both slots occupied retires everything -- today's behaviour --
+/// A third distinct CR3 value with both slots occupied retires everything (today's behaviour)
 /// and then occupies slot 0 with the new value.
 #[test]
 fn a_third_directory_retires_everything() {
@@ -602,7 +602,7 @@ fn taken_plus_skipped_equals_decode_inval_cr3() {
 }
 
 /// Bar C's divergence check: `wipes_tlb_flush` keeps counting every `MOV CR3` EVENT, ring hit or
-/// not -- the data half (TLB, FastMap, `data_read_pages`/`data_write_pages`) stays unconditional.
+/// not: the data half (TLB, FastMap, `data_read_pages`/`data_write_pages`) stays unconditional.
 #[cfg(feature = "jit")]
 #[test]
 fn wipes_tlb_flush_counts_every_cr3_write_ring_hit_or_not() {
@@ -626,13 +626,13 @@ fn wipes_tlb_flush_counts_every_cr3_write_ring_hit_or_not() {
 // |---|---|---|
 // | force the fast arm unconditionally (never retire on R3) | `a_third_directory_retires_everything` | by hand |
 // | drop `range_hits_translation_page` from `code_write_watched` | **FIXED, no longer a
-//   non-gate** (design doc `2026-09-02-cr3-jit-half-design.md` (e)). The original
+//   non-gate** (CR3 JIT-half design (e)). The original
 //   `pte_edit_with_a_tlb_warm_target_still_retires` ran its warm-up BEFORE the witness decode,
 //   so `warm_witness`'s own walk (not the store under test) did the only retire the row ever
-//   observed -- the row's final assertion was satisfied by an ORDERING accident, not by the
+//   observed: the row's final assertion was satisfied by an ORDERING accident, not by the
 //   mechanism it was built to isolate. Reordered so the warm-up runs FIRST (marking the table
 //   page with nothing live to retire) and the witness decodes SECOND (retiring there, against
-//   the now-marked page -- F11's placement doing its job), leaving the STORE UNDER TEST as the
+//   the now-marked page: F11's placement doing its job), leaving the STORE UNDER TEST as the
 //   only remaining door: `translation_a_stores`/`translation_d_stores` asserted unchanged across
 //   it proves it takes no walk of its own. Verified by hand: forcing `code_write_watched`'s
 //   `range_hits_translation_page` disjunct to `false` now reddens this row (and only this row;

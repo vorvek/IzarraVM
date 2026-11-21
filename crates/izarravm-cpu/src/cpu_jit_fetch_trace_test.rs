@@ -9,8 +9,8 @@
 //! return and per side-exit return, and it opens by loading `NativeExit::trace_ptr` and
 //! comparing it against zero. A bus whose fetches are uniform hands out `trace_ptr == 0`, so
 //! that preamble can only ever fall through its own `jz`. These tests pin BOTH halves: the
-//! preamble really disappears when the bus cannot arm it, and it is really still there — and
-//! still populates the trace — when the bus can.
+//! preamble really disappears when the bus cannot arm it, and it is really still there (and
+//! still populates the trace) when the bus can.
 
 use super::jit_direct::{
     STORE_ENTRY, arm_store_fixture, drive, fresh, prime_direct_store_block, store_exit_program,
@@ -118,13 +118,13 @@ fn a_trace_observing_bus_reinstates_the_preamble_over_an_elided_cache() {
     // that is the only window in which the clear is observable: `try_direct_continuation`
     // synchronises ahead of its own probe, so any fuller drive would have refilled the cache by
     // the time the assertion ran. Asserting only the field flip and the recompiled shape below
-    // would be VACUOUS for the clear — deleting `jit_direct.clear()` from
-    // `sync_native_fetch_trace` passes both (verified by mutation, review finding).
+    // would be VACUOUS for the clear: deleting `jit_direct.clear()` from
+    // `sync_native_fetch_trace` passes both (verified by mutation).
     //
     // MUTATION-VERIFIED, and worth recording which guard wins the race. With the clear deleted,
     // the resident elided block is still Ready, so this continuation ENTERS it and
-    // `run_direct_block`'s `debug_assert_eq!(exit.trace_len == 0, uniform_fetches)` fires first
-    // — a stronger signal than the assertion below, since it catches the dropped observation
+    // `run_direct_block`'s `debug_assert_eq!(exit.trace_len == 0, uniform_fetches)` fires first,
+    // a stronger signal than the assertion below, since it catches the dropped observation
     // itself rather than the bookkeeping. That guard is debug-only; the `len()` assertion is
     // what kills the same mutation in a release-profile test run.
     bus.uniform_native_fetches = false;

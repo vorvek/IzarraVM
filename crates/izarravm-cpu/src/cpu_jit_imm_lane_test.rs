@@ -120,7 +120,7 @@ fn test_bus(memory: Vec<u8>) -> TestBus {
     bus
 }
 
-/// A guest dword store through the ordinary data-write path — the same path a `mov [addr], reg`
+/// A guest dword store through the ordinary data-write path: the same path a `mov [addr], reg`
 /// takes, so it reaches the SMC choke with the physical address already resolved.
 fn guest_store(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, value: u32) {
     cpu.write_memory_bus_width(
@@ -165,7 +165,7 @@ fn lane_fixture(imm: u32) -> (CpuGsw, TestBus, jit::direct::BlockId) {
 ///
 /// The other lane-probe fixture only ever observes `compile_walked` with both lane bits clear,
 /// which a build that hard-coded `imm_lane_matched = false` would pass. This is the fixture that
-/// proves the IMM bit can be set at all — and it is the column §B.4's hypothesis is read out of,
+/// proves the IMM bit can be set at all, and it is the column §B.4's hypothesis is read out of,
 /// so a column stuck at false would refute that hypothesis for free.
 ///
 /// Named for the CI filter (`barrier_census_closure`) rather than for this file's own convention:
@@ -395,7 +395,7 @@ fn decode_range_word_patch_reexecutes_with_exact_state_and_clocks() {
     assert_eq!(native_bus.memory, interpreter_bus.memory);
 }
 
-/// A write to the instruction's OTHER bytes — its opcode and ModRM — is structural and retires the
+/// A write to the instruction's OTHER bytes (its opcode and ModRM) is structural and retires the
 /// block. It overlaps no lane byte, so it is not even a lane rejection.
 #[test]
 fn structural_write_to_the_same_instruction_retires_the_block() {
@@ -429,7 +429,7 @@ fn straddling_write_over_the_lane_retires_the_block() {
     );
 }
 
-/// The page-kind guard, stated positively. A lane is created ONLY from the fetch-page cache — the
+/// The page-kind guard, stated positively. A lane is created ONLY from the fetch-page cache: the
 /// one direct-page cache that cannot hold a device-aperture pointer, because `Bus::direct_page`
 /// hands out a video pointer for `DataRead`/`DataWrite` and for no other access kind. With the
 /// fetch entry gone but the data caches warm for the same page, the qualifying ADD must compile
@@ -443,7 +443,7 @@ fn a_page_the_fetch_cache_cannot_see_gets_no_lane() {
     let mut bus = test_bus(image(5));
     decode_at(&mut cpu, &mut bus, &block_starts());
     // Warm the data-write cache for the code page (well past the block's bytes), then drop the
-    // fetch entry — the state every code write already leaves behind, since the choke invalidates
+    // fetch entry: the state every code write already leaves behind, since the choke invalidates
     // the fetch page.
     guest_store(&mut cpu, &mut bus, ENTRY + 0x40, 0x1234_5678);
     cpu.fetch_page.invalidate();
@@ -536,7 +536,7 @@ fn overlapping_block_without_a_lane_retires_while_the_owner_survives() {
 #[path = "cpu_jit_imm_lane_matrix_test.rs"]
 mod matrix;
 
-/// The G1 lane trial's contract (`IZARRAVM_SMC_LANE_TRIAL`, default off — see
+/// The G1 lane trial's contract (`IZARRAVM_SMC_LANE_TRIAL`, default off: see
 /// `lane_trial_enabled` for the measured rationale), driven through the test override because
 /// the env gate is a process-global `OnceLock`: a hot entry chunk spends exactly one compile
 /// per key per epoch, and a lane-bearing compilation installs THROUGH the hot span. The
@@ -544,7 +544,7 @@ mod matrix;
 ///
 /// THE ARM IS STATED, NOT INHERITED, and after the 2026-08-29 budget flip that is load-bearing: the
 /// shipped default is now `MAX_LANE_TRIAL_BUDGET`, so "exactly one compile" is no longer something
-/// the budget enforces here. It holds because the trial's block INSTALLS and survives — every later
+/// the budget enforces here. It holds because the trial's block INSTALLS and survives: every later
 /// probe answers `Ready` and never reaches `BlockProbe::Compile`, so no second grant is ever asked
 /// for. Forcing the shipped arm is what keeps this a test of that, rather than a test of a budget
 /// of 1 that no shipped build runs.

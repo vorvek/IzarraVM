@@ -44,7 +44,7 @@ macro_rules! timing_classes {
 
         impl TimingClass {
             /// Every table-backed class, in table order. `Legacy` is absent by
-            /// construction -- it has no table row.
+            /// construction: it has no table row.
             pub(crate) const ALL: &'static [TimingClass] = &[ $( TimingClass::$name, )+ ];
 
             /// This class's dense index into a [`ClassTable`].
@@ -64,8 +64,8 @@ macro_rules! timing_classes {
             /// The class at a dense index, the inverse of [`TimingClass::index`].
             ///
             /// The JIT's `Load`/`LoadExtend`/`Store` slots store their class as a
-            /// `u8` INDEX where they used to store a raw clock count -- the same
-            /// byte, so the slot does not widen (review B4) -- and this is how a
+            /// `u8` INDEX where they used to store a raw clock count: the same
+            /// byte, so the slot does not widen (review B4), and this is how a
             /// slot turns back into a class at charge time.
             ///
             /// # Panics
@@ -117,7 +117,7 @@ macro_rules! timing_classes {
         /// `I386` has to be a `static` for its address to be stable.
         const I386_ENTRIES: [u16; N_CLASSES] = [ $( $i386, )+ ];
 
-        /// The I486 epoch-2 column (`dev_docs/2026-09-05-486-timing-audit.md` §5).
+        /// The I486 epoch-2 column (486 timing audit §5).
         pub(crate) static I486: ClassTable = ClassTable([ $( $i486, )+ ]);
 
         /// The I586 epoch-2 column (design §3.2 as amended by §9).
@@ -139,9 +139,9 @@ timing_classes! {
     /// `execute.rs` `execute_alu_decoded`, the `0x88`..`0x8b` register forms,
     /// `0x84`/`0x85`, `run.rs`'s `0x40..=0x4f`.
     Reg = (2, 12, 12, "cmp §3 row 1 (1 clk, UV)"),
-    /// ALU with a memory SOURCE (`ADD r, m`) -- Intel's 2-clock load form.
+    /// ALU with a memory SOURCE (`ADD r, m`): Intel's 2-clock load form.
     AluRegMem = (2, 24, 24, "cmp §3 row 3 (2 clk, UV)"),
-    /// ALU with a memory DESTINATION (`ADD m, r`) -- the 3-clock read/modify/write.
+    /// ALU with a memory DESTINATION (`ADD m, r`): the 3-clock read/modify/write.
     AluMemReg = (2, 36, 36, "cmp §3 row 4 (3 clk, UV)"),
     /// `MOV r, m`. One clock on both references; today's 2 is the i386 column.
     MovRegMem = (2, 12, 12, "cmp §3 row 2 (1 clk, UV)"),
@@ -151,10 +151,10 @@ timing_classes! {
     MovImmReg = (2, 12, 12, "cmp §3 row 1 (MOV, 1 clk)"),
     /// `MOV m, imm` (`0xc6`/`0xc7` memory form).
     MovImmMem = (2, 12, 12, "cmp §3 row 2 (1 clk)"),
-    /// `MOV AL/eAX, moffs` and back (`0xa0`..`0xa3`) -- a `MOV r,m` / `m,r` in
+    /// `MOV AL/eAX, moffs` and back (`0xa0`..`0xa3`): a `MOV r,m` / `m,r` in
     /// Intel's table; today's 4 is the i386's moffs penalty.
     MovAccMoffs = (4, 12, 12, "cmp §3 row 2 (1 clk)"),
-    /// `LEA` (`0x8d`) -- address arithmetic, no memory access.
+    /// `LEA` (`0x8d`): address arithmetic, no memory access.
     Lea = (2, 12, 12, "cmp §3 row 1 (LEA, 1 clk)"),
     /// `XCHG` in every form (`0x86`, `0x87`, `0x91..=0x97`), today's
     /// `XCHG_CORE_CLOCKS`.
@@ -163,7 +163,7 @@ timing_classes! {
     MovExtend = (3, 36, 36, "F2 (MOVSX/MOVZX 3) / T10.1 (3)"),
 
     // --- flag and accumulator housekeeping -----------------------------------
-    /// `CLC`/`STC`/`CMC`/`CLD`/`STD`/`SALC` -- the one-byte flag writes.
+    /// `CLC`/`STC`/`CMC`/`CLD`/`STD`/`SALC`: the one-byte flag writes.
     FlagOp = (2, 24, 24, "F2 (CLC/CLD/STC/STD/CMC 2) / T10.1 (2); SALC has no row on either part"),
     /// `CLI` (`0xfa`), today's `CLI_CORE_CLOCKS`.
     Cli = (3, 60, 84, "F2 (CLI 7) / T10.1 (CLI 5); V86 is INT+9, a later mode-keyed sub-slice"),
@@ -202,7 +202,7 @@ timing_classes! {
     PushSeg = (2, 36, 12, "486 §5 (3 clk) / cmp §3 row 1 (1 clk)"),
     /// `POP Sreg` (`0x07`/`0x1f`, `0x0fa1`, `0x0fa9`).
     PopSeg = (7, 36, 24, "486 §5 MovSregReg 36 real / cmp §3 row 15 (2 clk real)"),
-    /// `POP SS` (`0x17`) -- today's `POP_SS_CORE_CLOCKS`, a separate arm from
+    /// `POP SS` (`0x17`): today's `POP_SS_CORE_CLOCKS`, a separate arm from
     /// `PopSeg` because it arms the SS interrupt shadow.
     PopSs = (7, 36, 24, "486 §5 MovSregReg 36 real / cmp §3 row 15 (2 clk real)"),
     /// `PUSHA`/`PUSHAD` (`0x60`), today's `PUSH_ALL_CORE_CLOCKS`.
@@ -246,21 +246,21 @@ timing_classes! {
     /// direct forms. Fast personas use the slower real-mode CALL count for both.
     CallJmpFarMem = (11, 216, 60, "F2 (CALL far indirect 5 real) / T10.1 (18 real)"),
     /// A far `CALL`/`JMP`/`RETF` to a protected-mode CODE SEGMENT at the same
-    /// privilege level -- no gate, no stack switch. The one flat 17 covered
+    /// privilege level: no gate, no stack switch. The one flat 17 covered
     /// this and the three rows below it; the census measures the gate row at
     /// 15.5x under and the TSS row at ~122x.
     FarTransferPm = (17, 408, 264, "F2 (CALL far pm same level 22) / T10.1 (34 clk)"),
     /// A far transfer through a CALL GATE, which switches stacks and copies
     /// parameters.
     FarTransferGate = (17, 828, 528, "F2 (CALL gate different level 44) / T10.1 (69 clk)"),
-    /// A far transfer through a TASK GATE or a TSS selector -- a full task
+    /// A far transfer through a TASK GATE or a TSS selector: a full task
     /// switch, and the single largest missing term the census found.
     ///
     /// It is here AND `TaskSwitch` is charged on the switch path itself,
     /// because a task switch is also reachable from `IRET` with NT set and from
     /// an interrupt through a task gate, which never touch this class.
     FarTransferTss = (17, 2388, 2076, "F2 (CALL far to TSS 173) / T10.1 (199 clk)"),
-    /// `LOOP` (`0xe2`) -- charged taken or not, one arm past both branches.
+    /// `LOOP` (`0xe2`): charged taken or not, one arm past both branches.
     Loop = (11, 84, 66, "486 §5 (7 clk taken) / design §3.2 (5.5 clk)"),
     /// `LOOPE`/`LOOPNE` (`0xe0`/`0xe1`).
     LoopCc = (11, 108, 90, "486 §5 (9 clk taken) / design §3.2 (7.5 clk)"),
@@ -276,10 +276,10 @@ timing_classes! {
     /// an under-charge and is recorded here rather than guessed at.
     IntN = (37, 360, 204, "486 §5 (30 clk real) / cmp §3 row 17 (17 clk real)"),
     /// `INT imm8` taken from **V86** through a trap or interrupt gate to a
-    /// different level -- the mode `IntN` used to serve from one flat 37.
+    /// different level: the mode `IntN` used to serve from one flat 37.
     ///
-    /// This is the row `dev_docs/2026-09-05-v86-port-io-timing-research.md`
-    /// section 1.2 re-anchored: Intel's Interrupt Clock Counts Table gives the
+    /// This is the row the V86 port I/O timing research
+    /// re-anchored: Intel's Interrupt Clock Counts Table gives the
     /// V86 / trap gate, different level entry as **54**, plus **12** on a cache
     /// miss, so 66 clocks and raw 792. The 486's own V86 gate row is 86.
     IntNV86 = (37, 1032, 792, "F2 INT table, V86/trap gate different level 54 +12 miss / 486 §5 (86 clk)"),
@@ -313,7 +313,7 @@ timing_classes! {
     /// tell them apart at charge time. The 486 prices them differently (2 vs 3
     /// clocks) and the 586 does not (1 clock either way), so keeping them apart
     /// would buy one clock on one persona at the cost of native and interpreted
-    /// code charging differently for the same instruction -- the exact
+    /// code charging differently for the same instruction, the exact
     /// divergence the arm-equality bar exists to stop. The shared entry takes the
     /// SLOWER of the two 486 counts, per the owner's 12:15 ruling.
     ShiftImm = (2, 36, 12, "486 §5 (3 clk, the slower of 2/3) / cmp §3 row 11 (1 clk, PU)"),
@@ -330,20 +330,20 @@ timing_classes! {
     // --- group 3 (`0xf6`/`0xf7`), SPLIT -------------------------------------
     // Design §9.1's headline finding: one `clocks(2)` used to serve all seven
     // sub-opcodes at every width, giving `DIV EAX, ECX` the cost of
-    // `MOV EAX, EBX` -- 0.167 guest clocks against Intel's 41, a **246x**
+    // `MOV EAX, EBX`: 0.167 guest clocks against Intel's 41, a **246x**
     // under-charge. The interpreter splits on `modrm.reg` plus the operand
     // shape; the JIT splits on the kind, since `classify` already produces
     // separate `MulReg`/`MulMemAcc`/`ImulRegAcc`/`ImulMemAcc`/`DivReg`/`DivMem`/
     // `NegReg`/`TestImmReg`/`TestImmMem` kinds and admits them at Dword only.
-    /// `TEST r, imm` -- group 3 `/0` register form, and `0xa8`/`0xa9`.
+    /// `TEST r, imm`: group 3 `/0` register form, and `0xa8`/`0xa9`.
     TestImmReg = (2, 12, 12, "cmp §3 row 1 (1 clk)"),
-    /// `TEST m, imm` -- group 3 `/0` memory form, a load rather than an RMW.
+    /// `TEST m, imm`: group 3 `/0` memory form, a load rather than an RMW.
     TestImmMem = (2, 24, 24, "cmp §3 row 3 (2 clk load)"),
-    /// `NOT`/`NEG r` -- group 3 `/2`, `/3` register form.
+    /// `NOT`/`NEG r`: group 3 `/2`, `/3` register form.
     NotNegReg = (2, 12, 12, "cmp §3 row 1 (1 clk)"),
-    /// `NOT`/`NEG m` -- group 3 `/2`, `/3` memory form, a read/modify/write.
+    /// `NOT`/`NEG m`: group 3 `/2`, `/3` memory form, a read/modify/write.
     NotNegMem = (2, 36, 36, "cmp §3 row 4 (3 clk RMW)"),
-    /// `MUL`/`IMUL r/m8` -- group 3 `/4`, `/5` at byte width. One class for both
+    /// `MUL`/`IMUL r/m8`: group 3 `/4`, `/5` at byte width. One class for both
     /// sub-opcodes because both references price them together (comparison
     /// §3 row 13; audit §5 `Mul` 8/16/32).
     Mul8 = (2, 216, 132, "F2 p.F-13 (MUL/IMUL r/m8 11) / T10.1 note 3 (13-18, slow end)"),
@@ -351,13 +351,13 @@ timing_classes! {
     Mul16 = (2, 312, 132, "F2 p.F-13 (11) / T10.1 note 3 (13-26, slow end)"),
     /// `MUL`/`IMUL r/m32`.
     Mul32 = (2, 504, 120, "F2 p.F-13 (10) / T10.1 note 3 (13-42, slow end)"),
-    /// `DIV r/m8` -- group 3 `/6` at byte width.
+    /// `DIV r/m8`: group 3 `/6` at byte width.
     Div8 = (2, 192, 204, "F2 p.F-13 (DIV r/m8 17) / T10.1 (16)"),
     /// `DIV r/m16`.
     Div16 = (2, 288, 300, "F2 p.F-13 (25) / T10.1 (24)"),
-    /// `DIV r/m32` -- the 246x row itself.
+    /// `DIV r/m32`: the 246x row itself.
     Div32 = (2, 480, 492, "F2 p.F-13 (41) / T10.1 (40) -- design section 9.1's 246x row, sourced digit for digit"),
-    /// `IDIV r/m8` -- group 3 `/7` at byte width.
+    /// `IDIV r/m8`: group 3 `/7` at byte width.
     Idiv8 = (2, 240, 264, "F2 p.F-13 (IDIV r/m8 22) / T10.1 (19 reg, 20 mem, slow end)"),
     /// `IDIV r/m16`.
     Idiv16 = (2, 336, 360, "F2 p.F-13 (30) / T10.1 (27 reg, 28 mem)"),
@@ -374,7 +374,7 @@ timing_classes! {
     // --- bit operations ------------------------------------------------------
     /// `BT`/`BTS`/`BTR`/`BTC` in both encodings, today's `BIT_STRING_CORE_CLOCKS`.
     BitTest = (6, 96, 108, "F2 (BT 4-9, slow end 9) / T10.1 (BT 3-8, slow end 8)"),
-    /// `BTS`/`BTR`/`BTC` in both encodings -- the read/modify/write bit ops,
+    /// `BTS`/`BTR`/`BTC` in both encodings: the read/modify/write bit ops,
     /// which lock their memory form and cost 13 clocks on both parts where `BT`
     /// costs 8-9.
     BitTestModify = (6, 156, 156, "F2 (BTS/BTR/BTC mem,reg 13, locked) / T10.1 (13)"),
@@ -434,13 +434,13 @@ timing_classes! {
     Rdmsr = (11, 132, 288, "F2 (RDMSR 20-24 MN/MX, slow end); no MSRs on a 486DX2 -- I486 keeps the literal"),
     /// `INVD` (`0x0f08`).
     Invd = (4, 48, 180, "F2 (INVD 15) / T10.1 (4)"),
-    /// `WBINVD` (`0x0f09`) -- **2000+ clocks on a P5**, against `INVD`'s 15.
+    /// `WBINVD` (`0x0f09`): **2000+ clocks on a P5**, against `INVD`'s 15.
     ///
     /// The two shared one class until the manual sourcing found the spread: a
     /// 133x difference on the Pentium and the single largest hole the pass
     /// turned up. The 486's own spread is 4 vs 5 and would never have shown it.
     /// Intel prints "2000+" rather than a count, so this is a floor, not a
-    /// measurement -- which is the slow side and the side the 12:15 ruling wants.
+    /// measurement, which is the slow side and the side the 12:15 ruling wants.
     Wbinvd = (4, 60, 24000, "F2 (WBINVD 2000+, a printed floor) / T10.1 (5)"),
     /// `CPUID` (`0x0fa2`).
     Cpuid = (14, 168, 144, "F2 (CPUID 12; 14 is often republished, 12 taken as read and flagged); no CPUID on the DX2 stepping -- I486 keeps the literal"),
@@ -459,7 +459,7 @@ timing_classes! {
     OutsString = (14, 240, 156, "F3 (OUTS 13 real) / T10.2 DX2 (20 real; base i486 17). The bus term is P1's"),
     /// `IN AL/eAX, imm8` and `IN AL/eAX, DX`, today's `IN_PORT_CORE_CLOCKS`.
     ///
-    /// P1 (`dev_docs/2026-09-05-port-io-repricing-design.md`) owns the epoch-2
+    /// P1 of the port I/O repricing design owns the epoch-2
     /// port charge and applies it on the BUS side, not here; this row keeps the
     /// core term so a port access does not lose its core cost when the bus term
     /// moves. 486 §5's 168/192 are recorded, not yet reconciled with P1.
@@ -477,18 +477,18 @@ timing_classes! {
     /// Delivering an exception or a V86 monitor trip, from real or protected
     /// mode. `run.rs`'s `Err(Exception)` arm charged a flat 59 for every mode.
     ExceptionDelivery = (59, 828, 480, "F2 INT table, pm trap gate different level 40 / T10.1 (69 clk)"),
-    /// Delivering a V86 monitor trip -- the reflected-call path, and census row
+    /// Delivering a V86 monitor trip: the reflected-call path, and census row
     /// 7: **16.7x under**, the worst row in its group.
     ///
-    /// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 1.2
+    /// The V86 port I/O timing research
     /// re-anchored it: Intel's V86 / trap gate, different level row is 54 plus
     /// 12 on a cache miss, so 66 clocks, and a reflected V86 `IN` costs that
-    /// plus the instruction's own class -- the ~88-100 the research quotes,
+    /// plus the instruction's own class, the ~88-100 the research quotes,
     /// once the `IN` itself is added back.
     ExceptionDeliveryV86 = (59, 1032, 792, "F2 INT table, V86/trap gate different level 54 +12 miss / 486 §5 (86 clk)"),
     /// Delivering a maskable hardware interrupt. `run.rs` charged a flat 61.
     /// The INTA cycles the PIC drives are NOT in this number and are not
-    /// modelled anywhere -- the census lists 8259A INTA as missing entirely.
+    /// modelled anywhere: the census lists 8259A INTA as missing entirely.
     HardwareInterrupt = (61, 372, 192, "F2 INT table, real mode 11 + external INTA / T10.1 (31 clk)"),
     /// Hardware task-switch work, separate from the invoking instruction.
     /// The I386 column retains zero; the fast tables carry the documented term.
@@ -512,7 +512,7 @@ timing_classes! {
     X87MemArithInt32 = (20, 240, 96, "F5 (FIADD/FISUB/FIMUL 7, FICOM 8 latency -- FIDIV split out) / T10.3 via the shipped literal"),
     /// The same family with an m16 integer operand (`0xde`).
     X87MemArithInt16 = (20, 240, 96, "F5 (integer-operand arith 8 latency without FIDIV) / T10.3 via the shipped literal"),
-    /// `FIDIV`/`FIDIVR m32int` (`0xda /6`, `/7`) -- **42 P5 clocks against the
+    /// `FIDIV`/`FIDIVR m32int` (`0xda /6`, `/7`): **42 P5 clocks against the
     /// rest of the family's 7-8**, and 85.5 on the 486 against 20.
     ///
     /// Splitting it is worth more than any other x87 split the sourcing found:
@@ -536,7 +536,7 @@ timing_classes! {
     /// `FILD m32` (`0xdb /0`). Intel's row is `3/1` (latency/throughput); the
     /// 12:15 ruling takes the slow side.
     X87LoadInt32 = (14, 168, 36, "cmp §3 row 20 (FILD m32 3 clk latency, slow side)"),
-    /// **`FIST`/`FISTP m32`** (`0xdb /2`, `/3`) -- the fixed-point boundary the
+    /// **`FIST`/`FISTP m32`** (`0xdb /2`, `/3`): the fixed-point boundary the
     /// Quake span rasterizer lives on, and the row `fp_timing_class`'s x34
     /// absorber was fitted around.
     X87StoreInt32 = (14, 168, 72, "cmp §3 row 20 (FISTP m32 6 clk)"),
@@ -587,7 +587,7 @@ timing_classes! {
     /// because it shares the literal; splitting it needs an epoch-2 source it
     /// does not have yet.
     X87RegConst = (8, 96, 60, "F5 (FLDL2T/L2E/PI/LG2/LN2 5 latency) / T10.3 via the shipped literal (8)"),
-    /// `FXAM` (`0xd9 e5`) -- **21 P5 clocks**, where the five constant loads it
+    /// `FXAM` (`0xd9 e5`): **21 P5 clocks**, where the five constant loads it
     /// used to share a literal with are 5. It is not a constant load and never
     /// was; only the shipped `clocks(8)` put them together.
     X87Xam = (8, 96, 252, "F5 (FXAM 21 latency) / T10.3 (FXAM 8)"),
@@ -623,7 +623,7 @@ timing_classes! {
     X87StatusReg = (3, 36, 72, "F5 (FSTSW AX 6 latency) / T10.3 via the shipped literal"),
     /// `FST ST(i)` / `FSTP ST(i)` register forms (`0xdd /2`, `/3`).
     X87RegStore = (3, 36, 12, "F5 (FST/FSTP ST(i) 1) / T10.3 via the shipped literal"),
-    /// `FCOMPP` (`0xde d9`) and `FUCOMPP` (`0xda e9`) -- compare and pop twice.
+    /// `FCOMPP` (`0xde d9`) and `FUCOMPP` (`0xda e9`): compare and pop twice.
     X87ComparePop = (5, 60, 48, "F5 (FCOMPP/FUCOMPP 4 latency) / T10.3 via the shipped literal"),
 }
 
@@ -650,7 +650,7 @@ impl ClassTable {
         }
     }
 
-    /// The largest charge in the table -- "the epoch's own maximum-class
+    /// The largest charge in the table: "the epoch's own maximum-class
     /// constant" the budget bound needs (review B3).
     ///
     /// Taken over every class, including the x87 and system rows a native JIT
@@ -747,8 +747,8 @@ const _: () = {
 
     // The PORT term is `MAX_PORT_CORE_CLOCKS`, not this table's `InPort`/`OutPort`
     // rows, and the difference is the point. Since the port slices (P1-P3) landed,
-    // a port slot's charge is keyed on the live CPL/IOPL column -- which no class
-    // row can carry -- so `MAX_CALL_OUT_CORE_CLOCKS` prices it at the widest
+    // a port slot's charge is keyed on the live CPL/IOPL column, which no class
+    // row can carry, so `MAX_CALL_OUT_CORE_CLOCKS` prices it at the widest
     // column and the class rows survive only as the poll projection's terms.
     // Folding the class row in here would assert the two authorities agree, which
     // they deliberately do not.

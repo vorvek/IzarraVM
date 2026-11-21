@@ -5,11 +5,11 @@
 //!
 //! Direct-arena only. This module describes exactly one prologue: the Direct backend's
 //! 7 `SAVED_HOST_REGS` pushes then `sub rsp, NATIVE_STACK_LEN`. (The now-removed clif
-//! backend's Cranelift-compiled units had a different prologue shape -- `push rbp; mov
-//! rbp, rsp` -- and never registered against this descriptor for exactly that reason.)
+//! backend's Cranelift-compiled units had a different prologue shape (`push rbp; mov
+//! rbp, rsp`) and never registered against this descriptor for exactly that reason.)
 //!
-//! Every emitted block shares ONE frame shape — the 7 `SAVED_HOST_REGS` pushes then
-//! `sub rsp, NATIVE_STACK_LEN` (see direct.rs, "One frame shape for every block") — so a
+//! Every emitted block shares ONE frame shape: the 7 `SAVED_HOST_REGS` pushes then
+//! `sub rsp, NATIVE_STACK_LEN` (see direct.rs, "One frame shape for every block"), so a
 //! single shared UNWIND_INFO, written once into a metadata page past the arena's code
 //! bytes, serves every sealed span. Registration uses `RtlAddGrowableFunctionTable`, the
 //! API built for JITs: the OS keeps the RUNTIME_FUNCTION array pointer, so the array is
@@ -22,20 +22,20 @@
 //!
 //! Known, accepted gap: x87-bearing blocks save RSI by a plain store (not a push), so a
 //! debugger recovering nonvolatile REGISTERS through an arena frame sees a stale RSI.
-//! Stack WALKS (RIP chains) — the point of this module — are unaffected.
+//! Stack WALKS (RIP chains) (the point of this module) are unaffected.
 //!
 //! Known, accepted gap: five emitted `pushfq`/`popfq` (or `push`/`popfq`) pairs move RSP by
-//! 8 for the span of one instruction each -- `emit_capture_flags` and `emit_load_host_flags`,
+//! 8 for the span of one instruction each: `emit_capture_flags` and `emit_load_host_flags`,
 //! plus the three inlined `pushfq`/`pop rax` sequences in `emit_alu_candidate`,
-//! `emit_double_shift_candidate` and `emit_shift_cl` (all five are in `jit/direct.rs`)
-//! -- while the UNWIND_INFO above asserts a constant RSP for the whole block body. A sample
+//! `emit_double_shift_candidate` and `emit_shift_cl` (all five are in `jit/direct.rs`),
+//! while the UNWIND_INFO above asserts a constant RSP for the whole block body. A sample
 //! landing inside one of those narrow windows walks the frame one slot short: it reads a
 //! fabricated "return address" out of the saved-RBX slot instead of the honest,
 //! orphan-at-the-arena result registration didn't exist to prevent before this module. The
 //! window is a handful of host instructions out of an entire block body, so the odds of a
 //! sample landing there are small, and accepting it avoids the alternative of describing
 //! RSP motion mid-block (`UWOP_SET_FPREG`, or capturing flags through `lahf` instead of
-//! `pushfq` so RSP never moves) -- both of which change emitted bytes, which this phase
+//! `pushfq` so RSP never moves), both of which change emitted bytes, which this phase
 //! forbids. The fix belongs to whichever later phase is already changing the flag-capture
 //! encoding (Phase 2+), not this one.
 //!
@@ -127,7 +127,7 @@ unsafe impl Sync for ArenaUnwind {}
 impl ArenaUnwind {
     /// Write the shared UNWIND_INFO into `metadata_page` (one host page situated at
     /// `range_base + code_len`) and register an empty growable table for the range.
-    /// Returns `None` on registration failure — the arena then simply runs unregistered.
+    /// Returns `None` on registration failure, the arena then simply runs unregistered.
     pub(crate) fn new(
         range_base: *const u8,
         code_len: usize,

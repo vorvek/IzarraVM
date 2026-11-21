@@ -316,7 +316,7 @@ fn stack_golden_cases() -> &'static [StackGolden] {
 /// writes don't bleed into later cases.
 fn stack_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[..code.len()].copy_from_slice(code);
-    // POP tests: plant 0xBEEF at ss:0x1f0 (the initial SP — the first word a POP reads).
+    // POP tests: plant 0xBEEF at ss:0x1f0 (the initial SP, the first word a POP reads).
     mem[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
 }
 
@@ -766,7 +766,7 @@ fn group_div_by_zero_raises_de_through_the_split() {
     // test). `div bl` (F6 /6, mod=11 rm=011) with BL = 0 must raise the divide error. The
     // group 3 fused arm is deleted on this branch, so this drives the decode/execute split
     // (exec_one_split) directly and asserts the raw fault is the deliverable
-    // `InternalFault::Exception { vector: 0, .. }` (#DE, no error code) -- `exec_one_split`
+    // `InternalFault::Exception { vector: 0, .. }` (#DE, no error code): `exec_one_split`
     // runs below `finish_instruction`/`deliver_exception`, so this checks the raise site
     // itself, not the delivered frame. The `div` helper checks divide-by-zero BEFORE any
     // register write, and `decode` consumes exactly the F6 + ModRM bytes (no immediate for
@@ -814,9 +814,9 @@ fn group_div_by_zero_raises_de_through_the_split() {
 
 /// One golden end-state for a relative/loop branch case (task A6a). Adds `cx` to the shared
 /// golden shape so a single battery can drive both the taken and not-taken LOOP/JCXZ/LOOPcc
-/// outcomes (which differ only in the post-decrement count) from one seed — `branch_seed`
+/// outcomes (which differ only in the post-decrement count) from one seed: `branch_seed`
 /// overwrites CX with this per-case value before the instruction runs. The captured fields are
-/// the standard set: end gpr (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip (the branch target — the key
+/// the standard set: end gpr (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip (the branch target: the key
 /// assertion for this group), (offset,value) memory writes (CALL's pushed return address), and
 /// the InstructionPrefetch fetch count.
 struct BranchGolden {
@@ -874,7 +874,7 @@ fn branch_golden_cases() -> &'static [BranchGolden] {
             deltas: &[],
             fetch: 2,
         },
-        // Jcc short with a backward (negative) rel8 — exercises the sign-extension.
+        // Jcc short with a backward (negative) rel8, exercises the sign-extension.
         BranchGolden {
             name: "jz -2 taken backward (74, ZF set)",
             code: &[0x74, 0xfe],

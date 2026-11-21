@@ -1,8 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `0xE4` IN AL,imm8 -- the `PortReadAlImm8` call-out, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
-//! (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3, gp2's B2 residue).
+//! `0xE4` IN AL,imm8: the `PortReadAlImm8` call-out, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
+//! (in-imm8 call-out design rev 3, gp2's B2 residue).
 //!
 //! This file covers the KNOB and the `classify` ARM: whether `0xE4` reaches the compile walk at
 //! all, and with what `port` baked into the slot. The HELPER's own contract (status encoding,
@@ -43,7 +43,7 @@ fn flat_cpu() -> CpuGsw {
     cpu
 }
 
-/// Resets the thread-local override to the ambient reading when dropped -- including on unwind
+/// Resets the thread-local override to the ambient reading when dropped, including on unwind
 /// (ROUND-3 review m3-6), which is what a plain trailing
 /// `set_direct_in_imm8_callout_for_test(None)` does not do: a panic partway through a fixture used
 /// to skip it, and under `--test-threads=1` a leaked `Some(true)` could silently arm a later
@@ -99,7 +99,7 @@ fn in_imm8_callout_ships_on_by_default() {
 }
 
 /// The spelling table (mutant table gate 1): unset and `""` must BOTH parse `true` (the
-/// default, ON since the 2026-08-27 flip) -- one convention, not `IZARRAVM_ATA_POLL_SKIP`'s
+/// default, ON since the 2026-08-27 flip): one convention, not `IZARRAVM_ATA_POLL_SKIP`'s
 /// inverted one where `""` disagrees with unset.
 ///
 /// Catches: a `_ => false` fallthrough replacing the panic (a mistyped ladder leg would silently
@@ -171,7 +171,7 @@ fn compile_imm8_block(port: u8) -> Option<jit::direct::Compilation> {
     }
 }
 
-/// With the knob OFF, `0xE4` must stay a barrier -- byte-identical to the pre-slice tree. This is
+/// With the knob OFF, `0xE4` must stay a barrier: byte-identical to the pre-slice tree. This is
 /// the A/B base every ladder leg on this row is read against.
 ///
 /// Catches: a classify arm that forgot its `direct_in_imm8_callout_armed()` guard, i.e. the row
@@ -191,7 +191,7 @@ fn in_imm8_callout_stays_a_barrier_with_the_gate_off() {
 ///
 /// Catches: a missing or wrongly-keyed allowlist term (the block would still refuse to compile);
 /// the port immediate lost or wrong (`callout_port_slots` would still be right, since the DX and
-/// imm8 helpers share the same class predicate, but the emitted slot would serve the wrong port --
+/// imm8 helpers share the same class predicate, but the emitted slot would serve the wrong port,
 /// covered end-to-end by `imm8_call_out_matches_the_interpreter_mid_block` in
 /// `cpu_jit_callout_test.rs`); and the Word-size allowlist term (exercised separately below).
 #[test]
@@ -212,7 +212,7 @@ fn in_imm8_callout_joins_the_block_with_the_gate_on() {
     );
 }
 
-/// `classify` admits `0xE4` for ANY immediate port, unconditionally (rev 3 §1.1, ROUND-2 item 5) --
+/// `classify` admits `0xE4` for ANY immediate port, unconditionally (rev 3 §1.1, ROUND-2 item 5):
 /// there is no per-port allowlist to consult. Two arbitrary ports, one of them the PIT counter
 /// port the design's own port-class table names.
 #[test]

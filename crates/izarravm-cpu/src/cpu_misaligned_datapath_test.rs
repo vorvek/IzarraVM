@@ -11,7 +11,7 @@
 //! * **Value.** The data path never needed the refusal: the direct entries and the FastMap
 //!   pointers already use `read_unaligned`/`write_unaligned`.
 //! * **Reachability.** Page-crossing accesses must STILL split, and the Mode13h aperture must
-//!   still be refused -- its split has different data semantics, not merely different timing.
+//!   still be refused: its split has different data semantics, not merely different timing.
 //! * **Side-effect ordering.** A refused access must install NOTHING. That class of bug changes
 //!   no guest byte and no clock, only which later accesses run fast, so only counters can see it.
 //!
@@ -38,7 +38,7 @@ fn flat_cpu_and_bus() -> (CpuGsw, TestBus) {
 
 /// A PAGED fixture: two adjacent linear pages mapped to two adjacent physical frames, both
 /// writable and both primed into the FastMap. Paging must be ON for any crossing-scoped behaviour
-/// to be reachable at all -- `linear_range_crosses_page` is consulted only when it is.
+/// to be reachable at all: `linear_range_crosses_page` is consulted only when it is.
 fn paged_cpu_and_bus() -> (CpuGsw, TestBus, u32) {
     const DIRECTORY: u32 = 0x1000;
     const TABLE: u32 = 0x2000;
@@ -105,7 +105,7 @@ fn write_sized(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, width: BusWidth
     .unwrap();
 }
 
-/// Every misalignment of every sized width, page-local, is now SERVED by the FastMap -- and the
+/// Every misalignment of every sized width, page-local, is now SERVED by the FastMap, and the
 /// bytes that come back are the bytes that went in.
 ///
 /// The `+0xffd` / `+0xff9` rows are the page-edge cases that are still page-local; they are the
@@ -161,7 +161,7 @@ fn every_page_local_misalignment_is_served_and_round_trips() {
             "{width:?}@{offset:#x}: stored bytes are at the wrong address"
         );
         // `slot_reject_misaligned` is the counter that must COLLAPSE. Nothing above may land in
-        // it any more -- the alignment refusal no longer exists as a rung of the ladder.
+        // it any more: the alignment refusal no longer exists as a rung of the ladder.
         assert_eq!(cpu.fast_map_audit_counters().slot_reject_misaligned, 0);
     }
 }
@@ -200,7 +200,7 @@ fn page_crossing_accesses_still_split() {
         // The value equalities below are NOT sufficient on their own and must not be read as if
         // they were: `TestBus` backs consecutive linear pages with consecutive HOST bytes, so a
         // wrongly-served crossing access still returns the right bytes here. Two adjacent linear
-        // pages on DIFFERENT physical frames -- which needs paging -- are what make the value
+        // pages on DIFFERENT physical frames, which needs paging, are what make the value
         // wrong, and `fast_map_serves_cross_page_reads_correctly_via_page_local_fragments` in
         // `cpu_test.rs` is the test that sets that up.
         assert_eq!(
@@ -223,12 +223,12 @@ fn page_crossing_accesses_still_split() {
 /// Two separate properties, on two separate aperture pages, because they fail independently:
 ///
 /// * **The probe's `split && is_mode13` reject.** Only observable on a page the FastMap has
-///   ALREADY populated -- on a cold page the probe misses anyway and the reject is unreachable,
+///   ALREADY populated: on a cold page the probe misses anyway and the reject is unreachable,
 ///   so a test that only ever touches a cold aperture page passes with the reject deleted. Page
 ///   one is therefore warmed with an ALIGNED access first.
 /// * **Classify-before-populate in the DirectPageCache.** A misaligned aperture access must
 ///   decline BEFORE `data_read_pages.insert` and `populate_fast_map`. This changes no guest byte
-///   and no clock -- only which later accesses run fast -- so only counters and the map can see
+///   and no clock: only which later accesses run fast, so only counters and the map can see
 ///   it. Page two is touched misaligned FIRST, while still cold.
 #[test]
 fn a_misaligned_mode13_access_is_refused_and_installs_nothing() {
@@ -270,7 +270,7 @@ fn a_misaligned_mode13_access_is_refused_and_installs_nothing() {
     const COLD: u32 = 0x000a_3001; // misaligned, a page nothing has touched
     let page_hits_before = cpu.perf.direct_page_hits;
     let value = read_word(&mut cpu, &mut bus, COLD);
-    assert_eq!(value, 0); // it still WORKS -- it went the old way
+    assert_eq!(value, 0); // it still WORKS: it went the old way
     assert_eq!(
         cpu.perf.direct_page_hits, page_hits_before,
         "a declined Mode13 access installed a DirectPageCache entry"
@@ -281,7 +281,7 @@ fn a_misaligned_mode13_access_is_refused_and_installs_nothing() {
     );
 
     // And the same cold page ALIGNED does populate, so the refusal above is about alignment and
-    // not about that page being unreachable -- without this the case could not fail.
+    // not about that page being unreachable: without this the case could not fail.
     read_word(&mut cpu, &mut bus, 0x000a_3000);
     assert!(
         cpu.jit_fast_map.has_read_mapping(0x000a_3000, 0x000a_3000),
@@ -389,7 +389,7 @@ fn a_based_ss_frame_is_refused_by_the_relocated_alignment_clause() {
         "the aligned control frame was refused; the negative case below cannot fail"
     );
 
-    // Base SS at 2. ESP stays 4-aligned -- `esp.is_multiple_of(4)` is happy -- but every slot's
+    // Base SS at 2. ESP stays 4-aligned (`esp.is_multiple_of(4)` is happy) but every slot's
     // LINEAR address is 2 mod 4, and every slot is still page-local.
     let mut based = SegmentRegister::flat(0x10, 0x93);
     based.base = 2;
@@ -417,7 +417,7 @@ fn a_based_ss_frame_is_refused_by_the_relocated_alignment_clause() {
 /// than an inflated total: `census_note_write` scores a read-modify-write pair when the same
 /// instruction already read the same linear PAGE. An entry-level note fires at the first
 /// fragment's page while `last_read_page` still matches, so an instruction that reads a page and
-/// then crossing-writes it would score TWO pairs where it scores one -- a manufactured pair, in
+/// then crossing-writes it would score TWO pairs where it scores one, a manufactured pair, in
 /// the one counter the whole N5 interleaving question is decided on.
 ///
 /// Paging is ON here on purpose: `linear_range_crosses_page` is only consulted when it is, so a
@@ -439,7 +439,7 @@ fn a_crossing_access_notes_the_census_once_per_fragment_and_never_at_the_entry()
 
     // A dword straddling the page boundary at +0xffe splits into two WORD fragments
     // (`page_local_fragment_width` never returns a width that would itself cross), so the census
-    // must advance by exactly TWO -- not three.
+    // must advance by exactly TWO, not three.
     let before = cpu.fast_map_audit_counters();
     read_dword(&mut cpu, &mut bus, base + 0xffe);
     let after = cpu.fast_map_audit_counters();
@@ -451,7 +451,7 @@ fn a_crossing_access_notes_the_census_once_per_fragment_and_never_at_the_entry()
 
     // THE MANUFACTURED PAIR. One instruction epoch: read page P, then crossing-write starting in
     // page P. The read scores `last_read_page = P`. If the entry noted the write's census at
-    // linear `base + 0xffe` -- still page P -- it would score an RMW pair, and the first fragment
+    // linear `base + 0xffe`, still page P, it would score an RMW pair, and the first fragment
     // would then score a second one.
     let before = cpu.fast_map_audit_counters();
     read_dword(&mut cpu, &mut bus, base);
@@ -476,7 +476,7 @@ fn a_crossing_access_notes_the_census_once_per_fragment_and_never_at_the_entry()
 /// paths' hooks (`write_linear_u8`, `write_linear_fragment`) saw every watched store and the
 /// absence of a hook here was survivable. After the admission it is not: misaligned stores are
 /// served here, and a hook that was never executed would let the instrument answer "no writes to
-/// this range" while the writes simply moved -- which is this instrument's documented failure
+/// this range" while the writes simply moved, which is this instrument's documented failure
 /// mode, not a hypothetical one.
 ///
 /// **This test only compiles under `--features watch-write`**, so it does NOT run on a default CI

@@ -5,14 +5,14 @@
 
 // FILE SIZE. By owner ruling the dynarec is ONE file and is exempt from the source-line ceiling
 // `scripts/check_file_policy.py` enforces on everything else. The exemption is the literal path
-// `crates/izarravm-cpu/src/jit/direct.rs` in that script's `SOURCE_LINE_LIMIT_EXEMPT` set -- a
+// `crates/izarravm-cpu/src/jit/direct.rs` in that script's `SOURCE_LINE_LIMIT_EXEMPT` set: a
 // NAMED FILE, not a glob, so a rename or a split has to update the set (the script errors when a
 // named path is no longer tracked). Do not split this file to chase headroom; there is no ceiling
 // here to stay under.
 //
 // HOW TO NAVIGATE IT. Six `MERGED:` banners divide the file into top-level sections; inside them,
 // `---- from jit/direct/<name>.rs ----` sub-banners open each run of text. Those paths are
-// PROVENANCE, not live paths -- they name the child module a section was before the single-file
+// PROVENANCE, not live paths. They name the child module a section was before the single-file
 // merge, so history and older reviews stay findable. None of those files exists now, and nothing
 // in this file is reached through them. Prose elsewhere in the file names SYMBOLS rather than
 // files or line numbers, deliberately: cross-file line citations here have drifted in every
@@ -129,11 +129,11 @@ pub(super) const EMITTED_CALL_OUT_SLOT_BYTES: u32 = 592;
 pub(super) const EMITTED_TERMINAL_SLOT_EXTRA_BYTES: u32 = 208;
 pub(crate) const HOT_LOOKUP_LEN: usize = 65_536;
 /// `LinkTarget::context` for a successor published by `compile_with_budget`, before it has ever
-/// been through a rendezvous. The field is meaningless at compile time (S1a, design doc
-/// `2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1): `resolve_successors` overwrites
+/// been through a rendezvous. The field is meaningless at compile time (S1a, Tyrian
+/// unbound-to-compiled design section 4.1): `resolve_successors` overwrites
 /// it with the LIVE ring slot before either the `linear_blocks` lookup or the `waiting` park, so
 /// no reader may ever branch on a successor's stored `context`. `u8::MAX` rather than `0` so the
-/// value can never be mistaken for a real ring slot (review finding S1-11).
+/// value can never be mistaken for a real ring slot.
 pub(crate) const LINK_CONTEXT_UNSTAMPED: u8 = u8::MAX;
 pub(crate) const MAX_CHAIN_BLOCKS: usize = 256;
 pub(crate) const MIN_STANDALONE_INSTRUCTIONS: u8 = 8;
@@ -156,7 +156,7 @@ pub(crate) const MAX_BLOCK_CALLOUT_SLOTS: u8 = 4;
 /// 4,096 sites is 32 KiB of set at two `u32`s a site, and two orders of magnitude above what a
 /// whole loader phase produces: the tombraid loader learns 64 sites in 500 M cycles, all of them
 /// one row (`0x8e_mov_sreg`). At the cap a further site is REFUSED and its demotion does not
-/// retire anything -- the block keeps its slot and pays the emitted prologue test on every
+/// retire anything. The block keeps its slot and pays the emitted prologue test on every
 /// execution, which is the pre-mechanism cost and is bounded. `note_demoted_callout_site` is where
 /// that is decided, and `jit_direct_demoted_callout_sites_refused` counts it, because a cap that
 /// binds silently is a cap nobody finds.
@@ -176,7 +176,7 @@ pub(crate) const RETRY_LIFT_VISITS: u8 = 64;
 
 /// How many spent-lift records the set may hold. It grows by at most one entry per lift, a lift
 /// needs `RETRY_LIFT_VISITS` probes, and a key can contribute at most one entry per clearable
-/// cause (two), so this is far above what any measured workload reaches -- the loader parks 466
+/// cause (two), so this is far above what any measured workload reaches. The loader parks 466
 /// keys in total. Full means no further key is lifted, which fails closed to the pre-slice
 /// behaviour rather than to an eviction policy that could hand one key an endless supply of
 /// lifts.
@@ -199,7 +199,7 @@ pub(crate) enum CallOutAdmission {
     /// Some serve in the trial touched device state and step-broke. Refused at head, exactly as
     /// before the governor existed.
     IoTouching,
-    /// Some serve in the trial returned abnormal -- a denied or undecoded port. Refused at head.
+    /// Some serve in the trial returned abnormal: a denied or undecoded port. Refused at head.
     Denied,
     /// `MAX_UNTRIED_TRIALS` entries produced no serve at all. Normal quota, call-out still
     /// refused at head: today's behaviour, which is the safe resting state.
@@ -225,7 +225,7 @@ impl Default for CallOutAdmission {
 /// `MAX_MEMORY_ALU_SLOTS` long and within a byte budget that is already most of one page.
 ///
 /// `MAX_MEMORY_ALU_SLOTS` therefore bounds the memory-ALU term and this constant bounds
-/// EVERYTHING ELSE sharing the page with it — the difference of the two is how many non-memory-ALU
+/// EVERYTHING ELSE sharing the page with it. The difference of the two is how many non-memory-ALU
 /// slots may join, which at these values is one. Together they keep such a block inside its page
 /// without going through `compile_with_page_len`'s fallback, which re-compiles a binary search of
 /// shorter prefixes and lands on a shorter block anyway. Exceeding the page is a COST, never a
@@ -238,7 +238,7 @@ impl Default for CallOutAdmission {
 /// up to that cap is covered there and raising this one cannot under-budget a chain.
 ///
 /// MEASURED 2026-08-01 (phase 3 task 3), so nobody re-runs it: 8 and 16 are both admissible and
-/// both really change formation — on quake the mean instructions per dispatcher entry rises about
+/// both really change formation. On quake the mean instructions per dispatcher entry rises about
 /// 3% and installed blocks fall about a sixth, on doom the same figures move by under a tenth of a
 /// percent. Neither bought wall. Six-pair A/B/B/A ladders against this value read noise_only on
 /// BOTH fixtures with the geomean and min-wall estimators agreeing (doom especially flat), and the
@@ -255,7 +255,7 @@ pub(crate) const fn max_x87_block_core_clocks() -> u64 {
 /// question. Four covered Doom's paired patch sites; duke3d's Build-engine patch bursts rewrite
 /// around ten sites per region per iteration (duke586-smc-trace-20260808.txt, the 0x2AFxxx site
 /// families), so a block spanning such a region needs the larger budget for its lanes to absorb
-/// the whole burst — one uncovered patched slot is enough to keep killing the block.
+/// the whole burst: one uncovered patched slot is enough to keep killing the block.
 pub(crate) const MAX_BLOCK_IMM_LANES: usize = 12;
 /// The six lane families that draw on `MAX_BLOCK_IMM_LANES`, indexed in the order the compile
 /// walk tries their matchers. A walk carries one `u16` per family beside its `disp_lane_count`
@@ -263,7 +263,7 @@ pub(crate) const MAX_BLOCK_IMM_LANES: usize = 12;
 ///
 /// The last two are the Option D arms. `LANE_CAP_DISP_STORE` is LIVE on a shipped binary since
 /// the 2026-08-23 flip; `LANE_CAP_DISP_LOAD_WIDEN` stays zero while its knob is default OFF, for
-/// the reason every off arm's cap cell does -- each arm tests its knob before it reaches the
+/// the reason every off arm's cap cell does: each arm tests its knob before it reaches the
 /// budget. The store cell is now one of the numbers the lane-cap re-price is graded on.
 pub(crate) const LANE_CAP_FAMILIES: usize = 6;
 pub(crate) const LANE_CAP_IMM: usize = 0;
@@ -289,7 +289,7 @@ pub(crate) type LaneCapRefusals = [u16; LANE_CAP_FAMILIES];
 /// or word patch of it takes the normal invalidation path.
 ///
 /// Since the 2026-08-19 L2 arm-1 slice this is one of TWO widths a lane can carry, not the only
-/// one — see `IMM8_LANE_WIDTH`. Each lane records its own width and the write choke accepts a
+/// one. See `IMM8_LANE_WIDTH`. Each lane records its own width and the write choke accepts a
 /// patch only at that lane's exact width, so the two classes cannot absorb each other's writes.
 pub(crate) const IMM_LANE_WIDTH: u32 = 4;
 /// The store width a ONE-BYTE lane accepts (`imm8_lane_for`, the `0x80 /r` ALU r/m8 imm8 family).
@@ -299,8 +299,8 @@ pub(crate) const IMM_LANE_WIDTH: u32 = 4;
 /// width (it changes one byte of a field the emitted code reads whole, so the block's baked shape
 /// is wrong), and a four-byte patch landing on a one-byte lane must still reject on width (it
 /// rewrites the three instruction bytes after the immediate as well). `smc_lane_reject_width`
-/// counts both, and its meaning — "a write started exactly at a lane and was refused for its
-/// size" — is unchanged by the second class existing.
+/// counts both, and its meaning ("a write started exactly at a lane and was refused for its
+/// size") is unchanged by the second class existing.
 pub(crate) const IMM8_LANE_WIDTH: u32 = 1;
 /// Empty slot in a block's lane array. Physical address 0 is a real address (the real-mode IVT),
 /// so the sentinel has to be an address no six-byte instruction's immediate can start at.
@@ -355,7 +355,7 @@ impl BlockSpan {
     /// arrays. A span is filed on exactly ONE page's `starts` / `lens` row, and the SMC
     /// invalidation scan reads that one page's arrays as the complete description of the page's
     /// coverage. Admitting a page-crossing span here would silently drop the tail half of every
-    /// such block from the invalidation window -- a missed kill, not a slow path. The shape to
+    /// such block from the invalidation window: a missed kill, not a slow path. The shape to
     /// adopt on the day the refusal is relaxed is 86Box's: file the block in BOTH pages' indexes
     /// (`page->block_2` / `block->page_mask2`), never in one.
     pub(crate) fn new(key: BlockKey, guest_len: usize, instructions: usize) -> Option<Self> {
@@ -464,11 +464,11 @@ pub(crate) struct CompiledBlock {
     /// BIT-PACKED rather than separate fields, and that is a size decision measured rather than
     /// assumed: `compiled_block_stays_small_enough_to_copy_per_entry` pins this struct at 128
     /// bytes, the budget is exactly full, and a whole extra `u8` for the LAR/LSL count rounds it
-    /// to 136 -- eight bytes on each of the three per-entry memcpys, on a row that measures
+    /// to 136: eight bytes on each of the three per-entry memcpys, on a row that measures
     /// 383 M entries. The two flag bits are read only through masks (`dynamic_successor`,
     /// `far_dynamic` below) and written once at `install`, so three bits were spare here before
     /// the LAR/LSL count needed a home; `CallOutSlotCounts` beside it is bit-packed for the same
-    /// reason. The alternative the design named -- a parallel `BlockCache::far_dynamic` lane --
+    /// reason. The alternative the design named (a parallel `BlockCache::far_dynamic` lane)
     /// would grow `BlockCache`, therefore `JitState`, therefore shift every `CpuGsw` field after
     /// `jit_direct` including the offsets emitted code bakes, and would additionally need an
     /// `active_index` lookup at the per-entry reader below, which has a `CompiledBlock` by value
@@ -515,7 +515,7 @@ impl CompiledBlock {
     /// `LAR_LSL_CORE_CLOCKS` plus `LAR_LSL_MAX_DATA_ACCESSES` worst-width data accesses each in
     /// `compute_iteration_upper`, for the same admission-change reason `callout_int_imm8_slots`
     /// gives: LAR/LSL charges 11 core clocks against the interpret-one class's 7. Unlike that
-    /// class it is a genuine COUNT, not a flag -- packed into `block_flags` bits 2..4 rather than
+    /// class it is a genuine COUNT, not a flag, packed into `block_flags` bits 2..4 rather than
     /// carried as its own field, per that field's doc.
     pub(crate) fn callout_lar_lsl_slots(&self) -> u32 {
         u32::from((self.block_flags & LAR_LSL_COUNT_MASK) >> LAR_LSL_COUNT_SHIFT)
@@ -544,7 +544,7 @@ impl CompiledBlock {
     /// `segment_write_block` agreed on every block. Now an ELIGIBLE V86 segment-write block
     /// (`seg_write_edge_eligible`: one write, not CS/SS, no call-out write, the plain-fallthrough
     /// terminal shape, V86) publishes `successors = [Some(fallthrough), None]` at COMPILE TIME
-    /// regardless of whether the edge ever actually binds at link time -- so this predicate reads
+    /// regardless of whether the edge ever actually binds at link time, so this predicate reads
     /// **false** for that population, exactly as it would for any other block with a published
     /// successor. What it still answers exactly is "the compile walk refused this block a
     /// successor for a segment-write reason": CS/SS writes, a multi-write head, an `InterpretOne`
@@ -562,13 +562,13 @@ impl CompiledBlock {
     ///
     /// **THE FAR RETURN IS A THIRD ARM AND IT BREAKS THAT EXCLUSIVITY**, which is why the
     /// derivation carries a `|| far_dynamic()` disjunct. A `RetFar16` block reaches `[None, None]`
-    /// through the SEGMENT-WRITE arm -- it writes CS, so `segment_write_block` is true, and CS is
-    /// barred from `seg_write_edge_eligible` unconditionally -- while `dynamic_successor` is ALSO
+    /// through the SEGMENT-WRITE arm: it writes CS, so `segment_write_block` is true, and CS is
+    /// barred from `seg_write_edge_eligible` unconditionally, while `dynamic_successor` is ALSO
     /// true, because the far-return slice's relaxation is exactly to let a segment-write block own
     /// a dynamic successor. Without the disjunct this predicate would answer "no" for every far
     /// block and silently under-count the segment-write population by 274 M on wolf3d. Nothing
-    /// correctness-load-bearing reads it -- a `DirectStallTally` diagnostic and the refusal census
-    /// -- but a quietly-false counter is the exact failure this campaign has been burned by.
+    /// correctness-load-bearing reads it: a `DirectStallTally` diagnostic and the refusal census,
+    /// but a quietly-false counter is the exact failure this campaign has been burned by.
     ///
     /// `segment_write_block` itself has TWO PRODUCERS since S4f and the proof above is unchanged
     /// by that: it is a proof about the two `successors` arms, not about what sets the flag. The
@@ -585,7 +585,7 @@ impl CompiledBlock {
     }
 
     /// The raw `successors` array, for fixtures that need to distinguish "no successor at all"
-    /// from "a successor was published but `try_link_inner` refused to bind it" -- a distinction
+    /// from "a successor was published but `try_link_inner` refused to bind it": a distinction
     /// `is_segment_write_block` cannot make, since it answers a compile-time question and this
     /// answers a slightly different one for the same population.
     #[cfg(test)]
@@ -620,7 +620,7 @@ impl CompiledBlock {
     /// (`cpu_jit_direct_execution_test.rs`), which refuses to enter a call-out-bearing block
     /// through a path that does not publish `CpuGsw::native_callout`.
     ///
-    /// It is a DERIVED value -- `port() + memory()` -- so it can never disagree with the split it
+    /// It is a DERIVED value, `port() + memory()`, so it can never disagree with the split it
     /// sums, and an assertion comparing the two is vacuous. The place that can genuinely notice a
     /// classless slot is `BlockCache::install`, where the compile walk's independently accumulated
     /// total is still in hand.
@@ -661,7 +661,7 @@ impl CompiledBlock {
     /// is an admission change rather than tidiness. `INT` charges 37 core clocks against that
     /// class's 7 and presents more data accesses than its 4, so folding it in would raise
     /// `INTERPRET_ONE_MAX_CORE_CLOCKS` 7 -> 37 and `INTERPRET_ONE_MAX_DATA_ACCESSES` 4 -> 10 for
-    /// EVERY block carrying any of the eighteen other rows -- CLI, STI, the segment loads, the
+    /// EVERY block carrying any of the eighteen other rows: CLI, STI, the segment loads, the
     /// four string rows, PUSHF, POPF. `compute_iteration_upper` multiplies those constants by the
     /// block's slot count and the quotient decides `budget_quota`, so an over-priced bound changes
     /// WHICH blocks are admitted, and that is guest-visible. Under-pricing is the other way round
@@ -862,7 +862,7 @@ pub(crate) enum DormantLift {
     Lifted,
     /// Dormant, stamp still current: parked, and provably parked for the rest of this epoch.
     ///
-    /// FOR THE REST OF THIS EPOCH ONLY — this is not a bound on the park. With no live block over
+    /// FOR THE REST OF THIS EPOCH ONLY. This is not a bound on the park. With no live block over
     /// the span, `range_hits_compiled_code` is false, `lane_only` can never be set, and every
     /// further guest patch charges FULL heat at the write's physical, re-stamping the parked key's
     /// entry chunk to the then-current epoch. A park therefore RENEWS across epoch boundaries for
@@ -928,7 +928,7 @@ pub(crate) enum BlockProbe {
 /// grows (a stale-high value is correct, just less tight) and resets with the
 /// vecs. A page whose last span row is dropped empties and is removed, so
 /// `max_span` dies with it. Spans never cross a 4 KiB page (the span
-/// constructors refuse page-crossing spans -- see `BlockSpan::new`), so a
+/// constructors refuse page-crossing spans, see `BlockSpan::new`), so a
 /// page's own window covers every span its keys can root and `starts[i] +
 /// lens[i]` never leaves the page the row is filed on.
 #[derive(Default)]
@@ -987,13 +987,13 @@ pub(crate) struct BlockCache {
     /// Design section 9.1's sparse list: a block's class vector is known at
     /// compile time, so a block execution adds it once instead of the emitted
     /// code counting per instruction. It lives here rather than on
-    /// `CompiledBlock` for the reason `segment_layouts` does -- that struct is
-    /// copied several times per entry and is size-pinned -- and it exists only
+    /// `CompiledBlock` for the reason `segment_layouts` does: that struct is
+    /// copied several times per entry and is size-pinned, and it exists only
     /// under the `timing-class-histogram` feature, so a plain build carries
     /// neither the vector nor the `Vec` that holds it.
     #[cfg(feature = "timing-class-histogram")]
     class_vectors: Vec<Box<[u8]>>,
-    /// Parallel to `blocks`, same `BlockId::index()`: this block's CHAIN segment requirement --
+    /// Parallel to `blocks`, same `BlockId::index()`: this block's CHAIN segment requirement:
     /// its own `SegmentLayout` merged with the requirement of every block reachable from it
     /// through currently live links. Only `used` ever differs from `segment_layouts[i]`, because
     /// the merge is non-adopting (`SegmentLayout::merge_chain`).
@@ -1004,7 +1004,7 @@ pub(crate) struct BlockCache {
     /// can never come apart), `widen_chain_requirement` (only ever adds bits),
     /// `invalidate_translation` and `reset_storage` (wholesale, after every edge is dropped), and
     /// `narrow_chain_requirement_if_leaf` (per block, when a cut takes its last outbound edge).
-    /// A stale-too-WIDE requirement costs an over-strict refusal -- and, once the entry check
+    /// A stale-too-WIDE requirement costs an over-strict refusal, and, once the entry check
     /// reads this array, an over-strict ENTRY; a stale-too-NARROW one is a wrong-base miscompile,
     /// which is why the narrowing keys on `outbound` emptiness and never on link VISIBILITY.
     chain_layouts: Vec<SegmentLayout>,
@@ -1034,7 +1034,7 @@ pub(crate) struct BlockCache {
     entry_layout_fetches: std::sync::atomic::AtomicU32,
     /// Parallel to `blocks`, same `BlockId::index()`: the physical start of each mutable imm32
     /// lane the block's emitted code reads through, `NO_IMM_LANE` for an unused slot. Out of
-    /// `CompiledBlock` for the reason its size pin states — nothing here is read on a block entry,
+    /// `CompiledBlock` for the reason its size pin states: nothing here is read on a block entry,
     /// only at the SMC write choke. A recycled slot is refilled by `install`, so a retired
     /// occupant's lanes can never answer for its successor.
     block_imm_lanes: Vec<[u32; MAX_BLOCK_IMM_LANES]>,
@@ -1051,7 +1051,7 @@ pub(crate) struct BlockCache {
     /// grants that epoch has already spent, and whether the LATEST of them installed (see
     /// `lane_trial_enabled` for the mechanism and `lane_trial_budget` for the budget it spends
     /// against). Stale epochs are reset in place on the next ask, so the map only ever holds one
-    /// entry per key that has EVER been hot — thousands on a Build-engine fixture, cleared with
+    /// entry per key that has EVER been hot: thousands on a Build-engine fixture, cleared with
     /// the rest of the cache storage.
     ///
     /// Deliberately left on std's hasher while the linking maps moved to `PodKeyBuildHasher`: the
@@ -1065,7 +1065,7 @@ pub(crate) struct BlockCache {
     /// A SIDE MAP rather than a field on `DormantEntry`, deliberately: `DormantEntry` is the
     /// payload of `BlockState`, the value type of `entries`, which every probe and every
     /// invalidation walks. It exactly fills the `Compiled(BlockId)` payload today, so a `u32`
-    /// there would DOUBLE it — a footprint change on a hot map inside the duke-fragile SMC
+    /// there would DOUBLE it: a footprint change on a hot map inside the duke-fragile SMC
     /// machinery, for a diagnostic. Behind the census feature, so the shipped build's footprint is
     /// byte-identical.
     ///
@@ -1087,7 +1087,7 @@ pub(crate) struct BlockCache {
     /// `DATA_SEGMENT_RETIRE_CAP`. Empty on the OFF arm of `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`,
     /// which is what makes an OFF leg a reproduction of `main` rather than a close relative.
     ///
-    /// Containment: same discipline as `top_mismatch_retires` above, and for the same reason --
+    /// Containment: same discipline as `top_mismatch_retires` above, and for the same reason:
     /// the row is only ever written on the `Compiled` path, and both sites that drop a key from
     /// `entries` (`invalidate_physical_range`, `reset_storage`) drop it here too. It deliberately
     /// SURVIVES `invalidate_translation`: see `forget_data_segment_decline` for the asymmetry.
@@ -1110,7 +1110,7 @@ pub(crate) struct BlockCache {
     /// than linear for the reason invalidation is physical: the code byte is what was judged.
     ///
     /// Bounded by `DEMOTED_CALLOUT_SITE_CAP` rather than by containment in `entries`, because it
-    /// deliberately OUTLIVES the block it was learned from -- that is the whole mechanism. It does
+    /// deliberately OUTLIVES the block it was learned from: that is the whole mechanism. It does
     /// NOT outlive a whole-cache wipe: `reset_storage` clears it with every other map, on the
     /// invariant that a cache that has thrown away its rejected spans, its dormant heat and its
     /// admission classes has learned nothing. Re-learning costs three resyncs, a retire and a
@@ -1118,7 +1118,7 @@ pub(crate) struct BlockCache {
     /// case; and a reset can follow an overlay load, where a physical address holding different
     /// code would otherwise inherit the old code's judgement. MEASURED both ways on the loader and
     /// byte-identical, because that fixture takes no cache reset at all (`jit_direct_cache_resets`
-    /// is 0), so this is an argument and not a measurement -- said plainly rather than dressed up
+    /// is 0), so this is an argument and not a measurement, said plainly rather than dressed up
     /// as one.
     demoted_callout_sites: HashSet<(u32, u32), PodKeyBuildHasher>,
     /// The KEY of a block whose `InterpretOne` slot the governor just demoted, parked for
@@ -1131,7 +1131,7 @@ pub(crate) struct BlockCache {
     ///
     /// The KEY and not a bool. A chained entry runs successor blocks, and `run_direct_block`'s own
     /// `span.key` is the ROOT's, so a bool would retire the root and leave the demoted slot where
-    /// it is -- permanently, because `note_execution` latches once per cell and never asks again.
+    /// it is, permanently, because `note_execution` latches once per cell and never asks again.
     /// The key comes off the cell, which was compiled into exactly one block.
     ///
     /// HERE and not beside `callout_error` on `DirectRuntimeState`, which is where the two other
@@ -1139,7 +1139,7 @@ pub(crate) struct BlockCache {
     /// by-value field of `CpuGsw`, and sixteen bytes of `Option<BlockKey>` there moved
     /// `CpuGsw.registers` and `CpuGsw.pending_flags`, both of which are pinned by tests precisely
     /// so that the hot interpreter region is not reshuffled by accident. `BlockCache` is behind a
-    /// `Box`, so a field here costs the CPU struct nothing -- the same reason
+    /// `Box`, so a field here costs the CPU struct nothing: the same reason
     /// `last_side_exit_reason` lives on `JitState`.
     ///
     /// At most one is ever pending: a cell latches its demotion once, and the entry that observed
@@ -1165,7 +1165,7 @@ pub(crate) struct BlockCache {
     interrupt_shadow_armed_at: Option<(u32, u32)>,
     /// How many arming call-out steps in this run left the shadow set. The latch above carries the
     /// value this counter had when it was written, and the boundary asserts the two agree, which
-    /// is the invariant review finding F1 broke: a latch from an EARLIER arming slot than the last
+    /// is the invariant defect F1 broke: a latch from an EARLIER arming slot than the last
     /// one is exactly the state in which the boundary clears a shadow it should have left alone.
     ///
     /// The stamp and the latch take the SAME predicate at the one site that writes them
@@ -1182,18 +1182,18 @@ pub(crate) struct BlockCache {
     /// The RUN's remaining guest-clock budget (`run_direct_block`'s own `cap` parameter),
     /// published beside `block_entry_interrupt_shadow` on the exact matched-pair model: set at
     /// native entry, read by the GP2 poll-skip seam's admissibility bound, cleared after the
-    /// native return. Zero means "no cap published", which the seam reads as "admit nothing" --
+    /// native return. Zero means "no cap published", which the seam reads as "admit nothing":
     /// `run_direct_block` always publishes a nonzero `cap` on a normal entry, so zero is reachable
     /// only through the unpublished window a test seam that calls `run_direct_block` directly must
     /// not skip past.
     ///
     /// **This is RUN-remaining, not the batch cap.** `run_direct_block`'s `cap` parameter comes
     /// from `ContinuationBudget::cap`, which is `run_budgeted_inner`'s own `cap` parameter, which
-    /// the machine's batch loop passes as `remaining = cap.saturating_sub(spent)` -- already net
+    /// the machine's batch loop passes as `remaining = cap.saturating_sub(spent)`, already net
     /// of the batch's core clocks AND the batch's scaled bus clocks so far
     /// (`izarravm-machine/src/run.rs`, the `spent`/`remaining` locals ahead of `run_budgeted`).
     /// The interpreter's own `try_poll_skip` bounds against the DIFFERENT, batch-absolute `cap`
-    /// (`machine/run.rs:1622`'s call site) -- an earlier revision's comment here claimed the two
+    /// (`machine/run.rs:1622`'s call site). An earlier revision's comment here claimed the two
     /// were "the same quantity", which is exactly wrong and was the proximate cause of a real
     /// double-subtraction defect in the seam (GP2 poll-skip revision report, BLOCKER 2). The seam
     /// must compare THIS field only against a RUN-scoped total (`block_bus_at_entry`, below, is
@@ -1208,7 +1208,7 @@ pub(crate) struct BlockCache {
     /// term `run_direct_block`'s own `bus_growth = bus.in_batch_scaled_bus_clocks() -
     /// bus_at_entry` subtracts this field from). Without this field the seam has no way to turn a
     /// batch-absolute bus reading into the run-scoped GROWTH the cap test needs, and ends up
-    /// comparing a run-scoped budget against a batch-absolute spend -- silently subtracting the
+    /// comparing a run-scoped budget against a batch-absolute spend: silently subtracting the
     /// batch's prior bus clocks from the budget twice.
     block_bus_at_entry: u64,
     /// Per-CPU override of `direct_poll_skip_armed()`'s ambient (env-cached) reading, `None`
@@ -1217,7 +1217,7 @@ pub(crate) struct BlockCache {
     /// acceptance fixture (`a_port_callout_preserves_the_blocks_eflags_shadow`,
     /// `direct_poll_skip_engages_through_the_real_bus`) has to drive it from an
     /// `izarravm-machine` integration test, and `#[cfg(test)]` items are compiled ONLY into the
-    /// crate whose OWN test harness set `--cfg test` -- they do not exist in the rlib
+    /// crate whose OWN test harness set `--cfg test`. They do not exist in the rlib
     /// `izarravm-machine` links against. `set_native_backend_enabled` and `set_jit_auto_admit`
     /// are the precedent for a plain `pub` per-CPU setter crossing this exact boundary.
     direct_poll_skip_override: Option<bool>,
@@ -1233,7 +1233,7 @@ pub(crate) struct BlockCache {
     ///
     /// A plain `bool` rather than a call to `direct_poll_skip_16_armed_for()` from inside the
     /// call-out, and the reason is a measurement one (review round-2 MAJOR-10). The 16-bit screen
-    /// runs on EVERY 0x3DA read from 16-bit code -- ~1.52e9 of them in one tyrian window -- and
+    /// runs on EVERY 0x3DA read from 16-bit code (~1.52e9 of them in one tyrian window) and
     /// an `Option<bool>` load plus a `OnceLock` acquire-load there is roughly 1-2.5% of that
     /// row's wall. That is the whole +/-2% band the ladder's "the A arm equals `main`" check
     /// allows, so the OFF arm's claimed cost-identity would have been unmeasurable. As a field
@@ -1241,8 +1241,8 @@ pub(crate) struct BlockCache {
     block_poll_skip_16_armed: bool,
     /// ONE-ENTRY sticky memo for the D1b mask-value decline (review round-2 MAJOR-7).
     ///
-    /// `(slot_linear, ah, page_gen)`. A `Found` is never written to the negative cache --
-    /// positives are rebuilt on every call so an SMC restamp replaces the descriptor -- so a
+    /// `(slot_linear, ah, page_gen)`. A `Found` is never written to the negative cache:
+    /// positives are rebuilt on every call so an SMC restamp replaces the descriptor, so a
     /// site whose shape certifies STRUCTURALLY but whose live AH is not `0x01`/`0x08` would
     /// otherwise pay a negative-cache miss plus a full ten-probe backward scan, each probe
     /// decoding a block and allocating a `Vec<Slot>`, ON EVERY READ. That is precisely the
@@ -1267,14 +1267,14 @@ pub(crate) struct BlockCache {
     ///
     /// A SET OF PAIRS and not a map from key to cause. The map remembered only the LAST cause, so
     /// a key alternating `DecodeMiss` and `TranslationMismatch` found its record overwritten every
-    /// time and lifted for ever -- the exact treadmill the rule exists to stop, reached by a key
+    /// time and lifted for ever, the exact treadmill the rule exists to stop, reached by a key
     /// whose two causes are both clearable. As a set the bound is what it says: at most one lift
     /// per key per cause, and `clearable_by_retry` names two causes, so at most two lifts per key.
     ///
     /// Deliberately left on std's hasher while the linking maps moved to `PodKeyBuildHasher`:
     /// `retry_lift_enabled` is default-OFF, so there is no wall here to win.
     retry_lift_spent: HashSet<(BlockKey, RetryCause)>,
-    /// Test-only override of `lane_trial_enabled` — the env gate is a process-global `OnceLock`,
+    /// Test-only override of `lane_trial_enabled`: the env gate is a process-global `OnceLock`,
     /// so in-process tests of the trial path set this instead of the environment.
     lane_trial_override: Option<bool>,
     block_portals: Vec<Arc<BlockPortal>>,
@@ -1287,7 +1287,7 @@ pub(crate) struct BlockCache {
     /// the only place with exactly that lifetime, and it is why the demotion needs no recompile.
     ///
     /// A `Vec` per block rather than a fixed array: `MAX_BLOCK_CALLOUT_SLOTS` blocks carry none at
-    /// all, and this vector is never read on an entry path -- only at install and at retire.
+    /// all, and this vector is never read on an entry path, only at install and at retire.
     interpret_one_cells: Vec<Vec<Arc<InterpretOneCell>>>,
     link_sources: HashMap<usize, LinkSource<BlockId>, PodKeyBuildHasher>,
     outbound: Vec<[Option<BlockId>; 2]>,
@@ -1303,7 +1303,7 @@ pub(crate) struct BlockCache {
     /// `block_link_epochs[i] == link_epochs[link_slot]` is the "visible under the LIVE context"
     /// test `is_link_visible` reads; `block_link_epochs[i] == link_epochs[1 - link_slot]` is the
     /// "visible under the OTHER, currently-parked context" case `make_link_visible`'s L3 arm
-    /// must catch and clear before rebinding (design doc `2026-09-02-cr3-jit-half-design.md`
+    /// must catch and clear before rebinding (CR3 JIT-half design
     /// (b), L1/L3).
     link_epochs: [u64; 2],
     /// The live index into `link_epochs`, 0 or 1. Seeded to 0 (design doc J7): `select_context`
@@ -1314,8 +1314,8 @@ pub(crate) struct BlockCache {
     /// The SOLE source of fresh epoch values (design doc J2). Minting `link_epochs[0]` and
     /// `link_epochs[1]` independently off two counters (or bumping both of one scalar) can
     /// alias two DIFFERENT contexts onto the SAME epoch value, which `make_link_visible`'s
-    /// same-epoch fast path cannot tell apart from a genuine re-select. Every mint -- R2's
-    /// `allocate_link_context` and a wholesale `invalidate_translation` re-mint of both slots --
+    /// same-epoch fast path cannot tell apart from a genuine re-select. Every mint (R2's
+    /// `allocate_link_context` and a wholesale `invalidate_translation` re-mint of both slots)
     /// draws its next value from here and none is ever reused. Wraps to 1 with both epoch slots
     /// zeroed, mirroring the pre-slice wrap arm.
     next_link_epoch: u64,
@@ -1337,7 +1337,7 @@ pub(crate) struct BlockCache {
     /// slot is zeroed by `install`, so a stale entry cannot outlive its block.
     iteration_upper_cache: Vec<u64>,
     /// The call-out admission governor's learned class per block, parallel to `blocks` and keyed
-    /// exactly like `iteration_upper_cache` above -- same `BlockId::index()`, same epoch, same
+    /// exactly like `iteration_upper_cache` above: same `BlockId::index()`, same epoch, same
     /// `install`-zeroes-a-recycled-slot discipline, and deliberately no clear in `retire_block`:
     /// one invariant, one mechanism.
     ///
@@ -1373,7 +1373,7 @@ pub(crate) struct BlockCache {
     /// after a failed build makes that block fall back to the inline (gate-off) emission.
     store_stub_pad: Option<(super::exec_mem::ExecutableBuffer, [usize; STORE_STUB_COUNT])>,
     /// The shared read-resolve stub pad (one-lookup load design D4). Same lifetime contract as
-    /// the two pads above, its own executable mapping because reads gate on `map_bases` alone —
+    /// the two pads above, its own executable mapping because reads gate on `map_bases` alone:
     /// a load-only block has NO code-watch tables, so the read pad must not ride the store
     /// pad's build condition. `None` after a failed build makes that block fall back to the
     /// inline (gate-off) read emission.
@@ -1412,8 +1412,8 @@ pub(crate) struct BlockCache {
     /// SMC census stage A. It lives on the CACHE rather than on `JitState` (which is where the
     /// design put it) for one reason: every stage-A increment site is a `BlockCache` method
     /// reached through `&mut self`, and `invalidate_physical_range` cannot see a `JitState` field
-    /// without a signature change the design explicitly forbids. The layout argument is unchanged
-    /// — `CpuGsw` owns `Box<JitState>`, which owns this cache, so the field costs zero bytes on
+    /// without a signature change the design explicitly forbids. The layout argument is unchanged:
+    /// `CpuGsw` owns `Box<JitState>`, which owns this cache, so the field costs zero bytes on
     /// `CpuGsw` and the pinned `pending_flags` offset does not move. A clone drops it, exactly as
     /// the link-refusal census above does: a lockstep clone must not double-count its parent.
     #[cfg(feature = "smc-census")]
@@ -1510,14 +1510,14 @@ impl BlockCache {
             block_decode_slots: Vec::new(),
             decode_slot_mask: decode_slot_count - 1,
             block_link_epochs: Vec::new(),
-            // [1, 2], NOT [1, 0] (review finding N1): 0 is the unstamped-block sentinel
+            // [1, 2], NOT [1, 0] (N1): 0 is the unstamped-block sentinel
             // (`block_link_epochs.push(0)` on install, the reset on retire, the wrap fill),
             // and slot 1's epoch must never equal it. A virgin cache's first `MOV CR3` to a
             // second directory takes R2 (`select_link_context`, no `allocate_link_context`
-            // call -- see its own doc comment), so slot 1's epoch is whatever this seed left
+            // call, see its own doc comment), so slot 1's epoch is whatever this seed left
             // it at; `[1, 0]` would make `link_epoch()` read 0 under that context, and
             // `make_link_visible` would take its same-epoch fast path for every UNSTAMPED
-            // block, republishing without ever inserting into `linear_blocks` -- a silent
+            // block, republishing without ever inserting into `linear_blocks`: a silent
             // loss of the whole JIT-half win for that context, with no cross-context
             // corruption to make a test notice.
             link_epochs: [1, 2],
@@ -1591,7 +1591,7 @@ impl BlockCache {
     /// Arm the FastMap WITHOUT refreshing `CpuGsw::fast_map_serve_enabled`.
     ///
     /// The long name is the guard rail. This moves an input to `fast_map_population_enabled()`
-    /// and so owes that predicate's mirror a refresh, but it cannot pay one -- the mirror lives on
+    /// and so owes that predicate's mirror a refresh, but it cannot pay one: the mirror lives on
     /// `CpuGsw`. Call `CpuGsw::set_fast_map_enabled_for_test`, which does both. Calling this
     /// directly leaves the mirror stale, which used to be survivable only because every consumer
     /// recomputed the predicate; one consumer now reads the mirror, and a stale one stops a JIT
@@ -1693,7 +1693,7 @@ impl BlockCache {
             return None;
         };
         // The one place the call-out TOTAL is dropped in favour of the class counts, so the one
-        // place that can notice a slot belonging to no class -- the shape a fifth `CallOutHelper`
+        // place that can notice a slot belonging to no class: the shape a fifth `CallOutHelper`
         // takes if it is added without choosing one. `CompiledBlock` then derives the total from
         // the split, and `compute_iteration_upper` prices the split, so a classless slot would be
         // invisible to both.
@@ -1924,11 +1924,11 @@ impl BlockCache {
             // buy another 64 visits and another compile for ever.
             //
             // `retry_lift_reparks` counts PARK EVENTS, not distinct keys, and can therefore exceed
-            // `retry_lifts` -- 10,265 against 1,961 on duke. That is not a defect and not a
+            // `retry_lifts`: 10,265 against 1,961 on duke. That is not a defect and not a
             // treadmill: the permanence is enforced by `retry_lift_spent`, which this reads, so a
             // key past its lift never lifts again however often it re-parks. What produces the
-            // extra events is a key returning to `Seen` by some OTHER path -- the SMC heat lift,
-            // or `retire_key_for_recompile` after an invalidation -- and then re-parking on the
+            // extra events is a key returning to `Seen` by some OTHER path: the SMC heat lift,
+            // or `retire_key_for_recompile` after an invalidation, and then re-parking on the
             // same gate. Read the pair as "the arm fired N times and its keys came back at least
             // N' times", not as a per-key rate.
             let permanent =
@@ -2093,7 +2093,7 @@ impl BlockCache {
     }
 
     /// The governor's class for one block, valid only under `epoch`. A stale epoch, a block that
-    /// was never installed and a recycled slot all read `Untried(0)` -- the same miss-means-retry
+    /// was never installed and a recycled slot all read `Untried(0)`, the same miss-means-retry
     /// default `iteration_upper_cached` uses, and the reason no clear belongs in `retire_block`.
     pub(crate) fn callout_admission(&self, id: BlockId, epoch: u64) -> CallOutAdmission {
         if self.callout_admission_epoch != epoch {
@@ -2142,12 +2142,12 @@ impl BlockCache {
     /// The first ask of an epoch is always granted, exactly as before this slice. Grants beyond
     /// it are EARNED: they require `lane_trial_budget()` above 1 (unset is 1, the pre-slice world)
     /// AND the previous grant's compilation to have installed (INV-B3). A key whose trial did not
-    /// install therefore still gets exactly one trial per epoch — re-granting there would
+    /// install therefore still gets exactly one trial per epoch: re-granting there would
     /// recompile identical code to fail identically, which is the recompile storm this gate
     /// exists to prevent.
     ///
     /// INV-B7: the stale-epoch reset runs BEFORE the decision reads `spent` or `earned`. That
-    /// ordering is the ENTIRE defence against cross-epoch `earned` leakage — with the reset below
+    /// ordering is the ENTIRE defence against cross-epoch `earned` leakage: with the reset below
     /// the decision, a key that earned an install at epoch E would arrive at E+1 and be granted as
     /// an earned RE-grant rather than as a first trial, silently doubling the per-epoch budget.
     pub(crate) fn lane_trial_spend(&mut self, key: BlockKey, epoch: u32) -> bool {
@@ -2192,7 +2192,7 @@ impl BlockCache {
     /// span gate never ran at all.
     ///
     /// A missing slot is a silent no-op, never an `expect`. A slot always exists when this is
-    /// called — `lane_trial` implies a prior grant, and a grant inserts one — so an `expect` would
+    /// called: `lane_trial` implies a prior grant, and a grant inserts one, so an `expect` would
     /// be "correct" today and would turn a diagnostic into a crash the first time a
     /// `reset_storage` landed between the grant and the install.
     pub(crate) fn note_lane_trial_install(&mut self, key: BlockKey) {
@@ -2204,7 +2204,7 @@ impl BlockCache {
 
     /// Task 0, the F2 population: an entry-gate heat demote whose key had ALREADY spent a trial
     /// this epoch, split by whether that trial's compilation installed. The `_earned` half is the
-    /// only set INV-B3 will ever re-grant — trial spent, block installed, then killed by a write —
+    /// only set INV-B3 will ever re-grant: trial spent, block installed, then killed by a write,
     /// so a go/no-go read off the gross count alone can pass on a population the lever cannot
     /// touch.
     ///
@@ -2231,7 +2231,7 @@ impl BlockCache {
     /// Task 0, the span-gate demote arm, split by whether the refused compilation carried any
     /// mutable lane at all. `no_lanes` is the §0.4 confound: a zero-lane compilation short-circuits
     /// `run.rs`'s `imm_lane_count() > 0 && …` and spends no trial, so it is a demotion Lever B can
-    /// never convert. `trial_spent` is the complement — the trial, not the lane, was the refusal.
+    /// never convert. `trial_spent` is the complement: the trial, not the lane, was the refusal.
     #[cfg(feature = "direct-admission-census")]
     pub(crate) fn note_lane_install_demote(&mut self, had_lanes: bool) {
         if had_lanes {
@@ -2260,19 +2260,19 @@ impl BlockCache {
         self.park_epochs.len()
     }
 
-    /// Displacement lanes registered by an install — the disp share of the aggregate
+    /// Displacement lanes registered by an install: the disp share of the aggregate
     /// `smc_lane_registrations` the same install site feeds.
     pub(crate) fn note_disp_lane_registrations(&mut self, lanes: u64) {
         self.stalls.disp_lane_registrations += lanes;
     }
 
-    /// One-byte immediate lanes registered by an install — the imm8 share of the aggregate
+    /// One-byte immediate lanes registered by an install: the imm8 share of the aggregate
     /// `smc_lane_registrations` the same install site feeds.
     pub(crate) fn note_imm8_lane_registrations(&mut self, lanes: u64) {
         self.stalls.imm8_lane_registrations += lanes;
     }
 
-    /// Group-2 count lanes registered by an install — the L2 arm-2 share of the aggregate
+    /// Group-2 count lanes registered by an install: the L2 arm-2 share of the aggregate
     /// `smc_lane_registrations` the same install site feeds. Separate from
     /// `imm8_lane_registrations` even though both classes register at `IMM8_LANE_WIDTH`, because
     /// the two arms are independent knobs and a combined ladder leg has to be able to say which
@@ -2453,8 +2453,8 @@ impl BlockCache {
     /// demotion.
     ///
     /// Returns which of the three shapes this call took. `StillDormant` is EXACTLY the predicate
-    /// the sticky-decline memo encodes — "was Dormant, did not lift"
-    /// (`dev_docs/sticky-decline-memo-design.md` §1.4) — and the entry-state test it needs is one
+    /// the sticky-decline memo encodes, "was Dormant, did not lift"
+    /// (sticky-decline memo design §1.4), and the entry-state test it needs is one
     /// this function already performs, so reporting it costs nothing.
     pub(crate) fn lift_cold_smc_dormant(
         &mut self,
@@ -2468,8 +2468,8 @@ impl BlockCache {
         if heat.take_stale_stamp(key.physical, epoch) {
             self.entries.insert(key, BlockState::Seen);
             // The park-LENGTH diagnostic's closing end, and the ONLY place a park is measured.
-            // A park that never lifts — and a park ended by a cache-wide `reset_storage`, which
-            // drops the heat record so this arm is never reached — contributes NOTHING here and
+            // A park that never lifts (and a park ended by a cache-wide `reset_storage`, which
+            // drops the heat record so this arm is never reached) contributes NOTHING here and
             // one to the censoring count `smc_heat_demotions - park_lifts`. Those are precisely
             // the LONGEST parks, so the mean over `dormant_heat_park_epochs / park_lifts` is a
             // LOWER BOUND on park length and must be published with the censoring rate beside it.
@@ -2496,7 +2496,7 @@ impl BlockCache {
     /// Full at `DEMOTED_CALLOUT_SITE_CAP` answers FALSE, and that is the whole reason this returns
     /// anything. The set is a COST policy, and a guest that somehow reached the cap is better
     /// served by paying the prologue test on the overflow sites than by an eviction policy that
-    /// could thrash a site in and out of the allowlist -- but it must not also be paying a
+    /// could thrash a site in and out of the allowlist, but it must not also be paying a
     /// recompile per execution to learn the same refusal again. The cap is far above what a whole
     /// loader phase produces (64 sites on tombraid, 2026-08-22).
     ///
@@ -2533,7 +2533,7 @@ impl BlockCache {
     /// returned. Deliberately separate from the latch below: the two are written from the same
     /// place today, and a future edit that guards the latch on one status while leaving this
     /// count on every step makes the boundary's assertion fire instead of silently comparing
-    /// against a stale address. That is the shape review finding F1 found.
+    /// against a stale address. That is the shape of defect F1.
     pub(crate) fn note_interrupt_shadow_arm(&mut self) {
         self.interrupt_shadow_arms = self.interrupt_shadow_arms.wrapping_add(1);
     }
@@ -2597,7 +2597,7 @@ impl BlockCache {
     }
 
     /// `direct_poll_skip_16_armed()`'s ambient reading, unless this CPU overrides it. Read ONCE
-    /// per native block entry (`run_direct_block`), never per call-out -- see
+    /// per native block entry (`run_direct_block`), never per call-out, see
     /// `block_poll_skip_16_armed`'s doc for why that distinction is load-bearing.
     pub(crate) fn direct_poll_skip_16_armed_for(&self) -> bool {
         self.direct_poll_skip_16_override
@@ -2655,8 +2655,8 @@ impl BlockCache {
     /// Drop every demoted site the write at `physical..physical + width` lands on, because the
     /// code the judgement was about is being replaced.
     ///
-    /// Called from BOTH of `note_code_write_inner`'s invalidation doors -- the compiled-block one
-    /// and the decode-line one -- and from neither `invalidate_physical_range` nor the top of that
+    /// Called from BOTH of `note_code_write_inner`'s invalidation doors (the compiled-block one
+    /// and the decode-line one) and from neither `invalidate_physical_range` nor the top of that
     /// function. Each of those three placements is wrong in its own way:
     ///
     /// * `invalidate_physical_range` alone misses most of it. A demotion RETIRES its block, so by
@@ -2677,7 +2677,7 @@ impl BlockCache {
     /// The low end is widened by the longest x86 instruction. A site names the instruction's FIRST
     /// byte and the instruction runs to fifteen more, so a write landing inside it changes that
     /// instruction without touching the address the map is keyed on. Over-retaining costs one
-    /// re-learn -- three resyncs and a recompile -- and under-retaining is the stale ban.
+    /// re-learn (three resyncs and a recompile) and under-retaining is the stale ban.
     ///
     /// The `is_empty` shortcut is what keeps this off the shipped store path in every run that
     /// never demotes a slot: one length load and a not-taken branch.
@@ -2695,7 +2695,7 @@ impl BlockCache {
     /// Whether the compile walk must treat this code site as a hard boundary.
     ///
     /// The emptiness test is first and is the shape that matters: on a guest that never demotes a
-    /// slot -- which is every guest until one does -- this costs a length load per call-out slot
+    /// slot (which is every guest until one does) this costs a length load per call-out slot
     /// and no hash at all.
     pub(crate) fn callout_site_demoted(&self, physical: u32, mode_key: u32) -> bool {
         !self.demoted_callout_sites.is_empty()
@@ -2703,7 +2703,7 @@ impl BlockCache {
     }
 
     /// Sites currently in the demoted-call-out map. Read by the census gauge and, under `cfg(test)`
-    /// as `demoted_callout_site_count_for_test`, by the fixtures -- one accessor, two names, so a
+    /// as `demoted_callout_site_count_for_test`, by the fixtures: one accessor, two names, so a
     /// test cannot drift from what the gauge reports.
     pub(crate) fn demoted_callout_sites_len(&self) -> usize {
         self.demoted_callout_sites.len()
@@ -2772,14 +2772,14 @@ impl BlockCache {
     /// (`.bench/results/tomb-turnover-falsify-20260815/`, +8.9% wall on `tombraid-586` with every
     /// guest counter and the frame hash identical), and `u8::MAX` is pre-slice `main`, whose
     /// 4.77M TOP-mismatch recompiles on that row bought zero native execution. 2 gives every key
-    /// one re-specialization plus one spare, which is what a one-time TOP shift -- the only shape
-    /// where the retire pays -- actually needs, and it is bounded per key by construction for
+    /// one re-specialization plus one spare, which is what a one-time TOP shift (the only shape
+    /// where the retire pays) actually needs, and it is bounded per key by construction for
     /// every entry sequence. Not an env knob.
     const X87_TOP_RETIRE_CAP: u8 = 2;
 
     /// The x87 TOP-mismatch half of `retire_key_for_recompile`, capped per key.
     ///
-    /// The entry REFUSAL is the caller's and is unconditional -- this decides only whether the
+    /// The entry REFUSAL is the caller's and is unconditional: this decides only whether the
     /// block is also demoted so the next encounter re-specializes it at the then-live TOP. A key
     /// that has already spent its budget keeps its block and keeps refusing, so the worst case is
     /// permanent interpretation of that block: slow, never wrong. On a guest that cycles TOPs
@@ -2801,7 +2801,7 @@ impl BlockCache {
         if !matches!(self.entries.get(&key), Some(BlockState::Compiled(_))) {
             return false;
         }
-        // One lookup on the sticky path -- the one a churning guest takes millions of times. The
+        // One lookup on the sticky path: the one a churning guest takes millions of times. The
         // second lookup below is paid only by a retire that is actually about to happen, beside a
         // hot-table clear and a `retire_block`.
         let spent = *self.top_mismatch_retires.entry(key).or_insert(0);
@@ -2846,7 +2846,7 @@ impl BlockCache {
         if self.entries.is_empty() && self.blocks.is_empty() && self.arena.is_none() {
             // No second clear for `top_mismatch_retires`: its key set is a subset of `entries`'
             // (see the field), so an empty `entries` implies an empty map. One invariant, one
-            // mechanism -- assert it here rather than papering over a violation.
+            // mechanism: assert it here rather than papering over a violation.
             debug_assert!(
                 self.top_mismatch_retires.is_empty(),
                 "TOP-mismatch budgets outlived their entries"
@@ -2904,22 +2904,22 @@ impl BlockCache {
         // Every edge is gone, so every CHAIN requirement those edges justified is gone with it.
         // Monotonicity is a rule about a LIVE link graph; here there is none left, and the state
         // written back is exactly what `install` would write, which is the array's only other
-        // writer. Without this a flushed block keeps demanding a segment nothing live reaches --
+        // writer. Without this a flushed block keeps demanding a segment nothing live reaches:
         // safe, but permanently over-strict, and it would refuse precisely the class-B edges this
         // mask exists to admit. Wholesale SMC and paging flushes make that the common case, not a
-        // corner. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
+        // corner.
         //
         // ORDER IS LOAD-BEARING, and it is a MISCOMPILE and not merely a cost once the entry check
         // reads this array: reset first and a still-armed cell could reach a body under a
         // requirement that no longer names the segment that body's cone pins. The clearing loop
         // above visits every live edge through `inbound`, which is why an inactive slot's
-        // `outbound` is already empty -- `retire_block` runs `unlink_block` before it clears
+        // `outbound` is already empty: `retire_block` runs `unlink_block` before it clears
         // `block_active`. That is the whole reason this assert can quantify over ALL slots.
         self.assert_no_live_edge_before_wholesale_reset();
         self.chain_layouts.copy_from_slice(&self.segment_layouts);
         // BESIDE the line above, and for one level up of its own argument: a decline earned
         // against a chain requirement this flush just ERASED would bar re-linking for the rest of
-        // the cache's life -- the same permanently-over-strict failure. The BUDGET survives; see
+        // the cache's life: the same permanently-over-strict failure. The BUDGET survives; see
         // `forget_data_segment_decline`.
         self.data_segment_link_declined.clear();
         self.waiting.clear();
@@ -2957,7 +2957,7 @@ impl BlockCache {
     }
 
     /// R1: reselect a ring slot the cache was already told is occupied. Restores that context's
-    /// epoch with no other work -- every block previously made link-visible under it is visible
+    /// epoch with no other work: every block previously made link-visible under it is visible
     /// again for free, because the epoch comparison IS the restore. Never re-checks a link at
     /// this point; the whole argument for that is design doc (b) L1-L4.
     pub(crate) fn select_link_context(&mut self, slot: u8) {
@@ -3000,7 +3000,7 @@ impl BlockCache {
             // because a global bump on every CR3 write meant no visible portal could outlive its
             // epoch. Under L1 a block made visible under ring slot A keeps its published portal
             // while slot B is live, so the invariant this assert states is "the stamp equals ONE
-            // OF THE TWO live `link_epochs`", not "equals the live one" -- design doc J1. Hiding
+            // OF THE TWO live `link_epochs`", not "equals the live one", design doc J1. Hiding
             // a portal stamped for the OTHER slot is still conservative and correct
             // (`is_link_visible` requires both the epoch match against the LIVE slot AND the
             // portal), so only the assert's statement changes, not the code path.
@@ -3058,7 +3058,7 @@ impl BlockCache {
     ///   registered lane of THIS block exactly, or retires it below.
     /// - Therefore a block that is still alive has had no non-lane byte of its span written since
     ///   it compiled. Its opcode, ModRM, length and displacement bytes are exactly what the
-    ///   compiler decoded, and only its lane bytes may differ — which is precisely what the
+    ///   compiler decoded, and only its lane bytes may differ, which is precisely what the
     ///   emitted code re-reads from RAM. So "the write is exactly this block's lane" IS the
     ///   current shape of the instruction, not a stale memory of it.
     ///
@@ -3144,8 +3144,8 @@ impl BlockCache {
                     );
                     // THE PRE-FILTER. Row coverage rides inline in the vectors this scan already
                     // walks, so the overlap decision costs two sequential reads instead of a
-                    // `HashMap` probe plus a per-state `match`. (INV) makes it conservative --
-                    // `physical_ranges_overlap` is monotone in the second width -- so a skipped row
+                    // `HashMap` probe plus a per-state `match`. (INV) makes it conservative:
+                    // `physical_ranges_overlap` is monotone in the second width, so a skipped row
                     // is one the authoritative test would have called a survivor too. Live rows
                     // are spans; a leaked point row (`lens == 1` on Seen/Dormant) is the tripwire
                     // below, not the population this filter was written for.
@@ -3237,7 +3237,7 @@ impl BlockCache {
                         }
                     };
                     if !overlaps {
-                        // Review finding M7: THIS is the quantity a per-page presence filter would
+                        // M7: THIS is the quantity a per-page presence filter would
                         // elide, and it is the denominator R2's W is defined against. What reaches
                         // here after the pre-filter is the CONSERVATIVE remainder: a row whose
                         // `lens` overlapped but whose current state does not.
@@ -3315,13 +3315,13 @@ impl BlockCache {
                     self.entries.remove(&key);
                     // Below the lane `continue` above deliberately: a patched imm32 lane keeps
                     // its block and its `entries` row, so it must keep its budget too. A genuine
-                    // kill drops all three -- the code at this address is NEW and inheriting the
+                    // kill drops all three: the code at this address is NEW and inheriting the
                     // previous occupant's stickiness would pin it out of specialization silently.
                     //
                     // The demoted-site map is the fourth thing that has to go and is NOT dropped
                     // here: it is keyed on the INSTRUCTION rather than on the block entry, and it
                     // outlives the block. By the time an overwrite arrives the demoted block has
-                    // usually been retired already, so this arm is not even reached --
+                    // usually been retired already, so this arm is not even reached:
                     // `range_hits_compiled_code` is what gates the call. `forget_demoted_sites_in`
                     // is called from the code-write door instead.
                     self.top_mismatch_retires.remove(&key);
@@ -3399,7 +3399,7 @@ impl BlockCache {
 
     /// The authoritative per-state overlap decision `invalidate_physical_range`'s loop body makes,
     /// factored out so the inline pre-filter can be graded against it. It probes `entries` and
-    /// reads `blocks` -- exactly the work the pre-filter exists to avoid -- so it is reached ONLY
+    /// reads `blocks`, exactly the work the pre-filter exists to avoid, so it is reached ONLY
     /// from the pre-filter's `debug_assert!` and from the `smc-census` `probe_divergences` counter,
     /// never from a plain release build.
     ///
@@ -3444,7 +3444,7 @@ impl BlockCache {
     /// The entry pointer for a block id, re-resolved through the same generational lookup
     /// `block()` uses. Arena compaction can relocate code while a caller holds a copied
     /// descriptor, so this resolve sits below every refusal and before the transmute into a
-    /// callable entry -- it is not the LAST safe point (a `&mut jit_direct` counter bump runs
+    /// callable entry: it is not the LAST safe point (a `&mut jit_direct` counter bump runs
     /// after it at the caller), only the last one that reads block identity. It returns the ONE
     /// field that resolve exists for rather than another 120-byte copy of a struct whose other
     /// 112 bytes go unused at the call site.
@@ -3462,7 +3462,7 @@ impl BlockCache {
     ///
     /// Diagnostic only, and gated at the call site on the barrier census. Two successive audit
     /// hypotheses for the 20.8M static-unbound exits (x87 link refusal, then link churn) were
-    /// both refuted by counters that already existed — `x87_pad_bails` and `reject_x87_top` are
+    /// both refuted by counters that already existed: `x87_pad_bails` and `reject_x87_top` are
     /// flat zero, and the global `invalidate_translation` does not fire in steady state. This
     /// answers the question directly instead of inferring it a third time.
     /// The `RetryCause` a dormant key was parked with, or `None` when it is not a compile-Retry
@@ -3500,8 +3500,8 @@ impl BlockCache {
     /// Which half of `BlockProbe::Rejected` this key actually is: `Dormant` (transient, and the
     /// only half with a recovery) or `Rejected` (settled).
     ///
-    /// `probe` folds the two states into one answer, which is fine for the dispatcher -- both mean
-    /// "interpret" -- but not for a caller deciding whether the recovery is worth running. Both
+    /// `probe` folds the two states into one answer, which is fine for the dispatcher (both mean
+    /// "interpret") but not for a caller deciding whether the recovery is worth running. Both
     /// lifts require `Dormant`: `lift_cold_smc_dormant` reports `NotDormant` for a `Rejected`
     /// entry and `lift_clearable_retry_dormant` never matches one. So on `false` there is provably
     /// nothing for the recovery to do, and skipping it cannot change any later probe's answer.
@@ -3965,8 +3965,8 @@ impl BlockCache {
         self.callout_retire_pending = None;
         self.retry_lift_spent.clear();
         // The three interrupt-shadow latches. A reset drops every block, so a latch surviving it
-        // would be read at the next boundary by an entry that did not set it -- the reason
-        // `callout_retire_pending` is cleared on the line above (review finding F5).
+        // would be read at the next boundary by an entry that did not set it: the reason
+        // `callout_retire_pending` is cleared on the line above (F5).
         self.interrupt_shadow_armed_at = None;
         self.interrupt_shadow_arms = 0;
         self.interrupt_shadow_consumed = false;
@@ -4015,7 +4015,7 @@ impl BlockCache {
                 continue;
             };
             // S1a: the successor's stored `context` is whatever was published when this block was
-            // compiled (`LINK_CONTEXT_UNSTAMPED` from `compile_with_budget`, never a real slot --
+            // compiled (`LINK_CONTEXT_UNSTAMPED` from `compile_with_budget`, never a real slot,
             // see that constant's doc comment). It must never be read. The rendezvous key is built
             // HERE instead, from the LIVE ring slot, for both halves of the lookup below:
             // `linear_blocks` and `waiting` are both partitioned by the slot that was live when a
@@ -4024,7 +4024,7 @@ impl BlockCache {
             // rendezvous silently stop agreeing the first time this block is re-stamped under the
             // other slot (the defect this slice fixes).
             //
-            // Enforced, not just documented (review finding N3): a real ring slot leaking into a
+            // Enforced, not just documented (N3): a real ring slot leaking into a
             // successor at compile time is exactly the defect class this slice fixes, so a future
             // site that re-bakes one here should fail loudly rather than silently reopen it.
             debug_assert_eq!(
@@ -4042,7 +4042,7 @@ impl BlockCache {
             }
             // The do-not-park contract. A declined source is refused by `try_link_inner` on every
             // attempt, so parking it would have every later install at this `LinkTarget` re-try
-            // and re-refuse it -- bounded in size, unbounded in count, and `link_refusals`'
+            // and re-refuse it: bounded in size, unbounded in count, and `link_refusals`'
             // `declined` bucket would stop meaning "stage 2 trips". The written precedent is
             // `LinkClearCause::ChainWiden`, which is not re-parked for the same reason: a retry
             // could only re-derive the same refusal.
@@ -4229,7 +4229,7 @@ pub(crate) struct Compilation {
     /// Whether that dynamic successor is a FAR one. Readable outside this module for
     /// `dynamic_successor`'s reason: a `RetFar16` block that reported a NEAR dynamic successor
     /// would bind its cell with an EIP where the emitted compare reads a LINEAR, and nothing in
-    /// guest state or in the block's shape shows it -- the cell would simply never hit.
+    /// guest state or in the block's shape shows it: the cell would simply never hit.
     pub(crate) far_dynamic: bool,
     /// Readable outside this module so a fixture can pin a terminal's LINK EDGE. A kind missing
     /// from the successor match falls to the fall-through arm, which is a wrong edge rather than
@@ -4254,8 +4254,8 @@ pub(crate) struct Compilation {
     /// `NO_IMM_LANE` for an unused slot. `install` copies these into the cache's per-block lane
     /// array, which is what the SMC write choke matches a patch against.
     ///
-    /// **The name is narrower than the contents.** This array holds EVERY mutable-lane family —
-    /// imm, imm8, group-2 count, displacement, Option D store and load-widen — written through one
+    /// **The name is narrower than the contents.** This array holds EVERY mutable-lane family:
+    /// imm, imm8, group-2 count, displacement, Option D store and load-widen, written through one
     /// cursor against one `MAX_BLOCK_IMM_LANES` budget, and the five `u8` fields below are SUBSET
     /// TALLIES of it, not parallel arrays. There is exactly one lane registration path and one
     /// write-choke array (`block_imm_lanes`); a disp-only compilation already installs through it
@@ -4267,7 +4267,7 @@ pub(crate) struct Compilation {
     /// arrays rather than one array of pairs.
     imm_lane_widths: [u8; MAX_BLOCK_IMM_LANES],
     /// How many of `imm_lanes` are DISPLACEMENT lanes (`disp_lane_for`). The write choke never
-    /// needs the distinction — a lane is a lane there — but the install site does: the split
+    /// needs the distinction (a lane is a lane there) but the install site does: the split
     /// between `smc_lane_registrations` and `disp_lane_registrations` is what says which lane
     /// kind an A/B's `smc_lane_accepts` movement belongs to.
     disp_lanes: u8,
@@ -4302,7 +4302,7 @@ pub(crate) struct Compilation {
     /// Deliberately NOT folded into `DirectStallSnapshot` at install the way `jcc_shadow_sites`
     /// is: that fold is a run-path counter and this ledger has no run-path job. Its two consumers
     /// (the byte ledger and the arm vacuity check) both read a `Compilation` directly, and both
-    /// are fixtures -- which is why the field is `dead_code` outside a test build rather than
+    /// are fixtures, which is why the field is `dead_code` outside a test build rather than
     /// silently wired into a counter nobody asked for.
     #[cfg_attr(not(test), allow(dead_code))]
     eager_flags_sites: [u16; EAGER_FLAGS_CLASSES],
@@ -4338,7 +4338,7 @@ impl Compilation {
             .collect()
     }
 
-    /// How many mutable lanes this compilation registered — **EVERY family, not the immediate
+    /// How many mutable lanes this compilation registered: **EVERY family, not the immediate
     /// family alone.** The five sibling accessors below (`disp_lane_count`, `imm8_lane_count`,
     /// `count_lane_count`, `disp_store_lane_count`, `disp_load_widen_lane_count`) are SUBSET
     /// TALLIES of the same `imm_lanes` array through the same cursor, so
@@ -4413,10 +4413,10 @@ impl Compilation {
 /// `host` is a raw pointer to the same bytes, resolved at compile time from a direct page. It
 /// stays valid for the block's whole life: RAM host pointers never move for a given physical page
 /// (see `note_direct_data_map_changed`), and every event that could change which host bytes back a
-/// physical address — an A20 toggle, a direct-map change, a bus mapping-epoch change that is not
-/// data-only — routes through `invalidate_code_caches`, which clears this cache.
+/// physical address (an A20 toggle, a direct-map change, a bus mapping-epoch change that is not
+/// data-only) routes through `invalidate_code_caches`, which clears this cache.
 ///
-/// `width` is the lane's WIDTH CLASS in bytes — `IMM_LANE_WIDTH` for the `0x81` dword family and
+/// `width` is the lane's WIDTH CLASS in bytes: `IMM_LANE_WIDTH` for the `0x81` dword family and
 /// `disp_lane_for`'s disp32 field, `IMM8_LANE_WIDTH` for the `0x80` imm8 family. It travels with
 /// the lane all the way to the cache's `block_imm_lane_widths` so the write choke can test a patch
 /// against the width of the lane it landed on rather than against a single global width.
@@ -4451,7 +4451,7 @@ pub(crate) enum DirectKind {
     /// operand size and it decides how much of the destination the write DEFINES: a Word
     /// form writes bits 15..0 and leaves 31..16 exactly as the interpreter's
     /// `write_gpr_sized(.., Word, ..)` leaves them. Without the field the Word form lowers
-    /// as a 32-bit move, which zeroes the upper half rather than preserving it -- `decode`
+    /// as a 32-bit move, which zeroes the upper half rather than preserving it: `decode`
     /// zero-extends the immediate, so the wrong bits are zeros rather than garbage, which
     /// makes the miscompile quiet on any guest whose upper half happened to be clear.
     MovImm {
@@ -4465,7 +4465,7 @@ pub(crate) enum DirectKind {
     /// `data_matches`/`all_data_matches` for the other five).
     ///
     /// A CHAINED path reaches this slot without an entry check of its own, and what covers that is
-    /// the `used` mask below, not any rule about equal snapshots -- links stopped requiring those
+    /// the `used` mask below, not any rule about equal snapshots. Links stopped requiring those
     /// in the 2026-08-18 chain-used mask slice. Because `selector_segment` puts the segment in
     /// `used`, it is in this block's chain requirement, and every edge on the path here had to
     /// agree with that requirement (`SegmentLayout::link_merge`) or be refused. So no chained path
@@ -4474,7 +4474,7 @@ pub(crate) enum DirectKind {
     ///
     /// For the five DATA segments that pinning is not automatic. `data_matches` SKIPS any
     /// segment outside the block's `used` mask, and that mask is derived from actual memory
-    /// accesses — which a `0x8C` slot does not imply. `DirectKind::selector_segment` is what puts
+    /// accesses, which a `0x8C` slot does not imply. `DirectKind::selector_segment` is what puts
     /// the segment in the mask; without it a block whose only mention of DS is `mov ax, ds` would
     /// bake one selector and then be re-entered under another. Register destination only: a
     /// memory destination is a word store and belongs in `Store` if it ever ranks.
@@ -4501,7 +4501,7 @@ pub(crate) enum DirectKind {
         segment: SegmentIndex,
         src: u8,
     },
-    /// `MOV Sreg, m16` (0x8E, MEMORY source) -- ES or DS only, real mode or V86. `LoadSegReal`'s
+    /// `MOV Sreg, m16` (0x8E, MEMORY source): ES or DS only, real mode or V86. `LoadSegReal`'s
     /// write with a word memory read standing in for the register read: one guarded word load,
     /// then the same three stores (`access`/`default_size_32` and `base = selector << 4`, no
     /// limit) `LoadSegReal`'s own arm argues for at length.
@@ -4509,7 +4509,7 @@ pub(crate) enum DirectKind {
     /// `stack_width_kind` rewrites this into the `InterpretOne` call-out the register form
     /// already takes in protected mode (`InterpretOneRow::MovSreg`, the SAME row the memory form
     /// used unconditionally before this kind existed), so a protected-mode compile sees no change
-    /// at all -- only real mode and V86 gain a lowering.
+    /// at all: only real mode and V86 gain a lowering.
     ///
     /// Pyramid's `0x8E` non_continuable rows are the census this admits: 1,401,930 (#1) and
     /// 134,070 (#3), both memory-source, real mode.
@@ -4517,7 +4517,7 @@ pub(crate) enum DirectKind {
         segment: SegmentIndex,
         addr: DirectAddr,
     },
-    /// `LES`/`LDS` (0xC4 ES, 0xC5 DS), WORD operand size only -- two guarded word memory reads
+    /// `LES`/`LDS` (0xC4 ES, 0xC5 DS), WORD operand size only: two guarded word memory reads
     /// (the offset, then the selector at `addr + 2`), a GPR write and a `LoadSegReal`-shaped
     /// segment write, in the interpreter's own order: `execute_system_seg_decoded`'s 0xc4/0xc5 arm
     /// reads both words first, then calls `load_segment`, and only then writes the GPR. The
@@ -4525,7 +4525,7 @@ pub(crate) enum DirectKind {
     /// so the final GPR write reads it back rather than racing the scratch registers those two
     /// clobber.
     ///
-    /// Real mode or V86 only. There is no `InterpretOne` row for this opcode to fall back to --
+    /// Real mode or V86 only. There is no `InterpretOne` row for this opcode to fall back to,
     /// unlike `LoadSegRealMem` above, `jit_admits_non_continuable` only admits the WORD form to
     /// `classify` at all, so `stack_width_kind` refuses a protected-mode instance outright
     /// (`StackWidthDecline::LesLdsPmode`) rather than rewriting it into a call-out, and the block
@@ -4543,7 +4543,7 @@ pub(crate) enum DirectKind {
         addr: DirectAddr,
     },
     /// `POP Sreg` (0x07 ES, 0x1F DS) on a SIXTEEN-BIT stack at Word operand size, in REAL MODE or
-    /// V86 -- the tombraid loop-A census's largest row, behind `IZARRAVM_V86_LOOP_ROWS`.
+    /// V86: the tombraid loop-A census's largest row, behind `IZARRAVM_V86_LOOP_ROWS`.
     ///
     /// One kind, not two, because only one width exists. `classify` refuses the Dword form in its
     /// own arm (there the interpreter pops FOUR bytes and loads the low 16), so `stack_width_kind`
@@ -4555,7 +4555,7 @@ pub(crate) enum DirectKind {
     /// the arms that already ship them, including the two things about each that are easy to get
     /// wrong: the pointer advance is a 16-bit register op (`alu_r16_imm16` on the SP home), so
     /// ESP's high half survives; and there is deliberately NO limit store on the segment write,
-    /// because a real-mode segment load leaves the cached limit alone -- see `LoadSegReal`'s emit
+    /// because a real-mode segment load leaves the cached limit alone, see `LoadSegReal`'s emit
     /// arm for the full argument, which holds here for the same reason. The one thing it does NOT
     /// inherit is `Pop16`'s POP SP ordering note: the destination is a segment register, so it can
     /// never alias the stack pointer this instruction is advancing.
@@ -4571,11 +4571,11 @@ pub(crate) enum DirectKind {
     PopSegReal {
         segment: SegmentIndex,
     },
-    /// `CLC` (0xF8) and `STC` (0xF9) -- the tombraid loop-A census's `0xf8` row at 95,090,745
+    /// `CLC` (0xF8) and `STC` (0xF9): the tombraid loop-A census's `0xf8` row at 95,090,745
     /// interpreted hits, behind `IZARRAVM_V86_LOOP_ROWS`.
     ///
     /// The interpreter is one line, `set_flag(FLAG_CF, set)`, and `emit_set_cf_only` is already a
-    /// transcription of exactly that function's CF path -- both of its branches, the live-descriptor
+    /// transcription of exactly that function's CF path: both of its branches, the live-descriptor
     /// one that reproduces `PendingFlags::with_cf_override` in place and the bare one that writes
     /// EFLAGS directly, plus the trailing `eflags |= 0x2` that `set_flag` does on both. The rotate
     /// rows have been driving it from a CAPTURED carry since 2026-08-09; the only difference here
@@ -4596,45 +4596,45 @@ pub(crate) enum DirectKind {
         condition: u8,
         dst: u8,
     },
-    /// `SETcc m8` (0F 90..9F, MEMORY destination) -- the tombraid FMV census's `0x0F94 /0` row at
+    /// `SETcc m8` (0F 90..9F, MEMORY destination): the tombraid FMV census's `0x0F94 /0` row at
     /// 27,602,402 interpreted hits, behind `IZARRAVM_FPU_LOOP_ROWS`.
     ///
     /// A separate kind from `SetCc` rather than a `StoreSource` on `Store`, because of WHERE the
     /// value has to be computed. `emit_store` materialises its source LAST, inside the page-kind
     /// arm, after the address, the permission check and the write-pointer resolve have all
-    /// clobbered RAX/RCX/RDX/RDI -- and the value here is `popfq`-derived from RBP, which cannot
+    /// clobbered RAX/RCX/RDX/RDI, and the value here is `popfq`-derived from RBP, which cannot
     /// run there without disturbing the store's own live scratch. So the byte is computed FIRST,
     /// parked in the frame, and the store reads it back: see `StoreSource::ParkedByte` and
     /// `emit_set_cc_mem`.
     ///
     /// ALL SIXTEEN conditions, not just `/4` SETE. The condition is a raw four-bit code handed
     /// straight to `Encoder::setcc`, identical to what the register form above already does with
-    /// it, so there is no per-condition correctness question to measure separately -- and the
+    /// it, so there is no per-condition correctness question to measure separately, and the
     /// closure rule stated at the top of `classify` ("admitting one member of a shared arm while
     /// refusing its sibling would be arbitrary") applies to this arm exactly as it does there.
     ///
     /// Byte-wide by FORM, whatever the operand-size prefix says: the interpreter's arm calls
     /// `write_operand_u8` without consulting `operand_size`. `0x0f9x` is absent from classify's
     /// Word-size allowlist, so a 66-prefixed encoding never reaches the arm and an unprefixed one
-    /// in a CS.D = 0 segment does not either -- which is the width bar for this row, and it is the
+    /// in a CS.D = 0 segment does not either, which is the width bar for this row, and it is the
     /// SAME bar the register form has always had.
     SetCcMem {
         condition: u8,
         addr: DirectAddr,
     },
-    /// `SAHF` (0x9E) -- the tombraid FMV census's second-largest loop-B row at 55,203,044
+    /// `SAHF` (0x9E): the tombraid FMV census's second-largest loop-B row at 55,203,044
     /// interpreted hits, behind `IZARRAVM_FPU_LOOP_ROWS`.
     ///
     /// The interpreter is three lines: `materialize_flags()`, then
     /// `eflags = (eflags & !0xd5) | (ah & 0xd5) | 0x02`. Every bit in `0xd5` (CF, PF, AF, ZF, SF)
     /// is inside `ARITH_FLAGS`, so this touches nothing the lazy descriptor does not already own,
-    /// and OF -- the sixth `ARITH_FLAGS` member -- is deliberately PRESERVED.
+    /// and OF (the sixth `ARITH_FLAGS` member) is deliberately PRESERVED.
     ///
     /// No width field and no width bar of its own: SAHF has identical semantics at either operand
     /// size (it reads AH and writes five EFLAGS bits, neither of which is width-dependent), and
     /// `0x9e` is absent from classify's Word-size allowlist so the Word form stays a barrier. That
-    /// absence is a MEASUREMENT boundary, not a correctness one -- the census row is dword and no
-    /// fixture measures a 16-bit SAHF -- and it is stated here because the kind carries no width to
+    /// absence is a MEASUREMENT boundary, not a correctness one: the census row is dword and no
+    /// fixture measures a 16-bit SAHF, and it is stated here because the kind carries no width to
     /// bar on.
     Sahf,
     /// CBW/CWDE (0x98): widen the accumulator's sign into the next width. `width` is the
@@ -4699,7 +4699,7 @@ pub(crate) enum DirectKind {
         /// OperandSize::Word allowlist for exactly that reason; the field is what let it in.
         ///
         /// Only `Byte` is impossible here (`OperandSize` has two variants and the byte group is
-        /// `AluByteImm`), and a lane is admitted at `Dword` alone -- `IMM_LANE_WIDTH` is four.
+        /// `AluByteImm`), and a lane is admitted at `Dword` alone: `IMM_LANE_WIDTH` is four.
         width: MemoryWidth,
     },
     AluByteImm {
@@ -4717,39 +4717,39 @@ pub(crate) enum DirectKind {
         /// flags from the host operation's own result at run time whatever the source operand is
         /// (`emit_alu_reg_byte` already feeds it a register), so there is no compile-time split on
         /// the immediate's VALUE to preserve. `emit_rotate_reg`, by contrast, picks its capture
-        /// mask at emission from the count — see `rotate_rows_enabled`'s "THE DESIGN COST".
+        /// mask at emission from the count. See `rotate_rows_enabled`'s "THE DESIGN COST".
         lane: Option<ImmLane>,
     },
     /// The BYTE-LANE register ALU: `op r8, r8` for the whole eight-operation set, both operand
     /// orders (0x00/0x08/../0x38 with a register r/m, and 0x02/0x0A/../0x3A likewise).
     ///
-    /// `dst` and `src` are BYTE-register indices, where 4..=7 are AH/CH/DH/BH — the high byte of
+    /// `dst` and `src` are BYTE-register indices, where 4..=7 are AH/CH/DH/BH: the high byte of
     /// the first four 32-bit registers. That is the whole reason this cannot be `AluReg` with
     /// `width: MemoryWidth::Byte`: `AluReg`'s emitter reaches its operands through `home(index)`,
     /// which maps index 5 to the host register holding guest EBP, so a `cmp al, ch` lowered
     /// through it would compare against the wrong register at the wrong width. x86-64 cannot name
     /// AH/CH/DH/BH in an instruction that also carries a REX prefix, so the lane is reached by
     /// shift-and-mask on the way in (`emit_read_store_value` at Byte) and by mask-shift-or on the
-    /// way out (`emit_write_gpr8`) — machinery `AluByteImm`, `TestByte` and the byte INC/DEC form
+    /// way out (`emit_write_gpr8`): machinery `AluByteImm`, `TestByte` and the byte INC/DEC form
     /// already share.
     ///
     /// A separate variant rather than a `width` field on `AluReg` for that reason and for the
     /// `AluByteImm`/`AluImm` precedent: the byte forms are a different lane, not a narrower one,
     /// and every accessor on this kind (`byte_reads`, `read_segment`, `uses_stack`, ...) wants the
-    /// register-only default. `raw_clocks` wants the `_ => 2` default too, and correctly — the
+    /// register-only default. `raw_clocks` wants the `_ => 2` default too, and correctly: the
     /// interpreter's `execute_alu_decoded` returns one `Ok(clocks(2))` for all six forms. That
     /// default is PINNED rather than argued, in `direct_timing_cases`.
     ///
     /// # What this reaches, stated correctly
     ///
     /// **32-bit byte ALU, and only that.** The slice's first write-up justified this kind as
-    /// "ubiquitous in DOS-era software — text-mode tools, byte blitters, character loops",
+    /// "ubiquitous in DOS-era software: text-mode tools, byte blitters, character loops",
     /// explicitly discounting both benchmarks. That describes a population the arm CANNOT REACH,
-    /// and an adversarial review caught it. Two independent gates put 16-bit code out of range:
+    /// and a later check caught it. Two independent gates put 16-bit code out of range:
     /// `try_direct_continuation` returns `Interpret` at every `!d` boundary, so no block is ever
     /// compiled in a 16-bit code segment on any persona; and a `66`-prefixed byte ALU is refused
     /// because none of `0x00`/`0x02`/…/`0x38`/`0x3A` is in `classify`'s `OperandSize::Word`
-    /// allowlist — which `sixteen_bit_byte_alu_register_form_is_still_a_barrier` locks in.
+    /// allowlist, which `sixteen_bit_byte_alu_register_form_is_still_a_barrier` locks in.
     ///
     /// So the honest claim is narrower and still worth having: this closes a byte-lane hole in
     /// 32-bit protected-mode coverage that had been open since the ALU block was written, and it
@@ -4761,7 +4761,7 @@ pub(crate) enum DirectKind {
     /// oversight.** ALU form 4 (`0x04..=0x3c`), `0x88`, `0x8a`, `0xb0..=0xb7`, `0xc6`, `0xf6` and
     /// `0x84` are all admitted at Word on the stated grounds that a byte form's width is a
     /// property of the FORM and the prefix cannot leak past `classify`. Forms 0 and 2 satisfy that
-    /// argument identically — they carry a literal byte lane and no `operand_width` — so the only
+    /// argument identically: they carry a literal byte lane and no `operand_width`, so the only
     /// thing keeping them out is the campaign's standing rule against unmeasured admissions. Left
     /// out deliberately: admitting them would be a formation change with no census row to
     /// attribute it to, and it belongs to whichever slice opens the 16-bit region as a whole.
@@ -4785,7 +4785,7 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
         addr: DirectAddr,
     },
-    /// `TEST r/m16|32, r16|32` (0x85), REGISTER form -- AND for flags with no write-back.
+    /// `TEST r/m16|32, r16|32` (0x85), REGISTER form: AND for flags with no write-back.
     ///
     /// `width` arrived with the 2026-08-21 duke slice and is the whole of that slice on this kind.
     /// It is the same move `MovImm`, `AluImm`, `Load` and `Store` each made in their own slice:
@@ -4815,7 +4815,7 @@ pub(crate) enum DirectKind {
         dst: u8,
         src: u8,
     },
-    /// IMUL r32, r/m32, imm — the THREE-operand form, REGISTER source only (0x69 with a full-width
+    /// IMUL r32, r/m32, imm: the THREE-operand form, REGISTER source only (0x69 with a full-width
     /// immediate, 0x6B with a sign-extended imm8). `dst = src * imm`, and `dst` may equal `src`.
     ///
     /// One variant for both opcodes because the interpreter reaches them through two arms that are
@@ -4832,7 +4832,7 @@ pub(crate) enum DirectKind {
     ///
     /// No `width` field: 0x69 and 0x6b are absent from `classify`'s `OperandSize::Word` allowlist,
     /// so a 66-prefixed encoding never reaches the arm that builds this and the source is always a
-    /// dword. The MEMORY form is absent too — see the classify arm for why it is a missed lowering
+    /// dword. The MEMORY form is absent too: see the classify arm for why it is a missed lowering
     /// rather than a hazard.
     ImulImm {
         dst: u8,
@@ -4881,23 +4881,23 @@ pub(crate) enum DirectKind {
     /// `op` is the guest ModRM `reg` field, 0 for ROL and 1 for ROR, and it is passed STRAIGHT
     /// through to `shift_r32_imm8`'s own `/op` slot. Host group 2 numbers its sub-opcodes the same
     /// way the guest does, so the field needs no translation table and a widening to a third
-    /// sub-opcode would need one -- /2 and /3 are RCL and RCR, which the classify arm refuses
+    /// sub-opcode would need one: /2 and /3 are RCL and RCR, which the classify arm refuses
     /// because they take the incoming CF as a rotate INPUT.
     ///
     /// `width` selects the host rotate's operand width, Word or Dword. `classify` never constructs
     /// this kind at `MemoryWidth::Byte`: 0xD0/0xC0's rotate sub-opcodes (`/0`, `/1`) stay refused
-    /// there for the reason `emit_rotate_reg` still gives -- a byte rotate needs
+    /// there for the reason `emit_rotate_reg` still gives: a byte rotate needs
     /// `emit_read_store_value`/`emit_write_gpr8`, not a host rotate over the whole home.
     ///
     /// **This Word admission has no census row behind it, and that is stated plainly rather than
     /// argued around.** `census_row` (`jit/direct.rs`) stores `shape.opcode` VERBATIM and derives
     /// `operand_size` from the decoded `insn.operand_size` alone, which follows CS.D independently
-    /// of the instruction's own width -- so a census row printed `0xD0 word register /1` names the
+    /// of the instruction's own width, so a census row printed `0xD0 word register /1` names the
     /// literal BYTE opcode `0xD0` decoded in a CS.D=0 segment, not this arm's `0xD1`/`0xC1` at
     /// `OperandSize::Word`. `123-talk-shareware`'s 24.86M and 0.45M rows and `21-for-1-to-4`'s
     /// 13.50M row are therefore BYTE-register rotates and are unaffected by this admission; see
     /// `RotateRegByte` for the lane that claims them. `123-talk`'s remaining 29.70M row is a `0xD1`
-    /// word MEMORY form, which this kind cannot reach either -- it is register-only, see below --
+    /// word MEMORY form, which this kind cannot reach either (it is register-only, see below)
     /// and stays a named follow-up. This admission is enabling work: it closes the Word/Dword
     /// parity gap `Shift` already has and gives the byte lane's own emitter (`shift_r8_imm8`) a
     /// Word sibling to be measured against, but no corpus row currently exercises `0xC1`/`0xD1`
@@ -4907,7 +4907,7 @@ pub(crate) enum DirectKind {
     /// `shift_r16_imm8` takes CF from the bit rotated across the 16-bit boundary and computes OF
     /// from the 16-bit result, matching `CpuGsw::shift_rotate` at `BusWidth::Word` bit for bit. The
     /// x86-64 16-bit rotate also writes only the destination's low 16 bits, leaving bits 16..=63 of
-    /// the underlying 64-bit host register untouched -- the same high-half preservation
+    /// the underlying 64-bit host register untouched: the same high-half preservation
     /// `word_shifts_write_the_operand_size_and_preserve_what_is_above_it` pins for `Shift`, and for
     /// the identical reason: nothing in the emitter has to ask for it, the host CPU does it as part
     /// of executing a 16-bit instruction.
@@ -4924,7 +4924,7 @@ pub(crate) enum DirectKind {
         count: u8,
         width: MemoryWidth,
         /// Present only for the shapes `count_lane_for` admits (the register-destination `0xC1`
-        /// form, no prefixes, `imm_len == 1`, `len == 3`, and `width: MemoryWidth::Dword` -- see
+        /// form, no prefixes, `imm_len == 1`, `len == 3`, and `width: MemoryWidth::Dword`, see
         /// `count_lane_for`'s kind guard for why the Word admission does not extend to this field).
         /// When present the emitted form IGNORES
         /// `count` and loads the count byte out of guest RAM on every execution, so a guest patch
@@ -4932,7 +4932,7 @@ pub(crate) enum DirectKind {
         /// and is what the non-lane form bakes.
         ///
         /// **A runtime count is NOT flag-neutral here, and that is this lane's whole cost.**
-        /// `emit_rotate_reg` picks its capture mask at EMISSION from the masked count -- 0 emits
+        /// `emit_rotate_reg` picks its capture mask at EMISSION from the masked count: 0 emits
         /// nothing at all, 1 captures `CF|OF` and publishes the shadow, 2..31 captures CF and goes
         /// through `emit_set_cf_only`. The lane form has to reproduce that split as a RUNTIME
         /// three-way branch (`emit_rotate_reg_lane`), which is what `rotate_rows_enabled`'s "THE
@@ -4942,7 +4942,7 @@ pub(crate) enum DirectKind {
     /// ROL and ROR r8, register form (0xC0 and 0xD0, sub-opcodes /0 and /1). This is the ROW the
     /// corpus actually names: `census_row` stores `shape.opcode` verbatim and derives
     /// `operand_size` from the decoded segment default rather than the instruction's own width, so
-    /// a row printed `0xD0 word register /1` is this opcode -- a byte rotate -- decoded in a
+    /// a row printed `0xD0 word register /1` is this opcode, a byte rotate, decoded in a
     /// CS.D=0 segment, not `RotateReg` at `OperandSize::Word`. `123-talk-shareware`'s `0xD0
     /// register /1` and `/0` rows (24.86M and 0.45M runtime hits, its #1 and #3 census rows) and
     /// `21-for-1-to-4`'s `0xD0 register /1` (13.50M) are this kind.
@@ -4989,7 +4989,7 @@ pub(crate) enum DirectKind {
     /// CF = OF = (high half nonzero) and host `imul` sets CF = OF = (the full product does not
     /// sign-extend back from the low half). Those are different predicates over the same operands,
     /// which is why `emit_mul_mem_acc` is written out rather than parameterising
-    /// `emit_imul_mem_acc` on a bool -- the encoder keeps `mul_r32` and `imul_r32` apart for
+    /// `emit_imul_mem_acc` on a bool: the encoder keeps `mul_r32` and `imul_r32` apart for
     /// exactly that reason, and a shared body would make picking the wrong one a one-character
     /// edit.
     ///
@@ -5015,7 +5015,7 @@ pub(crate) enum DirectKind {
     ImulMemAcc {
         addr: DirectAddr,
     },
-    /// IMUL r/m32, one-operand SIGNED multiply, REGISTER form (0xF7 /5) -- the sibling
+    /// IMUL r/m32, one-operand SIGNED multiply, REGISTER form (0xF7 /5): the sibling
     /// `ImulMemAcc` is named after. Same implicit EDX:EAX destination, and no `raw_clocks` and no
     /// `width` field for exactly the reasons that variant gives.
     ImulRegAcc {
@@ -5027,7 +5027,7 @@ pub(crate) enum DirectKind {
     /// HOST: `emit_div_reg` guards a superset of the interpreter's fault set and side-exits with
     /// the instruction UN-STARTED, so the interpreter re-executes it and faults by its own rules.
     /// Read that function before touching this. Carries no `raw_clocks` field: group 3 charges
-    /// `clocks(2)` for every sub-opcode, which is the `_ => 2` default -- the `ImulMemAcc`
+    /// `clocks(2)` for every sub-opcode, which is the `_ => 2` default: the `ImulMemAcc`
     /// situation, not the `ImulMem` one.
     ///
     /// ONE variant with a flag where the encoder keeps `div_r32` and `idiv_r64` apart, because
@@ -5044,13 +5044,13 @@ pub(crate) enum DirectKind {
     /// would be exactly the arbitrary split the top of `classify` warns against).
     ///
     /// `DivReg`'s comment used to say the memory form was "deliberately absent, and the reason is
-    /// the fault rather than the address: a memory DIV can side-exit for two independent reasons --
-    /// the read's own guards and the divide guard -- at the same slot, and the second must not be
+    /// the fault rather than the address: a memory DIV can side-exit for two independent reasons:
+    /// the read's own guards and the divide guard, at the same slot, and the second must not be
     /// reachable before the first has been proved not to fire." **That ordering requirement is
     /// what this kind's emitter is built around** and it is stricter than it first sounds, because
     /// the hazard is not the ORDER of the exits, it is the mode-13 read COUNTER that sits between
     /// them. `emit_ram_read_pointer` deposits `mode13_*_reads` into the frame before it returns,
-    /// and those lanes are copied out on EVERY exit -- so a divide-guard exit taken after the
+    /// and those lanes are copied out on EVERY exit, so a divide-guard exit taken after the
     /// deposit would charge the read once natively and once more when the interpreter re-executes
     /// the instruction whole.
     ///
@@ -5063,7 +5063,7 @@ pub(crate) enum DirectKind {
     /// No `width` field, for `DivReg`'s reason exactly: classify's `OperandSize::Word` gate
     /// excludes `0xf7` (bar `/0` TEST), so the arm is unreachable at Word, and a `width` field
     /// would invite a future edit to pass `operand_width` and lower a 16-bit divide as a 32-bit
-    /// one. The bar is on the KIND -- this kind is dword-only by construction -- rather than on
+    /// one. The bar is on the KIND (this kind is dword-only by construction) rather than on
     /// the absence of a 0x66 prefix, which is why an UNPREFIXED `F7 /7 mem` in a CS.D = 0 segment
     /// (`OperandSize::Word`, prefix mask 0) is refused too.
     DivMem {
@@ -5085,7 +5085,7 @@ pub(crate) enum DirectKind {
     /// five-bit mask.
     ///
     /// `width` is the operand size and reaches the emitter at all three widths. It exists for the
-    /// reason `LoadExtend::dst_width` does -- a shift is a REGISTER-DESTINATION write, so a
+    /// reason `LoadExtend::dst_width` does: a shift is a REGISTER-DESTINATION write, so a
     /// Dword-only lowering of a 66-prefixed form clobbers the destination's high 16 bits where the
     /// interpreter's `write_operand_sized(.., Word, ..)` merges into the low 16. That is a
     /// miscompile, not a missed lowering, which is why the Word allowlist refused 0xC1 until this
@@ -5117,7 +5117,7 @@ pub(crate) enum DirectKind {
     ///
     /// No `raw_clocks` arm and none is owed: the interpreter's whole group-2 arm returns
     /// `Ok(clocks(2))` without consulting `operand_size`, which IS the `_ => 2` default. This is
-    /// the `ImulMemAcc` situation rather than the `ImulMem` one -- adding an arm here would invent
+    /// the `ImulMemAcc` situation rather than the `ImulMem` one: adding an arm here would invent
     /// a charge, as the Phase 5 call-out double-charge did in the other direction.
     Shift {
         op: u8,
@@ -5131,8 +5131,8 @@ pub(crate) enum DirectKind {
         /// `emit_shift_lane` for the branch itself.
         ///
         /// **Word can never carry one, and `count_lane_for` bars it EXPLICITLY on this field.**
-        /// The first version of this slice barred it by inference instead — "a Word `0xC1` needs a
-        /// `0x66`, which fails both the prefix bar and `len == 3`" — and that inference is FALSE in
+        /// The first version of this slice barred it by inference instead, "a Word `0xC1` needs a
+        /// `0x66`, which fails both the prefix bar and `len == 3`", and that inference is FALSE in
         /// a 16-bit code segment, where the operand size follows CS.D and not a prefix. An
         /// unprefixed `c1 e0 03` in a CS.D=0 segment is `shl ax, 3`: `Prefixes::default()`,
         /// `disp_len 0`, `imm_len 1`, `len 3`, `width: Word`. `0xC1` is on classify's Word
@@ -5145,7 +5145,7 @@ pub(crate) enum DirectKind {
         /// regression fixture.)
         lane: Option<ImmLane>,
     },
-    /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY -- the imm8 arm also
+    /// Group-2 shift by CL (0xD3 /4../7), register destination. SHIFTS ONLY: the imm8 arm also
     /// admits ROL (/0) and ROR (/1) but routes them to `RotateReg`, because rotates do not define
     /// PF, ZF, SF or AF and `emit_shift_cl` merges the shift mask.
     ///
@@ -5174,7 +5174,7 @@ pub(crate) enum DirectKind {
         width: MemoryWidth,
         addr: DirectAddr,
         /// This slot's `TimingClass` INDEX (`TimingClass::index`), where the raw
-        /// clock count used to sit. Same `u8`, same slot width -- review B4 bars
+        /// clock count used to sit. Same `u8`, same slot width: review B4 bars
         /// widening this field and the class migration does not need to.
         class: u8,
     },
@@ -5182,7 +5182,7 @@ pub(crate) enum DirectKind {
     ///
     /// `width` is the SOURCE width and is only ever Byte or Word. This differs from `Load`, where
     /// the source and destination widths are the same. Any shared code that reads this field must
-    /// treat it as the memory access width, never as the write-back width -- that is `dst_width`.
+    /// treat it as the memory access width, never as the write-back width: that is `dst_width`.
     ///
     /// `dst_width` is the DESTINATION width and is only ever Word or Dword. It is the operand
     /// size, so the two fields are independent: `66 0F B6` is a Byte source into a Word
@@ -5250,8 +5250,8 @@ pub(crate) enum DirectKind {
     /// and `Shift`, and the asymmetry is deliberate.** That split exists because the two register
     /// emitters differ in their WHOLE body: `emit_shift`'s falls through to an arithmetic shift
     /// right and publishes the RBP shadow wholesale, which would be wrong for a rotate twice over.
-    /// Here the body is the memory gauntlet -- one effective address, one page-kind check, one
-    /// permission check, one code-watch probe, two bias lookups and one mode-13 tail -- and it is
+    /// Here the body is the memory gauntlet: one effective address, one page-kind check, one
+    /// permission check, one code-watch probe, two bias lookups and one mode-13 tail, and it is
     /// IDENTICAL for all five sub-opcodes. Only the flag capture differs, and it differs by one
     /// mask and one three-line tail. Two kinds would mean two copies of the gauntlet, which is
     /// the duplication this tree refuses rather than the separation the register side needs.
@@ -5397,8 +5397,8 @@ pub(crate) enum DirectKind {
         release: u16,
     },
     /// RETF (`0xCB`) and RETF imm16 (`0xCA`), MODE-INDEPENDENT. Produced by `classify`; it never
-    /// reaches the emitter, because `stack_width_kind` admits exactly one cell -- 16-bit stack,
-    /// Word operand -- and rewrites it into `RetFar16`. Every other cell is refused explicitly.
+    /// reaches the emitter, because `stack_width_kind` admits exactly one cell (16-bit stack,
+    /// Word operand) and rewrites it into `RetFar16`. Every other cell is refused explicitly.
     RetFar {
         release: u16,
     },
@@ -5413,23 +5413,23 @@ pub(crate) enum DirectKind {
     /// so the whole CS record is a pure function of the popped selector and the emitted stores
     /// can reproduce it without reading a descriptor table. In protected mode that is false.
     ///
-    /// A terminal that WRITES A SEGMENT and still owns a dynamic successor -- the one shape the
+    /// A terminal that WRITES A SEGMENT and still owns a dynamic successor: the one shape the
     /// backend had no room for before this slice, and the reason `is_segment_write_block`'s
     /// derivation and `dynamic_successor`'s `!segment_write_block` term both had to move.
     RetFar16 {
         release: u16,
     },
     /// CALL FAR ptr16:16 (`0x9A`) on a 16-bit stack at Word operand size, in REAL MODE or V86
-    /// only. L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`), gated on L7 Part 1's run-loop
+    /// only. L8 of the corpus lever plan, gated on L7 Part 1's run-loop
     /// reachability fix landing first: without it this kind converts the block ENTRY sites
     /// `rejected -> compiled`, but the run loop never reaches `try_direct_continuation` at a
     /// non-continuable entry, so nothing native ever runs there. With it, the ten `0x9A` sites
     /// that carried 116.3 M of the corpus's 186.7 M `absent` class on 15-move-hole-puzzle become
     /// reachable, compiled and (once a predecessor's link binds) chained.
     ///
-    /// `selector` and `offset` are the instruction's own bytes -- a ptr16:16 IMMEDIATE, already
+    /// `selector` and `offset` are the instruction's own bytes: a ptr16:16 IMMEDIATE, already
     /// fully decoded by `decode.rs`'s `0x9a` arm into `insn.imm` (offset) and `insn.imm2`
-    /// (selector) -- not a value read off the stack. This is the whole reason the kind is
+    /// (selector), not a value read off the stack. This is the whole reason the kind is
     /// EASIER than `RetFar16` despite writing the same CS record: nothing about the target is
     /// runtime-unknown, so there is no POP, no stack READ guard for the target and no register
     /// materialization needed to name it.
@@ -5441,8 +5441,8 @@ pub(crate) enum DirectKind {
     /// alone, which is exactly the EIP-space difference because CS's base does not change across
     /// the edge. A far call's target lives in a DIFFERENT segment with a DIFFERENT, compile-time
     /// KNOWN base (`selector << 4`), so the arithmetic identity `entry_eip + (offset -
-    /// entry_eip) == offset` still holds bit-for-bit -- modular subtraction and re-addition of
-    /// the same value always cancels, whatever that value denotes -- but `classify` (`insn: &_,
+    /// entry_eip) == offset` still holds bit-for-bit: modular subtraction and re-addition of
+    /// the same value always cancels, whatever that value denotes, but `classify` (`insn: &_,
     /// lin: u32, entry_lin: u32`) is never handed the block's entry EIP or CS base needed to
     /// compute that delta, only linear addresses. Recovering `entry_eip` would mean threading
     /// `memory.segments.cs.base` from the EMITTER back through `classify`'s signature, which
@@ -5456,23 +5456,23 @@ pub(crate) enum DirectKind {
     /// This is sound rather than merely convenient, and cheap rather than merely simple:
     /// `written_segment() == Some(SegmentIndex::Cs)` already forces `segment_write_block = true`
     /// through the existing catch-all, which ALREADY forces `successors = [None, None]`
-    /// regardless of which completion path is chosen -- so the "simpler" static path would have
+    /// regardless of which completion path is chosen, so the "simpler" static path would have
     /// bought no chaining a link cell could use anyway, only saved a `mov_r32_imm32` and a
     /// register move that this path already pays once, on a terminal that fires far less often
     /// than the instructions inside the blocks it replaces. `far_dynamic` is therefore SET for
     /// this kind (a fourth arm on the `matches!` `is_segment_write_block`'s own doc proof
-    /// enumerates as "a third arm" for `RetFar16` alone -- read that comment; the argument is
+    /// enumerates as "a third arm" for `RetFar16` alone: read that comment; the argument is
     /// identical here: this kind reaches `[None, None]` through the segment-write arm while
     /// `dynamic_successor` is independently true through the `far_dynamic` disjunct, which is
     /// exactly the non-exclusivity `RetFar16` already introduced and this kind now shares).
     ///
     /// The two pushes mirror `Call16`'s single push widened to two, in the exact order
     /// `far_call` (`control.rs`) uses: CS first (the higher stack address, at `(SP+2) & 0xFFFF`
-    /// after both pushes), then the return IP (at `SP & 0xFFFF`) -- the mirror image of
+    /// after both pushes), then the return IP (at `SP & 0xFFFF`): the mirror image of
     /// `RetFar16`'s two pops, which is what lets one instruction's CALL be undone by the other's
     /// RETF. Both pushes share one `MemorySideExits` guard set (`AddressWrap::Word`), and SP does
     /// not move until AFTER both stores, so a fault on EITHER push leaves CS, EIP and SP
-    /// completely unchanged from the guest's perspective -- matching, rather than merely
+    /// completely unchanged from the guest's perspective, matching, rather than merely
     /// tolerating, the interpreter's own `far_call`, whose comment states the identical fact: a
     /// second-push fault "restores (E)SP past the committed first one", so the CS word may
     /// already be physically in memory at that point and it does not matter, because nothing
@@ -5486,8 +5486,8 @@ pub(crate) enum DirectKind {
     /// (`decode_inval_cs_load(armed) + far_ret_native(armed) == decode_inval_cs_load(base)`),
     /// since a CALL and a RETF are two different `decode_inval_cs_load` gaps that must stay
     /// separately attributable. So this kind deposits into a NEW, DEDICATED counter instead of a
-    /// shared half -- the `CpuGsw::far_call_ledger` cell (`far_call_ledger_offset`), written
-    /// through R15 by leg (e) below since the 2026-09-01 reprice moved it out of the frame -- read
+    /// shared half: the `CpuGsw::far_call_ledger` cell (`far_call_ledger_offset`), written
+    /// through R15 by leg (e) below since the 2026-09-01 reprice moved it out of the frame, read
     /// by `direct_stall_snapshot` and exposed as the `far_call_native` JSON field, with its own
     /// identity extension: `decode_inval_cs_load(armed) + far_ret_native(armed) +
     /// far_call_native(armed) == decode_inval_cs_load(base)`.
@@ -5498,7 +5498,7 @@ pub(crate) enum DirectKind {
         /// 5-byte instruction), exactly `Call16`'s own `return_delta`: computed by `classify` from
         /// `lin` and `entry_lin`, which is the LINEAR-space difference and, because CS's base does
         /// not change before this push executes, is also the EIP-space difference
-        /// `StoreSource::EipDelta` needs -- "the LIVE eip plus the delta". Carried as a field
+        /// `StoreSource::EipDelta` needs: "the LIVE eip plus the delta". Carried as a field
         /// because `classify` is the only place `lin` is in hand; the emitter has only `span` and
         /// `slot`, not the instruction's own address.
         return_delta: u32,
@@ -5518,28 +5518,28 @@ pub(crate) enum DirectKind {
     /// slice's doc comment already settled that: LOOP is a control transfer, and R1 refuses
     /// resume unless `eip == start + len` after the step. A native terminal is the only route.
     ///
-    /// SIMPLER THAN `Jcc`, which is the surprise in this kind. LOOP touches NO FLAGS -- the
-    /// interpreter's `0xe2` arm (execute.rs) contains not one `set_flag` -- so there is no
+    /// SIMPLER THAN `Jcc`, which is the surprise in this kind. LOOP touches NO FLAGS: the
+    /// interpreter's `0xe2` arm (execute.rs) contains not one `set_flag`, so there is no
     /// condition to materialise, no `emit_capture_flags`, no pending descriptor and no
     /// `emit_load_host_flags`. The emitted decrement sets the host ZF that the emitted branch
     /// reads, one instruction later, and nothing publishes host flags to the guest.
     ///
     /// **THE EMITTER'S WHOLE INVARIANT, stated as a requirement rather than left as an accident
     /// of ordering: nothing may be inserted between the decrement and the branch.** Anything
-    /// placed there -- a counter, a probe, a future guard -- reads a stale ZF, and the loop then
+    /// placed there, a counter, a probe, a future guard, reads a stale ZF, and the loop then
     /// either never exits or exits at once. `Jcc`'s arm calls `emit_load_host_flags` in exactly
     /// that gap; this kind must NOT, and a reader porting one arm to the other will reach for it.
     ///
     /// `raw_clocks` carries an EXPLICIT 11: the interpreter charges `clocks(11)` whether the
     /// branch is taken or not, against a `_ => 2` default. This is the `ImulMem` situation (an
     /// arm is required), not the `ImulMemAcc` one (rides the default), and getting the two
-    /// backwards is the most likely silent error in this slice -- `completed_raw` sums the same
+    /// backwards is the most likely silent error in this slice: `completed_raw` sums the same
     /// accessor, so the end-of-emit assertion agrees with itself whatever it returns.
     ///
     /// TWO WIDTHS IN ONE INSTRUCTION. The COUNTER is CX or ECX by ADDRESS size; the branch
     /// target wraps by OPERAND size (`relative_jump(rel, operand_size)` masks EIP to 16 bits at
-    /// Word). `classify` admits the two MATCHED cells -- `AddressSize::Dword` with
-    /// `OperandSize::Dword`, and `AddressSize::Word` with `OperandSize::Word` -- and refuses the
+    /// Word). `classify` admits the two MATCHED cells (`AddressSize::Dword` with
+    /// `OperandSize::Dword`, and `AddressSize::Word` with `OperandSize::Word`) and refuses the
     /// two mixed cells explicitly: a Word counter paired with a Dword target, or a Dword counter
     /// paired with a Word target. `counter_word` records which matched cell this instance is, so
     /// the emitter can pick the decrement width; the Word target's wrap is handled upstream by
@@ -5547,7 +5547,7 @@ pub(crate) enum DirectKind {
     /// no help from this kind.
     ///
     /// The Word cell's decrement uses `Encoder::alu_r16_imm16`, which writes only the low 16 bits
-    /// and PRESERVES bits 31..16 of the guest register -- the opposite of `alu_r32_imm32`, which
+    /// and PRESERVES bits 31..16 of the guest register: the opposite of `alu_r32_imm32`, which
     /// would clear ECX's high half on every Word LOOP. Getting this backwards is silent: the
     /// block still compiles, still runs, and only the guest's ECX comes out wrong.
     ///
@@ -5565,16 +5565,16 @@ pub(crate) enum DirectKind {
     /// guest ZF matches `wanted_zf` (`true` for LOOPE). Behind `IZARRAVM_LOOPCC_ROWS`.
     ///
     /// The nascar-586 census at merged main `a836b309`: the `0xE1` dword row is 2,639,630
-    /// `runtime_hits` and 2,638,564 unbound exits across NINE sites -- hits equal exits to
+    /// `runtime_hits` and 2,638,564 unbound exits across NINE sites: hits equal exits to
     /// 99.96%, the densest termination row on the board: every single execution ended its
     /// block. `0xE0` appears only at Word width there (380 exits), which the address-size gate
     /// refuses anyway.
     ///
-    /// **The wall claim is PRE-DECLARED EXPECTED-NULL** (design doc
-    /// `dev_docs/nascar-loopcc-slice-design-2026-08-30.md` section 1): 2.64 M exits at the
+    /// **The wall claim is PRE-DECLARED EXPECTED-NULL** (NASCAR LOOPcc
+    /// slice design, section 1): 2.64 M exits at the
     /// corrected 101-111 ns/entry is ~0.5% of the nascar run, under that fixture's measured
-    /// floor. The slice's case is the mechanism -- census exits removed with zero relocation,
-    /// guest identity, clean controls -- not a wall number.
+    /// floor. The slice's case is the mechanism: census exits removed with zero relocation,
+    /// guest identity, clean controls. Not a wall number.
     ///
     /// What separates this from `Loop`, and it is ONE thing: **it READS the guest ZF.** The
     /// read must see the PRE-instruction guest flag, possibly still in a live pending
@@ -5582,7 +5582,7 @@ pub(crate) enum DirectKind {
     /// counter FIRST off the decrement's own host ZF (the same adjacency `Loop`'s invariant
     /// names), then rebuilds host flags from the guest state through the EXACT
     /// `emit_load_host_flags(); e.jcc(cond)` sequence `Jcc`'s non-shadow arm uses at the same
-    /// slot position -- whatever contract makes that correct against a live pending descriptor
+    /// slot position, whatever contract makes that correct against a live pending descriptor
     /// for `Jcc` makes it correct here, and this kind deliberately re-derives nothing about the
     /// lazy-flag machinery. Like `Loop`, it PUBLISHES no flag.
     ///
@@ -5659,7 +5659,7 @@ pub(crate) enum DirectKind {
     /// The register form is `JmpReg`, below. It was absent for two reasons that have both since
     /// been settled: the attribution census measured zero occurrences of it (the duke3d-486
     /// census now reads 11,718,562 static exits, 11,736,700 interpreted executions, and 586 reads
-    /// 32.8M/32.8M -- its fourth-largest rejected row), and its clock charge was unverified
+    /// 32.8M/32.8M, its fourth-largest rejected row), and its clock charge was unverified
     /// (`execute_extended.rs` group-5 arm 4 returns `clocks(7)` unconditionally, for the register
     /// and memory operand alike, so it charges what this kind charges).
     ///
@@ -5680,7 +5680,7 @@ pub(crate) enum DirectKind {
         addr: DirectAddr,
     },
     /// JMP r/m32, REGISTER form (`0xFF /4`, mod == 3): EIP becomes the register's value and
-    /// nothing else changes. `CallReg` minus the push, or `JmpMem` minus the memory read -- it
+    /// nothing else changes. `CallReg` minus the push, or `JmpMem` minus the memory read: it
     /// touches no memory at all, which makes it the simplest dynamic-successor kind in the set.
     ///
     /// Four properties, each inherited rather than invented, and each pinned by a mutation:
@@ -5705,7 +5705,7 @@ pub(crate) enum DirectKind {
     ///   rebound keeps its stale `target_eip`, and a later jump landing on that value transfers
     ///   natively into the wrong block. Recording a static successor here would arm that trap.
     /// * **The CS-limit check precedes the slot's completion accounting.** There is no guest byte
-    ///   to leave untouched -- this kind mutates only EIP -- so the atomicity question is entirely
+    ///   to leave untouched (this kind mutates only EIP) so the atomicity question is entirely
     ///   about WHICH EIP the side exit resumes at. Publishing the limit exit after `completed`
     ///   and `completed_raw` advance would hand the interpreter a state in which the jump already
     ///   retired, and it would re-enter past the instruction that faulted with its 7 clocks
@@ -5779,7 +5779,7 @@ pub(crate) enum DirectKind {
     /// `raw_clocks` carries an explicit `=> 0` arm, and the rule is the opposite of what this
     /// comment claimed when the slice shipped: the call-out's ENTIRE charge is the RUNTIME lane
     /// (the helper's return value, added at the call site), so the STATIC lane must see zero.
-    /// Omitting the arm does not express that -- it selects the `_ => 2` default and charges 2 on
+    /// Omitting the arm does not express that: it selects the `_ => 2` default and charges 2 on
     /// top of the runtime 12. `X87` carries its own `=> 0` for exactly this reason.
     ///
     /// The `completed_raw == raw_clocks` assertion at the end of `emit` is BLIND to this class
@@ -5889,7 +5889,7 @@ impl MemoryWidth {
     /// of legitimately-4-aligned doubles that DOS compilers emit. Tbyte's first eight bytes ARE
     /// those two transactions, so it inherits the same 4, and the divergence is wider still
     /// (4 against 10). `emit_wide_page_guard` is the site that must read this method rather than
-    /// `bytes()` for the alignment mask -- and, because both wide widths have
+    /// `bytes()` for the alignment mask, and, because both wide widths have
     /// `alignment_bytes() < bytes()`, the site whose page-crossing compare is live for both.
     pub(crate) const fn alignment_bytes(self) -> u32 {
         match self {
@@ -5905,7 +5905,7 @@ impl MemoryWidth {
     /// The mask an alignment test ANDs against a linear address: nonzero means the access does
     /// not meet this width's alignment requirement. The `MemoryWidth` counterpart of
     /// `BusWidth::misaligned_at`, which cannot be reused here because the two carve Qword and
-    /// Tbyte differently -- see `alignment_bytes` above for why those two ask for 4.
+    /// Tbyte differently, see `alignment_bytes` above for why those two ask for 4.
     ///
     /// Read this at a site that asks the GUARD's question, "did the call-site alignment test
     /// consider this misaligned". A site asking whether the access is one natural transaction of
@@ -5958,9 +5958,9 @@ pub(crate) enum StoreSource {
     /// A byte the SLOT computed before the store's address work started, parked in the native
     /// frame at `STACK_PUSH_MEM_VALUE` and read back here. Today's only producer is `SetCcMem`.
     ///
-    /// It exists because `emit_store` materialises its source LAST -- inside the page-kind arm,
+    /// It exists because `emit_store` materialises its source LAST, inside the page-kind arm,
     /// after the address, the permission check and the write-pointer resolve have consumed every
-    /// one of RAX/RCX/RDX/RDI -- and a SETcc byte cannot be produced there: it needs
+    /// one of RAX/RCX/RDX/RDI, and a SETcc byte cannot be produced there: it needs
     /// `emit_load_host_flags`, which works in RAX and moves RSP with a `push`/`popfq` pair.
     ///
     /// The frame slot is the one `emit_push_mem` already uses for the same shape (a value read
@@ -5987,10 +5987,10 @@ pub(crate) struct DirectAddr {
     /// Present only for the shapes the THREE displacement-lane matchers in `jit::direct::disp_lanes`
     /// admit, and they are no longer one family:
     ///
-    /// * `disp_lane_for` — `0x8A MOV r8, [..disp32..]`, default ON;
-    /// * `disp_load_widen_lane_for` — `0x8B MOV r32, [..disp32..]`, `IZARRAVM_DISP_LOAD_WIDEN`,
+    /// * `disp_lane_for`: `0x8A MOV r8, [..disp32..]`, default ON;
+    /// * `disp_load_widen_lane_for`: `0x8B MOV r32, [..disp32..]`, `IZARRAVM_DISP_LOAD_WIDEN`,
     ///   default OFF;
-    /// * `disp_store_lane_for` — `0x89 MOV [..disp32..], r32` and `0x88 MOV [..disp32..], r8`,
+    /// * `disp_store_lane_for`: `0x89 MOV [..disp32..], r32` and `0x88 MOV [..disp32..], r8`,
     ///   `IZARRAVM_DISP_STORE_LANES`, default OFF. **So a lane can now ride a `Store`.**
     ///
     /// When present the emitted effective address IGNORES `disp` and loads the four displacement
@@ -6000,14 +6000,14 @@ pub(crate) struct DirectAddr {
     ///
     /// It rides on the ADDRESS rather than on `DirectKind::Load` because the displacement's one
     /// consumer is `emit_effective_address` and every memory emitter reaches it through
-    /// `emit_segmented_linear_address` — including the one-lookup fast paths — so a single seam
+    /// `emit_segmented_linear_address`, including the one-lookup fast paths, so a single seam
     /// serves them all. That is what made the Store admission a matcher widening rather than new
     /// plumbing, and it is why the segment-limit compare and the base add downstream of the lane
     /// arm run on the PATCHED address: a store whose patched displacement walks past the limit
     /// takes the same `segment_limit` side exit the baked form would.
     ///
     /// The lane arm forms the address through EAX alone, so it is safe whatever a caller has
-    /// staged in the other scratch registers — and, for the Store admission, both store emitters
+    /// staged in the other scratch registers, and, for the Store admission, both store emitters
     /// were checked to stage NOTHING across it (`emit_store` and `emit_store_fast` both form the
     /// address first). An `AluMemSource` / `RmwIncDec` / `RotateShiftMem` / x87 admission is still
     /// unmeasured and still owes its own review and census row. `RotateShiftMem` is named here
@@ -6050,12 +6050,12 @@ impl DirectKind {
     /// `TimingClass` the interpreter's arm for that opcode names, and both sides
     /// read it out of the one persona-and-epoch table the CPU resolved at
     /// construction. That is what makes native and interpreted charges equal by
-    /// construction rather than by two literals happening to agree -- the
+    /// construction rather than by two literals happening to agree: the
     /// failure mode the `_ => 2` default this function used to end with shipped
     /// twice this campaign.
     ///
     /// **There is no `_` arm, deliberately.** Every one of `DirectKind`'s
-    /// variants is listed, so a new variant is a compile error here -- exactly
+    /// variants is listed, so a new variant is a compile error here: exactly
     /// the review the old default silently skipped. Nothing inside the emitter
     /// can catch a wrong arm: `completed_raw` sums this same accessor, so the
     /// end-of-`emit` assertion agrees with itself whatever the arm returns, and
@@ -6085,7 +6085,7 @@ impl DirectKind {
             // the interpreter's `0x84`/`0x85` arm.
             Self::Test { .. } | Self::TestByte { .. } => TimingClass::Reg,
             // The slot's own class INDEX, stored where the raw clock count used
-            // to be. Same `u8`, same slot width -- the review's B4 bars widening
+            // to be. Same `u8`, same slot width: the review's B4 bars widening
             // these three fields and this migration does not need to.
             Self::Load { class, .. }
             | Self::LoadExtend { class, .. }
@@ -6114,7 +6114,7 @@ impl DirectKind {
             // 0xf7 Word forms, and the 0xf6 byte forms become `InterpretOne`
             // call-outs. So the WIDTH is a property of the kind rather than a
             // field, and widening that admission means giving these kinds a
-            // width field and splitting these arms -- never adding a default.
+            // width field and splitting these arms, never adding a default.
             Self::TestImmReg { .. } => TimingClass::TestImmReg,
             Self::TestImmMem { .. } => TimingClass::TestImmMem,
             Self::NegReg { .. } => TimingClass::NotNegReg,
@@ -6197,7 +6197,7 @@ impl DirectKind {
             | Self::CallReg { .. }
             | Self::CallMem { .. } => TimingClass::CallJmpRm,
             // `Ret`/`Ret16` carry `release`, which is `0xc3`'s zero and `0xc2`'s
-            // immediate, so the two encodings ARE separable here -- unlike the
+            // immediate, so the two encodings ARE separable here, unlike the
             // shift pair above. A `0xc2 0x0000` is indistinguishable from `0xc3`
             // and charges `0xc3`'s count, which both references give as the
             // cheaper of the two; it is a two-byte-longer encoding of the same
@@ -6455,7 +6455,7 @@ impl DirectKind {
     }
 
     /// The operand address and access width of a slot whose emitter reaches the UNRELAXED wide
-    /// guard -- `emit_wide_page_guard`, whose alignment half SIDE-EXITS rather than falling into a
+    /// guard: `emit_wide_page_guard`, whose alignment half SIDE-EXITS rather than falling into a
     /// split-charge slow path. `None` for every other kind.
     ///
     /// THIS IS AN ENUMERATION OF EMITTER SITES, not of opcodes, and it is written against them one
@@ -6494,7 +6494,7 @@ impl DirectKind {
     /// `ImulMem`, `ImulMemAcc`, `TestImmMem`, `Store`, `SetCcMem` and CMP's read all dispatch to a
     /// relaxed site through `emit_ram_read_pointer` / `emit_store`, and they do so only while
     /// `one_lookup_load` and `one_lookup_store` are on. With either turned off they become
-    /// unrelaxed too and this list under-covers -- which costs a missed refusal, never a
+    /// unrelaxed too and this list under-covers, which costs a missed refusal, never a
     /// miscompile, on an arm no fixture benches.
     fn unrelaxed_wide_guard_access(self) -> Option<(DirectAddr, MemoryWidth)> {
         match self {
@@ -6542,7 +6542,7 @@ impl DirectKind {
             | Self::PushMem { addr, .. }
             | Self::JmpMem { addr, .. }
             | Self::CallMem { addr, .. }
-            // The memory SOURCE segment -- DS by default, overridable -- not the ES/DS the
+            // The memory SOURCE segment (DS by default, overridable) not the ES/DS the
             // instruction WRITES. `written_segment` reports that half; the two are independent
             // and can differ (`les bx, es:[si]` reads through ES and writes ES right back).
             | Self::LoadSegRealMem { addr, .. }
@@ -6589,12 +6589,12 @@ impl DirectKind {
     /// Separate from `read_segment` because the two want different things from
     /// `SegmentLayout::capture`: a read wants the descriptor pinned AND validated as accessible,
     /// while a selector read wants it pinned only. Folding this into `read_segment` would refuse
-    /// to compile `mov ax, fs` whenever FS is null — a legal instruction with a legal answer.
+    /// to compile `mov ax, fs` whenever FS is null: a legal instruction with a legal answer.
     fn selector_segment(self) -> Option<SegmentIndex> {
         match self {
             // CS is excluded on purpose rather than by omission: it is not in `SegmentLayout.data`
             // at all, it rides the separate `cs` field, and `cs_matches` pins it for every block
-            // unconditionally. Putting it in the DESCRIPTOR mask would be inert at best -- there
+            // unconditionally. Putting it in the DESCRIPTOR mask would be inert at best: there
             // is no `data[1]` for `data_matches` to compare. The selector bake is reported instead
             // by `bakes_cs_selector` below as `BAKES_CS_BIT`, which is a different bit answering a
             // different question, and which exists because a chained far transfer skips
@@ -6603,7 +6603,7 @@ impl DirectKind {
             // `PUSH Sreg`. Reporting it here is what makes the lowering safe, not bookkeeping: the
             // emitted code bakes the selector as a constant, so without this a block whose only
             // mention of DS is `push ds` leaves DS out of `used`, `data_matches` skips it, and the
-            // block keeps matching after the guest reloads DS -- pushing the old selector forever.
+            // block keeps matching after the guest reloads DS, pushing the old selector forever.
             // `PUSH CS` (admitted 2026-08-08) is deliberately EXCLUDED by the guard, exactly like
             // `MovSegToReg` above: CS is not in `SegmentLayout.data`, `SegmentLayout::selector`
             // reads the separate `cs` field, and `cs_matches` pins it for every block
@@ -6627,8 +6627,8 @@ impl DirectKind {
     /// `used` that names no segment.
     ///
     /// Why it has to exist. Both shapes below turn a segment register into an immediate at emit
-    /// time -- `emit_store` rewrites `StoreSource::Selector(Cs)` into `StoreSource::Imm` and the
-    /// `MovSegToReg` arm emits `mov_r32_imm32` -- reading it through `SegmentLayout::selector`'s
+    /// time: `emit_store` rewrites `StoreSource::Selector(Cs)` into `StoreSource::Imm` and the
+    /// `MovSegToReg` arm emits `mov_r32_imm32`, reading it through `SegmentLayout::selector`'s
     /// separate `cs` field. Until far returns, that was pinned for every block by `cs_matches` at
     /// the dispatcher entry check and needed no mask bit. A chained far transfer enters a
     /// successor's body without returning to the dispatcher, so `cs_matches` never runs for it,
@@ -6651,7 +6651,7 @@ impl DirectKind {
                     ..
                 }
                 // `CallFar16` pushes the OLD (pre-transfer) CS selector as a compile-time
-                // immediate baked from this block's entry CS -- exactly the same shape `PUSH CS`
+                // immediate baked from this block's entry CS: exactly the same shape `PUSH CS`
                 // and `MOV r16, CS` bake, just inside a far-call's own emitter arm rather than a
                 // dedicated PUSH/MOV kind. It is NOT applicable to `RetFar16`, which is the sibling
                 // this predicate might be mistaken for: `RetFar16` writes a NEW CS record it just
@@ -6690,7 +6690,7 @@ impl DirectKind {
     /// accessors above and must not be folded into any of them.
     ///
     /// `write_segment` names the segment a slot stores THROUGH, and it feeds
-    /// `segment_access_supported(.., write = true)` -- "can this descriptor be written through",
+    /// `segment_access_supported(.., write = true)`: "can this descriptor be written through",
     /// not "is this register being replaced". Reporting the load there would ask the wrong
     /// question and, via `pinned_segments`, drag the segment into `used`, making `data_matches`
     /// compare an entry value the slot never reads and retiring the block on every entry-DS
@@ -6707,10 +6707,10 @@ impl DirectKind {
             // `dynamic_successor`'s `!segment_write_block` term (the one structural change this
             // slice makes) invites an implementer to stop reporting the write instead. Do not.
             // This report is what sets `segment_writes` and therefore `segment_write_block`,
-            // which is what masks the `successors` catch-alls -- and a far block that published a
+            // which is what masks the `successors` catch-alls, and a far block that published a
             // static fallthrough would put a LINEAR-keyed cell on a static edge.
             // `CallFar16` writes CS from an IMMEDIATE selector already in the instruction bytes,
-            // not from a value popped off the stack -- a different source but the identical
+            // not from a value popped off the stack: a different source but the identical
             // question this accessor asks (which segment REGISTER does this slot overwrite), and
             // the identical reason it must answer it: this report is what sets `segment_writes`
             // and therefore `segment_write_block`, which masks the `successors` catch-alls. See
@@ -6750,7 +6750,7 @@ impl DirectKind {
             | Self::PushMem { .. }
             | Self::CallMem { .. }
             // The two pushed words (CS then the return IP) both go through SS, exactly like
-            // `Call16`'s one push -- widened by one word, not by a different segment.
+            // `Call16`'s one push: widened by one word, not by a different segment.
             | Self::CallFar16 { .. } => Some(SegmentIndex::Ss),
             _ => None,
         }
@@ -6822,10 +6822,10 @@ impl DirectKind {
     /// members that are not are `CallOut { PortWriteAlImm8 }` and `CallOut { PortWriteAlDx }`, and
     /// both are here for the same reason: the OUT helper returns its step-break bit
     /// UNCONDITIONALLY, so the block's side exit at the OUT is taken on every execution and any
-    /// slot the walk appended after it is emitted dead -- paid for in compile time, in the page
+    /// slot the walk appended after it is emitted dead, paid for in compile time, in the page
     /// budget, in the block's static accounting and in its budget bound, and then never executed.
     /// Terminating the walk is strictly less work with no behavioural difference (`is_terminal` is
-    /// read by the walk, the min-length rule, the size estimate and the census suffix scan --
+    /// read by the walk, the min-length rule, the size estimate and the census suffix scan,
     /// never by the emitter, which ends a non-control block by advancing EIP past its slots
     /// exactly as it does for a block that ran out of instruction budget).
     ///
@@ -6899,8 +6899,8 @@ impl DirectKind {
     ///
     /// * x87 slots. They declare no GPR access, so the accessor test would price them at the
     ///   register rate, and the constants' doc says they are priced at the MEMORY rate. That is
-    ///   deliberately low rather than measured -- `MAX_X87_BLOCK_INSTRUCTIONS` already keeps such
-    ///   a block inside its page -- but low is not the same as forty bytes, and the doc has to be
+    ///   deliberately low rather than measured: `MAX_X87_BLOCK_INSTRUCTIONS` already keeps such
+    ///   a block inside its page, but low is not the same as forty bytes, and the doc has to be
     ///   true of the code.
     /// * the four register-operand kinds that still emit a SIDE EXIT: the two divide guards and
     ///   the two dynamic transfers. A stub plus its shared accounting block is worth far more than
@@ -6916,7 +6916,7 @@ impl DirectKind {
             // `emit_ram_read_pointer` call behind its own cross-page/permission/segment-limit
             // guard set (see the emit arm). A single `EMITTED_MEMORY_SLOT_BYTES` prices this at
             // half its actual emitted size, which only under-estimates a page budget the
-            // recovery search would otherwise catch -- but LES/LDS is exactly the shape (two
+            // recovery search would otherwise catch, but LES/LDS is exactly the shape (two
             // reads in one slot) that makes the gap large enough to name rather than absorb.
             2 * EMITTED_MEMORY_SLOT_BYTES
         } else if self.is_x87()
@@ -6980,11 +6980,11 @@ impl DirectKind {
 /// compare and the `SegmentLayout` pin at all three stages. The four `DirectAddr` producers in the
 /// tree are exactly: `direct_addr` (override folded by decode), the `0xa0..=0xa3` moffs arms
 /// (which read `segment_override` themselves), and `stack_addr` / `frame_addr` (hard-coded SS,
-/// matching the hard-coded `Some(SegmentIndex::Ss)` those kinds return) — so there is no path on
+/// matching the hard-coded `Some(SegmentIndex::Ss)` those kinds return), so there is no path on
 /// which a lowered access can disagree with the interpreter about which segment it uses.
 ///
 /// Census evidence for the admitted set (`.bench/results/rejected-rows-20260802/slice5`): SS
-/// carries 19,552,517 doom exits across two rows — 97.63% of doom's whole rejected class — ES 718
+/// carries 19,552,517 doom exits across two rows, 97.63% of doom's whole rejected class, ES 718
 /// more across seven, and GS 1,170 on quake. DS and FS measure zero on both fixtures but share the
 /// mechanism exactly: the five data segments are handled uniformly by `SEGMENT_ORDER`,
 /// `segment_bit`, `SegmentLayout.data` and `segment_access_supported`, with no per-segment arm
@@ -7009,7 +7009,7 @@ impl DirectKind {
 /// only. That is true in PROTECTED mode and only there: `segment_access_supported`'s first line
 /// returns `true` unconditionally in real mode and V86, where a segment load has no descriptor to
 /// have a type. Loop A is V86. So the mechanism this gate admits is exactly "reads wherever CS is
-/// readable, writes only where a segment load has no descriptor" -- a split the existing function
+/// readable, writes only where a segment load has no descriptor": a split the existing function
 /// already expresses, rather than a new gate this one has to add. A block admitted under one of
 /// those modes can never later be entered under the other: CR0.PE and EFLAGS.VM are bits 1 and 2 of
 /// `jit_mode_key`, which `BlockKey` carries and the entry check compares, the same argument
@@ -7028,7 +7028,7 @@ impl DirectKind {
 /// the two homes agreeing. They cannot disagree. `Registers::cs()` is literally
 /// `self.segment(SegmentIndex::Cs)` (`lib.rs`), and `SegmentLayout::capture` fills `cs` and
 /// `data[1]` from that one array element in the same call, so `cs_matches` and the `data[1]` half
-/// of `data_matches` are the same predicate -- and `all_data_matches`, which the dispatcher entry
+/// of `data_matches` are the same predicate, and `all_data_matches`, which the dispatcher entry
 /// check runs, already compares `data[1]` on every block today. What the admission newly does is
 /// put the CS bit in `used`, which makes `SegmentLayout::descriptor(Cs)` legal (its `debug_assert`
 /// is on `used`) and adds CS to `merge_chain`'s comparison; the latter can refuse no edge that
@@ -7104,7 +7104,7 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 ///
 /// `block_continuable` decides whether the INTERPRETER may chain an instruction into a
 /// `run_budgeted` straight-line run. The compile walk has always consulted it as if it were a
-/// statement about emittability, which it never was — the rejected-row campaign's Slice 5 census
+/// statement about emittability, which it never was: the rejected-row campaign's Slice 5 census
 /// named the arm and found it holding the largest `non_continuable` rows on both fixtures. Its
 /// refusals fall into three kinds, and only the first is a property this backend must inherit:
 ///
@@ -7115,8 +7115,8 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 ///  * **Device-visible.** The port forms. A write always sets `io_touched`, so the run must end at
 ///    the boundary after it; the IN forms are admitted by `block_continuable` itself on the
 ///    Approximate personas and reach this backend through a call-out slot that reproduces that
-///    boundary (see the call-out section). OUT is a genuine policy refusal and NOT admitted here —
-///    see the audit note at the end.
+///    boundary (see the call-out section). OUT is a genuine policy refusal and NOT admitted here.
+///    See the audit note at the end.
 ///  * **Classification artifact.** `route_group` sorts three-operand IMUL (0x69/0x6B) into
 ///    `DecodeGroup::Misc`, the "heterogeneous one-off single-byte block", purely because of the
 ///    opcode neighbourhood it shares with the BCD adjusts, INS/OUTS, AAM/AAD, SALC/XLAT and HLT.
@@ -7133,7 +7133,7 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 ///
 /// Admitting 0x69/0x6B upstream would also lengthen the INTERPRETER's straight-line runs, which
 /// moves run boundaries, and run boundaries are where the machine services device events. That is
-/// a guest-TIMING change on the Approximate personas — legitimate under the state-exact contract,
+/// a guest-TIMING change on the Approximate personas, legitimate under the state-exact contract,
 /// but it would have to be measured against the doom and quake oracles as its own slice. This
 /// predicate changes only which instructions a compiled block may contain, so the interpreter's
 /// batch structure is byte-identical by construction and the oracles cannot move for this reason.
@@ -7148,7 +7148,7 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 /// ## The OUT audit, RESOLVED for `0xEE` (see the section below); recorded for the rest
 ///
 /// `0xEE` OUT DX,AL was quake's largest `non_continuable` row (1,198,302 static exits) and the
-/// refusal below was a POLICY refusal, not a semantic one — the call-out mechanism that serves
+/// refusal below was a POLICY refusal, not a semantic one: the call-out mechanism that serves
 /// `0xEC` IN would serve it, and every FastMap invalidation clears entries in place rather than
 /// reallocating, so the bases a running block baked stay valid across whatever a VGA port write
 /// triggers. (As of the aperture-scoping slice a VGA port write no longer triggers
@@ -7157,21 +7157,21 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 /// What used to stop it was not reachable from this predicate: `CpuBus::write_io` reaches every
 /// device's write path, and the call-out contract's "no WATCHED guest memory access while a block
 /// is live" proof would have to be re-established over all of them, not argued for one. That
-/// objection is answered the same way the `0xE6` re-opening below answers it -- an unconditional
-/// step break, not the bus's own `requires_step_break()` answer -- and `0xEE` now carries a
+/// objection is answered the same way the `0xE6` re-opening below answers it: an unconditional
+/// step break, not the bus's own `requires_step_break()` answer, and `0xEE` now carries a
 /// `classify` arm; see "`0xEE` OUT DX,AL" below for the admission itself. `0xE7`/`0xEF` stay
 /// refused on the original policy grounds: the reason is written
 /// down so the next slice re-opens it on the device-write proof rather than on the census rank.
 ///
 /// ## The re-opening, for `0xE6` (`IZARRAVM_OUT_IMM8_ROWS`, default ON since the 2026-08-30
-/// gp2-586 ladder -- see `parse_out_imm8_rows_arm`)
+/// gp2-586 ladder, see `parse_out_imm8_rows_arm`)
 ///
 /// The audit above is discharged on its own terms rather than overruled. Its two live objections
 /// were the `CpuBus::write_io` device-write proof and the `io_touched` bound, and the second is
 /// what answers the first: `PortWriteAlImm8` reports a step break UNCONDITIONALLY, so the native
 /// block ends at the write, so no LATER slot in the same native block can act on a pendency
 /// answer the write invalidated. It does NOT make the interrupt deliverable any sooner than the
-/// interpreter makes it -- see `port_write_al_imm8`, which states exactly what the bit buys and
+/// interpreter makes it, see `port_write_al_imm8`, which states exactly what the bit buys and
 /// what it does not. That scope is still what discharges the audit's device-write objection
 /// per-opcode instead of per-device: the family's pendency premise ("`interrupt_pending()` cannot
 /// change inside a batch, because no `InterpretOne` row writes a port") is false for an OUT, and
@@ -7180,7 +7180,7 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 /// The audit's benefit bound is ALSO wrong for the guest this row was measured on, and that is the
 /// reason to spend the slice: `MachineBus::write_io`'s `skip_io_touched` exemption means a ring-0
 /// protected-mode guest's port writes set NOTHING, so gp2 reads `brk_step` 17,677 against
-/// 59,968,424 OUTs. The boundary the audit assumed already existed does not exist there -- today
+/// 59,968,424 OUTs. The boundary the audit assumed already existed does not exist there: today
 /// the only boundary is the one BEFORE the OUT, from this predicate's own refusal.
 ///
 /// **`0xE6` no longer carries a Word refusal.** The corpus campaign supplied the missing
@@ -7188,31 +7188,31 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 /// `non_continuable` row (238,768 unbound exits), 173,344 on 1000-miglia, 11,530 on
 /// 100-000-pyramid. Every corpus guest is a 16-bit V86 real-mode guest, so the population that
 /// stayed unmeasured while gp2 (32-bit, ring 0) was the only fixture is now measured and it is
-/// large. `PortWriteAlImm8`'s helper is width-invariant -- it reads AL, writes one byte, and the
+/// large. `PortWriteAlImm8`'s helper is width-invariant: it reads AL, writes one byte, and the
 /// port immediate rides the fourth-argument channel regardless of the segment's default operand
-/// size -- so admitting the Word form spends no new mechanism, only the `insn.operand_size` guard
+/// size, so admitting the Word form spends no new mechanism, only the `insn.operand_size` guard
 /// that used to sit in front of it.
 ///
 /// `0xE7` (OUT imm8, AX/EAX) stays refused: it is a DIFFERENT instruction (a word or dword
 /// register write path `PortWriteAlImm8` does not implement, not a width tag on the same one),
 /// and no row in this campaign's evidence measures it.
 ///
-/// ## `0xEE` OUT DX,AL -- admitted unconditionally, mirroring `0xEC`
+/// ## `0xEE` OUT DX,AL: admitted unconditionally, mirroring `0xEC`
 ///
 /// `0xEE` is the WRITE twin of `0xEC` (`CallOutHelper::PortWriteAlDx`) exactly as `PortWriteAlImm8`
 /// is the write twin of `PortReadAlImm8`: same two-phase TSS-bitmap probe
 /// (`port_permission_resident`), same `port_io_core_clocks(bus, true)` charge and unconditional step break as
 /// `PortWriteAlImm8`, but with the port read out of DX at runtime instead of riding a compile-time
-/// immediate -- the same difference `PortReadAlDx` already carries against `PortReadAlImm8`. It
+/// immediate, the same difference `PortReadAlDx` already carries against `PortReadAlImm8`. It
 /// ships unconditionally, with no knob, for the same reason `0xEC` does: the OUT audit's device-write
 /// objection is discharged the identical way (the unconditional step break), and the corpus supplies
-/// the measurement the standing refusal was waiting for -- `0xEE` word is 1000-miglia's largest
+/// the measurement the standing refusal was waiting for: `0xEE` word is 1000-miglia's largest
 /// `non_continuable` row, `unbound_exits` 46,927,173, exactly its post-#776 `timer.pit_writes`: this
 /// row IS the PIT write storm. 123-talk carries it too (94,170 unbound plus 130,766 dynamic-unbound,
-/// `max_native_prefix = 22`). Post-admission: `port_write_al_dx`'s doc has the served numbers --
+/// `max_native_prefix = 22`). Post-admission: `port_write_al_dx`'s doc has the served numbers:
 /// the row does not merely compile, it serves the corpus's measured guest class.
 ///
-/// It carries NO `slot_delta` and no poll-skip scan -- the GP2 poll-skip design's own scan requires
+/// It carries NO `slot_delta` and no poll-skip scan: the GP2 poll-skip design's own scan requires
 /// a `len == 1` fetch to seed from and a write has nothing to poll for, so folding the scan in was
 /// explicitly out of scope. `PortWriteAlDx::carries_a_cell()` is false, matching `PushAllDword` /
 /// `PopAllDword`: no fourth argument is emitted for this helper at all.
@@ -7225,14 +7225,14 @@ fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
 /// `retf_admitted_here` states the rule: a refusal that this predicate does not make itself gets
 /// made LATER, by `classify` returning `None`, and the block then stops with
 /// `BarrierStop::HardBoundary` where main stopped it with `NonContinuable`. That is a census row
-/// relocating between arms -- the exact reading error the two-arm reconciliation exists to detect
-/// -- for an instruction neither arm ever compiles. `classify` has a `0xEE` arm at both widths, so
+/// relocating between arms, the exact reading error the two-arm reconciliation exists to detect,
+/// for an instruction neither arm ever compiles. `classify` has a `0xEE` arm at both widths, so
 /// no analogous Word term is needed for that opcode; `classify` still has no `0xE6` Word arm and
 /// must not grow one, so the Word admission stays HERE, where it leaves the OFF arm's row
 /// untouched. (`0x69`/`0x6B` need no such term: they are on `classify`'s Word allowlist and are
 /// admitted at both sizes, so admitting them here relocates nothing.)
 fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
-    // The candidate test is redundant here -- every arm below is already inside the set -- and it
+    // The candidate test is redundant here (every arm below is already inside the set) and it
     // is written anyway, because that redundancy is what makes the superset property STRUCTURAL
     // instead of asserted. Add an opcode to this function without adding it to the set and the
     // function stops admitting it, which the lowering fixtures catch, rather than the decode pack
@@ -7242,13 +7242,13 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
             // LAR (`0x0F02`) and LSL (`0x0F03`), the descent2 L2 lever. `SystemSeg` is not in
             // `block_continuable`'s (decode.rs) admitted group list, so `insn.continuable` is
             // false for both opcodes and the walk would refuse them before `classify` is ever
-            // reached without this entry -- exactly the `0xCD` INT imm8 gap this OR-chain exists
+            // reached without this entry: exactly the `0xCD` INT imm8 gap this OR-chain exists
             // to close, except LAR/LSL need no CPU-state predicate the way `int_imm8_admitted_here`
             // does: the row is admitted unconditionally, at every operand size and every mode
             // (real mode and V86 raise `#UD` at execute time, not at compile time).
             || matches!(insn.opcode, 0x0f02 | 0x0f03)
             || (insn.opcode == 0xe6 && out_imm8_rows_armed())
-            // LES/LDS (0xc4/0xc5), the L4 slice, WORD form only -- the inverse shape from `0xe6`
+            // LES/LDS (0xc4/0xc5), the L4 slice, WORD form only: the inverse shape from `0xe6`
             // above: real-mode DOS code is unprefixed 16-bit code, so the Word form is the census
             // row and the Dword form (a 32-bit offset behind a 66 prefix) is neither measured nor
             // built. Refusing it HERE rather than in `classify` keeps the Dword form's barrier
@@ -7277,8 +7277,8 @@ fn jit_admits_non_continuable(insn: &DecodedInsn) -> bool {
 ///
 /// `0x9a` (`CALL FAR imm16:16`) is IN the set as of the L8 slice, which gave it a `classify` arm
 /// and `call_far_admitted_here` as its admission predicate. Before that slice it was absent on
-/// purpose -- a walk starting on it stopped before its first instruction because no `classify` arm
-/// existed to reach -- and this comment is the reason the earlier revision gave; it is recorded
+/// purpose: a walk starting on it stopped before its first instruction because no `classify` arm
+/// existed to reach, and this comment is the reason the earlier revision gave; it is recorded
 /// here rather than deleted because the same reasoning applies to every opcode NOT in the set
 /// today (`0x9a`'s own history is the worked example).
 ///
@@ -7340,7 +7340,7 @@ pub(crate) const fn non_continuable_break_probe_candidate(opcode: u16) -> bool {
 /// screened that half false. Both terms are needed: the prefix test is a separate conjunct in the
 /// walk, and `jit_admits_non_continuable`'s two families say nothing about prefixes, so without it
 /// a `0x66`-prefixed `IMUL` entry would pass here and stop inside the walk anyway. (`RETF` needs
-/// no help from the prefix term -- `retf_admitted_here` already demands `Prefixes::default()` --
+/// no help from the prefix term, `retf_admitted_here` already demands `Prefixes::default()`,
 /// but the other families do.)
 ///
 /// The run loop's break-site probe asks this before spending an admission chain: an opcode the
@@ -7355,7 +7355,7 @@ pub(crate) const fn non_continuable_break_probe_candidate(opcode: u16) -> bool {
 /// predicates below should claim it, and those two edits open the pack bit and this gate together.
 ///
 /// **L8's `call_far_admitted_here` folds into this SAME disjunction** rather than requiring the
-/// walk to consult a second, independent list -- see that predicate's own doc for why this is
+/// walk to consult a second, independent list, see that predicate's own doc for why this is
 /// the site the L7 design named and why it is not a gate-design defect that a brand-new predicate
 /// needs to be named here explicitly (an opcode reusing an ALREADY-disjoined predicate needs no
 /// edit; a genuinely new predicate is, definitionally, one `||` term away from being reachable).
@@ -7363,7 +7363,7 @@ pub(crate) const fn non_continuable_break_probe_candidate(opcode: u16) -> bool {
 /// The RUN LOOP now reaches this function through a narrower door. Being admissible here is
 /// necessary but no longer sufficient for a break-site probe: `non_continuable_break_probe_candidate`
 /// screens the opcode first, and it carries only the far-transfer family. That is deliberately a
-/// second list, because the two ask different questions -- this one is a capability test, that one
+/// second list, because the two ask different questions: this one is a capability test, that one
 /// is a population decision about which addresses are worth a permanent block key. Adding an
 /// opcode here still opens it to the WALK with no further edit, which is the self-opening property
 /// L8 wanted; opening it to the break-site probe as well is now an explicit, measured choice.
@@ -7416,7 +7416,7 @@ fn compile_with_page_len(
             CompileOutcome::Retry(cause) => return CompileOutcome::Retry(cause),
             // A structural barrier the SEARCH found and the full walk did not, which is not a
             // host-page failure however it arrives here. It was reported as `HostPageLen` until
-            // review finding F7, which mislabelled the one arm on this path that has nothing to
+            // fix F7; that label mislabelled the one arm on this path that has nothing to
             // do with the arena page. It is its own cause; whether it is reachable at all is a
             // question the counter now answers instead of the label pre-judging it.
             CompileOutcome::StructuralReject(_) => {
@@ -7587,12 +7587,12 @@ fn pushf_mask(persona: CpuPersona) -> u32 {
 /// Why `stack_width_kind` refused to admit a stack-touching kind.
 ///
 /// One variant per REFUSING arm inside `stack_width_kind`, named for the cell that arm would
-/// have to build to admit it (`PushDwordSs16` etc.), plus `Other` for the `_ => ...` residue --
+/// have to build to admit it (`PushDwordSs16` etc.), plus `Other` for the `_ => ...` residue,
 /// spelled out rather than folded into a named cell so a non-zero reading there is visible on
-/// its own, per the design note's standing rule (`dev_docs/descent2-l1-stack-width-design-2026-08-30.md`
-/// §2(H)).
+/// its own, per the standing rule of the descent2 L1
+/// stack-width design.
 ///
-/// `ControlTargetLimit` and `SegmentAccess` are NOT produced by this function -- they name the
+/// `ControlTargetLimit` and `SegmentAccess` are NOT produced by this function: they name the
 /// second `RetryCause::AdmissionMatrix` producer, the `!control_target_ok ||
 /// !kind_segment_access_supported` check that runs after this one in the compile walk. They live
 /// on this enum because both producers feed the same census block (`stack_width_declines`) and
@@ -7600,8 +7600,8 @@ fn pushf_mask(persona: CpuPersona) -> u32 {
 ///
 /// Compiled unconditionally, not behind `direct-admission-census`: computing WHICH reason a
 /// refusal was is a compile-walk-only classification with no allocation and no side table, so it
-/// costs nothing worth gating. What the feature gates is RECORDING the reason -- the per-reason
-/// tally and the per-site map on `DirectBarrierCensus` -- which is where the cost of this
+/// costs nothing worth gating. What the feature gates is RECORDING the reason: the per-reason
+/// tally and the per-site map on `DirectBarrierCensus`, which is where the cost of this
 /// instrument actually lives. Plain builds ignore the payload (`stack_width_kind(..).ok()` at the
 /// suffix scan; the compile walk's `Err(reason)` arm records only under the feature) and the
 /// optimizer drops the dead tag.
@@ -7621,7 +7621,7 @@ pub(crate) enum StackWidthDecline {
     RetFarNonWord,
     /// `CallFar16`'s sibling of `RetFarNonWord`: `call_far_admitted_here` already restricts a
     /// walked `0x9A` to (Word, SS.B = 0) before it can reach `classify` at all, so every other
-    /// cell this arm names is defence in depth rather than a live path -- exactly the status
+    /// cell this arm names is defence in depth rather than a live path: exactly the status
     /// `RetFarNonWord` has, and for the identical reason.
     CallFarNonWord,
     PopSegRealPmode,
@@ -7688,7 +7688,7 @@ fn stack_width_kind(
     // PUSHFD checks IOPL in V86 and can raise #GP there (`check_v86_iopl`, execute.rs 0x9C).
     // The emitted form has no fault path, so refuse it outright when compiling in V86. That is
     // sound rather than merely cautious: V86 is bit 2 of `jit_mode_key`, so a block compiled
-    // outside V86 can never later run inside it -- the entry mode-key check rejects first.
+    // outside V86 can never later run inside it: the entry mode-key check rejects first.
     //
     // The persona mask is resolved HERE for the same reason: `classify` has no `&CpuGsw`.
     let kind = match kind {
@@ -7714,14 +7714,14 @@ fn stack_width_kind(
         // one mode from being ENTERED in another; it says nothing about which mode the block was
         // compiled in. What the key then adds is that this refusal is sufficient rather than
         // merely necessary: a block admitted under real mode can never later run under protected.
-        // V86 is admitted deliberately -- `.bench/prince_c` runs V86 under JEMMEX, and V86 takes
+        // V86 is admitted deliberately: `.bench/prince_c` runs V86 under JEMMEX, and V86 takes
         // the real-mode path in `load_segment_checked` before the protected-mode branch is even
         // considered.
         //
         // `PopSegReal` rides the same refusal, and it must: its emit arm is `LoadSegReal`'s three
         // stores with the selector coming off the stack instead of out of a register, so the
         // descriptor question is identical and the source of the selector changes nothing about
-        // it. The mode-key argument above carries across unchanged -- V86 is bit 2 of
+        // it. The mode-key argument above carries across unchanged: V86 is bit 2 of
         // `jit_mode_key`, so a block admitted here under real mode or V86 can never later be
         // entered under protected mode.
         //
@@ -7740,7 +7740,7 @@ fn stack_width_kind(
         // this block's `dirty_segments` mask no longer learns that the instruction can move a
         // record. Safe for one reason, stated because it is not local: R2 compares every record
         // the LATER SLOTS bake, so a slot that moved one of those ends the run before any of them
-        // addresses through it -- and the block publishes no successors, so there is no chained
+        // addresses through it, and the block publishes no successors, so there is no chained
         // body to enter against a record it moved either.
         DirectKind::LoadSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
             DirectKind::CallOut {
@@ -7752,7 +7752,7 @@ fn stack_width_kind(
         // `LoadSegRealMem` rides the exact argument above: it is `0x8E`'s memory-sourced twin, on
         // the SAME `InterpretOne` allowlist row, so its protected-mode instance rewrites into the
         // identical call-out rather than being refused. This is what makes the memory-form
-        // admission a no-op for a protected-mode compile -- see the kind's own doc comment.
+        // admission a no-op for a protected-mode compile, see the kind's own doc comment.
         DirectKind::LoadSegRealMem { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
             DirectKind::CallOut {
                 helper: CallOutHelper::InterpretOne {
@@ -7763,7 +7763,7 @@ fn stack_width_kind(
         DirectKind::PopSegReal { .. } if cpu.is_protected_mode() && !cpu.is_v86_mode() => {
             return Err(StackWidthDecline::PopSegRealPmode);
         }
-        // `LesLds` has no `InterpretOne` row to rewrite into -- `jit_admits_non_continuable` is
+        // `LesLds` has no `InterpretOne` row to rewrite into: `jit_admits_non_continuable` is
         // what let a Word-operand `0xc4`/`0xc5` reach `classify` at all, and it carries no CPU
         // state, so protected mode reaches this arm exactly as real mode does and the mode
         // question has to be answered HERE. Refusing rather than rewriting is `PopSegReal`'s own
@@ -7802,7 +7802,7 @@ fn stack_width_kind(
         // `Enter16` state: nothing can reach that arm today, because `retf_admitted_here` refuses
         // every operand size but Word and every stack width but 16-bit, so an unadmitted RETF
         // never becomes a slot. But a future admission of the Dword form would otherwise be waved
-        // through to an emitter that only knows the 16-bit shape -- four bytes popped with a
+        // through to an emitter that only knows the 16-bit shape: four bytes popped with a
         // 16-bit pointer, and a 32-bit offset written into a segment whose limit is 0xFFFF.
         (DirectKind::RetFar { .. }, _, _) => Err(StackWidthDecline::RetFarNonWord),
         // CALL FAR, real mode and V86 only (`call_far_admitted_here` already decided that,
@@ -7824,7 +7824,7 @@ fn stack_width_kind(
         }),
         // Spelled out ABOVE the blanket 32-bit-stack arm below, for the reason `RetFar` states
         // just above: `call_far_admitted_here` refuses every operand size but Word and every
-        // stack width but 16-bit, so an unadmitted far call never becomes a slot -- but a future
+        // stack width but 16-bit, so an unadmitted far call never becomes a slot, but a future
         // admission of the Dword form would otherwise be waved through to an emitter that only
         // knows the 16-bit shape.
         (DirectKind::CallFar16 { .. }, _, _) => Err(StackWidthDecline::CallFarNonWord),
@@ -7858,8 +7858,8 @@ fn stack_width_kind(
         // The residue: every stack-touching kind not named above, at the (SS.B, operand size)
         // cross the explicit arms did not cover. Four of these ARE the missing cells the design
         // note's §2(H) instrument exists to attribute (a Dword push/pop/ret/call on a 16-bit
-        // stack, a Word push/pop/ret/call on a 32-bit stack); everything else -- `PushMem`,
-        // `CallReg`, `CallMem`, or a combination none of the arms above name -- falls to `Other`,
+        // stack, a Word push/pop/ret/call on a 32-bit stack); everything else (`PushMem`,
+        // `CallReg`, `CallMem`, or a combination none of the arms above name) falls to `Other`,
         // spelled out rather than silently folded into a named cell so a non-zero reading there
         // is visible on its own.
         (kind, stack32, size) => Err(match (kind, stack32, size) {
@@ -7941,11 +7941,11 @@ fn imm_lane_for(
     //
     // `op` is bound rather than matched: every ALU op the kind carries is lane-safe, because the
     // lane emit arm routes through the SAME `emit_alu_preloaded` the baked form uses, and that
-    // helper already dispatches the whole op set at Dword — carry ops (/2 ADC, /3 SBB) to
+    // helper already dispatches the whole op set at Dword: carry ops (/2 ADC, /3 SBB) to
     // `emit_carry_alu_preloaded`, CMP (/7) to the non-writing path. The original `op: 0` match
     // was Doom's shape (its renderer patches `ADD r32, imm32` immediates); the duke3d SMC shape
     // census (duke586-smc-shapes-20260808.txt) measured 31.7M of its 37.2M imm-field patch events
-    // on `0x81 /3, /5, /2, /0` — same kind, other ops — so the narrow match was leaving 85% of
+    // on `0x81 /3, /5, /2, /0` (same kind, other ops) so the narrow match was leaving 85% of
     // the lane-shaped patch volume killing blocks.
     let DirectKind::AluImm {
         op,
@@ -7997,7 +7997,7 @@ fn imm_lane_for(
 }
 
 /// The ONE-BYTE twin of `imm_lane_for`: `0x80 /r`, ALU r/m8 with an imm8, REGISTER destination,
-/// no prefixes — the first user of the `IMM8_LANE_WIDTH` class, behind `IZARRAVM_IMM8_LANES`.
+/// no prefixes: the first user of the `IMM8_LANE_WIDTH` class, behind `IZARRAVM_IMM8_LANES`.
 ///
 /// # Why this family and not the other two
 ///
@@ -8012,7 +8012,7 @@ fn imm_lane_for(
 /// such split: `emit_alu_byte_preloaded` derives every flag from the host operation it just ran,
 /// which is why `emit_alu_reg_byte` can already feed it a register operand. Swapping a baked
 /// `mov ecx, imm32` for a `movzx ecx, byte [lane]` therefore changes the SOURCE of the operand and
-/// nothing else — same operation, same lazy-flag descriptor, same truncation, same write-back
+/// nothing else: same operation, same lazy-flag descriptor, same truncation, same write-back
 /// suppression on CMP.
 ///
 /// # The admission bars, and each one's job
@@ -8026,14 +8026,14 @@ fn imm_lane_for(
 ///   A `0x82` alias, if the decoder ever produced one, is likewise out.
 /// - `insn.prefixes == Prefixes::default()`: no segment override, no address-size override, no
 ///   operand-size override, no REP and no LOCK. Any prefix byte moves the immediate off offset 2,
-///   and a LOCK'd patch is refused rather than argued impossible — the same bar `imm_lane_for`
+///   and a LOCK'd patch is refused rather than argued impossible: the same bar `imm_lane_for`
 ///   sets.
 /// - `insn.disp_len == 0`, `insn.imm_len == 1`, `insn.len == 3`: the decoder's own record of what
 ///   it consumed. Together they pin the immediate at instruction offset 2 and nowhere else. The
 ///   register destination is implied by the kind (`classify` produces `AluByteImm` only from
 ///   `DecodedOperand::Reg`) and re-implied by `len == 3`, which no memory form can reach.
 /// - `direct_host_bytes(lane, IMM8_LANE_WIDTH)`: the page-kind guard, verbatim from
-///   `imm_lane_for` — only a page the fetch cache hands out may back a lane, so device apertures
+///   `imm_lane_for`: only a page the fetch cache hands out may back a lane, so device apertures
 ///   and unmapped pages never produce one. The instruction is already page-local in physical
 ///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
 /// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
@@ -8048,7 +8048,7 @@ fn imm_lane_for(
 /// doom's unpatched texture loads regress; this lane replaces a `mov r32, imm32` with a
 /// `mov r64, imm64` + `movzx r32, byte [r64]`, on a row duke measures at 4.73 M actual patch
 /// events. If the ladder shows the untaxed sites dominating, the disp gate
-/// (`has_record_range(lane, IMM8_LANE_WIDTH)`) is the ready-made second arm — but gating on
+/// (`has_record_range(lane, IMM8_LANE_WIDTH)`) is the ready-made second arm, but gating on
 /// unmeasured suspicion would ship two mechanisms as one A/B.
 fn imm8_lane_for(
     cpu: &CpuGsw,
@@ -8103,7 +8103,7 @@ fn imm8_lane_for(
 }
 
 /// The GROUP-2 COUNT twin of `imm8_lane_for`: the count byte of `0xC1 /0` ROL, `0xC1 /1` ROR,
-/// `0xC1 /4..=7` (SHL/SHR/SAL/SAR at Dword) and `0xC0 /4..=7` (the byte shifts) — register
+/// `0xC1 /4..=7` (SHL/SHR/SAL/SAR at Dword) and `0xC0 /4..=7` (the byte shifts): register
 /// destinations, no prefixes. The second user of the `IMM8_LANE_WIDTH` class, behind
 /// `IZARRAVM_COUNT_LANES`.
 ///
@@ -8112,7 +8112,7 @@ fn imm8_lane_for(
 /// This is the RE-TEST TRIGGER `rotate_rows_enabled` names. duke3d patches the COUNT BYTE of its
 /// group-2 shifts and rotates (the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows, ~1.97 M
 /// events on the duke3d-586 long row), and since the 2026-08-19/20 `IZARRAVM_ROTATE_ROWS` default
-/// flip those sites are ADMITTED — so each patch now kills a compiled block that may also carry
+/// flip those sites are ADMITTED, so each patch now kills a compiled block that may also carry
 /// live `0x81` imm lanes and `0x8A` displacement lanes, taking their accepts down with it.
 /// `smc_lane_accepts` fell 109.0 M -> 91.8 M (-16%) on that row when the rows were admitted, and
 /// this class is what turns those kills back into accepts.
@@ -8128,7 +8128,7 @@ fn imm8_lane_for(
 /// - `count_lanes_enabled()`: the A/B arm. **Default ON since the 2026-08-20 ladder** (-5.73%
 ///   short, -4.94% long), with `0` / `off` the escape to the pre-slice world; both arms ship in one
 ///   executable so a later ladder can still measure them. Independent of `IZARRAVM_IMM8_LANES` on
-///   purpose — see `count_lanes_enabled`.
+///   purpose. See `count_lanes_enabled`.
 /// - `DirectKind::RotateReg { lane: None, width: Dword, .. }` / `DirectKind::Shift { lane: None,
 ///   width: Byte | Dword, .. }`: the kinds and widths whose emitters have a lane arm. `ShiftCl`
 ///   (`0xD3`) is excluded by kind: its count is already runtime data out of guest CL and it has no
@@ -8146,11 +8146,11 @@ fn imm8_lane_for(
 ///   fixture; the Word form keeps compiling with a baked count, exactly as before this slice.
 ///   `RotateReg` carries the identical hazard now that Word rotates are admitted (the
 ///   `vorvek/direct-word-rot1` slice), so its kind match bars `width: MemoryWidth::Word` the same
-///   way `Shift`'s does — an unprefixed `c1 e0 03` ROL in a CS.D=0 segment satisfies every other
+///   way `Shift`'s does: an unprefixed `c1 e0 03` ROL in a CS.D=0 segment satisfies every other
 ///   bar here too, and `emit_rotate_reg_lane` has no Word arm.
 ///   `a_word_rotate_in_a_sixteen_bit_segment_takes_no_count_lane` is that regression fixture.
 /// - `insn.opcode == 0xC1 || insn.opcode == 0xC0`: `0xD1` produces the SAME two kinds but carries
-///   no immediate at all — its count is the literal 1 baked into the opcode — so `physical + 2`
+///   no immediate at all: its count is the literal 1 baked into the opcode, so `physical + 2`
 ///   would name the next instruction's first byte. **This bar is REDUNDANT today and kept anyway,
 ///   which is worth stating plainly rather than leaving a reader to discover by mutation:** every
 ///   opcode that produces `RotateReg` or `Shift` other than these two (`0xD0`..`0xD3`) has
@@ -8160,15 +8160,15 @@ fn imm8_lane_for(
 ///   fields, on `imm_lane_for`'s over-determined-checks principle.
 /// - `insn.prefixes == Prefixes::default()`: no segment override, no address-size override, no
 ///   operand-size override, no REP and no LOCK. Any prefix byte moves the immediate off offset 2,
-///   and a LOCK'd patch is refused rather than argued impossible — `imm_lane_for`'s bar exactly.
-///   This bar does NOT keep Word out — the width test above is what does that, and reading this
+///   and a LOCK'd patch is refused rather than argued impossible: `imm_lane_for`'s bar exactly.
+///   This bar does NOT keep Word out: the width test above is what does that, and reading this
 ///   bar as if it did is the exact mistake that shipped a compiler panic.
 /// - `insn.disp_len == 0`, `insn.imm_len == 1`, `insn.len == 3`: the decoder's own record of what
 ///   it consumed. Together they pin the count byte at instruction offset 2 and nowhere else. The
 ///   register destination is implied by the kinds (`classify` produces both only from
 ///   `DecodedOperand::Reg`) and re-implied by `len == 3`, which no memory form can reach.
 /// - `direct_host_bytes(lane, IMM8_LANE_WIDTH)`: the page-kind guard, verbatim from
-///   `imm_lane_for` — only a page the fetch cache hands out may back a lane, so device apertures
+///   `imm_lane_for`: only a page the fetch cache hands out may back a lane, so device apertures
 ///   and unmapped pages never produce one. The instruction is already page-local in physical
 ///   (`physical_page_local` in the compile loop), so the single byte cannot straddle.
 /// - `lanes_used >= MAX_BLOCK_IMM_LANES`: the shared per-block budget. Slots past it keep their
@@ -8187,7 +8187,7 @@ fn imm8_lane_for(
 /// # What does NOT change, stated where a reviewer will look for it
 ///
 /// **Admission is untouched, so `census_native_suffix` owes no new mirror.** This lane attaches to
-/// a kind `classify` has already admitted — every bar above narrows which admitted slots take a
+/// a kind `classify` has already admitted: every bar above narrows which admitted slots take a
 /// lane, and none of them can turn a Native classification into a boundary. The L1 heat gate needed
 /// a census mirror precisely because it was the one admission rule that was not a `classify`
 /// answer; this is not an admission rule at all. The suffix scan therefore stops exactly where the
@@ -8274,20 +8274,20 @@ fn count_lane_for(
 }
 
 /// The physical address of the byte that encodes the COUNT for the two rows `IZARRAVM_ROTATE_ROWS`
-/// gates -- `0xC1`/`0xD1` `/0` ROL and `0xC0 /4` SHL r8 -- or `None` for anything else, including
+/// gates (`0xC1`/`0xD1` `/0` ROL and `0xC0 /4` SHL r8) or `None` for anything else, including
 /// the rows that were lowered before the 2026-08-09 slice (`/1` ROR, `/4..=7` at Dword) and which
 /// the knob deliberately does not cover.
 ///
 /// **`IZARRAVM_BYTE_SHIFT_ROWS`'s rows are deliberately NOT gated here**, and "we did not touch
-/// it" is not the argument. This gate exists for a MEASURED amplification -- duke3d patches the
-/// count byte of its group-2 SMC shape table (`0xC1 /0,/4,/5`, ~1.97 M events) -- so it defends a
+/// it" is not the argument. This gate exists for a MEASURED amplification: duke3d patches the
+/// count byte of its group-2 SMC shape table (`0xC1 /0,/4,/5`, ~1.97 M events), so it defends a
 /// known patched byte rather than stating a policy for group 2. No fixture measures SMC on
 /// tyrian's `0xC0 /5` sites, and extending the gate on inspection would be the unmeasured
 /// admission's mirror image: an unmeasured REFUSAL. The rows are also under a different knob, and
 /// coupling them to this one's third arm would make the byte-shift ladder unattributable, which is
 /// the recorded lesson for CLD/STD. `0xD0` has no immediate at all, so there is no count byte to
 /// gate: its only count-bearing byte is the opcode, and a `D0 -> C0` patch changes the instruction
-/// LENGTH as well as the count -- an ordinary code write the block-kill machinery already handles.
+/// LENGTH as well as the count: an ordinary code write the block-kill machinery already handles.
 /// Note also that this function reads `insn.modrm.reg`, not the kind's `op`, so a `/6` site is not
 /// gated even though it emits identically to `/4`.
 ///
@@ -8302,7 +8302,7 @@ fn count_lane_for(
 ///
 /// * `0xC0`/`0xC1` carry an `imm8` and it is the instruction's LAST byte (`physical + len - 1`).
 ///   That is the byte duke patches: the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows.
-/// * `0xD1` has no immediate at all -- its count is the literal 1 baked into the OPCODE, so the
+/// * `0xD1` has no immediate at all: its count is the literal 1 baked into the OPCODE, so the
 ///   only byte that can change the count is the opcode byte itself. REGISTER FORM ONLY, tested
 ///   rather than assumed since the memory lane landed, so the encoding is prefixes + opcode +
 ///   modrm and the opcode sits at `physical + len - 2`. Gating a `0xD1` on its opcode byte is the
@@ -8324,7 +8324,7 @@ fn rotate_row_count_byte(insn: &DecodedInsn, physical: u32) -> Option<u32> {
             // THE REGISTER FORM ONLY, and this bar is load-bearing rather than a restatement of
             // the test above. `vorvek/direct-rot-mem-lane` admits the MEMORY form of `0xD1 /0`,
             // and a memory operand with `mod = 00, rm = 100` carries a SIB byte and no
-            // displacement -- so `imm_len` and `disp_len` are both zero, `len` is one larger than
+            // displacement, so `imm_len` and `disp_len` are both zero, `len` is one larger than
             // the register form's, and `physical + len - 2` lands on the ModRM byte rather than
             // the opcode. The gate would then read an unrelated byte's heat record.
             //
@@ -8369,7 +8369,7 @@ fn rotate_row_count_byte(insn: &DecodedInsn, physical: u32) -> Option<u32> {
 ///
 /// What the gate actually gives is a BOUND with self-correction. In a window where the record is
 /// missing, a patched site admits and the next patch kills the block exactly as it did on
-/// 2026-08-09 -- but that kill is precisely what writes the record back
+/// 2026-08-09, but that kill is precisely what writes the record back
 /// (`note_code_write_inner`), so the site refuses from its next recompile onward and the cost is
 /// one kill per site per erasure rather than the steady-state churn the unconditional arm paid.
 /// That convergence is the same shape as `disp_lane_for`'s, one kill behind the truth in the other
@@ -8378,11 +8378,11 @@ fn rotate_row_count_byte(insn: &DecodedInsn, physical: u32) -> Option<u32> {
 ///
 /// The probe reads the heat accelerator WITHOUT `sync_smc_heat`, exactly as `disp_lane_for` does
 /// and for the same reason (this is a `&CpuGsw` path). A stale read can at worst admit one site
-/// that a later kill will refuse on recompile, or refuse one that could have converted --
+/// that a later kill will refuse on recompile, or refuse one that could have converted,
 /// admission tuning, never correctness, because the lowering itself is correct at every count.
 ///
 /// One byte, not `IMM_LANE_WIDTH`: the design phrase is `has_record_range(count_lane, 1)`. The
-/// heat map's resolution is a 16-byte chunk, so this is not as narrow as it reads -- it asks "has
+/// heat map's resolution is a 16-byte chunk, so this is not as narrow as it reads: it asks "has
 /// anything in this instruction's chunk ever taken a heat-charged kill", which is the conservative
 /// direction for a refusal gate.
 fn rotate_row_count_byte_is_patched(cpu: &CpuGsw, insn: &DecodedInsn, physical: u32) -> bool {
@@ -8414,13 +8414,13 @@ fn compile_with_budget(
     let Some(key) = key_for(cpu, entry_lin, d) else {
         return CompileOutcome::Retry(RetryCause::NoKey);
     };
-    // The compile-time ring slot is NOT baked into any successor `LinkTarget` below (S1a, design
-    // doc `2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1, correcting
-    // `2026-09-02-cr3-jit-half-design.md` (b) L2's original instruction). Every successor
+    // The compile-time ring slot is NOT baked into any successor `LinkTarget` below (S1a, Tyrian
+    // unbound-to-compiled design section 4.1, correcting
+    // the original instruction of L2 (b) in the CR3 JIT-half design). Every successor
     // published here carries `LINK_CONTEXT_UNSTAMPED` instead: a rendezvous is resolved later, at
     // `resolve_successors` time, against `linear_blocks` / `waiting`, and both of those are
     // partitioned by the LIVE ring slot at THAT instant, which `resolve_successors` reads itself.
-    // Baking the compile-time value here was the defect this slice fixes -- a block re-stamped
+    // Baking the compile-time value here was the defect this slice fixes: a block re-stamped
     // under the other slot after compiling made the two ends of the rendezvous disagree forever.
     // What actually keeps a cross-context edge from being armed is `try_link_inner`'s
     // `stale_epoch` arm, which compares both ends' `block_link_epochs` against the LIVE slot's
@@ -8429,7 +8429,7 @@ fn compile_with_budget(
     let unstamped_context = LINK_CONTEXT_UNSTAMPED;
     // B.3: "a compile walk started here", recorded before anything can refuse the block, so a walk
     // that stops on its first slot still counts as tried. `key.linear()` and not `entry_lin` on
-    // purpose -- `classify_unbound_exit` reports the same canonicalized value, and the whole point
+    // purpose: `classify_unbound_exit` reports the same canonicalized value, and the whole point
     // of this map is that it joins against the dormant-heat histogram on an identical key.
     #[cfg(feature = "barrier-census-closure")]
     if cpu.jit_direct.barrier_census_active() {
@@ -8488,17 +8488,17 @@ fn compile_with_budget(
     let mut interpret_one_cells: Vec<(usize, Arc<InterpretOneCell>)> = Vec::new();
     // How many `InterpretOne` slots hold a row that can overwrite a segment register.
     //
-    // Feeds `segment_write_block` and NOTHING ELSE -- in particular not `dirty_segments`, which
+    // Feeds `segment_write_block` and NOTHING ELSE: in particular not `dirty_segments`, which
     // would end the block at the next slot that uses the segment and take the whole relaxation
     // with it. What makes that safe is R2: a resumed slot has already compared every record any
     // OTHER slot in the block depends on, so nothing in the block ever runs against a record the
     // step moved.
     //
-    // Only a `MovSreg` row OUTSIDE V86 counts. `MovSreg` -- `0x8E` `/0`, `/3`, `/4`, `/5` -- opts
+    // Only a `MovSreg` row OUTSIDE V86 counts. `MovSreg` (`0x8E` `/0`, `/3`, `/4`, `/5`) opts
     // into R2's mask, keyed on the block's OWN prefix-plus-suffix `used` mask, when
     // `movsreg_block_keyed_eligible` is true (the block's `mode_key` has the V86 bit clear); see
-    // the accumulator below and the mask-gate note at the R2 pass. A V86 `MovSreg` cell -- an FS/GS
-    // load beside a native DS/ES write, the shape the V86 guarded successor edge exists for -- does
+    // the accumulator below and the mask-gate note at the R2 pass. A V86 `MovSreg` cell (an FS/GS
+    // load beside a native DS/ES write, the shape the V86 guarded successor edge exists for) does
     // not count. `MovSsReg` and `PopSs` do not count in any mode, and their cells stay R2-strict
     // at `u8::MAX`. Read this counter alongside `may_write_segment()`: it does not name every
     // segment-writing row.
@@ -8653,7 +8653,7 @@ fn compile_with_budget(
         // Quake's 586 renderer benefits from native word operations. Doom's 486 self-patching
         // renderer recompiles the wider blocks often enough to lose throughput, so keep word
         // instructions as precise interpreter barriers in that mode.
-        // Follow-up (dev_docs/specs/2026-07-15-smc-hardening-design.md, G1): with heat demotion
+        // Follow-up (SMC hardening design, G1): with heat demotion
         // landed, A/B re-enabling 486 word ops - heat should now bound the churn this defends.
         if insn.operand_size == OperandSize::Word && !word_operands_admitted(cpu) {
             // Attributed since the completeness slice, and expected to read ZERO on both shipped
@@ -8698,11 +8698,11 @@ fn compile_with_budget(
             )),
             other => other,
         };
-        // L1, the third `IZARRAVM_ROTATE_ROWS` arm (dev_docs/duke-reprofile-2026-08-19.md §6.1).
+        // L1, the third `IZARRAVM_ROTATE_ROWS` arm (duke re-profile §6.1).
         //
         // WHY HERE AND NOT IN `classify`. `classify` takes a `&DecodedInsn` and two LINEAR
         // addresses; the heat map is keyed by PHYSICAL and lives behind `cpu`, and neither is in
-        // scope there. `disp_lane_for` -- the gate this one inverts -- is called from this same
+        // scope there. `disp_lane_for` (the gate this one inverts) is called from this same
         // loop for exactly that reason, and mirroring its access path is what keeps the two probes
         // reading the one structure through the one accessor.
         //
@@ -8714,7 +8714,7 @@ fn compile_with_budget(
         //
         // COST ON THE OTHER TWO ARMS. The arm compare is a `OnceLock` read against a cached enum
         // and short-circuits before any instruction inspection, so `Off` and `On` pay one
-        // perfectly-predicted branch per NATIVE slot on the COMPILE walk -- never on the execution
+        // perfectly-predicted branch per NATIVE slot on the COMPILE walk, never on the execution
         // path, which this function does not sit on
         // ([[default-off-instruments-tax-hot-path]]).
         let planned = match planned {
@@ -8729,7 +8729,7 @@ fn compile_with_budget(
             // `emit_rmw_inc_dec` is one of the memory sites the one-lookup relaxation never
             // reached: it guards with `emit_wide_page_guard`, which ends in an alignment test that
             // side-exits rather than falling into a split-charge slow path. `classify` has said so
-            // in prose for a long time, on the form-1 memory shape it refuses -- "admitted today,
+            // in prose for a long time, on the form-1 memory shape it refuses: "admitted today,
             // an odd operand would sit INSIDE the block and side-exit at that slot on every
             // execution, so nothing after it retires natively".
             //
@@ -8753,7 +8753,7 @@ fn compile_with_budget(
             // It said "only `RmwIncDec`, because it is the only unrelaxed site this slice can
             // reach", and that was false: `emit_alu_mem_dest` takes the same unrelaxed guard for
             // every op but CMP, `classify` lowers `0x81`/`0x83` memory forms at `operand_width`,
-            // and the CS clause of `prefixes_supported_for` is a PREFIX gate -- it unlocks every
+            // and the CS clause of `prefixes_supported_for` is a PREFIX gate: it unlocks every
             // memory kind at once, not the two the tombraid loop happens to use. The census says
             // so on its face: `0x83 /5 cs:` leaves the rejected table on the ON arm carrying
             // 9,464,397 unbound exits. Tombraid's own instance is aligned, so nothing was measured
@@ -8781,7 +8781,7 @@ fn compile_with_budget(
             // seven pre-existing fixtures that deliberately build a statically misaligned disp-only
             // operand to exercise the RUNTIME guard (`the_non_relaxed_sites_still_refuse_a_
             // misaligned_access`, `a_misaligned_x87_access_still_exits`, the double-shift and
-            // memory-ALU transactional rows, and two x87 alignment rows) -- and it would be
+            // memory-ALU transactional rows, and two x87 alignment rows), and it would be
             // changing a hazard that PRE-DATES this slice, on a knob whose A/B cannot price it.
             // A statically misaligned `add dword [odd], imm8` through DS has certain-exited since
             // long before this branch; turning that into a barrier is a real and separate slice,
@@ -8880,8 +8880,8 @@ fn compile_with_budget(
             }
         };
         // The governor's answer, applied at compile time instead of at every execution. A slot it
-        // demoted has exactly one behaviour left -- test the byte, take the abnormal exit, hand
-        // the instruction to the interpreter -- which is the boundary the row had before it was
+        // demoted has exactly one behaviour left: test the byte, take the abnormal exit, hand
+        // the instruction to the interpreter, which is the boundary the row had before it was
         // admitted, reached through a prologue and a side exit that the boundary does not pay.
         // Ending the block here IS that boundary, and it also drops the slots after it, which a
         // demoted block carries and can never reach.
@@ -8891,7 +8891,7 @@ fn compile_with_budget(
         // not produce every call-out: the protected-mode `MOV Sreg,r/m` arrives as `LoadSegReal`
         // and BECOMES a `CallOut` inside `stack_width_kind`, because the mode is CPU state.
         // `0x8e_mov_sreg` is also the only row the tombraid loader demotes, so a check above that
-        // conversion saw none of them -- 402,264 demotions with the mechanism "on", identical to
+        // conversion saw none of them: 402,264 demotions with the mechanism "on", identical to
         // the run without it, which is how the placement was caught.
         //
         // Read only for a slot that actually interprets one instruction: the port and stack-frame
@@ -9117,7 +9117,7 @@ fn compile_with_budget(
         //
         // The instruction that ENDS the block here has already been counted by the mechanism
         // counters above (`jit_direct_word_address_slots` and the two Word-control ones). That is
-        // deliberate and matches every other cap in this walk -- the stack-access, memory-ALU,
+        // deliberate and matches every other cap in this walk: the stack-access, memory-ALU,
         // call-out-slot and x87 caps all sit below those counters too, and all of them refuse an
         // instruction the counters have already seen. Those columns count instructions the walk
         // CONSIDERED, which is what makes "zero on a corpus with no 16-bit code" the inertness
@@ -9238,7 +9238,7 @@ fn compile_with_budget(
         // segment write leave a stale base under it and R2 would compare nothing about it.
         // WEAKER since `BAKES_CS_BIT`, and worth naming before the next slice leans on it:
         // `MovSegToReg { segment: Cs }` and `Push*{ Selector(Cs) }` now satisfy the first
-        // disjunct through a bit that names NO segment. Inert here -- those kinds still touch no
+        // disjunct through a bit that names NO segment. Inert here: those kinds still touch no
         // memory, so they satisfy the second disjunct as well and the assertion's purpose (a
         // memory-touching kind must pin the segment it addresses through) is undamaged. But the
         // message is no longer literally what the predicate tests.
@@ -9265,7 +9265,7 @@ fn compile_with_budget(
             kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
         // Attached HERE, at the last point before the slot is committed, not next to `classify`.
         // Every `break` above abandons the slot, and a lane recorded for an instruction that never
-        // joined the block would name bytes outside the block's span -- an address the write choke
+        // joined the block would name bytes outside the block's span: an address the write choke
         // could never match, but also a lane the block does not actually read through.
         // The three lane matchers are mutually exclusive by kind (`AluImm` vs `AluByteImm` vs
         // `Load`), so at most one fires per slot and all three draw on the one
@@ -9366,12 +9366,12 @@ fn compile_with_budget(
                         // The two Option D arms, LAST. The position was chosen when both were
                         // default OFF; since the 2026-08-23 flip the STORE arm is on by default
                         // and it is kept here anyway, because the ordering is cost and never
-                        // admission -- all six matchers are mutually exclusive by KIND and
+                        // admission: all six matchers are mutually exclusive by KIND and
                         // OPCODE, so no ordering can change which one fires.
                         //
                         // THE PRICE ON A SHIPPED BINARY, stated exactly rather than waved at.
                         // Each arm tests its own knob first, so a slot that reaches here pays TWO
-                        // `OnceLock` reads and their two branches -- not one, and not a shared
+                        // `OnceLock` reads and their two branches, not one, and not a shared
                         // test, because the arms are separately knobbed and `option_d_lane_for`
                         // calls them in turn. Each `OnceLock` is resolved once per process, so a
                         // read is a relaxed load of an initialised cell plus a branch. Since the
@@ -9453,9 +9453,9 @@ fn compile_with_budget(
             // did not decide anything there, it would only re-report the same failure.
             CompileStop::Retry(cause) => CompileOutcome::Retry(cause),
             // `Boundary` with NO slots at all is not the min-length rule. The walk ended cleanly
-            // before it could form a single slot -- the block-page budget or the instruction
-            // limit refusing the first instruction -- and calling that `TooShort` files a budget
-            // refusal under a rule that never looked at it. Review finding F7; a cause of its own
+            // before it could form a single slot: the block-page budget or the instruction
+            // limit refusing the first instruction, and calling that `TooShort` files a budget
+            // refusal under a rule that never looked at it. Fix F7; a cause of its own
             // so the two can be told apart in a census that is used to price a retry policy.
             CompileStop::Boundary if slots.is_empty() => {
                 CompileOutcome::Retry(RetryCause::BudgetFirstSlot)
@@ -9476,7 +9476,7 @@ fn compile_with_budget(
     // access accessors alone would let a resumed `mov ds, ax` leave a stale selector baked into a
     // `mov ax, ds` beside it.
     //
-    // EVERY OTHER SLOT, before as well as after. The suffix half is the obvious one -- a later
+    // EVERY OTHER SLOT, before as well as after. The suffix half is the obvious one: a later
     // slot would run against a record the step moved. The PREFIX half looks redundant, since those
     // slots have already run, and the first loader gate is what showed it is not: `used` is the
     // block-wide pinned set and `data_matches` compares all of it at every entry, so a block that
@@ -9485,8 +9485,8 @@ fn compile_with_budget(
     //
     // STRICTLY other: a slot's own pinned set is in neither of its masks. It has already run by
     // the time R2 is asked, and its own operand was resolved against the records as they stood
-    // before the step. In practice the distinction is inert -- a `CallOut` kind pins nothing at
-    // all -- and it is written this way because the rule is about the OTHER slots, not because the
+    // before the step. In practice the distinction is inert: a `CallOut` kind pins nothing at
+    // all, and it is written this way because the rule is about the OTHER slots, not because the
     // arithmetic needs it.
     //
     // Runs when the block holds a block-keyed-eligible `MovSreg` cell. The pass itself does not
@@ -9780,7 +9780,7 @@ fn compile_with_budget(
     // code-watch tables, and the read stubs consult none. Same lazy build, same F5-style
     // per-block fallback through `None`. Deliberately looser than D2's "first load-bearing
     // compile": any block with map bases builds the pad, so a store-only workload pays one
-    // small pad build it never calls into — cheaper than threading a has-reads bit through
+    // small pad build it never calls into: cheaper than threading a has-reads bit through
     // here, and the publish is idempotent.
     #[cfg(all(
         target_arch = "x86_64",
@@ -9827,18 +9827,18 @@ fn compile_with_budget(
     // in 2026-08-18. The refutation below did not depend on it and stands unchanged.)
     // That compares the wrong two things: the predicate compares the two blocks'
     // COMPILE-TIME ENTRY snapshots, and on the pass that compiles them the write is very often a
-    // no-op -- `mov ds, ax` where AX already holds DS is the ordinary "reload DS with what it
+    // no-op: `mov ds, ax` where AX already holds DS is the ordinary "reload DS with what it
     // has" case. The edge links, and then a LINKED successor runs no segment check at all: a
     // chained transfer jumps into the successor's body without returning to `run_direct_block`,
     // so its `data_matches` never executes. A later entry with a different AX writes DS and jumps
     // straight into a body baked against the old base.
     //
     // Barring both edges makes the property true by construction, and it is what keeps INBOUND
-    // links safe as well -- not any argument about snapshots. A block that publishes no
+    // links safe as well, not any argument about snapshots. A block that publishes no
     // successors is where the chain ENDS: its segment write is the last thing that happens before
     // control returns to `run_direct_block`, so there is no downstream body to enter against the
-    // base the write just invalidated. That argument survives the chain-used mask
-    // (dev_docs/plans/2026-08-18-chain-used-link-mask.md), which is about frozen compile-time
+    // base the write just invalidated. That argument survives the chain-used mask,
+    // which is about frozen compile-time
     // capture and says nothing about a value the block is about to overwrite at run time.
     // TWO producers now, not one. `segment_writes` counts the `LoadSegReal`/`PopSegReal`
     // lowerings; `callout_segment_writes` counts the `InterpretOne` slots whose row can call
@@ -9852,7 +9852,7 @@ fn compile_with_budget(
     // successor is not a later slot in this block, and nothing in the mask says anything about
     // what it bakes.
     let segment_write_block = segment_writes != 0 || callout_segment_writes != 0;
-    // `SEGWRITE-V86-EDGE` (dev_docs/2026-09-01-segwrite-continue-design.md §4.1). The bars a
+    // `SEGWRITE-V86-EDGE` (segwrite continue design §4.1). The bars a
     // segment-write block must clear to publish its plain static fallthrough anyway, on the
     // default path, because this is what decides `successors` below. The bars are: one write,
     // not CS/SS, no call-out write, the plain-fallthrough terminal shape, and V86, the one mode
@@ -9885,11 +9885,11 @@ fn compile_with_budget(
     // The one segment this edge would guard. `None` whenever `seg_write_edge_eligible` is false,
     // in which case nothing reads it.
     //
-    // `expect`, NOT `.flatten()` (review finding N2). `count_ones() == 1` in
+    // `expect`, NOT `.flatten()` (N2). `count_ones() == 1` in
     // `seg_write_edge_eligible` is what makes `segment_of_bit` total here, and that is an
     // invariant of THIS predicate, not a fact `segment_of_bit` can defend on its own. A `.flatten()`
     // here would fail OPEN: if `seg_write_edge_eligible` were ever relaxed to admit a multi-bit
-    // mask (a mutation that leaves the whole test suite green -- see
+    // mask (a mutation that leaves the whole test suite green, see
     // `a_two_segment_write_block_still_publishes_no_successor`), `segment_of_bit` would return
     // `None`, `.flatten()` would swallow it silently, and the catch-all `successors` arm below
     // would publish an UNGUARDED edge for a block this design's §4.1 explicitly bars
@@ -9913,7 +9913,7 @@ fn compile_with_budget(
             && cpu.jit_direct.live_data_segments_arm() == 2
             && dirty_segments & segment_bit(SegmentIndex::Cs) == 0);
     // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
-    // segment-write block -- it writes CS, which is the whole point -- so the `!segment_write_block`
+    // segment-write block: it writes CS, which is the whole point, so the `!segment_write_block`
     // term above would make the far cell unreachable and the slice inert.
     //
     // What the term protects is stated at `:7720` and is untouched for every other kind: a chained
@@ -9989,8 +9989,8 @@ fn compile_with_budget(
         // `RetFar16` is EXPLICIT here rather than left to the catch-all, and it is the one arm
         // in this match that is load-bearing on its own. `emitted_static_targets` is built from
         // `emitted_mask` and is NOT masked by `segment_write_block`, so a far block riding the
-        // catch-all would register a phantom static-fallthrough refusal-census row on SLOT 0 --
-        // the far cell -- and the campaign ranks and closes on censuses. `CallFar16` joins it for
+        // catch-all would register a phantom static-fallthrough refusal-census row on SLOT 0,
+        // the far cell, and the campaign ranks and closes on censuses. `CallFar16` joins it for
         // the identical reason: it is ALSO a far terminal whose successor cell is the linear-keyed
         // far PIC, not an ordinary static fallthrough, and letting it ride the catch-all below
         // would register the same phantom census row this arm exists to prevent.
@@ -10032,7 +10032,7 @@ fn compile_with_budget(
         // `SEGWRITE-V86-EDGE`: an eligible segment-write block falls through to the ordinary
         // catch-all arm below instead of taking this bar. `seg_write_edge_eligible` already
         // requires the plain-fallthrough terminal shape (`is_plain_fallthrough_terminal`), so
-        // when it holds this guard is never reached for any OTHER named kind below -- the arm
+        // when it holds this guard is never reached for any OTHER named kind below: the arm
         // order still matters for the non-eligible population, which is every other reason
         // `segment_write_block` can be true (CS/SS writes, multi-write heads, call-out writes,
         // plain real mode, a non-fallthrough terminal).
@@ -10278,8 +10278,8 @@ fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u
 /// here. What is left is the `disp`-only mode (`mod = 00, rm = 110` at Word address size, `rm = 101`
 /// at Dword), which is exactly the shape the tombraid driver uses.
 ///
-/// The offset is masked the way `emit_effective_address` masks it -- to sixteen bits for a 16-bit
-/// address, by `effective_wrap` -- BEFORE the segment base is added, because that is the order the emitted address
+/// The offset is masked the way `emit_effective_address` masks it: to sixteen bits for a 16-bit
+/// address, by `effective_wrap`, BEFORE the segment base is added, because that is the order the emitted address
 /// is computed in and a mask applied afterwards would name an address the guest never forms.
 /// `emit_alignment_test` runs on RAX, i.e. on the LINEAR address after the base add, so the base
 /// belongs in this arithmetic. It is inert in real mode and V86, where a base is a multiple of 16
@@ -10352,7 +10352,7 @@ fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind, live: u8) -> bo
 // one.
 //
 // **The discriminants are a wire format.** Emitted code stores the integer, `run.rs` compares
-// against the enum, and the two are matched only by these values -- so renumbering any variant
+// against the enum, and the two are matched only by these values, so renumbering any variant
 // silently remaps what a stale compiled block reports. `SideExitReason::MAX` exists so `run.rs`
 // can bound-assert what it reads rather than trusting it.
 //
@@ -10394,7 +10394,7 @@ pub(crate) enum SideExitReason {
     CallOutStepBreak = 9,
     /// A lowered DIV or IDIV refused its operands. The guard fires on a superset of the
     /// interpreter's #DE conditions, the run ends AT the instruction with nothing done, and the
-    /// interpreter re-executes it -- delivering #DE where the guest's rules say it must. A
+    /// interpreter re-executes it, delivering #DE where the guest's rules say it must. A
     /// per-EXECUTION property of the data like `X87Eligibility`, not a per-compile property of
     /// the address, so it can fire on a block that will never bind differently.
     DivideGuard = 10,
@@ -10402,7 +10402,7 @@ pub(crate) enum SideExitReason {
     /// input the rest of the block depends on moved under it (a segment record, a control
     /// register, IF going 0 to 1, a mapping epoch, a write onto a watched code page). The
     /// instruction RETIRED, so the exit reports `prefix + 1`, and EIP is left exactly where the
-    /// interpreter put it -- the stub advances it by zero.
+    /// interpreter put it: the stub advances it by zero.
     CallOutResync = 11,
     /// An `InterpretOne` call-out's step returned `Err` and `finish_instruction` delivered it. The
     /// fault path already counted the instruction in `perf.instructions` and already charged its
@@ -10435,7 +10435,7 @@ pub(crate) enum UnresolvedReason {
     X87TopMismatch,
     /// `SEGWRITE-V86-EDGE`: the edge WAS linked, but the live selector the source block just
     /// wrote did not equal the target's frozen requirement (`LinkCell::expected_selector`). A
-    /// distinct variant on purpose -- not folded into `StaticUnbound`, which would hide the
+    /// distinct variant on purpose, not folded into `StaticUnbound`, which would hide the
     /// guard's true conversion rate behind a counter that also holds every ordinary unlinked
     /// edge.
     SegmentSelectorMismatch,
@@ -10462,7 +10462,7 @@ pub(crate) struct NativeExit {
     pub(crate) byte_reads: u64,
     /// Low 32 bits: the block's STATIC dword-read count.
     ///
-    /// High 32 bits: `split_extra_bytes` -- the EXTRA byte cycles owed by misaligned RAM accesses
+    /// High 32 bits: `split_extra_bytes`: the EXTRA byte cycles owed by misaligned RAM accesses
     /// served natively, `bytes() - 1` apiece, and fed by STORES as well as reads. The lane's name
     /// covers only its low half; `run.rs` masks before every consumer and prices the high half
     /// through `jit_data_cost_clocks(Byte)`, the same dial `ram_byte_writes` and `ram_byte_reads`
@@ -10504,8 +10504,8 @@ pub(crate) struct BlockKey {
 /// captured. `SEGWRITE-V86-EDGE` keys its edge relaxation on this bit and only this bit: in V86,
 /// `load_segment_checked` routes to `load_segment_real`, which rebuilds the whole segment record
 /// from the selector alone (`SegmentRegister::real`), so a selector-equality guard is sufficient
-/// for a whole descriptor. That is false in plain real mode -- `load_segment_real_mode` preserves
-/// the cached limit, which is what unreal mode IS -- so a block compiled outside V86 must never
+/// for a whole descriptor. That is false in plain real mode: `load_segment_real_mode` preserves
+/// the cached limit, which is what unreal mode IS, so a block compiled outside V86 must never
 /// take the relaxed path, and `BlockKey`/the entry check already refuse to enter a block admitted
 /// under one mode key from another.
 pub(crate) const JIT_MODE_KEY_V86_BIT: u32 = 1 << 2;
@@ -10537,8 +10537,8 @@ impl BlockKey {
 
 /// May the Direct backend key a block at all, on this host and this persona? The screen
 /// `key_for_phys` opened with, lifted to a function of `mode` alone so `CpuGsw` can cache it
-/// (`JitState::native_keys_admitted`) and so the cache and the thing it caches are ONE expression
-/// — the same discipline `fast_map_population_enabled` and its serve gate keep.
+/// (`JitState::native_keys_admitted`) and so the cache and the thing it caches are ONE expression:
+/// the same discipline `fast_map_population_enabled` and its serve gate keep.
 ///
 /// This does NOT subsume `word_operands_admitted`, and the two must not be merged. That predicate
 /// answers a per-BLOCK question (does this segment's operand size survive the compile walk?) and
@@ -10578,7 +10578,7 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     // Refusing the key here instead keeps that persona byte-identical by construction.
     //
     // The 16-bit population is real mode, V86 and 16-bit protected mode. V86 is deliberately IN,
-    // and 16-bit V86 BLOCKS EXIST in the shipped configuration -- an earlier revision of this
+    // and 16-bit V86 BLOCKS EXIST in the shipped configuration. An earlier revision of this
     // comment said "no 16-bit block exists on any persona today", which was true while
     // `try_direct_continuation` refused every `!d` boundary and stopped being true when
     // `IZARRAVM_JIT16` defaulted to 1. The V86 conclusion now rests on per-opcode gates:
@@ -10590,13 +10590,13 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     //     SUPPORT the V86 / CPL>IOPL state instead of refusing it: a pure phase (TLB hits only, an
     //     uncharged RAM peek) proves the TSS I/O-permission answer with no effect at all, and only
     //     then does a committed phase charge and touch the port, in the interpreter's own order.
-    //     Anything the pure phase cannot answer -- a TLB miss above all -- still returns the
+    //     Anything the pure phase cannot answer (a TLB miss above all) still returns the
     //     instruction to the interpreter unexecuted. `run_direct_block`'s entry refusal is
     //     UNCHANGED and still refuses dispatcher entries into a call-out-bearing block in that
     //     state; a CHAINED entry bypasses it by construction, which is the mechanism the slice is
     //     for. See the call-out section and the notes on `classify`'s `0xec` and `0xee` arms.
     //   * PUSHF: its Dword arm (PUSHFD) is refused by `stack_width_kind` in V86
-    //     (`StoreSource::Flags`, IOPL check) -- a compile-time barrier with no fault path. Its
+    //     (`StoreSource::Flags`, IOPL check): a compile-time barrier with no fault path. Its
     //     WORD form is an `InterpretOne` call-out since N2, so its V86 cover is the helper's fault
     //     arm rather than a compile-time refusal, the same argument CLI makes below.
     //   * POPF: WORD form is an `InterpretOne` call-out since N2, same cover as PUSHF's Word form.
@@ -10676,21 +10676,20 @@ pub(crate) const BAKES_CS_BIT: u8 = 1 << 6;
 /// set: the segments this block's emitted code depends on, whether through a baked base or a
 /// baked selector, plus `BAKES_CS_BIT` when it bakes CS's selector as an immediate.
 ///
-/// A linked target does NOT have to carry an identical snapshot -- it used to, and that rule cost
+/// A linked target does NOT have to carry an identical snapshot. It used to, and that rule cost
 /// prince-586 its whole wall. What it must do is AGREE on every segment that some block in the
 /// chain pins. `BlockCache::chain_layouts` carries that transitive requirement per block (own
 /// `used`, plus the union of the masks of everything reachable through live links), and
-/// `link_merge` below is the edge predicate over it. Because the merge is NON-ADOPTING -- a bit
-/// set on either side demands descriptor EQUALITY -- a chain requirement never names a descriptor
+/// `link_merge` below is the edge predicate over it. Because the merge is NON-ADOPTING, a bit
+/// set on either side demands descriptor EQUALITY: a chain requirement never names a descriptor
 /// its holder's own snapshot does not have.
 ///
 /// TWO CHECKS DISCHARGE THE ROOT'S OBLIGATION, selected by `IZARRAVM_CHAIN_ENTRY_CHECK`.
 /// `all_data_matches` proves all six of the root's own descriptors: sound by the non-adoption
 /// property above, and far stronger than the obligation. `data_matches` over
-/// `chain_layouts[root]` proves exactly the obligation and nothing more -- every segment some
+/// `chain_layouts[root]` proves exactly the obligation and nothing more: every segment some
 /// block in the LIVE cone pins. The second is why the requirement must be narrowed when a block's
 /// last outbound edge dies; see `BlockCache::narrow_chain_requirement_if_leaf`.
-/// dev_docs/plans/2026-08-18-chain-used-link-mask.md has the invariant and its proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentLayout {
     cs: SegmentRegister,
@@ -10699,7 +10698,7 @@ pub(crate) struct SegmentLayout {
 }
 
 impl SegmentLayout {
-    /// `pinned_segments` is the PINNED set — every segment `data_matches` will compare on entry —
+    /// `pinned_segments` is the PINNED set (every segment `data_matches` will compare on entry)
     /// while the accessibility check below runs over the ACCESSED set only. The two used to be the
     /// same mask; they came apart when `MovSegToReg` arrived, which needs a segment's selector
     /// pinned without asserting anything about whether memory can be reached through it.
@@ -10768,7 +10767,7 @@ impl SegmentLayout {
 
     /// Merge two CHAIN requirements, NON-ADOPTING: the result requires the UNION of the two
     /// masks, and every segment in that union must carry the SAME descriptor on both sides.
-    /// `None` is a conflict -- no requirement satisfies both ends at once.
+    /// `None` is a conflict: no requirement satisfies both ends at once.
     ///
     /// Non-adoption is what makes the result's descriptors identical to `self`'s: the two agree
     /// wherever the result's mask can ever be read, so the merge only ever moves `used`. The
@@ -10810,8 +10809,8 @@ impl SegmentLayout {
     }
 
     /// Diagnostic only (`direct-link-refusal-census` scratch instrument, design section 4.3
-    /// slice 0, `dev_docs/2026-09-02-tyrian-s1b-refusals-design.md`): the mask a per-edge
-    /// runtime guard would need to bind THIS refused edge under the section 4.2 disposition --
+    /// slice 0 of the Tyrian S1b refusals design): the mask a per-edge
+    /// runtime guard would need to bind THIS refused edge under the section 4.2 disposition:
     /// the target's pinned DATA segments this source does not already pin with an agreeing
     /// descriptor. `target.used & guard_mask == guard_mask` holds by construction, matching the
     /// design's own invariant.
@@ -10821,11 +10820,11 @@ impl SegmentLayout {
     /// a DATA-segment mechanism (section 4.3's table tops out at "5 (every data segment)"), not a
     /// CS one. But the call site serves `far_merge` and `seg_write_merge` too, and both can refuse
     /// for reasons this method neither sees nor names (INV-FAR-CS, the segwrite target not
-    /// claiming the written segment) -- so a popcount of 0 out of THIS method is not proof of a
+    /// claiming the written segment), so a popcount of 0 out of THIS method is not proof of a
     /// CS-only conflict, only that no reason `guard_mask` itself can see applied. See the
     /// histogram's own doc comment on `DirectLinkRefusalCensus::guard_mask_popcount_histogram`.
     ///
-    /// Never read on the shipped path -- no guard exists yet -- only from the census call site
+    /// Never read on the shipped path (no guard exists yet) only from the census call site
     /// under the census feature, so it costs nothing on a plain build.
     #[cfg(feature = "direct-link-refusal-census")]
     pub(crate) fn guard_mask(self, target: Self) -> u8 {
@@ -10859,7 +10858,7 @@ impl SegmentLayout {
     ///
     /// Why a CS EQUALITY is the wrong test and this refusal is the right one. The far cell is
     /// keyed on the target's LINEAR, which is the block-identity quantity, and the emitted slot
-    /// has already written the guest CS register from the popped selector -- so the architectural
+    /// has already written the guest CS register from the popped selector, so the architectural
     /// CS is correct on arrival whatever the cell was bound under. The only thing that can go
     /// wrong is T READING CS: through a baked descriptor (base and limit, `segment_bit(Cs)`) or
     /// through a baked selector immediate (`BAKES_CS_BIT`). Excluding both is exact, and it admits
@@ -10895,7 +10894,7 @@ impl SegmentLayout {
 
     /// `merge_chain` for a `SEGWRITE-V86-EDGE` source: `self` writes the segment(s) named by
     /// `dirty` (`Compilation::written_segments`/`BlockCache::written_segments`, always exactly
-    /// one bit for an edge `try_link_inner` will admit -- `seg_write_edge_eligible` is what
+    /// one bit for an edge `try_link_inner` will admit: `seg_write_edge_eligible` is what
     /// guarantees that) before it exits, so `self.data`'s entry for that segment is the PRE-write
     /// value and comparing it against anything would be comparing a dead value no downstream body
     /// ever observes.
@@ -10908,17 +10907,17 @@ impl SegmentLayout {
     /// 2. **The target must already CLAIM the written segment** (`target.used & dirty != 0`), or
     ///    this returns `None`. Not a courtesy check: `SegmentLayout::selector` debug-asserts its
     ///    `used` bit before reading, and the emitted guard's `expected_selector` comes from
-    ///    `chain_layouts[target].selector(written_segment)` -- so a target that never pins the
+    ///    `chain_layouts[target].selector(written_segment)`, so a target that never pins the
     ///    segment has nothing for the guard to compare against, and the edge must fall back to
     ///    today's dispatcher-mediated bar rather than manufacture a value. This is exactly the
     ///    Stage-0 "does the successor's `chain_layouts[..].used` claim the write" measurement
-    ///    (`dev_docs/2026-09-01-measurement-backlog-results.md` §4); a game whose successors
+    ///    (measurement backlog results §4); a game whose successors
     ///    rarely claim the write pays this refusal, unchanged from before the slice, on that
     ///    share.
     ///
-    /// `used` does NOT carry `dirty` (review finding N3). An earlier revision OR'd it in on the
+    /// `used` does NOT carry `dirty` (N3). An earlier revision OR'd it in on the
     /// theory that a later widen re-deriving this edge needs to see the segment as part of
-    /// `self`'s own requirement -- that theory is wrong: `widen_chain_requirement` selects THIS
+    /// `self`'s own requirement. That theory is wrong: `widen_chain_requirement` selects THIS
     /// method for a predecessor by testing `written_segments[predecessor]` directly
     /// (`BlockCache`'s own parallel lane), never by testing `chain_layouts[predecessor].used`, so
     /// nothing downstream needs the bit to survive in `used` for the re-derivation to keep firing.
@@ -10927,12 +10926,12 @@ impl SegmentLayout {
     /// block's own `chain_layouts` snapshot against live state
     /// (`chain_entry_check_armed`/`entry_layout`, on by default), so a dirty bit surviving into
     /// `used` makes every entry into `self` compare the LIVE pre-write descriptor of a segment
-    /// `self` never reads against a frozen snapshot -- a spurious requirement on a segment the
+    /// `self` never reads against a frozen snapshot: a spurious requirement on a segment the
     /// source block only overwrites. On a hot site whose caller leaves that segment varying
     /// (`0x18803: MOV ES,AX`, design §2.1, ES is whatever the caller left), that refuses every
     /// entry, and `own_mask_matches` reading `segment_layouts[self]` (which never carried the bit)
-    /// as `true` sends the refusal down the data-segment decline path: unlink, re-bind, re-reject
-    /// -- the treadmill this whole design exists to convert *out of*. Dropping the bit removes the
+    /// as `true` sends the refusal down the data-segment decline path: unlink, re-bind, re-reject:
+    /// the treadmill this whole design exists to convert *out of*. Dropping the bit removes the
     /// requirement entirely: the ONLY thing that ever discharges the written segment is the
     /// runtime guard, exactly as clause 3 above already requires.
     pub(crate) fn seg_write_merge(self, target: Self, dirty: u8) -> Option<Self> {
@@ -11106,7 +11105,7 @@ const fn segment_index(segment: SegmentIndex) -> usize {
 // Keeping the whole layout TOGETHER is the point rather than an accident: the slot constants, the
 // frame length they must fit inside, the const-asserts that check that, and the counter-lane table
 // are a single invariant spread across four declarations. Separating any of them from the others
-// is how a slot silently starts overlapping another -- see the STACK_PUSH_MEM_VALUE and
+// is how a slot silently starts overlapping another, see the STACK_PUSH_MEM_VALUE and
 // STACK_SAVED_RSI notes below, both of which exist because that nearly happened.
 
 const GUEST_HOMES: [Reg; 8] = [
@@ -11157,7 +11156,7 @@ const EXIT_ARG: Reg = Reg::RCX;
 // 152 below (STACK_QUOTA through STACK_SHIFT_COUNT), filling 160 bytes.
 //
 // L8 grew this to 176 for a far-CALL ledger slot at 160 plus its alignment padding, and every
-// compiled block paid the prologue zero and the `emit_return` copy that slot needed -- three
+// compiled block paid the prologue zero and the `emit_return` copy that slot needed: three
 // memory ops per ENTRY for a counter that ticks once per far CALL. The 2026-09-01 reprice moved
 // the ledger to `CpuGsw::far_call_ledger`, written through R15 by the `CallFar16` lowering
 // itself, and the frame came back to 160. Anything added here is paid ~384 M times on
@@ -11197,7 +11196,7 @@ const STACK_BYTE_READS: i8 = 112;
 /// `emit_add_static_accounting`.
 ///
 /// High 32 bits: `split_extra_bytes`, the extra byte cycles owed by MISALIGNED
-/// RAM accesses served natively at the two lean one-lookup sites -- `bytes() - 1`
+/// RAM accesses served natively at the two lean one-lookup sites: `bytes() - 1`
 /// per access, deposited dynamically by `emit_dynamic_split_extra` from the load
 /// and store stubs' RAM tails.
 ///
@@ -11234,10 +11233,10 @@ const STACK_PUSH_MEM_VALUE: i32 = STACK_ALU_OLD_RESULT;
 ///
 /// Aliased onto the ALU slot by `STACK_PUSH_MEM_VALUE`'s argument, and it needs all three parts of
 /// it: `RetFar16` is not an ALU kind, it is not `PushMem` (the two can never appear in one slot's
-/// emission -- both are terminal or, in `PushMem`'s case, never co-emitted with a far return in
+/// emission: both are terminal or, in `PushMem`'s case, never co-emitted with a far return in
 /// the same slot), and both the write and the read happen inside a single slot's emission. It must
 /// NOT be `STACK_READ_KIND` (80): `emit_code_watch_branch` writes `STACK_WATCH_PAGE`, the same
-/// slot, on a read's path -- and this value has to survive exactly such a path. Nor
+/// slot, on a read's path, and this value has to survive exactly such a path. Nor
 /// `STACK_STUB_RETURN` (= `STACK_ALU_FLAGS` = 144), which the shared read stub uses across its
 /// CALL.
 ///
@@ -11263,7 +11262,7 @@ const STACK_ALU_FLAGS: i32 = 144;
 /// Aliased onto the ALU-flags slot by the `STACK_PUSH_MEM_VALUE` argument. The safety
 /// argument, restated for the read twin: every stub caller writes and reads this slot inside a
 /// single CALL's lifetime, and no caller has a LIVE value in the ALU scratch cluster at the
-/// call point — the store stubs are reached from `Store`/x87-pointer emission (no ALU-cluster
+/// call point: the store stubs are reached from `Store`/x87-pointer emission (no ALU-cluster
 /// use at all), and the read stubs' callers that touch the cluster (`AluMemDest`'s CMP form,
 /// `AluMemSource`, `TestImmMem`) do so only AFTER the read helper returns, never across it.
 /// The emitters that hold cluster state ACROSS a memory front (`AluMemDest`'s writing forms,
@@ -11281,7 +11280,7 @@ const STACK_SHIFT_COUNT: i32 = 152;
 /// total-word-store count `word_stores()` feeds. Conflating a far CALL into `far_ret_native`
 /// would silently break its pre-registered identity (`decode_inval_cs_load(armed) +
 /// far_ret_native(armed) == decode_inval_cs_load(base)`), since a CALL and a RETF are two
-/// different `decode_inval_cs_load` gaps that must stay separately attributable -- a CALL never
+/// different `decode_inval_cs_load` gaps that must stay separately attributable: a CALL never
 /// calls `invalidate_code_caches_for_cs_load` any more than a RETF does, but the two are different
 /// instructions with different census rows and, on the corpus, wildly different execution counts.
 ///
@@ -11289,7 +11288,7 @@ const STACK_SHIFT_COUNT: i32 = 152;
 /// grew `BASE_STACK_LEN` 160 -> 176); the 2026-09-01 reprice moved it here, to this `CpuGsw` cell,
 /// and brought `BASE_STACK_LEN` back down to 160. The frame slot charged every block ENTRY a
 /// prologue zero and every block EXIT an `emit_return` copy so a counter that ticks once per far
-/// call could be aggregated per native exit -- on duke3d-586, ~384 M entries against a far-call
+/// call could be aggregated per native exit: on duke3d-586, ~384 M entries against a far-call
 /// count four to five orders of magnitude smaller.
 ///
 /// **Why the R15 cell is correct where the frame slot was the wrong shape.** It survives a
@@ -11323,8 +11322,8 @@ const _: () = {
 /// The prologue's zero-fill window: frame bytes `0..STACK_ZERO_FILL_LEN`, cleared as whole
 /// 32-byte vector stores instead of one 8-byte store per accumulator.
 ///
-/// Thirteen slots need zeroing — `STACK_ITERATIONS`, the seven `dynamic_counter_fields` lanes
-/// and the five static accumulators — and they are scattered across 8..128 with
+/// Thirteen slots need zeroing: `STACK_ITERATIONS`, the seven `dynamic_counter_fields` lanes
+/// and the five static accumulators, and they are scattered across 8..128 with
 /// `STACK_EXIT` (56) and `STACK_READ_KIND` (80) interleaved between them. Clearing the whole
 /// window and writing `STACK_EXIT` and `STACK_QUOTA` afterwards is four stores instead of
 /// thirteen, per block ENTRY (a chained transfer jumps to `body_offset` and skips the prologue
@@ -11338,7 +11337,7 @@ const _: () = {
 /// One side effect worth naming rather than leaving to be rediscovered: `STACK_READ_KIND`
 /// (and its alias `STACK_WATCH_PAGE`) now starts every entry at a DETERMINISTIC zero, where
 /// before it held whatever the previous entry left in the slot. That is strictly safer but it
-/// changes a failure mode — a future read-before-write of that slot now reads page 0 and
+/// changes a failure mode: a future read-before-write of that slot now reads page 0 and
 /// resolves something wrong, instead of reading garbage and failing loudly. Nothing reads it
 /// before writing it today; every parker writes it inside the same slot's emission.
 const STACK_ZERO_FILL_LEN: i32 = 128;
@@ -11382,7 +11381,7 @@ const _: () = {
 // The Windows-only areas above the base frame. The prologue writes BOTH of these BEFORE the
 // fill runs (the x87 entry path saves RSI and XMM6-11 immediately after `sub rsp`), so a
 // `BASE_STACK_LEN` that ever shrank under the fill window would have the fill quietly eat a
-// saved host register on its way past — handing garbage RSI or XMM state back to the Rust
+// saved host register on its way past, handing garbage RSI or XMM state back to the Rust
 // caller with nothing else complaining.
 #[cfg(target_os = "windows")]
 const _: () = {
@@ -11400,7 +11399,7 @@ const _: () = {
 /// Every lane is unconditional. There was once a per-`DirectKind` mask that nominated a subset,
 /// but it never reached `emit_return`, which was always called with the all-bits constant; it was
 /// removed rather than wired up, because gating the copies would save about five stores per block
-/// exit — unmeasurable against this campaign's layout noise — on the hottest shared exit path,
+/// exit (unmeasurable against this campaign's layout noise) on the hottest shared exit path,
 /// where a wrongly-cleared lane is a guest-visible bus-accounting error rather than a diagnostic
 /// one.
 ///
@@ -11416,13 +11415,13 @@ const _: () = {
 ///
 /// Links form at runtime between any two blocks sharing a mode key, so no compile-time union
 /// bounds either set. Both failures are guest-visible bus accounting. The prologue cost was
-/// recovered instead by making the zeroing WIDER, not narrower — see `STACK_ZERO_FILL_LEN`.
+/// recovered instead by making the zeroing WIDER, not narrower. See `STACK_ZERO_FILL_LEN`.
 ///
 /// The identical argument later killed a conditional-growth design for L8's far-CALL ledger
 /// (`far_call_ledger_offset`): a per-`CallFar16` frame mask hits the same two failures above,
 /// just for one lane instead of seven. That lane's escape hatch was to leave the frame alone
 /// and put the counter in `CpuGsw` instead, written through R15 by the one lowering that needs
-/// it — see `dev_docs/2026-09-01-duke-l8-reprice.md` for the worked example.
+/// it.
 fn dynamic_counter_fields() -> [(i8, usize); 7] {
     [
         (
@@ -11503,7 +11502,7 @@ pub(crate) const TABLE_SLOT_CODE_WATCH_NATIVE: usize = 5;
 pub(crate) const TABLE_SLOT_STORE_BIASES: usize = 6;
 /// The store-stub pad's published entry addresses (design D4), one slot per stub in the pad's
 /// canonical order; emitted sites `call qword [r15 + slot]` straight through them. The layout
-/// helpers below are the single source of the (family, width, cpl) -> slot mapping — the pad
+/// helpers below are the single source of the (family, width, cpl) -> slot mapping: the pad
 /// emitter records offsets in the identical order.
 pub(crate) const TABLE_SLOT_STORE_STUBS: usize = 7;
 /// 3 mode13 stubs (byte/word/dword) + 6 slow stubs (3 widths x cpl0/cpl3) + 8 x87 resolve
@@ -11526,20 +11525,20 @@ pub(crate) const fn store_stub_slot_x87(width_index: usize, cpl3: bool) -> usize
 }
 
 /// The one-lookup LOAD table (`FastMapStorage::load_biases`, load design D1). Appended AFTER
-/// the store slots — the array lives at the CpuGsw TAIL precisely so growth like this cannot
+/// the store slots: the array lives at the CpuGsw TAIL precisely so growth like this cannot
 /// move `pending_flags` or any hot interpreter field (the #719 layout-tax lesson; the pinned
 /// offset tests are this commit's proof).
 pub(crate) const TABLE_SLOT_LOAD_BIASES: usize = TABLE_SLOT_STORE_STUBS + STORE_STUB_COUNT;
 /// The read-resolve stub pad's published entry addresses (load design D4). Three families:
 ///
 /// * COUNTING stubs for the lean sites, per GPR width x cpl (6): resolve AND move the mode13
-///   read lane on a mode13 success, so the site's slow join needs no completion bytes — the
+///   read lane on a mode13 success, so the site's slow join needs no completion bytes: the
 ///   restructure the L8 size swap forced (the first-cut inline mode13 arm + cold completion
 ///   made every read site ~40 bytes LARGER than the classic front; native mode13 reads exist
-///   only under chained 13h — Mode X produces no read fills, review F3 — so they are stub-cold
+///   only under chained 13h: Mode X produces no read fills, review F3, so they are stub-cold
 ///   by evidence, unlike the store side's doom-hot aperture writes).
 /// * PARK-ONLY stubs for the Ret/Ret16/JmpMem trio, per cpl (2): park the bare kind, never
-///   count — the trio's own deferred completion moves the lane after its CS-limit exit.
+///   count: the trio's own deferred completion moves the lane after its CS-limit exit.
 /// * x87 stubs, per cpl (2): park the `kind << 32 | linear` pack for the untouched x87
 ///   completion, never count.
 pub(crate) const TABLE_SLOT_READ_STUBS: usize = TABLE_SLOT_LOAD_BIASES + 1;
@@ -11651,7 +11650,7 @@ impl NativeTableSlots {
     }
 
     /// Publish the read-resolve stub pad's entry addresses (load design D4), in the pad's
-    /// canonical order — the store pad's write-once contract verbatim.
+    /// canonical order: the store pad's write-once contract verbatim.
     pub(crate) fn publish_read_stubs(&mut self, addresses: [usize; READ_STUB_COUNT]) {
         for (index, address) in addresses.into_iter().enumerate() {
             self.publish(TABLE_SLOT_READ_STUBS + index, address);
@@ -11773,7 +11772,7 @@ pub(crate) fn set_lane_family_for_test(forced: Option<bool>) {
 /// DEFAULT ON SINCE THE DISP LANES LANDED, and the flip is the same measurement that once
 /// turned it off, repeated on the other side of its stated precondition. 2026-08-08
 /// (duke586-lanetrial-{0,1}.json), imm lanes only: 146,956 trials, 61,216 installs, rt -5.5%
-/// (0.2600 -> 0.2456) — Build's patch bursts mix lane-shaped 0x81 writes with disp-field 0x8A
+/// (0.2600 -> 0.2456): Build's patch bursts mix lane-shaped 0x81 writes with disp-field 0x8A
 /// rewrites in the same chunks, so trial installs died to the writes the lanes could not
 /// absorb, and the doc said "re-measure after displacement lanes exist". 2026-08-09
 /// (duke586-displane3-{0,1,trial}.json), heat-gated disp lanes shipped: trial-off is INERT on
@@ -11788,7 +11787,7 @@ pub(crate) fn set_lane_family_for_test(forced: Option<bool>) {
 /// each other on a fixture whose patch loop never pauses: the gate refuses to compile while the
 /// chunk is hot, so no block exists, so no lanes register, so every patch narrow-kills decode
 /// lines and re-stamps the heat, forever. Duke3d spends 44.8% of its dispatcher seams exiting
-/// into exactly this state (dev_docs/2026-08-08-dispatch-tier-next.md). Doom never hit the
+/// into exactly this state. Doom never hit the
 /// deadlock only because its blocks compiled BEFORE the heat crossed the threshold.
 ///
 /// The trial breaks the cycle with a bounded probe: a compilation per key per heat epoch is
@@ -11796,7 +11795,7 @@ pub(crate) fn set_lane_family_for_test(forced: Option<bool>) {
 /// From there the mechanism self-selects. If the lanes cover the guest's patches, the writes
 /// become `lane_accepts`, contribute no heat, the chunk cools at the next epoch, and admission
 /// normalizes. If they do not, the next patch kills the block, the key re-parks Dormant exactly
-/// as before, and the trial cannot re-fire until the epoch turns — worst case `lane_trial_budget()`
+/// as before, and the trial cannot re-fire until the epoch turns: worst case `lane_trial_budget()`
 /// extra compiles and installs per key per epoch, of which all but the first must be EARNED by the
 /// previous one installing. That budget is 4 since the 2026-08-29 ladder; it was 1 before it.
 pub(crate) fn lane_trial_enabled() -> bool {
@@ -11807,8 +11806,8 @@ pub(crate) fn lane_trial_enabled() -> bool {
 /// One key's lane-trial state inside ONE heat epoch: which epoch it belongs to, how many grants
 /// it has already spent there, and whether the LATEST of those grants installed.
 ///
-/// Four bytes, and the whole of Lever B's state. `spent` is per-`(key, epoch)` and is RESET — not
-/// decremented, not aged — the first time the key is asked in a new epoch (INV-B2: nothing outside
+/// Four bytes, and the whole of Lever B's state. `spent` is per-`(key, epoch)` and is RESET (not
+/// decremented, not aged) the first time the key is asked in a new epoch (INV-B2: nothing outside
 /// an epoch change may clear it, because a per-probe or per-kill reset makes the budget unbounded
 /// per epoch and IS the recompile storm the gate exists to prevent).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11834,7 +11833,7 @@ impl LaneTrial {
 /// prevent, and a clamp would let a ladder leg name an arm the binary did not run.
 pub(crate) const MAX_LANE_TRIAL_BUDGET: u32 = 4;
 
-/// duke3d-586's `dormant_heat` head cluster — `0x00540220` alone is 47.5% of the class and the
+/// duke3d-586's `dormant_heat` head cluster: `0x00540220` alone is 47.5% of the class and the
 /// three together are 79% of it (census at `f777010c`). The one split that answers "can a
 /// head-only lever reach duke's 79% at all", as against "does it have anything to act on
 /// anywhere"; the two questions have opposite answers if the convertible heads sit in the 34-site
@@ -11844,17 +11843,17 @@ pub(crate) const MAX_LANE_TRIAL_BUDGET: u32 = 4;
 pub(crate) const DORMANT_HEAT_HEAD3_LINEARS: [u32; 3] = [0x0054_0220, 0x0054_0266, 0x0054_0280];
 
 /// How many compile-through-heat lane trials ONE key may spend in ONE heat epoch
-/// (`IZARRAVM_SMC_LANE_TRIAL_BUDGET`). Grants past the first are EARNED — see `lane_trial_spend`
-/// for INV-B3 — so this is a ceiling on a probation ladder, not a flat allowance.
+/// (`IZARRAVM_SMC_LANE_TRIAL_BUDGET`). Grants past the first are EARNED (see `lane_trial_spend`
+/// for INV-B3) so this is a ceiling on a probation ladder, not a flat allowance.
 ///
-/// **DEFAULT 4 SINCE THE 2026-08-29 LADDER.** It shipped at 1 — the pre-slice world, byte for byte
-/// — for exactly one commit, and the flip is priced by its own measurement, the `IZARRAVM_COUNT_LANES`
+/// **DEFAULT 4 SINCE THE 2026-08-29 LADDER.** It shipped at 1 (the pre-slice world, byte for byte)
+/// for exactly one commit, and the flip is priced by its own measurement, the `IZARRAVM_COUNT_LANES`
 /// and `IZARRAVM_ROTATE_ROWS` pattern.
 ///
 /// THE EVIDENCE LINE. duke3d-586-short min-wall **-11.5%** (75.13 -> 66.48 s) and the duke3d-586
 /// LONG merge-gate row **-8.8%** (rt 0.81 -> 0.89) at budget 4, interleaved legs on one binary.
 /// Non-vacuity all green on the short row: `unbound_targets` 121.2 M -> 92.2 M,
-/// `heat_demote_trial_spent` 9,756 -> 2,376 — the population Lever B exists to drain, draining —
+/// `heat_demote_trial_spent` 9,756 -> 2,376 (the population Lever B exists to drain, draining)
 /// and 33,116 re-grants producing 60,486 installs, so the re-grants are not pure recompile cost.
 /// Controls nascar-586, tyrian-586 and doom-586 all inside the +/-2% floor. Task 0's go/no-go
 /// passed before the ladder ran: the earned share of `smc_heat_demotions` was ~100% (against the
@@ -11872,7 +11871,7 @@ pub(crate) const DORMANT_HEAT_HEAD3_LINEARS: [u32; 3] = [0x0054_0220, 0x0054_026
 /// # THE SPELLING TABLE
 ///
 /// Trimmed and case-folded on the way in, the shape `IZARRAVM_COUNT_LANES` carries. This is a
-/// PARAMETER, so per the house rule it has **no `0` or `off` spelling** — UNSET is the escape:
+/// PARAMETER, so per the house rule it has **no `0` or `off` spelling**: UNSET is the escape:
 ///
 /// * **unset -> 4.** The shipped default since the 2026-08-29 ladder.
 /// * `1` -> 1. The BASE and the ESCAPE: the pre-slice world, one trial per key per heat epoch, and
@@ -11972,8 +11971,8 @@ pub(crate) fn parse_lane_trial_budget_arm_for_test(
 ///   unset is ON**, which is the whole family's convention and the reason for it: nulling a
 ///   variable in PowerShell leaves it PRESENT and EMPTY, so a leg that meant to unset the knob
 ///   gets the off arm and a leg that meant the off arm gets it too. `Remove-Item Env:` is the only
-///   true unset. This is a CHANGE for this knob alone -- the bare form read the empty string as ON
-///   -- and it is made deliberately, so that all four lane knobs answer a nulled variable the same
+///   true unset. This is a CHANGE for this knob alone (the bare form read the empty string as ON)
+///   and it is made deliberately, so that all four lane knobs answer a nulled variable the same
 ///   way rather than one of them silently disagreeing.
 /// * **anything else PANICS**, for `parse_imm8_lanes_arm`'s reason.
 pub(crate) fn disp_lanes_enabled() -> bool {
@@ -12042,14 +12041,14 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
     parse_disp_lanes_arm(value)
 }
 
-/// Whether `disp_store_lane_for` admits the STORE half of Option D — `0x89 MOV r/m32, r32` and
+/// Whether `disp_store_lane_for` admits the STORE half of Option D: `0x89 MOV r/m32, r32` and
 /// `0x88 MOV r/m8, r8` with a disp32 memory operand (`IZARRAVM_DISP_STORE_LANES`).
 ///
 /// **DEFAULT ON SINCE THE 2026-08-23 OPTION D LADDER.** It shipped default OFF for exactly one
-/// commit — the slice that built it — and the ladder that priced it flipped it in the next. On
+/// commit (the slice that built it) and the ladder that priced it flipped it in the next. On
 /// the OFF arm every `0x89`/`0x88` slot bakes its displacement exactly as it did before the
 /// slice, and `smc_disp_store_lane_registrations` / `_cap_refusals` both read zero, because the
-/// knob is tested ABOVE the shared budget — the rule that keeps an off arm from reporting a whole
+/// knob is tested ABOVE the shared budget: the rule that keeps an off arm from reporting a whole
 /// family as budget pressure. That arm is the escape AND the A/B base, and it still ships whole.
 ///
 /// **WHAT PRICED THE FLIP** (binary `de751809`, governor at its shipped `cap` default, every
@@ -12058,7 +12057,7 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// | row | off | store ON | delta |
 /// |---|---:|---:|---:|
 /// | **`duke3d-586` SHORT** | 115.3 s | **87.1 s** | **−24.5%** |
-/// | **`duke3d-586` LONG — decides** | 259.6 s | **194.8 s** (both arms) | **−25.0%** |
+/// | **`duke3d-586` LONG: decides** | 259.6 s | **194.8 s** (both arms) | **−25.0%** |
 ///
 /// `direct_native_coverage` 85.7% -> **91.5%**, and the corpus rows are INERT
 /// (`jit_direct_entries` identical), which is what says this is a duke-shaped admission and not a
@@ -12066,16 +12065,16 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// patch its displacements registers no lane and pays nothing.
 ///
 /// **AN ORDER OF MAGNITUDE OVER THE PRE-REGISTRATION, and that is stated rather than smoothed
-/// over.** The floor pre-registered in `dev_docs/duke-heat-gate-design-2026-08-21.md` §13 was
+/// over.** The floor pre-registered in the duke heat-gate design §13 was
 /// −2.6% and the bar was −2%. The measured −25% does not come from the pre-registered term: the
 /// counter smoke reads **115 store lanes registered** and BLOCK KILLS FLAT (32,261 off against
-/// 32,263 on). The movement is in HEAT — `smc_heat_chunks_hot` −32.7%, `smc_heat_demotions`
-/// −38.2%, total dispatcher asks −43.8%, `smc_lane_accepts` +87% — i.e. the compounding
+/// 32,263 on). The movement is in HEAT: `smc_heat_chunks_hot` −32.7%, `smc_heat_demotions`
+/// −38.2%, total dispatcher asks −43.8%, `smc_lane_accepts` +87%, i.e. the compounding
 /// equilibrium §12.3 describes, arriving through the POOL term rather than the kill term. A
 /// handful of laned stores stop a handful of chunks going hot, and those chunks were very hot.
 ///
 /// WHAT IT IS FOR. `disp_lane_for` covers `0x8A` only; the un-laned displacement family that is
-/// left is 89% `0x89` by events (`dev_docs/duke-heat-gate-design-2026-08-21.md` §12.3), and the
+/// left is 89% `0x89` by events (duke heat-gate design §12.3), and the
 /// 2026-08-23 settling census measured that family's block kills still rising at flat event
 /// volume (un-laned `0x89` block kills 15,634 -> 21,178 on duke3d-586-short, 96.8% of all joined
 /// un-laned-disp block kills). The mechanism is `disp_lane_for`'s, one KIND over: a laned write
@@ -12086,7 +12085,7 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// lane arm of `emit_effective_address` stages the displacement through RAX and nothing else, so
 /// a kind whose emitter resolves the address AFTER staging other live state could not carry one.
 /// `Store` is not such a kind, and it is checked at the line rather than assumed: BOTH store
-/// emitters — `emit_store` and, on the one-lookup store path, `emit_store_fast` — call
+/// emitters (`emit_store` and, on the one-lookup store path, `emit_store_fast`) call
 /// `emit_segmented_linear_address` as their FIRST emission, before `emit_read_store_value`
 /// materialises anything into RDX and before the bias probe touches RCX or RDI. Nothing is live
 /// across the address form, so the lane arm's RAX write and the baked arm's RAX write present
@@ -12127,7 +12126,7 @@ fn parse_disp_store_lanes_arm(value: Result<String, std::env::VarError>) -> bool
         // Unset = ON since the 2026-08-23 flip; `0` / `off` is the escape. The nulling trap now
         // damages the OFF leg rather than the ON one: an off leg must EXPORT `0`. A leg that
         // merely nulls the variable leaves it present and empty, which is spelled OFF one arm
-        // down -- so that particular accident happens to land on the arm it named. Do not rely on
+        // down, so that particular accident happens to land on the arm it named. Do not rely on
         // it: every other default-ON knob in this file fails the other way, and `Remove-Item
         // Env:` is the only true unset.
         Err(std::env::VarError::NotPresent) => return true,
@@ -12178,10 +12177,10 @@ pub(crate) fn parse_disp_store_lanes_arm_for_test(
     parse_disp_store_lanes_arm(value)
 }
 
-/// Whether `disp_load_widen_lane_for` admits the LOAD-widening half of Option D — `0x8B MOV r32,
+/// Whether `disp_load_widen_lane_for` admits the LOAD-widening half of Option D: `0x8B MOV r32,
 /// r/m32` with a disp32 memory operand (`IZARRAVM_DISP_LOAD_WIDEN`).
 ///
-/// **DEFAULT OFF, and it stays off AT THE CURRENT CAP — the one place the 2026-08-23 ladder
+/// **DEFAULT OFF, and it stays off AT THE CURRENT CAP: the one place the 2026-08-23 ladder
 /// contradicted the settling census's packaging advice, so the reasoning is written out here
 /// rather than left to a log.**
 ///
@@ -12198,7 +12197,7 @@ pub(crate) fn parse_disp_store_lanes_arm_for_test(
 ///
 /// At twelve slots the `0x8B` lanes do not add capture, they COMPETE for a budget the store arm
 /// has just made valuable: the two cap counters roughly triple, which is precisely the
-/// disambiguation §13 step 4 pre-registered — disp registrations flat or low WHILE
+/// disambiguation §13 step 4 pre-registered: disp registrations flat or low WHILE
 /// `imm_lane_cap_refusals` is non-zero is a CAP result, not a lane-CLASS result, and it points at
 /// raising `MAX_BLOCK_IMM_LANES` rather than at abandoning the lever. At sixteen slots it is the
 /// BEST arm on the row.
@@ -12211,11 +12210,11 @@ pub(crate) fn parse_disp_store_lanes_arm_for_test(
 ///
 /// It is a SEPARATE knob from `IZARRAVM_DISP_STORE_LANES` for the reason it always was: the two
 /// halves are 8.6% and 89% of the un-laned displacement mass, so a single fused arm could not say
-/// which one moved a ladder — and on this ladder that separation is exactly what produced the
+/// which one moved a ladder, and on this ladder that separation is exactly what produced the
 /// finding above.
 ///
 /// WHAT IS NEWLY ADMITTED, stated exactly, because "widen `0x8B`" is not a shape. Today
-/// `disp_lane_for` admits `insn.opcode == 0x8a` — the BYTE load `MOV r8, [..disp32..]` — and
+/// `disp_lane_for` admits `insn.opcode == 0x8a` (the BYTE load `MOV r8, [..disp32..]`) and
 /// nothing else; `0x8A`'s register form is not a `Load` at all (classify lowers `mod == 3` to
 /// `MovRegByte`), so the admitted set is exactly "the `0x8A` ModRM MEMORY forms with a disp32,
 /// no prefixes, no immediate". This arm adds `insn.opcode == 0x8b` under the identical bars:
@@ -12227,13 +12226,13 @@ pub(crate) fn parse_disp_store_lanes_arm_for_test(
 /// `0x8B`'s register form (`MovReg`) and the disp8 / disp16 forms are NOT admitted: the lane is
 /// `IMM_LANE_WIDTH` wide and the write choke matches a patch at exactly that width, and a
 /// sub-4-byte displacement would need sign-extension at load time and a choke rule of its own. No
-/// measured population asks for one (`dev_docs/2026-08-09-disp-lanes-design.md`, "Deliberate
+/// measured population asks for one (disp-lanes design, "Deliberate
 /// scope cuts").
 ///
 /// # THE SPELLING TABLE
 ///
 /// unset / `0` / `off` -> OFF (the default), `1` / `on` -> ON, anything else panics. The empty
-/// string is OFF and so is unset, so an ON leg must EXPORT `1` — which is the OPPOSITE of
+/// string is OFF and so is unset, so an ON leg must EXPORT `1`, which is the OPPOSITE of
 /// `IZARRAVM_DISP_STORE_LANES` since that knob's 2026-08-23 flip. The two Option D knobs no
 /// longer share a default, and a leg script must state both explicitly.
 pub(crate) fn disp_load_widen_enabled() -> bool {
@@ -12299,7 +12298,7 @@ pub(crate) fn parse_disp_load_widen_arm_for_test(
 /// is what priced the flip, but every arm's admission rule applies identically to both opcodes.
 ///
 /// **`V86` IS THE SHIPPED DEFAULT SINCE THE 2026-08-24 LADDER.** It shipped `Off` for exactly the
-/// commits that built it, and the ladder that priced it flipped it in the next -- the same
+/// commits that built it, and the ladder that priced it flipped it in the next: the same
 /// sequence `IZARRAVM_DISP_STORE_LANES` took on 2026-08-23. See `direct_retf_v86` for the numbers.
 ///
 /// `Off` is the ESCAPE and the A/B BASE, and it still ships whole: the compile walk stops at the
@@ -12309,7 +12308,7 @@ pub(crate) fn parse_disp_load_widen_arm_for_test(
 ///
 /// `V86` is the BLAST-RADIUS control, not a half-measure. wolf3d runs in V86 once TOKAEMM is
 /// resident, so it captures that fixture's whole RETF population while leaving BIOS POST and
-/// pre-CONFIG.SYS DOS byte-identical -- which is what made the corpus rows a layout A/A on the
+/// pre-CONFIG.SYS DOS byte-identical, which is what made the corpus rows a layout A/A on the
 /// ladder and is why this and not `On` is the arm that flipped.
 ///
 /// `On` adds plain real mode (PE = 0) and **STAYS OPT-IN**, pending a real-mode-only fixture
@@ -12320,10 +12319,10 @@ pub(crate) fn parse_disp_load_widen_arm_for_test(
 ///
 /// PROTECTED MODE IS NOT AN ARM AND CANNOT BECOME ONE. A protected-mode RETF loads a descriptor,
 /// runs the RPL/DPL checks and can pop SS:eSP for an inter-privilege return; the lemma this slice
-/// rests on -- the CS record is a pure function of the popped selector -- is false there.
+/// rests on (the CS record is a pure function of the popped selector) is false there.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub(crate) enum RetfArm {
-    /// The ESCAPE and the A/B base. Reached by the EMPTY STRING, `0` or `off` -- **NOT by leaving
+    /// The ESCAPE and the A/B base. Reached by the EMPTY STRING, `0` or `off`: **NOT by leaving
     /// the variable unset**, which is `V86` since the 2026-08-24 flip.
     Off,
     /// Admit only when `cpu.is_v86_mode()`. **The shipped default**, reached by unset or `v86`.
@@ -12333,12 +12332,12 @@ pub(crate) enum RetfArm {
 }
 
 impl RetfArm {
-    /// Whether this arm admits a native RETF -- or, since L8, a native CALL FAR ptr16:16 -- in the
+    /// Whether this arm admits a native RETF (or, since L8, a native CALL FAR ptr16:16) in the
     /// CPU's CURRENT mode.
     ///
     /// The caller tests `self != Off` FIRST and only then calls this, so the OFF arm reads no CPU
     /// state per walked instruction. That ordering is the whole of what makes the ESCAPE arm's
-    /// compile walk identical to main's rather than merely equivalent to it -- and the escape is
+    /// compile walk identical to main's rather than merely equivalent to it, and the escape is
     /// the A/B base every future measurement on this mechanism is read against, so it has to stay
     /// identical rather than equivalent even though it is no longer the default.
     pub(crate) fn admits(self, cpu: &CpuGsw) -> bool {
@@ -12350,7 +12349,7 @@ impl RetfArm {
     }
 }
 
-/// Which modes serve RETF -- and, since L8, CALL FAR ptr16:16 -- natively
+/// Which modes serve RETF (and, since L8, CALL FAR ptr16:16) natively
 /// (`IZARRAVM_DIRECT_RETF_V86`). See `RetfArm`. `call_far_admitted_here` calls this same function
 /// and applies the same arm; there is no separate CALL-FAR knob.
 ///
@@ -12363,14 +12362,14 @@ impl RetfArm {
 ///
 /// | row | off (the escape) | `v86` | verdict |
 /// |---|---:|---:|---|
-/// | **`wolf3d-586` min-wall — DECIDES** | 89.737 s | **66.015 s** | **ratio 1.359** against a
+/// | **`wolf3d-586` min-wall: DECIDES** | 89.737 s | **66.015 s** | **ratio 1.359** against a
 ///   pre-registered bar of 1.15, and above the design's own priced-floor bracket |
 /// | `doom-586`, `quake-586`, `tombraid-586` | — | — | **INERT**: counters IDENTICAL, which is
 ///   what the `v86` arm predicted for a row that never enters V86 |
 /// | `duke3d-586` short | 87.8 s | 88.8 s | inside its own 3.8% leg spread |
 ///
 /// The mechanism counters say the population was actually served rather than merely reshaped:
-/// `decode_inval_cs_load` **274.0 M -> 0.60 M**, and the §3.6 ledger identity closed EXACTLY --
+/// `decode_inval_cs_load` **274.0 M -> 0.60 M**, and the §3.6 ledger identity closed EXACTLY:
 /// `600,071 + 273,380,624 = 273,980,695`, the base's own reading to the unit.
 ///
 /// **`guest_seconds`, `perf.instructions` and `raw_bus_clocks` came out IDENTICAL per row on both
@@ -12388,7 +12387,7 @@ impl RetfArm {
 /// # THE SPELLING TABLE
 ///
 /// Trimmed and case-folded on the way in. Governs both `0xCA`/`0xCB` RETF and, since L8, `0x9A`
-/// CALL FAR ptr16:16 -- one arm, read once, applied identically to both opcodes' admission
+/// CALL FAR ptr16:16: one arm, read once, applied identically to both opcodes' admission
 /// predicates:
 ///
 /// * **unset** or `v86` -> V86 only, the shipped default since the 2026-08-24 flip. Every
@@ -12422,7 +12421,7 @@ fn parse_direct_retf_v86_arm(value: Result<String, std::env::VarError>) -> RetfA
         // Unset = `v86` since the 2026-08-24 flip; `0` / `off` is the escape. The nulling trap
         // flipped with it and now damages the ESCAPE leg: an off leg must EXPORT `0`. A leg that
         // merely nulls the variable leaves it present and empty, which is spelled OFF one arm
-        // down -- so that particular accident happens to land on the arm it named. Do not rely on
+        // down, so that particular accident happens to land on the arm it named. Do not rely on
         // it: `Remove-Item Env:` is the only true unset, and this file's default-OFF knobs fail
         // the other way.
         Err(std::env::VarError::NotPresent) => return RetfArm::V86,
@@ -12469,7 +12468,7 @@ pub(crate) fn parse_direct_retf_v86_arm_for_test(
 /// Whether the compile walk may carry on THROUGH this `0xCA`/`0xCB` RETF and lower it natively.
 ///
 /// The CPU-STATE-dependent half of `jit_admits_non_continuable`. That predicate reads the decoded
-/// instruction -- opcode and operand size, since the `0xE6` row joined it -- and this one reads
+/// instruction (opcode and operand size, since the `0xE6` row joined it) and this one reads
 /// the CPU as well; it lives here rather than there for `stack_width_kind`'s reason: the question
 /// needs a `&CpuGsw` and `classify` has none. (It was a pure `const fn` on the opcode alone until
 /// the `0xE6` admission, whose Word refusal has to be made in the predicate for the reason stated
@@ -12477,7 +12476,7 @@ pub(crate) fn parse_direct_retf_v86_arm_for_test(
 ///
 /// THE ARM IS TESTED FIRST, and that ordering is load-bearing rather than stylistic. On the `0`
 /// ESCAPE this returns after one `OnceLock` load and one compare, having read no CPU state, on
-/// every walked instruction of every block in the tree -- which is what makes the escape's compile
+/// every walked instruction of every block in the tree, which is what makes the escape's compile
 /// walk main's walk rather than an equivalent of it. That still matters after the 2026-08-24
 /// default flip: the escape is the A/B base every future measurement on this mechanism is read
 /// against.
@@ -12513,7 +12512,7 @@ pub(crate) fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// Whether the compile walk may carry on THROUGH this `0x9A` CALL FAR ptr16:16 and lower it
 /// natively. `CallFar16`'s sibling of `retf_admitted_here`, and deliberately structured to match
 /// it term for term: same lemma (the CS record a real-mode or V86 far transfer writes is a pure
-/// function of the selector -- here an IMMEDIATE rather than a popped word, which changes nothing
+/// function of the selector: here an IMMEDIATE rather than a popped word, which changes nothing
 /// about the lemma itself), same mode restriction, same operand-size and stack-width restriction.
 ///
 /// **REUSES `IZARRAVM_DIRECT_RETF_V86` rather than inventing a second knob**, a deliberate design
@@ -12522,7 +12521,7 @@ pub(crate) fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// blast-radius argument (V86 is the measured population; plain real mode is the unpriced one),
 /// and a corpus fixture that ladders one far-transfer arm should ladder both together rather than
 /// needing two knobs kept in sync by hand. If a future ladder measures CALL FAR and RETF diverging
-/// under the SAME arm, that is the trigger to split them -- not a reason to split them in advance
+/// under the SAME arm, that is the trigger to split them, not a reason to split them in advance
 /// of any evidence that they differ.
 ///
 /// **THIS IS THE ONE EDIT THAT MAKES THE L7 RUN-LOOP GATE SELF-OPEN FOR L8.**
@@ -12534,12 +12533,12 @@ pub(crate) fn retf_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// walk's own per-slot admission (`compile_with_budget`'s `continuable` term, for a `0x9A` that is
 /// not the block's first slot), and the barrier-census suffix scan that mirrors the compile walk
 /// for counterfactual accounting. All three already OR in `retf_admitted_here`; this predicate is
-/// added to all three of the SAME three disjunctions -- not a fourth, independent list -- which is
+/// added to all three of the SAME three disjunctions, not a fourth, independent list, which is
 /// exactly the multi-site pattern `retf_admitted_here` itself already established (the suffix
 /// scan's own comment names this explicitly: "THE THIRD DISJUNCT MIRRORS THE COMPILE WALK, and it
 /// has to"). No gate outside these three sites needed a second edit.
 pub(crate) fn call_far_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
-    // OPCODE FIRST, ahead of `direct_retf_v86`'s `OnceLock` load -- same ordering and the same
+    // OPCODE FIRST, ahead of `direct_retf_v86`'s `OnceLock` load: same ordering and the same
     // reason `retf_admitted_here` gives: the overwhelming majority of asks are about some other
     // opcode, and the `non_continuable_walk_candidate` conjunct is redundant (the `matches!` is
     // inside the set) and folds away.
@@ -12569,8 +12568,8 @@ pub(crate) fn call_far_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 ///
 /// The interpreter's `0xCD` arm (`execute_extended.rs`) faults on EVERY execution in V86 below
 /// IOPL 3: it notifies the bus and then `check_v86_iopl()?` raises #GP to the monitor. Admitted
-/// there, the slot would take the call-out's RESYNC-FAULT path on every single visit -- spill,
-/// call, delivery, side exit, dispatcher trip -- buying the guest nothing and costing it a frame
+/// there, the slot would take the call-out's RESYNC-FAULT path on every single visit (spill,
+/// call, delivery, side exit, dispatcher trip) buying the guest nothing and costing it a frame
 /// per visit. The `InterpretOneCell` governor would eventually demote the site (three faults in
 /// its first eight executions), which bounds the loss but does not make it a win, and it charges
 /// a permanent demoted-site entry for every distinct `INT` site in an EMM386-style guest.
@@ -12605,13 +12604,13 @@ pub(crate) fn int_imm8_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// (`IZARRAVM_IMM8_LANES`). See `imm8_lane_for` for what qualifies and why this family alone.
 ///
 /// **DEFAULT ON SINCE THE 2026-08-21 RE-PRICE.** An unset knob registers one-byte `0x80` lanes;
-/// `0` or `off` is the escape back to the pre-slice world, which still ships whole — its baked
-/// emitter, its fixtures and its differential sweep — because it is the base every A/B on this
+/// `0` or `off` is the escape back to the pre-slice world, which still ships whole (its baked
+/// emitter, its fixtures and its differential sweep) because it is the base every A/B on this
 /// class is read against. On the escape no `0x80` lane is registered, every such slot bakes its
 /// immediate exactly as it did, and the write choke's per-lane width test degenerates to the old
 /// global one because every registered lane is then four bytes wide. Both arms ship in one
 /// executable because this box has measured 6% wall variance between builds of identical source
-/// (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a cross-build comparison would not be
+/// (duke re-profile §6.2), so a cross-build comparison would not be
 /// evidence.
 ///
 /// # THE REFUTATION INVERTED, exactly as `IZARRAVM_ROTATE_ROWS`'s did before it
@@ -12619,7 +12618,7 @@ pub(crate) fn int_imm8_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// This arm shipped default-OFF on **−1.0%**, a `duke3d-586-short` number taken at `4bf7a4c8` on
 /// 2026-08-19. **That number was measured against `IZARRAVM_ROTATE_ROWS=off`, a baseline that
 /// stopped existing the same night**, and the same session's nearer pair (`on` -> `on_imm8`, i.e.
-/// rotate-rows ON) read **+1.89%** with entries +2.30% — which is why it shipped off. Re-priced
+/// rotate-rows ON) read **+1.89%** with entries +2.30%, which is why it shipped off. Re-priced
 /// against today's full defaults on 2026-08-21 the sign inverted again and hard. This is the second
 /// time a duke lane's refutation has reversed once the baseline under it moved; `rotate_rows_enabled`
 /// records the first, and the lesson both times is that a lane's value is a property of the
@@ -12631,8 +12630,8 @@ pub(crate) fn int_imm8_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 ///
 /// | row | A (off) min | B (on) min | min-wall | arms |
 /// |---|---:|---:|---:|---|
-/// | **`duke3d-586` LONG — decides** | 287.423 s | **267.952 s** | **−6.774%** | non-overlapping, 10.1 s clear |
-/// | `duke3d-586-short` — corroborates | 127.320 s | **117.615 s** | **−7.623%** | non-overlapping |
+/// | **`duke3d-586` LONG: decides** | 287.423 s | **267.952 s** | **−6.774%** | non-overlapping, 10.1 s clear |
+/// | `duke3d-586-short`: corroborates | 127.320 s | **117.615 s** | **−7.623%** | non-overlapping |
 ///
 /// rt on the deciding row **0.4806 -> 0.5155**, the first time duke3d-586 has been above 0.5.
 /// DUKEMARK `test_exit:81` with 1027 / 403 samples on every one of the twelve legs, and ONE
@@ -12645,20 +12644,20 @@ pub(crate) fn int_imm8_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 /// populations). The 2026-08-21 `0x85` adjudication named entries as duke's acceptance metric in
 /// place of coverage, and on this slice the deciding row honours that and the corroborating row
 /// does not. **The metric that IS consistent across both rows, and with the wall, is total
-/// dispatcher asks — `entries + declines`, −18.8% long and −17.0% short** — with declines alone
+/// dispatcher asks: `entries + declines`, −18.8% long and −17.0% short**, with declines alone
 /// −22.66% / −22.46%, coverage +3.78 pp / +4.16 pp, `jit_direct_insns` +4.68% / +5.29%, and
 /// block-killing `code_invalidations` −19.67% / −22.12%. Price asks in the next duke
 /// pre-registration.
 ///
 /// **THE PRE-REGISTERED ENGAGEMENT FALSIFIER WAS MIS-SPECIFIED and is recorded as such, not as
 /// evidence.** It said `smc_lane_registrations` must RISE on the ON arm. It fell 13.57% on the long
-/// row and rose 1.91% on the short one — because it is not `0x80`-specific (it counts every lane
+/// row and rose 1.91% on the short one, because it is not `0x80`-specific (it counts every lane
 /// class) and it is a PER-COMPILE event counter, so it tracked `blocks_installed` in both
 /// directions rather than tracking the lane. Engagement is established instead by counters the gate
 /// is the only possible cause of, the arms being one binary differing in one environment variable:
 /// `smc_lane_accepts` +19.9% per registration, and ~9.8 M block-killing invalidations that stop
 /// happening (`code_invalidations` and `smc_narrow_kills` both ~−20%), which is what a laned write
-/// not killing a block looks like. `smc_imm8_lane_registrations` DOES ship in plain builds — it
+/// not killing a block looks like. `smc_imm8_lane_registrations` DOES ship in plain builds: it
 /// rides `DirectStallSnapshot` into `direct_stall_json` ungated (the flip doc first called it
 /// census-only, which the heat-gate design review refuted at the line). What a plain build still
 /// lacks is the `0x80`-specific runtime ACCEPT counter; closing that is the owed follow-up.
@@ -12695,7 +12694,7 @@ fn parse_imm8_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
         // Unset = ON since the 2026-08-21 flip; `0` / `off` is the escape. Same shape and the same
         // trap as `IZARRAVM_ROTATE_ROWS`, `IZARRAVM_COUNT_LANES`, `IZARRAVM_FPU_LOOP_ROWS` and
         // `IZARRAVM_V86_LOOP_ROWS`: an off leg must EXPORT `0`, and every "defaults" leg recorded
-        // before that date is the OFF arm. NULLING the variable is not unsetting it -- PowerShell
+        // before that date is the OFF arm. NULLING the variable is not unsetting it: PowerShell
         // leaves it present and empty, and the empty string is spelled OFF one arm down.
         Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of either arm. It reaches the same panic as a typo rather
@@ -12756,12 +12755,12 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// `emit_shift_lane` for the runtime three-way branch that is the whole cost of the class.
 ///
 /// **DEFAULT ON SINCE THE 2026-08-20 LADDER.** An unset knob registers count lanes; `0` or `off`
-/// is the escape back to the pre-slice world, which still ships whole -- its baked emitters, its
-/// fixtures and its mutation record -- because it is the base every A/B on this class is read
+/// is the escape back to the pre-slice world, which still ships whole (its baked emitters, its
+/// fixtures and its mutation record) because it is the base every A/B on this class is read
 /// against. On the escape no lane is registered, every `0xC1` and `0xC0` slot bakes its count
 /// exactly as it did, and the emitted code is the compile-time three-way split it has always been.
 /// Both arms ship in one executable because this box has measured 6% wall variance between builds
-/// of identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a cross-build comparison
+/// of identical source (duke re-profile §6.2), so a cross-build comparison
 /// would not be evidence.
 ///
 /// **WHY IT IS ON (2026-08-20).** `.bench/results/duke-l2-count-lane-20260820/`, one binary at
@@ -12787,7 +12786,7 @@ pub(crate) fn parse_imm8_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// alive, so spans that used to end at a patched byte now extend past it and reach NEW seams, and
 /// the newly admitted spans bring their own decode lines for the interpreter to kill. The wall
 /// wins anyway, on both rows, which is the currency this ladder is read in. If a later slice moves
-/// these two counters the other way, that is not automatically progress -- check the wall.
+/// these two counters the other way, that is not automatically progress. Check the wall.
 ///
 /// **A SEPARATE KNOB FROM `IZARRAVM_IMM8_LANES`, deliberately, and NOT because the two classes are
 /// unrelated.** They are both one-byte lanes and they share the width class, the budget and the
@@ -12883,7 +12882,7 @@ fn parse_count_lanes_arm(value: Result<String, std::env::VarError>) -> bool {
 // Not a convenience, in EITHER direction, and the direction that matters flipped on 2026-08-20.
 // While the arm was default-OFF, every positive fixture for this class had to force it on through
 // here or it would test the refusal and call it a lowering. Now that the default is ON, it is the
-// REFUSAL fixtures that must force `Some(false)` explicitly -- a fixture that means to pin the
+// REFUSAL fixtures that must force `Some(false)` explicitly: a fixture that means to pin the
 // baked-count world and reads the ambient arm would silently compile a lane and pass for the wrong
 // reason. Both kinds state their arm; neither leans on the default.
 #[cfg(test)]
@@ -12910,7 +12909,7 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 /// Whether `classify` admits the FIVE dword rows the 32-bit FPU-loop census names
 /// (`IZARRAVM_FPU_LOOP_ROWS`). **DEFAULT ON since 2026-08-20** (the slice shipped OFF for one
 /// commit; the flip was priced by the tombraid-586 wall ladder exactly as `IZARRAVM_ROTATE_ROWS`
-/// and `IZARRAVM_COUNT_LANES` were -- the numbers are in the spelling table below).
+/// and `IZARRAVM_COUNT_LANES` were, the numbers are in the spelling table below).
 ///
 /// The rows, and each one's home:
 ///
@@ -12922,27 +12921,27 @@ pub(crate) fn parse_count_lanes_arm_for_test(value: Result<String, std::env::Var
 /// | `0xF7 /6`,`/7` DIV/IDIV r/m32 | MEMORY | `DirectKind::DivMem` |
 /// | `0x0F90..=0x0F9F` SETcc r/m8 | MEMORY | `DirectKind::SetCcMem` |
 ///
-/// WHY IT EXISTS. `dev_docs/tombraid-reprofile-2026-08-20.md` §4: on tombraid-586 the FMV phase is
+/// WHY IT EXISTS. The tombraid re-profile, section 4: on tombraid-586 the FMV phase is
 /// 77% of the row's wall at rt 0.609, 93.6% of its JIT entries end on a `static_unbound` exit, and
-/// 72.0% of that mass (643.5 M of 893.3 M) is class `rejected` -- the successor block is REFUSED
+/// 72.0% of that mass (643.5 M of 893.3 M) is class `rejected`: the successor block is REFUSED
 /// compilation. `.bench/results/tombraid-reprofile-20260820/census-fmv-summary.json` splits the
 /// rejected table into two loops, and this knob is the whole of loop B, the game's 32-bit FPU loop
 /// at linear `0x49ACF3-0x4CB300` (mode key `0x31B`, ~27.6 M iterations). Its five rows, by
 /// interpreted runtime hits over the 20e9 census prefix:
 ///
-/// * `0x9B` **165,587,061** -- three sites, six per iteration, the single largest row in the table;
-/// * `0x9E` 55,203,044 and `0xD9 /7` 55,195,911 -- two per iteration each;
-/// * `0xF7 /7` memory 27,602,949 and `0x0F94 /0` memory 27,602,402 -- one per iteration each.
+/// * `0x9B` **165,587,061**: three sites, six per iteration, the single largest row in the table;
+/// * `0x9E` 55,203,044 and `0xD9 /7` 55,195,911: two per iteration each;
+/// * `0xF7 /7` memory 27,602,949 and `0x0F94 /0` memory 27,602,402: one per iteration each.
 ///
 /// **THE DOC'S NAME FOR THE THIRD ROW IS WRONG, and the census says so on its face.** Both
-/// `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1 and the handoff call `0xD9 /7` "FNSTCW". The
+/// the tombraid re-profile §4.1 and the handoff call `0xD9 /7` "FNSTCW". The
 /// row's `operand_form` is `"none"`, and `decode`'s FPU arm sets `insn.operand` for `mod != 3`
-/// ONLY -- so the row is a REGISTER form, and FNSTCW m16 (which is `mod != 3`, and which
+/// ONLY, so the row is a REGISTER form, and FNSTCW m16 (which is `mod != 3`, and which
 /// `NativeX87Insn::StoreControlWord` has lowered since before this slice) cannot be it. The eight
 /// `mod = 3` encodings are FPREM/FYL2XP1/FSQRT/FSINCOS/FRNDINT/FSCALE/FSIN/FCOS. Which one was
 /// settled by measurement rather than by inference: a temporary probe in `execute_fpu_register`,
 /// run on the tombraid fixture at 4e9 cycles, saw ModRM byte `0xFC` and nothing else, i.e.
-/// **FRNDINT**. That matters beyond bookkeeping -- FNSTCW would have been a two-byte store and
+/// **FRNDINT**. That matters beyond bookkeeping: FNSTCW would have been a two-byte store and
 /// FSIN/FCOS/FPTAN are not expressible in SSE at all, so the row's identity decides whether the
 /// slice is buildable.
 ///
@@ -12998,7 +12997,7 @@ fn parse_fpu_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
 // Per-THREAD, for `IMM8_LANES_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
 // and the fixtures have to run both arms in one process, so one test's arm selection must not
 // reach another's compile. Every fixture for these five rows states its arm through here in
-// BOTH directions -- a positive fixture that rode the ambient default would go vacuous the day
+// BOTH directions: a positive fixture that rode the ambient default would go vacuous the day
 // the default moved, and the negative (refusal) fixtures need the off arm now that ON ships.
 #[cfg(test)]
 thread_local! {
@@ -13086,7 +13085,7 @@ fn parse_mul_mem_rows_arm(value: Result<String, std::env::VarError>) -> bool {
 // Per-THREAD, for `FPU_LOOP_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
 // and the fixtures have to run both arms in one process, so one test's arm selection must not
 // reach another's compile. Every fixture for this row states its arm through here in BOTH
-// directions -- the refusal fixture needs the off arm explicitly, so that it does not go vacuous
+// directions: the refusal fixture needs the off arm explicitly, so that it does not go vacuous
 // the day the default flips.
 #[cfg(test)]
 thread_local! {
@@ -13111,18 +13110,18 @@ pub(crate) fn parse_mul_mem_rows_arm_for_test(value: Result<String, std::env::Va
 
 /// Whether the backend lowers `0xE2` LOOP natively (`DirectKind::Loop`). **DEFAULT ON since
 /// the 2026-08-30 flip.** `0` / `off` is the escape, the pre-slice barrier and the A/B base
-/// every measurement below was read against. **An OFF leg must now EXPORT `0`** -- the trap
+/// every measurement below was read against. **An OFF leg must now EXPORT `0`**: the trap
 /// the whole knob family carries.
 ///
 /// WHAT PRICED THE FLIP (`.bench/results/loop-ladder-20260830/`, quiet box, `foreign_s` 0.0
 /// on all 28 legs): gp2-586 pooled min-wall **1.0238** (OFF 79.311 s / ON 77.464 s), min-cpu
 /// independently 1.0239, **7 of 7 quiet rounds above 1** (11/11 counting the contaminated
 /// first run), the between-arm effect beating its own round's within-arm null in EVERY
-/// round, and nascar-586 -- a second effect row with 6.6 M LOOP hits of its own -- above 1
+/// round, and nascar-586 (a second effect row with 6.6 M LOOP hits of its own) above 1
 /// in both its rounds. Implied 32-bit entry cost 101-111 ns.
 ///
 /// The row: the gp2-586 barrier census at `ce4fd221` measures `0xE2` at 20,918,551 `runtime_hits`
-/// and 18,374,120 unbound exits across 294 sites -- the LARGEST head of that fixture's rejected
+/// and 18,374,120 unbound exits across 294 sites: the LARGEST head of that fixture's rejected
 /// class. nascar-586 adds 9.2 M for `0xE0`/`0xE1`/`0xE2` together.
 ///
 /// **Chosen because it is large enough to MEASURE.** The MUL-memory slice removed 8.99 M exits,
@@ -13149,7 +13148,7 @@ pub(crate) fn loop_rows_enabled() -> bool {
 fn parse_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
     let raw = match value {
         // Unset = ON since the 2026-08-30 flip; `0` / `off` is the escape. An off leg must
-        // EXPORT `0`, not unset the variable -- the same trap the whole knob family carries.
+        // EXPORT `0`, not unset the variable: the same trap the whole knob family carries.
         Err(std::env::VarError::NotPresent) => return true,
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!(
@@ -13258,7 +13257,7 @@ pub(crate) fn parse_addr32_word_rows_arm_for_test(
 /// worst row, guest identity at 44 ppm (the accepted PROTOCOL.md:199 cutoff class). The
 /// precedent is #766's small cross-checked merge, not a wall figure. `0` / `off` is the
 /// escape and the A/B base; **an OFF leg must EXPORT `0`.** Its own knob rather than a widening of `IZARRAVM_LOOP_ROWS`, because it is
-/// its own slice with its own measurement -- and that measurement's wall half is PRE-DECLARED
+/// its own slice with its own measurement, and that measurement's wall half is PRE-DECLARED
 /// EXPECTED-NULL (see the `DirectKind::LoopCc` comment), so the default decision is the
 /// owner's, made against the mechanism evidence rather than a wall number.
 ///
@@ -13341,7 +13340,7 @@ pub(crate) fn parse_loopcc_rows_arm_for_test(value: Result<String, std::env::Var
 /// plus `0xa3` MOV moffs16,AX and `0xc7 /0` MOV m16,imm16 with a CS override, which the same
 /// straight-line run passes through and which the census measures as rows of their own.
 ///
-/// WHY IT EXISTS. `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1: after the FPU-loop slice
+/// WHY IT EXISTS. The tombraid re-profile, section 4.1: after the FPU-loop slice
 /// (`IZARRAVM_FPU_LOOP_ROWS`) closed loop B, the tombraid-586 FMV window's remaining `rejected`
 /// mass is loop A, a V86 16-bit driver loop at linear `0xC8FDE-0xC9035` (UMB, mode key `0x316`,
 /// ~93M iterations). A decoder probe over the fixture disassembles it as a BIOS-tick watchdog that
@@ -13368,11 +13367,11 @@ pub(crate) fn parse_loopcc_rows_arm_for_test(value: Result<String, std::env::Var
 ///
 /// **THE RE-PROFILE MISNAMED THE TWO `prefix_unsupported` ROWS' SEGMENT.** §4.1 and the evening
 /// handoff both call them "word-memory forms (both prefix mask 64)" and the queue item calls the
-/// refusal "the segment-override prefix", which reads as one of the five DATA segments -- the class
+/// refusal "the segment-override prefix", which reads as one of the five DATA segments: the class
 /// `prefixes_supported_for` has admitted since the rejected-row campaign's slice 6. Mask 64 is
 /// **CS**: `BarrierShape::from_insn` writes `(segment_index(seg) + 1) << 5`, and
 /// `segment_index(Cs)` is 1. ES would be 32, SS 96, DS 128. That was settled by measurement rather
-/// than by arithmetic -- a temporary probe printed the decoder's own
+/// than by arithmetic: a temporary probe printed the decoder's own
 /// `insn.prefixes.segment_override` for every instruction in the window, and every mask-64 row came
 /// back `Cs`. It matters because CS was refused DELIBERATELY, with a written justification on
 /// `prefixes_supported_for`, so this is a reversal rather than a widening.
@@ -13450,7 +13449,7 @@ fn parse_v86_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
         // Unset = ON since the 2026-08-20 flip; `0` / `off` is the escape. Same shape and the
         // same trap as `IZARRAVM_FPU_LOOP_ROWS`, `IZARRAVM_ROTATE_ROWS` and `IZARRAVM_COUNT_LANES`:
         // an off leg must EXPORT `0`, and every "defaults" leg recorded BEFORE this flip is the
-        // OFF arm. NULLING the variable is not unsetting it -- PowerShell leaves it present and
+        // OFF arm. NULLING the variable is not unsetting it: PowerShell leaves it present and
         // empty, and the empty string is spelled OFF two arms down, which is how three earlier
         // evidence directories came to measure their default-ON knobs off.
         Err(std::env::VarError::NotPresent) => return true,
@@ -13482,7 +13481,7 @@ fn parse_v86_loop_rows_arm(value: Result<String, std::env::VarError>) -> bool {
 
 // Per-THREAD, for `FPU_LOOP_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide `OnceLock`
 // and the fixtures have to run both arms in one process. Every fixture for these rows states its
-// arm through here in BOTH directions -- the refusal fixtures need the off arm stated rather than
+// arm through here in BOTH directions: the refusal fixtures need the off arm stated rather than
 // inherited, so that they keep meaning what they say the day the default moves.
 #[cfg(test)]
 thread_local! {
@@ -13511,17 +13510,17 @@ pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::V
 /// **DEFAULT ON SINCE THE 2026-08-28 RE-PRICE.** An unset knob admits the Word register-form
 /// TEST row. `0` or `off` is the escape back to the pre-slice refusal, which still ships whole
 /// because it is the base every A/B on this row is read against. Both arms ship in one executable because this box has measured 6% wall variance
-/// between builds of byte-identical source (`dev_docs/duke-reprofile-2026-08-19.md` §6.2), so a
+/// between builds of byte-identical source (duke re-profile §6.2), so a
 /// cross-build comparison would not be evidence.
 ///
 /// # The row, from the census that ranked it
 ///
-/// `.bench/results/duke-census-slice-20260821/`, duke3d-586 LONG row at main `49c7ad97` — the
+/// `.bench/results/duke-census-slice-20260821/`, duke3d-586 LONG row at main `49c7ad97`, the
 /// first duke census taken after `IZARRAVM_ROTATE_ROWS`, `IZARRAVM_COUNT_LANES`,
 /// `IZARRAVM_FPU_LOOP_ROWS` and `IZARRAVM_V86_LOOP_ROWS` all became the shipped default. Ranked by
 /// `runtime_hits` per [[barrier-census-mispredicts-both-ways]], the whole rejected table is
-/// 126,933,336 runtime hits over 287 rows, and **`0x85` register-form Word is 53,583,389 of them
-/// -- 42.2%, over twelve rows, 2.4x the next single row.** It is the head either way you count:
+/// 126,933,336 runtime hits over 287 rows, and **`0x85` register-form Word is 53,583,389 of them,
+/// 42.2%, over twelve rows, 2.4x the next single row.** It is the head either way you count:
 /// the largest of the twelve is 25,275,365 on its own, which is still the table's #1 against
 /// `0x8E /0`'s 22,638,814.
 ///
@@ -13565,12 +13564,12 @@ pub(crate) fn parse_v86_loop_rows_arm_for_test(value: Result<String, std::env::V
 ///   with no row to attribute it to.
 /// * **`0xA9` TEST eAX, imm at Word.** Its kind (`TestImmReg`) has carried a width since it was
 ///   written and `emit_test_imm_reg` is fully width-parameterised, so it is one allowlist entry
-///   away — and it stays out anyway, because the duke census measures **zero** `0xA9` rows at any
+///   away, and it stays out anyway, because the duke census measures **zero** `0xA9` rows at any
 ///   width. Riding it along would be an unmeasured admission, which is the campaign's standing
 ///   refusal. It is a one-line follow-up for whichever census first ranks it.
 /// * **`0x8E /0` MOV Sreg, m16, the table's #2 row at 22,638,814 hits (17.8%).** Refused on duke's
 ///   own law rather than on difficulty: its mean suffix is **0.31**. It TERMINATES rather than
-///   EXTENDS — and it must, because a segment write makes its block a segment-write block, which
+///   EXTENDS, and it must, because a segment write makes its block a segment-write block, which
 ///   bars the self-loop shape and attempts no static link. Converting it would move ~1.3
 ///   instructions per hit into native code and buy nothing on the link axis.
 ///
@@ -13613,7 +13612,7 @@ fn parse_test_word_rows_arm(value: Result<String, std::env::VarError>) -> bool {
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        // Empty names the SAME arm as unset, the default, deliberately NOT ATA's shape.
         "" => true,
         "0" | "off" => false,
         "1" | "on" => true,
@@ -13661,13 +13660,12 @@ pub(crate) fn parse_test_word_rows_arm_for_test(value: Result<String, std::env::
 /// back to the pre-slice refusal (`0xd3` absent from the Word allowlist), which still ships whole
 /// because it is the base any A/B on this row is read against.
 ///
-/// # The rows, from the tyrian-586 no-EMM census (`cenB.json`, cited in
-/// `dev_docs/2026-09-02-tyrian-sb-entry-cut-review.md` finding 4)
+/// # The rows, from the tyrian-586 no-EMM census (`cenB.json`)
 ///
 /// `0xD3 /4` (SHL) register word: 1,247,451 unbound exits, 1,247,714 runtime hits. `/5` (SHR) and
 /// `/7` (SAR) register word land with the same admission because `classify`'s own arm narrows
 /// `matches!(m.reg, 4..=7)` before this knob is reached, so admitting `0xd3` cannot sweep in `/0`
-/// ROL, `/1` ROR, `/2` RCL or `/3` RCR — those stay refused by the arm's narrowing, not by this
+/// ROL, `/1` ROR, `/2` RCL or `/3` RCR: those stay refused by the arm's narrowing, not by this
 /// gate.
 ///
 /// # What is deliberately NOT in this gate
@@ -13753,7 +13751,7 @@ pub(crate) fn parse_word_shift_cl_rows_arm_for_test(
 /// **The evidence.** tyrian-586 re-laddered on main AFTER the poll16 merge moved the denominator:
 /// **min-wall -9.5%, 19.95 s -> 18.06 s**, with dispatcher entries **37.2 M -> 23.6 M**. Retired
 /// instructions and `irq0_edges` are IDENTICAL per arm, which is what says the win is fewer
-/// entries over the same work rather than a different guest execution -- the currency this
+/// entries over the same work rather than a different guest execution: the currency this
 /// campaign ranks 16-bit slices by. The flip is the overnight campaign's standing-authority call
 /// under [[autonomous-overnight-working-style]] rather than an owner ruling.
 ///
@@ -13766,14 +13764,14 @@ pub(crate) fn parse_word_shift_cl_rows_arm_for_test(
 /// **This flip also changes what `IZARRAVM_BYTE_SHIFT_ROWS=` (the empty string) means, from OFF to
 /// ON**, because `""` names the same arm as unset. It is stated here, in
 /// `parse_byte_shift_rows_arm` and in the flip commit. Every ladder leg exports an explicit `0` or
-/// `1` and records the RESOLVED arm, so no recorded leg is affected -- which is the whole reason
+/// `1` and records the RESOLVED arm, so no recorded leg is affected, which is the whole reason
 /// that rule exists.
 ///
 /// # The rows, from the census that ranked them
 ///
 /// tyrian-586 at main `0333d956`, `IZARRAVM_DIRECT_BARRIER_CENSUS=1`, plain release build per
 /// [[census-grade-on-plain-builds]]. The static-unbound `rejected` class is 22.23 M runtime hits
-/// and two rows of one instruction family are 14,540,543 of them -- **65.4%**:
+/// and two rows of one instruction family are 14,540,543 of them, **65.4%**:
 ///
 /// | row | form | operand_size | prefix_mask | `runtime_hits` |
 /// |---|---|---|---:|---:|
@@ -13781,8 +13779,8 @@ pub(crate) fn parse_word_shift_cl_rows_arm_for_test(
 /// | `0xC0 /5` SHR r8, imm8 | register | word AND dword, MERGED | 0 | 607,227 |
 ///
 /// `0xD0 /5` is the hottest single rejected row on the fixture by 4x. The `0xC0 /5` figure is a
-/// MERGED word/dword row and the two halves are refused by different mechanisms -- the Word half
-/// by the allowlist, the Dword half by the `m.reg != 4` test inside the `0xc0` arm -- so no ladder
+/// MERGED word/dword row and the two halves are refused by different mechanisms: the Word half
+/// by the allowlist, the Dword half by the `m.reg != 4` test inside the `0xc0` arm, so no ladder
 /// on this knob can attribute a shortfall between them.
 ///
 /// tyrian's code segment is CS.D = 0, so its byte shifts decode at `OperandSize::Word` with
@@ -13792,19 +13790,19 @@ pub(crate) fn parse_word_shift_cl_rows_arm_for_test(
 ///
 /// # Two axes, not one, and `0xC0 /4` at Word needs both
 ///
-/// `IZARRAVM_ROTATE_ROWS` gates whether `0xC0 /4` is a lowering at all -- a ROW axis. This knob
-/// gates whether `0xC0`/`0xD0` reach the Word decode path -- a REACHABILITY axis, which did not
+/// `IZARRAVM_ROTATE_ROWS` gates whether `0xC0 /4` is a lowering at all: a ROW axis. This knob
+/// gates whether `0xC0`/`0xD0` reach the Word decode path: a REACHABILITY axis, which did not
 /// exist before this slice. `0xC0 /4` at Word sits at the intersection and therefore needs BOTH
 /// arms on. That is a conjunction rather than two knobs on one row: each knob still restores its
-/// own pre-slice world when turned off. It is an UNMEASURED CLOSURE admission -- no census row
-/// asks for it -- and it is admitted rather than screened out because refusing one sub-opcode of a
+/// own pre-slice world when turned off. It is an UNMEASURED CLOSURE admission (no census row
+/// asks for it) and it is admitted rather than screened out because refusing one sub-opcode of a
 /// shared arm at one width alone would put a byte-SHL boundary in the middle of admitted byte-SHRs,
 /// against this file's own contiguity rule.
 ///
 /// # What is deliberately NOT behind this knob
 ///
 /// * **`0xD0 /0,/1` and `0xC0 /0,/1` (ROL/ROR r8).** `DirectKind::RotateReg` carries a `width`
-///   field as of `vorvek/direct-word-rot1`, but that field is Word or Dword only -- `emit_rotate_reg`
+///   field as of `vorvek/direct-word-rot1`, but that field is Word or Dword only: `emit_rotate_reg`
 ///   dispatches on it to `shift_r16_imm8` or `shift_r32_imm8`, neither of which is the byte rotate
 ///   this opcode pair needs. A byte rotate through either one rotates 16 or 32 bits where the guest
 ///   rotates 8, takes CF from bit 15 or 31 instead of bit 7, and for byte indices 4..7 reaches a
@@ -13835,7 +13833,7 @@ pub(crate) fn byte_shift_rows_enabled() -> bool {
     *ENABLED.get_or_init(|| parse_byte_shift_rows_arm(std::env::var("IZARRAVM_BYTE_SHIFT_ROWS")))
 }
 
-/// The arm an unset -- and an EMPTY -- `IZARRAVM_BYTE_SHIFT_ROWS` names. Named rather than spelled
+/// The arm an unset (and an EMPTY) `IZARRAVM_BYTE_SHIFT_ROWS` names. Named rather than spelled
 /// twice so the two cannot drift apart the day the default moves, and it HAS moved once: ON since
 /// the 2026-08-29 re-ladder (tyrian-586 min-wall -9.5%, entries 37.2 M -> 23.6 M). The fixtures
 /// reach it through `byte_shift_rows_default_arm_for_test`, so the empty-string assertion tracks
@@ -13860,7 +13858,7 @@ fn parse_byte_shift_rows_arm(value: Result<String, std::env::VarError>) -> bool 
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default -- deliberately NOT
+        // Empty names the SAME arm as unset, the default, deliberately NOT
         // `parse_rotate_rows_arm`'s shape, which folds "" in with `0`/`off`. A wrapper that
         // computes a leg value and produces "" has MISSED a lookup; it has not said "off". The
         // ladder's defence against that is that every leg exports an explicit `0` or `1` and
@@ -13921,15 +13919,15 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
     BYTE_SHIFT_ROWS_DEFAULT_ARM
 }
 
-/// Whether `classify` admits the four UNPREFIXED STRING FAMILIES -- `0xA4`/`0xA5` MOVS,
-/// `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS -- as
+/// Whether `classify` admits the four UNPREFIXED STRING FAMILIES (`0xA4`/`0xA5` MOVS,
+/// `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS) as
 /// `InterpretOne` call-outs (`IZARRAVM_GENERIC_CALLOUT`, default ON since the 2026-08-29 ladder).
 ///
 /// # The rows, from the census that ranked them
 ///
 /// nascar-586 at main `f777010c`, `IZARRAVM_DIRECT_BARRIER_CENSUS=1`, plain release build per
 /// [[census-grade-on-plain-builds]]. Entries 162.1 M, unbound 115.8 M (71% of entries), and the
-/// `rejected` class -- the one this knob converts -- is 40,666,390 unbound exits, 35.1% of unbound.
+/// `rejected` class (the one this knob converts) is 40,666,390 unbound exits, 35.1% of unbound.
 /// Its two largest heads are string primitives:
 ///
 /// | head | `runtime_hits` | native prefix / suffix | stop |
@@ -13966,7 +13964,7 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 ///   two the ordinary memory rows already present, so `INTERPRET_ONE_MAX_DATA_ACCESSES` stays 4.
 /// * **R1 (EIP).** No string primitive writes EIP; `end_eip = start + len` always.
 /// * **R2 (segments).** None writes a segment register, so `may_write_segment` is false and R2
-///   compares all six records -- the STRICT side. They READ DS (overridable) and ES; a moved record
+///   compares all six records: the STRICT side. They READ DS (overridable) and ES; a moved record
 ///   resyncs, which is correct and conservative.
 /// * **R3.** None arms the shadow, none writes IF or TF, none touches CR*. Both per-row
 ///   relaxations stay false and R3 is unconditional for these rows.
@@ -13983,7 +13981,7 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 ///
 ///   N2 added a SECOND writer of both copies: `InterpretOneRow::Popf`'s resume path.
 ///   `CallOutHelper::republishes_flags()` is true for every `InterpretOne` row, unconditionally,
-///   so `emit_call_out` reloads RBP from the memory copy after ANY of them -- but only `Popf` can
+///   so `emit_call_out` reloads RBP from the memory copy after ANY of them, but only `Popf` can
 ///   actually move DF, because `load_flags` writes the full popped image and DF sits inside it.
 ///   The invariant survives because the reload is unconditional on the resume path, not because
 ///   `emit_direction_flag` stays the sole writer: a POPF slot ahead of a string slot in the same
@@ -14034,7 +14032,7 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 ///   currency a wall leg can see.
 /// * **duke3d-586, the expected-NEAR-ZERO control**: **+0.16% wall, guest instruction counts
 ///   IDENTICAL.** That row is the one gate that could have failed while every other counter looked
-///   good -- duke's rejected heads are integer ALU and this slice admits none of them, so a duke
+///   good: duke's rejected heads are integer ALU and this slice admits none of them, so a duke
 ///   that MOVED would have meant something other than the designed mechanism was firing. It did
 ///   not move.
 ///
@@ -14042,7 +14040,7 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 /// is therefore -2.9% MEASURED, comfortably outside the ~1-2% noise floor on a quiet host.
 ///
 /// **This flip is STANDING AUTHORITY, not an owner ruling.** It is the campaign's ordinary
-/// "ladder priced it, so the default moves" pattern -- the same authority the
+/// "ladder priced it, so the default moves" pattern: the same authority the
 /// `IZARRAVM_BYTE_SHIFT_ROWS` and `IZARRAVM_TEST_WORD_ROWS` flips ship under. No owner decision was
 /// sought or given for it, and nothing here should be cited as one.
 ///
@@ -14064,7 +14062,7 @@ pub(crate) fn byte_shift_rows_default_arm_for_test() -> bool {
 /// **The flip CHANGES WHAT `IZARRAVM_GENERIC_CALLOUT=` (the empty string) MEANS, from OFF to ON**,
 /// because `""` names the same arm as unset. It is stated here, in `parse_generic_callout_arm` and
 /// in the flip commit. Every ladder leg exports an explicit `0` or `1` and records the RESOLVED
-/// arm, so no recorded leg is affected -- which is the whole reason that rule exists, and the
+/// arm, so no recorded leg is affected, which is the whole reason that rule exists, and the
 /// [[env-null-empty-is-off-trap]] shape it exists to survive: nulling the variable is not unsetting
 /// it, PowerShell leaves it present and empty, and before this flip that spelled OFF.
 pub(crate) fn generic_callout_enabled() -> bool {
@@ -14076,7 +14074,7 @@ pub(crate) fn generic_callout_enabled() -> bool {
     *ENABLED.get_or_init(|| parse_generic_callout_arm(std::env::var("IZARRAVM_GENERIC_CALLOUT")))
 }
 
-/// The arm an unset -- and an EMPTY -- `IZARRAVM_GENERIC_CALLOUT` names. Named rather than spelled
+/// The arm an unset (and an EMPTY) `IZARRAVM_GENERIC_CALLOUT` names. Named rather than spelled
 /// twice so the two cannot drift apart the day the default moves, and it HAS moved once: ON since
 /// the 2026-08-29 ladder (nascar-586 min-wall -2.9%, 56.16 s -> 54.55 s, entries -10%). The
 /// fixtures reach it through `generic_callout_default_arm_for_test`, so the empty-string assertion
@@ -14102,7 +14100,7 @@ fn parse_generic_callout_arm(value: Result<String, std::env::VarError>) -> bool 
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default -- deliberately NOT
+        // Empty names the SAME arm as unset, the default, deliberately NOT
         // `parse_rotate_rows_arm`'s shape, which folds "" in with `0`/`off`. A wrapper that
         // computes a leg value and produces "" has MISSED a lookup; it has not said "off". The
         // ladder's defence against that is that every leg exports an explicit `0` or `1` and
@@ -14177,7 +14175,7 @@ pub(crate) fn generic_callout_default_arm_for_test() -> bool {
 /// the A/B base a ladder leg on this row is read against.
 ///
 /// **THE CONVENTION: unset and `""` name the SAME (default) arm.** Not
-/// `IZARRAVM_ATA_POLL_SKIP`'s inverted spelling -- there is no reason to give this knob a third
+/// `IZARRAVM_ATA_POLL_SKIP`'s inverted spelling: there is no reason to give this knob a third
 /// shape on this campaign.
 pub(crate) fn direct_in_imm8_callout_armed() -> bool {
     #[cfg(test)]
@@ -14207,7 +14205,7 @@ fn parse_direct_in_imm8_callout_arm(value: Result<String, std::env::VarError>) -
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        // Empty names the SAME arm as unset, the default, deliberately NOT ATA's shape.
         "" => true,
         "0" | "off" => false,
         "1" | "on" => true,
@@ -14224,7 +14222,7 @@ fn parse_direct_in_imm8_callout_arm(value: Result<String, std::env::VarError>) -
 // Per-THREAD, for `TEST_WORD_ROWS_OVERRIDE`'s reason: the shipped knob is a process-wide
 // `OnceLock` and the fixtures have to run both arms in one process, so one test's arm selection
 // must not reach another's compile. Every positive fixture forces the arm on through here and
-// every refusal fixture states the off arm rather than inheriting it -- which is why both kept
+// every refusal fixture states the off arm rather than inheriting it, which is why both kept
 // meaning what they say across the 2026-08-27 default flip to ON.
 #[cfg(test)]
 thread_local! {
@@ -14250,7 +14248,7 @@ pub(crate) fn parse_direct_in_imm8_callout_arm_for_test(
 }
 
 /// Whether `0xE6` OUT imm8,AL is admitted as a `PortWriteAlImm8` call-out
-/// (`IZARRAVM_OUT_IMM8_ROWS`, `dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+/// (`IZARRAVM_OUT_IMM8_ROWS`, Option B of the gp2 OUT 0xE6 research).
 ///
 /// **DEFAULT ON.** The census that motivated the row: gp2-586's single `0xE6` site at linear
 /// 0x00532951 takes 59,968,424 static-unbound exits in an 80-second run, which is 97% of that
@@ -14291,7 +14289,7 @@ fn parse_out_imm8_rows_arm(value: Result<String, std::env::VarError>) -> bool {
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        // Empty names the SAME arm as unset, the default, deliberately NOT ATA's shape.
         "" => true,
         "0" | "off" => false,
         "1" | "on" => true,
@@ -14397,17 +14395,17 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
     parse_out_imm8_rows_arm(value)
 }
 
-/// Whether `classify` admits the 2026-08-09 group-2 rows -- `0xC1`/`0xD1` **`/0` ROL** and
+/// Whether `classify` admits the 2026-08-09 group-2 rows: `0xC1`/`0xD1` **`/0` ROL** and
 /// **`0xC0 /4` SHL r8**, both register forms.
 ///
 /// **DEFAULT ON SINCE THE 2026-08-19/20 RE-MEASUREMENT.** `IZARRAVM_ROTATE_ROWS` unset admits both
 /// rows unconditionally; `0` or `off` is the escape back to the pre-slice refusal, which still
-/// ships whole -- its classify path, its fixtures and its mutation record -- because it is the base
+/// ships whole (its classify path, its fixtures and its mutation record) because it is the base
 /// every A/B on these rows is read against.
 ///
 /// WHY IT EXISTS. The duke3d-586 re-census (`.bench/results/duke586-census-20260809.json`) ranks
-/// `0xC1 /0` first by BOTH currencies -- 260,659,304 runtime hits, the hottest interpreted
-/// instruction in the trace, and 111,123,374 static unbound exits, the largest refused-row seam --
+/// `0xC1 /0` first by BOTH currencies: 260,659,304 runtime hits, the hottest interpreted
+/// instruction in the trace, and 111,123,374 static unbound exits, the largest refused-row seam,
 /// with `0xC0 /4` second at 32,839,852 and 31,743,121. On paper this is the top of the list.
 ///
 /// WHY IT WAS OFF (2026-08-09). Interleaved A/B/B/A on duke3d-586, one binary, quiet box. Off arm
@@ -14419,7 +14417,7 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// 55.57M -> 25.45M, narrow kills rose 45.25M -> 49.55M, `heat_hot` 357k -> 373k. Duke patches the
 /// COUNT BYTE of its group-2 shifts (the SMC shape table's `0xC1 /0,/4,/5` `imm_len=1` rows, ~1.9M
 /// events). Before the slice those ROLs were hard boundaries, so no compiled block ever spanned the
-/// patched byte and the patch cost nothing. After it, blocks span the byte -- and each 1-byte count
+/// patched byte and the patch cost nothing. After it, blocks span the byte, and each 1-byte count
 /// patch now kills a block that ALSO carries live `0x81` imm lanes and `0x8A` displacement lanes,
 /// taking their accepts down with it. That is the lane-trial iteration-1 mixing failure reborn one
 /// level up: not lane-shaped writes mixed with unlaned ones inside a chunk, but a lane-shaped BLOCK
@@ -14442,8 +14440,8 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// The 08-09 kill-amplification signature is STILL THERE and is no longer wall-dominant:
 /// `smc_lane_accepts` 109.0 M -> 91.8 M on the long row (-16%), while `smc_heat_demotions` actually
 /// FELL, 147,518 -> 144,136. What changed between the two measurements is the decline path those
-/// killed blocks land on -- the sticky-decline memo, the chain-used link mask, warm-fetch-inline
-/// and the one-lookup pair all repriced it -- so the same number of kills now costs a fraction of
+/// killed blocks land on: the sticky-decline memo, the chain-used link mask, warm-fetch-inline
+/// and the one-lookup pair all repriced it, so the same number of kills now costs a fraction of
 /// what it cost in August's first week. The short row's census says the same thing from the other
 /// side: `rejected` static-unbound target 231.8 M -> 89.6 M (-142 M), entries -20%, insns/entry
 /// 11.08 -> 13.69. **The lesson to carry, not just the number: a refutation whose mechanism is
@@ -14459,7 +14457,7 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// **STATUS 2026-08-19: the width class EXISTS and its first user shipped.** `IMM8_LANE_WIDTH` is
 /// one, every lane carries its own width, and `imm8_lane_for` admits the `0x80 /r` third of the
 /// trigger behind `IZARRAVM_IMM8_LANES` (default on). `0xC1`/`0xC0` and `0x0FA4` are NOT admitted
-/// and are still blocked on THE DESIGN COST below, which is untouched by that slice — the plumbing
+/// and are still blocked on THE DESIGN COST below, which is untouched by that slice: the plumbing
 /// is no longer the obstacle, the flag-capture split is.
 ///
 /// **STATUS 2026-08-20: THE TRIGGER HAS FIRED for `0xC1`/`0xC0`, AND ITS SLICE IS NOW THE SHIPPED
@@ -14483,7 +14481,7 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// **THE 2x2 HAS A CROSS TERM, and a combined ladder leg must be read knowing it.** With
 /// `IZARRAVM_IMM8_LANES=1`, a `0x80` patch that a lane absorbs no longer stamps SMC heat on its
 /// 16-byte chunk (`lane_only` at core.rs suppresses the bump). The `heat_gated` arm below admits a
-/// `0xC1 /0` site exactly when its count byte carries NO heat record — and heat records are
+/// `0xC1 /0` site exactly when its count byte carries NO heat record, and heat records are
 /// per-chunk, so a `0xC1` whose chunk was being kept hot by a neighbouring `0x80` patch becomes
 /// admissible once that `0x80` is laned. **So `ROTATE_ROWS=heat_gated` with `IMM8_LANES=1` admits
 /// a SUPERSET of the sites it admits with `IMM8_LANES=0`, and the combined leg's delta is not the
@@ -14495,7 +14493,7 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// COMPILE-TIME split on the count: 0 emits nothing, 1 captures `CF|OF` and publishes the shadow,
 /// 2..31 captures CF alone and goes through `emit_set_cf_only`. A runtime count cannot pick a
 /// capture mask at emission, so the lane form is forced onto the CL-shaped emission whose flag
-/// update is runtime-conditional -- and the count-0 case is not "some flags" but "no flag moves
+/// update is runtime-conditional, and the count-0 case is not "some flags" but "no flag moves
 /// and no descriptor is created or destroyed", which a conservative publish gets WRONG rather than
 /// approximately right. So the lane-form rotate needs either a genuinely conditional runtime flag
 /// path (the three-way branch `emit_shift_cl` already declined) or a guard that admits the lane
@@ -14504,13 +14502,13 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 ///
 /// THE ALTERNATIVE PRICED FIRST, because it might not have needed the lane work at all: **BUILT on
 /// 2026-08-19 as the `heat_gated` arm below and MEASURED THE SAME NIGHT, where it LOST.** It admits
-/// `0xC1 /0` only at sites whose count byte has no heat record -- the disp-lane heat gate INVERTED,
-/// admitting never-patched sites instead of hot ones -- on the theory that duke's ~1.9M count-byte
+/// `0xC1 /0` only at sites whose count byte has no heat record: the disp-lane heat gate INVERTED,
+/// admitting never-patched sites instead of hot ones, on the theory that duke's ~1.9M count-byte
 /// patch events sit on a small number of sites while the 260M runtime hits do not. The unpatched
 /// share `u` came out at only **11.4%** of the row's runtime hits (ROL `runtime_hits` 170,902,770 ->
 /// 151,490,740, chunk-granular so a lower bound), and the arm cost **+1.6%** wall against the eight-
 /// leg off floor. The row's mass sits on HEATED chunks, so gating by heat gives up almost all of the
-/// prize to protect against a cost that -- as the `on` arm then showed -- is no longer the dominant
+/// prize to protect against a cost that (as the `on` arm then showed) is no longer the dominant
 /// term anyway. `heat_gated` stays as a measured arm, not as a candidate default.
 ///
 /// **The knob covers THIS SLICE ONLY.** `0xC1 /1` and `0xD1 /1` ROR at Dword were lowered by the
@@ -14518,15 +14516,15 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// every future A/B price two slices as one. The heat gate is scoped to the same two rows.
 ///
 /// **THREE ARMS SINCE THE 2026-08-19 L1 SLICE**, all shipping in the one executable on the
-/// `IZARRAVM_LANE_FAMILY` / `IZARRAVM_DISP_LANES` contract -- this box has measured 6% wall
+/// `IZARRAVM_LANE_FAMILY` / `IZARRAVM_DISP_LANES` contract: this box has measured 6% wall
 /// variance between builds of identical source, which is larger than the effect, so a cross-build
-/// comparison would not be evidence (`dev_docs/duke-reprofile-2026-08-19.md` §6.2):
+/// comparison would not be evidence (duke re-profile §6.2):
 ///
 /// * `IZARRAVM_ROTATE_ROWS` **unset**, or `1` / `on` -> `On`: unconditional admission of both rows.
 ///   **THE SHIPPED DEFAULT since 2026-08-19/20**, on -5.6% short / -6.3% long. `1` is pinned to
 ///   this arm rather than merely accepted by it, because `1` is the spelling every historical A/B
 ///   leg used and keeping it stable is what makes those legs comparable with a leg run on this
-///   binary -- including the 2026-08-09 legs it has now contradicted.
+///   binary, including the 2026-08-09 legs it has now contradicted.
 /// * `0` or `off` (or an empty value) -> `Off`: the pre-slice refusal. **THE ESCAPE, and THE BASE
 ///   every A/B on these rows is read against**, because it is byte-for-byte the pre-slice world.
 /// * `heat` or `heat_gated` -> `HeatGated`: admit ONLY where the count byte carries no SMC heat
@@ -14541,7 +14539,7 @@ pub(crate) fn parse_out_imm8_rows_arm_for_test(value: Result<String, std::env::V
 /// classifies as `On` does and is narrowed one step later, in the compile walk, where the physical
 /// address and the heat map are in scope; it downgrades to the SAME `HardBoundary`, so its
 /// refusals are the same census row as the off arm's. `census_native_suffix` mirrors that
-/// downgrade -- see the divergence ledger there, which is the only other place `classify` is
+/// downgrade, see the divergence ledger there, which is the only other place `classify` is
 /// consulted as if it were the admission.
 pub(crate) fn rotate_rows_enabled() -> bool {
     rotate_rows_arm() != RotateRowsArm::Off
@@ -14572,7 +14570,7 @@ pub(crate) fn rotate_rows_arm() -> RotateRowsArm {
 /// unit-tested without a process-global env write. See `rotate_rows_enabled` for the contract.
 ///
 /// **AN UNRECOGNISED VALUE PANICS, and that is the load-bearing choice here.** The obvious
-/// alternative -- fall through to `On` the way the pre-L1 `value != "0"` reading did -- silently
+/// alternative (fall through to `On` the way the pre-L1 `value != "0"` reading did) silently
 /// turns a mistyped ladder leg (`IZARRAVM_ROTATE_ROWS=heat-gated`, `=heatgated`, `=gated`) into
 /// whatever arm the fallthrough names, and the reading of the leg is then a statement about an arm
 /// nobody selected. That was worth failing loudly for when the fallthrough was the negative
@@ -14603,7 +14601,7 @@ fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRow
         Ok(raw) => raw,
     };
     // Each arm answers to its DESIGN NAME (`off` / `heat_gated` / `on`, the spellings
-    // dev_docs/duke-reprofile-2026-08-19.md §6.2 uses to describe the ladder) as well as to its
+    // the duke re-profile §6.2 uses to describe the ladder) as well as to its
     // numeric one. A ladder leg written from the design doc and a leg written from the shell
     // history must reach the same arm, or the accepted-spelling set is itself a trap.
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -14635,7 +14633,7 @@ fn parse_rotate_rows_arm(value: Result<String, std::env::VarError>) -> RotateRow
 // Not a convenience, in EITHER direction, and the direction that matters flipped on 2026-08-19.
 // While the default was OFF, every positive fixture for these two rows had to force the on arm
 // through here or it would test the refusal and call it a lowering. Now that the default is ON, it
-// is the REFUSAL fixtures that must force `Off` explicitly -- a fixture that means to pin the
+// is the REFUSAL fixtures that must force `Off` explicitly: a fixture that means to pin the
 // pre-slice boundary and reads the ambient arm would silently compile the rows and pass for the
 // wrong reason. Both kinds state their arm; neither leans on the default.
 #[cfg(test)]
@@ -14679,7 +14677,7 @@ pub(crate) fn parse_rotate_rows_arm_for_test(
 ///
 /// Separate from `IZARRAVM_JIT16` on purpose: that one selects WHICH memory a 16-bit code segment
 /// may live in, and this one selects WHICH PERSONAS lower Word operands at all. They compose, and
-/// keeping them independent is what let the two halves be measured apart — an
+/// keeping them independent is what let the two halves be measured apart: an
 /// `IZARRAVM_JIT16=0` arm isolates this flag's 32-bit half (66-prefixed word ops) exactly, because
 /// `try_direct_continuation` then refuses every 16-bit boundary before a key is built.
 ///
@@ -14705,7 +14703,7 @@ pub(crate) fn word_at_486_default() -> bool {
 /// so it is the first thing an A/B has to be able to remove. It is NOT established as the cause,
 /// and the arithmetic argues against it: 1,961 lifts on that run, against duke's measured ~16 us
 /// per compile, is about 31 ms of compile time inside an 11 s regression. The counter signature
-/// there -- `linked_transfers` -99 M, `jit_direct_insns` -264 M, entries +54 M -- is a chaining
+/// there (`linked_transfers` -99 M, `jit_direct_insns` -264 M, entries +54 M) is a chaining
 /// and block-shape collapse, which is a different family of cause. Defaulting off is what makes
 /// the next duke run able to say so instead of guessing.
 ///
@@ -14774,8 +14772,8 @@ pub(crate) fn parse_retry_lift_arm_for_test(value: Result<String, std::env::VarE
 /// ONE predicate for what used to be three copies of `persona != I586`: the compile walk's Word
 /// refusal, `key_for_phys`'s 16-bit-segment refusal, and the census suffix scan's copy of the
 /// first. They have to move together. The compile walk and `key_for_phys` are COUPLED by
-/// construction — `key_for_phys` refuses the key precisely BECAUSE the walk would reject the first
-/// slot and install a rejected span for zero yield — so lifting either alone is wrong in a
+/// construction: `key_for_phys` refuses the key precisely BECAUSE the walk would reject the first
+/// slot and install a rejected span for zero yield, so lifting either alone is wrong in a
 /// different direction: the walk alone is inert, the key alone is pure churn. The census copy is
 /// the one that would silently re-open a seventh divergence between the two walks.
 ///
@@ -14809,15 +14807,15 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
 ///
 /// | spelling | arm |
 /// |---|---|
-/// | **unset** | **`cap`** — the shipped default: the per-key retire cap (`DATA_SEGMENT_RETIRE_CAP`) |
-/// | `""`, `0`, `off` | `Off` — pre-slice behaviour, every data-segment reject retires its key |
+/// | **unset** | **`cap`**, the shipped default: the per-key retire cap (`DATA_SEGMENT_RETIRE_CAP`) |
+/// | `""`, `0`, `off` | `Off`: pre-slice behaviour, every data-segment reject retires its key |
 /// | `cap` | `Cap`, stated explicitly; identical to unset |
-/// | `1`, `on` | `On` — the cap PLUS the stage 2 link decline |
+/// | `1`, `on` | `On`: the cap PLUS the stage 2 link decline |
 /// | anything else | panics |
 ///
 /// WHY IT SHIPS ARMED. The pre-registered ladder on `2d126c5e`, one binary, ABBA interleaved:
 /// **tombraid loader phase `cap` +27.1% (lower95 1.263), `on` +28.8%; duke3d-586 short `cap`
-/// +4.3%, `on` +3.5%**, every pin identical on every leg. The mechanism is not subtle -- the
+/// +4.3%, `on` +3.5%**, every pin identical on every leg. The mechanism is not subtle: the
 /// loader was paying 0.94 s of a 7.09 s phase to recompile blocks it then refused to run, 97.9%
 /// of its compile attempts, and the cap takes `jit_direct_compile_attempts` from 314,318 to 9,695.
 ///
@@ -14832,7 +14830,7 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
 /// that is frozen on one layout INTERPRETS every entry that carries another, forever, where the
 /// pre-slice retire would have re-specialized it and run. On a guest whose record settles after a
 /// few moves the retire was the right bet and the cap now refuses to take it. The answer is not a
-/// bigger cap -- it is slice (a), per-layout block VARIANTS, whose go/no-go census this slice
+/// bigger cap: it is slice (a), per-layout block VARIANTS, whose go/no-go census this slice
 /// ships and whose `cap`-leg reading is in the design's §R rev 5.
 ///
 /// THE ESCAPE, AND THE A/B BASE, IS NOW `off`. It touches no map, reads no set, and does not even
@@ -14842,7 +14840,7 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
 ///
 /// **THE NULLING TRAP IS INVERTED HERE, AND IT MATTERS.** Everywhere else in this file unset means
 /// OFF, so `env-null-empty-is-off-trap` bites the ON leg. Here unset means `cap`, and `""` means
-/// OFF -- so PowerShell's `SetEnvironmentVariable($null)`, which leaves `""` behind, silently
+/// OFF, so PowerShell's `SetEnvironmentVariable($null)`, which leaves `""` behind, silently
 /// DISARMS the shipped default. A leg that means to measure the default must leave the variable
 /// genuinely unset or EXPORT `cap`; a leg that nulls it is measuring the escape.
 pub(crate) fn segment_retire_governor() -> SegmentRetireGovernor {
@@ -14920,8 +14918,8 @@ pub(crate) fn parse_segment_retire_governor_arm_for_test(
 ///   lane family where unset is the shipped ON default: nulling a variable in PowerShell leaves it
 ///   PRESENT and EMPTY, and this knob's default arm is the off arm, so both spellings agree.
 /// * `1` / `on` / `full` -> FULL. All sixteen phases, >= 16 marks per entry.
-/// * `2` / `coarse` -> COARSE. Four marks — `begin`, the native window in, the native window out,
-///   `end` — whose totals must agree with FULL's to within 5% (A6).
+/// * `2` / `coarse` -> COARSE. Four marks: `begin`, the native window in, the native window out,
+///   `end`, whose totals must agree with FULL's to within 5% (A6).
 /// * **anything else PANICS**, for `parse_disp_lanes_arm`'s reason: a mistyped ladder leg would
 ///   silently run the DEFAULT and be read as the arm it named doing nothing.
 #[cfg(feature = "direct-entry-attribution")]
@@ -15010,8 +15008,7 @@ pub(crate) fn parse_entry_attribution_sample(value: Result<String, std::env::Var
 /// **DEFAULT ON since the 2026-08-25 flip.** The OFF arm is `main`-before-the-slice's entry check
 /// verbatim: `all_data_matches` for a linked root, `data_matches` for an unlinked one; it is the
 /// ESCAPE and the A/B base. The ON arm runs one `data_matches` over the chain
-/// requirement for both, which is exactly the statement INV-ENTRY needs and nothing more. Design:
-/// `dev_docs/specs/2026-08-25-chain-requirement-entry-check-design.md`.
+/// requirement for both, which is exactly the statement INV-ENTRY needs and nothing more.
 ///
 /// # THE NULLING SEMANTICS, STATED PLAINLY, BECAUSE THE NEIGHBOURING KNOB'S ARE INVERTED
 ///
@@ -15038,8 +15035,8 @@ pub(crate) fn parse_entry_attribution_sample(value: Result<String, std::env::Var
 /// `narrow_chain_requirement_if_leaf`: that is a correctness prerequisite of the armed arm and, on
 /// the OFF arm, a strictly more accurate statement about a live link graph. Gating it would hand
 /// the two arms different link graphs to reason about. The honest consequence is that the OFF arm
-/// is **not** a bit-for-bit reproduction of `main` on the COMPILE side -- some later edges are
-/// admitted which `main` refused against a stale-wide requirement -- while it is behaviourally
+/// is **not** a bit-for-bit reproduction of `main` on the COMPILE side: some later edges are
+/// admitted which `main` refused against a stale-wide requirement, while it is behaviourally
 /// identical at the entry check itself. `link_refusals[segment_layout]` is where that shows, in one
 /// direction only.
 pub(crate) fn chain_entry_check_armed() -> bool {
@@ -15060,7 +15057,7 @@ fn parse_chain_entry_check_arm(value: Result<String, std::env::VarError>) -> boo
                             CHAIN requirement)";
     let raw = match value {
         // Unset is the shipped default and it is ON since the 2026-08-25 flip. `""` follows it
-        // below rather than here and reaches the same arm -- see `chain_entry_check_armed` on why
+        // below rather than here and reaches the same arm, see `chain_entry_check_armed` on why
         // this knob deliberately does NOT copy `IZARRAVM_SEGMENT_RETIRE_GOVERNOR`'s inverted shape.
         Err(std::env::VarError::NotPresent) => return true,
         // Not-UTF-8 is not a spelling of any arm. Someone set the variable and meant something by
@@ -15316,7 +15313,7 @@ pub(crate) fn parse_chain_entry_check_arm_for_test(
 ///
 /// **No thread-local test override here** (unlike `chain_entry_check_armed`): the fixture that
 /// needs to flip this arm per-run is an `izarravm-machine` integration test, which cannot reach a
-/// `#[cfg(test)]` item in this crate at all -- `#[cfg(test)]` compiles only into the crate whose
+/// `#[cfg(test)]` item in this crate at all: `#[cfg(test)]` compiles only into the crate whose
 /// OWN harness set `--cfg test`, not into the rlib a dependent crate links against. The override
 /// that DOES cross the boundary is the per-CPU `CpuGsw::set_direct_poll_skip_override` /
 /// `BlockCache::direct_poll_skip_armed_for`, on the `set_native_backend_enabled` precedent; every
@@ -15343,7 +15340,7 @@ fn parse_direct_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        // Empty names the SAME arm as unset, the default, deliberately NOT ATA's shape.
         "" => true,
         "0" | "off" => false,
         // `poll` rides beside `1` / `on` so a leg written from the design reaches the same arm as
@@ -15366,7 +15363,7 @@ pub(crate) fn parse_direct_poll_skip_arm_for_test(
     parse_direct_poll_skip_arm(value)
 }
 
-/// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`: the binary search's floor, default 2 -- matching the
+/// `IZARRAVM_DIRECT_POLL_MIN_ITERATIONS`: the binary search's floor, default 2, matching the
 /// interpreter's `try_poll_skip` (`machine/run.rs`, `low = 2`). Unset and `""` both mean the
 /// default: a threshold has no "off" value, the same convention `sweep_knob`-style numeric knobs
 /// on this campaign use.
@@ -15412,7 +15409,7 @@ pub(crate) fn direct_poll_skip_max_raw() -> u64 {
 /// # THE SPELLING TABLE
 ///
 /// A boolean ARM knob on the `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK`
-/// construction -- explicitly NOT `IZARRAVM_ATA_POLL_SKIP`'s inverted shape, and explicitly
+/// construction: explicitly NOT `IZARRAVM_ATA_POLL_SKIP`'s inverted shape, and explicitly
 /// NOT a PARAMETER knob (those have no OFF spelling at all: UNSET, never `=0`).
 ///
 /// * **unset** and the EMPTY STRING -> ON: the same arm, and since the flip below that arm is
@@ -15433,11 +15430,11 @@ pub(crate) fn direct_poll_skip_max_raw() -> u64 {
 /// `jit_direct_poll_skip_spans` 29,120, `jit_direct_poll_decline_mask_source` **0** (so the
 /// MAJOR-7 storm class never fired and the sticky memo was never load-bearing on this row), and
 /// `timer.irq0_edges` / MPU `data_writes` / DSP `command_bytes` / guest seconds all
-/// BIT-IDENTICAL across the arms -- the skip moved wall, not guest-visible state. gp2-586, the
+/// BIT-IDENTICAL across the arms: the skip moved wall, not guest-visible state. gp2-586, the
 /// 32-bit control, passes with the mechanism idle. wolf3d-586 is neutral: its apparent +3.7% was
 /// binary-layout variance, ON equals OFF on one binary, and it records zero 16-bit declines.
 /// **The flip changes exactly the two `return` arms below the `NotPresent` and `""` matches
-/// below, and nothing else** -- every other spelling row is untouched.
+/// below, and nothing else**: every other spelling row is untouched.
 ///
 /// **THE NULLING TRAP REVERSES WITH THE FLIP, and that is the cost of it.** Nulling a variable
 /// in PowerShell leaves it PRESENT and EMPTY, and this table now spells that ON, the same arm
@@ -15450,7 +15447,7 @@ pub(crate) fn direct_poll_skip_max_raw() -> u64 {
 ///
 /// `port_read_al_dx` does NOT call this per read. Tyrian executes ~1.52e9 16-bit 0x3DA reads in
 /// one 48-second window, and an `Option<bool>` field load plus a `OnceLock` acquire-load on each
-/// of them is roughly 1-2.5% of that row's wall -- enough on its own to consume the +/-2% band
+/// of them is roughly 1-2.5% of that row's wall: enough on its own to consume the +/-2% band
 /// the ladder's "A arm equals `main`" check allows, which would make the ladder unreadable.
 /// The arm is resolved ONCE per native block entry into a plain `bool` on `BlockCache`
 /// (`set_block_poll_skip_16_armed`, published beside `set_block_batch_cap`), and the call-out
@@ -15481,7 +15478,7 @@ fn parse_direct_poll_skip_16_arm(value: Result<String, std::env::VarError>) -> b
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default. Post-flip the nulling trap points at
+        // Empty names the SAME arm as unset, the default. Post-flip the nulling trap points at
         // the OFF leg: an OFF leg must EXPORT `0`.
         "" => true,
         "0" | "off" => false,
@@ -15511,7 +15508,7 @@ pub(crate) fn parse_direct_poll_skip_16_arm_for_test(
 /// The Direct backend keeps a materialised EFLAGS shadow resident in RBP for a whole native
 /// block (the prologue loads it from `materialized_eflags()`; every producer merges into it
 /// through `emit_capture_flags`). Today's Jcc terminator calls `emit_load_host_flags`, which is
-/// `mov`/`and`/`push`/`popfq` -- and POPFQ is roughly 19-20 uops with a matching reciprocal
+/// `mov`/`and`/`push`/`popfq`, and POPFQ is roughly 19-20 uops with a matching reciprocal
 /// throughput, sitting on the CRITICAL PATH of the branch that consumes it. The shadow arm
 /// replaces the whole round trip with `test`/`jz` or `test`/`jnz` against the same RBP bits: the
 /// twelve simple and overflow conditions in two host instructions, the four signed ones
@@ -15524,7 +15521,7 @@ pub(crate) fn parse_direct_poll_skip_16_arm_for_test(
 ///
 /// Scope is the TERMINATOR alone. `SetCc` and `SetCcMem` keep `emit_load_host_flags` because
 /// `e.setcc` needs a real host flags word, and the three `adc`/`sbb` sites keep it because they
-/// load host CF to FEED the host adder -- no test on a shadow bit can replace an architectural
+/// load host CF to FEED the host adder: no test on a shadow bit can replace an architectural
 /// carry-in. See `emit_jcc_shadow`.
 ///
 /// # THE SPELLING TABLE, AND WHICH WAY ITS NULLING TRAP POINTS
@@ -15548,9 +15545,9 @@ pub(crate) fn parse_direct_poll_skip_16_arm_for_test(
 ///
 /// # READ AT THE EMISSION SITE, NOT CACHED ON `JitState`
 ///
-/// `emit`'s Jcc arm calls this directly. A `JitState` field would buy nothing -- the thread-local
+/// `emit`'s Jcc arm calls this directly. A `JitState` field would buy nothing: the thread-local
 /// override below covers every fixture, which is the only reason the other emission arms are
-/// fields -- and it would add a second layout perturbation on top of the one `jcc_shadow_sites`
+/// fields, and it would add a second layout perturbation on top of the one `jcc_shadow_sites`
 /// already spends inside `repr(Rust)` `BlockCache`. The consequence is a PROTOCOL requirement and
 /// it is the reason this knob exists at all: **the ladder's ON and OFF legs must share ONE
 /// binary**, so the layout term is carried by both arms and subtracts out. A
@@ -15807,12 +15804,12 @@ pub(crate) const EAGER_FLAGS_CLASSES: usize = 6;
 pub(crate) const EAGER_CLASS_ARITH: usize = 0;
 /// `AND`/`OR`/`XOR`/`TEST` at Word and Dword, register destination.
 pub(crate) const EAGER_CLASS_LOGIC: usize = 1;
-/// The BYTE logic arm of `emit_alu_byte_preloaded` -- the arm that carried a second emitted reader
+/// The BYTE logic arm of `emit_alu_byte_preloaded`, the arm that carried a second emitted reader
 /// of the descriptor, the RDX reload supplying the guest byte-ALU RESULT.
 ///
 /// **The lane alone does not witness that reload, and it would be wrong to think it does.** Byte
 /// `TEST` charges this lane too (`emit_test_preloaded` at `MemoryWidth::Byte`), and byte `TEST` has
-/// no write-back and never had the reload -- so a regression that restored the reload in
+/// no write-back and never had the reload, so a regression that restored the reload in
 /// `emit_alu_byte_preloaded` while leaving byte `TEST` alone would keep the lane non-zero. What
 /// actually witnesses it is the byte ledger's SEPARATE ROWS: `and_al_cl` at -76 against
 /// `test_al_cl` at -69, a difference that is exactly the reload's seven bytes.
@@ -15830,7 +15827,7 @@ pub(crate) const EAGER_CLASS_MEM_COMMIT: usize = 5;
 ///
 /// **THE CONVENTION IS `IZARRAVM_JCC_SHADOW` / `IZARRAVM_CHAIN_ENTRY_CHECK`'s: unset and `""` name
 /// the SAME arm, and that arm is THE DEFAULT.** It is a BOOLEAN knob, so `0` IS a legal OFF
-/// spelling and is stated as one below -- said explicitly because the
+/// spelling and is stated as one below, said explicitly because the
 /// `parameter-knobs-have-no-off-spelling` trap (a `PARAMETER` knob whose `=0` ARMS it) cost a
 /// whole census, and the two conventions now coexist in this file.
 ///
@@ -15839,8 +15836,8 @@ pub(crate) const EAGER_CLASS_MEM_COMMIT: usize = 5;
 /// pairs, quake-586 +3.7% (3 of 3), nascar-586 +1.5% (4 of 5), duke3d-586-short neutral at 0.999
 /// over six pairs, prince-486 inert (a 16-bit row; the slice rewrote the 32-bit emitters); the
 /// two-arm 13-row scoreboard passed every invariant on both arms. `flag_materializations`
-/// dropped 5-15x on every ON leg. Both mechanisms still exist in the shipped binary -- `0` /
-/// `off` names the descriptor arm, stated -- and every claim elsewhere in this file that a
+/// dropped 5-15x on every ON leg. Both mechanisms still exist in the shipped binary: `0` /
+/// `off` names the descriptor arm, stated, and every claim elsewhere in this file that a
 /// descriptor writer is "dead", "not emitted" or "vacuous" is an EAGER-ARM claim; on the
 /// descriptor arm the descriptor is still written, every helper is still emitted, and every
 /// argument that depends on a live descriptor is still load-bearing.
@@ -15855,8 +15852,8 @@ pub(crate) const EAGER_CLASS_MEM_COMMIT: usize = 5;
 ///
 /// It is NOT a licence to publish where the caller has not captured. Every switched site publishes
 /// immediately after its own `emit_capture_flags`, under that site's own `defined` mask, so the
-/// bits the mask excludes keep their pre-slot values in the shadow and are republished unchanged
-/// -- which is `emit_commit_shift_flags`' argument, in-tree since the shift slice, applied to a
+/// bits the mask excludes keep their pre-slot values in the shadow and are republished unchanged,
+/// which is `emit_commit_shift_flags`' argument, in-tree since the shift slice, applied to a
 /// mask narrower than `ARITH_FLAGS`.
 ///
 /// The entry clear that makes the arm sound (`run.rs`'s E1) is NOT under this knob: it is correct
@@ -15890,7 +15887,7 @@ fn parse_eager_flags_arm(value: Result<String, std::env::VarError>) -> bool {
         Ok(raw) => raw,
     };
     match raw.trim().to_ascii_lowercase().as_str() {
-        // Empty names the SAME arm as unset -- the default -- deliberately NOT ATA's shape.
+        // Empty names the SAME arm as unset, the default, deliberately NOT ATA's shape.
         "" => true,
         "0" | "off" | "false" => false,
         "1" | "on" | "true" => true,
@@ -15914,7 +15911,7 @@ thread_local! {
 /// ambient `IZARRAVM_DIRECT_EAGER_FLAGS` reading.
 ///
 /// The arm is read at EMISSION time, so a fixture flipping it mid-run must compile its blocks
-/// after the flip -- the same hazard `set_rotate_rows_for_test` carries.
+/// after the flip: the same hazard `set_rotate_rows_for_test` carries.
 #[cfg(test)]
 pub(crate) fn set_direct_eager_flags_for_test(forced: Option<bool>) {
     EAGER_FLAGS_OVERRIDE.with(|cell| cell.set(forced));
@@ -15957,7 +15954,7 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 // and it is blocked on the cap re-price rather than refuted. Both knob docs carry the tables.
 //
 // `disp_lane_for`'s body, its bars, its ordering and every line of its doc comment are
-// byte-identical to `f6620e6e` -- a checkable pin, kept so "unchanged" does not have to be taken
+// byte-identical to `f6620e6e`, a checkable pin, kept so "unchanged" does not have to be taken
 // on trust.
 //
 // The two new arms, `disp_store_lane_for` and `disp_load_widen_lane_for`, are PRIVATE. The only
@@ -15977,7 +15974,7 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 //   sub-4-byte rule in the write choke, which matches a patch at exactly the lane's width. The
 //   2026-08-23 settling census counted the `0x89` disp population at 1,034,337 events with the
 //   whole prize in the disp32 forms; no measured population asks for a narrower lane. This is
-//   the same scope cut `dev_docs/2026-08-09-disp-lanes-design.md` made for `0x8A`.
+//   the same scope cut the disp-lanes design made for `0x8A`.
 // * **No prefixes.** That bar carries the width argument for all three: a `0x66` or `0x67`
 //   instruction is refused outright, and a disp32 requires CS.D = 1, so an admitted `0x8B` or
 //   `0x89` is a DWORD access, an admitted `0x88` is a byte access, and `AddressWrap::Word` can
@@ -15986,7 +15983,7 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 //   `mod == 3` encodings of all four opcodes to register kinds (`MovReg` / `MovRegByte`), so a
 //   register form never reaches a `Load` or a `Store` arm at all.
 //
-// # Why a `Store` may carry a lane — the register-pressure contract, discharged
+// # Why a `Store` may carry a lane: the register-pressure contract, discharged
 //
 // `disp_lane_for`'s own doc states the obligation: the lane arm of `emit_effective_address`
 // stages the displacement through RAX alone, "but widening admission to a kind whose emitter
@@ -16001,14 +15998,14 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 //
 // So nothing is live across the address form at either site, and the lane arm's RAX write is
 // indistinguishable from the baked arm's `mov eax, imm32` to every caller. Since the LEA fusion,
-// `emit_effective_address` writes RAX and nothing else on either arm -- the `scale != 1` index
-// path's RCX detour is gone -- so the contract has narrowed rather than widened.
+// `emit_effective_address` writes RAX and nothing else on either arm: the `scale != 1` index
+// path's RCX detour is gone, so the contract has narrowed rather than widened.
 //
 // # Semantics
 //
 // A patched displacement forms a different effective address, and every guard downstream of
-// `emit_effective_address` — the 64K wrap, the segment-limit compare, the fast-map lookup, the
-// page-kind classify, the write-permission check and the code-watch consultation — already runs
+// `emit_effective_address` (the 64K wrap, the segment-limit compare, the fast-map lookup, the
+// page-kind classify, the write-permission check and the code-watch consultation) already runs
 // on the RUNTIME value. A store through a patched displacement therefore takes exactly the side
 // exits the baked form would have taken, including a store that now lands on a watched code
 // page: the watch consultation is inside `emit_store_write_resolve`, after the address exists.
@@ -16018,18 +16015,18 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 // store lands, which is the argument the imm lanes and `0x8A` already rely on, unchanged.
 
 /// The displacement twin of `imm_lane_for`: `0x8A MOV r8, [..disp32..]`, every ModRM memory
-/// form, no prefixes — GATED ON MEASURED PATCH HISTORY. The admitted field is the
+/// form, no prefixes: GATED ON MEASURED PATCH HISTORY. The admitted field is the
 /// instruction's disp32, which duke3d-586's SMC trace measured at 17M of its 19.3M disp-patch
-/// events (dev_docs/2026-08-09-disp-lanes-design.md); each one today either kills the covering
+/// events; each one today either kills the covering
 /// block or keeps its chunk's G1 heat stamped.
 ///
 /// THE HEAT GATE IS THE SLICE'S LOAD-BEARING DECISION, and it was reached by refutation twice
 /// over. The lane form costs two host instructions per EXECUTION whether or not the field is
 /// ever patched. Iteration 1 admitted the whole family unconditionally: duke +8.2%, but the
-/// 2026-08-09 formal gate FAILED — doom-486 paired RTF 0.978, doom-586 0.975 — because doom's
+/// 2026-08-09 formal gate FAILED: doom-486 paired RTF 0.978, doom-586 0.975, because doom's
 /// renderer executes `[base+disp32]` texture/colormap byte loads constantly and patches none
 /// of them. Iteration 2 tried the shape cut (bare `[disp32]` only): doom recovered but duke's
-/// win VANISHED (rt 0.2706 vs 0.2697, 3.4k lanes vs 233k) — Build patches the indexed forms
+/// win VANISHED (rt 0.2706 vs 0.2697, 3.4k lanes vs 233k): Build patches the indexed forms
 /// too, so no static shape separates the populations. What separates them is BEHAVIOR:
 /// `SmcHeatMap::has_record_range` over the disp field's bytes is true only after the field
 /// took a heat-charged kill, so a never-patched load compiles baked and untaxed forever, and a
@@ -16040,19 +16037,19 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 ///
 /// The probe reads the heat accelerator WITHOUT `sync_smc_heat` (this is a `&CpuGsw` path); a
 /// stale read across a cache reset can at worst bake one block that a later recompile lanes, or
-/// lane one block that did not need it — admission tuning, never correctness.
+/// lane one block that did not need it: admission tuning, never correctness.
 ///
 /// `disp_len == 4` plus the default-prefix test confines this to 32-bit addressing: a CS.D=0
 /// segment cannot reach a four-byte displacement without a `0x67` prefix, so a lane and
-/// `AddressWrap::Word` can never co-occur and the loaded field needs no sign-extension — the
+/// `AddressWrap::Word` can never co-occur and the loaded field needs no sign-extension: the
 /// four guest bytes ARE the architectural displacement. With `imm_len == 0` those bytes are
 /// the instruction's last four, so the lane start is `physical + len - 4` (offset 2 on the
-/// mod-0 rm-5 form, 3 on the SIB forms, more under mod 2 — the SIB fixture pins this).
+/// mod-0 rm-5 form, 3 on the SIB forms, more under mod 2, the SIB fixture pins this).
 ///
 /// Only `DirectKind::Load` may carry a lane, and that is a REGISTER-PRESSURE contract, not
 /// taste: the lane arm of `emit_effective_address` stages the displacement through EAX alone,
 /// which is safe for every caller, but widening admission to a kind whose emitter resolves the
-/// address AFTER staging other live state would still deserve its own review — and its own
+/// address AFTER staging other live state would still deserve its own review, and its own
 /// census row, per the standing rule against unmeasured admissions.
 pub(crate) fn disp_lane_for(
     cpu: &CpuGsw,
@@ -16143,11 +16140,11 @@ pub(crate) enum OptionDArm {
 ///
 /// ORDER IS THE CONTRACT, not a detail:
 ///
-/// 1. the shape bars (prefixes, `disp_len`, `imm_len`) — cheapest, and they are what narrow the
+/// 1. the shape bars (prefixes, `disp_len`, `imm_len`): cheapest, and they are what narrow the
 ///    slot to one family, which is what makes the cap counter below per-family;
 /// 2. the lane start `physical + len - 4`, which is the instruction's last four bytes exactly
 ///    because `imm_len == 0` was just established;
-/// 3. **the heat gate** `has_record_range` — a record exists only after a heat-charged kill at
+/// 3. **the heat gate** `has_record_range`: a record exists only after a heat-charged kill at
 ///    those bytes, so a never-patched displacement compiles baked and untaxed forever. This is
 ///    the doom cut, and it is why the cap sits BELOW it: a cap tested above the heat gate would
 ///    report the entire `0x89` population as budget pressure;
@@ -16157,7 +16154,7 @@ pub(crate) enum OptionDArm {
 ///    AND a host pointer waiting.
 ///
 /// The knob is NOT here. Each arm tests its own knob first and returns before reaching this
-/// function, so an off arm charges no cap refusal — the rule that lets a ladder tell a
+/// function, so an off arm charges no cap refusal: the rule that lets a ladder tell a
 /// lane-BUDGET answer from a lane-CLASS one.
 fn shared_disp32_lane(
     cpu: &CpuGsw,
@@ -16204,7 +16201,7 @@ fn shared_disp32_lane(
 /// form with a disp32 and no prefixes, gated on measured patch history exactly as `0x8A` is.
 ///
 /// `0x89` is the prize. The 2026-08-23 settling census puts it at 1,034,337 disp-class SMC events
-/// and 21,178 of the 21,882 joined un-laned-disp BLOCK KILLS on duke3d-586-short — 96.8% —
+/// and 21,178 of the 21,882 joined un-laned-disp BLOCK KILLS on duke3d-586-short (96.8%)
 /// against `0x88`'s 37,717 events and a numerator that never joins uniquely. `0x88` is admitted
 /// with it because it is the same instruction one width down, its emitter is the same
 /// `emit_store`, and refusing it would be an unexplained hole rather than a scope cut.
@@ -16215,7 +16212,7 @@ fn shared_disp32_lane(
 ///
 /// Refuses everything that is not a `Store` kind, which includes `RmwIncDec`, `SetCcMem`,
 /// `AluMemDest` and the x87 stores. Those are unmeasured admissions with emitters this arm's
-/// review did not cover, and they wait for a census row of their own — the standing rule the
+/// review did not cover, and they wait for a census row of their own: the standing rule the
 /// register-pressure contract states.
 fn disp_store_lane_for(
     cpu: &CpuGsw,
@@ -16265,7 +16262,7 @@ fn disp_store_lane_for(
 /// The LOAD-WIDENING arm of Option D: `0x8B MOV r32, r/m32`, every ModRM MEMORY form with a
 /// disp32 and no prefixes.
 ///
-/// The cheap half — same `DirectKind::Load`, same emitter, same `DirectAddr` seam as `0x8A`, and
+/// The cheap half: same `DirectKind::Load`, same emitter, same `DirectAddr` seam as `0x8A`, and
 /// the only thing that changes is which opcode reaches it. 177,730 disp-class events on the
 /// settling census against `0x89`'s 1,034,337, and 1,346 of the 12,887 joined un-laned-disp
 /// crossings. It is not worth shipping alone and it is not optional either: the pre-registered
@@ -16327,7 +16324,7 @@ fn disp_load_widen_lane_for(
 /// The walk already nests four matchers; a fifth and sixth level of `match` would be unreadable
 /// and would say nothing, because the two arms are mutually exclusive by KIND (`Store` against
 /// `Load`) and by OPCODE. Trying the store first is therefore an ordering with no observable
-/// consequence — it is written prize-first so the common case is the first test.
+/// consequence: it is written prize-first so the common case is the first test.
 pub(crate) fn option_d_lane_for(
     cpu: &CpuGsw,
     insn: &DecodedInsn,
@@ -16354,7 +16351,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         }
         let native = NativeX87Insn::classify(insn)?;
         // The two FPU-loop rows are gated HERE rather than inside `NativeX87Insn::classify`,
-        // which is a pure encoding table -- `native_x87_test.rs` asserts it opcode by opcode with
+        // which is a pure encoding table: `native_x87_test.rs` asserts it opcode by opcode with
         // no CPU and no environment in scope, and threading a policy knob through it would make
         // every one of those rows read the ambient arm. This is the same seam `classify` already
         // uses for `rotate_rows_enabled` and `count_lanes_enabled`.
@@ -16440,12 +16437,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // naming, because proximity is exactly how they would have got swept in: both hard-coded
     // `MemoryWidth::Dword`, so admitting either at Word size would have moved four bytes where the
     // guest moves two. That is no longer the shape of the answer. The V86 loop-A slice gave both
-    // arms `operand_width` -- the same fix MOVZX/MOVSX got with `dst_width` rather than being kept
-    // off the list -- and put them on the GATED allowlist below. The hazard the paragraph named was
+    // arms `operand_width`: the same fix MOVZX/MOVSX got with `dst_width` rather than being kept
+    // off the list, and put them on the GATED allowlist below. The hazard the paragraph named was
     // real and is now expressed instead of avoided; see the two arms for the width argument at each
     // end. `0xd0` USED to stay refused here, and not for a width reason: no classify arm existed
     // for it, which made listing it a no-op that read like a lowering. It has an arm as of the
-    // byte-shift-rows slice and its allowlist entry is load-bearing rather than decorative -- the
+    // byte-shift-rows slice and its allowlist entry is load-bearing rather than decorative: the
     // tyrian-586 row it claims is 13,933,316 runtime hits at `operand_size: word`, so the entry is
     // the whole admission. It sits on the GATED term below with `0xc0` rather than on this list.
     //
@@ -16480,25 +16477,25 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // 16-bit workload ranks these ten rows near 19% of block-stopping hits.
     //
     // `0x11`/`0x19` and `0x13`/`0x1b`, ADC and SBB in the same two forms, joined on the L1 width
-    // lift (`dev_docs/2026-08-31-corpus-lever-plan.md`). They used to be the exclusion this
+    // lift. They used to be the exclusion this
     // paragraph named: `emit_alu_preloaded`'s Word branch masked both operands with `and`, which
     // CLEARS host CF, so an admitted carry op would have computed without its carry in.
     // `emit_carry_alu_preloaded` now carries a Word arm that loads host CF from the RBP shadow
     // BEFORE the masked `alu_r16_r16`, the same ordering its Dword arm has always used, so the two
     // opcodes reach the SAME arm as their five siblings and need no allowlist entry of their own.
-    // Form 1's MEMORY shape stays refused at Word regardless of op (see that arm) -- that boundary
+    // Form 1's MEMORY shape stays refused at Word regardless of op (see that arm): that boundary
     // is untouched by this slice, it is the read-modify-write economics guard 3 left standing.
     // Form 3's memory shape is admitted for every op including ADC/SBB, because `emit_alu_mem_
     // source`'s Word arm stages RAX/RCX exactly as the register callers do before reaching
-    // `emit_alu_preloaded` -- see that arm and `cpu_jit_word_memory_test.rs`.
+    // `emit_alu_preloaded`, see that arm and `cpu_jit_word_memory_test.rs`.
     //
     // `0x83` WAS on the exclusion list and is now admitted, which is this slice's other half. Its
     // register form produces `AluImm`, which carries a `width` field, and its memory form lowers
-    // through `AluMemDest` -- both including ADC/SBB as of the L1 lift; see that arm. The census
-    // ranks `0x83 /5` word at 9,776,289 doom exits, forty-seven apart from `0x60` PUSHAD -- one
+    // through `AluMemDest`: both including ADC/SBB as of the L1 lift; see that arm. The census
+    // ranks `0x83 /5` word at 9,776,289 doom exits, forty-seven apart from `0x60` PUSHAD: one
     // function prologue, so the two must land together or neither's exits go anywhere. Pyramid-586
     // ranks `0x83 word mem /2` (ADC) at 18,902,081 runtime hits, the largest non-monitor row in the
-    // corpus's slowest game -- that is the ADC/SBB memory admission's own census line.
+    // corpus's slowest game: that is the ADC/SBB memory admission's own census line.
     //
     // `0x81` joined on 2026-08-08 (the wolf3d demo-workload census ranked its `/7` word register
     // form at 634M block-stopping hits, the single largest row). The immediate-path check the
@@ -16514,7 +16511,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // it is which of two kinds of path a form lands on, and the two answer differently:
     //
     //  * Paths that CARRY a `MemoryWidth` end to end express Word already, and 0x89 and 0x8b have
-    //    been proving it in production since they were admitted -- `emit_store`'s Word arm is
+    //    been proving it in production since they were admitted: `emit_store`'s Word arm is
     //    `store_r16_disp8` plus `emit_dynamic_word_increment`, guarded by `emit_wide_page_guard`
     //    at 2-byte alignment and by `emit_watched_store_guard`, whose `needs_alignment_guard`
     //    branch probes the LAST byte of the access as well as the first. So a two-byte store
@@ -16526,7 +16523,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     //  * Paths that hard-code a 32-bit destination write cannot, and no allowlist entry fixes
     //    that. MOVZX/MOVSX were the case here: `emit_load_extend` ended in `mov_r32_r32`, which
     //    defines all 32 bits where a 66-prefixed form defines 16. The fix is the `dst_width`
-    //    field, not the admission -- see the MOVZX arm below.
+    //    field, not the admission. See the MOVZX arm below.
     //
     // Still OUT for the second reason, and each would be a miscompile: `0xb8..=0xbf` and `0xc7`'s
     // REGISTER form, both of which produce `MovImm`, whose `mov_r32_imm32(home(dst), imm)` has no
@@ -16538,7 +16535,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // THE SIXTEEN-BIT REGISTER SHIFT LANE (rejected-row campaign, slice 3b) adds `0xc1`, and it is
     // the second kind of path above rather than the first: `Shift` hard-coded a 32-bit destination
     // write until this slice gave it a `width` field, so the admission and the field are one
-    // change. Slice 3 is what asked -- lowering quake's `0x0FB6` memory-word row let its blocks
+    // change. Slice 3 is what asked: lowering quake's `0x0FB6` memory-word row let its blocks
     // extend one instruction further and stop on `shl cx, imm8` instead, relocating 30,692 exits
     // onto `0xC1 /4` and costing quake +8.78% blocks installed and ~1% of wall.
     //
@@ -16567,7 +16564,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     //
     // `0xec` (IN AL,DX) is the V86 PORT CALL-OUT slice, and it is admitted here only because the
     // helper gained its second arm in the SAME commit. It is the first entry on this list whose
-    // value is zero on its own and NEGATIVE on its own -- see the long note on the `0xec`
+    // value is zero on its own and NEGATIVE on its own, see the long note on the `0xec`
     // classifier arm below for the measurement that says so, and for why the pair moves together.
     if insn.operand_size == OperandSize::Word
         && !matches!(
@@ -16609,7 +16606,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // block-stopping hits.
                 | 0x8d
                 | 0x8e
-                // LES/LDS, WORD form only -- the L4 slice. `jit_admits_non_continuable` is the
+                // LES/LDS, WORD form only: the L4 slice. `jit_admits_non_continuable` is the
                 // gate that lets a Word-operand `0xc4`/`0xc5` reach `classify` at all (see that
                 // function); this entry is what keeps the Word gate here from refusing it a
                 // second time once it does. The Dword form stays off `jit_admits_non_continuable`
@@ -16618,8 +16615,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 | 0xc5
                 // XCHG, the whole family, admitted to the S3 `InterpretOne` allowlist. Every one
                 // of them decodes at `OperandSize::Word` in a 16-bit segment whatever its actual
-                // operand width -- `0x86` is a byte exchange and takes its size from the encoding
-                // -- so without this entry the Word gate refuses the loader's rows before the
+                // operand width: `0x86` is a byte exchange and takes its size from the encoding,
+                // so without this entry the Word gate refuses the loader's rows before the
                 // classifier arm can see them. The census ranks `0x87` register word at 1.21 M
                 // block-stopping hits and `0x93`/`0x97` at 507 k.
                 //
@@ -16655,28 +16652,28 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 | 0xc3
                 // RETF (0xcb) and RETF imm16 (0xca), the V86/real-mode far-return slice. On
                 // wolf3d-586 with TOKAEMM resident, 0xcb alone is 99.70% of every block-stopping
-                // non-continuable break -- 274.34 M executions per run, 80.4% of the whole
+                // non-continuable break: 274.34 M executions per run, 80.4% of the whole
                 // interpreted residue. Admission is decided by `retf_admitted_here` in the compile
                 // walk, which is where the CPU mode is in hand; this entry only lets the Word form
                 // reach the classifier arm at all, and the stack-width matrix then builds the one
                 // (SS.B = 0, Word) cell that has an emitter and refuses the rest.
                 | 0xca
                 | 0xcb
-                // INT imm8 (0xcd), and ONLY 0xcd -- 0xcc INT3, 0xce INTO and 0xcf IRET have no
+                // INT imm8 (0xcd), and ONLY 0xcd: 0xcc INT3, 0xce INTO and 0xcf IRET have no
                 // classify arm at any size and keep their `hard_boundary` census arm. Every site
                 // the corpus measures is 16-bit code, so this entry is not a widening of a Dword
                 // row but the ONLY form the row has: without it `classify` returns `None` before
                 // the `0xcd` arm below is ever tried, and the census row would relocate from
-                // `non_continuable` to `hard_boundary` on the ON arm -- the two-arm reconciliation
+                // `non_continuable` to `hard_boundary` on the ON arm: the two-arm reconciliation
                 // error `jit_admits_non_continuable`'s doc describes. Admission is decided by
                 // `int_imm8_admitted_here` in the compile walk, which is where the V86 IOPL state
                 // is in hand.
                 | 0xcd
-                // CALL FAR ptr16:16, L8 (`dev_docs/2026-08-31-corpus-lever-plan.md`). L7 Part 1
+                // CALL FAR ptr16:16, L8 of the corpus lever plan. L7 Part 1
                 // made the ten `0x9A` block-ENTRY sites on 15-move-hole-puzzle (116.3 M of the
                 // corpus's 186.7 M `absent` class) reachable by the Direct dispatcher; without
                 // this entry they would still never reach the classifier arm at Word, and Part 1
-                // would only convert them `absent -> rejected` -- a zero-slot span, no win.
+                // would only convert them `absent -> rejected`: a zero-slot span, no win.
                 // Admission is decided by `call_far_admitted_here` in the compile walk (mirroring
                 // `retf_admitted_here`'s own placement note immediately above), which is where
                 // the CPU mode is in hand; this entry only lets the Word form reach the classifier
@@ -16712,12 +16709,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 | 0xeb
                 | 0xec
                 // `0xe6` (OUT imm8,AL), behind `IZARRAVM_OUT_IMM8_ROWS`. Its own `classify` arm is
-                // gated on the knob, not this entry -- this entry only lets the Word form reach
+                // gated on the knob, not this entry: this entry only lets the Word form reach
                 // that arm at all, which is what `jit_admits_non_continuable`'s doc means by "the
                 // Word admission stays HERE": without this entry classify's OWN internal Word gate
                 // would return `None` before the `0xe6` arm is ever tried, moving the row from
                 // `non_continuable` to `hard_boundary` regardless of what
-                // `jit_admits_non_continuable` decided -- exactly the relocation the two-arm
+                // `jit_admits_non_continuable` decided: exactly the relocation the two-arm
                 // census reconciliation exists to catch. `PortWriteAlImm8` is width-invariant (one
                 // byte, AL, whatever the segment's default operand size), so the entry costs no
                 // new mechanism. Corpus measurement: 123-talk-shareware 238,768 unbound exits,
@@ -16754,7 +16751,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // hits.
                 | 0xfa | 0xfb
                 // PUSHF (0x9c) and POPF (0x9d), N2. Both are `InterpretOne` call-outs at this
-                // width -- PUSHFD (Dword) keeps its existing `Push` lowering below and never
+                // width: PUSHFD (Dword) keeps its existing `Push` lowering below and never
                 // reaches this list's question because its arm produces a kind before this gate
                 // is even consulted at Dword; POPFD (Dword) has no arm at any width and stays
                 // refused, unmeasured and out of scope. This entry only lets the Word forms reach
@@ -16782,7 +16779,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // `0x05..=0x3d` step 8 are ALU form 5, the accumulator with a full-width immediate, and
         // `0x3d` CMP AX,imm16 is the census row (96,182,170 interpreted hits). The whole form is
         // admitted for the closure rule at the top of this file: all eight members reach ONE arm,
-        // which produces `AluImm { dst: 0, width: operand_width }` -- a kind that has carried a
+        // which produces `AluImm { dst: 0, width: operand_width }`, a kind that has carried a
         // width field since the `0x81` slice and whose Word lane (`emit_alu`'s `mov ecx, imm32`
         // then a 66-prefixed `alu_r16_r16` with both operands masked, then `emit_write_gpr16`) has
         // been in production on `0x81`/`0x83` since then. `decode` fetches this immediate with
@@ -16791,7 +16788,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // (`0x1d`) are ADMITTED here as of the L1 width lift, the same way forms 1 and 3 are: they
         // reach this gate already, and the classifier arm below no longer refuses `op 2|3` for any
         // of the three forms now that `emit_carry_alu_preloaded` carries a Word lane. This entry
-        // predates that lift and was never the thing refusing them -- the arm was -- so nothing
+        // predates that lift and was never the thing refusing them (the arm was) so nothing
         // here needed to change beyond this comment.
         //
         // `0xa1` / `0xa3` are the moffs word forms, and they are the pair the long note above
@@ -16830,7 +16827,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // `0x85` is named in this file's header as a Dword sibling whose kind hard-codes Dword,
         // and that WAS the whole reason it was refused at Word. `DirectKind::Test` carries a
         // `width` as of this slice, exactly as `0xC7`, `0x81`, `0xB8..=0xBF` and `0xA1`/`0xA3`
-        // each grew one before it, so the header entry is discharged rather than excepted -- see
+        // each grew one before it, so the header entry is discharged rather than excepted, see
         // the arm below and `test_word_rows_enabled` for the census that ranked it (duke3d-586,
         // 53,583,389 runtime hits, 42.2% of the whole rejected table) and for the suffix
         // measurement that prices its extension exposure at ONE instruction.
@@ -16846,7 +16843,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // allowlist term, its own for the same reason the two above are: the gate-off arm stays
         // byte-identical to the pre-slice tree by inspection. `0xd3` reaches this list; the
         // `/4..=7` narrowing that keeps ROL/ROR/RCL/RCR out lives in the classifier arm below,
-        // not here -- admitting the opcode does not sweep the rotates in.
+        // not here: admitting the opcode does not sweep the rotates in.
         && !(word_shift_cl_rows_enabled() && insn.opcode == 0xd3)
         // Group 3, admitted by SUB-OPCODE rather than by adding `0xf7` to the list above, because
         // the group's members do not get the same answer and the list cannot say so.
@@ -16863,8 +16860,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // The post-S2 loader census ranks /6 DIV r16 at 729 k block-stopping hits, /4 MUL r16 at
         // 482 k and /0 word memory TEST at 242 k.
         //
-        // `/1` is not a group-3 operation at all -- the interpreter answers it with
-        // `undefined_opcode` -- so it stays refused here rather than being compiled into a block
+        // `/1` is not a group-3 operation at all: the interpreter answers it with
+        // `undefined_opcode`, so it stays refused here rather than being compiled into a block
         // that can only ever fault.
         && !(insn.opcode == 0xf7 && insn.modrm.is_some_and(|m| m.reg != 1))
         // `0xe4` IN AL,imm8, gp2's B2 residue, its OWN knob-gated term for the same reason
@@ -16887,7 +16884,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // collapses to `&& !false`.
         //
         // KEYED ON THE SUB-OPCODE as well as the opcode. `/0` and `/1` (ROL/ROR) USED TO be named
-        // here as "the byte ROTATES, which have no arm and no emitter at this width" -- true when
+        // here as "the byte ROTATES, which have no arm and no emitter at this width", true when
         // that sentence was written, false since `vorvek/direct-word-rot1` gave them
         // `DirectKind::RotateRegByte` and `emit_rotate_reg8`. THIS is the row the corpus actually
         // measures: `123-talk-shareware`'s `0xD0 register /1` and `/0` rows (24.86M and 0.45M
@@ -16918,13 +16915,13 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
         // with the same result and the same flags. The emitted code does not read `operand_width`:
         // every arm hard-codes `MemoryWidth::Byte` or carries no width field at all (`RotateRegByte`
         // has none, exactly as `RotateReg` at Dword has none), as `0xC6`'s Shift arm does. And this
-        // is the byte set's own CLOSURE rule rather than an exception to it -- opcodes whose arms
+        // is the byte set's own CLOSURE rule rather than an exception to it: opcodes whose arms
         // produce a kind whose width is a literal `Byte` fact, not a decoded one, which is exactly
         // the property the ungated list above is built on.
         //
         // THE MEMORY FORM RIDES THIS TERM UNCHANGED, and the term needed no widening for it: it
         // keys on `insn.opcode` and `m.reg` alone and has always been form-agnostic. What changed
-        // with `vorvek/direct-rot-mem-lane` is the sentence above rather than the test -- a memory
+        // with `vorvek/direct-rot-mem-lane` is the sentence above rather than the test: a memory
         // `0xC0`/`0xD0` now produces `DirectKind::RotateShiftMem`, whose `width` field this arm
         // sets to a literal `MemoryWidth::Byte` for exactly the reason `Shift`'s and
         // `RotateRegByte`'s arms do. The closure rule holds for it verbatim: the width is the
@@ -17025,8 +17022,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // The register forms of BTS/BTR/BTC ride the arm with their memory forms, and that is the
     // closure rule at the top of this file rather than a widening for its own sake: `0F BA /5`
     // register is a call-out because the whole `0F BA` group is one interpreter arm, so refusing
-    // `0F AB` register -- the same operation with the index in a register instead of an immediate,
-    // through the same `bit_string_op` -- would be arbitrary. They reach one helper because the
+    // `0F AB` register (the same operation with the index in a register instead of an immediate,
+    // through the same `bit_string_op`) would be arbitrary. They reach one helper because the
     // helper runs the decode line.
     //
     // The whole family joins the `OperandSize::Word` allowlist above with this slice. That is what
@@ -17049,8 +17046,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             });
         }
     }
-    // `0x0F02` LAR and `0x0F03` LSL, the descent2 L2 lever
-    // (`dev_docs/2026-09-05-586-laggard-board.md`): 20.6 M block-stopping exits on
+    // `0x0F02` LAR and `0x0F03` LSL, the descent2 L2 lever:
+    // 20.6 M block-stopping exits on
     // descent2-3dfx-586, the identical `0x0f02 /1 register dword` row on tombraid-loader-586.
     // Keyed on the full u16 opcode and placed ABOVE the `u8::try_from(insn.opcode).ok()`
     // truncation for the same reason `0x0faf` and the bit-string family are: that truncation
@@ -17060,11 +17057,11 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     // Both register and memory forms are admitted, and every operand size: the helper runs the
     // decode line through the interpreter (`execute_extended.rs` `0x0f02`/`0x0f03`), which handles
     // both forms and both widths identically, so there is no emitter and no width field to get
-    // wrong here -- the same shape `BitString`'s memory forms take immediately above. The
+    // wrong here: the same shape `BitString`'s memory forms take immediately above. The
     // interpreter's own first statement is the mode check (`!self.is_protected_mode()` raises
     // `#UD`), so a block compiled in real mode or V86 still admits the slot and the fault delivers
     // normally at execute time, exactly as an out-of-range or null selector clears ZF rather than
-    // faulting -- neither path needs a compile-time gate.
+    // faulting: neither path needs a compile-time gate.
     //
     // Priced in the LAR/LSL slot class rather than through `INTERPRET_ONE_MAX_CORE_CLOCKS`; see
     // `InterpretOneRow::Lar`'s doc for why.
@@ -17116,7 +17113,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
     //
     // `width` is the SOURCE width and comes from the sub-opcode. `dst_width` is the DESTINATION
     // width and comes from `operand_width`, i.e. from CS.D and the 0x66 prefix. They are
-    // independent -- `66 0F B6` is a byte source into a word destination -- and confusing them in
+    // independent: `66 0F B6` is a byte source into a word destination, and confusing them in
     // either direction is a miscompile: `width` from `operand_width` turns every byte capture
     // into a dword read; `dst_width` hard-coded to Dword clobbers the destination's high half on
     // the 66-prefixed forms. The doom census ranks `0x0FB6` memory word at 1,442,795 exits and
@@ -17214,12 +17211,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // Operand roles follow `execute_alu_decoded`'s form-0 arm exactly: `a` is the
                 // r/m (the destination, written back unless op is CMP) and `b` is `modrm.reg`.
                 // That is the OPPOSITE assignment from form 2 below, and getting it backwards is
-                // silent for the commutative ops and wrong for SUB/SBB/CMP — which is why the two
+                // silent for the commutative ops and wrong for SUB/SBB/CMP, which is why the two
                 // arms name `dst` and `src` explicitly rather than sharing a helper.
                 //
-                // Width is a property of the form, not of the prefix — the interpreter's arm
+                // Width is a property of the form, not of the prefix: the interpreter's arm
                 // reads `read_operand_u8`/`read_gpr8` and charges the same `clocks(2)` as every
-                // other ALU form without consulting `operand_size` — so `MemoryWidth::Byte` is a
+                // other ALU form without consulting `operand_size`, so `MemoryWidth::Byte` is a
                 // literal here rather than `operand_width`. 0x38 is deliberately NOT in the
                 // Word-size allowlist above, so a 66-prefixed encoding never reaches this arm.
                 0 => {
@@ -17254,7 +17251,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         //
                         // A missed lowering rather than a hazard, and the reason is economics.
                         // 16-bit DOS code has no alignment discipline, and an `AluMemDest` slot
-                        // lowers through `emit_alu_mem_dest` -- one of the ELEVEN memory sites
+                        // lowers through `emit_alu_mem_dest`, one of the ELEVEN memory sites
                         // that still refuse a misaligned access outright. Guard 3 relaxed only the
                         // two lean one-lookup sites (the plain load and the plain store), so
                         // naming the guard here would now be wrong: the refusal is the SITE's, not
@@ -17263,8 +17260,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         // retires natively.
                         //
                         // This is the hook for the read-modify-write follow-on. An RMW slot needs
-                        // a read deposit AND a write deposit inside one slot -- guard 3's stubs
-                        // each carry one -- which is what has to be built before this arm can be
+                        // a read deposit AND a write deposit inside one slot (guard 3's stubs
+                        // each carry one) which is what has to be built before this arm can be
                         // opened, not a census row.
                         DecodedOperand::Mem(_)
                             if insn.operand_size == OperandSize::Word && op != 7 =>
@@ -17316,7 +17313,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         // dispatches to the RELAXED lean one-lookup read site whenever
                         // `one_lookup_load` is on (the default). So a misaligned page-local operand
                         // is served natively with the split bus charge instead of side-exiting at
-                        // that slot on every execution — which is exactly the economics that keep
+                        // that slot on every execution, which is exactly the economics that keep
                         // form 1's read-modify-write shape refused, since site 6 carries the
                         // unrelaxed guard and would need a read deposit AND a write deposit inside
                         // one slot. `a_misaligned_word_alu_memory_source_runs_natively` in
@@ -17343,7 +17340,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         //
                         // The census asked for this one. `IZARRAVM_DIRECT_BARRIER_CENSUS=1` on
                         // peachdrm-586 ranks `0x2B` SUB r16,r/m16 word memory at 655,103,963 of
-                        // 661,739,172 barrier runtime_hits — 99.0%, a single shape. The whole
+                        // 661,739,172 barrier runtime_hits, 99.0%, a single shape. The whole
                         // non-carry set lands together because it is one arm and one emitter path,
                         // and because the relocation trap predicts `0x03` would simply inherit
                         // `0x2B`'s exits otherwise.
@@ -17397,7 +17394,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // and Dword otherwise. It has always been passed rather than hard-coded, which is
                 // what let the admission be an allowlist entry rather than an emitter change; the
                 // carry members (`0x15`/`0x1d`) reach this SAME arm and are admitted at Word too,
-                // as of the L1 width lift -- `emit_alu` stages RCX exactly as the register forms
+                // as of the L1 width lift: `emit_alu` stages RCX exactly as the register forms
                 // do, so `emit_carry_alu_preloaded`'s new Word lane serves them with no arm change.
                 5 => {
                     return Some(DirectKind::AluImm {
@@ -17426,7 +17423,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // instruction.
             //
             // A CALL-OUT rather than a lowering, and for a SIZE reason rather than a reachability
-            // one -- emitted code can reach guest memory perfectly well; eight guarded accesses per
+            // one: emitted code can reach guest memory perfectly well; eight guarded accesses per
             // instruction is what does not fit a one-host-page block. The call-out section
             // carries the class table, the two-phase resident-then-move design, and a note on the
             // single-wide-guard shape that would beat this if the family is ever worth more wall.
@@ -17513,7 +17510,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     width: operand_width,
                 });
             }
-            // IN AL, DX -- the FIRST and, this phase, the ONLY interpreter call-out slot. Not a
+            // IN AL, DX: the FIRST and, this phase, the ONLY interpreter call-out slot. Not a
             // native lowering: the block spills, routes this one instruction through the
             // interpreter's port path (which needs the bus, and the bus is not reachable from
             // emitted code), reloads, and keeps running. See the call-out section for the
@@ -17529,15 +17526,15 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // THE 2026-08-11 REFUTATION BELOW IS SUPERSEDED, and is kept because its measurement
             // is still the reason the admission cannot travel alone. What it refuted was the ONE
-            // LINE version -- the allowlist entry with the helper's blanket V86 refusal left in
+            // LINE version: the allowlist entry with the helper's blanket V86 refusal left in
             // place. That version is still provably negative, and re-deriving it from the census
             // is still the mistake the note was written to stop.
             //
-            // What changed is the helper. `dev_docs/wolf-v86-port-callout-design.md` takes the
+            // What changed is the helper. The wolf V86 port call-out design takes the
             // 08-11 numbers apart into THREE gates rather than the two the earlier reading saw,
             // and shows that the 136.8M call-outs which executed could only have arrived by
             // CHAINED entry (a chained transfer never returns to `run_direct_block`, so its
-            // entry gate cannot have refused them) -- i.e. links into a call-out block already
+            // entry gate cannot have refused them), i.e. links into a call-out block already
             // bind and already fire at nine-figure volume on this exact fixture. The remaining
             // 100% abnormal rate was the helper's first statement, and `port_read_al_dx` now has
             // a two-phase arm that answers the TSS I/O-bitmap question purely (TLB hits only, an
@@ -17550,23 +17547,23 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // used to be. Reverting either half alone re-creates exactly the measurement below.
             //
             // The superseded reading, verbatim:
-            // `dev_docs/wolf3d-586-measurement-results.md` ranks this row at
+            // The wolf3d-586 measurement results rank this row at
             // 370,316,594 of 381,560,241 block-stopping hits (97.05%) on wolf3d-586 and recommends
             // exactly one line: `0xec` added to the list above. Built and run (2026-08-11,
             // A/B/B/A at ProcessorIndex 8, 12e9 clocks) it serves ZERO port reads natively, and
-            // the reason is the one fact a barrier census cannot see -- THE GUEST IS IN V86 MODE.
+            // the reason is the one fact a barrier census cannot see: THE GUEST IS IN V86 MODE.
             // wolf3d-586's CONFIG.SYS loads TOKAEMM, so every 16-bit block runs under the V86
             // monitor, and V86 is the FIRST thing `port_read_al_dx` refuses (module docs, abnormal
             // producer 1: the TSS I/O-bitmap probe page-walks, which is unsupportable from inside
             // a live block). With the admission in, the full run measures
             // `side_exit_callout_abnormal` 136,772,308 against `jit_direct_callout_executed`
-            // 136,772,308 -- ONE HUNDRED PERCENT of the call-outs that ran returned abnormal --
+            // 136,772,308: ONE HUNDRED PERCENT of the call-outs that ran returned abnormal,
             // plus 233,559,698 whole-block entries refused up front by `run_direct_block`'s
             // `callout_port_slots` privilege gate. So the admission buys a spill, a call, a reload
             // and a side exit where a free barrier used to be, and refuses 9.3% of this fixture's
             // block entries outright, in exchange for nothing at all.
             //
-            // (The four wall legs were 289.706 / 294.872 / 304.269 / 312.868 s in A/B/B/A order --
+            // (The four wall legs were 289.706 / 294.872 / 304.269 / 312.868 s in A/B/B/A order:
             // a monotonic 8% HOST DRIFT that swamps the effect, so the drift-corrected wall delta
             // of −0.57% is noise and is NOT the evidence here. The evidence is that not one port
             // read was served: `perf.instructions` was byte-identical at 15,218,471,683 on all
@@ -17579,8 +17576,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // 1,085 of 26,612,249 (doom-586) and 135,164 of 1,836,356,449 (gp2-586). The problem
             // is V86, not the mechanism.
             //
-            // The note's own item 1 -- "a V86-capable port call-out ... that is the slice that
-            // unlocks 97% of this census; it is a real slice, not a list entry" -- is the slice
+            // The note's own item 1 ("a V86-capable port call-out ... that is the slice that
+            // unlocks 97% of this census; it is a real slice, not a list entry") is the slice
             // that shipped, with the residency probe read off the TLB and the bus rather than off
             // the FastMap. Item 2 (a compile-time V86 refusal of the slot) is now moot.
             // (End of the superseded reading.)
@@ -17595,7 +17592,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     helper: CallOutHelper::PortReadAlDx,
                 });
             }
-            // OUT DX, AL -- the write twin of the arm above, admitted unconditionally with no
+            // OUT DX, AL: the write twin of the arm above, admitted unconditionally with no
             // knob, for the same reason `0xEC` is. `jit_admits_non_continuable` is what lets the
             // compile walk reach this arm at all (`0xEE` is a `non_continuable` opcode per
             // `block_continuable`'s own OUT refusal); this arm is the emittability half.
@@ -17604,7 +17601,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // two-phase probe, same `port_io_core_clocks(bus, true)` charge, same unconditional step break
             // for the reason stated on `port_write_al_imm8`'s doc: a port write can make an
             // interrupt newly deliverable from inside `write_io`, and the guest class this row is
-            // measured on -- 16-bit V86 -- never sets `io_touched` on a write either, the same gap
+            // measured on, 16-bit V86, never sets `io_touched` on a write either, the same gap
             // `PortWriteAlImm8` was built to close for ring-0 protected mode) but reads its port
             // from DX at runtime instead of a compile-time immediate, the same difference
             // `PortReadAlDx` carries against `PortReadAlImm8`. No poll-skip scan: the scan needs a
@@ -17622,14 +17619,14 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     helper: CallOutHelper::PortWriteAlDx,
                 });
             }
-            // IN AL, imm8 -- gp2's B2 residue, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
-            // (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3). The lean sibling
+            // IN AL, imm8: gp2's B2 residue, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
+            // (in-imm8 call-out design rev 3). The lean sibling
             // of the arm above: same `port_permission_resident` two-phase probe, same shared
             // `port_io_core_clocks(bus, false)` charge, no poll-skip scan (rev 3 §1.4).
             //
             // `classify` admits ANY immediate port here, unconditionally (rev 3 §1.1, ROUND-2
             // item 5 correction): the per-port-class safety table the design carries is a PROOF
-            // that every reachable class is safe, not a `classify`-arm filter -- gating this arm
+            // that every reachable class is safe, not a `classify`-arm filter: gating this arm
             // to "only the ports this routine happens to read" would admit exactly the port class
             // that needs no proof (any port whose read sets `io_touched` is self-safing through
             // `requires_step_break()`, the same argument the OUT refusal below already makes) and
@@ -17637,13 +17634,13 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // | port class | sets `io_touched`? | can it make an interrupt newly deliverable? |
             // |---|---|---|
-            // | PIT counter (0x40..=0x42) | No | No -- `read_port_at` is a pure peek against
+            // | PIT counter (0x40..=0x42) | No | No: `read_port_at` is a pure peek against
             //   `elapsed_pit_clocks`; it does not advance the counter's own reload/decrement
             //   schedule or touch the PIC. |
-            // | VGA status (0x3DA, lazy path) | No, when `lazy_port_reads` | No -- the case
+            // | VGA status (0x3DA, lazy path) | No, when `lazy_port_reads` | No: the case
             //   `0xEC`'s own shipped helper already relies on without a step break. |
             // | Any port whose read DOES set `io_touched` (PIC, DMA, non-lazy VGA, etc.) | Yes |
-            //   Not applicable -- `requires_step_break()` ends the block at the slot itself, so no
+            //   Not applicable: `requires_step_break()` ends the block at the slot itself, so no
             //   LATER instruction in the block can observe a stale pendency answer. |
             // | Any other port `read_io` might reach | Unknown | EITHER it sets `io_touched`
             //   (self-terminating, safe by construction) OR it does not (the PIT row's argument,
@@ -17662,8 +17659,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     },
                 });
             }
-            // OUT imm8, AL -- gp2's 59,968,424-exit row, behind `IZARRAVM_OUT_IMM8_ROWS`
-            // (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B). The WRITE twin of the arm
+            // OUT imm8, AL: gp2's 59,968,424-exit row, behind `IZARRAVM_OUT_IMM8_ROWS`
+            // (Option B of the gp2 OUT 0xE6 research). The WRITE twin of the arm
             // above: same `port_permission_resident` two-phase probe, same privilege gate, same
             // compile-time port immediate riding the fourth-argument channel, no poll-skip scan.
             //
@@ -17673,8 +17670,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //    interpreter's `0xE6` arm charges 10, and the exact-clocks claim is what the
             //    census identity gate reads.
             // 2. THE STEP BREAK IS UNCONDITIONAL, not `bus.requires_step_break()`. A port WRITE can
-            //    make an interrupt newly deliverable from inside `write_io` -- the PIT arm's
-            //    `pic.request(0)` on a channel-0 control word raising OUT -- and on a ring-0
+            //    make an interrupt newly deliverable from inside `write_io` (the PIT arm's
+            //    `pic.request(0)` on a channel-0 control word raising OUT) and on a ring-0
             //    protected-mode guest `io_touched` is never set, so the bus's own answer is false
             //    for exactly the guest class that carries this row. The bit ends the BLOCK, not
             //    the run, and buys no earlier delivery than the interpreter's; read
@@ -17684,8 +17681,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // ANY immediate port, unconditionally, for the reason the arm above admits any: the
             // forced break discharges the pendency obligation for every port at once, so a
             // per-port allowlist would exclude nothing that needed excluding. This arm is
-            // width-invariant -- it reads AL and bakes a port immediate whichever operand size the
-            // segment decoded at -- so admitting the Word form costs no new mechanism, only
+            // width-invariant: it reads AL and bakes a port immediate whichever operand size the
+            // segment decoded at, so admitting the Word form costs no new mechanism, only
             // `jit_admits_non_continuable`'s Word guard, which the corpus campaign's measurement
             // removed (see that function's doc): `0xE6` word is 123-talk-shareware's #1
             // `non_continuable` row at 238,768 unbound exits, 173,344 on 1000-miglia, 11,530 on
@@ -17719,7 +17716,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // `reg != 0` is refused HERE rather than left to the helper. Those encodings are
             // illegal and the interpreter's arm answers them with `undefined_opcode`, which the
-            // helper would deliver through its fault arm -- correct, but it would burn a call-out
+            // helper would deliver through its fault arm: correct, but it would burn a call-out
             // and a governor execution on every one of them, and a block would be compiled around
             // an instruction that can only ever fault.
             //
@@ -17745,7 +17742,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             }
             // CLD / STD. Ranked third in the runtime-weighted reject audit at 1.37M dispatcher
             // exits (10.9% of rejected-target exits) despite being worth only ~0.06pp of
-            // instruction coverage -- coverage share and dispatch-exit share are different
+            // instruction coverage: coverage share and dispatch-exit share are different
             // quantities, and an earlier slice dismissed this opcode on the wrong one.
             //
             // ON the OperandSize::Word allowlist above since the S1 width lift. The old refusal
@@ -17807,7 +17804,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // Unlike CLD/STD above these ARE on the Word allowlist (under the gate), because the
             // measured row is a 16-bit one. Neither instruction consults `operand_size` in the
-            // interpreter -- both are one `set_flag(FLAG_CF, ..)` -- so the two widths are the
+            // interpreter: both are one `set_flag(FLAG_CF, ..)`, so the two widths are the
             // same operation and the kind carries no width to get wrong.
             0xf8 | 0xf9 if v86_loop_rows_enabled() => {
                 return Some(DirectKind::CarryFlag {
@@ -17853,7 +17850,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // path, which is sound for the Dword lowering but would refuse the Word row outright
             // rather than let a V86 IOPL<3 task fault the way the interpreter does. The call-out's
             // fault arm covers that instead, the same argument that admitted `Cli`. The Dword form
-            // is UNTOUCHED -- it keeps the existing `Push` lowering below, which already ships and
+            // is UNTOUCHED: it keeps the existing `Push` lowering below, which already ships and
             // is not part of this row's measured population (every corpus guest is 16-bit).
             0x9c if insn.operand_size == OperandSize::Word => {
                 return Some(DirectKind::CallOut {
@@ -17868,7 +17865,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 });
             }
             // POPF, WORD form only, N2. No `classify` arm existed for this opcode at any width
-            // before this row -- see the pin comment on `key_for_phys` and
+            // before this row, see the pin comment on `key_for_phys` and
             // `v86_sensitive_opcodes_keep_their_word_answers`, both updated in this commit. POPFD
             // (Dword) is deliberately left with no arm: the corpus evidence (21-for-1-to-4's
             // `0x9d` row, its #1 rejected row at 23,476,271 unbound exits + 718,016 dyn,
@@ -17878,7 +17875,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // Its interpreter arm (`execute.rs` `0x9d`) calls `check_v86_iopl` before touching any
             // state and then `load_flags`, which writes `eflags` directly and clears
-            // `pending_flags` in the same call -- no lazy-descriptor staleness window for
+            // `pending_flags` in the same call: no lazy-descriptor staleness window for
             // `ResumeSnapshot::allows_resume` to read through. R3's existing TF and IF clauses,
             // neither scoped to a specific row, already cover every flag this instruction can
             // move.
@@ -17899,7 +17896,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // the IDT and the GDT to read its gate. Both need the `deferred_code_writes` window
             // that `interpret_one` opens around its step, or a push into the running block's own
             // page would reach `invalidate_physical_range` with that block's native frame still on
-            // the host stack. And it loads CS:EIP, so the slot's exit must advance EIP by ZERO --
+            // the host stack. And it loads CS:EIP, so the slot's exit must advance EIP by ZERO,
             // which is exactly what the two RESYNC stubs the `InterpretOne` class already emits
             // do, and what every other exit in `emit` deliberately does not do. A dedicated helper
             // would have had to reproduce both mechanisms plus the fault tail; running the
@@ -17929,7 +17926,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // Deliberately NOT added to the `OperandSize::Word` allowlist above, and the reason is
             // the NOP/CLD one rather than a hazard: SAHF's interpreter arm never consults
             // `operand_size` (it reads AH and rewrites five EFLAGS bits, both width-invariant), so
-            // a Word admission would be CORRECT and simply unmeasured -- no census row, 16-bit or
+            // a Word admission would be CORRECT and simply unmeasured: no census row, 16-bit or
             // otherwise, and this campaign does not ship admissions with no counter to gate them.
             // `sahf_word_segment_form_stays_a_barrier` pins that the unprefixed form in a
             // CS.D = 0 segment is refused rather than lowered or panicking, which is the shape the
@@ -17948,7 +17945,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // PUSH CS (0x0e) joined on 2026-08-08 when the wolf3d demo-workload census
             // ranked it at 158M block-stopping hits: it needs NO `selector_segment` entry because
-            // CS is not in `SegmentLayout.data` at all — `SegmentLayout::selector` reads the
+            // CS is not in `SegmentLayout.data` at all: `SegmentLayout::selector` reads the
             // separate `cs` field and `cs_matches` pins it for every block unconditionally, the
             // same argument that already carries `mov r16, cs` through `MovSegToReg`.
             //
@@ -18018,7 +18015,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // NOT through `stack_width_kind`. `PopSegReal` is refused there in protected mode and
             // refused again on a 32-bit stack, because its emitter knows one shape: three stores
             // computing `base = selector << 4` off a 16-bit stack read. This row has no emitter at
-            // all -- the helper runs the interpreter's own `0x17` arm -- so every mode and both
+            // all: the helper runs the interpreter's own `0x17` arm, so every mode and both
             // stack widths are the interpreter's, including the 386 PRM rule that a Dword POP SS
             // moves four bytes of stack and loads the low sixteen. `DirectKind::CallOut` is not in
             // `uses_stack`, so the width matrix is not consulted and does not need to be.
@@ -18050,8 +18047,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // These are the rejected-row campaign's `non_continuable` rows, and lowering them
             // takes TWO changes, not one. `block_continuable` (decode.rs) routes 0x69/0x6b to
-            // `DecodeGroup::Misc` -- the "heterogeneous one-off single-byte block", a decode
-            // CLASSIFICATION neighbourhood, not a semantic class -- and refuses the whole group
+            // `DecodeGroup::Misc`, the "heterogeneous one-off single-byte block", a decode
+            // CLASSIFICATION neighbourhood, not a semantic class, and refuses the whole group
             // bar TEST AL/AX,imm. The compile walk consults `insn.continuable` before it ever
             // reaches `classify`, so this arm is dead without the walk's own admission
             // (`jit_admits_non_continuable`, direct.rs) and that admission relocates the row onto
@@ -18060,7 +18057,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // MEMORY form deliberately absent. It is a missed lowering, not a hazard: the `else`
             // returns None and the instruction stays exactly the barrier it is today. Building it
             // means an `ImulMemImm` alongside `ImulMem` with the full memory side-exit set, for a
-            // row the census measures at 473 quake exits and zero doom -- an unmeasured mechanism
+            // row the census measures at 473 quake exits and zero doom, an unmeasured mechanism
             // by this campaign's standing rule. The register row is doom's largest at 244,547.
             //
             // Below the `OperandSize::Word` gate, and 0x69/0x6b are absent from its allowlist, so
@@ -18104,24 +18101,24 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             }
             0x81 | 0x83 => {
                 let m = insn.modrm?;
-                // ADC (/2) and SBB (/3) are admitted at Word size as of the L1 width lift
-                // (`dev_docs/2026-08-31-corpus-lever-plan.md`), for the REGISTER and the MEMORY
+                // ADC (/2) and SBB (/3) are admitted at Word size as of the L1 width lift,
+                // for the REGISTER and the MEMORY
                 // form alike, and the two forms got there by two different routes.
                 //
                 // The MEMORY form needed no emitter change at all: `emit_alu_candidate` /
                 // `emit_commit_alu_candidate` (below) were already width-parameterised through
-                // `width_tag` and already branched on the incoming CF for ANY op at ANY width --
+                // `width_tag` and already branched on the incoming CF for ANY op at ANY width:
                 // the carry-in test happens once, per instruction, independent of `width`. This
                 // arm's old refusal was purely a classifier decision with no emitter behind it, so
                 // removing it is the whole admission. Pyramid-586 ranks `0x83 word mem /2` at
                 // 18,902,081 runtime hits, the largest non-monitor row in the corpus's slowest
-                // game, and tyrian-586 carries `/3` at 3,223,263 -- both this shape exactly.
+                // game, and tyrian-586 carries `/3` at 3,223,263, both this shape exactly.
                 //
                 // The REGISTER form needed `emit_carry_alu_preloaded` to grow a Word arm, since it
                 // used to be Dword-only (`alu_r32_r32` on both branches) with pending tags
                 // 0x8000_0200 / 0x8000_0201 that assumed Dword. Its Word arm now exists and tags
-                // 0x8000_0100 / 0x8000_0101 on the no-carry branch -- the SAME class the non-carry
-                // Word lane already used for ADD/SUB -- because a clear incoming CF makes ADC/SBB
+                // 0x8000_0100 / 0x8000_0101 on the no-carry branch, the SAME class the non-carry
+                // Word lane already used for ADD/SUB, because a clear incoming CF makes ADC/SBB
                 // compute exactly as ADD/SUB do; see that function's doc. `0x15`/`0x1d` (the
                 // accumulator immediate form) and `0x11`/`0x13`/`0x19`/`0x1b` (the plain register
                 // forms) share this same arm, so all three admissions are one emitter change.
@@ -18147,7 +18144,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     // `movzx_r32_word_disp8`, so the ALU sees a 16-bit operand and the lazy
                     // descriptor's `a`/`b` are 16-bit values; the write-back is `store_r16_disp8`,
                     // so the two adjacent bytes are untouched. `emit_alu_candidate` uses
-                    // `alu_r16_r16` -- a real 66-prefixed host instruction -- so CF and OF are the
+                    // `alu_r16_r16`, a real 66-prefixed host instruction, so CF and OF are the
                     // 16-bit ones rather than a 32-bit operation's masked afterwards, and
                     // `emit_commit_alu_candidate` tags the descriptor 0x100 for Word where it tags
                     // 0x200 for Dword. Nothing in that path had to be built; it had no caller.
@@ -18280,7 +18277,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // MOV r/m16, Sreg. The interpreter writes `OperandSize::Word` unconditionally
                 // ("always a word store regardless of operand size", execute.rs 0x8c), so this
                 // kind carries no width and both the prefixed and unprefixed encodings lower
-                // identically — which is what lets 0x8c join the Word-size allowlist above.
+                // identically, which is what lets 0x8c join the Word-size allowlist above.
                 // reg 6 and 7 are left to the interpreter deliberately. `segment_from_reg_field`
                 // folds them into GS through a catch-all `_` arm rather than by intent, and
                 // reproducing an accident is how a lowering and its oracle drift apart; 0..=5 are
@@ -18307,7 +18304,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     // the other two of 0..=5: the helper runs the decode line, so there is no
                     // per-segment lowering to get wrong and refusing four of six would be the
                     // arbitrariness this file's header rules out. `/6` and `/7` stay refused by
-                    // the match above, on the same ground the register form refuses them --
+                    // the match above, on the same ground the register form refuses them:
                     // `segment_from_reg_field` folds them into GS through a catch-all rather
                     // than by intent, and a block compiled around an accident is worse than a
                     // boundary.
@@ -18348,7 +18345,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // WHAT IT COSTS, as revised by S4f. R2 compares the segments the slots STRICTLY
             // AFTER this one bake, plus CS and SS, and not all six records. So a load that moves
             // a record NO LATER SLOT USES resumes, and one that moves a record a later slot bakes
-            // resyncs -- and the second still demotes after three of its first eight executions,
+            // resyncs, and the second still demotes after three of its first eight executions,
             // back to the boundary it had before.
             //
             // The relaxation is the S4 census's answer to its own top remaining barrier class:
@@ -18362,7 +18359,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // because they are not loads at all: the interpreter raises #UD for each
             // (`execute.rs`, the 0x8e arm). Compiling a block around an instruction that can only
             // fault burns a call-out and a governor execution on every execution, and 0x8c is NOT
-            // the symmetric case to copy -- `MOV r16, CS` is legal where `MOV CS, r16` is not.
+            // the symmetric case to copy: `MOV r16, CS` is legal where `MOV CS, r16` is not.
             //
             // A CALL-OUT SLOT REPORTS NO SEGMENT WRITE, unlike the `LoadSegReal` lowering it
             // replaces: `DirectKind::written_segment` answers `None` for it, so the block's
@@ -18419,7 +18416,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     _ => return None,
                 };
                 // The MEMORY form used to be an unconditional `InterpretOne` call-out here, mode
-                // and all -- `classify` has no `&CpuGsw`, so it could not tell real mode from
+                // and all: `classify` has no `&CpuGsw`, so it could not tell real mode from
                 // protected. It returns the same lowering the register arm below does now,
                 // unconditionally, and `stack_width_kind` is what rewrites a protected-mode
                 // instance back into the identical call-out (`InterpretOneRow::MovSreg`), so a
@@ -18432,8 +18429,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     }),
                 };
             }
-            // LES (0xc4) / LDS (0xc5), WORD form only. The register form does not exist --
-            // `mod == 3` raises #UD (`execute_system_seg_decoded`'s own comment) -- so
+            // LES (0xc4) / LDS (0xc5), WORD form only. The register form does not exist:
+            // `mod == 3` raises #UD (`execute_system_seg_decoded`'s own comment), so
             // `insn.operand` is Mem for every legal encoding, and the `else` arm below covers the
             // illegal one the same way an unreached memory form does elsewhere in this file: it
             // returns `None`, the instruction stays a barrier, and the interpreter delivers the
@@ -18442,7 +18439,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // Reached only at Word: `jit_admits_non_continuable` withholds the Dword form from
             // `classify` entirely (see that function and the Word allowlist entry above), so
             // there is no operand-size branch to write here. `LesLds` carries no width field for
-            // the same reason `PopSegReal` doesn't -- one width exists.
+            // the same reason `PopSegReal` doesn't: one width exists.
             0xc4 | 0xc5 => {
                 let DecodedOperand::Mem(addr) = insn.operand? else {
                     return None;
@@ -18495,7 +18492,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // end since `0x8b`: at Word `emit_load` reads two bytes through
             // `movzx_r32_word_disp8` and writes the destination with `emit_write_gpr16`, merging
             // into AX and leaving EAX's high half exactly as `write_gpr_sized(0, Word, ..)` does.
-            // `raw_clocks: 4` is right at both widths -- the interpreter's arm returns `clocks(4)`
+            // `raw_clocks: 4` is right at both widths: the interpreter's arm returns `clocks(4)`
             // without consulting `operand_size`.
             //
             // The moffs displacement is fetched at ADDRESS size and zero-extended (`decode`), so a
@@ -18583,7 +18580,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // was measured rather than assumed: `block_continuable` refuses INS/OUTS above this
             // function entirely, so widening this arm to `0x6c..=0x6f` changes nothing observable
             // and is a mutation that SURVIVES. Do not read that survival as the arm being
-            // decorative -- read it as this bar being the one that still holds if the walk's
+            // decorative. Read it as this bar being the one that still holds if the walk's
             // continuable rule ever moves.
             //
             // A CALL-OUT rather than a lowering, and the reason is the operand path rather than the
@@ -18596,7 +18593,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // NO REP FORM reaches here: `prefixes_supported_for` and `addr32_word_admitted` refuse
             // the prefix upstream and the walk stops as `BarrierStop::PrefixUnsupported`, a
             // different census arm. The 0x67 form reaches here only through the knob. That is
-            // what makes the admitted form a SINGLE-STEP object -- `run_string`'s
+            // what makes the admitted form a SINGLE-STEP object: `run_string`'s
             // `prefixes.rep == None` arm is one `string_step` with no yielding and no
             // `rep_execution` bookkeeping.
             //
@@ -18653,7 +18650,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // Three things had to line up and all three are the interpreter's, not a re-derivation:
             //  * the IMMEDIATE. `decode` fetches it with `fetch_immediate(operand_size)`, which at
-            //    Word is `u32::from(fetch_u16(..))` -- zero-extended into the same `insn.imm`. So
+            //    Word is `u32::from(fetch_u16(..))`, zero-extended into the same `insn.imm`. So
             //    `emit_read_store_value`'s `imm & 0xffff` for a Word `StoreSource::Imm` is exactly
             //    the two bytes decode read, and the mask is a no-op rather than a truncation. This
             //    is the check `0x81` is still refused for wanting; here it passes.
@@ -18702,8 +18699,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             //
             // `/5`, `/6` and `/7` are the byte-shift-rows slice, and the census that asked for
             // them is tyrian-586 at main 0333d956 rather than duke: `0xC0 /5` is 607,227 runtime
-            // hits there -- a MERGED word/dword row, the two halves refused by different
-            // mechanisms -- alongside the `0xD0 /5` row the arm below claims. An older version of
+            // hits there: a MERGED word/dword row, the two halves refused by different
+            // mechanisms, alongside the `0xD0 /5` row the arm below claims. An older version of
             // this comment said `/5` and `/7` "have no byte row at all" and that `0xD0` "tops out
             // at 49,021 runtime hits across every sub-opcode"; both were true of the duke census
             // and are false of tyrian's, which is what a 16-bit workload changes.
@@ -18747,8 +18744,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // whole opcode had no arm before that slice, so returning None from the top of it
                 // puts the row back in the census as the same `hard_boundary` it was ranked as.
                 // `rotate_rows_enabled` is true on BOTH admitting arms (`on` and `heat_gated`);
-                // the heat gate cannot live here -- it needs the physical address and the heat
-                // map, neither of which is in this function's signature -- so it runs one step
+                // the heat gate cannot live here: it needs the physical address and the heat
+                // map, neither of which is in this function's signature, so it runs one step
                 // later, in the compile loop, and downgrades this admission to the very same
                 // `HardBoundary` the `!enabled` return produces. See `rotate_rows_arm`.
                 //
@@ -18760,8 +18757,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // top of this file, on `IZARRAVM_BYTE_SHIFT_ROWS` alone. `0xC0 /4` at Word
                 // therefore needs BOTH knobs; see `byte_shift_rows_enabled` for the full matrix
                 // and for why that row is an unmeasured CLOSURE admission rather than a smuggled
-                // one. `/0` and `/1` need the SAME reachability term -- they are on the identical
-                // opcode -- so `0xC0` at Word reaches this arm at all only because that term
+                // one. `/0` and `/1` need the SAME reachability term: they are on the identical
+                // opcode, so `0xC0` at Word reaches this arm at all only because that term
                 // already admits it; nothing new is needed for the byte rotates specifically.
                 match m.reg {
                     0 | 1 | 4 if !rotate_rows_enabled() => return None,
@@ -18786,7 +18783,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     // `/6` is the undocumented SAL alias of `/4` and is NORMALISED here rather
                     // than passed through, so `DirectKind::Shift` only ever carries a documented
                     // sub-opcode and no part of this lowering depends on undocumented host
-                    // behaviour -- the encoders pass `op` into the ModRM `/op` slot verbatim, so
+                    // behaviour: the encoders pass `op` into the ModRM `/op` slot verbatim, so
                     // without this the host would execute a real `C0 /6`. `core.rs`'s
                     // `4 | 6 => // SHL` and `4 | 6 => top ^ cf` already treat the two as one arm,
                     // so nothing observable changes. The CENSUS still bins by `insn.modrm.reg` and
@@ -18815,7 +18812,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // the corpus measures: `123-talk-shareware`'s `0xD0 register /1` and `/0` rows (24.86M
             // and 0.45M runtime hits, its #1 and #3 census rows) and `21-for-1-to-4`'s `0xD0
             // register /1` (13.50M) are this literal opcode with this literal sub-opcode, not the
-            // `0xc1 | 0xd1` arm's Word admission -- `census_row` stores `shape.opcode` verbatim
+            // `0xc1 | 0xd1` arm's Word admission: `census_row` stores `shape.opcode` verbatim
             // and derives `operand_size` from the decoded segment default, which is Word for every
             // corpus game regardless of which opcode actually ran. `DirectKind::RotateRegByte`
             // carries the emitter that gets this right: `emit_rotate_reg8` is built on
@@ -18826,7 +18823,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // rotate INPUT.
             //
             // NO IMMEDIATE: the count is the literal 1 baked into the opcode, so `count: 1` here is
-            // the encoding rather than a decode field. `insn.imm` is not read and must not be --
+            // the encoding rather than a decode field. `insn.imm` is not read and must not be:
             // `0xD0` has `imm_len == 0` and `insn.imm` carries whatever the decoder last left
             // there.
             0xd0 => {
@@ -18882,7 +18879,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // RCL (/2) and RCR (/3) stay out and the reason is structural rather than a
                 // missing row: both take the incoming CF as a rotate INPUT (`shift_rotate` seeds
                 // `cf` from `flag(FLAG_CF)` before its loop), which needs the guest flags loaded
-                // into the host before the rotate rather than only captured after it -- the shape
+                // into the host before the rotate rather than only captured after it, the shape
                 // `emit_carry_alu_preloaded` has, and a slice of its own rather than a list entry.
                 if !matches!(m.reg, 0 | 1 | 4..=7) {
                     return None;
@@ -18892,7 +18889,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // was lowered before this slice and stays ungated: the off arm has to restore the
                 // pre-slice world, not a no-rotates world, or an A/B would price two slices as
                 // one. `/4..=7` are older still. Read here, above the shared `let-else` and the
-                // Word guard, so the off arm reproduces the pre-slice refusal exactly -- ROL had
+                // Word guard, so the off arm reproduces the pre-slice refusal exactly: ROL had
                 // no arm at all then, so the row goes back to being an ordinary `hard_boundary`.
                 //
                 // The `heat_gated` arm reads as ADMITTING here and is narrowed one step later, in
@@ -18911,7 +18908,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     // row is 29,698,831 runtime hits, 66.8% of that game's whole static unbound
                     // class. It stayed refused through `#784` because every group-2 kind in this
                     // file bound `DecodedOperand::Reg`; `DirectKind::RotateShiftMem` is the
-                    // read-modify-write lane that reaches it. RCL and RCR are unaffected -- the
+                    // read-modify-write lane that reaches it. RCL and RCR are unaffected: the
                     // `matches!(m.reg, 0 | 1 | 4..=7)` guard above has already refused them, and
                     // `group_two_mem_kind` re-states the narrowing rather than assuming it.
                     let DecodedOperand::Mem(addr) = insn.operand? else {
@@ -18923,7 +18920,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     // BOTH rotates are now admitted at Word (the `vorvek/direct-word-rot1` slice),
                     // via the same width field `Shift`'s Word arm carries: `emit_rotate_reg` picks
                     // `shift_r16_imm8` or `shift_r32_imm8` on this field, and a 66-prefixed rotate
-                    // narrows to the guest's own 16 bits instead of rotating 32 -- CF from bit 15
+                    // narrows to the guest's own 16 bits instead of rotating 32: CF from bit 15
                     // instead of bit 31, OF from the 16-bit result, and the host leaves bits 16..=63
                     // of the underlying 64-bit register untouched, which is the guest's high-half
                     // preservation for free.
@@ -18937,8 +18934,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     // `123-talk-shareware`'s 24.86M and 0.45M rows and `21-for-1-to-4`'s 13.50M row
                     // are byte-register rotates and belong to `RotateRegByte`; `123-talk`'s 29.70M
                     // row is a `0xD1` word MEMORY form, which this register-only arm cannot reach
-                    // either. This admission is enabling work -- Word/Dword parity with `Shift`, and
-                    // a Word sibling for `emit_rotate_reg` to be measured against -- rather than a
+                    // either. This admission is enabling work: Word/Dword parity with `Shift`, and
+                    // a Word sibling for `emit_rotate_reg` to be measured against, rather than a
                     // claimed win on any of those four rows. RCL (`/2`) and RCR (`/3`) are
                     // unaffected: they never reach this branch, `matches!(m.reg, 0 | 1)`.
                     return Some(DirectKind::RotateReg {
@@ -18960,7 +18957,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // Group 2 by CL. Sixth in the runtime-weighted reject audit: /7 alone is 807,607
             // dispatcher exits and the three shift sub-ops together are 7.9% of rejected-target
             // exits. Same /4..=7 admission as the imm8 arm's shift half; ROL (/0), ROR (/1),
-            // RCL (/2) and RCR (/3) stay out -- ROR because its flag rules differ and the other
+            // RCL (/2) and RCR (/3) stay out: ROR because its flag rules differ and the other
             // three for the imm8 arm's standing reasons (no measured rejects; RCL/RCR consume
             // the incoming CF as a rotate input the emitted form never loads).
             0xd3 => {
@@ -19074,8 +19071,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // sign-extend back from the low half, rather than the high half being nonzero.
                 //
                 // ORDERING INVARIANT, and it is load-bearing rather than cosmetic. This arm MUST
-                // stay BELOW the /4 arm. That arm `return`s from `classify` on EVERY path -- both
-                // operand forms, and the knob-off memory form too -- so a /4 is already
+                // stay BELOW the /4 arm. That arm `return`s from `classify` on EVERY path: both
+                // operand forms, and the knob-off memory form too, so a /4 is already
                 // unreachable by the time control gets here. Move this arm above it and widen
                 // either to `4..=5` and an unsigned `mul dword [mem]` is emitted as a signed
                 // multiply, with the wrong EDX and the wrong CF and OF.
@@ -19107,10 +19104,10 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     return match insn.operand? {
                         // The REGISTER form, added by the rejected-row campaign's F7 slice. It
                         // shares this arm with the memory form rather than sitting in its own
-                        // `if` because everything that makes the memory form correct here --
-                        // `opcode == 0xf7` excluding the byte IMUL, the position BELOW /4
+                        // `if` because everything that makes the memory form correct here
+                        // (`opcode == 0xf7` excluding the byte IMUL, the position BELOW /4
                         // excluding an unsigned multiply, the Word gate excluding a 66-prefixed
-                        // encoding -- is exactly what makes the register form correct, and
+                        // encoding) is exactly what makes the register form correct, and
                         // splitting them would invite one of the three to be re-derived wrongly.
                         DecodedOperand::Reg(src) => Some(DirectKind::ImulRegAcc { src }),
                         DecodedOperand::Mem(addr) => Some(DirectKind::ImulMemAcc {
@@ -19133,8 +19130,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // What this arm used to say, and what the emitter now has to answer:
                 //
                 // > MEMORY is deliberately absent, and the reason is the fault rather than the
-                // > address. A memory DIV can side-exit for two independent reasons -- the read's
-                // > own guards and the divide guard -- at the same slot, and the second must not
+                // > address. A memory DIV can side-exit for two independent reasons (the read's
+                // > own guards and the divide guard) at the same slot, and the second must not
                 // > be reachable before the first has been proved not to fire.
                 //
                 // `emit_div_mem` answers it with the DEFERRED mode-13 completion `Ret`/`JmpMem`
@@ -19166,7 +19163,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     return None;
                 }
                 // `/0` TEST. `0xf6` is the byte form regardless of prefix; `0xf7` follows the
-                // operand size, and it is the group-3 member with a real Word LOWERING --
+                // operand size, and it is the group-3 member with a real Word LOWERING:
                 // `emit_test_preloaded` has carried a full Word lane (66-prefixed `test`, 0x100
                 // descriptor tag) since the width field landed, with no caller until the wolf3d
                 // census ranked the register form at 634M block-stopping hits.
@@ -19205,8 +19202,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             }
             // RETF and RETF imm16. Mode-independent here, exactly like `0xc2`/`0xc3` above: the
             // compile walk's `retf_admitted_here` has already decided that this instruction may
-            // join a block at all -- it is non-continuable, so an unadmitted one never reaches
-            // `classify` -- and the stack-width matrix rewrites the admitted cell into
+            // join a block at all: it is non-continuable, so an unadmitted one never reaches
+            // `classify`, and the stack-width matrix rewrites the admitted cell into
             // `RetFar16`. `classify` has no CPU, so the mode question cannot be asked here.
             0xca | 0xcb => {
                 return Some(DirectKind::RetFar {
@@ -19215,8 +19212,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             }
             // CALL FAR ptr16:16. Mode-independent here, exactly like `0xca`/`0xcb` above: the
             // compile walk's `call_far_admitted_here` has already decided that this instruction
-            // may join a block at all -- it is non-continuable, so an unadmitted one never
-            // reaches `classify` -- and the stack-width matrix admits the one cell with an
+            // may join a block at all: it is non-continuable, so an unadmitted one never
+            // reaches `classify`, and the stack-width matrix admits the one cell with an
             // emitter. `classify` has no CPU, so the mode question cannot be asked here.
             //
             // `decode.rs`'s `0x9a` arm already parses the far pointer in full: the offset into
@@ -19321,7 +19318,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // them and does not claim to. What the gate is for is the case the matrix stops
                 // covering the moment anyone adds a `CallMem16` mapping arm: the pushed return
                 // address and the READ WIDTH of the target are independent, and only this gate
-                // constrains the second. `JmpMem` has no matrix at all -- it is not a stack kind --
+                // constrains the second. `JmpMem` has no matrix at all: it is not a stack kind,
                 // so there the same check is the only one there is.
                 if m.reg == 2 {
                     let return_delta = lin
@@ -19349,7 +19346,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     //
                     // The split is the stack, not the read. `PushMem` is a `uses_stack()` kind, so
                     // the Word form already reached the compile loop's stack-width matrix, which
-                    // has no `PushMem16` cell and refuses it in BOTH stack widths -- a Word push
+                    // has no `PushMem16` cell and refuses it in BOTH stack widths: a Word push
                     // moves two bytes and decrements the pointer by two, and no emitter builds
                     // that. Deciding it here rather than there is what keeps the matrix's arms
                     // about emitters: a call-out is not a stack kind and never reaches it.
@@ -19388,7 +19385,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // clock risk" note this arm used to carry recorded two objections and both have
                 // been answered: the duke3d-486 census reads 11,718,562 static exits and
                 // 11,736,700 interpreted executions here (32.8M/32.8M at 586, its fourth-largest
-                // rejected row), and the clock charge is not a guess -- `execute_extended.rs`
+                // rejected row), and the clock charge is not a guess: `execute_extended.rs`
                 // group-5 arm 4 returns `clocks(7)` unconditionally, reading its target through
                 // `read_operand_sized`, which serves the register and memory operands alike.
                 // NOT ON THE `InterpretOne` ALLOWLIST, and the reason is structural rather than
@@ -19400,7 +19397,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 // holds, and R1 demands `cpu.registers.eip == slot_start + insn_len`. A JMP sets
                 // EIP to its TARGET. The two are equal only for a jump to the next instruction,
                 // so the slot resyncs on every real execution, and the governor demotes it after
-                // three of the first eight -- back to the boundary it replaced, having paid a
+                // three of the first eight, back to the boundary it replaced, having paid a
                 // spill, a call, a run, a reload and a side exit three times over to get there.
                 //
                 // The compile walk makes the same point from the other side. `DirectKind::JmpMem`
@@ -19468,7 +19465,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // `0xE0` LOOPNE / `0xE1` LOOPE. `taken_delta` is computed by the same three
             // lines the Jcc and 0xE2 arms use, deliberately unshared for the reason the 0xE2
             // arm gives. The refusals are 0xE2's exactly (the counter/target width argument is
-            // identical); what differs is only which knob gates the admission -- its own,
+            // identical); what differs is only which knob gates the admission: its own,
             // because it is its own slice with its own measurement.
             0xe0 | 0xe1 if insn.group == DecodeGroup::Branch => {
                 if insn.address_size != AddressSize::Dword
@@ -19541,9 +19538,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
 /// The MEMORY half of the three group-2 imm8/by-one classify arms, shared by all three rather
 /// than written out per opcode.
 ///
-/// One function because the three arms differ in exactly two things by the time they reach it --
+/// One function because the three arms differ in exactly two things by the time they reach it:
 /// the width (`Byte` for `0xC0`/`0xD0`, the decoded operand width for `0xC1`/`0xD1`) and where
-/// the count came from (a decoded immediate or the opcode's literal 1) -- and both arrive as
+/// the count came from (a decoded immediate or the opcode's literal 1), and both arrive as
 /// arguments. Everything else is one rule for the whole family, so a per-arm copy would be three
 /// places for the RCL/RCR bar and the zero-count bar to drift apart.
 ///
@@ -19610,7 +19607,7 @@ fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
         // compile loop attaches one through the `disp_lanes` matchers, exactly as `imm_lane_for`
         // does for `AluImm`. Three shapes qualify now, not one: `0x8A` loads (default ON), `0x8B`
         // loads (default OFF) and `0x89` / `0x88` STORES (default ON since the 2026-08-23
-        // Option D ladder) -- so the `DirectAddr`
+        // Option D ladder), so the `DirectAddr`
         // this function builds for a `DirectKind::Store` can come back carrying a lane.
         disp_lane: None,
         ea_wrap: Some(match addr.address_size {
@@ -19637,7 +19634,7 @@ struct EmitInput<'a> {
     /// numbers the compile walk summed into `raw_clocks` above. It is a
     /// `&'static`, so a block compiled under one epoch cannot silently start
     /// charging another: the epoch is fixed for the life of the machine
-    /// (`dev_docs/2026-09-05-port-io-repricing-design.md` section 4) and a block
+    /// (port I/O repricing design, section 4) and a block
     /// cache outlives no epoch change.
     class_table: &'static ClassTable,
     weighted_fp_clocks: u32,
@@ -19662,7 +19659,7 @@ struct EmitInput<'a> {
     /// The instrument only has a consumer when the bus wants per-block fetch observation:
     /// `run_direct_block` hands the block a `NativeExit` whose `trace_ptr` is 0 whenever
     /// `CpuBus::native_fetches_are_uniform()`, and the emitted preamble then loads the exit
-    /// pointer, loads `trace_ptr`, compares it against 0 and jumps over its own body — four
+    /// pointer, loads `trace_ptr`, compares it against 0 and jumps over its own body: four
     /// instructions and two dependent loads, per completed path AND per chain hop, to discover
     /// a compile-time constant. This flag moves the gate from the emitted callee to the
     /// emission site.
@@ -19674,8 +19671,8 @@ struct EmitInput<'a> {
     fetch_trace: bool,
     /// `SEGWRITE-V86-EDGE`: `Some(segment)` when this block is an eligible V86 segment-write
     /// block (`seg_write_edge_eligible`) publishing a guarded static fallthrough, naming the ONE
-    /// segment `dirty_segments` set. Consumed by exactly one `emit_completed_path` call --
-    /// the catch-all after the slot loop, the only site a plain-fallthrough terminal reaches --
+    /// segment `dirty_segments` set. Consumed by exactly one `emit_completed_path` call:
+    /// the catch-all after the slot loop, the only site a plain-fallthrough terminal reaches,
     /// which emits the three-instruction selector guard ahead of the ordinary chain hop. Every
     /// other `emit_completed_path` call in this function passes `None`: the source's own body is
     /// unchanged by this slice (§4.4's byte-identity claim), only this one exit gains anything.
@@ -19689,7 +19686,7 @@ struct EmittedCode {
     /// `JccShadowClass`. A `u16` per class because a block carries at most one Jcc terminator
     /// today and the walk's slot cap bounds it regardless.
     ///
-    /// It is a COMPILE-TIME site ledger and it is not a measurement of executed volume -- a
+    /// It is a COMPILE-TIME site ledger and it is not a measurement of executed volume: a
     /// chained transfer runs a successor's terminator without any entry, and a self-loop Jcc runs
     /// arbitrarily many times per entry, so `sites x entries` converts to nothing. Its two jobs
     /// are the arena BYTE delta (each class has its own ON-minus-OFF byte cost) and the ARM
@@ -19699,7 +19696,7 @@ struct EmittedCode {
     /// Flag-producing slots this emission lowered through the EAGER arm
     /// (`IZARRAVM_DIRECT_EAGER_FLAGS`), by `EAGER_CLASS_*` lane.
     ///
-    /// It is a COMPILE-TIME site ledger and it is not a measurement of executed volume -- a
+    /// It is a COMPILE-TIME site ledger and it is not a measurement of executed volume: a
     /// chained transfer runs a successor's producers without any entry of its own, and a
     /// self-loop runs its producers arbitrarily many times per entry, so `sites x entries`
     /// converts to nothing. Its two jobs are the arena BYTE delta (each class has its own
@@ -19919,8 +19916,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     // written after the fill, not before.
     //
     // AVX, like the x87 host-XMM save below. That is not a new host requirement: no block is
-    // ever admitted at all unless `jit::host_supported()` (AVX2) holds — `native_keys_admitted`
-    // screens every key on it — so every host that can reach this emitter can execute it.
+    // ever admitted at all unless `jit::host_supported()` (AVX2) holds: `native_keys_admitted`
+    // screens every key on it, so every host that can reach this emitter can execute it.
     e.vxorpd(Xmm::XMM0, Xmm::XMM0, Xmm::XMM0);
     let mut zero_fill = 0i32;
     while zero_fill < STACK_ZERO_FILL_LEN {
@@ -20045,7 +20042,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             //
             // The same lowering is admitted under V86, where the limit must be 0xFFFF. It is,
             // and that is now true by construction rather than by luck: BOTH V86 entries
-            // canonicalize all six segments -- the IRET-into-V86 tail calls `load_segment_real`
+            // canonicalize all six segments: the IRET-into-V86 tail calls `load_segment_real`
             // directly, and a task switch into a V86 task commits EFLAGS.VM before its
             // segment-restore loop, so every selector that loop handles goes through
             // `load_segment_checked`'s V86 branch, INCLUDING a null one (that branch's
@@ -20112,15 +20109,15 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 );
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
             }
-            // LES (0xC4) / LDS (0xC5), WORD form, real mode or V86. Two guarded word reads --
-            // the offset, then the selector at `addr + 2` -- both against the SAME `reasons`,
+            // LES (0xC4) / LDS (0xC5), WORD form, real mode or V86. Two guarded word reads:
+            // the offset, then the selector at `addr + 2`, both against the SAME `reasons`,
             // exactly as `RetFar16`'s two stack reads share one `MemorySideExits`: both go
             // through the same segment, so one segment-limit label serves both.
             //
             // The ORDER is the interpreter's (`execute_system_seg_decoded`'s 0xc4/0xc5 arm): both
             // reads complete, THEN the segment loads, THEN the GPR is written. Every guest write
             // sits after both reads' guards, so a memory exit on either leaves the instruction
-            // entirely un-started -- neither the GPR nor the segment record has moved.
+            // entirely un-started: neither the GPR nor the segment record has moved.
             //
             // The offset is parked at `STACK_LES_LDS_OFFSET` across the selector read and the
             // segment write, both of which clobber RAX/RDX exactly as `RetFar16`'s CS write does
@@ -20144,7 +20141,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 //
                 // ACCURACY DECISION: the selector address WRAPS MOD 64K at a 16-bit address size,
                 // rather than reading a linear byte past the wrapped offset word. 86Box's
-                // `opLDS_w_a16` (src/cpu/x86_ops_mov_seg.h) is the citation -- `cpu_state.eaa16[0]`
+                // `opLDS_w_a16` (src/cpu/x86_ops_mov_seg.h) is the citation: `cpu_state.eaa16[0]`
                 // is a `uint16_t`, so `cpu_state.eaa16[0] += 2` wraps in C's unsigned 16-bit
                 // arithmetic and the following `CHECK_READ` bounds it with `& 0xffff` too, so an
                 // EA of 0xFFFE reads its selector back at 0x0000, not at the linear 0x10000.
@@ -20159,7 +20156,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // block, which is the only mode this kind reaches). `(x + 2) mod M == ((x mod M) +
                 // 2) mod M` for any base+index+disp sum `x` and `M = 0x10000`, so masking once
                 // after folding in the +2 is exactly the same value as the interpreter's mask,
-                // add-2, mask-again -- the two engines were never going to disagree on the FORM of
+                // add-2, mask-again: the two engines were never going to disagree on the FORM of
                 // this address, only (before the interpreter fix) on whether the SECOND mask ran
                 // at all. `les_lds_second_word_wraps_at_the_sixty_four_k_boundary`
                 // (cpu_jit_seg_load_mem_test.rs) is the differential that pins both sides of
@@ -20177,7 +20174,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     memory.address_wrap,
                 );
                 e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
-                // (c) the segment record -- `LoadSegReal`'s three stores, unchanged.
+                // (c) the segment record: `LoadSegReal`'s three stores, unchanged.
                 let base = segment_field_base(segment);
                 e.mov_r32_r32(Reg::RAX, Reg::RDX);
                 e.store_r16_disp32(Reg::R15, base + selector_offset(), Reg::RAX);
@@ -20223,8 +20220,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 e.setcc(condition, Reg::RDX);
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
             }
-            // SETcc m8. The condition byte is produced FIRST -- before `emit_store` touches the
-            // address, the page kind or the write pointer -- and parked in the frame, because
+            // SETcc m8. The condition byte is produced FIRST (before `emit_store` touches the
+            // address, the page kind or the write pointer) and parked in the frame, because
             // `emit_store` materialises its source last and this source needs `emit_load_host_
             // flags`, whose `push`/`popfq` pair and RAX use cannot run inside a store's live
             // scratch. See `StoreSource::ParkedByte`.
@@ -20232,7 +20229,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // The park must also precede `MemorySideExits::new`'s guards in EFFECT even though it
             // precedes them in emission: it writes only a frame scratch slot and no guest state,
             // so a memory side exit after it leaves the instruction un-started exactly as a plain
-            // `Store`'s does. The flag READ is likewise harmless to repeat -- RBP is not consumed.
+            // `Store`'s does. The flag READ is likewise harmless to repeat: RBP is not consumed.
             DirectKind::SetCcMem { condition, addr } => {
                 let side = e.label();
                 e.xor_r64_self(Reg::RDX);
@@ -20273,7 +20270,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Sahf => emit_sahf(&mut e),
             // CBW / CWDE. Dword widens AX to EAX in one step: `movsx_r32_r16` reads the source's
             // low 16 bits and defines all 32, so `home(0)` as both source and destination is
-            // safe -- the instruction reads before it writes, same as `emit_mov_extend_reg`'s
+            // safe: the instruction reads before it writes, same as `emit_mov_extend_reg`'s
             // `dst == src` case. Word (CBW) widens AL to AX and must leave EAX's upper 16 bits
             // alone, so it goes through RDX and `emit_write_gpr16`: `movsx_r32_r8` already sign
             // extends AL across all 32 bits, and the low 16 of that is exactly AL sign-extended
@@ -20354,7 +20351,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             }
             DirectKind::XchgReg { a, b, width } => emit_xchg_reg(&mut e, a, b, width),
             // CLC / STC. The flag shadow gets the constant bit, then `emit_set_cf_only` publishes
-            // it exactly as `set_flag(FLAG_CF, ..)` would -- through the pending descriptor's CF
+            // it exactly as `set_flag(FLAG_CF, ..)` would, through the pending descriptor's CF
             // override when one is live, straight into EFLAGS when none is, and with the trailing
             // `eflags |= 0x2` on both paths.
             //
@@ -20393,7 +20390,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             //
             // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, so
             // no guest register lives in it, and RDX is dead by the time `emit_alu_preloaded`
-            // dispatches — every op path may clobber it (the CMP path stages its non-written
+            // dispatches: every op path may clobber it (the CMP path stages its non-written
             // result there) but none reads it on entry.
             DirectKind::AluImm {
                 op,
@@ -20422,13 +20419,13 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // zero-extended; this zero-extends the byte out of guest RAM instead, so a guest
             // patch of that one byte takes effect on the next entry with no recompile.
             // `emit_alu_byte_preloaded` reads only CL, so the zero-extension is a convenience
-            // and not a correctness term -- but it keeps RCX's upper bits defined, which is what
+            // and not a correctness term, but it keeps RCX's upper bits defined, which is what
             // the baked form's `mov r32, imm32` also does.
             //
             // RDX is the address scratch and is free here: `GUEST_HOMES` is R8-R14 plus RBX, and
             // `emit_alu_byte_preloaded`'s FIRST instruction is `mov edx, eax`, so nothing reads
             // RDX on entry. The destination byte is read into RAX BEFORE the address is staged,
-            // which matters if `dst` ever aliased the scratch -- it cannot (it is a guest home),
+            // which matters if `dst` ever aliased the scratch: it cannot (it is a guest home),
             // but the ordering costs nothing and removes the question.
             DirectKind::AluByteImm { op, dst, imm, lane } => match lane {
                 Some(lane) => {
@@ -20502,8 +20499,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // the Byte form in production. That helper already carries the 16-bit `alu_r16_r16`
             // and the Word lazy-flag descriptor `0x8000_0102`; neither is new code.
             //
-            // TEST writes no register, so the usual Word hazard -- preserving the destination's
-            // high half -- does not arise here at all. What has to be right is the FLAGS, and the
+            // TEST writes no register, so the usual Word hazard (preserving the destination's
+            // high half) does not arise here at all. What has to be right is the FLAGS, and the
             // helper gets them from a genuine 16-bit host AND, which is what the interpreter's
             // `self.alu(4, value, reg, BusWidth::Word)` computes: CF/OF cleared, SF from bit 15,
             // ZF over sixteen bits, PF over the low byte, AF left live by `emit_logic_live_af`.
@@ -20574,7 +20571,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::ImulRegAcc { src } => emit_imul_reg_acc(&mut e, src),
             // ONE side exit, and it is the divide guard rather than a memory reason: the operands
             // are registers, so nothing here can fault on an address. The guard fires BEFORE any
-            // home or flag is written, so the exit leaves the instruction un-started -- the same
+            // home or flag is written, so the exit leaves the instruction un-started: the same
             // contract `X87Eligibility` has, and for the same kind of reason (a property of the
             // data, not of the address).
             DirectKind::DivReg { src, signed } => {
@@ -20621,7 +20618,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // The count-lane forms differ from the baked forms in exactly one thing: where the
             // COUNT comes from. That one thing costs more here than it does for `AluByteImm`,
             // because the baked emitters select their whole flag shape from the count's value at
-            // emission — see `emit_shift_lane` and `emit_rotate_reg_lane` for the runtime three-way
+            // emission. See `emit_shift_lane` and `emit_rotate_reg_lane` for the runtime three-way
             // branch that reproduces the selection.
             DirectKind::Shift {
                 op,
@@ -20931,7 +20928,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             //
             // The ORDER is the interpreter's: `pop` advances SP and only then does `load_segment`
             // write the register (execute.rs, the 0x07 / 0x1f arms). Nothing between the two is
-            // observable here -- there is no fault path left once the read's guards have passed,
+            // observable here: there is no fault path left once the read's guards have passed,
             // and the destination is a segment register, so it can never alias the stack pointer
             // the way `Pop16`'s POP SP case can.
             //
@@ -21115,7 +21112,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // lane's readers and shifts this out.
                 //
                 // ITS PLACEMENT IS LOAD-BEARING. `emit_dynamic_word_increment` stages its addend
-                // in RDX -- every deposit primitive in this file does, and
+                // in RDX: every deposit primitive in this file does, and
                 // `emit_dynamic_split_extra`'s doc comment states the contract. Between (d) and
                 // (f) RDX is dead: its last use is the limit store above and (f) reloads it from
                 // `STACK_RET_FAR_OFFSET`. Moved UP beside the pops "to keep the writes together",
@@ -21156,12 +21153,12 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 return_delta,
             } => {
                 // `far_call` (`control.rs`) pushes CS FIRST (the higher stack address, at
-                // `(SP - 2) & 0xFFFF`) and the return IP SECOND (at `(SP - 4) & 0xFFFF`) -- the
+                // `(SP - 2) & 0xFFFF`) and the return IP SECOND (at `(SP - 4) & 0xFFFF`), the
                 // mirror image of `RetFar16`'s two pops, offset then selector, which is what lets
                 // one instruction's CALL be undone by the other's RETF. SP itself does not move
                 // until step (c), AFTER both stores, so a fault on EITHER leaves CS, EIP and SP
                 // completely unchanged from the guest's perspective even though the CS word may
-                // already be physically in memory when the SECOND store faults -- exactly the
+                // already be physically in memory when the SECOND store faults, exactly the
                 // interpreter's own `far_call`, whose comment states the identical fact ("A fault
                 // on the SECOND push restores (E)SP past the committed first one"): nothing
                 // architectural ever reads a word at an address SP no longer names.
@@ -21169,9 +21166,9 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let ip_addr = stack_addr(0u32.wrapping_sub(4));
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(cs_addr));
-                // (a) the OLD, CURRENT CS selector -- NOT `selector`, the far call's TARGET,
+                // (a) the OLD, CURRENT CS selector: NOT `selector`, the far call's TARGET,
                 // which does not go on the stack at all. `far_call` (`control.rs`) pushes
-                // `self.registers.cs().selector` -- the pre-transfer value -- exactly as a plain
+                // `self.registers.cs().selector`, the pre-transfer value, exactly as a plain
                 // `push cs` does. This block's entry CS is a compile-time constant (the block is
                 // keyed on CS through `mode_key`/`segment_layout`), read the same way
                 // `MovSegToReg { segment: Cs, .. }` reads it: `memory.segments.selector(Cs)`.
@@ -21203,7 +21200,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 );
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
                 side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
-                // (c) SP -= 4, 16-bit and wrapping -- both pushes' worth in one SUB (op 5), the
+                // (c) SP -= 4, 16-bit and wrapping: both pushes' worth in one SUB (op 5), the
                 // same operation `Call16`'s single push uses for its own SP -= 2, folded here to
                 // cover both pushes' worth of movement in one instruction.
                 e.alu_r16_imm16(5, home(4), 4);
@@ -21228,7 +21225,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 // (e) the far-CALL ledger: a plain `+= 1` into the `CpuGsw` cell through R15,
                 // which this emitter has just been writing CS through. RDX is scratch here and
                 // is reloaded with the target offset two instructions below. Three memory ops
-                // per RETIRED far call, and none at all per block entry -- see
+                // per RETIRED far call, and none at all per block entry. See
                 // `far_call_ledger_offset` for why the frame slot this replaces was the wrong
                 // shape for a counter this rare.
                 let ledger = far_call_ledger_offset();
@@ -21444,11 +21441,11 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let step_break_stub = e.label();
                 // The `InterpretOne` class's fourth argument is its slot cell's ADDRESS (also the
                 // governor byte's home) plus the two RESYNC stubs. The `PortReadAlDx` class's
-                // fourth argument is its `slot_delta` VALUE -- no cell, no governor, no RESYNC
+                // fourth argument is its `slot_delta` VALUE: no cell, no governor, no RESYNC
                 // (GP2 poll-skip design obligation 1/4): the classifier's backward scan re-derives
                 // the certified shape fresh on every call-out attempt instead of caching a
                 // negative in a heap cell. The `PortReadAlImm8` / `PortWriteAlImm8` classes' fourth
-                // argument is their PORT VALUE instead -- a THIRD quantity riding the same channel,
+                // argument is their PORT VALUE instead: a THIRD quantity riding the same channel,
                 // because they carry no `slot_delta` (there is no poll-skip scan to seed) and no
                 // cell (gp2 in-imm8 callout design rev 3 §1.1). `PushAllDword` / `PopAllDword` /
                 // `PortWriteAlDx` need neither and emit neither: the OUT DX,AL helper has a live DX
@@ -21511,8 +21508,8 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 ));
                 // The two RESYNC exits, and the whole of what makes them different from every
                 // other exit in this function: their EIP DELTA IS ZERO. The helper already left
-                // `cpu.eip` at the architectural next address -- which for a fault is the
-                // handler's entry, not the instruction after the slot -- so `emit_advance_eip`
+                // `cpu.eip` at the architectural next address, which for a fault is the
+                // handler's entry, not the instruction after the slot, so `emit_advance_eip`
                 // must add nothing. Every other exit here computes a delta from the block's entry
                 // linear because the body never moved EIP; these two are the exception because the
                 // body did.
@@ -21909,14 +21906,14 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             //
             // `alu_r32_imm32(5, home(1), 1)` is SUB, not DEC, and the difference is deliberate:
             // both set ZF identically, SUB additionally writes CF, and NOTHING here publishes
-            // host flags to the guest -- so the extra flag is free while the shared ALU
+            // host flags to the guest, so the extra flag is free while the shared ALU
             // primitive avoids a second encoder entry point. `home(1)` IS the guest ECX during
             // native execution, so the subtract is the architectural write-back; there is no
             // separate store.
             // `Loop`'s arm with ONE insertion: the guest-ZF test between the counter test
             // and the taken label. Ordering is the whole correctness argument (see the
             // DirectKind::LoopCc comment): the counter test consumes the decrement's OWN host
-            // ZF first -- nothing between them, `Loop`'s adjacency invariant -- and only then
+            // ZF first (nothing between them, `Loop`'s adjacency invariant) and only then
             // is the host state rebuilt from the guest's, so the guest read cannot see the
             // decrement and the counter test cannot see the guest. Swapping the two hands the
             // counter test the GUEST's ZF, which the differential fixture catches on its first
@@ -21930,12 +21927,12 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let counter_dead = e.label();
                 e.alu_r32_imm32(5, home(1), 1);
                 // JZ, condition 4: the counter reached zero, so the branch is never taken and
-                // the guest flags need not even be loaded -- the interpreter's `&&`
+                // the guest flags need not even be loaded: the interpreter's `&&`
                 // short-circuit, in the same order.
                 e.jcc(4, counter_dead);
                 emit_load_host_flags(&mut e);
-                // LOOPE (wanted_zf) takes on ZF set -- guest condition 4, JZ; LOOPNE on ZF
-                // clear -- condition 5, JNZ. Passed straight through as Jcc passes its own.
+                // LOOPE (wanted_zf) takes on ZF set: guest condition 4, JZ; LOOPNE on ZF
+                // clear: condition 5, JNZ. Passed straight through as Jcc passes its own.
                 e.jcc(if wanted_zf { 4 } else { 5 }, taken);
                 e.place(counter_dead);
                 if self_loop {
@@ -22508,7 +22505,7 @@ fn emit_completed_path(
         e.cmp_r64_imm32(Reg::RDX, 0);
         e.jz(unresolved);
         // `SEGWRITE-V86-EDGE`'s guard (design §4.3): three instructions, RAX only, ABOVE the
-        // quota decrement and the `linked_transfers` increment so a mismatch counts as neither --
+        // quota decrement and the `linked_transfers` increment so a mismatch counts as neither:
         // it is a completed-path exit through the dispatcher, not a chain hop. RCX still holds
         // the `LinkCell` address here (the doc comment above states that invariant for the whole
         // branch) and RDX still holds the resolved target, untouched by the compare.
@@ -22640,7 +22637,7 @@ fn emit_completed_dynamic_path(
     // return moves CS and the two ends of the edge therefore disagree about the EIP split of one
     // address. Linear is the block-identity quantity (`BlockKey.linear`, `LinkTarget.linear`,
     // `linear_blocks`), so one compare covers both halves of the far target, and a (selector, EIP)
-    // pair would be STRICTER than identity -- it would miss on an aliased split naming the same
+    // pair would be STRICTER than identity: it would miss on an aliased split naming the same
     // block.
     //
     // CS's base is read from the CPU rather than baked, because the `RetFar16` slot has already
@@ -22779,7 +22776,7 @@ struct StaticAccounting {
     /// `u32`, not `u16`, since slice 1d (review B4.2).
     ///
     /// This accumulator used to be a `u16` fed by `slot.kind.raw_clocks() as u16`
-    /// -- a TRUNCATING cast -- and an unchecked `+=` that panics in debug and
+    /// (a TRUNCATING cast) and an unchecked `+=` that panics in debug and
     /// wraps in release. At epoch 1 the widest slot charge is 17 and 32 of them
     /// cannot overflow a byte and a half; at epoch 2 a single class reaches
     /// 24,000 (`WBINVD`), so the pair was a latent wrap. `u32` makes the sum
@@ -22899,8 +22896,8 @@ fn emit_load_extend(
         (MemoryWidth::Word, false) => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
         (MemoryWidth::Word, true) => e.movsx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
         // classify derives the SOURCE width from the sub-opcode and can only produce Byte or Word.
-        // This arm exists so that a future edit passing `operand_width` here -- which is now a live
-        // local rather than a constant, so the confusion is easier to make than it was -- fails
+        // This arm exists so that a future edit passing `operand_width` here (which is now a live
+        // local rather than a constant, so the confusion is easier to make than it was) fails
         // loudly instead of silently emitting a dword read.
         (MemoryWidth::Dword, _) => {
             unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
@@ -22914,8 +22911,8 @@ fn emit_load_extend(
 
 /// The two widths a MOVZX/MOVSX carries, travelling together.
 ///
-/// They are the same type and mean opposite things -- `source` is Byte or Word and comes from the
-/// sub-opcode, `destination` is Word or Dword and is the operand size -- so as two positional
+/// They are the same type and mean opposite things: `source` is Byte or Word and comes from the
+/// sub-opcode, `destination` is Word or Dword and is the operand size, so as two positional
 /// arguments they are silently swappable, and swapping them is precisely the miscompile this
 /// slice exists to prevent. Named fields make the swap a compile error instead. The constructor
 /// asserts the domains in debug builds, which is where a `classify` edit that passed
@@ -22954,7 +22951,7 @@ fn emit_extend_write_back(e: &mut Encoder, dst: u8, dst_width: MemoryWidth) {
         MemoryWidth::Word => emit_write_gpr16(e, dst, Reg::RDX),
         // `dst_width` is `operand_width`, which `classify` derives from CS.D and the 0x66 prefix
         // alone; it has no other value. Byte gets its own arm rather than joining the wide ones so
-        // that a caller confusing `dst_width` with the SOURCE width -- the one real hazard here --
+        // that a caller confusing `dst_width` with the SOURCE width (the one real hazard here)
         // names the mistake it made.
         MemoryWidth::Byte => unreachable!("MOVZX/MOVSX destination width is never Byte"),
         MemoryWidth::Qword | MemoryWidth::Tbyte => {
@@ -23051,7 +23048,7 @@ fn emit_x87_memory_pointer(
 
     if write && memory.one_lookup_store {
         // The one-lookup probe replaces the classify, the resolve AND the kind-pack tail
-        // below — the fast arms park `STACK_READ_KIND` from the statically-known kind, and
+        // below: the fast arms park `STACK_READ_KIND` from the statically-known kind, and
         // the resolve stub parks it on the way out.
         emit_x87_store_pointer_fast(e, width, memory, sides);
         return;
@@ -23201,7 +23198,7 @@ fn emit_ram_read_pointer_inner(
 
     if memory.one_lookup_load {
         // The parking probe (load design D3b): kind parked in STACK_READ_KIND, pointer in RDI,
-        // NO counter moved — the direct callers of this `_inner` form (Ret/Ret16/JmpMem) run
+        // NO counter moved: the direct callers of this `_inner` form (Ret/Ret16/JmpMem) run
         // their CS-limit side exit and only then call `emit_mode13_read_completion`, and that
         // deferred-increment ordering must survive the probe swap byte-identically.
         emit_read_probe_parking(e, memory, sides);
@@ -23596,11 +23593,11 @@ fn emit_alu_mem_dest(
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
     e.jnz(sides.unavailable_or_kind);
     e.place(valid);
-    // D3 Group B (review F1): the flags byte is DEAD in RDX by the guard position below — RDX
+    // D3 Group B (review F1): the flags byte is DEAD in RDX by the guard position below: RDX
     // holds the ALU result candidate there, and testing THAT for bit 6 would skip SMC detection
     // on guest data. So the bit rides beside the kind in the `STACK_ALU_ADDRESS_KIND` pack.
     // cpl0 only: the fold consumes RDX, which the cpl3 permission check needs first, and no
-    // scratch survives to carry it (H3) — cpl3 blocks keep the unconditional guard.
+    // scratch survives to carry it (H3). cpl3 blocks keep the unconditional guard.
     let watch_fast = memory.watch_page_bit && !memory.cpl3;
     if watch_fast {
         e.and_r32_imm32(Reg::RDX, u32::from(NATIVE_PAGE_WATCHED));
@@ -23658,7 +23655,7 @@ fn emit_alu_mem_dest(
     e.shift_r64_imm8(5, Reg::RCX, 32);
     // Unconditional kind masking (H6): the pack's upper word may carry PAGE_WATCHED beside the
     // kind, and an unmasked equality compare would misroute every watched mode-13 ALU dest.
-    // Emitted on the bit-off arm too — a no-op there, and immune to the arms drifting apart.
+    // Emitted on the bit-off arm too: a no-op there, and immune to the arms drifting apart.
     e.and_r32_imm32(Reg::RCX, u32::from(NATIVE_KIND_MASK));
     let mode13 = e.label();
     let done = e.label();
@@ -23872,8 +23869,8 @@ fn emit_double_shift_mem(
     unreachable!("direct memory lowering is x86-64-only")
 }
 
-/// Form the guest effective address in RAX, optionally with `fold` -- a segment base the CALLER
-/// has established may ride the address-forming instruction's own displacement field -- already
+/// Form the guest effective address in RAX, optionally with `fold` (a segment base the CALLER
+/// has established may ride the address-forming instruction's own displacement field) already
 /// added in.
 ///
 /// The baked arm is ONE `lea` with the 0x67 address-size override: base, scaled index and
@@ -23888,8 +23885,8 @@ fn emit_double_shift_mem(
 /// The lane form differs from the baked form in exactly where the displacement comes from: the
 /// four bytes of the guest instruction's disp32 field, loaded on every execution, so a guest patch
 /// of that field takes effect on the next entry with no recompile. Like the baked arm, the lane
-/// arm writes RAX and nothing else -- and the 32-bit load clears the upper half, leaving exactly
-/// the state `mov eax, imm32` leaves -- so the two arms present one register contract to every
+/// arm writes RAX and nothing else, and the 32-bit load clears the upper half, leaving exactly
+/// the state `mov eax, imm32` leaves, so the two arms present one register contract to every
 /// caller. Everything downstream (the 64K wrap, the segment-limit compare, the fast-map lookup and
 /// its guards) already runs on the runtime value, which is what makes a patched displacement take
 /// the same side exits the baked form would.
@@ -23974,8 +23971,8 @@ fn emit_segmented_linear_address(
     let wrap = effective_wrap(addr, wrap);
     // The mask lands inside `emit_effective_address`, which is BEFORE the limit compare below.
     // That ordering is load-bearing twice over: the compare sits between the effective address
-    // and the segment base, so masking afterwards would compare an address the guest never forms
-    // -- AND the mask is the precondition of the compare's own elision under `AddressWrap::Word`
+    // and the segment base, so masking afterwards would compare an address the guest never forms,
+    // AND the mask is the precondition of the compare's own elision under `AddressWrap::Word`
     // below. Hoist the mask after the compare and that elision stops being sound.
     if memory.live_data & segment_bit(addr.segment) != 0 {
         emit_live_segmented_linear_address(e, addr, width, memory, sides, wrap, write);
@@ -23991,7 +23988,7 @@ fn emit_segmented_linear_address(
     //   * NO displacement lane, because the lane arm forms the address through a RUNTIME load out
     //     of guest RAM and has no immediate field to fold into. Without this third term the fold
     //     is computed, passed down and silently dropped, and every execution of the block
-    //     addresses the raw offset instead of `base + offset` -- in a release build too, which is
+    //     addresses the raw offset instead of `base + offset`, in a release build too, which is
     //     why it is a term of the predicate and not an assert inside the callee.
     let foldable =
         descriptor.limit == u32::MAX && wrap == AddressWrap::None && addr.disp_lane.is_none();
@@ -24027,7 +24024,7 @@ fn emit_segmented_linear_address(
         // Under a plain real-mode 0xFFFF limit the population is exactly Byte: `max_start` is
         // 0xFFFF for Byte, 0xFFFE for Word, 0xFFFC for Dword, 0xFFF8 for Qword, 0xFFF6 for
         // Tbyte, so only Byte's compare goes. This is the dividend of `emit_effective_address`
-        // owning the 64K mask -- the ordering that comment calls load-bearing is this proof's
+        // owning the 64K mask: the ordering that comment calls load-bearing is this proof's
         // whole precondition.
         //
         // The `segment_limit` label is still allocated and its reason stub still appended: a
@@ -24205,7 +24202,7 @@ fn emit_store(
 /// imm64 + one L1-hot byte load) rather than carrying the byte across the permission check is
 /// deliberate twice over: all four scratch registers are occupied at these sites, and the
 /// carry-by-duplication shape this replaced (a watched arm re-running the check + resolve) grew
-/// store-dense blocks past the one-host-page install limit — the doom drawcolumn fixture caught
+/// store-dense blocks past the one-host-page install limit: the doom drawcolumn fixture caught
 /// it. It is also what makes the cpl3 arm uniform (H3): the byte is re-read AFTER the check
 /// destroys RDX, so there is nothing to preserve. With the bit OFF this reproduces the
 /// pre-slice sequence exactly.
@@ -24222,7 +24219,7 @@ fn emit_store_write_resolve(
     emit_write_permission_check(e, memory.cpl3, sides.permission);
     emit_write_pointer(e, sides.unavailable_or_kind);
     if memory.watch_page_bit {
-        // RCX is the page index from the kind classify — the permission check never touches it
+        // RCX is the page index from the kind classify: the permission check never touches it
         // and the pointer resolve only reads it. RDX is dead (the store value loads later, and
         // the guard re-derives its own scratches).
         let unwatched = e.label();
@@ -24260,7 +24257,7 @@ fn emit_store_write_resolve(
 /// inside the page the pointer was resolved against.
 ///
 /// At the eleven REFUSING sites the two verdicts share one label, and there this compare is dead
-/// for the self-aligning widths -- `emit_wide_page_guard` gates it out and carries the proof.
+/// for the self-aligning widths: `emit_wide_page_guard` gates it out and carries the proof.
 /// Nothing else may apply that gate: it is sound only where a crossing access and a misaligned
 /// access go to the same place.
 fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, scratch: Reg, cross: Label) {
@@ -24285,7 +24282,7 @@ fn emit_page_cross_bound(e: &mut Encoder, width: MemoryWidth, scratch: Reg, cros
 /// **`scratch` has exactly two legal values, and passing the wrong one produces a silent wrong
 /// answer rather than a fault.**
 ///
-/// * `Reg::RDX` at twelve of the thirteen sites -- the eleven refusing sites plus the lean READ
+/// * `Reg::RDX` at twelve of the thirteen sites: the eleven refusing sites plus the lean READ
 ///   site, where the guard precedes `emit_load_bias_probe` and that pad's contract is "RDX is
 ///   untouched" (see `emit_load_bias_probe`).
 /// * `Reg::RCX` at the lean STORE site, and ONLY there, and only because the alignment half is
@@ -24326,7 +24323,7 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 ///
 /// **The crossing bound is emitted only for a width that does NOT self-align**, which is Qword and
 /// Tbyte and nothing else. For the three self-aligning widths it is dead code here, and the proof
-/// is a statement about one 32-bit register value rather than about how that value was produced --
+/// is a statement about one 32-bit register value rather than about how that value was produced:
 /// both halves read RAX at the same point in the stream (`emit_page_cross_bound` and
 /// `emit_alignment_test` each open with `mov <scratch>, RAX`), and BOTH verdicts target the SAME
 /// label at these eleven sites:
@@ -24336,7 +24333,7 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 /// `N` divides 0x1000, so `x mod N == (x mod 0x1000) mod N`. The crossing interval
 /// `[0x1000 - N + 1, 0xFFF]` lies strictly between two consecutive multiples of `N` and so
 /// contains none of them. Concretely, Word's bound catches only 0xFFF (`& 1 == 1`) and Dword's
-/// catches 0xFFD, 0xFFE, 0xFFF (`& 3 == 1, 2, 3`) -- every one of which the alignment test one
+/// catches 0xFFD, 0xFFE, 0xFFF (`& 3 == 1, 2, 3`), every one of which the alignment test one
 /// instruction later sends to the same place. Byte never reaches here at all.
 ///
 /// The two wide widths keep it because `alignment_bytes() < bytes()` for them (see
@@ -24352,7 +24349,7 @@ fn emit_alignment_test(e: &mut Encoder, width: MemoryWidth, scratch: Reg, misali
 /// verdict-identical: before it, RDX went `RAX & 0xFFF` then `RAX` then `&= mask`; after it, RDX
 /// goes `RAX` then `&= mask`. Same final RDX, same final flags. On the
 /// `IZARRAVM_DIRECT_ALIGN_TEST_AL` arm the alignment half does not write scratch at all, so RDX
-/// is left untouched rather than holding `RAX & 0xFFF` -- which is the one place a stale-RDX
+/// is left untouched rather than holding `RAX & 0xFFF`, which is the one place a stale-RDX
 /// reader would surface, and that arm has its own suite.
 ///
 /// **The crossing bound comes FIRST wherever the wrapper emits it.** The lean sites no longer
@@ -24449,7 +24446,7 @@ fn emit_mov_extend_reg(e: &mut Encoder, dst: u8, src: u8, widths: ExtendWidths, 
             unreachable!("MOVZX/MOVSX source width is only ever Byte or Word")
         }
     }
-    // The write is the operand size, not the source size -- see `emit_extend_write_back`.
+    // The write is the operand size, not the source size. See `emit_extend_write_back`.
     //
     // dst == src is safe by construction at either destination width, including `movzx eax, ah`
     // and `movzx ax, al`: the whole value is materialised into RDX before the single write, and no
@@ -24525,7 +24522,7 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
         }
         // The byte `SetCcMem` computed at the top of its slot. Byte width only: the parker is the
         // only producer and it stores a `setcc` result, so a wider read here would pick up the
-        // upper bytes of a frame slot nothing defined. The `debug_assert` is the whole check --
+        // upper bytes of a frame slot nothing defined. The `debug_assert` is the whole check:
         // there is no correct wider behaviour to fall back to.
         StoreSource::ParkedByte => {
             debug_assert!(matches!(width, MemoryWidth::Byte));
@@ -24580,8 +24577,8 @@ fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
     e.add_r64_to_mem_disp8(Reg::RSP, byte_counter_offset, Reg::RDX);
 }
 
-/// Deposit `extra` EXTRA byte cycles -- the ones a misaligned RAM access owes beyond the single
-/// wide cycle its static count already charges -- into the HIGH half of `STACK_DWORD_READS`.
+/// Deposit `extra` EXTRA byte cycles (the ones a misaligned RAM access owes beyond the single
+/// wide cycle its static count already charges) into the HIGH half of `STACK_DWORD_READS`.
 ///
 /// The lane's low half is the block's static dword-read count and the two cannot interact:
 /// `emit_add_static_accounting` writes the low half with `mov r32, imm32` plus a 64-bit add and
@@ -24589,16 +24586,16 @@ fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
 /// count times at most `MAX_NATIVE_SELF_LOOP_ITERATIONS`. `run.rs` asserts that beside the unpack.
 ///
 /// **The lane's name lies, and it is worth knowing why that was chosen.** This quantity rides in
-/// a lane called "dword reads" and is fed by STORES as well as reads. It is numerically right --
+/// a lane called "dword reads" and is fed by STORES as well as reads. It is numerically right:
 /// `run.rs` prices `ram_byte_writes` through the same `jit_data_cost_clocks(Byte)` as
-/// `ram_byte_reads`, so one shared pool of extra byte cycles is exact -- and it costs nothing:
+/// `ram_byte_reads`, so one shared pool of extra byte cycles is exact, and it costs nothing:
 /// the high half was already copied out by `emit_return` as part of a full 64-bit lane, already
 /// zeroed by the prologue's vector fill, and had no consumer. The single pool is chosen because it
 /// is one deposit helper and one clock term.
 ///
 /// This comment used to offer `STACK_RAM_DWORD_WRITES`'s equally free high half to a future
 /// reader who would rather split reads from stores. **It is taken.** Since the V86/real-mode
-/// far-return slice it carries the far-return ledger -- `RetFar16` deposits into it with
+/// far-return slice it carries the far-return ledger: `RetFar16` deposits into it with
 /// `emit_dynamic_word_increment` and `run.rs` unpacks it into `jit_direct_far_ret_native`, having
 /// first MASKED the low half at both of that lane's readers. Do not double-allocate it.
 ///
@@ -24690,8 +24687,8 @@ fn base_offset() -> i32 {
 }
 
 /// The CS limit `RetFar16` stores. `PopSegReal` and `LoadSegReal` deliberately omit their limit
-/// store, and their argument -- a real-mode load PRESERVES the cached limit, and a V86 entry has
-/// already canonicalised all six -- is about the five DATA segments. The interpreter's CS path
+/// store, and their argument (a real-mode load PRESERVES the cached limit, and a V86 entry has
+/// already canonicalised all six) is about the five DATA segments. The interpreter's CS path
 /// writes 0xFFFF unconditionally through `SegmentRegister::real`, and the difference between "the
 /// interpreter writes it" and "we can prove it was already there" is one 10-byte store on a path
 /// that runs once per block. Store it.
@@ -24774,8 +24771,8 @@ fn emit_commit_alu_candidate(e: &mut Encoder, op: u8, source: StoreSource, width
     // The ALU RESULT still has to be reloaded: the caller clobbers RDX between `emit_alu_candidate`
     // and here (the write-pointer resolve, and the watched-page pack reload), which is why the OFF
     // arm's carry path already reloads it even though nothing on that path writes RDX. What goes
-    // away is the RAX/RCX halves of `load_values` -- they exist only to fill the descriptor's `a`
-    // and `b` -- and, on the carry-bearing ops, the whole three-instruction head test: it selects
+    // away is the RAX/RCX halves of `load_values`: they exist only to fill the descriptor's `a`
+    // and `b`, and, on the carry-bearing ops, the whole three-instruction head test: it selects
     // between two DESCRIPTOR shapes, and with no descriptor the two arms are the same store.
     if eager_flags_enabled() {
         capture(
@@ -24963,7 +24960,7 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, src_
             // The EAGER arm. `emit_logic_live_af` exists because `materialized_eflags`' Logic arm
             // cannot recompute AF and takes it from the memory base instead; with no descriptor
             // there is nothing to recompute from, and `emit_capture_flags(LOGIC_FLAGS)` leaves
-            // RBP's AF untouched -- which is the SAME value those seven instructions write.
+            // RBP's AF untouched, which is the SAME value those seven instructions write.
             emit_eager_publish(e, EAGER_CLASS_LOGIC);
         } else {
             emit_pending(e, 0x8000_0202, None, None, target);
@@ -24989,7 +24986,7 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, src_
 /// # THE WORD ARM (the L1 width lift)
 ///
 /// It is not `alu_r32_r32` masked down: it stages the operands through RAX/RCX/RDX exactly as the
-/// non-carry Word lane in `emit_alu_preloaded` does, for the same reason -- `alu_r16_r16` only
+/// non-carry Word lane in `emit_alu_preloaded` does, for the same reason: `alu_r16_r16` only
 /// defines the destination's low sixteen bits, so the merge back into `target` has to be an
 /// explicit `mov_r16_r16` rather than the Dword arm's direct in-place `alu_r32_r32`. The masks
 /// exist for the lazy descriptor's `a`/`b`, not for the arithmetic: a real 16-bit host op already
@@ -25014,7 +25011,7 @@ fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, src_
 ///   The Dword arm below relies on the identical fact for its own no-carry `alu_r32_r32`.
 /// * On the CARRY path the Word arm masks RAX/RCX and copies RAX into RDX BEFORE calling
 ///   `emit_load_host_flags`, never after: that call clobbers RAX (it stages the RBP-derived word
-///   through it) and, on real hardware, `push`/`popfq` is what actually plants host CF -- an `and`
+///   through it) and, on real hardware, `push`/`popfq` is what actually plants host CF: an `and`
 ///   emitted after it would erase the very bit the branch exists to set. RDX and RCX survive the
 ///   call untouched, which is what makes staging into them first correct.
 fn emit_carry_alu_preloaded(
@@ -25056,7 +25053,7 @@ fn emit_carry_alu_preloaded(
     if eager_flags_enabled() {
         emit_eager_publish(e, EAGER_CLASS_ARITH);
     } else {
-        // Word tag is 0x100 where Dword's is 0x200, the same split the non-carry Word lane uses --
+        // Word tag is 0x100 where Dword's is 0x200, the same split the non-carry Word lane uses:
         // a clear incoming CF makes ADC/SBB compute exactly as ADD/SUB, so this is the SAME
         // descriptor class those ops already tag with, not a new one.
         let (tag, result) = match width {
@@ -25080,13 +25077,13 @@ fn emit_carry_alu_preloaded(
     }
     // `emit_load_host_flags` MUST SURVIVE on both arms: it feeds the host adder's CARRY-IN, which
     // is an OPERAND of ADC/SBB and not a flag record. Only the descriptor asymmetry between the
-    // two arms collapses -- the carry arm already published and cleared, so on the eager arm the
+    // two arms collapses: the carry arm already published and cleared, so on the eager arm the
     // two arms end identically and the branch remains only because the two ARITHMETICS differ.
     //
     // On the Word arm this MUST run after the masks above, not before: it clobbers RAX to plant
     // host CF, and the masked operand this branch computes with already moved into RDX/RCX.
     // `word_alu_register_forms_match_the_interpreter_for_every_admitted_op`'s `(0x8d7, false)` row
-    // is the fixture that catches a hoist -- see its mutation ledger entry.
+    // is the fixture that catches a hoist. See its mutation ledger entry.
     emit_load_host_flags(e);
     match width {
         MemoryWidth::Word => e.alu_r16_r16(op, Reg::RDX, Reg::RCX),
@@ -25137,7 +25134,7 @@ fn emit_inc_dec_reg(e: &mut Encoder, dst: u8, is_dec: bool, width: MemoryWidth) 
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
     if eager_flags_enabled() {
         // The capture mask above already EXCLUDES CF, so the shadow still carries the CF this
-        // instruction architecturally preserves -- the same value `emit_pending_inc_dec` packs
+        // instruction architecturally preserves: the same value `emit_pending_inc_dec` packs
         // into the descriptor's `cf_override`, reached by one store instead of eight
         // instructions. The Word lane's three masking instructions go with the descriptor they
         // fed: nothing else reads RAX or RDX here.
@@ -25207,12 +25204,12 @@ fn emit_alu_byte_imm(e: &mut Encoder, op: u8, dst: u8, imm: u8) {
 /// touches only the destination lane's eight bits, exactly as `write_gpr8` does.
 ///
 /// **The ordering inside `emit_alu_byte_preloaded` is `emit_pending` THEN `emit_capture_flags`,**
-/// on both its branches and inside `emit_carry_alu_byte` — the descriptor is recorded first and
+/// on both its branches and inside `emit_carry_alu_byte`: the descriptor is recorded first and
 /// the host flags captured after. That is the opposite of `emit_inc_dec_reg8`, whose comment
 /// makes the reverse order load-bearing, and the difference is worth stating rather than glossing:
 /// it is safe HERE only because `emit_pending` emits nothing but `mov`s and stores, so it writes
 /// no host flag between the `alu_r8_r8` and the capture. Adding anything that sets flags to
-/// `emit_pending` — a test, a compare, an add — would silently corrupt every byte ALU result's
+/// `emit_pending` (a test, a compare, an add) would silently corrupt every byte ALU result's
 /// flags, and this function would be one of the callers it broke. (An earlier version of this
 /// comment stated the order backwards; the code has never had it either way but the claim was
 /// wrong, and a wrong claim about a flag window is an invitation.)
@@ -25244,14 +25241,14 @@ fn emit_alu_byte_preloaded(e: &mut Encoder, op: u8) {
             if eager_flags_enabled() {
                 // THE PAIRED DELETION, and it is the defect that rejected the first revision of
                 // this slice's design. The OFF arm below ends with a RELOAD of RDX from the
-                // descriptor's `result` word -- and RDX is not a flag here, it is the guest BYTE
+                // descriptor's `result` word, and RDX is not a flag here, it is the guest BYTE
                 // ALU RESULT that `emit_alu_reg_byte` writes back with `emit_write_gpr8`. The
                 // reload exists for exactly one reason: `emit_logic_live_af` clobbers RDX with
                 // `mov RDX, RBP`.
                 //
                 // So the producer and the reload must be dropped TOGETHER. Dropping the producer
                 // alone would leave the reload reading a cleared or stale word and miscompile the
-                // RESULT of every byte AND/OR/XOR with write-back -- guest-visible corruption of
+                // RESULT of every byte AND/OR/XOR with write-back: guest-visible corruption of
                 // a common shape, not merely wrong flags.
                 //
                 // With `emit_logic_live_af` gone nothing between the `alu_r8_r8` and the
@@ -25356,7 +25353,7 @@ fn emit_imul(e: &mut Encoder, dst: u8, src: u8) {
     emit_clear_pending(e);
 }
 
-/// IMUL r32, r/m32, imm — the three-operand form, register source (0x69 and 0x6B).
+/// IMUL r32, r/m32, imm: the three-operand form, register source (0x69 and 0x6B).
 ///
 /// `dst = src * imm`, which is one host instruction because the host has the same three-operand
 /// encoding with the same truncation and the same CF/OF rule. The flag tail is `emit_imul`'s
@@ -25364,7 +25361,7 @@ fn emit_imul(e: &mut Encoder, dst: u8, src: u8) {
 /// three-operand form through one `imul_truncated` (core.rs), which ends in
 /// `set_flag(FLAG_CF | FLAG_OF, significant)`. That mask has more than one bit set, so it cannot
 /// take the single-bit CF-override shortcut and instead materializes whatever was pending before
-/// writing just those two bits -- leaving SF/ZF/AF/PF exactly as they were.
+/// writing just those two bits, leaving SF/ZF/AF/PF exactly as they were.
 ///
 /// Unlike `emit_imul` this reads a source it does not write, and no shuffle is needed for it:
 /// every operand is a `GUEST_HOMES` register (R8-R14 plus RBX), the host instruction reads `src`
@@ -25457,12 +25454,12 @@ fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
 ///
 /// This is the only lowering whose guest instruction has an architectural fault, and the fault is
 /// raised by the HOST divide instruction rather than by a guard we choose to run. A guest divide
-/// that reached a host `div` with a zero divisor would raise a host #DE on the JIT stack --
+/// that reached a host `div` with a zero divisor would raise a host #DE on the JIT stack:
 /// SIGFPE / EXCEPTION_INT_DIVIDE_BY_ZERO inside the emulator process, not a guest fault. So the
 /// whole design is: prove the host divide cannot fault, then run it.
 ///
 /// The guard may be CONSERVATIVE but never permissive. A side exit ends the native run AT this
-/// instruction with nothing done, and the interpreter re-executes it whole -- raising #DE by its
+/// instruction with nothing done, and the interpreter re-executes it whole, raising #DE by its
 /// own rules if that is what the guest's operands call for. So the guard has to be a SUFFICIENT
 /// condition for the host divide's safety, and only its cost argues for making it tight.
 ///
@@ -25471,9 +25468,9 @@ fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
 /// `cmp edx, ecx; jae exit` before a 32-bit `div ecx` covers both of `CpuGsw::div`'s unsigned
 /// error returns and nothing else:
 ///
-/// * divisor zero -- `edx >= 0` is unsigned-true for every EDX, so a zero divisor ALWAYS exits.
+/// * divisor zero: `edx >= 0` is unsigned-true for every EDX, so a zero divisor ALWAYS exits.
 ///   The zero test is subsumed rather than omitted.
-/// * quotient overflow -- the interpreter's rule is `EDX:EAX / divisor > 0xffff_ffff`, and that
+/// * quotient overflow: the interpreter's rule is `EDX:EAX / divisor > 0xffff_ffff`, and that
 ///   holds if and only if `EDX >= divisor`. Forward: `EDX >= divisor` gives
 ///   `EDX*2^32 + EAX >= divisor*2^32`, so the quotient is at least 2^32. Backward:
 ///   `EDX <= divisor - 1` gives `EDX*2^32 + EAX <= (divisor-1)*2^32 + (2^32 - 1)
@@ -25487,26 +25484,26 @@ fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
 /// is no cheap exact predicate for it on the operands. At 64 bits there is no predicate to find:
 /// with `|divisor| >= 2` the quotient is at most `|dividend| / 2 <= 2^62`, so `idiv rcx` cannot
 /// overflow, and the guest's own 32-bit range rule becomes a COMPARISON on the answer. That is
-/// also a transliteration of the interpreter, which computes `i64 / i64` and then range-checks --
+/// also a transliteration of the interpreter, which computes `i64 / i64` and then range-checks,
 /// so the quotient and the remainder agree by construction rather than by a re-derivation.
 ///
 /// Three guards, in order:
 ///
-/// 1. `divisor == 0` -- the interpreter's first error return, and the host's first fault.
-/// 2. `divisor == -1` -- CONSERVATIVE, and the only place this function refuses more than the
+/// 1. `divisor == 0`: the interpreter's first error return, and the host's first fault.
+/// 2. `divisor == -1`: CONSERVATIVE, and the only place this function refuses more than the
 ///    interpreter faults on. It exists to remove `i64::MIN / -1`, the sole remaining 64-bit
 ///    overflow, without a 64-bit immediate compare against the dividend. What it costs is a side
 ///    exit on a legal `IDIV` by -1, which is a negation nothing emits; `side_exit_divide_guard`
 ///    is the always-on evidence for whether that stays true, and if it ever does not, the exact
 ///    form is `divisor == -1 && dividend == i64::MIN`.
-/// 3. quotient outside `i32` -- the interpreter's range check, done after the divide as
+/// 3. quotient outside `i32`: the interpreter's range check, done after the divide as
 ///    `movsxd rcx, eax; cmp rax, rcx`. The divide has run by then, but it has written only RAX
 ///    and RDX, which are emitter scratch, so the exit still leaves the instruction un-started.
 ///
 /// # Flags
 ///
 /// Both forms leave the guest's arithmetic flags ARCHITECTURALLY UNDEFINED, and `CpuGsw::div`
-/// implements that by touching neither `eflags` nor `pending_flags` -- so this emits no flag
+/// implements that by touching neither `eflags` nor `pending_flags`, so this emits no flag
 /// handling at all. That is not an omission: capturing the host divide's flags, or clearing the
 /// pending descriptor, would each diverge from the interpreter on a fixture that reads a lazy
 /// flag produced BEFORE the divide. The host divide does write host EFLAGS, which is harmless
@@ -25518,7 +25515,7 @@ fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
 /// because what saves it is machinery that predates this slice and could be "tidied" away by
 /// someone who does not know anything depends on it.
 ///
-/// A `DivReg` really can be a block's FIRST slot in production -- nothing in `classify` or the
+/// A `DivReg` really can be a block's FIRST slot in production: nothing in `classify` or the
 /// compile loop prevents it, and `compile_leading_block(&[0xf7, 0xf3])` builds exactly that. A
 /// guard exit there retires ZERO instructions and leaves EIP where it entered, so on its own it
 /// would re-dispatch the same block, refuse again, and never make progress.
@@ -25530,13 +25527,13 @@ fn emit_imul_reg_acc(e: &mut Encoder, src: u8) {
 ///   of `run_direct_block`), which becomes `DirectContinuation::Prefix` and sets
 ///   `direct_runtime.skip_direct_once`. The next loop iteration's admission gate consumes that
 ///   latch with a `mem::take` and returns `ContinuationDispatch::Skipped`, so the INTERPRETER
-///   executes the divide -- and raises #DE if the operands call for it.
+///   executes the divide, and raises #DE if the operands call for it.
 /// * **At a run boundary.** `run_budgeted_inner` clears `skip_direct_once` on entry, so a guard
 ///   exit that ends a run does not carry its latch forward. It does not need to: that loop's
 ///   `first` flag always interprets a run's first instruction, and the Direct dispatcher is only
 ///   consulted on continuations.
 ///
-/// This is not new with DIV -- any slot-0 side exit has the same shape, and a memory guard on an
+/// This is not new with DIV: any slot-0 side exit has the same shape, and a memory guard on an
 /// entry-slot `Load` reaches it today. What IS new is that this is the first exit reason that is
 /// a pure property of the DATA with no address component, so it can fire on a block that will
 /// never bind differently, arbitrarily often. That makes the liveness argument worth stating
@@ -25552,14 +25549,14 @@ fn emit_div_reg(e: &mut Encoder, src: u8, signed: bool, guard: Label) {
     emit_div_write_back(e);
 }
 
-/// The divide itself, with the divisor already staged in RCX -- sign-extended to 64 bits for the
+/// The divide itself, with the divisor already staged in RCX, sign-extended to 64 bits for the
 /// signed form, zero-extended (a plain `mov r32, r32`) for the unsigned one.
 ///
 /// Split out of `emit_div_reg` so the MEMORY form shares one body rather than a transcription of
 /// it, and split at the DIVISOR because that is the only thing the two operand forms disagree
 /// about: the dividend is EDX:EAX either way, the guards are the same three (or one) tests, and
 /// the quotient/remainder land in the same two registers. The split is byte-neutral for the
-/// register form -- the instructions below are emitted in exactly the order they were when this
+/// register form: the instructions below are emitted in exactly the order they were when this
 /// was one function, which is what keeps the gate-off build identical to main.
 ///
 /// Leaves the quotient in RAX and the remainder in RDX. It does NOT write them back to the guest
@@ -25589,7 +25586,7 @@ fn emit_div_preloaded(e: &mut Encoder, signed: bool, guard: Label) {
         // which is why the assembly above had to finish first.
         e.cqo();
         e.idiv_r64(Reg::RCX);
-        // Guard 3. RCX is free here -- the divisor has been consumed -- and the divide has
+        // Guard 3. RCX is free here (the divisor has been consumed) and the divide has
         // written only RAX and RDX, so this exit is still pre-effect.
         e.movsxd_r64_r32(Reg::RCX, Reg::RAX);
         e.cmp_r64_r64(Reg::RAX, Reg::RCX);
@@ -25624,7 +25621,7 @@ fn emit_div_write_back(e: &mut Encoder) {
 /// The reason the second one cannot simply follow the first is NOT the exits, it is the mode-13
 /// read counter between them. `emit_ram_read_pointer` deposits `mode13_dword_reads` into the frame
 /// before it returns, `emit_return` copies that lane out on EVERY exit including a side exit, and
-/// a side exit re-runs the whole instruction in the interpreter -- so a divide-guard exit taken
+/// a side exit re-runs the whole instruction in the interpreter, so a divide-guard exit taken
 /// after the deposit charges one guest read twice. That is a guest-visible bus-accounting error,
 /// the same class `dynamic_counter_fields` refuses to make maskable.
 ///
@@ -25632,9 +25629,9 @@ fn emit_div_write_back(e: &mut Encoder) {
 /// exit: `emit_ram_read_pointer_inner`, which parks the page kind and moves no counter, then every
 /// guard, then the commit, then `emit_mode13_read_completion` last. In order:
 ///
-/// 1. the address, alignment and page-kind guards (`_inner`) -- exit, nothing deposited;
+/// 1. the address, alignment and page-kind guards (`_inner`): exit, nothing deposited;
 /// 2. the divisor load out of RDI, and its sign extension for IDIV;
-/// 3. the divide guards, including IDIV's post-divide quotient-range one -- exit, still nothing
+/// 3. the divide guards, including IDIV's post-divide quotient-range one: exit, still nothing
 ///    deposited, and still pre-effect because the divide has written only RAX and RDX;
 /// 4. `emit_div_write_back`, the commit;
 /// 5. `emit_mode13_read_completion`, which clobbers RCX and RDX and is why 4 comes before it.
@@ -25691,7 +25688,7 @@ fn emit_div_mem(
 /// SAHF (0x9E), behind `IZARRAVM_FPU_LOOP_ROWS`.
 ///
 /// The interpreter is `materialize_flags()` then
-/// `eflags = (eflags & !0xd5) | (ah & 0xd5) | 0x02`, and RBP is the running materialized shadow --
+/// `eflags = (eflags & !0xd5) | (ah & 0xd5) | 0x02`, and RBP is the running materialized shadow,
 /// so the settle is already done and what is left is the mask-merge, the publish and the
 /// descriptor teardown. That is the same three-step tail `emit_rotate_reg`'s count-1 branch runs,
 /// for the same stated reason: with a live descriptor the net eflags is the materialized word with
@@ -25700,7 +25697,7 @@ fn emit_div_mem(
 ///
 /// `0xd5` is CF|PF|AF|ZF|SF and is a strict subset of `ARITH_FLAGS`. **OF is the sixth member and
 /// is deliberately NOT in the mask**: SAHF preserves it, and widening the mask to `ARITH_FLAGS`
-/// would clear it whenever AH's bit 11 happened to be clear -- silently, because AH's bit 11 does
+/// would clear it whenever AH's bit 11 happened to be clear, silently, because AH's bit 11 does
 /// not exist.
 ///
 /// AH is bits 8..15 of `home(0)`, read the way `emit_read_store_value`'s byte arm reads any high
@@ -25771,8 +25768,8 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
 /// Group-2 immediate shift (0xC1 /4../7, 0xD1 /4../7), register destination, Word or Dword.
 ///
 /// **The two widths differ in ONE instruction and nothing else, and that is the finding rather
-/// than a convenience.** Everything below the shift -- which flags are `defined`, the eager
-/// publish to `eflags`, the `emit_clear_pending` -- is width-invariant because
+/// than a convenience.** Everything below the shift (which flags are `defined`, the eager
+/// publish to `eflags`, the `emit_clear_pending`) is width-invariant because
 /// `CpuGsw::shift_rotate` routes both widths through the same `set_shift_result_flags`, which
 /// materializes and writes live at either width. Only the host shift itself has to narrow, and a
 /// 66-prefixed `C1 /op` narrows all four flag derivations at once:
@@ -25783,14 +25780,14 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
 /// | OF | only at a masked count of 1: SHL `msb(result) ^ CF` with msb at bit 15; SHR `msb(ORIGINAL)`; SAR always 0 | same, and the host leaves OF undefined above count 1 exactly where the interpreter leaves the previous value in place |
 /// | SF | bit 15 of the result | same |
 /// | ZF / PF | the 16-bit result; PF over its low byte | same |
-/// | AF | untouched at both widths -- `set_shift_result_flags` re-writes the value it read | not in `defined`, so RBP's AF survives |
+/// | AF | untouched at both widths: `set_shift_result_flags` re-writes the value it read | not in `defined`, so RBP's AF survives |
 ///
 /// A masked-Dword lowering gets every one of those wrong: CF from bit 31, SF from bit 31, ZF over
 /// 32 bits, and SAR shifting in zeros where the guest shifts in bit 15.
 ///
 /// **A count of 0 emits NOTHING, at both widths, and that is load-bearing.** `shift_rotate`
 /// returns before touching the value or a flag ("a zero count affects no flags at all"), so no
-/// flag moves, no descriptor is created and no live descriptor is destroyed -- and the
+/// flag moves, no descriptor is created and no live descriptor is destroyed, and the
 /// write-back the interpreter still performs is `write_gpr16(dst, value & 0xffff)` over the value
 /// it just read, i.e. the identity. Emitting the host shift with a count of 0 would be wrong in
 /// the other direction only for the flags, but emitting the `defined` merge below would publish
@@ -25805,8 +25802,8 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
 /// documents results and flags as undefined once the count reaches the operand size) and are
 /// still lowered, deliberately. The reference this tree matches is its own interpreter, and the
 /// two agree across the whole range: a sweep of SHL/SHR/SAR over ten operand values and every
-/// count 1..=31 on this host reproduced `shift_rotate`'s single-bit loop -- result, CF, OF, SF,
-/// ZF and PF -- with zero mismatches. `word_shifts_match_the_interpreter_for_every_count` pins
+/// count 1..=31 on this host reproduced `shift_rotate`'s single-bit loop (result, CF, OF, SF,
+/// ZF and PF) with zero mismatches. `word_shifts_match_the_interpreter_for_every_count` pins
 /// that as a test rather than an assumption, so a host that disagreed would fail the suite loudly
 /// instead of miscompiling quietly.
 fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidth) {
@@ -25848,8 +25845,8 @@ fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidt
 /// sub-opcode sets in mind for the same family.
 ///
 /// Modelled on `emit_inc_dec_reg8` rather than on the body above, and for the same reason: `dst`
-/// is a BYTE-register index where 4..7 name AH/CH/DH/BH, so `home(dst)` -- which is
-/// `GUEST_HOMES[index & 7]` -- would reach the guest ESP, EBP, ESI or EDI home and shift the wrong
+/// is a BYTE-register index where 4..7 name AH/CH/DH/BH, so `home(dst)` (which is
+/// `GUEST_HOMES[index & 7]`) would reach the guest ESP, EBP, ESI or EDI home and shift the wrong
 /// register by 32 bits. The read/modify/write-back through
 /// `emit_read_store_value` and `emit_write_gpr8` touches exactly the destination lane's eight
 /// bits, which is `write_gpr8`'s contract and the one the interpreter's
@@ -25866,7 +25863,7 @@ fn emit_shift(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidt
 /// what makes the flags the host's rather than something this function has to reconstruct:
 /// `shift_rotate` at `BusWidth::Byte` takes CF from the last bit shifted out of eight, SF from
 /// bit 7 and ZF/PF from the 8-bit result, which an 8-bit host shift does by construction and a
-/// 32-bit one gets wrong in all three. `0x80 shl 1` is the shortest witness -- 8 bits gives 0x00
+/// 32-bit one gets wrong in all three. `0x80 shl 1` is the shortest witness: 8 bits gives 0x00
 /// with CF set and ZF set, 32 bits gives 0x100 with CF clear and ZF clear. At `/7` the wrong shape
 /// is wrong in the VALUE and not merely the flags: a 32-bit arithmetic shift of a zero-extended
 /// byte shifts in zeros where the guest shifts in bit 7, which is why the genuine `C0 /7` matters
@@ -25905,13 +25902,13 @@ fn emit_shift_reg8(e: &mut Encoder, op: u8, dst: u8, count: u8) {
 /// name AH/CH/DH/BH, and `home()` would reach the wrong 32-bit register entirely.
 ///
 /// The encoder call is `shift_r8_imm8`, the SAME generic group-2 encoder `emit_shift_reg8` already
-/// uses -- it accepts any `op < 8` and places it straight into the ModRM `/op` slot, so ROL (0) and
+/// uses: it accepts any `op < 8` and places it straight into the ModRM `/op` slot, so ROL (0) and
 /// ROR (1) cost no new encoder work, exactly as the task that added this function expected.
 ///
 /// The flag contract is `emit_rotate_reg`'s, not `emit_shift_reg8`'s: CF from the bit rotated out
 /// of the 8-bit operand (bit 7 for ROL, bit 0 for ROR), OF defined only at a masked count of 1, and
-/// SF/ZF/PF/AF untouched at every count. `emit_commit_shift_flags` -- which `emit_shift_reg8` calls
-/// and which publishes SHIFT_DEFINED (CF, PF, ZF, SF) wholesale -- would be WRONG here for the same
+/// SF/ZF/PF/AF untouched at every count. `emit_commit_shift_flags` (which `emit_shift_reg8` calls
+/// and which publishes SHIFT_DEFINED (CF, PF, ZF, SF) wholesale) would be WRONG here for the same
 /// reason it is wrong in `emit_rotate_reg`: a rotate does not redefine SF/ZF/PF the way a shift
 /// does, so this function reproduces `emit_rotate_reg`'s own two-branch capture instead.
 ///
@@ -25954,7 +25951,7 @@ fn emit_rotate_reg8(e: &mut Encoder, op: u8, dst: u8, raw_count: u8) {
 
 /// Publish a group-2 SHIFT's flags: the four it always defines, plus OF at a masked count of 1.
 ///
-/// Shared by all three width lanes because the interpreter shares them -- `set_shift_result_flags`
+/// Shared by all three width lanes because the interpreter shares them: `set_shift_result_flags`
 /// is reached once from `shift_rotate`'s `matches!(op, 4..=7)` branch with an `of` of `None` above
 /// count 1, and its `None` arm re-reads the CURRENT OF, i.e. preserves it. Publishing the whole
 /// RBP shadow reproduces that: `emit_capture_flags` merges only the `defined` bits, so OF above
@@ -25998,7 +25995,7 @@ fn emit_set_cf_only(e: &mut Encoder) {
         // publishing the whole shadow IS that write.
         //
         // Bit 1 comes along for free rather than being reproduced: `set_flag`'s `eflags |= 0x2`
-        // is a no-op against RBP, whose bit 1 is invariantly set -- it is loaded from the entry
+        // is a no-op against RBP, whose bit 1 is invariantly set: it is loaded from the entry
         // flags word and every RBP writer masks by a `defined` set that excludes 0x2.
         emit_eager_publish(e, EAGER_CLASS_CF_ONLY);
         return;
@@ -26051,7 +26048,7 @@ fn emit_set_cf_only(e: &mut Encoder) {
 /// `op` is the guest ModRM `reg` field and goes STRAIGHT into the encoder's `/op` slot: host
 /// group 2 numbers ROL 0 and ROR 1 exactly as the guest does, so there is no translation to get
 /// wrong. Everything below this line is direction-independent, which is the whole reason the two
-/// sub-opcodes share one function -- the flag contract, not the rotate, is what the code is for.
+/// sub-opcodes share one function: the flag contract, not the rotate, is what the code is for.
 fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: MemoryWidth) {
     debug_assert!(matches!(op, 0 | 1), "only ROL and ROR reach this emitter");
     debug_assert!(
@@ -26071,10 +26068,10 @@ fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: Memor
     // have to be read off `shift_rotate` rather than off the manual, because the manual calls OF
     // undefined above count 1 and this tree's oracle is the interpreter.
     //
-    // CF is the bit rotated across the boundary -- out of the MSB for ROL, out of bit 0 for ROR --
+    // CF is the bit rotated across the boundary: out of the MSB for ROL, out of bit 0 for ROR,
     // which is what the loop leaves in `cf` for either direction. At count 1 the interpreter's OF
     // arm splits by op: `0 | 2 => top ^ cf` for a left rotate and `1 | 3 => top ^ (bit 30 of the
-    // result)` for a right one -- at Word width `shift_rotate` derives that same pair from bit 15
+    // result)` for a right one: at Word width `shift_rotate` derives that same pair from bit 15
     // and bit 14 instead. Those are the SAME definitions x86 gives ROL and ROR at either width, so
     // the host computes each one for us and the split never appears in this function.
     match width {
@@ -26113,7 +26110,7 @@ fn emit_rotate_reg(e: &mut Encoder, op: u8, dst: u8, raw_count: u8, width: Memor
 ///
 /// Shared by the baked path (`emit_commit_shift_flags`, which adds OF from a compile-time count)
 /// and the lane path (`emit_shift_lane`, which adds it under a runtime branch), because the two
-/// must define the same set for the same instruction at the same count — the lane form's whole
+/// must define the same set for the same instruction at the same count: the lane form's whole
 /// claim is that it changes where the count comes from and nothing else.
 const SHIFT_DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
 
@@ -26123,7 +26120,7 @@ const SHIFT_DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | cr
 /// # Why this is a branch and not a swapped operand
 ///
 /// `emit_rotate_reg`'s correctness argument is a COMPILE-TIME split on the masked count, and the
-/// three shapes are not variations on one flag update — they are three different contracts:
+/// three shapes are not variations on one flag update: they are three different contracts:
 ///
 /// * **0**: `shift_rotate` returns before touching the value or a flag. No flag moves, no
 ///   descriptor is created, and no live descriptor is destroyed. This is the shape a "conservative"
@@ -26153,7 +26150,7 @@ const SHIFT_DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | cr
 /// # Registers
 ///
 /// RDX stages the lane's host pointer and RCX the masked count, both emitter scratch (`GUEST_HOMES`
-/// is R8-R14 plus RBX), so neither can alias `home(dst)` — not even when `dst` is guest ECX or EDX.
+/// is R8-R14 plus RBX), so neither can alias `home(dst)`, not even when `dst` is guest ECX or EDX.
 /// Nothing between the mask and the last read of RCX writes it: `rol r32, cl` only READS CL, and
 /// `emit_capture_flags`/`emit_set_cf_only`/`emit_clear_pending` work in RAX, RDI and RBP.
 fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, lane: ImmLane) {
@@ -26178,7 +26175,7 @@ fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, la
     e.cmp_r32_imm32(Reg::RCX, 1);
     e.jz(one);
     // Counts 2 through 31: CF only, in place, exactly as `emit_rotate_reg`'s tail does it. The
-    // host rotate's OF is deliberately NOT captured — above count 1 it is undefined on x86 and the
+    // host rotate's OF is deliberately NOT captured: above count 1 it is undefined on x86 and the
     // guest's OF is still owned by the descriptor.
     e.shift_r32_cl(op, home(dst));
     emit_capture_flags(e, crate::FLAG_CF);
@@ -26199,10 +26196,10 @@ fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, la
 /// The Byte arm reaches `/5` and `/7` as of the byte-shift-rows slice, and it does so on the
 /// SHIPPED count-lane arm rather than in some corner: `count_lane_for` bars on
 /// `matches!(insn.opcode, 0xc0 | 0xc1)`, `imm_len == 1` and `len == 3`, all of which the new rows
-/// pass at BOTH segment kinds. `0xD0` takes no lane at all -- no immediate byte, and `len == 2`.
+/// pass at BOTH segment kinds. `0xD0` takes no lane at all: no immediate byte, and `len == 2`.
 ///
 /// The same runtime three-way branch `emit_rotate_reg_lane` carries, over the same masked loaded
-/// byte, and for the same reason — but the two upper arms differ only in ONE bit of the `defined`
+/// byte, and for the same reason, but the two upper arms differ only in ONE bit of the `defined`
 /// mask rather than in which flag path they take, because `emit_commit_shift_flags` is shared by
 /// every count above zero and adds `FLAG_OF` at exactly count 1. So the tail (the publish, the
 /// descriptor clear, and at Byte the write-back) is emitted once and both arms fall into it, which
@@ -26215,14 +26212,14 @@ fn emit_rotate_reg_lane(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth, la
 /// read would write scratch into a guest register.
 ///
 /// **Word is unreachable because `count_lane_for` BARS IT ON THE KIND'S WIDTH**, and that sentence
-/// is written this way because the first version of this slice made the weaker claim — that the
+/// is written this way because the first version of this slice made the weaker claim: that the
 /// prefix bar and `len == 3` refused Word already, since a Word `0xC1` needs a `0x66`. In a
 /// 16-bit code segment the operand size follows CS.D, so `c1 e0 03` is an unprefixed three-byte
 /// `shl ax, 3` at Word, and the arm below was reached and PANICKED THE COMPILER on ordinary DOS
 /// code. The width bar is now explicit at the admission site, and
 /// `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` is the regression
 /// fixture. That sentence used to end "that is what makes `shift_r16_cl` a helper this "
-/// "tree does not owe" -- true when this comment was about the COUNT-LANE arm alone, which
+/// "tree does not owe", true when this comment was about the COUNT-LANE arm alone, which
 /// takes an immediate byte and can never reach a CL-sourced shift. The S-B ALU-rows slice is
 /// what makes `shift_r16_cl` owed: `emit_shift_cl` (the SEPARATE, unrelated shift-by-CL
 /// emitter below) now has a Word arm that calls it, admitted under
@@ -26354,7 +26351,7 @@ fn emit_merge_double_shift_flags(e: &mut Encoder, defined: u32) {
 /// The count is runtime data, which forces three differences from `emit_shift`:
 ///
 /// 1. The masked count stays in RCX across the shift. Nothing between the mask and the last read
-///    writes RCX -- `shl r32, cl` only READS CL, and `pushfq`/`pop rax` do not touch it -- so no
+///    writes RCX: `shl r32, cl` only READS CL, and `pushfq`/`pop rax` do not touch it, so no
 ///    stack slot is needed for it, unlike the double-shift path this was first modelled on.
 /// 2. The host flags are captured with `pushfq` immediately after the shift, because the count
 ///    test below would otherwise destroy them.
@@ -26363,8 +26360,8 @@ fn emit_merge_double_shift_flags(e: &mut Encoder, defined: u32) {
 ///    captured value at that point is the masking `and`'s leftovers rather than the shift's.
 ///
 /// COMPACTNESS IS THE POINT, not style. The first version of this lowering spilled the count and
-/// the flags to the frame and inlined a full merge -- including `emit_clear_pending`'s four
-/// stores -- into BOTH the count==1 and count>1 arms. That came to ~31 host instructions per
+/// the flags to the frame and inlined a full merge (including `emit_clear_pending`'s four
+/// stores) into BOTH the count==1 and count>1 arms. That came to ~31 host instructions per
 /// site, grew generated code 51% and arena compactions 47.6%, and the slice was reverted for it.
 /// Here the two arms are two instructions each and everything after them, the OR, the EFLAGS
 /// publish and the single `emit_clear_pending`, is shared.
@@ -26374,7 +26371,7 @@ fn emit_merge_double_shift_flags(e: &mut Encoder, defined: u32) {
 /// publish are all width-invariant, because the host's 66-prefixed shift computes CF, SF, ZF and
 /// PF from the 16-bit operand directly (`shift_r16_cl`'s own doc). The shift itself is emitted
 /// UNCONDITIONALLY before the count test below and is a no-op at count 0 only because the host
-/// applies its own five-bit CL mask -- there is no count-0 branch to add at either width.
+/// applies its own five-bit CL mask: there is no count-0 branch to add at either width.
 fn emit_shift_cl(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
     const DEFINED: u32 = crate::FLAG_CF | crate::FLAG_PF | crate::FLAG_ZF | crate::FLAG_SF;
     const WITH_OF: u32 = DEFINED | crate::FLAG_OF;
@@ -26383,7 +26380,7 @@ fn emit_shift_cl(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
     let done = e.label();
 
     // Guest CL is the low byte of guest ECX. RCX is emitter scratch and GUEST_HOMES is R8-R14
-    // plus RBX, so this can never clobber `home(dst)` -- not even when `dst` is ECX itself.
+    // plus RBX, so this can never clobber `home(dst)`, not even when `dst` is ECX itself.
     e.mov_r32_r32(Reg::RCX, home(1));
     e.and_r32_imm32(Reg::RCX, 0x1f);
     match width {
@@ -26499,7 +26496,7 @@ fn emit_capture_flags(e: &mut Encoder, defined: u32) {
 /// One `test` against a mask of the RBP EFLAGS shadow, in the SHORTEST form the mask admits.
 ///
 /// `test bpl, imm8` is four bytes and `test ebp, imm32` is six, and the two set ZF identically for
-/// any mask that fits a byte -- so **a mutation of this rule is semantically INERT** and cannot be
+/// any mask that fits a byte, so **a mutation of this rule is semantically INERT** and cannot be
 /// caught by any differential fixture. It is pinned by the byte-delta ledger
 /// (`jcc_shadow_emission_delta_matches_the_ledger`) instead, which is also the ledger the arena
 /// occupancy risk is read on. `reg` is RBP for the twelve direct predicates and RAX for the two
@@ -26514,7 +26511,7 @@ fn emit_shadow_test(e: &mut Encoder, reg: Reg, mask: u32) {
 }
 
 /// Which of the four emission shapes a condition takes, in the order the `jcc_shadow_sites` lanes
-/// count them. The classes exist for the byte ledger -- each has its own ON-minus-OFF delta -- and
+/// count them. The classes exist for the byte ledger (each has its own ON-minus-OFF delta) and
 /// they double as the ARM VACUITY check a ladder leg is read on: all four read zero on the OFF arm.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JccShadowClass {
@@ -26536,7 +26533,7 @@ enum JccShadowClass {
 /// # THE CONDITION TABLE IS COMPLETE, AND IT IS A RAW GUEST NIBBLE
 ///
 /// `classify` hands the guest's own four-bit condition code through untranslated from both forms
-/// that produce a `DirectKind::Jcc` -- the short `0x70..=0x7f` and the near `0x0f80..=0x0f8f` --
+/// that produce a `DirectKind::Jcc`: the short `0x70..=0x7f` and the near `0x0f80..=0x0f8f`,
 /// so all sixteen are reachable and all sixteen are lowered here. The nibble's LOW BIT is the
 /// negation in every pair, which is why the branch below is a single `jnz`-or-`jz` choice and the
 /// mask table is indexed by `condition >> 1`: a pair shares its predicate and differs only in
@@ -26544,8 +26541,8 @@ enum JccShadowClass {
 ///
 /// # WHAT THESE SEQUENCES WRITE, AND WHY IT IS A SUBSET OF WHAT THEY REPLACE
 ///
-/// RAX (the two signed folds only) and the host flags. The OFF arm writes BOTH at every condition
-/// -- `emit_load_host_flags` clobbers RAX and `popfq` writes the entire flags register -- so the
+/// RAX (the two signed folds only) and the host flags. The OFF arm writes BOTH at every condition:
+/// `emit_load_host_flags` clobbers RAX and `popfq` writes the entire flags register, so the
 /// replacement's footprint is a strict subset and twelve of the sixteen conditions touch no
 /// general register at all. Nothing else is live across a terminator to disturb: `GUEST_HOMES` is
 /// R8-R14 plus RBX, R15 is the CPU pointer, RBP is the shadow itself, and RSI is the x87 tag-cache
@@ -26554,7 +26551,7 @@ enum JccShadowClass {
 /// later reader adding a fifth instruction to one of these chains needs to know that.
 ///
 /// RAX is dead across the terminator on every reachable continuation, at the four sites that
-/// actually touch it -- `emit_fetch_trace`, the link-cell quota load, the self-loop quota load and
+/// actually touch it: `emit_fetch_trace`, the link-cell quota load, the self-loop quota load and
 /// `emit_return` all WRITE RAX before any read, and `emit_advance_eip` loads into it first.
 ///
 /// # NO `| 0x2`
@@ -26609,7 +26606,7 @@ fn emit_jcc_shadow(e: &mut Encoder, condition: u8, taken: Label) -> JccShadowCla
             emit_shadow_test(e, Reg::RAX, 0x80);
             JccShadowClass::SignedXor
         }
-        // JLE / JG: ZF | (SF ^ OF). XOR6 goes the other way -- align SF UP onto OF's bit 11 and
+        // JLE / JG: ZF | (SF ^ OF). XOR6 goes the other way: align SF UP onto OF's bit 11 and
         // fold, so RAX bit 11 is SF^OF; shift that DOWN by 5 onto ZF's bit 6 (11 - 6 = 5); OR the
         // shadow back in so bit 6 becomes (SF^OF) | ZF; test bit 6. The final `or` is the whole
         // ZF term: delete it and the lowering computes JL where it should compute JLE.
@@ -26672,8 +26669,8 @@ fn emit_clear_pending(e: &mut Encoder) {
         // usually one. The descriptor is `Default` from the entry clear (`run.rs`'s E1) onwards,
         // and on this arm NOTHING inside a native block writes it: every producer publishes the
         // RBP shadow to `registers.eflags` instead, the two emitted READERS both belong to arms
-        // that are not emitted, and the only mid-block path that can install one -- the
-        // interpreter inside an `InterpretOne` call-out -- tears it down again in `publish_flags`
+        // that are not emitted, and the only mid-block path that can install one (the
+        // interpreter inside an `InterpretOne` call-out) tears it down again in `publish_flags`
         // on the way out. So these four stores would write zero over zero.
         //
         // Dropping them is the single largest byte saving in the slice (four `disp32` immediate
@@ -27094,7 +27091,7 @@ fn emit_rmw_inc_dec_dword(
 ///   only one of them;
 /// * the ALIGNMENT half is SERVED. A misaligned but page-local access reaches the same host bytes
 ///   through the same bias, so the only thing it owes is the bus charge, and the tail deposits it
-///   dynamically -- TWICE, because a read-modify-write performs two split accesses where the lean
+///   dynamically: TWICE, because a read-modify-write performs two split accesses where the lean
 ///   store stub performs one. `run.rs` prices `ram_byte_writes` through the same
 ///   `jit_data_cost_clocks(Byte)` as `ram_byte_reads`, which is why one pool takes both.
 ///
@@ -27146,7 +27143,7 @@ fn emit_rotate_shift_mem(
 ) {
     // A RELEASE-LIVE narrowing, not a `debug_assert`. `shift_r8_imm8` and its two siblings push
     // `op` into the ModRM `/op` slot with no translation and no table, so a `/2` or `/3` that ever
-    // slipped past `classify` would become a real host RCL or RCR seeded with the HOST's carry --
+    // slipped past `classify` would become a real host RCL or RCR seeded with the HOST's carry:
     // a silent miscompile in exactly the release builds the census grades on.
     let is_rotate = match op {
         0 | 1 => true,
@@ -27183,7 +27180,7 @@ fn emit_rotate_shift_mem(
     // misaligned aperture access is refused everywhere in the tree, so a misaligned aperture row
     // must not fall through to the RAM split-cost deposit. Re-run `emit_alignment_test` for the
     // aperture arm alone, matching `emit_wide_page_guard`'s discipline at every other Mode
-    // 13h-admitting emitter. RCX is free here -- it is unconditionally recomputed past `valid` --
+    // 13h-admitting emitter. RCX is free here: it is unconditionally recomputed past `valid`,
     // so it takes the scratch, leaving RDX's raw flags byte alone for the watched-bit read below.
     if width.needs_alignment_guard() {
         emit_alignment_test(e, width, Reg::RCX, sides.cross_page_or_alignment);
@@ -27199,8 +27196,8 @@ fn emit_rotate_shift_mem(
     emit_write_permission_check(e, memory.cpl3, sides.permission);
 
     // EXIT BEFORE ANY MUTATION, which is the ordering `emit_code_watch_branch` is placed for at
-    // every writing site. Unlike INC/DEC this instruction does NOT always change its operand -- a
-    // rotate by a multiple of the operand width is the identity -- so the exit is conservative
+    // every writing site. Unlike INC/DEC this instruction does NOT always change its operand: a
+    // rotate by a multiple of the operand width is the identity, so the exit is conservative
     // here rather than exact. That costs a watched chunk one interpreted execution and is the same
     // conservatism `emit_watched_store_guard` and `emit_watched_alu_result_guard` already carry:
     // neither compares the old value against the new one either.
@@ -27241,7 +27238,7 @@ fn emit_rotate_shift_mem(
     // A GENUINE 8- OR 16-BIT HOST OPERATION, not a 32-bit one over a zero-extended operand. That
     // is what makes the flags the host's rather than something this function reconstructs:
     // `shift_rotate` at `BusWidth::Byte` takes CF from the last bit shifted out of EIGHT, SF from
-    // bit 7 and ZF/PF from the 8-bit result. At `/7` the wrong width is wrong in the VALUE too --
+    // bit 7 and ZF/PF from the 8-bit result. At `/7` the wrong width is wrong in the VALUE too:
     // a 32-bit arithmetic shift of a zero-extended byte shifts in zeros where the guest shifts in
     // bit 7.
     match width {
@@ -27322,8 +27319,8 @@ fn emit_rotate_shift_mem(
     // `emit_rmw_inc_dec_dword` and `emit_push_mem` refuse it on a COUNTER-ORDERING argument:
     // `emit_mode13_read_completion` bumps the dynamic read count as soon as the read resolves,
     // and a store guard that side exits afterwards would leave `run.rs`'s
-    // `dword_reads - exit.mode13_dword_reads` negative. Nothing here can do that. Every guard --
-    // page kind, permission, code watch and both biases -- precedes the read, the store is
+    // `dword_reads - exit.mode13_dword_reads` negative. Nothing here can do that. Every guard
+    // (page kind, permission, code watch and both biases) precedes the read, the store is
     // unconditional once the read has happened, and both counters are bumped together in this
     // tail, after both accesses have completed.
     match width {
@@ -27637,7 +27634,7 @@ fn emit_call_mem(
     e.jz(stack_sides.unavailable_or_kind);
     e.add_r64_r64(Reg::RDX, Reg::RAX);
     // The live guest EIP is still the block's entry EIP here, so `EipDelta` computes exactly the
-    // `registers.eip` the interpreter pushes -- the same value and the same way `CallReg` gets it.
+    // `registers.eip` the interpreter pushes: the same value and the same way `CallReg` gets it.
     emit_read_store_value(
         e,
         StoreSource::EipDelta(return_delta),
@@ -27786,15 +27783,15 @@ fn emit_code_watch_table_branch(
     // granule touches at most `ceil((N + G - 1) / G)` of them, which is the expression below.
     //
     // Written as a worst case rather than as the ALIGNED span because the alignment test is no
-    // longer emitted at every call site -- the lean one-lookup load and store sites serve
-    // misaligned page-local accesses natively -- so the count must not depend on an alignment
+    // longer emitted at every call site: the lean one-lookup load and store sites serve
+    // misaligned page-local accesses natively, so the count must not depend on an alignment
     // nobody promises. At `CHUNK_SHIFT == 0` (the shipped granule) `GRANULE_MASK` is zero and this
     // is identical to the aligned formula, so the repair emits byte-identical code today; its only
     // evidence is a mutation that raises the shift and stores at an ODD offset.
     //
     // Erring high is safe in one direction only, and that is the direction taken: a larger `n` can
-    // report a MISS on a granule the access does not touch -- a false WATCHED, i.e. a spurious side
-    // exit -- never a missed invalidation. `code_watch.rs` const-asserts that the widest access's
+    // report a MISS on a granule the access does not touch: a false WATCHED, i.e. a spurious side
+    // exit, never a missed invalidation. `code_watch.rs` const-asserts that the widest access's
     // worst-case span still fits the 32-bit window this guard tests.
     const GRANULE_MASK: u32 = (1 << NATIVE_CHUNK_SHIFT) - 1;
     // The window bound `code_watch.rs` const-asserts is stated against a WIDEST access, and that
@@ -27817,7 +27814,7 @@ fn emit_code_watch_table_branch(
         // case keeps the cheap form. At `CHUNK_SHIFT == 0` the granule index IS the page offset,
         // so the shift is omitted entirely rather than emitted as `shr ecx, 0`.
         //
-        // Under the worst-case `n` above, `n == 1` requires `width.bytes() == 1` at EVERY shift --
+        // Under the worst-case `n` above, `n == 1` requires `width.bytes() == 1` at EVERY shift:
         // a Byte access, which cannot straddle a granule at any offset. So the single-`bt` form
         // stays exactly right once alignment is no longer promised; it is not reachable by a wide
         // access that merely happens to be aligned.
@@ -27853,7 +27850,7 @@ fn emit_code_watch_table_branch(
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.and_r32_imm32(Reg::RCX, 0x0fff);
     e.shift_r32_imm8(5, Reg::RCX, (3 + NATIVE_CHUNK_SHIFT) as u8);
-    // `mov edx, [rdx + rcx*1]` -- the window, unaligned, over the mask RDX points at.
+    // `mov edx, [rdx + rcx*1]`: the window, unaligned, over the mask RDX points at.
     e.load_r32_sib(Reg::RDX, Reg::RDX, Reg::RCX);
     // `r`, the first granule's bit position inside the window. The page mask is not needed: the
     // final `and 7` keeps only bits below 3 + CHUNK_SHIFT, which is at most 5 and so well inside
@@ -27870,10 +27867,10 @@ fn emit_code_watch_table_branch(
 }
 
 // ---- from jit/direct/emit/store_fast.rs --------------------------------------------------------
-// The one-lookup store path (`dev_docs/2026-08-07-one-lookup-store-design.md`): the emitted
+// The one-lookup store path: the emitted
 // fast-store site (D3), the x87 store-pointer probe (D5), and the shared stub pad (D4).
 //
-// The site probes ONE table — `FastMapStorage::store_biases` — whose entries encode, in-band,
+// The site probes ONE table, `FastMapStorage::store_biases`, whose entries encode, in-band,
 // everything today's classify/permission/bias/watch front derives per store: `usize::MAX` is
 // the poison (any special page), bit 0 tags the Mode 13h aperture, bit 1 tags entries that
 // fail ring 3's user+writable test (fast for cpl0 sites only). The fast arm is
@@ -27882,17 +27879,17 @@ fn emit_code_watch_table_branch(
 // `call qword [r15 + slot]`.
 //
 // Stub calling convention: RAX = linear address, RDX = store value (GPR stubs), RDI = the
-// probed entry. The page index is NOT part of the contract — every stub that needs it
+// probed entry. The page index is NOT part of the contract: every stub that needs it
 // recomputes it from RAX, so a site may clobber RCX between probe and call. **Guard 3 depends on
 // both halves of that: the site's alignment test is emitted AFTER `emit_read_store_value`, so
 // that a misaligned access entering the slow stub finds the value in RDX as the contract
 // promises, and it uses RCX as its scratch precisely because the page index is disposable.
 // Moving that test back above the value materialisation produces a store of the PREVIOUS slot's
-// value — silent, and not a fault.** Every stub's
+// value: silent, and not a fault.** Every stub's
 // prologue is
 // `pop qword [rsp + STACK_STUB_RETURN]`, which parks the return address AND restores RSP to
-// the frame level in one instruction — so every frame-offset helper (counters, watch guard,
-// dirty bit) emits at its normal displacement inside the stub — and the epilogue is
+// the frame level in one instruction, so every frame-offset helper (counters, watch guard,
+// dirty bit) emits at its normal displacement inside the stub, and the epilogue is
 // `jmp qword [rsp + STACK_STUB_RETURN]`. The slow stubs return a status in ECX (0 success,
 // 1 unavailable/kind, 2 permission, 3 code-watch) which the SITE dispatches to its own
 // per-site side exits, preserving exact-work exit accounting (design H4).
@@ -27946,7 +27943,7 @@ fn emit_store_bias_probe(e: &mut Encoder) {
 /// the inline emission would have.
 ///
 /// The permission branch exists only on cpl3 sites: a cpl0 stub emits no permission check and
-/// can never return status 2 — and the block emitter places the permission side-exit label
+/// can never return status 2, and the block emitter places the permission side-exit label
 /// only for cpl3 blocks (`append_stubs`), so an unconditional reference would leave an
 /// unplaced label on every ring-0 block.
 #[cfg(all(
@@ -27990,19 +27987,19 @@ fn emit_store_fast(
     emit_segmented_linear_address(e, addr, width, memory, sides, wrap, true);
     emit_store_bias_probe(e);
     // The value is materialized BEFORE the tag branch so the fast arm and both stubs share it
-    // (the stubs receive it in RDX; the slow stub spills it across its own front — review F1).
+    // (the stubs receive it in RDX; the slow stub spills it across its own front, review F1).
     emit_read_store_value(e, source, width, Reg::RDX);
     if width.needs_alignment_guard() {
         // AFTER the value, and on RCX rather than RDX. Both halves of that are load-bearing and
         // neither failure faults. Crossing is refused on the stub RAM arm, not here.
         //
         // AFTER, because `slow` is the slow stub and the stub's contract is "RAX = linear address,
-        // RDX = store value" -- it spills RDX as its SECOND instruction and reloads it to store.
+        // RDX = store value": it spills RDX as its SECOND instruction and reloads it to store.
         // A `jnz slow` emitted before the value exists means the stub spills and stores whatever
         // RDX held from the PREVIOUS slot: a silent wrong-value store into guest RAM.
         //
         // RCX, because RDX now holds that value and the alignment test uses its scratch
-        // destructively. RCX is free by this pad's own rule -- the page index is not part of the
+        // destructively. RCX is free by this pad's own rule: the page index is not part of the
         // stub contract, and every stub that needs it recomputes it from RAX. Neither the fast arm
         // nor the aux arm reads RCX after the probe, and `emit_mode13_dirty_bit` recomputes the
         // page index from RAX as its first two instructions.
@@ -28016,7 +28013,7 @@ fn emit_store_fast(
 
     // BOTH privilege arms test both tag bits: a tagged entry's low bits are part of the VALUE,
     // so even a site allowed to store through it (cpl0 through a supervisor entry) must strip
-    // them before forming the pointer — an untested bit 1 would store at address+2, the
+    // them before forming the pointer: an untested bit 1 would store at address+2, the
     // miscompile the WP+supervisor differential caught in round one of this suite.
     e.test_r8_low_imm8(
         Reg::RDI,
@@ -28039,7 +28036,7 @@ fn emit_store_fast(
     e.cmp_r64_imm32(Reg::RDI, u32::MAX);
     e.jz(slow);
     if memory.cpl3 {
-        // Ring 3 may not touch a supervisor entry at all — mode13 or plain, it takes the
+        // Ring 3 may not touch a supervisor entry at all: mode13 or plain, it takes the
         // full check in the slow stub.
         e.test_r8_low_imm8(Reg::RDI, NATIVE_STORE_BIAS_SUPERVISOR as u8);
         e.jnz(slow);
@@ -28056,7 +28053,7 @@ fn emit_store_fast(
     // The mode13 arm is INLINE, not the pad stub it first shipped as: doom's aperture stores
     // are its hottest store class, and the stub's call / pop-into-slot / jmp-through-slot
     // chain measured as a ~1.7% doom-586 wall cost at byte-identical counters (pinned pairs,
-    // quiet window) — indirection latency the instruction count never showed. The arm is
+    // quiet window): indirection latency the instruction count never showed. The arm is
     // cold bytes for every site that never touches the aperture; it is the exact sequence
     // the m13 stub runs, minus the transfer.
     e.and_r64_imm32(Reg::RDI, (NATIVE_STORE_BIAS_TAG_MASK as u32) ^ u32::MAX);
@@ -28112,12 +28109,12 @@ fn emit_x87_store_pointer_fast(
         Reg::RDI,
         (NATIVE_STORE_BIAS_MODE13 | NATIVE_STORE_BIAS_SUPERVISOR) as u8,
     );
-    // ANY tagged entry — mode13, supervisor, poison — takes the resolve stub, at BOTH
+    // ANY tagged entry (mode13, supervisor, poison) takes the resolve stub, at BOTH
     // privilege levels. This is deliberately narrower than the GPR site's aux arm: x87 stores
     // to the aperture or to supervisor pages are rare enough that inline arms are not worth
-    // their site bytes — x87 slots emit big AVX sequences and their blocks sit closest to the
+    // their site bytes: x87 slots emit big AVX sequences and their blocks sit closest to the
     // one-host-page split (this exact fixture class lost its tail slots to a fatter site in
-    // round one) — and the stub classifies, resolves and parks every one of those cases
+    // round one), and the stub classifies, resolves and parks every one of those cases
     // correctly (cpl0 emits no permission check inside its stub variant, today's semantics).
     e.jnz(slow);
     e.add_r64_r64(Reg::RDI, Reg::RAX);
@@ -28134,7 +28131,7 @@ fn emit_x87_store_pointer_fast(
     e.place(done);
 }
 
-/// Park `kind << 32 | linear` into `STACK_READ_KIND` — the same pack the shared tail of
+/// Park `kind << 32 | linear` into `STACK_READ_KIND`: the same pack the shared tail of
 /// `emit_x87_memory_pointer` builds from a flags-table re-read, built here from the
 /// statically-known kind instead.
 /// Clobbers RCX and RDX; RAX and RDI (the resolved pointer) survive.
@@ -28160,7 +28157,7 @@ fn emit_x87_kind_park(e: &mut Encoder, kind: u32) {
 impl BlockCache {
     /// The stub pad's published entry addresses, building the pad on first use (the x87
     /// re-entry pad pattern: own executable mapping, never replaced). `None` when the host
-    /// cannot provide an executable mapping — the caller then compiles the block with the
+    /// cannot provide an executable mapping: the caller then compiles the block with the
     /// inline (gate-off) store emission instead of calling through a zero slot (review F5).
     pub(crate) fn store_stub_addresses(&mut self) -> Option<[usize; STORE_STUB_COUNT]> {
         if self.store_stub_pad.is_none() {
@@ -28292,7 +28289,7 @@ fn emit_stub_return(e: &mut Encoder) {
 }
 
 /// The mode13 fast stub: entered with a bit-0-tagged entry the SITE already admitted for its
-/// privilege, so there are no refusing conditions — strip the tags, store, count, dirty-bit.
+/// privilege, so there are no refusing conditions: strip the tags, store, count, dirty-bit.
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -28324,8 +28321,8 @@ fn emit_m13_stub(width: MemoryWidth) -> Vec<u8> {
 }
 
 /// The slow stub: today's full classify + permission + bias-resolve + code-watch front and
-/// store tail, with side exits replaced by status returns. Entered for every poison cause —
-/// unavailable kind, watched page, permission-refused-for-this-site, misaligned backing —
+/// store tail, with side exits replaced by status returns. Entered for every poison cause
+/// (unavailable kind, watched page, permission-refused-for-this-site, misaligned backing)
 /// so the front re-derives everything from the flags byte exactly as the pre-slice emission
 /// did, including the #711 granule-mask window on watched pages (NASCAR's win, design H6).
 #[cfg(all(
@@ -28379,7 +28376,7 @@ fn emit_slow_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     // into the mode13 one. This stub has no such tail: both kind arms fall into the shared `store`
     // label below and the kind is re-split only AFTER the write. A refusal placed "in the mode13
     // tail" by analogy with the read side would therefore land after the aperture byte had already
-    // been written -- and the block would then side-exit, so the interpreter re-executes the
+    // been written, and the block would then side-exit, so the interpreter re-executes the
     // instruction and writes it a SECOND time. A double write to the aperture, caused by the very
     // mitigation meant to keep the aperture off this path.
     //
@@ -28439,11 +28436,11 @@ fn emit_slow_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     // The misaligned RAM store this stub now SERVES rather than refuses: charge the extra byte
     // cycles it owes beyond the one wide cycle the static store total already accounts for.
     // Placed here, in the RAM arm, because by this point the store has landed and the code-watch
-    // guard has passed -- the access is committed and can no longer refuse.
+    // guard has passed: the access is committed and can no longer refuse.
     //
     // CONDITIONAL, and on this side that is not a formality. Everything the site cannot serve
-    // inline arrives here: poisoned entries, supervisor entries at cpl3, and -- the population
-    // that matters -- every store to a WATCHED page, because a watch edge poisons the page's store
+    // inline arrives here: poisoned entries, supervisor entries at cpl3, and (the population
+    // that matters) every store to a WATCHED page, because a watch edge poisons the page's store
     // bias. Those are ordinary ALIGNED stores and they must charge exactly what they charged
     // before this slice. An unconditional deposit over-charges all of them.
     //
@@ -28558,17 +28555,17 @@ fn emit_x87_resolve_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
 }
 
 // ---- from jit/direct/emit/load_fast.rs ---------------------------------------------------------
-// The one-lookup load path (`dev_docs/2026-08-07-one-lookup-load-design.md`): the lean read
+// The one-lookup load path: the lean read
 // site (D3a) replacing `emit_ram_read_pointer`'s classic pair for its ten callers, the parking
 // probe (D3b) for the deferred-completion callers (the Ret/Ret16/JmpMem trio, and DivMem since
 // the FPU-loop-rows slice), the x87 read-pointer probe (D5), and the shared
-// read-resolve stub pad (D4) — the store pad's sibling: six counting stubs (GPR width x cpl,
+// read-resolve stub pad (D4), the store pad's sibling: six counting stubs (GPR width x cpl,
 // the only width dependence being the mode13 lane they move), two park-only trio stubs and
 // two x87 pack stubs, ten against the store pad's seventeen because reads have no code-watch
 // guard.
 //
 // The counter identity this load path exists to preserve (design §2, the run.rs subtraction): RAM
-// reads are counted STATICALLY at compile, only mode13 reads move dynamic lanes — and a
+// reads are counted STATICALLY at compile, only mode13 reads move dynamic lanes, and a
 // MISALIGNED RAM access deposits its extra byte cycles, which is a CLOCK quantity in
 // `STACK_DWORD_READS`'s high half and not a read count, so the static identity survives it: one
 // access still counts once. So the lean
@@ -28577,8 +28574,8 @@ fn emit_x87_resolve_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
 // after every status this access can refuse with (an emission-shape correction the L8 size
 // swap forced: the first-cut inline mode13 arm plus a cold per-site completion made every
 // read site ~40 bytes LARGER than the classic front, and native mode13 READS are stub-cold by
-// evidence — Mode X produces no read fills, review F3). The parking probe (trio)
-// moves nothing itself — the trio's own completion runs after their CS-limit side exit,
+// evidence: Mode X produces no read fills, review F3). The parking probe (trio)
+// moves nothing itself: the trio's own completion runs after their CS-limit side exit,
 // exactly as the classic front ordered it, and the RAM-kind park sits at `fast_join` where it
 // DOMINATES both native RAM arms, the untagged one and the cpl0 supervisor strip-rejoin
 // (review F1: a park on the untagged arm alone leaves every ring-0 flat-model RET reading a
@@ -28586,7 +28583,7 @@ fn emit_x87_resolve_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
 //
 // Stub calling convention (store pad's, minus the value): RAX = linear address (preserved),
 // RDI = the probed entry on entry / the resolved host pointer on success; statuses in ECX
-// (0 success, 1 unavailable/kind, 2 permission — NO code-watch status, and a cpl0 stub cannot
+// (0 success, 1 unavailable/kind, 2 permission, NO code-watch status, and a cpl0 stub cannot
 // return 2). The store side's `emit_status_dispatch` is unusable here (review F2): its tail
 // jumps to a code-watch label no read-bearing slot places, so the read dispatch below is its
 // own helper.
@@ -28634,7 +28631,7 @@ fn emit_reload_held_load_bias_if_armed(e: &mut Encoder) {
 }
 
 /// The read-resolve stubs' status dispatch at a call site: ECX carries the verdict, refusals
-/// jump to THIS site's side exits. No code-watch arm (review F2 — reads have no such status and
+/// jump to THIS site's side exits. No code-watch arm (review F2: reads have no such status and
 /// no such label), and the cpl0 shape needs no compare at all: its stub's only statuses are
 /// 0 and 1.
 #[cfg(all(
@@ -28655,7 +28652,7 @@ fn emit_read_status_dispatch(e: &mut Encoder, cpl3: bool, sides: MemorySideExits
 
 /// The D3a lean site, replacing the `emit_ram_read_pointer_inner` + `emit_mode13_read_completion`
 /// pair wholesale for the paired callers (design F5 composition constraint: never compose this
-/// with a trailing completion — the fast RAM arm writes no frame slot, and the counting stub
+/// with a trailing completion: the fast RAM arm writes no frame slot, and the counting stub
 /// already moved any mode13 lane). Contract unchanged from the classic pair: RDI = host
 /// pointer, RAX preserved, RCX/RDX clobbered, every side exit resolved inside.
 #[cfg(all(
@@ -28693,19 +28690,19 @@ fn emit_ram_read_pointer_fast(
     emit_load_bias_probe(e, memory.hold_load_bias);
 
     // Jumping past the probe into `slow` is legal, and neither fact is obvious:
-    // `emit_counting_read_stub` never reads incoming RDI -- it recomputes the page index from RAX
-    // and re-derives the kind from the flags byte -- and nothing in the stub writes RAX, so its
+    // `emit_counting_read_stub` never reads incoming RDI: it recomputes the page index from RAX
+    // and re-derives the kind from the flags byte, and nothing in the stub writes RAX, so its
     // own `test al, mask` sees the linear address this site formed.
 
     // BOTH privilege arms test both tag bits: a tagged entry's low bits are part of the VALUE,
     // so even a site allowed to read through it (cpl0 through a supervisor entry) must strip
-    // them before forming the pointer — the store slice's round-one miscompile class.
+    // them before forming the pointer: the store slice's round-one miscompile class.
     e.test_r8_low_imm8(
         Reg::RDI,
         (NATIVE_LOAD_BIAS_MODE13 | NATIVE_LOAD_BIAS_SUPERVISOR) as u8,
     );
     if memory.cpl3 {
-        // At cpl3 EVERY tagged case — poison, supervisor (may not read), mode13 — goes to the
+        // At cpl3 EVERY tagged case (poison, supervisor (may not read), mode13) goes to the
         // counting stub, so the site has no aux arm at all. The stub classifies, permission-
         // checks, resolves, and moves the mode13 lane itself on a mode13 success.
         e.jnz(slow);
@@ -28713,8 +28710,8 @@ fn emit_ram_read_pointer_fast(
         e.jmp(done);
     } else {
         let fast_join = e.label();
-        // At cpl0 the one native tagged case is supervisor RAM — today's checkless ring-0 read,
-        // and the COMMON case under a flat-model extender (design F1) — which strips and
+        // At cpl0 the one native tagged case is supervisor RAM: today's checkless ring-0 read,
+        // and the COMMON case under a flat-model extender (design F1), which strips and
         // rejoins. Poison and mode13 go to the counting stub: native mode13 READS exist only
         // under chained 13h (Mode X produces no read fills, review F3), so unlike the store
         // side's doom-hot aperture writes they are stub-cold by evidence, and the inline arm
@@ -28790,7 +28787,7 @@ fn emit_read_probe_parking(e: &mut Encoder, memory: MemoryEmitContext, sides: Me
     e.jnz(aux);
     e.place(fast_join);
     // Review F1, the domination rule: the RAM-kind park lives HERE, where the untagged arm and
-    // the cpl0 supervisor strip-rejoin both pass — under a ring-0 flat-model extender the
+    // the cpl0 supervisor strip-rejoin both pass: under a ring-0 flat-model extender the
     // supervisor arm is the COMMON case, and the prologue does not zero this chain-surviving
     // slot. RDX is dead at every caller site (the trio reloads it from RDI after the
     // completion; DivMem reloads it from home(2) before the divide).
@@ -28827,15 +28824,15 @@ fn emit_read_probe_parking(e: &mut Encoder, memory: MemoryEmitContext, sides: Me
         Reg::R15,
         table_slot_offset(read_stub_slot_park(memory.cpl3)),
     );
-    // The PARK-ONLY stub: it parked the kind on success and moved no lane — the trio's own
+    // The PARK-ONLY stub: it parked the kind on success and moved no lane: the trio's own
     // completion runs after their limit check, on every arm equally.
     emit_read_status_dispatch(e, memory.cpl3, sides, done);
     e.place(done);
 }
 
 /// The D5 x87 read-pointer probe, replacing the classify + permission + resolve + kind-pack
-/// tail of `emit_x87_memory_pointer`'s read arm. ANY tagged entry — mode13, supervisor,
-/// poison — takes the resolve stub at BOTH privilege levels (the lean-x87-site rule the store
+/// tail of `emit_x87_memory_pointer`'s read arm. ANY tagged entry (mode13, supervisor,
+/// poison) takes the resolve stub at BOTH privilege levels (the lean-x87-site rule the store
 /// slice paid a fixture to learn); the untouched `emit_x87_memory_completion` consumes the
 /// parked pack and owns all width accounting.
 #[cfg(all(
@@ -28959,11 +28956,11 @@ pub(crate) fn emit_read_stub_pad() -> ReadStubPad {
 }
 
 /// The counting read stub for the LEAN sites: classify, permission (cpl3 variant only),
-/// read-bias resolve — and on a mode13 success, move the width's dynamic read lane ITSELF
+/// read-bias resolve, and on a mode13 success, move the width's dynamic read lane ITSELF
 /// (the pop prologue put RSP at the frame level, so the increment helpers emit at their normal
 /// displacements). No park: the lean sites read no kind afterward, and keeping the frame slot
 /// untouched is what the R4 shape rule promises. The kind split happens BEFORE the resolve so
-/// the classified kind never needs to survive the page-index recompute — each kind gets its
+/// the classified kind never needs to survive the page-index recompute: each kind gets its
 /// own resolve tail, and stub bytes are per-cache, not per-site.
 #[cfg(all(
     target_arch = "x86_64",
@@ -28992,7 +28989,7 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     // Mode 13h keeps REFUSING misaligned accesses. Conservative rather than proven inequivalent:
     // the interpreter splits an aperture access into bytes exactly as it splits RAM, but nothing
     // has shown the VGA latch and plane state per access is equivalent under a split, and the
-    // population does not justify finding out -- wolf3d's entire aperture is 0.01% of its slow
+    // population does not justify finding out: wolf3d's entire aperture is 0.01% of its slow
     // reads, and only the misaligned subset reaches here.
     //
     // Placed BEFORE `emit_read_permission_check`, matching where the pre-slice
@@ -29064,8 +29061,8 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     // returns status 1 without ever reaching this point.
     //
     // What does reach here is a page whose HOST BACKING is not 4 KiB-aligned. `derive_load_bias`
-    // poisons the LOAD bias when `read_bias & PAGE_MASK != 0` -- that bias carries the mode13 and
-    // supervisor tags in its low bits, so a bias with low bits of its own cannot be tagged --
+    // poisons the LOAD bias when `read_bias & PAGE_MASK != 0`: that bias carries the mode13 and
+    // supervisor tags in its low bits, so a bias with low bits of its own cannot be tagged,
     // while `read_biases[index]` stays live, and `FastMap::populate` never requires the pointer to
     // be page-aligned. So the site's probe sees poison, jumps here, and `emit_read_pointer`
     // resolves the untagged read bias perfectly well. Every aligned wide read on such a page would
@@ -29073,7 +29070,7 @@ fn emit_counting_read_stub(width: MemoryWidth, cpl3: bool) -> Vec<u8> {
     //
     // The test is on RAX because `emit_read_pointer` ends `add rdi, rax`: RDI is now a HOST
     // pointer whose low bits carry the FastMap bias, while RAX is still the linear address and
-    // nothing in this stub writes it. RDX is dead here -- the tail is `xor ecx, ecx` and return.
+    // nothing in this stub writes it. RDX is dead here: the tail is `xor ecx, ecx` and return.
     //
     // Placed after the resolve, so the access is committed and can no longer refuse: a deposit
     // followed by a status-1 return would charge for an access the interpreter is about to redo.
@@ -29140,9 +29137,9 @@ fn emit_read_stub_classify(e: &mut Encoder, status_unavailable: Label) {
 }
 
 /// The trio's PARK-ONLY read stub: classify, park the BARE kind in `STACK_READ_KIND` (the
-/// classic front's convention — what `emit_mode13_read_completion` compares),
+/// classic front's convention: what `emit_mode13_read_completion` compares),
 /// permission (cpl3 variant only), read-bias resolve. NO store, NO value spill (loads carry no
-/// value — the store slice's F1 hazard class is structurally absent) and NO counter: the
+/// value: the store slice's F1 hazard class is structurally absent) and NO counter: the
 /// trio's own deferred completion moves the lane after the CS-limit check. Unlike the store
 /// x87 stub there is no watch guard writing the aliased `STACK_WATCH_PAGE`, so the park needs
 /// no staging slot.
@@ -29183,7 +29180,7 @@ fn emit_park_read_stub(cpl3: bool) -> Vec<u8> {
 }
 
 /// The x87 read-resolve stub: the same front, parking the `kind << 32 | linear` PACK instead of
-/// the bare kind — `emit_x87_memory_completion`'s convention, which splits the pack and does the
+/// the bare kind, `emit_x87_memory_completion`'s convention, which splits the pack and does the
 /// width-exact mode13 read accounting the moment the slot completes.
 #[cfg(all(
     target_arch = "x86_64",
@@ -29242,8 +29239,8 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 //
 // The memory class is the one that justifies the mechanism beyond port IO, and the justification
 // is a SIZE argument, not a reachability one: emitted code can reach guest memory perfectly well.
-// A lowered PUSHAD is eight guarded stores -- eight address computations, eight fast-map probes,
-// eight permission checks, eight code-watch guards and eight side-exit stub sets -- against a
+// A lowered PUSHAD is eight guarded stores: eight address computations, eight fast-map probes,
+// eight permission checks, eight code-watch guards and eight side-exit stub sets, against a
 // one-host-page block budget that `MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS` already caps at four
 // instructions for slots of that shape. A call-out is a fixed ~60 bytes whatever the instruction
 // does. See the module-level note at the end of this comment for the shape that WOULD beat it.
@@ -29251,51 +29248,51 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // # Why a call-out at all
 //
 // Emitted blocks never receive the bus. `DirectEntryFn` takes `(*mut CpuGsw, flags, quota,
-// *mut NativeExit)` and every native memory access goes through the fast map, so a port read --
-// which is a `CpuBus::read_io` call and nothing else -- has no reachable path from emitted code.
+// *mut NativeExit)` and every native memory access goes through the fast map, so a port read
+// (which is a `CpuBus::read_io` call and nothing else) has no reachable path from emitted code.
 // The helper below closes that by being MONOMORPHISED over the bus type in `run_direct_block`
 // and published, together with the live `&mut B`, through `CpuGsw::native_callout` just before
 // entry. Emitted code loads the function pointer out of the CPU struct and calls it.
 //
 // # The helper contract
 //
-// Written down before a byte was emitted, and the thing an adversarial review should attack.
+// Written down before a byte was emitted, and the first thing to check.
 //
 // **Synced IN (emitted code, before the call):** the whole `GUEST_HOMES` set, stored to
 // `CpuGsw.registers.gpr` by `emit_store_homes`. Nothing else, and each omission is deliberate:
 //
-// * EFLAGS -- RBP is a SHADOW of `CpuGsw.registers.eflags`, mirrored at every flag-producing
+// * EFLAGS: RBP is a SHADOW of `CpuGsw.registers.eflags`, mirrored at every flag-producing
 //   site, so the memory copy is already current at any point in the block body (the same
 //   property `shared_return` relies on when it stores homes but not flags).
-// * EIP -- stays at the block's entry value throughout the body by construction (`emit_advance_eip`
+// * EIP: stays at the block's entry value throughout the body by construction (`emit_advance_eip`
 //   runs only on exit paths), and the helper never reads it. Both call-out exit paths advance it
 //   through the ordinary side-exit machinery, so the block-body invariant is never broken and no
 //   exit can double-advance.
 // * Segment registers, CR*, TR, `pending_flags`, `interrupt_shadow`, the prefetch window and
-//   `written_pages` -- owned by `CpuGsw` and never mirrored into a host register by the block
+//   `written_pages`: owned by `CpuGsw` and never mirrored into a host register by the block
 //   body, so they are already exactly what the interpreter would see.
 //
 // **Read by the helper:** `registers.gpr[2]` (DX), `registers.eflags` (IOPL and VM, through
-// `iopl`/`is_v86_mode`), CPL, `tr`, `core_clocks_so_far`, `timing_rem`, the persona, and -- on
-// the TSS-bitmap arm only -- the TLB (read-only, `resident_translate_system`) and two bytes of
+// `iopl`/`is_v86_mode`), CPL, `tr`, `core_clocks_so_far`, `timing_rem`, the persona, and (on
+// the TSS-bitmap arm only) the TLB (read-only, `resident_translate_system`) and two bytes of
 // plain guest RAM (uncharged, `CpuBus::peek_direct_ram`).
 //
 // **Written by the helper, normal path:** `registers.gpr[0]`'s low byte (AL), plus whatever the
-// device behind the port does. Nothing else -- no clock counter, no `perf`, no EIP.
+// device behind the port does. Nothing else: no clock counter, no `perf`, no EIP.
 //
 // **Written by the helper, abnormal path:** NOTHING. See the enumeration below.
 //
 // **Returned:** an `i64` status.
-// * negative -- ABNORMAL. The caller must end the native run at the call-out with EIP AT the
+// * negative: ABNORMAL. The caller must end the native run at the call-out with EIP AT the
 //   call-out instruction.
-// * otherwise -- bits 0..32 are the instruction's raw core clocks (the interpreter's own charge,
+// * otherwise: bits 0..32 are the instruction's raw core clocks (the interpreter's own charge,
 //   unscaled), bit 32 is a step-break request.
 //
 // **Synced OUT (emitted code, after the call):** the whole `GUEST_HOMES` set is RELOADED,
 // unconditionally and on every path. Two independent reasons, either one sufficient: R8-R11 are
 // volatile under both host ABIs and the call clobbers them, and AL may have changed. The reload
-// precedes the status branch precisely so the abnormal path reaches `shared_return` -- which
-// stores homes -- with correct values instead of writing clobbered registers over good memory.
+// precedes the status branch precisely so the abnormal path reaches `shared_return` (which
+// stores homes) with correct values instead of writing clobbered registers over good memory.
 //
 // # The reload contract, RE-DERIVED for a helper that mutates the register file
 //
@@ -29307,11 +29304,11 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 //    loop is `for (index, home) in GUEST_HOMES.into_iter().enumerate()` with no filter, and it
 //    runs on every path before the status branch. So every register a helper can write is
 //    reloaded. There is no partial-set optimisation to get wrong, and `emit_store_homes` on the
-//    way IN is the same whole set, so the helper reads current values for all eight -- which
+//    way IN is the same whole set, so the helper reads current values for all eight, which
 //    `0xEC` did not need (it read only DX) and `PUSHAD` does.
 // 2. **Nothing else is cached.** The only other guest state a block body holds in a host register
 //    is EFLAGS, shadowed in RBP. Neither PUSHAD nor POPAD writes a flag (386 PRM: both are
-//    flag-transparent), so the shadow stays current and must NOT be reloaded -- reloading it
+//    flag-transparent), so the shadow stays current and must NOT be reloaded: reloading it
 //    would be the bug, because RBP is the authority mid-block, not memory.
 // 3. **The lazy-flag descriptor survives.** `PendingFlags` carries VALUES (`tag`, `a`, `b`,
 //    `result`), not register references, so a pending descriptor produced before the call still
@@ -29324,7 +29321,7 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 //    DESCRIPTOR arm (`IZARRAVM_DIRECT_EAGER_FLAGS=0`).** On the eager arm no descriptor is ever
 //    in flight, so there is nothing to survive. On the descriptor arm it is still written by
 //    every producing slot, and clause 2 above states that RBP must NOT be reloaded across the
-//    call -- so a descriptor produced by an earlier slot genuinely IS in flight across a
+//    call, so a descriptor produced by an earlier slot genuinely IS in flight across a
 //    PUSHAD/POPAD, and this argument is still what protects it. Rewriting the clause as vacuous
 //    would delete a correctness argument that still guards a reachable, stated arm.
 // 4. **Stack addressing follows.** Later slots' stack addresses are emitted relative to
@@ -29343,16 +29340,16 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // ONE producer, and it is a pre-check rather than a discovered failure:
 // `CpuGsw::call_out_stack_frame_resident` (memory.rs) refuses unless all eight dwords of the
 // frame can be moved through the FastMap serve path with no page walk, no fault and no
-// code-watch hit. Its clause-by-clause enumeration -- 16-bit stack, unarmed FastMap, unaligned
+// code-watch hit. Its clause-by-clause enumeration (16-bit stack, unarmed FastMap, unaligned
 // ESP, SS limit (including an ESP WRAP), absent/read-only/wrong-CPL page, stale mapping epoch, a
 // frame CROSSING A PAGE BOUNDARY onto a second page that is not resident, the Mode13h aperture,
-// and watched code -- lives at that function, next to the predicates it evaluates.
+// and watched code) lives at that function, next to the predicates it evaluates.
 //
 // Two things make the refusal cheap rather than a loss. It is `&self` and touches nothing, so a
 // refused call-out has ZERO partial effects by construction, exactly like the port class's
 // privilege refusal. And the cost of being wrong is one call-out: the native run ends at the
-// instruction, the interpreter executes PUSHAD or POPAD whole -- page walk, fault delivery,
-// partial frame and all -- at the same boundary a pre-slice barrier produced.
+// instruction, the interpreter executes PUSHAD or POPAD whole: page walk, fault delivery,
+// partial frame and all, at the same boundary a pre-slice barrier produced.
 //
 // The privilege gate the port class carries is DELIBERATELY ABSENT here, and the difference is
 // the TSS. `0xEC`'s two-phase probe exists because `check_io_permission` reads the IO-permission
@@ -29364,18 +29361,18 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // a block carrying a PORT call-out is refused entry by `run_direct_block`, which is why the
 // dispatch gate is keyed on `callout_port_slots()` rather than on `callout_slots()`.
 //
-// # The abnormal set, port class (`0xEC`) -- exactly three producers
+// # The abnormal set, port class (`0xEC`): exactly three producers
 //
 // 1. **The permission-checked port, refused by PHASE P.** When `is_v86_mode() || CPL > IOPL`,
-//    `check_io_permission` reads the TSS bitmap through `read_system_linear` -- and under paging
+//    `check_io_permission` reads the TSS bitmap through `read_system_linear`, and under paging
 //    a TLB MISS there walks, and the walk WRITES guest memory (PDE/PTE accessed bits), records
 //    `written_pages`, can set CR2, advances bus clocks mid-run, can evict a TLB entry and
 //    invalidate the fast map whose bases the running block has baked in, and can reach
-//    `note_code_write` with this block's native code live on the stack -- which is the exact
+//    `note_code_write` with this block's native code live on the stack, which is the exact
 //    situation `note_code_write_inner`'s "no compiled block is mid-execution" proof rules out.
 //    The helper therefore answers that state with a PURE probe first: TLB hits only
 //    (`resident_translate_system`), an uncharged RAM read (`CpuBus::peek_direct_ram`), and a
-//    refusal on anything it cannot settle -- a miss, a non-RAM or misaligned physical, a TSS
+//    refusal on anything it cannot settle: a miss, a non-RAM or misaligned physical, a TSS
 //    limit overrun, or a bitmap bit that denies the port. Only then does phase C charge. Every
 //    refusal is taken before ANY effect, so fail-closed is by construction, not by argument.
 // 2. `check_io_permission` returns `Err` anyway. Runs only on the OTHER arm, where it is the
@@ -29383,7 +29380,7 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 //    this refuses rather than proceeds. It runs BEFORE `read_io`, so no device has been
 //    addressed.
 // 3. `bus.read_io` returns `Err`. For `MachineBus` the sole producer is the `UnsupportedPort`
-//    fall-through, reached only after every device declined the port -- so no device observed
+//    fall-through, reached only after every device declined the port, so no device observed
 //    the access there either.
 //
 // Phase C's two charged re-reads are NOT a fourth producer: each address survived
@@ -29397,14 +29394,14 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // `perf`, `timing_rem`, `written_pages` and `prefetch` are untouched, and no clocks are charged
 // (the caller skips the raw-clock add on the negative branch). The native run then ends with EIP
 // at the call-out, which is byte-for-byte the state the run loop sees TODAY when a block ends at
-// an IN barrier -- so the interpreter re-executes the instruction and delivers exactly what it
+// an IN barrier, so the interpreter re-executes the instruction and delivers exactly what it
 // delivers today. FAIL-CLOSED: any status the helper cannot certify is negative.
 //
 // **The one exception, stated rather than hidden: producer 3 reached from the BITMAP arm.**
 // There, C1 and C2 have already charged the two TSS data reads before `read_io` is called, so an
 // `Err` returns after a charge. The interpreter then re-executes the whole instruction and
 // charges those two reads again: the run is short by nothing and long by two data-read cycles.
-// Nothing guest-visible other than timing moves -- no register, no flag, no guest memory, no
+// Nothing guest-visible other than timing moves: no register, no flag, no guest memory, no
 // device.
 //
 // It is unreachable on the production bus and OPT-IN everywhere else. `MachineBus::read_io` has
@@ -29437,17 +29434,17 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 //   it. `cpu_jit_callout_matrix_test.rs` separates them by ACCUMULATION, one to four slots.
 // * **The device's view of time.** `read_io` takes `core_clocks_so_far`, which the interpreter
 //   sets to the run's running total before each instruction. Inside a block that value is stale
-//   by the RUN's prefix -- this block's earlier slots and, on a chained entry, every hop before
+//   by the RUN's prefix: this block's earlier slots and, on a chained entry, every hop before
 //   it. The helper is handed BOTH accounting lanes, raw and weighted-FP, and folds them exactly
 //   as `run_direct_block` does (FP through `scale_weighted_fp_clocks`, added to raw, then the
 //   persona's long division). Both scalings are previews: neither `fp_rem` nor `timing_rem` is
 //   consumed, so no accounting moves and the charge is still made once, later, by the block's
-//   single batch call. The FP lane is not decoration -- a call-out block never holds an x87
+//   single batch call. The FP lane is not decoration: a call-out block never holds an x87
 //   slot, but a float-entered CHAIN can hop into one, and reading only the raw lane would hand
 //   the device a timestamp short by the whole float part of the chain. Without any of this a
 //   mid-block IN samples a beam or a counter in the past.
 // * **The step break.** After a successful read the helper asks `bus.requires_step_break()` and
-//   reports it. The caller then ends the native run at the boundary AFTER the call-out -- the
+//   reports it. The caller then ends the native run at the boundary AFTER the call-out: the
 //   same boundary `run_straight_line`'s post-instruction check produces for an interpreted
 //   continuation. This is what preserves `run_direct_block`'s standing "devices advance only
 //   after native return" invariant: a port access that touches time-dependent device state still
@@ -29460,7 +29457,7 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // IRQ1/IRQ12 is the live example) is delivered where it is delivered for every native block
 // today: at the block boundary, by the machine's batch loop. Every port read that reaches a
 // device sets `io_touched`, which is `requires_step_break`, which ends the native run at the
-// instruction after the IN -- so the delivery boundary is the same one an interpreted
+// instruction after the IN, so the delivery boundary is the same one an interpreted
 // continuation ending at that instruction would produce.
 //
 // # Self-modifying code
@@ -29475,7 +29472,7 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // cannot be "no access" and is instead "no WATCHED access". `call_out_stack_frame_resident`
 // evaluates `code_write_watched(physical, 4)` for each of the eight stores and refuses the whole
 // frame if any is watched, which makes `finish_fast_map_write`'s `changed && watched` gate
-// provably false for all eight -- so `note_code_write_hit` is not called and the "no compiled
+// provably false for all eight, so `note_code_write_hit` is not called and the "no compiled
 // block is mid-execution" proof in `note_code_write_inner` is not put to the test. The same
 // pre-check excludes the page walk, which is the OTHER way this path could have written guest
 // memory (accessed/dirty bits) and reached that proof by the back door. `record_write_page` still
@@ -29487,8 +29484,8 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // Recorded because it is the honest alternative rather than to close it off. A lowered PUSHAD as
 // eight ordinary `Store` slots is not close: it would blow both the one-host-page budget and
 // `MAX_BLOCK_STACK_ACCESSES`. But PUSHAD writes a CONTIGUOUS, 4-aligned 32-byte range, so the
-// shape that would win is ONE guard over the whole range -- the same all-or-nothing trick
-// `MemoryWidth::Tbyte` already plays for a ten-byte x87 store -- followed by eight plain `mov`s
+// shape that would win is ONE guard over the whole range: the same all-or-nothing trick
+// `MemoryWidth::Tbyte` already plays for a ten-byte x87 store, followed by eight plain `mov`s
 // and one counter add, which is of the order of two hundred bytes. What that needs and this slice
 // does not build: a 32-byte guard width, a code-watch guard over a range wider than one watch
 // chunk, and a native answer for PUSHAD's restore-(E)SP-on-fault rule. If this family is ever
@@ -29498,19 +29495,19 @@ fn emit_x87_read_stub(cpl3: bool) -> Vec<u8> {
 // # Unwinding
 //
 // The call site moves RSP by `CALLOUT_CALL_FRAME` for the span of the call, while the arena's
-// shared UNWIND_INFO (jit/unwind.rs) asserts a constant RSP for the whole block body -- the same
+// shared UNWIND_INFO (jit/unwind.rs) asserts a constant RSP for the whole block body: the same
 // shape as the accepted `pushfq` windows documented there. It is not the same RISK, because
 // nothing ever unwinds through it: the helper is `extern "C"`, whose Rust ABI is nounwind, so a
 // panic inside it aborts at the boundary instead of walking the JIT frame. What remains is the
-// pre-existing sampling gap -- a profiler sampling INSIDE the callee walks back to a call site
-// whose CFA is `CALLOUT_CALL_FRAME` bytes off -- and it is accepted on the same terms.
+// pre-existing sampling gap: a profiler sampling INSIDE the callee walks back to a call site
+// whose CFA is `CALLOUT_CALL_FRAME` bytes off, and it is accepted on the same terms.
 
-/// How many dwords `PUSHAD`/`POPAD` move. Eight registers, one dword each -- the SP slot included,
+/// How many dwords `PUSHAD`/`POPAD` move. Eight registers, one dword each: the SP slot included,
 /// which POPAD reads and discards.
 pub(crate) const CALL_OUT_STACK_FRAME_DWORDS: u32 = 8;
 
 /// The ABI emitted code calls a helper through. `extern "C"` and NOT `extern "C-unwind"`: see the
-/// unwinding note in the module docs -- the nounwind guarantee is load-bearing, because a panic
+/// unwinding note in the module docs: the nounwind guarantee is load-bearing, because a panic
 /// walking back through the call site would read the frame against unwind info that does not
 /// describe `CALLOUT_CALL_FRAME`.
 pub(crate) type CallOutFn = unsafe extern "C" fn(*mut CpuGsw, u64, u64) -> i64;
@@ -29525,13 +29522,13 @@ pub(crate) type CallOutFn = unsafe extern "C" fn(*mut CpuGsw, u64, u64) -> i64;
 ///   register on every execution.
 /// * `port_read_al_dx` knows exactly what it is (`0xEC`) but not WHERE, because the emitter never
 ///   allocates it a cell (the GP2 call-out-site poll-skip design deliberately spends no heap
-///   allocation on a port slot -- the classifier's backward scan re-derives the certified shape
+///   allocation on a port slot: the classifier's backward scan re-derives the certified shape
 ///   fresh on every attempt instead of caching a negative in a cell, which trades a small,
 ///   measured-negligible re-scan cost on the rare `NegativeCacheable` site for one fewer moving
 ///   part). Its fourth argument is therefore the slot's `slot_delta` VALUE directly, a plain
 ///   compile-time immediate, not a pointer.
 /// * `port_read_al_imm8` knows exactly what it is AND where its port is, but the port is not in
-///   any register -- it is baked in the guest bytes and decoded once, at `classify` time, into the
+///   any register: it is baked in the guest bytes and decoded once, at `classify` time, into the
 ///   `CallOutHelper::PortReadAlImm8` variant. Its fourth argument is therefore that PORT value
 ///   directly, the same "plain compile-time immediate, not a pointer" shape `port_read_al_dx`
 ///   uses, carrying a different quantity for a different reason (gp2 in-imm8 callout design rev 3
@@ -29621,7 +29618,7 @@ impl CallOutTable {
                 port_write_al_imm8: port_write_al_imm8::<B> as CallOutSlotFn as usize,
                 // `CallOutFn`, not `CallOutSlotFn`: `PortWriteAlDx` carries neither a `slot_delta`
                 // (no poll-skip scan) nor a port immediate (the port is read from DX at runtime), so
-                // it needs no fourth argument at all -- the same shape `push_all_dword` and
+                // it needs no fourth argument at all: the same shape `push_all_dword` and
                 // `pop_all_dword` already have.
                 port_write_al_dx: port_write_al_dx::<B> as CallOutFn as usize,
                 push_all_dword: push_all_dword::<B> as CallOutFn as usize,
@@ -29680,7 +29677,7 @@ pub(crate) enum InterpretOneRow {
     /// the two have different resume shapes and the same label would average them. A `MOV DS`
     /// resyncs when the guest moves the record and resumes when it re-establishes the same one;
     /// `MOV SS` additionally arms the interrupt shadow on EVERY execution, so its resync column is
-    /// the answer to a different question -- design review 10.1 M5's, which the loader measured as
+    /// the answer to a different question: design review 10.1 M5's, which the loader measured as
     /// 484,385 same-record loads against 488,498 record-moving ones.
     MovSsReg,
     /// `0x17` POP SS, every form and every mode.
@@ -29690,8 +29687,8 @@ pub(crate) enum InterpretOneRow {
     /// The four string rows below are FAMILY rows in the strongest sense this enum has: all ten
     /// opcodes are one interpreter arm (`execute_string_decoded`) with one exit, so they could
     /// have been one row. They are four because the census is what ranks them and the nascar-586
-    /// evidence is per family -- `0xAD` LODSD at 17,202,631 runtime hits and `0xAB` STOSD at
-    /// 7,984,903, against a whole `rejected` class of 40,666,390 -- and a single `String` row
+    /// evidence is per family: `0xAD` LODSD at 17,202,631 runtime hits and `0xAB` STOSD at
+    /// 7,984,903, against a whole `rejected` class of 40,666,390, and a single `String` row
     /// would have averaged the one that pays with three that may not.
     StringMove,
     /// `0xA6`/`0xA7` CMPS and `0xAE`/`0xAF` SCAS, unprefixed.
@@ -29708,16 +29705,16 @@ pub(crate) enum InterpretOneRow {
     /// resume there, which is correct and is one of the two resyncs these rows are expected to
     /// take at all.
     StringStore,
-    /// `0xAC`/`0xAD` LODS, unprefixed. The nascar-586 `0xAD` LODSD row, 17,202,631 runtime hits --
+    /// `0xAC`/`0xAD` LODS, unprefixed. The nascar-586 `0xAD` LODSD row, 17,202,631 runtime hits,
     /// the largest single rejected head on that fixture.
     StringLoad,
     /// `0x9C` PUSHF, WORD form only. N2. The Dword form (PUSHFD) stays the existing `Push`
-    /// lowering -- see the `0x9c` classify arm -- because that lowering already ships and this
+    /// lowering (see the `0x9c` classify arm) because that lowering already ships and this
     /// row is scoped to the population the corpus measures, which is 16-bit real mode and V86.
     ///
     /// Its interpreter arm (`execute.rs` `0x9c`) calls `check_v86_iopl` as its first statement,
     /// before touching any state, so a V86 task below IOPL 3 raises the same #GP from inside this
-    /// call-out that it raises at a compile-time barrier -- the same argument `Cli` already makes.
+    /// call-out that it raises at a compile-time barrier: the same argument `Cli` already makes.
     Pushf,
     /// `0x9D` POPF, WORD form only. N2. The Dword form (POPFD) has no `classify` arm at any width
     /// and stays a hard boundary, unmeasured and out of scope.
@@ -29747,7 +29744,7 @@ pub(crate) enum InterpretOneRow {
     /// `CallOutSlotCounts` for why (this row's charge is 37 core clocks against the allowlist's 7,
     /// and its worst-case data accesses are past `INTERPRET_ONE_MAX_DATA_ACCESSES`' 4, so folding
     /// it into that maximum would raise the budget bound of every CLI/STI/segment/string block on
-    /// the board -- an admission change, which is guest-visible, for a row those blocks do not
+    /// the board: an admission change, which is guest-visible, for a row those blocks do not
     /// carry).
     IntImm8,
     /// `0x0F02` LAR reg, r/m16/32. Descent II's DOS/4GW loader lever: 20.6 M block-stopping
@@ -29758,21 +29755,21 @@ pub(crate) enum InterpretOneRow {
     /// site is architecturally reachable and the interpreter arm handles both forms identically.
     ///
     /// Protected mode only: real mode and V86 raise `#UD` (vector 6) as the arm's first statement,
-    /// before it touches any register or memory. Writes the destination GPR and ZF alone --
-    /// `may_write_segment` is false -- so this row inherits none of the segment-record obligations
+    /// before it touches any register or memory. Writes the destination GPR and ZF alone:
+    /// `may_write_segment` is false, so this row inherits none of the segment-record obligations
     /// `MovSreg`/`MovSsReg`/`PopSs` carry. Priced in its OWN slot class, `LAR_LSL_CORE_CLOCKS`,
     /// rather than through `INTERPRET_ONE_MAX_CORE_CLOCKS`: see that constant's doc for why (11
     /// core clocks against the allowlist's 7 would raise the budget bound of every CLI/STI/
-    /// segment/string block on the board). Unlike `IntImm8` it is NOT terminal -- the whole point
-    /// of admitting it is that the block continues past it -- so it is not bounded at one per
+    /// segment/string block on the board). Unlike `IntImm8` it is NOT terminal: the whole point
+    /// of admitting it is that the block continues past it, so it is not bounded at one per
     /// block; see `CompiledBlock::callout_lar_lsl_slots`.
     Lar,
     /// `0x0F03` LSL reg, r/m16/32. The sibling row LAR shares its census population with: the
     /// same DOS/4GW descriptor-check idiom (`SLDT`/`LAR`/`LSL` pairs Watcom emits around a far
     /// call or a selector validation) puts both opcodes at the same sites.
     ///
-    /// Every property `Lar`'s doc states holds here identically -- protected-mode-only, `#UD`
-    /// elsewhere, writes a GPR and ZF alone, `LAR_LSL_CORE_CLOCKS`, not terminal -- because both
+    /// Every property `Lar`'s doc states holds here identically: protected-mode-only, `#UD`
+    /// elsewhere, writes a GPR and ZF alone, `LAR_LSL_CORE_CLOCKS`, not terminal, because both
     /// rows share one interpreter shape (`try_read_descriptor` plus a mask) and one census
     /// rationale; they are two rows rather than one because the census ranks them separately, the
     /// same reason the four string rows are four instead of one.
@@ -29844,8 +29841,8 @@ impl InterpretOneRow {
     /// address is the handler's entry and no continuation of the compiled span is reachable.
     ///
     /// A HARD GATE and not a shortcut around `ResumeSnapshot::allows_resume`. The clause that
-    /// would otherwise refuse is R1, `cpu.registers.eip != end_eip || cpu.registers.cs() != self.cs`
-    /// -- and that is a fact about the GUEST'S IDT rather than a construction. A vector whose gate
+    /// would otherwise refuse is R1, `cpu.registers.eip != end_eip || cpu.registers.cs() != self.cs`,
+    /// and that is a fact about the GUEST'S IDT rather than a construction. A vector whose gate
     /// points at the very address after the `INT` satisfies both halves of R1, and R3 does not
     /// cover the gap either: its IF clause is DIRECTIONAL and `INT` clears IF, which is the arm
     /// that RESUMES. `allows_resume` would then return true and `interpret_one_step`'s resume tail
@@ -29916,14 +29913,14 @@ impl InterpretOneRow {
     /// three opcodes that happened to be nearby. It is not: it is the statement of a bar, and the
     /// class it has to bar is one no reader derives from `0x8C`/`0x8F`/XCHG.
     ///
-    /// **The FAR-POINTER LOADS -- `0xC4` LES, `0xC5` LDS, `0x0F B2` LSS, `0x0F B4` LFS, `0x0F B5`
-    /// LGS -- must never reach this enum without a row of their own that answers TRUE**, and
+    /// **The FAR-POINTER LOADS (`0xC4` LES, `0xC5` LDS, `0x0F B2` LSS, `0x0F B4` LFS, `0x0F B5`
+    /// LGS) must never reach this enum without a row of their own that answers TRUE**, and
     /// admitting them is a slice rather than a list entry, for two independent reasons:
     ///
     /// * **LSS ARMS the interrupt shadow.** Carried as a non-arming row it would leave
     ///   `cpu.interrupt_shadow` set; R3's `(!arming && shadow && !shadow_before_step)` clause would
-    ///   resync, and the boundary would then clear a shadow an EARLIER `Sti` slot latched --
-    ///   delivering an interrupt ONE INSTRUCTION EARLY, which is review finding F1's exact shape
+    ///   resync, and the boundary would then clear a shadow an EARLIER `Sti` slot latched,
+    ///   delivering an interrupt ONE INSTRUCTION EARLY, which is defect F1's exact shape
     ///   and outside the caveat the owner approved. The `debug_assert_eq!` on the arming counts at
     ///   the boundary cannot see it, because `note_interrupt_shadow_arm` only runs for arming rows,
     ///   so both counts stay equal while the state diverges.
@@ -29939,13 +29936,13 @@ impl InterpretOneRow {
         match self {
             // `IntImm8` answers TRUE, and never because R2's answer decides anything for it:
             // `always_resyncs` refuses resume before the predicate is consulted on the deciding
-            // path. R2 still READS it -- `interpret_one_step`'s resync tail re-runs
+            // path. R2 still READS it: `interpret_one_step`'s resync tail re-runs
             // `allows_resume` with the suffix-only mask for the prefix-use census, and that call
-            // reaches this arm -- so the answer has to be the true one rather than a convenient
+            // reaches this arm, so the answer has to be the true one rather than a convenient
             // one. It is: `software_interrupt` loads CS through the IDT
             // gate, and a V86 reflection into the monitor additionally reloads DS, ES, FS and GS.
-            // The OTHER consumer is the one that still reads it -- the accumulator that bars a
-            // block from publishing a static successor -- and a block ending in a control transfer
+            // The OTHER consumer is the one that still reads it: the accumulator that bars a
+            // block from publishing a static successor, and a block ending in a control transfer
             // has none to publish, so the answer costs nothing there either.
             Self::MovSreg | Self::MovSsReg | Self::PopSs | Self::IntImm8 => true,
             Self::PopRm
@@ -29963,8 +29960,8 @@ impl InterpretOneRow {
             | Self::StringLoad
             | Self::Pushf
             | Self::Popf
-            // LAR and LSL write a general-purpose register and ZF alone -- the ModRM `reg` field
-            // is always a GPR, never a segment encoding -- so both answer false exactly as
+            // LAR and LSL write a general-purpose register and ZF alone: the ModRM `reg` field
+            // is always a GPR, never a segment encoding, so both answer false exactly as
             // `PopRm`/`MovRmSreg`/`Xchg` do.
             | Self::Lar
             | Self::Lsl => false,
@@ -29984,24 +29981,24 @@ pub(crate) enum CallOutHelper {
     /// `0xEC` IN AL,DX.
     PortReadAlDx,
     /// `0xE4` IN AL,imm8, behind `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`
-    /// (`dev_docs/specs/2026-08-27-gp2-in-imm8-callout-design.md` rev 3).
+    /// (in-imm8 call-out design rev 3).
     ///
     /// The LEAN sibling of `PortReadAlDx`: same two-phase TSS-bitmap probe
     /// (`port_permission_resident`), same shared `port_io_core_clocks(bus, false)` charge, same
-    /// `preview_scale_clocks` remainder carry, but no poll-skip scan (rev 3 §1.4 -- the scan's own
+    /// `preview_scale_clocks` remainder carry, but no poll-skip scan (rev 3 §1.4: the scan's own
     /// shape needs a one-byte IN fetch and this form is two bytes) and no `slot_delta` (nothing to
     /// scan backward from). The port is a compile-time IMMEDIATE rather than a live register, so
-    /// it travels with the variant exactly as `InterpretOne` carries its `InterpretOneRow` -- the
+    /// it travels with the variant exactly as `InterpretOne` carries its `InterpretOneRow`: the
     /// classify arm admits `0xE4` unconditionally on port (rev 3 §1.1: the per-port-class safety
     /// table is a PROOF that every reachable class is safe, not a `classify`-arm filter), so there
     /// is no allowlist to consult and the port only has to be carried, never matched against one.
     PortReadAlImm8 { port: u8 },
     /// `0xE6` OUT imm8,AL, behind `IZARRAVM_OUT_IMM8_ROWS`
-    /// (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+    /// (Option B of the gp2 OUT 0xE6 research).
     ///
     /// The WRITE twin of `PortReadAlImm8`: same two-phase TSS-bitmap probe, same compile-time port
     /// immediate on the fourth-argument channel, no poll-skip scan and no cell. It differs in
-    /// exactly two places, and both are load-bearing rather than incidental -- it charges
+    /// exactly two places, and both are load-bearing rather than incidental: it charges
     /// the OUT column (epoch 1: 10, not the reads' 12), and it reports a step break
     /// UNCONDITIONALLY, because a port write can raise an IRQ from inside `write_io` while the
     /// bus's own `requires_step_break()` stays false for the ring-0 protected-mode guests that
@@ -30014,7 +30011,7 @@ pub(crate) enum CallOutHelper {
     /// unconditional step break `PortWriteAlImm8` reports. It differs from `PortWriteAlImm8` the
     /// same way `PortReadAlDx` differs from `PortReadAlImm8`: the port is a live DX read at
     /// runtime, not a compile-time immediate, so it carries no port value in the variant and no
-    /// poll-skip `slot_delta` either -- the poll-skip scan needs a fetch to seed backward from and
+    /// poll-skip `slot_delta` either: the poll-skip scan needs a fetch to seed backward from and
     /// a write has none to offer, so this helper carries no cell at all
     /// (`carries_a_cell()` is false, joining `PushAllDword`/`PopAllDword`).
     PortWriteAlDx,
@@ -30035,7 +30032,7 @@ pub(crate) enum CallOutHelper {
 impl CallOutHelper {
     /// True for the PORT class: helpers that can reach `check_io_permission`, and therefore the
     /// TSS bitmap probe whose page walk is why `run_direct_block` refuses to enter such a block in
-    /// the privileged state. False for the memory class, which has no privileged probe at all --
+    /// the privileged state. False for the memory class, which has no privileged probe at all:
     /// its page-protection decision is made inside `call_out_stack_frame_resident` against the
     /// live CPL, and fails closed to a refusal. Keeping this a method rather than a `matches!` at
     /// the two call sites is what makes a fourth helper choose its class deliberately.
@@ -30094,8 +30091,8 @@ impl CallOutHelper {
     /// Whether this slot is PRICED as the INT class rather than as the interpret-one class.
     ///
     /// The one place the two split. `interprets_one` stays TRUE for the INT row, because it is the
-    /// generic helper that runs it and the two things that predicate gates -- the slot's
-    /// `InterpretOneCell` and the emitter's pair of RESYNC exit stubs -- are both needed. What the
+    /// generic helper that runs it and the two things that predicate gates (the slot's
+    /// `InterpretOneCell` and the emitter's pair of RESYNC exit stubs) are both needed. What the
     /// row does NOT share is the budget term: see `CompiledBlock::callout_int_imm8_slots` for why
     /// folding a 37-clock row into a 7-clock allowlist maximum would change block admission across
     /// the whole board.
@@ -30128,7 +30125,7 @@ impl CallOutHelper {
         )
     }
 
-    /// True for every helper whose slot is allocated a `PortSlotCell` -- the governor's per-site
+    /// True for every helper whose slot is allocated a `PortSlotCell`: the governor's per-site
     /// kill switch. `InterpretOne` needs one for `republish_flags`'s reason (below) as well as the
     /// governor; `PortReadAlDx` needs one PURELY as a `slot_delta` data channel for the poll-skip
     /// scan's origin (GP2 poll-skip design, obligation 4) and NEVER for the RBP reload
@@ -30150,7 +30147,7 @@ impl CallOutHelper {
     }
 
     /// True only for the ONE helper that republishes the architectural EFLAGS into memory before
-    /// returning -- `InterpretOne`'s STEP 2 (`materialize_flags`), the precondition
+    /// returning: `InterpretOne`'s STEP 2 (`materialize_flags`), the precondition
     /// `emit_call_out`'s RBP reload depends on. `PortReadAlDx` carries a cell (`carries_a_cell`)
     /// but never republishes: RBP is callee-saved and stays the block's live EFLAGS shadow across
     /// the call, and reloading it from memory here would clobber that shadow with a stale value a
@@ -30175,7 +30172,7 @@ impl CallOutHelper {
 /// THREE counts now, each bounded by `MAX_BLOCK_CALLOUT_SLOTS` (4). Two fitted a nibble each;
 /// three do not fit three bits each, and the byte is not negotiable: `CompiledBlock` is memcpy'd
 /// several times per Direct entry, `compiled_block_stays_small_enough_to_copy_per_entry` pins it
-/// at 120 bytes, and that budget is exactly full -- a second byte would round the struct to 128
+/// at 120 bytes, and that budget is exactly full: a second byte would round the struct to 128
 /// and cost eight bytes on every one of ~47 M entries in a Quake run.
 ///
 /// So the packing is BASE FIVE. Each count is in `0..=4`, and `5^3 = 125` fits a `u8` with room
@@ -30184,7 +30181,7 @@ impl CallOutHelper {
 /// already costs more than that. `interpret_one` and `memory` are read only by
 /// `compute_iteration_upper`, which is memoised per block.
 ///
-/// The alternative that keeps `port` a mask -- three bits, three bits, two bits -- cannot hold
+/// The alternative that keeps `port` a mask (three bits, three bits, two bits) cannot hold
 /// four `InterpretOne` slots, which is exactly the block the loader produces.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CallOutSlotCounts(u8);
@@ -30197,7 +30194,7 @@ const SLOT_COUNT_RADIX: u8 = 5;
 /// fits a byte the base-5 packing had already filled.
 ///
 /// Three classes in base 5 occupy `0..=124`. A fourth positional digit would need `5^4 = 625` and
-/// does not fit -- but the INT class does not need a digit, because it is bounded at ONE per
+/// does not fit, but the INT class does not need a digit, because it is bounded at ONE per
 /// block rather than at `MAX_BLOCK_CALLOUT_SLOTS`. `DirectKind::is_terminal` names the row, so the
 /// compile walk STOPS at an INT slot and a second one can never be appended. So the class is a
 /// flag, encoded as `+125`, and the widest value the byte can hold is `124 + 125 = 249`.
@@ -30206,8 +30203,8 @@ const SLOT_COUNT_RADIX: u8 = 5;
 const INT_IMM8_SLOT_STRIDE: u8 = SLOT_COUNT_RADIX * SLOT_COUNT_RADIX * SLOT_COUNT_RADIX;
 
 impl CallOutSlotCounts {
-    /// `lar_lsl` is NOT packed into the returned byte -- that class lives in `CompiledBlock::block_flags`
-    /// now, not here -- but it is still taken as a parameter so the budget assert below sums every
+    /// `lar_lsl` is NOT packed into the returned byte: that class lives in `CompiledBlock::block_flags`
+    /// now, not here, but it is still taken as a parameter so the budget assert below sums every
     /// class the walk can produce rather than the four this type happens to store. Passing it and
     /// dropping it silently would be the same omission the assert exists to catch, moved one line
     /// up instead of fixed.
@@ -30333,14 +30330,14 @@ struct PortPermissionProbe {
 /// runs before the helper is allowed to commit anything" is enforced by the compiler rather than
 /// argued. Each `None` is one lane of the design's abnormal set:
 ///
-/// * P0 the TSS is not a 32-bit TSS, so it holds no I/O permission bitmap -- the interpreter's
+/// * P0 the TSS is not a 32-bit TSS, so it holds no I/O permission bitmap: the interpreter's
 ///   `#GP(0)` for every port;
-/// * P1 the TSS is too small to hold the io_base word -- also the interpreter's `#GP(0)`;
+/// * P1 the TSS is too small to hold the io_base word: also the interpreter's `#GP(0)`;
 /// * P2 that word straddles a page (so one translate could not cover it);
-/// * P3/P7 a TLB MISS -- the interpreter would walk here, which is the whole hazard;
+/// * P3/P7 a TLB MISS: the interpreter would walk here, which is the whole hazard;
 /// * P4/P8 the physical is not aligned, page-local, A20-clean plain RAM;
-/// * P5 the bitmap byte is past the TSS limit -- the interpreter's `#GP(0)`;
-/// * P9 the bit is set -- the interpreter's other `#GP(0)`.
+/// * P5 the bitmap byte is past the TSS limit: the interpreter's `#GP(0)`;
+/// * P9 the bit is set: the interpreter's other `#GP(0)`.
 ///
 /// The `#GP` lanes refuse rather than fault for the reason the caller states: raising from
 /// inside a live block is the hazard class this design will not open, and the interpreter raises
@@ -30390,7 +30387,7 @@ fn port_permission_resident<B: CpuBus>(
 /// immediate exactly the way `InterpretOneCell::slot_delta` is (`emit`, the one caller, has both
 /// `slot.lin` and `span.key.linear` in scope). It is what lets the poll-skip classifier scan from
 /// the SLOT's own linear EIP rather than `cpu.linear_eip()`, which inside a native block is the
-/// block-ENTRY value throughout (see `build_poll_loop_from`'s doc) -- GP2 poll-skip design
+/// block-ENTRY value throughout (see `build_poll_loop_from`'s doc): GP2 poll-skip design
 /// obligation 1.
 ///
 /// # Safety
@@ -30429,13 +30426,13 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     let port = cpu.read_gpr16(2);
 
     // PHASE P. Pure: no charge, no guest write, no `trace.record`, no device. It runs only in the
-    // state `check_io_permission` does NOT early-return from -- V86, or CPL > IOPL -- and it
+    // state `check_io_permission` does NOT early-return from (V86, or CPL > IOPL) and it
     // answers one question: can this instruction's TSS I/O-permission probe be satisfied without
     // any effect the helper is not allowed to have?
     //
     // The effect it must avoid is the PAGE WALK. `read_system_linear` translates through
     // `translate_linear_system`, and on a TLB miss that walks, and `write_page_walk_entry` sets
-    // accessed bits through `bus.write_memory` + `record_write_page` + `note_code_write` -- with
+    // accessed bits through `bus.write_memory` + `record_write_page` + `note_code_write`, with
     // this block's native code live on the stack, which is exactly the situation
     // `note_code_write_inner`'s "no compiled block is mid-execution when this runs" proof
     // (core.rs) says cannot happen. `resident_translate_system` therefore serves TLB HITS ONLY
@@ -30445,7 +30442,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // Refusing costs the guest the call-out and nothing else: the native run ends here and the
     // INTERPRETER executes the whole instruction, TSS probe, page walk and `#GP` included,
     // exactly as it does for a block that stopped at an IN barrier. Same boundary, same charge,
-    // same faults. The miss case is self-healing -- the interpreted IN refills the TLB and the
+    // same faults. The miss case is self-healing: the interpreted IN refills the TLB and the
     // next one is served natively.
     //
     // The DENIED cases (P5 limit overrun, P9 bitmap bit set) refuse for the same reason rather
@@ -30474,15 +30471,15 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     let written_before = (cpu.written_count, cpu.written_pages_overflow);
 
     // The device's view of guest time. `core_clocks_so_far` was set to the run's total at block
-    // ENTRY; the RUN's prefix has executed since -- this block's earlier slots and, on a chained
+    // ENTRY; the RUN's prefix has executed since: this block's earlier slots and, on a chained
     // entry, every hop before it.
     //
     // BOTH lanes are previewed, not just the raw one. A call-out block never holds an x87 slot,
     // but a FLOAT-ENTERED CHAIN can hop into one, and those earlier hops deposited their cost in
     // `STACK_WEIGHTED_FP_CLOCKS`, which only becomes clocks through `scale_weighted_fp_clocks`.
     // Reading only the raw lane would hand the device a timestamp short by the whole float part
-    // of the chain. This mirrors `run_direct_block`'s own fold exactly -- FP clocks scaled first,
-    // added to raw, then the persona's long division -- and both scalings are read-only: neither
+    // of the chain. This mirrors `run_direct_block`'s own fold exactly: FP clocks scaled first,
+    // added to raw, then the persona's long division, and both scalings are read-only: neither
     // `fp_rem` nor `timing_rem` is consumed, so the charge itself is still made once, later, by
     // the block's single batch call.
     let fp =
@@ -30496,12 +30493,12 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // an earlier version of this comment that claimed it was): `poll_skip_eligible` (`block.rs`)
     // is `!is_protected_mode() || (!is_v86_mode() && cpl <= iopl)`, while `permission.is_none()`
     // is `!is_v86_mode() && cpl <= iopl` alone, with no real-mode disjunct of its own. The Direct
-    // screen this `if` guards is therefore the NARROWER (more conservative) of the two -- it can
-    // only decline where `poll_skip_eligible` would also decline, never the reverse -- which is
+    // screen this `if` guards is therefore the NARROWER (more conservative) of the two: it can
+    // only decline where `poll_skip_eligible` would also decline, never the reverse, which is
     // why the difference is safe to leave as is rather than a defect to fix. `extra_raw_clocks`
     // and `forced_step_break`
     // fold into the ordinary return at the bottom, so the current iteration's own read below
-    // (whether or not a skip preceded it) is completely unaffected -- M-26's pin.
+    // (whether or not a skip preceded it) is completely unaffected: M-26's pin.
     let mut extra_raw_clocks: u64 = 0;
     let mut forced_step_break = false;
     if permission.is_none() {
@@ -30534,16 +30531,16 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // here verbatim: it is cheap when it early-returns, and if the two predicates ever drift
     // apart this refuses rather than proceeds. With `permission` present the interpreter read the
     // io_base word and one bitmap byte through `read_system_linear`, and those two charges are
-    // replayed at C1/C2 -- SAME addresses, SAME widths, SAME `DataRead` kind, SAME order, and
+    // replayed at C1/C2: SAME addresses, SAME widths, SAME `DataRead` kind, SAME order, and
     // before `read_io`, which is row 9 of the design's charge table.
     //
     // Phase P's peek read the same bytes with no charge; these read them again with one. They
-    // cannot disagree -- nothing between them writes guest memory -- and the two assertions pin
+    // cannot disagree: nothing between them writes guest memory, and the two assertions pin
     // it. The physical survived `direct_page_ram_bytes`, whose `should_split` term rejects
     // exactly the misaligned case, so C1 is guaranteed the ALIGNED arm of `read_memory_direct`
     // and `charge_direct_ram_split` is unreachable from here; C2 is a byte and cannot split at
-    // all. An `Err` is likewise unreachable for the same reason -- the aligned arm returns `Ok`
-    // unconditionally -- and is asserted; the return and its attribution keep the helper honest
+    // all. An `Err` is likewise unreachable for the same reason: the aligned arm returns `Ok`
+    // unconditionally, and is asserted; the return and its attribution keep the helper honest
     // for a bus that violates the trait's promise, and keep `attempts == callout_executed` true
     // on the attribution snapshot whichever way this goes.
     match permission {
@@ -30627,7 +30624,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // The numerator the acceptance gate needs, and the reason it is separate from
     // `callout_executed`: on a mixed guest that count sums the CPL0 arm and this one, so it
     // cannot say whether the NEW arm ever served anything. Bumped last, so an abnormal return
-    // from any lane -- including the unreachable `read_io` error -- is excluded by construction.
+    // from any lane (including the unreachable `read_io` error) is excluded by construction.
     if permission.is_some() {
         cpu.jit_direct.note_callout_port_v86_served();
     }
@@ -30646,7 +30643,7 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
     // is set ONLY on a committed span and makes the skip BLOCK-TERMINATING (design BLOCKER A fix
     // 2): the block takes its ordinary step-break exit at THIS slot's next EIP, and the batch loop
     // re-budgets exactly as it does for the interpreter, so no running block can ever overshoot
-    // `cap` by more than one native re-entry -- the overshoot is zero by construction, not by
+    // `cap` by more than one native re-entry: the overshoot is zero by construction, not by
     // owner ruling, and there is no counter to prove that because there is nothing left to prove.
     #[cfg(feature = "direct-callout-attribution")]
     {
@@ -30675,10 +30672,10 @@ unsafe extern "C" fn port_read_al_dx<B: CpuBus>(
 ///
 /// The LEAN sibling of `port_read_al_dx`: same phase P (`port_permission_resident`), same phase C
 /// charged re-reads, same shared `port_io_core_clocks(bus, false)` charge and the same `preview_scale_clocks`
-/// remainder carry -- but with the whole GP2 call-out-site poll-skip block deleted (rev 3 §1.4: the
+/// remainder carry, but with the whole GP2 call-out-site poll-skip block deleted (rev 3 §1.4: the
 /// scan's own `debug_assert` requires a `len == 1` IN fetch, which this form's two-byte encoding
 /// cannot satisfy, and the shape it certifies is wrong for this routine besides), and with no
-/// `slot_delta` argument -- there is nothing to scan backward from, so the fourth argument this
+/// `slot_delta` argument: there is nothing to scan backward from, so the fourth argument this
 /// helper reads is the compile-time PORT immediate instead.
 ///
 /// # Safety
@@ -30714,7 +30711,7 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
 
     let port = port_imm as u16;
 
-    // PHASE P, verbatim from `port_read_al_dx` -- see that function for the derivation of every
+    // PHASE P, verbatim from `port_read_al_dx`. See that function for the derivation of every
     // `None` lane and why each one refuses rather than raises.
     let permission = if cpu.is_v86_mode() || cpu.current_privilege_level() > cpu.iopl() {
         let Some(probe) = port_permission_resident(cpu, bus, port) else {
@@ -30735,7 +30732,7 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
     #[cfg(debug_assertions)]
     let written_before = (cpu.written_count, cpu.written_pages_overflow);
 
-    // The device's view of guest time, verbatim from `port_read_al_dx` -- both lanes previewed
+    // The device's view of guest time, verbatim from `port_read_al_dx`: both lanes previewed
     // for the same reason: a float-entered chain can hop into this block with FP clocks parked in
     // `STACK_WEIGHTED_FP_CLOCKS`.
     let fp =
@@ -30825,7 +30822,7 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
     // reasoning but NOT calling it: that counter is `0xEC`'s own bitmap-arm numerator, and bumping
     // it here too would conflate the two opcodes' engagement on a guest that runs both.
     // `callout_executed` sums every helper class, so on a guest that runs both `0xEC` and `0xE4` it
-    // cannot say whether this NEW arm ever served anything -- `callout_port_imm8_served` is what
+    // cannot say whether this NEW arm ever served anything: `callout_port_imm8_served` is what
     // can. Bumped on every successful execution (not gated on `permission.is_some()`, unlike
     // `0xEC`'s bitmap-only counter), last, on the same success-only path as every other counter
     // above, so an abnormal return from any lane is excluded by construction.
@@ -30863,7 +30860,7 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
 }
 
 /// `0xE6` OUT imm8,AL through the interpreter's own port path, behind `IZARRAVM_OUT_IMM8_ROWS`
-/// (`dev_docs/gp2-out-e6-research-2026-08-30.md` §5 Option B).
+/// (Option B of the gp2 OUT 0xE6 research).
 ///
 /// The WRITE twin of `port_read_al_imm8`: phase P (`port_permission_resident`), phase C's charged
 /// re-reads, the `preview_scale_clocks` remainder carry and the fourth-argument PORT immediate are
@@ -30880,13 +30877,13 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
 /// STEP 8). `MachineBus`'s PIT arm is the live counterexample: a channel-0 control word that
 /// raises OUT calls `pic.request(0)` from inside `write_io`, so an interrupt can become
 /// deliverable in the middle of a block. Taking the bus's own `requires_step_break()` answer would
-/// not cover it -- `MachineBus::write_io`'s `skip_io_touched` exemption means a ring-0
+/// not cover it: `MachineBus::write_io`'s `skip_io_touched` exemption means a ring-0
 /// protected-mode guest's port writes set `io_touched` for nothing but 0x60/0x64/0x92/0xE7 and PCI
 /// config, which is why gp2 reads `brk_step` 17,677 against 59,968,424 OUTs.
 ///
-/// **WHAT THE BIT BUYS, exactly.** It ends the NATIVE BLOCK at this slot -- `e.jnz` to the
+/// **WHAT THE BIT BUYS, exactly.** It ends the NATIVE BLOCK at this slot: `e.jnz` to the
 /// step-break stub, `SideExitReason::CallOutStepBreak`, `DirectBlockOutcome::Complete` with EIP
-/// past the OUT -- so no LATER slot in this block executes against a pendency answer this write
+/// past the OUT, so no LATER slot in this block executes against a pendency answer this write
 /// invalidated. Paired with `DirectKind::is_terminal`, which stops the compile walk here, there is
 /// no later slot at all.
 ///
@@ -30905,7 +30902,7 @@ unsafe extern "C" fn port_read_al_imm8<B: CpuBus>(
 /// `run_direct_block`'s entry gate applies: a V86 or CPL > IOPL guest reaching a block that
 /// carries this slot goes through `callout_admission`, and a 32-bit ring-3 protected-mode guest
 /// with IOPL < 3 has its blocks classified `IoTouching` on the first trial and is then never
-/// entered natively -- the shape that made the wolf3d `0xEC` admission a total loss
+/// entered natively: the shape that made the wolf3d `0xEC` admission a total loss
 /// (`classify`'s `0xec` arm records that measurement). That is inert for gp2, which is CPL 0 =
 /// IOPL 0 and never takes the gate at all, and it is accepted for now rather than solved: this row
 /// is priced as a gp2-only lever and any ring-3 population is a separate slice with its own
@@ -30944,7 +30941,7 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
 
     let port = port_imm as u16;
 
-    // PHASE P, verbatim from `port_read_al_imm8` -- the gate is the READ helper's and not a wider
+    // PHASE P, verbatim from `port_read_al_imm8`: the gate is the READ helper's and not a wider
     // one. A write the interpreter would fault on (V86, or CPL > IOPL with the bitmap bit set)
     // must refuse HERE, before any effect, and a TSS bitmap that is not already TLB-resident is
     // refused rather than page-walked from inside a live block.
@@ -30974,13 +30971,13 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
     // device writing RAM through the bus never touches them.
     //
     // See `port_write_al_dx`'s doc for the real invariant and why it holds without a per-call
-    // check here -- the argument is the same for both helpers and is stated once there: `write_io`
+    // check here: the argument is the same for both helpers and is stated once there: `write_io`
     // callers set a machine-side flag the run loop drains at the NEXT batch boundary
     // (`consume_pending_device_memory_write_range` / `device_wrote_memory`, `run.rs` in
     // `izarravm-machine`), `lotura_font_bank_invalidates_executed_window_bytes`
     // (`machine_code_write_coherence_test.rs`) pins that the write itself does not retire the
     // code, and the UNCONDITIONAL STEP BREAK below is what guarantees the drain always runs
-    // before any later slot -- in this block or a chained one -- executes against the changed
+    // before any later slot (in this block or a chained one) executes against the changed
     // memory.
 
     let fp =
@@ -31081,15 +31078,15 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
     // The dedicated always-on engagement numerator, bumped last on the success-only path for the
     // reason `callout_port_imm8_served` is: `callout_executed` sums every helper class, so on a
     // guest that runs both `0xE4` and `0xE6` call-outs it cannot say whether THIS arm served
-    // anything -- which is the acceptance question this row's shipped ON default is graded on.
+    // anything, which is the acceptance question this row's shipped ON default is graded on.
     cpu.jit_direct.note_callout_port_out_imm8_served();
     #[cfg(feature = "reflected-call-memo")]
     crate::reflected_call_memo::note_port_io(cpu);
 
     // THE UNCONDITIONAL STEP BREAK. `bus.requires_step_break()` is deliberately not consulted:
     // see this function's doc for why its answer is false on exactly the guest class that carries
-    // this row, why an OR with it would therefore be dead code that reads as a safety net, and --
-    // the part worth re-reading before quoting this bit as a safety property -- what ending the
+    // this row, why an OR with it would therefore be dead code that reads as a safety net, and
+    // (the part worth re-reading before quoting this bit as a safety property) what ending the
     // BLOCK does and does not do about interrupt delivery.
     #[cfg(feature = "direct-callout-attribution")]
     cpu.jit_direct.note_callout_attribution(
@@ -31106,22 +31103,22 @@ unsafe extern "C" fn port_write_al_imm8<B: CpuBus>(
 /// The WRITE twin of `port_read_al_dx`, exactly as `port_write_al_imm8` is the write twin of
 /// `port_read_al_imm8`: phase P (`port_permission_resident`), phase C's charged re-reads, the
 /// `preview_scale_clocks` remainder carry, the OUT-column charge and the unconditional
-/// step break are `port_write_al_imm8`'s, verbatim -- see that function's doc for what the
+/// step break are `port_write_al_imm8`'s, verbatim. See that function's doc for what the
 /// unconditional bit buys and does not buy; nothing here restates it. The one thing this helper
-/// does that `port_write_al_imm8` does not is read the port out of DX, live, at the top -- the
+/// does that `port_write_al_imm8` does not is read the port out of DX, live, at the top: the
 /// same difference `port_read_al_dx` already carries against `port_read_al_imm8`.
 ///
 /// No poll-skip scan and no `slot_delta`: the scan's own shape needs a `len == 1` fetch to
 /// classify and seed a backward walk from, and an OUT has nothing to poll for. That is also why
 /// this helper carries no fourth argument at all (`CallOutHelper::PortWriteAlDx::carries_a_cell()`
-/// is `false`) -- there is neither a `slot_delta` nor a port immediate to ride the channel.
+/// is `false`): there is neither a `slot_delta` nor a port immediate to ride the channel.
 ///
 /// **THE V86 ADMISSION SERVES, MEASURED.** The unconditional step break forces
 /// `CallOutAdmission::IoTouching` on a block's first dispatcher trial, which was an open question
-/// on landing -- an admission that never got past that trial would never serve a single V86 port
+/// on landing: an admission that never got past that trial would never serve a single V86 port
 /// no matter how correct the helper is. A corpus census on 1000-miglia and 123-talk-shareware
 /// answered it: `jit_direct_callout_port_out_dx_served` reads 46,654,405 on 1000-miglia (against
-/// the removed `0xEE` barrier row's 46,654,278 unbound exits -- the same population, not a
+/// the removed `0xEE` barrier row's 46,654,278 unbound exits: the same population, not a
 /// coincidence) and 391,593 on 123-talk-shareware (whose `0xE6` row, `PortWriteAlImm8`, serves
 /// 1,385,922 the same run). Neither row relocated to a different `stop_reason`; 1000-miglia's
 /// `direct_native_coverage` rose 0.790 -> 0.832. The trial-admission gate is not a wall for this
@@ -31154,7 +31151,7 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
     #[cfg(feature = "direct-callout-attribution")]
     let original_port = cpu.read_gpr16(2);
 
-    // DX, live -- the one difference from `port_write_al_imm8`, and the same read
+    // DX, live: the one difference from `port_write_al_imm8`, and the same read
     // `port_read_al_dx` already takes.
     let port = cpu.read_gpr16(2);
 
@@ -31178,14 +31175,14 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
     };
 
     // NO SMC ASSERTION HERE, and the reason is worth stating rather than leaving a gap where a
-    // narrower one used to sit. `write_io` is NOT guaranteed to reach a device and nothing else --
+    // narrower one used to sit. `write_io` is NOT guaranteed to reach a device and nothing else:
     // `MachineBus`'s port 0x09 (the 8237 mem-to-mem DMA trigger, `bus.rs`'s `dma.mem_to_mem`) and
     // port 0xE7 (the Lotura codepage-font bank copy, up to 4096 bytes into
     // `CODEPAGE_FONT_WINDOW`) both write guest RAM synchronously from inside this call, and `0xEE`
     // takes its port from DX live, so either is reachable from this helper. A `written_count` /
     // `written_pages_overflow` check would not catch it even if one were written: those two
     // counters are the CPU's OWN write path (`note_code_write` from a CPU-driven store), and a
-    // device writing RAM through the bus never touches them -- the same gap a prior revision of
+    // device writing RAM through the bus never touches them: the same gap a prior revision of
     // this comment on `port_write_al_imm8` did not disclose.
     //
     // The real invariant, and why it holds without a per-call check here. `MachineBus` holds no
@@ -31203,7 +31200,7 @@ unsafe extern "C" fn port_write_al_dx<B: CpuBus>(
     // What makes THIS call-out safe under that ordering is the unconditional step break below,
     // for a reason beyond the IRQ-pendency one already stated on this function's doc: it is what
     // guarantees the drain always gets to run before anything else does. Without it, a block that
-    // kept going past the OUT could execute later slots -- already decoded, already compiled --
+    // kept going past the OUT could execute later slots (already decoded, already compiled)
     // against memory the device just changed, because nothing inside a live native run re-checks
     // the flag. `is_terminal()` stops the COMPILE walk at the OUT for the same reason; the two
     // together are what keep "the write happened, the flag is set, and the very next thing the
@@ -31349,14 +31346,14 @@ unsafe fn published_bus<'a, B: CpuBus>(cpu: &CpuGsw) -> Option<&'a mut B> {
 /// interpreter's own body, which phase one has made incapable of walking a page table, faulting,
 /// or reaching `note_code_write`. A refusal in phase one is `STATUS_ABNORMAL` with literally
 /// nothing done, so the native run ends at the instruction and the interpreter executes PUSHAD
-/// whole -- the same boundary a pre-slice PUSHAD barrier produced.
+/// whole: the same boundary a pre-slice PUSHAD barrier produced.
 ///
 /// The `Err` arm of phase two is UNREACHABLE given phase one and is written as a restore anyway.
 /// What phase one cannot exclude by construction is a `CpuBus::charge_direct_ram_memory` that
 /// errors on a resident RAM page; no bus in tree can (`MachineBus` returns `Ok` unconditionally,
 /// and so does the trait default). If one ever did, the restore puts (E)SP and the whole register
 /// file back, so the interpreter's re-execution writes the same bytes to the same addresses and
-/// the only residue is a duplicated bus charge for the sub-pushes that completed -- a timing
+/// the only residue is a duplicated bus charge for the sub-pushes that completed: a timing
 /// divergence on an unreachable path, disclosed rather than hidden.
 ///
 /// # Safety
@@ -31436,12 +31433,12 @@ unsafe extern "C" fn push_all_dword<B: CpuBus>(
 
 /// `0x61` POPAD through the interpreter's own stack path. Same two-phase shape as
 /// `push_all_dword`, with `write = false`: the frame is READ, so there is no code-watch clause to
-/// satisfy and no `note_code_write` to reach -- what phase one still has to exclude is the page
+/// satisfy and no `note_code_write` to reach: what phase one still has to exclude is the page
 /// walk (which WRITES accessed bits, and can therefore reach `note_code_write` by that route) and
 /// the fault, because `pop_all_gpr` does not restore on fault at all and a partial POPAD would
 /// leave eight registers half loaded.
 ///
-/// This helper MUTATES THE GUEST REGISTER FILE -- eight registers plus ESP, where `0xEC` wrote one
+/// This helper MUTATES THE GUEST REGISTER FILE: eight registers plus ESP, where `0xEC` wrote one
 /// byte of one. That is carried entirely by the emitted slot's unconditional whole-set reload; see
 /// the reload derivation in the module docs.
 ///
@@ -31554,8 +31551,8 @@ pub(crate) struct InterpretOneCell {
     ///
     /// THE PREFIX HALF IS NOT DECORATION, and the first loader gate is what proved it. A mask
     /// built from the SUFFIX alone let a block that bakes DS in its prefix resume having moved DS,
-    /// and the block then failed its own `data_matches` on the NEXT entry -- `used` is the
-    /// block-wide pinned set -- so it retired and recompiled on every visit:
+    /// and the block then failed its own `data_matches` on the NEXT entry: `used` is the
+    /// block-wide pinned set, so it retired and recompiled on every visit:
     /// `jit_direct_reject_data_segment` 307,714 -> 514,327 with compile attempts up by the same
     /// 206,000. Including the prefix makes the block never bake the segment it changes, so its own
     /// write can no longer fail its own entry check.
@@ -31563,7 +31560,7 @@ pub(crate) struct InterpretOneCell {
     /// Filled AFTER the walk, by slot index, because it is a fact about the rest of the block that
     /// the walk does not know while it is still growing.
     ///
-    /// `u8::MAX` -- R2 compares all six records -- for a `MovSsReg` or `PopSs` cell, and for a
+    /// `u8::MAX`: R2 compares all six records, for a `MovSsReg` or `PopSs` cell, and for a
     /// `MovSreg` cell inside a V86 block: that population is what the V86 guarded successor edge
     /// claims. A `MovSreg` cell OUTSIDE V86 gets the real mask: the mask is a fact about what the
     /// rest of THIS block bakes, and R2's own compare is what makes it sound (see its note).
@@ -31585,13 +31582,13 @@ pub(crate) struct InterpretOneCell {
     ///   successor, so `run_direct_block`'s own `span.key` names the ROOT. Retiring the root
     ///   leaves the successor's slot in place with its cell already latched, and `note_execution`
     ///   fires once per cell, so nothing ever asks again.
-    /// * the SITE's mode key. `jit_mode_key` is CPU state -- CS.D, SS.B, PE, PG, VM -- and any of
+    /// * the SITE's mode key. `jit_mode_key` is CPU state (CS.D, SS.B, PE, PG, VM) and any of
     ///   it can move between the block's entry and this slot: an earlier `MOV SS,r/m` in the same
     ///   block moves bit 3. Reading it live files the site under a key the compile walk never
     ///   asks for, which is an inert entry AND a demote/retire/recompile treadmill.
     ///
     /// `key.physical + slot_delta` is the site's physical address, and it is the same value the
-    /// walk computed as `expected_phys` -- the walk pins that equality itself, refusing any slot
+    /// walk computed as `expected_phys`: the walk pins that equality itself, refusing any slot
     /// whose decode line does not start there.
     key: BlockKey,
 }
@@ -31599,7 +31596,7 @@ pub(crate) struct InterpretOneCell {
 /// Executions the governor watches before it stops deciding, and RESYNCs within that window that
 /// demote the slot. Three in eight: the same order as the call-out admission governor's
 /// `MAX_UNTRIED_TRIALS`, and deliberately cheap to reach, because a slot that resyncs is strictly
-/// worse than the boundary it replaced -- spill, call, run, reload, side exit, and then the
+/// worse than the boundary it replaced: spill, call, run, reload, side exit, and then the
 /// dispatcher trip the boundary would have taken anyway.
 const GOVERNOR_WINDOW: u8 = 8;
 const GOVERNOR_RESYNC_LIMIT: u8 = 3;
@@ -31671,7 +31668,7 @@ impl InterpretOneCell {
     /// The whole governor is confined to the first `GOVERNOR_WINDOW` executions. Once the
     /// execution count saturates the cell is frozen: a slot that survived its window is admitted
     /// for the block's lifetime, and a slot that did not is refused for it. That is the same
-    /// terminal shape `CallOutAdmission` has, and for the same reason -- a governor that keeps
+    /// terminal shape `CallOutAdmission` has, and for the same reason: a governor that keeps
     /// re-deciding churns without converging.
     fn note_execution(&self, resynced: bool) -> bool {
         let state = self.state.load(Ordering::Acquire);
@@ -31714,16 +31711,16 @@ pub(crate) struct ResumeSnapshot {
     /// (`run_direct_block` refuses on `interrupt_shadow`), so the clause costs nothing and does
     /// not depend on that refusal staying put, which is design review 10.1 B3.
     ///
-    /// PER RUN and not per slot, and the difference is the whole of review finding F2. Read live,
-    /// this field would be true for every call-out slot BEHIND an arming one -- the helper does
-    /// not clear the shadow and no native slot consumes it -- so `sti; pop word [bx]` would resync
+    /// PER RUN and not per slot, and the difference is the whole of defect F2. Read live,
+    /// this field would be true for every call-out slot BEHIND an arming one: the helper does
+    /// not clear the shadow and no native slot consumes it, so `sti; pop word [bx]` would resync
     /// at the POP, and three of those in the governor's first eight executions would demote a slot
     /// that did nothing wrong.
     ///
     /// PER RUN rather than per BLOCK, precisely: `run_direct_block` publishes it once before the
     /// native entry and clears it after the return, and a CHAINED successor is entered without
     /// coming back here, so it inherits the head block's value. That is the right scope rather
-    /// than an approximation of a narrower one -- the question is whether the reprieve the run
+    /// than an approximation of a narrower one: the question is whether the reprieve the run
     /// began with has been spent, and a chained transfer does not spend it.
     block_entry_shadow: bool,
     /// The shadow as it stood before THIS step, which is what turns "the flag is set" into "this
@@ -31770,13 +31767,13 @@ impl ResumeSnapshot {
     ///
     /// R2 compares all six records for every row that cannot write a segment register, and a
     /// MASK for the three that can (`InterpretOneRow::may_write_segment`). The mask is the
-    /// segments EVERY OTHER SLOT in the block depends on -- before it as well as after it -- plus
+    /// segments EVERY OTHER SLOT in the block depends on (before it as well as after it) plus
     /// CS and SS unconditionally.
     ///
     /// The relaxation is design section 11 and the census is what asked for it: 2.23 M of the S4
     /// loader's remaining block-stopping hits are `0x8E` DS and ES reloads with CHANGED records,
     /// the far-pointer pattern a DOS extender emits, and every one of them resynced under the
-    /// six-record compare and then demoted -- while no remaining slot in the block used the
+    /// six-record compare and then demoted, while no remaining slot in the block used the
     /// segment that moved. A record nothing downstream bakes cannot reach anything the block goes
     /// on to do.
     ///
@@ -31798,7 +31795,7 @@ impl ResumeSnapshot {
     ///
     /// WHAT PAYS FOR IT is the successor bar rather than anything in this predicate. A block
     /// holding such a slot publishes no static successor and no dynamic one, so a chained
-    /// transfer -- which jumps into a successor's body without re-running `data_matches` -- can
+    /// transfer (which jumps into a successor's body without re-running `data_matches`) can
     /// never enter code baked against a record this block just moved. That is the same argument
     /// `is_segment_write_block` has always made for `LoadSegReal`, extended to the one other
     /// producer of a segment write.
@@ -31816,7 +31813,7 @@ impl ResumeSnapshot {
     /// R3's IF clause is DIRECTIONAL by design review M8. IF going 1 to 0 resumes, because the run
     /// loop has no delivery point on that edge: disabling interrupts cannot make one serviceable.
     /// IF going 0 to 1 resyncs, because the boundary after it is exactly where the run loop would
-    /// deliver -- EXCEPT for the `Sti` row, whose whole purpose is that edge and which pays for it
+    /// deliver, EXCEPT for the `Sti` row, whose whole purpose is that edge and which pays for it
     /// with a pendency test in the helper (`bus.interrupt_pending()`) that this predicate has no
     /// bus to ask. That exemption is `takes_interrupt_enable_edge` and it is deliberately NARROWER
     /// than `arms_interrupt_shadow`: the SS rows arm the shadow and write no flag at all.
@@ -31832,7 +31829,7 @@ impl ResumeSnapshot {
     /// R3 also carries TF, and it is a CLAUSE rather than an entry-gate argument on purpose. The
     /// entry gate nearly does it: `classify` admits no row that can set TF, since the flag-image
     /// loads are on no allowlist, so a block that entered with TF clear cannot acquire it. What
-    /// that does not cover is a block ENTERED with TF already set -- the Direct dispatcher has no
+    /// that does not cover is a block ENTERED with TF already set: the Direct dispatcher has no
     /// TF refusal to lean on, because single-step delivery is the run loop's business and happens
     /// at instruction boundaries a native block does not produce. Testing the live flag after the
     /// step costs one mask, needs no argument, and stays true when S3 admits a row that can write
@@ -31840,7 +31837,7 @@ impl ResumeSnapshot {
     ///
     /// R4 is conservative rather than exact, and the reason is worth stating. The FAST MAP needs
     /// no clause: emitted code never reads `mapping_epochs` at all, and an invalidation CLEARS
-    /// entries in place -- so a wipe mid-block makes the next native memory slot probe an
+    /// entries in place, so a wipe mid-block makes the next native memory slot probe an
     /// unavailable page and side-exit, rather than run against a dead pointer. The table bases
     /// can move, but only at a `MOV CR3` with two tables on (`NativeTableSlots::republish_map`).
     /// Every emitted base is read through the R15 slots at each use, and the held load-bias
@@ -31868,7 +31865,7 @@ impl ResumeSnapshot {
         // by `pinned_segments`, which is where `segment_mask` comes from: `BAKES_CS_BIT` (bit 6)
         // says the slot bakes CS's SELECTOR as an immediate. The loop below tests
         // `compare & segment_bit(*segment)` over `SEGMENT_ORDER` and cannot select it, so an
-        // incoming mask carrying bit 6 compares exactly the six segments it always did -- and
+        // incoming mask carrying bit 6 compares exactly the six segments it always did, and
         // `used_by_others` has defaulted to `u8::MAX` since this path shipped, so a mask with
         // bits above 5 set was already a production value here.
         let compare = if row.may_write_segment() {
@@ -32167,8 +32164,8 @@ unsafe extern "C" fn interpret_one<B: CpuBus, const TEST_WORD: bool>(
     //
     // SAVED AND RESTORED, not left advanced, and that is the difference between this and the port
     // helper: `port_read_al_dx` computes the same value into a LOCAL and hands it to `read_io`
-    // without touching the field, because it can. This helper cannot -- the interpreter reads the
-    // field through `execute_hot_cached_or_decoded` and there is no argument to thread -- so it
+    // without touching the field, because it can. This helper cannot: the interpreter reads the
+    // field through `execute_hot_cached_or_decoded` and there is no argument to thread, so it
     // writes the preview and puts the entry value back on every path out. `run_direct_block` sets
     // the field ONCE per entry, to the run's total; leaving it advanced would make the SECOND
     // call-out in a block preview a prefix that already contained the first one's, and would hand
@@ -32195,7 +32192,7 @@ unsafe extern "C" fn interpret_one<B: CpuBus, const TEST_WORD: bool>(
 /// compile walk over this instruction ends its block before the slot, and the latch asks
 /// `run_direct_block` to retire the block the slot is IN so that walk actually happens. Without
 /// the last two the demoted slot keeps its place in the block and every later execution pays a
-/// prologue test and an abnormal side exit to reach the boundary it already decided on -- which is
+/// prologue test and an abnormal side exit to reach the boundary it already decided on, which is
 /// what the tombraid loader measured as 1.97 M abnormal exits from 405 cells.
 ///
 /// Both of those come off the CELL and not off live CPU state: `InterpretOneCell::key` carries
@@ -32208,7 +32205,7 @@ unsafe extern "C" fn interpret_one<B: CpuBus, const TEST_WORD: bool>(
 ///
 /// A site that was ALREADY recorded still retires, and must. That is the block compiled BEFORE the
 /// site was learned, demoting afterwards; the recompile it asks for ends before the slot, so it
-/// terminates -- at most one retire per cell, because `note_execution` latches at the transition.
+/// terminates: at most one retire per cell, because `note_execution` latches at the transition.
 fn note_demotion(cpu: &mut CpuGsw, cell: &InterpretOneCell) {
     cpu.jit_direct.note_interpret_one_demoted(cell.row());
     let (physical, mode_key) = cell.site();
@@ -32293,8 +32290,8 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
             //
             // THE WINDOW IS STILL OPEN ACROSS THE DELIVERY, and that is the whole of this arm's
             // hazard. `deliver_exception` pushes three to five words onto the guest stack and, under
-            // paging, can write accessed bits during the walks that reach them. A tiny-model guest --
-            // which is exactly what the loader is -- puts SS on the same page as CS, so those pushes
+            // paging, can write accessed bits during the walks that reach them. A tiny-model guest
+            // (which is exactly what the loader is) puts SS on the same page as CS, so those pushes
             // can land on the running block's own bytes. Closing the window before this call let them
             // reach `invalidate_physical_range` with the block's native frame still on the host stack,
             // which retires the block the helper has to RETURN THROUGH. Closing it after is the fix
@@ -32350,7 +32347,7 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
             // the only thing the two runtime counters the snapshot closes against can see. This arm
             // leaves through the `resync_fault` stub, which is neither `CallOutAbnormal` nor
             // `CallOutStepBreak`, so it belongs in the residual bucket with every other continuation.
-            // The resync split itself is not lost -- `callout_interpret_one_rows` carries `resync`,
+            // The resync split itself is not lost: `callout_interpret_one_rows` carries `resync`,
             // `resync_fault`, `demoted` and `resume_refused_prefix_use` per row, ungated.
             #[cfg(feature = "direct-callout-attribution")]
             note_interpret_one_attribution(cpu, cell, CallOutOutcome::Continued);
@@ -32390,7 +32387,7 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     // safety proof the design carries (`classify`'s `0xe4` arm, above): a PIT read is a pure peek
     // against `elapsed_pit_clocks` that mutates nothing the PIC observes, so it cannot make an
     // interrupt newly deliverable inside the batch either. A port whose read DOES set `io_touched`
-    // needs no separate argument here -- `requires_step_break()` ends the block at that slot
+    // needs no separate argument here: `requires_step_break()` ends the block at that slot
     // regardless, so no LATER instruction in the block can observe a stale answer.
     //
     // ONE helper WRITES a port, and the sentence above is false for it: `PortWriteAlImm8`
@@ -32399,7 +32396,7 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     // helper CAN make an interrupt newly deliverable mid-block, and on a ring-0 protected-mode
     // guest `io_touched` is not even set, so the `requires_step_break()` half of the argument
     // above does not cover it either. It is sound here for a THIRD reason, which is why it is a
-    // port-class helper and deliberately not an `InterpretOne` row -- keeping this paragraph's
+    // port-class helper and deliberately not an `InterpretOne` row: keeping this paragraph's
     // opening sentence literally true is half the point: that helper returns the step-break bit
     // UNCONDITIONALLY and `DirectKind::is_terminal` stops the compile walk at it, so it is the
     // LAST slot of its block and there is no later instruction to observe anything. It buys no
@@ -32408,8 +32405,8 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     //
     // DEVICE-MAPPED MEMORY needs its own derivation, and "no row writes a port" is not it. The
     // string rows (`0xA4`-`0xA7`, `0xAA`-`0xAF`) write and read ORDINARY guest memory, and on this
-    // machine some ordinary guest addresses are devices -- the Mode 13h aperture and the linear
-    // frame buffer are the two that matter -- so an access that is not a port can still mutate
+    // machine some ordinary guest addresses are devices: the Mode 13h aperture and the linear
+    // frame buffer are the two that matter, so an access that is not a port can still mutate
     // device state. The premise for that class is the LAST sentence of the paragraph above rather
     // than the port argument: `bus.requires_step_break()` is read on the resume path below and
     // returned in the status word's bit 32, so an access that touched device state ENDS THE BLOCK
@@ -32436,17 +32433,17 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     //
     // THE `IF` TERM narrows it, and it is a no-op for STI by construction: a retired STI always
     // leaves IF set, so the clause reads exactly as it did before for that row. What it removes is
-    // the SS rows resyncing inside an interrupt-disabled region -- an ISR, or a guest's own
-    // critical section -- where nothing is deliverable at the boundary or anywhere else, so
+    // the SS rows resyncing inside an interrupt-disabled region (an ISR, or a guest's own
+    // critical section) where nothing is deliverable at the boundary or anywhere else, so
     // continuing cannot move a delivery point. Read plain rather than through `flag()` because IF
     // is never deferred into `pending_flags`.
     //
-    // Asked AFTER the step rather than before it because the step runs on either answer -- the row
-    // retires whatever this returns -- and executing it cannot change what is pending.
+    // Asked AFTER the step rather than before it because the step runs on either answer (the row
+    // retires whatever this returns) and executing it cannot change what is pending.
     //
     // THE `always_resyncs` GATE COMES FIRST, and it is structural rather than an optimisation.
     // `InterpretOneRow::IntImm8` loads CS:EIP through the IDT, so the block is finished at the
-    // slot -- but the clause that would otherwise notice is R1, and R1 compares `cpu.registers.eip`
+    // slot, but the clause that would otherwise notice is R1, and R1 compares `cpu.registers.eip`
     // and `cpu.registers.cs()` against the snapshot, which are facts about the GUEST'S IDT rather
     // than about the mechanism. A gate whose handler begins at the address right after the `INT`
     // satisfies both halves of R1, and R3 does not cover the gap either: its IF clause is
@@ -32458,12 +32455,12 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     // AND THERE IS NOTHING TO ASSERT ALONGSIDE IT. A `debug_assert` stood here claiming
     // `allows_resume` would have answered false for this row; it was the NEGATION of the paragraph
     // above and review N1 caught it. The predicate's answer for an `IntImm8` slot is not an
-    // invariant in either direction -- it is a reading of the guest's IDT. A vector pointing at the
+    // invariant in either direction: it is a reading of the guest's IDT. A vector pointing at the
     // fall-through address in the same code segment makes R1 pass, R2 pass (CS and SS both
     // unchanged with no privilege change), R3 pass (`INT` clears TF and the IF clause is
     // directional), and the epoch and deferred-write clauses are satisfied by any ordinary step. So
     // `allows_resume` returns TRUE on that guest, and the assert would have fired in debug builds
-    // on legitimate, correctly-compiled guest behaviour -- on exactly the shape this gate exists
+    // on legitimate, correctly-compiled guest behaviour, on exactly the shape this gate exists
     // for. The gate's whole point is that it does not care what the predicate says, so there is no
     // second derivation here to cross-check, and an assert that re-derives the same
     // `always_resyncs` call is one that cannot fail.
@@ -32481,13 +32478,13 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
             && bus.interrupt_pending());
 
     // THE ARMING LATCH (design section 10.1, B1), on EVERY path a row that armed the shadow can
-    // leave by, and review finding F1 is what moved it here from the resume path alone.
+    // leave by, and defect F1 is what moved it here from the resume path alone.
     //
     // The boundary decides whether the shadow survives by comparing the block's final EIP against
     // this latch. Written only on resume, the latch went stale the moment a SECOND arming slot in
     // the same run resynced: it never latched, so the boundary compared against the FIRST slot's
     // address, found the final EIP different, and cleared a shadow the second slot had just
-    // armed -- delivering one instruction EARLY, which is outside the caveat the owner approved.
+    // armed, delivering one instruction EARLY, which is outside the caveat the owner approved.
     //
     // So it is written here, before the status is chosen, and it is written by whichever arming
     // slot ran LAST, which is the only one whose shadow can still be live at the boundary. On a
@@ -32526,11 +32523,11 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
     // right for a row whose resume predicate keeps failing for reasons the compile walk could not
     // see. A row that can NEVER resume is not that case: its resync is the design, and demoting it
     // would retire the block, recompile it without the slot, and put the instruction back at a
-    // barrier -- the whole lever, undone after three visits.
+    // barrier, the whole lever, undone after three visits.
     //
     // The exemption is narrow ON PURPOSE and covers only this path. The FAULT arm above still
-    // charges `note_execution(true)`, so a site that faults on every execution -- which is what an
-    // `INT` in a V86 task below IOPL 3 does -- still demotes after three of its first eight. That
+    // charges `note_execution(true)`, so a site that faults on every execution (which is what an
+    // `INT` in a V86 task below IOPL 3 does) still demotes after three of its first eight. That
     // arm is the one the governor exists for, and `int_imm8_admitted_here` refuses that state up
     // front anyway, so the two bound it independently.
     if cell.note_execution(!resume && !always_resyncs) {
@@ -32624,7 +32621,7 @@ fn interpret_one_step<B: CpuBus, const TEST_WORD: bool>(
 /// the generic call-out (merge 4b6b1554) and `callout_attribution.rs` grew its fourth `match` arm
 /// and its fourth snapshot row, but no CALL SITE ever passed the new variant. The snapshot's
 /// `attempts == callout_executed` closure then failed by exactly the `InterpretOne` volume and
-/// `IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION=1` aborted any run that took one -- GP2 by 152,816,855.
+/// `IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION=1` aborted any run that took one: GP2 by 152,816,855.
 ///
 /// `None` for the port: no `InterpretOne` row reaches a port, which is the same claim
 /// `CallOutAttribution::note`'s no-port arm makes and `debug_assert`s.
@@ -32646,7 +32643,7 @@ fn note_interpret_one_attribution(
 /// `DirectPageCache` starts at epoch 0 and `invalidate` puts it back to 0; the first mapping
 /// inserted afterwards adopts the bus's live epoch. So `0 -> n` is a cache warming up, not a
 /// mapping changing, and refusing it would make the FIRST memory-touching call-out after every
-/// cold start and every invalidation resync for nothing -- three of the governor's eight
+/// cold start and every invalidation resync for nothing: three of the governor's eight
 /// executions, on a fixture that is behaving perfectly.
 ///
 /// It is sound to admit because the invalidation that produced the zero happened BEFORE the step:
@@ -32693,7 +32690,7 @@ pub(crate) fn pop_all_dword_for_test<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -
     status
 }
 
-/// Drive the helper exactly as an emitted slot does -- publish, call, clear -- so a test can
+/// Drive the helper exactly as an emitted slot does (publish, call, clear) so a test can
 /// assert the CONTRACT (status encoding, charge, zero partial effects) without an emitter in the
 /// picture. `prefix_raw_clocks` is what a block's prefix would have deposited.
 #[cfg(test)]
@@ -32723,7 +32720,7 @@ pub(crate) fn port_read_al_dx_for_test<B: CpuBus>(
     status
 }
 
-/// Drive `port_read_al_imm8` exactly as an emitted slot does -- publish, call, clear -- so a test
+/// Drive `port_read_al_imm8` exactly as an emitted slot does (publish, call, clear) so a test
 /// can assert the CONTRACT without an emitter in the picture. `prefix_raw_clocks` is what a
 /// block's prefix would have deposited; `port` is the compile-time immediate the slot would have
 /// baked.
@@ -32754,7 +32751,7 @@ pub(crate) fn port_read_al_imm8_for_test<B: CpuBus>(
     status
 }
 
-/// Drive `port_write_al_imm8` exactly as an emitted slot does -- publish, call, clear -- so a test
+/// Drive `port_write_al_imm8` exactly as an emitted slot does (publish, call, clear) so a test
 /// can assert the CONTRACT (the forced step break, the charge, zero partial effects) without an
 /// emitter in the picture. `port` is the compile-time immediate the slot would have baked.
 #[cfg(test)]
@@ -32783,7 +32780,7 @@ pub(crate) fn port_write_al_imm8_for_test<B: CpuBus>(
     status
 }
 
-/// Drive `port_write_al_dx` exactly as an emitted slot does -- publish, call, clear -- so a test
+/// Drive `port_write_al_dx` exactly as an emitted slot does (publish, call, clear) so a test
 /// can assert the CONTRACT (the forced step break, the charge, zero partial effects) without an
 /// emitter in the picture. The port is read from DX, live, exactly as an emitted slot would: the
 /// caller sets DX before calling, there is no port argument here.
@@ -32821,7 +32818,7 @@ const CALLOUT_CALL_FRAME: u32 = 16;
 
 // RSP is 16-byte aligned at a `call` when the bytes pushed since the ABI-guaranteed entry
 // alignment sum to 8 mod 16: the entry `call` itself pushed 8, then `SAVED_HOST_REGS`, then the
-// block frame, then this scratch frame. A chained transfer cannot break this -- it jumps into
+// block frame, then this scratch frame. A chained transfer cannot break this: it jumps into
 // another block's BODY, and every block frame has the one shape (`NATIVE_STACK_LEN`).
 const _: () =
     assert!((SAVED_HOST_REGS.len() as u32 * 8 + NATIVE_STACK_LEN + CALLOUT_CALL_FRAME) % 16 == 8);
@@ -32838,16 +32835,16 @@ const _: () = assert!(CALLOUT_CALL_FRAME >= 32);
 /// says has one, absent otherwise. `None` emits nothing at all rather than a zero, which is what
 /// keeps the `PushAllDword` / `PopAllDword` arms BYTE-IDENTICAL across this slice:
 /// `interpret_one_leaves_the_port_slot_bytes_unchanged` is the pin, rewritten by the GP2 poll-skip
-/// slice to also pin the NEW `PortReadAlDx` sequence -- see that test's doc for why the port
+/// slice to also pin the NEW `PortReadAlDx` sequence. See that test's doc for why the port
 /// slot's own bytes must change and the other two must not.
 ///
 /// **Two different values ride the same argument slot, for two different reasons.** For
 /// `InterpretOne`, `exit_arg` is a CELL POINTER (`InterpretOneCell`'s address), and it ALSO drives
-/// the governor prologue below -- `helper.interprets_one()` gates that test, deliberately NOT
+/// the governor prologue below: `helper.interprets_one()` gates that test, deliberately NOT
 /// `exit_arg.is_some()`, because `PortReadAlDx` carries an `exit_arg` too but it is a plain
 /// `slot_delta` VALUE, not a cell pointer, and testing byte 0 of an arbitrary small integer for
 /// the demoted bit would be nonsense (GP2 poll-skip design BLOCKER B4's fix, restated as two
-/// independent predicates rather than one conflated `slot_cell` -- `carries_a_cell()` for "gets a
+/// independent predicates rather than one conflated `slot_cell`: `carries_a_cell()` for "gets a
 /// fourth argument" and `republishes_flags()`, consulted further down, for "gets the RBP reload").
 ///
 /// `resync` and `resync_fault` are likewise `Some` only for the `InterpretOne` class. A helper
@@ -32883,7 +32880,7 @@ fn emit_call_out(
     );
     // The GOVERNOR, and the whole of it on the fast path: one immediate load, one byte test
     // against the demoted bit, one not-taken branch. A demoted slot leaves through the abnormal
-    // stub, which is the pre-slice hard boundary exactly -- the block ends AT the instruction with
+    // stub, which is the pre-slice hard boundary exactly: the block ends AT the instruction with
     // nothing done and the interpreter runs it.
     //
     // Bit 7 rather than a compare against zero (which is what the plan sketched): the cell's low
@@ -32892,7 +32889,7 @@ fn emit_call_out(
     //
     // Gated on `helper.interprets_one()`, NOT on `exit_arg.is_some()`: `PortReadAlDx` also carries
     // an `exit_arg`, but it is a `slot_delta` value, not a cell address, and nothing ever sets a
-    // demoted bit on it (there is no port-slot governor -- review MEDIUM 8 on the GP2 design found
+    // demoted bit on it (there is no port-slot governor: review MEDIUM 8 on the GP2 design found
     // no code path that would ever set one, so this slice does not emit a test that can never
     // fire).
     if helper.interprets_one()
@@ -32916,7 +32913,7 @@ fn emit_call_out(
     e.sub_r64_imm32(Reg::RSP, CALLOUT_CALL_FRAME);
     // Argument 2 FIRST: on Windows `FLAGS_ARG` IS RDX, so writing argument 1 before reading RDX
     // would destroy the FP lane. On SysV `QUOTA_ARG` is RDX and this degenerates to `mov rdx,rdx`.
-    // (Windows' `QUOTA_ARG` is R8, a guest home -- already spilled, and reloaded after the call.)
+    // (Windows' `QUOTA_ARG` is R8, a guest home: already spilled, and reloaded after the call.)
     e.mov_r64_r64(QUOTA_ARG, Reg::RDX);
     e.mov_r64_r64(FLAGS_ARG, Reg::RAX);
     e.mov_r64_r64(CPU_ARG, Reg::R15);
@@ -32972,20 +32969,20 @@ fn emit_call_out(
     e.shift_r64_imm8(5, Reg::RAX, STATUS_STEP_BREAK_BIT as u8);
     e.jnz(step_break);
     // RBP is the block body's EFLAGS shadow and the helper has just republished the architectural
-    // value into memory, so the RESUME path -- and only it -- reloads the register from there.
+    // value into memory, so the RESUME path (and only it) reloads the register from there.
     // Every other path leaves through `shared_return`, which does NOT store RBP back, so a reload
     // on those would be dead work and a reload BEFORE the status branch would have to be undone.
     //
     // Gated on `helper.republishes_flags()`, NOT on `exit_arg.is_some()` (design review BLOCKER
     // B4/M-24, and the miscompile it fixes): `PortReadAlDx` carries an `exit_arg` too (its
-    // `slot_delta`) but NEVER republishes flags into memory -- `publish_flags` has exactly two
+    // `slot_delta`) but NEVER republishes flags into memory: `publish_flags` has exactly two
     // call sites and both are on the `InterpretOne` path. RBP is callee-saved and survives the
     // Rust call intact and correct on its own; reloading it here for a port slot would clobber the
     // block's live EFLAGS shadow with a STALE value whenever an earlier slot in the same block
     // produced flags that only live in RBP so far (`emit_capture_flags` updates RBP alone; the
     // lazy ALU arms that follow it do not also store to memory). The concrete witness:
     // `emit_carry_alu_preloaded` reads CF straight out of RBP, so an `ADD` / `IN AL,DX` (0x3DA) /
-    // `ADC` block would take the wrong branch of that read with a stale RBP -- and `IN` sets no
+    // `ADC` block would take the wrong branch of that read with a stale RBP, and `IN` sets no
     // flags, so nothing on the port path would ever report it. `a_port_callout_preserves_the_
     // blocks_eflags_shadow` is the killer.
     if helper.republishes_flags() {
@@ -33001,7 +32998,7 @@ fn emit_call_out(
 // The link graph: publishing a block's edges, refusing the ones that cannot be taken, and tearing
 // them all down again when a block retires.
 //
-// `try_link_inner` is the single admission point for every edge -- static successor, resolved
+// `try_link_inner` is the single admission point for every edge: static successor, resolved
 // `waiting` entry, and dynamic RET/RETF bind all funnel through it, and its refusal chain is what
 // `stalls.link_refusals` counts. `make_link_visible` is the other half: it stamps a block into
 // `linear_blocks` for the current `link_epoch` and drains the two queues (`resolve_successors`,
@@ -33104,7 +33101,7 @@ impl BlockCache {
         let refusal = if stale_epoch {
             Some(LinkRefusal::StaleEpoch)
         }
-        // ABOVE `SegmentLayout` -- and therefore above the outbound fast path below, so even a
+        // ABOVE `SegmentLayout`, and therefore above the outbound fast path below, so even a
         // re-assert of an existing edge is caught. It needs a valid `source_index`, which is why
         // it cannot sit above `Inactive`. `link_source_declined` returns on an emptiness test
         // whenever the governor is not on its `on` arm, so the OFF and `cap` arms pay one
@@ -33114,7 +33111,7 @@ impl BlockCache {
         // load-bearing: a mutant that moves this check below the fast path SURVIVES the fixtures,
         // and provably has to, because the decline's own `unlink_outbound` clears BOTH outbound
         // cells, so `outbound[source][slot] == Some(target)` cannot hold for a declined source
-        // while it is declined. Kept up here anyway -- the fast path's precondition is a fact
+        // while it is declined. Kept up here anyway: the fast path's precondition is a fact
         // about today's decline implementation, and a refusal that depends on one is a refusal
         // waiting to be silently deleted.
         else if self.link_source_declined(source) {
@@ -33149,8 +33146,8 @@ impl BlockCache {
             //
             // IT UNDER-REPORTS, DELIBERATELY, AND BAR 7 MUST BE READ AS A LOWER BOUND (code
             // review L-1). The credit lands only when `SegmentLayout` is the BINDING refusal, so a
-            // far edge that also trips an earlier arm of the chain above -- `StaleEpoch` most
-            // plausibly, since the chain short-circuits in its original order -- is
+            // far edge that also trips an earlier arm of the chain above (`StaleEpoch` most
+            // plausibly, since the chain short-circuits in its original order) is
             // INV-FAR-CS-refused and silent here. Moving the counter above the chain would cost
             // the short-circuit the ordering comment protects and would start pricing a
             // six-segment merge on a high-frequency refusal. The honest denominator for the
@@ -33208,13 +33205,13 @@ impl BlockCache {
         // `SEGWRITE-V86-EDGE`: bind the guard's comparand. `!far` is load-bearing, not a style
         // choice: a far block's `written_segments` entry is the CS bit (`RetFar16`/`CallFar16`
         // report `written_segment() == Some(Cs)`), which is also nonzero, and CS's selector lives
-        // in a DIFFERENT bit (`BAKES_CS_BIT`) that `chain_merge`'s far branch never requires --
+        // in a DIFFERENT bit (`BAKES_CS_BIT`) that `chain_merge`'s far branch never requires:
         // calling `.selector(Cs)` on that layout trips `SegmentLayout::selector`'s own
         // `debug_assert_ne!(self.used & BAKES_CS_BIT, 0)` and corrupts the far edge's own chain
         // bookkeeping. `dirty != 0` alone would silently misroute every far bind onto this arm.
         //
-        // For a genuine (non-far) dirty edge, `target_eip` is always `None` here -- a
-        // segment-write block's terminal is the plain fallthrough, never the dynamic RET PIC --
+        // For a genuine (non-far) dirty edge, `target_eip` is always `None` here: a
+        // segment-write block's terminal is the plain fallthrough, never the dynamic RET PIC,
         // and `chain_merge` being admitted above already proved
         // `self.chain_layouts[target_index].used` claims `dirty`
         // (`SegmentLayout::seg_write_merge`'s own refusal bar), so `selector` cannot debug-assert.
@@ -33234,7 +33231,7 @@ impl BlockCache {
         self.note_direct_link_linked(source_index, slot_index, target);
         // AFTER the edge is visible: the propagation walks `inbound`, and this edge's own source
         // may itself be someone's target. `chain_merge` was proved `Some` by the refusal chain
-        // above, and that is ALL it is used for here -- the merged VALUE is recomputed inside,
+        // above, and that is ALL it is used for here: the merged VALUE is recomputed inside,
         // from the source's post-cut requirement. See `absorb_published_edge`.
         if chain_merge.is_some() {
             self.absorb_published_edge(source, target, far);
@@ -33315,7 +33312,7 @@ impl BlockCache {
                     self.link_cells[source_index][slot].clear();
                     self.outbound[source_index][slot] = None;
                     if let Some(successor) = self.blocks[source_index].successors[slot] {
-                        // Review finding M9: `link.block` is the SOURCE, so a self-linking block
+                        // M9: `link.block` is the SOURCE, so a self-linking block
                         // re-parks a waiting entry naming `id` right here. That is why the second
                         // `remove_waiting_sources` below is load-bearing and R6's "drop the second
                         // pass" arm cannot be proved. This counter measures how often it happens.
@@ -33324,7 +33321,7 @@ impl BlockCache {
                             census_reparked += 1;
                         }
                         // S1a (sixth site, found while landing that slice): `successor`'s stored
-                        // `context` is the compile-time sentinel, never a real slot -- same rule
+                        // `context` is the compile-time sentinel, never a real slot: same rule
                         // as `resolve_successors`. This park must be findable by the FUTURE
                         // `resolve_waiting` call that reinstalls something at `successor`'s
                         // linear, and that call always builds its key from the LIVE slot at that
@@ -33369,7 +33366,7 @@ impl BlockCache {
             !sources.is_empty()
         });
         // Phase (e). `retain` walks the WHOLE waiting map, not this block's sources, and
-        // `unlink_block` calls it twice — so `waiting_map_len_sum` is what prices the pass, not
+        // `unlink_block` calls it twice, so `waiting_map_len_sum` is what prices the pass, not
         // the call count.
         #[cfg(feature = "smc-census")]
         self.note_smc_census_waiting_retain(
@@ -33496,7 +33493,7 @@ impl BlockCache {
     /// filing the row if this is the first span on that page.
     ///
     /// The ONLY site that widens `lens`, and therefore the only site (INV) can
-    /// be broken from. Called once per install or reject -- orders of magnitude
+    /// be broken from. Called once per install or reject: orders of magnitude
     /// rarer than the store-side scan the row lookup here pays for. Probe and
     /// post-reset repair do not file a row; every first span hits a vacant map
     /// and `entry().or_default()` is what creates it.
@@ -33506,7 +33503,7 @@ impl BlockCache {
         // `u16`; a truncating conversion is an UNDER-bound and an
         // under-bound `lens` is exactly the missed kill (INV) exists to
         // prevent. Today `guest_len <= 4096` by construction (the span
-        // constructors refuse page-crossing spans) so this cannot bite --
+        // constructors refuse page-crossing spans) so this cannot bite,
         // but the signature does not say so, and that is the point.
         let len = u16::try_from(guest_len).unwrap_or(u16::MAX);
         let insert = {
@@ -33547,7 +33544,7 @@ impl BlockCache {
             return;
         }
         // L3 (design doc (b)): a block whose stamped epoch belongs to the OTHER slot's live
-        // series is still LINKED under that context -- no wholesale retire has happened, so its
+        // series is still LINKED under that context: no wholesale retire has happened, so its
         // outbound cells were never torn down. Left alone, a cell armed under the other context
         // is a direct jump inside the arena that bypasses every key check this partition relies
         // on (FS1/FS2). Clear both of this block's outbound cells BEFORE this context's
@@ -33583,7 +33580,7 @@ impl BlockCache {
     /// otherwise walk into: `run_direct_block`'s dispatcher entry refuses a block whose
     /// `eip + guest_len - 1` exceeds `cs.limit`, and a CHAINED transfer jumps to `body_offset` and
     /// never reaches that check. That gap is pre-existing for the near PIC and this slice does not
-    /// open it -- but the far edge multiplies the population by ~274 M on wolf3d and moves it into
+    /// open it, but the far edge multiplies the population by ~274 M on wolf3d and moves it into
     /// the 64 K-wrap region, where a return to `F000:FFxx` is an ordinary BIOS shape. Closed HERE,
     /// at bind time, where it is one compare that never runs again.
     pub(crate) fn bind_dynamic_successor(
@@ -33616,7 +33613,7 @@ impl BlockCache {
         };
         let far = self.blocks[source_index].far_dynamic();
         // FAR EDGES ONLY, and the gate is about ACCOUNTING rather than about outcome (code review
-        // M-1). For a NEAR bind the compare is outcome-inert in the normal path -- `link_merge`
+        // M-1). For a NEAR bind the compare is outcome-inert in the normal path: `link_merge`
         // refuses any near edge whose two chain layouts disagree on `cs`, `merge_chain` preserves
         // `self.cs`, so a linkable near target was compiled under the LIVE CS record and the
         // compile walk's own limit test already bounds `eip + guest_len - 1` by that CS's limit.
@@ -33629,8 +33626,8 @@ impl BlockCache {
         // OFF-arm delta list; it must not ride this slice.
         //
         // Written as `+ guest_len > limit + 1` rather than `+ guest_len - 1 > limit` so a
-        // `guest_len` of 0 cannot underflow (code review L-3). Unreachable today -- a compiled
-        // block has at least one byte -- but the value comes out of a struct field, and the two
+        // `guest_len` of 0 cannot underflow (code review L-3). Unreachable today (a compiled
+        // block has at least one byte) but the value comes out of a struct field, and the two
         // forms cost the same.
         if far && let Some(target_index) = self.active_index(target) {
             let guest_len = u64::from(self.blocks[target_index].span.guest_len);
@@ -33640,7 +33637,7 @@ impl BlockCache {
             }
         }
         // A FAR cell holds a LINEAR, not an EIP: the emitted compare adds the live CS base to the
-        // popped offset before it reads the cell. `target_linear` is already the post-RETF one --
+        // popped offset before it reads the cell. `target_linear` is already the post-RETF one:
         // the caller reads `cs().base` AFTER the native run.
         let cell_key = if far { target_linear } else { target_eip };
         if let Some(slot) = self.outbound[source_index]
@@ -33664,14 +33661,13 @@ impl BlockCache {
 // `BlockCache::chain_layouts` holds, per block, its own pinned segment set plus the union of the
 // masks of everything reachable through live links. `widen_chain_requirement` is the one writer
 // that GROWS a requirement, and it restores the obligation backwards over `inbound` until the
-// graph settles. The invariant and its proof live in
-// `dev_docs/plans/2026-08-18-chain-used-link-mask.md`.
+// graph settles.
 
 impl BlockCache {
     /// The layout the DISPATCHER ENTRY CHECK compares against, and the one place the
     /// `IZARRAVM_CHAIN_ENTRY_CHECK` arm selects an array.
     ///
-    /// * ARMED: `chain_layouts[i]` -- this block's own pinned set plus the union of the masks of
+    /// * ARMED: `chain_layouts[i]`, this block's own pinned set plus the union of the masks of
     ///   everything reachable through live links. The caller compares it MASKED (`data_matches`),
     ///   which is exactly INV-ENTRY's statement: every segment some block in the live cone pins
     ///   holds the descriptor that cone baked.
@@ -33681,7 +33677,7 @@ impl BlockCache {
     /// path rather than adding to it; the 2026-08-18 plan pinned that requirement and a second
     /// copy is mutant M14, which the `#[cfg(test)]` fetch counter below exists to kill. The
     /// counter is bumped by the ONE accessor both arms go through, so a mutant that reads a `Vec`
-    /// directly instead of calling it is not caught here -- that shape is a review kill, and the
+    /// directly instead of calling it is not caught here: that shape is a review kill, and the
     /// mutant sweep records it as one.
     ///
     /// `cs_matches` shares this fetch and is unaffected: `chain.cs == own.cs` always, because
@@ -33737,7 +33733,7 @@ impl BlockCache {
     /// LAST live outbound edge.
     ///
     /// A requirement is a statement about a LIVE link graph. With `outbound` empty the cone is
-    /// this block alone, and `segment_layouts[index].used` is exactly what this block pins --
+    /// this block alone, and `segment_layouts[index].used` is exactly what this block pins:
     /// the same argument `invalidate_translation` makes wholesale, applied per block. Without it
     /// a block that has ever linked keeps a stale-too-WIDE requirement forever, which under the
     /// chain entry check is a REJECT the block's own mask would have passed: up to 2.80% of all
@@ -33768,9 +33764,9 @@ impl BlockCache {
         if self.outbound[index] != [None, None] {
             return;
         }
-        // THE ORDERING PIN. The two cut sites disagree about the order of their two writes --
+        // THE ORDERING PIN. The two cut sites disagree about the order of their two writes:
         // `unlink_outbound` empties `outbound` (its `.take()`) BEFORE clearing the cell, and
-        // `unlink_block`'s inbound walk clears the cell BEFORE emptying `outbound` -- so only
+        // `unlink_block`'s inbound walk clears the cell BEFORE emptying `outbound`, so only
         // TAIL placement is correct at both. Move this call up beside either site's `outbound`
         // write and the narrowing can run while that slot's own cell is still armed, which is a
         // wrong-base miscompile and not merely a lying counter. This assert is what makes that
@@ -33784,7 +33780,7 @@ impl BlockCache {
         self.stalls.chain_requirement_narrowed[cause as usize] += 1;
     }
 
-    /// Clear one block's PORTAL, leaving the link graph untouched -- the state
+    /// Clear one block's PORTAL, leaving the link graph untouched: the state
     /// `suspend_decode_slot` and `compact_arena` produce, and the one the narrowing predicate must
     /// refuse to act on. Fixtures outside this module cannot reach `block_portals` directly.
     #[cfg(test)]
@@ -33795,7 +33791,7 @@ impl BlockCache {
     }
 
     /// The block's live outbound edges, for fixtures that must tell "no edge" from "edge whose
-    /// target is merely hidden" -- the distinction the whole narrowing predicate turns on.
+    /// target is merely hidden": the distinction the whole narrowing predicate turns on.
     #[cfg(test)]
     pub(crate) fn outbound_targets_for_test(&self, id: BlockId) -> [Option<BlockId>; 2] {
         self.active_index(id)
@@ -33813,7 +33809,7 @@ impl BlockCache {
     ///
     /// `invalidate_translation` drops every edge and then resets every requirement, and the ORDER
     /// is load-bearing. Reset first and a still-armed cell could reach a body under a requirement
-    /// that no longer names the segment that body's cone pins -- stale-too-NARROW, which is the
+    /// that no longer names the segment that body's cone pins: stale-too-NARROW, which is the
     /// miscompile direction, and which `main` was insulated from only because its entry check
     /// never read this array. The quantifier can range over ALL slots because an inactive one's
     /// `outbound` is already empty: `retire_block` runs `unlink_block` before it clears
@@ -33830,15 +33826,15 @@ impl BlockCache {
     /// **The merge is recomputed HERE rather than reused from the refusal decision, and that is
     /// the whole point of this function** (review round 2, R2-1). `try_link_inner` snapshots
     /// `chain_layouts[source]` before its refusal chain and, on the relink-replace path, calls
-    /// `unlink_outbound` afterwards -- which may narrow that very entry. Writing the pre-cut
+    /// `unlink_outbound` afterwards, which may narrow that very entry. Writing the pre-cut
     /// snapshot back would silently undo the narrowing and hand `source` a requirement carrying
     /// bits contributed by the edge that was just cut. Nothing asserts against it: the
     /// monotonicity test below passes, because the pre-cut value contains the narrowed one.
     ///
     /// Recomputing changes NO edge admission. The refusal decision was already taken, above, from
     /// the pre-cut value; this runs only on the admitted path. And the post-cut source can differ
-    /// from the pre-cut one only by having a NARROWER `used` -- non-adoption keeps `data` and `cs`
-    /// identical to `segment_layouts[source]`'s at all times -- so the recomputed merge is `Some`
+    /// from the pre-cut one only by having a NARROWER `used`: non-adoption keeps `data` and `cs`
+    /// identical to `segment_layouts[source]`'s at all times, so the recomputed merge is `Some`
     /// wherever the original was, and the `expect` below cannot fire.
     ///
     /// It is not behind `IZARRAVM_CHAIN_ENTRY_CHECK`: it is the other half of the un-gated
@@ -33856,10 +33852,10 @@ impl BlockCache {
         // `written_segments[source_index]` cannot have changed between admission and this call
         // (nothing in between recompiles `source`), so this reproduces the identical merge.
         //
-        // ASYMMETRY WITH `try_link_inner`, noted rather than silently carried (review finding
-        // N7): the dirty branch there guards this exact call with
+        // ASYMMETRY WITH `try_link_inner`, noted rather than silently carried
+        // (N7): the dirty branch there guards this exact call with
         // `source_layout.cs == target_layout.cs` before trying `seg_write_merge`, because
-        // `seg_write_merge` -- unlike `link_merge` -- does not check `cs` itself. This call omits
+        // `seg_write_merge`, unlike `link_merge`, does not check `cs` itself. This call omits
         // that guard. It is harmless: `cs` is immutable for a block's whole life, and the edge's
         // ORIGINAL admission at `try_link_inner` already proved the two ends agree on it, so
         // re-deriving the identical merge here cannot newly disagree. But the two "the same
@@ -33886,24 +33882,24 @@ impl BlockCache {
     /// subset of `chain(P).used` and the two agree on every descriptor in `chain(Q).used`. A
     /// widen at `Q` can break that for `Q`'s PREDECESSORS, so the walk is inbound-only; it cannot
     /// break it for `Q`'s successors, because their obligation ranges over their own (unchanged)
-    /// masks, and a bit new to `Q` cannot already be in a successor's mask -- if it were, `Q`
+    /// masks, and a bit new to `Q` cannot already be in a successor's mask: if it were, `Q`
     /// would have had it before this widen.
     ///
-    /// A predecessor that cannot absorb the widen -- its own frozen descriptor for one of the new
-    /// segments disagrees -- has its edge CUT. That arm is reachable and load-bearing even under
+    /// A predecessor that cannot absorb the widen (its own frozen descriptor for one of the new
+    /// segments disagrees) has its edge CUT. That arm is reachable and load-bearing even under
     /// the non-adopting merge: equality is demanded at link time over a mask that later GROWS,
     /// so an edge admitted because nobody pinned ES becomes unsound the moment a block downstream
     /// of the target pins ES with a different descriptor.
     ///
     /// Termination: a requirement bit, once set, is never cleared while the block lives, and
-    /// there are seven of them -- the six segments plus `BAKES_CS_BIT` -- so each block is pushed
+    /// there are seven of them: the six segments plus `BAKES_CS_BIT`, so each block is pushed
     /// at most seven times per generation.
     fn widen_chain_requirement(&mut self, source: BlockId, merged: SegmentLayout) {
         let Some(source_index) = self.active_index(source) else {
             return;
         };
         // ABOVE the no-change return, deliberately. Non-adoption is a property of every merge this
-        // function is ever handed, not only of the ones that widen something -- a merge that
+        // function is ever handed, not only of the ones that widen something: a merge that
         // rewrote the block's descriptors while leaving the mask alone is exactly the silent
         // failure this asserts against, and behind the return it would never be checked.
         debug_assert_eq!(
@@ -33940,7 +33936,7 @@ impl BlockCache {
                 // bit is UNLINKED rather than merged through.
                 //
                 // Merging would compare the predecessor's PRE-RETF `data[1]` against a POST-RETF
-                // requirement -- two unrelated CS records -- and the ordinary `push cs; call; retf`
+                // requirement (two unrelated CS records) and the ordinary `push cs; call; retf`
                 // shape would satisfy that comparison BY COINCIDENCE and then be wrong on a later
                 // rebind of the same cell. INV-FAR-CS is a property of the target's requirement,
                 // and a requirement GROWS, so the edge predicate alone is not enough: this is what
@@ -33955,19 +33951,19 @@ impl BlockCache {
                 // `SEGWRITE-V86-EDGE`, B2 (design §3/§4.4 item 5): a dirty, non-far predecessor
                 // must be re-folded through `seg_write_merge`, not plain `merge_chain`. The naive
                 // merge compares the predecessor's PRE-write descriptor against `requirement`'s
-                // POST-write one for the written segment and refuses on every widen -- L9's own
+                // POST-write one for the written segment and refuses on every widen: L9's own
                 // finding, reproduced here as the exact failure this arm exists to prevent.
                 //
-                // A far predecessor DOES still reach this line (review finding N7): the cut above
+                // A far predecessor DOES still reach this line (N7): the cut above
                 // only `continue`s when `requirement` itself carries a CS bit, so a far
                 // predecessor whose downstream widen never touches CS falls through to here like
                 // any other. The `far_dynamic() -> 0` guard immediately below is therefore
-                // LOAD-BEARING, not redundant belt-and-braces -- it is what stops a far
+                // LOAD-BEARING, not redundant belt-and-braces: it is what stops a far
                 // predecessor's `written_segments` entry (always the CS bit; `RetFar16`/
                 // `CallFar16` report `written_segment() == Some(Cs)`) from selecting
                 // `seg_write_merge` here, which would compare against `BAKES_CS_BIT` machinery
                 // `seg_write_merge` knows nothing about. Do not delete this guard on the theory
-                // that the cut above already excludes far predecessors -- it does not.
+                // that the cut above already excludes far predecessors: it does not.
                 let predecessor_dirty = if self.blocks[predecessor_index].far_dynamic() {
                     0
                 } else {
@@ -33998,7 +33994,7 @@ impl BlockCache {
 // ---- from jit/direct/retire_governor.rs --------------------------------------------------------
 // The data-segment reject governor: the retire cap, the link decline, and the layout census.
 //
-// Design: `dev_docs/specs/2026-08-23-data-segment-reject-treadmill-design.md` (rev 3).
+// Design: the data-segment reject treadmill design, rev 3.
 //
 // The problem, measured on the tombraid loader phase: 307,798 of 314,318 compile attempts (97.9%)
 // are data-segment rejects, and installs track them one for one. A block bakes six segment
@@ -34020,7 +34016,7 @@ pub(crate) enum SegmentRetireGovernor {
     /// `main` did. Nothing in this file writes a map or reads a set on this arm, and
     /// `run_direct_block` does not even build the two inputs the governor needs, so an OFF leg is
     /// a reproduction of pre-slice `main` at this site and not merely a close relative of one.
-    /// Reached by `""`, `0` or `off` -- NOT by leaving the variable unset, which is `Cap`.
+    /// Reached by `""`, `0` or `off`, NOT by leaving the variable unset, which is `Cap`.
     Off,
     /// Stage 1, and **the shipped default since the 2026-08-23 ladder** (loader phase +27.1%,
     /// lower95 1.263; duke3d-586 short +4.3%; every pin identical). The per-key retire cap: after
@@ -34036,7 +34032,7 @@ pub(crate) enum SegmentRetireGovernor {
     /// body compiled and unlinked.
     ///
     /// OPT-IN, and it stays that way. It beats `Cap` on the loader (+28.8% against +27.1%) and
-    /// LOSES to it on duke (+3.5% against +4.3%) -- which is exactly the shape §5's refutation
+    /// LOSES to it on duke (+3.5% against +4.3%), which is exactly the shape §5's refutation
     /// criterion 2 pre-registered for stage 2, a declined key trading chaining for dispatcher
     /// entries. Ship the arm that never loses; keep this one behind the knob.
     On,
@@ -34080,7 +34076,7 @@ pub(crate) enum DataSegmentRejectArm {
 /// Per-key data-segment governor state: the retire budget, and slice (a)'s missing census.
 ///
 /// The census is folded in HERE rather than kept in a map of its own so that it inherits, for
-/// free, the containment in `entries` that bounds the budget map — one key set, one set of
+/// free, the containment in `entries` that bounds the budget map: one key set, one set of
 /// lifetime hooks, one thing to get wrong.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DataSegmentRetireRecord {
@@ -34110,7 +34106,7 @@ pub(crate) struct DataSegmentRetireRecord {
     ///
     /// A collision UNDER-reports the distinct count, and the rate is stated per RUN rather than
     /// per key, because per-run is the number a reader of the histogram actually needs. Eight
-    /// samples in a 2^32 space is 28 pairs, so ~6.5e-9 per key -- but the loader carries ~14,205
+    /// samples in a 2^32 space is 28 pairs, so ~6.5e-9 per key, but the loader carries ~14,205
     /// keys, which is **~1e-4 that some key in a run under-reports by one**, not the ~1e-8 the
     /// per-key figure invites. Small enough to grade a go/no-go on, large enough that this is a
     /// fold and not a tuple count.
@@ -34150,14 +34146,14 @@ impl DataSegmentRetireRecord {
 /// The MASK is part of the fold, not just a filter over it: two rejects taken on different arms
 /// carry different masks, and a tuple that agrees on the intersection while the masks differ is
 /// genuinely a different requirement. Segments outside the mask contribute nothing, which is the
-/// whole point — an unmasked census on this loader saturates within a few hundred rejects on
+/// whole point: an unmasked census on this loader saturates within a few hundred rejects on
 /// records nothing in the chain pins, producing a false no-go for the variant slice.
 /// Reduce a block's `used` byte to the six bits that name a SEGMENT, before it reaches the fold.
 ///
 /// One line, extracted so that the mask the reject site applies is the mask the fixture tests.
 ///
 /// LOAD-BEARING rather than tidy. `layout_fingerprint` folds the mask BYTE unconditionally, and
-/// `used` carries `BAKES_CS_BIT` in bit 6 for every block that bakes CS's selector -- `PUSH CS`
+/// `used` carries `BAKES_CS_BIT` in bit 6 for every block that bakes CS's selector: `PUSH CS`
 /// alone is a 158 M block-stopping row on wolf3d. Without this, every such block's fingerprint
 /// changes value, shifting `distinct_layouts` and the `data_segment_layout_histogram` bucket on a
 /// census the campaign ranks and closes on, and shifting it on the OFF arm of a slice that
@@ -34198,7 +34194,7 @@ fn layout_fingerprint(mask: u8, live: &[SegmentRegister; 6]) -> u32 {
 impl BlockCache {
     /// The data-segment half of `retire_key_for_recompile`, governed per key.
     ///
-    /// The entry REFUSAL is the caller's and is unconditional on every arm — this decides only
+    /// The entry REFUSAL is the caller's and is unconditional on every arm: this decides only
     /// whether the block is also demoted so the next encounter re-specializes it at the then-live
     /// records, and (on `on`) whether the block's outbound edges are cut so it drops to its own
     /// masked check. A key that has spent its budget keeps its block and keeps refusing, so the
@@ -34206,7 +34202,7 @@ impl BlockCache {
     ///
     /// `own_mask_matches` is the caller's `data_matches`, computed on this cold path only and
     /// only when the arm is `Strict`. It is what separates "this block rejected BECAUSE it is
-    /// linked" from "this block rejected on a record it uses itself" — cutting the edges of the
+    /// linked" from "this block rejected on a record it uses itself": cutting the edges of the
     /// second kind would buy nothing, because the masked check it would fall back to refuses too.
     ///
     /// ORDERED pre-check first, deliberately, and for two reasons: it mirrors
@@ -34247,7 +34243,7 @@ impl BlockCache {
         let Some(index) = self.active_index(id) else {
             return false;
         };
-        // THE MASK THE REJECT WAS ACTUALLY TAKEN UNDER, per review H3 -- and the answer moves with
+        // THE MASK THE REJECT WAS ACTUALLY TAKEN UNDER, per review H3, and the answer moves with
         // `IZARRAVM_CHAIN_ENTRY_CHECK`, which is why this is a logic change and not only prose.
         //
         // OFF: the strict arm rejected against the CHAIN's requirement and the masked arm against
@@ -34258,7 +34254,7 @@ impl BlockCache {
         // ARMED: BOTH arms reject against the chain requirement, so the `match` collapses. Leaving
         // the `Masked` arm on `segment_layouts` would fingerprint the budget under a mask the
         // reject was not taken under. With the narrowing the two coincide for a true leaf, but NOT
-        // for a block whose successor is merely portal-hidden -- 168-1,529 entries a row-arm,
+        // for a block whose successor is merely portal-hidden: 168-1,529 entries a row-arm,
         // non-zero on 12 of 14. Budget accounting only; no soundness consequence.
         let mask = census_mask(if self.chain_entry_check_armed() {
             self.chain_layouts[index].used
@@ -34318,7 +34314,7 @@ impl BlockCache {
             // Stage 2 fires on EVERY suppressed strict-arm reject, not once at the crossing: the
             // crossing entry may well have been a masked-arm reject, and a key whose crossing
             // happened to land there would otherwise never decline at all. Idempotent by
-            // construction — the cells are already clear and the set already holds the key.
+            // construction: the cells are already clear and the set already holds the key.
             if matches!(governor, SegmentRetireGovernor::On)
                 && matches!(arm, DataSegmentRejectArm::Strict)
                 && own_mask_matches
@@ -34339,7 +34335,7 @@ impl BlockCache {
     /// Stage 2: cut the key's outbound edges and bar them from re-forming.
     ///
     /// With both cells cleared, `LinkCell::linked` is false for both, so `has_linked_successor`
-    /// is false and the next entry takes `data_matches` — the exact check this block would have
+    /// is false and the next entry takes `data_matches`, the exact check this block would have
     /// had if it had never linked. No new predicate, and no body ever runs under a record its
     /// snapshot does not match: the strict arm exists only because a chained transfer skips the
     /// successor's own entry check, and with no live outbound edge there is no chained transfer.
@@ -34348,12 +34344,12 @@ impl BlockCache {
     ///
     /// INBOUND edges are untouched. A predecessor P of this block is itself entered on the strict
     /// arm (it has a live outbound cell) and its entry check validates all six of its own
-    /// descriptors, which — by the non-adopting merge — are the ones this block and its cone
+    /// descriptors, which, by the non-adopting merge, are the ones this block and its cone
     /// baked. Cutting P's edge would only cost chaining.
     ///
     /// `chain_layouts` IS NARROWED HERE, and it has to be. The second `unlink_outbound` below
     /// empties `outbound`, and `narrow_chain_requirement_if_leaf` then resets the requirement to
-    /// the block's own layout -- which IS "the exact check this block would have had if it had
+    /// the block's own layout, which IS "the exact check this block would have had if it had
     /// never linked", the promise the paragraph above makes. Without it, and once the entry check
     /// reads the chain requirement, the declined block would be checked against its stale-wide
     /// requirement and reject again: the decline would buy nothing at all. (Before this slice the
@@ -34417,7 +34413,7 @@ impl BlockCache {
     }
 
     /// Drop one key's decline. Called from `retire_key_for_recompile` (the flag is a statement
-    /// about a specific block's live edges, and those do not survive a retire — without this the
+    /// about a specific block's live edges, and those do not survive a retire: without this the
     /// recompile is born declined and is permanently unchained for its predecessor incarnation's
     /// judgement) and from `invalidate_translation` (which erases every chain requirement a
     /// decline could have been earned against).
@@ -34425,8 +34421,8 @@ impl BlockCache {
     /// The BUDGET is deliberately not dropped at either site. It is a statement about the guest's
     /// records at this address, which surviving a recompile is the whole point of, and the two
     /// ways of being wrong are not symmetric: a stale count can only make a block interpret an
-    /// entry it could have run natively — bounded by the cap, never consulted once the block
-    /// stops rejecting — while a stale decline bars re-linking for the rest of the cache's life.
+    /// entry it could have run natively: bounded by the cap, never consulted once the block
+    /// stops rejecting, while a stale decline bars re-linking for the rest of the cache's life.
     pub(crate) fn forget_data_segment_decline(&mut self, key: BlockKey) {
         if self.data_segment_link_declined.is_empty() {
             return;
@@ -34454,10 +34450,10 @@ impl BlockCache {
     ///
     /// A PARTITION, deliberately: cell `n` for `n` in `0..=8` counts keys that saw EXACTLY `n`
     /// distinct masked layouts and stopped there, and the LAST cell counts keys whose census
-    /// SATURATED -- eight recorded and at least one more seen. A saturated key is counted ONLY in
+    /// SATURATED: eight recorded and at least one more seen. A saturated key is counted ONLY in
     /// the last cell. The first draft counted it in both, which made the cells sum to more than
-    /// the map's length and left "how many keys alternate between exactly two layouts" -- the one
-    /// question this census exists to answer -- unreadable without knowing that.
+    /// the map's length and left "how many keys alternate between exactly two layouts" (the one
+    /// question this census exists to answer) unreadable without knowing that.
     ///
     /// READ IT OFF THE `cap` LEG. The fingerprint folds the REJECTING ARM'S MASK into itself, and
     /// the `on` arm converts strict-arm keys into masked-arm ones part-way through a run, so a
@@ -34592,9 +34588,9 @@ struct SuffixSeed {
     memory_alu_slots: u8,
     callout_slots: u8,
     /// x87 slots the block had already committed when the barrier stopped it. Non-zero arms BOTH
-    /// x87 gates in the compile walk -- the loop-top cap at `MAX_X87_BLOCK_INSTRUCTIONS` and the
-    /// x87/call-out mixing `Retry` -- and both are PREFIX-armed, so the scan's own refusal of x87
-    /// KINDS does not make them unreachable. Leaving this out was the review finding: a barrier
+    /// x87 gates in the compile walk: the loop-top cap at `MAX_X87_BLOCK_INSTRUCTIONS` and the
+    /// x87/call-out mixing `Retry`, and both are PREFIX-armed, so the scan's own refusal of x87
+    /// KINDS does not make them unreachable. Leaving this out was the defect: a barrier
     /// whose prefix held one `FLD` over-reported its suffix by up to 20 instructions against the
     /// 12-instruction x87 ceiling, on exactly the x87-adjacent population (Quake) the campaign is
     /// trying to rank.
@@ -34678,7 +34674,7 @@ fn barred_segment_write(insn: &DecodedInsn) -> u8 {
 /// CALL-SITE GATED like every other census hook ([[default-off-instruments-tax-hot-path]]): each
 /// caller checks `barrier_census_enabled()` before building a single argument, because
 /// `census_native_suffix` walks the decode cache forward. Callers also require the FULL-length
-/// pass — `compile_with_page_len` re-enters this walk once per binary-search step and converts
+/// pass: `compile_with_page_len` re-enters this walk once per binary-search step and converts
 /// any structural reject it sees into a `Retry`, so a shorter pass can neither install a
 /// rejection nor be allowed to double-count a row.
 fn record_structural_barrier(
@@ -34723,8 +34719,8 @@ fn record_structural_barrier(
 /// * CLOSED, the PAGE BUDGET. The compile walk stops when its running emitted-size estimate
 ///   reaches one host page (`EMITTED_BLOCK_FIXED_BYTES`), which on a memory-heavy path binds long
 ///   before `MAX_BLOCK_INSTRUCTIONS`. A scan without the mirror reports the pre-budget length, so
-///   every row over-reports and the memory-heavy rows -- exactly the ones a coverage slice ranks
-///   -- over-report most. `SuffixSeed::estimated_bytes` carries the walk's total and the scan
+///   every row over-reports and the memory-heavy rows (exactly the ones a coverage slice ranks)
+///   over-report most. `SuffixSeed::estimated_bytes` carries the walk's total and the scan
 ///   continues it.
 ///
 /// * CLOSED, the DEMOTED-SITE stop. A slot the governor demoted is a boundary for every later walk
@@ -34733,7 +34729,7 @@ fn record_structural_barrier(
 ///   for the same reason: `classify` does not produce the protected-mode `MOV ES/DS,r16` call-out.
 ///
 /// * CLOSED, the L1 heat gate (`IZARRAVM_ROTATE_ROWS=heat`). That arm's refusal is NOT a
-///   `classify` None -- `classify` admits the group-2 row and the compile walk downgrades it to
+///   `classify` None: `classify` admits the group-2 row and the compile walk downgrades it to
 ///   `HardBoundary` afterwards, where the physical address and the heat map are in scope. This
 ///   scan calls `classify` directly, so before the mirror below it walked straight through a
 ///   heat-gated ROL that the compile walk stops at. The resulting over-report is the worst
@@ -34746,7 +34742,7 @@ fn record_structural_barrier(
 ///   because it is the first place a reader will look for it. That slice attaches a lane to a kind
 ///   `classify` has ALREADY admitted; every one of `count_lane_for`'s bars narrows which admitted
 ///   slots take a lane and none can turn a Native classification into a boundary. So unlike the L1
-///   heat gate above -- the one admission rule that was not a `classify` answer -- it needs no
+///   heat gate above (the one admission rule that was not a `classify` answer) it needs no
 ///   mirror, and this scan stops exactly where the compile walk stops on both of its arms.
 /// * CLOSED, the memory-ALU BLOCK cap. `compile_with_instruction_limit` breaks at its LOOP TOP on
 ///   `memory_alu_slots != 0 && slots.len() == MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS`, regardless of
@@ -34845,7 +34841,7 @@ fn census_native_suffix(
             // THE THIRD DISJUNCT MIRRORS THE COMPILE WALK, and it has to (code review M-2). This
             // scan exists to answer "how far would the walk have got", so an admission the walk
             // has and this does not truncates the counterfactual suffix at every RETF on the
-            // armed arm -- for exactly the 274 M-execution population the slice creates, which is
+            // armed arm, for exactly the 274 M-execution population the slice creates, which is
             // the population the ladder will be read against. Inert on the OFF arm, where
             // `retf_admitted_here` returns after one `OnceLock` load.
             || !(insn.continuable
@@ -34864,7 +34860,7 @@ fn census_native_suffix(
         // record classifies Native and is then downgraded to `HardBoundary` one step later. A scan
         // that took the bare `classify` answer would walk straight through the very instruction
         // the compile walk stops at, and the over-report would be correlated with the unpatched
-        // share `u` -- i.e. it would corrupt exactly the heat-vs-off census difference the arm
+        // share `u`, i.e. it would corrupt exactly the heat-vs-off census difference the arm
         // exists to measure. See the ledger entry above and `rotate_row_count_byte_is_patched`.
         if rotate_rows_arm() == RotateRowsArm::HeatGated
             && rotate_row_count_byte_is_patched(cpu, &insn, expected_phys)
@@ -34889,13 +34885,13 @@ fn census_native_suffix(
             break;
         }
         // The page budget, mirrored from the compile walk. Without it every row's suffix reports
-        // the pre-budget block length -- up to `MAX_BLOCK_INSTRUCTIONS` -- while the compiler
+        // the pre-budget block length (up to `MAX_BLOCK_INSTRUCTIONS`) while the compiler
         // stops at one host page, and the over-report is worst on exactly the memory-heavy rows a
         // coverage slice is trying to rank.
         //
         // The BARRIER itself is charged at the memory-slot rate. The suffix counts it as one slot
         // of the counterfactual block (`prefix_instructions + 1`), and its lowered size is by
-        // definition unknown -- there is no `kind` for an instruction the classifier refused. The
+        // definition unknown: there is no `kind` for an instruction the classifier refused. The
         // memory rate is the same conservative choice the slot-count caps make, and it is one slot
         // of error at worst.
         let next_estimated_bytes = estimated_bytes.saturating_add(kind.emitted_bytes_estimate());
@@ -34945,7 +34941,7 @@ fn census_native_suffix(
 }
 
 // ---------------------------------------------------------------------------------------
-// The stall/census taxonomy, kept beside `stall_snapshot` and `snapshot` -- the two builders that
+// The stall/census taxonomy, kept beside `stall_snapshot` and `snapshot`, the two builders that
 // read every one of these.
 // ---------------------------------------------------------------------------------------
 
@@ -34960,7 +34956,7 @@ pub(crate) struct BlockCacheStats {
     pub arena_compaction_bytes: u64,
     pub arena_compaction_failures: u64,
     /// Host wall nanoseconds inside `compact_arena`'s successful body. The §2 regression in
-    /// `dev_docs/duke3d-open-area-profile-results.md` INFERRED 7.44 ms per event from interval
+    /// the duke3d open-area profile results INFERRED 7.44 ms per event from interval
     /// wall; this measures it.
     pub arena_compaction_ns: u64,
     pub links: u64,
@@ -34993,9 +34989,9 @@ pub(crate) struct InterpretOneRowTally {
 ///
 /// `BlockCacheStats` is DRAINED by `take_stats` on every dispatcher exit and folded into
 /// `PerfCounters`; a field added there is zeroed before anything can read it back off the cache.
-/// These three groups have no `PerfCounters` home to be folded into -- growing that struct shifts
+/// These three groups have no `PerfCounters` home to be folded into: growing that struct shifts
 /// the pinned `pending_flags` offset (see the pin tests in cpu_test.rs/canonical_state_test.rs
-/// for the current value) -- so they live here, accumulate for the whole run,
+/// for the current value), so they live here, accumulate for the whole run,
 /// and are read directly by `stall_snapshot`. Not cleared by `reset_storage` either: a diagnostic
 /// that reset itself mid-run would under-report exactly the pathological runs it exists for.
 #[derive(Clone, Copy, Debug, Default)]
@@ -35003,7 +34999,7 @@ pub(crate) struct DirectStallTally {
     /// Why a compile attempt parked its key `Dormant` instead of installing, indexed by
     /// `DormantReason`. Before this split all four reasons folded into one terminal state that
     /// `classify_unbound_target` then reported as `SeenNotCompiled`, indistinguishable from a key
-    /// that had simply never been hot enough to try -- which is what made the 5.2M-exit
+    /// that had simply never been hot enough to try, which is what made the 5.2M-exit
     /// seen-not-compiled bucket unattributable.
     pub dormant: [u64; DormantReason::COUNT],
     /// The static-unbound EXITS that landed on a compile-Retry dormant key, split by the cause
@@ -35022,7 +35018,7 @@ pub(crate) struct DirectStallTally {
     ///
     /// THE STATIC LANE ONLY. `classify_dynamic_miss_exit` classifies the same key population
     /// through the same `UnboundTarget` table, and folding it in would put two populations with
-    /// different fixes into one column -- a static unbound wants the target compiled, a dynamic
+    /// different fixes into one column: a static unbound wants the target compiled, a dynamic
     /// miss whose target is dormant wants the same thing but arrives through the inline cache, and
     /// the 4.40 M figure this column is compared against is the static one. If the dynamic lane
     /// ever needs the same split it gets its own array.
@@ -35073,16 +35069,16 @@ pub(crate) struct DirectStallTally {
     ///
     /// SPLIT BY CAUSE, and that is the point rather than a convenience (review round 2, R2-1).
     /// `Retired` is the largest bucket and fires on every eviction, so a single scalar reads
-    /// non-zero on every row whatever the other causes do -- a witness that cannot fail. The
+    /// non-zero on every row whatever the other causes do: a witness that cannot fail. The
     /// buckets say which cut sites the narrowing actually reaches:
     ///
-    /// * `Retired` -- `unlink_block`'s inbound walk, the successor-evicted / SMC-flushed case.
-    /// * `ChainWiden`, `DataSegmentDecline`, `Replaced` -- the three `unlink_outbound` callers.
+    /// * `Retired`: `unlink_block`'s inbound walk, the successor-evicted / SMC-flushed case.
+    /// * `ChainWiden`, `DataSegmentDecline`, `Replaced`: the three `unlink_outbound` callers.
     /// * `Flushed` / `Reset` read **ZERO by construction**: those paths reset `chain_layouts`
     ///   wholesale and never call the helper.
     ///
     /// `Replaced` counts a narrowing that `try_link_inner` then legitimately re-widens with the
-    /// REPLACEMENT edge's own merge -- and only with that one, since the merge handed to
+    /// REPLACEMENT edge's own merge, and only with that one, since the merge handed to
     /// `widen_chain_requirement` is recomputed from the POST-cut requirement. Before that fix the
     /// pre-cut snapshot was written back and the narrowing was silently undone.
     pub chain_requirement_narrowed: [u64; LinkClearCause::COUNT],
@@ -35091,10 +35087,10 @@ pub(crate) struct DirectStallTally {
     ///
     /// Costs nothing: it reuses the `own_mask_matches` value the governor's cold path already
     /// builds. It therefore reads **zero whenever the governor is on its OFF arm**, because that
-    /// arm never builds the input -- and zero on every arm while `IZARRAVM_CHAIN_ENTRY_CHECK` is
+    /// arm never builds the input, and zero on every arm while `IZARRAVM_CHAIN_ENTRY_CHECK` is
     /// OFF, because there is no chain arm to reject on.
     pub entry_chain_reject_own_pass: u64,
-    /// Entries that PASSED the chain check and would have FAILED `all_data_matches` -- the
+    /// Entries that PASSED the chain check and would have FAILED `all_data_matches`: the
     /// engagement proof for the armed arm, and the direct counterpart of the census build's
     /// `chain_pass` column.
     ///
@@ -35106,7 +35102,7 @@ pub(crate) struct DirectStallTally {
     /// Entries with no live successor where the block's own mask PASSES and the chain mask FAILS:
     /// the shipped counterpart of the design's B1 column, and the residual the narrowing cannot
     /// remove (a successor that is merely portal-HIDDEN keeps its predecessor's requirement wide,
-    /// and narrowing on that state would be a miscompile -- see
+    /// and narrowing on that state would be a miscompile: see
     /// `narrow_chain_requirement_if_leaf`). Census-gated for `entry_chain_admitted`'s reason.
     pub entry_chain_masked_reject: u64,
     /// Side exits for a CS limit check and for an x87 eligibility guard, one counter each.
@@ -35130,7 +35126,7 @@ pub(crate) struct DirectStallTally {
     /// DENOMINATOR the two counters above needed: an abnormal count of zero says nothing without
     /// it, because zero is also what a mechanism that never ran reports.
     pub callout_executed: u64,
-    /// Port call-outs SERVED through the TSS-bitmap arm -- the V86 / CPL>IOPL state whose
+    /// Port call-outs SERVED through the TSS-bitmap arm: the V86 / CPL>IOPL state whose
     /// permission check the helper's two-phase probe now satisfies natively.
     ///
     /// Separate from `callout_executed` because that count sums both arms, so on a guest that
@@ -35148,18 +35144,18 @@ pub(crate) struct DirectStallTally {
     /// mirroring `callout_port_imm8_served`'s reasoning one opcode over: a guest that runs both the
     /// `0xE4` read and the `0xE6` write call-outs cannot be read out of `callout_executed`, which
     /// sums every helper class. Reads zero whichever way the knob is set until the arm serves a
-    /// port -- which is the acceptance question the knob's ON default (since the 2026-08-30
+    /// port, which is the acceptance question the knob's ON default (since the 2026-08-30
     /// ladder) is graded on.
     pub callout_port_out_imm8_served: u64,
     /// The dedicated always-on numerator for `PortWriteAlDx` (`0xEE`, unconditional, no knob),
     /// mirroring `callout_port_out_imm8_served`'s reasoning one opcode over: `callout_executed`
     /// sums every helper class, so on a guest running both OUT call-outs it cannot say whether
-    /// THIS arm -- the dynamic-port one -- served anything.
+    /// THIS arm (the dynamic-port one) served anything.
     pub callout_port_out_dx_served: u64,
     /// The `InterpretOne` family, five counters that price the mechanism on its own terms.
     ///
     /// `executed` is every slot the helper ENTERED, the denominator the rest need.
-    /// `resync` and `resync_fault` are the two RESYNC statuses -- the predicate refusing after a
+    /// `resync` and `resync_fault` are the two RESYNC statuses: the predicate refusing after a
     /// retired instruction, and the step faulting. `abnormal` is the helper's one fail-closed
     /// return: NO RESIDENT DECODE VIEW, and nothing else.
     ///
@@ -35174,7 +35170,7 @@ pub(crate) struct DirectStallTally {
     /// The design asked for a `BarrierStop::CallOutDemoted` row instead, and when this was written
     /// it was not implementable: the barrier census records COMPILE-WALK stops, and demotion was a
     /// runtime event on an already compiled block that never changed its classification. The
-    /// demoted-site map changed that -- a demotion now retires the block and marks the site, so
+    /// demoted-site map changed that: a demotion now retires the block and marks the site, so
     /// the RECOMPILE walk stops there and has a row to be attributed to. The variant exists.
     ///
     /// The gap described above still exists and is still the way to price a demotion, because it
@@ -35236,7 +35232,7 @@ pub(crate) struct DirectStallTally {
     /// the size model (`EMITTED_BLOCK_FIXED_BYTES`): it should be a rounding error against
     /// `jit_direct_compile_attempts`, and a large value says the model is wrong for this guest's
     /// slot mix, not that the search is expensive. `search_steps` is the cost itself, and it is
-    /// the counter that made the S3 regression legible -- 956,976 steps against 280,000 compiles,
+    /// the counter that made the S3 regression legible: 956,976 steps against 280,000 compiles,
     /// each one a full re-walk AND a full re-emission, which is where 4.4 seconds of the loader's
     /// wall went.
     pub compile_page_overflows: u64,
@@ -35260,7 +35256,7 @@ pub(crate) struct DirectStallTally {
     /// fixture that asserts it would test nothing.
     ///
     /// `lane_trial_regrants <= (lane_trial_budget() - 1) * lane_trial_first_grants` is INV-B1's
-    /// checkable form — an EXACT stop floor that needs no base arm and is evaluable on every arm of
+    /// checkable form: an EXACT stop floor that needs no base arm and is evaluable on every arm of
     /// every run, which is why both live in the plain build.
     pub lane_trial_first_grants: u64,
     pub lane_trial_regrants: u64,
@@ -35268,7 +35264,7 @@ pub(crate) struct DirectStallTally {
     /// A first ask of an epoch is never counted here.
     pub lane_trial_budget_refusals: u64,
     /// Entry-gate heat demotes whose key had already spent a trial this epoch, and the subset
-    /// whose spent trial INSTALLED — the population an earned re-grant can convert, against the
+    /// whose spent trial INSTALLED, the population an earned re-grant can convert, against the
     /// union of it with the compiles that died at `Retry` / `StructuralReject` / cover / install.
     ///
     /// **PLAIN fields, not census-gated, and that is load-bearing.** Both are read by the ladder's
@@ -35293,8 +35289,8 @@ pub(crate) struct DirectStallTally {
     pub lane_install_demote_trial_spent: u64,
     /// Park LENGTH: heat epochs summed across every `Dormant(SpanHot)` park that LIFTED, and how
     /// many parks that was. `dormant_heat_park_epochs / park_lifts` is a **LOWER BOUND** on the
-    /// mean park length — never-lifted and reset-ended parks contribute nothing and they are the
-    /// longest — so it must be published with the censoring rate
+    /// mean park length: never-lifted and reset-ended parks contribute nothing and they are the
+    /// longest, so it must be published with the censoring rate
     /// `(smc_heat_demotions - park_lifts) / smc_heat_demotions` beside it. A high censoring rate is
     /// itself evidence that the lift side, not the trial budget, is where the class lives.
     #[cfg(feature = "direct-admission-census")]
@@ -35328,7 +35324,7 @@ pub(crate) struct DirectStallTally {
     /// the counter smoke read 115 registrations on `duke3d-586-short` for a −24.5% min-wall,
     /// because the prize arrives through the heat equilibrium rather than through lane volume.
     /// Zero here on a plain leg now means the ESCAPE was exported (`IZARRAVM_DISP_STORE_LANES=0`)
-    /// or the workload patches no store displacements at all -- the corpus rows read zero and are
+    /// or the workload patches no store displacements at all: the corpus rows read zero and are
     /// inert, which is the heat gate doing its job.
     pub disp_store_lane_registrations: u64,
     /// The `0x8B` load-widening half of Option D (`IZARRAVM_DISP_LOAD_WIDEN`), still DEFAULT OFF
@@ -35338,13 +35334,13 @@ pub(crate) struct DirectStallTally {
     pub disp_load_widen_lane_registrations: u64,
     /// Jcc terminators lowered against the RBP EFLAGS shadow IN THE BLOCKS THIS RUN INSTALLED,
     /// by emission class (`IZARRAVM_JCC_SHADOW`, DEFAULT OFF). The classes are kept apart because
-    /// each carries a different ON-minus-OFF byte cost -- simple -6, overflow -4, signed-xor 0,
-    /// signed-xor-zf +5 -- and the arena BYTE delta the slice's occupancy risk is priced on is a
+    /// each carries a different ON-minus-OFF byte cost (simple -6, overflow -4, signed-xor 0,
+    /// signed-xor-zf +5) and the arena BYTE delta the slice's occupancy risk is priced on is a
     /// weighted sum of exactly these four.
     ///
     /// **ZERO on a shipped binary**, because the knob is default OFF and the OFF arm never calls
     /// `emit_jcc_shadow`. That is the point: on an ON leg a zero here means the leg did not arm
-    /// the knob (`IZARRAVM_JCC_SHADOW=1` must be EXPORTED -- unset and the empty string both spell
+    /// the knob (`IZARRAVM_JCC_SHADOW=1` must be EXPORTED: unset and the empty string both spell
     /// OFF) and the leg is vacuous, not inert.
     ///
     /// **NOT a measure of executed volume, and it must never be quoted as one.** A chained
@@ -35412,9 +35408,9 @@ pub(crate) struct DirectStallTally {
     pub imm8_lane_cap_refusals: u64,
     pub count_lane_cap_refusals: u64,
     pub disp_lane_cap_refusals: u64,
-    /// The two Option D arms' cap cells. Both keep `disp_lane_cap_refusals`' TIGHTER definition
-    /// -- the budget is tested below the `has_record_range` heat gate and below
-    /// `direct_host_bytes` -- so every slot they count had a heat record and a host pointer
+    /// The two Option D arms' cap cells. Both keep `disp_lane_cap_refusals`' TIGHTER definition:
+    /// the budget is tested below the `has_record_range` heat gate and below
+    /// `direct_host_bytes`, so every slot they count had a heat record and a host pointer
     /// waiting. `disp_store_lane_cap_refusals` is live on a shipped binary since the 2026-08-23
     /// flip (14 on the counter smoke); `disp_load_widen_lane_cap_refusals` reads zero unless that
     /// still-default-OFF knob is exported on.
@@ -35445,10 +35441,10 @@ pub(crate) struct DirectStallTally {
     /// HERE AND NOT IN `PerfCounters`, and that is this file's own rule rather than a preference:
     /// growing `PerfCounters` shifts the pinned `pending_flags` offset, which emitted code bakes.
     /// The design named `PerfCounters`; the two pin tests (`cpu_test.rs`,
-    /// `canonical_state_test.rs`) say what that costs -- a cache-line reshuffle of the hot region
-    /// and a wall confound against `main` -- and this slice's OFF arm has no reason to pay it.
+    /// `canonical_state_test.rs`) say what that costs: a cache-line reshuffle of the hot region
+    /// and a wall confound against `main`, and this slice's OFF arm has no reason to pay it.
     pub far_ret_native: u64,
-    // L8's sibling of `far_ret_native` -- CALL FARs served natively by `DirectKind::CallFar16` --
+    // L8's sibling of `far_ret_native` (CALL FARs served natively by `DirectKind::CallFar16`)
     // does NOT live here since the 2026-09-01 reprice. It is `CpuGsw::far_call_ledger`, a cell
     // written through R15 by the one lowering that needs it, and it is never folded into this
     // tally: there is nothing here to fold in from, since no emitted code writes `JitState` any
@@ -35460,7 +35456,7 @@ pub(crate) struct DirectStallTally {
     // `far_call_ledger_offset`'s own doc for the identity this counter extends
     // (`decode_inval_cs_load(armed) + far_ret_native(armed) + far_call_native(armed) ==
     // decode_inval_cs_load(base)`) and why it cannot share `far_ret_native`'s high half.
-    /// Stage 0 §5.0c: installed blocks whose OWN snapshot claims CS in either way -- the
+    /// Stage 0 §5.0c: installed blocks whose OWN snapshot claims CS in either way: the
     /// descriptor (`segment_bit(Cs)`, a CS-override memory operand) or the selector
     /// (`BAKES_CS_BIT`, `PUSH CS` / `MOV r16, CS`).
     ///
@@ -35478,23 +35474,23 @@ pub(crate) struct DirectStallTally {
     /// The three ways a FAR edge is refused or cut (`IZARRAVM_DIRECT_RETF_V86`). All zero on the
     /// `0` ESCAPE, because no far edge is ever offered there; live on a shipped binary since the
     /// 2026-08-24 flip, and `far_link_refused_cs` in particular reads 136.6 M on the wolf3d-586
-    /// ladder row -- see its bullet below for what that means and what it opens.
+    /// ladder row. See its bullet below for what that means and what it opens.
     ///
     /// They are counted at THREE DIFFERENT SITES, because the three events fire at three
     /// different places and a counter parked where its event cannot reach is worse than no
     /// counter at all:
     ///
-    ///   * `far_link_refused_cs` -- INV-FAR-CS. `SegmentLayout::far_merge` returned `None`
+    ///   * `far_link_refused_cs`: INV-FAR-CS. `SegmentLayout::far_merge` returned `None`
     ///     because the target's chain requirement claims CS's descriptor or CS's selector.
     ///     Bumped in `try_link_inner`, beside the `link_refusals[SegmentLayout]` increment it
     ///     rides (`far_merge` is a pure method on a `Copy` struct and can reach neither the
     ///     tally nor `PerfCounters`). A LARGE reading means the chain half is unavailable and the
-    ///     win is the ender removal alone -- `PUSH CS` is a 158 M block-stopping row on wolf3d,
+    ///     win is the ender removal alone: `PUSH CS` is a 158 M block-stopping row on wolf3d,
     ///     so this is a live possibility rather than a theoretical one.
-    ///   * `far_link_refused_limit` -- the target block's `eip + guest_len - 1` overruns the live
+    ///   * `far_link_refused_limit`: the target block's `eip + guest_len - 1` overruns the live
     ///     CS limit. Bumped in `bind_dynamic_successor`, which is where the compare is, BEFORE
     ///     `try_link_inner` is reached.
-    ///   * `far_link_cut_on_widen` -- a far edge cut by the backward chain-requirement
+    ///   * `far_link_cut_on_widen`: a far edge cut by the backward chain-requirement
     ///     propagation because the widened requirement reached it carrying either CS bit. Bumped
     ///     in `widen_chain_requirement`'s cut arm; `try_link_inner` never sees this event.
     pub far_link_refused_cs: u64,
@@ -35506,7 +35502,7 @@ pub(crate) struct DirectStallTally {
     pub reject_callout_privileged: u64,
     /// The call-out admission governor, three counters that price it without a new instrument.
     ///
-    /// `trials` is entries admitted at trial quota 1 -- the governor's whole cost, one
+    /// `trials` is entries admitted at trial quota 1: the governor's whole cost, one
     /// spill/call/serve/reload/side-exit per call-out block per epoch. `lazy` and `io_touching`
     /// are the classifications those trials reached. `trials - lazy - io_touching` is the rest:
     /// abnormal serves (`Denied`), trials that served nothing, and the truncated ones that
@@ -35537,7 +35533,7 @@ pub(crate) struct DirectStallTally {
     pub segment_write_block_head_entries: u64,
     pub segment_write_block_head_insns: u64,
     /// The x87 TOP-mismatch retire cap (`retire_key_for_top_mismatch`). `suppressed` counts every
-    /// retire the cap refused -- one per mismatch on an already-capped key, so on a churning guest
+    /// retire the cap refused: one per mismatch on an already-capped key, so on a churning guest
     /// it approaches `jit_direct_reject_x87_top`. The identity
     /// `reject_x87_top == x87_top_retires_suppressed + retires taken` closes across the run.
     pub x87_top_retires_suppressed: u64,
@@ -35548,7 +35544,7 @@ pub(crate) struct DirectStallTally {
     /// The data-segment retire cap (`retire_key_for_data_segment`), the same three instruments
     /// the x87 pair carries above plus one stage 2 needs.
     ///
-    /// `suppressed` counts every retire the cap refused -- one per data-segment reject on an
+    /// `suppressed` counts every retire the cap refused: one per data-segment reject on an
     /// already-capped key, so on a churning guest it approaches `jit_direct_reject_data_segment`.
     /// `sticky_crossings` counts CAP CROSSINGS, not live keys. `link_declines` counts stage 2
     /// assertions, not a live declined-set membership. Decline always bumps it, including on
@@ -35565,7 +35561,7 @@ pub(crate) struct DirectStallTally {
     pub data_segment_live_promotions: u64,
     /// Sticky-decline memo instruments, always on. Here for this struct's stated reason:
     /// `PerfCounters` sits ahead of `pending_flags` in `CpuGsw` at an offset emitted code bakes,
-    /// and `BlockCacheStats` is drained per dispatcher exit — these have to accumulate for the
+    /// and `BlockCacheStats` is drained per dispatcher exit: these have to accumulate for the
     /// whole run and be read by `stall_snapshot`. See `DirectStallSnapshot` for why they are not
     /// census-gated.
     pub decline_memo_hits: u64,
@@ -35603,7 +35599,7 @@ pub(crate) struct DirectStallTally {
     /// `NotSpinning`, `NoEdge`, `Cap`).
     ///
     /// `poll_skip_spans` / `poll_skip_iterations` are PER `PollLoop::diagnostic_class()` (0 = 3-slot
-    /// CurrentDx/Direct, 1 = 5-slot Ebx|Ecx/Direct, 2 = paired 6-slot) -- what makes the I9 residual
+    /// CurrentDx/Direct, 1 = 5-slot Ebx|Ecx/Direct, 2 = paired 6-slot): what makes the I9 residual
     /// identity evaluable. `poll_skip_raw_core_clocks` / `poll_skip_raw_bus_clocks` are the totals
     /// I1/I2 grade against. `poll_skip_max_span` is the largest single committed span, and
     /// `poll_skip_last_head` the certified shape's head linear address of the last committed span.
@@ -35616,14 +35612,14 @@ pub(crate) struct DirectStallTally {
     ///
     /// **Its own lane, deliberately, and it is the single most important signal in the 16-bit
     /// ladder.** It is what distinguishes "the shape did not certify" from "the shape certified
-    /// and then declined semantically" -- and the second of those is a COST, because a `Found`
+    /// and then declined semantically", and the second of those is a COST, because a `Found`
     /// is never written to the negative cache (positives are rebuilt every call so an SMC
     /// restamp replaces the descriptor). Folding it into `poll_declined_port_source` would have
     /// hidden exactly that signature behind a lane whose own cause `port != 0x03da` has already
     /// made impossible.
     ///
     /// **LADDER STOP ROW: if this exceeds 1% of `poll_attempts` on any arm, the mask-decline
-    /// path is a scan storm -- stop and fix it before reading the wall number.** Counts memo
+    /// path is a scan storm: stop and fix it before reading the wall number.** Counts memo
     /// hits as well as fresh declines, so the rate it reports is the true decline rate rather
     /// than the rate of scans the memo failed to absorb.
     pub poll_declined_mask_source: u64,
@@ -35637,7 +35633,7 @@ pub(crate) struct DirectStallTally {
     /// existed (2026-08-29).
     pub poll_declined_sixteen_bit: u64,
     pub poll_declined_shape: u64,
-    /// `MachineBus::callout_poll_skip` declining through `CalloutPollDecline::Cap` -- split OUT of
+    /// `MachineBus::callout_poll_skip` declining through `CalloutPollDecline::Cap`: split OUT of
     /// `poll_declined_seam` (M3, GP2 poll-skip revision report): `Cap` is exactly the lane BOTH
     /// BLOCKER 1 and BLOCKER 2 surfaced through before their fixes, so folding it in with
     /// `PortInactive`/`BusCertificate`/`NotSpinning`/`NoEdge` made it impossible for a ladder
@@ -35653,13 +35649,13 @@ pub(crate) struct DirectStallTally {
     pub poll_skip_raw_bus_clocks: u64,
     pub poll_skip_max_span: u64,
     pub poll_skip_last_head: u32,
-    /// `make_link_visible`'s L3 arm firing (design doc `2026-09-02-cr3-jit-half-design.md` (b)):
+    /// `make_link_visible`'s L3 arm firing (CR3 JIT-half design (b)):
     /// a block visible under one ring slot is re-touched under the other and its outbound cells
     /// are cleared before rebinding. Near zero on the Tyrian dwell says the slot and `mode_key`
     /// partitions align on that workload; a large value is a decayed win, not a correctness bug.
     pub link_context_rebinds: u64,
-    // `waiting` and `linear_blocks` residency (advisory J5) are GAUGES, not running totals -- the
-    // map's live size read at `stall_snapshot` time, not a tally incremented anywhere -- so they
+    // `waiting` and `linear_blocks` residency (advisory J5) are GAUGES, not running totals: the
+    // map's live size read at `stall_snapshot` time, not a tally incremented anywhere, so they
     // are computed directly there (`DirectStallSnapshot::link_waiting_entries` /
     // `link_linear_blocks_entries`) and have no field here, the same shape `demoted_callout_sites`
     // already uses for the identical reason.
@@ -35722,7 +35718,7 @@ impl DormantReason {
 /// in common (the walk found a real barrier but could not name a span for it) is the whole
 /// content of the answer.
 /// `Hash` because `BlockCache::retry_lift_spent` is a set of `(BlockKey, RetryCause)` pairs: one
-/// lift per key PER CAUSE, which a map from key to cause could not express -- it remembered only
+/// lift per key PER CAUSE, which a map from key to cause could not express: it remembered only
 /// the last one, and a key alternating two clearable causes lifted for ever.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RetryCause {
@@ -35777,13 +35773,13 @@ pub(crate) enum RetryCause {
     HostPageLen,
     /// A search step in `compile_with_page_len` hit a STRUCTURAL barrier the full walk did not,
     /// so the prefix cannot be compiled and cannot be parked as a rejected span either.
-    /// Deterministic. Split out of `HostPageLen` at review finding F7, which is the label it wore
+    /// Deterministic. Split out of `HostPageLen` at fix F7, which is the label it wore
     /// while having nothing to do with the arena page; whether the arm is reachable at all is now
     /// a question the counter answers rather than one the label pre-judges.
     SearchStructural,
     /// The walk ended cleanly with NO slots at all: the block-page budget or the instruction
     /// limit refused the very first instruction. Deterministic in the key. Split out of
-    /// `TooShort` at review finding F7 -- the min-length rule never looked at this block, so
+    /// `TooShort` at fix F7: the min-length rule never looked at this block, so
     /// filing a budget refusal under it made the one cause a retry policy most wants to trust
     /// mean two different things.
     BudgetFirstSlot,
@@ -35887,14 +35883,14 @@ pub(crate) enum LinkRefusal {
     /// The CHAIN segment requirements of the two ends do not merge: they disagree about `cs`, or
     /// about a `data` descriptor that some block in one of the two chains actually pins
     /// (`SegmentLayout::link_merge`). A descriptor no block in either chain pins is not a reason
-    /// to refuse -- that admission is the whole of the 2026-08-18 chain-used mask slice.
+    /// to refuse: that admission is the whole of the 2026-08-18 chain-used mask slice.
     SegmentLayout,
     /// The SOURCE key is data-segment link-declined: stage 2 of the reject governor cut its
     /// outbound edges after the retire cap was spent on a strict-arm reject, and nothing may
     /// rebind them. Reads ZERO on every arm but `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=on`.
     ///
     /// Its own variant rather than a fold into `SegmentLayout`: the two are the same FAMILY of
-    /// cause and nothing else about them is alike -- one is a per-edge descriptor conflict that a
+    /// cause and nothing else about them is alike: one is a per-edge descriptor conflict that a
     /// later install can resolve, the other is a standing judgement about a block, and reading
     /// the second inside the first's bucket would make stage 2 invisible on a ladder leg.
     Declined,
@@ -36064,16 +36060,16 @@ pub(crate) struct DirectLinkRefusalCensus {
     invalid_id: u64,
     rows: Vec<DirectLinkRefusalCell>,
     /// Histogram of `popcount(guard_mask)` over every `SegmentLayout`-refusal EVENT (not
-    /// weighted by later `unbound_exits`), indexed 0..=5 -- five data segments, CS excluded.
+    /// weighted by later `unbound_exits`), indexed 0..=5: five data segments, CS excluded.
     /// Design section 4.3 slice 0: "the diagnostic that gates this."
     ///
     /// Index 0 DOES occur, and the call site serves three different merges
     /// (`link_merge`/`far_merge`/`seg_write_merge`), so it is not one cause: (1) `merge_chain`
-    /// refuses on the UNION mask -- a segment the SOURCE pins, the target does not, and the two
+    /// refuses on the UNION mask: a segment the SOURCE pins, the target does not, and the two
     /// disagree on refuses the edge, and `guard_mask` skips it (`target.used & bit == 0`), which
     /// is a genuine data-segment conflict `guard_mask` cannot see; (2) `far_merge` refuses on
     /// INV-FAR-CS (the target pins CS or `BAKES_CS_BIT`) and `seg_write_merge` refuses when the
-    /// target does not claim the written segment, or on its own CS pre-test -- both reasons
+    /// target does not claim the written segment, or on its own CS pre-test: both reasons
     /// `guard_mask` discards or was never built to see, since it only reads `merge_chain`'s
     /// formula. A `SegmentLayout` refusal with CS agreeing and every pinned data segment agreeing
     /// too (the `link_merge` case `guard_mask`'s own doc describes) is ALSO index 0, and this
@@ -36232,7 +36228,7 @@ pub(crate) fn direct_link_refusal_census_default() -> Option<Box<DirectLinkRefus
 /// (direct_test.rs) pins the state-to-class mapping, and `unbound_exit_classes_sum_to_the_static_unbound_counter`
 /// plus `dynamic_miss_classes_sum_to_the_dynamic_miss_counter` (cpu_jit_direct_execution_test.rs)
 /// pin the sum on the real dispatcher path for both lanes. Do not add a classification path that
-/// returns without noting a variant -- that is exactly what the second pair of tests exists to
+/// returns without noting a variant: that is exactly what the second pair of tests exists to
 /// catch, and the first pair cannot see it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnboundTarget {
@@ -36240,7 +36236,7 @@ pub(crate) enum UnboundTarget {
     /// successor page is not mapped). No entry-map probe happened, so this is not `Absent`: it
     /// is "the question could not be asked". Exists so the classes close on the exit counter.
     NoKey,
-    /// Probed for, but the successor address has no entry at all — a genuinely cold edge.
+    /// Probed for, but the successor address has no entry at all: a genuinely cold edge.
     Absent,
     /// The key is tracked and admissible, just not hot enough to have been compiled yet.
     Seen,
@@ -36248,20 +36244,20 @@ pub(crate) enum UnboundTarget {
     /// other three dormant reasons because this is the only one with a designed recovery path
     /// (`lift_cold_smc_dormant`), so it is churn rather than a permanent refusal.
     DormantHeat,
-    /// Parked `Dormant` by any non-heat reason — compile retry, page-cover failure, or an arena
+    /// Parked `Dormant` by any non-heat reason: compile retry, page-cover failure, or an arena
     /// install failure. None of these lift on their own.
     DormantOther,
     /// Compilation was attempted and structurally refused. These are the edges an opcode
     /// lowering slice would convert.
     Rejected,
-    /// The target is compiled and live, but the edge was never linked — a `link_compatible`
+    /// The target is compiled and live, but the edge was never linked: a `link_compatible`
     /// refusal, or the transient window before the next probe binds it.
     Compiled,
     /// The target compiled once and its slot has since been retired or reused. Currently
     /// UNREACHABLE and reading zero on both fixtures by construction, not by luck: every retire
     /// path rewrites or removes the entry before anything can exit to it, so a live
     /// `Compiled(id)` whose slot is dead has no way to be observed today. Retained as a
-    /// tripwire -- a future slot-reuse or deferred-retire path would surface here first, and it
+    /// tripwire: a future slot-reuse or deferred-retire path would surface here first, and it
     /// is cheaper to keep the class than to re-derive it. Do NOT read its zero as evidence
     /// about retirement.
     CompiledRetired,
@@ -36310,7 +36306,7 @@ pub(crate) enum LinkClearCause {
     Retired,
     /// `invalidate_translation`: a paging/CR3/decode-slot flush tearing down link cells while
     /// the blocks themselves STAY compiled. Split from `Reset` because the two look alike in an
-    /// aggregate and are nothing alike as a lever -- this one leaves the code in place and only
+    /// aggregate and are nothing alike as a lever: this one leaves the code in place and only
     /// costs the re-binding, and it is where essentially all bulk clears actually come from
     /// (`jit_direct_cache_resets` is a single-digit number over a whole fixture run).
     Flushed,
@@ -36321,7 +36317,7 @@ pub(crate) enum LinkClearCause {
     /// satisfy, so the edge was cut to keep the chain sound. Both blocks stay compiled and the
     /// cell reverts to the zero portal, so the source's exits report `StaticUnbound`; the edge is
     /// NOT re-parked in `waiting`, because the widen is monotone and a retry could only re-derive
-    /// the same conflict. See dev_docs/plans/2026-08-18-chain-used-link-mask.md.
+    /// the same conflict.
     ChainWiden,
     /// Stage 2 of the data-segment reject governor cut this source's outbound edges after its
     /// retire cap was spent on a strict-arm reject. The only production path that still
@@ -36332,11 +36328,11 @@ pub(crate) enum LinkClearCause {
     /// re-parked in `waiting`. Reads ZERO on every arm but
     /// `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=on`.
     DataSegmentDecline,
-    /// `make_link_visible`'s L3 arm (design doc `2026-09-02-cr3-jit-half-design.md` (b)): a block
+    /// `make_link_visible`'s L3 arm (CR3 JIT-half design (b)): a block
     /// whose stamped link epoch belongs to the OTHER ring slot's live series is still linked
     /// under that context, and its outbound cells are cleared before this context's admission can
     /// rebind them. Deliberately split from `Flushed`, which Bar C's identity requires to move
-    /// ONLY on a wholesale retire (the `Taken` arm) -- a rebind is neither a CR3 flush nor a
+    /// ONLY on a wholesale retire (the `Taken` arm): a rebind is neither a CR3 flush nor a
     /// retire, and folding it into `Flushed` would make that identity untestable.
     ContextRebind,
 }
@@ -36369,8 +36365,8 @@ impl LinkClearCause {
 /// WHICH structural-stop arm of the compile walk refused the block.
 ///
 /// Added by the attribution-completeness slice. Before it, `record_barrier` fired on the
-/// `HardBoundary` arm ALONE, so the two other arms that produce a `CompileStop::Structural` --
-/// and therefore a `BlockState::Rejected` that static exits pile into -- installed a rejected
+/// `HardBoundary` arm ALONE, so the two other arms that produce a `CompileStop::Structural`
+/// (and therefore a `BlockState::Rejected` that static exits pile into) installed a rejected
 /// span with no census row at all. That was tolerable when `HardBoundary` was 78% of doom's
 /// rejected class and fatal by the time lowering slices had pushed it under 1%: "every row is
 /// under the stop floor" was about to be true while ~19.8M doom exits sat in a class the
@@ -36382,14 +36378,14 @@ impl LinkClearCause {
 /// is purely additive and a before/after row diff still lines up.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum BarrierStop {
-    /// `classify` returned `PlannedInsn::HardBoundary` — the opcode-coverage arm, and the only
+    /// `classify` returned `PlannedInsn::HardBoundary`: the opcode-coverage arm, and the only
     /// one instrumented before this slice.
     HardBoundary,
     /// `prefixes_supported_for` and `addr32_word_admitted` refused: the backend takes the
     /// operand-size override and nothing else (bar the gated 0x67 forms), so LOCK, REP/REPNE, an address-size override and **any explicit segment override**
     /// all stop the walk here. The row's `prefix_mask` names which.
     PrefixUnsupported,
-    /// `DecodedInsn::continuable` is false — `block_continuable` (decode.rs) refused the shape
+    /// `DecodedInsn::continuable` is false: `block_continuable` (decode.rs) refused the shape
     /// for straight-line batching, and the compile walk inherits that refusal.
     NonContinuable,
     /// A Word-size instruction on a persona other than I586. Dead on both shipped fixtures (they
@@ -36416,7 +36412,7 @@ pub(crate) enum BarrierStop {
     /// and the suffix instead.
     ///
     /// Its rows must be SUMMED, not ranked individually. The key is the shape of the instruction
-    /// that was barred -- the segment's USER -- so one structural cause spreads itself across
+    /// that was barred (the segment's USER) so one structural cause spreads itself across
     /// `0x8a`, `0x8b`, `0x88` and every other form that happens to touch the segment, rather than
     /// concentrating in one row the way an opcode-coverage barrier does.
     ///
@@ -36426,8 +36422,8 @@ pub(crate) enum BarrierStop {
     ///
     /// Separate from `HardBoundary` because the cause is different in kind: `classify` still
     /// admits the row, and what stops the walk is a runtime judgement about this code site. The
-    /// column therefore answers a question no other row can -- how much of the barrier population
-    /// a widened row won and then gave back -- and folding it into `HardBoundary` would make an
+    /// column therefore answers a question no other row can: how much of the barrier population
+    /// a widened row won and then gave back, and folding it into `HardBoundary` would make an
     /// admitted row look like an unlowered one.
     CallOutDemoted,
 }
@@ -36464,8 +36460,8 @@ impl BarrierStop {
 }
 
 /// The normalized instruction shape a barrier row is keyed on, WITHOUT the stop arm. Split out
-/// of `BarrierKey` so `note_interpreted` — which sits on the per-interpreted-instruction retire
-/// path — still costs exactly ONE map probe now that a shape can own up to four rows.
+/// of `BarrierKey` so `note_interpreted` (which sits on the per-interpreted-instruction retire
+/// path) still costs exactly ONE map probe now that a shape can own up to four rows.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct BarrierShape {
     opcode: u16,
@@ -36567,7 +36563,7 @@ pub(crate) struct DirectBarrierCensus {
     /// from `rows` so `note_interpreted` stays at one map probe: a shape can now own up to four
     /// rows (one per `BarrierStop`), and probing `rows` per arm would multiply the cost of the
     /// census's hottest hook by four. Every row of a shape reports this same total, which is the
-    /// honest reading — `runtime_hits` counts executions of an instruction SHAPE and an
+    /// honest reading: `runtime_hits` counts executions of an instruction SHAPE and an
     /// executing instruction has no stop arm.
     runtime_hits: HashMap<BarrierShape, u64>,
     /// `Rejected`-class STATIC exits whose entry linear was absent from `rejected_barrier`, i.e.
@@ -36595,18 +36591,18 @@ pub(crate) struct DirectBarrierCensus {
     dynamic_rejected_unattributed: u64,
     /// How many times a rejection claimed a linear `rejected_barrier` already held. This is the
     /// honest signal for the stale-hit hazard the two residuals above are blind to: an overwritten
-    /// key still resolves, so its exits are attributed — to the row recorded LAST. Duke runs
+    /// key still resolves, so its exits are attributed, to the row recorded LAST. Duke runs
     /// DOS4GW protected mode over JEMMEX with paging and overlays, which is exactly the workload
     /// where linear-only keys collide, so a large value here devalues the row ranking even while
     /// both residuals read zero.
     #[cfg(feature = "barrier-census-closure")]
     rejected_barrier_overwrites: u64,
-    /// B.3: the `DormantHeat` linear histogram — block entry linear -> `(static, dynamic)` exits.
+    /// B.3: the `DormantHeat` linear histogram: block entry linear -> `(static, dynamic)` exits.
     ///
     /// `note_unbound_target` has always RECEIVED the entry linear and discarded it for every class
     /// but `Rejected`, so the census could count 141.7M `dormant_heat` exits on duke and not say
-    /// whether they were fifty addresses or fifty thousand. The whole Track B fork — targeted lane
-    /// class versus policy-parameter sweep — turns on that one question, and no knob should be
+    /// whether they were fifty addresses or fifty thousand. The whole Track B fork (targeted lane
+    /// class versus policy-parameter sweep) turns on that one question, and no knob should be
     /// swept against a class whose addresses are unknown.
     ///
     /// Keyed on linear alone and never pruned, exactly like `rejected_barrier`, and it inherits
@@ -36615,7 +36611,7 @@ pub(crate) struct DirectBarrierCensus {
     ///
     /// Both lanes in ONE map with two columns rather than two maps, mirroring `BarrierStats`:
     /// Slice 4's lesson is that the two lanes move by wildly different factors for the same row,
-    /// so they must be separable — but they are separable as columns, and a site that exits both
+    /// so they must be separable, but they are separable as columns, and a site that exits both
     /// ways is one site.
     #[cfg(feature = "barrier-census-closure")]
     dormant_heat_sites: HashMap<u32, DormantHeatStats>,
@@ -36623,15 +36619,15 @@ pub(crate) struct DirectBarrierCensus {
     /// that still has no addresses: `rejected` is 33.64% of duke-586's static-unbound exits and
     /// 40.1% of duke-486's, against `dormant_heat`'s 46.04%.
     ///
-    /// `rejected_barrier` already attributes those exits to the BARRIER that refused the block —
-    /// an opcode shape — and `rejected_unattributed` counts the ones it could not resolve. Neither
+    /// `rejected_barrier` already attributes those exits to the BARRIER that refused the block
+    /// (an opcode shape) and `rejected_unattributed` counts the ones it could not resolve. Neither
     /// says how many distinct addresses the class covers, which is the question that decided the
     /// dormant-heat fork (7 addresses carried 80% there) and the one that has to be asked before
     /// any knob is swept at this class. Unlike `rejected_barrier` this histogram cannot miss: it
     /// IS the map, so its closure against `unbound_targets[rejected]` is exact and carries no
     /// residual.
     ///
-    /// Same key, same two columns, same caveat as its sibling — two rejected spans sharing a
+    /// Same key, same two columns, same caveat as its sibling: two rejected spans sharing a
     /// linear across mode or physical merge into one row.
     #[cfg(feature = "barrier-census-closure")]
     rejected_sites: HashMap<u32, DormantHeatStats>,
@@ -36647,15 +36643,15 @@ pub(crate) struct DirectBarrierCensus {
     /// This is the field that TESTS the §B.4 hypothesis "the 5.1M uncovered one-byte-imm patch
     /// events are the population behind the 24,722 failing lane trials". A `WALKED` bit with no
     /// `IMM`/`DISP` bit means a compile walk ran over these bytes and no lane matcher fired on any
-    /// slot of it — the region is not lane-shaped, whatever else is true of it. Joined against
+    /// slot of it: the region is not lane-shaped, whatever else is true of it. Joined against
     /// `dormant_heat_sites` on the same key, that answers the hypothesis directly instead of
     /// inferring it from two aggregates that were never shown to describe the same population.
     ///
     /// WALK, NOT TRIAL. The heat gate's `lane trial` is the one-per-key-per-epoch exception that
     /// installs only when the compilation registered a lane; a `compile walk` is any pass of
     /// `compile_with_instruction_limit`, trial or ordinary, and this map records walks. Trials are
-    /// a subset and nothing here can say which pass was one. That is fine for §B.4 — the question
-    /// is whether the BYTES are lane-shaped, and an ordinary walk answers it as well as a trial —
+    /// a subset and nothing here can say which pass was one. That is fine for §B.4: the question
+    /// is whether the BYTES are lane-shaped, and an ordinary walk answers it as well as a trial,
     /// but the two words must not be swapped, because "a trial was spent here" is a claim about
     /// the epoch budget that this record cannot support.
     ///
@@ -36674,8 +36670,8 @@ pub(crate) struct DirectBarrierCensus {
     admission_declines: [u64; AdmissionDecline::COUNT],
     /// Per-reason tally of `RetryCause::AdmissionMatrix`, split between the two producers
     /// `stack_width_kind` and the `control_target`/`segment_access` check that runs after it in
-    /// the compile walk (design note `dev_docs/descent2-l1-stack-width-design-2026-08-30.md`
-    /// §0(c), §2(H)).
+    /// the compile walk (descent2 L1
+    /// stack-width design §0(c), §2(H)).
     ///
     /// Recorded ONLY on the full-length compile pass (`instruction_limit >=
     /// MAX_BLOCK_INSTRUCTIONS`), the same gate the word-control counters use, and for the same
@@ -36720,7 +36716,7 @@ struct DormantHeatStats {
 /// §B.4: the first says the region is genuinely not lane-shaped, the second says nothing at all
 /// about its shape, and only the first supports widening the lane class.
 ///
-/// The second is also a WEAK negative — the census may simply have been armed after the walk. See
+/// The second is also a WEAK negative: the census may simply have been armed after the walk. See
 /// `DirectDormantHeatSite::compile_walked` for that caveat, which bounds how far the absence can
 /// be read.
 #[cfg(feature = "barrier-census-closure")]
@@ -36743,8 +36739,8 @@ pub(crate) const DORMANT_HEAT_SITES: usize = 64;
 
 /// How many `stack_width_declines` sites the snapshot publishes, same cap and same reasoning as
 /// `DORMANT_HEAT_SITES`: the tail is dropped rather than summed here because the per-reason
-/// tally (`stack_width_declines`) already carries the exact class total independent of head size
-/// -- unlike `dormant_heat_sites`, this list has no closure identity to preserve.
+/// tally (`stack_width_declines`) already carries the exact class total independent of head size:
+/// unlike `dormant_heat_sites`, this list has no closure identity to preserve.
 #[cfg(feature = "direct-admission-census")]
 pub(crate) const STACK_WIDTH_DECLINE_SITES: usize = 64;
 
@@ -36755,8 +36751,8 @@ impl DirectBarrierCensus {
             self.admission_declines[kind as usize].saturating_add(1);
     }
 
-    /// One `RetryCause::AdmissionMatrix` refusal, at either producer. `linear` is `key.linear()`
-    /// -- the compiling block's entry, not the refusing instruction's own address, matching the
+    /// One `RetryCause::AdmissionMatrix` refusal, at either producer. `linear` is `key.linear()`:
+    /// the compiling block's entry, not the refusing instruction's own address, matching the
     /// `dormant_heat_sites` / `rejected_sites` keying convention.
     #[cfg(feature = "direct-admission-census")]
     fn note_stack_width_decline(&mut self, reason: StackWidthDecline, linear: u32) {
@@ -36869,8 +36865,8 @@ impl DirectBarrierCensus {
         // Register the shape so `note_interpreted` can find it with one probe and without ever
         // creating a row for an instruction that never barriered.
         //
-        // EXCEPT for the dirty-segment rule. Its rows key on the segment's USER -- `0x8a`, `0x8b`
-        // and the other fully-lowered forms that happen to read the segment -- and
+        // EXCEPT for the dirty-segment rule. Its rows key on the segment's USER (`0x8a`, `0x8b`
+        // and the other fully-lowered forms that happen to read the segment) and
         // `note_interpreted` counts by SHAPE, not by address. Registering those shapes would land
         // every interpreted `MOV r,[mem]` in the guest in a barrier row, and `runtime_hits` is
         // the column the campaign ranks by. The census's own history already records this failure
@@ -36954,7 +36950,7 @@ impl DirectBarrierCensus {
             .map(|(&linear, &stats)| (linear, stats))
             .collect();
         // Descending by TOTAL exits, tiebroken by linear so the head is deterministic across runs
-        // with identical counts -- a census whose head reorders between two runs cannot be diffed.
+        // with identical counts: a census whose head reorders between two runs cannot be diffed.
         sites.sort_by(|(left_linear, left), (right_linear, right)| {
             (right.static_exits + right.dynamic_exits)
                 .cmp(&(left.static_exits + left.dynamic_exits))
@@ -37363,7 +37359,7 @@ impl crate::jit::JitState {
             demoted_callout_sites_refused: self.stalls.demoted_callout_sites_refused,
             // A GAUGE and not a running total: the size of a map, read here rather than kept on
             // the tally. Against `callout_interpret_one_demoted` it says whether a demotion is
-            // being LEARNED once per site or re-learned -- the two are within a rounding error of
+            // being LEARNED once per site or re-learned: the two are within a rounding error of
             // each other when the demoted-site map is doing its job, and orders apart when it is
             // not, which is how the misplaced site check was found.
             //
@@ -37516,7 +37512,7 @@ impl crate::jit::JitState {
     }
 
     /// One unconditional increment inside the call-out helper, which has already left native code
-    /// and is about to touch the bus -- the same "the gate would cost as much as the work"
+    /// and is about to touch the bus: the same "the gate would cost as much as the work"
     /// reasoning as the two side-exit counters above.
     pub(crate) fn note_callout_executed(&mut self) {
         self.stalls.callout_executed += 1;
@@ -37611,7 +37607,7 @@ impl crate::jit::JitState {
     /// or on a compile walk, and ungated for the reason `note_callout_executed` is.
     ///
     /// Four of the five keep a PER-ROW count beside the scalar, and the pair costs one extra
-    /// increment on a path that is already off the native lane -- the row index is a field of the
+    /// increment on a path that is already off the native lane: the row index is a field of the
     /// cell the helper is holding, so there is no lookup. Nothing is gated: these sit exactly
     /// where the scalars already sat.
     pub(crate) fn note_interpret_one_executed(&mut self, row: InterpretOneRow) {
@@ -37746,7 +37742,7 @@ impl crate::jit::JitState {
     /// add and neither can mispredict.
     ///
     /// **`SEGWRITE-V86-EDGE`'s counter-run expectation is a LARGE drop here, not a modest one**
-    /// (review finding, PR #809 §6/§7 item 13 -- corrects the segwrite continue design's own
+    /// (PR #809 §6/§7 item 13: corrects the segwrite continue design's own
     /// pre-registration, which predates this predicate's change). The `is_segment_write` predicate
     /// this counts is `CompiledBlock::is_segment_write_block()`, and that predicate now reads
     /// FALSE for the entire population this slice makes eligible (see its doc comment): an
@@ -37773,16 +37769,15 @@ impl crate::jit::JitState {
 }
 
 // ---- from jit/direct/smc_census.rs -------------------------------------------------------------
-// Stage A of the SMC census (`dev_docs/smc-census-design.md` §3, §4, §8 layer 1, cut to a
-// stage A by the adversarial review of 2026-08-15).
+// Stage A of the SMC census (layer 1 of its design, cut to a stage A on 2026-08-15).
 //
-// Scope, verbatim from the review's cut: Q1 (top-pages table), Q2 (no-kill versus killing scan
+// Scope, verbatim from that cut: Q1 (top-pages table), Q2 (no-kill versus killing scan
 // split) and Q6 layer 1 (per-phase UNIT counters). `memory.rs` is not touched, there is no
 // per-block row vector and there is no sampled timer, so the store hot path and the install path
 // are outside this instrument's blast radius entirely. Stage A decides R0, R1, R2 and R6.
 //
 // Everything here is compiled out without `--features smc-census` and, when compiled in, is
-// inert until `IZARRAVM_SMC_CENSUS=1` arms it — the `direct-callout-attribution` shape.
+// inert until `IZARRAVM_SMC_CENSUS=1` arms it: the `direct-callout-attribution` shape.
 //
 // # What the numbers mean, and what they do not
 //
@@ -37795,15 +37790,15 @@ impl crate::jit::JitState {
 // - Scan calls and narrow decode kills have different denominators (design §1). The choke 2x2 is
 //   the only licensed way to relate them.
 // - Phases (e) and (f) NEST (`retire_block` -> `unlink_block` -> `remove_waiting_sources`), which
-//   is review finding M8. The unit rows below are therefore disjoint BY CONSTRUCTION: every (f)
+//   is M8. The unit rows below are therefore disjoint BY CONSTRUCTION: every (f)
 //   row counts work done in `retire_block`/`unlink_block` OUTSIDE `remove_waiting_sources`, and
 //   every (e) row counts work inside it. R6 may add them; it may not add a timed `retire_block`
 //   to a timed `remove_waiting_sources`.
 //
 // # The page table
 //
-// Space-Saving with 64 counters, keyed on `keys_killed` — the quantity R1 ranks (review finding
-// M1). The other six per-page accumulators carry their OWN inherited error fields, so every
+// Space-Saving with 64 counters, keyed on `keys_killed`: the quantity R1 ranks
+// (M1). The other six per-page accumulators carry their OWN inherited error fields, so every
 // reported column has an honest `[count - error, count]` bound rather than borrowing the ranked
 // column's bound.
 //
@@ -37813,13 +37808,13 @@ impl crate::jit::JitState {
 // `k`-counter guarantee sound (a zero-increment item is simply not in the stream) and is also
 // what keeps the table from thrashing on the many pages that are written but never kill.
 //
-// Lookup is an open-addressed `page -> row` side index (review finding M3), not a linear scan
+// Lookup is an open-addressed `page -> row` side index (M3), not a linear scan
 // per fold: a resident page costs one multiply and one probe. The O(64) minimum search and the
 // index rebuild run only on a displacement, which by construction requires a NON-resident page
 // that killed at least one key.
 //
 // Reported error bound: for the ranked column, `error <= N / 64` where `N` is total
-// `keys_killed` (review finding M2). The snapshot carries `N` and `N / 64` so the reader does
+// `keys_killed` (M2). The snapshot carries `N` and `N / 64` so the reader does
 // not re-derive it.
 
 #[cfg(feature = "smc-census")]
@@ -37846,7 +37841,7 @@ pub(crate) struct PageCounts {
     pub(crate) keys_surviving: u64,
     pub(crate) lane_accepts: u64,
     pub(crate) no_kill_visits: u64,
-    /// Sum of `page_keys.keys.len()` at scan time — the occupancy figure design §12.6 says
+    /// Sum of `page_keys.keys.len()` at scan time: the occupancy figure design §12.6 says
     /// nothing records today.
     pub(crate) page_keys_len_sum: u64,
 }
@@ -38023,7 +38018,7 @@ impl PageTable {
 }
 
 #[cfg(feature = "smc-census")]
-/// One reporting phase: the whole run, or the pinned instruction window (design §9.6 — both are
+/// One reporting phase: the whole run, or the pinned instruction window (design §9.6: both are
 /// reported, and the decision rules apply to the pinned window).
 #[derive(Default)]
 struct SmcCensusPhase {
@@ -38170,7 +38165,7 @@ impl SmcCensus {
             if killed != 0 {
                 phase.units.scan_calls_kill += 1;
                 phase.units.keys_kill += keys_scanned;
-                // Review finding M7: the waste a presence filter would elide lives here too, not
+                // M7: the waste a presence filter would elide lives here too, not
                 // only in calls that killed nothing.
                 phase.units.keys_surviving_in_kill_calls += surviving;
             } else if lane_accepts != 0 {
@@ -38373,7 +38368,7 @@ impl BlockCache {
 // round:
 // `CallOutHelper::InterpretOne` was added with the generic call-out and every `match` here kept
 // its three arms, so `cargo build --all-features` had not compiled since. The four-arm shape is
-// restored below and `--all-features` is a build gate from now on -- a feature nobody builds is a
+// restored below and `--all-features` is a build gate from now on: a feature nobody builds is a
 // feature that rots, and this one is the attribution instrument the call-out campaign reaches for
 // whenever a helper's outcome mix is in question.
 //
@@ -38382,7 +38377,7 @@ impl BlockCache {
 // passed one of the three ORIGINAL helpers, so the fourth row stayed at zero while
 // `note_callout_executed` counted its calls, and `direct_callout_attribution_snapshot`'s
 // `attempts == callout_executed` assertion aborted the run instead of reporting anything. GP2
-// aborted on it, short by 152,816,855 -- exactly `callout_interpret_one_executed`. The lesson is
+// aborted on it, short by 152,816,855: exactly `callout_interpret_one_executed`. The lesson is
 // that a compile gate is not a behaviour gate: the closure this instrument asserts at runtime is
 // now
 // asserted by a test that ARMS the instrument and takes a real `InterpretOne` call-out
@@ -38410,7 +38405,7 @@ impl CallOutHelper {
             Self::PushAllDword => 1,
             Self::PopAllDword => 2,
             // ONE index for the whole `InterpretOne` family, not one per row. This instrument is
-            // about the HELPERS -- which of them is being called and how its calls end -- and the
+            // about the HELPERS (which of them is being called and how its calls end) and the
             // per-row split already exists as `callout_interpret_one_rows`, which is ungated and
             // carries executed, resync, resync_fault and demoted. A second row axis here would be
             // the same census under a feature flag.
@@ -38423,7 +38418,7 @@ impl CallOutHelper {
 
     /// Whether this helper's calls are ALSO keyed into the shared per-port table. Derived
     /// from the same exhaustive match shape as `attribution_index`, immediately beside it,
-    /// so a seventh helper cannot be added without answering the port question here -- the
+    /// so a seventh helper cannot be added without answering the port question here: the
     /// closure identity over the ports table is built from this predicate, and used to be a
     /// hand-written `{0, 4, 5}` index sum restated in two crates (it went stale in both).
     const fn attribution_is_port_class(self) -> bool {
@@ -38537,7 +38532,7 @@ impl CallOutAttribution {
             // design), `0xE6` (the gp2 OUT-imm8 slice) and `0xEE` (its DX-port twin). They touch
             // disjoint port SPACES on no fixture this campaign has measured, but nothing in the
             // type enforces that, so the shared table is keyed by the live port value regardless
-            // of which opcode produced it -- and the closure identity over it sums every row this
+            // of which opcode produced it, and the closure identity over it sums every row this
             // arm covers, derived from `attribution_is_port_class` rather than restated as an
             // index set.
             CallOutHelper::PortReadAlDx
@@ -38592,7 +38587,7 @@ impl CallOutAttribution {
             ports,
             totals,
         };
-        // EVERY closure identity, in one place, shared with the `izarravm` JSON writer -- see
+        // EVERY closure identity, in one place, shared with the `izarravm` JSON writer. See
         // `DirectCallOutAttributionSnapshot::assert_closed` for what it checks and for the two
         // stale copies of the ports identity it replaced.
         snapshot.assert_closed();
@@ -38604,7 +38599,7 @@ impl CallOutAttribution {
 impl DirectCallOutOutcomeCounts {
     /// One row's outcomes must sum to its attempts. The only caller is
     /// `DirectCallOutAttributionSnapshot::assert_closed`, which is where every closure clause
-    /// lives now -- including for the `izarravm` JSON writer, which calls the same method.
+    /// lives now, including for the `izarravm` JSON writer, which calls the same method.
     fn row_is_closed(self) -> bool {
         self.continued
             .checked_add(self.step_break)
@@ -38621,9 +38616,9 @@ impl DirectCallOutAttributionSnapshot {
     /// attempts, the totals are the helper rows' sum, the ports table is ordered and free of
     /// empty rows, and its total equals the sum of exactly the PORT-CLASS helper rows.
     ///
-    /// ONE COPY, DELIBERATELY. Every clause here previously existed twice -- once in
-    /// `CallOutAttribution::snapshot` and once in `izarravm`'s `direct_callout_attribution_json`
-    /// -- and the ports clause was written as a literal `{0, 4}` index sum in both. When the
+    /// ONE COPY, DELIBERATELY. Every clause here previously existed twice: once in
+    /// `CallOutAttribution::snapshot` and once in `izarravm`'s `direct_callout_attribution_json`,
+    /// and the ports clause was written as a literal `{0, 4}` index sum in both. When the
     /// `0xE6` OUT-imm8 helper landed at index 5, neither copy was updated, and the first armed
     /// descent2 run aborted at teardown with 101,836,675 port attempts against 54,191,998. The
     /// port-class set is now derived from `CallOutHelper::attribution_is_port_class` through
@@ -38767,8 +38762,8 @@ impl crate::jit::JitState {
         assert_eq!(snapshot.totals.step_break, side_exit_callout_step_break);
 
         // ABNORMAL IS AN INEQUALITY, and the gap is a real population rather than slack. A slot the
-        // governor has DEMOTED leaves through the abnormal stub from the emitted prologue --
-        // `emit_call_out`'s `test byte [cell], STATE_DEMOTED; jnz abnormal` -- without calling any
+        // governor has DEMOTED leaves through the abnormal stub from the emitted prologue
+        // (`emit_call_out`'s `test byte [cell], STATE_DEMOTED; jnz abnormal`) without calling any
         // helper, so it reaches `side_exit_callout_abnormal` and can reach no counter in here. The
         // same is true of the fail-closed return a null published bus takes, which is above
         // `note_callout_executed` in every helper. Census `callout_interpret_one_*` documents that
@@ -38778,7 +38773,7 @@ impl crate::jit::JitState {
 
         // What keeps the inequality above from being vacuous: the `InterpretOne` row is tied
         // EXACTLY to the two ungated counters that see the same events, so a call site that stops
-        // noting -- which is the bug this whole module owes its fourth row to -- still fails here.
+        // noting (which is the bug this whole module owes its fourth row to) still fails here.
         let interpret_one = snapshot
             .helpers
             .iter()
@@ -38799,24 +38794,24 @@ impl crate::jit::JitState {
 // ---- from jit/direct/entry_attribution.rs ------------------------------------------------------
 // Observer-build attribution of the Direct backend's per-entry cost.
 //
-// Implements `dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md` (rev 3, plus the
+// Implements the 16-bit entry-attribution design (rev 3, plus the
 // third review pass's M-R4 / M-R5 / M-R6 corrections). The whole instrument is behind the
 // `direct-entry-attribution` feature, which is excluded from `default`: without the feature the
 // `ea_*!` macros expand to NOTHING, so the plain build is byte-identical in behaviour and carries
-// no symbol. Those macros are NOT in this file -- they live at the crate root in
+// no symbol. Those macros are NOT in this file: they live at the crate root in
 // `crate::entry_attribution_macros`, because `run.rs` invokes some of them outside any `jit` gate.
 // See that module for the full reason.
 //
 // It IS in `--all-features`, and the Cargo.toml entry carries why: cargo gives a feature no way to
 // opt out of that flag, so the design's "excluded from --all-features" claim was never
 // enforceable. That is acceptable only because the instrument is zero-cost while DISARMED. NEVER
-// grade a wall number on an ARMED build -- the full arm measured +24.5% on the loader.
+// grade a wall number on an ARMED build: the full arm measured +24.5% on the loader.
 //
 // Shape: `begin()` at the dispatcher seam anchors a cursor and takes the sample decision;
 // `mark(phase)` closes one phase against that cursor with a raw `rdtsc` delta and no per-mark
 // subtraction; `end(population)` records the whole traversal against one of four populations.
 // State lives in a `thread_local!` `UnsafeCell` with a `const` initialiser and no `Drop`, so a
-// mark is a segment-relative load and a few adds — deliberately NOT a `CpuGsw` or `JitState`
+// mark is a segment-relative load and a few adds, deliberately NOT a `CpuGsw` or `JitState`
 // field, because `CpuGsw` carries `perf: PerfCounters` INLINE and ahead of `pending_flags`, whose
 // offset emitted code bakes (`pending_offset()`), so a cfg'd field there would move baked offsets
 // in the observer build only. This is the same layout hazard `run_direct_block` cites where it
@@ -38879,7 +38874,7 @@ pub const PHASE_NAMES: [&str; N_PHASES] = [
 pub const N_LANES: usize = 4;
 #[cfg(feature = "direct-entry-attribution")]
 pub const LANE_NAMES: [&str; N_LANES] = [
-    "sixteen_bit",    // CS.D = 0, not V86 — real mode and 16-bit protected mode
+    "sixteen_bit",    // CS.D = 0, not V86: real mode and 16-bit protected mode
     "thirty_two",     // CS.D = 1, not V86
     "v86_sixteen",    // CS.D = 0, V86
     "v86_thirty_two", // CS.D = 1, V86
@@ -38924,7 +38919,7 @@ pub const BIN_FIELDS: usize = 4;
 /// `linked_transfers` in {0, 1, 2+} crossed with self-loop.
 ///
 /// A free function, and the exporter's decoder is its inverse below, because the packing used to
-/// live inline in `note_native` while `main.rs` unpacked it by hand from three constants -- two
+/// live inline in `note_native` while `main.rs` unpacked it by hand from three constants: two
 /// expressions of one layout with nothing tying them together.
 #[inline(always)]
 pub fn native_bin_index(insns: u64, hops: u32, self_loop: bool) -> usize {
@@ -38964,7 +38959,7 @@ pub const FALLBACK_TAG_NAMES: [&str; N_FALLBACK_TAGS] = ["neither", "declined", 
 
 #[cfg(feature = "direct-entry-attribution")]
 /// Index constants for `REFUSAL_SITES`, named at the call sites in `run.rs`. Hand assigned and
-/// STABLE by name -- see the `ea_refusal!` doc comment in `entry_attribution_macros.rs` -- unlike
+/// STABLE by name. See the `ea_refusal!` doc comment in `entry_attribution_macros.rs`, unlike
 /// the line each name maps to, which is generated (see below): `build.rs` reads this block back
 /// as its authority for which array index a name owns, so renumbering or reordering here changes
 /// what the generated `REFUSAL_SITES` looks like, but a `run.rs` edit never has to touch it.
@@ -39013,12 +39008,12 @@ pub(crate) mod site {
 // This is what closes the recurring failure class four fixes patched by hand (twice before,
 // then #835 and #837, the last documented at commit 148d8d71): an edit to `run.rs` above one of
 // these sites used to shift the line every hand-typed literal below it cited, and nothing failed
-// until the `armed_tests` fixtures caught it downstream. There is nothing left here to hand-edit
-// -- the table is recomputed from the real call sites on every build that touches `run.rs` or
+// until the `armed_tests` fixtures caught it downstream. There is nothing left here to hand-edit:
+// the table is recomputed from the real call sites on every build that touches `run.rs` or
 // this file.
 //
 // `P0_MARK_LINE` is the `run.rs` line the `mark(P0)` sits on, and the sole authority for which
-// refusal sites are "above" it -- see `PRE_P0_REFUSAL_SITES` just below, which is hand-kept (it
+// refusal sites are "above" it. See `PRE_P0_REFUSAL_SITES` just below, which is hand-kept (it
 // is a set of INDICES, not a line, so it does not drift the way the tables above it did) but
 // checked against `P0_MARK_LINE` by `pre_p0_sites_are_exactly_the_returns_above_the_p0_mark`.
 include!(concat!(env!("OUT_DIR"), "/entry_attribution_lines.rs"));
@@ -39044,7 +39039,7 @@ pub const PRE_P0_REFUSAL_SITES: [usize; 8] = [
 ];
 #[cfg(feature = "direct-entry-attribution")]
 /// Index constants for `COMPILE_SITES`, named at the call sites in `run.rs` (the seven exits of
-/// the `BlockProbe::Compile` arm, B3-R -- all seven take `mark(P14)`, never `mark(P12)`;
+/// the `BlockProbe::Compile` arm, B3-R: all seven take `mark(P14)`, never `mark(P12)`;
 /// `compile_site` is what separates them). Hand assigned and STABLE by name, exactly like `site`
 /// above; `build.rs` reads this block back the same way.
 pub(crate) mod compile_site {
@@ -39064,7 +39059,7 @@ pub(crate) mod compile_site {
 ///
 /// **P14 is exempt** (M-R4): a cold compile that also pays `install`, the fast-map fill and an
 /// arena compaction legitimately exceeds 0.3 ms, and clamping it would shed ticks
-/// `jit_direct_compile_ns` keeps — manufacturing exactly the negative `P14 − compile_ns` gap A3
+/// `jit_direct_compile_ns` keeps, manufacturing exactly the negative `P14 − compile_ns` gap A3
 /// declares a falsifier.
 pub const OUTLIER_TICKS: u64 = 1_000_000;
 
@@ -39214,7 +39209,7 @@ fn rdtsc() -> u64 {
 struct Calibration {
     arm: Arm,
     sample_n: u64,
-    /// `median(bracketed real mark) - median(empty bracket)` -- the resolution floor.
+    /// `median(bracketed real mark) - median(empty bracket)`: the resolution floor.
     overhead_ticks: u64,
     /// The two halves of that difference, carried so the floor can be audited rather than
     /// trusted. The first calibration timed a `Vec::push` and over-stated the floor 2.6x.
@@ -39298,13 +39293,13 @@ fn calibration() -> &'static Calibration {
 ///
 /// Two passes of `CALIBRATION_SAMPLES`, each sample bracketed by a pair of `rdtsc` reads:
 ///
-///   * pass 1 times an EMPTY bracket -- the cost of the measurement itself;
+///   * pass 1 times an EMPTY bracket: the cost of the measurement itself;
 ///   * pass 2 times one real `accumulate()` against a scratch `Tally`, which is the same code the
 ///     hot path runs: an `rdtsc`, a subtract, the clamp compare and two array accumulations.
 ///
 /// `overhead = median(pass 2) - median(pass 1)`. The first version of this function timed
 /// `rdtsc`-to-`rdtsc` with a `Vec::push` between the reads, so it measured neither a mark nor an
-/// empty bracket -- it measured a push. It returned 42 ticks against an in-situ mark cost the
+/// empty bracket: it measured a push. It returned 42 ticks against an in-situ mark cost the
 /// loader put near 16, and the resulting aggregate subtraction drove ten of twelve phases
 /// negative. Medians, not means, because one host preemption in 1e5 samples otherwise owns the
 /// answer.
@@ -39347,8 +39342,8 @@ const CALIBRATION_SAMPLES: usize = 100_000;
 /// D0, invoked as `ea_begin!` at the dispatcher seam in `run_budgeted_inner`, anchored before
 /// anything else on the traversal. Takes the sample decision for this traversal, latches the lane
 /// and writes
-/// the cursor. **Accumulates nothing** (B1): the inter-entry gap — interpreted continuations,
-/// run-loop break checks, device work — never lands in P0, and re-anchoring on the first sampled
+/// the cursor. **Accumulates nothing** (B1): the inter-entry gap (interpreted continuations,
+/// run-loop break checks, device work) never lands in P0, and re-anchoring on the first sampled
 /// traversal after an unsampled stretch is what keeps `SAMPLE=64` from being 64x inflated.
 #[inline(always)]
 pub(crate) fn begin(d: bool, v86: bool) {
@@ -39402,7 +39397,7 @@ fn accumulate(t: &mut Tally, phase: Phase) {
 }
 
 #[cfg(feature = "direct-entry-attribution")]
-/// `mark(p)` — FULL arm only.
+/// `mark(p)`: FULL arm only.
 #[inline(always)]
 pub(crate) fn mark(phase: Phase) {
     if arm() != Arm::Full {
@@ -39430,7 +39425,7 @@ pub(crate) fn mark_coarse(phase: Phase) {
 }
 
 #[cfg(feature = "direct-entry-attribution")]
-/// `end()` — the traversal's whole span against one population. A path that misses `end()` loses
+/// `end()`: the traversal's whole span against one population. A path that misses `end()` loses
 /// one `total` sample and nothing else, because `begin()` re-anchors the cursor.
 #[inline(always)]
 pub(crate) fn end(population: Population) {
@@ -39534,7 +39529,7 @@ pub(crate) fn note_native(insns: u64, hops: u32, self_loop: bool) {
 /// H9's pin. `run_direct_block` has no `d` parameter, so the block's own `mode_key` bit 0 is the
 /// only term available there; the block's key was matched against the live CPU by the probe that
 /// produced it (see the mode-key note in `run_direct_block`), so a mismatch here means the LANE
-/// latched at `begin()` disagrees — which is the failure H9 is about.
+/// latched at `begin()` disagrees, which is the failure H9 is about.
 #[inline(always)]
 pub(crate) fn pin_lane_bit0(bit: u32) {
     if arm() == Arm::Off {
@@ -39568,11 +39563,11 @@ pub struct DirectEntryAttributionSnapshot {
     pub calibration_bracket_ticks: u64,
     pub calibration_mark_ticks: u64,
     pub tsc_hz: u64,
-    /// `ticks[lane][phase]`, raw — no per-mark subtraction, no clamp beyond `OUTLIER_TICKS`.
+    /// `ticks[lane][phase]`, raw: no per-mark subtraction, no clamp beyond `OUTLIER_TICKS`.
     pub ticks_raw: Vec<Vec<u64>>,
     pub marks: Vec<Vec<u64>>,
     pub totals: Vec<Vec<u64>>,
-    /// `end()` calls per population -- the count `totals` is the sum over.
+    /// `end()` calls per population: the count `totals` is the sum over.
     pub totals_count: Vec<Vec<u64>>,
     pub refusal_site: Vec<Vec<u64>>,
     pub compile_site: Vec<Vec<u64>>,
@@ -39623,7 +39618,7 @@ pub(crate) fn snapshot() -> Option<DirectEntryAttributionSnapshot> {
 
 #[cfg(feature = "direct-entry-attribution")]
 /// Test-only: drop everything the calling thread accumulated. The arm and the calibration are
-/// process-global `OnceLock`s and are deliberately NOT reset — a fixture that needs a different
+/// process-global `OnceLock`s and are deliberately NOT reset: a fixture that needs a different
 /// arm has to say so through the parse helpers, which are pure functions for exactly that reason.
 #[cfg(test)]
 pub(crate) fn reset_for_test() {

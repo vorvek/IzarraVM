@@ -3,7 +3,7 @@
 
 //! The SIX 16-bit rows of the tombraid FMV census's loop A, behind `IZARRAVM_V86_LOOP_ROWS`.
 //!
-//! `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1 names the loop and
+//! The 2026-08-20 tombraid re-profile names the loop and
 //! `.bench/results/tomb-fmv-admission-20260819/census-fpu-loop-rows-1-summary.json` carries the
 //! rows. Interpreted hits over the 20e9 boot+FMV prefix, and the static unbound exits behind them:
 //!
@@ -310,7 +310,7 @@ fn loop_a_collateral() -> Vec<(&'static str, Vec<u8>)> {
 /// that moved back without a ladder would change every shipped binary's admission silently, and
 /// the CS-override reversal in particular would ride along unmeasured.
 ///
-/// It reads the AMBIENT knob deliberately -- no override -- and it must therefore agree with the
+/// It reads the AMBIENT knob deliberately, no override, and it must therefore agree with the
 /// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: the whole point
 /// of the `DIRECT_BARRIER` episode is that a knob's ON arm has to be green too, and a fixture that
 /// hard-asserted "off" would make that impossible by construction.
@@ -387,7 +387,7 @@ fn v86_loop_rows_spelling_table_names_both_arms() {
 /// EVERY row flips with the gate, and NOTHING ELSE DOES.
 ///
 /// Catches, in the `false` direction: an arm that forgot its `v86_loop_rows_enabled()` guard, i.e.
-/// a row that ships admitted while the knob says off -- which would make the gate-off census leg
+/// a row that ships admitted while the knob says off, which would make the gate-off census leg
 /// disagree with main and destroy the A/B base. The CS half of that is the one that matters most,
 /// because `classify` ALREADY lowers `0x2b /0` and `0xff /1` and only `prefixes_supported_for`
 /// stands between them and a compiled block.
@@ -426,8 +426,8 @@ fn every_v86_loop_row_flips_with_the_gate() {
 
 /// The neighbours this slice must NOT have swept in. Each is one bit away from an admitted row.
 ///
-/// * `0xf5` CMC -- CLC/STC's neighbour. It needs the INCOMING carry rather than a constant.
-/// * `0xc7 /0` REGISTER form at Word -- refused inside its own arm since before this slice.
+/// * `0xf5` CMC: CLC/STC's neighbour. It needs the INCOMING carry rather than a constant.
+/// * `0xc7 /0` REGISTER form at Word, refused inside its own arm since before this slice.
 ///
 /// `0x15` ADC AX,imm16 and `0x1d` SBB AX,imm16 were on this list too, as ALU form 5's carry members
 /// held out by a separate refusal: `emit_alu_preloaded`'s Word lane used to mask both operands with
@@ -631,7 +631,7 @@ fn pop_segment_is_refused_outside_real_mode_and_at_dword() {
     // `stack_width_kind` must refuse it here through its `(PopSegReal, _, _) => None` arm.
     //
     // Without this row the fixture that NAMES the matrix did not cover it: removing
-    // `| Self::PopSegReal { .. }` from `uses_stack()` -- which skips `stack_width_kind` entirely --
+    // `| Self::PopSegReal { .. }` from `uses_stack()`, which skips `stack_width_kind` entirely,
     // was caught only by `the_loop_compiles_into_the_units_the_census_predicts`, three tests away.
     assert_eq!(
         compile_leading_block_on(sixteen_bit_cpu_with_thirty_two_bit_stack, false, &[0x07]),
@@ -983,7 +983,7 @@ fn the_dword_accumulator_immediate_form_is_unchanged() {
 ///
 /// Catches the trap this slice exists downstream of: both arms hard-coded `MemoryWidth::Dword`
 /// until now, so a Word admission that reused them would move FOUR bytes where the guest moves
-/// two. Two independent assertions see it -- the 0xdead high half on the load (`emit_write_gpr16`
+/// two. Two independent assertions see it: the 0xdead high half on the load (`emit_write_gpr16`
 /// merges, a 32-bit write clobbers) and the whole-RAM compare on the store.
 ///
 /// It also catches an arm that dropped the segment override on the way to `DirectAddr`: the three
@@ -1059,11 +1059,11 @@ fn the_dword_moffs_pair_is_unchanged() {
 ///
 /// Catches:
 ///
-/// * an emitter that wrote the flag SHADOW alone -- the in-memory EFLAGS word stays stale for the
+/// * an emitter that wrote the flag SHADOW alone: the in-memory EFLAGS word stays stale for the
 ///   next reader that goes to memory rather than to the shadow;
-/// * an emitter that wrote EFLAGS alone and left a LIVE descriptor in place -- CF is inside
+/// * an emitter that wrote EFLAGS alone and left a LIVE descriptor in place: CF is inside
 ///   `ARITH_FLAGS`, so the descriptor would recompute it from the pre-CLC operand pair at the next
-///   reader and silently overwrite what the guest just set -- which the `adc ax, 0` row below
+///   reader and silently overwrite what the guest just set, which the `adc ax, 0` row below
 ///   reads back as a different AX;
 /// * a polarity inversion, since both opcodes run against both incoming values;
 /// * `emit_direction_flag`'s shape copied here, which would touch the wrong bit entirely.
@@ -1212,7 +1212,7 @@ fn the_carry_clc_and_stc_write_is_read_back_by_a_later_rcl() {
 ///
 /// Catches:
 ///
-/// * a 32-bit pointer advance -- `alu_r16_imm16` preserves ESP's high half where `add r32` does
+/// * a 32-bit pointer advance: `alu_r16_imm16` preserves ESP's high half where `add r32` does
 ///   not, and the seed poisons it with 0xdead;
 /// * a missing or wrong `access` / `default_size_32` store, both of which live in `SegmentRegister`
 ///   and are compared through `registers`;
@@ -1225,7 +1225,7 @@ fn the_carry_clc_and_stc_write_is_read_back_by_a_later_rcl() {
 /// values, which an emitter that dropped that store would fail (that mutation survived the first
 /// version of this file, because both roles already held a real-mode descriptor and the value it
 /// failed to write was already there). The LIMIT must SURVIVE, because a real-mode segment load
-/// leaves the cached limit alone -- that is what unreal mode is -- and a lowering that helpfully
+/// leaves the cached limit alone (that is what unreal mode is) and a lowering that helpfully
 /// wrote 0xFFFF would disagree with the interpreter.
 #[test]
 fn pop_segment_matches_the_interpreter_in_real_mode_and_v86() {
@@ -1350,8 +1350,8 @@ fn the_cs_override_word_memory_forms_match_the_interpreter() {
 /// must stay a BARRIER, not become a slot that exits on every execution.
 ///
 /// This is the finding the design review blocked on, and it is the one class of defect the
-/// differential rows above cannot see: a certain-exit slot is perfectly CORRECT -- the exit reports
-/// zero completed work and the interpreter runs the instruction -- and it is strictly slower than
+/// differential rows above cannot see: a certain-exit slot is perfectly CORRECT: the exit reports
+/// zero completed work and the interpreter runs the instruction, and it is strictly slower than
 /// the rejected span it replaces, because a rejected span short-circuits through the decline memo
 /// while this pays a dispatcher lookup, a segment check, a native entry, the address, the
 /// page-cross bound, the alignment test and an exit stub first.
@@ -1371,7 +1371,7 @@ fn the_cs_override_word_memory_forms_match_the_interpreter() {
 ///
 /// * ALIGNED must still compile, or the rule is a blanket refusal wearing a measurement's clothes;
 /// * `AluMemDest` at op 7 (CMP) reads through the RELAXED lean site and is SERVED misaligned, so it
-///   must compile -- that op is excluded from the enumeration for that reason and nothing else;
+///   must compile: that op is excluded from the enumeration for that reason and nothing else;
 /// * `AluMemSource` and `Store` are relaxed too, and refusing them would cost the slice two rows;
 /// * a register-relative operand is not decidable here and must be left alone whatever the
 ///   displacement's parity;
@@ -1464,8 +1464,8 @@ fn a_statically_misaligned_cs_operand_stays_a_barrier() {
 /// MUTATION SURVIVED the first version of this file and the compiler even reported `cpu` as unused:
 /// every other row here runs in real mode or V86, where a segment base is a multiple of 16 and
 /// cannot move bit 0 or bit 1, so the term is genuinely inert there. Protected mode is where a data
-/// segment's base is arbitrary, and `emit_alignment_test` runs on RAX -- the LINEAR address, after
-/// `emit_segmented_linear_address` has added the base -- so the base belongs in the arithmetic.
+/// segment's base is arbitrary, and `emit_alignment_test` runs on RAX: the LINEAR address, after
+/// `emit_segmented_linear_address` has added the base, so the base belongs in the arithmetic.
 ///
 /// The two rows differ ONLY in CS's base: at base 0 the even displacement is aligned and the block
 /// compiles; at base 1 the same displacement lands on an odd linear address and the slot would

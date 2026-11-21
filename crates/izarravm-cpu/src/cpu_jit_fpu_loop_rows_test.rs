@@ -3,7 +3,7 @@
 
 //! The FIVE dword rows of the tombraid FMV census's loop B, behind `IZARRAVM_FPU_LOOP_ROWS`.
 //!
-//! `dev_docs/tombraid-reprofile-2026-08-20.md` §4.1 and
+//! The 2026-08-20 tombraid re-profile and
 //! `.bench/results/tombraid-reprofile-20260820/census-fmv-summary.json` between them name the
 //! rows and their interpreted-hit counts over the 20e9 boot+FMV prefix:
 //!
@@ -17,7 +17,7 @@
 //!
 //! **Every positive fixture here forces the arm through `set_fpu_loop_rows_for_test`.** The
 //! shipped default is OFF, so a fixture that read the ambient knob would be testing the refusal
-//! and calling it a lowering -- the mistake the count-lane slice's module doc records from the
+//! and calling it a lowering: the mistake the count-lane slice's module doc records from the
 //! other side of a default flip. The refusal fixtures force `Some(false)` for the same reason
 //! rather than leaning on the default, so they keep meaning what they say after a flip.
 //!
@@ -46,7 +46,7 @@
 //
 // One finding worth keeping. The mode-13 completion mutation fails FIRST inside `run.rs` on
 // `debug_assert!(exit.mode13_dword_reads <= dword_reads)` rather than on any comparison this file
-// makes -- a guard exit reports zero completed dword reads for a slot that deposited one. A
+// makes: a guard exit reports zero completed dword reads for a slot that deposited one. A
 // release build would see it only through the bus-timing equality, which is why `finish` asserts
 // that too rather than settling for the register comparison.
 
@@ -103,7 +103,7 @@ fn sixteen_bit_cpu() -> CpuGsw {
     // different machine than the one this file names.
     //
     // It is NOT what made the 16-bit half of the width bar vacuous, and saying so here is the
-    // point of the comment. `compile` never reads this level at all -- the only consumer is
+    // point of the comment. `compile` never reads this level at all: the only consumer is
     // `try_direct_continuation` (run.rs), which this fixture does not go through, and
     // `key_for_phys` gates a 16-bit key on `word_operands_admitted` instead. The vacuity was the
     // `d` argument; see `compile_leading_block_outcome_on`.
@@ -163,7 +163,7 @@ fn map_direct_page(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, physical: u
 ///
 /// The three-slot shape is `cpu_jit_test_imm_test.rs`'s and is load-bearing for the same reason it
 /// is there: warming only the entry decode line makes slot 1 miss, the walk stops at `Retry`, and
-/// the fewer-than-three-slots gate reports the same `None` as a genuine reject -- so a negative
+/// the fewer-than-three-slots gate reports the same `None` as a genuine reject, so a negative
 /// assertion on an unwarmed shape passes whether or not the opcode is lowered.
 fn compile_leading_block_on(cpu_builder: fn() -> CpuGsw, code: &[u8]) -> Option<u8> {
     compile_leading_block_outcome_on(cpu_builder, code)
@@ -174,14 +174,14 @@ fn compile_leading_block_on(cpu_builder: fn() -> CpuGsw, code: &[u8]) -> Option<
 ///
 /// Split out for the width bar below: since the S3 policy widening the `0xF7 /7` row at Word JOINS
 /// the block as an `InterpretOne` call-out instead of ending it, so the claim that fixture makes
-/// is about the slot CLASS -- it must not reach `DivMem` -- rather than about the block length.
+/// is about the slot CLASS (it must not reach `DivMem`) rather than about the block length.
 ///
 /// **`d` IS READ OFF THE CPU, and that is a fix rather than a tidy-up.** This walk passed a literal
 /// `true`, which is right for `flat_586` and wrong for `sixteen_bit_cpu`. The decode cache is keyed
 /// on `d` (`key_for` -> `DecodeCache::line_phys_start(lin, d)`), and `decode_fixture` warms its
 /// lines through `fetch_decoded`, which uses the CPU's REAL CS.D. So on the 16-bit builder every
 /// line was warmed at `d = false` and then looked up at `d = true`, `key_for` returned `None`, and
-/// the walk retried out for EVERY input -- a plain `inc ax` included. The whole 16-bit half of the
+/// the walk retried out for EVERY input, a plain `inc ax` included. The whole 16-bit half of the
 /// width bar below was therefore passing for the harness's reason rather than the rows'. Reading
 /// the flag off the same segment `fetch_decoded` reads makes the two sides unable to disagree.
 fn compile_leading_block_outcome_on(
@@ -206,7 +206,7 @@ fn compile_leading_block_outcome_on(
     // Unconditional, and not only for the memory rows: with `RAM_TARGET`'s page absent from the
     // fast map EVERY memory kind is refused, `mov eax, [disp32]` included, so a negative
     // assertion made without it would pass for the harness's reason rather than the row's. That
-    // is the "fixture that cannot fail" trap in its exact local form -- the first draft of this
+    // is the "fixture that cannot fail" trap in its exact local form: the first draft of this
     // file asserted the Word-size refusal of two memory rows against a CPU that would have
     // refused their DWORD forms too.
     map_direct_page(&mut cpu, &mut bus, RAM_TARGET, RAM_TARGET);
@@ -252,7 +252,7 @@ fn fpu_loop_row_encodings() -> [(&'static str, Vec<u8>); 5] {
 /// 2026-08-20 tombraid-586 ladder (-17.2% min-wall, full non-overlap); a default that moved back
 /// without a ladder would change every shipped binary's admission silently.
 ///
-/// It reads the AMBIENT knob deliberately -- no override -- so it also fails if
+/// It reads the AMBIENT knob deliberately (no override) so it also fails if
 /// `IZARRAVM_FPU_LOOP_ROWS=0` is exported in the environment running the suite, which is the
 /// correct outcome: the rest of this file states its arm, and a fixture that means to pin the
 /// shipped default has nowhere else to read it from.
@@ -307,7 +307,7 @@ fn fpu_loop_rows_spelling_table_names_both_arms() {
 /// EVERY row flips with the gate, and NOTHING ELSE DOES.
 ///
 /// Catches, in the `false` direction: an arm that forgot its `fpu_loop_rows_enabled()` guard, i.e.
-/// a row that ships admitted while the knob says off -- which would make the gate-off census leg
+/// a row that ships admitted while the knob says off, which would make the gate-off census leg
 /// disagree with main and destroy the A/B base.
 ///
 /// Catches, in the `true` direction: a missing or wrongly-keyed classify arm. This is the red
@@ -356,7 +356,7 @@ fn every_fpu_loop_row_flips_with_the_gate() {
 /// * a 66-prefixed encoding in a 32-bit segment (`OperandSize::Word`, prefix mask 1), and
 /// * an UNPREFIXED encoding in a CS.D = 0 segment (`OperandSize::Word`, prefix mask 0).
 ///
-/// Neither half may panic -- `compile_leading_block_outcome_on` runs the whole compile walk, so an
+/// Neither half may panic: `compile_leading_block_outcome_on` runs the whole compile walk, so an
 /// `unreachable!` or an `expect` reached through a Word path fails this test loudly rather than in
 /// production.
 ///
@@ -364,14 +364,14 @@ fn every_fpu_loop_row_flips_with_the_gate() {
 /// `InterpretOne` call-out since the S3 policy widening, and the claim this test makes about it is
 /// unchanged in substance: a Word operand must never reach a Dword lowering. What changed is how
 /// that is said. "The block ends here" was the proxy while nothing could carry the row; now the
-/// row is carried, so the assertion is the SLOT CLASS -- a `DivMem` lowering would report a
+/// row is carried, so the assertion is the SLOT CLASS: a `DivMem` lowering would report a
 /// compiled block with zero call-out slots, which is neither of the two answers the table admits.
 ///
 /// The gate is forced ON throughout: with it off the rows are refused for the wrong reason and the
 /// assertion would pass vacuously.
 ///
 /// The POSITIVE CONTROL runs first on BOTH machines and is not decoration. The 16-bit half of this
-/// test spent its whole life vacuous -- the walk was handed `d = true` against a CS.D = 0 CPU, so
+/// test spent its whole life vacuous: the walk was handed `d = true` against a CS.D = 0 CPU, so
 /// `key_for` missed the decode lines and returned `None` for every input including a plain
 /// `inc ax`, and all five refusals passed for the harness's reason. A refusal table with no
 /// control cannot tell "this row is refused" from "this harness refuses everything", and that is
@@ -535,11 +535,11 @@ fn assert_word_answer(label: &str, outcome: Option<jit::direct::Compilation>, an
 /// Catches a widened classify arm. Each of these is one bit away from an admitted row and each
 /// would be a miscompile rather than a missed lowering:
 ///
-/// * `0x9F` LAHF -- SAHF's sibling in the same interpreter arm, writing AH from the flag byte. No
+/// * `0x9F` LAHF: SAHF's sibling in the same interpreter arm, writing AH from the flag byte. No
 ///   emitter, no census row.
-/// * `0xD9 F8` FPREM, `0xD9 FE` FSIN -- two of the six `0xD9 /7` register encodings that stay
+/// * `0xD9 F8` FPREM, `0xD9 FE` FSIN: two of the six `0xD9 /7` register encodings that stay
 ///   rejected. They share the ModRM `reg` field with FRNDINT and differ only in `rm`.
-/// * `0xF7 /4` MUL memory and `0xF7 /5` IMUL-accumulator memory -- `DivMem`'s neighbours in the
+/// * `0xF7 /4` MUL memory and `0xF7 /5` IMUL-accumulator memory: `DivMem`'s neighbours in the
 ///   group-3 arm. `/4`'s register arm returns from `classify` rather than from the match, so a
 ///   memory `/4` was already unreachable; `/5`'s memory form was already admitted and must stay
 ///   admitted, which is what its entry in the ADMITTED list below pins.
@@ -666,7 +666,7 @@ fn prepare(row: &[u8], target: u32, arm: &dyn Fn(&mut CpuGsw)) -> Fixture {
 /// everything the campaign compares.
 ///
 /// `expect_retired` is the whole guard contract in one number. It is 3 when the row runs
-/// natively and 1 when the row's guard exits -- one for the leading `mov edi, edi` and nothing
+/// natively and 1 when the row's guard exits: one for the leading `mov edi, edi` and nothing
 /// for the row itself, which is what "the exit leaves the instruction un-started" means in
 /// counters. The interpreter is stepped the SAME number of instructions, so a comparison after a
 /// guard exit is still a comparison of the same guest program point.
@@ -760,7 +760,7 @@ fn base_arm(cpu: &mut CpuGsw, eflags: u32, live_descriptor: bool) {
 ///   recomputed from the pre-SAHF operand pair at the next reader, silently overwriting what the
 ///   guest just loaded, which `eflags()` then reads back wrong. The `adc` reader rows below are
 ///   what make that observable rather than merely stored.
-/// * **A mask widened to `ARITH_FLAGS`.** That clears OF whenever AH's bit 11 is clear -- and AH
+/// * **A mask widened to `ARITH_FLAGS`.** That clears OF whenever AH's bit 11 is clear, and AH
 ///   has no bit 11. The `of` loop is what sees it: the 0x00 and 0xff AH rows both keep OF.
 /// * **A missing publish to `CpuGsw.eflags`.** RBP alone leaves the in-memory word stale for the
 ///   next reader that goes to memory rather than to the shadow.
@@ -806,7 +806,7 @@ fn setcc_mem(condition: u8, target: u32) -> Vec<u8> {
 ///
 /// * a condition code translated on its way to `Encoder::setcc` (the register form's own tests
 ///   would not see a memory-only mistranslation);
-/// * a store WIDER than one byte -- `POISON` fills the seven bytes after the target and the whole
+/// * a store WIDER than one byte: `POISON` fills the seven bytes after the target and the whole
 ///   memory image is compared;
 /// * the value being computed inside `emit_store`'s scratch instead of parked, which produces
 ///   whatever the address path left in RDX rather than the condition;
@@ -907,8 +907,8 @@ fn run_div_mem(
 ///
 /// The `expect_retired` column IS the guard contract:
 ///
-/// * 3 -- the divide ran natively;
-/// * 1 -- a guard exited with the instruction un-started, and the interpreter (stepped one
+/// * 3: the divide ran natively;
+/// * 1: a guard exited with the instruction un-started, and the interpreter (stepped one
 ///   instruction, i.e. only the leading `mov edi, edi`) agrees on every register, flag and byte.
 ///
 /// Catches: a guard that admits a faulting divide (the host would fault inside emitted code, which
@@ -962,7 +962,7 @@ fn div_and_idiv_memory_match_the_interpreter_across_the_guard_classes() {
 ///
 /// `emit_ram_read_pointer` deposits `mode13_dword_reads` into the frame before it returns, and
 /// `emit_return` copies that lane out on every exit. A divide-guard exit taken after the deposit
-/// therefore charges one guest read TWICE -- once natively and once when the interpreter
+/// therefore charges one guest read TWICE: once natively and once when the interpreter
 /// re-executes the instruction whole.
 ///
 /// Catches it in two independent ways, and the first fires even in a build that ignores bus

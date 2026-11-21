@@ -1,30 +1,29 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Fixtures for the 16-bit entry-attribution observer
-//! (`dev_docs/specs/2026-08-23-sixteen-bit-entry-attribution-design.md`).
+//! Fixtures for the 16-bit entry-attribution observer.
 //!
 //! What each one is able to FAIL on, which is the only reason to write it:
 //!
-//! * `armed_and_disarmed_runs_leave_identical_guest_state` -- A4. Any stamp that touched guest
+//! * `armed_and_disarmed_runs_leave_identical_guest_state`: A4. Any stamp that touched guest
 //!   state, the guest clock or a perf counter shows up as a diff.
-//! * `marks_per_entry_are_the_published_factors` -- P8 twice per entry, P9/P7/P6 once. A mark
+//! * `marks_per_entry_are_the_published_factors`: P8 twice per entry, P9/P7/P6 once. A mark
 //!   placed on the wrong side of a branch, or a P4/P5/P8 pair reduced to one, breaks it, and A3
 //!   rests on it.
-//! * `every_traversal_that_enters_takes_one_p11_and_one_end` -- an exit path that forgets `end()`
+//! * `every_traversal_that_enters_takes_one_p11_and_one_end`: an exit path that forgets `end()`
 //!   leaves the entered population short of `marks(P11)`.
-//! * `entered_totals_exclude_the_compile_span` -- B3's denominator clause. Leaving the compile
+//! * `entered_totals_exclude_the_compile_span`: B3's denominator clause. Leaving the compile
 //!   inside `total_entered` put A1 at 0.66 and inflated E by 48% on the loader.
-//! * `refusal_sites_close_against_the_marks_that_reached_them` -- a refusal without a
+//! * `refusal_sites_close_against_the_marks_that_reached_them`: a refusal without a
 //!   `refusal_site` bump, or a site bumped without a mark.
-//! * `the_refusal_and_compile_tables_name_the_lines_they_claim` -- parses `run.rs` and checks
+//! * `the_refusal_and_compile_tables_name_the_lines_they_claim`: parses `run.rs` and checks
 //!   every cited line really carries the named return, so the tables cannot go stale in silence.
-//! * `the_sampled_arm_stamps_end_to_end` -- a stride that inflates a phase, or a sampled
+//! * `the_sampled_arm_stamps_end_to_end`: a stride that inflates a phase, or a sampled
 //!   traversal marked without a `begin()`.
-//! * `the_coarse_arm_takes_exactly_the_two_native_marks` -- a `mark_coarse` that leaked into the
+//! * `the_coarse_arm_takes_exactly_the_two_native_marks`: a `mark_coarse` that leaked into the
 //!   FULL-only set, or the reverse.
-//! * `the_disarmed_arm_accumulates_nothing` -- a stamp that runs before the arm is read.
-//! * `p14_is_exempt_from_the_outlier_clamp` -- drives a REAL over-clamp interval and checks P14
+//! * `the_disarmed_arm_accumulates_nothing`: a stamp that runs before the arm is read.
+//! * `p14_is_exempt_from_the_outlier_clamp`: drives a REAL over-clamp interval and checks P14
 //!   keeps it while another phase sheds it.
 //!
 //! The arm is overridden per THREAD (`arm_for_test`), never through the process-global env gate:
@@ -106,8 +105,8 @@ fn spin_ticks(target: u64) {
 
 /// A4 on the SAME binary: arming the observer must not move one bit of guest-visible state.
 ///
-/// Achievable by construction — the guest clock is `master_ticks` and the host `Instant`/`rdtsc`
-/// reads are observation only — which is exactly why a failure here means a stamp reached
+/// Achievable by construction: the guest clock is `master_ticks` and the host `Instant`/`rdtsc`
+/// reads are observation only, which is exactly why a failure here means a stamp reached
 /// somewhere it must not.
 #[test]
 fn armed_and_disarmed_runs_leave_identical_guest_state() {
@@ -128,7 +127,7 @@ fn armed_and_disarmed_runs_leave_identical_guest_state() {
 /// The published marks-per-entry factors (section 3 / 4b): P4, P5 and P8 are stamped TWICE per
 /// entry because they are not contiguous in source, and everything else once.
 ///
-/// P8 is the load-bearing one — A3 reads `marks(P8) = 2 x jit_direct_entries` — and it is the one
+/// P8 is the load-bearing one: A3 reads `marks(P8) = 2 x jit_direct_entries`, and it is the one
 /// a "tidy up the duplicated mark" edit would break.
 #[test]
 fn marks_per_entry_are_the_published_factors() {
@@ -180,7 +179,7 @@ fn every_traversal_that_enters_takes_one_p11_and_one_end() {
     assert!(entries > 0, "no native entry ran");
     assert_eq!(marks(&snap, Phase::TailClocks), entries);
     // The real check, and the reason `totals_count` exists: `totals` is a SUM of spans, so a
-    // return that forgot `end()` is invisible in it -- the sum just comes out smaller, which is
+    // return that forgot `end()` is invisible in it: the sum just comes out smaller, which is
     // indistinguishable from a faster run. The COUNT is not: one `end(Entered)` per terminal
     // mark, exactly.
     assert_eq!(
@@ -196,7 +195,7 @@ fn every_traversal_that_enters_takes_one_p11_and_one_end() {
 /// Driven through the instrument's own primitives rather than a guest run, because a guest
 /// compile is microseconds and the property needs a span big enough to see unambiguously. A
 /// traversal that spends `spin` inside P14 and then a short tail must record a total that is
-/// SMALLER than the compile it just paid for -- if the subtraction is dropped, the total is
+/// SMALLER than the compile it just paid for: if the subtraction is dropped, the total is
 /// larger than `spin` instead, which is the exact defect the loader measurement found (A1 at
 /// 0.66, E inflated 48%).
 #[test]
@@ -224,7 +223,7 @@ fn entered_totals_exclude_the_compile_span() {
 }
 
 /// H3: every early return is both marked and named. The refusal histogram's total must equal the
-/// number of P12 marks — a refusal that bumps the histogram without marking (or the reverse) is a
+/// number of P12 marks: a refusal that bumps the histogram without marking (or the reverse) is a
 /// hole in the closure A1 is computed over.
 #[test]
 fn refusal_sites_close_against_the_marks_that_reached_them() {
@@ -247,7 +246,7 @@ fn refusal_sites_close_against_the_marks_that_reached_them() {
 /// B1: the stride decision is taken at `begin()`, so a sampled traversal is stamped END TO END.
 ///
 /// The check that can fail: with a stride of N the mark COUNTS fall by roughly N, but the
-/// per-mark cost does not move — a stride that let the inter-entry gap into P0 would inflate it.
+/// per-mark cost does not move: a stride that let the inter-entry gap into P0 would inflate it.
 #[test]
 fn the_sampled_arm_stamps_end_to_end() {
     let (_cpu, full) = run_under(Arm::Full, 1);
@@ -339,7 +338,7 @@ fn the_disarmed_arm_accumulates_nothing() {
 
 /// M-R4: P14 is exempt from the outlier clamp, and every other phase is not.
 ///
-/// Drives a REAL interval past `OUTLIER_TICKS` twice -- once closed by P14, once by P2 -- and
+/// Drives a REAL interval past `OUTLIER_TICKS` twice (once closed by P14, once by P2) and
 /// checks the two are treated differently. The previous version of this fixture asserted
 /// `marks(P15) == outlier_marks` on a guest run where nothing took 0.3 ms, so both sides were
 /// zero and it could not fail. Without the exemption a cold compile that also pays `install` and
@@ -427,7 +426,7 @@ fn the_snapshot_reports_raw_ticks_and_the_overhead_separately() {
 /// The `IZARRAVM_DIRECT_ENTRY_ATTRIBUTION` spelling table, read through the pure parse helper so
 /// the process-global `OnceLock` is not involved.
 ///
-/// Unlike the lane family, unset and the EMPTY STRING both select OFF here — this knob's default
+/// Unlike the lane family, unset and the EMPTY STRING both select OFF here: this knob's default
 /// arm IS the off arm, so the two spellings agree and a nulled PowerShell variable cannot arm the
 /// observer by accident.
 #[test]

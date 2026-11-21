@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The rejected-row campaign's Slice 2: the F7 register-dword group -- `/5` IMUL, `/6` DIV and
+//! The rejected-row campaign's Slice 2: the F7 register-dword group: `/5` IMUL, `/6` DIV and
 //! `/7` IDIV.
 //!
 //! Every row runs the same guest bytes natively and through a BLOCK-FREE interpreter from
@@ -11,15 +11,15 @@
 //!
 //! Two row shapes, because DIV and IDIV are the first lowered instructions that can FAULT:
 //!
-//! * `lowered` -- the divide completes natively. All three slots retire in the block and the
+//! * `lowered`: the divide completes natively. All three slots retire in the block and the
 //!   divide guard must NOT have fired.
-//! * `guarded` -- the emitted guard refuses. The native run must end AT the divide with the
+//! * `guarded`: the emitted guard refuses. The native run must end AT the divide with the
 //!   instruction un-started, `side_exit_divide_guard` must count exactly one, and the state at
 //!   that boundary must equal the interpreter's after the one slot before it. Both roles then
 //!   step the divide interpreted and must agree on the outcome, fault included.
 //!
 //! **The guard is what keeps a guest #DE out of the host.** A host `div` with a zero divisor
-//! raises an exception on the JIT stack -- inside the emulator process, not in the guest. The
+//! raises an exception on the JIT stack, inside the emulator process, not in the guest. The
 //! mutation that proves it is deleting either guard from `emit_div_reg`: the `guarded` rows below
 //! then do not fail an assertion, they ABORT the test process. That is the whole point of the
 //! `divide_by_zero_*` and `quotient_overflow_*` rows, and it is why they exercise a real host
@@ -33,13 +33,13 @@
 //!   `idiv_min_dividend_over_minus_one_...` exits `0xc0000095 STATUS_INTEGER_OVERFLOW` on the
 //!   host's own `i64::MIN / -1`.
 //! * dropping guard 3 (the `i32` range compare): `idiv_quotient_overflow_...` fails on the
-//!   retirement count at `quotient i32::MAX + 1` -- all three slots retire where one should,
+//!   retirement count at `quotient i32::MAX + 1`: all three slots retire where one should,
 //!   i.e. the divide completed natively at a point the interpreter faults.
 //! * `emit_clear_pending` added to `emit_div_reg`: every `p=true` row fails on lazy flags
 //!   (`PendingFlags { tag: 0, .. }` against the seeded descriptor), because `CpuGsw::div` leaves
 //!   the descriptor alone.
 //! * `imul_r32` -> `mul_r32` in `emit_imul_reg_acc`: both IMUL rows fail on registers, first at
-//!   `eax=0xffffffff src=0xffffffff` -- (-1) * (-1), where the unsigned product's high half is
+//!   `eax=0xffffffff src=0xffffffff`: (-1) * (-1), where the unsigned product's high half is
 //!   0xfffffffe and the signed one is 0.
 
 use super::*;
@@ -68,7 +68,7 @@ fn idiv(rm: u8) -> [u8; 2] {
 
 /// The seeded architectural state a row starts both roles from. `edx:eax` is the implicit
 /// dividend / multiplicand pair; `divisor_reg` is the ModRM r/m register and `divisor` the value
-/// put in it (ignored when `divisor_reg` is 0 or 2, which alias the accumulator pair -- those
+/// put in it (ignored when `divisor_reg` is 0 or 2, which alias the accumulator pair, those
 /// rows are exactly the aliasing cover).
 #[derive(Clone, Copy)]
 struct Seed {
@@ -296,8 +296,8 @@ fn guarded(body: &[u8], seed: Seed, context: &str) {
         roles.native.registers.eip, roles.body_at,
         "{context}: the run must end AT the divide, not after it"
     );
-    // One interpreted step on the twin puts it at the same boundary. Everything -- the
-    // accumulator pair included -- must match: a guard that fired after touching a home would
+    // One interpreted step on the twin puts it at the same boundary. Everything (the
+    // accumulator pair included) must match: a guard that fired after touching a home would
     // show up here and nowhere else.
     roles.interp.cycle(&mut roles.interp_bus).unwrap();
     compare_state(&roles, &format!("{context}: at the guard"));
@@ -315,7 +315,7 @@ fn guarded(body: &[u8], seed: Seed, context: &str) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 0xF7 /5 -- IMUL r/m32, one-operand signed multiply. No fault path at all.
+// 0xF7 /5: IMUL r/m32, one-operand signed multiply. No fault path at all.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -373,7 +373,7 @@ fn imul_register_form_handles_its_own_destination_registers() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 0xF7 /6 -- DIV r/m32, unsigned. The guard is EXACTLY the interpreter's fault set.
+// 0xF7 /6: DIV r/m32, unsigned. The guard is EXACTLY the interpreter's fault set.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
@@ -412,7 +412,7 @@ fn div_register_form_matches_the_interpreter() {
 fn div_register_form_handles_its_own_destination_registers() {
     // `DIV EAX` and `DIV EDX` take the divisor out of the pair the result overwrites. Both are
     // representable only in narrow cases, and both of the rows here are: EDX < EAX for the first,
-    // and EDX < EDX is false, so the `DIV EDX` rows are GUARDED rather than lowered -- a divisor
+    // and EDX < EDX is false, so the `DIV EDX` rows are GUARDED rather than lowered: a divisor
     // that equals EDX always overflows, which is the guard's own boundary.
     for eax in [1u32, 2, 0xffff_ffff] {
         lowered(
@@ -434,7 +434,7 @@ fn div_register_form_handles_its_own_destination_registers() {
 fn div_by_zero_exits_to_the_interpreter_instead_of_faulting_the_host() {
     // THE row this whole guard exists for. A host `div ecx` with ECX = 0 raises #DE on the JIT
     // stack, which is an emulator-process exception and not a guest fault. Reaching this test at
-    // all -- never mind its assertions -- is the evidence that the guard runs first.
+    // all (never mind its assertions) is the evidence that the guard runs first.
     for edx in [0u32, 1, 0xffff_ffff] {
         for eax in [0u32, 0xffff_ffff] {
             guarded(
@@ -477,13 +477,13 @@ fn div_quotient_overflow_exits_at_the_guards_exact_boundary() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 0xF7 /7 -- IDIV r/m32, signed. Divided at 64 bits, then range-compared.
+// 0xF7 /7: IDIV r/m32, signed. Divided at 64 bits, then range-compared.
 // ---------------------------------------------------------------------------------------------
 
 #[test]
 fn idiv_register_form_matches_the_interpreter() {
     // Sign combinations first, because IDIV truncates TOWARD ZERO and the remainder takes the
-    // DIVIDEND's sign -- a lowering that used a flooring division would agree on every row where
+    // DIVIDEND's sign: a lowering that used a flooring division would agree on every row where
     // the two operands share a sign and differ on every row where they do not.
     for (edx, eax, divisor) in [
         (0u32, 0u32, 1u32),
@@ -494,7 +494,7 @@ fn idiv_register_form_matches_the_interpreter() {
         (0, 1, 1),
         (0xffff_ffff, 0xffff_ffff, 1), // -1 / 1
         (0, 0x7fff_ffff, 1),           // the largest representable quotient
-        (0xffff_ffff, 0x8000_0000, 1), // i32::MIN / 1, the smallest -- and legal
+        (0xffff_ffff, 0x8000_0000, 1), // i32::MIN / 1, the smallest, and legal
         (0, 0x0001_0000, 0x0001_0000),
         (0xffff_ffff, 0x8765_4321, 0x1234_5678),
     ] {
@@ -573,7 +573,7 @@ fn idiv_min_dividend_over_minus_one_exits_instead_of_overflowing_the_host_divide
 fn idiv_by_minus_one_is_refused_conservatively_and_still_agrees() {
     // Guard 2 is the ONLY place this lowering refuses more than the interpreter faults on: a
     // legal `IDIV` by -1 takes a side exit and the interpreter completes it. The row is here so
-    // the conservatism is a TESTED property rather than a comment -- if it is ever made exact,
+    // the conservatism is a TESTED property rather than a comment: if it is ever made exact,
     // these become `lowered` and the change is visible in the diff.
     for (edx, eax) in [
         (0u32, 0u32),
@@ -591,7 +591,7 @@ fn idiv_by_minus_one_is_refused_conservatively_and_still_agrees() {
 #[test]
 fn idiv_register_form_handles_its_own_destination_registers() {
     // `IDIV EAX` with EDX = 0 divides a positive dividend by itself: quotient 1, remainder 0, and
-    // representable. The row proves the divisor is read BEFORE EAX is overwritten -- an emitter
+    // representable. The row proves the divisor is read BEFORE EAX is overwritten: an emitter
     // that wrote the quotient home first would divide by the quotient.
     for eax in [1u32, 2, 7, 0x7fff_ffff] {
         lowered(
@@ -618,6 +618,6 @@ fn idiv_register_form_handles_its_own_destination_registers() {
 // Admission is pinned next to the group's other admission cover, in
 // `cpu_jit_test_imm_test.rs`: `group3_non_test_subops_remain_interpreter_only` holds the byte,
 // memory and 66-prefixed forms out, and `group3_dword_neg_register_form_is_lowered` holds these
-// three in. Both halves are needed -- a negative list alone cannot tell "this sub-opcode stayed
+// three in. Both halves are needed: a negative list alone cannot tell "this sub-opcode stayed
 // out" from "nothing compiles any more".
 // ---------------------------------------------------------------------------------------------

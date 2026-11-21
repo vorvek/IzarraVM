@@ -628,8 +628,8 @@ fn randomized_operations_match_a_chunk_refcount_model() {
 }
 
 /// Slice 0 of the watched-page-bit design: the sticky edge counter counts EXACTLY the
-/// unwatched -> watched page transitions — new precise entries, and re-marks after a
-/// generation `clear()` (the doom pattern the counter exists to price) — and nothing else.
+/// unwatched -> watched page transitions: new precise entries, and re-marks after a
+/// generation `clear()` (the doom pattern the counter exists to price), and nothing else.
 /// A re-mark on a live page, published or not, is not an edge.
 #[test]
 fn sticky_page_edges_count_only_unwatched_to_watched_transitions() {
@@ -657,7 +657,7 @@ fn sticky_page_edges_count_only_unwatched_to_watched_transitions() {
     );
 
     // The generation pattern: clear() empties the table, so the re-decode wave re-crosses the
-    // edge. The counter deliberately survives clear() — the churn is what it measures.
+    // edge. The counter deliberately survives clear(): the churn is what it measures.
     watch.clear();
     let _ = watch.mark_range(0x1000, 1);
     assert_eq!(watch.page_edges(), 3, "post-clear re-mark is a fresh edge");

@@ -503,7 +503,7 @@ fn a_wrapping_bp_operand_reads_the_masked_address() {
 /// 32-bit base register, so the divergence is arbitrary rather than merely high.
 ///
 /// The explicit 0x66 is what keeps this fixture about the DWORD operand form. It used to be what
-/// made the fixture possible at all -- `0x8d` was off the Word allowlist, so an unprefixed
+/// made the fixture possible at all: `0x8d` was off the Word allowlist, so an unprefixed
 /// `8D 46 22` in a 16-bit segment was refused before the emitter was reached, and the corollary
 /// recorded here was that nothing on any corpus would ever reach this path. The S1 width lift
 /// admitted the row, so the unprefixed form is now ordinary loader traffic and is covered by
@@ -896,7 +896,7 @@ fn tier_zero_byte_forms_and_near_jmp_form_a_sixteen_bit_block() {
 /// `0x66`, so the prefix and length bars already refuse it". **That argument is false in a 16-bit
 /// code segment**, where the operand size follows CS.D rather than a prefix: an unprefixed
 /// `c1 e0 03` decodes as `shl ax, 3` at `OperandSize::Word` with default prefixes, `disp_len 0`,
-/// `imm_len 1` and `len 3` — every bar satisfied. `0xC1` is on classify's Word allowlist, so
+/// `imm_len 1` and `len 3`, every bar satisfied. `0xC1` is on classify's Word allowlist, so
 /// `classify` produced `Shift { width: Word }`, the lane attached, and `emit_shift_lane` reached
 /// its `unreachable!` and PANICKED THE COMPILER. The fix bars the kind's own width; this fixture
 /// is what keeps it barred.
@@ -904,7 +904,7 @@ fn tier_zero_byte_forms_and_near_jmp_form_a_sixteen_bit_block() {
 /// The assertion is threefold and each third would have been enough to catch the crash: the
 /// compile does not panic, it takes NO lane, and the emitted block still computes the Word shift
 /// the interpreter computes. The last one is what says the fix is a lane refusal rather than a
-/// lowering refusal — the Word form must keep compiling with a baked count, exactly as it did
+/// lowering refusal: the Word form must keep compiling with a baked count, exactly as it did
 /// before this slice existed.
 #[cfg(all(
     feature = "jit",
@@ -917,8 +917,8 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
     let mut memory = vec![0u8; 0x2000];
     memory[ENTRY as usize..ENTRY as usize + 8].copy_from_slice(&[
         0x40, // inc ax
-        0xc1, 0xe0, 0x03, // shl ax, 3   -- Word by CS.D, no prefix, three bytes
-        0xc1, 0xe8, 0x01, // shr ax, 1   -- the count-1 shape, likewise Word
+        0xc1, 0xe0, 0x03, // shl ax, 3: Word by CS.D, no prefix, three bytes
+        0xc1, 0xe8, 0x01, // shr ax, 1: the count-1 shape, likewise Word
         0xf4, // hlt
     ]);
     let mut bus = sixteen_bit_bus(memory.clone());
@@ -976,15 +976,15 @@ fn a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane() {
 /// `vorvek/direct-word-rot1` gave `RotateReg` a `width` field and admitted `0xC1`/`0xD1 /0,/1` at
 /// Word, which puts the SAME shape past `count_lane_for` that the shift fixture above catches: an
 /// unprefixed `c1 c0 03` (`rol ax, 3`) in a CS.D=0 segment decodes at `OperandSize::Word` with
-/// default prefixes, `disp_len 0`, `imm_len 1`, `len 3` -- every bar the lane matcher tests bar
+/// default prefixes, `disp_len 0`, `imm_len 1`, `len 3`: every bar the lane matcher tests bar
 /// its own kind's width. `count_lane_for`'s kind guard reads `RotateReg { width:
 /// MemoryWidth::Dword, .. }` rather than a bare `lane: None`, for exactly this reason.
 ///
 /// Unlike the shift sibling, this is a PREVENTIVE fixture rather than a repeat of a documented
 /// crash: the width field and the kind guard's width bar were added in the same slice, so there was
 /// no moment in this tree's history where a Word rotate actually reached the lane matcher unbarred.
-/// What it protects against is real anyway. `emit_rotate_reg_lane` has no Word arm at all -- every
-/// host instruction inside it is hardcoded to `shift_r32_imm8`/`shift_r32_cl` -- so a hypothetical
+/// What it protects against is real anyway. `emit_rotate_reg_lane` has no Word arm at all: every
+/// host instruction inside it is hardcoded to `shift_r32_imm8`/`shift_r32_cl`, so a hypothetical
 /// future relaxation of the kind guard would not panic the compiler the way the shift sibling's
 /// `unreachable!()` does; it would either trip `emit_rotate_reg_lane`'s own `debug_assert` (a debug
 /// build) or silently emit a 32-bit rotate where the guest asked for 16 (a release build). This
@@ -1000,8 +1000,8 @@ fn a_word_rotate_in_a_sixteen_bit_segment_takes_no_count_lane() {
     let mut memory = vec![0u8; 0x2000];
     memory[ENTRY as usize..ENTRY as usize + 7].copy_from_slice(&[
         0x40, // inc ax
-        0xc1, 0xc0, 0x03, // rol ax, 3   -- Word by CS.D, no prefix, three bytes
-        0xd1, 0xc8, // ror ax, 1   -- the by-one shape, likewise Word
+        0xc1, 0xc0, 0x03, // rol ax, 3: Word by CS.D, no prefix, three bytes
+        0xd1, 0xc8, // ror ax, 1: the by-one shape, likewise Word
         0xf4, // hlt
     ]);
     let mut bus = sixteen_bit_bus(memory.clone());
@@ -1065,10 +1065,10 @@ fn a_word_rotate_in_a_sixteen_bit_segment_takes_no_count_lane() {
 // Under a plain real-mode 0xFFFF limit that is exactly the Byte accesses: max_start is 0xFFFF for
 // Byte, 0xFFFE for Word, 0xFFFC for Dword. The gate is written on `max_start` rather than on the
 // limit, which is what makes an unreal-mode block with a preserved wider limit elide for the
-// wider widths too -- the third row below is that case, and a gate spelled
+// wider widths too: the third row below is that case, and a gate spelled
 // `descriptor.limit == 0xFFFF` fails it.
 
-/// `and eax, 0xFFFF` -- the 64K mask, and the whole precondition of the elision.
+/// `and eax, 0xFFFF`: the 64K mask, and the whole precondition of the elision.
 const WORD_WRAP_MASK: [u8; 6] = [0x81, 0xe0, 0xff, 0xff, 0x00, 0x00];
 
 /// `cmp eax, max_start`, the segment-limit compare.
@@ -1140,7 +1140,7 @@ fn sixteen_bit_front_bytes(body: &[u8], ds_limit: u32) -> Vec<u8> {
 ))]
 #[test]
 fn a_word_wrapped_byte_access_elides_the_dead_segment_limit_compare() {
-    // `mov al,[0x200]` -- Byte, DS, 16-bit disp16 addressing.
+    // `mov al,[0x200]`: Byte, DS, 16-bit disp16 addressing.
     let byte = sixteen_bit_front_bytes(&[0x8a, 0x06, 0x00, 0x02], 0xffff);
     assert_eq!(
         occurrences(&byte, &WORD_WRAP_MASK),
@@ -1153,7 +1153,7 @@ fn a_word_wrapped_byte_access_elides_the_dead_segment_limit_compare() {
         "Byte's max_start is 0xFFFF and the masked EA cannot exceed it -- dead code"
     );
 
-    // `mov ax,[0x200]` -- Word, same segment. max_start is 0xFFFE, which offset 0xFFFF reaches.
+    // `mov ax,[0x200]`: Word, same segment. max_start is 0xFFFE, which offset 0xFFFF reaches.
     let word = sixteen_bit_front_bytes(&[0x8b, 0x06, 0x00, 0x02], 0xffff);
     assert_eq!(occurrences(&word, &WORD_WRAP_MASK), 1);
     assert_eq!(
@@ -1185,8 +1185,8 @@ fn a_preserved_wider_limit_elides_the_word_compare_too() {
     );
 }
 
-/// THE MUTANT ROW for S6. Weaken the gate to `wrap == AddressWrap::Word` alone -- dropping the
-/// `max_start >= 0xFFFF` term -- and a 16-bit access past a SHORT segment limit loses a compare
+/// THE MUTANT ROW for S6. Weaken the gate to `wrap == AddressWrap::Word` alone (dropping the
+/// `max_start >= 0xFFFF` term) and a 16-bit access past a SHORT segment limit loses a compare
 /// that is genuinely live. The access is then served natively instead of side-exiting, and the
 /// #GP the interpreter owes the guest never happens.
 ///

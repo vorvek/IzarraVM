@@ -648,8 +648,8 @@ fn straight_line_run_faults_on_cached_continuation_keeping_earlier_effects() {
     // earlier straight-line instruction's effects are kept. DIV is data-dependent, so it can
     // be cached with a good divisor and then fault on a later run with a zero divisor -
     // exactly the case where the faulting instruction is a valid cache hit (a delivered IVT
-    // exception reloads CS and flushes the cache, so a register-input fault -- not a decode
-    // change -- is the way to reach the cached-continuation path).
+    // exception reloads CS and flushes the cache, so a register-input fault, not a decode
+    // change, is the way to reach the cached-continuation path).
     //
     //   0x10: 40           INC AX     ; straight-line, runs before the DIV in the same run
     //   0x11: F6 F3        DIV BL     ; AX / BL ; #DE when BL = 0

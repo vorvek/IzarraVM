@@ -117,9 +117,9 @@ fn word_size_byte_forms_are_lowered() {
 /// field, which is the very property this table's header names as the reason the opcode was
 /// refused, so the row is now GATE-DEPENDENT rather than unconditionally refused. It is handled
 /// the way `0x05` is: the refusal table states `IZARRAVM_TEST_WORD_ROWS=off` explicitly rather
-/// than inheriting the ambient knob -- this suite is run on BOTH arms of every admission gate, and
+/// than inheriting the ambient knob: this suite is run on BOTH arms of every admission gate, and
 /// a row that leaned on the default would go red on the ON arm while certifying nothing on the OFF
-/// one -- and the flip itself is asserted at the end so the explicit `off` cannot quietly become
+/// one, and the flip itself is asserted at the end so the explicit `off` cannot quietly become
 /// the whole test. `cpu_jit_test_word_row_test.rs` pins it from the other side.
 ///
 /// `0xa9` stays in the table unconditionally, and that is deliberate rather than incidental: it is
@@ -155,7 +155,7 @@ fn word_size_dword_siblings_stay_refused() {
     // The `bool` is `refused_on_the_v86_on_arm` and it names ONE gate: `IZARRAVM_V86_LOOP_ROWS`,
     // the arm the loop below sweeps. It was written when that was the only gate in play; two are
     // now, so the name is spelled out rather than left as "refused on the ON arm too", which at the
-    // `0x85` row would read as a claim about `IZARRAVM_TEST_WORD_ROWS` and be FALSE — that row is
+    // `0x85` row would read as a claim about `IZARRAVM_TEST_WORD_ROWS` and be FALSE: that row is
     // refused here only because the test states `TEST_WORD_ROWS=off` above, and it is asserted
     // admitted under `=on` at the end of this test. (2026-08-21 review, N5.)
     //
@@ -164,7 +164,7 @@ fn word_size_dword_siblings_stay_refused() {
     // `cpu_jit_v86_loop_rows_test.rs` pins from the other side.
     let cases: &[(&str, &[u8], bool)] = &[
         ("0x05 add eax,imm", &[0x66, 0x05, 0x34, 0x12], false),
-        // Refused on both V86 arms, but only while TEST_WORD_ROWS is off — stated at the top of
+        // Refused on both V86 arms, but only while TEST_WORD_ROWS is off, stated at the top of
         // this test and flipped at the bottom.
         ("0x85 test r/m,r", &[0x66, 0x85, 0xc0], true),
         ("0xa9 test eax,imm", &[0x66, 0xa9, 0x34, 0x12], true),
@@ -291,7 +291,7 @@ fn word_size_sibling_stays_refused(label: &str, form: &[u8], arm: bool) {
 /// the classifier decides `2 | 3` on their own and a range would hide a member.
 #[test]
 fn word_size_0x83_register_forms_are_lowered() {
-    // ModRM 0xc0 | (op << 3) | 1 -- destination CX, sub-op in `reg`.
+    // ModRM 0xc0 | (op << 3) | 1: destination CX, sub-op in `reg`.
     let cases: &[(&str, u8)] = &[
         ("/0 add", 0),
         ("/1 or", 1),
@@ -471,7 +471,7 @@ fn word_size_push_segment_forms_are_lowered() {
         // opcode still being a barrier if you miss them.
         //
         // SS.B must be 0. `fresh()` sets `default_size_32` on CS and SS, and `stack_width_kind`
-        // implements no (SS.B = 1, Word) cell for any push at all -- `Push16` exists only for
+        // implements no (SS.B = 1, Word) cell for any push at all: `Push16` exists only for
         // (SS.B = 0, Word), which is the cell real 16-bit code runs in.
         //
         // ESP must be live BEFORE compiling. The default of 0 puts the store page at 0xFFFFFFFE,
@@ -659,8 +659,8 @@ fn word_size_load_segment_forms_are_lowered() {
 /// `/3`'s memory form flipped again with the L4 slice: `flat_fixture` is REAL MODE (`fresh()`
 /// with the segment limits stretched to `u32::MAX`, not protected mode), so ES/DS memory-source
 /// `MOV Sreg, m16` now lowers through `LoadSegRealMem` exactly as the register form already did,
-/// joining the block with ZERO call-out slots. `/2`, `/4` and `/5` are unaffected -- SS keeps its
-/// own row and FS/GS have no real-mode lowering -- so they still call out.
+/// joining the block with ZERO call-out slots. `/2`, `/4` and `/5` are unaffected: SS keeps its
+/// own row and FS/GS have no real-mode lowering, so they still call out.
 #[test]
 fn word_size_load_segment_shapes_outside_the_slice_get_their_own_answers() {
     // (label, bytes, call-out slots; `None` means the shape must end the block)
@@ -746,7 +746,7 @@ fn the_protected_mode_load_segment_form_calls_out_rather_than_lowering() {
 /// `POP ES` and `POP DS` keep the protected-mode refusal `MOV Sreg` left behind.
 ///
 /// They share `stack_width_kind`'s arm with `LoadSegReal` and used to share its answer. They are
-/// not on the `InterpretOne` allowlist -- no census row measures them -- so the arm splits, and
+/// not on the `InterpretOne` allowlist, no census row measures them, so the arm splits, and
 /// this is the half that would otherwise have been swept along by proximity.
 #[test]
 fn the_protected_mode_pop_segment_form_stays_refused() {
@@ -855,7 +855,7 @@ fn word_size_alu_register_forms_are_lowered() {
 /// is that the byte set is closed over its shared classifier arms, and the slice that opened
 /// forms 1 and 3 admitted five of eight members of two shared arms, so a silent miscompile was one
 /// line away for as long as the sixth and seventh members reached the OLD `emit_alu_preloaded`
-/// Word lane -- it masked both operands with `and`, which CLEARS host CF, then tagged the
+/// Word lane: it masked both operands with `and`, which CLEARS host CF, then tagged the
 /// descriptor as the SUB class, so an admitted `66 11 /r` would have computed `adc` without its
 /// carry in. `emit_carry_alu_preloaded`'s Word arm loads the host CF from the guest shadow before
 /// the masked `alu_r16_r16`, which is the lane that closes the gap; the differential coverage lives
@@ -899,7 +899,7 @@ fn word_size_alu_carry_forms_are_lowered() {
 /// test since the B2 slice:
 ///
 /// * Form 1 (`0x01 add m,r`) is `AluMemDest`, a read-modify-write through site 6, which still
-///   refuses a misaligned access outright — guard 3 relaxed only the two lean one-lookup sites.
+///   refuses a misaligned access outright: guard 3 relaxed only the two lean one-lookup sites.
 ///   16-bit DOS code has no alignment discipline, so admitted, an odd operand would sit inside the
 ///   block and side-exit at that slot on every execution, and nothing after it would retire
 ///   natively. Refused, it ends the block instead. Its Dword row must keep compiling, which is the
@@ -930,7 +930,7 @@ fn word_size_alu_memory_shapes_split_by_site() {
     //
     // The two form-3 writing rows below it are the B2 admission, asserted with the same three
     // numbers: the block covers all four slots, the slot counts ONE word read, and it stores
-    // nothing — `AluMemSource` never writes guest memory, so a `word_stores` of 1 would mean the
+    // nothing: `AluMemSource` never writes guest memory, so a `word_stores` of 1 would mean the
     // slot had been classified as the read-modify-write shape.
     for (label, form) in [
         ("0x39 cmp m,r", [0x66, 0x39, 0x0d, 0x00, 0x20, 0x00, 0x00]),
@@ -978,14 +978,14 @@ fn word_size_alu_memory_shapes_split_by_site() {
     }
 }
 
-/// The two `0x83` carry shapes, register AND memory, are LOWERED at Word size -- the L1 width
+/// The two `0x83` carry shapes, register AND memory, are LOWERED at Word size: the L1 width
 /// lift's headline row.
 ///
 /// ADC (/2) and SBB (/3) consume the incoming CF as an OPERAND. The REGISTER form used to have no
 /// sixteen-bit lane for that at all; `emit_carry_alu_preloaded` grew one. The MEMORY form's
 /// emitter (`emit_alu_candidate` / `emit_commit_alu_candidate`) was already width-parameterised and
 /// already branched on the incoming CF for ANY width, so admitting it here was a pure classifier
-/// change -- pyramid-586's `0x83 word mem /2` row is 18,902,081 runtime hits, the largest
+/// change: pyramid-586's `0x83 word mem /2` row is 18,902,081 runtime hits, the largest
 /// non-monitor row in the corpus's slowest game, and it is this memory case exactly.
 #[test]
 fn word_size_0x83_carry_forms_are_lowered() {
@@ -1028,7 +1028,7 @@ const WORD_OPERAND: u32 = 0x2000;
 /// Map `WORD_OPERAND`'s page for READ and WRITE.
 ///
 /// Without this the compile refuses for want of a direct-page mapping and a positive assertion
-/// would fail for a reason that has nothing to do with the allowlist -- and, worse, a NEGATIVE
+/// would fail for a reason that has nothing to do with the allowlist, and, worse, a NEGATIVE
 /// assertion would pass for that reason. The carry-form test above calls it too, so its two
 /// memory rows are refused by the classifier rather than by an unmapped page.
 fn map_word_operand_page(cpu: &mut CpuGsw, bus: &mut TestBus) {
@@ -1062,7 +1062,7 @@ fn map_word_operand_page(cpu: &mut CpuGsw, bus: &mut TestBus) {
 /// `0x83` and `0xC7` at Word size, MEMORY form: the rejected-row campaign's Slice 3.
 ///
 /// `0x83`'s memory form is a sixteen-bit READ-MODIFY-WRITE, which is both halves of the width
-/// hazard in one instruction -- the read must not widen and the write-back must touch exactly two
+/// hazard in one instruction: the read must not widen and the write-back must touch exactly two
 /// bytes. `0xC7`'s is a plain two-byte immediate store. Neither needed an emitter change:
 /// `emit_alu_mem_dest` and `emit_store` have carried complete Word arms all along and had no
 /// caller producing one. What this test pins is that they now have one.
@@ -1074,7 +1074,7 @@ fn map_word_operand_page(cpu: &mut CpuGsw, bus: &mut TestBus) {
 /// which is the one row that would catch `op: 0..=6` in `word_stores` being widened to `0..=7`.
 #[test]
 fn word_size_memory_immediate_forms_are_lowered() {
-    // ModRM 0x05 | (op << 3): mod 00, rm 101 -- a disp32 absolute operand, no base register.
+    // ModRM 0x05 | (op << 3): mod 00, rm 101: a disp32 absolute operand, no base register.
     let cases: &[(&str, &[u8], u8, u8)] = &[
         ("0x83 /0 add m16,imm8", &[0x66, 0x83, 0x05], 1, 1),
         ("0x83 /1 or m16,imm8", &[0x66, 0x83, 0x0d], 1, 1),
@@ -1168,7 +1168,7 @@ fn the_word_size_0xc7_register_form_stays_refused() {
 /// correctness is an aliasing claim rather than a decode claim.
 #[test]
 fn word_size_shift_forms_are_lowered() {
-    // ModRM 0xc0 | (op << 3) | 1 -- destination CX, sub-op in `reg`.
+    // ModRM 0xc0 | (op << 3) | 1: destination CX, sub-op in `reg`.
     let cases: &[(&str, u8)] = &[("/4 shl", 4), ("/5 shr", 5), ("/6 sal", 6), ("/7 sar", 7)];
 
     for &(label, op) in cases {
@@ -1209,10 +1209,10 @@ fn word_size_shift_forms_are_lowered() {
 /// The group-2 shapes that stay refused at Word size, and the boundary that keeps them out.
 ///
 /// Two separate refusals share this table now (a third, the ROL/ROR Word guard, was RETIRED by
-/// `vorvek/direct-word-rot1` -- see below):
+/// `vorvek/direct-word-rot1`, see below):
 ///
 /// * **RCL (`/2`) and RCR (`/3`) of both `0xC1` and `0xD1`.** Neither has ever had a classify arm
-///   at any width -- the standing structural reason is that both take the incoming CF as a rotate
+///   at any width: the standing structural reason is that both take the incoming CF as a rotate
 ///   INPUT, which needs the guest flags loaded before the rotate rather than only captured after
 ///   it. `/2` RCL is the largest single row in the 16-bit census at 10.91%, so it is the shape most
 ///   likely to be admitted by a hurried edit, which is why it still has a row here even though the
@@ -1223,7 +1223,7 @@ fn word_size_shift_forms_are_lowered() {
 /// **ROL (`/0`) and ROR (`/1`) of `0xC1` and `0xD1` moved OUT of this table.**
 /// `vorvek/direct-word-rot1` gave `RotateReg` a `width` field and `emit_rotate_reg` a
 /// `shift_r16_imm8` arm, so a 66-prefixed rotate now narrows to the guest's own 16 bits instead of
-/// rotating 32 -- the guard this table used to pin is gone by design, not by accident. Their
+/// rotating 32: the guard this table used to pin is gone by design, not by accident. Their
 /// positive coverage is `group2_word_rotate_register_form_is_lowered` in
 /// `cpu_jit_test_imm_test.rs` and the differential sweep in `cpu_jit_word_rotate_test.rs`.
 ///
@@ -1238,11 +1238,11 @@ fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
     // NO KNOB FORCE, and that absence is deliberate rather than an oversight. Every row left in
     // this table refuses UNCONDITIONALLY, on both arms of `IZARRAVM_ROTATE_ROWS`: RCL/RCR have
     // never had a classify arm at any width at EITHER operand form. A force here would be a gate
-    // that cannot fail -- it would pass identically with the knob on or off, certifying nothing
+    // that cannot fail: it would pass identically with the knob on or off, certifying nothing
     // about the knob and hiding that fact from a reader. (The one row that DID depend on the
     // knob, `0xC1`/`0xD1 /0` ROL, moved OUT of this table as of `vorvek/direct-word-rot1`:
     // `RotateReg` now carries a `width` field and is admitted at Word, so its positive coverage
-    // -- knob on and off -- lives in `cpu_jit_word_rotate_test.rs` and
+    // (knob on and off) lives in `cpu_jit_word_rotate_test.rs` and
     // `group2_word_rotate_register_form_is_lowered` instead. `0xD3 /4` and `/7`, shift-by-CL,
     // moved out the same way on the S-B ALU-rows slice: `ShiftCl` now carries a `width` field
     // and is admitted at Word behind `IZARRAVM_WORD_SHIFT_CL_ROWS`, and its positive coverage
@@ -1293,8 +1293,8 @@ fn the_word_size_group_two_shapes_outside_the_shift_lane_stay_refused() {
 ///
 /// Both the shift lane and `/1` ROR must still lower at Dword. The ROR row is the one that
 /// matters: the refusal this slice added is keyed on `insn.operand_size == OperandSize::Word`, and
-/// a guard written one character wider -- refusing the opcode outright, or testing the wrong
-/// polarity -- would silently retire the existing Dword ROR lowering and no other test in the tree
+/// a guard written one character wider (refusing the opcode outright, or testing the wrong
+/// polarity) would silently retire the existing Dword ROR lowering and no other test in the tree
 /// asserts its admission.
 #[test]
 fn the_dword_group_two_register_forms_are_unaffected() {
@@ -1510,7 +1510,7 @@ fn word_size_call_through_a_register_stays_refused() {
 /// gate, and `CallMem` is also `uses_stack()`, so the Word form additionally reaches the
 /// stack-width admission matrix, which has no `CallMem16` arm and refuses it in both stack widths.
 /// Deleting either one alone leaves the other refusing, and this fixture stays green. What it
-/// asserts is therefore the OUTCOME -- the Word form does not lower -- and not which check
+/// asserts is therefore the OUTCOME (the Word form does not lower) and not which check
 /// produced it.
 ///
 /// The outcome is worth pinning on its own terms: at Word operand size the interpreter reads TWO
@@ -1561,13 +1561,13 @@ fn word_size_call_through_memory_stays_refused() {
     }
 }
 
-/// A 66-prefixed `FF /4` REGISTER form (`jmp bx`) must stay REFUSED — and here, unlike every
+/// A 66-prefixed `FF /4` REGISTER form (`jmp bx`) must stay REFUSED, and here, unlike every
 /// paired fixture above, there is genuinely only ONE check that can refuse it.
 ///
 /// The residual census row this pins is small and real: 78,585 exits at duke3d-486 against the
 /// 11.7M the Dword register form carries. It is deliberately left unlowered.
 ///
-/// `JmpReg` is not `uses_stack()`, so the stack-width admission matrix never sees it — the
+/// `JmpReg` is not `uses_stack()`, so the stack-width admission matrix never sees it, the
 /// escape hatch that redundantly covers `CallReg`, `CallMem` and `PushMem` at Word does not exist
 /// for this kind. `static_control_target` is `None` for a dynamic target, so the Word control
 /// clamp never sees it either. The classifier's `insn.operand_size != OperandSize::Dword` gate,
@@ -1578,7 +1578,7 @@ fn word_size_call_through_memory_stays_refused() {
 /// for the target and masks EIP to 16 bits (`read_operand_sized(.., Word, ..)` then
 /// `target & operand_size.mask()`), while the Dword construction takes the full register and jumps
 /// unmasked. `jmp bx` with EBX = 0x1234_0500 lands at 0x0500 architecturally and at 0x1234_0500
-/// natively — two different blocks, not a rounding difference.
+/// natively: two different blocks, not a rounding difference.
 ///
 /// EXACT counts, paired against a POSITIVE CONTROL: the unprefixed `FF /4` register form at the
 /// same entry must lower and grow the block to four instructions. Without the control, "three

@@ -85,26 +85,26 @@ pub(crate) struct JitState {
     /// Default FALSE, which is the shipped behaviour this slice does not change.
     pub(crate) word_at_486: bool,
     /// Emitted stores take the PAGE_WATCHED fast path (watched-page-bit design
-    /// D3). Always true in production — the `IZARRAVM_WATCH_PAGE_BIT` gate
-    /// retired after #713 soaked — a field for `word_at_486`'s testability
+    /// D3). Always true in production: the `IZARRAVM_WATCH_PAGE_BIT` gate
+    /// retired after #713 soaked, a field for `word_at_486`'s testability
     /// reason, and CARRIED by clone for its lockstep-comparison reason.
     pub(crate) watch_page_bit: bool,
     /// Emitted stores probe the one-lookup store-bias table and route special pages through
-    /// the shared stub pad (`dev_docs/2026-08-07-one-lookup-store-design.md` D3/D4/D5).
+    /// the shared stub pad (store design D3/D4/D5).
     /// Always true at construction. A test sets it to false to get the classify/resolve
     /// emission for each store, which is also the emission of a block whose stub pad did not
     /// build. A FIELD for `word_at_486`'s testability reason, and CARRIED by clone for
     /// `watch_page_bit`'s lockstep-comparison reason.
     pub(crate) one_lookup_store: bool,
     /// Emitted reads probe the one-lookup load-bias table and route special pages through the
-    /// shared read-resolve pad (`dev_docs/2026-08-07-one-lookup-load-design.md` D3a/D3b/D5).
+    /// shared read-resolve pad (load design D3a/D3b/D5).
     /// Always true at construction. A test sets it to false to get the classify/resolve read
     /// emission, which is also the emission of a block whose read pad did not build. A FIELD
     /// for `word_at_486`'s testability reason, CARRIED by clone for the lockstep reason.
     /// Independent of `one_lookup_store`.
     pub(crate) one_lookup_load: bool,
     /// Whether the blocks in this cache were emitted WITH the `NativeBlockTrace` append
-    /// preamble — i.e. the answer to `!bus.native_fetches_are_uniform()` that every resident
+    /// preamble, i.e. the answer to `!bus.native_fetches_are_uniform()` that every resident
     /// block was compiled against.
     ///
     /// Not a policy dial: a MIRROR of a bus property, kept here because `direct::compile`
@@ -120,11 +120,11 @@ pub(crate) struct JitState {
     /// elided-trace block entered with a live `trace_ptr` would silently under-report fetch
     /// observations, so the shape and the bus can never be allowed to drift apart.
     ///
-    /// Seeded TRUE — the emitting arm, which is the pre-slice behaviour and what the
+    /// Seeded TRUE: the emitting arm, which is the pre-slice behaviour and what the
     /// `CpuBus` trait default (`native_fetches_are_uniform() == false`) asks for. On the
     /// production `MachineBus` the Direct backend only runs at all under an Approximate
     /// persona (`try_direct_continuation`'s `uses_approximate_timing` gate), and that is
-    /// exactly when `flat_data_cost` — and therefore `native_fetches_are_uniform` — is true,
+    /// exactly when `flat_data_cost` (and therefore `native_fetches_are_uniform`) is true,
     /// so the field flips to false on the first continuation and never moves again.
     /// CARRIED by clone, for `watch_page_bit`'s lockstep-comparison reason.
     pub(crate) native_fetch_trace: bool,
@@ -134,7 +134,7 @@ pub(crate) struct JitState {
     /// so a fixture cannot exercise both arms, and the level-0 early-out in `try_direct_continuation`
     /// would have lost its only cover the moment the default moved off 0.
     pub(crate) sixteen_bit_level: u8,
-    /// Sticky-decline memo era state (`dev_docs/sticky-decline-memo-design.md` §1.5 plus review
+    /// Sticky-decline memo era state (design §1.5 plus review
     /// BLOCKER B1). The memo byte in each `DecodePack` carries a 6-bit era stamp; a memo answers
     /// only while `decline_memo_stamp` still reads the value it was written under, so one advance
     /// invalidates all 65,536 of them at once.
@@ -147,8 +147,8 @@ pub(crate) struct JitState {
     ///     both directions, per review M3: `reset_perf_counters` restarts the instruction count,
     ///     so epoch numbers repeat and the monotonicity §2.4 originally claimed does not hold;
     ///   * `heat_resets`, because `BlockCache::clear` and `BlockCache::reset_storage` empty
-    ///     `entries` — every Dormant key vanishes and the true next verdict becomes
-    ///     `BlockProbe::Interpret` with a `lookup_misses` bump and a `Seen` insert — and neither
+    ///     `entries`: every Dormant key vanishes and the true next verdict becomes
+    ///     `BlockProbe::Interpret` with a `lookup_misses` bump and a `Seen` insert, and neither
     ///     has a site a `JitState` field could be advanced at. `heat_resets` is bumped by both
     ///     (`reset_storage`, and `clear`'s empty fast path), which is why `sync_smc_heat` already
     ///     reads it. It also covers `sync_native_fetch_trace`'s `jit_direct.clear()` (review M2),
@@ -166,19 +166,19 @@ pub(crate) struct JitState {
     /// extra branch and no extra field.
     #[cfg(test)]
     pub(crate) decline_memo_disabled_for_test: bool,
-    /// Cached mirror of `direct::native_keys_admitted(cpu.mode())` — the host-capability and
+    /// Cached mirror of `direct::native_keys_admitted(cpu.mode())`: the host-capability and
     /// persona screen `key_for_phys` opens with. A hoisted CONSTANT, not a policy dial: nothing
     /// sets it directly, and `CpuGsw::set_native_key_admission_for_test` does not exist.
     ///
     /// Why the cache cannot go stale, rather than a claim that it does not:
     ///
     ///   * The screen reads exactly two things. `jit::host_supported()` is
-    ///     `is_x86_feature_detected!("avx2")`, fixed for the life of the process — and the reason
+    ///     `is_x86_feature_detected!("avx2")`, fixed for the life of the process, and the reason
     ///     this hoist is worth anything, since it is an out-of-crate call the compiler cannot
     ///     fold away, measured at 1.19% of gp2's wall executed once per continuation.
     ///     `CpuGsw::mode` is the other, and `CpuGsw::set_mode` is its only writer THAT CAN
-    ///     REACH `key_for_phys` — two canonical-state test closures poke the crate-private
-    ///     field directly without ever keying a block, which the adversarial review proved
+    ///     REACH `key_for_phys`: two canonical-state test closures poke the crate-private
+    ///     field directly without ever keying a block, which a check proved
     ///     harmless by forcing a stale cache there and watching nothing fire
     ///     (the field is private to the crate root, and canonical restore goes through
     ///     `set_mode` like everything else). Both writers refresh this field; there is no third
@@ -186,7 +186,7 @@ pub(crate) struct JitState {
     ///   * CARRIED by clone, deliberately unlike `FastMapServeGate` (which resets to `false`).
     ///     The asymmetry follows the invariant: `CpuGsw::clone` copies `mode`, so the cached
     ///     answer is still the right one, and resetting to `false` would silently REFUSE every
-    ///     block key on a cloned CPU — an admission-policy change wearing an accelerator's
+    ///     block key on a cloned CPU, an admission-policy change wearing an accelerator's
     ///     clothes. `word_at_486`'s clone comment makes the same argument for the same reason.
     ///   * `key_for_phys` `debug_assert`s the cache against a live recompute on every call, so a
     ///     future writer that forgets the refresh fails the whole debug test suite at its first
@@ -338,7 +338,7 @@ impl JitState {
 
     // No emptiness assertion here: consecutive installs/rejects WITHOUT native execution between
     // them are harmless (edges just accumulate) and common in cache-level fixtures. The invariant
-    // that matters — INV-W, "no native code runs while edges are pending" — is enforced by the
+    // that matters (INV-W, "no native code runs while edges are pending") is enforced by the
     // backstop DRAIN at the dispatch boundary (`run_direct_block` sweeps both watches on entry).
     pub(crate) fn install(&mut self, compilation: &direct::Compilation) -> Option<direct::BlockId> {
         let id = self.direct.install(
@@ -528,7 +528,7 @@ impl JitState {
     /// Test-only block-watch mark. Routes its strict edges through the SAME pending buffer the
     /// production install/reject chokes use (design H7), so a fixture using this hook and then
     /// `CpuGsw::sweep_block_watch_edges` (or the `mark_block_code_for_test` wrapper) exercises
-    /// the identical coherence path — a hook that bypassed the sweep would devacuate every
+    /// the identical coherence path: a hook that bypassed the sweep would devacuate every
     /// watched-store fixture built on it.
     #[cfg(test)]
     pub(crate) fn mark_code_range(&mut self, physical: u32, len: u8) {

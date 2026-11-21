@@ -43,7 +43,7 @@ fn deliver_exception_onto_a_16bit_ring0_stack_wraps_sp_and_preserves_high_esp() 
     // The exact fault scenario this task fixes: a 32-bit interrupt gate delivers
     // onto a ring-0 stack whose SS descriptor has B=0 (a 16-bit stack segment,
     // as DOS4GW/VCPI clients use). 386 PRM 17-43/17-74: "Load new SS:eSP value
-    // from TSS" is B-keyed (17-12) -- a B=0 target stack takes the TSS value
+    // from TSS" is B-keyed (17-12): a B=0 target stack takes the TSS value
     // into SP only, and ESP's high word carries over from the interrupted
     // context untouched. The V86 interrupt frame (10 dwords) is then built at
     // SP-wrapped addresses, only SP advancing.
@@ -104,7 +104,7 @@ fn deliver_exception_onto_a_16bit_ring0_stack_preserves_interrupted_esp_high_wor
 fn v86_external_interrupt_on_vector_8_pushes_no_error_code() {
     // A real DOS boot under a V86 monitor keeps the PIC at base 0x08, so IRQ0
     // lands on vector 8 (#DF). An EXTERNAL interrupt must NOT push an error code
-    // even there — only a genuine CPU exception does. (is_external = true.)
+    // even there: only a genuine CPU exception does. (is_external = true.)
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     int_gate(&mut bus.memory, 8, MON_CODE);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
@@ -164,7 +164,7 @@ fn iret_into_v86_with_dirty_high_word_eip_faults_before_committing_v86_state() {
     // Same 32-bit V86 IRET frame as `iret_into_v86_restores_the_task`, but the popped
     // EIP carries a nonzero high word (0x0001_0000). 386 PRM STACK-RETURN-TO-V86 checks
     // "instruction pointer not within code segment limit" against the popped EIP and
-    // raises #GP(0) *before* EFLAGS/CS/EIP/ESP or the V86 data segments are committed --
+    // raises #GP(0) *before* EFLAGS/CS/EIP/ESP or the V86 data segments are committed,
     // ahead of every `Pop()` in the pseudocode's V86-tail sequence. A V86 CS is always a
     // 16-bit real-mode-style segment (fixed 0xffff limit), so this EIP is always out of
     // range: `iret` must return the fault directly, leaving the ring-0 monitor's own
@@ -295,7 +295,7 @@ fn iret_inter_privilege_return_to_a_16bit_stack_wraps_sp_and_preserves_high_esp(
     // 386 PRM 17-80: "Load SS:eSP from stack" is B-keyed (17-12). Returning to
     // an outer ring whose SS descriptor has B=0 (the DPMI/DOS-extender 16-bit
     // stack shape) must take the popped value into SP only, wrap at the
-    // 16-bit boundary, and leave ESP's high word as the inner stack's --
+    // 16-bit boundary, and leave ESP's high word as the inner stack's,
     // exactly the documented real-silicon ESP-high-word leak on a 16-bit ring
     // transition.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
@@ -412,7 +412,7 @@ fn iret_word_same_privilege_return_stays_on_the_current_stack() {
 #[test]
 fn deliver_exception_through_a_16bit_interrupt_gate_pushes_a_word_frame() {
     // A 16-bit interrupt gate (type 6, here access 0xe6: present, DPL 3) must
-    // build a WORD frame -- [ss, sp, flags, cs, ip, err] on a ring cross --
+    // build a WORD frame ([ss, sp, flags, cs, ip, err] on a ring cross)
     // and clear IF exactly like its 32-bit sibling. The Borland DPMI16BI host
     // (Tyrian) hangs its whole IDT off type-6 gates; dword pushes through them
     // desynchronize the host's word-sized IRET frames. The gate's high dword
@@ -495,7 +495,7 @@ fn deliver_exception_reads_the_ring0_stack_from_a_286_tss() {
     // Borland's DPMI16BI hangs TR off a 16-bit (286) TSS: SP0 is a WORD at
     // offset +2 and SS0 a WORD at +4 (vs the 386 TSS's ESP0 dword at +4 /
     // SS0 at +8). Reading 386 offsets from a 286 TSS returns SS0=0 and the
-    // null SS load kills the delivery with #GP(0) -- the second stage of the
+    // null SS load kills the delivery with #GP(0), the second stage of the
     // exodos-smoke-20260816 Tyrian crash.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
@@ -638,7 +638,7 @@ fn retf_to_a_not_present_code_segment_restores_sp_for_the_restart() {
     // Borland RTM's overlay core: RETF into a swapped-out (P=0) code segment
     // raises #NP, RTM's handler loads the segment, and the RETF re-executes.
     // The pops must be undone on the fault or the restarted RETF pops 4 bytes
-    // above the real frame -- on RTM's tight thunk stack that is past the SS
+    // above the real frame: on RTM's tight thunk stack that is past the SS
     // limit, and the retry dies #SS (the Tyrian swap-resume abort).
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     // Not-present ring-0 code descriptor at GDT 0x30 (access 0x18: P=0, code).
@@ -1045,7 +1045,7 @@ fn gate16(m: &mut [u8], vector: u8, offset: u16, access: u8) {
 fn iret_word_inter_privilege_to_a_16bit_stack_takes_sp_only_and_keeps_high_esp() {
     // B-keying pin for the WORD arm: the outer SS has B=0, the inner stack's
     // ESP carries a nonzero high word (0x0001). The popped SP must land in SP
-    // only, with the inner high word carried over -- a swapped branch
+    // only, with the inner high word carried over: a swapped branch
     // (zero-extending set_esp) yields 0x0000_0010 instead.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
@@ -1120,7 +1120,7 @@ fn retf_word_with_release_skips_the_inner_parameter_block_before_ss_sp() {
     cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
     cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
     cpu.registers.set_esp(0x6800);
-    // Frame, pushed high-to-low: SS, SP, param2, param1, CS, IP -- the two
+    // Frame, pushed high-to-low: SS, SP, param2, param1, CS, IP: the two
     // parameter words sit between CS:IP and the saved SS:SP, exactly as a
     // call gate with param_count=2 leaves them.
     for v in [0x2Bu32, 0x2000, 0xbead, 0xbeef, 0x23, 0x1234] {
@@ -1397,7 +1397,7 @@ fn v86_monitor_round_trip_go_no_go() {
 // `v86_world`'s page tables are identity-mapped, so TSS/GDT/IDT linear == physical
 // there and every system-structure read would look correct even with the raw,
 // unpaged `bus.read_memory` these tests were written to catch (the JEMMEX bug:
-// its monitor sits at a high linear alias -- e.g. 0xf8017000 -- of low physical
+// its monitor sits at a high linear alias, e.g. 0xf8017000, of low physical
 // RAM). These tests add a *second* PDE mapping a high linear window onto the same
 // physical TSS/GDT page, then address the TSS/GDT only through that alias, so a
 // regression back to raw `bus.read_memory(self.tr.base + ..)` reads unmapped
@@ -1433,8 +1433,8 @@ fn deliver_exception_from_v86_with_cs_rpl3_does_not_fault_the_monitors_own_pushe
     // (the DOS HMA stub lives at 0xFFFF, reached via an XMS chain-through) must not
     // make `deliver_exception`'s own ring-0 stack pushes look like a user access.
     // Before the fix, `current_privilege_level` derived "user" live from
-    // `CS.selector & 3` -- read at the moment of the push, i.e. still the V86
-    // source's arbitrary CS -- so a supervisor-only ESP0 page spuriously #PF'd on
+    // `CS.selector & 3`, read at the moment of the push, i.e. still the V86
+    // source's arbitrary CS, so a supervisor-only ESP0 page spuriously #PF'd on
     // the monitor's own frame-push, with CR2 landing on the stack pointer itself.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     // The frame's pushes land BELOW ESP0 (0x7000), on page 6 (0x6000..0x6FFF), not
@@ -1442,7 +1442,7 @@ fn deliver_exception_from_v86_with_cs_rpl3_does_not_fault_the_monitors_own_pushe
     // the 0x4 user bit `v86_world` sets by default).
     put32(&mut bus.memory, 0x2000 + 6 * 4, 0x6000 | 0x3);
     enter_v86_direct(&mut cpu, 0x10, 0x1000);
-    // Load a V86 CS whose low bits are 3 -- a real-mode-style segment, so this is
+    // Load a V86 CS whose low bits are 3, a real-mode-style segment, so this is
     // legal V86 state, just an unusual selector value (0xFFFF, the HMA stub).
     cpu.load_segment_real(SegmentIndex::Cs, 0xffff);
 
@@ -1501,7 +1501,7 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     // reported nested vector is therefore that third fault, and `original_vector`
     // is the one the chain started from.
     //
-    // The #NP here is NOT the architectural answer -- it pins the emulator's
+    // The #NP here is NOT the architectural answer: it pins the emulator's
     // documented divergence. On metal a zeroed IDT entry is a type-0 descriptor
     // and the PRM's AR-byte gate-type test, which precedes both the DPL and the
     // presence test, raises #GP(vector*8+2). This emulator omits that type check
@@ -1510,7 +1510,7 @@ fn an_escalation_chain_that_exhausts_every_handler_shuts_down_and_records_the_si
     // existed, which was the right vector for the wrong reason: it came from the
     // null-selector load further down, carrying error code 0 rather than
     // vector*8+2. #NP and #GP are both contributory, so the chain and its
-    // shutdown are unchanged either way -- only the vector each step reports.
+    // shutdown are unchanged either way: only the vector each step reports.
     // Adding the type check later moves these back to 13, correctly this time.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     put32(&mut bus.memory, 0x2000 + 6 * 4, 0x6000 | 0x6);
@@ -1788,7 +1788,7 @@ fn a_fault_while_calling_the_double_fault_handler_stops_the_machine() {
     // presence test, and which this emulator omits (see the ledger note in
     // `deliver_exception_body`). With that check absent the P check fires first
     // and reports #NP. This read 13 until `deliver_exception_body` gained the P
-    // check -- the right vector for the wrong reason, since it came from the
+    // check, the right vector for the wrong reason, since it came from the
     // null-selector load with error code 0 instead of vector*8+2. #NP and #GP
     // are both contributory (`fault_class`), so the escalation verdict and the
     // shutdown are identical either way; only the reported vector moves. Adding
@@ -2108,7 +2108,7 @@ fn v86_code_fetch_with_eip_beyond_the_cs_limit_raises_gp0() {
 
 /// The wrap half of E7 (what the fault trace actually showed: delivery at
 /// EIP exactly 0x10000): an instruction whose LAST byte sits at offset
-/// 0xFFFF is legal, and the 16-bit IP then wraps to 0 -- real-mode .COM
+/// 0xFFFF is legal, and the 16-bit IP then wraps to 0: real-mode .COM
 /// wrap tricks depend on it, and no fault is raised. Before the fix the
 /// interpreter left the unwrapped 0x10000 in EIP and the fetch guard
 /// #GP(0)'d a legal program.
@@ -2151,7 +2151,7 @@ fn v86_sequential_run_off_at_the_64k_boundary_wraps_ip_to_zero() {
 /// acknowledges the PIC.
 ///
 /// Today's TOKAEMM monitor runs its V86 guest at IOPL 0, so every guest CLI/STI
-/// traps to the monitor and the real IF stays pinned open -- the core then takes
+/// traps to the monitor and the real IF stays pinned open: the core then takes
 /// the IRQ (INTA) immediately and the monitor queues the vector in `vip`. The
 /// design deletes that by giving the guest IOPL 3. This fixture certifies the
 /// three CPU-level facts that makes possible, none of which involve tokaemm.asm:
@@ -2206,7 +2206,7 @@ fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
     );
     assert!(cpu.is_v86_mode(), "and the guest must still be running");
 
-    // 3. The guest's own STI re-opens the window -- but the one-instruction
+    // 3. The guest's own STI re-opens the window, but the one-instruction
     //    shadow means the instruction AFTER it still runs first.
     cpu.cycle(&mut bus).unwrap();
     assert!(cpu.flag(FLAG_IF), "the guest's STI must set the real IF");
@@ -2226,7 +2226,7 @@ fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
         "the STI shadow must still hold the request off"
     );
 
-    // 4. The next boundary takes it -- and THAT is where the INTA happens.
+    // 4. The next boundary takes it, and THAT is where the INTA happens.
     cpu.cycle(&mut bus).unwrap();
     assert_eq!(
         bus.pending_irq, None,
@@ -2242,7 +2242,7 @@ fn a_v86_guest_at_iopl3_holds_off_inta_across_its_own_cli_window() {
 
 // ---------------------------------------------------------------------------
 // IDT gate DPL / P-bit conformance (386 PRM, PROTECTED-MODE arm of the
-// INT n / INT 3 / INTO operation, dev_docs/reference/i386/i386.txt):
+// INT n / INT 3 / INTO operation):
 //
 //     IF software interrupt (* i.e. caused by INT n, INT 3, or INTO *)
 //     THEN
@@ -2364,7 +2364,7 @@ fn v86_hardware_interrupt_through_a_not_present_gate_raises_np_with_ext_set() {
     // the DPL line, and an external delivery is the one source that sets it.
     // This is the decision the brief asked for: hardware delivery is NOT exempt
     // from the P bit (only from the DPL comparison), so a not-present gate
-    // faults for an IRQ too -- with error code vector*8+2+1.
+    // faults for an IRQ too, with error code vector*8+2+1.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
     set_gate_access(&mut bus.memory, 0x21, 0x6e); // DPL 3, P = 0
     enter_v86_direct(&mut cpu, 0x1000, 0x1000);
@@ -2387,7 +2387,7 @@ fn v86_hardware_interrupt_through_a_not_present_gate_raises_np_with_ext_set() {
 fn v86_software_int_through_a_not_present_dpl0_gate_takes_gp_not_np() {
     // Exception priority. Both conditions hold at once; the PRM orders the DPL
     // test BEFORE the presence test, so the guest must see #GP, not #NP. This
-    // is what pins the checks to their position in the body -- after the gate
+    // is what pins the checks to their position in the body: after the gate
     // is read, before any stack switch or target-segment check.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0x21], &[0x00]);
     set_gate_access(&mut bus.memory, 0x21, 0x0e); // DPL 0, P = 0
@@ -2450,7 +2450,7 @@ fn a_software_interrupt_past_the_idt_limit_raises_gp_rather_than_stopping() {
     // "escalating would change the outcome only for a guest that keeps a short
     // IDT AND a real #DF handler". That reasoning skips a step: the FIRST
     // escalation from an out-of-limit vector is #GP, not #DF, so a short IDT
-    // with a real #GP handler is enough -- and Zone 66 is one.
+    // with a real #GP handler is enough, and Zone 66 is one.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0xfd, 0xf4], &[0x00]);
     enter_v86_direct(&mut cpu, 0, 0x1000);
     // IOPL 3, which `enter_v86_direct` does not set. INT n is IOPL-sensitive in
@@ -2479,7 +2479,7 @@ fn an_out_of_limit_vector_whose_gp_gate_is_also_missing_ends_in_a_triple_fault()
     // The other arm, and the reason the old stop looked adequate. When the IDT
     // is too short to hold vector 13 either, the #GP escalates to #DF, the #DF
     // cannot be delivered, and the processor shuts down. The machine still
-    // stops -- but through the architectural chain, not a bespoke error.
+    // stops, but through the architectural chain, not a bespoke error.
     let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xcd, 0xfd, 0xf4], &[0x00]);
     enter_v86_direct(&mut cpu, 0, 0x1000);
     cpu.registers.eflags |= 0x3000; // IOPL 3; see the test above
