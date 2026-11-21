@@ -10,9 +10,9 @@
 //! the same reason the lane families' refusal fixtures do: they must keep
 //! meaning what they say the day the default flips.
 //!
-//! The actuation fixtures call `Machine::actuate_ata_poll_skip` -- the
+//! The actuation fixtures call `Machine::actuate_ata_poll_skip` (the
 //! production method the run loop calls, not a re-derivation of its decision
-//! tree -- after arming through the real bus path. Three fixtures (1, 4, 12)
+//! tree) after arming through the real bus path. Three fixtures (1, 4, 12)
 //! run a guest poll loop end to end instead, because the wiring between the arm
 //! site, the batch-entry clear and the actuation is exactly what they exist to
 //! pin.
@@ -23,7 +23,7 @@ const STATUS_BSY: u8 = 0x80;
 /// One master tick per microsecond of guest time.
 const TICKS_PER_US: u64 = izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
 /// The real GUI quantum: `FAST_EMU_QUANTUM_TICKS = MASTER_CLOCK_HZ / 1000`
-/// (`gui_session.rs`), applied whenever the mode is approximate -- which is
+/// (`gui_session.rs`), applied whenever the mode is approximate, which is
 /// precisely and only the class this lever is scoped to.
 const GUI_SLICE_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 1000;
 
@@ -102,7 +102,7 @@ fn schedule_identify(machine: &mut Machine) -> u64 {
 }
 
 /// A packet READ(10) of the FARTHEST sector on the disc, so the scheduled
-/// boundary is `media_delay + sector_transfer` -- tens of milliseconds rather
+/// boundary is `media_delay + sector_transfer`, tens of milliseconds rather
 /// than the 100 us command latency. Returns the pending deadline.
 ///
 /// Needed wherever the fixture has to out-wait something else: a bus-master DMA
@@ -138,7 +138,7 @@ fn schedule_far_read(machine: &mut Machine) -> u64 {
 /// does (`cpu_is_ring0_pm == false`).
 ///
 /// `io_touched` is cleared first because the run loop clears it at batch entry
-/// and the arm predicate carries `!io_touched_before_read` -- a read that
+/// and the arm predicate carries `!io_touched_before_read`: a read that
 /// follows an access which already ended the batch is not part of a poll run.
 /// A fixture that skipped this would be measuring the port write it just did.
 fn poll_alt_status(machine: &mut Machine, count: u32) {
@@ -153,7 +153,7 @@ fn poll_alt_status(machine: &mut Machine, count: u32) {
 /// **This is what makes a no-pending-command fixture non-vacuous.** The hazard
 /// the mandatory ATA precondition exists for is the target FALLING THROUGH to an
 /// unrelated edge, and a machine with no unrelated edge armed has nothing to
-/// fall through to -- its `next_device_edge_ticks()` is `None`, so a mutant that
+/// fall through to: its `next_device_edge_ticks()` is `None`, so a mutant that
 /// drops the precondition stalls for zero ticks and the fixture passes anyway.
 /// `18.2 Hz` is exactly the "up to 54.9 ms away" the design's B1 names.
 fn arm_far_pit_edge(machine: &mut Machine) {
@@ -399,7 +399,7 @@ fn ata_poll_skip_ignores_nien() {
 ///
 /// **THIS DELIBERATELY DOES NOT COMPARE REGISTERS OR RETIRED INSTRUCTIONS.**
 /// The elided iterations are not executed, so the register file at a boundary
-/// and the instruction count both legitimately differ -- by construction, not
+/// and the instruction count both legitimately differ, by construction, not
 /// by accident. What IS claimed, and what this compares, is that at a common
 /// guest instant every device is in the same state and the drive delivered the
 /// same bytes.
@@ -532,8 +532,8 @@ fn ata_poll_skip_never_crosses_a_bmide_deadline() {
     machine.mount_cd(data_disc(16));
     machine.set_ata_poll_skip_enabled(true);
 
-    // Set up the secondary-channel wait FIRST -- a far-seek packet read, tens
-    // of milliseconds -- because arming it advances the timeline and would eat
+    // Set up the secondary-channel wait FIRST (a far-seek packet read, tens
+    // of milliseconds) because arming it advances the timeline and would eat
     // into a DMA transfer armed earlier. The skip is armed by the SECONDARY
     // channel; the bound has to come from the primary's DMA all the same.
     schedule_far_read(&mut machine);
@@ -593,7 +593,7 @@ fn ata_poll_skip_never_crosses_a_bmide_deadline() {
 ///
 /// Without the mandatory `ticks_until_completion()` precondition the target
 /// would fall through the optional ATA term inside `next_device_edge_ticks` to
-/// an unrelated edge -- PIT channel 0 at 18.2 Hz is up to 54.9 ms away -- and
+/// an unrelated edge (PIT channel 0 at 18.2 Hz is up to 54.9 ms away) and
 /// the machine would grant the guest that whole span with the drive READY,
 /// charged as `io_stall_clocks`: invisible to `cd_pio_bytes`, invisible to the
 /// frame anchor, and visible only as wall no ladder could attribute.
@@ -642,7 +642,7 @@ fn ata_poll_skip_declines_when_the_command_completed_in_the_same_batch() {
 /// mutant that deletes the precondition: `bus_machine` arms no device, so its
 /// `next_device_edge_ticks()` is `None` and there is nothing to fall through TO.
 /// Its `master_ticks() == before` is then satisfied by the ABSENCE of the hazard
-/// rather than by the guard -- the `fixtures-that-cannot-fail` class.
+/// rather than by the guard: the `fixtures-that-cannot-fail` class.
 ///
 /// With PIT channel 0 running at the DOS default the fall-through target exists
 /// and is 54.8 ms away. A machine that granted the guest that span with the
@@ -921,15 +921,15 @@ fn ata_poll_skip_armed_flag_does_not_survive_a_batch() {
 /// eventually".
 ///
 /// The batch-entry `reset_alt_status_run()` is the sole mitigation for design
-/// §7 risk 2 -- "a guest that polls while doing useful work would be robbed of
-/// it" -- and it is the one architectural hazard the design accepts rather than
+/// §7 risk 2 ("a guest that polls while doing useful work would be robbed of
+/// it") and it is the one architectural hazard the design accepts rather than
 /// eliminates. Nothing on the board can see it, because under TOKACD the run
 /// reaches the threshold inside the first batch anyway; without a fixture, the
 /// line is deletable with every other test green.
 ///
 /// So: get one read short of the threshold, cross a batch boundary by a route
 /// that touches no channel port, and take one more read. It must NOT arm, and
-/// the run must read 1 -- the reads on either side of the boundary must not
+/// the run must read 1: the reads on either side of the boundary must not
 /// accumulate.
 #[test]
 fn ata_poll_skip_run_does_not_accumulate_across_a_batch_boundary() {
@@ -948,7 +948,7 @@ fn ata_poll_skip_run_does_not_accumulate_across_a_batch_boundary() {
     //
     // The slice is deliberately ABOVE the floor. A sub-floor slice would leave
     // `ata_poll_skip_slice_too_short` set, the arm predicate would decline
-    // before counting, and the final read below would not increment the run --
+    // before counting, and the final read below would not increment the run,
     // which would make this fixture pass against the very mutant it exists to
     // kill. The two vacuity guards after the run call are what keep that honest.
     machine.cpu.registers.eip = 0x108;
@@ -990,14 +990,14 @@ fn ata_poll_skip_run_does_not_accumulate_across_a_batch_boundary() {
 
 /// The GUI drives `run_master_ticks(execution_budget(credit, approximate))`, and
 /// `execution_budget` clamps to `FAST_EMU_QUANTUM_TICKS = MASTER_CLOCK_HZ/1000`
-/// = **1 ms** whenever the mode is approximate -- i.e. exactly the class this
+/// = **1 ms** whenever the mode is approximate, i.e. exactly the class this
 /// lever is scoped to. That is SHORTER than the 1.111 ms `sector_transfer_ticks`
 /// this lever's largest win is, so the slice boundary lands inside the wait
 /// essentially every time.
 ///
 /// If a deadline-clamped sub-floor tail latched `poll_skip_blocked`, nothing
 /// would clear it until the sector completed and the guest would spin out the
-/// remaining ~1.1 ms interpreted -- systematically, in the GUI only, invisible
+/// remaining ~1.1 ms interpreted, systematically, in the GUI only, invisible
 /// to every headless leg on the board.
 #[test]
 fn ata_poll_skip_does_not_block_when_the_run_deadline_truncates() {
@@ -1012,7 +1012,7 @@ fn ata_poll_skip_does_not_block_when_the_run_deadline_truncates() {
          slice={GUI_SLICE_TICKS}"
     );
 
-    // PHASE A -- the real GUI geometry. Each 1 ms slice arms, clamps its target
+    // PHASE A: the real GUI geometry. Each 1 ms slice arms, clamps its target
     // to the remaining slice, and STILL COMMITS because the clamped residue
     // clears the floor. This is "the win largely survives on the interactive
     // path": most of each slice is skipped and the next slice takes the rest.
@@ -1057,7 +1057,7 @@ fn ata_poll_skip_does_not_block_when_the_run_deadline_truncates() {
         "the wait is still running, so the following phase is not vacuous"
     );
 
-    // PHASE B -- THE SUB-FLOOR SLICE, after the interactive mitigation.
+    // PHASE B: THE SUB-FLOOR SLICE, after the interactive mitigation.
     //
     // This phase used to build a clamped decline deliberately and assert that it
     // did not latch. Since the mitigation, a batch entered with less than the
@@ -1065,14 +1065,14 @@ fn ata_poll_skip_does_not_block_when_the_run_deadline_truncates() {
     // waste is removed rather than merely made harmless. What is asserted here
     // is that stronger property.
     //
-    // The clamped decline's own disposition -- declines, does NOT latch -- is
+    // The clamped decline's own disposition (declines, does NOT latch) is
     // still pinned, twice: at the actuation by
     // `ata_poll_skip_blocks_when_a_device_edge_truncates_but_not_when_the_deadline_does`,
     // which arms outside the run loop and calls `actuate_ata_poll_skip` with a
     // sub-floor deadline directly; and at scale by the interactive confirmation
     // run, where 364,753 real clamped declines moved `blocks` by exactly zero.
-    // The mitigation is not an elimination -- a batch entered just above the
-    // floor can still arm and clamp -- so that disposition still matters.
+    // The mitigation is not an elimination (a batch entered just above the
+    // floor can still arm and clamp) so that disposition still matters.
     let short_slice = machine.ata_poll_floor_ticks / 2;
     let _ = machine.run_master_ticks(short_slice).unwrap();
     let after_b = counters(&machine);
@@ -1157,7 +1157,7 @@ fn ata_poll_skip_blocks_when_a_device_edge_truncates_but_not_when_the_deadline_d
 /// `execution_budget` is `min(credit, quantum)` and in a paced window the
 /// CREDIT binds: a machine on time refills it in tiny wall-clock increments and
 /// spends it immediately. Most interactive slices are therefore BELOW the 20 µs
-/// floor, so a skip armed in one can never commit — 364,753 `_deadline_clamped`
+/// floor, so a skip armed in one can never commit: 364,753 `_deadline_clamped`
 /// declines in a single 328 s window, each costing a forced batch break and a
 /// device-edge-cache invalidation for nothing.
 ///
@@ -1220,11 +1220,11 @@ fn ata_poll_skip_does_not_arm_into_a_sub_floor_slice() {
 /// **THE EMPTY-STRING ROW IS THE LOAD-BEARING ONE**, and the two knob families
 /// deliberately spell it differently:
 ///
-/// * for THIS gate, empty is **OFF** -- OFF is a real arm, and nulling a
+/// * for THIS gate, empty is **OFF**: OFF is a real arm, and nulling a
 ///   variable in PowerShell leaves it PRESENT AND EMPTY, so a leg that meant to
 ///   restore the default would silently measure the escape. That is the trap
 ///   that voided three earlier evidence directories;
-/// * for the numeric SWEEP knobs, empty is **the default** -- a threshold has no
+/// * for the numeric SWEEP knobs, empty is **the default**: a threshold has no
 ///   "off" value, and the same nulling idiom killed this branch's own re-ladder
 ///   when they briefly panicked on it. See the sweep fixture below.
 ///
@@ -1256,7 +1256,7 @@ fn ata_poll_skip_env_spelling_table_and_default_on() {
 /// sake: their first real use will be a sweep, which is exactly the run a silent
 /// fallback poisons. `IZARRAVM_ATA_POLL_RUN=sixteen` used to run 16 without a
 /// word, and a mistyped sweep leg would have read as "that threshold changed
-/// nothing" -- the same trap the main gate already refuses.
+/// nothing", the same trap the main gate already refuses.
 #[test]
 fn ata_poll_skip_sweep_knobs_panic_on_a_typo() {
     use std::env::VarError;

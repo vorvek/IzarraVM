@@ -9,7 +9,7 @@ use crate::bus::{PortBusClass, port_bus_class};
 
 #[test]
 fn class_matrix_named_ranges_and_edges() {
-    // (port, expected class, label) -- one row per named range in the design's §1.2 table, plus
+    // (port, expected class, label): one row per named range in the design's §1.2 table, plus
     // the boundary pairs the design calls out explicitly.
     let rows: &[(u16, PortBusClass, &str)] = &[
         // DMA1 / page regs / DMA2.
@@ -222,7 +222,7 @@ fn construction_port_writes_preserve_devices_without_charging_guest_time() {
 
 /// T2-lite: the epoch-2 per-class charge for one byte cycle, on an I586 machine (so
 /// `bus_num_at_batch_start`/`bus_den_at_batch_start` are `(16, 105)` and the generic 4-raw-clock
-/// cycle scales to 0, making the charge exactly the class figure -- design §1.3's headline
+/// cycle scales to 0, making the charge exactly the class figure, design §1.3's headline
 /// numbers). Epoch 1 (the knob left unset) must charge nothing extra on a non-legacy port.
 #[test]
 fn epoch_2_charges_the_class_figure_per_byte_cycle() {
@@ -231,7 +231,7 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
 
     // Epoch 2: every port charges its class figure. IsaXBus (gameport 0x201) = 160
     // clocks, of which the generic byte cycle `read_io` records through `trace.record`
-    // now carries 4 -- slice 2 took `bus_timing(I586)` to `(1, 1)`, so the scaled
+    // now carries 4: slice 2 took `bus_timing(I586)` to `(1, 1)`, so the scaled
     // subtrahend that used to floor to 0 is the whole 4 raw. Lane 156 + cycle 4 = 160,
     // the same class figure by the same composition (design section 9.6 pre-registered
     // exactly this re-derivation: "156 / 52 / 52 / 0 once bus_timing is (1,1)").
@@ -268,7 +268,7 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
 }
 
 /// F3: under epoch 2, `IN 0x388` (OPL
-/// status) must pay exactly the `IsaXBus` class charge once, not twice -- the OPL arm's own
+/// status) must pay exactly the `IsaXBus` class charge once, not twice: the OPL arm's own
 /// hand-accrual must be epoch-1-only.
 #[test]
 fn epoch_2_does_not_double_charge_the_opl_status_read() {
@@ -294,7 +294,7 @@ fn epoch_2_admits_the_poll_skip_certificate_with_the_port_lane() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
     // `test_machine()` arms detailed bus tracing, which is its own certificate refusal
-    // (`trace.tracing_mode() != TracingMode::Off`) -- turn it off so this test exercises the
+    // (`trace.tracing_mode() != TracingMode::Off`): turn it off so this test exercises the
     // admission specifically.
     machine.trace.set_tracing_mode(TracingMode::Off);
     let (admitted_before, _, _) = machine.poll_skip_certificate_counters();
@@ -319,7 +319,7 @@ fn epoch_2_admits_the_poll_skip_certificate_with_the_port_lane() {
 }
 
 /// F9: the refusal is REPLACED, not deleted. Any port other than `POLL_SKIP_IO_PORT` is
-/// declined by name and counted -- the lane prices a port, it cannot express a port whose read
+/// declined by name and counted: the lane prices a port, it cannot express a port whose read
 /// is not idempotent (the 8254 read-back latch, the 0x61 refresh toggle).
 #[test]
 #[cfg(feature = "jit")]
@@ -348,7 +348,7 @@ fn a_port_other_than_3da_is_refused_by_name_in_both_epochs() {
 // ---------------------------------------------------------------------------------------------
 // F2: the port lane counts against the batch cap.
 //
-// `run.rs`'s own overshoot note stated the hole outright -- "`port_bus_batch_clocks` joins the
+// `run.rs`'s own overshoot note stated the hole outright: "`port_bus_batch_clocks` joins the
 // batch-end `step` without ever having been counted against the cap". With seven charged ports
 // that was hundreds of clocks. Under epoch 2 every port is charged, so a mode-set burst of 768
 // `OUT 0x3C9` would accrue ~40,000 clocks (a quarter of a PIT tick) that no cap test could see,
@@ -361,7 +361,7 @@ fn a_port_other_than_3da_is_refused_by_name_in_both_epochs() {
 // answering "certainly below the cap" from a bound that no longer holds.
 // ---------------------------------------------------------------------------------------------
 
-/// A hundred `OUT 0x3C9, AL` -- a VGA palette load, the mode-set burst the review names -- driven
+/// A hundred `OUT 0x3C9, AL` (a VGA palette load, the mode-set burst the review names) driven
 /// through the bus in the RING-0 PROTECTED-MODE regime, where `skip_io_touched` is live and the
 /// batch loop's `io_touched` break does NOT end the batch after each access. That regime is the
 /// only one in which the overshoot is interesting: a real-mode guest's `OUT` sets `io_touched`,
@@ -499,7 +499,7 @@ fn exact_cap_comparison_preserves_rounding_and_saturation() {
 fn epoch_2_turns_the_per_instruction_cap_screen_off() {
     // The screen's contract (`CpuBus::in_batch_scaled_bus_clocks_screen_scale`) is a per-batch
     // constant F with `S(raw2) - S(raw1) <= (raw2 - raw1) * F`. Epoch 2's figure carries a term
-    // that is not a function of raw bus clocks, so the bus ratio is NOT such an F -- and the
+    // that is not a function of raw bus clocks, so the bus ratio is NOT such an F, and the
     // screen only ever skips the exact test, so an invalid F silently removes cap breaks. The
     // trait spells `0` as "no bound offered", which sends every ask to the exact test.
     //
@@ -517,7 +517,7 @@ fn epoch_2_turns_the_per_instruction_cap_screen_off() {
 
     // WHY 1 would have been wrong, in the same units the screen uses. One palette write records
     // one 4-raw-clock generic I/O cycle and accrues 56 unscaled clocks on the port lane, so the
-    // scaled figure grows by 56 for 4 raw clocks -- fourteen times the bound the epoch-1 F claims.
+    // scaled figure grows by 56 for 4 raw clocks, fourteen times the bound the epoch-1 F claims.
     machine.port_bus_batch_clocks = 0;
     let (raw_growth, scaled_growth) = with_bus(&mut machine, |bus| {
         let raw_before = bus.in_batch_raw_bus_clocks();
@@ -540,7 +540,7 @@ fn epoch_2_turns_the_per_instruction_cap_screen_off() {
 /// T7's machine half: the charge follows the EXECUTED access. The CPU-side fixture
 /// (`izarravm-cpu`'s `a_bitmap_denied_port_charges_no_column_and_the_epoch_cannot_change_that`)
 /// pins that the FAULTING V86 instruction pays no column; this one pins that the monitor's own
-/// 0x92 access -- the ring-0 instruction the `#GP` handler eventually runs -- pays the `IsaXBus`
+/// 0x92 access (the ring-0 instruction the `#GP` handler eventually runs) pays the `IsaXBus`
 /// class charge exactly once, on both the read and the write side.
 #[test]
 fn the_monitors_own_0x92_access_pays_the_isa_class_charge_once() {
@@ -618,9 +618,9 @@ fn rep_insw_megabytes_per_guest_second(port: u16) -> f64 {
 /// The three candidate rates, all computed from the same 64 KiB transfer:
 ///
 /// * ATA `t0` 20 clocks/word (this slice): 3 + 20 = 23 clocks/word -> **14.5 MB/s**, against a
-///   real P166's PIO mode 4 16.6 MB/s -- 87% of the spec rate, period-correct and erring slow.
+///   real P166's PIO mode 4 16.6 MB/s: 87% of the spec rate, period-correct and erring slow.
 /// * `PciTarget` 56 per byte cycle: 6.7 MB/s, 2.5x slow.
-/// * `IsaXBus` 160 per byte cycle: 2.0 MB/s, **slower than PIO mode 0** -- which is what would
+/// * `IsaXBus` 160 per byte cycle: 2.0 MB/s, **slower than PIO mode 0**, which is what would
 ///   have landed on every HDD and CD read on the board without this rate.
 ///
 /// The band is wide because the figure also carries the element's memory write and the generic
@@ -645,8 +645,8 @@ fn a_rep_insw_from_the_ide_data_register_runs_at_the_ata_cycle_time() {
 }
 
 /// The other half of the same rule: an ISA-class port keeps its 160 per byte cycle for a string
-/// element. A floppy PIO stream really does pay a full 8 MHz X-bus cycle per byte -- Intel's
-/// pipelining note for string I/O is a CPU-side statement and we claim no bus credit for it -- so
+/// element. A floppy PIO stream really does pay a full 8 MHz X-bus cycle per byte (Intel's
+/// pipelining note for string I/O is a CPU-side statement and we claim no bus credit for it) so
 /// this rate must stay an order below the ATA one, and the exception must be the DATA register
 /// alone rather than "string accesses are cheap".
 #[test]
@@ -655,8 +655,8 @@ fn a_rep_insw_from_an_isa_port_keeps_the_class_rate() {
     // 0x378 rather than the FDC's 0x3F5, deliberately: a WORD string element covers two
     // consecutive ports and each byte cycle is charged its OWN class, so `INSW` from 0x3F5 reads
     // 0x3F5 (`IsaXBus` 160) and 0x3F6 (the IDE control block, `PciTarget` 56) and lands at 1.53
-    // MB/s rather than the flat-ISA 1.03. That is correct -- the charge follows the port on the
-    // wire -- but it makes 0x3F5 a bad fixture for "the ISA rate". Both LPT bytes are `IsaXBus`.
+    // MB/s rather than the flat-ISA 1.03. That is correct (the charge follows the port on the
+    // wire) but it makes 0x3F5 a bad fixture for "the ISA rate". Both LPT bytes are `IsaXBus`.
     let isa = rep_insw_megabytes_per_guest_second(0x0378);
     let ata = rep_insw_megabytes_per_guest_second(0x01f0);
     assert!(

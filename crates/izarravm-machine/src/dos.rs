@@ -28,7 +28,7 @@ impl Machine {
     }
 
     /// Build a machine with a DOS-format program loaded and ready to run, with
-    /// no DOS kernel behind it — only `handle_raw_program_int`'s minimal
+    /// no DOS kernel behind it: only `handle_raw_program_int`'s minimal
     /// terminate/console-I/O surface services interrupts. For tests and
     /// benchmarks that need a quick runnable machine, not C: drive access.
     pub fn new_raw_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
@@ -129,7 +129,7 @@ impl Machine {
         // but IRQ1 on the master so an unhandled timer INT cannot fire. Through
         // the CONSTRUCTION bus, for the reason the PIT seed above uses it: POST
         // work, not guest time. (The PIC ports are outside the charged set today,
-        // so this is future-proofing rather than a live fix -- but a seed write is
+        // so this is future-proofing rather than a live fix, but a seed write is
         // a seed write whatever the set holds.)
         {
             let mut bus = self.make_construction_bus();
@@ -362,7 +362,7 @@ impl Machine {
             }
             // Get drive device list: ES:BX -> 5 bytes per drive (subunit + driver
             // header far pointer). One entry: subunit 0, the IzarraCD ROM device
-            // header (`TOKACD01`) — a caller may far-call its strategy/interrupt
+            // header (`TOKACD01`). A caller may far-call its strategy/interrupt
             // entries directly and reach the host through the doorbell.
             0x1501 => {
                 if self.icdex_cd_drive_number().is_some() {
@@ -795,7 +795,7 @@ impl Machine {
 
     /// Read the mailbox's far pointer (offset word then segment word, both
     /// commands 1 and 3's layout) and resolve it to a physical address, or
-    /// `None` for the null 0:0 pointer -- the "nothing stored" sentinel both
+    /// `None` for the null 0:0 pointer, the "nothing stored" sentinel both
     /// callers treat as a refusal.
     fn mailbox_far_pointer(&mut self) -> Option<u32> {
         let off = u32::from(self.read_physical_u8(CD_DEVICE_MAILBOX_ADDRESS as u32))
@@ -812,7 +812,7 @@ impl Machine {
     /// Status codes and the block layout are the design's §2.3. The unit
     /// check is one half of a two-sided guard: the kernel gates drive
     /// selection (boot HDD only, `BootDrive >= 3`), and the host refuses
-    /// any unit that is not the Katea HDD -- on a floppy boot the kernel's
+    /// any unit that is not the Katea HDD: on a floppy boot the kernel's
     /// `dpb_unit == BootDrive - 1` test would otherwise name drive A: and
     /// this answer would come from the wrong volume's FAT.
     fn perform_hdd_map_lookup(&mut self) {
@@ -869,8 +869,8 @@ impl Machine {
         let (config, autoexec) = default_config_pair(&sound_blaster, self.cmos_mpu_port());
         // Per-file, not atomic across the two: if AUTOEXEC's write fails after
         // CONFIG was already rewritten, the folder is left half-repaired (default
-        // CONFIG, no live AUTOEXEC). No data is lost — both originals survive in
-        // their .OLD — and 0xfe tells the user it failed; Repair is a rare manual
+        // CONFIG, no live AUTOEXEC). No data is lost (both originals survive in
+        // their .OLD) and 0xfe tells the user it failed; Repair is a rare manual
         // recovery, so the simple sequence is acceptable.
         for (live_name, old_name, bytes) in [
             ("CONFIG.SYS", "CONFIG.OLD", &config),
@@ -901,7 +901,7 @@ impl Machine {
     /// Read a page at a time rather than byte at a time: a caller string can
     /// cross a page boundary, and one translation does not cover both sides.
     /// The scan stops at the first terminator, so a short name costs one page
-    /// read rather than the whole bound -- and, more to the point, a name that
+    /// read rather than the whole bound, and, more to the point, a name that
     /// ends before a page the caller's tables do not map is not turned into a
     /// walk of that page.
     pub(super) fn read_guest_linear_asciiz_lossy(&mut self, linear: u32, max: usize) -> String {

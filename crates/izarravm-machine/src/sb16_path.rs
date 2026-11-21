@@ -181,7 +181,7 @@ impl Ct1745Mix {
     /// (registers `0x34`/`0x35`) and the DSP voice (`0x32`/`0x33`, already
     /// applied at drain time in `render_voice`), then take the master and output
     /// gain. Keeping FM on its own leg is what lets a title balance music
-    /// against effects -- the two share only the master.
+    /// against effects: the two share only the master.
     pub(crate) fn mix_opl_voice(self, opl: (i32, i32), voice: (i32, i32)) -> (i32, i32) {
         if !self.active {
             return opl;
@@ -204,7 +204,7 @@ impl Ct1745Mix {
     /// `sb16_awe32_filter_pc_speaker` does (`buffer * speaker * master`). The
     /// beeper is a mono source, so one sample fans out to the stereo master.
     ///
-    /// `None` when no card is fitted. That is not "silent" -- it is "not on
+    /// `None` when no card is fitted. That is not "silent", it is "not on
     /// the card": the motherboard beeper on a machine with no sound card is
     /// wired to the speaker and nothing else, so it must take neither the
     /// card's summing-node headroom nor the card's output-stage gain. The
@@ -454,7 +454,7 @@ impl Sb16Path {
         // is the OPL resampler's count for the same window, driven by the
         // smooth host pacing. The two never agree frame-for-frame, so a window
         // where the guest ran long overproduces and one where it ran short
-        // underproduces -- even though they match on average. Discarding the
+        // underproduces, even though they match on average. Discarding the
         // surplus and repeating a frame to cover the shortfall turned that
         // ordinary jitter into a torn stream: measured on a real Quake capture,
         // ~14k frames discarded and ~14k repeated per second against 44.1k
@@ -484,7 +484,7 @@ impl Sb16Path {
         active.held_dac_frame = held;
         if let Some(trace) = &mut active.trace {
             trace.rendered_frames += produced_len as u64;
-            // `truncated` now counts only frames lost to the carry-over cap --
+            // `truncated` now counts only frames lost to the carry-over cap,
             // a real overrun, not per-window jitter. `padded` counts a genuine
             // underrun: the queue ran dry and the last frame was held.
             trace.truncated_frames += overflow as u64;

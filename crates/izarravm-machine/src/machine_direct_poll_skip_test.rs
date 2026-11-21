@@ -14,7 +14,7 @@
 //! and its neighbours drive `MachineBus::callout_poll_skip` directly against a REAL `Machine`'s
 //! VGA/CRTC state, warming the certified shape through the INTERPRETER (`run_budgeted(bus, 0)`,
 //! the `machine_native_bus_timing_test.rs` `prepare_setup_poll_head` pattern) rather than through
-//! native x86 host codegen -- this is the seam contract itself (`poll_bus_certificate` /
+//! native x86 host codegen: this is the seam contract itself (`poll_bus_certificate` /
 //! `poll_fetch_certificate_raw_from`, the split BLOCKER B needs; `predicted_beam` /
 //! `dots_until_status1_bit_change_from`; the admissibility binary search; `poll_commit_bus`), all
 //! through a live `Vega` and `BusTrace`, exercised exactly as `port_read_al_dx` exercises them
@@ -23,7 +23,7 @@
 //! `build_poll_loop(cpu) == build_poll_loop_from(cpu, cpu.linear_eip())`), so the shape and its
 //! `fetch_count()`/`fresh_iteration_spins`/`raw_core_clocks()` are the real, certified values.
 //!
-//! `a_port_callout_preserves_the_blocks_eflags_shadow` (M-24) DOES go through native codegen --
+//! `a_port_callout_preserves_the_blocks_eflags_shadow` (M-24) DOES go through native codegen:
 //! `set_native_backend_enabled(true)` + `set_jit_auto_admit(true)`, with
 //! `jit_direct_blocks_installed > 0` asserted so the fixture cannot silently prove nothing.
 //!
@@ -36,14 +36,14 @@
 //!
 //! **NOT built here: a native-codegen L3 fixture** (`poll_skip_is_clock_identical_to_the_
 //! unskipped_run`, the design's own name for it). Attempted, and dropped rather than shipped
-//! broken -- recorded in the GP2 poll-skip revision report rather than left as a silent gap. A
+//! broken, recorded in the GP2 poll-skip revision report rather than left as a silent gap. A
 //! program shaped `mov ecx,N; [outer/w1] in al,dx; test al,8; jnz w1; [w2] in al,dx; test al,8;
 //! jz w2; dec ecx; jnz outer; out 0x80,al; hlt` (an OUTER counted loop wrapping the certified
 //! 3-slot shape, needed so a single cold run gets enough native dispatcher entries to clear
 //! admission's heat threshold) reproducibly read `cs().default_size_32` as `false` at the
 //! call-out despite being forced `true` at construction, ONCE the outer wrapper's own back-edge
 //! also targeted the inner loop's head address (i.e. once TWO distinct back-edges converge on the
-//! same entry) -- and with it misdecoded, `EDX` read `0xA8EC03DA`, exactly the raw bytes at
+//! same entry), and with it misdecoded, `EDX` read `0xA8EC03DA`, exactly the raw bytes at
 //! `program[6..10]` reinterpreted as a 32-bit immediate under the wrong operand-size default. The
 //! callout-poll-skip and BLOCKER-1/2 fixtures above never exercise a program shape with two
 //! converging back-edges, so this is NOT known to be caused by anything this slice touches, and it
@@ -100,7 +100,7 @@ fn warm_5slot_poll_loop(cpu: &mut CpuGsw, bus: &mut MachineBus<'_>) -> PollLoop 
 
 /// Warm the certified 6-slot Ebx-source PairedJmp shape (`mov edx,ebx / sub eax,eax / in al,dx /
 /// test al,mask / je +2(exit) / jmp -11(entry)`) at `HEAD6`. Rank-5's `diagnostic_class() == 2`
-/// half -- the shape whose spin sense `fresh_iteration_spins` INVERTS relative to Direct.
+/// half, the shape whose spin sense `fresh_iteration_spins` INVERTS relative to Direct.
 #[cfg(feature = "jit")]
 fn warm_6slot_poll_loop(cpu: &mut CpuGsw, bus: &mut MachineBus<'_>) -> PollLoop {
     for offset in [0u32, 2, 4, 5, 7, 9] {
@@ -123,7 +123,7 @@ fn request_for(cpu: &CpuGsw, poll: PollLoop, cap: u64) -> CalloutPollSkipRequest
     request_for_with_bus_baseline(cpu, poll, cap, 0)
 }
 
-/// `request_for`, with an explicit `bus_scaled_at_run_entry` -- the field BLOCKER 2's fix added.
+/// `request_for`, with an explicit `bus_scaled_at_run_entry`, the field BLOCKER 2's fix added.
 /// Zero reproduces a fresh batch's first run (what `request_for` always built); a nonzero value
 /// is what a fixture needs to exercise a SECOND run inside one batch, which is exactly the
 /// scenario every pre-revision fixture skipped (see `prior_runs_core_clocks_is_nonzero_on_a_
@@ -226,7 +226,7 @@ fn poll_skip_seam_test_machine(mode: GswMode) -> Machine {
     // `PollBranchShape::PairedJmp` INVERTS the spin sense (`fresh_iteration_spins`: `!branch_
     // taken`, not `branch_taken`): the forward `je` must be taken to LEAVE the loop (bit
     // cleared), so spinning (bit set) is the branch NOT-taken, fall-through-to-the-backward-jmp
-    // case -- the opposite polarity from the 3-/5-slot Direct shapes just above, which is
+    // case, the opposite polarity from the 3-/5-slot Direct shapes just above, which is
     // exactly the case the GP2 revision diagnostic pair found never engaging in the wild
     // (`poll_skip_spans = [39543, 0, 0]`, classes 1 and 2 both zero).
     let head6_index = (HEAD6 - 0x100) as usize;
@@ -257,14 +257,14 @@ fn poll_skip_seam_test_machine(mode: GswMode) -> Machine {
     // classifier) gates on `poll_skip_eligible()`, which requires the Direct backend DISABLED
     // (`block.rs`'s own `poll_skip_eligible` doc: "the ONLY consumer this design serves is a
     // Direct-armed CPU, so this predicate is the interpreter's own eligibility gate and is
-    // deliberately blind to that arm"). This fixture never runs native code at all -- it drives
-    // `MachineBus::callout_poll_skip` directly -- so the interpreter's classifier is exactly the
+    // deliberately blind to that arm"). This fixture never runs native code at all (it drives
+    // `MachineBus::callout_poll_skip` directly) so the interpreter's classifier is exactly the
     // tool to certify the shape with, on the `poll_skip_test_machine` precedent
     // (`machine_native_bus_timing_test.rs`).
     machine.cpu.set_native_backend_enabled(false);
     // `0x75` (JNZ) spins while the bit is SET (`fresh_iteration_spins` for the Direct branch
     // shape: `spins = (status & mask == 0) == branch_when_zero`, and `branch_when_zero` is false
-    // for JNZ) -- position the beam so that is the CURRENT state, or the admissibility search has
+    // for JNZ): position the beam so that is the CURRENT state, or the admissibility search has
     // nothing to search over on the very first attempt.
     set_status1_bit(&mut machine, 0x08, true);
     machine.trace.set_tracing_mode(TracingMode::Off);
@@ -274,7 +274,7 @@ fn poll_skip_seam_test_machine(mode: GswMode) -> Machine {
 /// **I4/I1/I2, the seam's engagement bar, driven through the REAL bus.** A certified 3-slot shape
 /// spinning on a fresh-programmed CRTC's vsync bit must let `callout_poll_skip` commit a span,
 /// and the committed core/bus clocks must be exactly `raw_core_clocks * iterations` /
-/// `certificate.raw_clocks_per_iteration * iterations` -- the same identities L3 grades.
+/// `certificate.raw_clocks_per_iteration * iterations`, the same identities L3 grades.
 #[cfg(feature = "jit")]
 #[test]
 fn callout_poll_skip_commits_a_span_through_the_real_bus() {
@@ -304,7 +304,7 @@ fn callout_poll_skip_commits_a_span_through_the_real_bus() {
 
 /// **Rank-5 killer**: the 5-/6-slot shapes (`diagnostic_class() == 1` and `== 2`) and
 /// `PollBranchShape::PairedJmp`'s inverted spin sense. The GP2 revision diagnostic pair measured
-/// `poll_skip_spans = [39543, 0, 0]` on a real game corpus -- classes 1 and 2 NEVER engaged --
+/// `poll_skip_spans = [39543, 0, 0]` on a real game corpus (classes 1 and 2 NEVER engaged)
 /// and nothing in the pre-revision suite exercised either shape at all, so a broken `port_source`
 /// register read or an inverted-inversion bug in `fresh_iteration_spins` for `PairedJmp` could
 /// have shipped silently. This drives both shapes through the SAME real-bus seam the 3-slot test
@@ -386,7 +386,7 @@ fn five_and_six_slot_shapes_engage_with_the_correct_spin_sense() {
     );
 }
 
-/// **I4, engaged through NATIVE codegen end to end** -- the strongest form of BLOCKER D's
+/// **I4, engaged through NATIVE codegen end to end**: the strongest form of BLOCKER D's
 /// requirement: not just the seam (above), but the EMITTED `port_read_al_dx` call-out, compiled
 /// and run as real host machine code, committing a span through the real bus.
 #[cfg(feature = "jit")]
@@ -395,7 +395,7 @@ fn direct_poll_skip_engages_through_native_codegen() {
     // `in al,dx; test al,0x08; jnz $-4` at CS:0100 (entry IS the loop head, so no chain/re-entry
     // subtlety to get wrong): index 0 == guest offset 0x100 (the loader's `+0x100` COM
     // convention), so `HEAD` there is `0x100`, distinct from this file's other fixtures' `HEAD`
-    // (`0x103`) only in that this program has no `mov dx,3dah` prefix -- EDX is preloaded instead.
+    // (`0x103`) only in that this program has no `mov dx,3dah` prefix: EDX is preloaded instead.
     let program = [0xec, 0xa8, 0x08, 0x75, 0xfb];
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
@@ -440,7 +440,7 @@ fn direct_poll_skip_engages_through_native_codegen() {
 
 /// The 16-bit screen: a 0x3DA call-out from a 16-bit code segment must decline
 /// BEFORE the scan. Every shape is 32-bit (`poll_head_possible` requires `d`),
-/// so the scan can only ever say no -- and it says no expensively, one block
+/// so the scan can only ever say no, and it says no expensively, one block
 /// decode plus its allocations per call-out. Tyrian 2000 spins on 0x3DA from
 /// 16-bit native blocks and paid 1.5e9 doomed scans, ~80% of its wall,
 /// before this screen existed (2026-08-29; the OFF-arm A/B measured 5.2x at
@@ -554,17 +554,17 @@ fn a_non_certifiable_callout_scan_is_answered_from_the_negative_cache() {
 /// block reached by a linked unconditional `jmp` from a first block, so `current`/`entry` in
 /// `build_poll_loop_from` are computed from a slot whose block was entered via the link graph,
 /// not via the dispatcher's cold entry. If the composition were wrong, the classifier would scan
-/// from the wrong address -- silently declining (`declined_shape`) at best, certifying a
+/// from the wrong address, silently declining (`declined_shape`) at best, certifying a
 /// different shape that happens to sit there at worst. Two assertions the review names
 /// explicitly: `poll_skip_spans.sum() > 0` (it engages at all) and `poll_skip_last_head` equals
 /// the SUCCESSOR block's own head linear, not the first block's.
 #[cfg(feature = "jit")]
 #[test]
 fn direct_poll_skip_engages_in_a_chained_successor_block() {
-    // Block A (guest OFFSET 0x100 within the segment, COM convention): `nop; jmp +0x0d` -- a
+    // Block A (guest OFFSET 0x100 within the segment, COM convention): `nop; jmp +0x0d`, a
     // trivial predecessor whose only job is to hand control to block B via a linked transfer,
     // exactly once. Block B (guest offset 0x110): the same `in al,dx; test al,0x08; jnz $-4`
-    // 3-slot shape the unchained fixture certifies, at its OWN entry -- the "chain" is that block
+    // 3-slot shape the unchained fixture certifies, at its OWN entry: the "chain" is that block
     // B is reached only by the link from block A, never as anyone's cold dispatch target.
     let mut program = vec![0u8; 0x15];
     program[0] = 0x90; // nop
@@ -622,17 +622,17 @@ fn direct_poll_skip_engages_in_a_chained_successor_block() {
 
 /// **Rank-3 killer**: the admissibility binary search's edge boundary. `admissible(n)` requires
 /// `dots < edge_dots` (the projected dot position stays strictly on THIS side of the status-1
-/// bit's next geometric edge). An off-by-one HIGH there lets a committed span cross the edge --
+/// bit's next geometric edge). An off-by-one HIGH there lets a committed span cross the edge:
 /// the guest's wait-for-retrace loop would read a bit that already flipped and miss its frame, a
 /// wrong guest-visible answer with no counter that reports it.
 ///
-/// Two assertions, of unequal strength -- both are worth having, but only the first is the real
+/// Two assertions, of unequal strength: both are worth having, but only the first is the real
 /// invariant pin:
 ///
 /// (a) **The invariant itself.** After the commit, publish `now_after` the same way
 /// `port_read_al_dx` does (`bus.publish_core_clocks`), then re-read the status bit at
-/// `bus.predicted_beam()` -- the REAL post-commit beam position, not a re-derivation of the
-/// search's own arithmetic -- and require it to still read "spinning" by the request's own
+/// `bus.predicted_beam()` (the REAL post-commit beam position, not a re-derivation of the
+/// search's own arithmetic) and require it to still read "spinning" by the request's own
 /// polarity. A committed span that crossed the edge fails this directly, independent of anything
 /// this file assumes about `edge_dots`'s numeric scale.
 ///
@@ -641,7 +641,7 @@ fn direct_poll_skip_engages_in_a_chained_successor_block() {
 /// `min_iterations = best + 1`, must decline. This is NOT a reliable off-by-one killer on its
 /// own: `predicted_beam`'s dots-per-iteration granularity for this fixture is coarse enough that
 /// even a deliberately introduced `<=`-for-`<` mutation (verified by hand while building this
-/// fixture) left `best` completely unchanged -- the discrete dots(n) sequence never happens to
+/// fixture) left `best` completely unchanged: the discrete dots(n) sequence never happens to
 /// land exactly on `edge_dots` for this shape's clock ratio. (b) still catches a GROSS
 /// mis-derivation of the bound (an `admissible` that stopped consulting the edge at all, for
 /// example: `best` jumps from 3,587 to over 3.4 million with the edge check removed entirely in
@@ -758,7 +758,7 @@ fn direct_poll_skip_off_arm_declines_through_native_codegen() {
 
 /// **BLOCKER B's fix, exercised.** `poll_bus_certificate_from` (the split entry point the seam
 /// uses) must certify the SAME `raw_clocks_per_iteration` the `PollLoop`-typed
-/// `poll_bus_certificate` certifies for the identical fetch set -- the whole point of sharing
+/// `poll_bus_certificate` certifies for the identical fetch set, the whole point of sharing
 /// `poll_fetch_certificate_raw_from` between them.
 #[cfg(feature = "jit")]
 #[test]
@@ -822,12 +822,12 @@ fn callout_poll_skip_names_which_screen_declined() {
 /// (0x3DA) / `ADC` reads carry out of RBP directly (`emit_carry_alu_preloaded`), so a spurious
 /// RBP reload after the port call-out would flip the ADC's carry input to whatever stale value
 /// happened to be in memory. This block is NOT a certified poll shape (`STC`/`IN`/`ADC` matches
-/// none of `build_poll_loop_from`'s arms), so there is no HIT conjunct here on purpose -- see the
+/// none of `build_poll_loop_from`'s arms), so there is no HIT conjunct here on purpose. See the
 /// design review's BLOCKER E finding, which this test adopts by omitting it.
 ///
 /// **Rebuilt from the original ADD/IN/ADC fixture (revision report, M-24 replacement) because its
 /// stated invariant was false: `IN AL,DX` OVERWRITES AL, so `AL == 1` after the original fixture
-/// held only by accident -- iff the 0x3DA byte on the loop's last iteration happened to be
+/// held only by accident, iff the 0x3DA byte on the loop's last iteration happened to be
 /// exactly `0x00`. Worse, timing-contract amendment C4 releases 0x3DA
 /// bits 4-5 to 86Box's model, which would make that byte NON-DETERMINISTIC and break the fixture
 /// for a reason that has nothing to do with RBP.**
@@ -836,7 +836,7 @@ fn callout_poll_skip_names_which_screen_declined() {
 /// al,dx; adc bl,0; dec ecx; jnz head; hlt`. `stc` re-establishes CF=1 every iteration
 /// (independent of anything the port returns), `in al,dx` only ever writes AL, and `adc bl,0`
 /// adds exactly 1 to BL when CF survives the call-out intact. Under the correct gate `BL` reaches
-/// exactly `200`, deterministically, for ANY 0x3DA byte sequence -- C4-proof by construction.
+/// exactly `200`, deterministically, for ANY 0x3DA byte sequence, C4-proof by construction.
 /// Under the bug (RBP reloaded from a stale, CF-clear memory shadow after the call-out) `ADC
 /// BL,0` sees CF=0 every time and `BL` stays `0`.
 const STC_IN_ADC_PROGRAM: [u8; 13] = [
@@ -890,20 +890,20 @@ fn a_port_callout_preserves_the_blocks_eflags_shadow() {
 // GP2 poll-skip REVISION: BLOCKER 1 / BLOCKER 2 killers (2026-08-26 revision report)
 // ============================================================================================
 
-/// **Rank-1 killer (revision report §4 item 1) -- the acceptance test for BLOCKER 1's fix.**
+/// **Rank-1 killer (revision report §4 item 1): the acceptance test for BLOCKER 1's fix.**
 /// `MachineBus::publish_core_clocks` used to zero `prior_runs_core_clocks` on every call-out
 /// attempt, decline or commit alike, corrupting the batch instant every lazy prediction after it
 /// reads (`predicted_beam`, the seam's own edge test, the lazy PIT/OPL peeks) for the REST of the
 /// run. Every other fixture in this file runs with `prior_runs_core_clocks == 0` at the attempt
 /// (a fresh `machine.make_bus()`, or the first run of a batch), which is exactly why this defect
-/// was invisible to the whole suite -- corroborated by the 2026-08-26 diagnostic pair (C1
+/// was invisible to the whole suite, corroborated by the 2026-08-26 diagnostic pair (C1
 /// conservation held to 1.1 ppb while the frame hash moved: the charges were right, a prediction
 /// INPUT was wrong).
 ///
 /// Two assertions, both of which fail on the pre-fix code (reverting `publish_core_clocks` to
 /// `self.prior_runs_core_clocks = 0; self.core_clocks_so_far = now;` makes both red):
 ///
-/// (a) `bus.prior_runs_core_clocks` is BYTE-IDENTICAL before and after the call-out attempt --
+/// (a) `bus.prior_runs_core_clocks` is BYTE-IDENTICAL before and after the call-out attempt,
 ///     the direct, mechanical proof that nothing clears it.
 /// (b) The batch instant is actually CONSULTED, not merely preserved-but-ignored: two otherwise
 ///     identical machines that differ only in `prior_runs_core_clocks` at the attempt must predict
@@ -921,7 +921,7 @@ fn prior_runs_core_clocks_is_nonzero_on_a_second_batch_run() {
 
     // (a) The direct preservation proof. `port_read_al_dx`'s own sequence, reproduced exactly:
     // `bus.publish_core_clocks(now)` runs BEFORE `bus.callout_poll_skip(&request)` on every
-    // attempt, decline or commit alike -- so this test must call it too, or it exercises a
+    // attempt, decline or commit alike, so this test must call it too, or it exercises a
     // function the real defect never lived in.
     let mut machine = poll_skip_seam_test_machine(GswMode::Gsw586);
     let (before, after) = with_cpu_and_bus(&mut machine, |cpu, bus| {
@@ -965,8 +965,8 @@ fn prior_runs_core_clocks_is_nonzero_on_a_second_batch_run() {
     );
 }
 
-/// **BLOCKER 2's fix, exercised.** `req.cap` is the RUN's remaining budget -- already net of the
-/// batch's prior bus clocks -- but `MachineBus::poll_project_scaled_bus_clocks` reads a
+/// **BLOCKER 2's fix, exercised.** `req.cap` is the RUN's remaining budget (already net of the
+/// batch's prior bus clocks) but `MachineBus::poll_project_scaled_bus_clocks` reads a
 /// BATCH-ABSOLUTE total. Before this fix the seam compared the run-remaining `cap` against the
 /// batch-absolute bus reading directly, subtracting the batch's prior bus clocks from the budget
 /// a SECOND time (the first subtraction is already baked into `req.cap` by the caller). The fix
@@ -978,7 +978,7 @@ fn prior_runs_core_clocks_is_nonzero_on_a_second_batch_run() {
 /// FIRST call cannot mutate `bus.trace` and so contaminate the second (`callout_poll_skip`'s only
 /// side effect is `poll_commit_bus` on a commit, so the DECLINING request must run first): one
 /// claims none of the inflated bus total belongs to a prior run (`0`, reproducing the pre-fix
-/// effective behaviour -- the full batch-absolute reading counts as this run's own spend) under a
+/// effective behaviour: the full batch-absolute reading counts as this run's own spend) under a
 /// cap too tight to admit it; the other, run second under the SAME cap, claims all of it does (the
 /// batch-absolute reading itself, reproducing "this run just started, no bus growth yet") and
 /// must commit. If `bus_growth` collapsed back to the batch-absolute reading (the pre-fix
@@ -1012,7 +1012,7 @@ fn bus_growth_not_batch_absolute_bus_bounds_the_cap_test() {
         let cap = now + batch_bus_now.saturating_sub(20);
 
         // FIRST: baseline 0 claims the full batch-absolute reading as this run's own growth, so
-        // `run_spent(0) = now + batch_bus_now > cap` -- must decline, and a decline never touches
+        // `run_spent(0) = now + batch_bus_now > cap`, must decline, and a decline never touches
         // `bus.trace`, so the second call below still sees the same `batch_bus_now`.
         let charges_full_batch_bus = request_for_with_bus_baseline(cpu, poll, cap, 0);
         let outcome = bus.callout_poll_skip(&charges_full_batch_bus);
@@ -1023,7 +1023,7 @@ fn bus_growth_not_batch_absolute_bus_bounds_the_cap_test() {
         );
 
         // SECOND: baseline batch_bus_now claims none of it is this run's own growth (`run_spent(0)
-        // = now + 0`), comfortably under the same cap -- must commit.
+        // = now + 0`), comfortably under the same cap, must commit.
         let charges_only_run_growth = request_for_with_bus_baseline(cpu, poll, cap, batch_bus_now);
         let outcome = bus.callout_poll_skip(&charges_only_run_growth);
         assert!(
@@ -1038,13 +1038,13 @@ fn bus_growth_not_batch_absolute_bus_bounds_the_cap_test() {
 
 /// **Rank-4 killer**: the 32-bit return-lane bound, `bus::poll_skip_upper_bound`. No fixture in
 /// this file (or, per the diagnostic pair, any real game corpus) ever produces a span within
-/// four orders of magnitude of `LANE_SAFETY_CEILING` -- the status-1 edge always binds first, by
+/// four orders of magnitude of `LANE_SAFETY_CEILING`: the status-1 edge always binds first, by
 /// a huge margin (`callout_poll_skip_commits_exactly_to_the_edge_boundary` measured `best` in the
-/// low thousands against an unbounded-edge ceiling of 3.4 MILLION for the identical fixture) --
+/// low thousands against an unbounded-edge ceiling of 3.4 MILLION for the identical fixture),
 /// so a future edit to the clamp expression, or to `IZARRAVM_DIRECT_POLL_MAX_RAW`'s default,
 /// would ship silently and corrupt the clock lane (or set a phantom step-break bit) rather than
 /// fault. A pure-function unit test on the clamp alone, no machine and no VGA/beam state
-/// involved -- exactly what the review asked for.
+/// involved, exactly what the review asked for.
 #[cfg(feature = "jit")]
 #[test]
 fn poll_skip_upper_bound_never_lets_the_32_bit_lane_overflow() {
@@ -1060,7 +1060,7 @@ fn poll_skip_upper_bound_never_lets_the_32_bit_lane_overflow() {
          with an absurd cap and max_skipped_raw: upper={upper}, product={skipped_raw_core_clocks}"
     );
     // The margin: `IN_PORT_CORE_CLOCKS` (12, `izarravm-cpu`, not visible from this crate) plus
-    // this method's own return must still clear 2^32 -- `crate::bus::LANE_SAFETY_CEILING` reserves
+    // this method's own return must still clear 2^32: `crate::bus::LANE_SAFETY_CEILING` reserves
     // 64 clocks for exactly this, so 12 fits with headroom to spare.
     const IN_PORT_CORE_CLOCKS_FOR_TEST: u64 = 12;
     assert!(
@@ -1120,7 +1120,7 @@ fn sixteen_bit_spin_machine_for_mask(
         .cpu
         .set_direct_poll_skip_16_override(Some(poll_skip_16));
     machine.cpu.set_poll_neg_cache_enabled_for_test(true);
-    // The loader's own cs is left alone: 16-bit, limit 0xFFFF -- the state the slice is for.
+    // The loader's own cs is left alone: 16-bit, limit 0xFFFF, the state the slice is for.
     assert!(!machine.cpu.registers.cs().default_size_32);
     assert!(machine.cpu.registers.cs().limit <= 0xffff);
     machine.cpu.registers.set_edx(0x03da);
@@ -1134,7 +1134,7 @@ fn sixteen_bit_spin_machine_for_mask(
 /// **T-D5, the D1 half.** A 16-bit certified 3-slot loop with the new knob ON commits a
 /// span through the REAL bus, from the EMITTED call-out: `poll_skip_spans.sum() > 0`,
 /// `poll_skip_last_head` equal to the shape's own head linear, and
-/// `skipped_raw_core_clocks == 112 * iterations` -- the same arithmetic identity the
+/// `skipped_raw_core_clocks == 112 * iterations`, the same arithmetic identity the
 /// 32-bit slice shipped with.
 ///
 /// It also pins round-2 MINOR-6: with knob-first ordering the 16-bit screen's condition is
@@ -1258,7 +1258,7 @@ fn a_sixteen_bit_register_mask_poll_loop_commits_a_span_with_the_knob_on() {
 ///
 /// Both halves matter. The dedicated lane is what lets a ladder tell "the shape did not
 /// certify" (`_shape`) from "the shape certified and then declined semantically"
-/// (`_mask_source`) -- and the second is the storm-class signature, because a `Found` is
+/// (`_mask_source`), and the second is the storm-class signature, because a `Found` is
 /// never cached. The absent cache entry is what keeps the register half of the shape out
 /// of a `(lin, d)`-keyed structure it does not belong in: the SAME BYTES with `AH = 8`
 /// must still certify, which the sibling fixture above proves.
@@ -1267,7 +1267,7 @@ fn a_sixteen_bit_register_mask_poll_loop_commits_a_span_with_the_knob_on() {
 fn a_wrong_mask_value_declines_through_its_own_lane_without_caching() {
     // `in al,dx; test al,ah; JZ $-5` with `AH = 0x40`. The branch sense is inverted from the
     // sibling fixtures deliberately: status1 never sets bit 6, so this spins FOREVER on a mask
-    // the analytic edge oracle cannot read -- which is exactly the persistent wrong-mask site
+    // the analytic edge oracle cannot read, which is exactly the persistent wrong-mask site
     // the sticky memo exists for. With `JNZ` the loop would fall out after one iteration and
     // the call-out would never run enough to say anything.
     let mut machine = sixteen_bit_spin_machine(&[0xec, 0x84, 0xe0, 0x74, 0xfb], 0x4000, true);
@@ -1301,7 +1301,7 @@ fn a_wrong_mask_value_declines_through_its_own_lane_without_caching() {
 }
 
 /// The 16-bit slice's OFF arm, and the ladder's A arm: with the new knob unset, a 16-bit
-/// call-out is screened out exactly as on `main` -- into `poll_declined_sixteen_bit`, with
+/// call-out is screened out exactly as on `main`, into `poll_declined_sixteen_bit`, with
 /// no scan and no span. This is what makes the rollback claim ("unset restores the current
 /// behaviour exactly") true rather than aspirational.
 #[cfg(feature = "jit")]
@@ -1342,8 +1342,8 @@ fn the_sixteen_bit_off_arm_screens_before_the_scan() {
     }
 }
 
-/// **THE FLIP PIN.** With the per-CPU override left at `None` -- i.e. reading the AMBIENT
-/// `IZARRAVM_DIRECT_POLL_SKIP_16` exactly as a shipped build does -- a 16-bit certified loop
+/// **THE FLIP PIN.** With the per-CPU override left at `None`, i.e. reading the AMBIENT
+/// `IZARRAVM_DIRECT_POLL_SKIP_16` exactly as a shipped build does, a 16-bit certified loop
 /// must commit a span. That is the 2026-08-29 default-ON flip, asserted end to end through
 /// the emitted call-out rather than only at the spelling table.
 ///
@@ -1367,7 +1367,7 @@ fn the_sixteen_bit_arm_is_on_by_default_end_to_end() {
     machine.set_jit_auto_admit(true);
     machine.cpu.set_native_backend_enabled(true);
     machine.cpu.set_direct_poll_skip_override(Some(true));
-    // NO `set_direct_poll_skip_16_override` -- the ambient reading is the point of this row.
+    // NO `set_direct_poll_skip_16_override`: the ambient reading is the point of this row.
     machine.cpu.set_poll_neg_cache_enabled_for_test(true);
     assert!(!machine.cpu.registers.cs().default_size_32);
     machine.cpu.registers.set_edx(0x03da);

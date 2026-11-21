@@ -20,9 +20,9 @@ fn enabled_membrane_toggles_with_ch2_out() {
 
 /// The membrane's swing is 86Box's, peak to peak.
 ///
-/// Every other speaker level assertion in the tree is a RATIO -- the PC-SPK
+/// Every other speaker level assertion in the tree is a RATIO (the PC-SPK
 /// positions against each other, the card path against the cardless one, an
-/// ultrasonic tone against an audible one -- and every one of them is invariant
+/// ultrasonic tone against an audible one) and every one of them is invariant
 /// under this constant, by construction. That is what a level test should be,
 /// and it is also why nothing caught the beeper resting 9.88 dB above 86Box's
 /// for as long as it did. This is the one assertion that pins the absolute
@@ -46,8 +46,8 @@ fn membrane_swing_matches_the_86box_beeper_peak_to_peak() {
     );
 
     // And it reaches the output. A segment held at one level settles to the
-    // membrane's own amplitude through the fixed voicing chain -- the cone
-    // biquads pass DC at unity, the case ambience adds its wet path -- so the
+    // membrane's own amplitude through the fixed voicing chain (the cone
+    // biquads pass DC at unity, the case ambience adds its wet path) so the
     // rendered level is a constant multiple of the constant above, and the two
     // directions are symmetric because the swing is.
     let held = |level: bool| {

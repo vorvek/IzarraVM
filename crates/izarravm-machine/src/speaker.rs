@@ -13,7 +13,7 @@ use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 /// carries no DC bias.
 ///
 /// The swing is +/- this, so 5120 peak to peak, which is 86Box's mode-3 beeper
-/// (`snd_speaker.c`, 0..0x1400) exactly. It was 8000 -- 16000 peak to peak --
+/// (`snd_speaker.c`, 0..0x1400) exactly. It was 8000 (16000 peak to peak)
 /// until the beeper's level against a full-scale digital voice leg was measured
 /// through both emulators' whole chains and came out 9.88 dB hot; see the
 /// routing note on `MIX_HEADROOM` in `timing.rs`, which carries the derivation.

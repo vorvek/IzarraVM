@@ -11,12 +11,12 @@
 //! the REAL part's cache geometry, selected per persona (`CpuPersona`):
 //!
 //! * **486**: 8 KiB, 4-way set associative, 16-byte lines, 128 sets, 3-bit
-//!   tree pseudo-LRU, no-write-allocate, write-through -- Intel i486
+//!   tree pseudo-LRU, no-write-allocate, write-through. Intel i486
 //!   Microprocessor Hardware Reference Manual (1990) §4.2, and the i486DX2
 //!   Microprocessor Data Book (Jul 1992) §5/§6.1.
 //! * **586 (Pentium MMX 166, `GSW_MODE_SPECS[3]`)**: split 16 KiB instruction +
 //!   16 KiB data L1, 32-byte lines, 2-way set associative, 256 sets each,
-//!   1-bit LRU -- Pentium Processor Family Developer's Manual Volume 1 (Jul95)
+//!   1-bit LRU. Pentium Processor Family Developer's Manual Volume 1 (Jul95)
 //!   §3.5 pins the base part's 8+8 KiB / 2-way / 32-byte-line structure
 //!   ("Each of the caches are 8 Kbytes in size and each is organized as a 2-way
 //!   set associative ... Each cache line is 32 bytes wide"); the P55C (Pentium
@@ -32,16 +32,16 @@
 //!     associative, 4096 sets, LRU (reuses the 486 arm's 3-bit tree PLRU,
 //!     which is exact for 4 ways), write-back, inclusive of L1 in the sense
 //!     that it is probed only on an L1 miss (this shadow does not enforce
-//!     strict inclusion -- an L2 fill never explicitly invalidates other L1
-//!     lines -- because nothing here charges timing and S1's certifier only
+//!     strict inclusion: an L2 fill never explicitly invalidates other L1
+//!     lines, because nothing here charges timing and S1's certifier only
 //!     asks that L1 misses rise while L2 misses stay flat on an L2-resident
 //!     stride, which holds without enforced inclusion).
 //!
 //! Every counter here is diagnostic-only, exactly like `OplProbe`: never read
 //! by any emulation decision, never part of canonical state, and safe to
 //! recompute differently across a save/restore round trip. Coverage is
-//! necessarily partial for the interpreter/FastMap path's own reasons -- see
-//! `ShadowL1Probe`'s doc -- and additionally covers the Direct JIT's per-block
+//! necessarily partial for the interpreter/FastMap path's own reasons (see
+//! `ShadowL1Probe`'s doc) and additionally covers the Direct JIT's per-block
 //! code-fetch stream once `IZARRAVM_SHADOW_L1_PROBE=1` forces the
 //! `NativeBlockTrace` append preamble (`bus.rs`'s `native_fetches_are_uniform`);
 //! see that doc for what the JIT's bulk per-block DATA charge still leaves
@@ -60,7 +60,7 @@
 //! ## Invalidation
 //!
 //! The array is flushed (every tag, LRU byte and dirty bit reset) on INVD,
-//! WBINVD, and a persona change -- the same events a real part flushes its own
+//! WBINVD, and a persona change, the same events a real part flushes its own
 //! cache on ("the on-chip cache to be flushed", Nov89 Sec 5.7; "all 128 sets of
 //! three LRU bits are set to 0"). A persona change also re-selects the
 //! geometry (a persona change is a different part). INVD/WBINVD reach it
@@ -70,7 +70,7 @@
 //! hit/miss counts), not cache state, and are NOT reset by a flush.
 //!
 //! Guest DMA does **not** flush or invalidate the shadow, and this is a
-//! deliberate omission -- see the module's git history / predecessor doc for
+//! deliberate omission. See the module's git history / predecessor doc for
 //! the exposure bound; unchanged by S1.
 
 use izarravm_bus::BusAccessKind;
@@ -140,7 +140,7 @@ impl ShadowClassCounts {
         }
     }
 
-    /// Misses per access -- `1.0 - hit_ratio()` restated without the
+    /// Misses per access: `1.0 - hit_ratio()` restated without the
     /// subtraction, for callers that want the miss side directly (S1's `mpi`
     /// is this figure folded across classes and normalized by
     /// `perf.instructions`, computed by the caller from raw counts).
@@ -155,9 +155,9 @@ impl ShadowClassCounts {
 }
 
 /// A snapshot of one L1 array's three classes (a unified 486 array uses all
-/// three; the 586 split arrays each populate only the classes they can see --
+/// three; the 586 split arrays each populate only the classes they can see:
 /// `code_fetch` on the instruction array, `data_read`/`data_write` on the
-/// data array -- leaving the other classes at their default zero).
+/// data array, leaving the other classes at their default zero).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ShadowLevelDiagnostics {
     pub code_fetch: ShadowClassCounts,
@@ -172,7 +172,7 @@ pub struct ShadowL1Diagnostics {
     pub enabled: bool,
     pub persona: Option<CpuPersona>,
     /// The 486's unified array, or the 586's data array folded with its
-    /// instruction array's `code_fetch` class -- kept for backward
+    /// instruction array's `code_fetch` class, kept for backward
     /// compatibility with existing `--profile-json` consumers that read
     /// `code_fetch`/`data_read`/`data_write` directly off the top level.
     pub code_fetch: ShadowClassCounts,
@@ -190,7 +190,7 @@ pub struct ShadowL1Diagnostics {
     /// counts every compiled-block entry attempt seen while armed;
     /// `sampled_entries` counts the ones diverted to the interpreter so its
     /// existing per-address probe seam sees that iteration's DATA accesses
-    /// (the JIT's own compiled body never carries them -- see the module
+    /// (the JIT's own compiled body never carries them; see the module
     /// doc). `sampled_fraction()` is `sampled_entries / total_entries`, the
     /// estimator's own sampling rate; the design's `mpi` for the DATA classes
     /// should be read as "misses per SAMPLED instruction", not per
@@ -242,7 +242,7 @@ const fn plru4_touch(bits: u8, way: usize) -> u8 {
 }
 
 /// 1-bit true-LRU state for a 2-way set (the 586 arm's replacement, design
-/// §2b item 1: "1-bit LRU"). `bit == way` means "way `way` is the victim" --
+/// §2b item 1: "1-bit LRU"). `bit == way` means "way `way` is the victim",
 /// i.e. the bit names the LEAST recently used way directly, no tree needed
 /// for 2 ways (a real LRU stack for 2 ways needs exactly 1 bit).
 const fn lru2_victim(bit: u8) -> usize {
@@ -256,7 +256,7 @@ const fn lru2_touch(way: usize) -> u8 {
 
 /// One shadow tag array: `sets * ways` line-number tags, one replacement-state
 /// byte per set (3-bit PLRU for a 4-way array, 1-bit LRU for a 2-way array),
-/// and -- only meaningful when `write_allocate` is set -- one dirty bit per
+/// and (only meaningful when `write_allocate` is set) one dirty bit per
 /// line and a running write-back-victim count.
 ///
 /// Kept as one generically-sized type (rather than four monomorphized structs)
@@ -269,7 +269,7 @@ struct ShadowTags {
     ways: usize,
     /// 586 data / L2: write-allocate + write-back (dirty bit, write-back
     /// victims). 486 unified / 586 instruction: write-through, no-write-
-    /// allocate -- `dirty` stays allocated but is never set, so
+    /// allocate; `dirty` stays allocated but is never set, so
     /// `write_back_victims` reads 0, byte-for-byte the pre-S1a behavior.
     write_allocate: bool,
     tags: Box<[u32]>,   // [set * ways + way]
@@ -387,7 +387,7 @@ impl ShadowTags {
 }
 
 /// One L1 array (486 unified, or one half of the 586 split arrays) plus its
-/// per-class hit/miss counters -- everything `ShadowLevelDiagnostics` reports.
+/// per-class hit/miss counters: everything `ShadowLevelDiagnostics` reports.
 #[derive(Debug)]
 struct ShadowLevel {
     tags: ShadowTags,
@@ -448,7 +448,7 @@ impl ShadowArrays {
             // I386 never reaches the Approximate-timing / flat_data_cost arm
             // this probe shadows (`GSW_MODE_SPECS[0..1]` use the Accurate
             // `CacheModel` tag arrays already), but a shadow must still exist
-            // for `set_mode` to construct into -- give it the 486's unified
+            // for `set_mode` to construct into: give it the 486's unified
             // geometry rather than special-casing a fourth arm nothing ever
             // arms.
             CpuPersona::I386 | CpuPersona::I486 => {
@@ -542,7 +542,7 @@ impl ShadowArrays {
 /// (`MachineBus::charge_ram_only`, `data_access_wait_states`,
 /// `record_direct_ram_accesses`, the misaligned split in
 /// `charge_direct_ram_split`), the interpreter's per-instruction code-fetch
-/// path, and -- once armed -- the Direct JIT's compiled-block code-fetch
+/// path, and, once armed, the Direct JIT's compiled-block code-fetch
 /// stream: `bus.rs`'s `native_fetches_are_uniform()` returns `false` while
 /// this probe is enabled even under `flat_data_cost`, which forces every
 /// resident block to carry the `NativeBlockTrace` append preamble (the same
@@ -550,7 +550,7 @@ impl ShadowArrays {
 /// accounting) instead of the aggregate bulk-charge shape. That preamble
 /// hands `charge_native_cached_fetches` the block's `physical_start` and
 /// per-instruction `fetch_lens`, from which every fetch's own physical
-/// address is reconstructed and probed -- full, exact JIT code-fetch
+/// address is reconstructed and probed: full, exact JIT code-fetch
 /// coverage, not a sample.
 ///
 /// It does NOT probe the JIT's bulk per-block DATA charge
@@ -576,7 +576,7 @@ pub struct ShadowL1Probe {
 }
 
 /// `IZARRAVM_SHADOW_L1_PROBE`: unset or any value other than exactly `"1"` is
-/// OFF (the repo's off-spelling convention -- `""` is not a distinct signal
+/// OFF (the repo's off-spelling convention: `""` is not a distinct signal
 /// from unset, see the env-null-empty trap). `"1"` turns the probe on.
 fn shadow_l1_probe_enabled() -> bool {
     std::env::var("IZARRAVM_SHADOW_L1_PROBE").as_deref() == Ok("1")
@@ -585,7 +585,7 @@ fn shadow_l1_probe_enabled() -> bool {
 /// `IZARRAVM_SHADOW_PROBE_SAMPLE`: every Kth compiled-block entry, while
 /// armed, is diverted to the interpreter (S1d slice 2, S2 design §3c's
 /// sampling shape reused for measurement rather than charging). Unset,
-/// empty, non-numeric or `0` all fall back to the default 64 -- `0` would
+/// empty, non-numeric or `0` all fall back to the default 64: `0` would
 /// divide by zero in `should_sample_entry`, and it is not a meaningful "off"
 /// spelling for a divisor (the probe's own enable bit is `off`'s spelling).
 const DEFAULT_SAMPLE_K: u64 = 64;
@@ -611,10 +611,10 @@ impl ShadowL1Probe {
     }
 
     /// One compiled-block entry attempt. Disabled (or unarmed): always
-    /// `false`, no counters move -- the caller (`MachineBus::
+    /// `false`, no counters move: the caller (`MachineBus::
     /// shadow_probe_should_sample_entry`) is the one predictable branch this
     /// costs on the hot entry path. Armed: counts the attempt, and every Kth
-    /// one (`total_entries % sample_k == 0`) is diverted -- `K = 1` diverts
+    /// one (`total_entries % sample_k == 0`) is diverted: `K = 1` diverts
     /// every entry, matching the unit test's "every entry interpreted" case.
     #[inline]
     pub(crate) fn should_sample_entry(&mut self) -> bool {

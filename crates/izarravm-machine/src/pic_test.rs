@@ -751,7 +751,7 @@ fn acknowledge_with_irq_reports_line_zero_for_irq0() {
 
 #[test]
 fn acknowledge_with_irq_matches_acknowledge_for_every_line() {
-    // acknowledge() must still equal acknowledge_with_irq()'s vector half --
+    // acknowledge() must still equal acknowledge_with_irq()'s vector half:
     // the refactor that split them must not have changed acknowledge()'s own
     // behaviour or state transition.
     let mut plain = master_initialized();

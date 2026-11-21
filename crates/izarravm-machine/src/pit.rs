@@ -331,14 +331,14 @@ impl Counter {
     /// split mode for mode so the two stay obviously in sync; unlike `rise_from`
     /// this never returns early on "no more edges" (modes 0/1/4/5 with OUT already
     /// high) because the level itself, not a distance to the next edge, is being
-    /// asked for -- once OUT settles it just holds at that level.
+    /// asked for: once OUT settles it just holds at that level.
     ///
     /// Relies on NO reachability invariant: every combination of `value`, `reload`
     /// and `out` is answered exactly as `step_counting` would, whether or not the
     /// write paths can produce it. An earlier version leaned on "`value <= 1` at a
     /// Counting boundary implies `out == false` in modes 2 and 3" and, next to a
     /// hoisted `reload <= 1` check, that reasoning went wrong on a state the guest
-    /// really does reach -- a periodic counter whose reload register is rewritten
+    /// really does reach: a periodic counter whose reload register is rewritten
     /// while its counting element is still large (`arm` deliberately does not reset
     /// the CE for modes 2 and 3). The differential test in `pit_test` now pins this
     /// against clone-and-step over CONSTRUCTED states, not only reachable ones, so
@@ -351,7 +351,7 @@ impl Counter {
             // Modes 0/1: OUT rises once, at terminal count, and then holds (mode 0
             // keeps counting with OUT high; a mode-1 pulse's Counting state ends
             // there). OUT already high, or a degenerate v == 0 entry (mirrors
-            // rise_from's None -- no rise within the modeled range) holds forever.
+            // rise_from's None: no rise within the modeled range) holds forever.
             0 | 1 => {
                 if out || value == 0 {
                     out
@@ -393,7 +393,7 @@ impl Counter {
                 // of `clocks` into at most one full period (high half + low half,
                 // which the odd-count asymmetry still sums to exactly `reload`
                 // per mode3_odd_count_period_is_exact) via one modulo, then at
-                // most one more half-length comparison -- O(1), never a loop over
+                // most one more half-length comparison: O(1), never a loop over
                 // `clocks` or over elapsed periods.
                 let to_toggle = Self::mode3_half(value, out);
                 if clocks < to_toggle {
@@ -405,7 +405,7 @@ impl Counter {
                     // The datasheet's illegal mode-3 input (count 2 is the
                     // minimum legal reload): mode3_half floors both phases to 1
                     // clock each, so the real period is 2 CLKs (one high, one
-                    // low), not `reload`'s single clock -- the "halves sum to
+                    // low), not `reload`'s single clock: the "halves sum to
                     // reload" identity the general branch leans on does not hold
                     // here, so this folds the remainder by 2 directly instead.
                     return if rem.is_multiple_of(2) { level } else { !level };
@@ -440,7 +440,7 @@ impl Counter {
     /// CPU mode, so a mid-batch latch or read of 0x40/0x42 would otherwise report
     /// the CE as of BATCH START. A guest that measures elapsed time by
     /// latch-compute-latch (the classic PC calibration loop) would then under-read
-    /// the first sample by however far into its batch the latch landed -- up to the
+    /// the first sample by however far into its batch the latch landed, up to the
     /// whole batch grain. This peek removes that error outright, so the batch cap is
     /// free to be as coarse as the fallback allows without moving a counter read.
     ///
@@ -536,8 +536,8 @@ impl Counter {
                 // From v >= 2 the CE walks down to 1 (v-1 CLKs, OUT drops there) and
                 // the next CLK reloads to r; from v <= 1 the very first CLK reloads.
                 // After that it is periodic with period r. An illegal reload of 1
-                // needs NO special case here -- `r - (clocks - at) % r` is 1 for
-                // r == 1 -- but the walk down from a larger live CE must come
+                // needs NO special case here (`r - (clocks - at) % r` is 1 for
+                // r == 1) but the walk down from a larger live CE must come
                 // first, or a reload rewritten to 1 mid-period would report the
                 // reload while the CE is still counting down to it.
                 let (base, at) = if v >= 2 { (v, v) } else { (v, 1) };
@@ -590,7 +590,7 @@ impl Counter {
     /// The CE `k` CLKs into a mode-3 half-period that began at `value` with OUT at
     /// `out`, for `k` strictly inside the half (the caller folds the phase first).
     /// The chip steps the CE by two, trimming an odd count on the FIRST CLK of the
-    /// half -- by one with OUT high, by three with OUT low -- which is the same
+    /// half: by one with OUT high, by three with OUT low, which is the same
     /// asymmetry `step_counting` and `mode3_half` encode.
     fn mode3_value_in_half(value: u64, out: bool, k: u64) -> u64 {
         if k == 0 {
@@ -740,7 +740,7 @@ impl Counter {
     /// The status byte's NULL COUNT bit at the same in-batch instant `out_after`
     /// peeks OUT at. Bit 6 is the guest's "has the count I just wrote reached the
     /// counting element yet" answer, and it is the one bit of the status byte
-    /// besides OUT that a CLK can move -- so reading the live field made a
+    /// besides OUT that a CLK can move, so reading the live field made a
     /// mid-batch status read report the BATCH-START value, which is the same
     /// staleness `count_after` and `out_after` closed for the other two ports.
     ///
@@ -748,8 +748,8 @@ impl Counter {
     /// state-machine fact, not an arithmetic one.
     /// - `LoadDelay` with at least one CLK to spend: `step` loads the counting
     ///   element from the reload register and clears `null_count` on that first
-    ///   CLK, and it does so UNCONDITIONALLY -- only `step_counting` is
-    ///   GATE-gated -- so a low GATE does not hold the bit set. This is the same
+    ///   CLK, and it does so UNCONDITIONALLY (only `step_counting` is
+    ///   GATE-gated) so a low GATE does not hold the bit set. This is the same
     ///   load-on-the-first-CLK rule `count_after`'s `LoadDelay` arm mirrors.
     /// - `WaitGate` (modes 1 and 5, armed and waiting for a GATE rising edge):
     ///   `step` returns without loading, so the bit HOLDS however many CLKs
@@ -943,15 +943,15 @@ impl Counter {
         if self.bcd {
             // Same ground as `out_after` / `count_after` / `clocks_until_out_rise`:
             // no PC software clocks the PIT in BCD, so decimal half-cycles are
-            // not modeled analytically. Not the knob -- a BCD counter takes the
+            // not modeled analytically. Not the knob: a BCD counter takes the
             // loop on both arms.
             return Some(BulkDecline::Bcd);
         }
         let live = matches!(self.state, CounterState::LoadDelay | CounterState::Counting);
         if live && matches!(self.mode, 2 | 3) && self.effective_reload() <= 1 {
             // The datasheet's illegal input (count 2 is the minimum for modes 2
-            // and 3). `step_counting` handles it loosely -- it reloads on every
-            // CLK -- which leaves no period for the analytic form to fold, and
+            // and 3). `step_counting` handles it loosely: it reloads on every
+            // CLK, which leaves no period for the analytic form to fold, and
             // in mode 3 no half-period either. Declining is exact by
             // construction; guessing would not be.
             return Some(BulkDecline::IllegalReload);
@@ -961,7 +961,7 @@ impl Counter {
 
     /// Apply `clocks` input CLKs and return the number of OUT RISING edges in
     /// `(0, clocks]`. The post-state is what `clocks` calls to `step` produce,
-    /// field for field -- `Counter` derives `PartialEq`, so the differential
+    /// field for field: `Counter` derives `PartialEq`, so the differential
     /// test asserts exactly that and does not spot-check fields.
     ///
     /// The caller has already screened the chip through `bulk_decline`, so this
@@ -974,7 +974,7 @@ impl Counter {
             // No live count: `step` returns false and mutates nothing.
             CounterState::Inactive | CounterState::WaitGate => 0,
             CounterState::LoadDelay => {
-                // `step`'s LoadDelay arm, verbatim and UNCONDITIONAL -- the load
+                // `step`'s LoadDelay arm, verbatim and UNCONDITIONAL: the load
                 // does not consult GATE. It is also the ONLY place `null_count`
                 // is cleared; the mode-2/3 reload inside `step_counting` does
                 // not clear it.
@@ -997,9 +997,9 @@ impl Counter {
             //
             // The read-only peeks do NOT do this: `out_after`'s Counting +
             // !gate arm returns the STORED level. Today that divergence is
-            // unreachable -- the only two ways into a GATE-low mode-2/3 state
+            // unreachable: the only two ways into a GATE-low mode-2/3 state
             // are `set_gate`'s falling edge and `write_control`, and both set
-            // `out = true` on the way in -- so the peeks and the tick path
+            // `out = true` on the way in, so the peeks and the tick path
             // agree. This must not LEAN on that: it writes the field, and a
             // latent disagreement written back is a real state divergence.
             if matches!(self.mode, 2 | 3) {
@@ -1129,7 +1129,7 @@ impl Counter {
     /// tick `t` when `channel_out(channel)` differs from its value at `t - 1`,
     /// and a channel's OUT depends on nothing but that channel, so the emitted
     /// set is exactly this counter's own transitions. It must therefore be read
-    /// off the PRE-advance state -- the caller enumerates before it advances.
+    /// off the PRE-advance state: the caller enumerates before it advances.
     fn out_transitions_in<F: FnMut(u64, bool)>(&self, clocks: u64, emit: &mut F) {
         if clocks == 0 {
             return;
@@ -1257,11 +1257,11 @@ enum BulkDecline {
 /// Empty means DEFAULT, not "the OFF arm on purpose". **They coincided before
 /// this flip and they DO NOT COINCIDE NOW**: an empty variable selects ON. That
 /// is precisely why the rule was written as "empty == unset" rather than
-/// "empty == off" while the default was still OFF -- so the flip moved the
+/// "empty == off" while the default was still OFF, so the flip moved the
 /// default without moving the rule. **Every OFF leg must EXPORT `0`; clearing
 /// the variable runs the ON arm.** `[Environment]::SetEnvironmentVariable(
-/// $name, $null, "Process")` -- how every harness in this tree clears a variable
-/// -- leaves the variable PRESENT AND EMPTY on Windows, and a leg that cleared
+/// $name, $null, "Process")` (how every harness in this tree clears a variable)
+///leaves the variable PRESENT AND EMPTY on Windows, and a leg that cleared
 /// the variable means "the default", never "the escape".
 ///
 /// This follows `run::parse_ata_poll_skip_arm` (`run.rs`), which is the
@@ -1510,7 +1510,7 @@ impl Pit {
     /// Whether the counter this port addresses is currently BCD-programmed. `Counter::read`
     /// (via `count_after`) silently declines to a live peek and falls back to `masked_count`
     /// (the batch-start CE) for a BCD counter, the same decline `out_after` reports for the
-    /// 0x61 arm -- but unlike `out_after`, `read_port_at` above has no `Option` left to carry
+    /// 0x61 arm, but unlike `out_after`, `read_port_at` above has no `Option` left to carry
     /// that decline back to the caller (it already returns `Option` for "not a PIT port" and
     /// mutates read/latch state on every call, so calling it twice to probe is not free).
     /// `MachineBus::read_io`'s 0x40-0x42 arm calls this BEFORE deciding whether to exempt the

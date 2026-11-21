@@ -56,8 +56,8 @@ impl RatePhase {
     /// `u64`, and inside that domain `u64` and `u128` division agree digit for
     /// digit (the wide quotient is then also below `u64::MAX`, so `saturating_u64`
     /// was a no-op too). It exists because the wide form calls `__udivti3` /
-    /// `__umodti3` — twelve device clocks per advance, measured at ~1.6% of gp2's
-    /// wall — while the narrow form divides by the CONSTANT `MASTER_CLOCK_HZ` and
+    /// `__umodti3` (twelve device clocks per advance, measured at ~1.6% of gp2's
+    /// wall) while the narrow form divides by the CONSTANT `MASTER_CLOCK_HZ` and
     /// the compiler strength-reduces it to a multiply-high with no divide at all.
     /// The guard's domain is not tight: a device clock at `NANOSECOND_HZ`, the
     /// fastest rate this module drives, stays narrow for any advance below
@@ -329,7 +329,7 @@ impl Timeline {
     /// consults every armed device deadline), and the wide form burned a
     /// `__udivti3` per call for no reason: the NUMERATOR here is a plain `u64`,
     /// never a product, so nothing was ever wide. `u64::div_ceil` cannot overflow
-    /// for unsigned operands — the quotient is at most `master_ticks` — which is
+    /// for unsigned operands: the quotient is at most `master_ticks`, which is
     /// why the dropped `saturating_u64` clamped nothing.
     pub(crate) fn cpu_clocks_for_master_ticks_ceil(self, master_ticks: u64) -> u64 {
         master_ticks.div_ceil(self.ticks_per_cpu_clock)
@@ -450,7 +450,7 @@ impl Timeline {
     ///
     /// Same arithmetic as the `margo_nanoseconds` field of `advance_master_ticks`,
     /// run on a copy of that phase accumulator, so a peek and the real advance that
-    /// follows it cannot disagree -- the fractional carry `RatePhase` holds is why
+    /// follows it cannot disagree: the fractional carry `RatePhase` holds is why
     /// this clones the accumulator instead of recomputing ns from a rate.
     /// `preview_microseconds` is the precedent.
     pub(crate) fn preview_margo_nanoseconds_at_ticks(self, ticks: u64) -> u64 {
@@ -458,21 +458,21 @@ impl Timeline {
         margo.advance(ticks, NANOSECOND_HZ)
     }
 
-    /// Margo's scanout beam, in dots, after a `cpu_clocks` advance -- and the
+    /// Margo's scanout beam, in dots, after a `cpu_clocks` advance, and the
     /// whole dots that advance would produce, for a caller measuring a distance
     /// rather than a position.
     ///
     /// DERIVED FROM THE FRAME PHASE, NOT FROM A SECOND ACCUMULATOR. `frame_dots`
     /// dots occupy exactly one [`MARGO_FRAME_HZ`] frame, so the beam is the
     /// fractional part of the `margo_frame` phase scaled into dots, and the
-    /// dot count is `floor(total_phase * frame_dots / MASTER_CLOCK_HZ)` -- the
+    /// dot count is `floor(total_phase * frame_dots / MASTER_CLOCK_HZ)`, the
     /// same partition a real accumulator at `frame_dots * MARGO_FRAME_HZ` would
     /// make, because `frame_dots * (a * MASTER + b) / MASTER` is exactly
     /// `a * frame_dots + b * frame_dots / MASTER`.
     ///
     /// That identity is the whole point. A separate dot accumulator would be a
     /// SECOND 60 Hz clock, free to drift out of phase with the one that latches
-    /// `DISP_START` -- and two display clocks a fixed fraction of a frame apart
+    /// `DISP_START`, and two display clocks a fixed fraction of a frame apart
     /// is a milder version of the bug this replaced. Deriving both from one
     /// phase makes "the retrace a guest polls for" and "the frame boundary that
     /// applies a queued page flip" the same edge by construction, forever, with

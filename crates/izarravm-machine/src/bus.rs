@@ -56,7 +56,7 @@ fn lazy_port_reads_386_enabled() -> bool {
 /// instead of walking the aperture gauntlet for it. `IZARRAVM_EXTENDED_RAM_SCREEN`.
 ///
 /// DEFAULT ON. The screen changes no charged wait-state and no guest-visible
-/// value -- it only removes work -- so there is no fidelity reason to ship it
+/// value (it only removes work) so there is no fidelity reason to ship it
 /// off. The knob exists for MEASUREMENT: the win it claims is a few percent of
 /// wall, which is close enough to this box's noise floor that a two-binary
 /// comparison cannot carry it (layout variance between two builds has been
@@ -108,7 +108,7 @@ pub(super) enum PortBusClass {
 pub(crate) const PORT_BUS_CLASS_COUNT: usize = 5;
 
 impl PortBusClass {
-    /// The histogram index for this class -- `Machine::port_accesses_by_class` and the profile
+    /// The histogram index for this class. `Machine::port_accesses_by_class` and the profile
     /// JSON's `port_accesses_by_class` are both in this order, and `LABELS` names the same rows.
     pub(super) const fn index(self) -> usize {
         match self {
@@ -149,7 +149,7 @@ impl PortBusClass {
 /// (`machine_port_bus_class_test.rs`).
 pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
     match port {
-        // DMA1, page registers (incl. their 0x90-0x9F aliases -- `dma_page_register_port`
+        // DMA1, page registers (incl. their 0x90-0x9F aliases: `dma_page_register_port`
         // serves every port there except 0x92, which is classed separately below), DMA2.
         0x0000..=0x000F | 0x0080..=0x009F | 0x00C0..=0x00DF => PortBusClass::IsaXBus,
         // 8259A PIC 1/2.
@@ -160,7 +160,7 @@ pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
         0x00F0..=0x00FF => PortBusClass::IsaXBus,
         // 8254 PIT, PPI port B + mirror, RTC/CMOS (already charged today, unchanged).
         0x0040..=0x0043 | 0x0061 | 0x0063 | 0x0070..=0x0071 => PortBusClass::IsaXBus,
-        // System Control Port A -- the one port TOKAEMM traps -- is already covered by the
+        // System Control Port A (the one port TOKAEMM traps) is already covered by the
         // 0x0080-0x009F arm above (`IsaXBus` either way), so it needs no arm of its own here.
         // Lotura: a host-native device, not an ISA peripheral. The CD doorbell at 0xE8
         // stays outside this arm on purpose: it keeps the `Unclaimed` charge.
@@ -194,12 +194,12 @@ pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
 ///
 /// The one bus constant in this whole repricing that is READ FROM A DOCUMENT rather than
 /// inferred: `IsaXBus` 160 and `PciLegacyVga` 56 are 86Box constants (bracketed and unverified
-/// respectively -- design section 8). It is used only for a STRING element on the IDE/ATAPI data
+/// respectively, design section 8). It is used only for a STRING element on the IDE/ATAPI data
 /// register, never for a single access: status polling at 0x1F7 and the ATAPI poll skip's own
 /// port keep `PciTarget` 56, because those are single accesses and not a burst.
 ///
 /// Resulting rate: 3 (`REP INS` per element) + 20 = 23 clocks per word = 138 ns -> **14.5 MB/s**,
-/// against a real P166's PIO mode 4 **16.6 MB/s** -- 87% of the spec rate, period-correct and
+/// against a real P166's PIO mode 4 **16.6 MB/s**: 87% of the spec rate, period-correct and
 /// erring slow.
 pub(super) const ATA_STRING_WORD_CLOCKS: u64 = ata::PIO_WORD_REFERENCE_CLOCKS;
 
@@ -440,7 +440,7 @@ impl Machine {
     /// (`write_guest_linear_block` / `read_guest_linear_block`) deliver
     /// caller-visible data through this walk, because a BIOS service handed
     /// an ES:DI block must honor the caller's paging. The probe discipline
-    /// stands regardless -- a BIOS writing a reply is not an instruction, so
+    /// stands regardless: a BIOS writing a reply is not an instruction, so
     /// it must not set CR2, dirty a page, or check R/W and U/S. The known
     /// consequences (no accessed/dirty bits for a paging-to-disk host; no
     /// permission check) are recorded on those helpers.
@@ -473,7 +473,7 @@ impl Machine {
     /// `CpuBus::peek_direct_ram` against this machine's live bus, for the ONE thing a host-side
     /// test needs it for: asking whether a physical address is the aligned, page-local, A20-clean
     /// plain RAM that the call-out's phase P requires. Charges nothing, exactly as the trait
-    /// method it forwards to. Not a data path -- see that method's doc.
+    /// method it forwards to. Not a data path. See that method's doc.
     ///
     /// NAMED AND HIDDEN so it cannot be mistaken for one. A `pub` cross-crate forwarder to an
     /// uncharged RAM read is exactly the hole the trait method's doc warns about: a caller that
@@ -623,8 +623,8 @@ impl Machine {
     /// The block STOPS at the first page that cannot be translated, and the
     /// return is how many bytes landed, which is `bytes.len()` when every page
     /// translated. A short delivery is not reported anywhere else, so a service
-    /// that reports a transferred count -- AL for INT 13h AH=02h, the
-    /// block-count field of a Disk Address Packet -- has to take that count
+    /// that reports a transferred count (AL for INT 13h AH=02h, the
+    /// block-count field of a Disk Address Packet) has to take that count
     /// from here or it reports bytes that never arrived. Stopping is what makes
     /// that count describe memory: resuming on the far side of a hole would
     /// leave bytes in the caller's buffer that the count says did not arrive.
@@ -645,8 +645,8 @@ impl Machine {
     /// `read_guest_linear_block` fills an untranslatable page with 0xFF, and
     /// 0xFF is also what the bus returns for a page that IS mapped but has
     /// nothing behind it, so the fill cannot be told from real read-back. A
-    /// service that takes guest bytes and COMMITS them somewhere persistent --
-    /// a disk sector, a serial port -- must ask this first and shorten the
+    /// service that takes guest bytes and COMMITS them somewhere persistent
+    /// (a disk sector, a serial port) must ask this first and shorten the
     /// transfer rather than commit bytes the guest never supplied.
     ///
     /// This detects only pages the guest's tables do not map. A mapped page
@@ -858,11 +858,11 @@ impl MachineBus<'_> {
     /// Callers add their own family-specific addend (the io wait-state read or
     /// the memory family's data-read cost) on top.
     /// The fetch-byte certification loop's real body, over a plain SLICE rather than a
-    /// `PollLoop` -- so it can be shared by the interpreter's `poll_bus_certificate`
+    /// `PollLoop`, so it can be shared by the interpreter's `poll_bus_certificate`
     /// (which has a real `PollLoop`) and the call-out-site seam's
     /// `poll_bus_certificate_from_fetches` (which only ever has the POD's `fetches` /
     /// `fetch_count`, because `PollLoop`'s fields are private to `izarravm-cpu` and
-    /// cannot cross the seam -- GP2 poll-skip design, BLOCKER B). One derivation, two
+    /// cannot cross the seam: GP2 poll-skip design, BLOCKER B). One derivation, two
     /// callers with two different shapes of input, so a mutant that certifies one
     /// wrong cannot leave the other looking right.
     #[cfg(feature = "jit")]
@@ -894,7 +894,7 @@ impl MachineBus<'_> {
                 }
             }
             // Every byte of the run was just proved to be non-device cacheable RAM,
-            // so this is exactly the cached-fetch route -- 0 under the epoch-2 fold.
+            // so this is exactly the cached-fetch route: 0 under the epoch-2 fold.
             raw = raw.checked_add(self.cached_fetch_clocks())?;
         }
         Some(raw)
@@ -918,7 +918,7 @@ impl MachineBus<'_> {
     }
 
     /// Certify exact warm-RAM fetch and I/O costs for the classified io-family poll
-    /// loop, from the POD's own `fetches`/`fetch_count` rather than a `PollLoop` --
+    /// loop, from the POD's own `fetches`/`fetch_count` rather than a `PollLoop`:
     /// the call-out-site seam's entry point (BLOCKER B), sharing
     /// `poll_fetch_certificate_raw_from` with the interpreter's `poll_bus_certificate`
     /// below so the two can never certify the same shape differently.
@@ -983,7 +983,7 @@ impl MachineBus<'_> {
     }
 
     /// Test-only entry to `poll_bus_certificate_from` with no fetches, reachable without
-    /// constructing a real `PollLoop` -- used by F7's structural-refusal test.
+    /// constructing a real `PollLoop`. Used by F7's structural-refusal test.
     #[cfg(all(test, feature = "jit"))]
     pub(super) fn poll_bus_certificate_from_for_test(
         &self,
@@ -1315,14 +1315,14 @@ impl MachineBus<'_> {
     /// `None` means decline and fall through, which is exactly what the inactive status1 alias
     /// does in the non-lazy class. The lazy class answers 0xFF itself rather than declining.
     /// F14's instrument. Count the retrace-bit EDGES a guest observes through its own reads of
-    /// the status-1 register -- i.e. the instants at which a `VL_WaitVBL`-shaped poll loop
+    /// the status-1 register, i.e. the instants at which a `VL_WaitVBL`-shaped poll loop
     /// EXITS.
     ///
     /// WHY THIS IS THE DESIGN'S ONE SELF-CERTIFYING ANCHOR (review F14). Every other certifier
     /// for the port reprice is a band derived from a duty-cycle bracket we do not have a
     /// document for. This one is fixed by construction: mode 13h retraces at 70.086 Hz, and
-    /// Wolfenstein 3-D's `VL_WaitVBL` is two loops -- `in al,dx / test al,8 / jnz` (spin until
-    /// the retrace ENDS) then `in al,dx / test al,8 / jz` (spin until it STARTS) -- each of
+    /// Wolfenstein 3-D's `VL_WaitVBL` is two loops: `in al,dx / test al,8 / jnz` (spin until
+    /// the retrace ENDS) then `in al,dx / test al,8 / jz` (spin until it STARTS), each of
     /// which exits on exactly one edge per frame. So `rising` and `falling` must both read
     /// ~70.086 per guest second whatever the polls-per-frame figure is. Below that, the guest
     /// is no longer reaching the retrace in time and the model has OVER-charged; the poll count
@@ -1335,7 +1335,7 @@ impl MachineBus<'_> {
     /// comparable across the skip's arms as well as across the epoch.
     ///
     /// Feature-free: one branch and one compare at a site that has already predicted the beam.
-    /// It counts only reads that the VGA actually answered with status bits -- the inactive
+    /// It counts only reads that the VGA actually answered with status bits: the inactive
     /// alias's flat `0xFF` (bit 3 set) is returned by the caller without reaching here, so it
     /// cannot manufacture an edge. 0x3C2 (status 0) is excluded by the caller for the same
     /// reason: its bit 3 is not the retrace bit this instrument is about.
@@ -1362,9 +1362,9 @@ impl MachineBus<'_> {
             }
             // Inactive alias (e.g. 3BA polled in a color setup): no side
             // effects, matching `Vga::read_port`'s existing
-            // `status1_port_selected` gate, and -- since this arm's static
+            // `status1_port_selected` gate, and, since this arm's static
             // port set is disjoint from every other device's decoded ports
-            // (grep-confirmed: nothing else claims 0x3B0..=0x3DF) -- the same
+            // (grep-confirmed: nothing else claims 0x3B0..=0x3DF), the same
             // 0xFF the non-lazy path's fallthrough to `device_ports`'s passive
             // table would eventually produce. Returned directly, without
             // setting io_touched, so an inactive-alias poll stays lazy too
@@ -1383,7 +1383,7 @@ impl MachineBus<'_> {
         //
         // Why the Accurate class needs it. Without the peek this arm
         // read the LIVE beam, which is the beam as of BATCH START, and
-        // only then ended the batch -- so a retrace poll reported a
+        // only then ended the batch, so a retrace poll reported a
         // position up to a whole batch stale. That was bounded at a
         // DAC period while the fine fallback was unconditional, but
         // `fine_batch_grain_required` now gates it (and no term in that
@@ -1397,7 +1397,7 @@ impl MachineBus<'_> {
         // above calls and performs the identical guest-visible side
         // effects a `read_port` of these three ports would
         // (`status1_side_effects` / `catch_up`); it declines exactly
-        // where `read_port` declines -- the inactive status1 alias --
+        // where `read_port` declines (the inactive status1 alias)
         // so the fallthrough at the call site is unchanged.
         let beam = self.predicted_beam();
         let value = self.vega.read_status_port_lazy(port, beam)?;
@@ -1419,7 +1419,7 @@ impl MachineBus<'_> {
         if self.flat_data_cost {
             // Probe the POST-A20 address, matching `data_access_wait_states`: that is
             // the address the tag array on real silicon would see. The charge itself
-            // does not apply A20 here (see the doc above -- the FastMap precondition
+            // does not apply A20 here (see the doc above: the FastMap precondition
             // already guarantees identity for every caller of this arm), so this is a
             // probe-only fold with no effect on `address` used below.
             self.shadow_probe(kind, self.apply_a20(address));
@@ -1492,7 +1492,7 @@ impl MachineBus<'_> {
                         .record_instruction_fetch_run(first, count, first_ws);
                 }
             } else {
-                // Single I-cache access for the whole instruction run -- and none
+                // Single I-cache access for the whole instruction run, and none
                 // at all once epoch 2 has folded it into the class count.
                 if self.flat_data_cost {
                     self.shadow_l1.probe(ShadowAccessClass::CodeFetch, first);
@@ -1611,8 +1611,8 @@ impl CpuBus for MachineBus<'_> {
         // predicate. `direct_page_ram_bytes_unaligned` succeeds only if `direct_ram_bytes` does,
         // which requires this page's `page_bases` entry to be non-`RAM_LOOKUP_SLOW`, which
         // `ram_lookup_page_is_direct` grants only to a page with NO `memory_bar_overlaps` byte.
-        // That classification is page-granular BY CONSTRUCTION -- `ram_lookup_page_base` is
-        // evaluated per page over the whole `[start, end)` -- so no byte of this page is in the
+        // That classification is page-granular BY CONSTRUCTION (`ram_lookup_page_base` is
+        // evaluated per page over the whole `[start, end)`) so no byte of this page is in the
         // Distira BAR, so EVERY per-byte `vega` consultation in today's loop declines, whatever
         // width the wide call would have used. The bytes then come from the same slice, assembled
         // little-endian identically.
@@ -1650,7 +1650,7 @@ impl CpuBus for MachineBus<'_> {
 
     /// The aligned arm of `read_memory_direct` above with the charge pair deleted, and built by
     /// calling the SAME `direct_page_ram_bytes` predicate rather than by a parallel
-    /// reimplementation -- the two must agree byte for byte, because the one caller reads the same
+    /// reimplementation: the two must agree byte for byte, because the one caller reads the same
     /// address twice (once here, once through the charged arm) and pins the values equal.
     ///
     /// See the trait's doc for why nothing else may call this.
@@ -1701,7 +1701,7 @@ impl CpuBus for MachineBus<'_> {
         //
         // Here the lemma is the SHARP one, and the assert is not decoration. `write_wide_memory`'s
         // LFB arm SWALLOWS byte writes (`BusWidth::Byte => {}` while still returning `true`), so a
-        // byte-split write into the LFB is DROPPED where the wide write would have stored -- silent
+        // byte-split write into the LFB is DROPPED where the wide write would have stored: silent
         // data loss, not a timing difference. It cannot arise today, because no BAR page is
         // `direct_ram_bytes`-able; asserting L-RAM per byte is what stops a future BAR or decode
         // change from making it arise silently.
@@ -2087,12 +2087,12 @@ impl CpuBus for MachineBus<'_> {
     /// recursion re-applies A20 to its own `address + offset` before reaching
     /// `data_access_wait_states(gated_i, Byte)`. Those N gatings collapse to ONE because `A20_MASK`
     /// clears only bit 20 and `RAM_LOOKUP_PAGE_BITS` is 12, so bit 20 is constant across every byte
-    /// of one 4 KiB page -- the 1 MiB boundary is always a page boundary. Given page-locality,
+    /// of one 4 KiB page: the 1 MiB boundary is always a page boundary. Given page-locality,
     /// `apply_a20(base + i) == apply_a20(base) + i` for every `i < width.bytes()`. For a non-device
     /// address `data_access_wait_states` returns `cache.cost.l1`, never the `is_device_window` arm,
     /// which is the second premise the caller owes. `record_memory_run` then advances
     /// `elapsed_clocks` by `count * clocks_for(Byte, l1)`, bumps `access_count` by `count`, and in
-    /// `Full` mode pushes cycles at `address + i` -- identical in all three fields to N `record`
+    /// `Full` mode pushes cycles at `address + i`, identical in all three fields to N `record`
     /// calls (its own doc, and the `record_instruction_fetch_run` precedent).
     ///
     /// The three `debug_assert`s pin exactly the three preconditions: A20 identity, page-locality,
@@ -2121,8 +2121,8 @@ impl CpuBus for MachineBus<'_> {
         // gatings into one, so it leans on L-A20 and page-locality just as hard. A violation there
         // is worse, not milder: it produces a wrong ADDRESS SEQUENCE, and this arm's addresses
         // feed `data_access_wait_states`, whose modeled cache-tag mutations are CANONICAL STATE.
-        // Asserting only in the flat arm would have left the canonical-state arm -- the one whose
-        // whole reason for existing is that its tags must not be disturbed -- unguarded.
+        // Asserting only in the flat arm would have left the canonical-state arm (the one whose
+        // whole reason for existing is that its tags must not be disturbed) unguarded.
         //
         // L-A20: `A20_MASK` clears only bit 20 and a page is 4 KiB, so the 1 MiB boundary is
         // always a page boundary; given page-locality, `apply_a20(base + i) == apply_a20(base) + i`
@@ -2135,7 +2135,7 @@ impl CpuBus for MachineBus<'_> {
         // hardcodes `cache.cost.l1` instead of asking `data_access_wait_states`); the Accurate arm
         // would still be equal to the old loop without it, since that loop routed device bytes the
         // same way. It is asserted for both anyway because it is a CALLER precondition of this
-        // method either way -- the aperture must never reach here.
+        // method either way: the aperture must never reach here.
         debug_assert!((0..count).all(|i| {
             let at = address.wrapping_add(i);
             at < 0x000A_0000 || !self.is_device_window(at, BusWidth::Byte)
@@ -2144,7 +2144,7 @@ impl CpuBus for MachineBus<'_> {
             // `record_memory_run`'s `count` here is `count` SEPARATE byte accesses
             // (see its body: `elapsed_clocks += clocks_for(width, ws) * count`), the
             // same convention the non-flat per-byte loop below uses and the same one
-            // `record_direct_ram_accesses` follows -- not one access with `count`
+            // `record_direct_ram_accesses` follows, not one access with `count`
             // byte-cycles. Probe each byte's own address to match.
             for i in 0..count {
                 self.shadow_probe(kind, address.wrapping_add(i));
@@ -2327,7 +2327,7 @@ impl CpuBus for MachineBus<'_> {
     /// shape), so `charge_native_cached_fetches` sees every fetch's own
     /// physical address and can feed the shadow. Unarmed (the runtime
     /// default even with the feature compiled in), this reduces to exactly
-    /// the off-feature expression above -- one predictable branch.
+    /// the off-feature expression above: one predictable branch.
     #[cfg(feature = "shadow-cache-probe")]
     fn native_fetches_are_uniform(&self) -> bool {
         self.flat_data_cost && !self.shadow_l1.wants_native_fetch_trace()
@@ -2400,7 +2400,7 @@ impl CpuBus for MachineBus<'_> {
         // (see that method's doc). Gated on `wants_native_fetch_trace()` rather
         // than firing unconditionally: this loop is O(iterations * fetch_lens.len())
         // and the non-flat Accurate class already reaches this function today for
-        // its own reasons, with the probe disabled -- keep it a true no-op there.
+        // its own reasons, with the probe disabled: keep it a true no-op there.
         if self.shadow_l1.wants_native_fetch_trace() {
             let physical_run = self.apply_a20(physical_start);
             for _ in 0..iterations {
@@ -2724,8 +2724,8 @@ impl CpuBus for MachineBus<'_> {
         // run pays the `#[cold]` tail: two A20 folds, two wait-state lookups
         // through the device gauntlet, and the uniformity test. A run that lies
         // wholly inside `0x0010_0000 .. device_free_extended_floor()` reaches
-        // exactly the same conclusion as that tail -- cacheable RAM, uniform,
-        // one I-cache access -- because no window claims any byte of it (see
+        // exactly the same conclusion as that tail (cacheable RAM, uniform,
+        // one I-cache access) because no window claims any byte of it (see
         // `is_device_free_extended_ram`) and a contiguous run inside one region
         // is uniform by construction.
         //
@@ -2801,7 +2801,7 @@ impl CpuBus for MachineBus<'_> {
         // cost of every V86 trap for no fidelity gain: device time is still exact
         // because the batch still ends at the next event_batch_cap edge or the
         // next GUEST port access, and OCW3's read-select is pure register state
-        // (see pic.rs -- `read_isr` is a mode bit, not time-derived), so deferring
+        // (see pic.rs: `read_isr` is a mode bit, not time-derived), so deferring
         // exactly when it is consumed relative to batch-end timing is safe. Gated
         // on `lazy_port_reads` (Approximate class only, i.e. 486/586): the
         // Accurate 386 class keeps byte-identical batch semantics, matching
@@ -2820,7 +2820,7 @@ impl CpuBus for MachineBus<'_> {
         // its decode position is load-bearing (a configured WSS/SB base could in
         // principle overlap 0x200-0x207, and today the earlier arm wins). Rather
         // than hoist the arm and silently change that precedence, the arm CLEARS
-        // the flag again -- but only when this very read is what set it, which is
+        // the flag again, but only when this very read is what set it, which is
         // what this snapshot establishes. A wider-than-byte access re-enters
         // read_io per byte and so re-snapshots per byte.
         let io_touched_before_read = *self.io_touched;
@@ -2845,7 +2845,7 @@ impl CpuBus for MachineBus<'_> {
         if let Some(base) = self.pci.ide_bus_master_io_base()
             && bmide::BusMasterIde::owns_io(port, width, base)
         {
-            // F4: same reason as the PCI arm above -- the live BMIDE BAR4 block also sits
+            // F4: same reason as the PCI arm above. The live BMIDE BAR4 block also sits
             // above the general charge site.
             self.charge_pci_transaction(port, width, BusAccessKind::IoRead);
             if !skip_io_touched {
@@ -2895,7 +2895,7 @@ impl CpuBus for MachineBus<'_> {
         // The ISA bus charge, BELOW the width split so a word access pays for the
         // two byte cycles it actually decomposes into rather than three (one for
         // the wide access plus one per byte), and above every DEVICE arm, because
-        // the cycle happens on the bus before any device answers -- a charge
+        // the cycle happens on the bus before any device answers. A charge
         // tucked inside one device's arm is how the OPL and DSP charges came to be
         // the only two in the tree.
         //
@@ -3015,7 +3015,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         // Port 0x61 bits 4/5 use the same lazy
-        // per-port dispatch discipline as 3DA/3BA/3C2 above -- 0x61 always lands
+        // per-port dispatch discipline as 3DA/3BA/3C2 above: 0x61 always lands
         // here whether or not lazy_port_reads is set. Bits 0/1 (speaker gate/data)
         // are plain register state that cannot change mid-batch: the only writer
         // is `write_io`, which unconditionally sets io_touched and so ends the
@@ -3042,7 +3042,7 @@ impl CpuBus for MachineBus<'_> {
             // once and afterwards polls only 0x61 falls out of the 5 ms
             // observer window and back to the 1 ms coarse cap. Reading the LIVE
             // (batch-start) level there could report OUT up to a whole coarse
-            // batch stale -- a mode-3 square-wave FALL is half a period from
+            // batch stale: a mode-3 square-wave FALL is half a period from
             // the nearest cached rise, so the deadline cache does not bound it
             // either. With the peek the level is the one a real
             // `advance_devices` of the same clock total would produce, which is
@@ -3083,7 +3083,7 @@ impl CpuBus for MachineBus<'_> {
         // CE must be peeked at THIS instant or the guest reads the value the counter
         // had at batch start (`Counter::count_after`). The port test guards the
         // conversion so no other port pays for it; the peek itself runs in BOTH
-        // timing classes, exactly like the 0x61/3DA peeks above -- it changes only
+        // timing classes, exactly like the 0x61/3DA peeks above: it changes only
         // the VALUE read, never whether the batch ends on its own.
         //
         // L5 (corpus-lever campaign, 2026-08-31): hoisted from below the "all
@@ -3092,7 +3092,7 @@ impl CpuBus for MachineBus<'_> {
         // lazy_ports_386`), not the ring-0-only `skip_io_touched` gate. Before this
         // move, every 0x40-0x42 read fell through to the catch-all and so set
         // io_touched for any guest (V86 or real-mode) access in EITHER timing
-        // class -- the counter's own peek logic below never got a chance to decide
+        // class. The counter's own peek logic below never got a chance to decide
         // the flag, only the reported VALUE. The catch-all's comment ("The ring-0
         // monitor's PIC OCW3 probe still honors the same skip_io_touched gate")
         // was correct for ports that stop there; this port never needed to.
@@ -3103,26 +3103,26 @@ impl CpuBus for MachineBus<'_> {
         // `elapsed_pit_clocks` WHEN the counter is binary-programmed. It does not
         // advance the counter's own reload/decrement schedule and it does not
         // touch the PIC, so a guest that polls 0x40-0x42 and expects an IRQ
-        // cannot observe a stale pendency answer -- nothing about
+        // cannot observe a stale pendency answer: nothing about
         // `interrupt_pending()` moves because this byte was read. That is a
         // stronger, port-specific proof than "ring-0 monitor bookkeeping is not
         // guest-visible activity" (the `skip_io_touched` rationale), so it
         // composes with a guest access the ring-0 exemption was never meant to
         // cover, and does not touch `skip_io_touched` or `exempt_io_touched` at
-        // all -- exactly the 3DA/0x61 shape, not the ring-0-monitor shape.
+        // all: exactly the 3DA/0x61 shape, not the ring-0-monitor shape.
         //
         // THE BCD LEG (mirrors the 0x61 arm's own BCD fallback exactly). For a
         // BCD-programmed counter `count_after` declines and `Counter::read` falls
-        // back to `masked_count()` -- the frozen batch-start CE, not a live one --
+        // back to `masked_count()` (the frozen batch-start CE, not a live one)
         // so the peek's "changes only the VALUE, never whether the batch ends"
         // premise above does NOT hold for this leg: the value itself is already
         // stale for the whole batch. In the Approximate class nothing else
         // refreshes it (`fine_batch_grain_required` is never consulted here), so
         // exempting a BCD read from io_touched would let a guest spin an entire
         // coarse batch on one frozen byte. `counter_is_bcd` is checked BEFORE the
-        // exemption decision -- not folded into `read_port_at`'s `Option`, which
+        // exemption decision, not folded into `read_port_at`'s `Option`, which
         // already means "not a PIT port" and mutates latch/read-order state on
-        // every call -- so a BCD read always takes the exact non-lazy path
+        // every call, so a BCD read always takes the exact non-lazy path
         // (io_touched set, unless the unrelated ring-0-monitor exemption applies),
         // in every timing class, exactly like 0x61's BCD fallback.
         if matches!(port, 0x40..=0x42) {
@@ -3159,7 +3159,7 @@ impl CpuBus for MachineBus<'_> {
             //
             // In the Approximate class the chip has not been stepped since the
             // batch started, so read the PREDICTED status instead of the live
-            // one -- see `predicted_opl_status`. The Accurate 386 class advances
+            // one. See `predicted_opl_status`. The Accurate 386 class advances
             // devices per instruction and keeps the live byte, byte-identically.
             let (value, pending_micros) =
                 if self.lazy_port_reads && matches!(resolved, 0x0388 | 0x038a) {
@@ -3243,7 +3243,7 @@ impl CpuBus for MachineBus<'_> {
             // `io_touched_before_read` is snapshotted well above, BEFORE the
             // general set, and records whether an EARLIER access in this batch
             // already ended the batch. Under the ring-0-monitor exemption
-            // nothing set the flag either, so it stays false -- meaning
+            // nothing set the flag either, so it stays false, meaning
             // `!io_touched_before_read` is satisfied in exactly the case it was
             // once claimed to exclude. The exclusion has to come from
             // `skip_io_touched` itself. Both terms are kept: the first declines
@@ -3269,7 +3269,7 @@ impl CpuBus for MachineBus<'_> {
             // contract above: the TOKAEMM monitor's own chipset pokes must not
             // end the batch and signal through `exempt_io_touched` instead.
             // Writing `true` here would break that contract silently for any
-            // alt-status read reaching the bus with `cpu_is_ring0_pm` set --
+            // alt-status read reaching the bus with `cpu_is_ring0_pm` set,
             // changing the monitor's batch geometry on the one fixture that runs
             // the monitor. Suppressing the clear is exactly "end the batch on
             // the arming read, and only where the exemption would otherwise have
@@ -3290,7 +3290,7 @@ impl CpuBus for MachineBus<'_> {
             //
             // Slice 9C-pre: THE ARM SITE for the primary-channel poll skip, the
             // fixed-disk analogue of the ATAPI arm just above. It is dark unless
-            // `DeviceTimingProfile::ata` is armed on this machine -- there is no
+            // `DeviceTimingProfile::ata` is armed on this machine: there is no
             // separate `IZARRAVM_ATA_HDD_POLL_SKIP` enable bool the way the ATAPI
             // mechanism has one, by design, so the knob-unset identity bar (the
             // whole point of 9C-pre being "pure plumbing") holds without a second
@@ -3311,7 +3311,7 @@ impl CpuBus for MachineBus<'_> {
                 .as_mut()
                 .and_then(|d| d.read_port_at(port, prefix_ticks))
                 .unwrap_or(0xff);
-            // SUPPRESS THE CLEAR, never force the set -- same contract as the
+            // SUPPRESS THE CLEAR, never force the set: same contract as the
             // ATAPI arm above.
             if lazy_alt_status && !arm {
                 *self.io_touched = false;
@@ -3378,13 +3378,13 @@ impl CpuBus for MachineBus<'_> {
             // slices, so no batch boundary can reorder a button edge).
             //
             // The arm keys on DEVICE STATE, not on the persona switch, because
-            // the persona is not what makes the read time-independent -- an idle
+            // the persona is not what makes the read time-independent: an idle
             // monostable is. `charge(now)` writes deadlines at least
             // `now + RC_BASE_NS`, so any read later in the same batch is still
             // before them, `is_idle` is false, and a charged axis takes today's
             // batch-ending path by construction. A mid-pulse read with a stick
             // attached is genuinely time-dependent and is served exactly as
-            // before. What is left -- no stick, or both one-shots long expired --
+            // before. What is left (no stick, or both one-shots long expired)
             // is a constant function of state that no device advance can move.
             //
             // `!io_touched_before_read` stays: it is what stops this read from
@@ -3434,7 +3434,7 @@ impl CpuBus for MachineBus<'_> {
         // they are exempted from ending the batch in the Approximate class only.
         //
         // A20 carve-out: the batch loop's A20 seam ("any A20 write ... ends this
-        // step" -- the before/after compare at batch entry) depends on EVERY
+        // step", the before/after compare at batch entry) depends on EVERY
         // write that can move the A20 gate ending the batch, ring-0 or not.
         // Ports 0x92 (system control A), 0x60/0x64 (the 8042 path) can; keep
         // them batch-ending unconditionally. TOKAEMM's a20_apply is PTE-based
@@ -3460,7 +3460,7 @@ impl CpuBus for MachineBus<'_> {
         // which mirrors this post-write block for the HLE path.
         let pci_decode = self.vega.memory_decode_key();
         if self.pci.write_io(port, width, value, self.vega) {
-            // F4: see the matching comment in `read_io` -- 0xCF8-0xCFF sits above the width
+            // F4: see the matching comment in `read_io`. 0xCF8-0xCFF sits above the width
             // split and the general charge site.
             self.charge_pci_transaction(port, width, BusAccessKind::IoWrite);
             // The only bus-side door onto Distira's PCI command register and BAR, so the only
@@ -3540,7 +3540,7 @@ impl CpuBus for MachineBus<'_> {
         }
 
         // See `read_io`'s matching site: below the width split (one charge per
-        // byte cycle), above every device arm, and above `port_disabled` -- an
+        // byte cycle), above every device arm, and above `port_disabled`: an
         // ISA cycle to a listed port happens whether or not the decode answers.
         self.charge_port_bus(port, BusAccessKind::IoWrite);
 
@@ -3794,7 +3794,7 @@ impl CpuBus for MachineBus<'_> {
         // but shares the arm so the port test stays one range compare.
         if matches!(port, 0x40..=0x43) {
             let elapsed_pit_clocks = self.elapsed_pit_clocks();
-            // A channel-0 control word (SC=0, RW!=0 -- RW=0 is the latch
+            // A channel-0 control word (SC=0, RW!=0; RW=0 is the latch
             // command, which touches nothing) forces OUT to the mode's initial
             // level IMMEDIATELY, no CLK involved (8254 datasheet; 86Box and
             // DOSBox both drive the IRQ0 line from it). When the write lands
@@ -3862,11 +3862,11 @@ impl CpuBus for MachineBus<'_> {
         // startup). Both are write-only strobes: the board claims the write and
         // drives nothing on a read, so reads deliberately fall through to open
         // bus below. No FERR->IRQ13 latch is modeled yet, so there is no state
-        // to clear -- claiming the write IS the hardware behaviour.
+        // to clear: claiming the write IS the hardware behaviour.
         if matches!(port, 0x00f0 | 0x00f1) {
             return Ok(());
         }
-        // Nothing decoded it, so the write goes nowhere -- which is what happens
+        // Nothing decoded it, so the write goes nowhere, which is what happens
         // on real hardware and is why Prince of Persia's OUT to 0x7421 must not
         // stop the machine. See `OpenBusPorts`.
         self.open_bus.note(port, true)
@@ -3901,7 +3901,7 @@ impl CpuBus for MachineBus<'_> {
         *self.io_touched || self.pending_soft_int.is_some()
     }
 
-    /// `core_clocks_so_far = now` -- EXACTLY `read_io`'s own first statement
+    /// `core_clocks_so_far = now`, EXACTLY `read_io`'s own first statement
     /// (`self.core_clocks_so_far = core_clocks_so_far;`, `read_io`, a few lines below),
     /// just reachable before a lazy prediction rather than only inside the read itself.
     /// Idempotent with that statement: publishing `now` here and then calling
@@ -3910,14 +3910,14 @@ impl CpuBus for MachineBus<'_> {
     /// MUST NOT touch `prior_runs_core_clocks`. An earlier revision zeroed it here,
     /// which corrupted `in_batch_clocks()` (`prior_runs_core_clocks + core_clocks_so_far`
     /// plus `scaled_bus_clocks`, `timing.rs`) for the rest of the run: every lazy prediction
-    /// after the first call-out attempt in a batch -- `predicted_beam`, the seam's own
-    /// `poll_project_dot_advance`, the lazy PIT/OPL peeks -- read a beam short by the
+    /// after the first call-out attempt in a batch (`predicted_beam`, the seam's own
+    /// `poll_project_dot_advance`, the lazy PIT/OPL peeks) read a beam short by the
     /// whole prior-runs core total. `prior_runs_core_clocks` is published once per RUN by
     /// the batch loop (`machine/run.rs:1610`/`:1634`) and this method has no business
     /// resetting a batch-scoped field from a call that fires once per call-out ATTEMPT,
     /// decline or commit alike. Corroborated by measurement (GP2 poll-skip revision
     /// diagnostic pair, 2026-08-26): C1 conservation held to 1.1 ppb while the frame hash
-    /// moved -- the charges were right and a prediction INPUT was wrong, which is exactly
+    /// moved: the charges were right and a prediction INPUT was wrong, which is exactly
     /// this signature.
     fn publish_core_clocks(&mut self, now: u64) {
         self.core_clocks_so_far = now;
@@ -3938,7 +3938,7 @@ impl CpuBus for MachineBus<'_> {
     ///    `rep_resume_active` / `rep_execution.resume` and belongs to the
     ///    interpreter's own back-edge; a mid-block call-out has no REP resume state to
     ///    clear and must not touch `izarravm-cpu`-side fields it cannot even name
-    ///    (BLOCKER C). `poll_commit_bus` -- the bus half of the SAME mechanism -- IS
+    ///    (BLOCKER C). `poll_commit_bus` (the bus half of the SAME mechanism) IS
     ///    called, a few lines below where the interpreter calls it.
     /// 3. **The core-clock instant is `now_at(n)` (`core_clocks_at_block_entry +
     ///    scale_core_clocks(prefix_raw + raw*n, ..)`), never
@@ -3996,10 +3996,10 @@ impl CpuBus for MachineBus<'_> {
         };
         // BLOCKER 2's fix: two DIFFERENT totals, deliberately never conflated into one.
         //
-        // `batch_instant(n)` is what `poll_project_dot_advance` needs -- it compares against
+        // `batch_instant(n)` is what `poll_project_dot_advance` needs: it compares against
         // `MachineBus::in_batch_clocks()`, which is `prior_runs_core_clocks + core_clocks_so_far +
         // scaled_bus_clocks`, ALL THREE terms batch-absolute. `now_at_batch` adds the batch's
-        // prior-runs core term (now that `publish_core_clocks` no longer zeroes it -- BLOCKER 1)
+        // prior-runs core term (now that `publish_core_clocks` no longer zeroes it, BLOCKER 1)
         // and `poll_project_scaled_bus_clocks` is already batch-absolute on its own, so
         // `batch_instant(0) == in_batch_clocks()` exactly: the same identity `now_at(0) == now`
         // established for the run-scoped term, now holding for the batch-scoped one too.
@@ -4013,7 +4013,7 @@ impl CpuBus for MachineBus<'_> {
         };
         // `run_spent(n)` is what the RUN-remaining `req.cap` actually bounds: RUN-scoped core plus
         // RUN-scoped bus GROWTH (the batch-absolute bus reading minus the batch-absolute bus total
-        // this run STARTED at, `req.bus_scaled_at_run_entry`) -- algebraically identical to
+        // this run STARTED at, `req.bus_scaled_at_run_entry`), algebraically identical to
         // `run_direct_block`'s own `used = total + (bus.in_batch_scaled_bus_clocks() -
         // bus_at_entry)`, extended by `n` skipped iterations. Comparing `req.cap` against a
         // batch-absolute bus reading (the pre-fix defect) subtracted the batch's prior bus clocks
@@ -4158,7 +4158,7 @@ impl CpuBus for MachineBus<'_> {
     /// batch-absolute scaled bus clocks. `cap` is the batch cap the loop itself is
     /// bounded by, published at batch entry, so "the lump fits inside `cap - spent`"
     /// is the same question as "this batch will not run past its own cap", and
-    /// `next_device_edge_ticks` is inside that cap by construction -- which is what
+    /// `next_device_edge_ticks` is inside that cap by construction, which is what
     /// makes "no device edge is ever inside an answered lump" true without a second
     /// device scan here.
     ///
@@ -4222,7 +4222,7 @@ impl CpuBus for MachineBus<'_> {
     /// * **Device windows and the framebuffer aperture.** `peek_direct_ram` is the
     ///   single mechanism (plan Revision 2 item 18): `direct_page_ram_bytes` declines
     ///   an A20-masked address, a misaligned access, a page-crossing range, and every
-    ///   page `ram_lookup_page_is_direct` excludes -- which is `0xA0000-0xFFFFF` and
+    ///   page `ram_lookup_page_is_direct` excludes, which is `0xA0000-0xFFFFF` and
     ///   every Vega memory BAR. So one `peek_direct_ram` per covered dword answers
     ///   both, and a range too large to walk cheaply is refused rather than admitted.
     /// * **DMA.** Every DMA writer in this machine (the FDC's `advance_fdc_to`, the
@@ -4231,7 +4231,7 @@ impl CpuBus for MachineBus<'_> {
     ///   refuses any lump that would reach the batch cap, and the cap is at or before
     ///   the next device edge, so no DMA transfer can land inside an answered lump.
     ///   A device that advances at the batch end sees the trip's FINAL memory state
-    ///   in both worlds -- which is exactly what a Class R skip preserves. This is an
+    ///   in both worlds, which is exactly what a Class R skip preserves. This is an
     ///   argument, not a query: it is written down here rather than turned into a
     ///   per-channel address test because no such query exists on this bus, and the
     ///   argument is what the cap already buys.
@@ -4318,7 +4318,7 @@ impl MachineBus<'_> {
     ///
     /// The DOS multiplex vector (INT 2Fh) HLE is landing-scoped: it services
     /// a fetch that LANDS on the ROM stub, which happens only when every
-    /// hook above chained down to the boot vector — the Toka-DOS kernel
+    /// hook above chained down to the boot vector: the Toka-DOS kernel
     /// forwards AH=11h/15h there when the IzarraCD claim armed, and a guest
     /// TSR that chains behaves the same. A hook that fully handles 2Fh
     /// (JEMMEX, DOS/32A's stub) never lands, so it still owns the vector;
@@ -4581,7 +4581,7 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         // does.
         0x0280..=0x028f, // C/MS Game Blaster alternate-base probe range (Prince of
         // Persia's sound detect reads 0x283 and must see open bus,
-        // not a fault -- the port-0x201 joystick-stub precedent)
+        // not a fault, the port-0x201 joystick-stub precedent)
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
         0x5658..=0x565b, // VMware backdoor probe (DX=0x5658, EAX='VMXh'): real,
@@ -4621,7 +4621,7 @@ impl MachineBus<'_> {
     /// releases it, and re-selecting while it is held moves the assertion to the
     /// new line. An MSS install routine uses it to prove the line it picked
     /// actually reaches the CPU. The codec core has no interrupt controller, so
-    /// it records the delta and this drains it on the guest's own `OUT` -- the
+    /// it records the delta and this drains it on the guest's own `OUT`, the
     /// shape `sync_mpu_irq` above uses for the MPU-401 line.
     ///
     /// `set_irq_level` is the right primitive rather than `request`: the board
@@ -4712,7 +4712,7 @@ impl MachineBus<'_> {
     /// full-width REP MOVS of a 1024-byte row crosses on half of them.
     ///
     /// The A20 clause is NOT dead here. `A20_MASK` clears bit 20 at every
-    /// address, not only under 1 MiB, and the 4 MiB LFB aperture spans bit 20 --
+    /// address, not only under 1 MiB, and the 4 MiB LFB aperture spans bit 20,
     /// so with A20 off the second and fourth megabytes alias down. Declining
     /// leaves them to the slow path, which applies the same gating one byte at
     /// a time.
@@ -4840,7 +4840,7 @@ impl MachineBus<'_> {
     ///
     /// A sibling rather than a relaxation of `direct_page_ram_bytes`: that function's other
     /// callers are the bulk paths (`read_memory_bytes_direct`, `write_memory_bytes_direct`) whose
-    /// `access_width` contract is different -- they fold a RUN at the access width, and a
+    /// `access_width` contract is different: they fold a RUN at the access width, and a
     /// misaligned run would be mis-charged. Only the single-access direct read/write pair may
     /// come here, and each pays for it by calling `charge_direct_ram_split` instead of a wide
     /// charge.
@@ -5027,7 +5027,7 @@ impl MachineBus<'_> {
                     // The write that MOVED the Margo blit engine's busy time
                     // stamps its own in-batch instant as the origin that time is
                     // measured from. Margo drains once, at batch end, with the
-                    // WHOLE batch's nanoseconds -- so without this credit an
+                    // WHOLE batch's nanoseconds, so without this credit an
                     // operation armed partway in would be billed for the part of
                     // the batch that ran before it started, and STATUS.BUSY would
                     // report idle before the modeled time had passed
@@ -5043,7 +5043,7 @@ impl MachineBus<'_> {
                     // exactness. It is dropped on those grounds alone: removing
                     // it was MEASURED wall-neutral on current main (+0.10% on
                     // prince-486, +0.64% on nascar-586, both inside noise), and
-                    // the ~5% it once cost is not reproducible -- see the stale-
+                    // the ~5% it once cost is not reproducible. See the stale-
                     // cost note on `Machine::vega_edge_ticks`. Dropping it also
                     // stops this term arming that deadline at all, which is the
                     // dependency documented there.
@@ -5051,7 +5051,7 @@ impl MachineBus<'_> {
                     // EDGE, not level: `VideoWrite::ArmedBlit` is reported only
                     // by a write that moved busy time (see `VideoWrite`). A blit
                     // can outlast a batch, and writes overlapped with a running
-                    // one must NOT re-stamp the origin -- that would keep
+                    // one must NOT re-stamp the origin: that would keep
                     // resetting the operation's start and stretch it forever.
                     VideoWrite::ArmedBlit => {
                         let elapsed_ns = self.elapsed_margo_ns();
@@ -5161,7 +5161,7 @@ impl MachineBus<'_> {
         if self.is_device_free_extended_ram(address, bytes) {
             // The screen is a hand-derived claim about the two claimants below,
             // so prove it on every debug run rather than trusting the
-            // derivation -- the same discipline `Vega::owns_memory` applies to
+            // derivation, the same discipline `Vega::owns_memory` applies to
             // its own `may_own_memory` prefilter. If this ever fires, a window
             // moved above 1 MB without `device_free_extended_floor` learning
             // about it, and the cost of believing the screen is a wrong charged
@@ -5204,7 +5204,7 @@ impl MachineBus<'_> {
     /// plus `Vega::owns_memory` carried 4.65% of duke3d-586 wall, 2.88% of
     /// gp2-586 and 2.49% of nascar-586.
     ///
-    /// EXACTNESS, which is the whole contract -- this must not change a single
+    /// EXACTNESS, which is the whole contract: this must not change a single
     /// charged wait-state. Two claimants exist above 1 MB. `rom_offset` claims
     /// `HIGH_ROM_BASE ..= u32::MAX` (its other region, `LOW_BIOS_BASE`, ends at
     /// 1 MB), and `Vega::may_own_memory` claims Margo's LFB+MMIO block and
@@ -5221,9 +5221,9 @@ impl MachineBus<'_> {
     /// A20 is the way this screen could be wrong without ever looking wrong:
     /// with the gate masked, `0x0010_0000..0x0010_FFEF` aliases DOWN into
     /// conventional memory, so an address that reads as extended RAM can land in
-    /// a claimed window. Every caller already folds the address first -- the
+    /// a claimed window. Every caller already folds the address first (the
     /// whole wait-state family is documented "at the post-A20 physical
-    /// `address`", and every call site was checked against that -- and the
+    /// `address`", and every call site was checked against that) and the
     /// assertion below is what stops a future caller from quietly breaking it.
     /// The assertion is exact rather than approximate: a post-A20 address has
     /// bit 20 already resolved, so folding it a second time is the identity

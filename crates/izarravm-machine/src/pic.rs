@@ -417,7 +417,7 @@ impl Pic8259Pair {
     /// `irq_unmasked` alone only checks the slave IMR bit; if a guest masks the
     /// cascade line but leaves the slave bit open, the slave latches the IRR but no
     /// edge forwards to the master, so the CPU never wakes. Wake estimators must use
-    /// this -- not `irq_unmasked` -- so a halted CPU is not fast-forwarded to a wake
+    /// this, not `irq_unmasked`, so a halted CPU is not fast-forwarded to a wake
     /// that delivery can never produce.
     pub(crate) fn deliverable(&self, irq: u8) -> bool {
         if irq < 8 {
@@ -527,7 +527,7 @@ impl Pic8259Pair {
     /// `acknowledge`'s slice-9A instrument variant: identical state transition
     /// and vector, but also reports the MASTER-side IRQ line (0-7) the
     /// acknowledge resolved. Line 0 is IRQ0 (the PIT) on every AT wiring this
-    /// model supports -- never a cascade pin -- so a caller can attribute a
+    /// model supports, never a cascade pin, so a caller can attribute a
     /// delivered interrupt to the PIT without re-deriving cascade/priority
     /// logic. `acknowledge` is now a thin wrapper around this.
     pub(crate) fn acknowledge_with_irq(&mut self) -> Option<(u8, u8)> {

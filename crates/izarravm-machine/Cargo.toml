@@ -25,8 +25,8 @@ reflected-call-diagnostic = ["izarravm-cpu/reflected-call-diagnostic"]
 # cache probe (persona geometry, L2 shadow, JIT fetch coverage, JIT native-entry
 # sampling). NOT in `default`; the plain build must be byte-identical to a plain
 # main build, which is why every S1a/b/c/d addition lives behind this feature
-# rather than behind the pre-existing IZARRAVM_SHADOW_L1_PROBE env check alone --
-# see shadow_cache.rs (the off-feature module, verbatim pre-S1a) vs
+# rather than behind the pre-existing IZARRAVM_SHADOW_L1_PROBE env check alone.
+# See shadow_cache.rs (the off-feature module, verbatim pre-S1a) vs
 # shadow_cache_probe.rs (the on-feature module) in lib.rs's cfg'd `mod` pair.
 shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-bus/shadow-cache-probe"]
 # NOT a passthrough: this crate owns two of slice 1's seams, and both were added after
@@ -37,7 +37,7 @@ shadow-cache-probe = ["jit", "izarravm-cpu/shadow-cache-probe", "izarravm-bus/sh
 reflected-call-memo = ["izarravm-cpu/reflected-call-memo"]
 
 # Passthrough for the per-class retire histogram; see izarravm-cpu. The machine has no hook of
-# its own -- every increment is in izarravm-cpu and the only reader is the binary's profile JSON.
+# its own: every increment is in izarravm-cpu and the only reader is the binary's profile JSON.
 timing-class-histogram = ["izarravm-cpu/timing-class-histogram"]
 
 [dependencies]

@@ -865,10 +865,10 @@ fn simulated_count_after(counter: &Counter, clocks: u64) -> u16 {
 
 #[test]
 fn analytic_count_after_matches_the_step_simulation_across_modes_and_phases() {
-    // Same coverage shape as the out_after differential above -- every mode, a
+    // Same coverage shape as the out_after differential above (every mode, a
     // spread of reloads (even, odd, minimum legal, illegal, full-range), every
-    // phase across two-plus periods, and distances from 0 through several periods
-    // -- but pinning the COUNTER VALUE a mid-batch read reports, which is what the
+    // phase across two-plus periods, and distances from 0 through several periods)
+    //but pinning the COUNTER VALUE a mid-batch read reports, which is what the
     // 0x40/0x42 peek returns.
     for mode in 0..=5u8 {
         for reload in [2u16, 3, 4, 5, 6, 7, 18, 100, 101, 255, 1, 0] {
@@ -922,7 +922,7 @@ fn analytic_count_after_matches_the_step_simulation_across_modes_and_phases() {
 #[test]
 fn analytic_count_after_matches_the_step_simulation_with_a_low_gate() {
     // The sweep above always runs with GATE high (channel 0's gate is wired
-    // high), so it never enters LoadDelay-with-GATE-low -- the one state where
+    // high), so it never enters LoadDelay-with-GATE-low, the one state where
     // `step` still LOADS the counting element (the load is unconditional; only
     // `step_counting` is gated) while the counter cannot count. Guest-reachable
     // on channel 2: clear 0x61 bit 0, program the counter, then latch/read 0x42.
@@ -1067,7 +1067,7 @@ fn analytic_peeks_match_the_step_simulation_after_a_reload_rewrite() {
     // The gap the mode/reload/phase sweeps above never reach: a count REWRITTEN
     // while the counter is already running. `arm` deliberately does not reset the
     // counting element for modes 2 and 3 (a guest that rewrites faster than one
-    // period -- Prince of Persia's speaker driver -- must still complete cycles),
+    // period, Prince of Persia's speaker driver, must still complete cycles),
     // so the CE and the reload register legitimately come apart. Every state below
     // is produced by the real port path, so every one of them is reachable.
     let clockses = [0u64, 1, 2, 3, 4, 5, 88, 89, 90, 91, 92, 200, 1000];
@@ -1269,8 +1269,8 @@ fn mid_batch_status_byte_matches_the_step_simulation_across_load_delay_phases() 
     // and would also catch a peek leaking into the three register-state fields
     // that no CLK may move.
     //
-    // The sweep deliberately STARTS in LoadDelay -- the state entered by the
-    // count write and left on the very first CLK -- because that is the only
+    // The sweep deliberately STARTS in LoadDelay (the state entered by the
+    // count write and left on the very first CLK) because that is the only
     // phase where bit 6 moves at all. `clocks == 0` must still report the bit
     // SET (nothing has clocked yet) and `clocks >= 1` must report it CLEAR;
     // both edges are inside the sweep.
@@ -1331,7 +1331,7 @@ fn the_null_count_bit_is_set_at_zero_offset_and_clear_one_clock_later() {
 #[test]
 fn the_null_count_bit_holds_through_wait_gate_however_many_clocks_pass() {
     // Modes 1 and 5 park in WaitGate until a GATE rising edge, and `step` never
-    // loads there -- so unlike LoadDelay the bit must NOT clear with distance.
+    // loads there, so unlike LoadDelay the bit must NOT clear with distance.
     // A peek that keyed on "a count was written" rather than on the state
     // machine would clear it here and this is the case that catches that.
     for mode in [CW_MODE1, CW_MODE5] {
@@ -1688,8 +1688,8 @@ fn channel1_mode2_refresh_out_toggles_at_its_period() {
 //
 // The bar for this slice is IDENTITY, not plausibility: the guest state after a
 // bulk advance must be what `clocks` calls to `Counter::step` produce, field for
-// field, and the caller's two observables -- the channel-0 rising-edge COUNT and
-// the watched channel's OUT transition LIST -- must match element for element.
+// field, and the caller's two observables (the channel-0 rising-edge COUNT and
+// the watched channel's OUT transition LIST) must match element for element.
 // `Pit` and `OutTransition` both derive `PartialEq`, so every assertion below is
 // a whole-value comparison rather than a field spot-check.
 
@@ -1837,7 +1837,7 @@ fn pit_bulk_advance_of_zero_clocks_moves_nothing() {
     // `Counter::advance` and `Counter::out_transitions_in` are asserted DIRECTLY
     // here, not through `tick_with_observer`. The chip-level entry point already
     // returns early on an empty advance, so the zero-CLK guards inside these two
-    // are unreachable from production -- and an unreachable guard is exactly
+    // are unreachable from production, and an unreachable guard is exactly
     // what rots into a landmine the day a second caller appears. The contract is
     // pinned at the functions that state it. (Both guards SURVIVED the first
     // mutation round for precisely this reason; this test is what kills them.)
@@ -1882,7 +1882,7 @@ fn pit_bulk_advance_of_zero_clocks_moves_nothing() {
 fn pit_bulk_advance_declines_bcd_counters_and_still_matches_the_loop() {
     // BCD is declined on the same ground as every analytic peek in this file: no
     // PC software clocks the PIT in BCD, so decimal half-cycles are not modeled.
-    // The decline is NOT the knob -- a BCD counter takes the loop on both arms --
+    // The decline is NOT the knob (a BCD counter takes the loop on both arms)
     // and the two arms must still land in the same place.
     for mode in 0..=5u8 {
         for reload in [0x02u16, 0x07, 0x18, 0x99, 0x0100] {
@@ -1919,8 +1919,8 @@ fn pit_bulk_advance_declines_bcd_counters_and_still_matches_the_loop() {
 #[test]
 fn pit_bulk_advance_declines_an_illegal_mode_2_or_3_reload() {
     // Reload 1 is the datasheet's illegal input for modes 2 and 3 (count 2 is
-    // the minimum). `step_counting` handles it loosely -- it reloads on EVERY
-    // CLK -- which leaves the analytic form no period to fold and, in mode 3, no
+    // the minimum). `step_counting` handles it loosely: it reloads on EVERY
+    // CLK, which leaves the analytic form no period to fold and, in mode 3, no
     // half-period. It declines rather than guessing, and the decline names
     // itself so a row that lost the lever to an illegal count is diagnosable.
     for mode in [2u8, 3] {
@@ -1940,7 +1940,7 @@ fn pit_bulk_advance_declines_an_illegal_mode_2_or_3_reload() {
         // The reachable form of the same input: a live counter whose RELOAD is
         // rewritten to 1 while its counting element is still large. `arm`
         // deliberately does not reset the live count for modes 2 and 3, so this
-        // state really does occur -- it is the state the read-only peeks used to
+        // state really does occur: it is the state the read-only peeks used to
         // get wrong (they jumped straight to the reload for `r <= 1`, skipping the
         // walk down from the live CE); see
         // `analytic_peeks_match_the_step_simulation_for_the_prince_of_persia_rewrite`.
@@ -1984,7 +1984,7 @@ fn pit_bulk_advance_reproduces_the_gate_low_mode_2_and_3_out_force() {
     // The read-only peeks do NOT: `out_after`'s Counting + !gate arm returns the
     // STORED level. Today the two agree, because the only two ways into a
     // GATE-low mode-2/3 state (`set_gate`'s falling edge and `write_control`)
-    // both set OUT high on the way in -- so this state is CONSTRUCTED, not
+    // both set OUT high on the way in, so this state is CONSTRUCTED, not
     // programmed. A bulk advance writes the field, and writing back the peeks'
     // answer here would be a real state divergence.
     for mode in [2u8, 3] {
@@ -2049,7 +2049,7 @@ fn pit_bulk_advance_reproduces_the_gate_low_mode_2_and_3_out_force() {
 
 #[test]
 fn pit_bulk_advance_clears_null_count_only_on_the_load_clk() {
-    // `null_count` is cleared in exactly one place -- `step`'s LoadDelay arm --
+    // `null_count` is cleared in exactly one place (`step`'s LoadDelay arm)
     // and the mode-2/3 reload inside `step_counting` does NOT clear it. Modes 1
     // and 5 park in WaitGate and load on the GATE edge instead, so they have no
     // LoadDelay CLK to test here.
@@ -2223,7 +2223,7 @@ fn pit_bulk_advance_matches_the_step_loop_across_gate_edges_and_count_rewrites()
 #[test]
 fn pit_bulk_advance_both_arms_are_reachable_in_one_binary() {
     // The ladder drives both arms from ONE binary, so both must be reachable
-    // without a rebuild -- and the OFF arm must be provably the loop, not the
+    // without a rebuild, and the OFF arm must be provably the loop, not the
     // bulk path wearing the loop's label.
     let mut pit = Pit::default();
     program_channel(&mut pit, 0, 2, 100, false);
@@ -2269,7 +2269,7 @@ fn pit_bulk_advance_declines_a_span_wider_than_the_counting_element() {
     //
     // The predicate is checked directly rather than through `tick_arm`, because
     // taking the fallback here means running the four-billion-iteration loop the
-    // guard exists to stay away from -- that costs two minutes of test time and
+    // guard exists to stay away from: that costs two minutes of test time and
     // proves nothing the predicate does not.
     let mut pit = Pit::default();
     program_channel(&mut pit, 0, 2, 100, false);

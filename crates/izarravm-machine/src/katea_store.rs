@@ -353,7 +353,7 @@ impl SectorStore {
     /// hashed once per 128 KiB chunk the span touches instead of once per sector.
     /// The reconcile pass asks this per cluster of every live file's chain, so on
     /// a `spc = 8` volume it was eight SipHash probes per cluster ON THE WHOLE
-    /// MOUNT for a write that touched one file -- the same
+    /// MOUNT for a write that touched one file, the same
     /// scales-with-the-folder shape `KateaTreeVolume::fat_entry_walked` was
     /// built to remove, and what would be left holding the record once that one
     /// was gone. A cluster normally sits inside one chunk, so this is one probe.
@@ -364,7 +364,7 @@ impl SectorStore {
     /// `cluster_in_range`-checked cluster through `cluster_to_lba`, so the bound
     /// is unreachable, but this is a general `pub(crate)` helper and an
     /// unreachable bound that is not stated is one the next caller inherits
-    /// silently. Saturating is also the correct answer -- the clamp against
+    /// silently. Saturating is also the correct answer: the clamp against
     /// `last + 1` below already ends the walk at the span.
     pub(crate) fn was_written_span(&self, first: u32, count: u32) -> bool {
         if count == 0 {
@@ -452,7 +452,7 @@ impl SectorStore {
 
     /// The chunk covering `lba`. Callers cache a span's chunk ids once and then
     /// revalidate through [`Self::chunk_last_seq`] instead of walking the span
-    /// again -- one probe per 128 KiB rather than one per sector.
+    /// again: one probe per 128 KiB rather than one per sector.
     pub(crate) fn chunk_of(lba: u32) -> u32 {
         chunk_id(lba)
     }

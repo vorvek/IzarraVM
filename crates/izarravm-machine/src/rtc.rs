@@ -575,7 +575,7 @@ impl Rtc {
     /// and the POST-verified copy at 0x30/0x31.
     ///
     /// These read 0 before this existed, and plenty of DOS-era software asks the
-    /// CMOS directly rather than going through INT 15h or an XMS driver -- Chess
+    /// CMOS directly rather than going through INT 15h or an XMS driver: Chess
     /// Housers' startup check reports "extended memory: 0 Kb" on exactly this,
     /// in every CPU persona, while INT 15h AH=88h and XMS both answered
     /// correctly. Both register pairs are written because software picks either.

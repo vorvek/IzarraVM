@@ -49,12 +49,12 @@ pub(crate) const ATA_POLL_RUN: u32 = 16;
 ///
 /// WITHOUT A FLOOR the arm buys a *guaranteed* batch break plus a
 /// deadline-cache invalidation against an unknown payoff, because a nearer
-/// device edge can win the target `min` -- an FDC byte at ~16 us during a floppy
+/// device edge can win the target `min`: an FDC byte at ~16 us during a floppy
 /// transfer, an MPU byte at 320 us, RTC periodic at 1024 Hz.
 ///
 /// 20 us is derived, not picked. It sits below `PACKET_ACCEPT_TICKS` (50 us),
 /// the shortest deadline the ATAPI model ever schedules, net of the ~2 us the
-/// arming iterations themselves consume -- so all three of TOKACD's per-sector
+/// arming iterations themselves consume, so all three of TOKACD's per-sector
 /// phases (50 us, 100 us, 1.11 ms) stay skippable, which is what the
 /// `spans ~= 3 x sectors` acceptance assertion depends on. And it is ~10x the
 /// arming window, so the break is amortised at <=10% even in the worst admitted
@@ -374,8 +374,8 @@ impl IdeChannel {
     /// The run is ZEROED rather than frozen on every decline (review R2-N4), so
     /// a later clear cannot arm on a stale count.
     pub(crate) fn note_alt_status_read(&mut self) -> bool {
-        // Nothing pending: this is a read outside any wait -- TOKACD does one at
-        // `tokacd.asm:1506`, immediately after `wait_not_busy` returns -- and
+        // Nothing pending: this is a read outside any wait (TOKACD does one at
+        // `tokacd.asm:1506`, immediately after `wait_not_busy` returns) and
         // without this arm the run would carry across a completion boundary.
         if self.pending_command.is_none() {
             self.record_poll_run_length();
@@ -404,7 +404,7 @@ impl IdeChannel {
             // arm suppresses the lazy clear, so `io_touched` stays true and no
             // later read in this batch can satisfy `!io_touched_before_read` to
             // resume counting, and batch entry would zero it regardless. It is
-            // done anyway so the diagnostic histogram records each run ONCE --
+            // done anyway so the diagnostic histogram records each run ONCE:
             // without it the arm and the batch-entry reset both bucket the same
             // run and the 9-16 bucket reads twice the arm count.
             self.record_poll_run_length();
@@ -451,7 +451,7 @@ impl IdeChannel {
     }
 
     /// Sweep seam. Both values are read once at machine construction, never per
-    /// access -- the default-off-instrument tax rule.
+    /// access: the default-off-instrument tax rule.
     pub(crate) fn configure_poll_skip(&mut self, run: u32, floor_ticks: u64, diag: bool) {
         self.poll_run_threshold = run.max(1);
         self.poll_floor_ticks = floor_ticks;
@@ -518,8 +518,8 @@ impl IdeChannel {
         // the bus half's `note_alt_status_read` call. An alt-status read whose
         // arm predicate SHORT-CIRCUITED (the ring-0 monitor's own read, or a
         // read after an earlier access already ended the batch) therefore
-        // neither increments nor resets the run. Unreachable today -- no monitor
-        // path pokes 0x376 -- and benign if it ever were, because an early arm
+        // neither increments nor resets the run. Unreachable today (no monitor
+        // path pokes 0x376) and benign if it ever were, because an early arm
         // is bounded by the mandatory ATA term and by the floor.
         self.reset_alt_status_run();
         let reg = port - SECONDARY_CMD_BASE;
@@ -563,8 +563,8 @@ impl IdeChannel {
         // re-enables skipping for that command. That is the intended sequence,
         // not an accident of placement.
         //
-        // GUARD 2 -- the batch-end actuation's mandatory
-        // `ticks_until_completion()` precondition -- is sufficient on its own
+        // GUARD 2 (the batch-end actuation's mandatory
+        // `ticks_until_completion()` precondition) is sufficient on its own
         // after an SRST and is the one the fixture pins. This guard is cheap and
         // keeps the device's own bookkeeping honest.
         self.reset_alt_status_run();

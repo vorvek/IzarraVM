@@ -71,12 +71,12 @@ mod sb16_path;
 #[path = "shadow_cache_probe.rs"]
 mod shadow_cache;
 // OFF-FEATURE: plain `mod shadow_cache;` (no `#[path]` override) resolves to
-// `shadow_cache.rs`, byte-for-byte the pre-S1a module -- including its
+// `shadow_cache.rs`, byte-for-byte the pre-S1a module, including its
 // `file!()`-embedded panic/debug_assert! location strings. A `#[path]`
 // override to a differently-named file (tried first, reverted) changes those
 // embedded strings even when the file's CONTENT is identical, which showed up
 // as ~430 KiB of spurious whole-binary diff against a same-directory rebuild
-// of 64b379c9 -- the file's NAME, not just its content, is part of what must
+// of 64b379c9: the file's NAME, not just its content, is part of what must
 // stay identical for the plain build's byte-identity claim.
 #[cfg(not(feature = "shadow-cache-probe"))]
 mod shadow_cache;
@@ -390,7 +390,7 @@ pub struct PresentedFrameUpdate {
     /// The GUI publishes frames from a worker thread and paints them later, so
     /// a separate `Machine::active_display()` call at paint time can describe a
     /// different instant than the pixels do. Presentation settings that apply
-    /// to one engine only -- the Glide gamma toggle -- read this instead.
+    /// to one engine only (the Glide gamma toggle) read this instead.
     pub owner: ActiveDisplay,
 }
 
@@ -572,7 +572,7 @@ impl CacheModel {
     ///
     /// The tier travels WITH the cost because the caller treats one tier
     /// differently (epoch 2 folds the L1 hit into the instruction class count)
-    /// and resolving it MUTATES the tag arrays -- asking a second time would be
+    /// and resolving it MUTATES the tag arrays: asking a second time would be
     /// neither free nor idempotent.
     #[inline(always)]
     fn data_tier_and_wait_states(&mut self, phys: u32, _width: BusWidth) -> (Tier, u8) {
@@ -732,8 +732,8 @@ pub struct PhaseMark {
 ///
 /// The lever replaces `Pit::tick_with_observer`'s per-input-CLK loop with a
 /// per-counter analytic advance. The loop runs `PIT_INPUT_HZ` = 1,193,182
-/// iterations, and three `Counter::step()` calls each, per GUEST second --
-/// always, whatever the guest is doing -- so "did it engage" cannot be read off
+/// iterations, and three `Counter::step()` calls each, per GUEST second
+/// (always, whatever the guest is doing) so "did it engage" cannot be read off
 /// a wall number: a row that declines every advance and a row that barely
 /// advanced look the same. Every decline therefore names its own cause.
 ///
@@ -774,7 +774,7 @@ pub struct PitBulkAdvanceCounters {
     /// single device advance); it declines to the loop rather than guess.
     pub declines_span_too_wide: u64,
     /// OUT transitions the analytic enumeration emitted for the watched channel.
-    /// The loop arm's count is not recorded separately -- the differential test
+    /// The loop arm's count is not recorded separately: the differential test
     /// compares the two lists element for element, which is stronger.
     pub transitions: u64,
 }
@@ -786,7 +786,7 @@ pub struct PitBulkAdvanceCounters {
 /// wall number alone cannot tell "the arm never fired" from "the arm fired and
 /// Slice 9A of the device-timing design: the 8259A
 /// INTA instrument. Always-on, gated by nothing in `IZARRAVM_DEVICE_TIMING`
-/// (no family in that knob owns this -- it is read-only evidence for slice 8's
+/// (no family in that knob owns this: it is read-only evidence for slice 8's
 /// future interrupt-entry charge, not a behaviour switch), and cheap: one u64
 /// increment per delivered interrupt, plus one Option check and one histogram
 /// bucket per IRQ0 delivery specifically.
@@ -796,7 +796,7 @@ pub struct PitBulkAdvanceCounters {
 /// the IRQ0 handler measures the PIT-edge -> first-handler-instruction delay".
 /// Today's model charges nothing extra for INTA turnaround (`run.rs`'s 61 raw
 /// hardware-interrupt-entry charge is unaffected by this slice), so every
-/// sample under the current model is expected to land in the ZERO bucket --
+/// sample under the current model is expected to land in the ZERO bucket:
 /// that is the certifier slice 8 needs before it can charge the 8259A INTA sequence
 /// (about 166 core clocks at 166 MHz, or 1 us) and expect the histogram to shift. The 8259A also
 /// needs 500 ns of recovery between unlike commands. The PIC does not model either figure.
@@ -811,7 +811,7 @@ pub(crate) struct InterruptEntryDiagnostics {
     /// that has not yet been resolved by an IRQ0 acknowledge. `None` when no
     /// IRQ0 request is currently outstanding. Cleared by the matching
     /// acknowledge; a second edge arriving before that acknowledge does NOT
-    /// overwrite it -- IRR already coalesces repeat edges into the same
+    /// overwrite it: IRR already coalesces repeat edges into the same
     /// pending request, and this instrument should measure from the same edge
     /// IRR did, the earliest one.
     pub(crate) pending_edge_tick: Option<u64>,
@@ -870,7 +870,7 @@ pub struct AtaPollSkipCounters {
     /// and the floor wants re-deriving. It must NOT track `declines_deadline_clamped`.
     pub blocks: u64,
     /// The mandatory ATA precondition failed: no command was pending at batch
-    /// end, so the skip declined and stalled nothing. Reachable two ways -- the
+    /// end, so the skip declined and stalled nothing. Reachable two ways: the
     /// batch's own end-of-batch device advance crossing the completion, and a
     /// ring-0 SRST landing mid-batch.
     pub declines_not_pending: u64,
@@ -884,7 +884,7 @@ pub struct AtaPollSkipCounters {
     /// the guest spin out the rest of every sector at full interpreted cost,
     /// systematically, in the GUI only, invisible to every headless leg.
     ///
-    /// Expected 0 headless -- or at most ONE per run call, attributable to the
+    /// Expected 0 headless, or at most ONE per run call, attributable to the
     /// run tail: the batch loop exits on `now >= deadline_ticks`, so the final
     /// batch's post-advance remainder can land in (0, floor). Any value that
     /// SCALES WITH SECTORS is the falsifier.
@@ -896,8 +896,8 @@ pub struct AtaPollSkipCounters {
     ///
     /// Note what it is NOT: `!skip_io_touched` short-circuits BEFORE
     /// `note_alt_status_read`, so this counts monitor reads, not arms that would
-    /// otherwise have fired. Expected 0 on every fixture either way -- no
-    /// monitor path pokes 0x376 -- and now actually reachable, which is the
+    /// otherwise have fired. Expected 0 on every fixture either way (no
+    /// monitor path pokes 0x376) and now actually reachable, which is the
     /// point: the predicate it guards had to exist before the counter could
     /// mean anything.
     pub monitor_exempt: u64,
@@ -910,7 +910,7 @@ pub struct AtaPollSkipCounters {
 /// fixture), and the only seam that covers all of them is `Drop`. The counters
 /// therefore have to be owned by the thing that drops.
 ///
-/// The run-length histogram is deliberately NOT printed here -- it lives on the
+/// The run-length histogram is deliberately NOT printed here: it lives on the
 /// channel, which drops independently, and the whole-run JSON is a better home
 /// for it anyway (`Machine::ata_poll_run_histogram`).
 #[derive(Debug, Default)]
@@ -954,7 +954,7 @@ impl Drop for AtaPollSkipDiagnostics {
 /// Slice 9C-pre of the device-timing design:
 /// mechanism counters for the primary-channel (fixed-disk) analogue of the
 /// ATAPI poll skip. All zero unless `IZARRAVM_DEVICE_TIMING` armed the `ata`
-/// family AND the mechanism actually committed a skip -- there is no separate
+/// family AND the mechanism actually committed a skip: there is no separate
 /// enable flag the way `ata_poll_skip_enabled` is one, by design: the family
 /// flag IS the gate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1207,7 +1207,7 @@ pub struct MpuDiagnostics {
     pub stop_playbacks: u64,
     /// Complete MIDI messages the part emitted toward the synth. Counted at
     /// the DRAIN (`take_*_midi_message`), which only the GUI's MIDI pump
-    /// calls -- a headless profile reads 0 here beside live `data_writes`,
+    /// calls: a headless profile reads 0 here beside live `data_writes`,
     /// and that zero means "nothing drained the queue", not "no music".
     pub output_messages: u64,
     pub output_bytes: u64,
@@ -1427,7 +1427,7 @@ impl OplProbe {
 
     /// Record a command-port write. The command classification mirrors the
     /// `Mpu401` decoder without reading its state: 0x00-0x2F carries start/stop
-    /// bits, 0x3F enters UART, 0xFF resets -- and while the part sits in UART
+    /// bits, 0x3F enters UART, 0xFF resets, and while the part sits in UART
     /// mode it ignores everything except the reset, so the classifier keeps
     /// its own per-part UART latch and ignores the same bytes. Without the
     /// latch, a UART game whose stream bytes land on the command port would
@@ -1563,7 +1563,7 @@ pub struct Machine {
     /// F14's `VL_WaitVBL` exit-rate instrument (see `RetracePollCensus`).
     retrace_poll: RetracePollCensus,
     /// P2's certificate ledger (see `PollSkipCertificateCounters`). Replaced P1's single
-    /// `poll_skip_epoch_refusals`, which P2's admission lane makes structurally unreachable --
+    /// `poll_skip_epoch_refusals`, which P2's admission lane makes structurally unreachable:
     /// a counter that can never move is a gate that cannot fail.
     poll_skip_certificate: PollSkipCertificateCounters,
     profile: MachineProfile,
@@ -1619,13 +1619,13 @@ pub struct Machine {
     // Set by MachineBus on a port access that was EXEMPTED from `io_touched` (the
     // TOKAEMM ring-0-monitor carve-out in read_io/write_io). Such an access still
     // pokes real devices, so it can move a device schedule without ending the
-    // batch -- which is exactly the case the device-edge deadline cache must not
+    // batch, which is exactly the case the device-edge deadline cache must not
     // miss. Reset per batch alongside `io_touched`.
     exempt_io_touched: bool,
     // The slice-9 device-timing knob (`IZARRAVM_DEVICE_TIMING`). Parsed exactly
     // once, here at construction, and handed by copy to whichever device code
     // path later slices (9A onward) wire it into. Unset/empty is `is_none()`
-    // and today's behaviour is byte-identical -- see `device_timing.rs`.
+    // and today's behaviour is byte-identical. See `device_timing.rs`.
     device_timing: device_timing::DeviceTimingProfile,
     // Slice 9A: the 8259A INTA instrument. Always-on; see
     // `InterruptEntryDiagnostics`.
@@ -1635,15 +1635,15 @@ pub struct Machine {
     // WHY THIS IS NOT THE 0x3DA POLL SKIP. That one is an instruction-eliding
     // SHAPE skip: it certifies a straight-line loop body, analytically replays N
     // iterations and claims full state identity at the batch boundary. Four of
-    // its gates are closed against this workload and none is a policy knob --
+    // its gates are closed against this workload and none is a policy knob:
     // it is Interpreter-only, it refuses when the Direct backend is enabled and
     // when the guest is in V86, it refuses 16-bit code segments outright, and
     // every certified shape is a <=6-slot loop with no CALL. TOKACD's wait loops
     // are 16-bit V86 code containing a `call timeout_expired` that writes two
     // driver-private counter words.
     //
-    // This one certifies at the DEVICE instead -- a run of alt-status reads
-    // while an ATAPI command is pending -- and inspects nothing about the
+    // This one certifies at the DEVICE instead (a run of alt-status reads
+    // while an ATAPI command is pending) and inspects nothing about the
     // guest's code shape, which is what makes it backend-independent by
     // construction: the interpreter's `IN AL,DX` and the native V86 port
     // call-out both land in the same `read_io` IDE arm.
@@ -1667,7 +1667,7 @@ pub struct Machine {
     ata_poll_floor_ticks: u64,
     // Slice 9C-pre: the primary-channel (fixed-disk) analogue of
     // `ata_poll_skip_armed`, above. Gated by `DeviceTimingProfile::ata`
-    // ONLY -- there is no separate `IZARRAVM_ATA_HDD_POLL_SKIP` knob, by
+    // ONLY: there is no separate `IZARRAVM_ATA_HDD_POLL_SKIP` knob, by
     // design: this whole mechanism stays dark until the family is armed.
     // Reset at batch ENTRY next to `ata_poll_skip_armed`; taken at batch end
     // by `actuate_ata_hdd_poll_skip`.
@@ -1681,7 +1681,7 @@ pub struct Machine {
     port_bus_batch_clocks: u64,
     // DIAGNOSTIC ONLY, never read by an emulation decision: how many port accesses this run has
     // made in each `PortBusClass`, indexed by `PortBusClass::index()`. Counted in BOTH epochs and
-    // whatever the class charge is, which is the point -- the P1 ladder compares the SAME
+    // whatever the class charge is, which is the point: the P1 ladder compares the SAME
     // population across the epoch, and a counter that only existed under epoch 2 could not say
     // whether a row's accesses moved or only their price did. Never canonical.
     port_accesses_by_class: [u64; crate::bus::PORT_BUS_CLASS_COUNT],
@@ -1690,14 +1690,14 @@ pub struct Machine {
     // `fine_batch_grain_required`. Counter VALUES no longer depend on it:
     // `Counter::count_after` peeks the counting element at the in-batch instant of
     // the access, so a latch is exact at any batch grain. The window remains for the
-    // one case that peek declines -- a BCD-programmed counter, which falls back to
+    // one case that peek declines: a BCD-programmed counter, which falls back to
     // the live (batch-start) field. Host scheduling only: never guest-visible state,
     // never canonical.
     pit_observer_fine_until: u64,
     // Maintained next-device-edge deadline for the batch cap (86Box-style push
     // model, see `Machine::event_batch_cap_cached`). Host scheduling only: it can
     // only ever shorten a batch, it is never guest-visible, and it is never part
-    // of canonical state -- a restored machine simply re-scans.
+    // of canonical state: a restored machine simply re-scans.
     device_edge_cache: timing::DeviceEdgeCache,
     // Batch entries and pull-scans since power-on, for the deadline cache's own
     // hit-rate readout. Never an emulation input, and maintained only while
@@ -1710,15 +1710,15 @@ pub struct Machine {
     // unlike `port_bus_batch_clocks` above it does not gate a canonical capture.
     opl_probe: OplProbe,
     // S1 shadow-tag probe: diagnostic
-    // ONLY, exactly like `opl_probe` above -- never read by an emulation
+    // ONLY, exactly like `opl_probe` above: never read by an emulation
     // decision, never part of canonical state. See `shadow_cache` module doc.
     shadow_l1: ShadowL1Probe,
     // Set only when a bus-side DMA block copy writes guest RAM without exposing
     // its destination range. Range-aware HLE and device paths notify the CPU directly.
     device_wrote_memory: bool,
     /// The native-backend setting this machine was CONFIGURED with. The batch loop may force
-    /// the interpreter for a batch on the reflected-call memo's behalf -- a journaled trip's
-    /// write set is only complete under the interpreter -- and this is what it restores to,
+    /// the interpreter for a batch on the reflected-call memo's behalf (a journaled trip's
+    /// write set is only complete under the interpreter) and this is what it restores to,
     /// so the forcing can never silently promote an `ExecutionBackend::Interpreter` machine
     /// to the JIT.
     #[cfg_attr(
@@ -2033,7 +2033,7 @@ pub struct IpeWindow {
     /// TOTAL guest instructions retired inside this window, native and interpreted
     /// (`PerfCounters::instructions`). `direct_insns / retired` is the window's native COVERAGE,
     /// which is what separates a low-IPE window that is barely compiled from one that is fully
-    /// compiled into very short stints -- two different problems that a bare IPE column cannot
+    /// compiled into very short stints, two different problems that a bare IPE column cannot
     /// tell apart.
     pub retired: u64,
     /// Distinct direct-entry linears seen in this window. `0` when the entry-target tally was
@@ -2060,8 +2060,8 @@ impl IpeWindow {
     /// Native coverage for this window: the share of the guest instructions retired inside it
     /// that the direct backend executed. Zero retired reads as 0.0, for `ipe`'s reason.
     ///
-    /// Cannot exceed 1.0 by construction -- the direct entry path adds the SAME `instructions`
-    /// to `perf.instructions` and `perf.jit_direct_insns`, two adjacent lines -- and is not
+    /// Cannot exceed 1.0 by construction: the direct entry path adds the SAME `instructions`
+    /// to `perf.instructions` and `perf.jit_direct_insns`, two adjacent lines, and is not
     /// clamped, deliberately: a value above 1.0 would mean those two counters had diverged, and
     /// hiding that behind a `min` would turn a counter bug into a plausible-looking number.
     pub fn coverage(&self) -> f64 {
@@ -2084,7 +2084,7 @@ const MOUSE_GUEST_CENTER_Y: i32 = MOUSE_GUEST_MAX_Y / 2;
 /// auto-detecting games. `BLASTER` and `SETSOUND` carry the same value:
 /// `A220` (the fixed ReSonique II base), `I`/`D`/`H` from the host config, `T6`
 /// (the SB16 card type), and `P` for whichever MPU-401 port is advertised
-/// (`0x300` wavetable header or `0x330` rear connector -- both stay decoded
+/// (`0x300` wavetable header or `0x330` rear connector; both stay decoded
 /// either way). Returns an empty list when the card is disabled, so no `BLASTER`
 /// leaks into a machine that has no SB16; the value always matches the routing
 /// the CT1745 mixer answers, since both are derived from the same config.
@@ -2169,10 +2169,10 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
 #[derive(Debug, Default)]
 pub(crate) struct RetracePollCensus {
     /// The retrace bit as the guest last read it, or `None` before its first read. The
-    /// comparand -- edges are measured between consecutive GUEST reads, so an elided poll span
+    /// comparand: edges are measured between consecutive GUEST reads, so an elided poll span
     /// contributes none and the exit read that follows still carries its edge.
     pub(crate) last_observed: Option<bool>,
-    /// Status-1 reads the instrument saw at all -- the DENOMINATOR. Without it, "polls per
+    /// Status-1 reads the instrument saw at all: the DENOMINATOR. Without it, "polls per
     /// exit" has to be inferred from the `PciLegacyVga` class total, which also carries every
     /// other VGA-file access; with it, the ratio is exact and an instrument that is silently
     /// missing reads can be told apart from a guest that genuinely polls in bursts.
@@ -2195,7 +2195,7 @@ pub(crate) struct PollSkipCertificateCounters {
     /// Certified status-port poll admissions with the current per-iteration tariff.
     pub(crate) admitted_epoch2: std::cell::Cell<u64>,
     /// Refused because the polled port is not `POLL_SKIP_IO_PORT` (F9's explicit admission).
-    /// Unreachable today -- both entry points establish the port first -- and that is the
+    /// Unreachable today (both entry points establish the port first) and that is the
     /// point: it is the lane a future second-port shape would light up.
     pub(crate) refused_unpriced_port: std::cell::Cell<u64>,
     /// Refused because tracing is armed or the lazy port path is off, which is the screen that
@@ -2429,7 +2429,7 @@ impl Machine {
                 .set_native_backend_enabled(machine.native_backend_configured);
         }
         machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
-        // Both sweep knobs are read ONCE, here, and pushed onto the channel --
+        // Both sweep knobs are read ONCE, here, and pushed onto the channel,
         // never per access. See `ata_poll_run_default`.
         machine.ide.configure_poll_skip(
             run::ata_poll_run_default(),
@@ -2571,7 +2571,7 @@ impl Machine {
     /// after next.
     ///
     /// The profile is updated too, not just the devices, because it is what
-    /// every *description* of the card is derived from -- the `BLASTER` line
+    /// every *description* of the card is derived from: the `BLASTER` line
     /// `stock_autoexec` writes into an emulator-owned AUTOEXEC.BAT, and the
     /// environment `dos.rs` injects on the HLE path. Leaving it on the old
     /// value is how the card ends up answering on one IRQ while `BLASTER`
@@ -2880,7 +2880,7 @@ impl Machine {
     ///
     /// Deliberately LEANER than `note_phase_mark`, and the difference is load-bearing rather than
     /// tidiness. That one takes a full `cpu_profile` snapshot whenever `IZARRAVM_CPU_PROFILE` is
-    /// armed -- which the hdd-folder benchmark path arms -- and that snapshot sorts `hot_addrs`,
+    /// armed (which the hdd-folder benchmark path arms) and that snapshot sorts `hot_addrs`,
     /// an UNTRUNCATED map of every distinct sampled address, which only grows across a run. Since
     /// `wall` is sampled first, mark k's snapshot cost is charged to interval k and grows
     /// monotonically, so late intervals would carry more overhead than early ones. On a fixture
@@ -2929,7 +2929,7 @@ impl Machine {
     /// Three of the four recorded quantities are FREE: `jit_direct_entries`, `jit_direct_insns`
     /// and `instructions` are counters the run loop already maintains unconditionally, and this
     /// only subtracts window starts from them. The fourth, the per-window distinct entry-target
-    /// tally, is NOT free while armed -- it costs a hash-map probe per direct entry, on the
+    /// tally, is NOT free while armed: it costs a hash-map probe per direct entry, on the
     /// backend's hottest path. See `izarravm_cpu::IpeEntryTargets`. Arming this therefore MAPS a
     /// workload; it does not time one, and no wall number may be taken from an armed run.
     ///
@@ -2968,9 +2968,9 @@ impl Machine {
     ///
     /// v2 widened "empty" from "no entries" to "no entries AND nothing retired". A trailing
     /// stretch that retired guest instructions without taking a single direct entry is a
-    /// zero-coverage phase -- precisely what the `coverage` column exists to find -- and
+    /// zero-coverage phase (precisely what the `coverage` column exists to find) and
     /// dropping it would also break the file's own arithmetic, since the per-window `retired`
-    /// values are meant to sum to the instructions retired SINCE ARMING -- not to the run's
+    /// values are meant to sum to the instructions retired SINCE ARMING, not to the run's
     /// whole `perf.instructions`, which also covers everything retired before the arm.
     pub fn ipe_window_tail(&self) -> Option<IpeWindow> {
         if self.next_ipe_window_entries == u64::MAX {
@@ -3026,8 +3026,8 @@ impl Machine {
             .unwrap_or_default();
         let entries = entries_now.saturating_sub(self.ipe_window_start_entries);
         // The tally and the counter must have counted the SAME entries. This is the one place
-        // the two independent mechanisms meet -- the counter is incremented by the backend and
-        // windowed by subtraction here, the tally is filled per entry and cleared below -- and
+        // the two independent mechanisms meet: the counter is incremented by the backend and
+        // windowed by subtraction here, the tally is filled per entry and cleared below, and
         // until now their agreement was argued rather than checked. A missed `reset`, a hook
         // that fires on a path the counter does not, or a window boundary taken between the two
         // reads all show up here, in every debug test and every debug fixture run.
@@ -3493,7 +3493,7 @@ impl Machine {
         izarravm_cpu::TIMING_MODEL_EPOCH
     }
 
-    /// Port accesses this run, by bus class, in `PortBusClass::index()` order --
+    /// Port accesses this run, by bus class, in `PortBusClass::index()` order:
     /// `[IsaXBus, PciLegacyVga, PciTarget, ChipsetInternal, Unclaimed]`. Counted in both epochs
     /// (see the field), so the P1 ladder can separate "the row makes fewer accesses" from "the
     /// same accesses cost more". Diagnostic only; the profile JSON reports it as
@@ -3503,7 +3503,7 @@ impl Machine {
     }
 
     /// F14: `(rising, falling)` vertical-retrace edges the guest has observed through its own
-    /// 0x3DA/0x3BA reads since construction -- the number of times a `VL_WaitVBL`-shaped poll
+    /// 0x3DA/0x3BA reads since construction: the number of times a `VL_WaitVBL`-shaped poll
     /// loop EXITED. At mode 13h's 70.086 Hz both must read ~70.086 per guest second by
     /// construction, whatever the polls-per-frame figure is; that is what makes this the port
     /// repricing's one self-certifying anchor (review F14). Diagnostic only.
@@ -3522,7 +3522,7 @@ impl Machine {
     }
 
     /// P2's poll-skip certificate ledger, since construction: `(admitted_epoch2,
-    /// refused_unpriced_port, refused_inactive)`. Diagnostic only -- no emulation decision
+    /// refused_unpriced_port, refused_inactive)`. Diagnostic only: no emulation decision
     /// reads it. `admitted_epoch2` is the counter that says the skip is ALIVE under epoch 2,
     /// which is the whole point of the slice; the two refusal lanes name why a certificate was
     /// declined, replacing P1's single structural-epoch refusal.
@@ -3640,8 +3640,8 @@ impl Machine {
     /// native (49716 Hz) time; the DSP is advanced by the matching wall-clock
     /// duration at its own rate. Each stream is resampled to 44100 and summed.
     ///
-    /// Every level in this chain is GUEST state on the CT1745 register file --
-    /// the source levels, the master, the output gain, the PC-SPK leg -- so what
+    /// Every level in this chain is GUEST state on the CT1745 register file
+    /// (the source levels, the master, the output gain, the PC-SPK leg) so what
     /// this returns is what the machine's line-out carries. There is no
     /// host-side multiplier left in here. There were two (an "amp gain" and a
     /// "PC speaker volume" the settings panel owned), and they were a second,
@@ -3728,7 +3728,7 @@ impl Machine {
         // percent short of real time hands back a few percent fewer frames every
         // call. Reading a short stream positionally with
         // `get(i).unwrap_or((0, 0))` appended a hole of hard silence to the DAC
-        // stream on every render -- a full-scale impulse ~1000 times a second at
+        // stream on every render: a full-scale impulse ~1000 times a second at
         // the frontend's pump rate, which is exactly the "crackling" a 486 persona
         // at 96-99% of real time produced. Hold the last frame instead (what the
         // DAC latch does on real hardware when its data is late).
@@ -3737,7 +3737,7 @@ impl Machine {
         // were also forced to consume exactly one window's worth per call: the
         // surplus from a long window was discarded and the next short window was
         // padded out with repeats. A Quake capture measured ~14k frames dropped
-        // and ~14k repeated per second against 44.1k rendered -- the documented
+        // and ~14k repeated per second against 44.1k rendered: the documented
         // "zero-order hold spreads a sustained shortfall as repeated samples"
         // ceiling, made far worse by throwing the other half away. Both streams
         // now queue their surplus (`Sb16Path::render_voice` and `wss_pending`
@@ -3769,7 +3769,7 @@ impl Machine {
                 // join it to. With one fitted it is a card leg (PC-SPK level,
                 // then the master, then the node); with none it goes straight
                 // to the output, taking neither the node's reserve nor the
-                // card's amp -- there is no card in the path to take them.
+                // card's amp: there is no card in the path to take them.
                 let (spk_l, spk_r, spk_direct) = match ct1745.mix_speaker(s) {
                     Some((left, right)) => (left, right, 0),
                     None => (0, 0, s),
@@ -3894,8 +3894,8 @@ impl Machine {
     /// wavetable volume registers `0x50`/`0x51`.
     ///
     /// Native MIDI synthesis is mixed by the frontend AFTER
-    /// [`render_audio`](Self::render_audio) returns -- the synth runs on the
-    /// host, not on the guest's clock -- so this leg cannot be folded into the
+    /// [`render_audio`](Self::render_audio) returns (the synth runs on the
+    /// host, not on the guest's clock) so this leg cannot be folded into the
     /// summing node above. The caller applies it to the MIDI engines before
     /// they add themselves to the mix. It is a plain scalar read out of a guest
     /// device register, so the value is a pure function of canonical state.
@@ -4040,7 +4040,7 @@ struct MachineBus<'a> {
     a20_open: bool,
     /// `vega.device_free_extended_floor()`, snapshotted at construction and rewritten wherever a
     /// Distira PCI config write can move it. `is_device_free_extended_ram` asks it on every access
-    /// at or above 1 MB -- where every 32-bit game's data lives -- and answering it re-derived
+    /// at or above 1 MB (where every 32-bit game's data lives) and answering it re-derived
     /// `distira_memory_enabled() && distira_mem_base < MARGO_LFB_BASE` through a reference each
     /// time.
     device_free_extended_floor: u32,
@@ -4060,12 +4060,12 @@ struct MachineBus<'a> {
     /// (42721631) BOTH arms compute their bits from `predicted_beam()`; the
     /// Accurate arm merely sets `io_touched` first and ends the batch as it
     /// always has. So this bool no longer buys byte-identical Accurate-class
-    /// behavior -- it buys the batch-ending behavior alone.
+    /// behavior: it buys the batch-ending behavior alone.
     ///
     /// Nor is it the sole test at that dispatch: every shared use site reads
     /// `lazy_port_reads || lazy_ports_386` (see `lazy_ports_386` below), so
-    /// "one arm branches on it" describes the shape of the dispatch -- a static
-    /// per-port landing plus a bool test, never a per-access classification --
+    /// "one arm branches on it" describes the shape of the dispatch: a static
+    /// per-port landing plus a bool test, never a per-access classification,
     /// not a single reader.
     lazy_port_reads: bool,
     /// Construction seeds devices without charging a guest instruction batch.
@@ -4107,7 +4107,7 @@ struct MachineBus<'a> {
     /// A lazy read is exact against the contract "end the batch HERE, advance
     /// devices, then read": `predicted_beam` and `Pit::out_after` are pinned to
     /// agree with a real `advance_devices` of the same clock total. But the
-    /// batch-ending path the Accurate class uses today is the OTHER order -- it
+    /// batch-ending path the Accurate class uses today is the OTHER order: it
     /// reads the LIVE device state, which is the state as of BATCH START, and
     /// only then ends the batch. So moving a port from batch-ending to lazy
     /// moves its answer forward by the batch clocks already elapsed at the read
@@ -4211,7 +4211,7 @@ struct MachineBus<'a> {
     // end-of-batch `scale_bus` call.
     bus_num_at_batch_start: u32,
     bus_den_at_batch_start: u32,
-    // The batch cap this batch was entered with, in CPU clocks from batch start --
+    // The batch cap this batch was entered with, in CPU clocks from batch start,
     // exactly the `cap` the run loop bounds itself by
     // (`compose_batch_cap(next_device_edge_ticks(), remaining)`). Published here so
     // `CpuBus::reflected_call_gate` can answer "does this lump fit inside the

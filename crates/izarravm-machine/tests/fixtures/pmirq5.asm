@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; pmirq5.com -- protected-mode SB16 DMA IRQ5 smoke test.
+; pmirq5.com: protected-mode SB16 DMA IRQ5 smoke test.
 ; Assemble: nasm -f bin pmirq5.asm -o pmirq5.com
 cpu 386
 org 0x100

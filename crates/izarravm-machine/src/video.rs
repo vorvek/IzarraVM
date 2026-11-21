@@ -2115,7 +2115,7 @@ impl Machine {
     /// VBE 2.0 function 0Ah: hand back the protected-mode interface block. The
     /// caller far-calls the routines inside it directly, with no INT 10h
     /// involved, so unlike every other function here the answer is an ADDRESS
-    /// of real code rather than an emulated effect -- see `izbios-vbepm.inc`.
+    /// of real code rather than an emulated effect. See `izbios-vbepm.inc`.
     ///
     /// NASCAR Racing 2 is why this exists. It asks 4F00h, then 4F0Ah, and treats
     /// an unsupported 4F0Ah as "no VESA driver" and exits, without ever trying
@@ -2158,7 +2158,7 @@ impl Machine {
         // The mode list lives in the block's reserved scratch area at 0x22, where
         // period BIOSes put it. It USED TO sit at 0x14, which is fine in a VBE
         // 1.2 block and is OemSoftwareRev + the three OEM pointers in a VBE 2.0
-        // one -- so a VBE2 client read mode numbers as far pointers. The three
+        // one, so a VBE2 client read mode numbers as far pointers. The three
         // OEM pointers stay null, which the spec allows; what it does not allow
         // is them holding 0x0100, 0x0101, 0x0103.
         //
@@ -2452,7 +2452,7 @@ impl Machine {
     }
 
     /// Text rows the legacy VGA path has actually rendered, whole run. Flat
-    /// while a Voodoo-style device owns the monitor cable -- see
+    /// while a Voodoo-style device owns the monitor cable. See
     /// `Vga::text_rows_rendered`.
     pub fn vga_text_rows_rendered(&self) -> u64 {
         self.vega.vga_text_rows_rendered()
@@ -2646,13 +2646,13 @@ impl Machine {
 
     /// An O(1) live content-generation key for graphics mutations.
     ///
-    /// Returns `Some(key)` only when the output is a pure function of guest writes —
+    /// Returns `Some(key)` only when the output is a pure function of guest writes:
     /// the active display is the VGA raster AND the mode is a graphics mode (mode 13h,
     /// planar, mode X, CGA graphics). The key changes iff the graphics-mode output
     /// could change, so a consumer that re-renders only when the key moves can never
     /// show a stale frame, while idling on a static screen. It folds every input that
     /// can change the output: the Vga `content_gen` (bumped inside every Vga display
-    /// mutator — VRAM writers, register/DAC writes, and the start-address latch — so
+    /// mutator: VRAM writers, register/DAC writes, and the start-address latch, so
     /// it catches writes from BOTH the CPU bus AND the HLE BIOS INT 10h services that
     /// mutate the legacy Adapter directly, regardless of caller), plus the raster dimensions
     /// (so a mode or resolution change always moves the key).
@@ -2666,8 +2666,8 @@ impl Machine {
     /// as "no key, always publish"; now a Margo title with a still screen moves
     /// no key and publishes nothing, so its `frames_skipped` count steps up from
     /// roughly zero to roughly every idle frame. That is the same reading the
-    /// VGA raster has always had -- a skipped frame is a frame that would have
-    /// been identical -- so profile numbers from before and after this change
+    /// VGA raster has always had (a skipped frame is a frame that would have
+    /// been identical) so profile numbers from before and after this change
     /// are not comparable for Margo titles.
     ///
     /// Consumers of

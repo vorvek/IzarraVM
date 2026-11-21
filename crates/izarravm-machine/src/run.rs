@@ -57,7 +57,7 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
 /// family exactly:
 ///
 /// * **unset** or `1` / `on` -> ON. The shipped default. **Every OFF leg must
-///   now EXPORT `0`** -- the same trap `ROTATE_ROWS`, `COUNT_LANES`,
+///   now EXPORT `0`**, the same trap `ROTATE_ROWS`, `COUNT_LANES`,
 ///   `FPU_LOOP_ROWS` and `V86_LOOP_ROWS` all carry, and any leg recorded before
 ///   this flip that merely left the variable alone is an OFF leg.
 /// * `` (empty), `0` or `off` -> OFF. The escape and the A/B base. **Empty is
@@ -65,7 +65,7 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
 ///   nulling a variable in PowerShell leaves it PRESENT AND EMPTY, which is how
 ///   three earlier evidence directories came to measure their default-on knobs
 ///   off. (The numeric sweep knobs below spell empty as THE DEFAULT instead,
-///   because a threshold has no "off" value -- see `sweep_knob`.)
+///   because a threshold has no "off" value; see `sweep_knob`.)
 /// * **anything else PANICS.** A mistyped ladder leg that fell through to the
 ///   default would be read as "the arm I asked for changed nothing".
 ///
@@ -79,7 +79,7 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
 ///   instructions 19.49G -> 16.82G. A second, earlier ladder on the
 ///   pre-mitigation binary read -28.55% with **byte-identical counters**, which
 ///   is what proves the interactive mitigation inert on the headless path.
-/// * **Mechanism assertions**, which are what actually carry the acceptance --
+/// * **Mechanism assertions**, which are what actually carry the acceptance:
 ///   the wall numbers corroborate them, not the other way round.
 ///   `spans / atapi_packet_commands` = **2.9273** against the 3 that TOKACD's
 ///   three separately-scheduled per-sector poll phases predict, so all three
@@ -91,20 +91,20 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
 /// * **Windows**: the load window (guest 142-145) -68.6% wall and -89.3%
 ///   dispatcher entries, the FMV window (guest 4-124) -33.0% wall.
 /// * **The interactive path**, which no headless leg can grade. A windowed run
-///   measured the GUI slice at a ~13 us median -- not the 1 ms the design
+///   measured the GUI slice at a ~13 us median, not the 1 ms the design
 ///   assumed, because `execution_budget` is `min(credit, quantum)` and the
-///   credit binds in a paced window -- so most interactive slices sit below the
+///   credit binds in a paced window, so most interactive slices sit below the
 ///   floor. Before the batch-entry slice test the skip armed 538,305 times to
 ///   commit 170,564 spans, with 364,753 clamped declines; after it, 169,467 arms
 ///   for 167,806 spans and **385** clamped declines, with the skipped guest time
 ///   unchanged. Crucially `ata_poll_skip_blocks` never tracked the clamped
-///   cause -- 2,988 blocks against 364,753 clamped declines, and blocks equals
-///   `declines_below_floor` exactly -- which is the R2-B split holding under a
+///   cause: 2,988 blocks against 364,753 clamped declines, and blocks equals
+///   `declines_below_floor` exactly, which is the R2-B split holding under a
 ///   load no fixture could reproduce.
 /// * **Board, gate ON, main's scoreboard against this branch's binary**: 11 of
 ///   12 passed before the pin move, the twelfth being the retired-instruction
 ///   pin this flip moves. All eleven non-CD rows read `ata_poll_skip.arms == 0`
-///   with the gate ARMED -- inert because nothing arms, not because nothing ran.
+///   with the gate ARMED, inert because nothing arms, not because nothing ran.
 ///   The board at the OFF default was 12/12 with all nine counters zero.
 /// * **The 0.5G exact-frame anchor is byte-identical with the skip active**, and
 ///   that is counted rather than argued: the anchor run commits two spans
@@ -113,7 +113,7 @@ pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
 /// THE PIN THIS FLIP MOVES, and where it physically lives. `tombraid-586`'s
 /// `final_instructions` centre goes 19,491,752,775 -> **16,822,094,052**,
 /// tolerance untouched at 5%, because the lever cuts retired instructions 13.696%
-/// BY CONSTRUCTION -- the elided poll iterations are not executed. The centre
+/// BY CONSTRUCTION: the elided poll iterations are not executed. The centre
 /// moved, never the band. **That edit is NOT in this repository's history and
 /// cannot be**: `scripts/fixture-scoreboard-invariants.json` is in
 /// `.git/info/exclude` and exists only in the main checkout's working tree, so
@@ -162,7 +162,7 @@ fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
 /// **THE KNOBS' FIRST REAL USE WILL BE A SWEEP, WHICH IS EXACTLY THE RUN A
 /// SILENT FALLBACK POISONS.** These two started life as
 /// `.ok().and_then(|r| r.parse().ok())`, so `IZARRAVM_ATA_POLL_RUN=sixteen` ran
-/// 16 without a word -- while the main gate one screen up panics on
+/// 16 without a word, while the main gate one screen up panics on
 /// `IZARRAVM_ATA_POLL_SKIP=yes` for the stated reason that "a mistyped ladder
 /// leg that fell through to the default would be read as 'the arm I asked for
 /// changed nothing'". A mistyped sweep leg is the same trap wearing the same
@@ -172,7 +172,7 @@ fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
 ///
 /// The empty string has to be a spelling of unset here, and this is not a
 /// convenience: `[Environment]::SetEnvironmentVariable($name, $null, "Process")`
-/// — how every harness in this repo clears a variable it does not want — leaves
+///(how every harness in this repo clears a variable it does not want) leaves
 /// the variable PRESENT AND EMPTY on Windows. That is the same
 /// nulling-is-not-unsetting trap that made three earlier evidence directories
 /// measure their default-ON knobs off, and it bit this branch's own re-ladder
@@ -490,8 +490,8 @@ pub(super) fn try_poll_skip(
     cap: u64,
 ) -> Option<u64> {
     // I-D1b clause 2: no register-mask (D1b) shape can reach the interpreter. It is true by
-    // double gating -- `build_poll_loop` passes `sixteen_bit_ok: false` at every interpreter
-    // call site, and `poll_head_possible` still refuses a 16-bit head -- and it is load-bearing
+    // double gating (`build_poll_loop` passes `sixteen_bit_ok: false` at every interpreter
+    // call site, and `poll_head_possible` still refuses a 16-bit head) and it is load-bearing
     // rather than decorative: `fresh_iteration_spins` below and `req.status_mask
     // .trailing_zeros()` in the seam both assume a mask that already passed the
     // `0x01 | 0x08` check, which for an `Ah` shape happens only at the Direct call-out.
@@ -749,7 +749,7 @@ impl Machine {
     ///
     /// Called once per batch from `run_until_tick`, from the halt
     /// fast-forward's position: after `advance_cpu_work`, after every pending
-    /// service arm, and BEFORE the device-edge cache invalidation -- where
+    /// service arm, and BEFORE the device-edge cache invalidation, where
     /// `io_touched` is already true (the arm let the lazy clear stand), so the
     /// cache is dropped for free.
     ///
@@ -766,9 +766,9 @@ impl Machine {
         let armed = std::mem::take(&mut self.ata_poll_skip_armed);
         if armed && !halted {
             // THE MANDATORY ATA TERM. `next_device_edge_ticks`'s own
-            // ATA term is OPTIONAL -- it chains `next_ata_deadline`
+            // ATA term is OPTIONAL: it chains `next_ata_deadline`
             // alongside PIT ch0/ch2, DSP, WSS, RTC and timed I/O and
-            // takes the `min` over whatever is present -- so with no
+            // takes the `min` over whatever is present, so with no
             // pending command the `min` falls through to an
             // unrelated edge, and PIT channel 0 at the default
             // 18.2 Hz is up to 54.9 ms away. Stalling there would
@@ -778,11 +778,11 @@ impl Machine {
             // time still advances), and visible only as wall no
             // ladder could attribute.
             //
-            // Two independent routes reach the no-pending state --
+            // Two independent routes reach the no-pending state:
             // this batch's own end-of-batch advance crossing the
             // completion, and a ring-0 SRST landing mid-batch (the
             // write-side `skip_io_touched` carve-out does not name
-            // 0x376, so such a write does not end the batch) -- so
+            // 0x376, so such a write does not end the batch), so
             // the guard is explicit, read straight off the channel,
             // never inferred from the `min`.
             match self.ide.ticks_until_completion() {
@@ -813,7 +813,7 @@ impl Machine {
                     // Kept as defence in depth because it is free and
                     // because it makes the precondition and the bound
                     // the SAME fact rather than two facts that happen
-                    // to agree -- so a future change that gates the
+                    // to agree, so a future change that gates the
                     // ATA term inside the edge set cannot silently
                     // unbound this.
                     let device_target = self
@@ -845,7 +845,7 @@ impl Machine {
                         // sector completes, so blocking on this
                         // cause would make the guest spin out the
                         // rest of every sector at full interpreted
-                        // cost -- in the GUI only, invisible to
+                        // cost, in the GUI only, invisible to
                         // every headless leg on the board.
                         let remaining = deadline_ticks.saturating_sub(self.timeline.now_ticks());
                         let ticks = device_target.min(remaining);
@@ -872,7 +872,7 @@ impl Machine {
                             // and must stay that.
                             //
                             // A clamped target still COMMITS
-                            // whenever it clears the floor -- a
+                            // whenever it clears the floor: a
                             // 500 us residue of a 1.11 ms wait is a
                             // 500 us skip, the latch is cleared, and
                             // the following slice takes the rest.
@@ -896,7 +896,7 @@ impl Machine {
     }
 
     /// Slice 9C-pre: the primary-channel (fixed-disk) analogue of
-    /// `actuate_ata_poll_skip`, above -- same shape, same seam, a SEPARATE
+    /// `actuate_ata_poll_skip`, above: same shape, same seam, a SEPARATE
     /// armed flag and counter set so this stays entirely independent of the
     /// shipped ATAPI mechanism (no shared mutable state, no risk of
     /// interference either way).
@@ -908,7 +908,7 @@ impl Machine {
     /// transfer's, exactly as the ATAPI skip cannot outrun the primary's.
     /// Reuses `stall_for_master_ticks` to commit: the same whole-machine
     /// advance `stall_for_hdd_sectors` uses for the INT 13h path, so
-    /// every device -- including `self.ata` itself -- advances in lockstep
+    /// every device (including `self.ata` itself) advances in lockstep
     /// with the master clock the skip moves.
     ///
     /// A reduced mechanism relative to the ATAPI one BY DESIGN, not by
@@ -1233,7 +1233,7 @@ impl Machine {
             cs_base.wrapping_add(eip),
         );
         // The descriptor tables. A delivery fault names a vector and nothing
-        // else, which leaves the reader unable to tell WHOSE tables are loaded --
+        // else, which leaves the reader unable to tell WHOSE tables are loaded:
         // the monitor's, a VCPI client's, or the ones a guest built for a V86
         // task of its own. Added 2026-08-30 while diagnosing a Zone 66 crash on
         // INT 0FDh, where exactly that question was the whole investigation: the
@@ -1369,9 +1369,9 @@ impl Machine {
             self.cpu.note_device_memory_write();
         }
         // The device-edge deadline cache is only maintained INSIDE this loop. Every
-        // host-side mutator that can move a device schedule -- key/mouse/joystick
+        // host-side mutator that can move a device schedule (key/mouse/joystick
         // injection, media mount and eject, RTC/CMOS seeding, audio rendering, a
-        // mode change from the GUI -- runs between run calls on the machine
+        // mode change from the GUI) runs between run calls on the machine
         // thread, so dropping it once here covers all of them
         // at the cost of one pull-scan per run call (~1 ms of guest time).
         self.invalidate_device_edge_cache();
@@ -1435,7 +1435,7 @@ impl Machine {
             self.ata_poll_skip_armed = false;
             self.ide.reset_alt_status_run();
             // Slice 9C-pre: the primary-channel analogue, cleared at the same
-            // batch-entry point and for the same reason -- see the ATAPI
+            // batch-entry point and for the same reason. See the ATAPI
             // comment above.
             self.ata_hdd_poll_skip_armed = false;
             if let Some(disk) = self.ata.as_mut() {
@@ -1447,7 +1447,7 @@ impl Machine {
             // GUI's real slice is ~13 us, not the 1 ms
             // `FAST_EMU_QUANTUM_TICKS` the design assumed.
             // `execution_budget` is `min(credit, quantum)`, and in a paced
-            // window the CREDIT binds -- a machine running on time refills it
+            // window the CREDIT binds: a machine running on time refills it
             // in tiny wall-clock increments and spends it immediately. So the
             // typical interactive slice is BELOW the 20 us floor, a skip armed
             // in it can never commit, and it declines as `_deadline_clamped`:
@@ -1455,8 +1455,8 @@ impl Machine {
             // each costing a forced batch break plus a device-edge-cache
             // invalidation and its pull-scan.
             //
-            // Harmless to guest state -- the latch correctly never fired, which
-            // is the R2-B split holding under real load -- but pure waste, and
+            // Harmless to guest state (the latch correctly never fired, which
+            // is the R2-B split holding under real load) but pure waste, and
             // a paced run at rt 1.0 has no observable margin in which to see
             // its cost. On a slower host that margin is what runs out first.
             //
@@ -1519,7 +1519,7 @@ impl Machine {
                 .max(1);
             // The reflected-call memo's interpreter forcing (slice1 plan section 4.2: the
             // batch loop owns this toggle, never the call-out). A learn cycle's two JOURNALED
-            // trips, and any audit trip, must retire through the interpreter's write seams --
+            // trips, and any audit trip, must retire through the interpreter's write seams:
             // a compiled block's stores reach none of them. Read once per batch and acted on
             // only when the answer CHANGES, so a run with the knob off pays one bool compare.
             #[cfg(all(feature = "jit", feature = "reflected-call-memo"))]
@@ -1920,7 +1920,7 @@ impl Machine {
                                 if !can_take_before && cpu.can_take_interrupt() {
                                     // D5: this break is the trip's OWN
                                     // instructions re-enabling IF, not a
-                                    // cap/deadline/device reason -- the next
+                                    // cap/deadline/device reason: the next
                                     // `on_batch_boundary` call must NOT count
                                     // toward `batch_straddle_trips`.
                                     #[cfg(feature = "reflected-call-diagnostic")]
@@ -2092,7 +2092,7 @@ impl Machine {
                         // outside every CPU seam. A reflected trip straddles 6-8 batch
                         // boundaries, so a nested `INT 1Ah`/`INT 10h`/`INT 13h`/`INT 2Fh`
                         // inside a trip is serviced mid-trip and the flag is cleared at the
-                        // next batch entry -- long before `finish_trip` or the answer screen
+                        // next batch entry, long before `finish_trip` or the answer screen
                         // could ask the bus whether one was posted. Refusing the open trip
                         // HERE is the only place that sees it.
                         #[cfg(feature = "reflected-call-memo")]
@@ -2176,7 +2176,7 @@ impl Machine {
                     self.actuate_ata_hdd_poll_skip(deadline_ticks, outcome.halted);
                     // Keep the cached device edge across this batch only if the batch
                     // was provably quiet. Anything else could have rearmed a device:
-                    // a guest port access (io_touched -- NOT a Margo blit arm, which
+                    // a guest port access (io_touched, NOT a Margo blit arm, which
                     // is a memory write and arms only the uncached `vega_edge_ticks`
                     // terms; see `Machine::device_edge_cache`), a bus-side DMA write
                     // into guest RAM, any serviced HLE / mode-switch / Toka / BIOS32
@@ -2250,7 +2250,7 @@ impl Machine {
 /// (merge-review nit 7) independent of the surrounding CPU/bus machinery: the
 /// interesting half of D5 is that this tag defaults to "real" every
 /// iteration and is marked "not real" ONLY by the trip's own IF-enable edge
-/// (`can_take_before` false, then true) -- a wrong default, or a mark that
+/// (`can_take_before` false, then true): a wrong default, or a mark that
 /// leaks across iterations, would silently restore the 100%-tautological
 /// `batch_straddle_trips` 0c exists to fix, and `cargo check` alone (the only
 /// gate this file gets under `-p izarravm-machine` in CI's quartet) cannot
@@ -2268,7 +2268,7 @@ impl BatchBoundaryRealTag {
     }
 
     /// Read the tag left by the batch that just ended, then reset it to
-    /// `true` -- the default for the batch about to run, overridden only if
+    /// `true`, the default for the batch about to run, overridden only if
     /// THAT batch's own `can_take_before` edge calls `mark_if_edge` before
     /// the next `take_and_reset`.
     fn take_and_reset(&mut self) -> bool {

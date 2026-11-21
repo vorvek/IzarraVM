@@ -92,8 +92,8 @@ fn extracts_the_embedded_image_payload() {
     // FreeCOM's startup ver() banner is now suppressed at both call sites so
     // the styled boot tree owns the screen instead of racing FreeCOM's own
     // signon: the /P (resident shell) branch's unconditional `cmd_ver(NULL)`
-    // in initialize() -- the path CONFIG.SYS's shipped
-    // `SHELL=...COMMAND.COM ... /P=C:\AUTOEXEC.BAT` line actually takes --
+    // in initialize() (the path CONFIG.SYS's shipped
+    // `SHELL=...COMMAND.COM ... /P=C:\AUTOEXEC.BAT` line actually takes)
     // and the non-/P `showinfo` block's `cmd_ver(NULL)` a few lines below it,
     // which a COMMAND.COM invoked without /P (e.g. a nested interactive
     // shell) still reaches. VER remains fully functional as an explicit
@@ -164,7 +164,7 @@ fn extracts_the_embedded_image_payload() {
     );
     // The actual dispatch order is set by the FOR list, not by where each
     // labeled block sits in the file (a self-calling AUTOEXEC.BAT jumps to
-    // whichever label %1 names) -- pin the list itself rather than comparing
+    // whichever label %1 names): pin the list itself rather than comparing
     // block positions, or reordering the list would stay green while the
     // boot order silently flipped.
     let autoexec_text = String::from_utf8_lossy(autoexec);
@@ -208,7 +208,7 @@ fn extracts_the_embedded_image_payload() {
     // DOS=HIGH,UMB, so every default boot runs FreeDOS in V86 under the
     // guest memory manager. BYTE compare, not a
     // length compare: the driver's resident envelope is padded to a fixed
-    // size, so two different builds are routinely the same length — a stale
+    // size, so two different builds are routinely the same length: a stale
     // tokados-hdd.img sailed through the old length check while every real
     // boot silently ran the previous monitor (found in the V86 trap tax work).
     assert_eq!(
@@ -253,7 +253,7 @@ fn extracts_the_embedded_image_payload() {
     );
 
     // FreeDOS KERNEL.SYS is a raw binary, not an MZ: it begins with a short
-    // JMP (0xEB) past the embedded BPB — the load-bearing first byte the boot
+    // JMP (0xEB) past the embedded BPB, the load-bearing first byte the boot
     // sector relies on.
     let kernel = by_name.get("KERNEL.SYS").unwrap();
     assert_eq!(kernel[0], 0xEB, "KERNEL.SYS begins with a short JMP");

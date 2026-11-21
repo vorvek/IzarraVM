@@ -61,7 +61,7 @@ const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 
 // ---------------------------------------------------------------------------
 // Slice 9C of the device-timing design: the ATA seek / rotational / drive-buffer / sustained-media model.
-// Every constant below is dark unless `DeviceTimingProfile::ata` is armed --
+// Every constant below is dark unless `DeviceTimingProfile::ata` is armed.
 // `charge_pio_transfer` below is the ONLY consumer, and it takes today's
 // exact `COMMAND_LATENCY_TICKS` / `pio_sector_ticks()` formula whenever the
 // family is unarmed, byte-identical to the pre-9C model.
@@ -75,7 +75,7 @@ const COMMAND_LATENCY_TICKS_PERIOD: u64 = MASTER_CLOCK_HZ / 20_000;
 /// 3.5 ms. Verified against the two 1996-class drives named in the census:
 /// above the
 /// Quantum Fireball 1280AT (3.1 ms) and 86Box's own 1996-generic preset
-/// (3 ms), just under the Seagate Medalist 1276 (3.8 ms) -- erring toward the
+/// (3 ms), just under the Seagate Medalist 1276 (3.8 ms), erring toward the
 /// slower drive of the pair, per the owner's anchor rule.
 const SEEK_TRACK_TO_TRACK_TICKS: u64 = MASTER_CLOCK_HZ / 1_000 * 7 / 2;
 
@@ -93,17 +93,17 @@ const ROTATIONAL_LATENCY_TICKS: u64 = (MASTER_CLOCK_HZ / 100_000) * 555;
 
 /// The drive's sequential read-ahead buffer: 128 KiB. Verified
 /// against
-/// the real Quantum Fireball 1280AT spec sheet (128 KB) -- the Seagate
+/// the real Quantum Fireball 1280AT spec sheet (128 KB). The Seagate
 /// Medalist 1276's real buffer is smaller still (64 KB), so 128 KiB errs
 /// toward the larger of the two named period drives while still being the
 /// slower (smaller) choice against the previous 256 KiB, which sat above
 /// both. Bytes within it, on a SEQUENTIAL continuation of the previous
 /// transfer, cost the cable-burst rate (`PIO_BYTES_PER_SECOND`) rather than
-/// the sustained media rate -- this is what design §5 risk 2 means by "take
+/// the sustained media rate. This is what design §5 risk 2 means by "take
 /// the guest-visible charge from the modelled drive buffer": a real drive's
 /// read-ahead already has the next sequential sector staged by the time the
 /// host asks for it. Bytes beyond it, or any part of a non-sequential
-/// (random-LBA) transfer, cost `MEDIA_BYTES_PER_SECOND` instead -- the
+/// (random-LBA) transfer, cost `MEDIA_BYTES_PER_SECOND` instead: the
 /// platter has to feed them live.
 const DRIVE_BUFFER_BYTES: u64 = 128 * 1024;
 
@@ -113,8 +113,8 @@ const DRIVE_BUFFER_BYTES: u64 = 128 * 1024;
 const MEDIA_BYTES_PER_SECOND: u64 = 5_000_000;
 
 /// Slice 9C-pre of the device-timing design: the
-/// primary-channel analogue of `ide::ATA_POLL_RUN`, reusing the same value --
-/// this is a PORT, not an independent tuning. See `ide.rs`'s doc comment for
+/// primary-channel analogue of `ide::ATA_POLL_RUN`, reusing the same value.
+/// This is a PORT, not an independent tuning. See `ide.rs`'s doc comment for
 /// the full derivation; it is not repeated here because the rationale is a
 /// property of the shared poll-skip shape, not of either channel.
 pub(crate) const ATA_POLL_RUN: u32 = 16;
@@ -321,7 +321,7 @@ pub struct AtaDisk {
     last_access_bytes: usize,
     /// Host-side sector cache under every addressing form. `RefCell` because a
     /// lookup mutates LRU order on a `&self` read path. Host-side state, and
-    /// deliberately outside canonical capture — see `sector_cache`.
+    /// deliberately outside canonical capture. See `sector_cache`.
     cache: std::cell::RefCell<crate::sector_cache::SectorCache>,
 
     // ------------------------------------------------------------------
@@ -347,7 +347,7 @@ pub struct AtaDisk {
 
     // ------------------------------------------------------------------
     // Slice 9C: the drive-buffer / seek model's host bookkeeping. HOST
-    // STATE, never canonical -- see `charge_pio_transfer`. Dark (never
+    // STATE, never canonical. See `charge_pio_transfer`. Dark (never
     // updated, never consulted) unless `DeviceTimingProfile::ata` is armed.
     // ------------------------------------------------------------------
     /// Current head position, in LBA. Moves to `lba + sectors` at the end of
@@ -491,7 +491,7 @@ impl AtaDisk {
         }
     }
 
-    /// Answer a B3 FAT-position hypercall, or None for an image-backed disk —
+    /// Answer a B3 FAT-position hypercall, or None for an image-backed disk:
     /// the hypercall serves only the Katea host-folder volume.
     pub fn map_fat_chain(
         &self,
@@ -562,9 +562,9 @@ impl AtaDisk {
         //
         // CHARGE ASYMMETRY, deliberate: only the BIOS fixed-disk service reads
         // that delta. The ATA task-file and BMIDE DMA paths take cache hits for
-        // their DATA -- there is one residency set and it sits under all of them,
-        // which is what keeps the bytes a guest sees independent of how it asked
-        // -- but they still price their transfers with the UNCACHED formula,
+        // their DATA: there is one residency set and it sits under all of them,
+        // which is what keeps the bytes a guest sees independent of how it asked,
+        //but they still price their transfers with the UNCACHED formula,
         // because they schedule their own deadlines at command time, before any
         // sector has been looked up. That matches the thing being modelled:
         // SMARTDRV hooked INT 13h and nothing below it, so a driver talking to
@@ -670,7 +670,7 @@ impl AtaDisk {
         }
         // Write-through, which is also the invalidation: the guest's bytes are
         // the new truth for this sector, so storing them leaves nothing stale to
-        // serve. Both backings return exactly these bytes on the next read --
+        // serve. Both backings return exactly these bytes on the next read:
         // the image writes them in place and the Katea overlay reads back out of
         // the same overlay the write just landed in.
         let mut stored = [0u8; SECTOR];
@@ -737,7 +737,7 @@ impl AtaDisk {
     /// Count one alt-status read and answer "arm the skip on this read".
     ///
     /// Called ONLY from the bus's primary-channel arm, and only when
-    /// `DeviceTimingProfile::ata` is armed on this machine -- unlike the
+    /// `DeviceTimingProfile::ata` is armed on this machine. Unlike the
     /// ATAPI mechanism, this whole path is DARK by default (the design's
     /// slice-9 knob-unset identity bar), not merely gated by a separate
     /// enable flag.
@@ -877,7 +877,7 @@ impl AtaDisk {
 
     /// Shared, side-effect-free computation behind both `charge_pio_transfer`
     /// (which applies the mutation) and `pio_transfer_breakdown` (which does
-    /// not) -- one formula, so the census can never drift from the model it
+    /// not): one formula, so the census can never drift from the model it
     /// is reporting on.
     fn pio_transfer_breakdown_impl(
         &self,
@@ -982,7 +982,7 @@ impl AtaDisk {
 
     pub fn write_port_at(&mut self, port: u16, value: u8, prefix_ticks: u64) -> bool {
         // A write is not a poll, and a control-port write can trigger SRST,
-        // which clears `pending_command` mid-batch -- mirroring
+        // which clears `pending_command` mid-batch, mirroring
         // `ide::IdeChannel::write_port`'s two guards. Ordering is
         // load-bearing: `schedule` clears the latch, and `write_command`
         // below reaches `schedule`, so writing a new command re-enables
@@ -1304,7 +1304,7 @@ impl AtaDisk {
     /// A PIO command serves one sector per DRQ, and the guest drains each one
     /// through the data port before the next is scheduled. A coalesced window
     /// would therefore have to survive from this sector's read until the guest
-    /// has drained every sector it covers -- an interval bounded by GUEST
+    /// has drained every sector it covers, an interval bounded by GUEST
     /// execution, not by a host-side call. Two things follow, and either alone
     /// disqualifies it:
     ///

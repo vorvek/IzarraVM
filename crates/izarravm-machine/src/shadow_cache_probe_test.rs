@@ -36,8 +36,8 @@ fn probe_for_k(persona: CpuPersona, k: u64) -> ShadowL1Probe {
 }
 
 /// Known-pattern proof of the 4-way pseudo-LRU replacement: fill one set,
-/// evict its pseudo-LRU victim, and confirm the victim -- not just "a"
-/// miss -- is exactly the one Intel's 3-bit tree algorithm predicts. Every
+/// evict its pseudo-LRU victim, and confirm the victim (not just "a"
+/// miss) is exactly the one Intel's 3-bit tree algorithm predicts. Every
 /// access here is a READ, so every miss allocates (no-write-allocate is
 /// exercised separately below).
 ///
@@ -54,7 +54,7 @@ fn probe_for_k(persona: CpuPersona, k: u64) -> ShadowL1Probe {
 /// 6. probe(L512) MISS  bits 0b011 -> victim way2 (L128 evicted) -> bits 0b110
 /// 7. probe(L256) HIT   (way1, untouched by the eviction) -> bits 0b101
 /// 8. probe(L128) MISS  (evicted at step 6, so this proves the eviction
-///    target -- not merely that some slot missed)
+///    target, not merely that some slot missed)
 #[test]
 fn four_way_pseudo_lru_matches_hand_traced_sequence() {
     let mut tags = ShadowTags::new_i486_unified();
@@ -100,7 +100,7 @@ fn write_miss_does_not_allocate_on_486() {
 /// `four_way_pseudo_lru_matches_hand_traced_sequence` (l0/l128/l256/l384 land
 /// in ways 0/2/1/3 from cold, ending with PLRU bits `0b000`), but the
 /// protecting touch here is a WRITE HIT on line 0 rather than a read, and a
-/// 5th line then evicts way 2 (line 128) rather than way 0 -- proving the
+/// 5th line then evicts way 2 (line 128) rather than way 0, proving the
 /// write hit moved the PLRU state exactly like a read hit would have.
 #[test]
 fn write_hit_touches_lru_like_a_read_hit_on_486() {
@@ -298,7 +298,7 @@ fn write_hit_dirties_a_clean_line() {
 /// An L1-thrash / L2-resident stride: two lines alias into the same 586 L1
 /// data set (256 sets) but land in DIFFERENT L2 sets (4096 sets), so as the
 /// L1 set thrashes between them every access after the first two misses at
-/// L1 -- while L2, having room for both, keeps missing only on their FIRST
+/// L1, while L2, having room for both, keeps missing only on their FIRST
 /// arrival and then hits every time. This is S1c's certifier: "L1 misses
 /// rising with L2 misses flat".
 #[test]
@@ -307,7 +307,7 @@ fn l1_thrash_l2_resident_certifier() {
     let mut probe = probe_for(persona);
     // Three lines, all 256 lines apart, all alias into L1 data set 0 (256
     // sets: 0, 256, 512 all reduce to set 0). At L2 (4096 sets) they land in
-    // sets 0, 256 and 512 respectively -- three DIFFERENT L2 sets, so L2
+    // sets 0, 256 and 512 respectively: three DIFFERENT L2 sets, so L2
     // never even has to evict across this whole sequence.
     let lines = [0u32, 256, 512];
     let addrs: Vec<u32> = lines.iter().map(|&l| line_addr_586(l)).collect();
@@ -325,7 +325,7 @@ fn l1_thrash_l2_resident_certifier() {
         "round 1: all three cold-miss at L2 too"
     );
     // Round 2: the 2-way L1 set can hold only 2 of the 3 lines, so this
-    // round L1 thrashes (every access misses -- the set can never contain
+    // round L1 thrashes (every access misses: the set can never contain
     // all three), but L2 (4096 sets, no collision among these three) now
     // HITS on all three, since the L1 miss probes L2 lazily.
     for &addr in &addrs {
@@ -514,7 +514,7 @@ fn should_sample_entry_disabled_never_diverts() {
     assert_eq!(diag.sampled_entries, 0);
 }
 
-/// K = 1: every entry is diverted -- the design's "every entry interpreted"
+/// K = 1: every entry is diverted, the design's "every entry interpreted"
 /// case. `total_entries` and `sampled_entries` end up equal.
 #[test]
 fn should_sample_entry_k1_diverts_every_entry() {
@@ -530,7 +530,7 @@ fn should_sample_entry_k1_diverts_every_entry() {
 
 /// K = 64: the sampled fraction converges to 1/64 within rounding, and the
 /// diverted entries land exactly on the Kth call (64, 128, ...), not just
-/// at the right COUNT -- both are checked, matching the design's "sampled
+/// at the right COUNT: both are checked, matching the design's "sampled
 /// fraction is 1/64 within rounding" wording.
 #[test]
 fn should_sample_entry_k64_samples_one_in_64() {

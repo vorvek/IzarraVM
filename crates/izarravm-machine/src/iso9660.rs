@@ -108,7 +108,7 @@ pub fn build(root: &Path) -> Result<BuiltImage, String> {
     // Assign each directory's own extent LBA and sector count. Directory sizes
     // depend on the records they contain, which depend on children's assigned
     // LBAs (for the directory records naming subdirectories) and lengths (for
-    // files) -- but not on grandchildren's LBAs, so a single pass in node
+    // files), but not on grandchildren's LBAs, so a single pass in node
     // index order (parents before children, since a child node index is
     // always allocated after its parent starts walking) works as long as we
     // assign directory LBAs before formatting any directory's record bytes.

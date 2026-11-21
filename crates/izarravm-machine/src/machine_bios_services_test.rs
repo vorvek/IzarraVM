@@ -1344,7 +1344,7 @@ fn port_92_and_int15_a20_stay_coherent() {
 fn a20_toggle_through_the_run_loop_invalidates_the_decode_cache() {
     // End-to-end check of the A20 -> decode-cache seam: a guest OUT to port 0x92, executed by
     // the real run loop, must advance the CPU's decode generation (so a wrap-region cached
-    // decode is dropped). The control program -- identical but a NOP instead of the OUT -- must
+    // decode is dropped). The control program (identical but a NOP instead of the OUT) must
     // not advance it, proving the bump comes from the A20 toggle and not incidental run-loop
     // activity. Both spin on JMP $ so the short run never reaches a HLT or a timer interrupt.
     fn gen_after_running(program: &[u8]) -> (bool, u32, u32) {
@@ -1359,7 +1359,7 @@ fn a20_toggle_through_the_run_loop_invalidates_the_decode_cache() {
         )
     }
 
-    // MOV AL, 0; OUT 0x92, AL; JMP $  -- drives A20 off (port 0x92 bit 1 = 0).
+    // MOV AL, 0; OUT 0x92, AL; JMP $ : drives A20 off (port 0x92 bit 1 = 0).
     let (a20, before, after) = gen_after_running(&[0xb0, 0x00, 0xe6, 0x92, 0xeb, 0xfe]);
     assert!(
         !a20,
@@ -1370,7 +1370,7 @@ fn a20_toggle_through_the_run_loop_invalidates_the_decode_cache() {
         "the A20 toggle advanced the decode generation (note_a20_changed fired)"
     );
 
-    // MOV AL, 0; NOP; JMP $  -- no port write, so A20 stays on and the generation is steady.
+    // MOV AL, 0; NOP; JMP $ : no port write, so A20 stays on and the generation is steady.
     let (a20, before, after) = gen_after_running(&[0xb0, 0x00, 0x90, 0xeb, 0xfe]);
     assert!(a20, "control: A20 stays on");
     assert_eq!(
@@ -2109,9 +2109,9 @@ fn lpt2_data_round_trips_through_the_bus() {
 #[test]
 fn game_port_reports_no_joystick() {
     // Port 0x201: a routine joystick probe (OUT to fire the one-shots, then
-    // IN) must see the absent-joystick byte -- an open connector, so every
+    // IN) must see the absent-joystick byte: an open connector, so every
     // line floats high and the whole byte reads 0xFF, exactly as 86Box and
-    // DOSBox-X report it -- not an UnsupportedPort fault that halts the
+    // DOSBox-X report it, not an UnsupportedPort fault that halts the
     // machine. The probe's wait-for-clear loop is then supposed to time out.
     let mut m = int15_machine(16);
     let mut bus = m.make_bus();
@@ -2153,8 +2153,8 @@ fn game_port_aliases_share_joystick_state_and_charge_deadlines() {
 fn cms_probe_range_reads_open_bus_not_a_fault() {
     // Ports 0x240-0x24F, 0x260-0x26F and 0x280-0x28F are the C/MS Game
     // Blaster's alternate probe bases. With no card there, a read must see
-    // open bus (0xFF) so a sound-detect routine concludes "nothing present"
-    // -- not an UnsupportedPort fault that halts the machine headless.
+    // open bus (0xFF) so a sound-detect routine concludes "nothing present",
+    //not an UnsupportedPort fault that halts the machine headless.
     //
     // Prince of Persia reads base+3 at each one. The 0x280 entry landed first
     // and covered only the LAST address in that sweep, so PRINCE SBLAST still
@@ -2204,7 +2204,7 @@ fn vmware_backdoor_probe_reads_open_bus_not_a_fault() {
     // Port 0x5658 is the VMware backdoor detection port: real VMware sets
     // EAX/EBX/ECX/EDX on `IN EAX, DX` (DX=0x5658, EAX='VMXh'); real,
     // non-VMware hardware has nothing there, so the guest must see open
-    // bus (all-ones) and conclude "not VMware" -- not an UnsupportedPort
+    // bus (all-ones) and conclude "not VMware", not an UnsupportedPort
     // fault that halts the machine. JEMMEX runs this probe and used to
     // crash with CpuError("unsupported I/O port 0x5658") before this stub
     // existed; regression guard for the passive-port entry.
@@ -2913,7 +2913,7 @@ fn coprocessor_latch_strobes_are_claimed_writes_and_floating_reads() {
 /// INT 14h AH=1Bh returns the FOSSIL driver information block at ES:DI. The
 /// service is dispatched for any caller that is not in ring-0 protected mode,
 /// so a communications program running in V86 under a memory manager reaches it
-/// with a buffer its page tables put outside the identity map -- the same
+/// with a buffer its page tables put outside the identity map, the same
 /// defect the VBE information blocks had.
 #[test]
 fn fossil_driver_info_lands_in_a_non_identity_mapped_caller_buffer() {
@@ -2997,7 +2997,7 @@ fn fossil_write_block_reads_a_non_identity_mapped_caller_buffer() {
 // Both fixtures below start at DI=FFFFh with CX=2: the head byte is at ES:FFFF
 // and the tail byte has to be the one at ES:0000. Guest linear D8C5Fh, where
 // the head lands, is the unbacked upper-memory hole, so only the tail is
-// assertable -- but the tail is the whole question here, and without the wrap
+// assertable, but the tail is the whole question here, and without the wrap
 // it would be taken from D8C60h, which is unbacked as well.
 
 /// INT 14h AH=18h: the received tail lands at ES:0000, through the caller's

@@ -130,7 +130,7 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
     // P2 adds the epoch dimension. Under epoch 2 an elided iteration must project the port's
     // full class charge on the certificate's third lane and the live privilege column's `IN`
     // count on the core lane, so a span of N elided iterations has to land the guest clock in
-    // exactly the place N naturally executed iterations land it -- which is what
+    // exactly the place N naturally executed iterations land it, which is what
     // `assert_poll_machine_boundary_eq`'s `elapsed_clocks` / `trace.elapsed_clocks()` /
     // `timeline` / beam comparisons say. This machine runs in REAL mode, which is one of the
     // two privilege columns the skip can actually take (F8: V86 is structurally refused, see
@@ -200,7 +200,7 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
 
 /// P2's projection equality, stated as arithmetic rather than as a boundary comparison: an
 /// elided run of N iterations must charge EXACTLY N times the per-iteration cost on all three
-/// lanes -- core (through `level_timing`), bus (through `scale_bus`) and port (unscaled) -- and
+/// lanes: core (through `level_timing`), bus (through `scale_bus`) and port (unscaled), and
 /// the per-iteration figures must be the same ones an executed access pays.
 ///
 /// The lane values are written here as literals, not read back from the code under test:
@@ -252,8 +252,8 @@ fn an_elided_span_charges_exactly_n_times_one_iteration_on_every_lane() {
         bus.poll_commit_bus(certificate, N);
     });
 
-    // Core: one scaling of (raw x N), carrying the remainder -- never N separate scalings.
-    // `level_timing(I586)` is (1, 12) -- written as a literal here, not read back from the
+    // Core: one scaling of (raw x N), carrying the remainder, never N separate scalings.
+    // `level_timing(I586)` is (1, 12), written as a literal here, not read back from the
     // function under test, so a dial change has to come and edit this line deliberately.
     let scaled = raw_per_iteration * N + carry_before;
     assert_eq!(
@@ -274,7 +274,7 @@ fn an_elided_span_charges_exactly_n_times_one_iteration_on_every_lane() {
 }
 
 /// F8's machine half. The poll skip is unavailable in V86 by construction, so the V86 column
-/// (Intel's 19 -- the row the design's own §2 arithmetic used) is exactly the row this path
+/// (Intel's 19, the row the design's own §2 arithmetic used) is exactly the row this path
 /// never takes; the per-iteration figure is nonetheless DERIVED from the live mode rather than
 /// baked, which is what would keep it right if the eligibility rule ever changed. The four
 /// columns themselves are pinned in `izarravm-cpu`'s
@@ -294,8 +294,8 @@ fn the_poll_skip_prices_the_real_mode_column_because_v86_can_never_reach_it() {
     assert_eq!(raw, 52 + 84, "real mode: Intel's IN 7 x 12 = 84 raw");
 }
 
-/// F14's instrument, as a RATE. The fixture is the `VL_WaitVBL` shape itself -- spin while the
-/// retrace bit is set, then spin until it is set, repeat -- so each of its two loops exits
+/// F14's instrument, as a RATE. The fixture is the `VL_WaitVBL` shape itself (spin while the
+/// retrace bit is set, then spin until it is set, repeat) so each of its two loops exits
 /// exactly once per displayed frame, and the two edge counters must track the VGA's own frame
 /// sequence rather than the number of polls. That is the whole point of the instrument: the
 /// poll count moves by design under the reprice and under the skip, and this does not.
@@ -398,12 +398,12 @@ fn poll_bus_certificate_rejects_instruction_fetches_from_a_device_window() {
 #[test]
 fn poll_bus_certificate_admits_only_the_one_port_it_prices() {
     // WAS `poll_bus_certificate_refuses_a_port_the_isa_wait_charge_covers`. P2 retires the ISA
-    // refusal's REASON -- the certificate now carries an unscaled third lane
-    // (`port_bus_clocks_per_iteration`), so a charged port CAN be priced -- but replaces it
+    // refusal's REASON (the certificate now carries an unscaled third lane
+    // (`port_bus_clocks_per_iteration`), so a charged port CAN be priced) but replaces it
     // with an explicit admission rather than deleting it (review F9). The lane prices a port;
     // it cannot express a port whose read is not idempotent, and an elided span performs the
     // port's side effects ONCE rather than per iteration. 0x40 (the 8254 read-back latch) is
-    // exactly such a port, and it must still refuse -- in BOTH epochs and with the ISA knob in
+    // exactly such a port, and it must still refuse, in BOTH epochs and with the ISA knob in
     // either position, because the admission no longer depends on either.
     let mut machine =
         setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
@@ -411,7 +411,7 @@ fn poll_bus_certificate_admits_only_the_one_port_it_prices() {
     {
         // The arm has to be set BEFORE `with_cpu_and_bus`: the bus caches the resolved knob at
         // construction (one bool test per access instead of a lazy-static touch), which is also
-        // the production shape -- the environment is read once per process.
+        // the production shape: the environment is read once per process.
         for armed in [false, true] {
             with_cpu_and_bus(&mut machine, |cpu, bus| {
                 let poll = cpu.poll_loop().expect("warm poll descriptor");
@@ -1767,8 +1767,8 @@ fn direct_large_self_loop_bulk_fetch_uses_physical_paging_alias_timing() {
     let native_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are -- before anything settles them, or
-    // the assertion is a tautology -- then the whole structure on SETTLED CLONES.
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are (before anything settles them, or
+    // the assertion is a tautology) then the whole structure on SETTLED CLONES.
     //
     // `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags, and the native role
     // settles that representation on the way into emitted code (`run_direct_block`'s entry clear)
@@ -1777,7 +1777,7 @@ fn direct_large_self_loop_bulk_fetch_uses_physical_paging_alias_timing() {
     //
     // `CpuGsw::settled` and NOT an inline `registers.eflags = eflags()`: the inline form leaves
     // `pending_flags` standing, and `CpuGsw` derives `PartialEq` over every field, so it would go on
-    // byte-comparing the raw descriptor -- the exact invariant this campaign released -- surviving
+    // byte-comparing the raw descriptor (the exact invariant this campaign released) surviving
     // at the only two sites reached across a crate boundary. It would also construct a state no code
     // path produces: a settled base with a live descriptor over it.
     assert_eq!(native_cpu.eflags(), interp_cpu.eflags());
@@ -2001,8 +2001,8 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     let native_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
 
     assert_eq!(native_outcomes, interp_outcomes);
-    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are -- before anything settles them, or
-    // the assertion is a tautology -- then the whole structure on SETTLED CLONES.
+    // THE ARCHITECTURAL FLAGS FIRST, on the roles as they are (before anything settles them, or
+    // the assertion is a tautology) then the whole structure on SETTLED CLONES.
     //
     // `registers.eflags` plus `pending_flags` is a REPRESENTATION of the flags, and the native role
     // settles that representation on the way into emitted code (`run_direct_block`'s entry clear)
@@ -2011,7 +2011,7 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     //
     // `CpuGsw::settled` and NOT an inline `registers.eflags = eflags()`: the inline form leaves
     // `pending_flags` standing, and `CpuGsw` derives `PartialEq` over every field, so it would go on
-    // byte-comparing the raw descriptor -- the exact invariant this campaign released -- surviving
+    // byte-comparing the raw descriptor (the exact invariant this campaign released) surviving
     // at the only two sites reached across a crate boundary. It would also construct a state no code
     // path produces: a settled base with a live descriptor over it.
     assert_eq!(native_cpu.eflags(), interp_cpu.eflags());
@@ -2529,7 +2529,7 @@ fn paged_memory_poll_declines_on_a_not_present_page_without_perturbation() {
     // gate's write watch now treats the `cell_pte` store as the live page-table edit it is (it
     // shares `PAGED_PT`'s physical page with the head's own PTE, and `PAGED_PT` is exactly the
     // structure `translate_linear_checked` marked while warming the poll loop), so it retires the
-    // whole ring -- `code_pages`/`code_bytes` included, which is what `poll_head_possible`'s
+    // whole ring, `code_pages`/`code_bytes` included, which is what `poll_head_possible`'s
     // prefilter reads. Re-decoding the head to restore the mark is not available cross-crate
     // (`fetch_decoded` is crate-private) and re-EXECUTING it would read the now-not-present cell
     // and triple-fault, so the row can no longer isolate the R2 probe this way. What still holds,

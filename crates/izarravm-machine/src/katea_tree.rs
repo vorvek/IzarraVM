@@ -44,8 +44,8 @@ const HOST_READ_COMMAND_WINDOW_SECTORS: u32 = 64;
 /// than as one big command, so the buffer has to span *commands* to pay off.
 ///
 /// A FILL NEVER STARTS THIS BIG. It starts at the extent the command actually
-/// asked for -- one sector when nothing declared a command at all, which is what
-/// a reconcile gather looks like -- and doubles only when the previous fill for
+/// asked for (one sector when nothing declared a command at all, which is what
+/// a reconcile gather looks like) and doubles only when the previous fill for
 /// that same path was consumed to its exact end. Any other offset (a backward
 /// seek, a jump, a first touch) resets it to the command extent.
 ///
@@ -53,7 +53,7 @@ const HOST_READ_COMMAND_WINDOW_SECTORS: u32 = 64;
 /// only ever granted to a path that has already been read sequentially that far,
 /// so the bytes read ahead are paid for by bytes already served: physical bytes
 /// stay within roughly twice logical bytes, the overshoot being the last fill of
-/// a stream that stops early. A flat fill has no such bound -- a single-sector
+/// a stream that stops early. A flat fill has no such bound: a single-sector
 /// probe outside any command would pull 256 KiB for 512 bytes, and an
 /// alternating or backward pattern would do it on every read.
 ///
@@ -63,7 +63,7 @@ const HOST_READAHEAD_MAX_BYTES: u64 = 256 * 1024;
 
 /// Read-ahead slots. Four, for the reason the handle cache holds eight: an asset
 /// load interleaves a handful of files (the executable, an overlay, a PAK), and
-/// a single slot would miss on every alternation -- the worst case for a ramp,
+/// a single slot would miss on every alternation, the worst case for a ramp,
 /// because a miss is also what resets it.
 const HOST_READAHEAD_SLOTS: usize = 4;
 
@@ -117,12 +117,12 @@ struct FatWalk {
     /// The FAT-copy-relative sector index the cursor currently describes.
     within: Option<u32>,
     /// The guest's bytes for that sector, when the store holds it. `None` means
-    /// the base view answers, and the base view needs no sector at all --
+    /// the base view answers, and the base view needs no sector at all:
     /// `ClusterIndex::fat_entry` is a single `HashSet` probe. Boxed so the cursor
     /// itself stays pointer-sized on the walk's stack frame.
     overlay: Option<Box<[u8; SECTOR]>>,
     /// Every FAT sector this walk resolved, in resolve order. This is the walk's
-    /// COMPLETE dependency set -- see [`ChainMemo`], which keeps it so a later
+    /// COMPLETE dependency set. See [`ChainMemo`], which keeps it so a later
     /// pass can prove the chain cannot have changed.
     sectors: Vec<u32>,
     /// Set when a resolve failed to read a guest-written FAT sector back and the
@@ -150,7 +150,7 @@ pub(crate) enum ChainMapOutcome {
 /// WHY. Even with the per-sector walk cursor, the projection pass still stepped
 /// every cluster of every live file's chain three to four times over, and did it
 /// again on the next pass whether or not anything had changed. Measured: a worst
-/// pass of 0.96 ms on a 47 MB folder against 9.68 ms on a 498 MB one -- the same
+/// pass of 0.96 ms on a 47 MB folder against 9.68 ms on a 498 MB one, the same
 /// tenfold ratio as the allocated cluster count, for a write that touched one
 /// file.
 ///
@@ -162,7 +162,7 @@ pub(crate) enum ChainMapOutcome {
 ///   mutated.
 /// * The overlay changes only through `SectorStore::insert`, whose sole caller is
 ///   `write_sector`, which routes every FAT-region LBA through
-///   `note_metadata_write` -- the site that stamps `fat_sector_epoch`. It can
+///   `note_metadata_write`, the site that stamps `fat_sector_epoch`. It can
 ///   also change through `SectorStore::acknowledge`, whose sole caller
 ///   acknowledges a projected file's DATA sectors and never a metadata one
 ///   (asserted there).
@@ -188,7 +188,7 @@ pub(crate) enum ChainMapOutcome {
 ///
 /// That is safe, and it is safe in the strong direction. A memo can only be
 /// current if nothing has written its sectors, and a sector nothing has written
-/// is one whose value we already hold correctly -- the walk that produced the
+/// is one whose value we already hold correctly: the walk that produced the
 /// memo read it successfully. So the memoized chain IS the chain a successful
 /// fresh read would return, and proceeding on the true chain is strictly better
 /// than holding because we could not re-read a value we already knew. The
@@ -210,14 +210,14 @@ struct ChainMemo {
     /// Whether every cluster of the chain is a valid data cluster.
     ///
     /// A pure function of the chain and of `geo`, which is immutable after
-    /// `new` -- so it rides the FAT token above with no argument of its own, and
+    /// `new`, so it rides the FAT token above with no argument of its own, and
     /// there is no case in which the chain is current and this is not. Three
     /// call sites used to evaluate it with an `any()` over the whole chain, per
     /// live file, per pass.
     all_in_range: bool,
     /// The store chunks the chain's DATA sectors span, deduplicated.
     ///
-    /// A chunk is 128 KiB -- 32 clusters at `spc = 8` -- so a chain of any
+    /// A chunk is 128 KiB (32 clusters at `spc = 8`) so a chain of any
     /// length collapses to a handful of ids, and revalidating
     /// [`Self::data_written`] costs that handful of probes instead of one per
     /// cluster.
@@ -229,7 +229,7 @@ struct ChainMemo {
     /// MONOTONE: `set_present` sets both `present` and `written`, and
     /// `clear_present` clears only `present`. So `true` is permanent and needs
     /// no revalidation at all, and `false` can only be falsified by a guest
-    /// write to a data sector of the chain -- which is a write to one of
+    /// write to a data sector of the chain, which is a write to one of
     /// `data_chunks`, and therefore visible as that chunk's `last_seq` passing
     /// `data_seq`.
     ///
@@ -244,7 +244,7 @@ struct ChainMemo {
 /// The keys claiming one cluster.
 ///
 /// A `Vec` per cluster would be one heap allocation per cluster of the mounted
-/// folder -- 128,000 of them on a 498 MB fixture -- for a list that is almost
+/// folder (128,000 of them on a 498 MB fixture) for a list that is almost
 /// always exactly one key long. The full scan it replaces stored a bare key in
 /// its `HashMap` and allocated nothing, and the index has to be able to build
 /// itself at least as cheaply as the scan it removes: the first measurement of
@@ -316,7 +316,7 @@ type ChainToken = (u64, Vec<u32>);
 /// `sectors` the walk's FAT dependency set. Held here rather than looked up in
 /// the memo because the memo is keyed by first cluster and is evictable at
 /// [`CHAIN_MEMO_MAX_ENTRIES`], while a claim is keyed by directory ENTRY and must
-/// outlive that -- a claim that vanished when a memo was evicted would be a
+/// outlive that: a claim that vanished when a memo was evicted would be a
 /// RETRACTION, which is the one direction the guard cannot afford (see
 /// [`KateaTreeVolume::insert_claim`]).
 #[derive(Debug)]
@@ -328,7 +328,7 @@ struct ClaimUnit {
 
 /// What one directory entry KEY currently claims.
 ///
-/// `units` is one per live entry with this key -- normally exactly one, but a
+/// `units` is one per live entry with this key: normally exactly one, but a
 /// guest can write two directory entries with the same 8.3 name and the guard's
 /// definition treats them as one file whose clusters are the UNION of theirs
 /// (see `ambiguous_by_full_scan`'s property 2). `clusters` is that union, sorted
@@ -337,7 +337,7 @@ struct ClaimUnit {
 struct KeyClaim {
     units: Vec<ClaimUnit>,
     clusters: Vec<u32>,
-    /// How many of `clusters` are contested -- claimed by another live key, or
+    /// How many of `clusters` are contested: claimed by another live key, or
     /// registered as a directory cluster. The key is ambiguous exactly when this
     /// is non-zero.
     ///
@@ -355,7 +355,7 @@ struct KeyClaim {
 ///
 /// Insurance, not correctness: the invalidation hooks are what make the index
 /// right, and this bounds how long an unanticipated miss could persist. It is
-/// AMORTISED -- each pass forcibly refreshes `1/N` of the live keys in rotation
+/// AMORTISED: each pass forcibly refreshes `1/N` of the live keys in rotation
 /// rather than rebuilding everything every Nth pass. A periodic full rebuild
 /// would land in `projection_max_ns`, which is the metric the whole slice is
 /// graded on, and would make the worst pass a property of the rebuild rather
@@ -367,8 +367,8 @@ const CLAIM_REFRESH_PERIOD: usize = 64;
 ///
 /// `katea_write::parse_dir` stops at the first entry whose first byte is 0x00,
 /// which in a well-formed FAT directory means "this slot and every slot after it
-/// is free". A TORN directory -- one whose middle sector the guest has zeroed but
-/// not yet rewritten, which is what an installer growing a directory produces --
+/// is free". A TORN directory (one whose middle sector the guest has zeroed but
+/// not yet rewritten, which is what an installer growing a directory produces)
 /// looks identical from `parse_dir`'s side: it stops early and silently hides
 /// every entry behind the hole.
 ///
@@ -377,13 +377,13 @@ const CLAIM_REFRESH_PERIOD: usize = 64;
 /// does.
 ///
 /// IT IS THE ONLY *DETECTABLE* SIGNATURE, WHICH IS NOT THE SAME AS THE ONLY ONE.
-/// A tear whose hole runs to the end of the image -- nothing but 0x00 behind it
-/// -- is indistinguishable from a directory the guest legitimately truncated,
+/// A tear whose hole runs to the end of the image (nothing but 0x00 behind it)
+///is indistinguishable from a directory the guest legitimately truncated,
 /// because DOS marks a deletion 0xE5 and never 0x00, so there is nothing left to
 /// look at. That undetectable case costs nothing here: the FULL SCAN reads the
 /// same truncated `live` set and is blind in exactly the same way, so the
-/// incremental answer still equals the reference -- which is what the
-/// differential and the verify harness grade -- and the retraction is correct
+/// incremental answer still equals the reference (which is what the
+/// differential and the verify harness grade) and the retraction is correct
 /// relative to what the volume actually says. (A torn SECTOR cannot arise at
 /// all: `write_sector` inserts whole 512-byte sectors.)
 ///
@@ -409,7 +409,7 @@ fn directory_image_is_whole(bytes: &[u8]) -> bool {
 /// per live file and the total of their chains is bounded by the volume's
 /// cluster count. What is NOT bounded by that is a guest that keeps creating
 /// files at fresh clusters: each leaves an entry behind that nothing prunes.
-/// Clearing wholesale at a ceiling costs one cold pass and cannot be wrong --
+/// Clearing wholesale at a ceiling costs one cold pass and cannot be wrong:
 /// the memo is only ever an optimization over walking.
 const CHAIN_MEMO_MAX_ENTRIES: usize = 65_536;
 
@@ -425,7 +425,7 @@ struct HostReadContext<'a> {
     /// Ceiling on one fill, or 0 when `IZARRAVM_HDD_READAHEAD=0` disarmed it.
     readahead_max: u64,
     /// First data-region LBA of the volume. Carried only to assert the window's
-    /// range invariant where the window is filled -- see the `debug_assert` in
+    /// range invariant where the window is filled. See the `debug_assert` in
     /// [`read_host_span`], which is what lets [`KateaTreeVolume::fat_entry_walked`]
     /// resolve a FAT sector without consulting the window at all.
     first_data_lba: u32,
@@ -433,7 +433,7 @@ struct HostReadContext<'a> {
 
 /// DOS device names Win32 still resolves as character devices. Per Microsoft's
 /// "Naming Files, Paths, and Namespaces", these are reserved *in every
-/// directory* -- `C:\mount\CON` is the console, not a file -- and the rule
+/// directory* (`C:\mount\CON` is the console, not a file) and the rule
 /// applies to the name followed by any extension as well, so `NUL.TXT` is also
 /// `NUL`. Matching is case-insensitive. COM0 and LPT0 are on Microsoft's
 /// current list and cost nothing to include.
@@ -444,8 +444,8 @@ const WIN32_RESERVED_DEVICE_NAMES: &[&str] = &[
 ];
 
 /// The suffix that lifts a guest name off a Win32 device name. `+` is legal in a
-/// Win32 file name and illegal in an 8.3 short name -- `fat_name::is_legal_83`
-/// excludes it and `katea_write::classify` now rejects it -- so no name the
+/// Win32 file name and illegal in an 8.3 short name (`fat_name::is_legal_83`
+/// excludes it and `katea_write::classify` now rejects it) so no name the
 /// guest can write ever folds onto a mangled one. That is what keeps a guest
 /// that creates both `CON` and some other name from having them collide on one
 /// host file.
@@ -460,7 +460,7 @@ const DEVICE_NAME_ESCAPE: char = '+';
 /// the null device, so the guest's bytes go to a terminal or vanish, and its
 /// reads come back as zeros. The guard belongs here rather than in `classify`
 /// because rejecting the *entry* would read as "this file disappeared" and
-/// delete a real host file of that name -- which a non-Windows host can hold
+/// delete a real host file of that name, which a non-Windows host can hold
 /// perfectly well. So non-Windows keeps `decode_83` verbatim.
 fn host_child_name(name: &[u8; 11]) -> String {
     let decoded = crate::katea_volume::decode_83(name);
@@ -489,11 +489,11 @@ fn host_child_name(name: &[u8; 11]) -> String {
 /// volume gets `spc >= 8`.
 ///
 /// This replaced a data-cluster floor of 94,742, which reproduced the flat static
-/// image's proven-bootable 96,256-sector geometry — and, with it, that geometry's
+/// image's proven-bootable 96,256-sector geometry, and, with it, that geometry's
 /// `spc = 1`. 512-byte clusters are the degenerate case: a 44 MB file becomes an
 /// ~86,600-entry FAT chain, DOS re-walks that chain on every seek, and 86.2% of
 /// all sectors a measured Duke Nukem 3D benchmark read were FAT sectors. No 1997
-/// tool would have produced it either — FORMAT.COM sized clusters off this same
+/// tool would have produced it either: FORMAT.COM sized clusters off this same
 /// table, and 512-byte clusters were reserved for volumes under 260 MB, which
 /// FAT32 was not used on. Flooring the PARTITION rather than the cluster count is
 /// what keeps the derivation self-consistent: `fat32_geometry_for` still requires
@@ -543,8 +543,8 @@ pub(crate) struct HostTree {
 /// The Toka-DOS system binaries that the overlay places in a synthetic `C:\DOS`
 /// folder rather than the boot-drive root, so the host-folder root isn't buried
 /// under system files. This is the executable subset of the committed image's
-/// `dos_files` (`scripts/build-freedos-hdd-image.py`). NOT here — and therefore
-/// left at the root — are the boot/kernel-required files (KERNEL.SYS, CONFIG.SYS,
+/// `dos_files` (`scripts/build-freedos-hdd-image.py`). NOT here (and therefore
+/// left at the root) are the boot/kernel-required files (KERNEL.SYS, CONFIG.SYS,
 /// AUTOEXEC.BAT), LICENSE.TXT (the kernel signon points at `C:\LICENSE.TXT`), and
 /// any user or runner file (which stays where it was dropped). HELLO.TXT is
 /// excluded too: it is a data file, so a caller-supplied one stays at the root
@@ -577,7 +577,7 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
 /// Build the tree from a host folder, overlaying the in-memory system files (so the
 /// disk still boots). The Toka-DOS binaries land in a synthetic `C:\DOS` subdir;
 /// KERNEL.SYS / CONFIG.SYS / AUTOEXEC.BAT / LICENSE.TXT and any user/runner file
-/// stay at the root. Metadata only — never reads host file contents. Cluster fields
+/// stay at the root. Metadata only: never reads host file contents. Cluster fields
 /// are zero here; cluster assignment happens after construction.
 pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> HostTree {
     let mut names = NameTable::new();
@@ -618,7 +618,7 @@ pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> Hos
     }
 
     // Attach the C:\DOS folder (reserving its name at the root so a host subfolder
-    // named DOS can't collide), but only when it actually holds binaries — an empty
+    // named DOS can't collide), but only when it actually holds binaries: an empty
     // overlay (e.g. a test with no system files) leaves the root free of a stray DOS.
     if !dos.files.is_empty() {
         let dos_name = fold_literal_83("DOS");
@@ -709,13 +709,13 @@ fn fold_literal_83(name: &str) -> [u8; 11] {
 /// One sector as served, plus whether serving it DEGRADED.
 ///
 /// `degraded` is true when `bytes` is the all-zero fallback this module
-/// substitutes for a host-side failure — a spilled guest write whose payload
+/// substitutes for a host-side failure (a spilled guest write whose payload
 /// could not be read back, a host file that vanished, or one that was truncated
-/// underneath a live handle — rather than the sector's real content.
+/// underneath a live handle) rather than the sector's real content.
 ///
 /// It exists because of what sits ABOVE this module: `AtaDisk` keeps a host-side
 /// LRU sector cache and fills it from whatever the backing returns. Without this
-/// flag a transient failure would be made PERMANENT — the zeros would be cached
+/// flag a transient failure would be made PERMANENT: the zeros would be cached
 /// and served on every later read of that LBA even after the host file came
 /// back, defeating the retry design this module already has (a failed read drops
 /// the cached handle so the next sector re-opens, and `reconcile` brackets read
@@ -844,7 +844,7 @@ fn next_spc(spc: u8) -> u8 {
 /// returns the tree's data-cluster demand at a given cluster size in bytes; the
 /// loop re-queries it each iteration because bigger clusters need fewer of them.
 /// Returns `Err` only when the folder doesn't fit even at the largest cluster size
-/// (`MAX_SPC` = 64, i.e. roughly > 8 TB of data) — `count_of_clusters` past
+/// (`MAX_SPC` = 64, i.e. roughly > 8 TB of data), `count_of_clusters` past
 /// `FAT32_MAX_CLUSTERS` or a sector count past `u32::MAX` at a *smaller* `spc` just
 /// means "climb to a bigger cluster", not "fail". All sizing is done in `u64`; the
 /// final values are range-checked once before being narrowed into `u32`.
@@ -889,7 +889,7 @@ fn fat32_geometry_for(demand_at: impl Fn(u32) -> u64) -> Result<Geometry, std::i
         // (`fat_size_sectors(PART_SECTORS, spc)`): the formula's divisor accounts
         // for the FAT sectors, so passing the full partition is self-correcting.
         // We do not know `fatsz` until we size the partition, and the partition
-        // size includes the FAT — so close the loop by re-deriving `fatsz` from
+        // size includes the FAT, so close the loop by re-deriving `fatsz` from
         // the partition built with the previous estimate until it is stable (it
         // settles in one or two steps because the data region dominates).
         let mut fatsz = fat_size_sectors(u32::from(RESERVED_SECTORS) + data_sectors, spc);
@@ -977,8 +977,8 @@ fn assign_dir(dir: &mut TreeDir, is_root: bool, parent: u32, next: &mut u32, clu
 /// run* of clusters, so a used cluster's FAT entry is simply `c + 1` unless `c`
 /// is the last cluster of its run (then EOC), and any cluster the tree never
 /// touched is free (0). We therefore store only the set of run-end clusters and
-/// `next_free` (the first never-allocated cluster) and derive every FAT entry —
-/// and any FAT sector — from those, so RAM scales with the chain count rather
+/// `next_free` (the first never-allocated cluster) and derive every FAT entry
+/// (and any FAT sector) from those, so RAM scales with the chain count rather
 /// than the disk size.
 #[derive(Debug)]
 pub(crate) struct ClusterIndex {
@@ -1163,7 +1163,7 @@ enum Role {
 /// The struct is **pointer-free**: it owns only `Vec`s (the flattened dirs/files
 /// and the sorted cluster-run table), the two stamped boot sectors, the geometry,
 /// and the cluster index. `tree` is kept whole for tests and writes; it is
-/// not consulted by `read_sector` — that path resolves a cluster through `runs`.
+/// not consulted by `read_sector`: that path resolves a cluster through `runs`.
 #[derive(Debug)]
 pub(crate) struct KateaTreeVolume {
     /// The owned tree. Only the test-only `tree()` reads it; `read_sector` does not.
@@ -1218,7 +1218,7 @@ pub(crate) struct KateaTreeVolume {
     /// written so far, so the session cost grew with the square of its size.
     /// A sector only stops being unmapped when its own cluster becomes
     /// projectable, so a commit needs the clusters it touched and the clusters
-    /// a projection just claimed -- never the whole set.
+    /// a projection just claimed, never the whole set.
     unmapped_by_cluster: HashMap<u32, HashSet<u32>>,
     /// `unmapped_by_cluster`'s total, maintained rather than recounted. Every
     /// entry is pending by construction: the only path that clears a sector's
@@ -1267,7 +1267,7 @@ pub(crate) struct KateaTreeVolume {
     file_projection_checks: HashSet<(u32, [u8; 11])>,
     /// Read-path attribution for the boot profiler. `Cell`s because `read_sector`
     /// is `&self`; the emulation thread owns the volume, so no sharing is implied.
-    /// One cell PER FIELD -- see [`katea_counter_block`] for why the single
+    /// One cell PER FIELD. See [`katea_counter_block`] for why the single
     /// whole-block `Cell` this replaced was a 352-byte copy per increment.
     counters: KateaCounterCells,
     /// One open read handle for the host file most recently served, so a
@@ -1326,7 +1326,7 @@ pub(crate) struct KateaTreeVolume {
     /// than to the clusters it walks, and a test reads it to prove that.
     #[cfg(test)]
     fat_sector_builds: std::cell::Cell<u64>,
-    /// How many times a [`FatWalk`] cursor has had to RESOLVE a FAT sector --
+    /// How many times a [`FatWalk`] cursor has had to RESOLVE a FAT sector,
     /// that is, ask the store whether the guest wrote it. The whole point of the
     /// cursor is that this is proportional to the FAT sectors a walk crosses
     /// (one per 128 clusters) rather than to the clusters it steps through, and a
@@ -1435,7 +1435,7 @@ fn readahead_max_bytes() -> u64 {
 ///
 /// The split exists because the counters used to live in a single
 /// `Cell<KateaStorageCounters>`, and `Cell::get` + `Cell::set` around one `+= 1`
-/// is a read-modify-write of the WHOLE block -- 44 `u64` fields, 352 bytes,
+/// is a read-modify-write of the WHOLE block: 44 `u64` fields, 352 bytes,
 /// copied twice per bump. There are bumps on the per-sector read path, inside
 /// `read_host_span`, and (before the FAT walk was fixed) once per cluster of
 /// every chain walk in the projection pass, so the block copy was ~2.1 KB per
@@ -1474,7 +1474,7 @@ macro_rules! katea_counter_block {
 }
 
 /// Add `n` to one counter cell, saturating. The saturation matters at exactly
-/// one place -- `host_bytes` and friends accumulate sizes -- and costs nothing
+/// one place (`host_bytes` and friends accumulate sizes) and costs nothing
 /// where it does not.
 #[inline]
 fn bump(cell: &std::cell::Cell<u64>, n: u64) {
@@ -1495,7 +1495,7 @@ katea_counter_block! {
     /// Not "served to the guest": most of these are not guest reads at all. The
     /// reconcile pass resolves a FAT sector per cluster of every chain it walks,
     /// and on a 498 MB folder that was 3.6 M of the 3.7 M counted. Since the
-    /// cluster-chain memo landed, a walk served from the memo resolves NONE --
+    /// cluster-chain memo landed, a walk served from the memo resolves NONE,
     /// which is why this counter fell 78-96% on the measured rows with every
     /// guest-visible number identical to the digit.
     ///
@@ -1567,7 +1567,7 @@ katea_counter_block! {
     projection_operations,
     projection_bytes,
     projection_wall_ns,
-    /// The longest SINGLE projection operation this session, in nanoseconds --
+    /// The longest SINGLE projection operation this session, in nanoseconds:
     /// one `commit_guest_write_batch` or one `flush_guest_writes`, each of which
     /// runs synchronously on the emulation thread. See [`Self::host_read_max_ns`]
     /// for why the sum is not enough.
@@ -1581,7 +1581,7 @@ katea_counter_block! {
     /// project knowingly moved ~12-13 ms of O(folder) work onto a 498 MB mount.
     /// Nothing could catch that regressing: mount happens before `RUN_START`, so
     /// no boot-profile phase covers it, and the number lived only in a comment.
-    /// This cell is that comment made falsifiable -- and the first reading it
+    /// This cell is that comment made falsifiable, and the first reading it
     /// took falsified it: the ~12-13 ms the comment claimed measures 9.1-9.6 ms
     /// on the same 498 MB folder, which is why that comment now carries a
     /// measured number and a recorded band miss.
@@ -1590,15 +1590,15 @@ katea_counter_block! {
     /// boot-profile phase rows therefore carry it unsubtracted, the same way
     /// `projection_max_ns` and the occupancy gauges do.
     ///
-    /// Zero when `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` -- `prime_claim_index`
-    /// returns immediately -- and zero on a folder whose directory did not
+    /// Zero when `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` (`prime_claim_index`
+    /// returns immediately) and zero on a folder whose directory did not
     /// gather to completion, which leaves the index cold on purpose.
     mount_prime_ns,
     /// Wall nanoseconds spent seeding the write maps at mount.
     ///
     /// The `seed` recursion inserts one `projected_clusters` entry per cluster
     /// and one `mirrored` entry per name, so it is the OTHER O(folder) term in a
-    /// mount -- the one the claim-index comment names as its companion. Counted
+    /// mount, the one the claim-index comment names as its companion. Counted
     /// separately from [`Self::mount_prime_ns`] so a slow mount can be attributed
     /// rather than guessed at.
     ///
@@ -1616,7 +1616,7 @@ katea_counter_block! {
     ///
     /// Invariants the fixtures pin: `mount_prime_ns <= mount_total_ns` and
     /// `mount_seed_ns <= mount_total_ns`. The two parts are disjoint, so their
-    /// sum is a lower bound on the total, never an equality -- the flatten and
+    /// sum is a lower bound on the total, never an equality: the flatten and
     /// the FAT build sit between them.
     ///
     /// Cost outside mount: none. Three `Instant::now()` pairs per mount, on a
@@ -1798,7 +1798,7 @@ struct PendingDelete {
 impl KateaTreeVolume {
     /// Build the whole-disk view from the boot sectors, a host folder, and the
     /// in-memory system files overlaid at the root. Construction walks metadata
-    /// only — it never reads host file *contents* (those are read lazily, one
+    /// only: it never reads host file *contents* (those are read lazily, one
     /// 512-byte span at a time, in `read_sector`).
     pub(crate) fn new(
         mbr: &[u8; SECTOR],
@@ -2046,7 +2046,7 @@ impl KateaTreeVolume {
 
     /// Build the anti-clobber claim index once, HERE, at mount.
     ///
-    /// The index cannot make the FIRST derivation cheap -- pass one has to decide
+    /// The index cannot make the FIRST derivation cheap: pass one has to decide
     /// ambiguity over every live file, and that is O(clusters in the folder)
     /// however it is written. What it can decide is WHERE that cost lands. Left
     /// to the first projection pass it lands in `projection_max_ns`, which is the
@@ -2054,9 +2054,9 @@ impl KateaTreeVolume {
     /// cold build made the worst pass on a 498 MB folder 14.4 ms, WORSE than the
     /// 8.5 ms it was replacing, while every other pass fell to under 2 ms.
     ///
-    /// Mount is where that cost belongs. It is already O(folder) -- `walk_into`
+    /// Mount is where that cost belongs. It is already O(folder): `walk_into`
     /// recurses the host tree and `seed` inserts one `projected_clusters` entry
-    /// per cluster -- it happens once, and it happens while the user is waiting
+    /// per cluster. It happens once, and it happens while the user is waiting
     /// for a drive to appear rather than mid-game.
     ///
     /// No new derivation: this runs the same `gather_live` +
@@ -2068,12 +2068,12 @@ impl KateaTreeVolume {
     /// IT DOES NO HOST I/O. Every sector `gather_live` reads for a directory
     /// comes from `data_sector`'s `Role::Dir` arm, which serves `self.dirs[id]`
     /// out of memory, and every FAT entry comes from the walk cursor's base view
-    /// or the store -- so this addition is immune to the cold-host-filesystem
+    /// or the store, so this addition is immune to the cold-host-filesystem
     /// exposure the disk audit flags for mount generally (§5.8). It is CPU only.
     ///
     /// WHAT IT ADDS TO MOUNT, as a number: **~9.1-9.6 ms on a 498 MB folder**
     /// (~128,000 clusters), MEASURED, by
-    /// [`KateaStorageCounters::mount_prime_ns`] -- three `--headless-boot-profile`
+    /// [`KateaStorageCounters::mount_prime_ns`]: three `--headless-boot-profile`
     /// runs on 2026-08-23 read 9.59 / 9.10 / 9.50 ms, with `seed` a further
     /// 5.0-5.3 ms and the whole of `KateaTreeVolume::new` 14.5-15.5 ms.
     ///
@@ -2081,8 +2081,8 @@ impl KateaTreeVolume {
     /// was inferred from the cold build making a whole first projection pass cost
     /// 14.41 ms against a ~1.7 ms steady state, and that difference turns out to
     /// have over-attributed the part that moved here by about 25%. The inference
-    /// was the best available at the time -- mount had no instrument, which is the
-    /// debt this commit pays -- and the correction is in the direction that makes
+    /// was the best available at the time (mount had no instrument, which is the
+    /// debt this commit pays) and the correction is in the direction that makes
     /// the stage-3 trade slightly better than the project was told, not worse. The
     /// 10-16 ms band pre-registered for this measurement is therefore recorded as
     /// a MISS, low.
@@ -2090,7 +2090,7 @@ impl KateaTreeVolume {
     /// It scales with the folder's cluster count, so a 1 GB folder should now
     /// expect ~19 ms rather than the ~25 ms the old figure implied. If a mount
     /// ever starts feeling slow on a large folder, this is one of the two
-    /// O(folder) terms in it, `seed` being the other -- and both are now readable
+    /// O(folder) terms in it, `seed` being the other, and both are now readable
     /// rather than guessed at.
     fn prime_claim_index(&mut self) {
         if !self.incremental_claims {
@@ -2382,7 +2382,7 @@ impl KateaTreeVolume {
     /// `std::fs::rename`, the deletes, and `stream_file_overlay`'s positioned
     /// write / `set_len`. The first three all run inside `reconcile_mode`, which
     /// calls this unscoped on entry (as it always has) and again, scoped, at each
-    /// mutation -- the scoped calls matter because phase 3 *reads* file bytes and
+    /// mutation. The scoped calls matter because phase 3 *reads* file bytes and
     /// then rewrites them within the same pass, so an entry-only drop would let a
     /// handle opened by the gather serve pre-write bytes afterwards.
     /// `stream_file_overlay` is the fourth and is also reachable from
@@ -2390,7 +2390,7 @@ impl KateaTreeVolume {
     ///
     /// The fifth is outside: `Dos::katea_repair` rewrites CONFIG.SYS and
     /// AUTOEXEC.BAT in the mounted folder and renames the originals aside. It
-    /// does not call this and does not need to -- it finishes by calling
+    /// does not call this and does not need to: it finishes by calling
     /// `mount_hdd_folder`, which builds a whole new volume, so every cache here
     /// is dropped with the old one. That is the only safe way to reach a mounted
     /// folder from outside this module, and it is worth naming because a future
@@ -2500,19 +2500,19 @@ impl KateaTreeVolume {
     /// MOUNTED FOLDER rather than with the size of the write. Per cluster it paid
     /// a `SectorStore` lookup, a `RefCell` borrow for the command window, a
     /// 512-byte copy out of the FAT memo, another into `SectorRead`, and a third
-    /// out of it -- to read four bytes. Measured anchor: a 47 MB folder
+    /// out of it, to read four bytes. Measured anchor: a 47 MB folder
     /// (~12,000 clusters) cost a 1.81 ms worst pass, which extrapolates to
     /// ~19 ms at 500 MB, back into the freeze class.
     ///
-    /// WHAT THIS DOES INSTEAD. The cursor resolves ONE FAT SECTOR -- 128 clusters
-    /// -- and holds the answer:
+    /// WHAT THIS DOES INSTEAD. The cursor resolves ONE FAT SECTOR (128 clusters)
+    ///and holds the answer:
     ///
     /// * if the guest has written that FAT sector, the cursor owns its bytes and
     ///   every entry in it is a four-byte read out of a buffer already in hand;
     /// * if it has not, there is no sector at all. The base-view FAT is a pure
     ///   function of the immutable `fat`/`geo` pair, and
     ///   `ClusterIndex::fat_entry(c)` is exactly the value
-    ///   `fat.fat_sector(c / 128)[4 * (c % 128) ..]` would hold -- the sector
+    ///   `fat.fat_sector(c / 128)[4 * (c % 128) ..]` would hold: the sector
     ///   synthesis fills entry `i` of sector `s` from `fat_entry(s * 128 + i)`.
     ///   So the entry comes from one `HashSet` probe and no 512 bytes move.
     ///
@@ -2542,7 +2542,7 @@ impl KateaTreeVolume {
             //
             // `degraded` is load-bearing here, not defensive tidiness, and it is
             // the adversarial-guest case. `fat_entry` resolves this cluster
-            // through an LBA in FAT copy 1 (or past the FAT region entirely) --
+            // through an LBA in FAT copy 1 (or past the FAT region entirely),
             // an overlay sector the cursor never resolved and therefore never
             // recorded in `walk.sectors`. A memo built from such a walk would
             // depend on a sector outside its own dependency set, and a later
@@ -2658,7 +2658,7 @@ impl KateaTreeVolume {
     /// Uses the same
     /// overlay-shadowed FAT view as `chain_of`, through a `FatWalk` cursor so a
     /// long walk does not materialize a sector per entry. The step cap is
-    /// `max_chain()` -- the same corrupt-chain ceiling `chain_with_token`
+    /// `max_chain()`, the same corrupt-chain ceiling `chain_with_token`
     /// enforces, since a chain can never have more links than there are
     /// clusters. Refusal is decided entirely up front from `steps` against that
     /// cap, so the loop below runs at most `max_chain()` iterations on any
@@ -2667,7 +2667,7 @@ impl KateaTreeVolume {
     ///
     /// A `walk.degraded` read (a spilled FAT sector the store could not read
     /// back) is not special-cased: it yields entry `0` for the affected
-    /// cluster, which classifies as `EndBeforeTarget` -- the same conclusion a
+    /// cluster, which classifies as `EndBeforeTarget`, the same conclusion a
     /// native guest walk would reach hitting the same failed sector.
     pub(crate) fn map_chain(&self, start: u32, steps: u32) -> ChainMapOutcome {
         if !self.cluster_in_range(start) || steps as usize > self.max_chain() {
@@ -2698,7 +2698,7 @@ impl KateaTreeVolume {
     /// Follow the cluster chain starting at `first`, memoized.
     ///
     /// Every chain walk in the reconcile path goes through here, so none of them
-    /// pays `fat_entry`'s per-cluster sector copy -- and none of them re-walks a
+    /// pays `fat_entry`'s per-cluster sector copy, and none of them re-walks a
     /// chain whose FAT sectors nothing has written since the last walk. The
     /// result is `katea_write::chain`'s, unchanged, in both cases; see
     /// [`ChainMemo`] for why the second one is the same answer and not merely a
@@ -2711,7 +2711,7 @@ impl KateaTreeVolume {
     ///
     /// The whole-volume test first: with no FAT write at all since the memo was
     /// taken, nothing needs checking. Otherwise every sector the walk read is
-    /// compared against the epoch at which it was last written -- a handful of
+    /// compared against the epoch at which it was last written: a handful of
     /// probes for a chain of any length, because a FAT sector covers 128
     /// clusters.
     fn chain_memo_is_current(&self, memo: &ChainMemo) -> bool {
@@ -2730,7 +2730,7 @@ impl KateaTreeVolume {
 
     /// A chain walk plus the token that dates it, for the claim index.
     ///
-    /// `None` for the token means the walk was DEGRADED -- it read substituted
+    /// `None` for the token means the walk was DEGRADED: it read substituted
     /// zeros for an unreadable spilled FAT sector, or followed a link past FAT
     /// copy 0 through a sector it never recorded. Such a walk is not memoized and
     /// must not be claimed either: its answer is a function of an I/O failure or
@@ -2797,7 +2797,7 @@ impl KateaTreeVolume {
     /// Whether `c` is a valid data cluster (`2 ..= count_of_clusters + 1`). A FAT
     /// link outside this range is a corrupt or guest-crafted pointer; reconcile
     /// holds such a chain rather than computing an out-of-range LBA (which would
-    /// overflow `u32` in debug for large cluster sizes — and reads garbage in
+    /// overflow `u32` in debug for large cluster sizes, and reads garbage in
     /// release). Conservative: never materialize from an out-of-range chain.
     fn cluster_in_range(&self, c: u32) -> bool {
         (ROOT_CLUSTER..=self.geo.count_of_clusters + 1).contains(&c)
@@ -2828,7 +2828,7 @@ impl KateaTreeVolume {
             // caller of `SectorStore::insert` and routes every FAT-region LBA
             // through here, so stamping the sector here is what makes
             // [`ChainMemo`]'s dependency test sound. Taken modulo `fatsz`, so a
-            // write to either FAT copy expires memos that read the first -- the
+            // write to either FAT copy expires memos that read the first: the
             // conservative direction, and free.
             #[cfg(test)]
             if self.suppress_epoch_stamps {
@@ -2921,8 +2921,8 @@ impl KateaTreeVolume {
     /// else: the store no longer holds it. A chain that moves such a cluster to
     /// another index, or to another file, must therefore copy the bytes through
     /// the projection that still maps them (a gather) before that projection
-    /// is replaced. Streaming under the new indexes writes nothing -- the
-    /// sectors are not pending -- and installing the new projection would make
+    /// is replaced. Streaming under the new indexes writes nothing (the
+    /// sectors are not pending) and installing the new projection would make
     /// every later read and write of the cluster resolve to the wrong offset.
     /// Issue #729: a guest overwrite that re-points a file's head at its old
     /// second cluster after the payload landed lost the payload this way.
@@ -2955,7 +2955,7 @@ impl KateaTreeVolume {
         // write for any sibling entry drags this file through reconcile against
         // a size from before its payload existed. Truncating to that size would
         // destroy payload already acknowledged out of the store, and a later
-        // size update would then extend the file with zeros -- guest-visible
+        // size update would then extend the file with zeros: guest-visible
         // loss with no way back. Deliberate truncation still lands: it arrives
         // as a *changed* entry size while the projection is not extended.
         let existing = self
@@ -2965,7 +2965,7 @@ impl KateaTreeVolume {
         let mut set_len = pending.set_len;
         // Compare at sector granularity. A streamed extent is rounded up to the
         // sector that carried it, so a closing size inside that last sector is
-        // the entry catching up, not a shrink -- only a size that would drop a
+        // the entry catching up, not a shrink: only a size that would drop a
         // whole acknowledged sector is the stale-entry case.
         let declared_sectors = u64::from(pending.size).div_ceil(SECTOR as u64) * SECTOR as u64;
         let extended_past_directory = match existing {
@@ -3081,7 +3081,7 @@ impl KateaTreeVolume {
             // `acknowledge` is the other way the store's answer for an LBA can
             // change, and this is its only caller. [`ChainMemo`] is sound only
             // because what it drops is always a projected file's DATA sectors,
-            // never a FAT one -- the memo has no hook here and needs none.
+            // never a FAT one: the memo has no hook here and needs none.
             debug_assert!(
                 lba >= self.geo.part_start + self.geo.first_data_sector,
                 "acknowledged a metadata sector ({lba}): the chain memo has no \
@@ -3122,7 +3122,7 @@ impl KateaTreeVolume {
         let spc = u32::from(self.geo.spc);
         let mut files = ProjectedBatch::new();
         // The candidate set is this command's own writes plus the held sectors
-        // that could have changed status since the last commit -- the ones in a
+        // that could have changed status since the last commit: the ones in a
         // cluster this command touched, and the ones in a cluster a projection
         // has claimed. Every other held sector is in a cluster nothing has
         // touched and no projection owns, so it would reach the same verdict it
@@ -3216,9 +3216,9 @@ impl KateaTreeVolume {
             return;
         }
         // Ask the reverse index which projections own a dirtied cluster rather
-        // than rescanning every projected chain. The two select the same keys --
-        // `projected_clusters` holds exactly the clusters of every projected
-        // chain -- but scanning cost the total cluster count of the whole mount
+        // than rescanning every projected chain. The two select the same keys
+        // (`projected_clusters` holds exactly the clusters of every projected
+        // chain) but scanning cost the total cluster count of the whole mount
         // on every command that touched the FAT, which is most commands of a
         // sequential install.
         let affected_keys: HashSet<(u32, [u8; 11])> = self
@@ -3281,7 +3281,7 @@ impl KateaTreeVolume {
     /// `sync_all`, not `flush`: `File::flush` is a documented no-op, because a
     /// `File` has no userspace buffer to push. The guest reaches this through
     /// ATA FLUSH CACHE (0xE7), which on real hardware promises the write cache
-    /// has reached the platter -- reporting success after a no-op would be a
+    /// has reached the platter: reporting success after a no-op would be a
     /// durability claim this disk never made good on.
     ///
     /// The cost is scoped to the explicit-flush path by its callers: only
@@ -3399,7 +3399,7 @@ impl KateaTreeVolume {
     ///
     /// * its chain will not resolve (`chain_of` returns `None`);
     /// * a chain link is outside the data region;
-    /// * `parse_dir` stops at a zeroed entry with live entries behind it -- the
+    /// * `parse_dir` stops at a zeroed entry with live entries behind it, the
     ///   hazard `reconcile_mode`'s own entry comment names, and exactly what an
     ///   installer zeroing a directory cluster mid-write produces.
     ///
@@ -3410,7 +3410,7 @@ impl KateaTreeVolume {
     /// direction the anti-clobber guard cannot afford. So the verdict is reported
     /// and `ambiguous_files` falls back to the full scan when it is false.
     ///
-    /// A directory that exists but is not in `dir_paths` is not "incomplete" --
+    /// A directory that exists but is not in `dir_paths` is not "incomplete":
     /// it is not visited at all, by design (a just-MKDIR'd subdir is registered
     /// by the materialize phase and gathered on the next pass), and the full scan
     /// does not see it either.
@@ -3502,7 +3502,7 @@ impl KateaTreeVolume {
 
     /// Reconcile the overlay to the host folder: walk every known directory and
     /// atomically materialize each *complete, touched, changed* 8.3 file, and
-    /// create host subdirectories for MKDIR'd entries. Conservative — an
+    /// create host subdirectories for MKDIR'd entries. Conservative: an
     /// incomplete or ambiguous entry is held in the overlay and retried next pass.
     /// This entry point is the forced final pass used by explicit flush/eject.
     pub(crate) fn reconcile(&mut self) {
@@ -3564,7 +3564,7 @@ impl KateaTreeVolume {
                     for lba in stranded {
                         self.note_unmapped(lba);
                     }
-                    // A held sector's cluster can be projectable already -- what
+                    // A held sector's cluster can be projectable already: what
                     // failed is the host write, which is not a projection event.
                     // `stream_projected_batch` drained the revisit tickets at its
                     // top and then aborted, so re-arm every cluster still holding
@@ -3694,7 +3694,7 @@ impl KateaTreeVolume {
     /// 1. **Order-independence.** `HashMap::insert` keeps the last writer, so
     ///    three files claiming one cluster flag pairwise on each insert and all
     ///    three end up in the set, whatever order `live` is in.
-    /// 2. **A file does not collide with itself.** `other != key` — so two
+    /// 2. **A file does not collide with itself.** `other != key`, so two
     ///    directory entries with the SAME key (a guest can write duplicate 8.3
     ///    names) union their chains rather than flagging each other, and a chain
     ///    that revisits a cluster is impossible anyway (it would not terminate,
@@ -3708,7 +3708,7 @@ impl KateaTreeVolume {
     /// two ever disagree, this one is right.
     ///
     /// Cost: O(clusters in the mounted folder), every pass, for a write that
-    /// touched one file. Measured at 4.92 ms per pass on a 498 MB folder — 77% of
+    /// touched one file. Measured at 4.92 ms per pass on a 498 MB folder, 77% of
     /// the projection wall.
     fn ambiguous_by_full_scan(&self, live: &[LiveEntry]) -> HashSet<(u32, [u8; 11])> {
         let mut cluster_claims: HashMap<u32, (u32, [u8; 11])> = HashMap::new();
@@ -3753,8 +3753,8 @@ impl KateaTreeVolume {
     /// claimant if that makes the cluster contested for the first time.
     ///
     /// THE UNDER-FLAG HAZARD THIS CLOSES. A file's chain can be perfectly
-    /// unchanged -- its FAT token still current, so the index never revisits it
-    /// -- while a cluster it holds BECOMES a directory cluster underneath it.
+    /// unchanged (its FAT token still current, so the index never revisits it)
+    ///while a cluster it holds BECOMES a directory cluster underneath it.
     /// Nothing in the FAT epoch sees that, so the growth side of
     /// `directory_clusters` needs its own hook. It is O(clusters added), which is
     /// one directory chain, not the mount.
@@ -3835,7 +3835,7 @@ impl KateaTreeVolume {
             }
         }
         // One entry per cluster per KEY, so the key appears at most once in each
-        // `claimants` list -- which is what makes the 2 -> 1 transition in
+        // `claimants` list, which is what makes the 2 -> 1 transition in
         // `retract_claim` exact. A single chain cannot repeat a cluster (that
         // would not terminate and `katea_write::chain` returns `None`), so the
         // sort is needed ONLY to collapse an overlap between two entries sharing
@@ -3902,7 +3902,7 @@ impl KateaTreeVolume {
     ///
     /// `dirs_complete` is `gather_live`'s verdict on its own output. It is not a
     /// nicety: `gather_live` has three paths that drop a whole directory without
-    /// `store.read_errors()` moving -- a chain that will not resolve, a chain
+    /// `store.read_errors()` moving: a chain that will not resolve, a chain
     /// link out of range, and `parse_dir` stopping at a zeroed entry with live
     /// entries behind it, which is precisely what an installer zeroing a
     /// directory cluster mid-write produces. Retracting keys off such a live set
@@ -4086,7 +4086,7 @@ impl KateaTreeVolume {
             ));
         }
 
-        // PHASE 2: disappearances — a mirrored entry no longer live is a rename/move
+        // PHASE 2: disappearances. A mirrored entry no longer live is a rename/move
         // (a fresh entry claims its clusters), a delete (chain freed, no claimant), or
         // held. Collected read-only, then applied. `handled` tells phase 3 to skip an
         // entry already moved/renamed here.
@@ -4262,8 +4262,8 @@ impl KateaTreeVolume {
             // directory whose chain SHRINKS leaves its freed clusters behind. A
             // file that later reuses one has those sectors read as metadata:
             // held in the store rather than projected, and the file marked
-            // ambiguous. Conservative -- nothing is lost, the final reconcile
-            // still writes it -- but it is a permanent per-session leak.
+            // ambiguous. Conservative: nothing is lost, the final reconcile
+            // still writes it, but it is a permanent per-session leak.
             //
             // The projection-cost follow-up measured it and left it. The leak
             // is bounded by the clusters a directory has ever held, which is
@@ -4765,7 +4765,7 @@ impl KateaTreeVolume {
     /// Byte-identical to `self.fat.fat_sector(within, &self.geo)` by construction:
     /// `fat` and `geo` are immutable after `new`, so that call is a pure function
     /// of `within` and any two evaluations agree. The memo therefore cannot change
-    /// what any read ordering observes -- it only decides whether the same bytes
+    /// what any read ordering observes: it only decides whether the same bytes
     /// are recomputed or copied. See [`Self::fat_sector_cache`] for why it pays.
     fn base_fat_sector(&self, within: u32) -> [u8; SECTOR] {
         if let Some((cached_within, bytes)) = self.fat_sector_cache.borrow().as_ref()
@@ -4806,7 +4806,7 @@ impl KateaTreeVolume {
         // out clusters from one monotonically increasing counter, and
         // `clusters_for` floors every count at 1, so `last >= first` always and no
         // two runs overlap. Those three facts are exactly what makes a binary
-        // search return the same run the old linear `find` did -- for a cluster in
+        // search return the same run the old linear `find` did: for a cluster in
         // some run, that run is the unique one, and for a cluster in none, the
         // candidate fails the `last` test and it reads back as free space.
         //
@@ -4864,7 +4864,7 @@ impl KateaTreeVolume {
 /// Flatten the tree depth-first into `dirs`/`files` + the cluster-run table. The
 /// recursion order matches `assign_dir` (dir chain, then its files, then its
 /// subdirs), but `read_sector` searches `runs` by cluster, so the order is not
-/// load-bearing for reads — only for keeping each entity's run contiguous.
+/// load-bearing for reads, only for keeping each entity's run contiguous.
 fn flatten(
     dir: &TreeDir,
     is_root: bool,
@@ -4952,7 +4952,7 @@ fn read_host_span(
         return SectorRead::ok(out);
     }
     // A read-ahead hit is a memcpy out of RAM and nothing else: no open, no seek,
-    // no read, and no entry in the wall counters -- the same accounting the
+    // no read, and no entry in the wall counters, the same accounting the
     // command window already gets, for the same reason. The range test is exact
     // (same path, and the whole sector inside the buffered byte range), so the
     // bytes are the bytes a fresh positioned read would have returned, provided
@@ -4990,7 +4990,7 @@ fn read_host_span(
     }
 
     // Below the hit test, not above it. A hit does no host I/O, does not enter
-    // `host_wall_ns`, and returns before this value is ever read -- so taking the
+    // `host_wall_ns`, and returns before this value is ever read, so taking the
     // timestamp first was a `QueryPerformanceCounter` bought and thrown away on
     // every hit (duke486 E2: 10,625 of them). From here on the function always
     // reaches the tally, so the clock read is always used.
@@ -5004,7 +5004,7 @@ fn read_host_span(
     // The command window may only ever cover sectors this command asked for AND
     // that are LBA-contiguous in this file, which is what `command_sectors`
     // encodes. The read-ahead is under no such limit: it is keyed by file byte
-    // offset, so it stays correct however the guest's clusters are laid out --
+    // offset, so it stays correct however the guest's clusters are laid out,
     // which is why it, and not the window, is allowed to run past the command.
     let requested = u64::from(context.command_sectors.max(1)) * SECTOR as u64;
     let fill = requested.max(ramp.min(context.readahead_max));

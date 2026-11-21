@@ -161,7 +161,7 @@ start:
     ; getpos may show motion without the button. Don't fail on a single sample: keep
     ; polling within the cap for a sample where the held button and the motion coincide.
     ; This samples the button over a window, not one cycle point, so the check is robust
-    ; to where the host's per-chunk injection lands in the guest cycle cadence -- any
+    ; to where the host's per-chunk injection lands in the guest cycle cadence: any
     ; boot-path change (e.g. Katea's extra ATA probe on the HLE-C: fallback) shifts that
     ; cadence and otherwise flips this single-point sample pass<->fail.
     test word [last_btn], 0x0001

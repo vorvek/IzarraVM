@@ -48,7 +48,7 @@ fn int16_peek_available_clears_guest_zf() {
 fn int16_returns_extended_scancode_for_up_arrow() {
     // Up arrow is the bare scancode 0x48 (make) / 0xC8 (break); no 0xE0 prefix.
     // The layout table has no ASCII for it, so INT 16h returns scancode 0x48
-    // with ASCII 0 -- the value a full-screen editor keys arrow navigation off.
+    // with ASCII 0, the value a full-screen editor keys arrow navigation off.
     assert_eq!(int16_read_after(&[0x48, 0xC8]), 0x4800);
 }
 

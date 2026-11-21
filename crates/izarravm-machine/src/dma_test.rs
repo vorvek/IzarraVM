@@ -15,8 +15,8 @@ const TEST_TOTALS_ENVELOPE_ID: u32 = 0x7ffe_0001;
 /// ignored, because A16 comes from the counter) and the channel's word counter
 /// supplies A16-A1 with A0 tied low.
 ///
-/// Drivers program it as Linux's `set_dma_addr` does -- page `addr >> 16`,
-/// counter `(addr >> 1) & 0xFFFF` -- so shifting the whole page byte left by 17
+/// Drivers program it as Linux's `set_dma_addr` does (page `addr >> 16`,
+/// counter `(addr >> 1) & 0xFFFF`) so shifting the whole page byte left by 17
 /// would count the page twice and land a 128 KB window past the buffer.
 fn slave_byte_addr(page: u8, word_addr: u16) -> u32 {
     ((u32::from(page) & 0xFE) << 16) | (u32::from(word_addr) << 1)
@@ -1253,8 +1253,8 @@ fn a_rejected_block_cycle_does_not_latch_the_channel_active() {
 /// A 16-bit DMA buffer must be read from the address the driver programmed, not
 /// one page-shift further on. This is the defect that silenced Quake: it runs
 /// its SB16 output on channel 5 (16-bit, auto-init) and every counter looked
-/// healthy -- transfers ticking, IRQs firing, the resampler producing a full
-/// 44.1 kHz stream -- while the fetch came from the wrong 128 KB window, so the
+/// healthy (transfers ticking, IRQs firing, the resampler producing a full
+/// 44.1 kHz stream) while the fetch came from the wrong 128 KB window, so the
 /// mixer received a region that happened to be zeros. Doom was unaffected
 /// because it drives the 8-bit path on channel 1.
 #[test]
@@ -1353,7 +1353,7 @@ fn armed_count_slides_monotonically_at_quarter_marks() {
     );
     // At the deadline the window steps aside and reports the live cur_count,
     // which no byte has actually moved in this test (arm_transfer_window was
-    // called with no read_byte/read_word grants in between) -- so it is back
+    // called with no read_byte/read_word grants in between), so it is back
     // at the raw, un-interpolated value. This is deliberate: slice 9B never
     // changes what the device itself does, only what a PEEK reports while the
     // window is open.

@@ -1564,7 +1564,7 @@ fn dma_semantic_state_and_event_totals_share_one_read_only_capture() {
 #[test]
 fn rtc_pic_and_timeline_payloads_share_one_read_only_capture() {
     // Subject is capture/restore semantics of the RTC/PIC/timeline payloads at one
-    // capture boundary, not ISA batch-timing accounting -- the `write_rtc_port` calls
+    // capture boundary, not ISA batch-timing accounting: the `write_rtc_port` calls
     // below are setup, going through `machine.make_bus()` directly rather than a CPU
     // batch. Pin the ISA-wait arm OFF for this test so those raw setup pokes don't
     // leave an uncommitted charge sitting on `port_bus_batch_clocks`, which would refuse
@@ -1695,7 +1695,7 @@ fn serviced_unit_tester_noop_commands_leave_the_payload_stable() {
 #[test]
 fn speaker_payload_pins_every_port_61_latch_value() {
     // Subject is the speaker payload's pinned encoding of every port 0x61 latch
-    // value, not ISA batch-timing accounting -- `write_speaker_port`/`read_speaker_port`
+    // value, not ISA batch-timing accounting: `write_speaker_port`/`read_speaker_port`
     // are raw `machine.make_bus()` probes, not CPU batches, so each one leaves an
     // uncommitted charge that would refuse the capture inside `speaker_payload` for a
     // reason unrelated to what this test pins. Pin the arm OFF; the armed arm's
@@ -1722,7 +1722,7 @@ fn speaker_payload_pins_every_port_61_latch_value() {
 #[test]
 fn speaker_latch_and_pit_gate_remain_independent_owners() {
     // Subject is that the speaker latch and the PIT channel-2 gate are independently
-    // owned, not ISA batch-timing accounting -- `write_speaker_port`/`read_speaker_port`
+    // owned, not ISA batch-timing accounting: `write_speaker_port`/`read_speaker_port`
     // are raw bus probes outside any CPU batch, so pin the arm OFF here (see
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
     // armed arm's capture-after-a-charged-batch behavior is covered by
@@ -2626,7 +2626,7 @@ fn pci_config_capture_is_read_only_and_excludes_connected_device_state() {
 #[test]
 fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
     // "Batch" here means splitting device-tick advancement into one call versus two
-    // (whole vs. split), not the ISA I/O batch this knob accrues against -- the subject
+    // (whole vs. split), not the ISA I/O batch this knob accrues against: the subject
     // is RTC/PIC state equality across that split, and the `write_rtc_port` calls are
     // setup via a raw bus probe. Pin the arm OFF so setup doesn't leave an uncommitted
     // charge; the armed arm's capture-after-a-charged-batch behavior is covered by
@@ -2675,7 +2675,7 @@ fn rtc_periodic_update_and_alarm_state_is_batch_invariant() {
 #[test]
 fn rtc_and_pic_commit_the_irq8_deadline_at_one_capture_boundary() {
     // Subject is the RTC/PIC IRQ8 deadline commit at a capture boundary, not ISA
-    // batch-timing accounting -- the `write_rtc_port`/`read_rtc_port` calls are raw
+    // batch-timing accounting: the `write_rtc_port`/`read_rtc_port` calls are raw
     // bus probes, not CPU batches, so pin the arm OFF (see
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
     // armed arm's capture-after-a-charged-batch behavior is covered by
@@ -2854,7 +2854,7 @@ fn pit_capture_preserves_status_and_count_latch_read_order() {
 #[test]
 fn pit_capture_preserves_the_exact_586_irq0_deadline() {
     // Subject is the exact IRQ0 deadline the PIT payload pins across capture, not ISA
-    // batch-timing accounting -- `configured()`'s `write_pit_port`/`write_pic_port`
+    // batch-timing accounting: `configured()`'s `write_pit_port`/`write_pic_port`
     // calls are raw bus probes, not CPU batches, so pin the arm OFF (see
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
     // armed arm's capture-after-a-charged-batch behavior is covered by
@@ -2927,7 +2927,7 @@ fn pit_capture_preserves_the_exact_586_irq0_deadline() {
 #[test]
 fn pit_timeline_and_pic_payloads_match_split_586_advancement() {
     // "Split" here means splitting device-clock advancement into several calls versus
-    // one (whole vs. split), not the ISA I/O batch this knob accrues against -- the
+    // one (whole vs. split), not the ISA I/O batch this knob accrues against: the
     // subject is PIT/timeline/PIC payload equality across that split, and
     // `configured()`'s port writes are raw bus probes. Pin the arm OFF (see
     // `speaker_payload_pins_every_port_61_latch_value` for the full rationale; the
@@ -3158,7 +3158,7 @@ fn construction_seed_writes_never_accrue_isa_bus_time() {
     // A defect found in the `IZARRAVM_ISA_IO_WAIT` slice. `new_raw_program`
     // seeds PIT counter 0 with three `write_io` calls (dos.rs) and programs the 8259 pair,
     // modelling POST work that happened before the guest existed. With the charge armed
-    // those writes accrued three ISA periods into `port_bus_batch_clocks` -- an accrual with no
+    // those writes accrued three ISA periods into `port_bus_batch_clocks`, an accrual with no
     // batch to belong to, which whichever batch ran first would have paid, and which made
     // the machine uncapturable in the meantime. They go through `make_construction_bus`,
     // which disarms the charge; a freshly constructed machine must therefore hold zero and
@@ -3184,11 +3184,11 @@ fn armed_isa_io_wait_captures_cleanly_after_a_pit_batch_boundary() {
     // batch is flushed by the run loop's own batch-end step
     // (`std::mem::take(&mut self.port_bus_batch_clocks)` in `run_until_tick`) before the
     // run call returns, so canonical capture succeeds right after. No per-thread
-    // override is used here -- this is the armed arm's OWN contract, complementing the
+    // override is used here: this is the armed arm's OWN contract, complementing the
     // arm-pinned-OFF sibling tests elsewhere in this module that isolate PIT/RTC/
     // speaker capture semantics from a raw, batch-external port probe.
     let rom = rom_with_code(&[
-        0xb0, 0x34, 0xe6, 0x43, // OUT 0x43, AL -- a charged PIT control-word write
+        0xb0, 0x34, 0xe6, 0x43, // OUT 0x43, AL: a charged PIT control-word write
         0xf4, // HLT
     ]);
     let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
@@ -3655,7 +3655,7 @@ fn speaker_latch_survives_a_real_586_test_exit_boundary() {
     // Subject is that the speaker latch survives capture at a real TestExit boundary,
     // not ISA batch-timing accounting. The guest OUT 0x61 inside the ROM is charged and
     // properly flushed by the run loop's own batch-end step (TestExit is itself a
-    // captureable batch boundary -- see `unit_tester_exit_zero_is_a_captureable_batch_
+    // captureable batch boundary; see `unit_tester_exit_zero_is_a_captureable_batch_
     // boundary`), so that part needs no override. But the trailing `read_speaker_port`
     // probe below is a raw `machine.make_bus()` access with no batch to flush its
     // charge into, which would refuse the final capture with `UncommittedBatchTiming`

@@ -11,13 +11,13 @@
 //! the REAL 486's cache geometry rather than `CacheModel`'s direct-mapped
 //! 64-byte-line arrays (which price the guest and are untouched by this file):
 //! 8 KiB, 4-way set associative, 16-byte lines, 128 sets, pseudo-LRU
-//! replacement -- Intel i486 Microprocessor Hardware Reference Manual (1990)
+//! replacement. Intel i486 Microprocessor Hardware Reference Manual (1990)
 //! §4.2, and the i486DX2 Microprocessor Data Book (Jul 1992) §5/§6.1.
 //!
 //! Every counter here is diagnostic-only, exactly like `OplProbe`: never read
 //! by any emulation decision, never part of canonical state, and safe to
 //! recompute differently across a save/restore round trip. Coverage is
-//! necessarily partial -- see the module doc on `probe` for what it does and
+//! necessarily partial. See the module doc on `probe` for what it does and
 //! does not see.
 //!
 //! ## Persona
@@ -41,7 +41,7 @@
 //! ## Invalidation
 //!
 //! The array is flushed (every tag and every LRU byte reset) on INVD, WBINVD,
-//! and a persona change -- the same events a real i486 flushes its own cache
+//! and a persona change, the same events a real i486 flushes its own cache
 //! on ("the on-chip cache to be flushed", Nov89 Sec 5.7; "all 128 sets of
 //! three LRU bits are set to 0"). INVD/WBINVD reach it through
 //! `CpuBus::note_cache_flush`, called from `izarravm_cpu`'s two-byte-opcode
@@ -186,7 +186,7 @@ const fn plru_touch(bits: u8, way: usize) -> u8 {
 /// PLRU victim (DX2 Sec 5.5). This array always asks `plru_victim` and never
 /// looks for an `EMPTY_TAG` way. From the cold state (`plru` all zero, every
 /// tag `EMPTY_TAG`) the tree's own fill order happens to visit ways
-/// 0, 2, 1, 3 -- all four, no repeats -- before it can repeat any way, and a
+/// 0, 2, 1, 3 (all four, no repeats) before it can repeat any way, and a
 /// hit only ever re-marks an already-filled way. So no valid line is ever
 /// evicted while an empty way still exists; the shortcut is unobservable here,
 /// not because the code checks for it, but because the tree shape guarantees
@@ -210,7 +210,7 @@ impl ShadowTags {
     /// No-write-allocate (DX2 Data Book Sec 5.3): a HIT (read or write)
     /// touches PLRU like any real access. A READ MISS installs the line (a
     /// real fill) and touches PLRU for the new line. A WRITE MISS installs
-    /// NOTHING and touches no PLRU bit -- the i486 never allocates a line for
+    /// NOTHING and touches no PLRU bit: the i486 never allocates a line for
     /// a write that misses, so there is nothing on real silicon for this
     /// probe to mark as used.
     fn probe(&mut self, phys: u32, is_write: bool) -> bool {
@@ -276,7 +276,7 @@ pub struct ShadowL1Probe {
 }
 
 /// `IZARRAVM_SHADOW_L1_PROBE`: unset or any value other than exactly `"1"` is
-/// OFF (the repo's off-spelling convention -- `""` is not a distinct signal
+/// OFF (the repo's off-spelling convention: `""` is not a distinct signal
 /// from unset, see the env-null-empty trap). `"1"` turns the probe on.
 fn shadow_l1_probe_enabled() -> bool {
     std::env::var("IZARRAVM_SHADOW_L1_PROBE").as_deref() == Ok("1")
@@ -316,7 +316,7 @@ impl ShadowL1Probe {
 
     /// Flush the tag array (INVD/WBINVD/reset/persona change). Counters are
     /// cumulative performance data, not cache state, and are NOT reset by a
-    /// flush -- a real flush invalidates lines, it does not erase a
+    /// flush: a real flush invalidates lines, it does not erase a
     /// performance counter.
     pub(crate) fn flush(&mut self) {
         self.tags.flush();

@@ -165,7 +165,7 @@ fn margo_store_dump_ignores_the_active_mux() {
 #[test]
 fn vbe_mode_set_alone_does_not_move_the_register_derived_mux() {
     // On real hardware a VBE mode set is a 2D-side (Margo) affair and never
-    // touches FBIINIT0 -- see `set_distira_vga_pass`. The display stays with
+    // touches FBIINIT0. See `set_distira_vga_pass`. The display stays with
     // Distira until the GUEST writes the bit back to 0, which is what Tomb
     // Raider Gold's Glide driver does before handing off to WVIDEO for an
     // FMV (`guest_clearing_fbiinit0_yields_distira_and_publishes_margo`
@@ -220,7 +220,7 @@ fn guest_resetting_fbiinit0_restores_distira_over_a_yielded_vbe_session() {
     // resumes Glide gameplay. That latch is deleted here in favour of the
     // register truth: on real
     // hardware neither a VBE mode set, nor SWAPBUFFER, nor a rasterised
-    // triangle can move the mux -- only the guest's own FBIINIT0 write can,
+    // triangle can move the mux: only the guest's own FBIINIT0 write can,
     // and the fixture evidence (portlog + presented-frame captures) is that
     // Tomb Raider Gold's Glide driver does write it on both edges.
     let mut machine = test_machine();
@@ -230,7 +230,7 @@ fn guest_resetting_fbiinit0_restores_distira_over_a_yielded_vbe_session() {
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
 
     // A stray triangle and swap during the yielded session must not retake
-    // the cable -- the mux does not track "who is producing pixels".
+    // the cable: the mux does not track "who is producing pixels".
     machine.vega.distira_mut().set_frame_size(4, 4);
     machine.vega.distira_mut().draw_triangle([
         izarravm_video::DistiraVertex::rgb(0.0, 0.0, 255, 0, 0),
@@ -259,11 +259,11 @@ fn write_distira_u32(machine: &mut Machine, offset: usize, value: u32) {
     }
 }
 
-/// Write FBIINIT0 bit 0 through the bus -- the guest's only lever for the
+/// Write FBIINIT0 bit 0 through the bus, the guest's only lever for the
 /// display mux (86Box `vid_voodoo.c:744-761`, DOSBox-X
 /// `voodoo_emu.cpp:1764-1775`: both derive it purely from that bit, bit 0
-/// SET routing the Voodoo onto the cable). Nothing else in this file --
-/// not a VBE mode set, not SWAPBUFFER, not a rasterised triangle -- may
+/// SET routing the Voodoo onto the cable). Nothing else in this file
+/// (not a VBE mode set, not SWAPBUFFER, not a rasterised triangle) may
 /// move the mux; only a guest write of this register does, which is
 /// exactly what Tomb Raider Gold's Glide driver does around its FMVs.
 fn set_distira_vga_pass(machine: &mut Machine, enabled: bool) {
@@ -1004,7 +1004,7 @@ fn copper_bar_split_through_the_machine() {
     machine.video_mut().write_port(0x3CE, 0x08);
     machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
     // Fill the visible region of plane 0 (offset 0..8000 covers 200 lines * 40
-    // bytes) through the machine memory path — exercises the A0000 routing.
+    // bytes) through the machine memory path. Exercises the A0000 routing.
     for off in 0..8000u32 {
         machine.write_physical_u8(0x000A_0000 + off, 0xFF);
     }
@@ -1268,7 +1268,7 @@ fn presented_frame_generation_waits_for_the_matching_completed_raster() {
 //
 // `presented_frame_argb` answers "the most recently completed display frame".
 // There are two moments when there is none: before the first frame of the run,
-// and between a mode set and the first raster of the new mode — every mode set
+// and between a mode set and the first raster of the new mode: every mode set
 // drops the presented frame on purpose, so a consumer is never handed a frame
 // with the previous mode's geometry.
 //
@@ -1413,7 +1413,7 @@ fn frame_generation_tracks_hle_bios_graphics_writes() {
         "INT 10h AH=0Ch write-pixel must bump the generation (HLE bypasses the bus)"
     );
 
-    // CGA graphics (mode 04h), INT 10h AH=0Eh TELETYPE — draws a glyph as pixels.
+    // CGA graphics (mode 04h), INT 10h AH=0Eh TELETYPE: draws a glyph as pixels.
     let mut cga = int15_machine(16);
     cga.cpu.registers.set_eax(0x0004); // set CGA graphics mode 04h
     cga.handle_int10();
@@ -1438,7 +1438,7 @@ fn frame_generation_tracks_hle_bios_graphics_writes() {
     );
 
     // A palette change via INT 10h AH=10h AL=10h (set one DAC register) in mode 13h
-    // — the classic graphics output change with no VRAM write — must bump too.
+    //(the classic graphics output change with no VRAM write) must bump too.
     let mut pal = int15_machine(16);
     pal.video_mut().set_mode13h();
     let before = pal.frame_generation().expect("mode 13h graphics");
@@ -1721,7 +1721,7 @@ fn mode13h_presents_identically_through_both_frame_paths() {
 ///
 /// `presented_frame_argb` answers by truncating to what was rendered. The delta
 /// path must present exactly that, and in particular must not answer `None`:
-/// that is the placeholder-frame failure mode from the other side -- a screen
+/// that is the placeholder-frame failure mode from the other side: a screen
 /// that goes dark for as long as the guest holds the timing, in a moment where
 /// there IS a frame to show.
 #[test]

@@ -357,7 +357,7 @@ fn ltim_keyboard_request_stays_asserted_until_the_guest_reads_obf() {
 // ---------------------------------------------------------------------------
 // Slice 9A of the device-timing design: the 8259A
 // INTA instrument's PIT-edge-to-IRQ0-handler-entry histogram. Certifies that
-// under TODAY's model (no INTA-turnaround charge -- that belongs to slice 8)
+// under TODAY's model (no INTA-turnaround charge; that belongs to slice 8)
 // a PIT edge immediately followed by the IRQ0 acknowledge records exactly one
 // sample at zero extra delay, so slice 8 has a certifier to move the sample
 // off the zero bucket against.
@@ -429,7 +429,7 @@ fn irq0_entry_diagnostics_bucket_a_deliberately_delayed_acknowledge() {
     assert!(fired, "IRQ0 never asserted");
 
     // Let a handful of guest clocks pass BEFORE the acknowledge, so the sample
-    // must NOT land in the zero bucket -- proving the histogram actually
+    // must NOT land in the zero bucket, proving the histogram actually
     // measures elapsed time rather than always recording zero.
     let delay_ticks = machine.timeline.master_ticks_for_cpu_clocks(40);
     machine.advance_devices_ticks(delay_ticks);

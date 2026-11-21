@@ -7,7 +7,7 @@
 //! **deadline lane** (`MASTER_CLOCK_HZ` ticks: *when* a device event fires),
 //! never the charge lane (`guest_clocks`, what rt divides). Nothing this knob
 //! controls may touch `level_timing`, `bus_timing`, `wait_states.io` or any
-//! `clocks(N)` literal -- see the design's §3.3 point 4.
+//! `clocks(N)` literal. See the design's §3.3 point 4.
 //!
 //! `DeviceTimingProfile` is parsed exactly ONCE, at `Machine::new`
 //! (`default-off-instruments-tax-hot-path`: never re-read `std::env` on a hot
@@ -16,7 +16,7 @@
 //!
 //! **Unset or empty is today's behaviour, bit-identical.** Per
 //! `parameter-knobs-have-no-off-spelling`, there is deliberately no `=0`
-//! spelling -- the "off" arm for a *family list* is the empty list, which is
+//! spelling: the "off" arm for a *family list* is the empty list, which is
 //! also what unset and `""` both parse to.
 //!
 //! ```text
@@ -25,7 +25,7 @@
 //! ```
 //!
 //! Families, exactly as the design's §3.1 names them: `pic dma ata cd fdc kbc
-//! sb`. `period` is a whole-profile alias, not a family name of its own --
+//! sb`. `period` is a whole-profile alias, not a family name of its own:
 //! `IZARRAVM_DEVICE_TIMING=period,ata` is redundant, not an error, since
 //! `period` already implies every family.
 //!
@@ -76,7 +76,7 @@ impl DeviceTimingProfile {
         }
     }
 
-    /// True when no family is armed -- the knob-unset identity arm, and the
+    /// True when no family is armed: the knob-unset identity arm, and the
     /// one `9-0`'s fixture certifies.
     // Test-only: `device_timing_test.rs` calls it.
     #[cfg(test)]
@@ -108,7 +108,7 @@ pub(crate) fn device_timing_profile_default() -> DeviceTimingProfile {
 fn parse_device_timing_profile(value: Result<String, std::env::VarError>) -> DeviceTimingProfile {
     let raw = match value {
         Err(std::env::VarError::NotPresent) => return DeviceTimingProfile::none(),
-        // Not-UTF-8 is not a spelling of any arm -- someone set the variable
+        // Not-UTF-8 is not a spelling of any arm: someone set the variable
         // and meant something by it, so this must not fall back to silence.
         Err(std::env::VarError::NotUnicode(_)) => panic!(
             "IZARRAVM_DEVICE_TIMING is set to a value that is not valid UTF-8; accepted \
@@ -130,7 +130,7 @@ fn parse_device_timing_profile(value: Result<String, std::env::VarError>) -> Dev
         let family = family.trim();
         if family.is_empty() {
             // A stray comma (leading, trailing, doubled) names no family and
-            // is not itself a typo -- treat it as a separator artifact rather
+            // is not itself a typo: treat it as a separator artifact rather
             // than panicking on it, matching a permissive comma-list split
             // elsewhere in the codebase (`Resolve-KnobPassthrough`-adjacent
             // Rust-side parsing has no precedent to follow more strictly).

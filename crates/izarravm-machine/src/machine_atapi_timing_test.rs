@@ -155,7 +155,7 @@ fn read_deadlines_keep_master_ticks_across_a_live_cpu_switch() {
 
 /// The batch-invariant CD currency: one count per CDB the guest executed.
 ///
-/// `cd_accesses` cannot answer "how many sectors did the guest ask for" -- it
+/// `cd_accesses` cannot answer "how many sectors did the guest ask for": it
 /// increments once per device advance that carried bytes, so lengthening a
 /// batch collapses it. This counter is fed at `execute_packet`, i.e. once per
 /// command, so a per-sector assertion (TOKACD issues one PACKET per 2048-byte
@@ -175,7 +175,7 @@ fn atapi_packet_commands_count_one_per_executed_cdb() {
     );
 
     // Three more non-data CDBs. Split the SAME work across different advance
-    // shapes -- one in a single advance, one in two halves -- so the counter is
+    // shapes (one in a single advance, one in two halves) so the counter is
     // shown to be a property of the command, not of the batching.
     for split in [false, true, false] {
         send_cdb(&mut machine, [0u8; 12]);

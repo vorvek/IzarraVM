@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! The D5 real/IF-edge tag, `run.rs`'s `BatchBoundaryRealTag`, tested
-//! on its own -- it defaults to "real" every iteration and is marked "not
+//! on its own: it defaults to "real" every iteration and is marked "not
 //! real" ONLY by the trip's own IF-enable edge (`can_take_before` false, then
 //! true). A wrong default, or a mark that leaks across iterations, would
 //! silently restore the 100%-tautological `batch_straddle_trips` 0c exists to
-//! fix, and CI only `cargo check`s this crate under the feature -- it does
+//! fix, and CI only `cargo check`s this crate under the feature: it does
 //! not run these tests there today (see `ci.yml`'s quartet), so this is the
 //! ONE place that mutation would be caught locally before a human reads the
 //! diff.
@@ -14,7 +14,7 @@
 use super::BatchBoundaryRealTag;
 
 /// The default-true half: a fresh tag, and a tag that was just taken without
-/// an intervening `mark_if_edge`, both report "real" -- this is what makes
+/// an intervening `mark_if_edge`, both report "real": this is what makes
 /// ordinary cap-ended batches count.
 ///
 /// **Mutation bite**: change `BatchBoundaryRealTag::new` to `Self(false)` and
@@ -38,7 +38,7 @@ fn defaults_to_real_every_iteration_with_no_if_edge_mark() {
 }
 
 /// The mark-false half: `mark_if_edge` flips exactly the NEXT read, and only
-/// that one -- the reset inside `take_and_reset` restores the default
+/// that one: the reset inside `take_and_reset` restores the default
 /// immediately after, so a mark does not leak into the iteration after the
 /// one it was meant for.
 ///

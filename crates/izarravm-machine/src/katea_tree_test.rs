@@ -718,7 +718,7 @@ fn reconcile_materializes_a_multi_cluster_file() {
 #[test]
 fn reconcile_holds_a_chain_that_references_an_out_of_range_cluster() {
     // A guest-crafted FAT chain `free -> bogus -> EOC`, where `bogus` is past
-    // the last valid data cluster, must be HELD (no host file, no panic) — never
+    // the last valid data cluster, must be HELD (no host file, no panic), never
     // gathered, which would compute an out-of-range LBA (a u32 overflow in debug
     // for large cluster sizes, garbage in release). Conservative-by-construction.
     let (mut vol, root) = fresh_vol("rec_oob");
@@ -1433,7 +1433,7 @@ fn geometry_bounds_a_huge_folder_and_reproduces_m0_for_a_small_one() {
 ///
 /// NON-VACUOUS: restoring the old `MIN_DATA_CLUSTERS = 94_742` cluster floor
 /// makes the first four demands derive spc=1 and fails on the very first one.
-/// The large demands are here so the test cannot pass by the floor alone --
+/// The large demands are here so the test cannot pass by the floor alone:
 /// they clear the floor by their own size and must still never read back spc=1.
 #[test]
 fn no_folder_size_derives_five_hundred_twelve_byte_clusters() {
@@ -1870,7 +1870,7 @@ fn reconcile_renames_a_host_subdir() {
     assert!(root.join("NEWDIR").is_dir(), "dir renamed on host");
 
     // A file later created inside the (same-cluster) renamed dir must land under
-    // the NEW host path — proving dir_paths was updated to NEWDIR on the rename.
+    // the NEW host path, proving dir_paths was updated to NEWDIR on the rename.
     let file_fc = next_free_for_test(&vol);
     stamp_file(&mut vol, fc, "INSIDE.TXT", 0x20, file_fc, b"in\r\n");
     vol.reconcile();
@@ -1909,7 +1909,7 @@ fn reconcile_holds_rmdir_of_a_nonempty_host_dir() {
 #[test]
 fn reconcile_moves_a_host_file_into_a_subdir() {
     // Built by hand (not `fresh_vol`) because SUB must exist on the host BEFORE
-    // mount, so the tree walk registers its cluster in `dir_paths` — the move's
+    // mount, so the tree walk registers its cluster in `dir_paths`: the move's
     // destination dir must be known for the rename to resolve.
     let root = scratch("rec_move");
     std::fs::create_dir_all(root.join("SUB")).unwrap();
@@ -2343,7 +2343,7 @@ fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
 ///
 /// This list is an unenforced exemption: nothing here checks that an entry
 /// actually reaches an override call site. Before adding a name, trace it to
-/// its real override wiring and confirm the wiring exists -- do NOT add a name
+/// its real override wiring and confirm the wiring exists. Do NOT add a name
 /// here just to make `dos_folder_list_matches_the_committed_image` pass. If
 /// `DOS_FOLDER_BINARIES` gained a name that is genuinely missing from the
 /// image (the EDIT.COM bug this guard exists to catch), the fix is to put the
@@ -2353,7 +2353,7 @@ fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
 /// (`MachineGeneration::initialize`) reads `self.spec.glide_ovl`, wraps it as
 /// `("GLIDE2X.OVL".to_string(), bytes)`, and passes it through
 /// `mount_hdd_folder_with_user_overrides` (`storage.rs`) to `apply_overrides`
-/// (`lib.rs`) -- a real, traceable path from a runner-supplied override to the
+/// (`lib.rs`), a real, traceable path from a runner-supplied override to the
 /// overlay. That is the bar every entry here must clear.
 const OVERRIDE_SUPPLIED: &[&str] = &["GLIDE2X.OVL"];
 
@@ -2437,7 +2437,7 @@ fn image_dos_folder_names() -> Vec<String> {
 
 /// `DOS_FOLDER_BINARIES` and the committed image's `C:\DOS` are two hand-kept
 /// lists of the same thing (the image builder's `dos_files` is the other side).
-/// They drifted once already -- EDIT.COM shipped in the image's C:\DOS but was
+/// They drifted once already: EDIT.COM shipped in the image's C:\DOS but was
 /// missing here, so the overlay left it at the root and off the PATH.
 #[test]
 fn dos_folder_list_matches_the_committed_image() {
@@ -2565,9 +2565,9 @@ fn cached_host_handle_serves_identical_bytes_with_one_open_per_file() {
     let opened = after.host_file_opens - before.host_file_opens;
     assert_eq!(served as usize, sectors * 3, "every sector still counted");
     // Zero, not three. The `find` probe above already opened both files, and the
-    // handle cache is an LRU deep enough to hold both, so all three passes --
+    // handle cache is an LRU deep enough to hold both, so all three passes,
     // including the return to BIG.BIN after OTHER.BIN displaced it as most
-    // recent -- reuse a handle that is already open. A single-entry cache
+    // recent, reuse a handle that is already open. A single-entry cache
     // reopened on every change of file, which is the shape an asset load
     // produces whenever two files interleave.
     assert_eq!(opened, 0, "want no reopen at all, got {opened}");
@@ -2641,18 +2641,18 @@ fn reconcile_invalidates_the_cached_host_handle() {
 /// The kernel's compiled-in fallback shell must name a file the image actually
 /// ships, at the path it ships it at.
 ///
-/// This default is only reached when CONFIG.SYS supplies no `SHELL=` -- which is
+/// This default is only reached when CONFIG.SYS supplies no `SHELL=`, which is
 /// exactly what pressing F5 at the boot prompt does. Upstream FreeDOS defaults
 /// it to a bare `command.com`, i.e. the boot drive's ROOT, and that is where
 /// FreeDOS puts COMMAND.COM. Toka-DOS does not: the root holds only CONFIG.SYS
 /// and AUTOEXEC.BAT and every binary lives in `C:\DOS`. So the stock default
-/// stranded anyone who pressed F5 at "Bad or missing Command Interpreter" --
+/// stranded anyone who pressed F5 at "Bad or missing Command Interpreter",
 /// breaking the one escape hatch the F5 window exists to provide, and only in
 /// the situation where the user already believes something is wrong.
 ///
 /// Asserted against the shipped image rather than the source so it survives a
 /// kernel rebuild, a vendored-source refresh, or a change to where the image
-/// builder places binaries -- any of which can reintroduce it.
+/// builder places binaries, any of which can reintroduce it.
 #[test]
 fn the_kernels_fallback_shell_exists_where_the_image_puts_it() {
     let kernel = image_root_file("KERNEL.SYS");
@@ -2980,8 +2980,8 @@ fn held_sectors_do_not_make_a_write_run_quadratic() {
 }
 
 /// A host write that fails strands its sectors in the held index, and the next
-/// commit must retry them. The cluster is projectable already -- what failed is
-/// the host write, which is not a projection event -- so nothing re-arms the
+/// commit must retry them. The cluster is projectable already: what failed is
+/// the host write, which is not a projection event, so nothing re-arms the
 /// revisit ticket unless the failure path does it itself.
 ///
 /// Deliberately never calls `reconcile`/`flush_guest_writes`: the final full walk
@@ -3014,7 +3014,7 @@ fn a_failed_host_write_leaves_its_sectors_retryable_on_the_next_commit() {
     );
     // The whole cluster is held, not just the sector this commit wrote: the
     // payload `stamp_file` laid down arrived before any projection owned it, and
-    // `atomic_write` -- how `reconcile` materialized the file -- acknowledges
+    // `atomic_write` (how `reconcile` materialized the file) acknowledges
     // nothing, so those sectors were still held when this write joined them.
     assert_eq!(
         vol.storage_counters().pending_unmapped_sectors,
@@ -3141,7 +3141,7 @@ fn read_command(vol: &KateaTreeVolume, lba: u32, sectors: u32) -> Vec<u8> {
 /// A DOS asset load is not one big command: it is a long run of separate 8-sector
 /// (one 4 KiB cluster) INT 13h commands over one file. The PR 726 window is
 /// discarded at every command boundary, so each of those commands paid its own
-/// synchronous host `seek`+`read` -- which is what the 0.5-8 ms read tail in the
+/// synchronous host `seek`+`read`, which is what the 0.5-8 ms read tail in the
 /// duke3d-486 hitch profile was made of. The read-ahead buffer is keyed by host
 /// path and byte range rather than by LBA, so it can outlive the command.
 ///
@@ -3264,8 +3264,8 @@ fn interleaved_single_sector_reads_do_not_amplify() {
     // Three, not four: a first-touch fill that ignored the command extent and
     // took a fixed multiple of it would still slip under a looser bound. Measured
     // at 1.98x, so this leaves half again as much room as the ramp actually uses.
-    // The other half of that invariant -- that a first touch reads the command
-    // extent and NOTHING more -- is pinned exactly, one file over, by
+    // The other half of that invariant (that a first touch reads the command
+    // extent and NOTHING more) is pinned exactly, one file over, by
     // `the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder`.
     assert!(
         physical <= 3 * served,
@@ -3423,7 +3423,7 @@ fn the_read_handle_cache_is_a_bounded_lru() {
 /// A projection pass walks the cluster chain of every live file three times over
 /// (the ownership scan, the materialize scan, and the pending re-check), and each
 /// step of a walk asks `fat_entry` for one cluster. `fat_entry` reads a whole FAT
-/// sector, and synthesizing one costs 128 hashed set probes -- so the pass paid
+/// sector, and synthesizing one costs 128 hashed set probes, so the pass paid
 /// ~128 probes per cluster ON THE VOLUME for a write that touched one file.
 /// Measured on a 47 MB duke3d-486 folder: single passes of 290, 196 and 125 ms,
 /// each synchronous on the emulation thread.
@@ -3545,8 +3545,8 @@ fn seeded_volume(name: &str) -> (KateaTreeVolume, std::path::PathBuf) {
 /// region, a base-view region, and entries past the end of the FAT, the two paths
 /// agree.
 ///
-/// Swept three ways -- fresh cursor per cluster, one cursor ascending, one cursor
-/// descending -- because the cursor is the only state either path carries, and a
+/// Swept three ways (fresh cursor per cluster, one cursor ascending, one cursor
+/// descending) because the cursor is the only state either path carries, and a
 /// stale-cursor bug shows up only when consecutive calls land in different FAT
 /// sectors.
 ///
@@ -3605,7 +3605,7 @@ fn the_walked_fat_agrees_with_fat_entry_over_every_cluster() {
 ///
 /// `chain_of` is what every reconcile-path walk now calls. Its result is compared
 /// here, chain for chain, against `katea_write::chain` driven by the untouched
-/// `fat_entry` -- including the deliberately fragmented and the deliberately
+/// `fat_entry`, including the deliberately fragmented and the deliberately
 /// corrupt cases, where the answer is `None` and the pass HOLDS the file. A
 /// disagreement on `None` would be the dangerous direction: it would let
 /// reconcile act on a chain it should have held.
@@ -3644,7 +3644,7 @@ fn chain_of_agrees_with_the_old_per_cluster_walk() {
 /// 512-byte copies to read four bytes; a 47 MB folder cost a 1.71 ms worst
 /// projection pass and a 498 MB folder cost 18.47 ms, which is the visible-freeze
 /// class. A FAT32 sector holds 128 entries, so a contiguous chain may resolve at
-/// most `ceil(len / 128) + 1` sectors -- the `+ 1` covers a chain that starts
+/// most `ceil(len / 128) + 1` sectors: the `+ 1` covers a chain that starts
 /// mid-sector.
 ///
 /// Counter parity is asserted alongside, because the walk deliberately keeps
@@ -3694,7 +3694,7 @@ fn a_chain_walk_resolves_one_fat_sector_per_128_clusters() {
 /// >               for some live file k′ ≠ k }
 fn ambiguous_by_definition(vol: &KateaTreeVolume) -> HashSet<(u32, [u8; 11])> {
     let max = vol.max_chain();
-    // Union the chains of every live entry sharing a key -- a guest can write two
+    // Union the chains of every live entry sharing a key: a guest can write two
     // directory entries with the same 8.3 name, and the definition treats them as
     // one file, not as two files colliding.
     let mut chains: HashMap<(u32, [u8; 11]), HashSet<u32>> = HashMap::new();
@@ -3752,7 +3752,7 @@ fn the_full_scan_reference_matches_the_declarative_definition() {
 
     // SELF-COLLISION: two directory entries with the SAME 8.3 name AND the same
     // first cluster. Their chains are identical, so a definition that did not
-    // exempt a key from colliding with itself would flag this key -- and phase 3
+    // exempt a key from colliding with itself would flag this key, and phase 3
     // would hold a perfectly ordinary file forever.
     let self_key = {
         let before = vol.ambiguous_reference();
@@ -3825,12 +3825,12 @@ fn the_full_scan_reference_matches_the_declarative_definition() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// A LINK PAST FAT COPY 0 MUST NOT BE MEMOIZED — THE ADVERSARIAL-GUEST CASE.
+/// A LINK PAST FAT COPY 0 MUST NOT BE MEMOIZED: THE ADVERSARIAL-GUEST CASE.
 ///
 /// `fat_entry_walked` delegates a cluster whose entry falls outside FAT copy 0
 /// to `fat_entry`, which resolves it through an LBA in FAT COPY 1. That is an
 /// overlay sector the cursor never resolved, so it never lands in
-/// `walk.sectors` — and a memo whose dependency set is missing a sector it
+/// `walk.sectors`, and a memo whose dependency set is missing a sector it
 /// actually depends on would survive a guest write to that sector and serve a
 /// chain the FAT no longer says. `walk.degraded = true` on that arm is what
 /// stops the memo existing at all.
@@ -3840,7 +3840,7 @@ fn the_full_scan_reference_matches_the_declarative_definition() {
 ///
 /// NON-VACUOUS, and this is the mutant the review found survivable: deleting the
 /// `walk.degraded = true` line at the `within >= self.geo.fatsz` arm leaves the
-/// whole katea suite green. It fails BOTH assertions here — the memo appears,
+/// whole katea suite green. It fails BOTH assertions here: the memo appears,
 /// and the second walk then serves the pre-write chain.
 #[test]
 fn a_link_past_fat_copy_0_is_never_memoized() {
@@ -3877,7 +3877,7 @@ fn a_link_past_fat_copy_0_is_never_memoized() {
 
     // Now write the FAT COPY 1 sector that `past_copy0` resolves through. It is
     // the sector at partition-relative `reserved + fatsz`, whose `within` is
-    // 0 -- NOT the head's sector, so a memo of the walk above would still look
+    // 0, NOT the head's sector, so a memo of the walk above would still look
     // current.
     let copy1_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + fatsz;
     let mut sec = vol.read_sector(copy1_lba);
@@ -3904,7 +3904,7 @@ fn a_link_past_fat_copy_0_is_never_memoized() {
 /// direction is obvious: a stale chain fed to reconcile writes the wrong bytes
 /// into a real host file, or deletes one. So rather than assert the invalidation
 /// rule, the test replays a deterministic pseudo-random sequence of guest FAT
-/// writes -- links, EOCs, frees, and rewrites of sectors already written -- and
+/// writes (links, EOCs, frees, and rewrites of sectors already written) and
 /// after EVERY ONE of them compares `chain_of` against `katea_write::chain`
 /// driven by the untouched `fat_entry`, over every seeded first cluster.
 ///
@@ -4037,7 +4037,7 @@ fn a_second_pass_over_an_unchanged_volume_walks_no_chains() {
 
 /// The counter block is now one `Cell` per field rather than one `Cell` over the
 /// whole struct. The behaviour that has to survive is that a bump touches ITS
-/// field and nothing else -- the old whole-block read-modify-write made that true
+/// field and nothing else: the old whole-block read-modify-write made that true
 /// by construction, and per-field cells make it true by construction in a
 /// different way, so it is worth pinning.
 #[test]
@@ -4064,7 +4064,7 @@ fn a_counter_bump_moves_exactly_one_field() {
     assert_eq!(cells.snapshot(), want);
 }
 
-/// A read-ahead HIT does no host I/O, so it must not enter the wall counters --
+/// A read-ahead HIT does no host I/O, so it must not enter the wall counters,
 /// and, since it never uses one, must not pay for a clock read either. The
 /// counters are what a test can see: `host_wall_ns` and `host_read_max_ns` are
 /// frozen across a run of pure hits, which is only true while the `Instant` sits
@@ -4149,14 +4149,14 @@ fn the_fat_memo_is_byte_identical_to_an_uncached_synthesis() {
 }
 
 /// The mount instrument has to be non-zero and internally ordered on a real
-/// folder mount, because the number it exists to defend -- the ~12-13 ms
-/// `prime_claim_index` deliberately added to a 498 MB mount -- was previously
+/// folder mount, because the number it exists to defend (the ~12-13 ms
+/// `prime_claim_index` deliberately added to a 498 MB mount) was previously
 /// only a comment.
 ///
 /// The bar is deliberately structural, not a duration: a wall-clock threshold on
 /// a scratch folder would be a flake generator on a loaded CI box. What is
 /// pinned is that the clocks RAN (total > 0), that both parts are inside the
-/// whole, and that the two parts do not exceed it together -- which is what
+/// whole, and that the two parts do not exceed it together, which is what
 /// catches a cell being wired to the wrong `Instant`, the failure this fixture
 /// is actually for.
 #[test]
@@ -4274,8 +4274,8 @@ fn the_max_counters_track_the_longest_single_operation() {
 /// EVERY HOST MUTATION MUST LEAVE NOTHING CACHED FOR THE PATH IT TOUCHED.
 ///
 /// `reconcile_mode` drops every cached read view on entry, but it then READS file
-/// bytes -- phase 3 gathers a changing file from the base view before deciding to
-/// rewrite it -- and only afterwards mutates. So the entry drop is not enough on
+/// bytes (phase 3 gathers a changing file from the base view before deciding to
+/// rewrite it) and only afterwards mutates. So the entry drop is not enough on
 /// its own: by the time `atomic_write` replaces the file, the gather has already
 /// re-opened it and filled a read-ahead slot with its pre-write bytes. On Windows
 /// the stale handle stays perfectly valid and simply points at the replaced
@@ -4327,7 +4327,7 @@ fn an_overwrite_leaves_no_cached_read_view_for_the_file() {
 /// applies renames before phase 3 reads anything, so the entry drop alone
 /// already satisfies this and removing the scoped calls from the `renames` loop
 /// does NOT fail it. The scoped calls are defence in depth for the ordering, and
-/// this test is the post-condition they defend -- the one an ordering change
+/// this test is the post-condition they defend, the one an ordering change
 /// would break silently. `an_overwrite_leaves_no_cached_read_view_for_the_file`
 /// is the reachable case, and its mutation does fail.
 #[test]
@@ -4446,14 +4446,14 @@ fn set_entry_size(vol: &mut KateaTreeVolume, dir_cluster: u32, name: &str, size:
     vol.write_sector(dir_lba, &dsec);
 }
 
-/// F1 -- THE DIFFERENTIAL. The incremental claim index must produce EXACTLY the
+/// F1: THE DIFFERENTIAL. The incremental claim index must produce EXACTLY the
 /// full scan's set, not a superset of it.
 ///
 /// Exactness is not fussiness. A spurious flag holds a file in
 /// `blocked_projection_keys`, and a non-empty `blocked_projection_keys` makes
 /// `metadata_projection_pending` return `true` for the rest of the session,
 /// which pins a metadata reconcile on every subsequent write command and moves
-/// `metadata_projection_passes` -- a counter stages 1-2 held identical.
+/// `metadata_projection_passes`, a counter stages 1-2 held identical.
 ///
 /// The sequence mixes every shape the index has a hook for: chain growth,
 /// truncation (which RELEASES clusters), freeing, re-pointing one entry's chain
@@ -4462,7 +4462,7 @@ fn set_entry_size(vol: &mut KateaTreeVolume, dir_cluster: u32, name: &str, size:
 ///
 /// NON-VACUOUS: the sweep asserts it produced flagged files, that it both
 /// inserted and skipped claims, and that at least one pass really did retract.
-/// Removing any one invalidation hook fails it -- verified for the directory
+/// Removing any one invalidation hook fails it: verified for the directory
 /// hook by `a_directory_cluster_taken_over_a_live_claim_flags_it`, which isolates
 /// the one this sweep would otherwise catch only intermittently.
 #[test]
@@ -4544,7 +4544,7 @@ fn the_incremental_claim_set_matches_a_full_scan_under_random_mutation() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F2/F3 -- RELEASE THEN RECLAIM, the failure the guard exists to prevent.
+/// F2/F3: RELEASE THEN RECLAIM, the failure the guard exists to prevent.
 ///
 /// A truncated file RELEASES clusters. If the index went on crediting them to
 /// the old owner, the next file to take one would collide with a ghost and be
@@ -4621,7 +4621,7 @@ fn release_then_reclaim_across_two_passes() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F4 -- the same release and reclaim with NO pass between them.
+/// F4: the same release and reclaim with NO pass between them.
 ///
 /// This is the ordering an installer actually produces: the truncate and the new
 /// file's allocation land in one write batch, so "the index was refreshed
@@ -4671,12 +4671,12 @@ fn release_then_reclaim_in_one_batch() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F5 -- THE FAILURE DIRECTION. A stale claim must hold, never clobber.
+/// F5: THE FAILURE DIRECTION. A stale claim must hold, never clobber.
 ///
 /// The index is made stale on purpose: `suppress_fat_epoch_stamps` stops the one
 /// hook that expires a claim, which is the strongest form of the bug class the
 /// whole design is guarding against. The requirement is not that the outcome is
-/// right -- it cannot be -- but that it errs by HOLDING. A held file's bytes stay
+/// right (it cannot be) but that it errs by HOLDING. A held file's bytes stay
 /// in the overlay and the final flush still writes them; a clobbered file's host
 /// bytes are gone.
 ///
@@ -4753,7 +4753,7 @@ fn a_stale_claim_holds_and_never_clobbers() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F6 -- a cluster BECOMING a directory cluster must flag a claim that never
+/// F6: a cluster BECOMING a directory cluster must flag a claim that never
 /// changed.
 ///
 /// This is the one under-flag the FAT epoch cannot see: the file's chain is
@@ -4797,7 +4797,7 @@ fn a_directory_cluster_taken_over_a_live_claim_flags_it() {
     vol.write_sector(dlba, &dsec);
     // Zero the REST of the cluster too. It still holds F.BIN's data bytes, and a
     // directory image with non-zero entries behind its terminator is a TORN
-    // directory -- which would make the pass fall back to the full scan and this
+    // directory, which would make the pass fall back to the full scan and this
     // fixture would prove nothing about the hook. (It did exactly that in its
     // first draft; the mutation run is what surfaced it.)
     for s in 1..u32::from(vol.geo.spc) {
@@ -4830,7 +4830,7 @@ fn a_directory_cluster_taken_over_a_live_claim_flags_it() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F7 -- a DEGRADED walk must poison the index, not narrow it.
+/// F7: a DEGRADED walk must poison the index, not narrow it.
 ///
 /// A walk that read substituted zeros for an unreadable spilled FAT sector does
 /// not know what the FAT says, and the design's rule is that an unknowable input
@@ -4842,7 +4842,7 @@ fn a_degraded_walk_poisons_the_claim_index() {
     // A volume big enough that a FILE's FAT entries live in a different FAT
     // sector from the DIRECTORIES'. Without that separation the same broken read
     // also tears `gather_live`, the pass poisons through the incomplete-directory
-    // path instead, and the degraded-walk path is never exercised at all -- the
+    // path instead, and the degraded-walk path is never exercised at all: the
     // mutation run caught exactly that.
     let root = scratch("claims_degraded");
     for i in 0..8u32 {
@@ -4878,7 +4878,7 @@ fn a_degraded_walk_poisons_the_claim_index() {
     // Rewrite the file's FAT sector, which expires its memo AND puts the sector
     // in the store; then evict it to the spill and break spill reads. The next
     // walk has to re-read a sector it cannot get back, which is a degraded walk.
-    // (Without the rewrite the memo answers and nothing reads the store at all --
+    // (Without the rewrite the memo answers and nothing reads the store at all:
     // the first draft of this fixture failed for exactly that reason.)
     // Keep a copy of the root directory sector: the eviction below is
     // indiscriminate, and if the DIRECTORY's bytes are the ones that cannot be
@@ -4911,11 +4911,11 @@ fn a_degraded_walk_poisons_the_claim_index() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F13 -- a TORN DIRECTORY must not be read as a set of deletions.
+/// F13: a TORN DIRECTORY must not be read as a set of deletions.
 ///
 /// `parse_dir` stops at the first zeroed entry, so a directory whose middle
 /// sector the guest has zeroed but not yet rewritten hides every entry behind
-/// the hole -- with `store.read_errors()` never moving. Retracting those keys
+/// the hole, with `store.read_errors()` never moving. Retracting those keys
 /// would be a retraction on unreliable evidence. The pass must notice and fall
 /// back.
 ///
@@ -4968,7 +4968,7 @@ fn a_torn_directory_does_not_retract_the_hidden_keys() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F9 -- the cost claim. A pass over a volume nothing has written must insert no
+/// F9: the cost claim. A pass over a volume nothing has written must insert no
 /// claims at all.
 ///
 /// NON-VACUOUS: skipping the currency test (always refreshing) makes the insert
@@ -5013,7 +5013,7 @@ fn a_second_pass_over_an_unchanged_volume_inserts_no_claims() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F12 -- the amortised forced refresh must reach every key, and must not spike.
+/// F12: the amortised forced refresh must reach every key, and must not spike.
 ///
 /// It is insurance against a hook nobody anticipated, so its value is entirely in
 /// its period: every live key is re-derived within `CLAIM_REFRESH_PERIOD` passes.
@@ -5055,7 +5055,7 @@ fn the_amortised_refresh_reaches_every_key_within_its_period() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// F11 -- the kill switch. `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` must reproduce
+/// F11: the kill switch. `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` must reproduce
 /// the outcome, which is what makes it a usable A/B control and field bisect
 /// rather than a decoration.
 #[test]
@@ -5142,12 +5142,12 @@ fn directory_image_wholeness_detects_a_hole_and_nothing_else() {
     assert!(!directory_image_is_whole(&bytes));
 }
 
-/// M2's fixture -- A RETRACTION MUST CLEAR THE FLAG IT CAUSED.
+/// M2's fixture: A RETRACTION MUST CLEAR THE FLAG IT CAUSED.
 ///
 /// Two entries alias one chain, so both are flagged. Remove one; the other must
 /// go back to clean. If a retraction only ever removed its own claims and never
 /// decremented the key it stops contesting, the survivor would stay flagged for
-/// the rest of the session -- and a permanently flagged key sits in
+/// the rest of the session, and a permanently flagged key sits in
 /// `blocked_projection_keys`, which makes `metadata_projection_pending` return
 /// `true` forever, pinning a reconcile on every write command.
 ///
@@ -5157,7 +5157,7 @@ fn directory_image_wholeness_detects_a_hole_and_nothing_else() {
 /// NON-VACUOUS with the amortised refresh OFF: disabling the decrement in
 /// `retract_claim` leaves the survivor flagged and fails the second assertion.
 /// With the refresh on, the insurance re-derives the survivor and the mutant
-/// lives -- which is exactly why it is switched off here.
+/// lives, which is exactly why it is switched off here.
 #[test]
 fn retracting_a_claim_clears_the_flag_it_caused() {
     let (mut vol, root) = fresh_vol("claims_retract_clears");
@@ -5189,7 +5189,7 @@ fn retracting_a_claim_clears_the_flag_it_caused() {
     );
     assert_eq!(flagged, vol.ambiguous_reference());
 
-    // Drop the alias. Its chain is untouched, so nothing expires REAL's claim --
+    // Drop the alias. Its chain is untouched, so nothing expires REAL's claim:
     // only the retraction can clear REAL's flag.
     delete_entry(&mut vol, ROOT_CLUSTER, "ALIAS.BIN");
     let (after, _) = vol.ambiguous_incremental_for_test();
@@ -5203,7 +5203,7 @@ fn retracting_a_claim_clears_the_flag_it_caused() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// M6's fixture -- A DIRECTORY ENTRY RE-POINTED AT ANOTHER CHAIN, WITH NO FAT
+/// M6's fixture: A DIRECTORY ENTRY RE-POINTED AT ANOTHER CHAIN, WITH NO FAT
 /// WRITE AT ALL.
 ///
 /// The FAT token cannot see this: the guest rewrote 4 bytes of a DIRECTORY
@@ -5276,7 +5276,7 @@ fn re_pointing_a_directory_entry_expires_its_claim() {
 // on the chain token.
 // ---------------------------------------------------------------------------
 
-/// F10 -- `data_written` MUST FLIP THE MOMENT THE GUEST WRITES THE CHAIN, and
+/// F10: `data_written` MUST FLIP THE MOMENT THE GUEST WRITES THE CHAIN, and
 /// must not be re-derived while it cannot have changed.
 ///
 /// This is term B's whole soundness argument in one fixture. The cached `false`
@@ -5341,8 +5341,8 @@ fn a_cached_data_written_flips_on_the_first_write_to_its_chain() {
 /// The cached `all_in_range` must be the `any()` it replaces, over both a chain
 /// that is entirely valid and one the guest has pointed outside the data region.
 ///
-/// It rides the FAT token with no argument of its own -- it is a pure function
-/// of the chain and of the immutable geometry -- so what this pins is that the
+/// It rides the FAT token with no argument of its own (it is a pure function
+/// of the chain and of the immutable geometry) so what this pins is that the
 /// value is the same one, and that it moves when the chain does.
 ///
 /// NON-VACUOUS: returning `true` unconditionally from `chain_facts` fails the
@@ -5433,7 +5433,7 @@ fn a_steady_state_pass_re_derives_no_chain_facts() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// R-1 -- A RETRACTION MUST NOT UN-FLAG A CLUSTER THAT IS STILL A DIRECTORY
+/// R-1: A RETRACTION MUST NOT UN-FLAG A CLUSTER THAT IS STILL A DIRECTORY
 /// CLUSTER.
 ///
 /// `retract_claim` decrements the survivor's `bad` only on the 2 -> 1 transition
@@ -5445,10 +5445,10 @@ fn a_steady_state_pass_re_derives_no_chain_facts() {
 /// directory owns. That is precisely the clobber `ambiguous_files` exists to
 /// prevent.
 ///
-/// The two ingredients are each covered already --
-/// `a_directory_cluster_taken_over_a_live_claim_flags_it` for the directory
+/// The two ingredients are each covered already
+/// (`a_directory_cluster_taken_over_a_live_claim_flags_it` for the directory
 /// overlap, `retracting_a_claim_clears_the_flag_it_caused` for the two-claimant
-/// retraction -- but their CONJUNCTION followed by a retraction was not, and the
+/// retraction) but their CONJUNCTION followed by a retraction was not, and the
 /// random differential cannot reach it: its menu mutates FAT entries in a range
 /// that does not include the subdirectory, and a directory delete poisons the
 /// index, so the joint state never survives to an assertion.
@@ -5498,7 +5498,7 @@ fn retracting_one_claim_leaves_a_directory_cluster_still_flagged() {
     );
 
     // Retract A by removing its directory entry. Nothing touches a FAT sector, so
-    // B's claim token stays current and B is SKIPPED -- only the retraction can
+    // B's claim token stays current and B is SKIPPED: only the retraction can
     // change B's flag.
     delete_entry(&mut vol, ROOT_CLUSTER, "A.BIN");
 
@@ -5523,7 +5523,7 @@ fn retracting_one_claim_leaves_a_directory_cluster_still_flagged() {
 }
 
 /// `map_chain` must answer the same cluster a real chain walk lands on after
-/// the same number of hops -- including the zero-hop case, which is the start
+/// the same number of hops, including the zero-hop case, which is the start
 /// cluster itself.
 #[test]
 fn map_chain_matches_a_real_chain_walk() {
@@ -5564,8 +5564,8 @@ fn map_chain_reports_end_before_target() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// Out-of-range input -- a start cluster below the first valid cluster
-/// (0 or 1, never allocatable), or a step count past the step cap -- is
+/// Out-of-range input (a start cluster below the first valid cluster
+/// (0 or 1, never allocatable), or a step count past the step cap) is
 /// refused rather than walked. A well-formed kernel never sends either; a
 /// crafted one must not be able to run the loop past `max_chain()`
 /// iterations, the same corrupt-chain ceiling `chain_with_token` enforces.
@@ -5586,8 +5586,8 @@ fn map_chain_refuses_absurd_input() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// A FAT link that points outside the data region -- corrupt, or a guest
-/// crafting a bogus chain -- must be refused, not answered with a landing
+/// A FAT link that points outside the data region (corrupt, or a guest
+/// crafting a bogus chain) must be refused, not answered with a landing
 /// cluster reconcile itself would never materialize from. The guest's
 /// response to `Refused` is to fall back to its native walk, which is why
 /// this is `Refused` and not `EndBeforeTarget`: the difference matters to the

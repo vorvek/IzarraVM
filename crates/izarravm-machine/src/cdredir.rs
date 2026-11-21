@@ -11,7 +11,7 @@
 //! against the Toka-DOS kernel (`kernel.asm` SDA layout, `dosfns.c` call
 //! sites). The kernel calls these functions itself for any operation on a
 //! drive whose CDS carries the network flag; the arguments live in the SDA at
-//! fixed offsets from the DOS data segment (the DOS 4+ layout — the kernel
+//! fixed offsets from the DOS data segment (the DOS 4+ layout; the kernel
 //! hardcodes SDA format 1):
 //!
 //! | what | DOS_DS offset |
@@ -201,7 +201,7 @@ impl Machine {
 
     /// Serve one INT 2Fh AH=11h call for the CD drive. Returns false when the
     /// redirector is not armed, the call is not one it implements, or the
-    /// operation names another drive — the caller then falls back to the
+    /// operation names another drive: the caller then falls back to the
     /// absent-redirector refusal, which is what the kernel's own default
     /// handler answered.
     pub(super) fn handle_cd_redirector(&mut self, ax: u16) -> bool {
@@ -281,8 +281,8 @@ impl Machine {
                 let Some(path) = self.redirector_path(ds) else {
                     return false;
                 };
-                // The SFT is fresh here — its device-info word is filled BY
-                // the open — so the drive identity comes from the path alone.
+                // The SFT is fresh here (its device-info word is filled BY
+                // the open) so the drive identity comes from the path alone.
                 let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let sft = es.wrapping_add(u32::from(self.cpu.registers.edi() as u16));
                 self.redirector_open(ds, sft, &path, ax == 0x112E);
