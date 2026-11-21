@@ -10423,14 +10423,8 @@ pub(crate) enum SideExitReason {
     UnavailableOrKind = 2,
     Permission = 3,
     CodeWatch = 4,
-    /// The catch-all. The now-removed clif backend was its only remaining producer (two sites
-    /// in its `lower.rs`); every Direct producer names itself, because `Other` was 99.7% of the
-    /// side-exit growth across the x87 sweep and could not be attributed to any of its six
-    /// emitters. `allow(dead_code)` because no producer builds it anymore, and the discriminant
-    /// must keep its value regardless: `run.rs` still has a catch-all arm for it, and
-    /// renumbering would silently remap what emitted code stores.
-    #[allow(dead_code)]
-    Other = 5,
+    // 5 is reserved. It was the catch-all reason, and no emitter stores it. Do not give it to
+    // a new variant: each Direct producer names its own reason, so that `run.rs` can count it.
     /// A CS segment-limit check on a computed control-transfer target: the six
     /// `Ret`/`Ret16`/`JmpMem`/`CallReg`/`CallMem` sites plus `MemorySideExits`' own limit stub.
     SegmentLimit = 6,
@@ -35574,7 +35568,7 @@ pub(crate) struct DirectStallTally {
     /// and narrowing on that state would be a miscompile -- see
     /// `narrow_chain_requirement_if_leaf`). Census-gated for `entry_chain_admitted`'s reason.
     pub entry_chain_masked_reject: u64,
-    /// The two halves the old `SideExitReason::Other` counter conflated.
+    /// Side exits for a CS limit check and for an x87 eligibility guard, one counter each.
     pub side_exit_segment_limit: u64,
     pub side_exit_x87_eligibility: u64,
     /// Exits taken by the run-time access check of a live protected-mode data segment.
