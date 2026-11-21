@@ -2178,8 +2178,6 @@ fn katea_counters_json(k: &izarravm_machine::KateaStorageCounters) -> serde_json
         "host_readahead_fills": k.host_readahead_fills,
         "host_file_opens": k.host_file_opens,
         "run_scan_steps": k.run_scan_steps,
-        "fat_sector_reads": k.fat_sector_reads,
-        "dir_or_free_sector_reads": k.dir_or_free_sector_reads,
         "sector_writes": k.sector_writes,
         "int13_read_commands": k.int13_read_commands,
         "int13_read_sectors": k.int13_read_sectors,
@@ -3831,10 +3829,6 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "katea_host_read_bytes": mark.katea.as_ref().map(|k| k.host_read_bytes),
                 "katea_host_file_opens": mark.katea.as_ref().map(|k| k.host_file_opens),
                 "katea_run_scan_steps": mark.katea.as_ref().map(|k| k.run_scan_steps),
-                // The FAT / directory region split. Zero unless
-                // IZARRAVM_KATEA_REGION_CENSUS=1 armed the volume at mount.
-                "katea_fat_sector_reads": mark.katea.as_ref().map(|k| k.fat_sector_reads),
-                "katea_dir_or_free_sector_reads": mark.katea.as_ref().map(|k| k.dir_or_free_sector_reads),
                 "katea_sector_writes": mark.katea.as_ref().map(|k| k.sector_writes),
                 "katea_int13_read_commands": mark.katea.as_ref().map(|k| k.int13_read_commands),
                 "katea_int13_read_sectors": mark.katea.as_ref().map(|k| k.int13_read_sectors),

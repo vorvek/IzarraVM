@@ -75,8 +75,8 @@ pub struct Int13Profile {
     /// stall-advance and copy halves (hypotheses c vs d).
     pub host_wall_ns: u64,
     /// 1-sector read commands whose start LBA was in a FAT copy. Katea's
-    /// `fat_sector_reads` is the wrong discriminator: it also fires once per
-    /// cluster of an internal projection walk. This one is INT 13h only.
+    /// A count of FAT sectors served by Katea is the wrong discriminator: it would also
+    /// fire once per cluster of an internal projection walk. This one is INT 13h only.
     pub read1_fat: u64,
     /// 1-sector read commands whose start LBA was in the data region (files
     /// and directories). Unaligned GRP lumps and directory getblk land here.

@@ -1397,19 +1397,6 @@ pub(crate) struct KateaTreeVolume {
     /// fixture for the refresh itself leaves it on.
     #[cfg(test)]
     amortised_refresh: bool,
-    /// Arms the FAT / directory / free-space region census. Read once at mount
-    /// from `IZARRAVM_KATEA_REGION_CENSUS=1`, and OFF by default: those two
-    /// counters were investigation residue, and an increment is still a branch
-    /// and a read-modify-write on the per-sector read path. House discipline is
-    /// that a default-off instrument is gated at its call site, not inside the
-    /// helper it calls.
-    region_census: bool,
-}
-
-/// Whether a new volume counts FAT/directory/free-space sectors. See
-/// [`KateaTreeVolume::region_census`].
-fn region_census_enabled() -> bool {
-    std::env::var("IZARRAVM_KATEA_REGION_CENSUS").as_deref() == Ok("1")
 }
 
 /// Enabled by default; `IZARRAVM_KATEA_INCREMENTAL_CLAIMS=0` forces the full
@@ -1547,21 +1534,6 @@ katea_counter_block! {
     /// binary-searches the sorted `runs`, so this is now `log2(runs)` per sector
     /// rather than the tree-size-dependent linear walk it was built to expose.
     run_scan_steps,
-    /// Sectors served out of the synthesized FAT region. ZERO unless
-    /// `IZARRAVM_KATEA_REGION_CENSUS=1` armed the volume: this is a diagnostic,
-    /// gated at its call site so an ordinary run never pays for it.
-    ///
-    /// The FAT is generated in memory, so these cost no host I/O at all -- but
-    /// each one is still a whole guest INT 13h call, and a high count against
-    /// `host_file_reads` is the signature of DOS re-walking a cluster chain
-    /// rather than of the guest asking for data. That signature is what the
-    /// 512-byte-cluster geometry bug looked like from here.
-    fat_sector_reads,
-    /// Sectors served out of the data region that were NOT file bytes: directory
-    /// clusters and free space. Separating these from the FAT count is what tells
-    /// a chain walk apart from a directory rescan. Same gate, same default: zero
-    /// unless `IZARRAVM_KATEA_REGION_CENSUS=1`.
-    dir_or_free_sector_reads,
     /// Host `File::open` calls. Distinct from `host_file_reads` (which counts
     /// SECTORS served from a host file) because the one-entry handle cache makes
     /// them differ: their ratio is what says the cache is working. Before the
@@ -2057,7 +2029,6 @@ impl KateaTreeVolume {
             suppress_epoch_stamps: false,
             #[cfg(test)]
             amortised_refresh: true,
-            region_census: region_census_enabled(),
         };
         let prime_started = std::time::Instant::now();
         volume.prime_claim_index();
@@ -2142,14 +2113,6 @@ impl KateaTreeVolume {
             total_sectors: self.geo.total_sectors,
             count_of_clusters: self.geo.count_of_clusters,
         }
-    }
-
-    /// Arm the region census without going through the environment, so a test
-    /// can drive both legs of the gate in one process. Production arms it once
-    /// at mount from `IZARRAVM_KATEA_REGION_CENSUS`.
-    #[cfg(test)]
-    pub(crate) fn arm_region_census(&mut self) {
-        self.region_census = true;
     }
 
     /// What the read path has done since mount. See [`KateaStorageCounters`].
@@ -2559,10 +2522,8 @@ impl KateaTreeVolume {
     /// filled at exactly one site, always from a data-region LBA (asserted there),
     /// so it can never cover a FAT sector.
     ///
-    /// IDENTICAL COUNTERS. `sector_reads` is still bumped once per cluster, and
-    /// the `IZARRAVM_KATEA_REGION_CENSUS` FAT-sector counter once per cluster
-    /// served from the base view, exactly as the old path did -- so no profile
-    /// field moves. The store's `read_errors` counter is the one number that
+    /// IDENTICAL COUNTERS. `sector_reads` is still bumped once per cluster, exactly as the
+    /// old path did, so no profile field moves. The store's `read_errors` counter is the one number that
     /// changes: a failed spill read is now registered once per FAT SECTOR rather
     /// than once per cluster in it. Every reader compares it for INEQUALITY
     /// against a snapshot ("did anything fail in this bracket?"), so one is as
@@ -2622,15 +2583,7 @@ impl KateaTreeVolume {
                     sector[off + 3],
                 ]) & 0x0FFF_FFFF
             }
-            None => {
-                // Region census: default-off instrument, gated at the call site,
-                // and per CLUSTER because that is what the sector-reading path it
-                // replaces counted.
-                if self.region_census {
-                    bump(&self.counters.fat_sector_reads, 1);
-                }
-                self.fat.fat_entry(c) & 0x0FFF_FFFF
-            }
+            None => self.fat.fat_entry(c) & 0x0FFF_FFFF,
         }
     }
 
@@ -4667,7 +4620,7 @@ impl KateaTreeVolume {
 
     /// Which on-disk region an absolute LBA falls in. Used by the INT 13h census
     /// to split 1-sector commands into FAT walks vs data vs boot metadata, which
-    /// Katea's own `fat_sector_reads` cannot do: that counter also fires once per
+    /// a count of FAT sectors served by Katea cannot do: it would also fire once per
     /// cluster of an internal projection walk.
     pub(crate) fn lba_region(&self, lba: u32) -> LbaRegion {
         if lba < self.geo.part_start {
@@ -4791,11 +4744,6 @@ impl KateaTreeVolume {
         let reserved = u32::from(RESERVED_SECTORS);
         let fat_end = reserved + u32::from(NUM_FATS) * self.geo.fatsz;
         if (reserved..fat_end).contains(&rel) {
-            // Region census: default-off instrument, gated at the call site so an
-            // ordinary run never pays the read-modify-write of the counter block.
-            if self.region_census {
-                bump(&self.counters.fat_sector_reads, 1);
-            }
             let within = (rel - reserved) % self.geo.fatsz;
             return SectorRead::ok(self.base_fat_sector(within));
         }
@@ -4878,20 +4826,12 @@ impl KateaTreeVolume {
             .filter(|(_, last, _)| cluster <= *last);
         bump(&self.counters.run_scan_steps, steps);
         let Some(run) = found else {
-            // Region census: default-off, gated at the call site (see the FAT arm).
-            if self.region_census {
-                bump(&self.counters.dir_or_free_sector_reads, 1);
-            }
             return SectorRead::ok([0u8; SECTOR]); // free space
         };
         let cluster_off = cluster - run.0; // cluster index within the run
         let spc = u32::from(self.geo.spc);
         match &run.2 {
             Role::Dir(id) => {
-                // Region census: default-off, gated at the call site (see the FAT arm).
-                if self.region_census {
-                    bump(&self.counters.dir_or_free_sector_reads, 1);
-                }
                 let d = &self.dirs[*id];
                 let sector_in_dir = cluster_off * spc + sector_in_cluster;
                 let mut out = [0u8; SECTOR];

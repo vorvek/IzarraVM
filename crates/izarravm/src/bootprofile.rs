@@ -650,12 +650,6 @@ fn build_rows(marks: &[PhaseMark]) -> Vec<PhaseRow> {
                         .host_readahead_fills
                         .saturating_sub(before.host_readahead_fills),
                     run_scan_steps: after.run_scan_steps.saturating_sub(before.run_scan_steps),
-                    fat_sector_reads: after
-                        .fat_sector_reads
-                        .saturating_sub(before.fat_sector_reads),
-                    dir_or_free_sector_reads: after
-                        .dir_or_free_sector_reads
-                        .saturating_sub(before.dir_or_free_sector_reads),
                     sector_writes: after.sector_writes.saturating_sub(before.sector_writes),
                     int13_read_commands: after
                         .int13_read_commands

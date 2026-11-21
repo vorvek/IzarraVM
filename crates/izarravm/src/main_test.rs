@@ -28,14 +28,12 @@ fn munt_test_dir(name: &str) -> PathBuf {
 /// key above them they price the folder rather than the session.
 const KATEA_COUNTER_KEYS: &[&str] = &[
     "blocked_projection_keys",
-    "dir_or_free_sector_reads",
     "dma_read_commands",
     "dma_read_sectors",
     "dma_read_wait_ticks",
     "dma_write_commands",
     "dma_write_sectors",
     "dma_write_wait_ticks",
-    "fat_sector_reads",
     "host_bytes",
     "host_file_opens",
     "host_file_reads",
