@@ -18,7 +18,7 @@
 /// field cannot name an address outside its own RAM: the field is 9 bits
 /// of 8 KB pages (`distira.rs::recalculate_fbi_layout`, `n << 13`), so its
 /// maximum is `511 << 13` = 4,186,112, inside a 4 MB store but past a 2 MB
-/// one -- the same argument #814's review made for `SST_TEX_BASE_ADDR` at
+/// one, the same argument #814's review made for `SST_TEX_BASE_ADDR` at
 /// 4 MB.
 pub const DISTIRA_FB_SIZE: usize = 4 * 1024 * 1024;
 pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
@@ -34,10 +34,10 @@ pub const DISTIRA_MMIO_SIZE: usize = 0x0001_0000;
 ///
 /// 4 MB is also the size at which the mask stops disagreeing with the
 /// hardware it is masking: `SST_TEX_BASE_ADDR` (`raster_view.rs`,
-/// `tex_base_addr_for_tmu`/`_lod`) is itself only 19 bits wide --
+/// `tex_base_addr_for_tmu`/`_lod`) is itself only 19 bits wide:
 /// `(val & 0x0007_ffff) << 3`, the same field 86Box's non-Banshee
 /// `SST_texBaseAddr` handler masks (`vid_voodoo_reg.c`,
-/// `params.texBaseAddr[0] = (val & 0x7ffff) << 3`) -- so the register can
+/// `params.texBaseAddr[0] = (val & 0x7ffff) << 3`), so the register can
 /// name addresses only up to `0x3FFFF8`, one qword short of 4 MB. At the old
 /// 2 MB size that top register bit was being silently folded away by the
 /// (narrower) texture mask before the register's own width ever mattered;

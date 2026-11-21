@@ -709,7 +709,7 @@ fn atc_graphics_bits_without_chain4_stay_text() {
     // A text-mode guest (or an INT 10h state restore) re-writing ATC 10h
     // with the graphics bits must NOT flip the personality unless the
     // Graphics Controller is actually set up for 256-color graphics. Chain-4
-    // off alone (with no GC 256-color/graphics bits) is not enough — a stray
+    // off alone (with no GC 256-color/graphics bits) is not enough: a stray
     // ATC write in text mode must stay text.
     let mut vga = Vga::default();
     vga.read_status1();
@@ -725,7 +725,7 @@ fn register_banged_mode_x_320x240_entry_from_text() {
     // chain-4 OFF, the GC 256-color graphics bits, the guest's own 240-line
     // vertical CRTC timing, then ATC 10h graphics+8bit (the decision write).
     // The personality must flip to ModeX with the GUEST's geometry (480
-    // scanlines double-scanned to 240) — not stay text (blank screen), nor
+    // scanlines double-scanned to 240), not stay text (blank screen), nor
     // snap to canonical 320x200 (loses 40 lines).
     let mut vga = Vga::default();
     assert_eq!(vga.active_mode(), VideoMode::Text);
@@ -838,8 +838,8 @@ fn misc_output_ios_selects_crtc_status_and_feature_ports() {
 
 /// The one-lookup store table's tag-bit precondition, pinned at the VGA end: BOTH aperture
 /// backings hand out 4096-aligned page pointers (`PageAlignedBytes` on `vram` and
-/// `mode13_linear`). Correctness never depends on this — a misaligned backing degrades every
-/// aperture store to the CPU's slow path — which is exactly why it needs a pin: reverting
+/// `mode13_linear`). Correctness never depends on this: a misaligned backing degrades every
+/// aperture store to the CPU's slow path, which is exactly why it needs a pin: reverting
 /// either field to a plain `Vec` would silently re-poison doom's Mode X stores while every
 /// behavioral test kept passing. The offsets these pointers are formed from are page
 /// multiples by the refusal checks beside the accessors, so base alignment is the whole
@@ -862,7 +862,7 @@ fn both_vga_direct_page_backings_are_page_aligned() {
 /// Slice 0 of the "skip the VGA's per-frame render while a Voodoo owns the
 /// cable" lever (lever
 /// C): `advance_cable_aware(_, true)` must render zero rows, and it must do
-/// so without touching beam timing at all -- the frame counter blink derives
+/// so without touching beam timing at all: the frame counter blink derives
 /// from and the retrace bits the guest polls are pure beam-position geometry,
 /// computed independently of whether `finalize_frame` painted anything.
 #[test]
@@ -895,8 +895,8 @@ fn cable_ownership_elides_render_without_touching_beam_timing() {
         "the cable-elsewhere VGA renders zero rows over the same three frames"
     );
     // status1_bits (the CRTC vertical-retrace status the guest polls at 0x3DA)
-    // is a pure function of the CRTC timing and a beam position -- never of
-    // `work` or `presented` -- so it must read identically at every phase of
+    // is a pure function of the CRTC timing and a beam position, never of
+    // `work` or `presented`, so it must read identically at every phase of
     // the frame regardless of whether the cable is elsewhere.
     for beam in [
         0u64,
@@ -915,7 +915,7 @@ fn cable_ownership_elides_render_without_touching_beam_timing() {
 /// Slice 0, second half: switching the cable back to the VGA must present
 /// exactly the frame a VGA that was never skipped would have presented. The
 /// mechanism this pins is `finalize_frame`'s "`last_line` always resets to 0"
-/// invariant -- the first non-skipped frame after any number of skipped ones
+/// invariant: the first non-skipped frame after any number of skipped ones
 /// always renders every line from scratch against current register state, so
 /// nothing is ever presented stale.
 #[test]
@@ -933,7 +933,7 @@ fn switch_back_frame_matches_a_non_skipping_vga_exactly() {
         .cloned()
         .expect("control published");
 
-    // Same three frames, but the Voodoo owns the cable for the first two --
+    // Same three frames, but the Voodoo owns the cable for the first two:
     // nothing is published while it does.
     test.advance_cable_aware(dots_per_frame, true);
     test.advance_cable_aware(dots_per_frame, true);

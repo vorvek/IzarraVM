@@ -455,12 +455,12 @@ fn force_point_sampling_overrides_the_guest_bilinear_mode() {
     );
 }
 
-/// Same override, on TMU1 via the `Tmu1Only` combine target -- proves "every
+/// Same override, on TMU1 via the `Tmu1Only` combine target. Proves "every
 /// TMU" (the phrase in `Distira::set_force_point_sampling`'s doc comment,
 /// `Machine::set_glide_force_point_sampling`'s, and the GUI's) is not
 /// actually "TMU0 only". `texture_combine_target` reads TMU0's own
 /// `texture_mode` register to pick the target: leaving `TEXTUREMODE_LOCAL`
-/// and every combine bit clear selects PASSTHROUGH, i.e. TMU1 alone -- see
+/// and every combine bit clear selects PASSTHROUGH, i.e. TMU1 alone. See
 /// `tmu0_mode_selects_local_passthrough_and_modulated_texture_paths` above,
 /// which exercises the same selection.
 #[test]

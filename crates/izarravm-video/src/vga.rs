@@ -90,7 +90,7 @@ impl Default for Mode13ArgbCache {
 
 #[derive(Debug, Clone)]
 pub struct Vga {
-    // Both VRAM buffers back `DirectPage` pointers, so both live in 4096-aligned windows —
+    // Both VRAM buffers back `DirectPage` pointers, so both live in 4096-aligned windows:
     // the one-lookup store table's tag bits need every direct-page host pointer page-aligned,
     // and `vram` (the Mode X path) is doom's, not just `mode13_linear` (chained 13h). A plain
     // Vec here silently degrades every aperture store to the slow path.
@@ -126,7 +126,7 @@ pub struct Vga {
     pub(crate) frames: u64,
     /// True while a Voodoo-style device owns the monitor cable this tick, set
     /// each call by `advance_cable_aware`. Gates the per-pixel render work in
-    /// `finalize_frame`/`catch_up` only -- it never touches beam timing, the
+    /// `finalize_frame`/`catch_up` only: it never touches beam timing, the
     /// frame counter above, or any guest-visible register.
     pub(crate) skip_render: bool,
     /// Text rows actually rendered by `render_scanline`'s `VideoMode::Text`
@@ -176,7 +176,7 @@ pub struct Vga {
     // Content-generation counter for the host-side dirty-framebuffer cache. Bumped
     // inside every display mutator on this Vga: the VRAM writers, the register/DAC
     // write port, and the start-address latch at vsync. Putting it here (not on the
-    // machine bus) makes it caller-agnostic — a write lands the same whether it came
+    // machine bus) makes it caller-agnostic: a write lands the same whether it came
     // through the CPU bus or directly from an HLE BIOS INT 10h graphics service, so
     // neither path can change the output without bumping the gen. The machine folds
     // this into `Machine::frame_generation`. Over-bumping a no-op write is harmless
@@ -313,7 +313,7 @@ impl Vga {
     }
 
     /// Whether `port` is the ACTIVE Input Status 1 alias (0x3DA in a color
-    /// setup, 0x3BA in a mono one). The inactive alias is not decoded at all --
+    /// setup, 0x3BA in a mono one). The inactive alias is not decoded at all:
     /// no bits, and no side effects either.
     ///
     /// Public because Margo's scanout timing owns the BITS of a status read
@@ -666,7 +666,7 @@ impl Vga {
     /// memory. The machine uses this to invalidate cached direct pages only
     /// when a VGA write actually changes their availability.
     /// Whether the mode13 linear surface is the authoritative copy. Exposed so a
-    /// test can assert that a Margo-banked write did NOT set it -- the silent
+    /// test can assert that a Margo-banked write did NOT set it, the silent
     /// half of the dirty-notification routing, which sets this from Margo offsets
     /// when the guest was in mode 13h before its 4F02.
     pub fn mode13_linear_authoritative(&self) -> bool {
@@ -1129,10 +1129,10 @@ impl Vga {
     /// Bit 0: horizontal retrace active.
     /// Bit 1: light pen switch triggered (this core has no light pen; always 0).
     /// Bit 3: video pixel output (the current beam position is lit, i.e. the
-    ///   framebuffer bit at the beam's dot is set) -- only meaningful while the
+    ///   framebuffer bit at the beam's dot is set), only meaningful while the
     ///   beam is in the active display area.
     /// Bits 6-4: card ID (0 here; this core does not claim HGC+ id 001b).
-    /// Bit 7: vertical sync, active LOW (0 during vsync, 1 otherwise) -- the
+    /// Bit 7: vertical sync, active LOW (0 during vsync, 1 otherwise), the
     ///   inverse polarity of the VGA/CGA status1 vertical-retrace bit, and the
     ///   bit the classic HGC detection loop polls for a 0->1 (or 1->0) edge.
     fn read_hgc_status(&mut self) -> u8 {
@@ -1960,7 +1960,7 @@ impl Vga {
 
     /// Write the Hercules Mode Control register (port 3B8h). Real HGC software
     /// always sets BIOS mode 07h first (MDA-compatible 80x25 mono text, already
-    /// installed by `set_mono_text_mode`) and then bangs this port directly --
+    /// installed by `set_mono_text_mode`) and then bangs this port directly:
     /// there was never an INT 10h graphics mode number for Hercules graphics.
     /// The GRPH bit (bit 1) only takes effect once the Configuration Switch
     /// (3BFh) has set its allow-graphics bit; otherwise the card stays in
@@ -2602,7 +2602,7 @@ impl Vga {
     /// the standard 256-color register set (ATC mode-control graphics bit 0 +
     /// 8-bit color bit 6) IS the mode change. The ATC mode-control write is the
     /// last register in the conventional modeset order, so it is the decision
-    /// point. Only the personality/scanout state flips — the guest's own
+    /// point. Only the personality/scanout state flips: the guest's own
     /// SEQ/GC/ATC/CRTC values stay untouched (no VGABIOS readback seeding, no
     /// palette reset: a register-banging guest loads its own DAC).
     ///
@@ -2619,7 +2619,7 @@ impl Vga {
     /// canonical 320-wide values (a 64 KB aperture cannot hold a wider chained
     /// mode), while the unchained family decodes the guest's horizontal CRTC
     /// registers, so a nonstandard-width mode X keeps its width. The symmetric
-    /// register-banged EXIT to text is not derived — every known title restores
+    /// register-banged EXIT to text is not derived: every known title restores
     /// text via INT 10h.
     fn maybe_enter_256color_from_registers(&mut self) {
         let graphics = self.attr.mode_control & 0x01 != 0;
@@ -2630,7 +2630,7 @@ impl Vga {
         let chain4 = self.seq.memory_mode & 0x08 != 0;
         if chain4 {
             // Chained mode 13h: canonical 320x200. Reseed the raw CRTC bytes from
-            // the canonical timing before the recompute — a Text-origin bang's
+            // the canonical timing before the recompute: a Text-origin bang's
             // vertical CRTC writes are captured now but 320x200 is the correct
             // chained base regardless, and this keeps Quake byte-identical.
             self.bump_content_gen();
@@ -2639,7 +2639,7 @@ impl Vga {
             self.recompute_vertical_timing();
             self.mode = VideoMode::Mode13h;
         } else {
-            // Unchained mode X / mode Y — only when the Graphics Controller is
+            // Unchained mode X / mode Y, only when the Graphics Controller is
             // genuinely in 256-color graphics (256-shift + graphics/A0000 select),
             // so chain-4-off alone (a stray text-mode ATC write) does not flip.
             let gc_256_graphics = self.gc.mode_flags & 0x40 != 0 && self.gc.misc & 0x01 != 0;
@@ -2683,7 +2683,7 @@ impl Vga {
         // The reseed also cleared the CRTC write protect as a side effect, since
         // the 320x200 register set carries 11h = 0Eh. Mode 13h's BIOS table
         // carries 11h = 8Eh, so the protect is SET on entry here, and a guest
-        // that wants to retune registers 00h-07h must clear it first -- which is
+        // that wants to retune registers 00h-07h must clear it first, which is
         // what it must do on real silicon too.
         self.crtc = CrtcTiming::mode_x();
         // The mode is set BEFORE the recompute, because the recompute sizes the
@@ -2730,7 +2730,7 @@ impl Vga {
 
     /// Text rows rendered so far by `render_scanline`'s text-mode arm. Stays
     /// flat while a Voodoo-style device owns the monitor cable
-    /// (`advance_cable_aware(_, true)`), because that raster is elided --
+    /// (`advance_cable_aware(_, true)`), because that raster is elided:
     /// nobody will ever scan it out.
     pub fn text_rows_rendered(&self) -> u64 {
         self.text_rows_rendered
@@ -2745,7 +2745,7 @@ impl Vga {
 
     /// The content-generation counter, bumped by every display mutator (see
     /// `bump_content_gen`). The machine folds this into `Machine::frame_generation`
-    /// so any output change — from the CPU bus or an HLE BIOS service — invalidates
+    /// so any output change (from the CPU bus or an HLE BIOS service) invalidates
     /// the host frame cache.
     pub fn content_gen(&self) -> u64 {
         self.content_gen
@@ -2831,8 +2831,8 @@ impl Vga {
     pub fn set_attr_register(&mut self, index: u8, value: u8) {
         // Attribute palette / mode-control / overscan / panning / color-select all
         // change graphics output; the HLE INT 10h palette services write these
-        // directly. The 0x00..=0x0F path double-bumps via set_attr_palette_reg —
-        // harmless.
+        // directly. The 0x00..=0x0F path double-bumps via set_attr_palette_reg.
+        // Harmless.
         self.bump_content_gen();
         match index & 0x1F {
             0x00..=0x0F => self.set_attr_palette_reg(index, value),
@@ -2864,7 +2864,7 @@ impl Vga {
     }
 
     pub fn set_dac_entry(&mut self, index: u8, r: u8, g: u8, b: u8) {
-        // A palette change is a graphics-mode output change with no VRAM write — the
+        // A palette change is a graphics-mode output change with no VRAM write: the
         // HLE INT 10h AH=10h palette services call this directly, bypassing the bus.
         self.bump_content_gen();
         let [r, g, b] = self.dac_entry_for_write(r, g, b);

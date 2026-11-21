@@ -12,7 +12,7 @@ pub struct VgaRaster {
     /// `pixels` are the displayed image; the rows below are vertical blanking and
     /// border, which a real monitor never shows. `height` stays the full beam
     /// frame (`vtotal`); the host crops to `display_height` before presenting so
-    /// the active image — not the retrace region — is what fills the screen.
+    /// the active image, not the retrace region, is what fills the screen.
     pub display_height: u32,
     /// Content generation captured with this finalized raster.
     pub generation: u64,
@@ -104,7 +104,7 @@ impl Vga {
     /// the raster on those writes cost Psycho Pinball its whole picture: it
     /// replays the table late in the frame, so the frame published at the next
     /// vertical retrace held only the lines drawn after the write. Real silicon
-    /// has no such buffer -- rewriting a register with the value it already
+    /// has no such buffer: rewriting a register with the value it already
     /// holds changes nothing the beam is doing. A genuine size change still
     /// starts from a cleared buffer, because none of the old lines apply to the
     /// new geometry.
@@ -347,7 +347,7 @@ impl Vga {
     /// it never depends on `catch_up` having already rendered the given line.
     ///
     /// DECISION (lazy reads vs frame-latched state): the sampled pixel depends
-    /// on state latched at frame boundaries -- `crtc.start_address` is latched
+    /// on state latched at frame boundaries: `crtc.start_address` is latched
     /// by `finalize_frame` (via the pending-start vretrace latch) and the text
     /// cursor/attribute blink phase derives from `self.frames`. A lazy read
     /// whose predicted beam wrapped past a frame boundary the device has not
@@ -370,8 +370,8 @@ impl Vga {
         // Sample ONLY the one pel under the beam, through the same shared
         // per-pixel/per-cell implementations the full row renderers loop over
         // (`active_pixel`/`color256_pixel`/`text_cell_pixels`), so the sampled
-        // value is bit-identical to `render_*_row(line)[dot]` -- pinned by
-        // `status_mux_single_pixel_sample_matches_the_full_row_render` -- with
+        // value is bit-identical to `render_*_row(line)[dot]` (pinned by
+        // `status_mux_single_pixel_sample_matches_the_full_row_render`) with
         // no per-read row render or heap allocation (measured ~10x of a 3DA
         // poll's wall cost before this). `beam_display_enable` above guarantees
         // dot < hdisp_end, the exact domain the row indexing covered.
@@ -1112,14 +1112,14 @@ impl Vga {
         // Render the lines the beam has not yet crossed, with the current register
         // state, so a mid-frame change shows below the seam.
         //
-        // Unless the Voodoo owns the cable: then this raster is dead work --
+        // Unless the Voodoo owns the cable: then this raster is dead work:
         // `presented_frame_argb` bypasses the VGA raster entirely whenever
         // `active_display() != VgaRaster`, so nobody will ever read `work` or
         // `presented` while `skip_render` holds. `last_line` still resets to 0
         // at the bottom of every call, skipped or not, so the very next
         // non-skipped frame renders every line from scratch (the `while` loop
         // below always starts at 0 the first time skip_render goes false) and
-        // republishes a fully current raster -- the switch-back frame is
+        // republishes a fully current raster: the switch-back frame is
         // exactly what a non-skipping VGA would have produced.
         if !self.skip_render {
             while self.last_line < self.crtc.vtotal {
@@ -1187,7 +1187,7 @@ impl Vga {
     /// means a Voodoo-style device owns the monitor cable this tick, so the
     /// VGA's own raster is not being shown. The beam timing (retrace bits,
     /// the frame counter blink derives from, the CRTC status the guest
-    /// polls) is pure beam-position geometry and is completely unaffected --
+    /// polls) is pure beam-position geometry and is completely unaffected:
     /// only the per-pixel render work in `finalize_frame`/`catch_up` is
     /// elided. See `finalize_frame` for why the switch-back frame is still
     /// exactly right.

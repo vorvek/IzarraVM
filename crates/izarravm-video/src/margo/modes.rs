@@ -18,7 +18,7 @@ pub struct VbeMode {
 ///
 /// Ordered ascending by mode number, which is what a real VBE BIOS returns from
 /// 4F00h and which places the OEM mode (0x150) after the VESA-defined ones.
-/// Guests that index the enumeration by position -- DOS Quake does -- see the
+/// Guests that index the enumeration by position (DOS Quake does) see the
 /// standard modes in the order they expect. `vbe_mode_list_is_strictly_ascending`
 /// in `machine_margo_test.rs` pins this.
 pub const MARGO_VBE_MODES: &[VbeMode] = &[

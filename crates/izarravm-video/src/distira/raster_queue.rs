@@ -35,7 +35,7 @@
 //! remove.
 //!
 //! **Texture-aperture writes ride the same queue.** `write_texture_u32` used
-//! to drain unconditionally -- 65 times a frame on `tombraid3d-586`'s Lara's
+//! to drain unconditionally, 65 times a frame on `tombraid3d-586`'s Lara's
 //! Home walk, once per accepted write, which is what actually forced the 60
 //! drains a frame the module doc above is written against.
 //! A
@@ -46,7 +46,7 @@
 //! segment rasterises before the write is applied) and a triangle queued
 //! after samples the NEW one (its segment rasterises after). The write
 //! itself always applies serially, between segments, on the thread that
-//! calls `drain_raster_queue` -- never inside a lane. `texture: &'a [Vec<u8>;
+//! calls `drain_raster_queue`, never inside a lane. `texture: &'a [Vec<u8>;
 //! 2]` in [`ViewMemory`] is a plain shared borrow, not `FrameStore`'s atomic
 //! one, and the crate forbids unsafe, so a lane touching it while another
 //! lane (or the write) touches it too would be undefined behaviour, not
@@ -60,7 +60,7 @@ use super::*;
 /// grows without bound would hold the frame's whole geometry in memory and
 /// spend the win on cache misses; a few hundred entries is already more
 /// than enough to amortise one fork. Texture writes share the capacity with
-/// triangles -- both are queued commands now, and both need the guest to
+/// triangles: both are queued commands now, and both need the guest to
 /// keep moving without a synchronous drain.
 ///
 /// 512 was sized for a triangle-only queue. `tombraid3d-586`'s Lara's Home
@@ -84,7 +84,7 @@ pub(super) struct QueuedTriangle {
 }
 
 /// A texture-aperture write waiting to be applied, already decoded to a TMU
-/// and a byte offset (masked into `0..DISTIRA_TEX_SIZE`) -- the decode reads
+/// and a byte offset (masked into `0..DISTIRA_TEX_SIZE`): the decode reads
 /// live register state (`Distira::texture_write_offset`), so it happens at
 /// enqueue time, exactly as it always did. Only the STORE into texture
 /// memory is deferred.
@@ -100,7 +100,7 @@ pub(super) struct QueuedTextureWrite {
 /// `TextureWrite` pays `QueuedTriangle`'s full size (~600 bytes, mostly the
 /// `f32`/`f64` interpolation planes in `TriangleContext`) as padding.
 /// Boxing the triangle would shrink that, but it would also make the queue
-/// allocate per triangle and lose `Copy` -- exactly the cost this queue
+/// allocate per triangle and lose `Copy`, exactly the cost this queue
 /// exists to avoid paying per entry (see this module's header). The queue
 /// is capacity-bounded (`RASTER_QUEUE_CAPACITY`), so the wasted bytes are a
 /// few hundred KB at most, once, not a per-pixel cost.
@@ -139,7 +139,7 @@ impl RasterQueue {
             return false;
         }
         // S2: claim the spare allocation the moment `pending` needs to grow
-        // from empty -- this is the other half of `recycle`'s fix: a batch
+        // from empty. This is the other half of `recycle`'s fix: a batch
         // parked in `spare` because `pending` was non-empty at the join is
         // otherwise never seen again.
         if self.pending.is_empty() && self.spare.capacity() > self.pending.capacity() {
@@ -163,8 +163,8 @@ impl RasterQueue {
     /// synchronous model (slice 0b and earlier), where a drain always ran
     /// with nothing else queued yet. Under async the swap-flushed batch is
     /// joined at a call where the guest has ALREADY queued the next frame's
-    /// triangles into `pending` -- exactly the case the lever exists to
-    /// create -- so that guard failed on precisely the batch this fix cares
+    /// triangles into `pending`, exactly the case the lever exists to
+    /// create, so that guard failed on precisely the batch this fix cares
     /// about, reintroducing the per-frame allocation and memcpy #840's nit D
     /// removed, on the hot path a change chasing milliseconds should not be
     /// paying. `spare` is the fallback: when `pending` cannot adopt the
@@ -203,7 +203,7 @@ impl Eq for RasterQueue {}
 
 impl Clone for RasterQueue {
     fn clone(&self) -> Self {
-        // `spare` is a scratch allocation, not device state -- like
+        // `spare` is a scratch allocation, not device state: like
         // `pending`'s own capacity, a clone need not carry it, and starting
         // empty is simpler than deciding whether to clone dead memory too.
         Self {

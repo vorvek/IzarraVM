@@ -176,7 +176,7 @@ fn queue_stress_scene(queue_enabled: bool) -> QueueTrace {
     read_lfb_probe(&mut distira, &mut readings);
 
     // Two triangles with no read between them: the pair the queue actually
-    // batches. Then a texture upload -- which now ORDERS against them
+    // batches. Then a texture upload, which now ORDERS against them
     // instead of draining them (the texture-queue lever):
     // the
     // upload's 64 writes join the same queue as the triangles ahead of it,
@@ -483,7 +483,7 @@ fn a_batch_may_mix_y_origins_without_two_lanes_meeting_on_one_row() {
 /// bit 0 set) must still drain before it zeroes the FBI pixel counters. A
 /// queued triangle's pixels belong to the epoch BEFORE the reset, so they
 /// have to be folded in first. Deleting that drain (making `nopCMD` never
-/// drain at all) passes every other test in this suite -- the pre-existing
+/// drain at all) passes every other test in this suite: the pre-existing
 /// `nop_command_bit_zero_resets_all_fbi_pixel_counters` test never enables
 /// the queue, so it never exercises this ordering. This is the test that
 /// does.
@@ -602,7 +602,7 @@ fn nop_cmd_fences_between_triangles_batch_into_one_drain() {
 
 /// The correctness half of the same story: a framebuffer read that comes
 /// right after an ordering-only barrier must still see every triangle
-/// submitted before that barrier. This is what pins the consumer path --
+/// submitted before that barrier. This is what pins the consumer path:
 /// `scanout_argb` is a true consumer and must drain, even though the
 /// `nopCMD` immediately before it must not.
 #[test]
@@ -693,12 +693,12 @@ fn submit_flat_textured_triangle(distira: &mut Distira, vertices: [(u32, u32); 3
 /// (slice 1): a texture-aperture write must order against the triangles around it
 /// instead of draining them. Triangle A is enqueued, then a write changes
 /// the texel it samples, then triangle B is enqueued sampling the same
-/// texel. Both are queued (not drawn) the whole time -- proved by
+/// texel. Both are queued (not drawn) the whole time, proved by
 /// `raster_queue_depth` after each step, which is RED against the old
 /// unconditional-drain `write_texture_u32`: that design left the queue
 /// holding only triangle B by the time this function returns, because the
 /// write drained triangle A out from under it. The pixel-level assertions
-/// (A shows the OLD texel, B shows the NEW one) hold under EITHER design --
+/// (A shows the OLD texel, B shows the NEW one) hold under EITHER design:
 /// this test's whole point is that they must ALSO hold once the write stops
 /// forcing a drain, which the depth assertions are what actually pin. The
 /// sample point is `(8, y)`, not the triangles' own midpoints: `(32, y)`
@@ -729,8 +729,8 @@ fn a_texture_write_orders_against_triangles_instead_of_draining_them() {
     );
 
     // The OLD texel: an RGB565 value with all three channels non-zero and
-    // distinct from the NEW one below. This write itself queues too -- there
-    // is no drain point yet -- so it counts as entry 1.
+    // distinct from the NEW one below. This write itself queues too (there
+    // is no drain point yet) so it counts as entry 1.
     distira.write_texture_u32(0, 0x1111_1111);
     assert_eq!(
         distira.raster_queue_depth(),
@@ -747,7 +747,7 @@ fn a_texture_write_orders_against_triangles_instead_of_draining_them() {
     );
 
     // The write that separates A from B. It must join the queue, not drain
-    // it -- that is the whole lever.
+    // it: that is the whole lever.
     distira.write_texture_u32(0, 0x2222_2222);
     assert_eq!(
         distira.raster_queue_depth(),
@@ -793,7 +793,7 @@ fn a_texture_write_orders_against_triangles_instead_of_draining_them() {
 /// TRIANGLE runs either side of a write, not fall back to serial because a
 /// write happens to sit in the middle. Two large triangle batches (well
 /// past `PARALLEL_PIXEL_THRESHOLD`) separated by one texture write must
-/// produce the identical picture whether the run has 1 lane or 4 -- the
+/// produce the identical picture whether the run has 1 lane or 4: the
 /// segment split is a scheduling seam, not a pixel seam.
 #[test]
 fn a_texture_write_mid_batch_splits_lanes_without_moving_a_pixel() {
@@ -821,7 +821,7 @@ fn a_texture_write_mid_batch_splits_lanes_without_moving_a_pixel() {
         );
         distira.write_texture_u32(0, 0x1111_1111);
 
-        // A large triangle -- comfortably over the parallel threshold --
+        // A large triangle, comfortably over the parallel threshold,
         // queued BEFORE the write.
         submit_flat_textured_triangle(&mut distira, [(0, 0), (256, 0), (0, 256)], 10_000_000);
 
@@ -872,7 +872,7 @@ fn a_texture_write_mid_batch_splits_lanes_without_moving_a_pixel() {
 /// coordinates resolve against the register snapshot it was submitted
 /// with, not against live device state at raster time.
 /// Triangle A is enqueued, `SST_TEX_BASE_ADDR` changes (a
-/// snapshot-covered register -- it does NOT drain), a texture write lands
+/// snapshot-covered register: it does NOT drain), a texture write lands
 /// at the NEW base, then triangle B is enqueued. A must resolve through its
 /// OWN (old) base and see the OLD texel; B must resolve through the NEW
 /// base and see the NEW one.
@@ -889,11 +889,11 @@ fn a_texture_write_mid_batch_splits_lanes_without_moving_a_pixel() {
 /// forcing `triangle.params.tex_base_addr` to the OLD value at enqueue time
 /// for every queued triangle (simulating a snapshot that a later live
 /// register write could still reach) makes both A and B resolve through the
-/// OLD base -- both come back `0x0010208c`, the OLD texel's exact RGB565
+/// OLD base: both come back `0x0010208c`, the OLD texel's exact RGB565
 /// expansion, and the pixel comparison below panics with `left == right`.
 /// (The sample point matters here: an earlier draft of this test sampled
-/// `(32, 50)`, which sits past triangle B's hypotenuse -- `[(0, 32), (64,
-/// 32), (0, 64)]` only covers `x < 28` at `y=50` -- so it silently compared
+/// `(32, 50)`, which sits past triangle B's hypotenuse (`[(0, 32), (64,
+/// 32), (0, 64)]` only covers `x < 28` at `y=50`) so it silently compared
 /// A's colour against unpainted background instead of B's real sample. `(8,
 /// 50)` stays interior to every triangle shape both tests here use.)
 #[test]
@@ -933,7 +933,7 @@ fn a_queued_triangle_resolves_its_own_texture_register_snapshot_not_live_state()
     assert_eq!(distira.raster_queue_depth(), 2, "triangle A must be queued");
 
     // A base-address change. `raster_snapshot_covers_register` lists
-    // SST_TEX_BASE_ADDR, so this must NOT drain -- triangle A stays queued,
+    // SST_TEX_BASE_ADDR, so this must NOT drain: triangle A stays queued,
     // still holding its OLD base in its own snapshot.
     const NEW_BASE: u32 = 2 * 1024 * 1024;
     assert_eq!(
@@ -949,7 +949,7 @@ fn a_queued_triangle_resolves_its_own_texture_register_snapshot_not_live_state()
     );
 
     // The NEW texel, written at the NEW base (decode is always live, at
-    // write time -- this lands at NEW_BASE + 0, a different physical
+    // write time: this lands at NEW_BASE + 0, a different physical
     // address than A's write above).
     distira.write_texture_u32(0, 0x2222_2222);
     assert_eq!(

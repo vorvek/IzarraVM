@@ -278,7 +278,7 @@ fn visible_writes_report_only_the_rows_that_changed() {
 /// caller may hand it the frame it already holds. The rows outside the run keep
 /// a value the converter could never produce (`0x2a` maps to `0x0011_2233`, and
 /// every other index in this fixture maps to 0), so a converter that quietly
-/// rewrote the whole frame -- or resized it -- fails here.
+/// rewrote the whole frame (or resized it) fails here.
 #[test]
 fn scanout_argb_rows_converts_only_the_named_rows() {
     let mut palette = [0u32; 256];

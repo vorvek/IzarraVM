@@ -81,7 +81,7 @@ fn every_margo_mode_scans_out_at_exactly_the_frame_rate() {
 }
 
 /// Mode 0x150 stores 320x240 but is line-doubled to the display, so it scans out
-/// on the same monitor signal as 640x480 -- a guest polling retrace in the OEM
+/// on the same monitor signal as 640x480: a guest polling retrace in the OEM
 /// POST mode must see 640x480's blanking, not a half-size frame.
 #[test]
 fn the_line_doubled_oem_mode_scans_out_on_the_640x480_signal() {
@@ -96,7 +96,7 @@ fn the_line_doubled_oem_mode_scans_out_on_the_640x480_signal() {
 }
 
 /// `dots_until_vretrace_start` must always make progress, from anywhere in the
-/// frame including from inside the retrace window itself -- that is what makes a
+/// frame including from inside the retrace window itself: that is what makes a
 /// pacing loop ("advance to the edge, run a little, repeat") terminate.
 #[test]
 fn margo_vretrace_edge_distance_always_makes_progress() {

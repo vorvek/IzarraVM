@@ -14,15 +14,15 @@ fn texture_write(offset: usize) -> QueuedCommand {
 /// S2 of the slice 1 review: the OLD
 /// `recycle` only adopted a returned batch allocation when `pending` was
 /// ITSELF empty. Under async, the swap-flushed batch is joined at a call
-/// where the guest has ALREADY queued the next frame's first entries --
-/// `pending` is non-empty at exactly the moment the lever cares about --
+/// where the guest has ALREADY queued the next frame's first entries
+/// (`pending` is non-empty at exactly the moment the lever cares about)
 /// so that guard silently dropped the allocation on the floor every
 /// time, reintroducing the per-frame allocation #840's nit D removed.
 /// This reproduces that shape directly against `RasterQueue` alone (no
 /// `Distira` needed): recycle a big allocation while `pending` holds an
 /// unrelated, already-queued entry, then drain and recycle THAT small
 /// batch too, and confirm the next push ends up backed by the big
-/// allocation -- not a fresh, zero-capacity one.
+/// allocation, not a fresh, zero-capacity one.
 #[test]
 fn recycle_keeps_the_allocation_even_when_pending_already_holds_the_next_batch() {
     let mut queue = RasterQueue::default();
