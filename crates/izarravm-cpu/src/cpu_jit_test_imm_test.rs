@@ -2950,7 +2950,7 @@ fn mul_register_form_matches_the_interpreter_in_486_mode() {
 fn group3_non_test_subops_remain_interpreter_only() {
     // Everything in group 3 except TEST (/0), the lowered dword NEG (/3), MUL (/4), IMUL (/5) and
     // the lowered dword DIV (/6) and IDIV (/7) REGISTER forms, and the byte `0xF6 /2../7` call-outs
-    // (tyrian-486 intro). F6 `/1` stays #UD.
+    // (tyrian-486 intro). `/1` is the TEST alias and stays interpreter-only.
     //
     // The 66-prefixed WORD forms of /3, /4, /6 and /7 used to be on this list, each pinning the
     // `OperandSize::Word` allowlist as the only thing keeping a 16-bit operand away from a 32-bit
@@ -2961,7 +2961,7 @@ fn group3_non_test_subops_remain_interpreter_only() {
     for code in [
         vec![0xf7, 0xcb], // /1 TEST alias, undocumented
         vec![0xf7, 0xd3], // /2 NOT r/m32
-        vec![0xf6, 0xcb], // /1 byte, #UD
+        vec![0xf6, 0xcb], // /1 byte, TEST alias
         // NEG dword [disp32]: the MEMORY form of the very sub-opcode this slice lowers. Without
         // this case, replacing the register-only `let-else` in classify with a defaulting match
         // would lower it as `NEG EAX` and survive the whole battery, including the differential
@@ -3048,13 +3048,13 @@ fn group3_byte_non_test_subops_join_as_call_outs() {
     }
 }
 
-/// `/1` is not a group-3 operation at any width and stays refused on both sides of the prefix.
+/// `/1` is the TEST alias at any width. The compiler refuses it on both sides of the prefix.
 #[test]
 fn group3_undefined_extension_stays_refused_at_both_widths() {
     for code in [vec![0xf7u8, 0xcb], vec![0x66, 0xf7, 0xcb]] {
         assert!(
             compile_leading_block(&code).is_none(),
-            "group 3 {code:02x?} is #UD and must stay interpreter-only"
+            "group 3 {code:02x?} is the TEST alias and must stay interpreter-only"
         );
     }
 }

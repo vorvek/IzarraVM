@@ -2192,3 +2192,167 @@ fn id_flag_toggle_detection_sequence_finds_cpuid() {
     assert_eq!(cpu.registers.eax(), 1);
     assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
 }
+
+/// Result of one real-mode instruction run for the group 3 `/1` alias tests.
+struct Group3Run {
+    cpu: CpuGsw,
+    bus: TestBus,
+    result: Result<CycleOutcome, InternalFault>,
+}
+
+const GROUP3_MODES: [GswMode; 4] = [
+    GswMode::Gsw386Slow,
+    GswMode::Gsw386,
+    GswMode::Gsw486,
+    GswMode::Gsw586,
+];
+
+/// Run one instruction in real mode with EAX preset and the 8 bytes at 0x40 preset.
+fn run_group3(mode: GswMode, code: &[u8], eax: u32, data: [u8; 8]) -> Group3Run {
+    let mut memory = vec![0; 1024];
+    memory[..code.len()].copy_from_slice(code);
+    memory[0x40..0x48].copy_from_slice(&data);
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(mode);
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.registers.eip = 0;
+    cpu.registers.set_eax(eax);
+    cpu.set_flag(FLAG_CF, true);
+    cpu.set_flag(FLAG_OF, true);
+    let mut bus = TestBus::with_memory(memory);
+    let result = exec_one_split(&mut cpu, &mut bus);
+    Group3Run { cpu, bus, result }
+}
+
+#[test]
+fn group3_slash_one_is_a_test_alias_at_every_width_and_form() {
+    struct Case {
+        name: &'static str,
+        code: &'static [u8],
+        eax: u32,
+        data: [u8; 8],
+        zero: bool,
+        sign: bool,
+    }
+    let case = |name, code, eax, data, zero, sign| Case {
+        name,
+        code,
+        eax,
+        data,
+        zero,
+        sign,
+    };
+    let cases = [
+        case(
+            "TEST AL,0Fh",
+            &[0xf6, 0xc8, 0x0f][..],
+            0xf0,
+            [0; 8],
+            true,
+            false,
+        ),
+        case(
+            "TEST AL,F0h",
+            &[0xf6, 0xc8, 0xf0],
+            0xf0,
+            [0; 8],
+            false,
+            true,
+        ),
+        case(
+            "TEST AX,0FF0h",
+            &[0xf7, 0xc8, 0xf0, 0x0f],
+            0xf00f,
+            [0; 8],
+            true,
+            false,
+        ),
+        case(
+            "TEST EAX,0000FFFFh",
+            &[0x66, 0xf7, 0xc8, 0xff, 0xff, 0x00, 0x00],
+            0xffff_0000,
+            [0; 8],
+            true,
+            false,
+        ),
+        case(
+            "TEST byte [40h],0Fh",
+            &[0xf6, 0x0e, 0x40, 0x00, 0x0f],
+            0,
+            [0xf0, 0, 0, 0, 0, 0, 0, 0],
+            true,
+            false,
+        ),
+        case(
+            "TEST word [40h],0FF0h",
+            &[0xf7, 0x0e, 0x40, 0x00, 0xf0, 0x0f],
+            0,
+            [0x0f, 0xf0, 0, 0, 0, 0, 0, 0],
+            true,
+            false,
+        ),
+        case(
+            "TEST dword [40h],FFFF0000h",
+            &[0x66, 0xf7, 0x0e, 0x40, 0x00, 0x00, 0x00, 0xff, 0xff],
+            0,
+            [0x00, 0x00, 0x00, 0x80, 0, 0, 0, 0],
+            false,
+            true,
+        ),
+        case(
+            "TEST dword [40h],0000FFFFh",
+            &[0x66, 0xf7, 0x0e, 0x40, 0x00, 0xff, 0xff, 0x00, 0x00],
+            0,
+            [0x00, 0x00, 0x00, 0x80, 0, 0, 0, 0],
+            true,
+            false,
+        ),
+    ];
+    for mode in GROUP3_MODES {
+        for Case {
+            name,
+            code,
+            eax,
+            data,
+            zero,
+            sign,
+        } in &cases
+        {
+            let (name, code, eax, data, zero, sign) = (*name, *code, *eax, *data, *zero, *sign);
+            let run = run_group3(mode, code, eax, data);
+            assert!(run.result.is_ok(), "{name} on {mode:?}: {:?}", run.result);
+            assert_eq!(
+                run.cpu.registers.eip,
+                code.len() as u32,
+                "{name} on {mode:?} must consume the immediate"
+            );
+            assert_eq!(run.cpu.flag(FLAG_ZF), zero, "{name} on {mode:?} ZF");
+            assert_eq!(run.cpu.flag(FLAG_SF), sign, "{name} on {mode:?} SF");
+            assert!(!run.cpu.flag(FLAG_CF), "{name} on {mode:?} must clear CF");
+            assert!(!run.cpu.flag(FLAG_OF), "{name} on {mode:?} must clear OF");
+            assert_eq!(
+                run.cpu.registers.eax(),
+                eax,
+                "{name} on {mode:?} must not write EAX"
+            );
+            assert_eq!(
+                run.bus.memory[0x40..0x48],
+                data,
+                "{name} on {mode:?} must not write memory"
+            );
+        }
+    }
+}
+
+#[test]
+fn group3_slash_one_with_lock_is_still_an_undefined_opcode() {
+    for mode in GROUP3_MODES {
+        let run = run_group3(mode, &[0xf0, 0xf6, 0x0b, 0x00], 0, [0; 8]);
+        assert!(
+            matches!(run.result, Err(InternalFault::Exception { vector: 6, .. })),
+            "LOCK TEST on {mode:?}: {:?}",
+            run.result
+        );
+    }
+}

@@ -2483,19 +2483,20 @@ fn group3_test_word_splits_native_register_from_call_out_memory() {
     assert_row_is_native(&[0x66, 0xF6, 0xC3, 0x12]);
 }
 
-/// `/1` is not a group-3 operation and stays refused.
+/// `/1` is the undocumented alias of TEST. The compiler has no row for it, so it ends the block
+/// and the interpreter runs it.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn group3_word_refuses_the_undefined_extension() {
+fn group3_word_refuses_the_test_alias() {
     let mut code = vec![0xB8, 0x11, 0x11, 0x40, 0x41];
-    // F7 /1 with mod 11 r/m 011.
-    code.extend_from_slice(&[0xF7, 0xCB]);
-    code.extend_from_slice(&[0x40, 0xF4]);
-    let starts = vec![0, 3, 4, 5, 7];
+    // F7 /1 with mod 11 r/m 011, then its imm16 (0xF440).
+    code.extend_from_slice(&[0xF7, 0xCB, 0x40, 0xF4]);
+    code.push(0xF4);
+    let starts = vec![0, 3, 4, 5, 9];
     let (_, _, block) = build_native(&code, &starts);
     assert_eq!(
         block.span().instructions,
