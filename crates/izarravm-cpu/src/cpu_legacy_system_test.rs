@@ -3340,3 +3340,319 @@ fn halt_entry_uses_the_active_cpu_charge_and_preserves_carry() {
     assert!(!cpu.halted);
     assert_eq!(cpu.elapsed_clocks, 0);
 }
+
+#[test]
+fn no_wait_fpu_forms_ignore_a_pending_unmasked_exception() {
+    // FNSTCW, FNSTSW m16, FNSTENV, FNSAVE, FNSTSW AX, FNENI, FNDISI and FNSETPM never wait.
+    let forms: [&[u8]; 8] = [
+        &[0xd9, 0x3e, 0x40, 0x00],
+        &[0xdd, 0x3e, 0x40, 0x00],
+        &[0xd9, 0x36, 0x40, 0x00],
+        &[0xdd, 0x36, 0x40, 0x00],
+        &[0xdf, 0xe0],
+        &[0xdb, 0xe0],
+        &[0xdb, 0xe1],
+        &[0xdb, 0xe4],
+    ];
+    for code in forms {
+        let (mut cpu, memory) = real_mode_cpu(code, 0x200);
+        cpu.control.cr0 |= CR0_NE;
+        cpu.fpu.control &= !1;
+        cpu.fpu.status |= 1;
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert!(
+            !matches!(result, Err(InternalFault::Exception { vector: 16, .. })),
+            "{code:02x?} must not raise #MF: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn waiting_fpu_forms_still_raise_mf_on_a_pending_unmasked_exception() {
+    // FLD m32, FLDCW, FLDENV and FRSTOR keep the pending-exception check.
+    let forms: [&[u8]; 4] = [
+        &[0xd9, 0x06, 0x40, 0x00],
+        &[0xd9, 0x2e, 0x40, 0x00],
+        &[0xd9, 0x26, 0x40, 0x00],
+        &[0xdd, 0x26, 0x40, 0x00],
+    ];
+    for code in forms {
+        let (mut cpu, memory) = real_mode_cpu(code, 0x200);
+        cpu.control.cr0 |= CR0_NE;
+        cpu.fpu.control &= !1;
+        cpu.fpu.status |= 1;
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert!(
+            matches!(result, Err(InternalFault::Exception { vector: 16, .. })),
+            "{code:02x?} must raise #MF: {result:?}"
+        );
+    }
+}
+
+fn assert_exception(result: ExecResult<CycleOutcome>, vector: u8, code: Option<u32>) {
+    match result {
+        Err(InternalFault::Exception {
+            vector: v,
+            error_code,
+        }) => {
+            assert_eq!(v, vector, "vector");
+            assert_eq!(error_code, code, "error code");
+        }
+        other => panic!("expected vector {vector}, got {other:?}"),
+    }
+}
+
+#[test]
+fn pop_sreg_fault_restores_the_stack_pointer() {
+    // A not-present data descriptor at 0x08. The selector sits on the stack at 0x80.
+    let not_present = (0x08u16, 0x0000_ffff, 0x0000_1200);
+    let cases: [(&[u8], u8); 6] = [
+        (&[0x07], 11),
+        (&[0x17], 12),
+        (&[0x1f], 11),
+        (&[0x0f, 0xa1], 11),
+        (&[0x0f, 0xa9], 11),
+        (&[0x66, 0x07], 11),
+    ];
+    for (code, vector) in cases {
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(code, &[not_present]);
+        memory[0x80..0x84].copy_from_slice(&0x0008u32.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, vector, Some(0x08));
+        assert_eq!(cpu.registers.esp(), 0x80, "{code:02x?}");
+    }
+}
+
+#[test]
+fn leave_fault_leaves_esp_and_ebp_untouched() {
+    for code in [&[0xc9][..], &[0x66, 0xc9][..]] {
+        let (mut cpu, memory) = protected_cpu_with_gdt(code, &[]);
+        let ss = cpu.registers.segment(SegmentIndex::Ss);
+        cpu.registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister { limit: 0xff, ..ss });
+        cpu.write_gpr16(5, 0x300);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, 12, Some(0));
+        assert_eq!(cpu.registers.esp(), 0x80, "{code:02x?}");
+        assert_eq!(cpu.read_gpr16(5), 0x300, "{code:02x?}");
+    }
+}
+
+#[test]
+fn enter_nested_fault_leaves_esp_and_ebp_untouched() {
+    // ENTER 0x10,3: the first display read lies past the SS limit.
+    let (mut cpu, memory) = protected_cpu_with_gdt(&[0xc8, 0x10, 0x00, 0x03], &[]);
+    let ss = cpu.registers.segment(SegmentIndex::Ss);
+    cpu.registers
+        .set_segment(SegmentIndex::Ss, SegmentRegister { limit: 0xff, ..ss });
+    cpu.write_gpr16(5, 0x300);
+    let mut bus = TestBus::with_memory(memory);
+    let result = exec_one_split(&mut cpu, &mut bus);
+    assert_exception(result, 12, Some(0));
+    assert_eq!(cpu.registers.esp(), 0x80);
+    assert_eq!(cpu.read_gpr16(5), 0x300);
+}
+
+#[test]
+fn enter_with_nesting_builds_the_display_in_manual_order() {
+    // ENTER 4,2 at SP 0x80 with BP 0x100 and a word 0xBEEF at [0xFE].
+    let (mut cpu, mut memory) = protected_cpu_with_gdt(&[0xc8, 0x04, 0x00, 0x02], &[]);
+    memory[0xfe..0x100].copy_from_slice(&0xbeefu16.to_le_bytes());
+    cpu.write_gpr16(5, 0x100);
+    let mut bus = TestBus::with_memory(memory);
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_gpr16(5), 0x7e, "BP = FrameTemp");
+    assert_eq!(
+        cpu.registers.esp() & 0xffff,
+        0x76,
+        "SP after the allocation"
+    );
+    let word = |at: usize| u16::from_le_bytes(bus.memory[at..at + 2].try_into().unwrap());
+    assert_eq!(word(0x7e), 0x100, "saved BP");
+    assert_eq!(word(0x7c), 0xbeef, "display entry");
+    assert_eq!(word(0x7a), 0x7e, "FrameTemp");
+}
+
+#[test]
+fn iretd_in_real_mode_ignores_vm_in_the_popped_flags() {
+    let (mut cpu, mut memory) = real_mode_cpu(&[0x66, 0xcf], 0x200);
+    cpu.registers.set_esp(0x80);
+    memory[0x80..0x84].copy_from_slice(&0x20u32.to_le_bytes());
+    memory[0x84..0x88].copy_from_slice(&0u32.to_le_bytes());
+    memory[0x88..0x8c].copy_from_slice(&0x0002_0202u32.to_le_bytes());
+    let mut bus = TestBus::with_memory(memory);
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.registers.esp(), 0x8c, "three dwords popped");
+    assert_eq!(cpu.registers.eip, 0x20);
+    assert_eq!(cpu.registers.eflags & FLAG_VM, 0, "VM is not loaded");
+    assert_eq!(cpu.cpl, 0);
+}
+
+#[test]
+fn group6_lar_and_lsl_raise_ud_in_v86_mode() {
+    let codes: [&[u8]; 4] = [
+        &[0x0f, 0x00, 0xc0],
+        &[0x0f, 0x00, 0xe0],
+        &[0x0f, 0x02, 0xc3],
+        &[0x0f, 0x03, 0xc3],
+    ];
+    for code in codes {
+        let (mut cpu, memory) = protected_cpu_with_gdt(code, &[]);
+        cpu.registers.eflags |= FLAG_VM;
+        assert!(cpu.is_v86_mode());
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, 6, None);
+    }
+}
+
+#[test]
+fn mov_sreg_encodings_without_a_register_raise_ud() {
+    // MOV CS,AX and the reg 6 and 7 forms of MOV Sreg,r/m and MOV r/m,Sreg are undefined.
+    let codes: [&[u8]; 6] = [
+        &[0x8e, 0xc8],
+        &[0x8e, 0xf0],
+        &[0x8e, 0xf8],
+        &[0x8c, 0xf0],
+        &[0x8c, 0xf8],
+        &[0x8e, 0x0e, 0x40, 0x00],
+    ];
+    for code in codes {
+        let (mut cpu, memory) = real_mode_cpu(code, 0x80);
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_exception(result, 6, None);
+        assert_eq!(cpu.read_gpr16(0), 0x1234, "{code:02x?} leaves AX alone");
+    }
+}
+
+#[test]
+fn lldt_and_ltr_report_not_present_as_np_after_the_type_check() {
+    // (modrm, descriptor access byte, expected vector; 0 means the load succeeds)
+    let cases: [(u8, u32, u8); 5] = [
+        (0xd0, 0x02, 11), // LLDT: LDT descriptor, not present
+        (0xd8, 0x09, 11), // LTR: available TSS, not present
+        (0xd0, 0x12, 13), // LLDT: data descriptor, wrong type and not present
+        (0xd8, 0x92, 13), // LTR: present data descriptor, wrong type
+        (0xd0, 0x82, 0),  // LLDT: present LDT, loads
+    ];
+    for (modrm, access, vector) in cases {
+        let (mut cpu, memory) =
+            protected_cpu_with_gdt(&[0x0f, 0x00, modrm], &[(0x18, 0x0000_0067, access << 8)]);
+        cpu.registers.set_eax(0x18);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        if vector == 0 {
+            result.unwrap();
+        } else {
+            assert_exception(result, vector, Some(0x18));
+        }
+    }
+}
+
+#[test]
+fn task_switch_ldt_load_keeps_its_fault_vector() {
+    // The new TSS names an LDT descriptor that is not present.
+    let (mut cpu, mut bus) = direct_tss_jmp_fixture(GswMode::Gsw486, 0);
+    bus.memory[0x380 + 96..0x380 + 98].copy_from_slice(&0x28u16.to_le_bytes());
+    bus.memory[0x100 + 0x28..0x100 + 0x30]
+        .copy_from_slice(&[0x67, 0x00, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00]);
+    let result = exec_one_split(&mut cpu, &mut bus);
+    // The switch has committed when the LDT load fails, so the fault is a nested #GP.
+    assert!(
+        matches!(
+            result,
+            Err(InternalFault::Cpu(CpuError::FaultAfterTaskSwitchCommit {
+                nested_vector: 13
+            }))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn lgdt_and_lidt_with_a_16_bit_operand_keep_a_24_bit_base() {
+    for (modrm, prefix) in [(0x16u8, false), (0x1e, false), (0x16, true), (0x1e, true)] {
+        let mut code = Vec::new();
+        if prefix {
+            code.push(0x66);
+        }
+        code.extend_from_slice(&[0x0f, 0x01, modrm, 0x20, 0x00]);
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x80);
+        memory[0x20..0x22].copy_from_slice(&0x0027u16.to_le_bytes());
+        memory[0x22..0x26].copy_from_slice(&0xff12_3456u32.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        exec_one_split(&mut cpu, &mut bus).unwrap();
+        let table = if modrm == 0x16 { cpu.gdtr } else { cpu.idtr };
+        let expected = if prefix { 0xff12_3456 } else { 0x0012_3456 };
+        assert_eq!(table.base, expected, "modrm {modrm:#x} prefix {prefix}");
+        assert_eq!(table.limit, 0x27);
+    }
+}
+
+#[test]
+fn mov_ss_requires_rpl_and_dpl_equal_to_cpl() {
+    // (descriptor high dword, selector in AX, loads)
+    let dpl3 = 0x00cf_f200;
+    let dpl0 = 0x00cf_9200;
+    let cases: [(u32, u32, bool); 4] = [
+        (dpl3, 0x08, false), // DPL 3 stack at CPL 0
+        (dpl3, 0x0b, false), // RPL 3 and DPL 3 at CPL 0
+        (dpl0, 0x0b, false), // RPL 3 at CPL 0
+        (dpl0, 0x08, true),
+    ];
+    for (high, selector, loads) in cases {
+        let (mut cpu, memory) = protected_cpu_with_gdt(&[0x8e, 0xd0], &[(0x08, 0x0000_ffff, high)]);
+        cpu.registers.set_eax(selector);
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        if loads {
+            result.unwrap();
+        } else {
+            assert_exception(result, 13, Some(0x08));
+        }
+    }
+}
+
+#[test]
+fn io_permission_needs_a_32_bit_tss_that_holds_the_bitmap() {
+    // IN AL,0x10 at CPL 3 with IOPL 0 reads the bitmap bit for port 0x10. The bitmap starts at
+    // TSS offset 0x68. Port 0x10 is bit 0 of byte 2.
+    // (access byte, limit, permitted)
+    let cases: [(u8, u32, bool); 5] = [
+        (0x8b, 0x6f, true),
+        (0x89, 0x6f, true),
+        (0x81, 0x6f, false),
+        (0x83, 0x6f, false),
+        (0x8b, 0x60, false),
+    ];
+    for (access, limit, permitted) in cases {
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(&[0xe4, 0x10], &[]);
+        memory[0x300 + 0x66..0x300 + 0x68].copy_from_slice(&0x68u16.to_le_bytes());
+        cpu.cpl = 3;
+        cpu.registers.eflags = 0x202;
+        cpu.tr.base = 0x300;
+        cpu.tr.limit = limit;
+        cpu.tr.access = access;
+        let mut bus = TestBus::with_memory(memory);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        if permitted {
+            result.unwrap();
+        } else {
+            assert_exception(result, 13, Some(0));
+        }
+    }
+}
+
+#[test]
+fn fault_trace_row_address_wraps_for_error_code_zero() {
+    use crate::control::fault_trace_row_address;
+    assert_eq!(fault_trace_row_address(0x1000, 0, 0), 0x0ff8);
+    assert_eq!(fault_trace_row_address(0, 0, 0), 0xffff_fff8);
+    assert_eq!(fault_trace_row_address(0xffff_fff0, 0x10, 1), 0x0);
+}

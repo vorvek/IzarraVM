@@ -1927,7 +1927,7 @@ fn ltr_loads_a_gdt_tss_descriptor_through_a_non_identity_mapping() {
     cpu.gdtr.base = ALIAS_BASE + GDT;
     cpu.registers.eflags = 0x2; // ring 0, no VM/IOPL surprises
 
-    cpu.load_tr(&mut bus, TSS_SEL).unwrap();
+    cpu.load_tr_instruction(&mut bus, TSS_SEL).unwrap();
 
     assert_eq!(cpu.tr.selector, TSS_SEL);
     assert_eq!(

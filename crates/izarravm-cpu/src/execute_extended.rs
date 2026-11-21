@@ -313,9 +313,9 @@ impl CpuGsw {
         let operand_size = insn.operand_size;
         match insn.opcode {
             0x0f00 => {
-                // Group 6 (SLDT/STR/LLDT/LTR/VERR/VERW). The whole group is invalid outside
-                // protected mode, exactly as the fused handler gated it.
-                if !self.is_protected_mode() {
+                // Group 6 (SLDT/STR/LLDT/LTR/VERR/VERW). The whole group is invalid in real
+                // mode and in V86 mode.
+                if !self.is_protected_mode() || self.is_v86_mode() {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -340,7 +340,7 @@ impl CpuGsw {
                         self.require_cpl0()?;
                         let selector =
                             self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
-                        self.load_ldtr(bus, selector)?;
+                        self.load_ldtr_instruction(bus, selector)?;
                         Ok(self.charge(TimingClass::LldtLtr))
                     }
                     3 => {
@@ -348,7 +348,7 @@ impl CpuGsw {
                         self.require_cpl0()?;
                         let selector =
                             self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
-                        self.load_tr(bus, selector)?;
+                        self.load_tr_instruction(bus, selector)?;
                         Ok(self.charge(TimingClass::LldtLtr))
                     }
                     4 | 5 => {
@@ -444,6 +444,12 @@ impl CpuGsw {
                                     OperandSize::Dword,
                                     BusAccessKind::DataRead,
                                 )?;
+                                // A 16-bit operand size loads a 24-bit base.
+                                let base = if operand_size == OperandSize::Word {
+                                    base & 0x00ff_ffff
+                                } else {
+                                    base
+                                };
                                 let table = DescriptorTable { base, limit };
                                 if reg == 2 {
                                     self.gdtr = table;
@@ -453,15 +459,10 @@ impl CpuGsw {
                                 Ok(self.charge(TimingClass::LgdtLidt))
                             }
                             7 => {
-                                // INVLPG m: privileged on the 486. The operand supplies an address;
+                                // INVLPG m: privileged (#GP(0) outside CPL 0) on the 486. The operand supplies an address;
                                 // its memory contents are not read.
                                 self.require_isa_generation(IsaGeneration::I486)?;
-                                if self.current_privilege_level() != 0 {
-                                    return Err(InternalFault::Exception {
-                                        vector: 6,
-                                        error_code: None,
-                                    });
-                                }
+                                self.require_cpl0()?;
                                 let linear =
                                     self.segment_linear_byte(memory.segment, memory.offset, false)?;
                                 // The reflected-call memo's control-effect journal
@@ -479,8 +480,8 @@ impl CpuGsw {
                 }
             }
             0x0f02 => {
-                // LAR reg, r/m16: read the descriptor access-rights byte(s). Protected mode only.
-                if !self.is_protected_mode() {
+                // LAR reg, r/m16: read the descriptor access-rights byte(s). Invalid in real mode and V86 mode.
+                if !self.is_protected_mode() || self.is_v86_mode() {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -502,8 +503,8 @@ impl CpuGsw {
                 Ok(self.charge(TimingClass::Lar))
             }
             0x0f03 => {
-                // LSL reg, r/m16: read the descriptor segment limit. Protected mode only.
-                if !self.is_protected_mode() {
+                // LSL reg, r/m16: read the descriptor segment limit. Invalid in real mode and V86 mode.
+                if !self.is_protected_mode() || self.is_v86_mode() {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -1314,13 +1315,11 @@ impl CpuGsw {
             // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
             // Same clock cost (7) as those.
             0xa1 => {
-                let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Fs, value)?;
+                self.pop_segment(bus, SegmentIndex::Fs, operand_size)?;
                 Ok(self.charge(TimingClass::PopSeg))
             }
             0xa9 => {
-                let value = self.pop(bus, operand_size)? as u16;
-                self.load_segment(bus, SegmentIndex::Gs, value)?;
+                self.pop_segment(bus, SegmentIndex::Gs, operand_size)?;
                 Ok(self.charge(TimingClass::PopSeg))
             }
             _ => Err(undefined_opcode()),

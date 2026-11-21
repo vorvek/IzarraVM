@@ -251,8 +251,11 @@ impl CpuGsw {
             };
             let mut desc = [0u8; 8];
             for (i, b) in desc.iter_mut().enumerate() {
-                if let Ok(phys) = self.translate_linear(bus, base + index + i as u32, false)
-                    && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
+                if let Ok(phys) = self.translate_linear(
+                    bus,
+                    base.wrapping_add(index).wrapping_add(i as u32),
+                    false,
+                ) && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
                 {
                     *b = v as u8;
                 }
@@ -264,11 +267,12 @@ impl CpuGsw {
             // Neighborhood dump: stale-mapping garbage shows as a whole run of
             // non-descriptor bytes, a single clobbered entry as one bad row.
             for row in 0..4u32 {
-                let addr = base + index + row * 8 - 8;
+                let addr = fault_trace_row_address(base, index, row);
                 let mut d = [0u8; 8];
                 let mut phys0 = 0;
                 for (i, b) in d.iter_mut().enumerate() {
-                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false) {
+                    if let Ok(phys) = self.translate_linear(bus, addr.wrapping_add(i as u32), false)
+                    {
                         if i == 0 {
                             phys0 = phys;
                         }
@@ -281,7 +285,7 @@ impl CpuGsw {
                 }
                 eprintln!(
                     "fault trace: {table}[{:#x}] @lin {addr:#010x} phys {phys0:#010x} = {d:02x?}",
-                    index + row * 8 - 8
+                    index.wrapping_add(row * 8).wrapping_sub(8)
                 );
             }
             let cs_sel = u32::from(self.registers.cs().selector);
@@ -291,15 +295,15 @@ impl CpuGsw {
                 (self.gdtr.base, "GDT")
             };
             let targets = [
-                ("IDT gate 13", self.idtr.base + 13 * 8),
-                ("IDT gate 12", self.idtr.base + 12 * 8),
-                ("IDT gate 11", self.idtr.base + 11 * 8),
-                ("CS desc", tb + (cs_sel & 0xFFF8)),
+                ("IDT gate 13", self.idtr.base.wrapping_add(13 * 8)),
+                ("IDT gate 12", self.idtr.base.wrapping_add(12 * 8)),
+                ("IDT gate 11", self.idtr.base.wrapping_add(11 * 8)),
+                ("CS desc", tb.wrapping_add(cs_sel & 0xFFF8)),
             ];
             for (label, addr) in targets {
                 let mut d = [0u8; 8];
                 for (i, b) in d.iter_mut().enumerate() {
-                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false)
+                    if let Ok(phys) = self.translate_linear(bus, addr.wrapping_add(i as u32), false)
                         && let Ok(v) =
                             bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
                     {
@@ -323,10 +327,10 @@ impl CpuGsw {
                 ss_reg.default_size_32,
             );
             let ss_base = self.registers.segment(SegmentIndex::Ss).base;
-            let start = ss_base + (self.registers.esp() & !0xF).saturating_sub(16);
+            let start = ss_base.wrapping_add((self.registers.esp() & !0xF).saturating_sub(16));
             let mut stack = [0u8; 96];
             for (i, b) in stack.iter_mut().enumerate() {
-                if let Ok(phys) = self.translate_linear(bus, start + i as u32, false)
+                if let Ok(phys) = self.translate_linear(bus, start.wrapping_add(i as u32), false)
                     && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
                 {
                     *b = v as u8;
@@ -1247,7 +1251,10 @@ impl CpuGsw {
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
 
-                if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
+                if self.is_protected_mode()
+                    && self.current_privilege_level() == 0
+                    && flags & FLAG_VM != 0
+                {
                     // 386 PRM STACK-RETURN-TO-V86: "instruction pointer not within code
                     // segment limit THEN #GP(0)" is checked against the popped EIP before
                     // EFLAGS/CS/EIP/ESP or any of the V86 data segments are committed -- the
@@ -2400,7 +2407,13 @@ impl CpuGsw {
             let dpl = (access >> 5) & 3;
             let cpl = self.current_privilege_level();
             let rpl = (selector & 3) as u8;
-            if dpl < cpl.max(rpl) {
+            // SS needs RPL == CPL and DPL == CPL. The data segments need max(CPL, RPL) <= DPL.
+            let denied = if segment == SegmentIndex::Ss {
+                rpl != cpl || dpl != cpl
+            } else {
+                dpl < cpl.max(rpl)
+            };
+            if denied {
                 return Err(InternalFault::Exception {
                     vector: 13,
                     error_code: Some(selector_error_code(selector, in_ldt, false)),
@@ -2536,7 +2549,27 @@ impl CpuGsw {
         )
     }
 
+    /// The task switch loads the LDTR from the new TSS. A bad descriptor there is a #GP.
     pub(super) fn load_ldtr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
+        self.load_ldtr_checked(bus, selector, 13)
+    }
+
+    /// The LLDT instruction. A not-present descriptor is #NP.
+    pub(super) fn load_ldtr_instruction<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+    ) -> ExecResult<()> {
+        self.load_ldtr_checked(bus, selector, 11)
+    }
+
+    /// `not_present_vector` is the vector for a descriptor of the right type with P clear.
+    fn load_ldtr_checked<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+        not_present_vector: u8,
+    ) -> ExecResult<()> {
         if selector & 0x4 != 0 {
             // The LDT descriptor must live in the GDT (TI = 0).
             return Err(InternalFault::Exception {
@@ -2554,10 +2587,16 @@ impl CpuGsw {
         }
         let (low, high) = self.read_gdt_descriptor(bus, selector)?;
         let access = (high >> 8) & 0xff;
-        // Present LDT system descriptor (S = 0, type = 2).
-        if access & 0x80 == 0 || access & 0x1f != 0x02 {
+        // The type check comes first: LDT system descriptor (S = 0, type = 2).
+        if access & 0x1f != 0x02 {
             return Err(InternalFault::Exception {
                 vector: 13,
+                error_code: Some(selector_error_code(selector, false, false)),
+            });
+        }
+        if access & 0x80 == 0 {
+            return Err(InternalFault::Exception {
+                vector: not_present_vector,
                 error_code: Some(selector_error_code(selector, false, false)),
             });
         }
@@ -2565,7 +2604,12 @@ impl CpuGsw {
         Ok(())
     }
 
-    pub(super) fn load_tr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
+    /// The LTR instruction. A wrong type is #GP. A not-present TSS descriptor is #NP.
+    pub(super) fn load_tr_instruction<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+    ) -> ExecResult<()> {
         if selector & 0x4 != 0 || selector & !0x7 == 0 {
             return Err(InternalFault::Exception {
                 vector: 13,
@@ -2575,10 +2619,16 @@ impl CpuGsw {
         let (low, high) = self.read_gdt_descriptor(bus, selector)?;
         let access = (high >> 8) & 0xff;
         let descriptor_type = access & 0x1f;
-        // Present available TSS: type 1 (286) or 9 (386).
-        if access & 0x80 == 0 || (descriptor_type != 0x01 && descriptor_type != 0x09) {
+        // Available TSS: type 1 (286) or 9 (386).
+        if descriptor_type != 0x01 && descriptor_type != 0x09 {
             return Err(InternalFault::Exception {
                 vector: 13,
+                error_code: Some(selector_error_code(selector, false, false)),
+            });
+        }
+        if access & 0x80 == 0 {
+            return Err(InternalFault::Exception {
+                vector: 11,
                 error_code: Some(selector_error_code(selector, false, false)),
             });
         }
@@ -2671,4 +2721,12 @@ impl CpuGsw {
         // DPL >= max(CPL, RPL).
         conforming_code || dpl >= self.current_privilege_level().max(rpl)
     }
+}
+
+/// The address of one descriptor in the fault trace neighbourhood dump: the row before the
+/// faulting descriptor plus `row` slots. Wraps in u32, so error code 0 does not underflow.
+pub(crate) fn fault_trace_row_address(base: u32, index: u32, row: u32) -> u32 {
+    base.wrapping_add(index)
+        .wrapping_add(row * 8)
+        .wrapping_sub(8)
 }

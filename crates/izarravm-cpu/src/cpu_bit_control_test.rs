@@ -1880,8 +1880,8 @@ fn invlpg_invalidates_only_the_addressed_page_at_cpl0() {
 }
 
 #[test]
-fn invlpg_at_cpl3_delivers_ud() {
-    // invlpg [0x40] at CPL 3 in protected mode raises #UD (vector 6).
+fn invlpg_at_cpl3_delivers_gp() {
+    // invlpg [0x40] at CPL 3 in protected mode raises #GP(0).
     let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
@@ -1909,15 +1909,15 @@ fn invlpg_at_cpl3_delivers_ud() {
     let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0x3e, 0x40, 0x00, 0, 0, 0]);
 
     // INVLPG (0F 01 /7) is converted to the decode/execute split (task A12); run it through the
-    // split, where the CPL-3 #UD is raised in `execute_system_seg_decoded`.
+    // split, where the CPL-3 #GP is raised in `execute_system_seg_decoded`.
     let result = exec_one_split(&mut cpu, &mut bus);
 
     assert!(
         matches!(
             result,
             Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None
+                vector: 13,
+                error_code: Some(0)
             })
         ),
         "{result:?}"

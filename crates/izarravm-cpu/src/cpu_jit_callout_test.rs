@@ -599,6 +599,7 @@ fn paged_ring3_io_cpu_with(deny: bool, io_map_offset: u16, limit: u32) -> (CpuGs
     cpu.registers.eflags = 0x202;
     cpu.tr.base = TSS_BASE;
     cpu.tr.limit = limit;
+    cpu.tr.access = 0x8b;
     cpu.registers.set_edx(u32::from(PORT));
     cpu.registers.set_eax(0xdead_beef);
 
@@ -1937,6 +1938,7 @@ fn governor_block(
     cpu.cpl = 3;
     cpu.tr.base = GOVERNOR_TSS_BASE;
     cpu.tr.limit = GOVERNOR_TSS_LIMIT;
+    cpu.tr.access = 0x8b;
     configure_cpu(&mut cpu);
     cpu.registers.set_esp(STACK_TOP);
     for &linear in &starts {
