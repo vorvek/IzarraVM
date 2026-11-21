@@ -122,7 +122,7 @@ changes the result.
 | Name | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `IZARRAVM_JIT` | `0` or empty turn it off. Other values turn it on. | On | Controls whether the machine admits native blocks on its own. |
-| `IZARRAVM_JIT16` | `0`, `1`, `2` | `1` | `0` refuses 16-bit code segments. `1` admits them in ordinary RAM. `2` also admits the ROM and BIOS window. |
+| `IZARRAVM_JIT16` | `0`, `1` | `1` | `0` refuses 16-bit code segments. `1` admits them in ordinary RAM. Each other value has the effect of `1`. |
 | `IZARRAVM_JIT16_486` | `0` turns it off. | On | Lets 486 mode compile 16-bit word operands. |
 | `IZARRAVM_LANE_FAMILY` | `0` turns it off. | On | Admits the whole `0x81` register-immediate dword group, not only ADD. |
 | `IZARRAVM_SMC_LANE_TRIAL` | `0` turns it off. | On | Lets a hot self-modifying code chunk try a compile once for each key in each heat epoch. |

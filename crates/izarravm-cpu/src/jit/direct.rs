@@ -10670,16 +10670,11 @@ pub(crate) fn key_for_phys(cpu: &CpuGsw, lin: u32, d: bool, physical: u32) -> Op
     if lin.wrapping_sub(0x000f_f000) < 0x400 {
         return None;
     }
-    // The first direct slice has no page-kind guard in emitted code. Keep video and ROM code on
-    // the interpreter until the shared fast map can prove a page is ordinary RAM.
-    //
-    // The spike's level 2 lifts the ROM half of that window only (see
-    // `sixteen_bit_admission_level`): 0xC0000 and up is option ROM and the system BIOS, which is
-    // read-only storage with no side effects, while 0xA0000..0xC0000 is the VGA aperture the
-    // guard is really for and stays refused at every level.
-    if (0x000a_0000..0x0010_0000).contains(&physical)
-        && !(physical >= 0x000c_0000 && cpu.jit_direct.sixteen_bit_level >= 2)
-    {
+    // Emitted code has no page-kind guard. Keep video and ROM code on the interpreter:
+    // 0xA0000..0xC0000 is the VGA aperture, and 0xC0000..0x100000 is option ROM and the system
+    // BIOS. `install` refuses a ROM page, so a key for one would only cost a compile attempt.
+    // The refusal holds at every admission level.
+    if (0x000a_0000..0x0010_0000).contains(&physical) {
         return None;
     }
     Some(BlockKey::new(lin, physical, cpu.jit_mode_key()))
@@ -11694,21 +11689,14 @@ impl Eq for NativeTableSlots {}
 // whole family in one run of text is what makes "which rows does this build admit" answerable by
 // reading one place. Keep new knobs in this block rather than beside their call sites.
 
-/// Admission level for 16-bit code segments. **DEFAULT 1 since the 486 measurement**; it used to
-/// be 0, and the doc comment used to say "this exists to price a lever, not to ship".
+/// Admission level for 16-bit code segments, from `IZARRAVM_JIT16`. **DEFAULT 1.**
 ///
-///   0  refuse every 16-bit code segment (the old default, still the off switch)
+///   0  refuse every 16-bit code segment (the off switch)
 ///   1  admit 16-bit (CS.D = 0) code segments backed by ordinary RAM
-///   2  additionally admit the 0xC0000..0x100000 option-ROM + BIOS window
 ///
-/// Level 2 deliberately stops at 0xC0000 and leaves 0xA0000..0xC0000 (VGA memory) refused: that
-/// half of the window is a device aperture with read side effects, and it is the half the original
-/// guard was really about.
-///
-/// **Level 2 is measured WASTE and should not be used.** On a PoP boot it produces 531 extra
-/// compile attempts and ZERO extra installs, because `install`'s page-cover check wants a RAM
-/// direct page and ROM is not one. The admission gate and the installer disagree about the same
-/// window. Fix or retire it; do not set it hoping for BIOS coverage.
+/// Each other number has the effect of 1, and so does a value that is not a number. No level
+/// admits the 0xA0000..0x100000 window: `key_for_phys` refuses the VGA aperture and the ROM
+/// area for every caller.
 ///
 /// What flipping the default to 1 buys and costs, measured on a quiet box, min-of-N:
 ///

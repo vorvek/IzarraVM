@@ -7782,9 +7782,9 @@ fn a_stale_clear_bit_skips_the_guard_and_the_off_arm_still_probes() {
     }
 }
 
-/// PIN: no compiled block can be built over the VGA aperture, at ANY sixteen-bit admission
-/// level. The aperture-remap staleness fix relies on this refusal: a remap invalidates the
-/// DECODE cache, and the argument that no NATIVE twin of the bug exists is exactly this
+/// PIN: no compiled block can be built over the VGA aperture or the ROM area, at ANY sixteen-bit
+/// admission level. The aperture-remap staleness fix relies on this refusal: a remap invalidates
+/// the DECODE cache, and the argument that no NATIVE twin of the bug exists is exactly this
 /// clause. If a future admission level lifts it, that slice inherits the remap edge too.
 #[test]
 fn the_aperture_never_yields_a_block_key() {
@@ -7792,25 +7792,27 @@ fn the_aperture_never_yields_a_block_key() {
     for level in 0..=2u8 {
         cpu.set_sixteen_bit_admission_level(level);
         for physical in [
-            0x000a_0000u32,
-            0x000a_8000,
-            0x000b_0000,
-            0x000b_8000,
-            0x000b_ffff,
+            0xa_0000u32,
+            0xa_8000,
+            0xb_0000,
+            0xb_8000,
+            0xb_ffff,
+            0xc_0000,
+            0xc_8000,
+            0xf_ffff,
         ] {
             assert!(
                 crate::jit::direct::key_for_phys(&cpu, 0x100, true, physical).is_none(),
-                "aperture physical {physical:#x} admitted at level {level}"
+                "window physical {physical:#x} admitted at level {level}"
             );
         }
+        // Conventional memory below the window IS admitted. The contrast keeps this pin from
+        // passing vacuously through some earlier screen refusing every physical outright.
+        assert!(
+            crate::jit::direct::key_for_phys(&cpu, 0x100, true, 0x9_0000).is_some(),
+            "a physical below the window got no key at level {level}"
+        );
     }
-    // The ROM half above 0xC0000 IS admitted at level 2. The contrast keeps this pin from
-    // passing vacuously through some earlier screen refusing every physical outright.
-    cpu.set_sixteen_bit_admission_level(2);
-    assert!(
-        crate::jit::direct::key_for_phys(&cpu, 0x100, true, 0x000c_8000).is_some(),
-        "the ROM half must be admitted at level 2, or this pin is testing the wrong gate"
-    );
 }
 
 /// E7 pin: the fast map is keyed by LINEAR address so a compiled block is
