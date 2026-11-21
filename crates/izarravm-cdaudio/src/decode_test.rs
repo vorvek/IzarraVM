@@ -289,3 +289,146 @@ fn a_surround_source_plays_its_front_left_and_front_right() {
     assert_eq!(i16::from_le_bytes([first[2], first[3]]), -2000);
     std::fs::remove_file(&path).ok();
 }
+
+/// Decode through `decode_chunked` and return every chunk it published, with
+/// the sector count that came with it.
+fn chunks_of(path: &Path, info: TrackInfo, stage_sectors: u32) -> Vec<(u32, Vec<u8>)> {
+    let mut chunks = Vec::new();
+    decode_chunked(
+        path,
+        info,
+        info.sectors,
+        stage_sectors,
+        &mut |ready, chunk| chunks.push((ready, chunk.to_vec())),
+        &mut || false,
+    )
+    .unwrap();
+    chunks
+}
+
+/// Lay the chunks end to end in a track-sized buffer, as `DecodedTrack` does.
+fn assemble(info: TrackInfo, chunks: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
+    let mut at = 0;
+    for (_, chunk) in chunks {
+        pcm[at..at + chunk.len()].copy_from_slice(chunk);
+        at += chunk.len();
+    }
+    pcm
+}
+
+#[test]
+fn chunked_decode_matches_the_whole_buffer_decode_for_every_container() {
+    let odd_length = std::env::temp_dir().join(format!(
+        "izarravm-cdaudio-odd-length-{}.wav",
+        std::process::id()
+    ));
+    // 4410 frames are seven and a half sectors, so the last sector is partial.
+    std::fs::write(&odd_length, surround_wav(4410)).unwrap();
+    let mut paths: Vec<PathBuf> = [
+        "tone.wav",
+        "tone.flac",
+        "tone.ogg",
+        "tone.mp3",
+        // Needs resampling, and its length is not a whole number of sectors.
+        "tone-22k-mono.wav",
+    ]
+    .iter()
+    .map(|name| fixture(name))
+    .collect();
+    paths.push(odd_length.clone());
+
+    for path in &paths {
+        let info = crate::probe_info(path).unwrap().unwrap();
+        // One stage as large as the track never flushes early, so it is the
+        // reference for the small stages.
+        let whole = assemble(info, &chunks_of(path, info, info.sectors));
+        assert!(whole.iter().any(|b| *b != 0), "{path:?} decoded to silence");
+        for stage in [1, 2, 5, STAGE_SECTORS] {
+            let chunked = assemble(info, &chunks_of(path, info, stage));
+            assert!(chunked == whole, "{path:?} differs at {stage} sectors");
+        }
+    }
+    std::fs::remove_file(&odd_length).ok();
+}
+
+#[test]
+fn the_staging_size_bounds_every_published_chunk() {
+    let info = crate::probe_info(&fixture("tone.ogg")).unwrap().unwrap();
+    for stage in [1u32, 3, 8] {
+        let chunks = chunks_of(&fixture("tone.ogg"), info, stage);
+        let bound = stage as usize * AUDIO_FRAME_BYTES;
+        assert!(chunks.len() > 1, "stage {stage} published in one piece");
+        let (last, body) = chunks.split_last().unwrap();
+        for (_, chunk) in body {
+            assert!(
+                chunk.len() <= bound,
+                "chunk of {} over {bound}",
+                chunk.len()
+            );
+            // Mid-track chunks are whole sectors.
+            assert_eq!(chunk.len() % AUDIO_FRAME_BYTES, 0);
+        }
+        assert!(last.1.len() <= bound);
+        assert_eq!(
+            last.1.len() % AUDIO_FRAME_BYTES,
+            0,
+            "the padded tail is whole"
+        );
+        assert_eq!(last.0, info.sectors);
+    }
+}
+
+#[test]
+fn a_partial_last_sector_is_padded_with_silence_in_a_reused_stage() {
+    // 4410 frames: the last sector holds 294 frames. A one-sector stage has
+    // held nonzero audio before, so a missing pad would leave it in the tail.
+    let path = std::env::temp_dir().join(format!(
+        "izarravm-cdaudio-partial-tail-{}.wav",
+        std::process::id()
+    ));
+    std::fs::write(&path, surround_wav(4410)).unwrap();
+    let info = crate::probe_info(&path).unwrap().unwrap();
+    let chunks = chunks_of(&path, info, 1);
+    let tail = &chunks.last().unwrap().1;
+    assert_eq!(tail.len(), AUDIO_FRAME_BYTES);
+    let audio = 294 * 4;
+    assert!(tail[..audio].iter().any(|b| *b != 0));
+    assert!(tail[audio..].iter().all(|b| *b == 0));
+    std::fs::remove_file(&path).ok();
+}
+
+/// FNV-1a over the bytes, 64 bits.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+#[test]
+fn chunked_decode_matches_the_recorded_whole_buffer_output() {
+    // Length and hash of the PCM that the whole-buffer decoder produced before
+    // the staging change, one entry per fixture.
+    let odd_length = std::env::temp_dir().join(format!(
+        "izarravm-cdaudio-recorded-odd-{}.wav",
+        std::process::id()
+    ));
+    std::fs::write(&odd_length, surround_wav(4410)).unwrap();
+    let recorded: [(PathBuf, usize, u64); 6] = [
+        (fixture("tone.wav"), 35280, 0xf447_7443_7045_1455),
+        (fixture("tone.flac"), 35280, 0xf447_7443_7045_1455),
+        (fixture("tone.ogg"), 35280, 0xcea1_cbc2_46b7_c45d),
+        (fixture("tone.mp3"), 35280, 0x4a0a_780d_67e1_eb25),
+        (fixture("tone-22k-mono.wav"), 35280, 0x25fb_e9b5_a25f_82d9),
+        (odd_length.clone(), 18816, 0x154c_b6f7_7dd3_3d85),
+    ];
+    for (path, len, hash) in &recorded {
+        let info = crate::probe_info(path).unwrap().unwrap();
+        for stage in [1, 5, STAGE_SECTORS] {
+            let pcm = assemble(info, &chunks_of(path, info, stage));
+            assert_eq!(pcm.len(), *len, "{path:?} length at {stage} sectors");
+            assert_eq!(fnv1a(&pcm), *hash, "{path:?} hash at {stage} sectors");
+        }
+    }
+    std::fs::remove_file(&odd_length).ok();
+}

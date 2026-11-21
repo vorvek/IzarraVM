@@ -17,7 +17,7 @@
 //! `frame()` slicing a cleared buffer out of range, and that panic happens on
 //! the emulation thread under `panic = "abort"`.
 
-use crate::decode::decode_into_cancellable;
+use crate::decode::{STAGE_SECTORS, decode_chunked};
 use crate::probe::{CdAudioError, TrackInfo, probe_info};
 use izarravm_core::{AUDIO_FRAME_BYTES, AudioTrackSource};
 use std::path::{Path, PathBuf};
@@ -195,15 +195,15 @@ impl DecodedTrack {
 
 /// Decode the whole file, publishing each newly finished run of sectors.
 fn decode_worker(path: &Path, info: TrackInfo, shared: &Arc<Shared>, registry: Option<&Registry>) {
-    // Decode into a scratch buffer and copy under the lock. Holding the mutex
-    // across a decode call would block the mixer pull for as long as a packet
-    // takes to decode.
-    let mut scratch = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
+    // Decode through a small staging buffer and copy each chunk under the
+    // lock. Holding the mutex across a decode call would block the mixer pull
+    // for as long as a packet takes to decode.
     let mut published = 0usize;
-    let result = decode_into_cancellable(
+    let result = decode_chunked(
         path,
         info,
-        &mut scratch,
+        info.sectors,
+        STAGE_SECTORS,
         &mut |ready, new_bytes| {
             let from = published;
             let upto = from + new_bytes.len();

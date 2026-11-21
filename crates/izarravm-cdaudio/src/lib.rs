@@ -13,7 +13,7 @@ mod probe;
 mod sniff;
 mod track;
 
-pub use decode::{decode_into, decode_into_cancellable};
+pub use decode::{STAGE_SECTORS, decode_chunked, decode_into, decode_into_cancellable};
 pub use probe::{
     CD_SAMPLE_RATE, CdAudioError, SAMPLES_PER_FRAME, TrackInfo, probe_info, sectors_for,
 };
