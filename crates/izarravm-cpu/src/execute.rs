@@ -1355,7 +1355,8 @@ impl CpuGsw {
                 error_code: Some(0),
             });
         }
-        let io_base = self.read_system_linear(bus, self.tr.base + 0x66, BusWidth::Word)?;
+        let io_base =
+            self.read_system_linear(bus, self.tr.base.wrapping_add(0x66), BusWidth::Word)?;
         for p in u32::from(port)..u32::from(port) + width.bytes() {
             let byte_index = io_base + p / 8;
             if byte_index > self.tr.limit {
@@ -1364,8 +1365,11 @@ impl CpuGsw {
                     error_code: Some(0),
                 });
             }
-            let byte =
-                self.read_system_linear(bus, self.tr.base + byte_index, BusWidth::Byte)? as u8;
+            let byte = self.read_system_linear(
+                bus,
+                self.tr.base.wrapping_add(byte_index),
+                BusWidth::Byte,
+            )? as u8;
             if byte & (1 << (p % 8)) != 0 {
                 return Err(InternalFault::Exception {
                     vector: 13,

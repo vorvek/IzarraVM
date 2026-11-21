@@ -2498,3 +2498,50 @@ fn an_out_of_limit_vector_whose_gp_gate_is_also_missing_ends_in_a_triple_fault()
         "{result:?}"
     );
 }
+
+// System-table and TSS addresses come from registers the guest loads (GDTR, IDTR, TR). A base
+// near the top of the 32-bit space makes `base + offset` carry out. The linear address wraps at
+// 4 GiB, as on the real part, so a debug build must not panic. Each test below panics in a debug
+// build if the sum uses plain `+`. The result of the access is not the point, so it is ignored.
+
+#[test]
+fn a_gdt_descriptor_read_wraps_at_4_gib() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    // The TSS descriptor sits at GDT + 0x18. With this base the sum is 0x1_0000_0008.
+    cpu.gdtr.base = 0xffff_fff0;
+    cpu.registers.eflags = 0x2;
+
+    let _ = cpu.load_tr_instruction(&mut bus, TSS_SEL);
+}
+
+#[test]
+fn an_idt_gate_read_wraps_at_4_gib() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+    // Vector 13 is at offset 0x68. The gate address wraps to 0x60.
+    cpu.idtr.base = 0xffff_fff8;
+    cpu.idtr.limit = 0x7ff;
+
+    let _ = cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default());
+}
+
+#[test]
+fn a_tss_stack_switch_with_tr_base_near_4_gib_wraps() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+    // The ring-0 stack fields are at TR base + 4 and + 8.
+    cpu.tr.base = 0xffff_fffe;
+
+    let _ = cpu.deliver_exception(&mut bus, 13, Some(0), false, &mut CommittedCore::default());
+}
+
+#[test]
+fn a_v86_io_bitmap_read_with_tr_base_near_4_gib_wraps() {
+    let guest = [0xe6, 0x21, 0xf4]; // out 0x21, al ; hlt
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+    // The I/O map base word is at TR base + 0x66.
+    cpu.tr.base = 0xffff_ffe0;
+
+    let _ = cpu.cycle(&mut bus);
+}

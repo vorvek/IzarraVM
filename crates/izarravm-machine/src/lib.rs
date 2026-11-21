@@ -3331,7 +3331,7 @@ impl Machine {
     fn set_int_frame_carry(&mut self, carry: bool) {
         let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
         let sp = self.cpu.registers.esp() as u16;
-        let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
+        let flags_addr = ss.wrapping_add(u32::from(sp.wrapping_add(4))) as usize;
         if let Ok(mut flags) = self.memory.read_u16(flags_addr) {
             if carry {
                 flags |= 0x0001;
