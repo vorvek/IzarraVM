@@ -6,19 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const SOURCES: &[(&str, &str)] = &[
-    ("fluidsynth-2.5.6.tar.gz", "fluidsynth-2.5.6"),
-    ("libsndfile-1.2.2.tar.gz", "libsndfile-1.2.2"),
-    ("libogg-1.3.6.tar.gz", "ogg-1.3.6"),
-    ("libvorbis-1.3.7.tar.gz", "vorbis-1.3.7"),
-    ("flac-1.4.3.tar.gz", "flac-1.4.3"),
-    ("opus-1.5.2.tar.gz", "opus-1.5.2"),
-    (
-        "gcem-012ae73c6d0a2cb09ffe86475f5c6fba3926e200.tar.gz",
-        "gcem-012ae73c6d0a2cb09ffe86475f5c6fba3926e200",
-    ),
-    ("munt-2.8.2.tar.gz", "munt-munt_2_8_2"),
-];
+#[path = "build_support.rs"]
+mod build_support;
+use build_support::{SOURCES, Source, first_hash_token, vs_generator};
 
 fn main() {
     let target = env::var("TARGET").expect("Cargo provides TARGET");
@@ -40,19 +30,36 @@ fn main() {
     let source_dir = out_dir.join("source");
     fs::create_dir_all(&source_dir).unwrap();
 
-    for (archive, root) in SOURCES {
-        println!("cargo::rerun-if-changed=vendor/{archive}");
-        extract(&vendor_dir.join(archive), &source_dir, root);
+    let mut fresh: Vec<&Source> = Vec::new();
+    for source in SOURCES {
+        println!("cargo::rerun-if-changed=vendor/{}", source.archive);
+        if extract(
+            &vendor_dir.join(source.archive),
+            &source_dir,
+            &out_dir,
+            source,
+        ) {
+            fresh.push(source);
+        }
     }
-    let fluid_gcem = source_dir.join("fluidsynth-2.5.6").join("gcem");
-    if !fluid_gcem.join("include").join("gcem.hpp").is_file() {
+    // The fluidsynth archive has an empty gcem folder. Fill it each time
+    // fluidsynth or gcem is extracted again, before any stamp is written.
+    let gcem_root = "gcem-012ae73c6d0a2cb09ffe86475f5c6fba3926e200";
+    if fresh
+        .iter()
+        .any(|source| source.root == gcem_root || source.root == "fluidsynth-2.5.6")
+    {
         run(
             Command::new("cmake")
                 .args(["-E", "copy_directory"])
-                .arg(source_dir.join("gcem-012ae73c6d0a2cb09ffe86475f5c6fba3926e200"))
-                .arg(&fluid_gcem),
+                .arg(source_dir.join(gcem_root))
+                .arg(source_dir.join("fluidsynth-2.5.6").join("gcem")),
             "populate FluidSynth's pinned gcem submodule",
         );
+    }
+    // A stamp marks a complete tree. It is the last step for every archive.
+    for source in fresh {
+        fs::write(stamp_path(&source_dir, source), source.sha256).unwrap();
     }
     assert_offline_sources(&source_dir);
 
@@ -225,17 +232,76 @@ fn main() {
     }
 }
 
-fn extract(archive: &Path, destination: &Path, root: &str) {
-    if destination.join(root).exists() {
+fn stamp_path(source_dir: &Path, source: &Source) -> PathBuf {
+    source_dir.join(format!(".{}.stamp", source.root))
+}
+
+/// SHA-256 of `path` from `cmake -E sha256sum`, in lowercase.
+fn sha256_of(path: &Path) -> String {
+    let output = Command::new("cmake")
+        .args(["-E", "sha256sum"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to hash {}: {error}", path.display()));
+    assert!(
+        output.status.success(),
+        "failed to hash {}: {}",
+        path.display(),
+        output.status
+    );
+    first_hash_token(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Remove a folder. Fall back to `cmake -E rm -rf` if Rust cannot do it.
+fn remove_tree(path: &Path) {
+    if !path.exists() {
         return;
+    }
+    if fs::remove_dir_all(path).is_err() {
+        run(
+            Command::new("cmake").args(["-E", "rm", "-rf"]).arg(path),
+            "remove an incomplete native build folder",
+        );
+    }
+}
+
+/// Check the archive hash, then extract the archive unless the source tree
+/// carries a stamp for the same hash. Return true if the tree was extracted
+/// now. The caller writes the stamp when the tree is complete.
+fn extract(archive: &Path, source_dir: &Path, out_dir: &Path, source: &Source) -> bool {
+    let expected = source.sha256.to_ascii_lowercase();
+    let actual = sha256_of(archive);
+    assert_eq!(
+        actual,
+        expected,
+        "SHA-256 of {} does not match the pinned value (see vendor/SOURCES.md)",
+        archive.display()
+    );
+
+    let tree = source_dir.join(source.root);
+    let stamp = stamp_path(source_dir, source);
+    let stamped = fs::read_to_string(&stamp).is_ok_and(|text| text.trim() == expected);
+    if stamped && tree.exists() {
+        return false;
+    }
+
+    // An unstamped tree may hold a cut-short file with an old mtime, so the
+    // objects of its CMake build folder cannot be trusted either.
+    let _ = fs::remove_file(&stamp);
+    remove_tree(&tree);
+    if !source.build.is_empty() {
+        remove_tree(&out_dir.join(format!("build-{}", source.build)));
     }
     run(
         Command::new("cmake")
             .args(["-E", "tar", "xzf"])
             .arg(archive)
-            .current_dir(destination),
+            .current_dir(source_dir),
         "extract native source archive",
     );
+    true
 }
 
 fn build_project(
@@ -279,6 +345,13 @@ fn build_project(
         target,
         "--parallel",
     ]);
+    // Cargo sets NUM_JOBS. Without it CMake picks its own count.
+    if let Some(jobs) = env::var("NUM_JOBS")
+        .ok()
+        .filter(|value| value.parse::<u32>().is_ok_and(|count| count > 0))
+    {
+        compile.arg(jobs);
+    }
     compiler_environment(&mut compile);
     run(&mut compile, &format!("build {name}"));
     build
@@ -328,16 +401,19 @@ fn cmake_generator() -> Vec<String> {
         .path()
         .to_string_lossy()
         .replace('\\', "/");
-    let generator = if compiler.contains("/18/") || compiler.contains("/2026/") {
-        "Visual Studio 18 2026"
-    } else if compiler.contains("/17/") || compiler.contains("/2022/") {
-        "Visual Studio 17 2022"
-    } else if compiler.contains("/16/") || compiler.contains("/2019/") {
-        "Visual Studio 16 2019"
-    } else {
+    let Some(generator) = vs_generator(&compiler) else {
         panic!("unsupported MSVC installation: {compiler}");
     };
-    vec!["-G".into(), generator.into(), "-A".into(), "x64".into()]
+    let mut arguments = vec![
+        "-G".to_string(),
+        generator.name.to_string(),
+        "-A".to_string(),
+        "x64".to_string(),
+    ];
+    if let Some(instance) = generator.instance {
+        arguments.push(format!("-DCMAKE_GENERATOR_INSTANCE={instance}"));
+    }
+    arguments
 }
 
 fn compiler_environment(command: &mut Command) {

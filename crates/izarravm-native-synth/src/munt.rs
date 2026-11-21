@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::ffi::{CString, c_char, c_double, c_int, c_void};
+use std::ffi::{c_char, c_double, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 
@@ -27,11 +27,22 @@ unsafe extern "C" {
         instance_data: *mut c_void,
     ) -> *mut MuntContext;
     fn mt32emu_free_context(context: *mut MuntContext);
-    fn mt32emu_add_rom_file(context: *mut MuntContext, filename: *const c_char) -> c_int;
-    fn mt32emu_merge_and_add_rom_files(
+    // The library keeps the data pointers it is given and does not copy the bytes.
+    // A null digest makes the library compute the SHA-1 itself.
+    fn mt32emu_add_rom_data(
         context: *mut MuntContext,
-        part1_filename: *const c_char,
-        part2_filename: *const c_char,
+        data: *const u8,
+        data_size: usize,
+        sha1_digest: *const c_char,
+    ) -> c_int;
+    fn mt32emu_merge_and_add_rom_data(
+        context: *mut MuntContext,
+        part1_data: *const u8,
+        part1_data_size: usize,
+        part1_sha1_digest: *const c_char,
+        part2_data: *const u8,
+        part2_data_size: usize,
+        part2_sha1_digest: *const c_char,
     ) -> c_int;
     fn mt32emu_set_stereo_output_samplerate(context: *mut MuntContext, sample_rate: c_double);
     fn mt32emu_open_synth(context: *const MuntContext) -> c_int;
@@ -71,6 +82,21 @@ const ROM_PAIR_LIMIT: usize = 8;
 #[derive(Debug)]
 pub struct MuntSynth {
     context: NonNull<MuntContext>,
+    /// ROM images the library accepted. The library points into these bytes, so
+    /// they must outlive the context. Fields drop after `Drop::drop` has freed
+    /// the context, which gives the right order.
+    roms: Vec<Vec<u8>>,
+}
+
+/// The largest file a ROM scan reads. A real ROM image is 1 MiB or less.
+const ROM_SIZE_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// A candidate that no single call identified, kept for pairing.
+struct Image {
+    path: PathBuf,
+    data: Vec<u8>,
+    /// The library accepted this buffer, so it must outlive the context.
+    kept: bool,
 }
 
 impl MuntSynth {
@@ -103,7 +129,10 @@ impl MuntSynth {
         // SAFETY: A null report handler and instance pointer select libmt32emu defaults.
         let context = NonNull::new(unsafe { mt32emu_create_context(handler, ptr::null_mut()) })
             .ok_or(Error::NativeAllocation("Munt context"))?;
-        let mut result = Self { context };
+        let mut result = Self {
+            context,
+            roms: Vec::new(),
+        };
 
         // Round 1 is what the user actually chose; round 2 widens to the folders
         // those choices live in, and only if round 1 came up short. A user who
@@ -138,57 +167,105 @@ impl MuntSynth {
     /// image split into halves, which `mt32emu_add_rom_file` cannot recognise on
     /// its own: it matches against FULL images only.
     fn offer(&mut self, candidates: &[PathBuf], set: &mut RomSet, tried: &mut Vec<PathBuf>) {
-        let mut unpaired: Vec<PathBuf> = Vec::new();
+        let mut unpaired: Vec<Image> = Vec::new();
         for path in candidates {
             if tried.contains(path) {
                 continue;
             }
             tried.push(path.clone());
-            let Ok(native) = rom_path(path) else {
+            let Some(data) = read_rom(path) else {
                 continue;
             };
-            // SAFETY: The context is live and `native` is NUL-terminated for the call.
-            match unsafe { mt32emu_add_rom_file(self.context.as_ptr(), native.as_ptr()) } {
-                ADDED_CONTROL_ROM => set.control = Some(path.clone()),
-                ADDED_PCM_ROM => set.pcm = Some(path.clone()),
-                _ => unpaired.push(path.clone()),
+            // SAFETY: A buffer the library accepts is moved into `self.roms`
+            // below, and the other buffers are not referenced after a refusal.
+            match unsafe { self.add_image(&data) } {
+                ADDED_CONTROL_ROM => {
+                    set.control = Some(path.clone());
+                    self.roms.push(data);
+                }
+                ADDED_PCM_ROM => {
+                    set.pcm = Some(path.clone());
+                    self.roms.push(data);
+                }
+                code => unpaired.push(Image {
+                    path: path.clone(),
+                    data,
+                    kept: code >= 0,
+                }),
             }
         }
-        if set.is_complete() {
-            return;
+        if !set.is_complete() {
+            unpaired.truncate(ROM_PAIR_LIMIT);
+            for (index, other) in ordered_pairs(unpaired.len()) {
+                if set.is_complete() {
+                    break;
+                }
+                // SAFETY: Both buffers stay in `unpaired` until the end of this
+                // function, and a buffer the library accepts moves into `self.roms`.
+                let code =
+                    unsafe { self.merge_images(&unpaired[index].data, &unpaired[other].data) };
+                if code >= 0 {
+                    unpaired[index].kept = true;
+                    unpaired[other].kept = true;
+                }
+                match code {
+                    ADDED_CONTROL_ROM => set.control = Some(unpaired[index].path.clone()),
+                    ADDED_PCM_ROM => set.pcm = Some(unpaired[index].path.clone()),
+                    // `ROMS_NOT_PAIRABLE` lands here and is deliberately NOT used
+                    // to conclude "your two halves are from different dumps". It
+                    // cannot mean that: `addROMFiles` answers it whenever
+                    // `makeROMImage` returns NULL, which is every pair of files
+                    // that are not halves of one image, including two files that
+                    // are not ROMs at all. A folder of junk produces it on every
+                    // pair, so trusting it told a user with no ROMs whatsoever that
+                    // their ROM set was mismatched. The unpairable verdict comes
+                    // from `open` instead, where both images have already been
+                    // identified by SHA-1 and the synth still refuses them.
+                    _ => {}
+                }
+            }
         }
-        unpaired.truncate(ROM_PAIR_LIMIT);
-        for (first, second) in ordered_pairs(&unpaired) {
-            if set.is_complete() {
-                return;
-            }
-            let (Ok(first_native), Ok(second_native)) = (rom_path(&first), rom_path(&second))
-            else {
-                continue;
-            };
-            // SAFETY: The context is live and both paths are NUL-terminated for the call.
-            let code = unsafe {
-                mt32emu_merge_and_add_rom_files(
-                    self.context.as_ptr(),
-                    first_native.as_ptr(),
-                    second_native.as_ptr(),
-                )
-            };
-            match code {
-                ADDED_CONTROL_ROM => set.control = Some(first),
-                ADDED_PCM_ROM => set.pcm = Some(first),
-                // `ROMS_NOT_PAIRABLE` lands here and is deliberately NOT used
-                // to conclude "your two halves are from different dumps". It
-                // cannot mean that: `addROMFiles` answers it whenever
-                // `makeROMImage` returns NULL, which is every pair of files
-                // that are not halves of one image, including two files that
-                // are not ROMs at all. A folder of junk produces it on every
-                // pair, so trusting it told a user with no ROMs whatsoever that
-                // their ROM set was mismatched. The unpairable verdict comes
-                // from `open` instead, where both images have already been
-                // identified by SHA-1 and the synth still refuses them.
-                _ => {}
-            }
+        self.roms.extend(
+            unpaired
+                .into_iter()
+                .filter(|image| image.kept)
+                .map(|image| image.data),
+        );
+    }
+
+    /// Offer one full ROM image to the library and return its code.
+    ///
+    /// # Safety
+    /// If the code is not negative, the library keeps a pointer into `data`.
+    /// The caller must keep those bytes alive until the context is freed.
+    unsafe fn add_image(&mut self, data: &[u8]) -> c_int {
+        // SAFETY: The context is live and `data` is readable for its length.
+        unsafe {
+            mt32emu_add_rom_data(
+                self.context.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                ptr::null(),
+            )
+        }
+    }
+
+    /// Offer two halves of one ROM image to the library and return its code.
+    ///
+    /// # Safety
+    /// Same contract as `add_image`, for both buffers.
+    unsafe fn merge_images(&mut self, first: &[u8], second: &[u8]) -> c_int {
+        // SAFETY: The context is live and both buffers are readable for their length.
+        unsafe {
+            mt32emu_merge_and_add_rom_data(
+                self.context.as_ptr(),
+                first.as_ptr(),
+                first.len(),
+                ptr::null(),
+                second.as_ptr(),
+                second.len(),
+                ptr::null(),
+            )
         }
     }
 
@@ -372,26 +449,26 @@ fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
 /// Every ordered pair of distinct entries. Ordered, because merging two halves
 /// is not commutative: the library pairs part 1 with part 2, so a set whose
 /// halves are named in the other order still has to be tried both ways.
-fn ordered_pairs(paths: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+fn ordered_pairs(count: usize) -> Vec<(usize, usize)> {
     let mut pairs = Vec::new();
-    for (index, first) in paths.iter().enumerate() {
-        for (other, second) in paths.iter().enumerate() {
-            if index != other {
-                pairs.push((first.clone(), second.clone()));
+    for first in 0..count {
+        for second in 0..count {
+            if first != second {
+                pairs.push((first, second));
             }
         }
     }
     pairs
 }
 
-fn rom_path(path: &Path) -> Result<CString, Error> {
-    if !path.is_file() {
-        return Err(Error::MissingRom(path.to_path_buf()));
+/// Read a ROM candidate in Rust, so a path with non-ASCII characters works on
+/// Windows. The C library would open it with the ANSI code page.
+fn read_rom(path: &Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > ROM_SIZE_LIMIT {
+        return None;
     }
-    let value = path
-        .to_str()
-        .ok_or_else(|| Error::InvalidPath(path.to_path_buf()))?;
-    CString::new(value).map_err(|_| Error::InvalidPath(path.to_path_buf()))
+    std::fs::read(path).ok()
 }
 
 fn munt_result(operation: &'static str, code: c_int) -> Result<(), Error> {

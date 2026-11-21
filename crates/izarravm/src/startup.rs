@@ -248,6 +248,11 @@ impl ResolvedStartup {
         &self.hardware
     }
 
+    /// The per-user folder for state files, `~/.izarravm`.
+    pub(super) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     /// The folder the GUI would mount as C:, after --c-drive, the config file,
     /// and the portable/per-user default have all been applied. The boot
     /// profiler mounts exactly this, so its numbers describe the machine the
