@@ -8,7 +8,7 @@
 use izarravm_core::GswMode;
 
 /// Dhrystones per second of the VAX 11/780 reference.
-#[allow(dead_code)]
+#[cfg(test)]
 pub const VAX_DHRYSTONES_PER_SEC: f64 = 1757.0;
 
 pub const BAND_LOW_RATIO: f64 = 0.98;
@@ -19,13 +19,13 @@ pub struct BenchBand {
     pub payload: &'static str,
     pub mode: GswMode,
     pub target: f64,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub lo: f64,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub hi: f64,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub unit: &'static str,
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub cite: &'static str,
 }
 
