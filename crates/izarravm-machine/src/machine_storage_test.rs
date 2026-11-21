@@ -2057,7 +2057,7 @@ fn the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder() {
 
 /// A TRANSIENT HOST READ FAILURE MUST NEVER BE CACHED.
 ///
-/// The reviewer's reproduction, made permanent. The Katea read path answers an
+/// The reproduction of the defect, made permanent. The Katea read path answers an
 /// unreadable host file with ZEROS so a vanished or shrunk file cannot panic the
 /// guest, and it drops its cached host handle so the next sector re-opens -- a
 /// deliberate retry design. The host-side sector cache sits above all of that

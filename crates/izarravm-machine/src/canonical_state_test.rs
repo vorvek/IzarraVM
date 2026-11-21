@@ -3155,7 +3155,7 @@ fn uncommitted_batch_timing_is_rejected() {
 
 #[test]
 fn construction_seed_writes_never_accrue_isa_bus_time() {
-    // Adversarial-review finding on the `IZARRAVM_ISA_IO_WAIT` slice. `new_raw_program`
+    // A defect found in the `IZARRAVM_ISA_IO_WAIT` slice. `new_raw_program`
     // seeds PIT counter 0 with three `write_io` calls (dos.rs) and programs the 8259 pair,
     // modelling POST work that happened before the guest existed. With the charge armed
     // those writes accrued three ISA periods into `port_bus_batch_clocks` -- an accrual with no

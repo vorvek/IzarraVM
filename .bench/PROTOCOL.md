@@ -447,11 +447,11 @@ invariants. Carry forward verbatim into future JIT sessions.
   enforced was touched: the scoreboard and the realtime gate key on the guest
   oracle, and it matches. What is dead is the practice of eyeballing
   `instructions` / `jit_direct_entries` / `decode_probes` against the numbers
-  in this section — an agent doing that on current main will conclude every
+  in this section — a reader who does that on current main will conclude every
   build is confounded. Compare those fields CROSS-ROLE inside one ladder, as
   the sixpair summary already does, and treat the block above as the current
-  reading rather than a new pin. `realtics` remains session-local (see the
-  doom-realtics note in the campaign memory) and 979 is not a pin either.
+  reading rather than a new pin. `realtics` remains session-local
+  and 979 is not a pin either.
 
 ### Quake (the calibration anchor, NOT the wall target)
 
@@ -756,7 +756,7 @@ invariants. Carry forward verbatim into future JIT sessions.
   work.** The storage-charge and HDD-geometry slices earlier the same day moved
   the 486 count 580 → 919 (+58%) and the 586 count 962 → 1026 (+6.7%), which no
   sane band absorbs. That is the correct outcome: a change to what the emulated
-  machine charges for I/O SHOULD land on a reviewer's desk as a pin move with a
+  machine charges for I/O SHOULD be read as a pin move with a
   stated cause, and a change to how fast we execute the same charged work should
   not. Widening the band until timing-model changes fit would only hide the one
   class of move that is worth reading.

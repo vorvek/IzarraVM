@@ -3239,7 +3239,7 @@ impl CpuBus for MachineBus<'_> {
             // rather than by porting.
             //
             // `skip_io_touched` AND `io_touched_before_read` ARE NOT
-            // INTERCHANGEABLE, and conflating them was a blocking review finding.
+            // INTERCHANGEABLE, and code that conflates them is wrong.
             // `io_touched_before_read` is snapshotted well above, BEFORE the
             // general set, and records whether an EARLIER access in this batch
             // already ended the batch. Under the ring-0-monitor exemption
@@ -4401,13 +4401,13 @@ impl MachineBus<'_> {
         // ack never armed it, and the machine's own timer ISR chains INT 1Ch
         // (stub 0x1C) every tick, so an unconditional disarm would race a
         // hardware IRQ against a live hook-chain attribution and drop the
-        // chained service (round-2 review finding 1).
+        // chained service.
         if intercepted {
             *self.last_int_vector = None;
         }
         if let Some(pending) = *self.pending_soft_int {
             // The dedup above is vector-blind; the only legitimate repeat is a
-            // re-charge of the SAME pending visit (round-1 review finding 3).
+            // re-charge of the SAME pending visit.
             debug_assert!(
                 pending == vector,
                 "stub fetch posted vector {vector:#04x} while {pending:#04x} is still pending"

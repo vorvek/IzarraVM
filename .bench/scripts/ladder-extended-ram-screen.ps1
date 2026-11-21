@@ -309,12 +309,12 @@ function Set-BaseEnvironment {
 }
 
 # The confounder this campaign actually suffers from, MEASURED per leg rather
-# than assumed absent. The 2026-08-24 board was taken with an agent running and
+# than assumed absent. The 2026-08-24 board was taken with another session running and
 # read four rows 8-16% slow; the emulator is single-threaded but the workload is
 # L3- and memory-bandwidth sensitive, so a concurrent `cargo -j8` moves it even
 # on a 32-core host. A leg whose window contained a builder is marked and can be
 # re-run rather than silently averaged in. This matters more than usual here:
-# a second agent shares this box, and the two of us hand the box back and forth.
+# a second session shares this box, and the two sessions hand the box back and forth.
 function Get-BuilderCount {
     $builders = Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ProcessName -match '^(cargo|rustc|link|lld-link)$' }

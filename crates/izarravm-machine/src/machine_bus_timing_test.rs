@@ -986,7 +986,7 @@ fn lazy_pit_counter_read_does_not_set_io_touched_in_approximate_class_but_does_i
 
 #[test]
 fn v86_pit_counter_read_falls_back_to_the_non_lazy_path_for_a_bcd_channel() {
-    // The BCD leg the reviewer's fold caught: `count_after` declines for a
+    // The BCD leg: `count_after` declines for a
     // BCD-programmed counter and `Counter::read` (via `read_port_at`) silently
     // falls back to `masked_count()` -- the frozen batch-start CE, not a live
     // one. The lazy exemption above is only sound because the peek is live
@@ -5007,7 +5007,7 @@ fn charge_direct_ram_read_charges_exactly_what_the_direct_read_charges() {
     }
 }
 
-/// Review finding 17 (code-smell batch 2, S3, rung A). Phase C used to assert, per served
+/// Code-smell batch 2, S3, rung A. Phase C used to assert, per served
 /// call-out, that its charged re-read returned the SAME VALUE `peek_direct_ram` had already
 /// seen -- the only in-tree evidence that `peek_direct_ram`'s doc promise ("a `Some` result
 /// promises `read_memory_direct` will take its ALIGNED direct-RAM arm and return the same

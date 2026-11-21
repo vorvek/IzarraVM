@@ -3,7 +3,7 @@
 # Corpus candidates (owner's list, 2026-09-05)
 
 Source: `R:\La Colección de Neville\dosroot` (read-only). Add a game per the
-protocol in `README.md` and `AGENT-BRIEF.md`; record the outcome in `LEDGER.md`.
+protocol in `README.md` and `CORPUS-BRIEF.md`; record the outcome in `LEDGER.md`.
 The owner's expectation: many of these will run badly. A bad run is evidence.
 
 The standing target is rt 2.0x or better in any load under the 586 persona.

@@ -2086,8 +2086,8 @@ impl Machine {
                         && let Some(vector) = self.pending_soft_int
                     {
                         serviced = true;
-                        // The reflected-call memo's HLE seam (Fable review 2026-09-05,
-                        // BLOCKING F2). This is the instant a posted software interrupt is
+                        // The reflected-call memo's HLE seam (the F2 refusal).
+                        // This is the instant a posted software interrupt is
                         // SERVICED, and the machine writes guest registers and memory here,
                         // outside every CPU seam. A reflected trip straddles 6-8 batch
                         // boundaries, so a nested `INT 1Ah`/`INT 10h`/`INT 13h`/`INT 2Fh`

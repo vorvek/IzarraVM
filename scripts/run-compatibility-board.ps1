@@ -368,7 +368,7 @@ function New-SelfTestPpm([string]$Path, [int]$Width, [int]$Height, [scriptblock]
 }
 
 # The frame-stats self-test, also carried over. It exists because the colour
-# counter was WRONG on its first outing in a way no reviewer caught and no crash
+# counter was WRONG on its first outing in a way no review caught and no crash
 # reported: the channel packing dropped red and green, so it counted distinct
 # BLUE values and read 49 where the frame held 174.
 function Assert-BoardFrameStatsSelfTest {

@@ -1164,7 +1164,7 @@ fn live_mode_switch_debits_credit_in_master_ticks() {
 
 /// The audio pump carries the GUEST's wavetable level to the MIDI engines.
 ///
-/// This link had no test and reviewers flagged it repeatedly, for a structural
+/// This link had no test, for a structural
 /// reason: the level lives in CT1745 registers `0x50`/`0x51`, the only way to
 /// move them is a guest `OUT`, and both registers power on at unity -- so a
 /// test driving a real `Machine` reads (1.0, 1.0) whether the pump wires them

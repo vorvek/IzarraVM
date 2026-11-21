@@ -210,7 +210,7 @@ fn extracts_the_embedded_image_payload() {
     // length compare: the driver's resident envelope is padded to a fixed
     // size, so two different builds are routinely the same length — a stale
     // tokados-hdd.img sailed through the old length check while every real
-    // boot silently ran the previous monitor (V86 trap tax review finding).
+    // boot silently ran the previous monitor (found in the V86 trap tax work).
     assert_eq!(
         by_name.get("TOKAEMM.SYS").map(|d| d.as_slice()),
         Some(izarravm_firmware::tokaemm_sys()),

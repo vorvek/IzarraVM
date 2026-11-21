@@ -3265,7 +3265,7 @@ fn masked_sb16_line_does_not_offer_the_pause_wake() {
 
 #[test]
 fn pause_dac_holds_dma_across_the_batch_that_ends_at_its_deadline() {
-    // Codex on #734: `Sb16Path::advance` applied the countdown before it
+    // Found on #734: `Sb16Path::advance` applied the countdown before it
     // ticked the batch's frames, so a batch ending at the pause deadline
     // cleared the pause and then consumed every frame of the pause window.
     let mut machine = test_machine();

@@ -666,7 +666,7 @@ fn a_statistics_read_mid_batch_reports_the_joined_epoch() {
     );
 }
 
-/// S3, review finding 2's guard: `fastfillCMD` must still join a batch the
+/// S3, the fastfill-after-swap guard: `fastfillCMD` must still join a batch the
 /// swap left in flight -- unlike the swap itself, it reads and clears the
 /// SAME shared colour/depth buffer that batch may still be drawing into
 /// (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2). Queue

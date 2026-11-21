@@ -2415,8 +2415,8 @@ fn tick_machine_ticks(machine: &mut Machine, master_ticks: u64) -> Option<StopRe
 /// the MIDI engines, mix them into the machine's frame, apply the host playback
 /// level, queue it -- and wiring is exactly what a `Machine` cannot be asked
 /// about in a unit test: reaching `0x50`/`0x51` from outside means booting DOS
-/// and running SNDMIXER. Reviewers flagged `set_gain` here as untested three
-/// times for that reason. Behind this seam a fake reports a known gain and a
+/// and running SNDMIXER. `set_gain` here stayed untested
+/// for that reason. Behind this seam a fake reports a known gain and a
 /// known frame, so the whole pump is checked in microseconds.
 pub(super) trait AudioMachine {
     /// Guest time, for placing native synthesis on the guest's clock.

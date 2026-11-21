@@ -1177,7 +1177,7 @@ $maximumBackgroundLoadPercent = 30.0
 #             covers JIT-mix work with a factor of 18 in hand and deliberately
 #             does NOT cover timing-model work -- the same day's storage-charge
 #             slices moved this count 580 -> 919 -- which is the class of change
-#             that SHOULD reach a reviewer as a pin move. See .bench/PROTOCOL.md.
+#             that SHOULD be read as a pin move. See .bench/PROTOCOL.md.
 #
 #             The count and its band live in the SIDECAR JSON beside the frame
 #             hashes, not here, and go through the same -RecordInvariants /
@@ -2374,7 +2374,7 @@ function Get-PpmFrameStats([string]$Path) {
 }
 
 # Frame-stats self-test. It exists because the colour counter was WRONG on its
-# first outing in a way no reviewer caught and no crash reported: the channel
+# first outing in a way no review caught and no crash reported: the channel
 # packing dropped red and green (see the [int] casts above), so it counted
 # distinct BLUE values and read 49 where the frame held 174. What found it was
 # the tombraid row failing its own new band on a perfectly good frame. These

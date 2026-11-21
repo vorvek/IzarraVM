@@ -828,7 +828,7 @@ fn callout_poll_skip_names_which_screen_declined() {
 /// **Rebuilt from the original ADD/IN/ADC fixture (revision report, M-24 replacement) because its
 /// stated invariant was false: `IN AL,DX` OVERWRITES AL, so `AL == 1` after the original fixture
 /// held only by accident -- iff the 0x3DA byte on the loop's last iteration happened to be
-/// exactly `0x00` (adversarial review M2). Worse, timing-contract amendment C4 releases 0x3DA
+/// exactly `0x00`. Worse, timing-contract amendment C4 releases 0x3DA
 /// bits 4-5 to 86Box's model, which would make that byte NON-DETERMINISTIC and break the fixture
 /// for a reason that has nothing to do with RBP.**
 ///

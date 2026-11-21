@@ -36,8 +36,8 @@ DO NOT baseline against `.bench/results/retire-governor-blast-20260825/`. That
 survey was measured on `main` and ranks the effect; it does not grade it. All three
 cells come fresh from this binary and the two sets are never quoted across.
 
-CONTAMINATION IS MEASURED, NOT ASSUMED. The 2026-08-24 board was contaminated by an
-agent and read four rows 8-16% slow; the PIT ladder of the same night came back
+CONTAMINATION IS MEASURED, NOT ASSUMED. The 2026-08-24 board was contaminated by a
+concurrent session and read four rows 8-16% slow; the PIT ladder of the same night came back
 24/24 dirty on one row with a 2x outlier. Every leg records whether a builder was
 alive in its window.
 #>

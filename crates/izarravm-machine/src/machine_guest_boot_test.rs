@@ -880,7 +880,7 @@ fn int_opcode_dispatch_services_exactly_once() {
 
 #[test]
 fn hook_chaining_to_the_saved_default_services_exactly_once() {
-    // Reviewer reproducer (finding 1): a guest hooks an intercepted vector
+    // Reproducer: a guest hooks an intercepted vector
     // and chains to the saved default (the per-vector stub). The hook gets
     // no post at the opcode (it owns the vector); the chain landing posts
     // exactly one service. A double poster advances the BDA cursor column
@@ -920,7 +920,7 @@ fn hook_chaining_to_the_saved_default_services_exactly_once() {
 
 #[test]
 fn copied_vector_services_once_as_the_landed_vector() {
-    // Reviewer reproducer (finding 2): a guest copies one intercepted
+    // Reproducer: a guest copies one intercepted
     // vector's IVT entry over another (IVT[0x42] <- IVT[0x10]) and issues
     // the copy. Real hardware runs the landed handler exactly once; a
     // dispatch that posts at both the opcode (as 0x42) and the landing
@@ -952,8 +952,8 @@ fn copied_vector_services_once_as_the_landed_vector() {
 
 #[test]
 fn hook_chain_to_legacy_iret_survives_an_uninterceded_stub_landing() {
-    // Round-2 review finding 1 (deterministic stand-in for the timer-tick
-    // race): a guest hooks INT 13h and its hook body dispatches a
+    // A deterministic stand-in for the timer-tick
+    // race: a guest hooks INT 13h and its hook body dispatches a
     // NON-intercepted interrupt (INT 1Ch here, exactly what the machine's
     // own timer ISR chains every tick) before chaining to the hardcoded
     // legacy FF00:0000. The 1Ch stub landing must NOT disarm the live

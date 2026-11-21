@@ -3,8 +3,8 @@
 # .bench - JIT wall A/B workspace (local-only, git-excluded)
 
 Staging area for the JIT region wall-clock measurements. Everything here is
-untracked (in `.git/info/exclude` under `/.bench/` and the per-worktree
-`/.claude/worktrees/*/.bench/`). Game fixtures are copyrighted and must
+untracked (in `.git/info/exclude` under `/.bench/` and the same
+directory of each worktree). Game fixtures are copyrighted and must
 never be committed.
 
 ## Layout
@@ -52,7 +52,7 @@ keeps it out of git.
 ```
 # 1. Both exes must exist (baseline at origin/main, v2 on the feature branch):
 cargo build -j8 --release -p izarravm                           # v2
-cargo build -j8 --release -p izarravm --manifest-path .claude/worktrees/baseline-main/Cargo.toml
+cargo build -j8 --release -p izarravm --manifest-path <baseline-worktree>/Cargo.toml
 
 # 2. Run the interleaved A/B (equal guest event, minimal idle tail):
 bash .bench/ab_doom.sh

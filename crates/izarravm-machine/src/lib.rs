@@ -21,7 +21,7 @@ use izarravm_core::{
 };
 /// Are this crate's two reflected-call-memo seams compiled in?
 ///
-/// The batch loop's interpreter forcing (Fable review F1) and the HLE soft-int SERVICE
+/// The batch loop's interpreter forcing (F1) and the HLE soft-int SERVICE
 /// refusal (F2) both live in `run.rs` behind this crate's own `reflected-call-memo`
 /// feature. A build of the `izarravm` binary that enables `izarravm-cpu`'s arm without
 /// enabling this one gets the memo module and NEITHER fix, and says nothing about it: the

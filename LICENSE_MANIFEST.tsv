@@ -2,12 +2,12 @@ path	class	origin	license	sha256
 .bench/corpus/games/007-license-to-kill.json	test-fixture	IzarraVM project	GPL-3.0-only	1b71968ceafa06d22b0bb38939eba5c6ed52700ad0437cdc5ec7e11a4b17c3fd
 .bench/corpus/games/1-ton.json	test-fixture	IzarraVM project	GPL-3.0-only	82dc4d17de286914c8cead1306fbc9efa9713ab3892bf135dfe1f291ede25d37
 .bench/corpus/games/100-000-pyramid.json	test-fixture	IzarraVM project	GPL-3.0-only	1736bdbfb5b2c9099fab33827ba8fe934e0a8a5a43d132d9af3b3d3494916b17
-.bench/corpus/games/1000-miglia.json	test-fixture	IzarraVM project	GPL-3.0-only	0252cb093d94fa7c4c11edac59e086d6893b755d70687120423ffd55d0944465
+.bench/corpus/games/1000-miglia.json	test-fixture	IzarraVM project	GPL-3.0-only	773662a240404381680086594c52257ec81aae55f401108cf3b1a79aca6a2356
 .bench/corpus/games/10rogue.json	test-fixture	IzarraVM project	GPL-3.0-only	e2d5b1288a9d83825cb7364499d5b657b0b5c40357ab0752cf7610adf8bed40c
 .bench/corpus/games/10th-frame.json	test-fixture	IzarraVM project	GPL-3.0-only	aeaada028c8e8572e67217f2f580a5b0e3dada3a1ec6eb6c597e6db26f5e109b
 .bench/corpus/games/123-talk-shareware.json	test-fixture	IzarraVM project	GPL-3.0-only	cfd72584bfa3a3a0f377b3cc0f847fef338689b993318eef29160579e9b82472
 .bench/corpus/games/15-move-hole-puzzle.json	test-fixture	IzarraVM project	GPL-3.0-only	3f9cbb2d7443165ed141ce2ef6038d958d86976a940dd203e382109c512bba27
-.bench/corpus/games/15x15.json	test-fixture	IzarraVM project	GPL-3.0-only	dd249c65d0c092d68fbdd10d62c83068d21413d25251150e31c269d23beeff56
+.bench/corpus/games/15x15.json	test-fixture	IzarraVM project	GPL-3.0-only	979d68502a3f8fe0c4d60c79497293b9585e7ce31f08b7e74a99a6b4a177ec05
 .bench/corpus/games/1830-railroads-robber-barons.json	test-fixture	IzarraVM project	GPL-3.0-only	2184fda0c6d159702afccff6588a369e8bd1177708df0f410db1852592b704cb
 .bench/corpus/games/21-for-1-to-4.json	test-fixture	IzarraVM project	GPL-3.0-only	3a976e95b3be8c1ca605bdac7f893594dd3458d0b1c3d6d67f972922798eb0b6
 .bench/corpus/games/k-cheiw.json	test-fixture	IzarraVM project	GPL-3.0-only	52e64204119120c1bd292660b65b74461efdee515597872ff741a48c7c64ac06

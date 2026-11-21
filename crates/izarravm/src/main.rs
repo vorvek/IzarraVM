@@ -371,7 +371,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
     // R2.20(c)'s compare-loop microbenchmark: off unless
     // `IZARRAVM_REFLECTED_CALL_MEMO_BENCH` is set, in which case it prints to
     // stderr and does not otherwise affect this run. Gated under the feature
-    // (Fable review 2026-09-03), same as the rest of the module.
+    // (a plain build carries none of it), same as the rest of the module.
     #[cfg(feature = "reflected-call-memo")]
     izarravm_cpu::reflected_call_memo::maybe_run_compare_bench();
     tracing_subscriber::fmt()
@@ -2511,7 +2511,7 @@ fn write_hdd_profile_json(
     // Slice 1 (record-and-measure): additive, unconditional on both arms of the KNOB within
     // this build (plan section 7.4) -- all-zero / `{"armed":false}` when
     // `IZARRAVM_REFLECTED_CALL_MEMO` is unset. Gated under `feature = "reflected-call-memo"`
-    // (Fable review 2026-09-03), same shape as `reflected_call_diagnostic` above: a plain
+    // (not only the runtime knob), same shape as `reflected_call_diagnostic` above: a plain
     // build carries neither the key nor the module.
     #[cfg(feature = "reflected-call-memo")]
     {
@@ -3301,8 +3301,7 @@ fn reflected_call_diagnostic_json(
     })
 }
 
-/// Stage A of the SMC census. Design `dev_docs/smc-census-design.md` §3/§4/§8 layer 1, cut by the
-/// adversarial review of 2026-08-15.
+/// Stage A of the SMC census: layer 1 of the census design (sections 3, 4 and 8).
 ///
 /// The closure asserts below are the instrument's Gate D: an instrument that does not close is
 /// not evidence, so a mismatch panics rather than warning. They are `assert!`, not
@@ -3345,7 +3344,7 @@ fn smc_census_json(
         "stage": "A",
         "window": snapshot.window.map(|(start, end)| json!([start, end])),
         "clock_instructions": snapshot.clock,
-        // Review finding M11: R0's SMC_wall is NOT derivable from this instrument. Stage A carries
+        // R0's SMC_wall is NOT derivable from this instrument. Stage A carries
         // no sampled timer, so the only source is an external RIP-sample profile of a census-OFF
         // build. R6's shares are shares of measured WORK UNITS inside the invalidation choke; the
         // two are multiplied, never equated.
@@ -3595,12 +3594,12 @@ fn smc_census_phase_json(phase: &izarravm_cpu::DirectSmcCensusPhase) -> serde_js
             "error": smc_census_page_counts_json(row.error),
         })).collect::<Vec<_>>(),
         "derived": {
-            // R1. Lower-bound top-four share. Review finding M2: the worst-case per-row deflation
+            // R1. Lower-bound top-four share. The worst-case per-row deflation
             // is kills / 64, so an S4 landing inside [0.60, 0.66] is INSIDE the error band and
             // must be read as R1's middle arm, not the licensing arm.
             "r1_s4_lower": ratio(top4_lower, kills),
             "r1_space_saving_error_bound": ratio(kills, u64::from(phase.page_rows_capacity)),
-            // R2. Review finding M7: W is surviving keys over scanned keys, not the no-kill call
+            // R2. W is surviving keys over scanned keys, not the no-kill call
             // key sum, because a killing call also scans survivors a presence filter would elide.
             "r2_w_surviving": ratio(u.keys_surviving, u.keys_scanned),
             // C1's mechanism witness. `probes_elided / keys_scanned` is the share of the window

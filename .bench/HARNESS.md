@@ -657,7 +657,7 @@ periodic rows carry their own id; difference only those.
 
 ## Multi-session box coordination (adopted 2026-08-30)
 
-Several Claude sessions share this box. Before any TIMED measurement
+Several work sessions share this box. Before any TIMED measurement
 (a ladder, a board run for wall/rt), the measuring session sends
 "BENCH START (WALL)" to every ACTIVE session and waits for holds; for
 counter-only legs, "BENCH START (COUNTERS)" holds builds only. "BENCH
