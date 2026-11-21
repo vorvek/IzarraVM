@@ -24,7 +24,7 @@ crates/izarravm-cdaudio/tests/fixtures/tone.mp3	generated-test-fixture	IzarraVM 
 crates/izarravm-cdaudio/tests/fixtures/tone.ogg	generated-test-fixture	IzarraVM project source	GPL-3.0-only	e0e1355c548a2b5135c40a7a48555937a5c69a95241d490059f770b5974ac005
 crates/izarravm-cdaudio/tests/fixtures/tone.wav	generated-test-fixture	IzarraVM project source	GPL-3.0-only	b2704439a1ed0f31c3c3a6042e3cca65d9dac10839cd2c14681a53d02379dd4f
 crates/izarravm-cpu/tests/fixtures/conformance_sample.json	test-fixture	IzarraVM project	GPL-3.0-only	6191f0dc08877a7a1d0630386c3337a9aa4b4cb08fe6506c1fcd75769182164a
-crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	1d531809b75b516e17b90698ce7c79093a582ac192f1716903cc5217d7041da8
+crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	8eb2a9d37680cd9aff3fea62c6b33c39f22ff65a855da119f4be2324aebbf860
 crates/izarravm-firmware/roms/boot-suite/results.inc	generated-source	IzarraVM boot suite	GPL-3.0-only	1b59bb368a2089b05b118059cbdcd38a8a8e02bf02f6d9e4acf6a7c332e37db7
 crates/izarravm-firmware/roms/codepage-fonts.bin	generated-font	Modern DOS by Jayvee Enaguas	CC0-1.0	39c4644a8b3569e5181c12a4804ce47e4ce8014996c6286962179336bff64116
 crates/izarravm-firmware/roms/disttri.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	71342ef15413d15eb5ce0e8a45837d402d42d79651f0f54f67f0e47b58fdd575
