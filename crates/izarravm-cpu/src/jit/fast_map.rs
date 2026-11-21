@@ -19,8 +19,7 @@ const BITSET_WORDS: usize = LINEAR_PAGE_COUNT / u64::BITS as usize;
 const UNAVAILABLE_BIAS: usize = usize::MAX;
 const UNAVAILABLE_PHYSICAL_PAGE: u32 = u32::MAX;
 
-/// The store-bias poison (one-lookup store design D1,
-/// `dev_docs/2026-08-07-one-lookup-store-design.md`). In-band with the two tag bits below:
+/// The store-bias poison (one-lookup store design D1). In-band with the two tag bits below:
 /// a poisoned entry has bit 0 set AND cannot collide with a tagged mode13 bias, because a
 /// bias whose low 12 bits are not free is poisoned before tagging.
 const STORE_BIAS_POISON: usize = usize::MAX;
@@ -34,8 +33,7 @@ const STORE_BIAS_MODE13: usize = 1;
 const STORE_BIAS_SUPERVISOR: usize = 2;
 const STORE_BIAS_TAG_MASK: usize = STORE_BIAS_MODE13 | STORE_BIAS_SUPERVISOR;
 
-/// The load-bias twin (one-lookup load design D1,
-/// `dev_docs/2026-08-07-one-lookup-load-design.md`). Same in-band encoding as the store table —
+/// The load-bias twin (one-lookup load design D1). Same in-band encoding as the store table —
 /// the VALUES are shared so the emitted tag tests are byte-identical between the twins — but the
 /// MEANINGS differ where the read path differs: there is no watch term (no read path consults a
 /// watch table, so a watched page's loads stay fast), and bit 1 is ring 3's READ test alone.
@@ -55,7 +53,7 @@ const HAS_READ_BIAS: u8 = 0b0000_0100;
 const HAS_WRITE_BIAS: u8 = 0b0000_1000;
 const PAGE_WRITABLE: u8 = 0b0001_0000;
 const PAGE_USER: u8 = 0b0010_0000;
-/// The watched-page bit (design: `dev_docs/2026-08-06-watched-page-bit-design.md`). CLEAR
+/// The watched-page bit. CLEAR
 /// promises that NEITHER code-watch table has an entry for this linear page's physical page, so
 /// an emitted store may skip the code-watch guard entirely. SET promises nothing — the full
 /// guard decides. Recomputed from both watch tables on EVERY `populate` (never carried through

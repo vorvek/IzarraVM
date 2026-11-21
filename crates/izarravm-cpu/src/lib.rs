@@ -921,11 +921,11 @@ pub struct PerfCounters {
     ///
     /// They exist because `decode_inval_other` alone cannot say WHICH control-register write
     /// tore the code caches down, and the Tyrian 586 diagnosis
-    /// (`dev_docs/2026-09-02-tyrian-586-specs-diag.md` section 4.1) had to reach `MOV CR3` by
+    /// (section 4.1) had to reach `MOV CR3` by
     /// elimination rather than by measurement. A gate on any one of these three paths must be
     /// designed against the counter that names it.
     ///
-    /// **After the CR3 code-cache gate** (`2026-09-02-cr3-code-cache-gate-design.md`),
+    /// **After the CR3 code-cache gate**,
     /// `decode_inval_cr3` no longer implies a teardown: it is bumped by
     /// `flush_tlb_and_code_caches_for_cr3_write` on EVERY `MOV CR3`, ring hit or miss, so it keeps
     /// counting CR3 WRITES, not CR3 flushes. `cr3_code_flush_taken` and `cr3_code_flush_skipped`
@@ -945,7 +945,7 @@ pub struct PerfCounters {
     /// CR3 code-cache gate: `MOV CR3` writes served by the ring (a same-directory reselect, R1,
     /// or a fresh allocation into a free slot, R2) with no decode-cache teardown at all.
     pub cr3_code_flush_skipped: u64,
-    /// CR3 JIT-half gate (design doc `2026-09-02-cr3-jit-half-design.md`): `MOV CR3` writes whose
+    /// CR3 JIT-half gate (CR3 JIT-half design): `MOV CR3` writes whose
     /// LINK graph was served by `select_link_context` -- the `Skipped` arm, R1 or R2. Incremented
     /// beside `cr3_code_flush_skipped` in the same match arm, so
     /// `cr3_link_context_selects == cr3_code_flush_skipped` is true by construction and is kept
@@ -976,7 +976,7 @@ pub struct PerfCounters {
     /// rt sag. NOT cumulative: it can fall as well as rise (a retire-all that clears the bitmap
     /// drops it to 0).
     pub translation_pages_marked: u64,
-    /// CR3 data-side gate (design `2026-09-02-cr3-data-side-design.md` T2, D5): bumped once
+    /// CR3 data-side gate (CR3 data-side design T2, D5): bumped once
     /// per completed two-level page-table walk in `translate_linear_checked`, i.e. every time the
     /// TLB fast path does NOT serve the access. T2's win gate: a retained TLB entry across an R1
     /// reselect costs no walk, so this counter should fall on the Tyrian dwell once the ring keeps
@@ -1590,7 +1590,7 @@ fn slow_read_histo_default() -> bool {
 
 /// Where the interpreter's NON-DIRECT data reads land, bucketed by 4 KiB linear page.
 ///
-/// The diagnostic behind `dev_docs/wolf3d-586-measurement-results.md` N2: that fixture's demo phase
+/// The diagnostic behind the wolf3d-586 measurement results (N2): that fixture's demo phase
 /// takes 957.8 M `data_slow_reads` against 17.3 M direct ones, one for one with
 /// `jit_direct_exit_cross_page_or_alignment`, and the two candidate causes -- the mode-Y VGA
 /// aperture, which `ram_lookup_page_is_direct` refuses by design, and UMB/EMS RAM the same range
@@ -1851,7 +1851,7 @@ impl PartialEq for FastMapAuditCounters {
 impl Eq for FastMapAuditCounters {}
 
 /// Slice 0 instrument for the watched-page-bit design
-/// (`dev_docs/2026-08-06-watched-page-bit-design.md`, D6): how often a physical page crosses the
+/// (D6): how often a physical page crosses the
 /// unwatched -> watched edge in each code-watch table, and how often a block-watch page releases
 /// back to zero. These are the strict-sweep (E1/E2) and lazy-edge (E3) frequencies the design's
 /// go/no-go gate reads. The increments sit at the decode-mark and block install/retire chokes;
@@ -2123,8 +2123,8 @@ pub struct DirectBarrierCensusSnapshot {
     /// Per-reason split of `RetryCause::AdmissionMatrix`, as (label, count). The cause has TWO
     /// producers -- `stack_width_kind`'s 2x2 admission matrix, and the `control_target`/
     /// `segment_access` check that runs after it in the compile walk -- and this is the
-    /// instrument that tells them apart. See
-    /// `dev_docs/descent2-l1-stack-width-design-2026-08-30.md` §0(c), §2(H). Recorded only on the
+    /// instrument that tells them apart (Descent 2 L1 stack-width
+    /// design §0(c), §2(H)). Recorded only on the
     /// full-length compile pass, the same gate the word-control counters use, so binary-search
     /// re-walks do not multiply the total.
     #[cfg(feature = "direct-admission-census")]
@@ -2168,8 +2168,8 @@ pub struct DirectLinkRefusalCensusRow {
     pub unbound_exits: u64,
     pub buckets: Vec<(&'static str, u64)>,
     /// `popcount(guard_mask)` from the row's most recent `refused_segment_layout` refusal, or
-    /// `None` if the row never took that refusal. Design section 4.3 slice 0
-    /// (`dev_docs/2026-09-02-tyrian-s1b-refusals-design.md`): diagnostic only, no shipped guard
+    /// `None` if the row never took that refusal. Tyrian S1b refusals design section 4.3
+    /// slice 0: diagnostic only, no shipped guard
     /// reads this.
     pub last_guard_mask_popcount: Option<u32>,
 }
@@ -2241,7 +2241,7 @@ pub const DIRECT_CALLOUT_HELPER_LABELS: [&str; 7] = [
 ];
 
 /// Stage A of the SMC census. See `jit::direct::smc_census` for the measurement rules, and
-/// `dev_docs/smc-census-design.md` §3/§4/§8 for what each rule decides.
+/// the SMC census design §3/§4/§8 for what each rule decides.
 ///
 /// Every unit below is a WORK-UNIT count, never a timer: design §8's opening rule bans per-call
 /// `Instant::now` because 52M scan calls times six timer pairs would BE the subject.
@@ -2693,7 +2693,7 @@ pub struct DirectStallSnapshot {
     /// that alternates between exactly two layouts is what makes variants worth their surgery,
     /// and nobody has ever counted it.
     pub data_segment_distinct_layouts: [u64; 10],
-    /// Sticky-decline memo (`dev_docs/sticky-decline-memo-design.md`), always on. `hits` is the
+    /// Sticky-decline memo, always on. `hits` is the
     /// number of declines the memo answered without running the admission chain; `advances` and
     /// `sweeps` are era-stamp advances and the 63-wrap sweeps among them. The design predicts
     /// ~21,986 advances and ~349 sweeps on duke3d-586; an order of magnitude more means an era
@@ -3309,8 +3309,8 @@ pub struct CpuGsw {
     /// duke3d-486, and this instrument's disarm was gated on an interleaved A/B/B/A before the
     /// behavioural steps that consume it were allowed to land.
     slot_census_enabled: bool,
-    /// Slice1's reflected-call memo journal gate (`dev_docs/2026-09-04-reflected-call-
-    /// slice1-plan.md` Revision 2, section 7.1 / decision 13.3 reversed): a SEPARATE bool from
+    /// Slice1's reflected-call memo journal gate (slice1 plan
+    /// Revision 2, section 7.1 / decision 13.3 reversed): a SEPARATE bool from
     /// `rmw_census_enabled` above, on purpose -- folding it into that gate's recompute would be a
     /// correctness trap (a missed recompute on a fold drops
     /// journal entries silently, which makes a learned memo unsound rather than merely inert).
@@ -4278,7 +4278,7 @@ struct DecodeLine {
 ///
 /// FOOTPRINT is the reason it exists, not field count. A `DecodeLine` is 56 bytes and 65536 of
 /// them are 3.5 MB, so the first touch of a line is an L3 miss: on duke3d-586 that single touch
-/// is 11.75 percent of wall (`dev_docs/2026-08-08-dispatch-tier-next.md`). These sixteen bytes
+/// is 11.75 percent of wall. These sixteen bytes
 /// carry every field the continuable / page-cross / fetch-limit screens and the whole native
 /// admission path read, so at 1 MB the array stays resident and a continuation that dispatches
 /// natively never faults in the 3.5 MB table at all.
@@ -4319,7 +4319,7 @@ struct DecodePack {
     /// `direct_hot_at` runs on every admitted continuation, and a counter left behind on the line
     /// would fault in the exact cache line this array exists to avoid touching.
     jit_direct_hotness: u8,
-    /// The sticky-decline memo byte (`dev_docs/sticky-decline-memo-design.md` §1.2):
+    /// The sticky-decline memo byte (sticky-decline memo design §1.2):
     /// `[stamp:6][v86:1][ss_d:1]`, stamp 0 meaning "no memo". Renamed from `_pad` in the commit
     /// that first reads it — a `_`-prefixed field that is
     /// load-bearing is a defect waiting to be re-used by the next slice.
@@ -4398,7 +4398,7 @@ pub(crate) struct DecodeScreenView {
 ///
 /// `insn` is a COPY, not a borrow of the line, and that is settled rather than incidental:
 /// `invalidate_and_clear_code_marks` refills lines on a generation wrap, so a borrow cannot
-/// outlive the probe (`.bench/results/decodecache-20260731/RESULTS.md`). The other two fields are
+/// outlive the probe. The other two fields are
 /// snapshots for the same reason; the run-loop call site carries the staleness argument.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DecodeLineView {
@@ -4489,7 +4489,7 @@ pub(crate) fn poll_neg_cache_policy(value: Option<&str>) -> bool {
 /// MEASURED AND REFUTED, which is why the default is off. The motivation was a real number: an
 /// `#[inline(never)]` attribution build put 11.75 percent of duke3d-586's wall on the `view` copy
 /// at the `get_view` call in `run_budgeted_inner`, i.e. the first touch of a 56-byte line in a
-/// 3.5 MB table (`dev_docs/2026-08-08-dispatch-tier-next.md`). Three rounds of A/B:
+/// 3.5 MB table. Three rounds of A/B:
 ///
 /// 1. Contaminated box, duke3d-586: +22.5 percent. Not believed, re-run.
 /// 2. Quiet box, single pairs (`.bench/results/duke586-pack2-*.json`): doom-486 -2.7 percent,
@@ -4546,7 +4546,7 @@ pub(crate) fn poll_neg_cache_default() -> bool {
     poll_neg_cache_policy(value.as_deref())
 }
 
-/// Marker `retire_ring` returns (design `2026-09-02-cr3-data-side-design.md` T2, D2).
+/// Marker `retire_ring` returns (CR3 data-side design T2, D2).
 /// `retire_ring` RENUMBERS ring slots (`contexts = [None, None]`), which invalidates every
 /// per-slot cache keyed by the SAME slot indices -- today only `Tlb::generations` -- independent
 /// of what caused the retire. `#[must_use]` plus this crate's `-D warnings` clippy gate turns
@@ -4587,7 +4587,7 @@ struct DecodeCache {
     /// Coarse interpreter companion for the whole 4 GB physical space: 1 bit per 4 KiB page.
     /// Low memory still uses `code_bytes` for exact invalidation decisions.
     code_pages: Box<[u64]>,
-    /// The CR3 code-cache gate's write watch (design `2026-09-02-cr3-code-cache-gate-design.md`
+    /// The CR3 code-cache gate's write watch (CR3 code-cache gate design
     /// part 2(b)): 1 bit per 4 KiB physical page, set on every page-walk read of a page-directory
     /// or page-table page (`CpuGsw::mark_translation_page`, called from `translate_linear_checked`
     /// on EVERY walk, not only ones producing a code translation -- a TLB-hit code translation
@@ -5743,7 +5743,7 @@ pub(crate) const IN_PORT_CORE_CLOCKS: u32 = 12;
 pub(crate) const OUT_PORT_CORE_CLOCKS: u32 = 10;
 
 /// Which of Intel's four I/O privilege columns an `IN`/`OUT` executes in
-/// (`dev_docs/2026-09-05-port-io-repricing-design.md` §1.2, Appendix F re-anchored against V3
+/// (port I/O repricing design §1.2, Appendix F re-anchored against V3
 /// `:32962-32979` / `:35991-35995`). The discriminants are the index into the two epoch-2 tables
 /// below and nothing else reads them, so the order here IS the table order.
 ///
@@ -5794,7 +5794,7 @@ pub(crate) const OUT_PORT_CORE_CLOCKS_EPOCH2: [u32; 4] = [
 /// 9 / 6 / 24 / 22, in raw twelfths. Appendix F is column-drifted for the string-I/O rows and
 /// every one was re-anchored against the independent Chapter 25 pages (`INS` V3:33066-33070,
 /// `OUTS` :36058-36063, `REP` :36956-36988) --
-/// `dev_docs/2026-09-05-v86-port-io-timing-research.md` section 2.1.
+/// V86 port I/O timing research, section 2.1.
 pub(crate) const INS_CORE_CLOCKS_EPOCH2: [u32; 4] = [
     9 * PORT_CORE_CLOCK_TWELFTHS,
     6 * PORT_CORE_CLOCK_TWELFTHS,

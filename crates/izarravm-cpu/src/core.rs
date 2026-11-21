@@ -644,7 +644,7 @@ impl CpuGsw {
     /// no split counter, so the split can only ever UNDER-count, never over-count.
     ///
     /// The split is diagnostic, not behavioural: every arm does exactly the same work. Nothing
-    /// here gates anything. `dev_docs/2026-09-02-tyrian-586-specs-diag.md` section 4.1 reached
+    /// here gates anything. Section 4.1 of the Tyrian 586 diagnosis reached
     /// "it is CR3" by eliminating the other two from unrelated counters; this makes the same
     /// claim measurable, which is the precondition the diagnosis set for writing any gate.
     ///
@@ -663,7 +663,7 @@ impl CpuGsw {
             TranslationFlushReason::TaskSwitch => self.perf.decode_inval_task_switch += 1,
         }
         self.bump_wipes_tlb_flush_counter();
-        // T1 (design `2026-09-02-cr3-data-side-design.md`): the physical data-page caches
+        // T1 (CR3 data-side design): the physical data-page caches
         // (`data_read_pages`/`data_write_pages`) are keyed by physical page and a bus mapping
         // epoch, never by CR3, so they are no longer touched by any control-register flush --
         // only their three bus causes (`note_a20_changed`, `note_direct_map_changed`,
@@ -683,14 +683,14 @@ impl CpuGsw {
         self.retire_tlb_slots(retired);
     }
 
-    /// `MOV CR3, r32`, the ring-gated code half (design `2026-09-02-cr3-code-cache-gate-design.md`
+    /// `MOV CR3, r32`, the ring-gated code half (CR3 code-cache gate design
     /// part 2). Unlike `flush_tlb_and_code_caches(Cr3)` above, this is what a REAL reload executes:
     /// it needs the register's OLD value to seed the ring (R8) and to tell a same-directory
     /// reselect (R1) from a genuine third value (R3), so it owns the assignment to
     /// `self.control.cr3` itself. Callers must pass the value about to be written and must NOT
     /// assign the register first.
     ///
-    /// The data side is now split three ways (design `2026-09-02-cr3-data-side-design.md`, T1+T2,
+    /// The data side is now split three ways (CR3 data-side design, T1+T2,
     /// amending the paragraph this replaces). `data_read_pages`/`data_write_pages` are OUT of this
     /// function entirely (T1): they are keyed by physical page and a bus mapping epoch, never by
     /// CR3, so no arm here touches them any more -- only their three bus causes do. The FastMap
@@ -704,7 +704,7 @@ impl CpuGsw {
     /// `Taken` retires both generations with `retire_all_slots` (consuming the `RingRetired` token
     /// `select_context`'s R3 hands back) and then mints slot 0's fresh one.
     /// The eip-window fetch frontend stays unconditional on every write, both arms, unchanged. The
-    /// JIT half is gated TOO, by slice S-B (design doc `2026-09-02-cr3-jit-half-design.md`): a link
+    /// JIT half is gated TOO, by slice S-B (CR3 JIT-half design): a link
     /// graph built under one directory is retained across an R1 reselect back to it, keyed apart
     /// from a second directory's graph by a per-slot epoch and a `slot`-tagged rendezvous key
     /// rather than being torn down on every write.
@@ -905,7 +905,7 @@ impl CpuGsw {
     /// whether it was already 0 or already 1 on both sides. Two cases:
     ///
     /// - PG stays 1 (paging was already on, e.g. only TS/MP/EM/NE/AM/CD/NW moved): still wipe.
-    ///   CORRECTING THE PRIOR TEXT HERE (design `2026-09-02-cr3-data-side-design.md` section (c)):
+    ///   CORRECTING THE PRIOR TEXT HERE (CR3 data-side design section (c)):
     ///   `data_read_pages`/`data_write_pages` are NOT touched by this function at all any more
     ///   (T1 -- they are physical-keyed with no permission bits, so no control-register write of
     ///   any kind bears on them), and what the FastMap caches is never the filling access's
@@ -934,8 +934,8 @@ impl CpuGsw {
     ///
     /// `wipes_tlb_flush` still counts the EVENT on the skipped arm (`bump_wipes_tlb_flush_counter`
     /// runs unconditionally, same as the ungated function above) -- only `wipe_pages_cleared` and
-    /// the rest of the wipe's cost collapse. See `dev_docs/2026-09-01-tyrian-transition-diag.md`
-    /// section 7 S2 for the measured motivation (34,112 whole-map wipes per guest second on a
+    /// the rest of the wipe's cost collapse. See the Tyrian transition diagnosis,
+    /// section 7 S2, for the measured motivation (34,112 whole-map wipes per guest second on a
     /// workload that never enables paging) and `cpu_cr0_flush_test.rs`'s `data_caches` module for
     /// the red/anti-regression/correctness rows this rests on.
     fn flush_tlb_keep_code_caches(&mut self, new_cr0: u32) {
@@ -1153,7 +1153,6 @@ impl CpuGsw {
     /// HISTORY: doom moves this token 3,425,430 times in one timedemo, all of them the Mode X map
     /// mask (port 0x3C5, sequencer index 2) cycling planes 0-3. The global form threw away 43.3M
     /// live entries doing it, 88.1% of them RAM whose host pointers had not moved.
-    /// Evidence: `.bench/results/fastmap-wipe-20260803/README.md`.
     /// The APERTURE REMAP edge: what physical 0xA0000-0xBFFFF CONTAINS changed without any
     /// memory write, so the SMC marks cannot have seen it. Read-side register moves (GC read map
     /// select, read mode, odd/even), mode-set arms that never touch the direct-write identity,
@@ -1329,7 +1328,7 @@ impl CpuGsw {
     /// `smc_lane_reject_width` / `smc_lane_reject_address`, and it makes the choke walk the lane
     /// arrays for every block a byte store touches. Taking it unconditionally would move both
     /// counters and add that walk on the SHIPPED arm, which
-    /// `dev_docs/duke-reprofile-2026-08-19.md` reads as a baseline (`smc_lane_reject_width` "reads
+    /// the 2026-08-19 Duke re-profile reads as a baseline (`smc_lane_reject_width` "reads
     /// 0 today") and compares against the 08-16 census. The off arm must be the pre-slice world
     /// bit for bit, counters included, so it keeps the value-less door it always had.
     /// `the_off_arm_moves_no_rejection_counter_on_a_byte_write` is that pin.
@@ -2275,8 +2274,8 @@ impl CpuGsw {
         self.jit_direct.note_watch_sweep_cleared(cleared);
     }
 
-    /// Slice 0 of the watched-page-bit design (`dev_docs/2026-08-06-watched-page-bit-design.md`
-    /// D6): unwatched <-> watched page-edge rates for both code-watch tables — the design's
+    /// Slice 0 of the watched-page-bit design
+    /// (D6): unwatched <-> watched page-edge rates for both code-watch tables — the design's
     /// go/no-go instrument. Counters live on the watch types themselves so nothing on the store
     /// or interpreter hot paths moves; collection here is a cold per-run read.
     pub fn code_watch_edge_counters(&self) -> CodeWatchEdgeCounters {
@@ -2852,9 +2851,7 @@ impl CpuGsw {
         self.jit_direct.smc_census_snapshot()
     }
 
-    /// Slice 0 of the reflected-call HLE design's trip-shape instrument
-    /// (dev_docs/2026-09-03-reflected-call-hle-design.md /
-    /// dev_docs/2026-09-03-reflected-call-hle-review.md). `None` when the
+    /// Slice 0 of the reflected-call HLE design's trip-shape instrument. `None` when the
     /// feature is not built in or the run never armed
     /// `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC`.
     #[cfg(feature = "reflected-call-diagnostic")]
