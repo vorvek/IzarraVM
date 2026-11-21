@@ -1555,7 +1555,7 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         .unwrap();
     assert_eq!(
         conventional.split_whitespace().nth(3),
-        Some("599K"),
+        Some("598K"),
         "all three RAM-scaled tables -- the arena bitmap, the VCPI ownership \
          bitmap and the EMS chain table -- moved out of the resident core into \
          the system window at SYS_LIN_BASE, which took conventional free from \
@@ -1566,7 +1566,9 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
          function 53h plus hardware-info 59h (both required by 1830) crossed \
          back to 598; rewriting ef_map_multi as one sequential pass (the \
          EMM386 partial-application semantics 1830's decoder needs) dropped \
-         the two-pass rewind and recrossed to 599.\n{text}"
+         the two-pass rewind and recrossed to 599. The LIM 4.0 page-map \
+         function 4Eh then added 176 resident bytes. Free memory went from \
+         612,864 bytes to 612,688 bytes, and MEM rounds that to 598.\n{text}"
     );
     assert_extended_category(&screen, "23,552K", "23,141K");
 
@@ -1761,7 +1763,10 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
          the rounded figure from 23K to 24K; the IOPL-3 rewrite took it back \
          down, because deleting the sensitive-op emulation arms, the vif/vip \
          hold machinery, maybe_deliver and the VCPI boundary EOI release \
-         shrank the driver by 800 bytes (24,288 -> 23,488). Nothing left in \
+         shrank the driver by 800 bytes (24,288 -> 23,488). The later EMS \
+         functions brought the file to 23,840 bytes, and function 4Eh \
+         brought it to 24,016 bytes. MEM lists 24,032 bytes, which is 16 \
+         bytes more than the file and is still 23K. Nothing left in \
          the core scales with installed RAM -- all three tables that did are \
          in the system window -- so this figure is now the same on a 64 MB \
          machine and a \
@@ -1775,10 +1780,21 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
     assert_eq!(
         free.split_whitespace().nth(4),
-        Some("(599K)"),
-        "MEM /CLASSIFY should report about 599 KiB conventional free (EMS \
+        Some("(598K)"),
+        "MEM /CLASSIFY should report about 598 KiB conventional free (EMS \
          functions 53h and 59h grew the core across the KiB boundary to 598; \
-         the sequential ef_map_multi rewrite shrank it back).\n{}",
+         the sequential ef_map_multi rewrite shrank it back). Function 4Eh \
+         then added 176 resident bytes. Free memory went from 612,864 bytes \
+         to 612,688 bytes, and MEM rounds that to 598.\n{}",
+        screen.text
+    );
+    // The rounded figure hides small changes. The byte count shows each one.
+    assert_eq!(
+        free.split_whitespace().nth(3),
+        Some("612,688"),
+        "MEM /CLASSIFY should report 612,688 bytes of free conventional \
+         memory. A different count means that a resident item changed \
+         size.\n{}",
         screen.text
     );
 }

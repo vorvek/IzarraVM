@@ -549,6 +549,8 @@ test_sb_16bit_dma:
 .done:
     ret
 
+%define SPEAKER_POLL_LIMIT 0x4000
+
 test_pc_speaker:
     ; Program PIT channel 2: mode 3 square wave, LSB then MSB, divisor 0x0400.
     mov al, 0xb6
@@ -561,19 +563,34 @@ test_pc_speaker:
     in al, PORT_B
     or al, 0x03
     out PORT_B, al
-    ; Sample timer-2 OUT (bit 5), delay, sample again. It must toggle.
+    ; Read timer-2 OUT (bit 5) as the reference level in BL. Then poll with no
+    ; delay for two edges: OUT must leave the reference level and must come
+    ; back to it. One poll is much shorter than the half period of 512 PIT
+    ; clocks, so the result does not depend on the speed of the CPU. Each
+    ; poll loop has its own limit. The limit of 0x4000 polls is at least 16
+    ; times the count that the fastest CPU mode needs for one edge. A larger limit is
+    ; not safe: with 0xffff polls a failure in the slowest CPU mode does not
+    ; reach HLT in the half second that the headless runner permits.
     in al, PORT_B
     and al, 0x20
     mov bl, al
-    mov cx, 8
-.spin:
-    call delay
+    mov cx, SPEAKER_POLL_LIMIT
+.wait_change:
     in al, PORT_B
     and al, 0x20
     cmp al, bl
-    jne .passed
-    loop .spin
-    ret                       ; OUT never toggled: leave the record FAIL
+    jne .changed
+    loop .wait_change
+    ret                       ; OUT did not change: leave the record FAIL
+.changed:
+    mov cx, SPEAKER_POLL_LIMIT
+.wait_return:
+    in al, PORT_B
+    and al, 0x20
+    cmp al, bl
+    je .passed
+    loop .wait_return
+    ret                       ; OUT did not come back: leave the record FAIL
 .passed:
     mov di, RESULT_BLOCK + (pc_speaker_record - result_block_template)
     mov byte [di], 'P'

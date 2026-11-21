@@ -263,6 +263,38 @@ fn boot_image_emits_serial_records_and_result_block() {
         record.status == izarravm_firmware::SuiteRecordStatus::Pass
             && record.name == "sound.sb_16bit_dma"
     }));
+    assert!(
+        results.records.iter().any(|record| {
+            record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                && record.name == "sound.pc_speaker"
+        }),
+        "sound.pc_speaker did not pass on the 386 persona:\n{serial}"
+    );
+}
+
+#[test]
+fn boot_image_passes_the_speaker_record_on_the_486_persona() {
+    // The speaker test must not depend on the length of a guest delay loop.
+    // The 486 clock put all samples of the old test in one half of the period.
+    let profile = MachineProfile {
+        cpu: GswMode::Gsw486,
+        ..MachineProfile::gsw_386(16, VideoCard::Vega)
+    };
+    let budget = profile.cpu.clock_rate().clocks_for_fraction_floor(1, 2);
+    let mut machine =
+        Machine::new_boot_image(profile, izarravm_firmware::X86_BOOT_TEST_IMAGE).unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(budget).unwrap();
+    let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    assert!(
+        results.records.iter().any(|record| {
+            record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                && record.name == "sound.pc_speaker"
+        }),
+        "sound.pc_speaker did not pass on the 486 persona"
+    );
 }
 
 #[test]
