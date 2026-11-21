@@ -12057,7 +12057,7 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// | row | off | store ON | delta |
 /// |---|---:|---:|---:|
 /// | **`duke3d-586` SHORT** | 115.3 s | **87.1 s** | **−24.5%** |
-/// | **`duke3d-586` LONG — decides** | 259.6 s | **194.8 s** (both arms) | **−25.0%** |
+/// | **`duke3d-586` LONG: decides** | 259.6 s | **194.8 s** (both arms) | **−25.0%** |
 ///
 /// `direct_native_coverage` 85.7% -> **91.5%**, and the corpus rows are INERT
 /// (`jit_direct_entries` identical), which is what says this is a duke-shaped admission and not a
@@ -12362,7 +12362,7 @@ impl RetfArm {
 ///
 /// | row | off (the escape) | `v86` | verdict |
 /// |---|---:|---:|---|
-/// | **`wolf3d-586` min-wall — DECIDES** | 89.737 s | **66.015 s** | **ratio 1.359** against a
+/// | **`wolf3d-586` min-wall: DECIDES** | 89.737 s | **66.015 s** | **ratio 1.359** against a
 ///   pre-registered bar of 1.15, and above the design's own priced-floor bracket |
 /// | `doom-586`, `quake-586`, `tombraid-586` | — | — | **INERT**: counters IDENTICAL, which is
 ///   what the `v86` arm predicted for a row that never enters V86 |
@@ -12630,8 +12630,8 @@ pub(crate) fn int_imm8_admitted_here(cpu: &CpuGsw, insn: &DecodedInsn) -> bool {
 ///
 /// | row | A (off) min | B (on) min | min-wall | arms |
 /// |---|---:|---:|---:|---|
-/// | **`duke3d-586` LONG — decides** | 287.423 s | **267.952 s** | **−6.774%** | non-overlapping, 10.1 s clear |
-/// | `duke3d-586-short` — corroborates | 127.320 s | **117.615 s** | **−7.623%** | non-overlapping |
+/// | **`duke3d-586` LONG: decides** | 287.423 s | **267.952 s** | **−6.774%** | non-overlapping, 10.1 s clear |
+/// | `duke3d-586-short`: corroborates | 127.320 s | **117.615 s** | **−7.623%** | non-overlapping |
 ///
 /// rt on the deciding row **0.4806 -> 0.5155**, the first time duke3d-586 has been above 0.5.
 /// DUKEMARK `test_exit:81` with 1027 / 403 samples on every one of the twelve legs, and ONE
@@ -14807,10 +14807,10 @@ pub(crate) fn word_operands_admitted(cpu: &CpuGsw) -> bool {
 ///
 /// | spelling | arm |
 /// |---|---|
-/// | **unset** | **`cap`** — the shipped default: the per-key retire cap (`DATA_SEGMENT_RETIRE_CAP`) |
-/// | `""`, `0`, `off` | `Off` — pre-slice behaviour, every data-segment reject retires its key |
+/// | **unset** | **`cap`**, the shipped default: the per-key retire cap (`DATA_SEGMENT_RETIRE_CAP`) |
+/// | `""`, `0`, `off` | `Off`: pre-slice behaviour, every data-segment reject retires its key |
 /// | `cap` | `Cap`, stated explicitly; identical to unset |
-/// | `1`, `on` | `On` — the cap PLUS the stage 2 link decline |
+/// | `1`, `on` | `On`: the cap PLUS the stage 2 link decline |
 /// | anything else | panics |
 ///
 /// WHY IT SHIPS ARMED. The pre-registered ladder on `2d126c5e`, one binary, ABBA interleaved:
