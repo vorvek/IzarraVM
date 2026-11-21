@@ -1913,89 +1913,6 @@ impl CpuBus for MachineBus<'_> {
         }))
     }
 
-    fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
-        if !self.native_fetches_are_uniform()
-            || !self.native_aggregate_accounting_allowed()
-            || self.shadow_l1.diagnostics().enabled
-        {
-            return None;
-        }
-        self.begin_compiled_window()
-    }
-
-    fn begin_ram_write_region(&mut self) -> Option<CompiledBusWindow> {
-        if !self.native_fetches_are_uniform()
-            || !self.native_aggregate_accounting_allowed()
-            || self.shadow_l1.diagnostics().enabled
-        {
-            return None;
-        }
-        self.begin_compiled_window()
-    }
-
-    fn certify_inert_read_region(&self) -> Option<izarravm_bus::InertReadRegion> {
-        let (mapping_epoch, cost_epoch) = self.owned_code_replay_epochs()?;
-        izarravm_bus::InertReadRegion::certify(
-            mapping_epoch,
-            cost_epoch,
-            self.trace.tracing_mode(),
-            self.jit_fetch_cost_clocks(),
-            [
-                self.jit_data_cost_clocks(BusWidth::Byte),
-                self.jit_data_cost_clocks(BusWidth::Word),
-                self.jit_data_cost_clocks(BusWidth::Dword),
-            ],
-            self.jit_projected_batch_scaled_bus_clocks(0)?,
-        )
-    }
-
-    fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
-        if !self.flat_data_cost {
-            return None;
-        }
-        let raw = self
-            .trace
-            .elapsed_clocks()
-            .checked_sub(self.trace_elapsed_at_batch_start)?;
-        CompiledBusWindow::certify(
-            *self.direct_mapping_epoch,
-            self.trace.tracing_mode(),
-            self.jit_fetch_cost_clocks(),
-            [
-                self.jit_data_cost_clocks(BusWidth::Byte),
-                self.jit_data_cost_clocks(BusWidth::Word),
-                self.jit_data_cost_clocks(BusWidth::Dword),
-            ],
-            [
-                self.jit_mode13_data_cost_clocks(BusWidth::Byte),
-                self.jit_mode13_data_cost_clocks(BusWidth::Word),
-                self.jit_mode13_data_cost_clocks(BusWidth::Dword),
-            ],
-            raw.checked_add(*self.isa_io_clocks)?,
-            u64::from(self.bus_den_at_batch_start) - 1,
-            self.bus_num_at_batch_start,
-            self.bus_den_at_batch_start,
-        )
-    }
-
-    fn finish_compiled_window(&mut self, window: CompiledBusWindow, delta: CompiledBusDelta) {
-        debug_assert_eq!(window.mapping_epoch(), *self.direct_mapping_epoch);
-        debug_assert_eq!(
-            window.batch_raw_clocks(),
-            self.trace
-                .elapsed_clocks()
-                .saturating_sub(self.trace_elapsed_at_batch_start)
-                .saturating_add(*self.isa_io_clocks)
-        );
-        let writes = delta.vga_writes();
-        debug_assert_eq!(writes.is_empty(), writes.dirty_pages == 0);
-        if !writes.is_empty() {
-            self.vega.note_direct_write_pages(writes.dirty_pages);
-        }
-        self.trace
-            .add_elapsed_clocks(window.delta_raw_clocks(&delta));
-    }
-
     #[inline]
     fn charge_direct_memory(
         &mut self,
@@ -2216,6 +2133,8 @@ impl CpuBus for MachineBus<'_> {
         Some((2 + u64::from(wait_states)) * u64::from(accesses))
     }
 
+    // No code calls this hook yet. It stays for the planned port in which blocks own their
+    // decoded source.
     fn jit_preflight_cached_fetch(&self, linear: u32, physical: u32, len: u8) -> Option<u64> {
         let end = linear.checked_add(u32::from(len).checked_sub(1)?)?;
         if linear < FIRMWARE_FETCH_WINDOW_START + FIRMWARE_FETCH_WINDOW_LEN
@@ -2227,22 +2146,8 @@ impl CpuBus for MachineBus<'_> {
         self.jit_cached_fetch_run_clocks(physical, u32::from(len))
     }
 
-    fn jit_preflight_ram_read(
-        &self,
-        physical: u32,
-        width: BusWidth,
-        mapping_epoch: u64,
-    ) -> Option<u64> {
-        if mapping_epoch != *self.direct_mapping_epoch
-            || !self.native_fetches_are_uniform()
-            || !self.native_aggregate_accounting_allowed()
-        {
-            return None;
-        }
-        self.direct_page_ram_bytes(physical, width.bytes() as usize, width)?;
-        Some(self.flat_data_clocks(width))
-    }
-
+    // No code calls this hook yet. It stays for the planned port in which blocks own their
+    // decoded source.
     fn certify_owned_code_span(&self, linear: u32, physical: u32, len: u32) -> Option<(u64, u64)> {
         let epochs = self.owned_code_replay_epochs()?;
         let last = len.checked_sub(1)?;
@@ -2259,6 +2164,8 @@ impl CpuBus for MachineBus<'_> {
         Some(epochs)
     }
 
+    // No code calls this hook yet. It stays for the planned port in which blocks own their
+    // decoded source.
     fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
         (self.l1_charges_folded
             && self.native_fetches_are_uniform()

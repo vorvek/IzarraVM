@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use izarravm_bus::{
-    BusCycle, BusTrace, BusWidth, CompiledBusDelta, CompiledBusWindow, DirectPage, TracingMode,
-};
+use izarravm_bus::{BusCycle, BusTrace, BusWidth, DirectPage, TracingMode};
 use izarravm_bus::{DirectMemoryRead, DirectMemoryWrite};
 
 /// A role's `Registers` with the lazy flags SETTLED, for a CROSS-ROLE comparison.
@@ -2135,40 +2133,6 @@ fn scale_fp_clocks_batches_exactly() {
     }
 }
 
-#[test]
-fn test_bus_compiled_window_applies_fixed_costs_and_vga_effects() {
-    let mut bus = TestBus::with_memory(vec![0; 0x10_0000]);
-    assert!(bus.begin_compiled_window().is_none());
-    bus.direct_pages_enabled = true;
-    bus.uniform_native_fetches = true;
-    bus.direct_page_clocks = true;
-    bus.trace.set_tracing_mode(TracingMode::Off);
-
-    let window = bus.begin_compiled_window().unwrap();
-    assert_eq!(window.mapping_epoch(), 1);
-    assert_eq!(window.fetch_raw_clocks(), 2);
-    assert_eq!(window.ram_raw_clocks(BusWidth::Dword), 5);
-    assert_eq!(window.vga_raw_clocks(BusWidth::Dword), 9);
-    let mut delta = CompiledBusDelta::default();
-    delta.add_instruction_fetches(3);
-    delta.add_ram_accesses(BusWidth::Dword, 2);
-    delta.add_vga_reads(BusWidth::Word, 1);
-    delta.add_vga_writes(izarravm_bus::NativeVgaWrites {
-        dirty_pages: 0b0100,
-        byte_writes: 1,
-        word_writes: 2,
-        dword_writes: 3,
-    });
-    let raw = window.delta_raw_clocks(&delta);
-    bus.finish_compiled_window(window, delta);
-
-    assert_eq!(bus.trace.elapsed_clocks(), raw);
-    assert_eq!(bus.mode13_dirty_pages, 0b0100);
-    assert_eq!(bus.mode13_byte_writes, 1);
-    assert_eq!(bus.mode13_word_writes, 2);
-    assert_eq!(bus.mode13_dword_writes, 3);
-}
-
 /// The defining property of the scoped VGA aperture invalidation: the aperture's cached pointers
 /// go, and NOTHING else does. A VGA register write cannot move a RAM host pointer, and keeping
 /// those is the entire win: 88.1% of the 43.3M entries a doom timedemo used to discard here were
@@ -2363,17 +2327,9 @@ pub(crate) struct TestBus {
     fail_instruction_prefetch_direct_page: bool,
     instruction_prefetch_direct_page_requests: u64,
     uniform_native_fetches: bool,
-    mkii_exact_fetch_projection: bool,
-    mkii_read_regions: bool,
-    mkii_inert_regions: bool,
-    mkii_folded_fetches: bool,
-    mkii_owned_replay_disabled: bool,
-    mkii_session_ledger: bool,
-    mkii_native_session: bool,
-    mkii_session_trace_origin: u64,
-    mkii_session_isa: u64,
-    mkii_session_indirect_isa: bool,
-    mkii_session_boxed_isa: Box<u64>,
+    owned_source_read_regions: bool,
+    owned_source_folded_fetches: bool,
+    owned_source_replay_disabled: bool,
     // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
     // timing-free, so keep that default and let direct-memory differential tests request clocks.
     direct_page_clocks: bool,
@@ -2428,28 +2384,7 @@ pub(crate) struct TestBus {
 }
 
 impl TestBus {
-    fn mkii_session_isa_clocks(&self) -> u64 {
-        if self.mkii_session_indirect_isa {
-            *self.mkii_session_boxed_isa
-        } else {
-            self.mkii_session_isa
-        }
-    }
-
-    fn mkii_session_raw_clocks(&self) -> u64 {
-        self.trace.elapsed_clocks() - self.mkii_session_trace_origin
-            + self.mkii_session_isa_clocks()
-    }
-
-    fn mkii_session_scaled_clocks(&self, additional: u64) -> Option<u64> {
-        let (num, den) = self.batch_bus_scale;
-        self.mkii_session_raw_clocks()
-            .checked_add(additional)?
-            .checked_mul(num)
-            .map(|ticks| ticks.div_ceil(den))
-    }
-
-    fn mkii_region_effects_quiet(&self) -> bool {
+    fn owned_source_effects_quiet(&self) -> bool {
         self.code_fetch_observations.is_none()
             && self.core_events.is_none()
             && self.fail_fetch_charge_at.is_none()
@@ -2490,17 +2425,9 @@ impl TestBus {
             fail_instruction_prefetch_direct_page: false,
             instruction_prefetch_direct_page_requests: 0,
             uniform_native_fetches: false,
-            mkii_exact_fetch_projection: false,
-            mkii_read_regions: false,
-            mkii_inert_regions: false,
-            mkii_folded_fetches: false,
-            mkii_owned_replay_disabled: false,
-            mkii_session_ledger: false,
-            mkii_native_session: false,
-            mkii_session_trace_origin: 0,
-            mkii_session_isa: 0,
-            mkii_session_indirect_isa: false,
-            mkii_session_boxed_isa: Box::default(),
+            owned_source_read_regions: false,
+            owned_source_folded_fetches: false,
+            owned_source_replay_disabled: false,
             direct_page_clocks: false,
             flat_direct_page_clocks: false,
             report_batch_clocks: false,
@@ -2579,8 +2506,8 @@ impl CpuBus for TestBus {
         if let Some(events) = self.core_events.as_mut() {
             events.push(TestCoreEvent::Memory(address, kind, self.published_core));
         }
-        if !self.mkii_folded_fetches
-            || self.mkii_owned_replay_disabled
+        if !self.owned_source_folded_fetches
+            || self.owned_source_replay_disabled
             || kind != BusAccessKind::InstructionPrefetch
         {
             self.trace.push(BusCycle::new(kind, address, width, 0));
@@ -2817,7 +2744,7 @@ impl CpuBus for TestBus {
         if self.fail_fetch_charge_at == Some(address) {
             return Err(BusError::UnmappedMemory { address });
         }
-        if self.mkii_folded_fetches && !self.mkii_owned_replay_disabled {
+        if self.owned_source_folded_fetches && !self.owned_source_replay_disabled {
             return Ok(());
         }
         self.trace.push(BusCycle::new(
@@ -2848,7 +2775,7 @@ impl CpuBus for TestBus {
         physical_start: u32,
         count: u32,
     ) -> Result<(), BusError> {
-        if self.mkii_folded_fetches {
+        if self.owned_source_folded_fetches {
             return Ok(());
         }
         self.trace.record_instruction_fetch_run(
@@ -2864,11 +2791,11 @@ impl CpuBus for TestBus {
     }
 
     fn jit_fetch_cost_clocks(&self) -> u64 {
-        u64::from(self.uniform_native_fetches && !self.mkii_folded_fetches) * 2
+        u64::from(self.uniform_native_fetches && !self.owned_source_folded_fetches) * 2
     }
 
     fn jit_preflight_cached_fetch(&self, _linear: u32, physical: u32, len: u8) -> Option<u64> {
-        (self.mkii_region_effects_quiet()
+        (self.owned_source_effects_quiet()
             && len != 0
             && self.direct_memory_bytes(
                 physical,
@@ -2876,7 +2803,7 @@ impl CpuBus for TestBus {
                 BusWidth::Byte,
                 BusAccessKind::DataRead,
             ) == usize::from(len))
-        .then_some(if self.mkii_folded_fetches {
+        .then_some(if self.owned_source_folded_fetches {
             0
         } else if self.uniform_native_fetches {
             2
@@ -2888,15 +2815,15 @@ impl CpuBus for TestBus {
     fn jit_cost_dial_epoch(&self) -> u64 {
         1 + u64::from(self.uniform_native_fetches)
             + 2 * u64::from(self.direct_page_clocks)
-            + 4 * u64::from(self.mkii_folded_fetches)
+            + 4 * u64::from(self.owned_source_folded_fetches)
     }
 
     fn certify_owned_code_span(&self, linear: u32, physical: u32, len: u32) -> Option<(u64, u64)> {
         let last = len.checked_sub(1)?;
-        (self.mkii_region_effects_quiet()
-            && self.mkii_folded_fetches
-            && self.mkii_read_regions
-            && !self.mkii_owned_replay_disabled
+        (self.owned_source_effects_quiet()
+            && self.owned_source_folded_fetches
+            && self.owned_source_read_regions
+            && !self.owned_source_replay_disabled
             && self.trace.tracing_mode() == TracingMode::Off
             && linear >> 12 == linear.checked_add(last)? >> 12
             && physical >> 12 == physical.checked_add(last)? >> 12
@@ -2910,29 +2837,12 @@ impl CpuBus for TestBus {
     }
 
     fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
-        (self.mkii_region_effects_quiet()
-            && self.mkii_folded_fetches
-            && self.mkii_read_regions
-            && !self.mkii_owned_replay_disabled
+        (self.owned_source_effects_quiet()
+            && self.owned_source_folded_fetches
+            && self.owned_source_read_regions
+            && !self.owned_source_replay_disabled
             && self.trace.tracing_mode() == TracingMode::Off)
             .then(|| (self.direct_mapping_epoch, self.jit_cost_dial_epoch()))
-    }
-
-    fn jit_preflight_ram_read(
-        &self,
-        physical: u32,
-        width: BusWidth,
-        mapping_epoch: u64,
-    ) -> Option<u64> {
-        (mapping_epoch == self.direct_mapping_epoch
-            && !width.misaligned_at(physical)
-            && self.direct_memory_bytes(
-                physical,
-                width.bytes() as usize,
-                width,
-                BusAccessKind::DataRead,
-            ) == width.bytes() as usize)
-            .then(|| self.jit_data_cost_clocks(width))
     }
 
     fn native_fetches_are_uniform(&self) -> bool {
@@ -2960,9 +2870,6 @@ impl CpuBus for TestBus {
     }
 
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
-        if self.mkii_session_ledger {
-            return self.mkii_session_scaled_clocks(0).unwrap_or(u64::MAX);
-        }
         if self.report_batch_clocks {
             let (num, den) = self.batch_bus_scale;
             self.trace.elapsed_clocks() * num / den
@@ -2972,9 +2879,6 @@ impl CpuBus for TestBus {
     }
 
     fn in_batch_raw_bus_clocks(&self) -> u64 {
-        if self.mkii_session_ledger {
-            return self.mkii_session_raw_clocks();
-        }
         if self.report_batch_clocks {
             self.trace.elapsed_clocks()
         } else {
@@ -2983,9 +2887,6 @@ impl CpuBus for TestBus {
     }
 
     fn in_batch_scaled_bus_clocks_screen_scale(&self) -> u64 {
-        if self.mkii_session_ledger {
-            return 0;
-        }
         if self.report_batch_clocks {
             let (num, den) = self.batch_bus_scale;
             num.div_ceil(den).max(1)
@@ -3057,8 +2958,8 @@ impl CpuBus for TestBus {
         if self.fail_direct_charge_address == Some(address) {
             return Err(BusError::UnmappedMemory { address });
         }
-        if self.mkii_folded_fetches
-            && !self.mkii_owned_replay_disabled
+        if self.owned_source_folded_fetches
+            && !self.owned_source_replay_disabled
             && kind == BusAccessKind::InstructionPrefetch
         {
             return Ok(());
@@ -3111,13 +3012,6 @@ impl CpuBus for TestBus {
     }
 
     fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
-        if self.mkii_session_ledger {
-            return self.mkii_session_scaled_clocks(additional_raw);
-        }
-        if self.mkii_exact_fetch_projection {
-            let (num, den) = self.batch_bus_scale;
-            return Some((self.trace.elapsed_clocks() + additional_raw) * num / den);
-        }
         Some(if self.project_additional_bus_clocks {
             self.in_batch_scaled_bus_clocks()
                 .saturating_add(additional_raw)
@@ -3168,120 +3062,6 @@ impl CpuBus for TestBus {
         }))
     }
 
-    fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
-        if !self.mkii_read_regions || !self.mkii_region_effects_quiet() {
-            return None;
-        }
-        self.begin_compiled_window()
-    }
-
-    fn begin_ram_write_region(&mut self) -> Option<CompiledBusWindow> {
-        if !self.mkii_read_regions || !self.mkii_region_effects_quiet() {
-            return None;
-        }
-        self.begin_compiled_window()
-    }
-
-    fn certify_inert_read_region(&self) -> Option<izarravm_bus::InertReadRegion> {
-        if !self.mkii_inert_regions
-            || !self.mkii_region_effects_quiet()
-            || !self.direct_pages_enabled
-            || !self.uniform_native_fetches
-            || self.native_aggregate_accounting_disabled
-        {
-            return None;
-        }
-        let (mapping, cost) = self.owned_code_replay_epochs()?;
-        let total = self.jit_projected_batch_scaled_bus_clocks(0)?;
-        if total != self.in_batch_scaled_bus_clocks() {
-            return None;
-        }
-        izarravm_bus::InertReadRegion::certify(
-            mapping,
-            cost,
-            self.trace.tracing_mode(),
-            self.jit_fetch_cost_clocks(),
-            [
-                self.jit_data_cost_clocks(BusWidth::Byte),
-                self.jit_data_cost_clocks(BusWidth::Word),
-                self.jit_data_cost_clocks(BusWidth::Dword),
-            ],
-            total,
-        )
-    }
-
-    fn mkii_bus_session(&self) -> Option<izarravm_bus::MkiiBusSession<'_, Self>> {
-        use izarravm_bus::{MkiiBusSession, MkiiBusSessionParts, MkiiCounterPath};
-        use std::mem::offset_of;
-        if !self.mkii_session_ledger
-            || !self.mkii_native_session
-            || !self.report_batch_clocks
-            || self.requires_step_break()
-        {
-            return None;
-        }
-        let grant = self.certify_inert_read_region()?;
-        let isa_clocks = if self.mkii_session_indirect_isa {
-            MkiiCounterPath::indirect(offset_of!(Self, mkii_session_boxed_isa) as u32, 0)
-        } else {
-            MkiiCounterPath::direct(offset_of!(Self, mkii_session_isa) as u32)
-        };
-        let parts = MkiiBusSessionParts {
-            trace_clocks: MkiiCounterPath::direct(
-                offset_of!(Self, trace) as u32 + MkiiCounterPath::trace(0).pointee_offset,
-            ),
-            isa_clocks,
-            mapping_epoch: MkiiCounterPath::direct(offset_of!(Self, direct_mapping_epoch) as u32),
-            trace_origin: self.mkii_session_trace_origin,
-            cost_epoch: grant.epochs().1,
-            bus_numerator: self.batch_bus_scale.0,
-            bus_denominator: self.batch_bus_scale.1,
-        };
-        // SAFETY: these initialized counters and inert policy survive the run;
-        // helpers preserve pricing and report service requests before continuation.
-        unsafe { MkiiBusSession::certify(self, parts) }
-    }
-
-    fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
-        if !self.direct_pages_enabled
-            || !self.uniform_native_fetches
-            || self.native_aggregate_accounting_disabled
-        {
-            return None;
-        }
-        CompiledBusWindow::certify(
-            self.direct_mapping_epoch,
-            self.trace.tracing_mode(),
-            self.jit_fetch_cost_clocks(),
-            [
-                self.jit_data_cost_clocks(BusWidth::Byte),
-                self.jit_data_cost_clocks(BusWidth::Word),
-                self.jit_data_cost_clocks(BusWidth::Dword),
-            ],
-            [
-                self.jit_mode13_data_cost_clocks(BusWidth::Byte),
-                self.jit_mode13_data_cost_clocks(BusWidth::Word),
-                self.jit_mode13_data_cost_clocks(BusWidth::Dword),
-            ],
-            self.trace.elapsed_clocks(),
-            0,
-            1,
-            1,
-        )
-    }
-
-    fn finish_compiled_window(&mut self, window: CompiledBusWindow, delta: CompiledBusDelta) {
-        debug_assert_eq!(window.mapping_epoch(), self.direct_mapping_epoch);
-        debug_assert_eq!(window.batch_raw_clocks(), self.trace.elapsed_clocks());
-        let writes = delta.vga_writes();
-        self.mode13_dirty_pages |= writes.dirty_pages;
-        self.mode13_byte_writes = self.mode13_byte_writes.saturating_add(writes.byte_writes);
-        self.mode13_word_writes = self.mode13_word_writes.saturating_add(writes.word_writes);
-        self.mode13_dword_writes = self.mode13_dword_writes.saturating_add(writes.dword_writes);
-        self.trace
-            .add_elapsed_clocks(window.delta_raw_clocks(&delta));
-    }
-
     fn read_io(
         &mut self,
         port: u16,
@@ -3302,20 +3082,12 @@ impl CpuBus for TestBus {
         self.last_read_io_ring0 = Some(cpu_is_ring0_pm);
         self.io_reads
             .push((port, self.io_run_core_origin + core_clocks_so_far));
-        if self.mkii_session_ledger {
-            if self.mkii_session_indirect_isa {
-                *self.mkii_session_boxed_isa += 2;
-            } else {
-                self.mkii_session_isa += 2;
-            }
-        } else {
-            self.trace.push(BusCycle::new(
-                BusAccessKind::IoRead,
-                u32::from(port),
-                width,
-                0,
-            ));
-        }
+        self.trace.push(BusCycle::new(
+            BusAccessKind::IoRead,
+            u32::from(port),
+            width,
+            0,
+        ));
         let sequenced = self.io_read_sequence.get(self.io_read_cursor).copied();
         if sequenced.is_some() {
             self.io_read_cursor += 1;

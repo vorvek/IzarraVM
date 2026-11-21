@@ -9,9 +9,9 @@ pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, TimedMidiMessage};
 use izarravm_bus::{
     BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CalloutPollDecline,
-    CalloutPollSkipOutcome, CalloutPollSkipRequest, CompiledBusDelta, CompiledBusWindow, CpuBus,
-    DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, ReflectedCallDecline,
-    ReflectedCallGateRequest, TracingMode, scale_core_clocks,
+    CalloutPollSkipOutcome, CalloutPollSkipRequest, CpuBus, DirectMemoryRead, DirectMemoryWrite,
+    DirectPage, Memory, NativeVgaWrites, ReflectedCallDecline, ReflectedCallGateRequest,
+    TracingMode, scale_core_clocks,
 };
 #[cfg(test)]
 use izarravm_core::CpuPersona;
