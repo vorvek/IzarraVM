@@ -308,6 +308,68 @@ pub(crate) struct FastMap {
     storage: Option<FastMapStorage>,
     populated_pages: Vec<u32>,
     vga_pages: Vec<u32>,
+    /// CR3 census buffers, one per decode-ring slot. Empty unless the census is armed.
+    pub(crate) census_saved: [Vec<CensusPage>; 2],
+}
+
+/// One live fast-map page as it stood when its directory was left by a `MOV CR3`. Biases are not
+/// saved, only whether each one existed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CensusPage {
+    pub(crate) linear_page: u32,
+    pub(crate) physical_page: u32,
+    /// Saved for a later reader of the buffer. The census itself reads only the write flag.
+    #[allow(dead_code)]
+    pub(crate) read_bias: bool,
+    pub(crate) write_bias: bool,
+}
+
+/// Whether the CR3 census is armed (`IZARRAVM_FAST_MAP_CR3_CENSUS`). Read once per process.
+pub(crate) fn cr3_census_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = CR3_CENSUS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_cr3_census(std::env::var("IZARRAVM_FAST_MAP_CR3_CENSUS")))
+}
+
+/// The `IZARRAVM_FAST_MAP_CR3_CENSUS` spelling table. Unset, empty, and `0` name the off arm.
+fn parse_cr3_census(value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` (off) and `1` (on)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_FAST_MAP_CR3_CENSUS is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    match raw.trim() {
+        "" | "0" => false,
+        "1" => true,
+        other => panic!(
+            "IZARRAVM_FAST_MAP_CR3_CENSUS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a mistyped value that ran the default would look like a census that saw nothing"
+        ),
+    }
+}
+
+// Per-thread, so parallel tests can arm the census without touching each other.
+#[cfg(test)]
+thread_local! {
+    static CR3_CENSUS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the census on or off for this thread; `None` restores the ambient reading.
+#[cfg(test)]
+pub(crate) fn set_cr3_census_for_test(forced: Option<bool>) {
+    CR3_CENSUS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_cr3_census_for_test(value: Result<String, std::env::VarError>) -> bool {
+    parse_cr3_census(value)
 }
 
 /// Stable SoA base addresses for the direct backend. Keeping these behind accessors avoids
@@ -813,6 +875,30 @@ impl FastMap {
             cleared += 1;
         }
         cleared
+    }
+
+    /// Copy the live pages into the census buffer of ring slot `slot`, replacing what it held.
+    /// Returns how many pages the buffer held before (those never came back) and how many it
+    /// holds now. Reuses the buffer allocation.
+    pub(crate) fn census_save_live_pages(&mut self, slot: usize) -> (u64, u64) {
+        let saved = &mut self.census_saved[slot];
+        let replaced = saved.len() as u64;
+        saved.clear();
+        if let Some(storage) = self.storage.as_ref() {
+            for &page in &self.populated_pages {
+                let index = page as usize;
+                if FastMapStorage::bit(&storage.live_pages, index) {
+                    let flags = storage.flags[index];
+                    saved.push(CensusPage {
+                        linear_page: page,
+                        physical_page: storage.physical_pages[index],
+                        read_bias: flags & HAS_READ_BIAS != 0,
+                        write_bias: flags & HAS_WRITE_BIAS != 0,
+                    });
+                }
+            }
+        }
+        (replaced, saved.len() as u64)
     }
 
     /// Invalidate exactly one linear page. Its list membership remains until the next global

@@ -494,6 +494,140 @@ fn wipe_pages_cleared_is_not_this_slices_gate() {
     );
 }
 
+// ---- The CR3 census (`IZARRAVM_FAST_MAP_CR3_CENSUS`) ---------------------------------------------
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+mod cr3_census {
+    use super::*;
+    use crate::jit::fast_map::{
+        parse_cr3_census_for_test as parse_knob, set_cr3_census_for_test as set_knob,
+    };
+
+    /// Linear page 0x403 shares the TLB array slot of page 3 (`& 1023`). Directory B reaches it
+    /// through `ALIAS_TABLE`, which `collide_plant` fills for physical page 3.
+    const COLLIDING_LINEAR: u32 = ALIAS_LIN + TLB_DATA;
+
+    /// Also sets the accessed bit in B's first directory entry. Without it, the first walk under B
+    /// would store that bit into a directory page the alias walk already marked, and that store
+    /// would retire the ring.
+    fn collide_plant(bus: &mut TestBus) {
+        bus.memory[DIR_B as usize..DIR_B as usize + 4]
+            .copy_from_slice(&0x0000_9023u32.to_le_bytes());
+        let at = ALIAS_TABLE as usize + ((TLB_DATA >> 12) as usize) * 4;
+        bus.memory[at..at + 4].copy_from_slice(&(TLB_DATA | ACCESSED_RW).to_le_bytes());
+    }
+
+    /// A, then B, then A again. Under B the guest reads `under_b` when it is given. Returns the
+    /// CPU and bus so a test can compare guest state.
+    fn round_trip(armed: bool, under_b: Option<u32>) -> (CpuGsw, TestBus) {
+        set_knob(Some(armed));
+        let (mut cpu, mut bus) = data_flush_fixture();
+        cpu.set_fast_map_enabled_for_test(true);
+        collide_plant(&mut bus);
+        warm_writer_and_tlb_data(&mut cpu, &mut bus);
+        write_cr3(&mut cpu, &mut bus, DIR_B);
+        if let Some(linear) = under_b {
+            cpu.translate_linear(&mut bus, linear, false)
+                .expect("the translation under B must not fault");
+        }
+        write_cr3(&mut cpu, &mut bus, PAGE_DIRECTORY);
+        set_knob(None);
+        (cpu, bus)
+    }
+
+    #[test]
+    fn a_page_left_alone_in_b_is_live_on_return() {
+        let (cpu, _bus) = round_trip(true, None);
+        let audit = cpu.fast_map_audit_counters();
+        assert_eq!(audit.cr3_census_switches, 2, "A to B, then B to A");
+        assert!(audit.cr3_census_saved_pages >= 1, "{audit:?}");
+        assert_eq!(audit.cr3_census_tlb_live_same_physical, 1, "{audit:?}");
+        assert_eq!(audit.cr3_census_tlb_live_other_physical, 0, "{audit:?}");
+    }
+
+    #[test]
+    fn a_colliding_page_in_b_evicts_the_entry_of_a() {
+        let (quiet, _) = round_trip(true, None);
+        let quiet = quiet.fast_map_audit_counters();
+        let (cpu, _bus) = round_trip(true, Some(COLLIDING_LINEAR));
+        let audit = cpu.fast_map_audit_counters();
+        assert_eq!(
+            audit.cr3_census_tlb_live_same_physical,
+            quiet.cr3_census_tlb_live_same_physical - 1,
+            "{audit:?}"
+        );
+        assert_eq!(
+            audit.cr3_census_tlb_absent,
+            quiet.cr3_census_tlb_absent + 1,
+            "{audit:?}"
+        );
+        assert!(audit.tlb_insert_evicts_other_generation >= 1, "{audit:?}");
+        assert!(
+            audit.tlb_insert_evicts_other_generation > quiet.tlb_insert_evicts_other_generation,
+            "{audit:?}"
+        );
+    }
+
+    #[test]
+    fn the_census_counters_stay_zero_when_the_knob_is_off() {
+        let (cpu, _bus) = round_trip(false, Some(COLLIDING_LINEAR));
+        let audit = cpu.fast_map_audit_counters();
+        assert_eq!(audit.cr3_census_switches, 0);
+        assert_eq!(audit.cr3_census_saved_pages, 0);
+        assert_eq!(audit.cr3_census_tlb_live_same_physical, 0);
+        assert_eq!(audit.cr3_census_tlb_live_other_physical, 0);
+        assert_eq!(audit.cr3_census_tlb_absent, 0);
+        assert_eq!(audit.cr3_census_write_not_dirty, 0);
+        assert_eq!(audit.cr3_census_not_reselected, 0);
+    }
+
+    #[test]
+    fn guest_state_is_identical_with_the_knob_on_and_off() {
+        let (on, on_bus) = round_trip(true, Some(COLLIDING_LINEAR));
+        let (off, off_bus) = round_trip(false, Some(COLLIDING_LINEAR));
+        assert!(on == off, "registers and control state must match");
+        assert!(on_bus.memory == off_bus.memory, "memory must match");
+        assert_eq!(
+            on.perf_counters().tlb_walks,
+            off.perf_counters().tlb_walks,
+            "the census must not change how many walks run"
+        );
+    }
+
+    #[test]
+    fn a_new_directory_counts_its_saved_pages_as_not_reselected() {
+        set_knob(Some(true));
+        let (mut cpu, mut bus) = data_flush_fixture();
+        cpu.set_fast_map_enabled_for_test(true);
+        warm_writer_and_tlb_data(&mut cpu, &mut bus);
+        write_cr3(&mut cpu, &mut bus, DIR_B);
+        write_cr3(&mut cpu, &mut bus, DIR_C); // The third directory retires the ring.
+        set_knob(None);
+        let audit = cpu.fast_map_audit_counters();
+        assert_eq!(audit.cr3_census_tlb_live_same_physical, 0, "{audit:?}");
+        assert!(audit.cr3_census_not_reselected >= 1, "{audit:?}");
+    }
+
+    #[test]
+    fn the_knob_spelling_table() {
+        let parse = |value: &str| parse_knob(Ok(value.to_string()));
+        assert!(!parse_knob(Err(std::env::VarError::NotPresent)));
+        assert!(!parse(""));
+        assert!(!parse("0"));
+        assert!(parse("1"));
+        assert!(parse(" 1 "));
+        for bad in ["2", "true", "on", "yes", "-1"] {
+            assert!(
+                std::panic::catch_unwind(|| parse_knob(Ok(bad.to_string()))).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+}
 // MUTATION LEDGER, CR3 data-side gate T1+T2 (2026-09-02), amended for P1 (PR #826 review, fixed
 // in the same PR):
 //

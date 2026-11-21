@@ -3819,6 +3819,14 @@ mod jit_differential_generator;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
+#[path = "cpu_jit_translation_store_test.rs"]
+mod jit_translation_store;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_x87_direct_test.rs"]
 mod jit_x87_direct;
 

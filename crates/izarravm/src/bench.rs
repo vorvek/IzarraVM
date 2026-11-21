@@ -1023,6 +1023,14 @@ pub(super) fn perf_counters_json(
         "fast_map_wipe_pages_cleared": fast_map_audit.wipe_pages_cleared,
         "fast_map_wipe_vga_pages_cleared": fast_map_audit.wipe_vga_pages_cleared,
         "fast_map_wipe_aperture_pages_cleared": fast_map_audit.wipe_aperture_pages_cleared,
+        "fast_map_cr3_census_switches": fast_map_audit.cr3_census_switches,
+        "fast_map_cr3_census_saved_pages": fast_map_audit.cr3_census_saved_pages,
+        "fast_map_cr3_census_tlb_live_same_physical": fast_map_audit.cr3_census_tlb_live_same_physical,
+        "fast_map_cr3_census_tlb_live_other_physical": fast_map_audit.cr3_census_tlb_live_other_physical,
+        "fast_map_cr3_census_tlb_absent": fast_map_audit.cr3_census_tlb_absent,
+        "fast_map_cr3_census_write_not_dirty": fast_map_audit.cr3_census_write_not_dirty,
+        "fast_map_cr3_census_not_reselected": fast_map_audit.cr3_census_not_reselected,
+        "tlb_insert_evicts_other_generation": fast_map_audit.tlb_insert_evicts_other_generation,
         // As 0/1 rather than a bool: every value in this object is a counter, and the key
         // inventory test asserts a zeroed report reads `Some(0)` for all of them.
         "rmw_census_enabled": u64::from(fast_map_audit.census_enabled),

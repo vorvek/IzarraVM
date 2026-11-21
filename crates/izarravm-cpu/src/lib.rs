@@ -1815,6 +1815,28 @@ pub struct FastMapAuditCounters {
     /// Instrument scratch, not a counter: linear page of the last census read. `u32::MAX` is
     /// unreachable for `linear >> 12`, so it is the never-matches initial value.
     pub last_read_page: u32,
+    /// CR3 census (`IZARRAVM_FAST_MAP_CR3_CENSUS`): `MOV CR3` writes with paging on that changed
+    /// the directory, while the census was armed. Each one saved the fast-map pages the leaving
+    /// context held.
+    pub cr3_census_switches: u64,
+    /// Fast-map pages saved by those switches.
+    pub cr3_census_saved_pages: u64,
+    /// Saved pages that, when their directory came back as a ring hit, still had a live TLB entry
+    /// with the same physical page.
+    pub cr3_census_tlb_live_same_physical: u64,
+    /// Saved pages whose live TLB entry on return names a different physical page.
+    pub cr3_census_tlb_live_other_physical: u64,
+    /// Saved pages with no live TLB entry on return (evicted by a collision).
+    pub cr3_census_tlb_absent: u64,
+    /// Of the live same-physical pages, those that had a write bias but whose TLB entry is not
+    /// dirty. A native store to such a page would need a re-walk to set the D bit.
+    pub cr3_census_write_not_dirty: u64,
+    /// Saved pages that left their buffer without a ring hit: the directory was allocated or
+    /// retired, or a second save replaced them.
+    pub cr3_census_not_reselected: u64,
+    /// TLB inserts that overwrote a valid entry of a different generation that is still live in
+    /// a ring slot. Always counted: one compare on the walk path.
+    pub tlb_insert_evicts_other_generation: u64,
 }
 
 impl Default for FastMapAuditCounters {
@@ -1841,6 +1863,14 @@ impl Default for FastMapAuditCounters {
             slot_reject_enabled: slot_census_default(),
             last_read_insn: 0,
             last_read_page: u32::MAX,
+            cr3_census_switches: 0,
+            cr3_census_saved_pages: 0,
+            cr3_census_tlb_live_same_physical: 0,
+            cr3_census_tlb_live_other_physical: 0,
+            cr3_census_tlb_absent: 0,
+            cr3_census_write_not_dirty: 0,
+            cr3_census_not_reselected: 0,
+            tlb_insert_evicts_other_generation: 0,
         }
     }
 }

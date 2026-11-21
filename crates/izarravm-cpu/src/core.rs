@@ -268,6 +268,77 @@ impl CpuGsw {
         self.jit_direct.fast_map_audit.wipe_vga_pages_cleared += extent.vga_pages;
     }
 
+    /// CR3 census, save half. Runs BEFORE the fast-map wipe of a `MOV CR3`. When the census is
+    /// armed, paging is on and the directory changes, it copies the live fast-map pages into the
+    /// buffer of the ring slot being left (the TLB's live slot). Returns whether it saved. A
+    /// reload of the same directory saves nothing: it keeps the TLB generation, so it would only
+    /// report a trivial full hit.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_census_save(&mut self, old_cr3_masked: u32, new_cr3_masked: u32) -> bool {
+        if !crate::jit::fast_map::cr3_census_enabled()
+            || self.control.cr0 & CR0_PG == 0
+            || old_cr3_masked == new_cr3_masked
+        {
+            return false;
+        }
+        let slot = self.tlb.live_slot();
+        let (replaced, saved) = self.jit_fast_map.census_save_live_pages(slot);
+        let audit = &mut *self.jit_direct.fast_map_audit;
+        audit.cr3_census_switches += 1;
+        audit.cr3_census_saved_pages += saved;
+        audit.cr3_census_not_reselected += replaced;
+        true
+    }
+
+    /// CR3 census, restore half, for a ring hit. Call it after the TLB generation of `slot` is
+    /// selected. Classifies each page saved when `slot` was left against the TLB, then empties
+    /// the buffer and keeps its allocation.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_census_classify(&mut self, slot: u8) {
+        let mut saved = std::mem::take(&mut self.jit_fast_map.census_saved[usize::from(slot)]);
+        let audit = &mut *self.jit_direct.fast_map_audit;
+        for page in &saved {
+            match self.tlb.lookup(page.linear_page) {
+                Some(entry) if entry.phys == page.physical_page => {
+                    audit.cr3_census_tlb_live_same_physical += 1;
+                    if page.write_bias && !entry.dirty {
+                        audit.cr3_census_write_not_dirty += 1;
+                    }
+                }
+                Some(_) => audit.cr3_census_tlb_live_other_physical += 1,
+                None => audit.cr3_census_tlb_absent += 1,
+            }
+        }
+        saved.clear();
+        self.jit_fast_map.census_saved[usize::from(slot)] = saved;
+    }
+
+    /// CR3 census, restore half, for a directory the ring did not hold. Drops the buffer of
+    /// `slot`, or of both slots after a ring retire (`None`), and counts the pages as never
+    /// reselected.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn cr3_census_discard(&mut self, slot: Option<u8>) {
+        let mut dropped = 0;
+        for (index, saved) in self.jit_fast_map.census_saved.iter_mut().enumerate() {
+            if slot.is_none_or(|slot| usize::from(slot) == index) {
+                dropped += saved.len() as u64;
+                saved.clear();
+            }
+        }
+        self.jit_direct.fast_map_audit.cr3_census_not_reselected += dropped;
+    }
     #[cfg(feature = "jit")]
     fn bump_wipes_tlb_flush_counter(&mut self) {
         self.jit_direct.fast_map_audit.wipes_tlb_flush += 1;
@@ -387,6 +458,15 @@ impl CpuGsw {
         // the EVENT, not the outcome, and is the divergence check against `cr3_code_flush_taken +
         // _skipped`.
         self.bump_wipes_tlb_flush_counter();
+        let old_cr3_masked = self.control.cr3 & 0xffff_f000;
+        let new_cr3_masked = new_cr3 & 0xffff_f000;
+        // The census copies the page list the wipe below is about to discard.
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        let census_armed = self.cr3_census_save(old_cr3_masked, new_cr3_masked);
         // T1: the FastMap wipe stays unconditional on both arms (design section (d) point 5); T3,
         // retaining it too, is a later slice. `data_read_pages`/`data_write_pages` are not touched
         // here at all any more.
@@ -396,9 +476,7 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.record_fast_map_wipe_extent();
-        let old_cr3_masked = self.control.cr3 & 0xffff_f000;
         self.control.cr3 = new_cr3;
-        let new_cr3_masked = new_cr3 & 0xffff_f000;
         self.invalidate_fetch_frontend();
         // T2: the TLB is now gated on the SAME ring decision as the decode and JIT halves, so it
         // has to run AFTER `select_context`, not before -- the reverse of the pre-T2 ordering, in
@@ -415,6 +493,14 @@ impl CpuGsw {
                 // `lookup`/`insert`/`is_link_visible` IS the restore. Never mint here: see the
                 // `ContextSelect` doc comment (review finding P1, PR #826).
                 self.tlb.select_generation(slot);
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                if census_armed {
+                    self.cr3_census_classify(slot);
+                }
                 #[cfg(feature = "jit")]
                 {
                     self.jit_direct.select_link_context(slot);
@@ -434,6 +520,14 @@ impl CpuGsw {
                 // retired -- so this is not a narrower fix, it removes the dependency on every
                 // OTHER caller keeping its own retire paired correctly.
                 self.tlb.allocate_generation(slot);
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                if census_armed {
+                    self.cr3_census_discard(Some(slot));
+                }
                 #[cfg(feature = "jit")]
                 {
                     self.jit_direct.allocate_link_context(slot);
@@ -452,6 +546,14 @@ impl CpuGsw {
                 // halves mint their own fresh state only after their own retire.
                 self.tlb.retire_all_slots(token);
                 self.tlb.allocate_generation(slot);
+                #[cfg(all(
+                    feature = "jit",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                if census_armed {
+                    self.cr3_census_discard(None);
+                }
                 self.perf.translation_pages_marked = self.decode_cache.translation_pages_marked;
                 #[cfg(feature = "jit")]
                 {

@@ -234,6 +234,20 @@ impl Tlb {
         generation
     }
 
+    /// The ring slot whose generation `generation` mirrors now. The CR3 census reads it to name
+    /// the slot a `MOV CR3` is leaving.
+    #[inline]
+    pub(crate) fn live_slot(&self) -> usize {
+        usize::from(self.live)
+    }
+
+    /// Whether `generation` is the stored generation of either ring slot. Used only by the
+    /// eviction counter, on the rare insert that displaces another generation's entry.
+    #[inline]
+    pub(crate) fn is_slot_generation(&self, generation: u32) -> bool {
+        self.generations[0] == generation || self.generations[1] == generation
+    }
+
     /// R1: reselect a ring slot the caller already knows is occupied. Restores that slot's
     /// stored generation with no other work -- every entry inserted while it was last live is
     /// live again for free, because the generation comparison in `lookup`/`insert` IS the
