@@ -3658,6 +3658,14 @@ impl CpuBus for MachineBus<'_> {
                 let pending = self.pending_device_micros();
                 self.sb16.arm_pause_at(pending);
             }
+            // Bytes the DSP took as MIDI leave with the tick of this write. The
+            // wire time (31250 baud) is not modeled.
+            if port == 0x22C {
+                let guest_tick = self.guest_tick_now();
+                while let Some(byte) = self.sb16.take_midi_byte() {
+                    self.midi_mpu.write_sound_blaster_byte(byte, guest_tick);
+                }
+            }
             self.opl_probe.record_sb(port, true, value as u8);
             return Ok(());
         }

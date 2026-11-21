@@ -25,6 +25,8 @@ pub struct TimedMidiMessage {
     /// Fixed machine-timeline tick at which the message completed.
     pub guest_tick: u64,
     pub bytes: Vec<u8>,
+    /// The message came from the Sound Blaster DSP, not from the MPU ports.
+    pub from_sound_blaster: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +110,9 @@ pub struct Mpu401 {
     input: VecDeque<u8>,
     output: VecDeque<TimedMidiMessage>,
     parser: MidiParser,
+    /// Parser for the Sound Blaster DSP byte stream. It is separate from
+    /// `parser`, so the two streams never share running status.
+    sb_parser: MidiParser,
     timebase: u16,
     tempo: u8,
     pending_parameter: Option<PendingParameter>,
@@ -132,6 +137,7 @@ impl Default for Mpu401 {
             input: VecDeque::with_capacity(INPUT_CAPACITY),
             output: VecDeque::with_capacity(OUTPUT_CAPACITY),
             parser: MidiParser::default(),
+            sb_parser: MidiParser::default(),
             timebase: 120,
             tempo: 100,
             pending_parameter: None,
@@ -279,6 +285,17 @@ impl Mpu401 {
         self.parser.push(value, &mut completed);
         for bytes in completed {
             self.queue_output(guest_tick, bytes);
+        }
+    }
+
+    /// Take one MIDI byte from the Sound Blaster DSP. Complete messages join
+    /// the same output queue as the MPU messages. The MPU mode and its own
+    /// parser state do not affect this stream.
+    pub fn write_sound_blaster_byte(&mut self, value: u8, guest_tick: u64) {
+        let mut completed = Vec::new();
+        self.sb_parser.push(value, &mut completed);
+        for bytes in completed {
+            self.queue_message(guest_tick, bytes, true);
         }
     }
 
@@ -704,11 +721,18 @@ impl Mpu401 {
     }
 
     fn queue_output(&mut self, guest_tick: u64, bytes: Vec<u8>) {
+        self.queue_message(guest_tick, bytes, false);
+    }
+
+    fn queue_message(&mut self, guest_tick: u64, bytes: Vec<u8>, from_sound_blaster: bool) {
         if self.output.len() == OUTPUT_CAPACITY {
             self.output.pop_front();
         }
-        self.output
-            .push_back(TimedMidiMessage { guest_tick, bytes });
+        self.output.push_back(TimedMidiMessage {
+            guest_tick,
+            bytes,
+            from_sound_blaster,
+        });
     }
 }
 

@@ -25,6 +25,7 @@ fn message(frame: u64, bytes: &[u8]) -> TimedMidiMessage {
     TimedMidiMessage {
         guest_tick: tick_for_frame(frame),
         bytes: bytes.to_vec(),
+        from_sound_blaster: false,
     }
 }
 

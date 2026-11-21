@@ -1123,3 +1123,41 @@ fn peak_amplitude_is_tracked_when_the_instrument_is_armed() {
     assert_eq!(dsp.tick_n_samples(4, || bytes.next(), || None), 4);
     assert!(dsp.take_peak_abs() > 0);
 }
+
+#[test]
+fn uart_midi_bytes_are_queued_for_the_host_in_order() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x35, 0x90, 0x3C, 0x7F]);
+    assert_eq!(dsp.take_midi_byte(), Some(0x90));
+    assert_eq!(dsp.take_midi_byte(), Some(0x3C));
+    assert_eq!(dsp.take_midi_byte(), Some(0x7F));
+    assert_eq!(dsp.take_midi_byte(), None);
+}
+
+#[test]
+fn one_byte_midi_0x38_queues_its_argument_byte() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x38, 0xF8, 0x38, 0x90]);
+    assert_eq!(dsp.take_midi_byte(), Some(0xF8));
+    assert_eq!(dsp.take_midi_byte(), Some(0x90));
+    assert_eq!(dsp.take_midi_byte(), None);
+}
+
+#[test]
+fn the_midi_queue_is_bounded_and_a_dsp_reset_clears_it() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x35]);
+    for i in 0..1000u32 {
+        dsp.write_port(0x22C, (i & 0x7F) as u8);
+    }
+    let mut held = 0;
+    while dsp.take_midi_byte().is_some() {
+        held += 1;
+    }
+    assert!(held > 0 && held < 1000, "held {held} bytes");
+
+    write_cmd(&mut dsp, &[0x90, 0x3C]);
+    dsp.write_port(0x226, 0x01);
+    dsp.write_port(0x226, 0x00);
+    assert_eq!(dsp.take_midi_byte(), None, "reset drops queued bytes");
+}

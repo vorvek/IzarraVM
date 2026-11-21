@@ -175,6 +175,9 @@ pub const DSP_RESET_SETTLE_MICROS: u64 = 20;
 /// Lowest sample rate the 0x41 command programs, in Hz.
 const MIN_SET_RATE_HZ: u32 = 5_000;
 
+/// Most MIDI bytes the DSP holds for the machine to collect.
+const MIDI_OUT_CAPACITY: usize = 256;
+
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
 #[derive(Debug, Clone, PartialEq)]
@@ -192,10 +195,12 @@ pub struct SbDsp {
     test_reg: u8,
     speaker_on: bool,
     // MIDI UART mode (0x34..=0x37): every later command-port byte is MIDI
-    // data until a DSP reset. Limit: the SB-MIDI port is not wired to a
-    // synth, so the bytes are counted and dropped.
+    // data until a DSP reset.
     uart_midi: bool,
     midi_bytes_out: u64,
+    // MIDI bytes written by the guest (command 0x38 and UART mode) that the
+    // machine has not collected yet. Bounded: the oldest byte drops first.
+    midi_out: VecDeque<u8>,
     // Write-buffer status read counter. The DSP 4.xx reports busy on two of
     // every four 0x22C reads (86Box `busy_count`); a ready-poll sees bit 7
     // clear within two reads, and a probe that expects the bit to move sees
@@ -300,6 +305,7 @@ impl Default for SbDsp {
             speaker_on: false,
             uart_midi: false,
             midi_bytes_out: 0,
+            midi_out: VecDeque::new(),
             busy_count: 0,
             ram_8051: ram_8051_defaults(),
             rate_hz: 22_050,
@@ -463,7 +469,7 @@ impl SbDsp {
 
     fn write_command_byte(&mut self, byte: u8) {
         if self.uart_midi {
-            self.midi_bytes_out += 1;
+            self.push_midi_byte(byte);
             return;
         }
         if let Some(mut pending) = self.pending.take() {
@@ -559,7 +565,11 @@ impl SbDsp {
             // MIDI UART modes (polling / interrupt, with and without time
             // stamps): the command port becomes a MIDI data port until reset.
             0x34..=0x37 => self.uart_midi = true,
-            0x38 => self.midi_bytes_out += 1,
+            0x38 => {
+                if let Some(&byte) = args.first() {
+                    self.push_midi_byte(byte);
+                }
+            }
             0x48 if args.len() >= 2 => {
                 // Set DSP block transfer size, low byte then high byte (n+1 bytes).
                 let count = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
@@ -1100,6 +1110,20 @@ impl SbDsp {
         }
     }
 
+    /// Take the oldest MIDI byte the guest sent through the DSP (UART mode or
+    /// 0x38) that the machine has not collected yet.
+    pub fn take_midi_byte(&mut self) -> Option<u8> {
+        self.midi_out.pop_front()
+    }
+
+    fn push_midi_byte(&mut self, byte: u8) {
+        self.midi_bytes_out += 1;
+        if self.midi_out.len() == MIDI_OUT_CAPACITY {
+            self.midi_out.pop_front();
+        }
+        self.midi_out.push_back(byte);
+    }
+
     /// MIDI bytes the guest sent through the DSP (UART mode or 0x38).
     /// Diagnostic: the SB-MIDI port has no synth behind it.
     pub fn midi_bytes_out(&self) -> u64 {
@@ -1217,6 +1241,7 @@ impl SbDsp {
                     self.pause_fold_armed = false;
                     self.pending = None;
                     self.uart_midi = false;
+                    self.midi_out.clear();
                     // The mode latches must clear too, or the idle 16-bit
                     // guard in render_frame keeps direct DAC dead after any
                     // 16-bit session.
