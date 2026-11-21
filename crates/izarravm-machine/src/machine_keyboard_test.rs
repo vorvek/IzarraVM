@@ -216,3 +216,30 @@ fn io_port_reports_last_post_write() {
     assert_eq!(machine.io_port(0x80), Some(0x42));
     assert_eq!(machine.io_port(0x0100), None); // outside the passive port map
 }
+
+#[test]
+fn int16_ignores_the_international_keys_and_keeps_the_ring_sane() {
+    // IntlRo (73h), IntlYen (7Dh) and the keypad comma (7Eh) have no entry in
+    // the layout tables. Make and break of each must leave the ring empty, so
+    // the next real key is the first thing INT 16h returns.
+    assert_eq!(
+        int16_read_after(&[0x73, 0xf3, 0x7d, 0xfd, 0x7e, 0xfe, 0x1e, 0x9e]),
+        0x1e61
+    );
+}
+
+#[test]
+fn a_normal_key_after_an_ignored_code_still_arrives() {
+    assert_eq!(int16_read_after(&[0x73, 0x1e, 0x9e]), 0x1e61);
+    assert_eq!(int16_read_after(&[0x7d, 0xfd, 0x7e, 0x1e]), 0x1e61);
+}
+
+#[test]
+fn e0_prefixed_ignored_code_leaves_the_prefix_clean() {
+    // E0 5Bh is above the table. It enqueues nothing and clears the prefix, so
+    // the plain Home key after it carries no gray-key marker in AL.
+    assert_eq!(
+        int16_enhanced_read_after(&[0xe0, 0x5b, 0xe0, 0xdb, 0x47, 0xc7]),
+        0x4700
+    );
+}

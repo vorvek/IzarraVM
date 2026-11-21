@@ -36,6 +36,10 @@ int09:
     mov byte [KB_PREFIX], 0
     test bl, 0x80          ; break code? update shift state, do not enqueue
     jnz .break
+    ; Make codes of 59h and above have no layout entry. Ignore them so they do
+    ; not enter the ring as a scancode with ASCII 0.
+    cmp bl, 0x59
+    jae .eoi
     ; Make of a shift/Ctrl key sets the held bit and never enqueues ASCII.
     cmp bl, 0x2a
     je .set_lshift

@@ -19,6 +19,9 @@ fn maps_core_and_extended_keys() {
     assert_eq!(keycode_to_set1(KeyCode::NumpadEnter), Some((0x1c, true)));
     assert_eq!(keycode_to_set1(KeyCode::Delete), Some((0x53, true)));
     assert_eq!(keycode_to_set1(KeyCode::F24), None);
+    assert_eq!(keycode_to_set1(KeyCode::IntlRo), Some((0x73, false)));
+    assert_eq!(keycode_to_set1(KeyCode::IntlYen), Some((0x7d, false)));
+    assert_eq!(keycode_to_set1(KeyCode::NumpadComma), Some((0x7e, false)));
 }
 
 #[test]
@@ -189,4 +192,15 @@ fn physical_typematic_can_repeat_a_key_with_another_owner() {
         ),
         vec![0x1f]
     );
+}
+
+#[test]
+fn international_keys_emit_plain_make_and_break_codes() {
+    let mut kb = HostKeyboard::default();
+    assert_eq!(kb.key(KeyCode::IntlRo, true), vec![0x73]);
+    assert_eq!(kb.key(KeyCode::IntlRo, false), vec![0xf3]);
+    assert_eq!(kb.key(KeyCode::IntlYen, true), vec![0x7d]);
+    assert_eq!(kb.key(KeyCode::IntlYen, false), vec![0xfd]);
+    assert_eq!(kb.key(KeyCode::NumpadComma, true), vec![0x7e]);
+    assert_eq!(kb.key(KeyCode::NumpadComma, false), vec![0xfe]);
 }
