@@ -5,7 +5,7 @@
 ; on a full Toka-DOS boot. It checks the MSCDEX-style install surface the
 ; BIOS serves (INT 2Fh AX=1500h/1501h), verifies the ROM device header by
 ; name through the returned far pointer, then opens and verifies
-; D:\PROBE.TXT through ordinary DOS file I/O — which the kernel forwards to
+; D:\PROBE.TXT through ordinary DOS file I/O, which the kernel forwards to
 ; the BIOS redirector.
 ;
 ; Build: nasm -f bin cdtest.asm -o cdtest.com

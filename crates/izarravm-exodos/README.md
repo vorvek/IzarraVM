@@ -20,12 +20,12 @@ Classify every `<dos-root>/<short>/dosbox.conf` without extracting anything.
 Writes `census.jsonl`, `census.tsv` and `census-summary.json`, and prints the
 summary. Three classes:
 
-- `TRANSLATABLE` — the conf maps onto an IzarraVM invocation with no special
+- `TRANSLATABLE`: the conf maps onto an IzarraVM invocation with no special
   handling. A `call run` recipe is here, because the launcher BAT is flattened.
-- `RECOVERABLE` — translatable with work the translator does: a `pause` prompt,
+- `RECOVERABLE`: translatable with work the translator does: a `pause` prompt,
   several launch commands, a second directory mount, a composed `cd`, a
   `memsize` above 64.
-- `UNTRANSLATABLE` — a hard blocker with a reason code: a non-VGA `machine`, a
+- `UNTRANSLATABLE`: a hard blocker with a reason code: a non-VGA `machine`, a
   floppy image, a booter disk, no launch command, a multi-CD swap, BASIC, or a
   CD this machine cannot serve (see below).
 
@@ -39,11 +39,11 @@ There is one CD in this machine and it comes from `--cd-image`, which reads a
 therefore refused outright rather than translated into an AUTOEXEC that dies at
 its first line:
 
-- `cd-mount-unsupported` — the guest switches off C: (`d:`) with no image the
+- `cd-mount-unsupported`: the guest switches off C: (`d:`) with no image the
   translator can mount, which is what a conf that mounts a host DIRECTORY as its
   CD looks like. 54 confs, all of which already carried another reason; 12 of
   them moved out of `RECOVERABLE` when this was added.
-- `cd-image-unsupported` — an `imgmount` naming a bare `.bin`. A `.bin` is
+- `cd-image-unsupported`: an `imgmount` naming a bare `.bin`. A `.bin` is
   2352-byte raw sectors and is only readable through its sheet, so counting it
   as a working CD would overstate the census. No conf in the collection does
   this today; the reason exists so a silent drop cannot reappear.
@@ -88,7 +88,7 @@ label ABOVE the choice line is a menu loop, so it leaves the reachable set and
 the remaining branches are re-scored without it.
 
 Two refusals bound what a flattened menu may do. A menu whose every reachable
-branch scores as refused — Setup, Install, Quit and nothing else — takes no
+branch scores as refused (Setup, Install, Quit and nothing else) takes no
 branch at all and falls through to key injection, because the alternative is
 running an installer over the game. And branch scoring reads `order` and `help`
 as whole words, so the `Border` in a title is not read as an order form.
@@ -165,7 +165,7 @@ DOOM runs the full 120 guest seconds in mode X with its frame hash changing 11
 distinct times inside the window, and its window `device_write_bytes` delta is
 exactly zero, because the counter stops accruing once the VGA aperture goes
 through the direct-data path. The frame-hash index from `screens.jsonl` is the
-flatness test instead — one distinct hash across at least three in-window
-samples — and the counters serve as the corroborating polling signature. A flat
+flatness test instead (one distinct hash across at least three in-window
+samples) and the counters serve as the corroborating polling signature. A flat
 picture with no polling term stays `RAN` and carries `FLAT-PICTURE-NOT-IDLE`
 rather than disappearing into an idle bucket.

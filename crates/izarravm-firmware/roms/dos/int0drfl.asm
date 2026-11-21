@@ -4,8 +4,8 @@
 ; int0drfl.com: routing row 1 (design section 3.5). A guest `INT 0Dh` is a
 ; SOFTWARE interrupt and must always reach the guest's IVT[0x0D], whatever the
 ; 8259A's vector bases happen to be. On this monitor vector 13 is doubly
-; loaded -- it is the #GP the guest's own INT n traps through, and, while the
-; master sits at the DOS-default base 8, it is also IRQ5 -- so the monitor
+; loaded: it is the #GP the guest's own INT n traps through, and, while the
+; master sits at the DOS-default base 8, it is also IRQ5, so the monitor
 ; carries a discriminator there.
 ;
 ; The first half is the baseline: hook IVT[0x0D], execute INT 0Dh, check the

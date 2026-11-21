@@ -33,7 +33,7 @@ start:
     ; 4. assert the block landed in upper memory (segment >= 0xC800)
     cmp ax, 0x0C800
     jb fail_notumb
-    ; 5. write a 256-byte pattern to seg:0 and read it back — proves real RAM behind
+    ; 5. write a 256-byte pattern to seg:0 and read it back: proves real RAM behind
     ;    the UMB (the page-remap); without it the segment reads open bus (0xFF).
     mov es, ax
     xor di, di

@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; gpemul.com — TOKAEMM V86 privileged-0F emulation fixture (386MAX-surface
+; gpemul.com: TOKAEMM V86 privileged-0F emulation fixture (386MAX-surface
 ; port). A V86 task is CPL 3, so MOV r32,CRn / MOV CRn,r32 / CLTS / LMSW all
 ; #GP into the monitor, which must EMULATE them transparently (the way DOS16M
 ; and other extenders probe CR0), not reflect a fault. Verifies:
@@ -21,7 +21,7 @@ org 0x100
 %define OK 0xA5
 
 start:
-    ; 1. MOV EAX, CR0 — must read PE(bit0) and PG(bit31) set
+    ; 1. MOV EAX, CR0: must read PE(bit0) and PG(bit31) set
     mov eax, cr0
     test eax, 1
     jz f_cr0read
@@ -43,7 +43,7 @@ start:
     test eax, 8                   ; TS actually took?
     jz f_cr0write
 
-    ; 3. CLTS — clears TS
+    ; 3. CLTS: clears TS
     clts
     mov eax, cr0
     test eax, 8

@@ -3,7 +3,7 @@
 
 ; Default-off EMS fixture. Runs in V86 under
 ; TOKAEMM loaded with a bare DEVICE=C:\DOS\TOKAEMM.SYS (no RAM argument): the
-; manager must answer INT 67h as a FRAMELESS EMM386-NOEMS-style manager —
+; manager must answer INT 67h as a FRAMELESS EMM386-NOEMS-style manager:
 ; present, version 4.0, zero pages, no page frame, allocation refused.
 ;
 ; Signals 0xA5 (success) via the unit-tester exit port; 0xEn names the step.

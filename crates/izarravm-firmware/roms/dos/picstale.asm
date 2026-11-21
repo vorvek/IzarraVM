@@ -4,7 +4,7 @@
 ; picstale.com: routing row 3 (design section 3.5), the stale-bookkeeping
 ; construction. The monitor caches the 8259A's vector bases in its own
 ; vcpi_pic_master/vcpi_pic_slave words and reflects a hardware IRQ to
-; cache_base + line. The cache is only written by the VCPI DE0Ah/DE0Bh calls --
+; cache_base + line. The cache is only written by the VCPI DE0Ah/DE0Bh calls,
 ; but the PIC ports are NOT trapped in the monitor's TSS I/O-permission bitmap
 ; (only 0x92 is), so a guest can reprogram the chip straight through an ICW
 ; sequence and leave the cache saying something the chip does not.
@@ -13,7 +13,7 @@
 ; through IDT vector 8 is IVT[8]'s, whatever the monitor last recorded.
 ;
 ; Construction:
-;   1. DE0B the master to 0x88 -- both the cache and the chip move;
+;   1. DE0B the master to 0x88: both the cache and the chip move;
 ;   2. a direct ICW sequence on 0x20/0x21 puts the CHIP back to base 8, leaving
 ;      the cache stale at 0x88;
 ;   3. let a real IRQ0 fire and see which IVT slot runs.

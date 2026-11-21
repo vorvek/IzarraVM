@@ -156,7 +156,7 @@ pub fn translate(
 
     let mut walk = walk_autoexec(conf, &tree, &mut flags);
     // The disc can be named in `[autoexec]` or inside the launcher BAT the
-    // flattener just walked -- MechWarrior 2 mounts MECH2.CUE inside the CHOICE
+    // flattener just walked: MechWarrior 2 mounts MECH2.CUE inside the CHOICE
     // branch, and reading only the conf left a 749 MB disc unmounted.
     let cd_image = resolve_cd_image(&options.extract_root, conf)
         .or_else(|| resolve_flattened_cd_image(&options.extract_root, &walk.flattened, &mut flags));
@@ -586,8 +586,8 @@ fn resolve_cd_image(extract_root: &Path, conf: &DosboxConf) -> Option<PathBuf> {
 }
 
 /// The first usable disc an `imgmount` inside the flattened BAT named. The path
-/// is written the way the conf writes it -- relative to DOSBox's own working
-/// directory, not to the guest -- so it resolves through the same mapping.
+/// is written the way the conf writes it (relative to DOSBox's own working
+/// directory, not to the guest) so it resolves through the same mapping.
 fn resolve_flattened_cd_image(
     extract_root: &Path,
     flattened: &crate::bat::Flattened,

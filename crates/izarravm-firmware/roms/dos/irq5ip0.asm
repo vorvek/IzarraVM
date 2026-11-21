@@ -1,7 +1,7 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; irq5ip0.com — V86-trap-tax regression fixture: IRQ5 delivered while the
+; irq5ip0.com: V86-trap-tax regression fixture: IRQ5 delivered while the
 ; interrupted code's IP is EXACTLY 0. Runs in V86 under the TOKAEMM monitor
 ; (default-payload config).
 ;
@@ -18,7 +18,7 @@
 ; To make IP == 0 the COMMON case deterministically, we use SB16 auto-init DMA
 ; playback (NOT the one-shot DSP 0xF2): once armed, the DMA block boundary
 ; raises IRQ5 continuously on the card's own schedule, with NO re-arm and NO
-; frame surgery -- so the foreground is free to simply park on a 2-byte `jmp $`
+; frame surgery, so the foreground is free to simply park on a 2-byte `jmp $`
 ; placed at offset 0 of its own segment. Every delivery that lands while parked
 ; samples return-IP 0 with the non-sensitive byte 0xEB at CS:0: exactly the
 ; case the buggy discriminator killed. We count ONLY those IP == 0 deliveries;

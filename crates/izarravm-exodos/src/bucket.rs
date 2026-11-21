@@ -36,7 +36,7 @@
 //!
 //! ## The classification window
 //!
-//! Marks are guest-clock driven, not wall driven — MEASURED, not assumed, on
+//! Marks are guest-clock driven, not wall driven, MEASURED, not assumed, on
 //! the smoke archive: over 60 periodic marks the guest spacing holds
 //! 1999.25-2000.84 ms (0.08%) while the wall spacing between the same marks
 //! ranges 615 ms to 5,114 ms (8.3x). The window is therefore a
@@ -80,7 +80,7 @@ pub const REBOOT_BANNER_ENTRY_THRESHOLD: u32 = 2;
 pub const IDLE_MIN_WINDOW_SAMPLES: usize = 3;
 
 /// Distinct PICTURES inside the window that count as flat. One means the picture
-/// did not change for the whole steady window — where "did not change" is the
+/// did not change for the whole steady window, where "did not change" is the
 /// pixel test of `PIXEL_DELTA_FLOOR`, not frame-hash equality.
 pub const IDLE_MAX_WINDOW_DISTINCT: usize = 1;
 
@@ -317,7 +317,7 @@ pub struct Screen {
     /// first raster, or a mode set had just dropped the last one. Such a sample
     /// is the ABSENCE of an observation, not an observation of a blank screen,
     /// and every rule here skips it. Defaults to true so an archive written
-    /// before the field existed still reads correctly — every line it wrote had
+    /// before the field existed still reads correctly: every line it wrote had
     /// a frame behind it, because the dumper substituted a one-pixel image
     /// rather than admitting there was none.
     pub presented: bool,
@@ -589,7 +589,7 @@ pub fn distinct_count(classes: &[usize]) -> usize {
     seen.len()
 }
 
-/// Count arrivals at the Toka-DOS boot screen — the v2 reboot detector.
+/// Count arrivals at the Toka-DOS boot screen: the v2 reboot detector.
 ///
 /// An ARRIVAL is a sample carrying the banner whose predecessor does not; the
 /// first sample counts when it carries the banner, because the run's own boot is
@@ -642,7 +642,7 @@ pub struct Window {
     pub straight_line_runs: u64,
     pub decode_misses: u64,
     pub decode_probes: u64,
-    /// `w_instructions / perf.instructions` — how much of the run the window
+    /// `w_instructions / perf.instructions`: how much of the run the window
     /// covers, which is what a whole-run bucket must be discounted against.
     pub window_fraction: f64,
 }
@@ -776,7 +776,7 @@ impl Outcome {
     }
 }
 
-/// Count returns to the opening frame — the merged reboot detector.
+/// Count returns to the opening frame: the merged reboot detector.
 pub fn screen_recurrences(screens: &[Screen]) -> u32 {
     let observed: Vec<&str> = screens.iter().filter_map(Screen::frame_hash).collect();
     if observed.len() < 3 {
@@ -937,8 +937,8 @@ pub fn idle_evidence(picture: &ScreenWindow, profile: &Profile, window: &Window)
 ///
 /// **Deviation from §9.4, stated on purpose.** `SHORT-RUN` is "marks were
 /// armed and there were fewer than 31 of them". A profile with an EMPTY mark
-/// series is a run where `IZARRAVM_PHASE_INTERVAL_MS` was never armed — every
-/// in-tree fixture profile is one — and calling that `SHORT-RUN` would exclude
+/// series is a run where `IZARRAVM_PHASE_INTERVAL_MS` was never armed (every
+/// in-tree fixture profile is one) and calling that `SHORT-RUN` would exclude
 /// the acceptance oracle itself from every bucket. Such a row keeps its
 /// counter-derived outcome and is flagged `NO-MARKS`: whole-run only, no
 /// window, no window fraction to discount against.
@@ -1652,7 +1652,7 @@ fn host_verdict(row: &SweepRow) -> HostVerdict {
 }
 
 /// Load a bare profile JSON as a game named by its file stem. This is how the
-/// fixture board — eleven `<fixture>.json` files with no archive around them —
+/// fixture board (eleven `<fixture>.json` files with no archive around them)
 /// enters the classifier, and it is the acceptance path.
 pub fn load_profile_file(path: &Path) -> Archive {
     let short = path

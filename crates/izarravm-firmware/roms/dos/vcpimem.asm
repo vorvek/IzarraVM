@@ -131,7 +131,7 @@ start:
     or ax, ax
     jz f_xms
 
-    ; Hold a VCPI page and prove the XMS free TOTAL drops by that one page --
+    ; Hold a VCPI page and prove the XMS free TOTAL drops by that one page,
     ; the same shared-pool property from the other side. (It used to assert the
     ; XMS results were unchanged, which only held while the pools were split.
     ; The largest-run figure is deliberately not asserted: which run shrinks

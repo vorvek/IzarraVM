@@ -346,7 +346,7 @@ fn no_bucket_fires_on_a_healthy_anchor() {
 ///
 /// v1 asserted that EVERY bucket fires on some fixture. v2 cannot: B7 is
 /// restored on corpus evidence alone (`decode_misses/instructions` tops out at
-/// 0.0148 on the board, below the 0.05 bar, but reads 0.678 on Drilling — 13.6x
+/// 0.0148 on the board, below the 0.05 bar, but reads 0.678 on Drilling, 13.6x
 /// over the bar). Splitting the assertion keeps the board's guarantee exact
 /// instead of weakening it to "most buckets".
 #[test]
@@ -504,7 +504,7 @@ fn b3_excludes_every_healthy_row_by_orders_of_magnitude() {
 // The window: delta arithmetic against a real mark series.
 //
 // The numbers are DOOM's own, from
-// `.bench/results/exodos-smoke-20260816/DOOM/profile.json` — the mark at index
+// `.bench/results/exodos-smoke-20260816/DOOM/profile.json`: the mark at index
 // 31 (guest 60.0003 s) and the final mark (guest 120.0000 s). The deltas below
 // were computed by hand from those two absolute snapshots.
 // ---------------------------------------------------------------------------
@@ -857,7 +857,7 @@ fn a_recurring_opening_frame_is_no_longer_a_reboot_loop() {
         screen(3, "bbb", Some("modex")),
         screen(4, "aaa", Some("modex")),
     ];
-    // The v1 detector still reads 2 — the count is kept, the verdict is not.
+    // The v1 detector still reads 2: the count is kept, the verdict is not.
     assert_eq!(screen_recurrences(&screens), 2);
     assert_eq!(
         decide_outcome(
@@ -1111,7 +1111,7 @@ fn b2_is_strict_at_fifteen_percent_interpreted() {
     // there is no input that lands it exactly on 0.15. At N/I = 0.85 the
     // result is one ulp ABOVE the bar and the bucket fires. The bar is
     // effectively 0.15 minus an ulp, which is a property of the formula and
-    // not of the fixtures — no fixture sits anywhere near it (duke 0.224,
+    // not of the fixtures: no fixture sits anywhere near it (duke 0.224,
     // tombraid 0.137).
     inputs.windowed_jit_direct_insns = 850_000_000;
     assert!(inputs.interpreter_share() > 0.15);
@@ -1213,7 +1213,7 @@ fn b7_is_restored_and_strict_at_five_hundredths() {
 }
 
 /// The corpus row that earns B7 its restoration: Drilling reads 0.678, which is
-/// 13.6x the bar, and it is a RAN row at rt 0.11 — a slow row whose only other
+/// 13.6x the bar, and it is a RAN row at rt 0.11, a slow row whose only other
 /// bucket is B2.
 #[test]
 fn b7_fires_on_the_corpus_row_that_earned_its_restoration() {
@@ -1268,7 +1268,7 @@ fn b11_never_divides_by_a_missing_core_clock_total() {
     assert!(!ids(&inputs).contains(&"B11"));
 }
 
-/// B4's v86 clause — formerly bucket B6 — keeps its own bar and its own
+/// B4's v86 clause (formerly bucket B6) keeps its own bar and its own
 /// strictness after the merge, and a row that trips only that clause reports the
 /// v86 metric rather than the callout one.
 #[test]
@@ -1427,7 +1427,7 @@ fn the_tsv_has_one_header_and_one_line_per_row() {
 // Frame evidence: the pixels behind the reboot rule and the flatness rule.
 //
 // v1 decided both from the frame HASH alone, and one blinking text cursor
-// defeated both at once — it manufactured a reboot loop out of a DOS prompt and
+// defeated both at once: it manufactured a reboot loop out of a DOS prompt and
 // it hid eight idle rows inside the bucketable set by making their window read
 // "two distinct pictures". Both rules now read the pixels the archive kept.
 // ---------------------------------------------------------------------------
@@ -1555,7 +1555,7 @@ fn boot_banner_entries_count_arrivals_at_the_boot_screen_not_samples_of_it() {
     };
 
     // The banner is on screen for the whole run and never leaves: ONE boot. This
-    // is `billted` and `rogclon`, two of the eight v1 false positives — their
+    // is `billted` and `rogclon`, two of the eight v1 false positives: their
     // whole run sits at the DOS prompt under the banner.
     assert_eq!(boot_banner_entries(&series(&[true; 6]), &facts), 1);
 
@@ -1618,7 +1618,7 @@ fn differing_pixels_counts_pixels_and_refuses_a_geometry_mismatch() {
 ///
 /// MEASURED over all 203 archived stage-1 rows, pairwise between every distinct
 /// in-window frame. A blinking text cursor in 720x400 text mode differs by
-/// exactly **18 pixels** of 288,000 — the 9x2 underline cell — and that one
+/// exactly **18 pixels** of 288,000 (the 9x2 underline cell) and that one
 /// number accounts for eleven of the corpus's two-frame rows. The widest pair
 /// the floor absorbs is TSpaFarm at 464 px (0.161%, 1.55x below the bar); the
 /// narrowest it rejects is TGinRum at 1,035 px (0.359%, 1.44x above). The bar
@@ -1676,7 +1676,7 @@ fn a_cursor_blink_pair_is_one_picture_and_a_real_change_is_two() {
 }
 
 /// Classes must not CHAIN. Two frames that are each within the floor of a middle
-/// frame, but far from each other, are two pictures and not one — otherwise a
+/// frame, but far from each other, are two pictures and not one: otherwise a
 /// slow pan across 13 samples would collapse into "the picture never changed".
 #[test]
 fn frame_classes_never_chain_two_far_apart_pictures() {
@@ -1719,7 +1719,7 @@ fn identical_hashes_are_one_picture_without_any_pixel_evidence() {
 /// **The second half of the v1 defect, pinned.** Eight rows sat at a DOS prompt
 /// for the whole window with a blinking cursor. Their window held two distinct
 /// HASHES, so v1's `distinct <= 1` flatness test failed, the rows were called
-/// `RAN`, and they entered the bucketable set — where seven of them fired B2 on
+/// `RAN`, and they entered the bucketable set, where seven of them fired B2 on
 /// boot-phase-shaped counters. With the pixel-delta floor the two hashes are one
 /// picture, the window is flat, and a flat TEXT picture is `IDLE-TEXT`.
 #[test]
@@ -1768,7 +1768,7 @@ fn a_blinking_cursor_at_a_dos_prompt_is_idle_text_not_a_bucketable_row() {
 /// v1 raised it whenever the sample carried no `video_mode` line, which is a
 /// fact about the DISPLAY PATH (the Margo framebuffer) and not about the
 /// picture. Stage 1 read the flag as "the screen is blank" and needed that
-/// signal for real — defect E6 is a title showing a blank text screen while
+/// signal for real: defect E6 is a title showing a blank text screen while
 /// 29.2 billion instructions spin on port reads. The display-path fact keeps its
 /// own flag, `NO-MODE-LINE`.
 #[test]

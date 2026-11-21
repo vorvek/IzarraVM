@@ -9,7 +9,7 @@
 ; drive answers; FAIL leaves the icon grey.
 ;
 ; Note: drive C: is normally HLE-backed (the Toka service port), not a real ATA
-; image, so this probe FAILs on the default machine by design -- the icon reports
+; image, so this probe FAILs on the default machine by design: the icon reports
 ; the actual hardware, lighting only when a genuine ATA disk is mounted.
 
 %define ATA_STATUS     0x1f7         ; primary-channel status register

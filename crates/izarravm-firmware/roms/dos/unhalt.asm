@@ -12,7 +12,7 @@
 ; the difference. Two ways a program can tell:
 ;
 ;   * It masks IRQ0 and IRQ1 and then blocks. A spin loops forever; a halt has
-;     nothing left to wake it. Both are hung -- no key can ever arrive -- but
+;     nothing left to wake it. Both are hung (no key can ever arrive) but
 ;     they hang differently.
 ;   * It relies on guest time advancing smoothly across the wait rather than in
 ;     18.2 Hz steps.

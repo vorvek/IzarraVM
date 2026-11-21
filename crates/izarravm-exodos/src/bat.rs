@@ -623,7 +623,7 @@ impl<'a> Flattener<'a> {
             return Emit::Continue;
         }
         // `CALL` names a BAT most of the time, but DOS lets it name any program,
-        // and `ultimau1` ends its chosen branch on `call UW` -- UW.EXE, the
+        // and `ultimau1` ends its chosen branch on `call UW`: UW.EXE, the
         // game. Treating CALL as BAT-only refused the title outright. Handing
         // the tail back to the ordinary resolver makes `call FOO` and a bare
         // `FOO` the same decision, which is what COMMAND.COM does.
@@ -837,7 +837,7 @@ impl<'a> Flattener<'a> {
             return IfOutcome::NotTaken;
         }
         // A string comparison. `%var%` was already expanded on the way in, so
-        // both sides are literals and the test is decidable -- which is the
+        // both sides are literals and the test is decidable, which is the
         // whole point: `Ppersia` guards its launch on `if %cheats%==no`, and an
         // undecided test dropped the only line that runs the game.
         if let Some((left, right, tail)) = split_comparison(rest) {
@@ -904,7 +904,7 @@ impl<'a> Flattener<'a> {
                 // again, burns MAX_STEPS and refuses a title that runs. Such a
                 // branch leaves the reachable set entirely and the rest are
                 // re-scored without it, which is not the same as scoring it
-                // last -- a dropped branch must never win on a tie.
+                // last: a dropped branch must never win on a tie.
                 if let Some(index) = forward_label(program, label, pc) {
                     reachable.push((key, label.clone(), index));
                 }

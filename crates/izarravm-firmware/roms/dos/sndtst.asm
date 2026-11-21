@@ -4,7 +4,7 @@
 ; SB16 IRQ5 under V86 fixture. Runs under the
 ; TOKAEMM monitor (default-payload config).
 ;
-; IRQ5 lands on vector 13 — the SAME vector as #GP, which the monitor uses for
+; IRQ5 lands on vector 13, the SAME vector as #GP, which the monitor uses for
 ; sensitive-instruction emulation. This fixture proves the monitor's
 ; discriminator: it hooks INT 0Dh, resets the DSP, then requests immediate
 ; 8-bit interrupts (DSP command 0xF2) while spinning a CLI/STI-dense loop, so

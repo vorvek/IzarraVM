@@ -20,8 +20,8 @@
 ; Expected on the virtual-IF monitor: the real IF is pinned open, so the FIRST
 ; tick is acknowledged (ISR bit 0 set) and parked in `vip` the instant it
 ; appears, the SECOND tick is what finally shows up in the IRR, and the ISR read
-; returns 01 -> 0xE1. 0xD1 is the third possibility -- no request ever became
-; visible in the IRR -- kept distinct so an exhausted poll can never be read as
+; returns 01 -> 0xE1. 0xD1 is the third possibility: no request ever became
+; visible in the IRR, kept distinct so an exhausted poll can never be read as
 ; either answer.
 ;
 ; Signals via the unit-tester exit port.
@@ -37,7 +37,7 @@ org 0x100
 ; 22e6 * 0.0549 = ~1.2M emulated cycles. This loop is OUT + IN + TEST +
 ; DEC + JNZ and the port accesses force a step break each time round, so
 ; ~40 cycles/iteration: ~30k iterations per tick, and the bound covers
-; ~66 ticks. Exhaustion means no timer request ever appeared at all --
+; ~66 ticks. Exhaustion means no timer request ever appeared at all,
 ; reported as its own code, never confused with the ISR answer.
 %define IRR_SPIN 2000000
 

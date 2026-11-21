@@ -96,7 +96,7 @@ def detect_icons(grey):
     if run_start is not None:
         cells.append((run_start, W - 1))
     # Merge cells separated by a gap of <=2 columns (icons that nearly touch don't
-    # happen here, but split on gap>2 keeps the rule line — already excluded — out).
+    # happen here, but split on gap>2 keeps the rule line (already excluded) out).
     merged = [cells[0]]
     for a, b in cells[1:]:
         if a - merged[-1][1] <= 2:
