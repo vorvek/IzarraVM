@@ -509,16 +509,29 @@ pub fn prefs_path(c_root: &Path) -> PathBuf {
 
 impl GuiPrefs {
     /// A missing, unreadable, or unparseable file yields defaults.
+    #[cfg(test)]
     pub(super) fn load_with(
         path: &Path,
-        mut read_text: impl FnMut(&Path) -> std::io::Result<String>,
+        read_text: impl FnMut(&Path) -> std::io::Result<String>,
     ) -> Self {
+        Self::load_checked(path, read_text).0
+    }
+
+    /// Like `load_with`. The flag is true when the file was read but its
+    /// contents were rejected (a parse or type error), so the defaults returned
+    /// would replace the user's text at the next save.
+    pub(super) fn load_checked(
+        path: &Path,
+        mut read_text: impl FnMut(&Path) -> std::io::Result<String>,
+    ) -> (Self, bool) {
         let text = match read_text(path) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (Self::default(), false);
+            }
             Err(err) => {
                 warn!(%err, path = %path.display(), "could not read izarravm.conf; using defaults");
-                return Self::default();
+                return (Self::default(), false);
             }
         };
         // Parse to a document first so the retired key can be SEEN. Unknown
@@ -529,7 +542,7 @@ impl GuiPrefs {
             Ok(value) => value,
             Err(err) => {
                 warn!(%err, path = %path.display(), "could not parse izarravm.conf; using defaults");
-                return Self::default();
+                return (Self::default(), true);
             }
         };
         let retired = retired_keys_present(&value);
@@ -546,11 +559,28 @@ impl GuiPrefs {
             Ok(mut prefs) => {
                 prefs.master_volume = prefs.master_volume.clamp(0.0, MAX_VOLUME);
                 prefs.migrate_retired_hotkeys(path);
-                prefs
+                (prefs, false)
             }
             Err(err) => {
                 warn!(%err, path = %path.display(), "could not parse izarravm.conf; using defaults");
-                Self::default()
+                (Self::default(), true)
+            }
+        }
+    }
+
+    /// Copy a rejected prefs file to `izarravm.conf.bad` so the next save does
+    /// not destroy it. An older `.bad` file is replaced.
+    pub fn keep_rejected_copy(path: &Path) {
+        let mut bad = path.as_os_str().to_owned();
+        bad.push(".bad");
+        match std::fs::copy(path, &bad) {
+            Ok(_) => warn!(
+                path = %path.display(),
+                copy = %Path::new(&bad).display(),
+                "kept the rejected izarravm.conf; the next save writes a new file"
+            ),
+            Err(err) => {
+                warn!(%err, path = %path.display(), "could not keep a copy of the rejected izarravm.conf")
             }
         }
     }
@@ -588,7 +618,7 @@ impl GuiPrefs {
                 return;
             }
         };
-        if let Err(err) = std::fs::write(path, text) {
+        if let Err(err) = crate::fsutil::atomic_write(path, text.as_bytes()) {
             warn!(%err, path = %path.display(), "could not write izarravm.conf");
         }
     }

@@ -194,7 +194,7 @@ pub fn load_cmos_file(path: &Path) -> Option<[u8; 64]> {
 /// Write a 64-byte CMOS image to `path`, logging on failure rather than
 /// aborting the run.
 pub fn save_cmos_file(path: &Path, bytes: &[u8; 64]) {
-    if let Err(err) = std::fs::write(path, bytes) {
+    if let Err(err) = crate::fsutil::atomic_write(path, bytes) {
         warn!(%err, path = %path.display(), "failed to persist cmos.bin");
     }
 }

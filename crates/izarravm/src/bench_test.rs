@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_core::AppConfig;
 
 #[test]
 fn neurketa_completion_preserves_guest_results_across_386_speeds() {

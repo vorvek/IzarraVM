@@ -505,6 +505,12 @@ fn rejects_wss_sb16_irq_or_dma_collision() {
         config.validate(),
         Err(ConfigError::WssSbDmaCollision(1))
     ));
+    let message = ConfigError::WssSbDmaCollision(1).to_string();
+    assert!(
+        message.contains("--sb-dma") && message.contains("SNDCTRL"),
+        "{message}"
+    );
+    assert!(!message.contains("audio.sound_blaster.dma"), "{message}");
 
     // Pointing the WSS at the SB16's IRQ line (both IRQ7) is rejected.
     let mut config = AppConfig::default();
@@ -514,6 +520,11 @@ fn rejects_wss_sb16_irq_or_dma_collision() {
         config.validate(),
         Err(ConfigError::WssSbIrqCollision(7))
     ));
+    let message = ConfigError::WssSbIrqCollision(7).to_string();
+    assert!(
+        message.contains("--sb-irq") && message.contains("SNDCTRL"),
+        "{message}"
+    );
 
     // With the SB16 disabled there is no contention, so a "colliding" config is
     // allowed (the SB16 is not present to fight over the resource).
@@ -709,4 +720,32 @@ fn example_machine_config_names_no_host_folder() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/machine.toml");
     let config = AppConfig::from_toml_path(path).unwrap();
     assert_eq!(config.dos.c_drive, PathBuf::from("."));
+}
+
+#[test]
+fn from_toml_text_reports_retired_keys_and_the_unused_trace_flag() {
+    let text = r#"
+        [audio.sound_blaster]
+        enabled = true
+        irq = "5"
+
+        [diagnostics]
+        trace_devices = true
+    "#;
+    let loaded = AppConfig::from_toml_text(Path::new("machine.toml"), text).unwrap();
+    assert_eq!(loaded.notes.len(), 2, "{:?}", loaded.notes);
+    assert!(loaded.notes[0].contains("audio.sound_blaster.irq"));
+    assert!(loaded.notes[1].contains("diagnostics.trace_devices"));
+    let sound_blaster = &loaded.document["audio"]["sound_blaster"];
+    assert!(sound_blaster.get("irq").is_none());
+    assert!(sound_blaster.get("enabled").is_some());
+
+    let quiet = AppConfig::from_toml_text(
+        Path::new("machine.toml"),
+        "[machine]
+memory_mib = 16
+",
+    )
+    .unwrap();
+    assert!(quiet.notes.is_empty());
 }

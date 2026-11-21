@@ -302,6 +302,33 @@ fn show_message_box() {
     }
 }
 
+/// Tell the user about a failure the process cannot recover from. On Windows
+/// this opens a message box, because a GUI launched from Explorer has no
+/// console. Other targets print to stderr.
+#[cfg(windows)]
+pub fn show_error_dialog(title: &str, message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+
+    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain([0]).collect() };
+    let (title_w, message_w) = (wide(title), wide(message));
+    // SAFETY: both pointers are NUL-terminated UTF-16 buffers that outlive the
+    // call. The parent window is null. The return value is ignored: with no
+    // interactive desktop there is nothing better to do.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn show_error_dialog(title: &str, message: &str) {
+    eprintln!("{title}: {message}");
+}
+
 #[cfg(test)]
 #[path = "preflight_test.rs"]
 mod tests;

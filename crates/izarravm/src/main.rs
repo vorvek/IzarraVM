@@ -13,6 +13,7 @@ mod controller_names;
 mod controller_profiles;
 mod crt;
 mod display_transform;
+mod fsutil;
 mod gui;
 mod host_input;
 mod ipe_trace;
@@ -26,8 +27,7 @@ mod startup;
 
 use clap::Parser;
 use izarravm_core::{
-    AppConfig, GswMode, HardwareProfile, MASTER_CLOCK_HZ, MidiBackend, SbDma8, SbDma16, SbIrq,
-    VideoCard,
+    GswMode, HardwareProfile, MASTER_CLOCK_HZ, MidiBackend, SbDma8, SbDma16, SbIrq, VideoCard,
 };
 use izarravm_cpu::CpuProfileSnapshot;
 use izarravm_firmware::{
@@ -66,19 +66,26 @@ const CPU_OPCODE_PROFILE_PRINT_LIMIT: usize = 24;
 const HOT_ADDR_PRINT_LIMIT: usize = 64;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "IzarraVM emulator scaffold")]
+#[command(version, about = "IzarraVM, a DOS emulator for games")]
 struct Cli {
+    /// Machine description in TOML. See examples/machine.toml.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// CPU persona, such as 386-slow, 486 or 586.
     #[arg(long)]
     cpu: Option<GswMode>,
     /// Run the portable CPU interpreter and disable native block admission.
     #[arg(long)]
     interpreter: bool,
+    /// Guest RAM in MiB.
     #[arg(long)]
     memory_mib: Option<u16>,
+    /// Video card. Only vega exists. Older card names still select it.
     #[arg(long)]
     video: Option<VideoCard>,
+    /// Host folder used as the C: drive. cmos.bin and izarravm.conf are kept in the
+    /// parent folder of this path. A drive root such as D:\ has no parent, so the two
+    /// files are written inside it and the guest sees them.
     #[arg(long)]
     c_drive: Option<PathBuf>,
     /// Keep the C: drive, cmos.bin, and izarravm.conf beside the executable
@@ -95,22 +102,32 @@ struct Cli {
     /// --midi-port-ordinal, starting at zero.
     #[arg(long)]
     midi_port: Option<String>,
+    /// Zero-based index among host MIDI ports that share the --midi-port name.
     #[arg(long, requires = "midi_port")]
     midi_port_ordinal: Option<u16>,
+    /// MT-32 control ROM for the Munt receiver.
     #[arg(long)]
     mt32_control_rom: Option<PathBuf>,
+    /// MT-32 PCM ROM for the Munt receiver.
     #[arg(long)]
     mt32_pcm_rom: Option<PathBuf>,
+    /// Sound Blaster IRQ. A saved cmos.bin overrides it.
     #[arg(long)]
     sb_irq: Option<SbIrq>,
+    /// Sound Blaster 8-bit DMA channel. A saved cmos.bin overrides it.
     #[arg(long)]
     sb_dma: Option<SbDma8>,
+    /// Sound Blaster 16-bit DMA channel. A saved cmos.bin overrides it.
     #[arg(long)]
     sb_high_dma: Option<SbDma16>,
+    /// Load and check the configuration, then exit.
     #[arg(long, group = "run_mode")]
     headless_config_check: bool,
+    /// Run the built-in test ROM, or the ROM named by --bios, and print the screen
+    /// and POST code.
     #[arg(long, group = "run_mode")]
     headless_test_rom: bool,
+    /// Run the guest boot suite and print one record per check.
     #[arg(long, group = "run_mode")]
     headless_boot_suite: bool,
     /// Run the built-in calibration probes and the local Dhrystone and
@@ -131,29 +148,35 @@ struct Cli {
     /// Sample every Nth instruction in --headless-profile-exe.
     #[arg(long, default_value_t = 1024)]
     profile_sample_stride: u64,
+    /// Print memory bandwidth for growing block sizes, which shows the cache tiers.
     #[arg(long, group = "run_mode")]
     headless_bandwidth: bool,
+    /// Boot the keyboard ROM, type --stdin-text into it, and print the screen.
     #[arg(long, group = "run_mode")]
     headless_keyboard: bool,
+    /// Run the Izarra BIOS POST to its halt and print the result records.
     #[arg(long, group = "run_mode")]
     headless_izarra_bios: bool,
+    /// Boot this floppy image through the Izarra BIOS and print diagnostics.
     #[arg(long, group = "run_mode")]
     headless_boot_floppy: Option<PathBuf>,
+    /// Boot this hard-disk image through the Izarra BIOS and print diagnostics.
     #[arg(long, group = "run_mode")]
     headless_boot_hdd: Option<PathBuf>,
     /// Boot the Katea host-folder facade: mount the given directory as C: through
     /// the real FreeDOS system files, run the BIOS, and print the boot diagnostics.
-    /// The folder's top-level files are surfaced read-only beside the OS.
+    /// Top-level files in the folder appear as C: files. Guest writes are saved back to
+    /// the folder when the run ends without error.
     #[arg(long, group = "run_mode")]
     hdd_folder: Option<PathBuf>,
     /// With --hdd-folder, print a machine-readable result block after stop:
     /// stop reason, CS:IP, full register state, and the 80x25 text page. For
     /// headless benchmark/timedemo runs whose result lands in text mode.
-    #[arg(long)]
+    #[arg(long, requires = "hdd_folder")]
     dump_result: bool,
     /// With --hdd-folder, write the final framebuffer to this PPM (P6) path.
     /// For headless benchmark/timedemo runs whose result lands in graphics mode.
-    #[arg(long)]
+    #[arg(long, requires = "hdd_folder")]
     result_ppm: Option<PathBuf>,
     /// With --hdd-folder, write the last COMPLETED raster to this PPM (P6) path.
     ///
@@ -168,7 +191,7 @@ struct Cli {
     /// Writes nothing and says so when no frame has completed yet -- between a
     /// mode set and the first raster of the new mode there is genuinely no
     /// published frame, and a substitute would read as a measurement.
-    #[arg(long)]
+    #[arg(long, requires = "hdd_folder")]
     presented_ppm: Option<PathBuf>,
     /// With --hdd-folder, write the video mode census to this JSON path at the
     /// end of the run: every geometry the guest programmed and how many times.
@@ -233,20 +256,25 @@ struct Cli {
     #[arg(long, requires = "headless_boot_profile")]
     load_file: Option<String>,
     /// With --headless-boot-profile, guest seconds to sit at the DOS prompt.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, requires = "headless_boot_profile", default_value_t = 10)]
     idle_seconds: u64,
     /// Boot real FreeDOS from a temp Katea disk and run a single DOS program,
-    /// exiting with its DOS exit code (the Katea replacement for --headless-run).
+    /// exiting with its DOS exit code (for example a test tool or a benchmark).
     #[arg(long, group = "run_mode")]
     katea_run: Option<PathBuf>,
+    /// Text that --headless-keyboard types into the guest.
     #[arg(long)]
     stdin_text: Option<String>,
+    /// BIOS ROM file for --headless-test-rom, and for the GUI. The default is the
+    /// built-in ROM.
     #[arg(long)]
     bios: Option<PathBuf>,
     /// Cycle budget for the headless run. With --headless-test-rom and no --bios,
     /// a budget too small for the ROM to halt fails the run.
+    /// Stop a headless run after this many guest cycles.
     #[arg(long)]
     cycles: Option<u64>,
+    /// Load the Margo test pattern into video memory when the GUI session starts.
     #[arg(long)]
     margo_test_pattern: bool,
     /// Fallback C: root. Also read from `IZARRAVM_DOSROOT`, which is why the value parser
@@ -418,7 +446,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
     }
 
     if cli.headless_izarra_bios {
-        return run_izarra_bios();
+        return run_izarra_bios(hardware);
     }
 
     if let Some(path) = &cli.headless_boot_floppy {
@@ -455,6 +483,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
         if let Some(path) = cli.profile_json.as_deref() {
             validate_profile_json_parent(path)?;
         }
+        startup.ensure_c_drive();
         return bootprofile::run(
             startup.c_drive(),
             hardware,
@@ -470,7 +499,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
     }
 
     let rom = match cli.bios.as_deref() {
-        Some(path) => std::fs::read(path)?,
+        Some(path) => fsutil::read_file(path)?,
         None => izarravm_firmware::izarra_bios().to_vec(),
     };
     gui::run(startup.into_gui(rom, cli.margo_test_pattern))?;
@@ -649,10 +678,9 @@ fn run_keyboard_demo(
 /// Boot the Izarra3000 BIOS headless, run POST to halt, print the VDTS records.
 /// Its own function because a Machine is a large inline value (combining the
 /// headless paths overflows main's stack frame).
-fn run_izarra_bios() -> Result<(), Box<dyn Error>> {
-    let hardware = HardwareProfile::from_config(&AppConfig::default())?;
+fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     let mut machine = Machine::new(
-        MachineProfile::from_hardware_profile(&hardware),
+        MachineProfile::from_hardware_profile(hardware),
         izarravm_firmware::izarra_bios(),
     )?;
     // Exercise the complete Izarra storage profile while leaving every medium
@@ -778,7 +806,7 @@ fn run_boot_floppy(
     cycles: Option<u64>,
     hardware: &HardwareProfile,
 ) -> Result<(), Box<dyn Error>> {
-    let image = std::fs::read(path)?;
+    let image = fsutil::read_file(path)?;
     let image_len = image.len();
     let mut machine = Machine::new(
         MachineProfile::from_hardware_profile(hardware),
@@ -832,7 +860,7 @@ fn run_boot_hdd(
     cycles: Option<u64>,
     hardware: &HardwareProfile,
 ) -> Result<(), Box<dyn Error>> {
-    let image = std::fs::read(path)?;
+    let image = fsutil::read_file(path)?;
     let image_len = image.len();
     let mut machine = Machine::new(
         MachineProfile::from_hardware_profile(hardware),
@@ -900,7 +928,7 @@ impl Drop for TempDir {
 /// AUTOEXEC overlaid InMemory) via Katea, run the target through RUNNER.COM, and
 /// return its DOS exit code. The screen text is printed for diagnostics.
 fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box<dyn Error>> {
-    let bytes = std::fs::read(prog)?;
+    let bytes = fsutil::read_file(prog)?;
     let name = katea_run_prog_name(prog);
     let autoexec = format!("@echo off\r\nRUNNER {name}\r\n").into_bytes();
     let overrides = vec![
@@ -1660,7 +1688,7 @@ fn write_wav(path: &Path, pcm: &[(i16, i16)], rate: u32) -> Result<(), Box<dyn E
 }
 
 /// Mount a host folder as C: through the Katea facade (real FreeDOS system files
-/// plus the folder's top-level files, read-only), run the BIOS so INT 19h boots
+/// plus the folder's top-level files; guest writes are saved back when the run ends), run the BIOS so INT 19h boots
 /// it, and print the same diagnostics as `run_boot_hdd`. The lazy-facade analogue
 /// of the flat-image boot loop.
 #[allow(clippy::too_many_arguments)]
@@ -5006,7 +5034,7 @@ fn print_com1(serial: &str) {
 /// The BIOS ROM to boot: the file passed with --bios, or the built-in test ROM.
 fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
     match bios {
-        Some(path) => Ok(std::fs::read(path)?),
+        Some(path) => Ok(fsutil::read_file(path)?),
         None => Ok(test_rom().to_vec()),
     }
 }

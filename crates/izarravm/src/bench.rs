@@ -553,7 +553,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
 
 pub(super) fn run_bench_exe(path: &Path, hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     const BENCH_BUDGET: u64 = 50_000_000_000;
-    let exe = std::fs::read(path)?;
+    let exe = fsutil::read_file(path)?;
     let mode = GswMode::Gsw586;
     let run = run_bench_one(hardware, mode, &BenchSource::DosExe(exe), BENCH_BUDGET)?;
     let iters = u64::from(run.iterations.max(1));
@@ -654,7 +654,7 @@ pub(super) fn run_profile_exe(
     hardware: &HardwareProfile,
 ) -> Result<(), Box<dyn Error>> {
     const BENCH_BUDGET: u64 = 50_000_000_000;
-    let exe = std::fs::read(path)?;
+    let exe = fsutil::read_file(path)?;
     let mode = GswMode::Gsw586;
     let source = BenchSource::DosExe(exe);
     let baseline = run_bench_one_profiled(hardware, mode, &source, BENCH_BUDGET, None)?;

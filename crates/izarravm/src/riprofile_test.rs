@@ -126,26 +126,18 @@ fn resolve_extent_in_this_process() {
         "SymInitializeW failed"
     );
     let rip = std::hint::black_box(extent_anchor as *const () as usize as u64);
-    // A `--release` test binary carries no CodeView for this crate (`debug` is
-    // unset in that profile): its PDB holds only linker publics, which have no
-    // sizes and omit LTO-internalized functions entirely, so the extent
-    // invariant has nothing to attach to. Detect that build per-ADDRESS —
-    // module-level flags like `IMAGEHLP_MODULEW64.LineNumbers` read true even
-    // then, because the CRT's /Z7 objects contribute debug info for their own
-    // ranges.
+    // Every profile of this workspace that builds tests carries line tables
+    // (`debug` is set in the release profile), so the PDB must hold line info
+    // for this crate's own code. Test per ADDRESS: module-level flags such as
+    // `IMAGEHLP_MODULEW64.LineNumbers` read true even without it, because the
+    // CRT's /Z7 objects contribute debug info for their own ranges. Without
+    // line info the extent check below has nothing to attach to, so fail
+    // instead of skipping it.
     if super::resolve_line(process, rip).is_none() {
         unsafe { SymCleanup(process) };
-        if cfg!(debug_assertions) {
-            panic!(
-                "a debug build must carry line info for its own code; without it \
-                 the extent guard below would be silently skipped in CI"
-            );
-        }
-        eprintln!(
-            "riprofile extent test: publics-only PDB (optimized build without debug \
-             info); function extents do not exist in this binary, skipping"
+        panic!(
+            "the test binary has no line info for its own code; the extent              guard below cannot run. Build the tests with debug info."
         );
-        return;
     }
     let resolved = super::resolve_symbol(process, rip);
     unsafe { SymCleanup(process) };

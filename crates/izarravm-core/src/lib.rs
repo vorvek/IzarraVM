@@ -53,11 +53,11 @@ pub enum ConfigError {
     )]
     InvalidWssBase(u16, u16),
     #[error(
-        "audio.wss.dma {0} collides with audio.sound_blaster.dma {0}; the AD1848 and SB16 must use distinct 8237 DMA channels (real combo cards jumper them apart, e.g. WSS DMA0 vs SB16 DMA1)"
+        "The WSS DMA channel {0} is also the Sound Blaster DMA channel. The AD1848 and the SB16 need different 8237 channels (the defaults are WSS DMA0 and SB16 DMA1). Change the Sound Blaster channel with --sb-dma, or set the WSS channel with SNDCTRL in DOS"
     )]
     WssSbDmaCollision(usize),
     #[error(
-        "audio.wss.irq {0} collides with audio.sound_blaster.irq {0}; the AD1848 and SB16 must use distinct PIC lines (real combo cards jumper them apart, e.g. SB16 IRQ7 vs WSS IRQ11)"
+        "The WSS IRQ {0} is also the Sound Blaster IRQ. The AD1848 and the SB16 need different PIC lines (the defaults are WSS IRQ7 and SB16 IRQ5). Change the Sound Blaster line with --sb-irq, or set the WSS line with SNDCTRL in DOS"
     )]
     WssSbIrqCollision(u8),
     #[error(
@@ -601,6 +601,17 @@ pub fn strip_retired_keys(value: &mut toml::Value) -> Vec<String> {
     dropped
 }
 
+/// A parsed machine config with what the loader had to say about it.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: AppConfig,
+    /// One line per thing the file asked for that this build ignores.
+    pub notes: Vec<String>,
+    /// The document after retired keys were removed. Callers read it to learn
+    /// which keys the file set.
+    pub document: toml::Value,
+}
+
 impl AppConfig {
     pub fn from_toml_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -608,19 +619,45 @@ impl AppConfig {
             path: path.to_owned(),
             source,
         })?;
+        Ok(Self::from_toml_text(path, &text)?.config)
+    }
+
+    /// Parse the text of a machine config. `path` is only used in errors.
+    ///
+    /// Retired keys are removed before the parse, and each removal is reported
+    /// in `notes`, so an old file still loads and the caller can say what it
+    /// ignored.
+    pub fn from_toml_text(path: &Path, text: &str) -> Result<LoadedConfig, ConfigError> {
         let parse_error = |source: toml::de::Error| ConfigError::Parse {
             path: path.to_owned(),
             source: Box::new(source),
         };
-        let mut value = toml::from_str::<toml::Value>(&text).map_err(parse_error)?;
-        if let Some(key) = gui_prefs_marker(&value) {
+        let mut document = toml::from_str::<toml::Value>(text).map_err(parse_error)?;
+        if let Some(key) = gui_prefs_marker(&document) {
             return Err(ConfigError::GuiPrefsGivenAsMachineConfig {
                 path: path.to_owned(),
                 key,
             });
         }
-        strip_retired_keys(&mut value);
-        value.try_into::<Self>().map_err(parse_error)
+        let mut notes = Vec::new();
+        let dropped = strip_retired_keys(&mut document);
+        if !dropped.is_empty() {
+            notes.push(format!(
+                "ignoring config keys the machine's CMOS now owns ({}); set the CPU speed in                  the BIOS setup panel (Del) and the sound card's resources with SNDCTRL in DOS",
+                dropped.join(", ")
+            ));
+        }
+        let config = document.clone().try_into::<Self>().map_err(parse_error)?;
+        if config.diagnostics.trace_devices {
+            notes.push(
+                "diagnostics.trace_devices has no effect; older files may still set it".to_owned(),
+            );
+        }
+        Ok(LoadedConfig {
+            config,
+            notes,
+            document,
+        })
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1019,6 +1056,7 @@ impl Default for InputConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiagnosticsConfig {
+    /// Has no effect. The key stays so that older config files still load.
     pub trace_devices: bool,
 }
 

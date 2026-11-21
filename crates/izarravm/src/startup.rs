@@ -69,16 +69,8 @@ fn load_config_snapshot(
         path: path.to_owned(),
         source,
     })?;
-    let mut value = toml::from_str::<toml::Value>(&text).map_err(|source| ConfigError::Parse {
-        path: path.to_owned(),
-        source: Box::new(source),
-    })?;
-    if let Some(key) = izarravm_core::gui_prefs_marker(&value) {
-        return Err(ConfigError::GuiPrefsGivenAsMachineConfig {
-            path: path.to_owned(),
-            key,
-        });
-    }
+    let loaded = AppConfig::from_toml_text(path, &text)?;
+    let value = &loaded.document;
     let midi = value
         .get("audio")
         .and_then(|audio| audio.get("midi"))
@@ -96,25 +88,10 @@ fn load_config_snapshot(
             mt32_pcm_rom: midi.is_some_and(|table| table.contains_key("mt32_pcm_rom")),
         },
     };
-    // Drop the settings CMOS owns now, and say so: a user who edited one of
-    // them is otherwise left watching the machine ignore their file, which is
-    // exactly the confusion that moving them to CMOS was meant to end.
-    let dropped = izarravm_core::strip_retired_keys(&mut value);
-    if !dropped.is_empty() {
-        warn!(
-            path = %path.display(),
-            keys = %dropped.join(", "),
-            "ignoring config keys the machine's CMOS now owns; \
-             set the CPU speed in the BIOS setup panel (Del) and the sound \
-             card's resources with SNDCTRL in DOS"
-        );
+    for note in &loaded.notes {
+        warn!(path = %path.display(), "{note}");
     }
-    let config = value
-        .try_into::<AppConfig>()
-        .map_err(|source| ConfigError::Parse {
-            path: path.to_owned(),
-            source: Box::new(source),
-        })?;
+    let config = loaded.config;
     Ok((config, presence))
 }
 
@@ -206,8 +183,12 @@ pub(super) struct ResolvedStartup {
     /// is the built-in default".
     requested: cmos::RequestedHardware,
     prefs: prefs::GuiPrefs,
+    /// The prefs file existed but its contents were rejected.
+    prefs_rejected: bool,
     prefs_path: PathBuf,
     state_dir: PathBuf,
+    /// The C: folder is the per-user or portable default, so it may not exist yet.
+    create_c_drive: bool,
 }
 
 pub(super) struct GuiLaunch {
@@ -275,14 +256,29 @@ impl ResolvedStartup {
         &self.config.dos.c_drive
     }
 
+    /// Create the default C: folder, and with it the folder that holds
+    /// izarravm.conf and cmos.bin. Call this before the first save of either.
+    /// Modes that do not mount C: never call it.
+    pub(super) fn ensure_c_drive(&self) {
+        if self.create_c_drive
+            && let Err(err) = std::fs::create_dir_all(&self.config.dos.c_drive)
+        {
+            warn!(%err, path = %self.config.dos.c_drive.display(), "could not create the C: folder");
+        }
+    }
+
     pub(super) fn load_global_glide_ovl(&self) -> Option<Vec<u8>> {
         load_state_glide_ovl(&self.state_dir)
     }
 
     pub(super) fn into_gui(self, rom: Vec<u8>, test_pattern: bool) -> GuiLaunch {
+        self.ensure_c_drive();
         let mut rtc_setup = cmos::RtcSetup::from_c_root(&self.config.dos.c_drive);
         rtc_setup.requested = self.requested;
         let glide_ovl = self.load_global_glide_ovl();
+        if self.prefs_rejected {
+            prefs::GuiPrefs::keep_rejected_copy(&self.prefs_path);
+        }
         GuiLaunch {
             profile: MachineProfile::from_hardware_profile(&self.hardware),
             rom,
@@ -370,10 +366,9 @@ fn resolve_with(
     });
     if uses_default_c_root {
         config.dos.c_drive = locations.default_c_root(cli.portable);
-        let _ = std::fs::create_dir_all(&config.dos.c_drive);
     }
     let prefs_path = prefs::prefs_path(&config.dos.c_drive);
-    let saved_prefs = prefs::GuiPrefs::load_with(&prefs_path, &mut read_text);
+    let (saved_prefs, prefs_rejected) = prefs::GuiPrefs::load_checked(&prefs_path, &mut read_text);
     let mut midi_presence = presence.midi;
     midi_presence.backend |= cli.midi_backend.is_some();
     midi_presence.external_port |= cli.midi_port.is_some();
@@ -412,8 +407,10 @@ fn resolve_with(
         host_input,
         requested,
         prefs: saved_prefs,
+        prefs_rejected,
         prefs_path,
         state_dir: locations.state_dir.clone(),
+        create_c_drive: uses_default_c_root,
     })
 }
 
