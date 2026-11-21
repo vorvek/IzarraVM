@@ -370,6 +370,11 @@ pub enum StopReason {
     TestExit {
         code: u8,
     },
+    /// The guest pulsed the CPU reset line: an 8042 command that pulses the
+    /// output port reset bit, a write to the 8042 output port that holds
+    /// bit 0 low, or a 0-to-1 write of bit 0 of port 0x92. The machine does
+    /// not reset itself. The caller decides whether to rebuild it.
+    ResetRequested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

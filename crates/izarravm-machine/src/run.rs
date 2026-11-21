@@ -2069,6 +2069,14 @@ impl Machine {
                             service_stop = Some(StopReason::TestExit { code });
                         }
                     }
+                    // A guest reset request (8042 command, output port bit 0, or
+                    // port 0x92 bit 0). Taking the flag clears it, so the next
+                    // run after this stop starts clean. The caller rebuilds the
+                    // machine or runs on.
+                    if service_stop.is_none() && self.keyboard.take_reset_request() {
+                        serviced = true;
+                        service_stop = Some(StopReason::ResetRequested);
+                    }
                     if let Some(call) = self.pending_bios32.take() {
                         serviced = true;
                         match call {

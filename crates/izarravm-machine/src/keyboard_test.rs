@@ -639,3 +639,56 @@ fn controller_reply_uses_one_input_origin_and_one_successor_wire_delay() {
     kbd.advance_master_ticks(1);
     assert_eq!(kbd.read_port(0x60), Some(0xee));
 }
+
+#[test]
+fn controller_commands_f0_to_ff_with_bit_0_clear_pulse_the_reset_line() {
+    for command in 0x00..=0xFFu8 {
+        let mut kbd = Keyboard8042::default();
+        write(&mut kbd, 0x64, command);
+        let expected = command >= 0xF0 && command & 1 == 0;
+        assert_eq!(
+            kbd.take_reset_request(),
+            expected,
+            "controller command {command:#04x}"
+        );
+        assert!(!kbd.take_reset_request(), "the request is taken once");
+    }
+}
+
+#[test]
+fn output_port_write_with_bit_0_low_pulses_the_reset_line() {
+    let mut kbd = Keyboard8042::default();
+    write(&mut kbd, 0x64, 0xD1);
+    write(&mut kbd, 0x60, 0xFE); // bit 1 (A20) set, bit 0 low
+    assert!(kbd.take_reset_request());
+    assert!(kbd.a20_enabled(), "the A20 bit still follows the byte");
+}
+
+#[test]
+fn output_port_write_with_bit_0_high_does_not_reset() {
+    for value in [0xDF, 0xDD, 0x03, 0x01] {
+        let mut kbd = Keyboard8042::default();
+        write(&mut kbd, 0x64, 0xD1);
+        write(&mut kbd, 0x60, value);
+        assert!(!kbd.take_reset_request(), "output port {value:#04x}");
+    }
+}
+
+#[test]
+fn keyboard_device_command_fe_is_a_resend_and_not_a_reset() {
+    let mut kbd = Keyboard8042::default();
+    write(&mut kbd, 0x60, 0xFE);
+    assert!(!kbd.take_reset_request());
+}
+
+#[test]
+fn system_control_reset_bit_pulses_only_on_a_rising_edge() {
+    let mut kbd = Keyboard8042::default();
+    assert!(!kbd.write_system_control_a(0x02));
+    assert!(!kbd.write_system_control_a(0x00));
+    assert!(kbd.write_system_control_a(0x01), "0 to 1 pulses");
+    assert_eq!(kbd.read_system_control_a() & 1, 1, "the bit reads back");
+    assert!(!kbd.write_system_control_a(0x01), "1 to 1 does nothing");
+    assert!(!kbd.write_system_control_a(0x00));
+    assert!(kbd.write_system_control_a(0x01), "a new rising edge pulses");
+}

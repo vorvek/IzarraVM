@@ -3366,8 +3366,9 @@ impl CpuBus for MachineBus<'_> {
         }
         if port == 0x0092 {
             // System control port A: bit 1 mirrors the A20 gate (the 8042 output
-            // port is the single source of truth). Other bits read 0.
-            return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
+            // port is the single source of truth). Bit 0 is the latched fast
+            // reset bit. Other bits read 0.
+            return Ok(u32::from(self.keyboard.read_system_control_a()));
         }
         if (0x0200..=0x0207).contains(&port) {
             // The gameport is the strongest lazy candidate in the machine and the
@@ -3687,8 +3688,10 @@ impl CpuBus for MachineBus<'_> {
         }
         if port == 0x0092 {
             // Fast A20 gate: bit 1 drives A20, routed through the 8042 so every A20
-            // method agrees. Bit 0 (fast CPU reset) is not modeled.
+            // method agrees. Bit 0 is the fast CPU reset: a 0-to-1 change asks
+            // the run loop to stop with `ResetRequested`.
             self.set_a20_gate(value & 0x02 != 0);
+            self.keyboard.write_system_control_a(value as u8);
             return Ok(());
         }
         if (0x0200..=0x0207).contains(&port) {

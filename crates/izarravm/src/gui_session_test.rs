@@ -1577,3 +1577,30 @@ fn a_raw_bin_still_mounts_as_bytes_after_the_sniff() {
     assert_eq!(image.read_data_sector(0).unwrap()[0], 0xD1);
     assert_eq!(image.read_audio_frame(1).unwrap()[0], 0xA2);
 }
+
+#[test]
+fn guest_reset_ends_the_generation_and_starts_a_new_one_with_the_same_media() {
+    let scratch = TestScratch::new("guest-reset");
+    let mut spec = test_spec(&scratch);
+    // mov al,0xFE; out 0x64,al; jmp $. The 8042 pulses the reset line.
+    spec.rom[..6].copy_from_slice(&[0xB0, 0xFE, 0xE6, 0x64, 0xEB, 0xFE]);
+    let mut session = GuiSession::start(spec, PreparedInitialMedia::default()).unwrap();
+    assert_eq!(session.poll().snapshot.generation, 1);
+
+    let update = wait_for(&mut session, |update| {
+        update
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::GuestReset { .. }))
+    });
+    let Some(SessionEvent::GuestReset { generation }) = update
+        .events
+        .iter()
+        .find(|event| matches!(event, SessionEvent::GuestReset { .. }))
+    else {
+        unreachable!("the predicate found the event");
+    };
+    assert!(*generation >= 2, "a new generation started");
+    assert!(update.snapshot.powered, "the session is still powered");
+    session.shutdown();
+}

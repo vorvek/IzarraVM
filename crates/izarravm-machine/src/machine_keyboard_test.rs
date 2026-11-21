@@ -243,3 +243,83 @@ fn e0_prefixed_ignored_code_leaves_the_prefix_clean() {
         0x4700
     );
 }
+
+/// Run a raw guest program that ends in a delay and a Lotura test exit with
+/// code 0. The delay lets the 8042 finish any command before the exit.
+fn run_reset_probe(body: &[u8]) -> (Machine, StopReason) {
+    // mov cx,0xFFFF; loop $; xor al,al; then Lotura: index 12, data 0, exit.
+    const TAIL: [u8; 17] = [
+        0xB9, 0xFF, 0xFF, 0xE2, 0xFE, 0xB0, 0x0C, 0xE6, 0xE4, 0x30, 0xC0, 0xE6, 0xE5, 0xB0, 0x03,
+        0xE6, 0xE6,
+    ];
+    let mut prog = body.to_vec();
+    prog.extend_from_slice(&TAIL);
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &prog).unwrap();
+    let stop = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+    (machine, stop)
+}
+
+#[test]
+fn guest_out_64h_fe_requests_a_reset() {
+    // mov al,0xFE; out 0x64,al
+    let (_, stop) = run_reset_probe(&[0xB0, 0xFE, 0xE6, 0x64]);
+    assert_eq!(stop, StopReason::ResetRequested);
+}
+
+#[test]
+fn guest_d1_then_fe_requests_a_reset() {
+    // mov al,0xD1; out 0x64,al; wait for IBF clear; mov al,0xFE; out 0x60,al
+    let (_, stop) = run_reset_probe(&[
+        0xB0, 0xD1, 0xE6, 0x64, 0xE4, 0x64, 0xA8, 0x02, 0x75, 0xFA, 0xB0, 0xFE, 0xE6, 0x60,
+    ]);
+    assert_eq!(stop, StopReason::ResetRequested);
+}
+
+#[test]
+fn guest_d1_with_output_port_bit_0_high_does_not_reset() {
+    for value in [0xDF, 0xDD] {
+        let (_, stop) = run_reset_probe(&[
+            0xB0, 0xD1, 0xE6, 0x64, 0xE4, 0x64, 0xA8, 0x02, 0x75, 0xFA, 0xB0, value, 0xE6, 0x60,
+        ]);
+        assert_eq!(stop, StopReason::TestExit { code: 0 }, "value {value:#04x}");
+    }
+}
+
+#[test]
+fn guest_port_92h_writes_without_a_rising_bit_0_do_not_reset() {
+    for value in [0x02, 0x00] {
+        // mov al,value; out 0x92,al
+        let (_, stop) = run_reset_probe(&[0xB0, value, 0xE6, 0x92]);
+        assert_eq!(stop, StopReason::TestExit { code: 0 }, "value {value:#04x}");
+    }
+}
+
+#[test]
+fn guest_port_92h_bit_0_written_twice_resets_once() {
+    // mov al,1; out 0x92,al; out 0x92,al
+    let (mut machine, first) = run_reset_probe(&[0xB0, 0x01, 0xE6, 0x92, 0xE6, 0x92]);
+    assert_eq!(first, StopReason::ResetRequested);
+    // The run returned at the first write. The second write sees the latched
+    // bit and does not pulse again, so the program reaches its exit.
+    let second = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+    assert_eq!(second, StopReason::TestExit { code: 0 });
+}
+
+#[test]
+fn port_92h_reads_back_the_reset_bit_and_the_a20_bit() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    for (written, read) in [(0x03, 0x03), (0x00, 0x00)] {
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x92, BusWidth::Byte, written, false).unwrap();
+        });
+        let value = with_bus(&mut machine, |bus| {
+            bus.read_io(0x92, BusWidth::Byte, 0, false).unwrap()
+        });
+        assert_eq!(value, read, "wrote {written:#04x}");
+    }
+}

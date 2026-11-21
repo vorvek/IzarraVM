@@ -230,6 +230,11 @@ pub(super) enum SessionEvent {
         generation: u64,
         message: String,
     },
+    /// The guest pulsed the CPU reset line. The session has already ended
+    /// that generation and started the one named here, with the same media.
+    GuestReset {
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,10 +437,7 @@ impl GuiSession {
         if self.closed {
             return Err(SessionClosed);
         }
-        if self.worker.as_ref().is_some_and(RunningWorker::is_finished) {
-            let worker = self.worker.take().expect("worker checked above");
-            self.finish_worker(worker, CompletionDelivery::Event);
-        }
+        self.reap_finished_worker();
         let request_id = RequestId(self.next_request_id);
         if self.worker.is_none() {
             let SessionRequest::MidiConfig(config) = request else {
@@ -467,11 +469,42 @@ impl GuiSession {
         Ok(request_id)
     }
 
-    pub(super) fn poll(&mut self) -> SessionUpdate {
-        if self.worker.as_ref().is_some_and(RunningWorker::is_finished) {
-            let worker = self.worker.take().expect("worker checked above");
-            self.finish_worker(worker, CompletionDelivery::Event);
+    /// Collect a worker thread that ended on its own. When the guest pulsed
+    /// the CPU reset line, rebuild the machine the way the Reset button does,
+    /// with the same media.
+    fn reap_finished_worker(&mut self) {
+        if !self.worker.as_ref().is_some_and(RunningWorker::is_finished) {
+            return;
         }
+        let worker = self.worker.take().expect("worker checked above");
+        let exit = self.finish_worker(worker, CompletionDelivery::Event);
+        if !exit.reset_requested {
+            return;
+        }
+        match self.restart_with_media(exit.media) {
+            Ok(failures) => {
+                for failure in failures {
+                    self.pending_events
+                        .push_back(SessionEvent::FinalizationFailed {
+                            generation: exit.generation,
+                            message: failure.to_string(),
+                        });
+                }
+                self.pending_events.push_back(SessionEvent::GuestReset {
+                    generation: self.snapshot.generation,
+                });
+            }
+            Err(failure) => {
+                self.pending_events.push_back(SessionEvent::WorkerFailed {
+                    generation: exit.generation,
+                    message: failure.to_string(),
+                });
+            }
+        }
+    }
+
+    pub(super) fn poll(&mut self) -> SessionUpdate {
+        self.reap_finished_worker();
         let mut newest_frame = None;
         if let Some(worker) = &self.worker {
             let (snapshot, frame, events) =
@@ -530,9 +563,22 @@ impl GuiSession {
         if let Some(failure) = exit.failure {
             failures.push(failure);
         }
+        failures.extend(self.restart_with_media(exit.media)?);
+        Ok(ResetReport {
+            generation: self.snapshot.generation,
+            failures,
+        })
+    }
 
+    /// Start a new generation that carries over the media of an ended one.
+    /// Returns the failures met while preparing that media.
+    fn restart_with_media(
+        &mut self,
+        media: RetainedMedia,
+    ) -> Result<Vec<SessionFailure>, SessionFailure> {
+        let mut failures = Vec::new();
         let mut prepared = PreparedInitialMedia::default();
-        if let Some(floppy) = exit.media.floppy {
+        if let Some(floppy) = media.floppy {
             if floppy.writeback_pending {
                 prepared.floppy = Some(PreparedFloppy {
                     label: floppy.label,
@@ -547,7 +593,7 @@ impl GuiSession {
                 }
             }
         }
-        if let Some(cd) = exit.media.cd {
+        if let Some(cd) = media.cd {
             match PreparedCd::from_source(cd.source) {
                 Ok(cd) => prepared.cd = Some(cd),
                 Err(failure) => failures.push(failure),
@@ -555,10 +601,7 @@ impl GuiSession {
         }
 
         self.start_generation(prepared)?;
-        Ok(ResetReport {
-            generation: self.snapshot.generation,
-            failures,
-        })
+        Ok(failures)
     }
 
     pub(super) fn power_off(&mut self) -> ShutdownReport {
@@ -657,7 +700,9 @@ impl GuiSession {
             | SessionEvent::Rejected { request_id, .. } => {
                 self.outstanding.remove(request_id);
             }
-            SessionEvent::WorkerFailed { .. } | SessionEvent::FinalizationFailed { .. } => {}
+            SessionEvent::WorkerFailed { .. }
+            | SessionEvent::FinalizationFailed { .. }
+            | SessionEvent::GuestReset { .. } => {}
         }
         self.pending_events.push_back(event);
     }
@@ -853,6 +898,8 @@ struct RetainedCd {
 #[derive(Debug)]
 struct WorkerExit {
     generation: u64,
+    /// The guest pulsed the CPU reset line and the generation ended for it.
+    reset_requested: bool,
     media: RetainedMedia,
     midi_config: MidiConfig,
     failures: Vec<SessionFailure>,
@@ -863,6 +910,7 @@ impl WorkerExit {
     fn closed(generation: u64) -> Self {
         Self {
             generation,
+            reset_requested: false,
             media: RetainedMedia::default(),
             midi_config: MidiConfig::default(),
             failures: Vec::new(),
@@ -1222,6 +1270,7 @@ fn log_midi_status(config: &MidiConfig, wavetable: &MidiEngine, midi_receiver: &
 enum WorkerStop {
     Shutdown,
     Disconnected,
+    GuestReset,
     StartupFailed(SessionFailure),
 }
 
@@ -1259,9 +1308,10 @@ fn worker_entry(
         },
     );
 
+    let reset_requested = matches!(guarded, Ok(WorkerStop::GuestReset));
     let failure = match guarded {
         Ok(WorkerStop::StartupFailed(failure)) => Some(failure),
-        Ok(WorkerStop::Shutdown | WorkerStop::Disconnected) => None,
+        Ok(WorkerStop::Shutdown | WorkerStop::Disconnected | WorkerStop::GuestReset) => None,
         Err(failure) => {
             if !started {
                 let _ = startup.send(Err(failure.clone()));
@@ -1272,6 +1322,7 @@ fn worker_entry(
     publish_powered_off(&publication, generation_id, &finalized.midi_config);
     WorkerExit {
         generation: generation_id,
+        reset_requested,
         media: finalized.media,
         midi_config: finalized.midi_config,
         failures: finalized.failures,
@@ -1435,6 +1486,9 @@ fn run_worker(
                 &mut generation.machine,
                 execution_budget(credit, approximate),
             );
+            if matches!(stop, Some(StopReason::ResetRequested)) {
+                return WorkerStop::GuestReset;
+            }
             terminal_stop = matches!(
                 stop,
                 Some(
