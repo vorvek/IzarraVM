@@ -83,6 +83,29 @@ resolution and a high frame rate is more than the hardware can do. A late game
 that recommended a Pentium II or a faster CPU is also more than the hardware
 can do. These are limits of the hardware, and not defects in the emulation.
 
+## Requirements
+
+Windows is the first target. The CI builds and tests on `windows-latest`
+only. This page does not state support for other systems.
+
+To run IzarraVM, you need a PC with a CPU that supports AVX2. The build
+targets `x86-64-v3` (see `.cargo/config.toml`). At start, the program checks
+the CPU and shows a message if AVX2 is not present. See the
+[troubleshooting page](docs/troubleshooting.md).
+
+To build IzarraVM, you need these tools:
+
+- The Rust toolchain that `rust-toolchain.toml` names, with `clippy` and
+  `rustfmt`.
+- CMake. The build of `izarravm-native-synth` uses it to build FluidSynth and
+  Munt, and the libraries that they need.
+- A C compiler and a C++ compiler.
+- On Windows, Visual Studio 2019, 2022, or 2026 with the C++ tools. The build
+  uses the Visual Studio generator of CMake for x64.
+
+The sources of these libraries are in
+`crates/izarravm-native-synth/vendor`. The build does not download them.
+
 ## Quick Start
 
 ```powershell
@@ -141,7 +164,13 @@ IzarraVM does not download ROMs, Glide drivers, or game data, and it does not
 distribute them. The metadata of an archive item is not a license. Use these
 files only if you have the legal right to use them.
 
-## Validation
+## Development Policy
+
+- Windows is the first target.
+- Keep the architecture portable.
+- Isolate OS-specific code behind a backend trait.
+
+These four commands gate CI. Run them before you submit a change:
 
 ```powershell
 cargo fmt --check
@@ -149,6 +178,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace
 ```
+
+The headless checks are quick tests of the whole machine. Run them with
+`cargo run -p izarravm --`, followed by one of these switches:
+
+- `--headless-config-check`
+- `--headless-test-rom`
+- `--headless-boot-suite`
+- `--headless-izarra-bios`
+
+See the [command-line reference](docs/reference/command-line.md) for all
+switches.
 
 ## License
 

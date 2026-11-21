@@ -5,7 +5,7 @@
 
 ## IzarraVM will not start, or closes right away with an AVX2 message
 
-IzarraVM needs a host PC (not the emulated machine -- the real one that runs
+IzarraVM needs a host PC (not the emulated machine, but the real one that runs
 IzarraVM) with a CPU that supports AVX2. This has been true of practically
 every PC sold since around 2013, but some older machines, some low-power
 netbook and thin-client chips, and some virtual machines with a narrowed CPU

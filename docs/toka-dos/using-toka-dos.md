@@ -38,8 +38,8 @@ C:\DOS\
 ```
 
 The CD-ROM needs no driver files. The Izarra3000's CD-ROM drive uses a
-proprietary interface, and its support software — the IzarraCD ROM
-Extensions — is part of the system BIOS. Toka-DOS finds the extension at
+proprietary interface, and its support software, the IzarraCD ROM
+Extensions, is part of the system BIOS. Toka-DOS finds the extension at
 boot and assigns the drive to D:.
 
 `AUTOEXEC.BAT` adds `C:\DOS` to the `PATH`. Thus you can run each tool by its
