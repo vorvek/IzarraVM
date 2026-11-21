@@ -3294,3 +3294,53 @@ fn scancode_groups_cover_the_function_keys() {
     assert!(text_to_scancode_groups("{f0}").is_err());
     assert!(text_to_scancode_groups("{f13}").is_err());
 }
+
+#[test]
+fn every_cli_flag_has_help_text() {
+    use clap::CommandFactory;
+    let missing: Vec<String> = Cli::command()
+        .get_arguments()
+        .filter(|arg| {
+            arg.get_help()
+                .is_none_or(|help| help.to_string().is_empty())
+        })
+        .map(|arg| arg.get_id().to_string())
+        .collect();
+    assert!(missing.is_empty(), "flags without help text: {missing:?}");
+}
+
+#[test]
+fn result_flags_require_an_hdd_folder() {
+    for flag in [
+        ["--dump-result", ""],
+        ["--result-ppm", "r.ppm"],
+        ["--presented-ppm", "p.ppm"],
+    ] {
+        let mut args = vec!["izarravm", flag[0]];
+        if !flag[1].is_empty() {
+            args.push(flag[1]);
+        }
+        assert!(
+            Cli::try_parse_from(&args).is_err(),
+            "{} without --hdd-folder must be refused",
+            flag[0]
+        );
+        args.extend(["--hdd-folder", "fixture"]);
+        assert!(
+            Cli::try_parse_from(&args).is_ok(),
+            "{} with --hdd-folder must parse",
+            flag[0]
+        );
+    }
+}
+
+#[test]
+fn idle_seconds_requires_the_boot_profile_and_keeps_its_default() {
+    assert!(Cli::try_parse_from(["izarravm", "--idle-seconds", "3"]).is_err());
+    let cli = Cli::try_parse_from(["izarravm", "--headless-boot-profile", "--idle-seconds", "3"])
+        .unwrap();
+    assert_eq!(cli.idle_seconds, 3);
+    let cli = Cli::try_parse_from(["izarravm", "--headless-boot-profile"]).unwrap();
+    assert_eq!(cli.idle_seconds, 10);
+    assert_eq!(Cli::try_parse_from(["izarravm"]).unwrap().idle_seconds, 10);
+}
