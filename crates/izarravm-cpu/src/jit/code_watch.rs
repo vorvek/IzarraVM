@@ -142,7 +142,7 @@ const fn all_chunks_watched() -> ChunkMask {
 }
 
 /// Physical pages that just crossed the unwatched -> watched edge in one call into a watch
-/// table — the strict-edge signal of the watched-page-bit design (D4). The caller at the
+/// table, the strict-edge signal of the watched-page-bit design (D4). The caller at the
 /// `CpuGsw` layer MUST feed every page here through the fast-map sweep before native code can
 /// run again; dropping one is the silent-SMC-miss miscompile class. Page NUMBERS
 /// (`physical >> 12`). Empty on the overwhelmingly common no-edge call, which allocates
@@ -177,7 +177,7 @@ pub(crate) struct StickyDecodeCodeWatch {
     /// Strict E1 edge pages awaiting the fast-map sweep. It lives HERE, inside the boxed watch,
     /// rather than as a `DecodeCache` field, because `DecodeCache` sits inline in `CpuGsw` and a
     /// 24-byte `Vec` there moves the pinned `pending_flags` offset (the `fast_map_audit`
-    /// precedent). Drained by `CpuGsw::sweep_sticky_watch_edges` — synchronously after every
+    /// precedent). Drained by `CpuGsw::sweep_sticky_watch_edges`, synchronously after every
     /// production decode insert, and as the native-entry backstop drain.
     pending_edges: Vec<u32>,
 }
@@ -262,8 +262,8 @@ impl StickyDecodeCodeWatch {
         }
     }
 
-    /// Returns `Some(page)` when this mark crossed the page's unwatched -> watched edge — the
-    /// strict E1 signal the caller must sweep — and `None` for every re-mark of an
+    /// Returns `Some(page)` when this mark crossed the page's unwatched -> watched edge (the
+    /// strict E1 signal the caller must sweep) and `None` for every re-mark of an
     /// already-watched page.
     fn mark_chunk(&mut self, physical: u32) -> Option<u32> {
         let page = physical >> PAGE_SHIFT;
@@ -357,7 +357,7 @@ impl StickyDecodeCodeWatch {
     }
 
     /// Park a `mark_range` return until the owner's sweep drains it. Accumulation across several
-    /// marks is fine — the drain clears everything pending — as long as no native code runs in
+    /// marks is fine (the drain clears everything pending) as long as no native code runs in
     /// between, which the production chokes (sweep-after-put, native-entry drain) guarantee.
     pub(crate) fn stash_pending(&mut self, edges: WatchPageEdges) {
         self.pending_edges.extend(edges.0);
@@ -379,7 +379,7 @@ impl StickyDecodeCodeWatch {
         self.sweep_cleared = 0;
     }
 
-    /// Whether ANY granule of this physical page carries a sticky mark — the per-page fact the
+    /// Whether ANY granule of this physical page carries a sticky mark: the per-page fact the
     /// fast-map `PAGE_WATCHED` bit caches. Falls back to the precise/coarse maps when the
     /// published table does not exist yet (interpreter-only phase): a fill taken before the
     /// first `table_base` call must still see marks, or the page would carry a clear bit with
@@ -494,7 +494,7 @@ pub(crate) struct NativeCodeWatch {
     // Box addresses remain stable while native code can observe them.
     recycled_pages: Vec<Box<WatchPage>>,
     /// Slice 0 of the watched-page-bit design: `active_chunks` 0 -> nonzero page transitions
-    /// (the strict E2 edge — a fresh page or a retained inactive page reactivating). Refcounted
+    /// (the strict E2 edge: a fresh page or a retained inactive page reactivating). Refcounted
     /// re-acquires on an active page are not edges, which is exactly the claim about install
     /// churn the counter exists to check.
     page_edges: u64,
@@ -661,7 +661,7 @@ impl NativeCodeWatch {
     /// its twin `DecodeCache::range_hits_code` already carries, ported over.
     ///
     /// `bit + len <= 64` is the non-crossing test: a range that straddles a mask word needs both
-    /// words, and it also settles the 4 GiB wrap the loop arm handles with `wrapping_add` -- a
+    /// words, and it also settles the 4 GiB wrap the loop arm handles with `wrapping_add`, a
     /// range that cannot leave its 64-chunk word cannot leave its page or wrap the address space
     /// either. Anything failing it, and any access wider than four bytes, takes the exact loop.
     pub(crate) fn range_watched(&self, physical: u32, len: u32) -> bool {
@@ -842,7 +842,7 @@ impl NativeCodeWatch {
         self.sweep_cleared = 0;
     }
 
-    /// Whether ANY chunk of this physical page holds a live block reference — the per-page fact
+    /// Whether ANY chunk of this physical page holds a live block reference: the per-page fact
     /// the fast-map `PAGE_WATCHED` bit caches. Falls back to the pages map when the published
     /// table does not exist yet, for the sticky twin's reason: a fill before the first
     /// `table_base` call must still see live refcounts. Retained INACTIVE pages

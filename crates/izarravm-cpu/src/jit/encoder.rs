@@ -367,7 +367,7 @@ impl Encoder {
 
     /// `cmp a, b` (REX.W + 39 /r, CMP r/m64,r64: computes `a - b` and sets flags, discarding the
     /// result). Mirrors `mov_r64_r64`'s exact register/ModRM pattern with opcode 0x39 in place of
-    /// 0x89 -- needed to compare the runtime `cap_clocks` value (not a compile-time immediate, so
+    /// 0x89, needed to compare the runtime `cap_clocks` value (not a compile-time immediate, so
     /// `cmp_r64_imm32` does not apply) against the accumulated raw-clocks register.
     pub(crate) fn cmp_r64_r64(&mut self, a: Reg, b: Reg) {
         self.rex(true, b.ext(), false, a.ext());
@@ -478,7 +478,7 @@ impl Encoder {
     /// emitted code is a HOST exception on the JIT stack, not a guest fault. Every caller must
     /// prove both conditions excluded before this is reached; `emit_div_reg` carries the proof.
     /// Written out separately from `mul_r32`/`imul_r32` for the reason those two give about each
-    /// other -- but the stakes here are higher, because picking /6 where /4 was meant is not a
+    /// other, but the stakes here are higher, because picking /6 where /4 was meant is not a
     /// wrong answer, it is a process abort.
     pub(crate) fn div_r32(&mut self, src: Reg) {
         self.optional_rex(false, false, false, src.ext());
@@ -491,7 +491,7 @@ impl Encoder {
     ///
     /// SIXTY-FOUR bit on purpose, and it is the whole reason the guest's 32-bit IDIV can be
     /// lowered at all. The guest's dividend is 64 bits wide (EDX:EAX) and its quotient is 32, so
-    /// a host 32-bit IDIV faults on exactly the quotient-overflow case the guest defines -- which
+    /// a host 32-bit IDIV faults on exactly the quotient-overflow case the guest defines, which
     /// would have to be predicted BEFORE the divide, and there is no cheap exact predicate for it.
     /// At 64 bits the quotient always fits whenever `|src| >= 2`, so the overflow test becomes a
     /// COMPARISON on the answer instead of a prediction. See `emit_div_reg`.
@@ -540,7 +540,7 @@ impl Encoder {
     /// Register sibling of `movsx_r32_byte_disp8`. Every current caller passes either RDX or a
     /// `GUEST_HOMES` member. `GUEST_HOMES` is R8-R14 plus RBX: the seven extended homes force
     /// `REX.B` through `optional_rex`'s `src.ext()`, and RBX (low3 = 3) encodes as BL with no
-    /// REX. No home -- and not RDX -- is RSP/RBP/RSI/RDI, so the AH/CH/DH/BH aliasing encoding
+    /// REX. No home (and not RDX) is RSP/RBP/RSI/RDI, so the AH/CH/DH/BH aliasing encoding
     /// (legacy index 4..=7 with no REX) is unreachable for either family. Anyone adding a caller
     /// with a legacy non-RDX register (RSP/RBP/RSI/RDI in particular) must re-derive this
     /// guarantee rather than assume it.
@@ -634,7 +634,7 @@ impl Encoder {
     /// `mov dst32, src32` (32-bit move, no REX.W; used for passing a small u32 arg). REX byte is
     /// emitted only if an extended register is involved. Unit-tested but not yet called by the
     /// strcpy block's emitter (its u32 args are all compile-time constants, emitted via
-    /// `mov_r32_imm32` instead) -- kept for a future block that needs to move a 32-bit value
+    /// `mov_r32_imm32` instead), kept for a future block that needs to move a 32-bit value
     /// between registers.
     pub(crate) fn mov_r32_r32(&mut self, dst: Reg, src: Reg) {
         if src.ext() || dst.ext() {
@@ -678,7 +678,7 @@ impl Encoder {
     }
 
     /// Whether `base.low3()` requires a SIB byte after the ModRM byte. x86-64 reserves ModRM.rm
-    /// == 0b100 (RSP's low3 bits, also shared by R12) to mean "a SIB byte follows" -- it can never
+    /// == 0b100 (RSP's low3 bits, also shared by R12) to mean "a SIB byte follows": it can never
     /// mean "RSP/R12 is the base register" directly, for ANY mod (00/01/10), independent of
     /// REX.B. Skipping the SIB byte for these two bases silently shifts every following byte by
     /// one and runs the wrong instruction stream (caught the hard way: this gap originally broke
@@ -694,14 +694,14 @@ impl Encoder {
         self.bytes.push(0x8B);
         self.modrm(0b01, dst.low3(), base.low3());
         if Self::needs_sib(base) {
-            // scale=00, index=100 (none), base=100 -- "no index, RSP/R12 as the base", the only
+            // scale=00, index=100 (none), base=100: "no index, RSP/R12 as the base", the only
             // base value that can reach this branch (see `needs_sib`).
             self.bytes.push(0x24);
         }
         self.bytes.push(disp8 as u8);
     }
 
-    /// `mov [base + disp8], src` (REX.W + 89 /r, mod=01 disp8, SIB if `base` is RSP/R12) -- the
+    /// `mov [base + disp8], src` (REX.W + 89 /r, mod=01 disp8, SIB if `base` is RSP/R12): the
     /// store mirror of `load_r64_disp8` (which uses 8B, the load form of the same MOV r/m64,r64
     /// family). `disp8` must fit in `i8`.
     pub(crate) fn store_r64_disp8(&mut self, base: Reg, disp8: i8, src: Reg) {
@@ -714,7 +714,7 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
-    /// `mov dst32, [base + disp8]` (8B /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// `mov dst32, [base + disp8]` (8B /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12): the
     /// 32-bit-operand mirror of `load_r64_disp8`. Reads a 32-bit guest register (gpr[i]) from the
     /// `Registers` array the v2 inline slots address by offset; no REX.W so the load zero-extends to
     /// 64 bits (the host register's upper half is cleared, matching the x86-64 rule for 32-bit ops).
@@ -732,7 +732,7 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
-    /// `mov [base + disp8], src32` (89 /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// `mov [base + disp8], src32` (89 /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12): the
     /// 32-bit-operand store mirror, for writing a computed guest gpr[i] back to the `Registers`
     /// array.
     pub(crate) fn store_r32_disp8(&mut self, base: Reg, disp8: i8, src: Reg) {
@@ -747,7 +747,7 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
-    /// `mov dst32, [base + disp32]` (8B /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// `mov dst32, [base + disp32]` (8B /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12): the
     /// 32-bit-operand, 32-bit-displacement load. Zero-extends like `load_r32_disp8`.
     pub(crate) fn load_r32_disp32(&mut self, dst: Reg, base: Reg, disp32: i32) {
         if dst.ext() || base.ext() {
@@ -774,7 +774,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&disp32.to_le_bytes());
     }
 
-    /// `mov [base + disp32], src32` (89 /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// `mov [base + disp32], src32` (89 /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12): the
     /// 32-bit store mirror of `load_r32_disp32` for fields past the disp8 range.
     pub(crate) fn store_r32_disp32(&mut self, base: Reg, disp32: i32, src: Reg) {
         if src.ext() || base.ext() {
@@ -840,12 +840,12 @@ impl Encoder {
     /// (`codegen_ops_x86-64.h:719`, `:733`, `:743` in `FETCH_EA_32`; `:578`, `:593`, `:599`,
     /// `:610`, `:616` in `FETCH_EA_16`; `:929` and `:1084` in the MEM_* helpers). The forms it
     /// emits WITHOUT it are the ones that are not LEAs at all (`MOV EAX,imm32` at `:661`, `:765`;
-    /// `MOV EAX,base_reg` at `:665-667`, `:791-793`) -- exactly the split the caller reproduces by
+    /// `MOV EAX,base_reg` at `:665-667`, `:791-793`), exactly the split the caller reproduces by
     /// spelling the base-less, index-less shape as `mov_r32_imm32`.
     ///
     /// `scale` is 1, 2, 4 or 8. The index must not be RSP: index 100 with REX.X = 0 means "no
     /// index", and there is no encoding that names RSP as an index at all. **R12 IS a legal
-    /// index** -- REX.X = 1 disambiguates it -- so the assert is `index != Reg::RSP` and NOT the
+    /// index** (REX.X = 1 disambiguates it) so the assert is `index != Reg::RSP` and NOT the
     /// `index.low3() != 0b100` the `load_r32_sib` family spells, which would wrongly reject R12.
     /// No guest home is RSP.
     ///
@@ -893,7 +893,7 @@ impl Encoder {
             }
             (Some(_), None) => {
                 self.modrm(md, dst.low3(), 0b100);
-                // scale=00, index=100 (none), base=100 -- RSP/R12 as the base, the only base value
+                // scale=00, index=100 (none), base=100: RSP/R12 as the base, the only base value
                 // that can reach this branch (see `needs_sib`).
                 self.bytes.push(0x24);
             }
@@ -903,7 +903,7 @@ impl Encoder {
                     .push((scale.trailing_zeros() as u8) << 6 | (index.low3() << 3) | base.low3());
             }
             (None, Some((index, scale))) => {
-                // mod=00 with SIB base=101 is "disp32, no base", and the disp32 is MANDATORY --
+                // mod=00 with SIB base=101 is "disp32, no base", and the disp32 is MANDATORY:
                 // there is no disp8 spelling of a base-less SIB.
                 self.modrm(0b00, dst.low3(), 0b100);
                 self.bytes
@@ -918,7 +918,7 @@ impl Encoder {
         }
     }
 
-    /// `add dst32, imm32` (81 /0 id, no REX.W) -- the 32-bit-operand ADD-immmediate form the v2
+    /// `add dst32, imm32` (81 /0 id, no REX.W): the 32-bit-operand ADD-immmediate form the v2
     /// inline `add r32, imm32` slot uses against a host scratch register holding the guest gpr
     /// value. Sets the host flags, but those are not the guest flags (the guest flag update is a
     /// separate helper call); the emitted code does not read host flags after this.
@@ -931,7 +931,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
-    /// `shr dst32, imm8` (C1 /5 ib, no REX.W) -- the 32-bit logical right shift by an immediate,
+    /// `shr dst32, imm8` (C1 /5 ib, no REX.W): the 32-bit logical right shift by an immediate,
     /// the v2 inline `shr r32, imm8` slot. Count is the pinned drawcolumn value (25) at emit time.
     pub(crate) fn shr_r32_imm8(&mut self, dst: Reg, count: u8) {
         if dst.ext() {
@@ -942,7 +942,7 @@ impl Encoder {
         self.bytes.push(count);
     }
 
-    /// `and dst32, imm32` (81 /4 id, no REX.W) -- the 32-bit AND-immediate form. Used by the native
+    /// `and dst32, imm32` (81 /4 id, no REX.W): the 32-bit AND-immediate form. Used by the native
     /// memory probe to page-align a guest address (`& !0x0fff`), extract a page offset (`& 0x0fff`),
     /// and mask a page-cache slot index (`& (LINES-1)`). ModRM reg field is /4, distinct from add's
     /// /0. Zero-extends the result to 64 bits (any 32-bit op clears the host register's upper half).
@@ -966,7 +966,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
-    /// `test r32, imm32` (F7 /0 id, no REX.W) -- a NON-DESTRUCTIVE bit test, the `81`-family shape
+    /// `test r32, imm32` (F7 /0 id, no REX.W): a NON-DESTRUCTIVE bit test, the `81`-family shape
     /// of `cmp_r32_imm32` one ModRM `/n` over (test is /0, cmp is /7).
     ///
     /// Exists for the OF-bearing Jcc predicates of the `IZARRAVM_JCC_SHADOW` lowering, whose mask
@@ -982,7 +982,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
-    /// `or r32, r32` (09 /r, no REX.W) -- dst |= src. Byte-exact tested for the paged probe's
+    /// `or r32, r32` (09 /r, no REX.W): dst |= src. Byte-exact tested for the paged probe's
     /// physical = (entry.phys | (linear & 0xfff)).
     pub(crate) fn or_r32_r32(&mut self, dst: Reg, src: Reg) {
         if dst.ext() || src.ext() {
@@ -1002,7 +1002,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
-    /// `shl dst32, imm8` (C1 /4 ib, no REX.W) -- the 32-bit logical left shift by an immediate, the
+    /// `shl dst32, imm8` (C1 /4 ib, no REX.W): the 32-bit logical left shift by an immediate, the
     /// mirror of `shr_r32_imm8` (ModRM reg /4 vs shr's /5). Used by the native memory probe to scale
     /// a page-cache slot index by the entry size (`slot * 16` = `shl 4`).
     pub(crate) fn shl_r32_imm8(&mut self, dst: Reg, count: u8) {
@@ -1014,7 +1014,7 @@ impl Encoder {
         self.bytes.push(count);
     }
 
-    /// `add dst32, src32` (01 /r, no REX.W) -- the 32-bit register-register ADD, mirroring
+    /// `add dst32, src32` (01 /r, no REX.W): the 32-bit register-register ADD, mirroring
     /// `mov_r32_r32`'s register/ModRM pattern with opcode 0x01. Used by the native memory probe to
     /// fold a `[base+index]` guest effective address (scale 1) into one host register. Sets host
     /// flags, but the emitted probe does not read them.
@@ -1142,8 +1142,8 @@ impl Encoder {
     /// a future caller from reaching for RSP through this and silently encoding AH.
     ///
     /// The 8-bit width is the point, exactly as the 16-bit width is for `shift_r16_imm8`: the host
-    /// computes every flag against the 8-bit operand -- CF from bit 7 for a left shift and bit 0
-    /// for a right one, SF from bit 7, ZF and PF from the 8-bit result -- so it does the narrowing
+    /// computes every flag against the 8-bit operand: CF from bit 7 for a left shift and bit 0
+    /// for a right one, SF from bit 7, ZF and PF from the 8-bit result, so it does the narrowing
     /// the interpreter's `BusWidth::Byte` does instead of the emitter reconstructing it.
     ///
     /// The count byte is passed through verbatim; the host applies the architectural five-bit mask
@@ -1159,7 +1159,7 @@ impl Encoder {
         self.bytes.push(count);
     }
 
-    /// An 8-bit group-2 shift/rotate by CL (`D2 /op`) -- the CL-count twin of `shift_r8_imm8`, and
+    /// An 8-bit group-2 shift/rotate by CL (`D2 /op`): the CL-count twin of `shift_r8_imm8`, and
     /// it exists for the count-lane emitter, whose count is runtime data and cannot be encoded as
     /// an immediate at all.
     ///
@@ -1168,8 +1168,8 @@ impl Encoder {
     /// registers rather than encoding a guest byte lane directly.
     ///
     /// The 8-bit width is the point, exactly as it is for the imm8 form: the host computes every
-    /// flag against the 8-bit operand -- CF from bit 7 for a left shift and bit 0 for a right one,
-    /// SF from bit 7, ZF and PF from the 8-bit result -- so it does the narrowing the interpreter's
+    /// flag against the 8-bit operand: CF from bit 7 for a left shift and bit 0 for a right one,
+    /// SF from bit 7, ZF and PF from the 8-bit result, so it does the narrowing the interpreter's
     /// `BusWidth::Byte` does instead of the emitter reconstructing it.
     ///
     /// The host applies the architectural five-bit count mask to CL itself, exactly as it does for
@@ -1189,9 +1189,9 @@ impl Encoder {
     ///
     /// The 16-bit width is the whole point, exactly as it is for `alu_r16_imm16`: an x86-64 16-bit
     /// shift writes only the low 16 bits and PRESERVES bits 31 to 16, which is `write_gpr16`'s
-    /// `(slot & 0xffff_0000) | value`. It also computes every flag against the 16-bit operand --
+    /// `(slot & 0xffff_0000) | value`. It also computes every flag against the 16-bit operand:
     /// CF from bit 15 for a left shift and bit 0 for a right one, SF from bit 15, ZF and PF from
-    /// the 16-bit result -- so the host does the width narrowing the interpreter's `BusWidth::Word`
+    /// the 16-bit result, so the host does the width narrowing the interpreter's `BusWidth::Word`
     /// does, rather than the emitter having to reconstruct it.
     ///
     /// The count byte is passed through verbatim; the host applies the architectural five-bit mask
@@ -1242,9 +1242,9 @@ impl Encoder {
 
     /// A 16-bit shift/rotate by CL (`66 [REX] D3 /op`), the CL-count twin of `shift_r16_imm8` and
     /// modelled on it exactly as `shift_r32_cl` is modelled on `shift_r32_imm8`: the `0x66` prefix
-    /// goes ahead of the optional REX. The host computes every flag against the 16-bit operand --
+    /// goes ahead of the optional REX. The host computes every flag against the 16-bit operand:
     /// CF from bit 15 for a left shift and bit 0 for a right one, SF from bit 15, ZF and PF from
-    /// the 16-bit result -- and preserves bits 31 to 16, exactly as `shift_r16_imm8`'s doc records.
+    /// the 16-bit result, and preserves bits 31 to 16, exactly as `shift_r16_imm8`'s doc records.
     /// The host applies the architectural five-bit count mask to CL itself.
     pub(crate) fn shift_r16_cl(&mut self, op: u8, dst: Reg) {
         assert!(op < 8, "shift group must fit three bits");
@@ -1254,7 +1254,7 @@ impl Encoder {
         self.modrm(0b11, op, dst.low3());
     }
 
-    /// `movzx dst32, byte [base + index]` (0F B6 /r, mod=00, rm=100 SIB, scale=1, no REX.W) -- load a
+    /// `movzx dst32, byte [base + index]` (0F B6 /r, mod=00, rm=100 SIB, scale=1, no REX.W): load a
     /// byte from `[base + index]` and zero-extend it to 32 bits (clearing the host register's upper 64
     /// bits). The native byte-load probe uses this for the final deref off the host page pointer plus
     /// the in-page offset. Same SIB constraints as `load_r32_sib`: base must not be RBP/R13 (SIB
@@ -1298,7 +1298,7 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
-    /// `mov [base + disp8], src8` (88 /r, mod=01 disp8, SIB if `base` is RSP/R12) -- store the low
+    /// `mov [base + disp8], src8` (88 /r, mod=01 disp8, SIB if `base` is RSP/R12): store the low
     /// byte of `src` to `[base + disp8]`. The native byte-load probe uses this to write a loaded byte
     /// into a guest register's byte lane in the `Registers` array (low byte at `4*i`, high byte at
     /// `4*(i-4)+1`), which IS the `write_gpr8` semantics (the surrounding 24/16 bits are untouched).
@@ -1337,7 +1337,7 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
-    /// `cmp reg32, [base + disp8]` (3B /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12) -- compare
+    /// `cmp reg32, [base + disp8]` (3B /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12): compare
     /// a 32-bit register against a memory dword, setting flags (for a following `jnz`/`jz`). The native
     /// memory probe uses this to compare the page-cache entry's `physical_page` field against the
     /// computed guest page in a register, without spending a 4th scratch to load the field first. Same
@@ -1371,7 +1371,7 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
-    /// `test byte [base + disp8], imm8` (F6 /0 ib, mod=01 disp8, SIB if `base` is RSP/R12) --
+    /// `test byte [base + disp8], imm8` (F6 /0 ib, mod=01 disp8, SIB if `base` is RSP/R12):
     /// test a memory byte against an immediate mask, setting ZF for a following `jz`/`jnz`,
     /// without a register load first. The x87 link-relaxation boundary check reads a LinkCell's
     /// spilling flag straight out of the cell address already sitting in `base`.
@@ -1388,7 +1388,7 @@ impl Encoder {
         self.bytes.push(imm8);
     }
 
-    /// `setcc dst8` (0F 90+cc /0, mod=11) -- write 1 or 0 into the low byte of `dst` from the
+    /// `setcc dst8` (0F 90+cc /0, mod=11): write 1 or 0 into the low byte of `dst` from the
     /// host flags, leaving the other 24 bits alone. The condition encoding is x86's own four-bit
     /// code, the same one `jcc` takes and the same one the guest's ModRM-less opcode low nibble
     /// carries, so no translation is needed at any layer.
@@ -2059,7 +2059,7 @@ impl Encoder {
         self.modrm(0b11, 2, target.low3());
     }
 
-    /// `call qword [base + disp32]` (FF /2, mod=10, no REX.W — FF /2 is 64-bit by default in
+    /// `call qword [base + disp32]` (FF /2, mod=10, no REX.W, FF /2 is 64-bit by default in
     /// long mode). The one-lookup store sites use this against R15 slots: 7 bytes, no scratch
     /// register, unlike the 13-byte `mov r64, imm64` + `call r64` call-out pattern.
     pub(crate) fn call_m64_disp32(&mut self, base: Reg, disp32: i32) {
@@ -2080,7 +2080,7 @@ impl Encoder {
         self.bytes.push(0xC3);
     }
 
-    /// `and r64, imm32` (REX.W + 81 /4 id), the immediate SIGN-extended to 64 bits — so
+    /// `and r64, imm32` (REX.W + 81 /4 id), the immediate SIGN-extended to 64 bits, so
     /// `and rdi, -4` clears exactly the low two bits, which is how the mode13 stub strips the
     /// store-bias tags without touching the pointer's high half.
     pub(crate) fn and_r64_imm32(&mut self, dst: Reg, imm: u32) {
@@ -2106,7 +2106,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&disp32.to_le_bytes());
     }
 
-    /// `jmp qword [base + disp32]` (FF /4, mod=10) — the slow store stubs' epilogue, returning
+    /// `jmp qword [base + disp32]` (FF /4, mod=10): the slow store stubs' epilogue, returning
     /// through the frame slot their `pop` prologue parked the return address in.
     pub(crate) fn jmp_m64_disp32(&mut self, base: Reg, disp32: i32) {
         self.optional_rex(false, false, false, base.ext());
@@ -2121,7 +2121,7 @@ impl Encoder {
     /// `test r8_low, imm8` (F6 /0 ib) against the LOW byte lane of any GPR, emitting the empty
     /// REX (0x40) for RSP/RBP/RSI/RDI so the encoding selects SPL/BPL/SIL/DIL rather than
     /// AH/CH/DH/BH. The rest of the encoder deliberately avoids these byte registers (guest
-    /// high-byte lanes must map to shifts, see `emit_read_store_value`) — this form exists for
+    /// high-byte lanes must map to shifts, see `emit_read_store_value`). This form exists for
     /// HOST-side bit tests on scratch registers, the store-bias tag probe first.
     pub(crate) fn test_r8_low_imm8(&mut self, r: Reg, imm: u8) {
         if r.ext() {
@@ -2134,7 +2134,7 @@ impl Encoder {
         self.bytes.push(imm);
     }
 
-    /// `test al, al` (84 C0) -- tests the low byte of RAX (the C-ABI return register for a `u8`).
+    /// `test al, al` (84 C0): tests the low byte of RAX (the C-ABI return register for a `u8`).
     pub(crate) fn test_al_al(&mut self) {
         self.bytes.push(0x84);
         self.bytes.push(0xC0);
@@ -2179,11 +2179,11 @@ impl Encoder {
     }
 
     /// `ja label` (near, unsigned above, rel32; 0F 87 cd). Same shape as `jz`/`jnz`, the
-    /// unsigned-above condition (CF=0 and ZF=0) -- needed for the strcpy block's runtime
+    /// unsigned-above condition (CF=0 and ZF=0), needed for the strcpy block's runtime
     /// `cap_clocks` comparison, which cannot use `cmp_r64_imm32` (the cap is not a compile-time
     /// constant) and so cannot be tested with plain `jz`/`jnz` either. Unsigned (not the signed
     /// `jg`/0F 8F) because `cap_clocks` is a `u64` whose full range includes values at or above
-    /// `i64::MAX` (notably `u64::MAX`, the "no cap" sentinel some callers pass) -- a signed
+    /// `i64::MAX` (notably `u64::MAX`, the "no cap" sentinel some callers pass): a signed
     /// comparison would misread such a value as negative and exit immediately.
     pub(crate) fn ja(&mut self, target: Label) {
         let instr_start = self.bytes.len();
@@ -2203,7 +2203,7 @@ impl Encoder {
         self.queue_or_resolve(instr_start, PatchKind::Rel32AfterJcc, target);
     }
 
-    /// `xor rdx, rdx` then `div src` — unsigned divide RDX:RAX (= RAX zero-extended) by src.
+    /// `xor rdx, rdx` then `div src`: unsigned divide RDX:RAX (= RAX zero-extended) by src.
     /// Quotient in RAX, remainder in RDX. This is the two-instruction idiom for u64 / u64.
     /// Requires RDX and RAX as caller-saved scratch; the divisor is `src`.
     pub(crate) fn div_r64(&mut self, src: Reg) {
@@ -2218,7 +2218,7 @@ impl Encoder {
     }
 
     /// `jmp label` (near, rel32; E9 cd). Unit-tested but not called by the strcpy block's emitter
-    /// (every exit from its loop body is a conditional branch -- `ja`/`jnz`/`jz` -- never an
+    /// (every exit from its loop body is a conditional branch: `ja`/`jnz`/`jz`, never an
     /// unconditional one). Kept for a future block whose control flow needs it.
     pub(crate) fn jmp(&mut self, target: Label) {
         let instr_start = self.bytes.len();
@@ -2265,7 +2265,7 @@ impl Encoder {
     }
 
     /// Resolve every still-forward patch (a label referenced before it was placed) and return the
-    /// finished byte stream. Panics if a referenced label was never placed -- a programming error
+    /// finished byte stream. Panics if a referenced label was never placed: a programming error
     /// in the emitter, not a runtime condition.
     pub(crate) fn finish(mut self) -> Vec<u8> {
         for patch in std::mem::take(&mut self.patches) {

@@ -214,8 +214,8 @@ pub(crate) enum NativeX87Insn {
     /// The interpreter (fpu_exec.rs, the `opcode == 0x9b` head of `execute_fpu_decoded`) is three
     /// tests: `#NM` when `CR0.MP & CR0.TS` are BOTH set, `#MF` when `CR0.NE` is set and the x87
     /// has a pending unmasked exception, otherwise `clocks(6)` and nothing else. `emit_gate`'s
-    /// first test is `CR0.EM | CR0.TS`, which is a SUPERSET of the first -- it side exits on
-    /// `TS` alone and on `EM` alone, where WAIT would have retired -- and its second test is
+    /// first test is `CR0.EM | CR0.TS`, which is a SUPERSET of the first: it side exits on
+    /// `TS` alone and on `EM` alone, where WAIT would have retired, and its second test is
     /// `CR0.NE != 0 && status & 0x3f & !(control & 0x3f) != 0`, which is
     /// `X87::pending_unmasked_exception` transcribed. Conservative-but-never-permissive is the
     /// same contract every other guard in this file has: a side exit re-runs the instruction in
@@ -237,7 +237,7 @@ pub(crate) enum NativeX87Insn {
     /// `direct::fpu_loop_rows_enabled` for the census evidence and the probe that settled it.
     ///
     /// The interpreter is `fpu_round_rc(control, ST(0))` (lib.rs), whose four RC arms are
-    /// `round_ties_even` / `floor` / `ceil` / `trunc` -- which is `vroundsd`'s immediate encoding
+    /// `round_ties_even` / `floor` / `ceil` / `trunc`, which is `vroundsd`'s immediate encoding
     /// 0/1/2/3 exactly, in the same order. RC is a RUNTIME value, so the emitted form is a
     /// four-way branch on `(control >> 10) & 3` rather than a baked immediate; `emit_fistp_chop_
     /// guard`'s alternative (refuse every RC but chop) would leave the row uncollapsed on any
@@ -261,12 +261,12 @@ pub(crate) enum NativeX87Insn {
     TestZero,
     /// FXAM (0xD9 E5): classify ST(0) into C3/C2/C0 with C1 carrying the sign. Admitted only
     /// because `emit_load_physical` has already excluded the three classes that would need the
-    /// tag word to answer -- empty, NaN and infinity all side exit at its tag and finite guards --
+    /// tag word to answer: empty, NaN and infinity all side exit at its tag and finite guards,
     /// which leaves exactly the finite zero/non-zero split the emitted form can decide.
     Examine,
     /// FUCOM/FUCOMP ST(i) (0xDD /4 no pop, /5 pop). The interpreter treats these exactly like
-    /// FCOM/FCOMP -- one `fpu_compare` and an optional pop, with the unordered-versus-signaling
-    /// NaN distinction unmodelled (`fpu_dd_register`, fpu_exec.rs:656-666) -- so the emitted form
+    /// FCOM/FCOMP: one `fpu_compare` and an optional pop, with the unordered-versus-signaling
+    /// NaN distinction unmodelled (`fpu_dd_register`, fpu_exec.rs:656-666), so the emitted form
     /// is `BinaryRegister`'s compare path verbatim. What is NOT shared is the timing: this is
     /// `clocks(4)` against `BinaryRegister`'s 20, which is the whole reason it cannot be folded
     /// into `NativeX87BinaryOp` and must carry its own metadata arm.
@@ -296,7 +296,7 @@ pub(crate) enum NativeX87Insn {
     },
     /// FSTP m80 (0xDB /7): store ST(0) as an 80-bit extended real, then pop.
     ///
-    /// The register file is f64, so this is not a widening of the stored value -- it is the
+    /// The register file is f64, so this is not a widening of the stored value: it is the
     /// interpreter's `write_extended80` (fpu_exec.rs:917-957) reproduced as bit surgery, and the
     /// emitted form matches it exactly for every finite input rather than matching an 8087. The
     /// f64-for-f80 ceiling this inherits is the file-level one documented in `fpu.rs`, not
@@ -335,7 +335,7 @@ pub(crate) struct NativeX87Metadata {
     ///
     /// `u16`, not `u8`, since slice 1d (review B4.1). The widest epoch-1 literal
     /// here is 70 (`FSQRT`), which fits a byte; every epoch-2 x87 charge is that
-    /// count times twelve -- `FSQRT` alone is raw 840 -- so the byte overflows
+    /// count times twelve (`FSQRT` alone is raw 840) so the byte overflows
     /// the moment this table is driven from the class table. Widening it ahead of
     /// that is free: the field is read as `u64` one line below, and
     /// `MAX_X87_BLOCK_CORE_CLOCKS`'s compile-time dominance check re-derives
@@ -521,8 +521,8 @@ impl NativeX87Insn {
             }),
             (0xd9, 0, index) => Some(Self::LoadRegister { index }),
             (0xd9, 1, index) => Some(Self::Exchange { index }),
-            // 0xD9 /4 register forms. rm 2, 3, 6 and 7 are undefined -- `fpu_d9_register` has no
-            // arm for 0xE2/0xE3/0xE6/0xE7 and answers #UD -- so the rm list is explicit rather
+            // 0xD9 /4 register forms. rm 2, 3, 6 and 7 are undefined: `fpu_d9_register` has no
+            // arm for 0xE2/0xE3/0xE6/0xE7 and answers #UD, so the rm list is explicit rather
             // than `0..=7`, the same shape the (0xd9, 5, 0 | 6) pair below uses.
             (0xd9, 4, 0) => Some(Self::SignOp { negate: true }),
             (0xd9, 4, 1) => Some(Self::SignOp { negate: false }),
@@ -870,7 +870,7 @@ impl NativeX87Insn {
                 terminates_block: false,
             },
             // 0xDB /7, `Ok(clocks(14))` (fpu_exec.rs:236-242). `IntConvert32` because the class
-            // comes from the OPCODE BYTE and 0xdb maps there -- NOT `F64Mem`, which is what
+            // comes from the OPCODE BYTE and 0xdb maps there, NOT `F64Mem`, which is what
             // reading this as "a floating-point store" would suggest and which would undercharge
             // the largest x87 row in the reject census by 34x.
             //

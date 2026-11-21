@@ -51,7 +51,7 @@ const MEMORY_POLL_RAW_CORE_CLOCKS: u64 = 5;
 ///
 /// A skipped poll iteration must charge what a really-run one charges, or the
 /// projection lane and the interpreter disagree about how much guest time an
-/// elided span consumed. The four literals these replace -- 17, 21, 28 and 5 --
+/// elided span consumed. The four literals these replace (17, 21, 28 and 5)
 /// were correct sums of the epoch-1 charges and could not follow the table, so
 /// under epoch 2 a skipped `IN AL,DX` poll would have cost 17 raw where a run
 /// one costs 168.
@@ -83,7 +83,7 @@ mod poll_clocks {
 
     /// `CMP m, imm` + `Jcc rel8`. Epoch 1: 2 + 3 = 5, which is
     /// `MEMORY_POLL_RAW_CORE_CLOCKS`. The memory-operand `CMP` writes nothing
-    /// back, so it is Intel's load form and not a read/modify/write -- the same
+    /// back, so it is Intel's load form and not a read/modify/write, the same
     /// split `alu_class` and `DirectKind::timing_class` make.
     pub(super) const fn memory(table: &ClassTable) -> u64 {
         table.raw(TimingClass::AluRegMem) as u64 + table.raw(TimingClass::Jcc) as u64
@@ -354,7 +354,7 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
 /// `fetch_within_limit` is `eip <= limit - (len - 1)`, so with the `cs.limit <= 0xFFFF`
 /// admission term in force (the 3-slot arm's `!d` branch) that slot fails here and the
 /// shape refuses `NegativeVolatile`. No certified slot can then start at or past
-/// `0x10000`, and none can have a last byte above `0xFFFF` -- which is why the admission
+/// `0x10000`, and none can have a last byte above `0xFFFF`, which is why the admission
 /// term delegates the boundary arithmetic here instead of carrying its own `slot_eip +
 /// len` compare, and why it has no off-by-one at the segment top.
 fn poll_slots_within_live_cs(cpu: &CpuGsw, slots: &[Slot]) -> bool {
@@ -403,12 +403,12 @@ fn exact_poll_test_branch(test: &Slot, branch: &Slot) -> Option<(u8, bool)> {
 /// ModRM `(mode, reg, rm)` triple and that the r/m operand is a REGISTER (excluding the
 /// memory form), and never reads AH. So a `0x84` shape with the wrong `reg`, the wrong
 /// `rm`, or a memory operand is a structural negative like any other non-shape, and the
-/// negative cache absorbs it -- that is what stops a hot site from rescanning per read.
+/// negative cache absorbs it: that is what stops a hot site from rescanning per read.
 /// The mask VALUE is resolved later, at the call-out, where the registers are live.
 ///
 /// Exactly ONE `0x84` encoding is accepted, `84 E0` (`mod=3, reg=4 (AH), rm=0 (AL)`).
-/// The mirrored `84 C4` (`TEST AH,AL`) is the same test with identical flags -- AND is
-/// commutative -- and is still refused. Fail-closed on purpose: a site using the
+/// The mirrored `84 C4` (`TEST AH,AL`) is the same test with identical flags (AND is
+/// commutative) and is still refused. Fail-closed on purpose: a site using the
 /// mirrored form is a coverage gap to diagnose, not a defect to hunt.
 fn three_slot_poll_test_branch(
     test: &Slot,
@@ -461,7 +461,7 @@ pub(crate) enum PollScanOutcome {
 /// view used by compiled blocks. Re-running this before every span makes an SMC
 /// restamp replace the descriptor rather than reusing stale bytes or addresses.
 /// Slot opcodes here are mirrored in poll_head_possible's set; extending the
-/// shapes requires extending that set -- with ONE documented exemption, the
+/// shapes requires extending that set, with ONE documented exemption, the
 /// `sixteen_bit_ok`-only D1b test slot (`0x84`), which cannot reach that
 /// prefilter at all. See `poll_head_possible`'s own doc.
 ///
@@ -477,8 +477,8 @@ pub(crate) enum PollScanOutcome {
 /// unprefixed 16-bit forms are DIFFERENT instructions with different lengths, so
 /// they stay 32-bit-only.
 ///
-/// `current` is the scan's ORIGIN -- the instruction start every `at_head` computed
-/// here is measured against -- and it is a caller-supplied value rather than a fresh
+/// `current` is the scan's ORIGIN (the instruction start every `at_head` computed
+/// here is measured against) and it is a caller-supplied value rather than a fresh
 /// `cpu.linear_eip()` read so `build_poll_loop_from` can call this with the same
 /// origin for every `entry` candidate it tries walking backward from `current`. The
 /// interpreter's own caller (`build_poll_loop`) passes `cpu.linear_eip()`, so its
@@ -518,8 +518,8 @@ fn build_poll_loop_at(
             return PollScanOutcome::NegativeCacheable;
         };
         // D-O1, the 16-bit slice's ONE added admission term. `CS.D = 0` with a limit
-        // above 0xFFFF -- a 16-bit protected-mode code segment with G=1, or any
-        // descriptor whose D bit and limit disagree -- is the single reachable state
+        // above 0xFFFF (a 16-bit protected-mode code segment with G=1, or any
+        // descriptor whose D bit and limit disagree) is the single reachable state
         // where IP wraps at 0xFFFF and the limit check does NOT catch it. It is also
         // what makes the call-out's unmasked scan anchor (`cs.base + eip + slot_delta`)
         // exact, because the compile walk's own guarantee is written in terms of
@@ -771,10 +771,10 @@ pub(crate) fn build_poll_loop_from(
 }
 
 /// Find an exact poll shape containing the current instruction start.
-/// `build_poll_loop_from(cpu, cpu.linear_eip())` -- see that function's doc for why the
+/// `build_poll_loop_from(cpu, cpu.linear_eip())`, see that function's doc for why the
 /// origin is a parameter rather than an internal read.
 pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
-    // `sixteen_bit_ok: false` -- the INTERPRETER's value, unconditionally. See
+    // `sixteen_bit_ok: false`, the INTERPRETER's value, unconditionally. See
     // `build_poll_loop_at`'s doc: 16-bit admission is scoped to the Direct call-out,
     // and a partial revert of that slice cannot silently open this path.
     build_poll_loop_from(cpu, cpu.linear_eip(), false)
@@ -798,7 +798,7 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
 ///
 /// **ONE DOCUMENTED EXEMPTION: the D1b test slot `0x84` (`TEST AL,AH`) is deliberately
 /// NOT in this set.** The rule above exists because every certified shape's slots can be
-/// the `current` this prefilter is asked about -- but the D1b arm of
+/// the `current` this prefilter is asked about, but the D1b arm of
 /// `three_slot_poll_test_branch` is reachable only with `sixteen_bit_ok == true`, and
 /// this function's only callers (`poll_loop`, `probe_poll_head`) are the interpreter's,
 /// which pass `false`. A D1b shape therefore cannot exist on any path that reaches here,
@@ -809,7 +809,7 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
 /// Adding `0x84` anyway would not be free. `TEST r/m8, r8` is a common instruction, and
 /// widening the set turns a free prefilter reject at every such interpreter boundary into
 /// a negative-cache probe plus, once per page generation, a full ten-probe backward
-/// scan -- new per-boundary cost on a path no ladder arm exercises
+/// scan, new per-boundary cost on a path no ladder arm exercises
 /// (`poll_skip_eligible` requires the Direct backend OFF). Pinned by
 /// `the_register_mask_test_slot_is_exempt_from_the_head_prefilter_set`.
 fn poll_head_possible(cpu: &CpuGsw, lin: u32, d: bool) -> bool {

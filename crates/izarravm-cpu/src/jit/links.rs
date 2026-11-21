@@ -168,7 +168,7 @@ pub(crate) struct LinkCell {
     /// meaningful for a slot whose source is a V86 segment-write block publishing a guarded
     /// static fallthrough (`direct.rs`'s `emit_completed_path`, gated on `segment_guard`);
     /// every other edge shape never reads this field. Written once, at bind time, by
-    /// `try_link_inner`; never updated in place -- a rebind goes through `clear` first, exactly
+    /// `try_link_inner`; never updated in place; a rebind goes through `clear` first, exactly
     /// like `entry_top`/`spilling`.
     ///
     /// `AtomicU16` rather than a plain field for the same non-load-bearing-ordering reason as
@@ -260,7 +260,7 @@ impl LinkCell {
 
     /// `SEGWRITE-V86-EDGE`: bind the selector the emitted guard compares the live write against.
     /// Called by `try_link_inner` on the admitted path only, after the merge that requires the
-    /// target to claim the written segment -- see `SegmentLayout::seg_write_merge`.
+    /// target to claim the written segment. See `SegmentLayout::seg_write_merge`.
     pub(crate) fn set_expected_selector(&self, selector: u16) {
         self.expected_selector.store(selector, Ordering::Release);
     }

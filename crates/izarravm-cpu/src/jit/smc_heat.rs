@@ -111,7 +111,7 @@ impl SmcHeatMap {
     /// ANY epoch (count > 0). Read-only and non-consuming, unlike `take_stale_stamp`: this is
     /// the disp-lane admission probe, and consuming here would fight `lift_cold_smc_dormant`'s
     /// recovery contract. A record means the chunk took at least one heat-charged kill (a
-    /// killed block or a narrow decode kill — `note_code_write_inner` bumps on nothing else),
+    /// killed block or a narrow decode kill: `note_code_write_inner` bumps on nothing else),
     /// i.e. the bytes have measured patch history; lane-absorbed patches deliberately stop
     /// refreshing it, so "no record" stays the steady state of code that never needed lanes.
     pub(crate) fn has_record_range(&self, physical: u32, len: u32) -> bool {
