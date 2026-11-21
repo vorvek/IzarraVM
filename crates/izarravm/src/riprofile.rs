@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! TEMPORARY diagnostic tooling — statistical RIP sampler for headless runs.
+//! Diagnostic tooling: a statistical RIP sampler for headless runs.
 //!
 //! Gated by `IZARRAVM_RIP_PROFILE=<report-path>`. A sampler thread suspends the
 //! emulation (main) thread at ~2 kHz, records the instruction pointer, and at
