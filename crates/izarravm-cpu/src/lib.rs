@@ -1092,6 +1092,11 @@ pub struct PerfCounters {
     /// `_sixteen_bit` counters below, which key on the mode key of an installed or entered block.
     /// Compile-time, counted once per compile attempt, not execution traffic.
     pub jit_direct_word_address_slots: u64,
+    /// Instructions with a 0x67 address-size override admitted into a 16-bit block, so their
+    /// effective address is 32-bit inside 16-bit code. Compile-time, counted once per compile
+    /// attempt, not execution traffic. It reads zero unless
+    /// IZARRAVM_ADDR32_WORD_ROWS is on.
+    pub jit_direct_addr32_word_block_slots: u64,
     /// The CS.D = 0 split of `jit_direct_blocks_installed`, `_entries` and `_insns`, keyed on
     /// `BlockKey::mode_key` bit 0 (`jit_mode_key`, `core.rs`).
     ///

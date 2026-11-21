@@ -840,7 +840,7 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // canonical architectural state. Check the plain-build native layout here;
     // the histogram feature adds a boxed field before this offset.
     #[cfg(not(feature = "timing-class-histogram"))]
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4800);
     let cpu = sentinel_cpu();
     let _ = arch_payload(&cpu);
     // The `timing-class-histogram` feature adds one boxed field ahead of this
@@ -848,5 +848,5 @@ fn arch_payload_keeps_pending_flags_offset_pinned() {
     // invariant -- emitted code bakes these offsets and the instrument arm is
     // never the one that ships -- so it is checked where it means something.
     #[cfg(not(feature = "timing-class-histogram"))]
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4800);
 }

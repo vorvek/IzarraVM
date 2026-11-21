@@ -1081,6 +1081,7 @@ pub(super) fn perf_counters_json(
         "jit_direct_word_control_admitted": perf.jit_direct_word_control_admitted,
         "jit_direct_word_control_refused": perf.jit_direct_word_control_refused,
         "jit_direct_word_address_slots": perf.jit_direct_word_address_slots,
+        "jit_direct_addr32_word_block_slots": perf.jit_direct_addr32_word_block_slots,
         "jit_direct_blocks_installed_sixteen_bit": perf.jit_direct_blocks_installed_sixteen_bit,
         "jit_direct_entries_sixteen_bit": perf.jit_direct_entries_sixteen_bit,
         "jit_direct_insns_sixteen_bit": perf.jit_direct_insns_sixteen_bit,

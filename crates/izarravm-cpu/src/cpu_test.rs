@@ -2010,7 +2010,7 @@ fn pending_flags_offset() {
     // architectural state. Native code still requires this plain-build layout;
     // the histogram feature adds a boxed field before the pinned offset.
     #[cfg(not(feature = "timing-class-histogram"))]
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4792);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4800);
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and

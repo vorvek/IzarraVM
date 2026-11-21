@@ -4664,8 +4664,8 @@ pub(crate) enum DirectKind {
     /// which defines all 32 bits, so a 66-prefixed LEA would have clobbered the destination's
     /// high half. This is the same fix MOVZX/MOVSX got with `dst_width` and `Shift` with `width`.
     ///
-    /// ADDRESS size is a separate question and does not live here: it rides the block-level
-    /// `address_wrap`, which `emit_effective_address` consumes. The two are independent, and the
+    /// ADDRESS size is a separate question and does not live here: it rides the address's own
+    /// `ea_wrap`, which `emit_effective_address` consumes. The two are independent, and the
     /// `lea16_at_a_dword_address_size_keeps_the_high_half` fixture is the cell that separates
     /// them.
     Lea {
@@ -5997,6 +5997,11 @@ pub(crate) struct DirectAddr {
     /// the flag capture reads the host flags of one instruction it emitted itself, so a lane
     /// staged inside the address work would have to be proven not to disturb them.
     pub(crate) disp_lane: Option<ImmLane>,
+    /// The wrap of this address, as the decoder resolved it from CS.D and the 0x67 prefix. `Some`
+    /// on every ModRM-derived address; `None` on the addresses the emitter builds itself (stack
+    /// cells, frame cells, moffs), which take the wrap their caller passes. `effective_wrap`
+    /// applies the rule.
+    pub(crate) ea_wrap: Option<AddressWrap>,
 }
 
 /// One block's diagnostic classes in slot order, one entry per slot.
@@ -6920,6 +6925,7 @@ impl DirectKind {
 ///
 /// Two prefixes are supported: the operand-size override, and an explicit segment override naming
 /// one of the five DATA segments. LOCK, REP/REPNE and the address-size override are still refused.
+/// The address-size override has its own gate, `addr32_word_admitted`.
 ///
 /// Whether the operand-size override is present for a given `operand_size` depends on the segment
 /// width, because `decode` computes `operand_size = default_32 XOR operand_size_override`. Deriving
@@ -7005,13 +7011,56 @@ fn prefixes_supported_for(prefixes: Prefixes, operand_size: OperandSize, d: bool
             operand_size_override: (operand_size == OperandSize::Dword) != d,
             // Carried through rather than defaulted: this is the admission. Every other field
             // stays at its default, so LOCK, REP/REPNE and the address-size override still refuse.
-            // The address-size override in particular MUST keep refusing — `MemoryEmitContext`'s
-            // `address_wrap` is a BLOCK property derived from CS.D alone, and its doc comment says
-            // so; admitting a per-instruction address size would falsify that field for every
-            // other slot in the block.
+            // The address-size override has its own gate, `addr32_word_admitted`, which a caller
+            // ORs with this function. Do not widen this function: most emitters read the block
+            // wrap, and only the forms on that allowlist read the wrap of their own address.
             segment_override: prefixes.segment_override,
             ..Prefixes::default()
         }
+}
+
+/// Whether a 16-bit block admits this instruction although it carries the 0x67 address-size
+/// override (32-bit effective address in 16-bit code). It is a second gate beside
+/// `prefixes_supported_for`, and callers OR the two.
+///
+/// Every term must hold:
+///
+/// * the `IZARRAVM_ADDR32_WORD_ROWS` knob is on;
+/// * the code is 16-bit (`!d`);
+/// * the override is present, and the instruction passes `prefixes_supported_for` with the
+///   override cleared. That keeps the CS-override rule and every refusal of LOCK, REP and REPNE;
+/// * the opcode is on the allowlist, with a memory operand: `0x89`, `0x8B` and `0x8D` (the
+///   forms that read the wrap of their own address through `DirectAddr::ea_wrap`), `0x8F /0`,
+///   `0xF6` (an interpreter call-out for `/2..7`, a native TEST for `/0`) and `0xA4`/`0xA5`
+///   (a call-out whose helper runs the decoded line).
+///
+/// An opcode that is not on the list keeps its `PrefixUnsupported` stop, because its emitter
+/// reads the block wrap and would form a 16-bit address for a 32-bit one.
+fn addr32_word_admitted(insn: &DecodedInsn, d: bool) -> bool {
+    if d || !insn.prefixes.address_size_override || !addr32_word_rows_enabled() {
+        return false;
+    }
+    let memory = insn.modrm.is_some_and(|m| m.mode != 3);
+    let on_list = match insn.opcode {
+        0x89 | 0x8b | 0x8d | 0xf6 => memory,
+        0x8f => memory && insn.modrm.is_some_and(|m| m.reg == 0),
+        0xa4 | 0xa5 => true,
+        _ => false,
+    };
+    on_list
+        && prefixes_supported_for(
+            Prefixes {
+                address_size_override: false,
+                ..insn.prefixes
+            },
+            insn.operand_size,
+            d,
+        )
+}
+
+/// The prefix admission of the compile walk: `prefixes_supported_for` or `addr32_word_admitted`.
+fn walk_prefixes_supported(insn: &DecodedInsn, d: bool) -> bool {
+    prefixes_supported_for(insn.prefixes, insn.operand_size, d) || addr32_word_admitted(insn, d)
 }
 
 /// The backend's OWN answer to "may this instruction sit in the middle of a block", for the
@@ -7286,7 +7335,7 @@ pub(crate) const fn non_continuable_break_probe_candidate(opcode: u16) -> bool {
 /// opcode here still opens it to the WALK with no further edit, which is the self-opening property
 /// L8 wanted; opening it to the break-site probe as well is now an explicit, measured choice.
 pub(crate) fn walk_admits_non_continuable_entry(cpu: &CpuGsw, insn: &DecodedInsn, d: bool) -> bool {
-    prefixes_supported_for(insn.prefixes, insn.operand_size, d)
+    walk_prefixes_supported(insn, d)
         && (jit_admits_non_continuable(insn)
             || retf_admitted_here(cpu, insn)
             || call_far_admitted_here(cpu, insn)
@@ -8405,7 +8454,9 @@ fn compile_with_budget(
             break;
         }
         let structural_span = RejectedSpan::new(key, next.wrapping_sub(entry_lin) as usize);
-        // The only prefix this backend supports is the operand-size override, and whether it is
+        // The prefixes this backend supports are the operand-size override and the segment
+        // overrides, plus the address-size override on the allowlist of `addr32_word_admitted`
+        // (16-bit code only, behind its knob). Whether the operand-size override is
         // PRESENT for a given `operand_size` depends on the code segment's default size, because
         // `decode` computes `operand_size = default_32 XOR operand_size_override`. Deriving the
         // expected override from `d` rather than hard-coding CS.D = 1 keeps this exact in both
@@ -8416,7 +8467,7 @@ fn compile_with_budget(
         // BOTH arms, so every 16-bit instruction died here as PrefixesUnsupported regardless of
         // what the classifier could lower. That is why this has to be fixed before any of the
         // 16-bit admission work can produce a single native instruction.
-        let prefixes_supported = prefixes_supported_for(insn.prefixes, insn.operand_size, d);
+        let prefixes_supported = walk_prefixes_supported(&insn, d);
         let continuable = insn.continuable
             || jit_admits_non_continuable(&insn)
             || retf_admitted_here(cpu, &insn)
@@ -8767,6 +8818,13 @@ fn compile_with_budget(
         // claim for that work, stated positively rather than as an absence of movement.
         if instruction_limit >= MAX_BLOCK_INSTRUCTIONS && insn.address_size == AddressSize::Word {
             cpu.perf.jit_direct_word_address_slots += 1;
+        }
+        // The 32-bit-address-in-16-bit-code gate. Zero with the knob off is the inertness claim.
+        if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
+            && insn.prefixes.address_size_override
+            && addr32_word_admitted(&insn, d)
+        {
+            cpu.perf.jit_direct_addr32_word_block_slots += 1;
         }
         if instruction_limit >= MAX_BLOCK_INSTRUCTIONS
             && insn.operand_size == OperandSize::Word
@@ -10057,8 +10115,8 @@ fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u
 /// here. What is left is the `disp`-only mode (`mod = 00, rm = 110` at Word address size, `rm = 101`
 /// at Dword), which is exactly the shape the tombraid driver uses.
 ///
-/// The offset is masked the way `emit_effective_address` masks it -- to sixteen bits in a 16-bit
-/// code segment -- BEFORE the segment base is added, because that is the order the emitted address
+/// The offset is masked the way `emit_effective_address` masks it -- to sixteen bits for a 16-bit
+/// address, by `effective_wrap` -- BEFORE the segment base is added, because that is the order the emitted address
 /// is computed in and a mask applied afterwards would name an address the guest never forms.
 /// `emit_alignment_test` runs on RAX, i.e. on the LINEAR address after the base add, so the base
 /// belongs in this arithmetic. It is inert in real mode and V86, where a base is a multiple of 16
@@ -10085,7 +10143,15 @@ fn certainly_exits_on_alignment(cpu: &CpuGsw, kind: DirectKind, d: bool) -> bool
     if addr.base.is_some() || addr.index.is_some() || addr.disp_lane.is_some() {
         return false;
     }
-    let offset = if d { addr.disp } else { addr.disp & 0xffff };
+    let block_wrap = if d {
+        AddressWrap::None
+    } else {
+        AddressWrap::Word
+    };
+    let offset = match effective_wrap(addr, block_wrap) {
+        AddressWrap::None => addr.disp,
+        AddressWrap::Word => addr.disp & 0xffff,
+    };
     let linear = cpu
         .registers
         .segment(addr.segment)
@@ -12911,6 +12977,64 @@ pub(crate) fn set_loop_rows_for_test(forced: Option<bool>) {
 #[cfg(test)]
 pub(crate) fn parse_loop_rows_arm_for_test(value: Result<String, std::env::VarError>) -> bool {
     parse_loop_rows_arm(value)
+}
+
+/// Whether 16-bit blocks admit the 0x67 address-size override on a short allowlist of memory
+/// forms (`addr32_word_admitted`). Default OFF. `IZARRAVM_ADDR32_WORD_ROWS`: unset, empty, `0` or
+/// `off` is OFF. `1` or `on` is ON. Any other value panics, so a mistyped ladder leg cannot run
+/// the default and be read as the arm it named.
+pub(crate) fn addr32_word_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ADDR32_WORD_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_addr32_word_rows_arm(std::env::var("IZARRAVM_ADDR32_WORD_ROWS")))
+}
+
+/// The `IZARRAVM_ADDR32_WORD_ROWS` spelling table, lifted out of the `OnceLock` closure so a unit
+/// test can reach it without a process-wide env write.
+fn parse_addr32_word_rows_arm(value: Result<String, std::env::VarError>) -> bool {
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return false,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!(
+                "IZARRAVM_ADDR32_WORD_ROWS is set to a value that is not valid UTF-8; accepted \
+                 spellings are unset or `0` / `off` (the default) and `1` / `on`"
+            )
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" => false,
+        "1" | "on" => true,
+        other => panic!(
+            "IZARRAVM_ADDR32_WORD_ROWS={other:?} names no arm; accepted spellings are unset or \
+             `0` / `off` (the default) and `1` / `on`. Refusing to guess: a mistyped ladder leg \
+             would silently run the default and be read as the arm it named"
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADDR32_WORD_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the address-size-override arm on this thread for the length of a fixture; `None`
+/// restores the ambient reading. Set it before the CPU is created.
+#[cfg(test)]
+pub(crate) fn set_addr32_word_rows_for_test(forced: Option<bool>) {
+    ADDR32_WORD_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_addr32_word_rows_arm_for_test(
+    value: Result<String, std::env::VarError>,
+) -> bool {
+    parse_addr32_word_rows_arm(value)
 }
 
 /// Whether the backend lowers `0xE0`/`0xE1` LOOPNE/LOOPE natively (`DirectKind::LoopCc`).
@@ -17388,7 +17512,8 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // an instruction that can only ever fault.
             //
             // Everything else the row needs is already gated above and inherited rather than
-            // restated: `prefixes_supported_for` refuses REP, LOCK and the address-size override,
+            // restated: `prefixes_supported_for` refuses REP, LOCK and the address-size override
+            // (`addr32_word_admitted` re-admits the override on a memory `/0` behind its knob),
             // so the helper never meets a REP whose single step would be one iteration of many;
             // the Word allowlist decides whether a 16-bit form is admitted at all; and
             // `block_continuable` admits 0x8F through `DecodeGroup::Stack` on every persona, so
@@ -18131,7 +18256,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                     addr: direct_addr(addr)?,
                     // The OPERAND size, which is what the interpreter passes to
                     // `write_gpr_sized`. The ADDRESS size is a different question and reaches the
-                    // emitter through the block's `address_wrap`.
+                    // emitter through `DirectAddr::ea_wrap`.
                     width: operand_width,
                 });
             }
@@ -18146,6 +18271,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         scale: 1,
                         disp: insn.imm,
                         disp_lane: None,
+                        ea_wrap: None,
                     },
                     class: TimingClass::MovAccMoffs.index() as u8,
                 });
@@ -18177,6 +18303,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         scale: 1,
                         disp: insn.imm,
                         disp_lane: None,
+                        ea_wrap: None,
                     },
                     class: TimingClass::MovAccMoffs.index() as u8,
                 });
@@ -18192,6 +18319,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         scale: 1,
                         disp: insn.imm,
                         disp_lane: None,
+                        ea_wrap: None,
                     },
                     class: TimingClass::MovAccMoffs.index() as u8,
                 });
@@ -18219,6 +18347,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                         scale: 1,
                         disp: insn.imm,
                         disp_lane: None,
+                        ea_wrap: None,
                     },
                     class: TimingClass::MovAccMoffs.index() as u8,
                 });
@@ -18252,8 +18381,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             // decision the interpreter already makes in one arm; emitting it would be a second
             // derivation of the same decision with a second chance to disagree.
             //
-            // NO REP FORM reaches here: `prefixes_supported_for` refuses the prefix upstream and
-            // the walk stops as `BarrierStop::PrefixUnsupported`, a different census arm. That is
+            // NO REP FORM reaches here: `prefixes_supported_for` and `addr32_word_admitted` refuse
+            // the prefix upstream and the walk stops as `BarrierStop::PrefixUnsupported`, a
+            // different census arm. The 0x67 form reaches here only through the knob. That is
             // what makes the admitted form a SINGLE-STEP object -- `run_string`'s
             // `prefixes.rep == None` arm is one `string_step` with no yielding and no
             // `rep_execution` bookkeeping.
@@ -19253,8 +19383,8 @@ fn group_two_mem_kind(
 fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
     // Both address sizes. The 16-bit modes already arrive in exactly this shape:
     // `parse_16bit_address` emits the eight register pairs as base/index at scale 1, with the
-    // displacement sign-extended and SS selected for the BP forms. The 64K wrap is applied by the
-    // emitter as a block property, because the address size is a pure function of CS.D.
+    // displacement sign-extended and SS selected for the BP forms. The 64K wrap is a property of
+    // the decoded address (`ea_wrap`): the decoder resolved it from CS.D and the 0x67 prefix.
     if !matches!(addr.scale, 1 | 2 | 4 | 8) {
         return None;
     }
@@ -19271,6 +19401,10 @@ fn direct_addr(addr: crate::AddrMode) -> Option<DirectAddr> {
         // Option D ladder) -- so the `DirectAddr`
         // this function builds for a `DirectKind::Store` can come back carrying a lane.
         disp_lane: None,
+        ea_wrap: Some(match addr.address_size {
+            crate::AddressSize::Word => AddressWrap::Word,
+            crate::AddressSize::Dword => AddressWrap::None,
+        }),
     })
 }
 
@@ -19413,16 +19547,14 @@ struct MemoryEmitContext {
     /// The block is a live block: `PUSH Sreg` and `MOV r16,Sreg` read the selector of ES, SS, DS,
     /// FS, and GS from the CPU state, not from a baked immediate.
     live_form: bool,
-    /// Whether a ModRM-derived effective address wraps at 64K.
+    /// The default wrap for an address that carries no wrap of its own.
     ///
-    /// A BLOCK property, not an address one. `decode` computes
-    /// `address_size = cs.default_size_32 XOR address_size_override`, and `prefixes_supported_for`
-    /// refuses the override outright, so within an admitted block the address size is a pure
-    /// function of CS.D, which the mode key pins.
-    ///
-    /// It lives here rather than on `DirectAddr` because that struct rides inside `Load`,
-    /// `Store`, `AluMemSource` and other kinds shared across many emit sites, and this
-    /// property is a block-wide fact, not a per-address one.
+    /// `decode` computes `address_size = cs.default_size_32 XOR address_size_override`. A
+    /// ModRM-derived address carries its own wrap in `DirectAddr::ea_wrap`, which `effective_wrap`
+    /// prefers. Without the override the two agree: the block value is a pure function of CS.D,
+    /// which the mode key pins. The address-size override (`addr32_word_admitted`) makes the
+    /// per-address value differ from this one. Stack cells, frame cells and moffs addresses carry
+    /// `ea_wrap: None` and take this value.
     ///
     /// **It does NOT govern stack addresses.** Those follow SS.B, which is independent of CS.D
     /// and is keyed separately, so all nine `stack_addr` call sites pass a literal.
@@ -19438,6 +19570,7 @@ fn stack_addr(disp: u32) -> DirectAddr {
         scale: 1,
         disp,
         disp_lane: None,
+        ea_wrap: None,
     }
 }
 
@@ -19455,6 +19588,7 @@ fn frame_addr() -> DirectAddr {
         scale: 1,
         disp: 0,
         disp_lane: None,
+        ea_wrap: None,
     }
 }
 
@@ -23586,6 +23720,7 @@ fn emit_double_shift_mem(
 /// its guards) already runs on the runtime value, which is what makes a patched displacement take
 /// the same side exits the baked form would.
 fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: AddressWrap, fold: u32) {
+    let wrap = effective_wrap(addr, wrap);
     match addr.disp_lane {
         Some(lane) => {
             // `fold` is ALWAYS 0 here, and that is the CALLER's obligation rather than something
@@ -23637,13 +23772,20 @@ fn emit_effective_address(e: &mut Encoder, addr: DirectAddr, wrap: AddressWrap, 
 /// `(base + index + disp) & 0xFFFF`. Masking the 32-bit sum ONCE is equivalent, because addition
 /// is congruent mod 2^16, and it matches `resolve_memory_addr_mode`'s `(sum as u16)`.
 ///
-/// It is a PARAMETER rather than a field on `DirectAddr` deliberately. A `DirectAddr` field would
-/// ride inside many kinds (`Load` among them) whose emitters would then need to remember to
-/// apply the mask individually. That is the same trap as putting a width field on `Push`.
+/// The wrap is a property of each decoded address: `direct_addr` stores it in
+/// `DirectAddr::ea_wrap` from the decoder's address size. The block wrap that the emitters pass
+/// is the default for addresses that the emitter builds itself (stack cells, frame cells,
+/// moffs), which carry `ea_wrap: None`. Only the three address builders read the field, through
+/// `effective_wrap`, so no memory emitter has to remember to apply the mask.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AddressWrap {
+pub(crate) enum AddressWrap {
     None,
     Word,
+}
+
+/// The wrap to use for `addr`: its own, or `block_wrap` when it has none.
+fn effective_wrap(addr: DirectAddr, block_wrap: AddressWrap) -> AddressWrap {
+    addr.ea_wrap.unwrap_or(block_wrap)
 }
 
 fn emit_segmented_linear_address(
@@ -23655,6 +23797,7 @@ fn emit_segmented_linear_address(
     wrap: AddressWrap,
     write: bool,
 ) {
+    let wrap = effective_wrap(addr, wrap);
     // The mask lands inside `emit_effective_address`, which is BEFORE the limit compare below.
     // That ordering is load-bearing twice over: the compare sits between the effective address
     // and the segment base, so masking afterwards would compare an address the guest never forms
@@ -23744,6 +23887,7 @@ fn emit_live_segmented_linear_address(
     wrap: AddressWrap,
     write: bool,
 ) {
+    let wrap = effective_wrap(addr, wrap);
     // Live descriptors never take the compile-time fold: the live limit may be finite when the
     // captured one was u32::MAX, and a fold would bake the captured base this path exists
     // to stop emitting.
@@ -34488,7 +34632,7 @@ fn census_native_suffix(
             .checked_add(insn_len - 1)
             .is_none_or(|last| key.physical >> BLOCK_PAGE_SHIFT != last >> BLOCK_PAGE_SHIFT)
             || cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys)
-            || !prefixes_supported_for(insn.prefixes, insn.operand_size, d)
+            || !walk_prefixes_supported(&insn, d)
             // THE THIRD DISJUNCT MIRRORS THE COMPILE WALK, and it has to (code review M-2). This
             // scan exists to answer "how far would the walk have got", so an admission the walk
             // has and this does not truncates the counterfactual suffix at every RETF on the
@@ -36058,8 +36202,8 @@ pub(crate) enum BarrierStop {
     /// `classify` returned `PlannedInsn::HardBoundary` — the opcode-coverage arm, and the only
     /// one instrumented before this slice.
     HardBoundary,
-    /// `prefixes_supported_for` refused: the backend takes the operand-size override and nothing
-    /// else, so LOCK, REP/REPNE, an address-size override and **any explicit segment override**
+    /// `prefixes_supported_for` and `addr32_word_admitted` refused: the backend takes the
+    /// operand-size override and nothing else (bar the gated 0x67 forms), so LOCK, REP/REPNE, an address-size override and **any explicit segment override**
     /// all stop the walk here. The row's `prefix_mask` names which.
     PrefixUnsupported,
     /// `DecodedInsn::continuable` is false — `block_continuable` (decode.rs) refused the shape
