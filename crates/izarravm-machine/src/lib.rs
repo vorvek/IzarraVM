@@ -1685,6 +1685,8 @@ pub struct Machine {
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
     port_bus_batch_clocks: u64,
+    // Audio sample-clock start origins for the batch in flight. See `AudioStart`.
+    audio_start: timeline::AudioStart,
     // DIAGNOSTIC ONLY, never read by an emulation decision: how many port accesses this run has
     // made in each `PortBusClass`, indexed by `PortBusClass::index()`. Counted in BOTH epochs and
     // whatever the class charge is, which is the point: the P1 ladder compares the SAME
@@ -2284,6 +2286,7 @@ impl Machine {
             ata_poll_skip: AtaPollSkipDiagnostics::new(run::ata_poll_skip_diag_default()),
             ata_poll_floor_ticks: run::ata_poll_floor_ticks_default(),
             port_bus_batch_clocks: 0,
+            audio_start: timeline::AudioStart::default(),
             port_accesses_by_class: [0; crate::bus::PORT_BUS_CLASS_COUNT],
             ata_hdd_poll_skip_armed: false,
             ata_hdd_poll_skip_counters: AtaHddPollSkipCounters::default(),
@@ -4163,6 +4166,8 @@ struct MachineBus<'a> {
     // Approximate class; the run loop folds it into the batch's device advance.
     // Points at `Machine::port_bus_batch_clocks`.
     isa_io_clocks: &'a mut u64,
+    // Points at `Machine::audio_start`.
+    audio_start: &'a mut timeline::AudioStart,
     // Points at `Machine::port_accesses_by_class`. Diagnostic only; see that field.
     port_accesses_by_class: &'a mut [u64; crate::bus::PORT_BUS_CLASS_COUNT],
     // Points at `Machine::pit_observer_fine_until`. Armed by any PIT counter or

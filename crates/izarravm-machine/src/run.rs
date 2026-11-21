@@ -1482,6 +1482,7 @@ impl Machine {
             // Capture live timing state before the fields move into MachineBus.
             let timeline_at_batch_start = self.timeline;
             let master_ticks_at_batch_start = self.timeline.now_ticks();
+            self.note_audio_live_at_batch_start();
             let beam_at_batch_start = self.scanout_beam_dots();
             let margo_scanout_at_batch_start = self.vega.margo_scanout().is_some();
             let trace_elapsed_at_batch_start = trace_before;
@@ -1630,6 +1631,7 @@ impl Machine {
                     ata_poll_skip_armed,
                     ata_poll_skip,
                     port_bus_batch_clocks,
+                    audio_start,
                     port_accesses_by_class,
                     ata_hdd_poll_skip_armed,
                     pit_observer_fine_until,
@@ -1726,6 +1728,7 @@ impl Machine {
                     ata_poll_skip_slice_too_short,
                     ata_poll_skip,
                     isa_io_clocks: port_bus_batch_clocks,
+                    audio_start,
                     port_accesses_by_class,
                     ata_hdd_poll_skip_armed,
                     pit_observer_fine_until,
@@ -1973,6 +1976,7 @@ impl Machine {
             let elapsed_before = self.elapsed_clocks;
             let advance_start = self.host_profile.start();
             self.advance_cpu_work(master_ticks, settled_core);
+            self.clear_audio_start_origins();
             debug_assert_eq!(self.opl_timer_advance_credit_us, 0);
             debug_assert_eq!(self.serial.advance_credit_ticks(), 0);
             debug_assert_eq!(self.serial2.advance_credit_ticks(), 0);
