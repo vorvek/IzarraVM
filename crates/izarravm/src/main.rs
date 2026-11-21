@@ -401,6 +401,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
         );
     }
     let startup = ResolvedStartup::from_cli(&cli)?;
+    izarravm_audio::set_soundfont_cache_dir(startup.state_dir.join("soundfonts"));
     let hardware = startup.hardware();
 
     if cli.headless_config_check {

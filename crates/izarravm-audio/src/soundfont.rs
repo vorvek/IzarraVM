@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const EMBEDDED_SOUNDFONT_SHA256: &str =
@@ -14,17 +15,44 @@ const FILE_NAME: &str =
     "FluidR3Mono_GM-cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2.sf3";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Materialize the embedded SoundFont in the process temporary directory.
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the per-user folder that holds the extracted SoundFont. The first call
+/// wins. Without a call, the process temporary directory is the fallback.
+pub fn set_soundfont_cache_dir(directory: PathBuf) {
+    let _ = CACHE_DIR.set(directory);
+}
+
+/// The folder that holds the extracted SoundFont. A configured folder is used
+/// as is. The shared temporary folder gets a fixed sub-folder.
+fn cache_root(configured: Option<&Path>, temp: &Path) -> PathBuf {
+    match configured {
+        Some(directory) => directory.to_path_buf(),
+        None => temp.join("izarravm").join("soundfonts"),
+    }
+}
+
+/// Materialize the embedded SoundFont in the per-user folder.
 ///
 /// FluidSynth loads SoundFonts by path. The content hash in the file name lets
 /// compatible processes share the extracted file and makes an asset update
-/// select a new cache entry.
+/// select a new cache entry. If the per-user folder cannot be written, the
+/// process temporary directory is used instead.
 pub fn embedded_soundfont_path() -> io::Result<PathBuf> {
-    materialize_embedded_soundfont_in(&std::env::temp_dir())
+    let temp = std::env::temp_dir();
+    let configured = CACHE_DIR.get().map(PathBuf::as_path);
+    let primary = cache_root(configured, &temp);
+    match materialize_embedded_soundfont_in(&primary) {
+        Ok(path) => Ok(path),
+        Err(error) if configured.is_some() => {
+            tracing::warn!(%error, "state folder is not writable; using the temporary directory");
+            materialize_embedded_soundfont_in(&cache_root(None, &temp))
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn materialize_embedded_soundfont_in(cache_root: &Path) -> io::Result<PathBuf> {
-    let directory = cache_root.join("izarravm").join("soundfonts");
+fn materialize_embedded_soundfont_in(directory: &Path) -> io::Result<PathBuf> {
     fs::create_dir_all(&directory)?;
     let path = directory.join(FILE_NAME);
     if file_matches(&path, EMBEDDED_SOUNDFONT)? {

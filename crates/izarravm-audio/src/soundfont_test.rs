@@ -12,15 +12,34 @@ fn embedded_bank_has_the_vendored_identity() {
 }
 
 #[test]
+fn cache_root_prefers_the_configured_folder_over_temp() {
+    let temp = Path::new("tmp");
+    let configured = Path::new("state").join("soundfonts");
+    assert_eq!(cache_root(Some(&configured), temp), configured);
+    assert_eq!(
+        cache_root(None, temp),
+        temp.join("izarravm").join("soundfonts")
+    );
+}
+
+#[test]
+fn an_unwritable_folder_is_an_error_the_caller_can_fall_back_from() {
+    let root = tempfile::tempdir().unwrap();
+    let blocker = root.path().join("file");
+    fs::write(&blocker, b"x").unwrap();
+    assert!(materialize_embedded_soundfont_in(&blocker.join("soundfonts")).is_err());
+}
+
+#[test]
 fn extraction_is_content_addressed_and_repairs_a_corrupt_cache() {
     let root = tempfile::tempdir().unwrap();
-    let path = materialize_embedded_soundfont_in(root.path()).unwrap();
+    let path = materialize_embedded_soundfont_in(&root.path().join("soundfonts")).unwrap();
 
     assert_eq!(path.file_name().unwrap(), FILE_NAME);
     assert!(file_matches(&path, EMBEDDED_SOUNDFONT).unwrap());
     fs::write(&path, b"corrupt").unwrap();
 
-    let repaired = materialize_embedded_soundfont_in(root.path()).unwrap();
+    let repaired = materialize_embedded_soundfont_in(&root.path().join("soundfonts")).unwrap();
     assert_eq!(repaired, path);
     assert!(file_matches(&repaired, EMBEDDED_SOUNDFONT).unwrap());
 }
