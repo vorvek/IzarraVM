@@ -332,7 +332,7 @@ def closures(block, lane_name):
         )
         # The corrected numerator subtracts `overhead x marks`; the raw one subtracts nothing. When
         # the two disagree by more than the residual, the CALIBRATION is what failed, not the
-        # closure -- which is why the design keeps the raw sums alongside.
+        # closure, which is why the design keeps the raw sums alongside.
         print(
             f"      on RAW ticks (no subtraction)      {raw_numerator:>16,.0f}"
             f" / {denominator:>16,.0f} = {raw_ratio:6.3f}"

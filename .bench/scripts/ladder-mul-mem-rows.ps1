@@ -10,7 +10,7 @@ A two-arm knob ladder: one binary, both arms, with the null measured in-session.
 THE NAME IS HISTORICAL. This began as the MUL-memory ladder and is now the
 general two-arm ladder; `-Knob` names which knob the arms select and defaults
 to that first slice. The file keeps its name so the commits and memories that
-cite it do not become dangling references -- the same reason the classify arm's
+cite it do not become dangling references, the same reason the classify arm's
 repaired test citations matter.
 
 `run-fixture-scoreboard.ps1` REMOVES every IZARRAVM_* variable from the child
@@ -18,7 +18,7 @@ repaired test citations matter.
 work therefore needs a direct invocation, and this is it.
 
 WHY ONE BINARY. Layout variance between two builds of this workspace has been
-measured at 3.7% on this box -- larger than most levers. A two-binary comparison
+measured at 3.7% on this box, larger than most levers. A two-binary comparison
 cannot carry a claim that size, so the knob exists and both arms come out of the
 same executable.
 
@@ -36,7 +36,7 @@ THREE GATES, and each answers a different way of being wrong.
   divergence is a real finding, not noise.
 * NON-VACUITY. `decode_probes` moving proves the arm reached block formation.
   Probes that did NOT move mean EITHER the knob never took OR this fixture has
-  no population for the row -- and wall data cannot separate those, so the gate
+  no population for the row, and wall data cannot separate those, so the gate
   reports both and says a census settles it.
 * THE IN-SESSION NULL. Every A/B/B/A round runs each arm TWICE, so the spread
   between one arm's own two legs is a null pair from that round, with zero
@@ -46,19 +46,19 @@ THREE GATES, and each answers a different way of being wrong.
   DISTRIBUTION, NOT A FLOOR.
 
 PROVING AN OFF ARM IS OFF. Not from this script, and not from a counter reading
-zero -- that is equally consistent with "the knob is off" and "the instrument is
+zero: that is equally consistent with "the knob is off" and "the instrument is
 unwired". Take a barrier-census leg per arm (`IZARRAVM_DIRECT_BARRIER_CENSUS=1`,
 plain release build) and read the row: present in one arm, ABSENT in the other.
 That instrument answers differently under each hypothesis.
 
 ESTIMATOR: min-wall. Process CPU time was TESTED as an alternative on
-2026-08-30 and REJECTED -- it tracked wall within 1% (the emulator was never
+2026-08-30 and REJECTED: it tracked wall within 1% (the emulator was never
 descheduled, so there was nothing to remove) and its floor was worse. `cpu_s`
 and `foreign_s` are still recorded: `foreign_s` is what explains a 15%
 between-run difference that the four-name builder count called clean.
 
 READ A NULL RESULT AS A PARK, NOT A FAIL. The most likely null for an admission
-slice is RELOCATION -- the exits moving onto the next census head instead of
+slice is RELOCATION: the exits moving onto the next census head instead of
 disappearing, so the block still terminates. Check that row by row against a
 two-arm census before calling a null a mystery.
 #>
@@ -96,7 +96,7 @@ param(
     # size of the effect expected: a round where one arm disagrees with itself by more than
     # the effect has not measured the effect.
     #
-    # The default is 1.0 because that is roughly what a quiet round on this box delivers --
+    # The default is 1.0 because that is roughly what a quiet round on this box delivers:
     # the 2026-08-29 MUL ladder's round 1 read 0.45% and 0.54%, while its round 3 read 16.12%.
     # Gating on this CANNOT bias the answer: the within-arm spread is zero-effect by
     # construction and blind to the arm comparison.
@@ -254,7 +254,7 @@ function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
 
 # Half drives Resolve-RowSelection directly. The other half spawns this very
 # script under `pwsh -File` with the mangled two-token shape, because that
-# failure happens in the parameter binder -- before any function here runs --
+# failure happens in the parameter binder (before any function here runs)
 # and only a real child invocation can prove the guard fires there. The
 # campaign rule applies: the guard must go RED on the broken input, and a green
 # control must show the child harness works.
@@ -373,12 +373,12 @@ function Set-BaseEnvironment {
     $env:IZARRAVM_LOOP_ROWS = "1"
     $env:IZARRAVM_RETRY_LIFT = "0"
     # Flipped ON with the same-night default flip (the 2026-08-30 gp2 ladder); pinned to the
-    # shipped arm. The RETRY_LIFT ladders earlier that night ran with this pin at "0" -- both
+    # shipped arm. The RETRY_LIFT ladders earlier that night ran with this pin at "0": both
     # their arms shared it, and duke3d-586-short carries no 0xE6 population, so those results
     # stand.
     $env:IZARRAVM_OUT_IMM8_ROWS = "1"
     # Flipped ON 2026-08-30 (owner-directed, the isa-io-wait ladder slate); pinned to the
-    # shipped arm. The ladders that MEASURED the flip ran with this pin at "0" -- correct then:
+    # shipped arm. The ladders that MEASURED the flip ran with this pin at "0", correct then:
     # arm 0 was the pre-flip shipped base.
     $env:IZARRAVM_ISA_IO_WAIT = "1"
     foreach ($observer in @(
@@ -389,8 +389,8 @@ function Set-BaseEnvironment {
             "IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION", "IZARRAVM_DIRECT_ENTRY_ATTRIBUTION")) {
         # REMOVAL, not the empty string: an empty value leaves the variable SET,
         # and several readers arm on var_os()/is_some(). The knob under test is
-        # one of them in the other direction -- for it, empty means OFF, which
-        # AGREES with its default -- which is why it is always set to an explicit
+        # one of them in the other direction: for it, empty means OFF, which
+        # AGREES with its default, which is why it is always set to an explicit
         # "0" or "1" below and never cleared.
         if (Test-Path "Env:$observer") { Remove-Item "Env:$observer" }
     }
@@ -428,7 +428,7 @@ function Get-BuilderCount {
 
 # Total CPU seconds consumed by every process this session can see. Sampled either side of a
 # leg, the DELTA is the whole box's CPU consumption across that leg; subtract the emulator's
-# own `cpu_s` and what is left is FOREIGN CPU -- an indexer, an antivirus pass, an update
+# own `cpu_s` and what is left is FOREIGN CPU: an indexer, an antivirus pass, an update
 # worker, a differently-named child, anything.
 #
 # Protected processes (System, Idle, and anything this session cannot open) throw on the
@@ -521,7 +521,7 @@ function Invoke-Leg([string]$Row, [string]$Arm, [int]$Round) {
         dirty    = ($buildersBefore -gt 0 -or $buildersAfter -gt 0)
         wall_s   = [math]::Round($watch.Elapsed.TotalSeconds, 3)
         # The candidate estimator. The emulator is single-threaded, so this is wall MINUS
-        # time the scheduler gave to something else -- which is exactly what an indexer or an
+        # time the scheduler gave to something else, which is exactly what an indexer or an
         # antivirus pass takes and what no name-list detector can see.
         cpu_s    = [math]::Round($cpuSeconds, 3)
         # Foreign CPU seconds across the leg, a lower bound. Non-zero means something else ran.
@@ -585,7 +585,7 @@ foreach ($row in $Rows) {
     # reached the child, OR the fixture has no population for the row to admit.
     # On the row under test the first is a harness bug; on a CONTROL row the
     # second is the expected and desired answer. The script cannot tell them
-    # apart from wall data, so it REPORTS both and refuses to pick -- a barrier
+    # apart from wall data, so it REPORTS both and refuses to pick: a barrier
     # census on the row settles it, because the census either shows the row or
     # does not.
     if ($NullControl) {
@@ -635,8 +635,8 @@ foreach ($row in $Rows) {
 
 # THE IN-SESSION NULL, and it costs nothing because every A/B/B/A round already contains it.
 #
-# WHY THIS EXISTS. Two A/A null controls on gp2-586 -- same fixture, same estimator, same
-# binary, two hours apart on 2026-08-29 -- returned min-wall ratios of 1.0290 and 0.9993. A
+# WHY THIS EXISTS. Two A/A null controls on gp2-586 (same fixture, same estimator, same
+# binary, two hours apart on 2026-08-29) returned min-wall ratios of 1.0290 and 0.9993. A
 # SINGLE A/A IS ONE SAMPLE OF THE NULL DISTRIBUTION, NOT A FLOOR, and running one before or
 # after the effect measures a different box from the one the effect was measured on.
 #
@@ -647,7 +647,7 @@ foreach ($row in $Rows) {
 # READ IT THIS WAY: if the between-arm effect is not comfortably larger than the worst
 # within-arm null in the same run, the ladder has not resolved anything, whatever the
 # headline ratio says. On the 2026-08-29 MUL slice the within-arm nulls ran 0.45% to 16.1%
-# with a median near 2%, against a 2.3% effect -- which is the park verdict, reached without
+# with a median near 2%, against a 2.3% effect, which is the park verdict, reached without
 # spending one extra leg.
 Write-Host ""
 Write-Host "=== IN-SESSION NULL: within-arm spread per round (zero effect by construction) ==="
@@ -682,8 +682,8 @@ foreach ($row in $Rows) {
 # measured has not measured the effect, whatever its between-arm ratio says.
 #
 # Measured on the 2026-08-29 MUL ladder, the four rounds' worst within-arm nulls were 0.54%,
-# 4.38%, 16.12% and 2.26%. The box is not uniformly noisy -- round 1 was quiet enough to
-# resolve well under 1% -- so the failure was mixing quiet and contaminated rounds into one
+# 4.38%, 16.12% and 2.26%. The box is not uniformly noisy (round 1 was quiet enough to
+# resolve well under 1%) so the failure was mixing quiet and contaminated rounds into one
 # min-wall figure, not the rig being hopeless.
 #
 # HOW TO USE IT: pick -NullThreshold BEFORE the run, from the size of the effect you expect;

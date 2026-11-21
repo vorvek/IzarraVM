@@ -19,7 +19,7 @@ seven instruments that reported green regardless of what they gated; this is the
 cheap guard against being the eighth.
 
 Contamination is MEASURED per leg, not assumed absent: builder processes AND host
-CPU, because the builder check is blind to everything outside our own toolchain --
+CPU, because the builder check is blind to everything outside our own toolchain:
 a browser or mail client moved a leg by 5.5 s earlier tonight with `dirty` false.
 #>
 

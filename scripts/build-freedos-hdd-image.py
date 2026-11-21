@@ -276,7 +276,7 @@ def main(check: bool = False) -> int:
     assert len(mbr) == 512, "MBR must be 512 bytes"
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
     # The small Toka-DOS drivers, GSWMODE.COM and TOKADESK.EXE are committed
-    # binaries (built by toka-dos/build-freedos.ps1 into the firmware crate --
+    # binaries (built by toka-dos/build-freedos.ps1 into the firmware crate:
     # NASM alone for the drivers, NASM + Open Watcom + pack.py for TOKADESK),
     # never extracted from the previous image.
     tokamous = open(os.path.join(
@@ -326,11 +326,11 @@ def main(check: bool = False) -> int:
     # to reach the visual workbench; the whole boot stays within the 25-row
     # screen budget (10 logo + 4 box + 5 tree lines [kernel compat, C: drive,
     # TOKAEMM, the kernel's IzarraCD claim, TOKAMOUS] + 2 ReSonique II rows
-    # [heading + values] + 3 footer + 1 shell prompt = 25 -- the screen is
+    # [heading + values] + 3 footer + 1 shell prompt = 25: the screen is
     # exactly full; the IzarraCD claim line replaced IZCDEX's install line
     # one-for-one, and any component that grows a row must take one from
     # another owner) so nothing scrolls the logo off row 0. (the kernel welcome box is
-    # deliberately 79 -- TOKA_BOX_W in kernel/kernel/init-mod.h -- both match
+    # deliberately 79, TOKA_BOX_W in kernel/kernel/init-mod.h: both match
     # the approved mockup; they are not meant to align)
     footer_text = b"   Starting in text mode. Run TOKADESK to enable the visual workbench."
     assert len(footer_text) <= 76, "footer_text must fit the 76-byte box interior"
@@ -404,7 +404,7 @@ def main(check: bool = False) -> int:
     # the boot sector loads KERNEL.SYS by root-directory name, and the kernel opens
     # CONFIG.SYS (then, via SHELL=, AUTOEXEC.BAT) from the boot-drive root. LICENSE.TXT
     # stays at root too, because the kernel signon points at "See LICENSE.TXT".
-    # Everything else -- COMMAND.COM and the command-line tools -- lives in C:\DOS so
+    # Everything else (COMMAND.COM and the command-line tools) lives in C:\DOS so
     # a plain DIR of the root isn't buried under system files. KERNEL.SYS carries the
     # hidden+system+read-only attributes (0x27, the DOS convention for IO.SYS/
     # MSDOS.SYS) so it doesn't show in DIR either; the boot sector matches it by name
@@ -436,11 +436,11 @@ def main(check: bool = False) -> int:
         ("FIND.EXE", find, ATTR_ARCHIVE),
         ("LABEL.EXE", label, ATTR_ARCHIVE),
         ("DELTREE.COM", deltree, ATTR_ARCHIVE),
-        # Original Toka-DOS project tool (GPL-3, not vendored) -- see
+        # Original Toka-DOS project tool (GPL-3, not vendored). See
         # toka-dos/tools-src/README.md and toka-dos/msdos4/VENDOR.md.
         ("XCOPY.EXE", xcopy, ATTR_ARCHIVE),
         # Original Toka-DOS project tool (GPL-3, not vendored): TokaEdit, the
-        # full-screen editor. A large-model MZ exe shipped as EDIT.COM --
+        # full-screen editor. A large-model MZ exe shipped as EDIT.COM,
         # faithful to real MS-DOS, whose EDIT.COM is itself an MZ executable.
         ("EDIT.COM", edit, ATTR_ARCHIVE),
         # TokaDesk, the visual workbench (GPL-3, original tools-src). A
@@ -559,7 +559,7 @@ def main(check: bool = False) -> int:
 
     # --check: prove the committed image still matches its inputs, without
     # writing. The image is a build product of ~30 committed binaries plus
-    # LICENSE.TXT, which is generated from NOTICE and the kernel COPYING -- so
+    # LICENSE.TXT, which is generated from NOTICE and the kernel COPYING, so
     # editing NOTICE silently staled the shipped attribution file once already
     # (the Cranelift credit outlived the dependency by 465 commits), and every
     # file after it moved a cluster, which reads as 323 KB of mystery drift to

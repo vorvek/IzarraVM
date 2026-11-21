@@ -13,13 +13,13 @@ work therefore needs a direct invocation, and this is it.
 
 WHAT IS BEING MEASURED. The bus classifies an address as a device window (ROM,
 VGA, Margo or Distira) to decide what wait-state to charge it, and its only fast
-screen was `< 0x000A_0000` -- conventional memory. A 32-bit game runs its code
+screen was `< 0x000A_0000`, conventional memory. A 32-bit game runs its code
 and keeps its data above 1 MB, so every instruction-fetch run and every data
 access it makes missed that screen and walked the aperture gauntlet to be told
 what the address range already guarantees. The screen answers it directly.
 
 WHY ONE BINARY. The effect is a few percent, and layout variance between two
-builds of this workspace has been measured at 3.7% on this box -- larger than
+builds of this workspace has been measured at 3.7% on this box, larger than
 what is being measured. A two-binary comparison cannot carry a claim this size,
 so the knob exists and both arms come out of the same executable.
 
@@ -184,7 +184,7 @@ function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
 
 # Half drives Resolve-RowSelection directly. The other half spawns this very
 # script under `pwsh -File` with the mangled two-token shape, because that
-# failure happens in the parameter binder -- before any function here runs --
+# failure happens in the parameter binder (before any function here runs)
 # and only a real child invocation can prove the guard fires there. The
 # campaign rule applies: the guard must go RED on the broken input, and a green
 # control must show the child harness works.
@@ -301,7 +301,7 @@ function Set-BaseEnvironment {
             "IZARRAVM_DIRECT_CALLOUT_ATTRIBUTION", "IZARRAVM_DIRECT_ENTRY_ATTRIBUTION")) {
         # REMOVAL, not the empty string: an empty value leaves the variable SET,
         # and several readers arm on var_os()/is_some(). The knob under test is
-        # one of them in the other direction -- for it, empty means OFF -- which
+        # one of them in the other direction: for it, empty means OFF, which
         # is why it is always set to an explicit "0" or "1" below and never
         # cleared.
         if (Test-Path "Env:$observer") { Remove-Item "Env:$observer" }

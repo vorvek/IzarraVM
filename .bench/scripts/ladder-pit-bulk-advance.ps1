@@ -139,7 +139,7 @@ function Assert-BinderSelfTestThrows([scriptblock]$Action, [string]$Expected,
 
 # Half drives Resolve-RowSelection directly. The other half spawns this very
 # script under `pwsh -File` with the mangled two-token shape, because that
-# failure happens in the parameter binder -- before any function here runs --
+# failure happens in the parameter binder (before any function here runs)
 # and only a real child invocation can prove the guard fires there. The
 # campaign rule applies: the guard must go RED on the broken input, and a green
 # control must show the child harness works.

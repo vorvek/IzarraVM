@@ -109,8 +109,8 @@ $configSys = @(
     "SHELL=C:\DOS\COMMAND.COM C:\DOS /E:2048 /P=C:\AUTOEXEC.BAT"
 )
 
-# MOJO is fully non-interactive -- `usage: mojo [-v]` is its entire command
-# line -- so this row needs no key injection at all. Bare MOJO prints the board
+# MOJO is fully non-interactive (`usage: mojo [-v]` is its entire command
+# line) so this row needs no key injection at all. Bare MOJO prints the board
 # report; `-v` prints the SST-1 register dump INSTEAD of it, so both are run and
 # both are pinned.
 $autoexec = @(

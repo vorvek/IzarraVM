@@ -32,7 +32,7 @@ exact schedules and invariants:
 
 - **NASCAR Racing 1** needs none. Its 3D attract mode starts by itself, which
   is why it is the fixture and NASCAR 2 (menu, no attract mode) is not.
-- **Grand Prix 2** is MOUSE ONLY -- keystrokes leave its first screen
+- **Grand Prix 2** is MOUSE ONLY: keystrokes leave its first screen
   bit-identical. `--inject-mouse` drives the three clicks into a Monza quick
   race. Both the menus and the race replay byte-identically, because a headless
   run seeds no entropy (`--hdd-folder` never calls `seed_rtc`).

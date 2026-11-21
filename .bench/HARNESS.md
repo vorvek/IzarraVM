@@ -12,7 +12,7 @@ covers how to compare two builds without lying to yourself.
 
 Each is a C: drive: `CONFIG.SYS`, an `AUTOEXEC.BAT` that launches the game, and
 the game directory. DOS itself comes from the Katea FreeDOS overlay, not the
-fixture. **Copy fresh per run** — several of them mutate their own tree. Most
+fixture. **Copy fresh per run**: several of them mutate their own tree. Most
 AUTOEXECs `goto loop` so the game restarts for the whole budget; `duke3d_c` is
 the exception and runs DUKEMARK exactly once, then ends the VM itself with
 `EXITVM.COM`.
@@ -42,7 +42,7 @@ writes it from `duke3d_c` by lowering the record count in BENCH2.DMO's header an
 pointing the AUTOEXEC at the copy. Ladder candidates on it; re-run the LONG
 `duke3d-586` row before any merge decision. Full account in `PROTOCOL.md`.
 
-`nascar1_c` and `gp2_c` need input schedules and have framebuffer invariants —
+`nascar1_c` and `gp2_c` need input schedules and have framebuffer invariants:
 `gp2_c` an end-of-budget hash, `nascar1_c` a frame contract since 2026-08-18
 (below); both are documented in full in `PROTOCOL.md`, which is the authority for
 every fixture's exact invocation. Do not paraphrase an invocation from here: the
@@ -80,7 +80,7 @@ insns/entry 55-60), then menu/demo rotation repeats. The 28e9 budget (169
 guest seconds) covers FMV + menu + load + most of demo 1 and lands the end
 frame MID-DEMO on purpose: that is where the fixture's real work is, and 30e9
 would land on the demo-to-menu transition. The end frame is graded on BANDS,
-not on a hash — see below.
+not on a hash, see below.
 
 The game's sound config (`HMISET.CFG`) selects Sound Blaster 16 at 220/7/1
 with no MIDI device. `TOMBPATH.TXT` sits in `C:\` (17 bytes, NO trailing
@@ -93,7 +93,7 @@ at `C:\GAMES\TOMBRAID`.
 Distira. Full account in `PROTOCOL.md`; three things belong here.
 
 **The discs.** `tombraid3d_c` mounts `.bench/tombraid_cd/tombeng.cue`, the SAME
-image `tombraid_c` uses -- same game, same pressing, so a second 643 MB copy
+image `tombraid_c` uses: same game, same pressing, so a second 643 MB copy
 would buy nothing. `descent2_c` needs its own, `.bench/descent2_cd/`, 691 MB.
 
 **`descent2_c` deliberately omits the movies.** The three `.MVL` files are
@@ -102,8 +102,8 @@ scoreboard robocopies the whole fixture per run. Adding them back would cost
 more per run than the rest of the fixture put together.
 
 **Both rows carry an input schedule, and it is minimal on purpose.** Each 3dfx
-build waits for a keypress on a screen that shows nothing useful -- Tomb
-Raider's is BLACK -- and a run without the schedule reads exactly like a hung
+build waits for a keypress on a screen that shows nothing useful (Tomb
+Raider's is BLACK) and a run without the schedule reads exactly like a hung
 emulator, with every device counter frozen and the CPU still busy. But ONE key
 too many and Tomb Raider opens its ring menu and never starts the attract demo
 at all, so the row would pin a still picture and pass. The measured windows are
@@ -128,10 +128,10 @@ An exact hash is nearly the right instrument here for the reason it is the
 wrong one on an animating demo: a MOJO report is almost all board-identity
 facts, none of which may drift benignly. Almost. `MOJOV.TXT` prints `vRetrace`,
 a LIVE beam position, and the first version of this row walked straight into
-the phase-sensitivity trap with it -- removing two unused binaries from the
+the phase-sensitivity trap with it: removing two unused binaries from the
 fixture tree moved that one line and nothing else. That line is masked before
 hashing; everything else in both reports is pinned exactly. Measured all three
-ways -- a hand-mutated pin fails and names the file; the PR #814 binary (4 MB
+ways: a hand-mutated pin fails and names the file; the PR #814 binary (4 MB
 per TMU) fails against main's pins with a two-line diff, `TMU 0 RAM` and
 `TMU 1 RAM`; and a tree that shifts the beam line passes. Full account,
 including the fixture-tree recipe and the MOJO.EXE provenance flag, in
@@ -172,9 +172,9 @@ WHAT IT CATCHES, both arms measured by restoring the defect and re-running:
 No end-of-budget hash, for the reason Duke3D and Tomb Raider lost theirs: the
 picture animates continuously. Three repeat runs are bit-identical, so the
 determinism is real; it is robustness to CODE change that a hash would lack.
-The anchor is the Toka-DOS boot text at 0.6 guest seconds -- the ONLY run of
+The anchor is the Toka-DOS boot text at 0.6 guest seconds, the ONLY run of
 four identical 250 ms samples in the first 25 guest seconds, measured rather
-than assumed -- so it pins boot determinism and nothing about the graphics.
+than assumed, so it pins boot determinism and nothing about the graphics.
 
 ### The warning about `bench16_c`
 
@@ -187,7 +187,7 @@ Prefer PoP and Wolf3D for any 16-bit conclusion.
 an out-of-memory CRASH LOOP, not the game.** The fixture's CONFIG.SYS was
 missing its `DEVICE=C:\DOS\TOKAEMM.SYS` line, so DOS could not load high,
 WOLF3D.EXE printed "You do not have enough memory" ~0.4 s after each launch,
-and the AUTOEXEC `goto loop` restarted it forever -- the recorded "signon
+and the AUTOEXEC `goto loop` restarted it forever: the recorded "signon
 screen" frame was each fresh attempt's redraw, and the 1.2-2.1 insns/entry
 "16-bit worst case" reading was program startup + DOS reload, not raycasting.
 The tell in hindsight: wolf3d-486 and wolf3d-586 shared ONE frame hash. The
@@ -221,7 +221,7 @@ C:\EXITVM.COM
 ```
 
 DUKEMARK plays its demo, prints a report through DOS stdout (so redirection
-catches it — verified, the 80x25 text page is blank on a redirected run), and
+catches it: verified, the 80x25 text page is blank on a redirected run), and
 `EXITVM.COM` ends the VM through the Lotura unit-tester exit port. **The cycle
 budget is a guard, not the length of the run.** Katea flushes the guest's writes
 on the way out, and the harness reads `DUKEMARK.TXT` out of the working copy.
@@ -230,15 +230,15 @@ Invariant (all four must hold): the run stopped as `test_exit` code `0x51`, the
 result file exists and parses, the Info String is `2,320,200,2,0,1,1,1` (the
 config fingerprint `Demo,Width,Height,Mode,Hud,Detail,Sound,Music`, so the
 trailing `1,1` pins sound and music ENABLED), and the extrapolation count is
-within ±2% of its pin — **pinned PER PERSONA**, because the count is not
+within ±2% of its pin, **pinned PER PERSONA**, because the count is not
 machine-independent the way DUKEMARK's docs claim. The first three are
 timing-insensitive. See `PROTOCOL.md` for the reasoning. **FPS min/max/avg are
-measurements** — they move with host load and are reported in the row's notes,
+measurements**: they move with host load and are reported in the row's notes,
 never asserted.
 
 This replaced the framebuffer-PPM hash on 2026-08-09. That hash was
 cutoff-phase sensitive: the fixed-cycle axe landed mid-render in an animating
-demo, so any JIT-mix change that shifted cycle charging moved it legitimately —
+demo, so any JIT-mix change that shifted cycle charging moved it legitimately:
 six benign moves in three days, then an automatic re-pin path that turned main
 red three times over the LICENSE_MANIFEST sha it had to move with it. The full
 account is in `PROTOCOL.md`.
@@ -248,12 +248,12 @@ account is in `PROTOCOL.md`.
 Both rows lost their end-of-budget framebuffer hash for the reason Duke3D lost
 its own: the frame lands mid-attract-demo with the camera in flight, so the hash
 samples the demo's PHASE and any cadence-adjacent change moves it while rendering
-stays perfect. It moved twice in one day — tombraid-586 by 84.31% of its pixels
+stays perfect. It moved twice in one day (tombraid-586 by 84.31% of its pixels
 under the IOPL-3 V86 monitor, nascar-586 by 12.41% under the same day's
-follow-up — and each move cost a full attribution cycle to prove nothing was
+follow-up) and each move cost a full attribution cycle to prove nothing was
 wrong. What replaces it, per row: **one exact frame hash at an EARLY anchor**
 where the picture is not moving (tombraid at 0.5G, the DOS/4GW banner page,
-pinned as a set of two hashes because the DOS underline cursor blinks there —
+pinned as a set of two hashes because the DOS underline cursor blinks there:
 18 pixels, measured; nascar at 0.445G, the static startup logo, sitting at the
 centre of a measured 100M-cycle window of bit-identical frames), plus **bands at
 the budget** on non-black coverage and distinct-colour count, plus the **display
@@ -437,7 +437,7 @@ Both variables are set EXPLICITLY on every arm. Never unset one to turn it off:
 as ON, and `IZARRAVM_JIT16_486` is on for every value except exactly `"0"`.
 
 `-OneLookupStore 1|0` (default `1`) drives `IZARRAVM_ONE_LOOKUP_STORE` the same
-way — the one-lookup store emission A/B,
+way, the one-lookup store emission A/B,
 orthogonal to `-Arm`,
 also set explicitly on every run and on for every value except exactly `"0"`.
 The chosen value is recorded per row and in the summary as `one_lookup_store`.
@@ -445,14 +445,14 @@ The chosen value is recorded per row and in the summary as `one_lookup_store`.
 ### The frame hash is asserted, not just reported
 
 Expected hashes live in `scripts/fixture-scoreboard-invariants.json`. Duke3D has
-no frame hash — it has the DUKEMARK invariants instead — but it does have an
+no frame hash (it has the DUKEMARK invariants instead) but it does have an
 entry there, and since 2026-08-10 that entry carries the thing about Duke3D that
 is NOT a property of the fixture's config and demo: `dukemark_samples` and
 `dukemark_samples_tolerance`, the extrapolation-count band. The timing-insensitive
 half of the DUKEMARK pins (demo, Info String, result filename, EXITVM's exit
 code) stays in `New-DukemarkPins` in the script, because none of it can move
 without the fixture itself being rebuilt. **The sample count DOES follow emulated
-timing** — the HDD-geometry slice moved the 486 count from 580 to 919 — so it
+timing** (the HDD-geometry slice moved the 486 count from 580 to 919) so it
 goes through the sidecar with everything else that moves, and a pin move is a
 one-line reviewable diff with the manifest sha updated in the same breath rather
 than an edit buried in a script constant. (An earlier version of this paragraph
@@ -462,8 +462,8 @@ That is true of three of the four and false of the one that matters.)
 with the recorded one unless `-Force`, so a real change cannot be papered over by
 re-recording. The sample band works the same way: re-recording a count that has
 drifted outside its own band needs `-Force`. The ±2% band was sized against a
-measurement rather than guessed — `-Arm off`, the largest lever here, moves the
-486 count by ONE against an allowance of 18 — and the derivation, including why
+measurement rather than guessed (`-Arm off`, the largest lever here, moves the
+486 count by ONE against an allowance of 18) and the derivation, including why
 it covers JIT-mix changes but deliberately not timing-model changes, is in
 `PROTOCOL.md`'s Duke3D section. A fixture with no recorded hash (or
 no recorded sample pin) reports `unpinned` rather than `pass`, so "never checked"
@@ -476,14 +476,14 @@ that has no meaning once the guest does a different amount of work per guest
 second.
 
 **`-RecordInvariants` REFUSES to write the frame-contract bands, by design.** It
-records what a single run can honestly establish — the anchor frame hash and the
-retired-instruction centre — and for the coverage and colour bands it writes
+records what a single run can honestly establish (the anchor frame hash and the
+retired-instruction centre) and for the coverage and colour bands it writes
 nothing and says so in the row's notes. A band recorded from one run is a band of
 width zero around whatever that run happened to do, which is the fragile
 invariant these rows were rewritten to escape wearing a different hat. The bands
-come from a PHASE-SPREAD measurement instead — the row sampled at several budgets
+come from a PHASE-SPREAD measurement instead (the row sampled at several budgets
 either side of the graded one, which moves the camera far further than any
-cadence change can — and are edited into the sidecar deliberately. The anchor
+cadence change can) and are edited into the sidecar deliberately. The anchor
 hash gets one extra guard: a row may declare that its anchor takes more than one
 frame (tombraid's two cursor-blink phases), and `-RecordInvariants` will union a
 new phase into the set under `-Force` but will NOT exceed the declared count, so
@@ -520,8 +520,8 @@ Both orientations happen, and they are NOT equally safe:
 
 | you invoke | you test | result | how it reads |
 |---|---|---|---|
-| main's script | worktree's exe | worktree code vs **main's old pins** | **false FAIL** — loud, wastes an hour |
-| worktree's script | main's exe | main's code vs **worktree's new pins** | **false PASS — SILENT, blesses a regression** |
+| main's script | worktree's exe | worktree code vs **main's old pins** | **false FAIL**: loud, wastes an hour |
+| worktree's script | main's exe | main's code vs **worktree's new pins** | **false PASS: SILENT, blesses a regression** |
 
 The second is the dangerous one. A branch that legitimately re-pins a hash, then
 measures an unrelated or reverted binary through its own script, gets a green
@@ -536,7 +536,7 @@ pwsh D:\path\to\worktree\scripts\run-fixture-scoreboard.ps1 -Fixtures gp2-586 -L
 ```
 
 **But a fresh worktree cannot do that yet, and that is the trap's real bait.**
-`/.bench/` is in `.gitignore`, so a worktree has NO fixtures — the run dies with
+`/.bench/` is in `.gitignore`, so a worktree has NO fixtures: the run dies with
 `Fixture folder is missing: <worktree>\.bench\nascar1_c`, and the obvious repair
 is to invoke the main checkout's script instead, which is exactly the wrong fix.
 The right one is a directory junction, so the worktree's script sees the one
@@ -550,12 +550,12 @@ Ignored by git, costs no disk, and results still land in the one shared
 `.bench/results/`. Do this once per worktree, before the first scoreboard.
 
 Cross-tree `-Executable` is legitimate for a deliberate A/B of two binaries
-against ONE pin set — but then say so in the report, because the pins are the
+against ONE pin set, but then say so in the report, because the pins are the
 invoking tree's and that is the whole point of doing it.
 
 Hit for real on 2026-08-12: the VBE/Margo slice-1 branch re-pinned gp2-586 in its
 own commit, was scoreboarded through the MAIN checkout's script, and reported
-`FAIL expected b4f4bcda… got ac11e66a…` — the got-value being the branch's own
+`FAIL expected b4f4bcda… got ac11e66a…`, the got-value being the branch's own
 correctly committed pin. The expected-vs-got pair naming the *old* hash is the
 tell; without it the failure looks like a real regression. It cost two full gp2
 runs (~7 minutes each) before the mechanism was traced.
@@ -613,7 +613,7 @@ where the boundary is: find the knee in the data. Duke's is where rt falls from
 **It does not perturb the run.** Measured: `perf.instructions` and the frame SHA
 are identical marks-on against marks-off, and wall differs by 0.14% against a
 0.6-0.8% run-to-run spread. It samples at an existing batch boundary and never
-slices the host's single `run_until_halt_or_cycles` call — slicing would move
+slices the host's single `run_until_halt_or_cycles` call: slicing would move
 where devices are serviced, which is why the benchmark path must not do it.
 
 **The rt in this series is not the gate's rt.** `stall_for_master_ticks` grants

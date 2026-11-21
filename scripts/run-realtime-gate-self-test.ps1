@@ -86,8 +86,8 @@ function Invoke-RealtimeGateSelfTest {
     # The clif backend (Task 1), the region JIT (Task 2), and the four dead region-only counters
     # (dynarec-refactor Task 3b) are all gone from the codebase: `jit_clif_*`, `jit_region_*`, and
     # `jit_native_*` do not exist as JSON keys any more, so a policy that still named any of them
-    # would be asserting against a key that can never appear. This structural check -- no required
-    # -zero-counters entry may carry any of those three dead prefixes -- is what would have caught
+    # would be asserting against a key that can never appear. This structural check (no required
+    # -zero-counters entry may carry any of those three dead prefixes) is what would have caught
     # both of this phase's gate-script regressions (the stale clif/region key names, and the dead
     # jit_native_* counters) automatically, instead of relying on a manual sweep each time a legacy
     # backend is retired.

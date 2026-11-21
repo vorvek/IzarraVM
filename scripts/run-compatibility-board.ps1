@@ -22,7 +22,7 @@ A/B OR A SCOREBOARD CLAIM: it runs under whatever load the box has.
 WHAT A ROW GRADES. Four checks, and all four must pass:
   1. a published frame exists at all
   2. its content sits inside the pinned colour and non-black bands
-  3. the mode census holds the row's target mode -- THE ACCEPTANCE RULE
+  3. the mode census holds the row's target mode, THE ACCEPTANCE RULE
   4. the retired instruction count is within 5%
 
 Check 3 is the one this board adds. Every game here shows a menu before it
@@ -124,7 +124,7 @@ function Get-RowTable {
             # DEMO plays a real level well before the budget.
             cycles = [uint64]10000000000
             # ONE key, then nothing. Walking to a level entrance was tried twice
-            # -- a square with {ctrl} presses, then long single-direction legs --
+            # (a square with {ctrl} presses, then long single-direction legs)
             # and both left Keen on the world map. Sending nothing lets the title
             # cycle to its demo, which plays a level by itself.
             injectKeys = "330000000:{enter}"
@@ -153,7 +153,7 @@ function Get-RowTable {
             cycles = [uint64]8000000000
             injectKeys = $null; injectMouse = $null
             # MEASURED 2026-08-30: the mode is ModeX, not Mode13h, and it reads
-            # 320x398 with double_scan set -- 199 SOURCE rows. The survey reported
+            # 320x398 with double_scan set: 199 SOURCE rows. The survey reported
             # "mode 13h 320x400" for this title and concluded the non-standard
             # line count was NOT reached; both halves of that are wrong. It is
             # reached, in mode X, within 76 guest seconds and with no input.
@@ -236,7 +236,7 @@ function Get-RowTable {
         #
         # They are not duplicated here on purpose. Each takes two to three
         # minutes of wall time, and their frame contract already asserts
-        # `active_display = Distira` at the budget -- which is the only thing a
+        # `active_display = Distira` at the budget, which is the only thing a
         # row on THIS board would have proven. A board whose job is "did the
         # guest reach this graphics mode" has nothing to add to a row that
         # reaches the mode and then measures it for two more minutes.
@@ -337,7 +337,7 @@ function Get-PpmFrameStats([string]$Path) {
         $at = $cursor + $i * 3
         # [int] casts, and they are load-bearing. PowerShell's shift operators
         # keep the LEFT OPERAND'S TYPE, so `[byte]65 -shl 16` is not 4259840, it
-        # is 0 -- the result wraps back into a byte. Packing the channels without
+        # is 0: the result wraps back into a byte. Packing the channels without
         # these casts silently collapses every colour key to its blue channel,
         # and the count becomes "distinct blue values": 49 where the frame holds
         # 174 colours. Caught 2026-08-18 by the tombraid row FAILING its own new
@@ -422,7 +422,7 @@ The environment every row runs under.
 
 WHY THIS EXISTS. A board that does not scrub the environment pins invariants
 measured under whatever the parent shell happened to hold. That failure is
-silent, it is DURABLE -- the pins outlive the shell that made them -- and
+silent, it is DURABLE (the pins outlive the shell that made them) and
 nothing downstream can detect it, because every later run reproduces the wrong
 number faithfully. This board sets no knobs of its own, so the correct
 environment is simply "no observer at all".
@@ -451,7 +451,7 @@ function Get-BoardEnvironment {
 Read a CHILD PROCESS's own environment block back.
 
 Asserting about the hashtable `Get-BoardEnvironment` returns would be a test
-that cannot fail for the only thing that matters -- whether the variable
+that cannot fail for the only thing that matters: whether the variable
 actually reaches the emulator. `cmd /c set` is the cheapest faithful observer on
 this host: it lists a PRESENT-BUT-EMPTY variable as `NAME=` and omits an ABSENT
 one entirely, which is exactly the distinction that matters here.
@@ -1100,7 +1100,7 @@ if ($RecordInvariants) {
         $pins[$result.name] = New-BoardPin $result.stats $result.instructions $result.census
     }
     # LF, not CRLF. Set-Content writes CRLF on Windows, but .gitattributes
-    # declares `* text=auto eol=lf`, so any checkout sees LF -- and
+    # declares `* text=auto eol=lf`, so any checkout sees LF, and
     # check_file_policy.py hashes the WORKING TREE. A CRLF file here means the
     # manifest carries a sha no CI checkout can reproduce, and the file policy
     # is CI step 1, so it would hide every later gate. Measured: the same pins

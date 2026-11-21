@@ -103,7 +103,7 @@ TEST_LINE_LIMIT = 7000
 # The comment above already states the principle this exemption follows: "the limits
 # exist to catch runaway growth, not to force splitting a hot module", and "this
 # codebase optimizes for performance and locality, not layer count". The dynarec is the
-# case where those two sentences bind hardest. It is ONE system -- block key, admission
+# case where those two sentences bind hardest. It is ONE system: block key, admission
 # policy, register/frame layout, emitter, call-out helpers, link graph, retirement and
 # the census instruments are a single invariant that has to be read together, and each
 # time the ceiling forced a slice out into a child module the slice took its own
@@ -366,7 +366,7 @@ def main() -> int:
     files = tracked_files()
     data = {path: (ROOT / path).read_bytes() for path in files}
     # An exemption that outlives the file it names is a silent hole: the entry stops
-    # matching anything, the ceiling quietly applies again -- or, worse, a rename carries
+    # matching anything, the ceiling quietly applies again, or, worse, a rename carries
     # the file out from under the ruling and nobody notices. Make it loud instead.
     for path in sorted(SOURCE_LINE_LIMIT_EXEMPT):
         if path not in files:
