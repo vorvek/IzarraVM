@@ -178,3 +178,29 @@ jobs:
 
       - name: Run Izarra BIOS POST
         run: cargo run -p izarravm -- --headless-izarra-bios
+
+  # Runs the Toka-DOS tests marked "slow in debug" in a release build, on pushes to main only.
+  slow-tests:
+    name: slow-tests
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: clippy,rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: slow-tests-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Slow tests
+        run: cargo test --release -p izarravm -- --ignored
