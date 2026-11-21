@@ -1354,6 +1354,22 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
+    /// A 32-bit ALU operation with a register destination and a `[base + disp32]` source (the
+    /// `op r32, r/m32` forms, opcode `op * 8 + 3`). `op` uses the group numbers of
+    /// `alu_r32_r32`: ADD=0 through CMP=7.
+    pub(crate) fn alu_r32_disp32(&mut self, op: u8, reg: Reg, base: Reg, disp32: i32) {
+        assert!(op < 8, "ALU group must fit three bits");
+        if reg.ext() || base.ext() {
+            self.rex(false, reg.ext(), false, base.ext());
+        }
+        self.bytes.push(op * 8 + 3);
+        self.modrm(0b10, reg.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
     /// `cmp reg8, [base + disp8]` (3A /r). The source must name AL/CL/DL/BL.
     pub(crate) fn cmp_r8_disp8(&mut self, reg: Reg, base: Reg, disp8: i8) {
         assert!(

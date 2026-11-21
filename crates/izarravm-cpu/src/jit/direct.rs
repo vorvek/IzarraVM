@@ -24062,8 +24062,21 @@ fn emit_live_segmented_linear_address(
     let limit_exit = sides
         .segment_limit
         .expect("live descriptors always allocate a segment_limit label");
-    e.load_r32_disp32(Reg::RDX, Reg::R15, field + limit_offset());
     let extent = width.bytes() - 1;
+    if wrap == AddressWrap::Word {
+        // The offset is already masked to 0xFFFF, so offset + extent cannot overflow 32 bits.
+        // One compare against the limit in the CPU state is enough. RDX is free scratch here.
+        if extent == 0 {
+            e.alu_r32_disp32(7, Reg::RAX, Reg::R15, field + limit_offset());
+        } else {
+            e.lea_r32(Reg::RDX, Some(Reg::RAX), None, extent);
+            e.alu_r32_disp32(7, Reg::RDX, Reg::R15, field + limit_offset());
+        }
+        e.jcc(7, limit_exit);
+        e.alu_r32_disp32(0, Reg::RAX, Reg::R15, field + base_offset());
+        return;
+    }
+    e.load_r32_disp32(Reg::RDX, Reg::R15, field + limit_offset());
     if extent != 0 {
         e.cmp_r32_imm32(Reg::RDX, extent);
         e.jcc(2, limit_exit);

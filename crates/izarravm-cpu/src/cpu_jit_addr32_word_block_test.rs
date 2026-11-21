@@ -1114,6 +1114,106 @@ fn a_prefixed_store_into_the_code_page_takes_the_code_watch_exit() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The live data segment arms and the 64K wrap
+// ---------------------------------------------------------------------------------------------
+
+/// DS at 0x10800, so that the top of a 64K segment is inside one RAM page and the page guard
+/// cannot hide a wrong limit check.
+fn ds_mid_page(cpu: &mut CpuGsw) {
+    let selector = (DS_BASE + 0x800) >> 4;
+    let mut register = cpu.registers.segment(SegmentIndex::Ds);
+    register.selector = selector as u16;
+    register.base = DS_BASE + 0x800;
+    cpu.registers.set_segment(SegmentIndex::Ds, register);
+}
+
+/// Forces one arm of the live data segment switch for the length of a test.
+struct ArmKnob;
+
+impl ArmKnob {
+    fn set(arm: u8) -> Self {
+        jit::direct::set_live_data_segments_for_test(Some(arm));
+        Self
+    }
+}
+
+impl Drop for ArmKnob {
+    fn drop(&mut self) {
+        jit::direct::set_live_data_segments_for_test(None);
+    }
+}
+
+/// A 0x67 word access at EBX = 0xFFFFFFFF has no 64K mask, so the live limit check must keep
+/// the 32-bit sequence and send the access to the interpreter, which faults.
+///
+/// Catches: a short limit check that trusts the block wrap and not the wrap of the address.
+#[test]
+fn a_prefixed_word_at_the_top_of_the_address_space_does_not_run_natively_in_any_arm() {
+    let _knob = Knob::set(true);
+    for arm in [0u8, 1, 2] {
+        let _arm = ArmKnob::set(arm);
+        for mode in [Mode::Real, Mode::V86] {
+            for (name, body) in [
+                ("word load", vec![A32, 0x8b, 0x03]),
+                ("word store", vec![A32, 0x89, 0x03]),
+                ("byte test", vec![A32, 0xf6, 0x03, 0x5a]),
+            ] {
+                let case = Case::middle(format!("arm {arm} {mode:?} {name}"), mode, &body)
+                    .gpr(3, 0xffff_ffff)
+                    .tweak(ds_mid_page)
+                    .exit_at(1);
+                execute(&case);
+            }
+        }
+    }
+}
+
+/// One access through `[bx]` at each width, at the offsets around the top of a 64K segment with
+/// limit 0xFFFF: 0xFFFF, limit - (bytes - 1) and limit - (bytes - 2). The access is native when
+/// it ends inside the limit and exits to the interpreter otherwise.
+///
+/// Catches: a short limit check that adds the extent after the compare, or compares the start
+/// and not the last byte.
+#[test]
+fn accesses_at_the_top_of_a_sixty_four_k_segment_match_the_interpreter_in_every_arm() {
+    let _knob = Knob::set(true);
+    // (name, instruction bytes, access width, the access is native-eligible)
+    let widths: [(&str, &[u8], u32, bool); 4] = [
+        ("byte", &[0xf6, 0x07, 0x5a], 1, true),
+        ("word", &[0x8b, 0x07], 2, true),
+        ("dword", &[O32, 0x8b, 0x07], 4, true),
+        ("qword", &[O32, 0xdd, 0x07], 8, false),
+    ];
+    for arm in [0u8, 1, 2] {
+        let _arm = ArmKnob::set(arm);
+        for mode in SIXTEEN_BIT_MODES {
+            for (name, body, bytes, plain) in widths {
+                let mut offsets = vec![0xffffu32];
+                offsets.push(0xffff - (bytes - 1));
+                if bytes >= 2 {
+                    offsets.push(0xffff - (bytes - 2));
+                }
+                for offset in offsets {
+                    let label = format!("arm {arm} {mode:?} {name} at {offset:#x}");
+                    let case = Case::middle(label, mode, body)
+                        .gpr(3, offset)
+                        .tweak(ds_mid_page);
+                    let fits = offset + bytes - 1 <= 0xffff;
+                    let case = if !plain {
+                        case.any()
+                    } else if fits {
+                        case
+                    } else {
+                        case.exit_at(1)
+                    };
+                    execute(&case);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The knob
 // ---------------------------------------------------------------------------------------------
 
