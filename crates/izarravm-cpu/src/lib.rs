@@ -902,7 +902,7 @@ pub struct PerfCounters {
     /// invalidation storm: the Doom 586 census measured decode_hit pinned at 21% regardless of
     /// cache size by 326M per-CS-load whole-cache flushes.
     ///
-    /// **NOT counted here** (review finding N2): the CR3 code-cache gate's translation-page
+    /// **NOT counted here** (N2): the CR3 code-cache gate's translation-page
     /// write watch (`core.rs`'s `range_hits_translation_page` arm) is a THIRD class of
     /// wholesale decode teardown, reached from an ordinary guest or native STORE with no CR3
     /// write, no TLB flush, and no `flush_tlb_and_code_caches` call anywhere on its path -- it
@@ -949,7 +949,7 @@ pub struct PerfCounters {
     /// LINK graph was served by `select_link_context` -- the `Skipped` arm, R1 or R2. Incremented
     /// beside `cr3_code_flush_skipped` in the same match arm, so
     /// `cr3_link_context_selects == cr3_code_flush_skipped` is true by construction and is kept
-    /// as documentation rather than a check (design review J8); the identity with teeth is
+    /// as documentation rather than a check (J8); the identity with teeth is
     /// `stalls.links_cleared[Flushed]` moving only on the `Taken` arm.
     pub cr3_link_context_selects: u64,
     /// CR3 JIT-half gate: `MOV CR3` writes whose LINK graph was wholesale-retired via
@@ -976,7 +976,7 @@ pub struct PerfCounters {
     /// rt sag. NOT cumulative: it can fall as well as rise (a retire-all that clears the bitmap
     /// drops it to 0).
     pub translation_pages_marked: u64,
-    /// CR3 data-side gate (design `2026-09-02-cr3-data-side-design.md` T2, review D5): bumped once
+    /// CR3 data-side gate (design `2026-09-02-cr3-data-side-design.md` T2, D5): bumped once
     /// per completed two-level page-table walk in `translate_linear_checked`, i.e. every time the
     /// TLB fast path does NOT serve the access. T2's win gate: a retained TLB entry across an R1
     /// reselect costs no walk, so this counter should fall on the Tyrian dwell once the ring keeps
@@ -986,7 +986,7 @@ pub struct PerfCounters {
     pub tlb_walks: u64,
     /// Code-cache invalidation events, including narrow self-modifying-code kills. This is the
     /// aggregate rate; the `decode_inval_*` and `smc_narrow_kills` counters retain the cause and
-    /// affected-line detail EXCEPT the translation-page write watch (review finding N2): that
+    /// affected-line detail EXCEPT the translation-page write watch (N2): that
     /// arm bumps this counter and `translation_page_writes`, but no `decode_inval_*` field,
     /// because it is reached directly from `code_write_watched`'s store path, not from
     /// `flush_tlb_and_code_caches`. A `decode_inval_*` sum will therefore under-count this
@@ -1530,8 +1530,8 @@ impl Eq for ApertureCodeFlag {}
 /// the very tail of `CpuGsw`, following the `PollSkipMemoryCounters` pattern
 /// exactly: these two fields were first added directly to `PerfCounters` and, AT THE TIME, moved
 /// the pinned `pending_flags` offset from 4512 to 4528 (the interpreter's hot-field layout pin in
-/// `cpu_test.rs`/`canonical_state_test.rs`) -- an avoidable layout confound the campaign's
-/// adversarial review caught, which is why they moved to the tail instead of staying in
+/// `cpu_test.rs`/`canonical_state_test.rs`) -- an avoidable layout confound,
+/// which is why they moved to the tail instead of staying in
 /// `PerfCounters`. HISTORY: the pin has since moved again (unrelated later changes to
 /// `PerfCounters`/`CpuGsw`); see the pin tests for the current value, not this comment. At the
 /// tail they change only the struct's total size. Serialized into the same
@@ -2269,7 +2269,7 @@ pub struct DirectSmcCensusUnits {
     pub keys_no_kill: u64,
     pub keys_lane_only: u64,
     pub keys_kill: u64,
-    /// Review finding M7: surviving keys scanned INSIDE a killing call. A presence filter would
+    /// M7: surviving keys scanned INSIDE a killing call. A presence filter would
     /// elide these too, so `keys_no_kill` alone understates the waste.
     pub keys_surviving_in_kill_calls: u64,
 
@@ -2280,7 +2280,7 @@ pub struct DirectSmcCensusUnits {
     pub page_reinserts: u64,
     pub page_dropped_empty: u64,
 
-    // Phase (b) — the two `partition_point`s. Review finding M10: BOTH the per-call window
+    // Phase (b) — the two `partition_point`s. M10: BOTH the per-call window
     // occupancy and the page key count, or the binary-search question is unanswerable.
     pub window_searches: u64,
     pub page_keys_len_sum: u64,
@@ -2326,7 +2326,7 @@ pub struct DirectSmcCensusUnits {
     pub waiting_sources_visited: u64,
     pub waiting_entries_dropped: u64,
 
-    // Phase (f) — retirement work OUTSIDE `remove_waiting_sources` (review finding M8: (e) and
+    // Phase (f) — retirement work OUTSIDE `remove_waiting_sources` (M8: (e) and
     // (f) nest, so these rows are disjoint by construction and R6 may add them).
     pub retire_calls: u64,
     pub retire_calls_effective: u64,
@@ -2339,7 +2339,7 @@ pub struct DirectSmcCensusUnits {
 }
 
 /// The seven per-page accumulators, used both for a row's counts and for its inherited
-/// Space-Saving error (review finding M1: one error field for eight counters is unsound, so
+/// Space-Saving error (M1: one error field for eight counters is unsound, so
 /// every column carries its own).
 #[cfg(feature = "smc-census")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3019,7 +3019,7 @@ pub(crate) struct RetireGates {
     #[cfg(feature = "jit")]
     pub(crate) barrier_census: bool,
     /// `reflected_call_diag::armed()`, resolved at construction. Process-constant,
-    /// same shape as `diff_trace` above. Merge-review nit 3: `on_clock_charge`'s
+    /// same shape as `diff_trace` above. `on_clock_charge`'s
     /// seven (now six) call sites in `run.rs`'s interpreted-retire tails were
     /// each paying `armed()`'s `OnceLock` init check plus a relaxed atomic load
     /// on EVERY retired instruction under the feature -- two atomic loads and
@@ -3312,18 +3312,18 @@ pub struct CpuGsw {
     /// Slice1's reflected-call memo journal gate (`dev_docs/2026-09-04-reflected-call-
     /// slice1-plan.md` Revision 2, section 7.1 / decision 13.3 reversed): a SEPARATE bool from
     /// `rmw_census_enabled` above, on purpose -- folding it into that gate's recompute would be a
-    /// correctness trap (Revision 2's re-review item 14: a missed recompute on a fold drops
+    /// correctness trap (a missed recompute on a fold drops
     /// journal entries silently, which makes a learned memo unsound rather than merely inert).
     /// One never-taken branch per journal seam when the knob is off, same shape as
-    /// `rmw_census_enabled`. Gated under `feature = "reflected-call-memo"` (Fable review,
-    /// 2026-09-03: the module must be `cfg`-gated like `reflected_call_diag`, not merely
+    /// `rmw_census_enabled`. Gated under `feature = "reflected-call-memo"` (the
+    /// module must be `cfg`-gated like `reflected_call_diag`, not merely
     /// knob-gated, so the plain build's `CpuGsw` layout and binary are byte-identical to a
     /// plain `main` build with neither field present at all).
     #[cfg(feature = "reflected-call-memo")]
     pub(crate) reflected_call_journal: bool,
     /// The reflected-call memo's own state, lazily boxed on the first armed `INT` and `None` for
     /// the whole run when `IZARRAVM_REFLECTED_CALL_MEMO` is unset/off (plan section 2: "one
-    /// pointer of growth"). `cfg`-gated as of the Fable review above.
+    /// pointer of growth"). `cfg`-gated for the reason above.
     #[cfg(feature = "reflected-call-memo")]
     pub(crate) reflected_call: Option<Box<crate::reflected_call_memo::ReflectedCallMemoState>>,
     /// The hoisted per-retire diagnostic gates; see `RetireGates`. At the `CpuGsw` tail for the
@@ -4052,7 +4052,7 @@ struct DecodedInsn {
     /// recover it); resolve admission at decode, never in the run loop — this
     /// measurement is the reason.
     continuable: bool,
-    /// C1e (D3, review finding M3): the ENCODED byte counts of this instruction's
+    /// C1e (D3, M3): the ENCODED byte counts of this instruction's
     /// displacement and immediate fields, recorded by the decoder as it consumes them
     /// (the single decode authority; never back-computed from the stored values, whose
     /// widths are ambiguous after sign extension). The moffs address bytes of 0xA0-0xA3
@@ -4246,7 +4246,7 @@ fn decode_cache_lines() -> usize {
 /// replay. That gap used to be masked by the per-CS-load whole-cache flush (one per ~38
 /// instructions on Doom); with CS loads no longer flushing (the decode-cache invalidation-storm
 /// fix), extended-memory SMC - e.g. Quake's self-patching software renderer - MUST be watched or
-/// a stale line replays indefinitely (stage-2 adversarial review finding 12).
+/// a stale line replays indefinitely.
 /// 2 MiB / 8 bits = 2^15 `u64` = 256 KB, allocated once per cache; only the words for live code and
 /// written bytes are ever touched, so its working set is a handful of lines.
 const SMC_BYTE_COVERAGE: u32 = 2 << 20;
@@ -4321,7 +4321,7 @@ struct DecodePack {
     jit_direct_hotness: u8,
     /// The sticky-decline memo byte (`dev_docs/sticky-decline-memo-design.md` §1.2):
     /// `[stamp:6][v86:1][ss_d:1]`, stamp 0 meaning "no memo". Renamed from `_pad` in the commit
-    /// that first reads it, per that design's review NIT N4 — a `_`-prefixed field that is
+    /// that first reads it — a `_`-prefixed field that is
     /// load-bearing is a defect waiting to be re-used by the next slice.
     ///
     /// Every writer of a whole `DecodePack` (`publish_line`, and `DecodePack::default` through
@@ -4546,7 +4546,7 @@ pub(crate) fn poll_neg_cache_default() -> bool {
     poll_neg_cache_policy(value.as_deref())
 }
 
-/// Marker `retire_ring` returns (design `2026-09-02-cr3-data-side-design.md` T2, review D2).
+/// Marker `retire_ring` returns (design `2026-09-02-cr3-data-side-design.md` T2, D2).
 /// `retire_ring` RENUMBERS ring slots (`contexts = [None, None]`), which invalidates every
 /// per-slot cache keyed by the SAME slot indices -- today only `Tlb::generations` -- independent
 /// of what caused the retire. `#[must_use]` plus this crate's `-D warnings` clippy gate turns
@@ -5435,7 +5435,7 @@ impl DecodeCache {
 
     /// The ring/marks half of a wholesale invalidation, split out so `select_context`'s R3 arm can
     /// retire the ring and THEN allocate the new context's generation separately, without a second
-    /// generation bump landing on top of it. Returns `RingRetired` (design T2, review D2): every
+    /// generation bump landing on top of it. Returns `RingRetired` (design T2, D2): every
     /// call renumbers `self.contexts`, which invalidates any per-slot cache keyed by the same slot
     /// indices, so every caller must forward the token to `Tlb::retire_all_slots`.
     fn retire_ring(&mut self, clear_translation_marks: bool) -> RingRetired {
@@ -5484,7 +5484,7 @@ impl DecodeCache {
         // R1: select. A hit means the requested directory already owns a slot; adopt its
         // generation and clear nothing. `Reselected`, never `Allocated`: the caller's per-slot
         // state (the `Tlb` generation, the JIT link epoch) must be RESTORED, not re-minted --
-        // review finding P1 (PR #826) is exactly a caller that could not tell the difference.
+        // P1 (PR #826) is exactly a caller that could not tell the difference.
         if let Some(slot) = self
             .contexts
             .iter()
@@ -5498,7 +5498,7 @@ impl DecodeCache {
         // nothing already live is invalidated. `Allocated`, never `Reselected`: this slot's
         // PREVIOUS occupant, if any, may have left per-slot state elsewhere (the `Tlb`
         // generation, the JIT link epoch) that this call site knows nothing about restoring
-        // correctly -- see the `ContextSelect` doc comment and review finding P1 (PR #826).
+        // correctly -- see the `ContextSelect` doc comment and P1 (PR #826).
         if let Some(slot) = self.contexts.iter().position(Option::is_none) {
             let slot_gen = self.allocate_generation();
             self.contexts[slot] = Some((new_cr3_masked, slot_gen));
@@ -5562,7 +5562,7 @@ impl DecodeCache {
 /// for the per-slot state a CR3 writer restores alongside the decode ring, not for those counters.
 ///
 /// **`Reselected` and `Allocated` are not interchangeable, and merging them into one `Skipped`
-/// variant was review finding P1 (PR #826).** `DecodeCache::select_context`'s own ring
+/// variant was the P1 defect (PR #826).** `DecodeCache::select_context`'s own ring
 /// (`self.contexts`) is the only thing that renumbers atomically with every other per-slot cache
 /// this ring gates -- the `Tlb`'s `generations` and the JIT link graph's `link_epochs`. A caller
 /// that cannot tell R1 (`Reselected`: the requested directory already owns a slot, so its saved
@@ -5986,7 +5986,7 @@ impl DeferredCodeWrites {
     }
 
     /// Open the window. Paired with `close` on EVERY path out of the helper, including the fault
-    /// arm, where the pairing is the whole of design review B1's sibling hazard: exception
+    /// arm, where the pairing is the whole of B1's sibling hazard: exception
     /// delivery pushes three to five words and can write page-walk accessed bits, and a tiny-model
     /// stack puts those writes on the block's own page.
     pub(crate) fn open(&mut self) {

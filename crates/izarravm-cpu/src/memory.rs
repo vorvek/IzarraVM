@@ -1570,7 +1570,7 @@ impl CpuGsw {
         // page-local fragments that each reach `read_linear_fragment`, which
         // notes its own address there. Noting here too would count a
         // crossing access 1 + N times where it is N, inflating every
-        // read-set-size number this instrument reports (review N2).
+        // read-set-size number this instrument reports (N2).
         #[cfg(feature = "reflected-call-diagnostic")]
         if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
             crate::reflected_call_diag::note_read(self, bus, linear);
@@ -1669,7 +1669,7 @@ impl CpuGsw {
             self.census_note_write(linear);
         }
         // Scoped OUT on a crossing access, for the same reason as the read arm
-        // above (review N2): `write_paged_cross_page` splits it into
+        // above (N2): `write_paged_cross_page` splits it into
         // page-local fragments that each note their own address at
         // `write_linear_fragment`.
         #[cfg(feature = "reflected-call-diagnostic")]
@@ -2145,7 +2145,7 @@ impl CpuGsw {
             }
         }
 
-        // CR3 data-side gate win counter (design T2, review D5): every walk that reaches here is
+        // CR3 data-side gate win counter (design T2, D5): every walk that reaches here is
         // one the TLB fast path above did NOT serve, whether from a cold entry, a permission
         // mismatch, or a dirty-bit miss. A retained entry across an R1 reselect costs no walk, so
         // this is the direct measure of T2's payoff -- and the direct, non-proxy assertion for a

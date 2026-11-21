@@ -181,7 +181,7 @@ impl CpuGsw {
         // None of these causes moves a linear->physical PAGE TABLE mapping (T1's own A1
         // analysis: A20/direct-map/aperture/device-DMA are bus-level), so no `Tlb` entry is made
         // stale by one on its OWN account. But `retire_ring` (inside `invalidate_decode_frontend`
-        // above) still renumbers ring slots regardless of cause (design review D2), and unlike
+        // above) still renumbers ring slots regardless of cause (D2), and unlike
         // INVLPG this caller has no narrower, targeted fix for that -- so retire fully. These
         // causes are all rare (A20 toggles once at boot; aperture/direct-map track video mode
         // and PCI decode changes, not per-instruction traffic), so the cost is negligible, and it
@@ -210,7 +210,7 @@ impl CpuGsw {
     ///
     /// The SOLE choke point for `invalidate_code_caches_uncounted` (A20, direct-map, aperture)
     /// and `invalidate_translation_code_caches` (CR0/task-switch full flush, INVLPG): the decode
-    /// ring is always fully retired here, which renumbers its slots (design review D2). Returns
+    /// ring is always fully retired here, which renumbers its slots (D2). Returns
     /// the `RingRetired` token instead of consuming it, because what that renumbering means for
     /// the `Tlb` is NOT the same at every caller -- INVLPG has its OWN narrower, targeted fix
     /// (`retire_dormant_slot`, called in `execute_extended.rs` before this function even runs),
@@ -674,8 +674,8 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.record_fast_map_wipe_extent();
-        // The decode ring retires below, unconditionally, which renumbers ring slots (design
-        // review D2) -- this caller (unlike INVLPG) has no narrower `Tlb` fix of its own, so the
+        // The decode ring retires below, unconditionally, which renumbers ring slots
+        // (D2) -- this caller (unlike INVLPG) has no narrower `Tlb` fix of its own, so the
         // whole `Tlb` retires too, consuming the token `invalidate_translation_code_caches`
         // returns. `translation_pages` may clear here (F11): both the TLB and the decode lines it
         // could back are gone by the time this returns.
@@ -698,8 +698,8 @@ impl CpuGsw {
     /// R1 reselect, is a later slice). The TLB is now GATED, the same shape as the decode and JIT
     /// halves (T2): `Reselected` restores the reselected slot's generation with `select_generation`,
     /// no walk, no entry lost; `Allocated` mints a fresh generation for the newly occupied slot
-    /// with `allocate_generation`, trusting nothing about who held the slot before (review finding
-    /// P1, PR #826: merging this with `Reselected` let a directory that had just vacated a slot
+    /// with `allocate_generation`, trusting nothing about who held the slot before (P1,
+    /// PR #826: merging this with `Reselected` let a directory that had just vacated a slot
     /// via INVLPG's narrower retire be silently restored for a completely different directory);
     /// `Taken` retires both generations with `retire_all_slots` (consuming the `RingRetired` token
     /// `select_context`'s R3 hands back) and then mints slot 0's fresh one.
@@ -718,7 +718,7 @@ impl CpuGsw {
     /// | L5, every wholesale cause retires both `link_epochs` | `invalidate_translation` (this function's `Taken` arm, the translation-page store arm, the SMC wholesale arm) keeps tearing the WHOLE graph down exactly as before this slice; only the R1 reselect path is new |
     ///
     /// `ContextSelect::Reselected(slot)` is R1 and `ContextSelect::Allocated(slot)` is R2
-    /// (review finding P1, PR #826, split them: `DecodeCache::select_context` used to return one
+    /// (P1, PR #826, split them: `DecodeCache::select_context` used to return one
     /// `Skipped(slot)` for both, and a caller that could not tell them apart could only stay safe
     /// by leaning on an invariant a narrower retire elsewhere could break). `Reselected` calls
     /// `select_link_context`, restoring that slot's saved epoch; `Allocated` calls
@@ -783,7 +783,7 @@ impl CpuGsw {
                 // R1: the requested directory already owns this slot. RESTORE its saved
                 // generation and epoch; no entry is lost, and the generation/epoch compare in
                 // `lookup`/`insert`/`is_link_visible` IS the restore. Never mint here: see the
-                // `ContextSelect` doc comment (review finding P1, PR #826).
+                // `ContextSelect` doc comment (P1, PR #826).
                 self.tlb.select_generation(slot);
                 #[cfg(all(
                     feature = "jit",
@@ -809,7 +809,7 @@ impl CpuGsw {
                 self.perf.cr3_code_flush_skipped += 1;
                 // R2: a miss took a free slot. MINT a fresh generation and epoch for it; nothing
                 // about that slot's previous occupant, if any, may be trusted. This is the P1
-                // fix (review, PR #826): before this split, this arm called `select_generation`,
+                // fix (PR #826): before this split, this arm called `select_generation`,
                 // which could restore a directory that had just vacated the slot via a narrow
                 // retire (INVLPG's `retire_dormant_slot`) that never re-minted THIS slot's
                 // generation, silently serving one directory's cached translations to another.
@@ -843,8 +843,8 @@ impl CpuGsw {
                 self.perf.decode_inval_other += 1;
                 self.perf.code_invalidations += 1;
                 self.has_aperture_code.0 = false;
-                // R3: both TLB generations retire together with the decode ring (design review
-                // D2) -- `retire_ring` already renumbered the slots this token came from, so
+                // R3: both TLB generations retire together with the decode ring
+                // (D2) -- `retire_ring` already renumbered the slots this token came from, so
                 // `slot`'s old occupant, if any, must not be served under the new one. Mint slot
                 // 0's fresh generation only after the retire, exactly as the decode and JIT
                 // halves mint their own fresh state only after their own retire.
@@ -1038,7 +1038,7 @@ impl CpuGsw {
     /// * `false` to `invalidate_translation_code_caches`: `translation_pages` must
     ///   not clear here (F11) -- another linear address's TLB entry can still serve a
     ///   code translation with no walk to re-mark it. The decode ring and link graph
-    ///   are still torn down wholesale (pre-existing coarseness, design review D2);
+    ///   are still torn down wholesale (pre-existing coarseness, D2);
     ///   the returned token is discarded, deliberately, for the reason above.
     pub(super) fn apply_invlpg(&mut self, linear: u32) {
         self.tlb.invalidate(linear >> 12);
@@ -1485,7 +1485,7 @@ impl CpuGsw {
         // T2, so clearing the bitmap here would leave a future TLB-hit translation's line
         // unprotected (F11); the marks stay set, which only costs a future retire that would have
         // fired anyway. `retire_ring`'s call inside DOES retire both `Tlb` generations now (design
-        // T2, review D2): this arm renumbers ring slots exactly like every other wholesale cause,
+        // T2, D2): this arm renumbers ring slots exactly like every other wholesale cause,
         // and the TLB's per-slot generations must retire with it or a stale generation would
         // survive under the wrong directory.
         if self
@@ -1568,7 +1568,7 @@ impl CpuGsw {
                     // stay set (F11) -- the ring's slots are still retired below via this same
                     // call, only the bitmap survives. SMC has no bearing on any linear->physical
                     // map, but `retire_ring` renumbers ring slots regardless of cause (design T2,
-                    // review D2), so the `Tlb`'s per-slot generations must retire here too or a
+                    // D2), so the `Tlb`'s per-slot generations must retire here too or a
                     // stale generation would survive under the wrong directory after the next
                     // `MOV CR3` reoccupies this slot.
                     let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
@@ -1614,7 +1614,7 @@ impl CpuGsw {
         {
             trace.record(physical, width, pre, action);
         }
-        // The reflected-call memo's code watch (slice1 plan R2.4 / BLOCKING finding 4).
+        // The reflected-call memo's code watch (slice1 plan R2.4).
         //
         // `invalidated` is true iff this write hit a compiled block, a cached decode line
         // or a marked translation page -- i.e. iff it touched CODE the CPU had cached. Any
@@ -1927,7 +1927,7 @@ impl CpuGsw {
         // stays stuck at whatever it was on the PREVIOUS persona -- on a switch away from an
         // Approximate persona this both reinstates the guaranteed-miss preamble cost the serve
         // gate exists to avoid, and lets already-live FastMap entries keep serving under a persona
-        // that must never take this path (both found by adversarial review of the lever-1 slice).
+        // that must never take this path (both found during the lever-1 slice).
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -2473,7 +2473,7 @@ impl CpuGsw {
         }
     }
 
-    /// The machine's HLE software-interrupt SERVICE seam (Fable review F2).
+    /// The machine's HLE software-interrupt SERVICE seam.
     #[cfg(feature = "reflected-call-memo")]
     pub fn reflected_call_note_soft_int_serviced(&mut self) {
         crate::reflected_call_memo::note_soft_int_serviced(self);
@@ -2700,13 +2700,13 @@ impl CpuGsw {
 
     /// Whether the SS-load shape measurement is being taken at all.
     ///
-    /// GATED with the barrier census since the S4 review round. The pair of counters behind it
+    /// GATED with the barrier census since S4. The pair of counters behind it
     /// sits in two INTERPRETER arms and is read on census legs only, which is the same bargain
     /// every other diagnostic on a hot path takes here; before the gate, `0x8e` paid a segment
     /// compare and `0x17` an unconditional record read on every execution, in every build.
     ///
     /// The measurement itself is answered: the tombraid loader phase split 484,385 same-record
-    /// against 488,498 record-moving, which is what design review 10.1 M5 asked for and what the
+    /// against 488,498 record-moving, which is what 10.1 M5 asked for and what the
     /// two SS call-out rows were built on. It stays because the ladder still reads it, not
     /// because anything is waiting on it.
     #[inline]
