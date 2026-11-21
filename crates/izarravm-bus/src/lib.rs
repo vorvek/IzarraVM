@@ -3,9 +3,6 @@
 
 #![deny(unsafe_code)]
 
-mod mkii_session;
-pub use mkii_session::{MkiiBusSession, MkiiBusSessionParts, MkiiCounterPath};
-
 use std::collections::VecDeque;
 
 use thiserror::Error;
@@ -323,239 +320,6 @@ impl NativeVgaWrites {
 /// Compatibility name retained while the direct CPU backend still labels the
 /// VGA aperture page kind as Mode 13h.
 pub type NativeMode13Writes = NativeVgaWrites;
-
-const fn compiled_width_index(width: BusWidth) -> usize {
-    match width {
-        BusWidth::Byte => 0,
-        BusWidth::Word => 1,
-        BusWidth::Dword => 2,
-    }
-}
-
-/// Aggregate effects produced while the CPU remains in compiled execution.
-///
-/// RAM reads and writes share one count because the fixed direct-RAM timing is
-/// identical for both directions. VGA writes retain their dirty-page mask so
-/// the bus can publish display changes when the compiled window closes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CompiledBusDelta {
-    instruction_fetches: u64,
-    ram_accesses: [u64; 3],
-    vga_reads: [u64; 3],
-    vga_writes: NativeVgaWrites,
-}
-
-impl CompiledBusDelta {
-    pub fn add_instruction_fetches(&mut self, count: u64) {
-        self.instruction_fetches = self.instruction_fetches.saturating_add(count);
-    }
-
-    pub fn add_ram_accesses(&mut self, width: BusWidth, count: u64) {
-        let slot = &mut self.ram_accesses[compiled_width_index(width)];
-        *slot = slot.saturating_add(count);
-    }
-
-    pub fn add_vga_reads(&mut self, width: BusWidth, count: u64) {
-        let slot = &mut self.vga_reads[compiled_width_index(width)];
-        *slot = slot.saturating_add(count);
-    }
-
-    pub fn add_vga_writes(&mut self, writes: NativeVgaWrites) {
-        self.vga_writes.dirty_pages |= writes.dirty_pages;
-        self.vga_writes.byte_writes = self
-            .vga_writes
-            .byte_writes
-            .saturating_add(writes.byte_writes);
-        self.vga_writes.word_writes = self
-            .vga_writes
-            .word_writes
-            .saturating_add(writes.word_writes);
-        self.vga_writes.dword_writes = self
-            .vga_writes
-            .dword_writes
-            .saturating_add(writes.dword_writes);
-    }
-
-    pub const fn instruction_fetches(&self) -> u64 {
-        self.instruction_fetches
-    }
-
-    pub const fn ram_accesses(&self, width: BusWidth) -> u64 {
-        self.ram_accesses[compiled_width_index(width)]
-    }
-
-    pub const fn vga_reads(&self, width: BusWidth) -> u64 {
-        self.vga_reads[compiled_width_index(width)]
-    }
-
-    pub const fn vga_writes(&self) -> NativeVgaWrites {
-        self.vga_writes
-    }
-}
-
-/// Inert fetch and RAM-read accounting within one helper-free native region.
-/// This grant has no completion obligation and expires at any helper or side exit.
-#[derive(Debug, Clone, Copy)]
-pub struct InertReadRegion {
-    mapping_epoch: u64,
-    cost_epoch: u64,
-    scaled_bus_clocks: u64,
-}
-
-impl InertReadRegion {
-    pub fn certify(
-        mapping_epoch: u64,
-        cost_epoch: u64,
-        tracing_mode: TracingMode,
-        fetch_raw_clocks: u64,
-        ram_raw_clocks: [u64; 3],
-        scaled_bus_clocks: u64,
-    ) -> Option<Self> {
-        (tracing_mode == TracingMode::Off && fetch_raw_clocks == 0 && ram_raw_clocks == [0; 3])
-            .then_some(Self {
-                mapping_epoch,
-                cost_epoch,
-                scaled_bus_clocks,
-            })
-    }
-
-    pub const fn epochs(self) -> (u64, u64) {
-        (self.mapping_epoch, self.cost_epoch)
-    }
-
-    pub const fn scaled_bus_clocks(self) -> u64 {
-        self.scaled_bus_clocks
-    }
-}
-
-/// Stable bus state certified for one compiled-execution residency window.
-///
-/// The value is neither `Copy` nor `Clone`. Passing it to
-/// `CpuBus::finish_compiled_window` prevents a second finish in safe Rust. A bus
-/// returns a window only when aggregate accounting is exact and direct mappings
-/// remain valid for its `mapping_epoch` until a side exit.
-#[must_use = "a compiled bus window must be finished exactly once"]
-#[derive(Debug, PartialEq, Eq)]
-pub struct CompiledBusWindow {
-    mapping_epoch: u64,
-    tracing_mode: TracingMode,
-    fetch_raw_clocks: u64,
-    ram_raw_clocks: [u64; 3],
-    vga_raw_clocks: [u64; 3],
-    batch_raw_clocks: u64,
-    bus_scale_remainder: u64,
-    bus_scale_numerator: u32,
-    bus_scale_denominator: u32,
-}
-
-impl CompiledBusWindow {
-    /// Build a window after the bus has checked mapping and timing stability.
-    /// Full and count tracing require individual observations, so only off mode
-    /// supports aggregate effects.
-    #[allow(clippy::too_many_arguments)]
-    pub fn certify(
-        mapping_epoch: u64,
-        tracing_mode: TracingMode,
-        fetch_raw_clocks: u64,
-        ram_raw_clocks: [u64; 3],
-        vga_raw_clocks: [u64; 3],
-        batch_raw_clocks: u64,
-        bus_scale_remainder: u64,
-        bus_scale_numerator: u32,
-        bus_scale_denominator: u32,
-    ) -> Option<Self> {
-        if tracing_mode != TracingMode::Off || bus_scale_denominator == 0 {
-            return None;
-        }
-        Some(Self {
-            mapping_epoch,
-            tracing_mode,
-            fetch_raw_clocks,
-            ram_raw_clocks,
-            vga_raw_clocks,
-            batch_raw_clocks,
-            bus_scale_remainder,
-            bus_scale_numerator,
-            bus_scale_denominator,
-        })
-    }
-
-    pub const fn mapping_epoch(&self) -> u64 {
-        self.mapping_epoch
-    }
-
-    pub const fn tracing_mode(&self) -> TracingMode {
-        self.tracing_mode
-    }
-
-    pub const fn fetch_raw_clocks(&self) -> u64 {
-        self.fetch_raw_clocks
-    }
-
-    pub const fn ram_raw_clocks(&self, width: BusWidth) -> u64 {
-        self.ram_raw_clocks[compiled_width_index(width)]
-    }
-
-    pub const fn vga_raw_clocks(&self, width: BusWidth) -> u64 {
-        self.vga_raw_clocks[compiled_width_index(width)]
-    }
-
-    /// Raw bus clocks accumulated by this CPU batch before compiled entry.
-    pub const fn batch_raw_clocks(&self) -> u64 {
-        self.batch_raw_clocks
-    }
-
-    pub const fn bus_scale_remainder(&self) -> u64 {
-        self.bus_scale_remainder
-    }
-
-    pub const fn bus_scale_numerator(&self) -> u32 {
-        self.bus_scale_numerator
-    }
-
-    pub const fn bus_scale_denominator(&self) -> u32 {
-        self.bus_scale_denominator
-    }
-
-    /// Raw clocks represented by `delta` under this window's fixed costs.
-    pub fn delta_raw_clocks(&self, delta: &CompiledBusDelta) -> u64 {
-        let mut clocks = self
-            .fetch_raw_clocks
-            .saturating_mul(delta.instruction_fetches);
-        for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
-            clocks = clocks.saturating_add(
-                self.ram_raw_clocks(width)
-                    .saturating_mul(delta.ram_accesses(width)),
-            );
-            clocks = clocks.saturating_add(
-                self.vga_raw_clocks(width)
-                    .saturating_mul(delta.vga_reads(width)),
-            );
-        }
-        let writes = delta.vga_writes;
-        clocks = clocks.saturating_add(
-            self.vga_raw_clocks(BusWidth::Byte)
-                .saturating_mul(writes.byte_writes),
-        );
-        clocks = clocks.saturating_add(
-            self.vga_raw_clocks(BusWidth::Word)
-                .saturating_mul(writes.word_writes),
-        );
-        clocks.saturating_add(
-            self.vga_raw_clocks(BusWidth::Dword)
-                .saturating_mul(writes.dword_writes),
-        )
-    }
-
-    /// Exact scaled bus total after an additional raw-clock charge.
-    pub fn projected_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
-        self.batch_raw_clocks
-            .checked_add(additional_raw)?
-            .checked_mul(u64::from(self.bus_scale_numerator))?
-            .checked_add(self.bus_scale_remainder)
-            .map(|scaled| scaled / u64::from(self.bus_scale_denominator))
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusState {
@@ -1101,16 +865,6 @@ pub trait CpuBus {
         Ok(None)
     }
 
-    /// Open a native-residency window. The default declines and keeps the
-    /// interpreter path for buses without stable direct mappings and timing.
-    fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
-        None
-    }
-
-    /// Apply the aggregate effects from one completed native-residency window.
-    /// Implementations must not fail after returning a window from `begin`.
-    fn finish_compiled_window(&mut self, _window: CompiledBusWindow, _delta: CompiledBusDelta) {}
-
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         0
     }
@@ -1295,6 +1049,8 @@ pub trait CpuBus {
         None
     }
 
+    /// No code calls this hook yet. It stays for the planned port in which blocks own
+    /// their decoded source.
     /// Certify page-local RAM fetches for a fixed native span. The returned raw charge
     /// matches `charge_physical_instruction_fetch_run`; that charge and the linear
     /// observation cannot fault, request service, change mappings or observe CPU state.
@@ -1302,6 +1058,8 @@ pub trait CpuBus {
         None
     }
 
+    /// No code calls this hook yet. It stays for the planned port in which blocks own
+    /// their decoded source.
     /// Certify owned instructions in one linear and physical RAM page. Cold decode
     /// and cached replay both charge zero for these bytes and have no observations,
     /// faults or service effects. The returned mapping and cost epochs remain valid
@@ -1316,60 +1074,13 @@ pub trait CpuBus {
         None
     }
 
-    /// Revalidate owned source certificates without opening a bus window. `Some`
-    /// accepts their mapping, backing, cost and fetch-observation namespace and
-    /// permits zero-cost, inert cold or cached source replay within one helper-free,
-    /// observer-free native read region protected by a live bus window or inert
-    /// read grant. Revalidate
-    /// after helpers, mutating bus operations or observer changes.
+    /// Revalidate owned source certificates. `Some` accepts their mapping, backing,
+    /// cost and fetch-observation namespace and permits zero-cost, inert cold or
+    /// cached source replay within one helper-free, observer-free native region.
+    /// Revalidate after helpers, mutating bus operations or observer changes.
+    /// No code calls this hook yet. It stays for the planned port in which blocks
+    /// own their decoded source.
     fn owned_code_replay_epochs(&self) -> Option<(u64, u64)> {
-        None
-    }
-
-    /// Certify an aligned RAM read at the caller's mapping epoch. The returned raw
-    /// cost matches `charge_direct_ram_memory(DataRead)`. That call and certified
-    /// fetch charges cannot fault, request service, observe CPU state, or change
-    /// RAM contents, backing pointers or mappings during the native region.
-    fn jit_preflight_ram_read(
-        &self,
-        _physical: u32,
-        _width: BusWidth,
-        _mapping_epoch: u64,
-    ) -> Option<u64> {
-        None
-    }
-
-    /// Open a read-only native region with no instruction or address observers.
-    /// Current-epoch plain RAM mappings stay valid until completion. For certified
-    /// warm source fetches and aligned RAM reads, aggregate completion is exactly
-    /// equivalent to the ordered accesses and cannot fault or request service.
-    fn begin_read_region(&mut self) -> Option<CompiledBusWindow> {
-        None
-    }
-
-    /// Open a native region that may write ordinary RAM. Certified source bytes stay
-    /// unchanged. Mapping epoch and bus-clock machinery match `begin_read_region`.
-    /// Data RAM contents may change. Tracing, non-uniform fetches and write-watch
-    /// observers must refuse.
-    fn begin_ram_write_region(&mut self) -> Option<CompiledBusWindow> {
-        None
-    }
-
-    /// Certify inert accounting for separately validated source fetches and aligned
-    /// plain-RAM reads. Those accesses and their completion have no effects,
-    /// including observations, faults, service or clock charges.
-    /// RAM contents, backing and mappings stay stable until a helper or side exit.
-    /// The grant records the exact current scaled batch bus total. Owned cold
-    /// source replay still requires its separate live capability.
-    fn certify_inert_read_region(&self) -> Option<InertReadRegion> {
-        None
-    }
-
-    /// Acquire fresh mkII policy and counter access paths for one CPU invocation.
-    fn mkii_bus_session(&self) -> Option<MkiiBusSession<'_, Self>>
-    where
-        Self: Sized,
-    {
         None
     }
 

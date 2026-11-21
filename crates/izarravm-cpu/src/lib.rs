@@ -63,8 +63,6 @@ pub use reflected_call_diag::{
 pub mod reflected_call_memo;
 #[cfg(feature = "reflected-call-memo")]
 pub use reflected_call_memo::reflected_call_memo_json;
-#[cfg(feature = "dynarec-mkii")]
-mod mkii;
 mod run;
 mod smc_trace;
 mod strings;

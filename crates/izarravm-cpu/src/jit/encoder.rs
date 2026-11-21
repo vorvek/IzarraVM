@@ -5,8 +5,8 @@
 //! general assembler. Each supported instruction form has a byte-level test.
 //! The region compiler uses only the subset it needs for a given host path.
 
-// The encoder forms have users in the mkii backend, in feature-gated code and in non-Windows arms,
-// so a default Windows build sees some of them as unused.
+// Some encoder forms have users only in feature-gated code and in non-Windows arms, so a default
+// Windows build sees some of them as unused.
 #![allow(dead_code)]
 
 /// A host x86-64 general-purpose register, numbered 0-15 in the standard encoding order

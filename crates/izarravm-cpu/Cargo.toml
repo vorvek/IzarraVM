@@ -15,7 +15,6 @@ authors.workspace = true
 # build for unsupported hosts and differential checks.
 default = ["jit"]
 jit = []
-dynarec-mkii = ["jit"]
 # Partial Direct admission attribution. The dispatcher hooks are compiled out unless this
 # diagnostic feature is selected, then armed with IZARRAVM_DIRECT_BARRIER_CENSUS=1.
 direct-admission-census = ["jit"]

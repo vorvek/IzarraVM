@@ -14,7 +14,6 @@ authors.workspace = true
 # Forward the CPU template JIT by default. Disabling defaults keeps the interpreter-only path.
 default = ["jit"]
 jit = ["izarravm-cpu/jit"]
-dynarec-mkii = ["jit", "izarravm-cpu/dynarec-mkii"]
 # Slice 0b of the reflected-call HLE design's trip-shape instrument: the ONLY
 # reason this diagnostic-only feature is allowed to propagate past the CPU
 # crate is the batch-straddle counter (`on_batch_boundary`, called from

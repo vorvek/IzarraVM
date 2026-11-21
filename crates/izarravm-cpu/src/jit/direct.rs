@@ -2855,12 +2855,9 @@ impl BlockCache {
                 self.data_segment_state_is_empty(),
                 "data-segment governor state outlived its entries"
             );
-            #[cfg(not(feature = "dynarec-mkii"))]
             if watch.has_resident_pages() {
                 watch.clear();
             }
-            #[cfg(feature = "dynarec-mkii")]
-            watch.clear_unreferenced();
             // A full clear still drops heat: signal the owner of the hoisted map.
             self.heat_resets = self.heat_resets.wrapping_add(1);
             self.disabled = false;
@@ -3900,19 +3897,6 @@ impl BlockCache {
     }
 
     fn reset_storage(&mut self, watch: &mut NativeCodeWatch) {
-        #[cfg(feature = "dynarec-mkii")]
-        {
-            for (block, active) in self.blocks.iter().zip(&self.block_active) {
-                if *active {
-                    watch.release_range(block.span.key.physical, u32::from(block.span.guest_len));
-                }
-            }
-            for state in self.entries.values() {
-                if let BlockState::Rejected(span) = state {
-                    watch.release_range(span.key.physical, u32::from(span.guest_len));
-                }
-            }
-        }
         let links = self
             .outbound
             .iter()
@@ -3988,10 +3972,7 @@ impl BlockCache {
         self.block_link_epochs.clear();
         self.iteration_upper_cache.clear();
         self.callout_admission.clear();
-        #[cfg(not(feature = "dynarec-mkii"))]
         watch.clear();
-        #[cfg(feature = "dynarec-mkii")]
-        watch.clear_unreferenced();
         // Every storage reset drops heat; the owner of the hoisted map observes this counter.
         self.heat_resets = self.heat_resets.wrapping_add(1);
         self.block_active.clear();

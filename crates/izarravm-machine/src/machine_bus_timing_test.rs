@@ -195,7 +195,7 @@ fn jit_direct_memory_preview_bounds_the_live_bus_charge() {
 }
 
 #[test]
-fn mkii_fetch_certificate_rejects_firmware_aliases_and_matches_physical_charges() {
+fn fetch_certificate_rejects_firmware_aliases_and_matches_physical_charges() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
     with_bus(&mut machine, |bus| {
@@ -224,82 +224,7 @@ fn mkii_fetch_certificate_rejects_firmware_aliases_and_matches_physical_charges(
 }
 
 #[test]
-fn mkii_read_region_window_matches_live_charges_and_refuses_observers() {
-    for mode in [GswMode::Gsw586, GswMode::Gsw486, GswMode::Gsw386] {
-        let mut machine = test_machine();
-        machine.set_mode(mode);
-        with_bus(&mut machine, |bus| {
-            bus.trace.set_tracing_mode(TracingMode::Off);
-            if mode == GswMode::Gsw386 {
-                assert!(bus.begin_read_region().is_none());
-                return;
-            }
-            *bus.direct_mapping_epoch += 1;
-            let window = bus.begin_read_region().unwrap();
-            assert_eq!(window.mapping_epoch(), *bus.direct_mapping_epoch);
-            let mut delta = izarravm_bus::CompiledBusDelta::default();
-            delta.add_instruction_fetches(3);
-            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
-                delta.add_ram_accesses(width, 1);
-            }
-            let before = bus.trace.elapsed_clocks();
-            bus.finish_compiled_window(window, delta);
-            let aggregated = bus.trace.elapsed_clocks() - before;
-            let before = bus.trace.elapsed_clocks();
-            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
-                bus.charge_physical_instruction_fetch_run(0x3000, 4)
-                    .unwrap();
-                bus.charge_direct_ram_memory(0x2000, width, BusAccessKind::DataRead)
-                    .unwrap();
-            }
-            assert_eq!(bus.trace.elapsed_clocks() - before, aggregated);
-            bus.trace.set_tracing_mode(TracingMode::Full);
-            assert!(bus.begin_read_region().is_none());
-            #[cfg(not(feature = "shadow-cache-probe"))]
-            {
-                bus.trace.set_tracing_mode(TracingMode::Off);
-                bus.shadow_l1.enable_for_test();
-                assert!(bus.begin_read_region().is_none());
-            }
-        });
-    }
-}
-
-#[test]
-fn mkii_ram_certificate_tracks_epoch_backing_and_folded_charge() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
-    with_bus(&mut machine, |bus| {
-        bus.trace.set_tracing_mode(TracingMode::Off);
-        let epoch = *bus.direct_mapping_epoch;
-        assert_eq!(
-            bus.jit_preflight_ram_read(0x2000, BusWidth::Word, epoch + 1),
-            None
-        );
-        for address in [0x2001, 0x2fff, 0xa0000] {
-            assert_eq!(
-                bus.jit_preflight_ram_read(address, BusWidth::Word, epoch),
-                None
-            );
-        }
-        let raw = bus
-            .jit_preflight_ram_read(0x2000, BusWidth::Word, epoch)
-            .unwrap();
-        assert_eq!(raw, 0);
-        let before = bus.in_batch_reference_bus_clocks();
-        bus.charge_direct_ram_memory(0x2000, BusWidth::Word, BusAccessKind::DataRead)
-            .unwrap();
-        assert_eq!(bus.in_batch_reference_bus_clocks() - before, raw);
-        bus.trace.set_tracing_mode(TracingMode::Full);
-        assert_eq!(
-            bus.jit_preflight_ram_read(0x2000, BusWidth::Word, epoch),
-            None
-        );
-    });
-}
-
-#[test]
-fn mkii_owned_source_certificate_covers_cold_fetches_and_excludes_special_windows() {
+fn owned_source_certificate_covers_cold_fetches_and_excludes_special_windows() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw586);
     with_bus(&mut machine, |bus| {
@@ -5557,93 +5482,7 @@ fn dsp_lazy_settle_does_not_service_unrelated_ports_or_accurate_reads() {
 }
 
 #[test]
-fn mkii_inert_read_grant_matches_live_zero_charges_and_prior_bus_total() {
-    for mode in [GswMode::Gsw586, GswMode::Gsw486, GswMode::Gsw386] {
-        let mut machine = test_machine();
-        machine.set_mode(mode);
-        with_bus(&mut machine, |bus| {
-            bus.trace.set_tracing_mode(TracingMode::Off);
-            bus.trace.add_elapsed_clocks(177);
-            *bus.isa_io_clocks += 5;
-            if mode == GswMode::Gsw386 {
-                assert!(bus.certify_inert_read_region().is_none());
-                return;
-            }
-            let grant = bus.certify_inert_read_region().unwrap();
-            assert_eq!(
-                grant.epochs(),
-                (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch())
-            );
-            assert_eq!(grant.scaled_bus_clocks(), bus.in_batch_scaled_bus_clocks());
-            let raw = bus.in_batch_reference_bus_clocks();
-            for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
-                bus.note_code_fetch_linear(0x3000);
-                bus.charge_physical_instruction_fetch_run(0x3000, 4)
-                    .unwrap();
-                bus.charge_direct_ram_memory(0x2000, width, BusAccessKind::DataRead)
-                    .unwrap();
-            }
-            assert_eq!(bus.in_batch_reference_bus_clocks(), raw);
-            assert!(!bus.requires_step_break());
-            for tracing in [TracingMode::Full, TracingMode::Counts] {
-                bus.trace.set_tracing_mode(tracing);
-                assert!(bus.certify_inert_read_region().is_none());
-            }
-            bus.trace.set_tracing_mode(TracingMode::Off);
-            bus.l1_charges_folded = false;
-            assert!(bus.certify_inert_read_region().is_none());
-            bus.l1_charges_folded = true;
-            #[cfg(not(feature = "shadow-cache-probe"))]
-            {
-                bus.shadow_l1.enable_for_test();
-                assert!(bus.certify_inert_read_region().is_none());
-            }
-        });
-    }
-}
-
-#[cfg(feature = "dynarec-mkii")]
-#[test]
-fn mkii_session_rechecks_policy_after_bus_construction() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
-    with_bus(&mut machine, |bus| {
-        bus.trace.set_tracing_mode(TracingMode::Off);
-        let root = std::ptr::from_ref(&*bus);
-        let epochs = (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch());
-        assert!(bus.mkii_bus_session().unwrap().into_parts(root).is_some());
-        for (flat, folded) in [(false, true), (true, false), (false, false), (true, true)] {
-            bus.flat_data_cost = flat;
-            bus.l1_charges_folded = folded;
-            assert_eq!(bus.mkii_bus_session().is_some(), flat && folded);
-            assert_eq!(
-                (*bus.direct_mapping_epoch, bus.jit_cost_dial_epoch()),
-                epochs
-            );
-        }
-        for tracing in [TracingMode::Counts, TracingMode::Full, TracingMode::Off] {
-            bus.trace.set_tracing_mode(tracing);
-            assert_eq!(
-                bus.mkii_bus_session().is_some(),
-                tracing == TracingMode::Off
-            );
-        }
-        *bus.io_touched = true;
-        assert!(bus.mkii_bus_session().is_none());
-        *bus.io_touched = false;
-        *bus.pending_soft_int = Some(0x21);
-        assert!(bus.mkii_bus_session().is_none());
-        *bus.pending_soft_int = None;
-        let parts = bus.mkii_bus_session().unwrap().into_parts(root).unwrap();
-        assert_eq!(parts.trace_origin, bus.trace_elapsed_at_batch_start);
-        assert_eq!(parts.cost_epoch, bus.jit_cost_dial_epoch());
-        assert_eq!(parts.bus_numerator, BUS_CLOCK_MASTER_TICKS);
-        assert_eq!(parts.bus_denominator, u64::from(bus.bus_den_at_batch_start));
-    });
-}
-
-#[test]
-fn mkii_ram_read_proof_avoids_repeated_device_classification() {
+fn ram_read_proof_avoids_repeated_device_classification() {
     for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine = test_machine();
         machine.set_mode(mode);
@@ -5674,7 +5513,7 @@ fn mkii_ram_read_proof_avoids_repeated_device_classification() {
 }
 
 #[test]
-fn mkii_ram_read_proof_preserves_live_costs_cache_and_observers() {
+fn ram_read_proof_preserves_live_costs_cache_and_observers() {
     for mode in [
         GswMode::Gsw386,
         GswMode::Gsw386Slow,
@@ -5785,7 +5624,7 @@ fn mkii_ram_read_proof_preserves_live_costs_cache_and_observers() {
 }
 
 #[test]
-fn mkii_ram_read_proof_obeys_a_bar_changed_during_the_bus_borrow() {
+fn ram_read_proof_obeys_a_bar_changed_during_the_bus_borrow() {
     const BAR: u32 = 0x0200_0000;
     const ADDRESS: u32 = BAR + 0x0040_0000;
     let run = |direct: bool| {
