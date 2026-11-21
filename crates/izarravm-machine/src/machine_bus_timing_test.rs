@@ -1858,7 +1858,7 @@ fn lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter() {
     // `out_after` conservatively declines for a
     // BCD-programmed counter, so the lazy 0x61 arm must fall all the way
     // back to the exact non-lazy path (io_touched set, today's live read)
-    //rather than a second implementation of the bit composition.
+    // rather than a second implementation of the bit composition.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path would
     // otherwise apply.
@@ -1916,7 +1916,7 @@ fn opl_status_read_matches_the_live_byte_when_no_device_time_is_pending() {
     // The Approximate class predicts the status byte from un-applied device
     // time (see `predicted_opl_status`). With NOTHING pending (which is the
     // case here, because run_cycles below commits the advance before the read)
-    //the prediction must reduce exactly to the live byte: `expired_after(0)`
+    // the prediction must reduce exactly to the live byte: `expired_after(0)`
     // is the live `expired` flag, since `advance` leaves `accumulated_us` below
     // one step. Pin that equality, and the batch-ending behaviour with it.
     let mut machine = test_machine();

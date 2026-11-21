@@ -580,7 +580,7 @@ impl Timer {
     /// `micros_elapsed` more microseconds of chip time, without mutating
     /// `self`? `expired` is sticky (only a register-0x04 bit7 write clears it,
     /// via `OplChip::write_bank`), so the answer is `self.expired` already, OR,
-    ///when running, whether the count would cross 0xff within
+    /// when running, whether the count would cross 0xff within
     /// `micros_elapsed`. Mirrors `advance`'s exact step arithmetic
     /// (accumulated_us + micros, divided by step_us, whole steps added to
     /// count) without the loop: since only the CROSSING matters (not the

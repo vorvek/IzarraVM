@@ -2154,7 +2154,7 @@ fn cms_probe_range_reads_open_bus_not_a_fault() {
     // Ports 0x240-0x24F, 0x260-0x26F and 0x280-0x28F are the C/MS Game
     // Blaster's alternate probe bases. With no card there, a read must see
     // open bus (0xFF) so a sound-detect routine concludes "nothing present",
-    //not an UnsupportedPort fault that halts the machine headless.
+    // not an UnsupportedPort fault that halts the machine headless.
     //
     // Prince of Persia reads base+3 at each one. The 0x280 entry landed first
     // and covered only the LAST address in that sweep, so PRINCE SBLAST still

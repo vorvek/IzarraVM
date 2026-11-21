@@ -716,7 +716,7 @@ impl Ad1848 {
     /// sticky INT bit is still pending the host's ack, `advance_count` freezes the
     /// Current Count (datasheet: "the DMA Current Counter will not decrement while
     /// both the TRD bit is set and the INT bit is a one"), so no further underflow
-    ///(hence no new IRQ) is generated until the host acks. The estimator must
+    /// (hence no new IRQ) is generated until the host acks. The estimator must
     /// mirror that gate and return `None`, or the run loop would fast-forward a
     /// halted CPU to a wake the producer never actually generates.
     pub fn frames_until_next_irq(&self) -> Option<u64> {

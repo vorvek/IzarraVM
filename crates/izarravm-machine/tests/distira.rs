@@ -449,7 +449,7 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
 /// FBI on a dual-TMU board, a config that never shipped). Renamed from
 /// `glide_destructive_framebuffer_probe_reports_two_megabytes`, which
 /// pinned the OLD 2 MB size and went red the moment `DISTIRA_FB_SIZE` grew:
-///this is the guest-facing half of that decision, not incidental
+/// this is the guest-facing half of that decision, not incidental
 /// breakage, the same shape as PR #814's texture-memory probe rename.
 #[test]
 fn glide_destructive_framebuffer_probe_reports_four_megabytes() {

@@ -517,7 +517,7 @@ impl SbMixer {
     /// resets `0x36`/`0x37` to `0xF8`. It used to power on hard-muted, which meant
     /// a CD-audio title that never programmed the mixer (the usual case, since
     /// the drive plays Red Book through the card's CD-in with no guest involvement)
-    ///got silence from a working drive. The GUI front panel and `set_cd_levels`
+    /// got silence from a working drive. The GUI front panel and `set_cd_levels`
     /// remain the host's control over this line.
     ///
     /// The wavetable extension (`0x50`/`0x51`) powers on at level 31 for the

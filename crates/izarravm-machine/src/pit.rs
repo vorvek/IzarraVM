@@ -1261,7 +1261,7 @@ enum BulkDecline {
 /// default without moving the rule. **Every OFF leg must EXPORT `0`; clearing
 /// the variable runs the ON arm.** `[Environment]::SetEnvironmentVariable(
 /// $name, $null, "Process")` (how every harness in this tree clears a variable)
-///leaves the variable PRESENT AND EMPTY on Windows, and a leg that cleared
+/// leaves the variable PRESENT AND EMPTY on Windows, and a leg that cleared
 /// the variable means "the default", never "the escape".
 ///
 /// This follows `run::parse_ata_poll_skip_arm` (`run.rs`), which is the

@@ -1438,7 +1438,7 @@ fn frame_generation_tracks_hle_bios_graphics_writes() {
     );
 
     // A palette change via INT 10h AH=10h AL=10h (set one DAC register) in mode 13h
-    //(the classic graphics output change with no VRAM write) must bump too.
+    // (the classic graphics output change with no VRAM write) must bump too.
     let mut pal = int15_machine(16);
     pal.video_mut().set_mode13h();
     let before = pal.frame_generation().expect("mode 13h graphics");

@@ -2044,7 +2044,7 @@ impl Distira {
     }
 
     /// Attribute one join's `window_ns`/`blocked_ns`/`overlap_ns` to `cause`,
-    ///the per-[`DrainCause`] half of `Self::join_raster`'s bookkeeping,
+    /// the per-[`DrainCause`] half of `Self::join_raster`'s bookkeeping,
     /// factored out because both `Self::flush_raster_queue`'s depth-one
     /// pre-join and `Self::drain_raster_queue`'s own post-flush join need it
     /// (N3 of the slice 1 review: one `drain_raster_queue` call can record
@@ -2768,7 +2768,7 @@ impl Distira {
         // already uncovered by `raster_snapshot_covers_register`, so a real
         // NCC write has already joined above; this second check exists so a
         // write to an UNRELATED register (a vertex, a colour, `triangleCMD`,
-        //the whole hot path a Glide driver spends most of its time on)
+        // the whole hot path a Glide driver spends most of its time on)
         // does not join here too.
         if NccState::touches_register(register)
             && self
@@ -3560,7 +3560,7 @@ impl Distira {
     // (`vid_voodoo_fb.c:91-95,132-136`); note the `& fb_mask` that follows
     // the guard is therefore redundant for memory safety, so the guard is a
     // deliberate behavioural choice, not a bounds check standing in for one,
-    //and DOSBox-X's `lfb_r` returns `0xffffffff` the same way
+    // and DOSBox-X's `lfb_r` returns `0xffffffff` the same way
     // (`voodoo_emu.cpp:2860-2862`). Only the FBI *write* decode wraps
     // (`RasterView::framebuffer_pixel_offset`'s doc comment carries that
     // citation); this function stays unbounded and lets its callers apply

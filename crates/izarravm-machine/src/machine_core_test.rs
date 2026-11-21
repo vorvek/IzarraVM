@@ -59,7 +59,7 @@ fn cache_model_reset_goes_cold() {
 fn measure_read_bandwidth_returns_a_finite_sample_in_every_mode() {
     // Small block (fits every mode's L1) and a large block (exceeds every L2).
     // Both must move bytes and take clocks; we do NOT assert tier ordering here:
-    //the tier costs are calibrated and a separate ordering test covers the
+    // the tier costs are calibrated and a separate ordering test covers the
     // descending L1/L2/RAM curve.
     const TOTAL: u64 = 4 * 1024 * 1024;
     let modes = [

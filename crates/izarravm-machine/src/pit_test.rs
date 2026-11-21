@@ -868,7 +868,7 @@ fn analytic_count_after_matches_the_step_simulation_across_modes_and_phases() {
     // Same coverage shape as the out_after differential above (every mode, a
     // spread of reloads (even, odd, minimum legal, illegal, full-range), every
     // phase across two-plus periods, and distances from 0 through several periods)
-    //but pinning the COUNTER VALUE a mid-batch read reports, which is what the
+    // but pinning the COUNTER VALUE a mid-batch read reports, which is what the
     // 0x40/0x42 peek returns.
     for mode in 0..=5u8 {
         for reload in [2u16, 3, 4, 5, 6, 7, 18, 100, 101, 255, 1, 0] {

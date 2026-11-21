@@ -378,7 +378,7 @@ const CLAIM_REFRESH_PERIOD: usize = 64;
 ///
 /// IT IS THE ONLY *DETECTABLE* SIGNATURE, WHICH IS NOT THE SAME AS THE ONLY ONE.
 /// A tear whose hole runs to the end of the image (nothing but 0x00 behind it)
-///is indistinguishable from a directory the guest legitimately truncated,
+/// is indistinguishable from a directory the guest legitimately truncated,
 /// because DOS marks a deletion 0xE5 and never 0x00, so there is nothing left to
 /// look at. That undetectable case costs nothing here: the FULL SCAN reads the
 /// same truncated `live` set and is blind in exactly the same way, so the
@@ -2505,7 +2505,7 @@ impl KateaTreeVolume {
     /// ~19 ms at 500 MB, back into the freeze class.
     ///
     /// WHAT THIS DOES INSTEAD. The cursor resolves ONE FAT SECTOR (128 clusters)
-    ///and holds the answer:
+    /// and holds the answer:
     ///
     /// * if the guest has written that FAT sector, the cursor owns its bytes and
     ///   every entry in it is a four-byte read out of a buffer already in hand;
@@ -3754,7 +3754,7 @@ impl KateaTreeVolume {
     ///
     /// THE UNDER-FLAG HAZARD THIS CLOSES. A file's chain can be perfectly
     /// unchanged (its FAT token still current, so the index never revisits it)
-    ///while a cluster it holds BECOMES a directory cluster underneath it.
+    /// while a cluster it holds BECOMES a directory cluster underneath it.
     /// Nothing in the FAT epoch sees that, so the growth side of
     /// `directory_clusters` needs its own hook. It is O(clusters added), which is
     /// one directory chain, not the mount.

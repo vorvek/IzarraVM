@@ -24,7 +24,7 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// The CT1745 powers on with master, voice, FM and CD all at level 31 (0 dB),
 /// matching DOSBox-X's `CTMIXER_Reset` and 86Box. Every one of those legs is
 /// therefore unity, and they SUM: a title playing digital effects over FM music
-///(Duke Nukem 3D, the common case) drives the summing node past full scale
+/// (Duke Nukem 3D, the common case) drives the summing node past full scale
 /// with both legs at their defaults and nothing misprogrammed. Saturating that
 /// at `clamp_i16` is not just loud, it is destructive in a way a level control
 /// cannot undo: symmetric clipping squashes a panned image toward the centre

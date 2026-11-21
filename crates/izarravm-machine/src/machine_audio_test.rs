@@ -2374,7 +2374,7 @@ fn wss_disabled_advance_and_render_run_cleanly_and_stay_silent() {
     // disabled machine through advance_devices AND render_audio to prove those
     // branches execute cleanly (no panic) and the WSS contributes silence. We
     // arm DMA/codec ports first to confirm a disabled codec ignores them entirely,
-    //but the ports do not decode, so the writes that would land on the codec
+    // but the ports do not decode, so the writes that would land on the codec
     // are skipped; only the DMA programming (separate decoder) is set up.
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.wss = WssConfig {
@@ -2830,7 +2830,7 @@ fn opl_trace_is_off_by_default_and_respects_its_cap() {
 }
 
 /// Program the SB16 for 22050 Hz 16-bit signed stereo auto-init output on DMA5
-///(what Duke Nukem 3D and its SETUP utility play through) looping over an
+/// (what Duke Nukem 3D and its SETUP utility play through) looping over an
 /// 8-frame buffer of the given (left, right) sample pair. The CT1745 is left at
 /// its power-on defaults: the point of these tests is what the DEFAULTS do.
 fn play_16bit_stereo_pair(machine: &mut Machine, left: i16, right: i16) {
@@ -3085,7 +3085,7 @@ fn pc_speaker_mixer_level_attenuates_the_beeper_through_render_audio() {
 /// the level tests above cannot see: the PC-SPK register would decode
 /// identically whether its output joined the mix before or after the node, and
 /// `MIX_HEADROOM` is the node's remaining scalar. A beeper added AFTER the node
-///(which is what it used to be) reaches the output at the cardless level
+/// (which is what it used to be) reaches the output at the cardless level
 /// on both machines, and the comparison below fails by exactly 6 dB.
 #[test]
 fn a_machine_with_no_card_keeps_its_beeper_outside_the_card_stage() {

@@ -564,7 +564,7 @@ impl AtaDisk {
         // that delta. The ATA task-file and BMIDE DMA paths take cache hits for
         // their DATA: there is one residency set and it sits under all of them,
         // which is what keeps the bytes a guest sees independent of how it asked,
-        //but they still price their transfers with the UNCACHED formula,
+        // but they still price their transfers with the UNCACHED formula,
         // because they schedule their own deadlines at command time, before any
         // sector has been looked up. That matches the thing being modelled:
         // SMARTDRV hooked INT 13h and nothing below it, so a driver talking to

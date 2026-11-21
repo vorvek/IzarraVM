@@ -692,7 +692,7 @@ pub fn status1_geometry_bits(t: &CrtcTiming, beam: u64, display_forced_inactive:
 /// (`status1_geometry_bits` is its companion, and the pair has to agree: this
 /// returns `None` exactly when the bit already has the target value, so a caller
 /// that sees `None` knows the state is settled, not that the geometry is unusable:
-///the unusable cases return `None` too, and both mean "do not schedule").
+/// the unusable cases return `None` too, and both mean "do not schedule").
 ///
 /// `display_forced_inactive` carries the same meaning as in
 /// `status1_geometry_bits`; when it is set, bit 0 never transitions and this

@@ -119,7 +119,7 @@ fn ata_hdd_poll_skip_never_fires_with_the_family_unarmed() {
 
 /// A test-injected latency stands in for the non-zero `COMMAND_LATENCY_TICKS`
 /// slice 9C will one day ship, so this fixture proves the mechanism itself
-///(not merely its inertness) ports correctly.
+/// (not merely its inertness) ports correctly.
 #[test]
 fn ata_hdd_poll_skip_lands_exactly_on_the_completion() {
     let mut machine = hdd_machine(true);

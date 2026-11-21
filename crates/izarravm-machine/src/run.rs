@@ -172,7 +172,7 @@ fn parse_ata_poll_skip_arm(value: Result<String, std::env::VarError>) -> bool {
 ///
 /// The empty string has to be a spelling of unset here, and this is not a
 /// convenience: `[Environment]::SetEnvironmentVariable($name, $null, "Process")`
-///(how every harness in this repo clears a variable it does not want) leaves
+/// (how every harness in this repo clears a variable it does not want) leaves
 /// the variable PRESENT AND EMPTY on Windows. That is the same
 /// nulling-is-not-unsetting trap that made three earlier evidence directories
 /// measure their default-ON knobs off, and it bit this branch's own re-ladder
