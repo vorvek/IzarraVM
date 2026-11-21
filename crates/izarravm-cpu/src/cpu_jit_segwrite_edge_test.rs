@@ -6,20 +6,20 @@
 //! requirement.
 //!
 //! Design: the segwrite continue design. Companion refutation this must not
-//! repeat: the L9 segment-chain design §9 (B1 -- the selector-purity lemma is
+//! repeat: the L9 segment-chain design §9 (B1: the selector-purity lemma is
 //! false in plain real mode).
 //!
 //! Three red proofs (design §7.1 items 1-3), in order:
 //!
-//! 1. `a_v86_segment_write_edge_binds_and_chains_in_one_entry` -- the WIN. On `main` (before this
+//! 1. `a_v86_segment_write_edge_binds_and_chains_in_one_entry`: the WIN. On `main` (before this
 //!    slice) `is_segment_write_block()` is true for block A and `jit_direct_entries` rises by 2
 //!    per pass (A, then B through the dispatcher); on this branch it rises by 1 (A chains straight
 //!    into B).
-//! 2. `unreal_mode_refuses_the_edge_while_v86_binds_it` -- THE UNREAL CASE, the fixture that
+//! 2. `unreal_mode_refuses_the_edge_while_v86_binds_it`: THE UNREAL CASE, the fixture that
 //!    answers L9 B1. Plain real mode with a stale 4 GB-limit DS (the classic unreal-mode setup)
 //!    must NOT get the relaxation: `successors == [None, None]`, and the >64 KB access through the
 //!    preserved limit still succeeds. The identical bytes compiled in V86 DO get the relaxation.
-//! 3. `a_mismatched_selector_takes_the_guarded_exit_to_the_dispatcher` -- a live selector that
+//! 3. `a_mismatched_selector_takes_the_guarded_exit_to_the_dispatcher`: a live selector that
 //!    disagrees with the target's frozen requirement exits through `SegmentSelectorMismatch`, not
 //!    `StaticUnbound`, and does not spend a linked transfer.
 //!
@@ -27,17 +27,17 @@
 //! mutation sweep found (N1, N2) and red-proving what dropping `seg_write_merge`'s `| dirty` term
 //! changes (N3):
 //!
-//! 4. `a_two_segment_write_block_still_publishes_no_successor` -- N2. Relaxing
+//! 4. `a_two_segment_write_block_still_publishes_no_successor`: N2. Relaxing
 //!    `dirty_segments.count_ones() == 1` to `>= 1` left every existing test green; a multi-write
 //!    head (14.3% of 10rogue's, per L9 §9.1) must still get `[None, None]`.
-//! 5. `a_chain_widen_folds_through_a_dirty_predecessor_instead_of_cutting_it` -- N1, design §7.1
+//! 5. `a_chain_widen_folds_through_a_dirty_predecessor_instead_of_cutting_it`: N1, design §7.1
 //!    item 5, cloned from `cpu_jit_retf_v86_test.rs`'s "a requirement GROWS" shape. Reverting the
 //!    `widen_chain_requirement` arm to plain `merge_chain` left every existing test green; this
 //!    proves the B2 fold survives a widen instead of cutting the edge.
-//! 6. `a_write_only_segment_never_gates_reentry_into_its_own_source_block` -- N3. `seg_write_merge`
+//! 6. `a_write_only_segment_never_gates_reentry_into_its_own_source_block`: N3. `seg_write_merge`
 //!    no longer OR's the written segment into the merged `used` mask (an earlier revision did);
 //!    this proves why not: with the bit present, re-entering the SOURCE block with a live value of
-//!    the segment it is about to overwrite -- unrelated to anything the guard checks -- would
+//!    the segment it is about to overwrite, unrelated to anything the guard checks, would
 //!    refuse the entry through the chain entry check and route it down the data-segment decline
 //!    treadmill this design exists to convert out of.
 
@@ -54,17 +54,17 @@ fn filler() -> Vec<u8> {
     FILL.concat()
 }
 
-/// `mov ds, ax` -- `0x8E /3`, register form.
+/// `mov ds, ax`: `0x8E /3`, register form.
 const MOV_DS_AX: [u8; 2] = [0x8e, 0xd8];
 
-/// `mov fs, cx` -- `0x8E /4`, register form. `MovSreg` in every mode, unlike `mov ds,ax` above,
+/// `mov fs, cx`: `0x8E /4`, register form. `MovSreg` in every mode, unlike `mov ds,ax` above,
 /// which is native (`LoadSegReal`) outside protected mode: this is what the block-keyed
 /// un-demotion's V86 exclusion (2026-09-02 review N1) is about.
 const MOV_FS_CX: [u8; 2] = [0x8e, 0xe1];
 
 /// Block B's body: `mov al,[bx]` (a byte read through DS, the segment A just wrote), followed by
 /// two filler slots so B also clears the three-instruction floor. `[bx]`'s default segment is DS
-/// with no override, which is what makes B's `SegmentLayout` PIN DS -- `seg_write_merge`'s own
+/// with no override, which is what makes B's `SegmentLayout` PIN DS: `seg_write_merge`'s own
 /// admission bar (design §4.2 clause 2) needs the target to claim the written segment or there is
 /// nothing for the guard to compare against.
 const READ_DS_BX: [u8; 2] = [0x8a, 0x07];
@@ -95,7 +95,7 @@ fn v86_cpu() -> CpuGsw {
     cpu
 }
 
-/// Plain real mode: CR0.PE clear, no V86. `load_segment_real_mode` -- not `load_segment_real` --
+/// Plain real mode: CR0.PE clear, no V86. `load_segment_real_mode`, not `load_segment_real`,
 /// is what a `MOV Sreg` takes here, and it PRESERVES the cached limit. That omission IS unreal
 /// mode, and it is L9 B1: a selector-only guard chains onto a stale baked limit unless it is
 /// barred from this population entirely.
@@ -240,7 +240,7 @@ fn stage_with(
 const TARGET_SELECTOR: u16 = 0x0040;
 
 // =================================================================================================
-// Red proof 1: the win -- V86 binds the edge and chains A into B in one entry.
+// Red proof 1: the win. V86 binds the edge and chains A into B in one entry.
 // =================================================================================================
 
 #[test]
@@ -254,7 +254,7 @@ fn a_v86_segment_write_edge_binds_and_chains_in_one_entry() {
     );
 
     // Compile B with DS = TARGET_SELECTOR live, so its `SegmentLayout` freezes exactly that
-    // selector as the requirement `chain_layouts[B].selector(Ds)` -- the value the emitted guard
+    // selector as the requirement `chain_layouts[B].selector(Ds)`, the value the emitted guard
     // will compare A's live post-write selector against.
     cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
     let block_b = install_at(&mut cpu, b_linear);
@@ -304,14 +304,14 @@ fn a_v86_segment_write_edge_binds_and_chains_in_one_entry() {
 }
 
 // =================================================================================================
-// Red proof 2: the unreal case -- L9's B1, answered.
+// Red proof 2: the unreal case. L9's B1, answered.
 // =================================================================================================
 
 #[test]
 fn unreal_mode_refuses_the_edge_while_v86_binds_it() {
     // Real mode with a stale 4 GB-limit DS: `load_segment_real_mode` preserves that limit across
     // the block's own `MOV DS,AX`, which is unreal mode by definition. The relaxation must NOT
-    // admit this population -- it is exactly L9 B1.
+    // admit this population: it is exactly L9 B1.
     let (mut cpu, _bus, _b_linear) = stage(real_cpu, &block_b_body());
     stamp_unreal_ds(&mut cpu);
     let block = install_at(&mut cpu, ENTRY);
@@ -350,7 +350,7 @@ fn unreal_mode_refuses_the_edge_while_v86_binds_it() {
     //
     // RED-PROOF MUTATION NOTE: deleting the `key.mode_key & JIT_MODE_KEY_V86_BIT != 0` conjunct
     // from `seg_write_edge_eligible` (`jit/direct.rs`) makes the REAL-MODE assertion above go
-    // green for the wrong reason -- `successors_for_test()` would then read
+    // green for the wrong reason: `successors_for_test()` would then read
     // `[Some(fallthrough), None]` in real mode too, and a subsequent run would either read the
     // WRONG address (a rebuilt 0xFFFF limit truncating the >64K access) or, if the limit happened
     // to survive by accident, would still have removed the one bar this fixture exists to prove.
@@ -437,7 +437,7 @@ fn a_mismatched_selector_takes_the_guarded_exit_to_the_dispatcher() {
 // rest of the suite; this is the fixture that catches it.
 // =================================================================================================
 
-/// `mov es, bx` -- `0x8E /0`, register form. Writes a SECOND segment after `MOV_DS_AX` without
+/// `mov es, bx`: `0x8E /0`, register form. Writes a SECOND segment after `MOV_DS_AX` without
 /// tripping the compile walk's dirty-segment rule: `LoadSegReal` bakes nothing (`written_segment`
 /// is deliberately excluded from `pinned_segments`), so this instruction's own `pinned_segments()`
 /// does not intersect `dirty_segments` after the DS write, and the walk keeps going.
@@ -446,7 +446,7 @@ const MOV_ES_BX: [u8; 2] = [0x8e, 0xc3];
 #[test]
 fn a_two_segment_write_block_still_publishes_no_successor() {
     // filler(2) + mov ds,ax + mov es,bx + filler(2): six slots, two segment writes, ending on the
-    // ordinary catch-all boundary (decode simply runs out after the tail filler) -- every OTHER
+    // ordinary catch-all boundary (decode simply runs out after the tail filler): every OTHER
     // `seg_write_edge_eligible` term holds (V86, no CS/SS, no call-out write, plain-fallthrough
     // terminal) except `dirty_segments.count_ones() == 1`.
     let mut code = filler();
@@ -501,7 +501,7 @@ fn a_two_segment_write_block_still_publishes_no_successor() {
 // to plain `merge_chain` is invisible to the rest of the suite; this proves the fold, not the cut.
 // =================================================================================================
 
-/// `mov ax, fs` -- `0x8C /4`, register form. Pins FS's SELECTOR (`selector_segment`, part of
+/// `mov ax, fs`: `0x8C /4`, register form. Pins FS's SELECTOR (`selector_segment`, part of
 /// `pinned_segments`) without addressing memory through it, so it is exactly two bytes like every
 /// other slot here and needs no segment-override prefix.
 const MOV_AX_FS: [u8; 2] = [0x8c, 0xe0];
@@ -510,7 +510,7 @@ const MOV_AX_FS: [u8; 2] = [0x8c, 0xe0];
 fn a_chain_widen_folds_through_a_dirty_predecessor_instead_of_cutting_it() {
     // A (writes DS) -> B (reads DS) -> C (pins FS), each compiled and installed in its own pass so
     // the walk cannot fuse two of them into one block. Installing C widens B's OWN chain
-    // requirement to include FS -- a segment B's compile-time snapshot never claimed -- and that
+    // requirement to include FS, a segment B's compile-time snapshot never claimed, and that
     // widen must propagate backward across the A -> B edge through `seg_write_merge`, not the
     // ordinary `merge_chain` L9's own design pass reached for and got wrong (B2).
     let mut code = filler();
@@ -547,8 +547,8 @@ fn a_chain_widen_folds_through_a_dirty_predecessor_instead_of_cutting_it() {
     let block_a = install_at(&mut cpu, ENTRY);
     assert!(!block_a.is_segment_write_block());
 
-    // B: three slots, compiled with DS = TARGET_SELECTOR live so it claims exactly that selector
-    // -- installing it binds A -> B (unrelated to the widen this fixture is about).
+    // B: three slots, compiled with DS = TARGET_SELECTOR live so it claims exactly that selector:
+    // installing it binds A -> B (unrelated to the widen this fixture is about).
     for i in 0..3u32 {
         let linear = b_linear + 2 * i;
         cpu.set_eip(linear);
@@ -564,7 +564,7 @@ fn a_chain_widen_folds_through_a_dirty_predecessor_instead_of_cutting_it() {
         .1;
 
     // C: three slots. Installing it binds B -> C through the ORDINARY (non-dirty) merge, and
-    // because C pins FS -- which B's own compile-time snapshot never touched -- that admission
+    // because C pins FS, which B's own compile-time snapshot never touched, that admission
     // WIDENS B's chain requirement to include FS. `widen_chain_requirement` then walks B's
     // inbound edges, finds A (a dirty, non-far predecessor), and must re-fold A's requirement
     // through `seg_write_merge`, not cut the edge.
@@ -624,7 +624,7 @@ fn a_write_only_segment_never_gates_reentry_into_its_own_source_block() {
 
     // Re-enter A STANDALONE (not chained into, just a plain top-level dispatcher entry) with a
     // live DS that agrees with NEITHER A's original compile-time DS (0, from `stage`) NOR B's
-    // frozen requirement (`TARGET_SELECTOR`). A never READS DS -- it only overwrites it -- so
+    // frozen requirement (`TARGET_SELECTOR`). A never READS DS. It only overwrites it, so
     // this must have no bearing on whether A can be entered at all.
     //
     // If `seg_write_merge` OR'd the written segment into `used` (the reverted shape N3 removes),
@@ -661,7 +661,7 @@ fn a_write_only_segment_never_gates_reentry_into_its_own_source_block() {
         "the written-but-unread segment must not gate A's own entry"
     );
     // And the chain into B still works off the write A performs during this very run, exactly as
-    // fixture 1 already covers -- confirmed here as a sanity check that this run actually took
+    // fixture 1 already covers, confirmed here as a sanity check that this run actually took
     // the native path rather than silently falling through to the interpreter for some other
     // reason.
     assert_eq!(
@@ -678,7 +678,7 @@ fn a_write_only_segment_never_gates_reentry_into_its_own_source_block() {
 // =================================================================================================
 
 /// `mov fs,cx` beside `mov ds,ax` in the SAME V86 block, CX held at FS's own already-current
-/// selector so the call-out is a plain same-record reload -- resumable under R2's `u8::MAX`
+/// selector so the call-out is a plain same-record reload, resumable under R2's `u8::MAX`
 /// default regardless of the mask, which isolates this fixture to the property under test
 /// (`callout_segment_writes` / `seg_write_edge_eligible`) rather than conflating it with R2's mask
 /// width.

@@ -7,8 +7,8 @@
 //!
 //! Two failure classes are worth fixtures, and they are not the same class:
 //!
-//! 1. The two arms disagree about what the guest did. Covered by running whole programs — a
-//!    self-patching loop, a REP string move, a page-boundary break — through both arms and
+//! 1. The two arms disagree about what the guest did. Covered by running whole programs (a
+//!    self-patching loop, a REP string move, a page-boundary break) through both arms and
 //!    comparing architectural state, memory AND the break counters that say WHERE each run
 //!    ended.
 //! 2. A pack outlives the line it describes. That one is silent: the screens would pass on a
@@ -150,7 +150,7 @@ fn assert_arms_agree(name: &str, code: &[u8], origin: u32, mem_len: usize) -> Pe
 
 /// A self-patching loop: address 0x10 is decoded and cached as `INC AX`, the store at 0x11
 /// narrow-kills that very line, and the branch back re-decodes it as the patched `INC CX`. The
-/// shape the slice has to survive — a live pack whose line dies under it — driven by a real
+/// shape the slice has to survive: a live pack whose line dies under it, driven by a real
 /// guest write rather than by calling the invalidator.
 const SELF_PATCHING_LOOP: [u8; 0x1c] = [
     0xb9, 0x03, 0x00, // 0x00 MOV CX, 3
@@ -344,7 +344,7 @@ fn narrow_smc_kill_retires_the_packed_entry() {
 }
 
 /// The other in-place retirement: a different key landing on the same slot. `put` republishes
-/// both arrays from one value, so the displaced key must miss in the pack as well — and the new
+/// both arrays from one value, so the displaced key must miss in the pack as well, and the new
 /// key's hotness must start over, which is the field `put` used to reset on the line.
 #[test]
 fn eviction_republishes_the_packed_entry() {
@@ -410,7 +410,7 @@ fn wholesale_invalidation_retires_every_packed_entry() {
 }
 
 /// The hit condition itself, field by field. A pack that ignored the tag or the D bit would serve
-/// one key's screens for another's — a colliding linear address and a mode change are the two
+/// one key's screens for another's: a colliding linear address and a mode change are the two
 /// ways that happens in practice.
 #[test]
 fn packed_hit_condition_screens_tag_and_d_bit() {
@@ -549,7 +549,7 @@ fn two_arms_agree_on_the_break_probe_bit() {
 
 /// The counter that says the deferred line fetch never misses is only worth reading if it CAN
 /// report a miss. Nothing in a passing run exercises the increment or its snapshot copy, so a
-/// mistyped field in `stall_snapshot` would make the counter report zero forever — which is
+/// mistyped field in `stall_snapshot` would make the counter report zero forever, which is
 /// exactly the reading the whole staleness argument leans on. This drives the plumbing directly.
 #[test]
 fn the_late_view_miss_counter_reaches_the_snapshot() {

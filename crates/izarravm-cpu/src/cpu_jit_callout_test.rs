@@ -5,9 +5,9 @@
 //!
 //! Two layers, deliberately separable so a reviewer can refute either claim on its own:
 //!
-//! * the HELPER, driven directly against a CPU and a device bus -- the status encoding, the
+//! * the HELPER, driven directly against a CPU and a device bus: the status encoding, the
 //!   exact charge, and the zero-partial-effects claim on the abnormal returns;
-//! * the EMITTED SLOT, run mid-block against the interpreter -- registers, lazy flags, EFLAGS,
+//! * the EMITTED SLOT, run mid-block against the interpreter: registers, lazy flags, EFLAGS,
 //!   core clocks and bus clocks, plus the two exit shapes.
 //!
 //! The tested opcode is MID-BLOCK in every emitted case. An opcode at a block's entry slot parks
@@ -126,7 +126,7 @@ fn the_helper_hands_the_device_the_running_clock_total_not_the_block_entry_total
 #[test]
 fn a_denied_port_is_abnormal_with_zero_partial_effects() {
     // CPL 3 with IOPL 0 sends `check_io_permission` to the TSS bitmap, and a zero TSS limit
-    // denies every port -- the `#GP(0)` producer, the first member of the abnormal set.
+    // denies every port: the `#GP(0)` producer, the first member of the abnormal set.
     let mut cpu = flat_cpu();
     cpu.registers
         .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x0b, 0xfb));
@@ -158,7 +158,7 @@ fn a_denied_port_is_abnormal_with_zero_partial_effects() {
 #[test]
 fn an_unsupported_port_is_abnormal_with_zero_partial_effects() {
     // The second abnormal producer: every device declined, so `read_io` errors and no device
-    // observed the access -- which is what makes the interpreter's retry side-effect free.
+    // observed the access, which is what makes the interpreter's retry side-effect free.
     let mut cpu = flat_cpu();
     cpu.registers.set_edx(u32::from(PORT));
     cpu.registers.set_eax(0xdead_beef);
@@ -284,7 +284,7 @@ fn slot_block_with(
 
 #[test]
 fn call_out_matches_the_interpreter_mid_block() {
-    // Lazy reads so the bus asks for no step break and the block runs all three slots -- the
+    // Lazy reads so the bus asks for no step break and the block runs all three slots: the
     // shape the whole slice exists for. `io_read_value` is non-zero so a reload that dropped AL
     // is visible; a bus that always returned 0 would pass against a broken reload.
     let (mut fixture, mut interpreter, mut interpreter_bus) = slot_block(|bus| {
@@ -362,7 +362,7 @@ fn accounted_direct_result_retains_the_real_native_block_charge() {
 #[test]
 fn a_step_breaking_port_ends_the_native_run_after_the_call_out() {
     // A non-lazy read touches time-dependent device state, so the run must end at the boundary
-    // AFTER the IN -- the same boundary `run_straight_line`'s post-instruction check produces.
+    // AFTER the IN: the same boundary `run_straight_line`'s post-instruction check produces.
     // The third slot stays for the interpreter.
     let (mut fixture, mut interpreter, mut interpreter_bus) = slot_block(|bus| {
         bus.io_read_value = Some(0x5a);
@@ -546,7 +546,7 @@ const PAGED_TABLE: u32 = 0x3000;
 
 /// A CPU whose `check_io_permission` MUST consult the TSS bitmap, with paging on so that consult
 /// takes a real page walk. Low memory is identity-mapped with the ACCESSED BITS CLEAR, so the
-/// first walk through any entry writes one -- which is the hazard, and the thing the native path
+/// first walk through any entry writes one, which is the hazard, and the thing the native path
 /// must be shown not to do.
 ///
 /// `deny` picks whether the bitmap refuses `PORT`. Either way the CONSULT is the subject.
@@ -660,7 +660,7 @@ fn a_permission_checked_port_is_refused_before_the_tss_probe_can_touch_memory() 
 fn the_interpreter_still_does_the_tss_probe_the_call_out_refused() {
     // What stops the test above from being vacuous: from the SAME state the interpreter really
     // does walk the TSS, set accessed bits and charge for it. The hazard is live, and refusing it
-    // costs the guest only the call-out -- the instruction still executes, completely, one
+    // costs the guest only the call-out: the instruction still executes, completely, one
     // boundary later.
     for deny in [false, true] {
         let (mut cpu, mut bus) = paged_ring3_io_cpu(deny);
@@ -669,7 +669,7 @@ fn the_interpreter_still_does_the_tss_probe_the_call_out_refused() {
         bus.memory[entry as usize + 1] = 0xf4;
         cpu.set_eip(entry);
 
-        // NOT unwrapped: with `deny` the #GP has no IDT to land in and nests. Irrelevant here --
+        // NOT unwrapped: with `deny` the #GP has no IDT to land in and nests. Irrelevant here:
         // the page walk that this test is about has already happened by then, which is the point.
         let outcome = cpu.cycle(&mut bus);
 
@@ -679,7 +679,7 @@ fn the_interpreter_still_does_the_tss_probe_the_call_out_refused() {
         );
         if deny {
             // The fault has no IDT to land in, so this fixture stops before `finish_instruction`
-            // can charge; the probe -- the subject -- already ran, which the walk above pins.
+            // can charge; the probe (the subject) already ran, which the walk above pins.
             assert_eq!(
                 cpu.registers.eax(),
                 0xdead_beef,
@@ -740,7 +740,7 @@ const SPLIT_BITMAP_PAGE: u32 = 3;
 /// look at.
 ///
 /// This is not fixture convenience, it is the mechanism: the interpreted instruction is what
-/// FILLS the two TLB entries phase P then requires, which is the design's self-healing claim --
+/// FILLS the two TLB entries phase P then requires, which is the design's self-healing claim:
 /// a miss costs one interpreted IN and the next one is served natively. Building the entries by
 /// hand would let the fixture pass against a phase P that read the wrong linear.
 ///
@@ -751,7 +751,7 @@ const SPLIT_BITMAP_PAGE: u32 = 3;
 /// ALREADY-marked table, which retires the whole ring (both TLB generations) on EVERY one of
 /// them, not just the first. Without a throwaway pass, `entry`'s page (walked first, to fetch
 /// the `IN` opcode) is inserted before io_base's walk retires, and io_base's own entry is then
-/// inserted before bitmap's walk retires it AGAIN -- so entry, io_base and bitmap each end up
+/// inserted before bitmap's walk retires it AGAIN, so entry, io_base and bitmap each end up
 /// under a DIFFERENT generation, and `port_read_al_dx_for_test`'s fast path, which needs
 /// io_base's and bitmap's entries live SIMULTANEOUSLY, cannot be served even by the unbroken
 /// fixture. The throwaway pass settles every accessed bit these three pages will ever need
@@ -771,7 +771,7 @@ fn warm_the_tss_tlb(cpu: &mut CpuGsw, bus: &mut TestBus) {
     cpu.set_eip(entry);
     cpu.cycle(bus).expect("the warming IN must retire");
     // The throwaway pass above already settled every accessed bit these three pages need, so
-    // THIS pass is expected to take no walk-triggered store at all -- and, since the throwaway
+    // THIS pass is expected to take no walk-triggered store at all, and, since the throwaway
     // pass also already inserted all three TLB entries under the ring's one unchanged
     // generation, this pass is typically served entirely from the TLB, with no walk (not even a
     // read) at all. A write here would mean the settling did not happen and the ring retired
@@ -928,7 +928,7 @@ fn the_bitmap_arm_charges_exactly_what_the_interpreter_charges() {
     // The DEVICE-VISIBLE TIMESTAMP, which the cycle list cannot see. 0x3DA is answered by the
     // lazy status-port path, whose `predicted_beam` is a pure function of the clock the CPU hands
     // it, so a helper that passed a different `now` would return a different retrace bit from the
-    // same guest state -- a guest-visible divergence with an identical charge.
+    // same guest state: a guest-visible divergence with an identical charge.
     let mut timestamps: Vec<Option<u64>> = Vec::new();
     for leg in 0..4 {
         bus.trace = BusTrace::default();
@@ -984,8 +984,8 @@ fn the_bitmap_arm_charges_exactly_what_the_interpreter_charges() {
 
 #[test]
 fn every_phase_p_lane_refuses_with_zero_partial_effects() {
-    // One case per refusal lane. Each starts from a state that would otherwise SERVE -- the warm
-    // fixture above -- and breaks exactly one premise, so a lane that stopped firing would show up
+    // One case per refusal lane. Each starts from a state that would otherwise SERVE (the warm
+    // fixture above) and breaks exactly one premise, so a lane that stopped firing would show up
     // as a SERVED port rather than as a silently different refusal (`fixtures-that-cannot-fail`).
     #[allow(clippy::type_complexity)]
     let lanes: Vec<(&str, u16, u32, Box<dyn Fn(&mut CpuGsw, &mut TestBus)>)> = vec![
@@ -1020,7 +1020,7 @@ fn every_phase_p_lane_refuses_with_zero_partial_effects() {
             Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tlb.invalidate(IO_BASE_PAGE)),
         ),
         (
-            // P4a: MISALIGNED io_base word. `should_split` rejects it, so the peek declines --
+            // P4a: MISALIGNED io_base word. `should_split` rejects it, so the peek declines:
             // the kill condition the design's section 6.0 falsification was written against.
             "P4 misaligned io_base word",
             TSS_IO_MAP_OFFSET,
@@ -1037,7 +1037,7 @@ fn every_phase_p_lane_refuses_with_zero_partial_effects() {
             }),
         ),
         (
-            // P5: the bitmap byte is past the limit -- the interpreter's first `#GP(0)`.
+            // P5: the bitmap byte is past the limit; the interpreter's first `#GP(0)`.
             "P5 bitmap byte past the TSS limit",
             TSS_IO_MAP_OFFSET,
             0x1000,
@@ -1061,7 +1061,7 @@ fn every_phase_p_lane_refuses_with_zero_partial_effects() {
             }),
         ),
         (
-            // P9: the guest TRAPS this port -- the interpreter's other `#GP(0)`. The byte is
+            // P9: the guest TRAPS this port; the interpreter's other `#GP(0)`. The byte is
             // flipped after warming so the warm pass itself stays clean.
             "P9 bitmap bit set",
             TSS_IO_MAP_OFFSET,
@@ -1201,7 +1201,7 @@ fn a_word_size_in_al_dx_joins_the_block_instead_of_ending_it() {
     // arm: on its own it buys a spill, a call, a reload and a side exit where a free barrier used
     // to be (classify.rs records the measurement).
     //
-    // `66 EC` mid-block, never at entry -- an opcode at a block's entry slot parks the block on
+    // `66 EC` mid-block, never at entry: an opcode at a block's entry slot parks the block on
     // the interpreter and certifies nothing.
     let mut code = vec![0x89, 0xf6];
     code.extend_from_slice(&[0x66, 0xec]);
@@ -1235,7 +1235,7 @@ fn a_word_size_in_al_dx_joins_the_block_instead_of_ending_it() {
 fn a_call_out_block_is_not_entered_at_all_in_the_privileged_port_state() {
     // The DISPATCH gate, and the one that decides cost. The helper's refusal is correct but it is
     // reached only after the whole-set spill, the scratch frame, the indirect call and the
-    // whole-set reload -- and then the run still ends and the interpreter still executes the
+    // whole-set reload, and then the run still ends and the interpreter still executes the
     // instruction. Paying all of that to arrive where a barrier would have arrived for free is
     // strictly worse than the pre-slice behaviour, on every execution, for a paged V86 or
     // CPL>IOPL guest. `run_direct_block` therefore refuses to ENTER such a block, which returns
@@ -1303,7 +1303,7 @@ fn a_call_out_block_is_not_entered_at_all_in_the_privileged_port_state() {
 #[test]
 fn a_call_out_block_runs_again_once_the_privilege_state_clears() {
     // The dispatch gate is a TRANSIENT refusal, not a retirement: a V86 task returns to ring 0
-    // and back, and the block is perfectly good -- it is the privilege level that is wrong. Pinned
+    // and back, and the block is perfectly good: it is the privilege level that is wrong. Pinned
     // because retiring here would recompile the block on every privilege transition.
     let (mut fixture, _, _) = slot_block_with(
         |bus| {
@@ -1331,7 +1331,7 @@ fn a_call_out_block_runs_again_once_the_privilege_state_clears() {
     );
 
     // IOPL 3 lets a CPL-3 task reach ports without the bitmap, which is the interpreter's own
-    // early-return condition -- and it is checked BEFORE the governor, so a `Denied` class does
+    // early-return condition, and it is checked BEFORE the governor, so a `Denied` class does
     // not follow the block into a privilege state the gate does not govern.
     rearm_governor_block(&mut fixture);
     fixture.cpu.registers.eflags |= 3 << 12;
@@ -1413,7 +1413,7 @@ fn the_helper_folds_the_chains_float_clocks_into_the_device_timestamp() {
 // The MEMORY class helpers, driven directly.
 //
 // The emitted-slot cover for these lives in the differential matrix; this section is about the
-// HELPER's own contract -- the charge, and the fail-closed pre-check clause by clause. Every
+// HELPER's own contract: the charge, and the fail-closed pre-check clause by clause. Every
 // refusal row asserts zero partial effects on all four channels the helper could touch: the
 // register file, guest RAM, the bus trace and the clock counter.
 // ---------------------------------------------------------------------------------------------
@@ -1437,7 +1437,7 @@ const FRAME_SEED: [u32; 8] = [
 ///
 /// Residency is established through real guest accesses rather than by populating the map
 /// directly, because `lookup_access` compares the entry's mapping epoch against
-/// `data_write_pages.mapping_epoch()` -- an entry installed behind the DirectPageCache's back is
+/// `data_write_pages.mapping_epoch()`: an entry installed behind the DirectPageCache's back is
 /// not servable, and the fixture would then measure the refusal instead of the mechanism. This is
 /// also exactly how the map is populated in production: the interpreter touches the stack once and
 /// the next call-out finds it there.
@@ -1492,7 +1492,7 @@ fn assert_no_partial_effects(
 
 #[test]
 fn the_pushad_helper_moves_exactly_what_the_interpreters_own_pushad_moves() {
-    // The oracle is `push_all_gpr` itself -- the SAME function the interpreter's 0x60 arm calls,
+    // The oracle is `push_all_gpr` itself: the SAME function the interpreter's 0x60 arm calls,
     // driven on a twin from the same state. That is the point of factoring it out of the opcode
     // arm: the claim "the call-out does what the interpreter does" is a claim about one body with
     // two callers, not about two implementations agreeing.
@@ -1606,7 +1606,7 @@ fn a_pushad_frame_that_is_not_resident_is_refused_with_zero_partial_effects() {
 fn a_pushad_frame_that_hits_watched_code_is_refused_with_zero_partial_effects() {
     // THE hazard. A push landing on watched code would reach `note_code_write_hit` with a compiled
     // block live on the stack, which is the situation `note_code_write_inner`'s proof rules out.
-    // Here the watch is a DECODED LINE rather than a compiled block -- `code_write_watched` is the
+    // Here the watch is a DECODED LINE rather than a compiled block: `code_write_watched` is the
     // disjunction of the two, so either establishes it, and a decode line needs no block cache.
     let (mut cpu, mut bus) = resident_stack_cpu();
     // Decode an instruction inside the frame the PUSHAD is about to write, so
@@ -1706,7 +1706,7 @@ fn callout_attribution_splits_every_port_outcome() {
         assert_eq!(callout_helper_counts(&snapshot, "in_al_dx"), expected);
         assert_eq!(callout_helper_counts(&snapshot, "pushad").attempts, 0);
         assert_eq!(callout_helper_counts(&snapshot, "popad").attempts, 0);
-        // The fixture drives the port helper alone, so the new row is present and silent -- which
+        // The fixture drives the port helper alone, so the new row is present and silent, which
         // is the claim worth making: one index for the whole family, and it is not absorbing the
         // port's calls.
         assert_eq!(
@@ -1714,7 +1714,7 @@ fn callout_attribution_splits_every_port_outcome() {
             0
         );
         // The gp2 in-imm8 callout design's row: present and silent, for the same reason
-        // `interpret_one`'s is -- this fixture drives `0xEC` alone.
+        // `interpret_one`'s is: this fixture drives `0xEC` alone.
         assert_eq!(callout_helper_counts(&snapshot, "in_al_imm8").attempts, 0);
         assert_eq!(snapshot.ports.len(), 1);
         assert_eq!(snapshot.ports[0].port, PORT);
@@ -1770,8 +1770,8 @@ fn callout_attribution_orders_ports_and_survives_unrelated_resets() {
 #[cfg(feature = "direct-callout-attribution")]
 #[test]
 fn callout_attribution_closes_the_port_table_over_the_write_helper_too() {
-    // THE REGRESSION. `CallOutAttribution::note` routes all THREE port helpers -- `0xEC`,
-    // `0xE4` and (since the gp2 `0xE6` slice) `0xE6` -- into the one shared per-port table,
+    // THE REGRESSION. `CallOutAttribution::note` routes all THREE port helpers (`0xEC`,
+    // `0xE4` and (since the gp2 `0xE6` slice) `0xE6`) into the one shared per-port table,
     // but `snapshot`'s closure assertion summed only the two READ helper rows on the right
     // hand side. Any run that fired an `OUT imm8, AL` call-out with the instrument armed
     // therefore panicked at teardown with "port call-out ports did not close", the port
@@ -1976,12 +1976,12 @@ fn an_esp_wrap_pushad_is_refused_with_zero_partial_effects() {
 // ---------------------------------------------------------------------------------------------
 // The call-out admission governor (run.rs G2). Each transition of the state machine is driven
 // through `run_direct_block` on a real compiled block, and each one is asserted to CHANGE what
-// the next entry does -- a governor whose classifications never reached the gate would pass a
+// the next entry does: a governor whose classifications never reached the gate would pass a
 // test that only read the counters.
 // ---------------------------------------------------------------------------------------------
 
 /// A TSS placed above the fixture's stack, inside the fixture's zeroed RAM. `io_base` reads 0 and
-/// every bitmap byte reads 0, so the bitmap PERMITS `PORT` -- which is what lets a CPL-3 / IOPL-0
+/// every bitmap byte reads 0, so the bitmap PERMITS `PORT`, which is what lets a CPL-3 / IOPL-0
 /// block reach a real serve instead of the `#GP` the zero-limit TSS produces.
 const GOVERNOR_TSS_BASE: u32 = 0x4800;
 const GOVERNOR_TSS_LIMIT: u32 = 0x200;
@@ -1989,7 +1989,7 @@ const GOVERNOR_TSS_LIMIT: u32 = 0x200;
 /// `slot_block`'s block, generalised over its instruction list and compiled in the state G2
 /// governs. `insns` is the exact set primed into the decode cache; a `HLT` is appended as the
 /// terminator and left unprimed. `head_instructions` is how many of them the compile walk is
-/// expected to take -- fewer than all of them when a terminal instruction ends the head block and
+/// expected to take: fewer than all of them when a terminal instruction ends the head block and
 /// the rest are a successor the caller compiles separately.
 fn governor_block(
     insns: &[&[u8]],
@@ -2203,7 +2203,7 @@ fn an_io_touching_trial_leaves_the_block_refused_at_head() {
 #[test]
 fn an_abnormal_trial_denies_the_block() {
     // A permanently trapped port: the zero-limit TSS denies every one, so the helper refuses and
-    // the run ends at the instruction. The trial bounds that cost to once per epoch -- exactly
+    // the run ends at the instruction. The trial bounds that cost to once per epoch: exactly
     // the residual Q3 item 4 records as an accepted price.
     let mut fixture = governor_block(
         &[&[0x89, 0xf6], &[0xec], &[0x89, 0xff]],
@@ -2264,7 +2264,7 @@ fn a_trial_that_never_reaches_its_call_out_gives_up_after_the_cap() {
 
     for entry in 1..=u64::from(jit::direct::MAX_UNTRIED_TRIALS) {
         rearm_governor_block(&mut fixture);
-        // EDX:EAX / 0 -- the guard refuses and the run ends AT the divide.
+        // EDX:EAX / 0: the guard refuses and the run ends AT the divide.
         fixture.cpu.registers.set_ecx(0);
         assert!(
             fixture
@@ -2421,7 +2421,7 @@ fn deny_the_port_in_the_bitmap(fixture: &mut Fixture) {
 #[test]
 fn a_lazy_block_that_later_meets_a_denied_port_is_demoted_once() {
     // The ONE post-trial transition. Without it, a block classified `Lazy` whose port is later
-    // revoked -- a V86 monitor rewriting the bitmap under a running task -- pays
+    // revoked (a V86 monitor rewriting the bitmap under a running task) pays
     // spill/call/refuse/side-exit on every execution of that IN, unbounded in count. With it the
     // residual is one abnormal per block.
     let mut fixture = governed_slot_block(|bus| {
@@ -2436,8 +2436,8 @@ fn a_lazy_block_that_later_meets_a_denied_port_is_demoted_once() {
     );
     assert_eq!(admission(&fixture), jit::direct::CallOutAdmission::Lazy);
 
-    // The monitor revokes the port. The next entry is NOT a trial -- the block is already
-    // classified -- so this is the demotion arm and nothing else.
+    // The monitor revokes the port. The next entry is NOT a trial (the block is already
+    // classified) so this is the demotion arm and nothing else.
     deny_the_port_in_the_bitmap(&mut fixture);
     let trials = fixture.cpu.direct_stall_snapshot().callout_governor_trials;
     rearm_governor_block(&mut fixture);
@@ -2489,7 +2489,7 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
     //
     // The link is warmed with IOPL 3 first. That is not scaffolding: at IOPL 3 a CPL-3 task
     // reaches ports without the bitmap, G2's privilege predicate is false, and the governor never
-    // sees the entry -- so the warm pass both binds the edge and establishes that this block DOES
+    // sees the entry, so the warm pass both binds the edge and establishes that this block DOES
     // chain when nothing clamps it. Without that leg a broken clamp and an unbound link look the
     // same.
     let mut fixture = governor_block(
@@ -2509,7 +2509,7 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
         },
         |_| {},
     );
-    // `governor_block` compiled and installed block A only -- the walk stops at the `jz`. Install
+    // `governor_block` compiled and installed block A only: the walk stops at the `jz`. Install
     // B so the fall-through edge has somewhere to resolve to.
     // 2 + 1 + 2 + 2 bytes of block A. The `jz +6` measures from the end of the branch, so its
     // TAKEN target is the HLT past block B and its fall-through is block B's first byte. Block B
@@ -2617,7 +2617,7 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
 }
 
 // =================================================================================================
-// `0xE4` IN AL,imm8 -- `PortReadAlImm8`, the lean sibling of `PortReadAlDx` above.
+// `0xE4` IN AL,imm8: `PortReadAlImm8`, the lean sibling of `PortReadAlDx` above.
 //
 // gp2 in-imm8 callout design rev 3,
 // §8.2: the HELPER's contract lives beside `PortReadAlDx`'s equivalent fixtures here; the KNOB and
@@ -2641,7 +2641,7 @@ fn a_trial_entry_runs_one_block_where_a_classified_entry_chains() {
 const IMM8_PORT: u16 = 0x40;
 
 /// Resets `IZARRAVM_DIRECT_IN_IMM8_CALLOUT`'s thread-local override to the ambient reading when
-/// dropped -- including on unwind, which is what closes the m3-6 gap a plain trailing reset left
+/// dropped, including on unwind, which is what closes the m3-6 gap a plain trailing reset left
 /// open.
 #[must_use]
 struct InImm8CalloutGuard;
@@ -2659,7 +2659,7 @@ fn select_in_imm8_callout(enabled: bool) -> InImm8CalloutGuard {
 }
 
 /// Build the three-slot block `mov esi,esi` / `in al,PORT` / `mov edi,edi`, with the call-out
-/// MID-BLOCK -- `slot_block_with`'s shape, for `0xE4` instead of `0xEC`. Requires the knob ON.
+/// MID-BLOCK, `slot_block_with`'s shape, for `0xE4` instead of `0xEC`. Requires the knob ON.
 ///
 /// The guard is scoped to THIS function, not held by the caller: `classify` is consulted only
 /// during the `compile` call below, so the arm only has to be live for that long, and the caller's
@@ -2828,7 +2828,7 @@ fn imm8_v86_call_out_on_a_cold_tlb_is_refused_before_the_tss_probe() {
     // The TLB-miss refusal lane, isolated exactly as `v86_call_out_on_a_cold_tlb_is_refused_
     // before_the_tss_probe` isolates it for `0xEC`: IOPL 3 makes the `CPL > IOPL` half false, so
     // only `is_v86_mode()` can send the helper down the TSS-bitmap arm, and a cold TLB refuses it
-    // there -- the interpreter would page-walk, which this design will not do from inside a block.
+    // there: the interpreter would page-walk, which this design will not do from inside a block.
     let (mut cpu, mut bus) = paged_ring3_io_cpu(false);
     cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
     assert_eq!(cpu.current_privilege_level(), 3);
@@ -3001,19 +3001,19 @@ fn imm8_bus_read_io_argument_fidelity() {
 
 /// The mutant/pendency table's "pendency / mid-block visibility" gate, rev 3 §8.1: "a
 /// `brk_interrupt`/pendency fixture shows a divergence from the interpreted path, proving the real
-/// PIT's read-only property is load-bearing" -- REBUILT per ROUND-3 review M3-1.
+/// PIT's read-only property is load-bearing", REBUILT per ROUND-3 review M3-1.
 ///
 /// The first version of this fixture ran only the HELPER, in isolation, and asserted that nothing
 /// about its own return value moved when the device wrongly armed `pending_irq`. That is a gate
 /// that CANNOT GO RED if the safety proof it stands behind were violated: it never exercised the
-/// interpreted path, so it had nothing to compare against and nothing that could diverge --
+/// interpreted path, so it had nothing to compare against and nothing that could diverge:
 /// `[[gates-that-cannot-fail-are-systemic]]`.
 ///
 /// This version runs the SAME guest instruction, from the SAME seeded state, against the SAME
-/// wrongly-arming device, through BOTH paths -- the native helper and `cycle()` -- and asserts they
+/// wrongly-arming device, through BOTH paths (the native helper and `cycle()`) and asserts they
 /// AGREE. `run.rs:892`'s `can_take_interrupt` never consults the bus, and `requires_step_break()`
 /// (`run.rs:933`, `TestBus`'s own impl reads `self.io_touched` alone) is false on a lazy read for
-/// the interpreted path too, so agreement is the EXPECTED result -- a STRONGER fact than the
+/// the interpreted path too, so agreement is the EXPECTED result: a STRONGER fact than the
 /// original design row asked for: even against a device that violates the pure-peek assumption,
 /// the two paths reach the same guest state and the same block-continuation decision, because
 /// there is nowhere in EITHER path that a wrongly-armed interrupt could make them diverge. The real
@@ -3037,7 +3037,7 @@ fn imm8_the_call_out_mechanism_agrees_with_the_interpreter_against_a_wrongly_arm
         let native_step_break = status >> jit::direct::STATUS_STEP_BREAK_BIT != 0;
 
         // The interpreted leg: the SAME instruction, from the SAME seed, against the SAME
-        // wrongly-arming device shape, through the real per-instruction path -- the oracle this
+        // wrongly-arming device shape, through the real per-instruction path: the oracle this
         // fixture was missing.
         let mut interp = flat_cpu();
         interp.registers.set_eax(0xdead_beef);
@@ -3054,7 +3054,7 @@ fn imm8_the_call_out_mechanism_agrees_with_the_interpreter_against_a_wrongly_arm
 
         // AGREEMENT, not blindness: the whole claim this fixture stands behind. Charge parity
         // between the two paths is `imm8_the_helper_charges_exactly_what_the_interpreter_charges_
-        // and_reports_the_step_break`'s claim, not this one -- `native.elapsed_clocks` reads 0 by
+        // and_reports_the_step_break`'s claim, not this one: `native.elapsed_clocks` reads 0 by
         // construction here (the helper charges nothing itself; the caller folds `status`'s raw
         // clocks into the block's lane), so it is not a fixture that could see this row's hazard
         // and is deliberately not asserted again here.
@@ -3200,18 +3200,18 @@ fn imm8_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_eff
 /// `CallOutHelper` exhaustiveness (mutant table gate 11): `helper_offset`, `probes_io_permission`,
 /// `moves_a_stack_frame`, `interprets_one`, `carries_a_cell` and `republishes_flags` are every one
 /// an EXHAUSTIVE `match` over `CallOutHelper` with no catch-all arm. The exhaustiveness itself is a
-/// property the Rust compiler enforces at BUILD time -- removing an arm from any of the six is a
-/// compile error, which no runtime assertion can strengthen -- but ROUND-3 review m3-4 is right
+/// property the Rust compiler enforces at BUILD time: removing an arm from any of the six is a
+/// compile error, which no runtime assertion can strengthen, but ROUND-3 review m3-4 is right
 /// that an EMPTY test body is this campaign's own `gates-that-cannot-fail-are-systemic` shape: it
 /// passes on any build that compiles, which says nothing about `PortReadAlImm8` in particular. This
 /// body gives it something that CAN fail: it exercises `helper_offset` (via the test-only
 /// `helper_offset_for_test`, since the real function is module-private) over every variant and
-/// checks the ONE fact the whole call-out ABI depends on -- each helper CLASS loads its function
+/// checks the ONE fact the whole call-out ABI depends on: each helper CLASS loads its function
 /// pointer from a DISTINCT, in-range `CallOutTable` field, so `PortReadAlImm8` cannot silently
 /// alias `PortReadAlDx`'s slot (or any other's) and jump to the wrong helper.
 ///
 /// MUTATION that turns this red: change `PortReadAlImm8`'s arm in `helper_offset` from
-/// `offset_of!(CallOutTable, port_read_al_imm8)` to `offset_of!(CallOutTable, port_read_al_dx)` --
+/// `offset_of!(CallOutTable, port_read_al_imm8)` to `offset_of!(CallOutTable, port_read_al_dx)`:
 /// the two offsets collapse to the same value and the distinctness assertion fails.
 #[test]
 fn call_out_helper_match_exhaustiveness_is_a_compile_time_property() {
@@ -3267,15 +3267,15 @@ fn call_out_helper_match_exhaustiveness_is_a_compile_time_property() {
 }
 
 // =================================================================================================
-// `0xE6` OUT imm8,AL -- `PortWriteAlImm8`, the WRITE twin of `PortReadAlImm8` above, behind
+// `0xE6` OUT imm8,AL: `PortWriteAlImm8`, the WRITE twin of `PortReadAlImm8` above, behind
 // `IZARRAVM_OUT_IMM8_ROWS` (Option B of the gp2 OUT 0xE6 research).
 //
 // Placement follows the `0xE4` slice: the HELPER's contract lives here beside its read siblings;
 // the KNOB and the `classify` arm are covered in `cpu_jit_out_imm8_callout_test.rs`.
 //
 // THE ONE FACT THESE FIXTURES EXIST FOR. A port WRITE can make an interrupt newly deliverable from
-// inside `write_io` -- `MachineBus`'s PIT arm calls `pic.request(0)` when a channel-0 control word
-// raises OUT -- which is the premise the whole call-out family's pendency proof denied ("no
+// inside `write_io`: `MachineBus`'s PIT arm calls `pic.request(0)` when a channel-0 control word
+// raises OUT, which is the premise the whole call-out family's pendency proof denied ("no
 // InterpretOne row writes a port; the call-outs that touch a port at all are both READS"). The
 // resolution is a step break reported UNCONDITIONALLY, not `bus.requires_step_break()`: on a
 // ring-0 protected-mode guest (gp2, DOS/4GW) `MachineBus::write_io` takes its `skip_io_touched`
@@ -3284,7 +3284,7 @@ fn call_out_helper_match_exhaustiveness_is_a_compile_time_property() {
 // is that claim, and `TestBus::lazy_io_writes` is the shape that lets it go red.
 // =================================================================================================
 
-/// The PIT control port -- gp2's own `0xE6` site, and the port whose write reaches
+/// The PIT control port, gp2's own `0xE6` site, and the port whose write reaches
 /// `pic.request(0)`. Distinct from `PORT` and `IMM8_PORT` so a fixture sharing state with the read
 /// suites would be visible.
 const OUT_IMM8_PORT: u16 = 0x43;
@@ -3422,7 +3422,7 @@ fn out_imm8_the_helper_charges_exactly_what_the_interpreter_charges() {
 }
 
 /// **THE UNCONDITIONAL BREAK.** With `lazy_io_writes` the bus models `MachineBus`'s
-/// `skip_io_touched` exemption -- the ring-0 protected-mode arm gp2 runs in, where a port write
+/// `skip_io_touched` exemption: the ring-0 protected-mode arm gp2 runs in, where a port write
 /// sets NOTHING and `requires_step_break()` stays false. The helper must report the step break
 /// anyway.
 ///
@@ -3506,7 +3506,7 @@ fn out_imm8_v86_call_out_on_a_cold_tlb_is_refused_before_the_tss_probe() {
     // The TLB-miss refusal lane, isolated exactly as the two IN helpers' equivalents isolate it:
     // IOPL 3 makes the `CPL > IOPL` half false, so only `is_v86_mode()` can send the helper down
     // the TSS-bitmap arm, and a cold TLB refuses it there rather than page-walking from inside a
-    // block. The gate is the READ helper's, verbatim -- a write that took a wider gate than 0xE4's
+    // block. The gate is the READ helper's, verbatim: a write that took a wider gate than 0xE4's
     // would admit a state the interpreter faults in.
     let (mut cpu, mut bus) = paged_ring3_io_cpu(false);
     cpu.registers.eflags = 0x202 | FLAG_VM | (3 << 12);
@@ -3603,8 +3603,8 @@ fn out_imm8_a_v86_port_is_served_natively_once_the_tss_pages_are_tlb_resident() 
 #[test]
 fn out_imm8_call_out_matches_the_interpreter_mid_block() {
     // The emitted-slot differential: the same guest bytes through the compiled block and through
-    // the block-free interpreter, from identical state. The block runs TWO slots -- the prefix and
-    // the call-out -- because the forced step break ends the native run at the boundary AFTER the
+    // the block-free interpreter, from identical state. The block runs TWO slots: the prefix and
+    // the call-out, because the forced step break ends the native run at the boundary AFTER the
     // OUT, so the interpreter twin is stepped twice to the same place.
     let (mut fixture, mut interpreter, mut interpreter_bus) =
         slot_block_out_imm8(OUT_IMM8_PORT as u8, |bus| {
@@ -3723,8 +3723,8 @@ fn out_imm8_an_irq_raised_inside_the_write_cannot_reach_a_later_slot_in_the_bloc
 /// question is whether the two roles deliver the vector at the SAME guest instruction, and the
 /// only way to ask it is to run the same guest through both and look.
 ///
-/// Both roles run `mov esi,esi` / `out 43h,al` / `inc edi` / `hlt` under `run_budgeted` -- the
-/// production driver, which is what owns the per-instruction interrupt check -- against a device
+/// Both roles run `mov esi,esi` / `out 43h,al` / `inc edi` / `hlt` under `run_budgeted` (the
+/// production driver, which is what owns the per-instruction interrupt check) against a device
 /// that raises IRQ0 from inside the write and does NOT set `io_touched`. Real mode with CS.D = 1
 /// (so the instruction decodes at Dword and is admitted) puts a usable IVT at zero: vector 0's
 /// entry is four zero bytes, address zero holds a `HLT`, so a delivered interrupt is visible as
@@ -3737,8 +3737,8 @@ fn out_imm8_an_irq_raised_inside_the_write_cannot_reach_a_later_slot_in_the_bloc
 ///
 /// WHAT IT MEASURED, recorded because it is the fact that corrected this slice's first draft:
 /// **neither role delivers before the tail.** EDI is 1 and `brk_interrupt` is 0 on both, because
-/// `run_budgeted_inner`'s run break reads `bus.requires_step_break()` -- false in the
-/// `skip_io_touched` regime this bus models -- and `can_take_interrupt` never consults the bus. So
+/// `run_budgeted_inner`'s run break reads `bus.requires_step_break()` (false in the
+/// `skip_io_touched` regime this bus models) and `can_take_interrupt` never consults the bus. So
 /// the guest runs `inc edi` with IRQ0 already raised, on the native path and on the interpreted
 /// path alike. That is the parity the design actually has, and the two explicit assertions at the
 /// end pin it so a future change on either side has to move both or fail.
@@ -3746,7 +3746,7 @@ fn out_imm8_an_irq_raised_inside_the_write_cannot_reach_a_later_slot_in_the_bloc
 /// Note what this fixture does NOT single out: with `DirectKind::is_terminal` stopping the walk
 /// at the OUT, the block-scoped property has two independent guards, and removing either one
 /// alone leaves this green. That is the design having belt and braces, not the fixture being
-/// weak -- the claim under test is parity, and parity is what is asserted.
+/// weak: the claim under test is parity, and parity is what is asserted.
 #[test]
 fn out_imm8_delivers_the_irq_at_the_same_guest_instruction_as_the_block_free_role() {
     /// Everything about a role's run that is guest-visible or device-visible.
@@ -3771,7 +3771,7 @@ fn out_imm8_delivers_the_irq_at_the_same_guest_instruction_as_the_block_free_rol
         // address zero holds the HLT a delivered interrupt lands on.
         memory[0] = 0xf4;
         // A leading NOP, and BOTH roles start on it. A native block is entered through the
-        // CONTINUATION path -- the second and later instructions of a run -- so a block sitting at
+        // CONTINUATION path (the second and later instructions of a run) so a block sitting at
         // the run's first instruction would never be entered and the native role would silently
         // interpret. The NOP is what makes the block at `ENTRY` a continuation.
         memory[(ENTRY - 1) as usize] = 0x90;
@@ -3891,7 +3891,7 @@ fn out_imm8_delivers_the_irq_at_the_same_guest_instruction_as_the_block_free_rol
     );
     // The measured answer, stated rather than left implicit in the equality above: BOTH roles run
     // the tail with the IRQ already raised. If a future change makes either path deliver at the
-    // boundary instead, these two go red and the doc above has to be rewritten with them -- which
+    // boundary instead, these two go red and the doc above has to be rewritten with them, which
     // is the point, because the first draft of this slice claimed the delivery point moved and
     // nothing in the fixtures could contradict it.
     assert_eq!(
@@ -3931,7 +3931,7 @@ fn out_imm8_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial
 }
 
 // =================================================================================================
-// 0xEE OUT DX,AL -- PortWriteAlDx, the DX-port twin of PortWriteAlImm8 above, admitted
+// 0xEE OUT DX,AL: PortWriteAlDx, the DX-port twin of PortWriteAlImm8 above, admitted
 // unconditionally (no knob), mirroring PortReadAlDx's admission of 0xEC.
 //
 // The tests below mirror the 0xE6/PortWriteAlImm8 suite one section up, opcode for opcode: the
@@ -3993,7 +3993,7 @@ fn out_dx_reads_the_port_from_dx_not_from_a_baked_immediate() {
 }
 
 /// THE UNCONDITIONAL BREAK. With lazy_io_writes the bus models MachineBus's skip_io_touched
-/// exemption -- the guest class 1000-miglia's PIT storm runs in, where a port write sets NOTHING
+/// exemption: the guest class 1000-miglia's PIT storm runs in, where a port write sets NOTHING
 /// and requires_step_break() stays false. The helper must report the step break anyway, for the
 /// identical reason PortWriteAlImm8 does.
 #[test]
@@ -4122,7 +4122,7 @@ fn out_dx_a_permission_checked_port_is_refused_before_the_tss_probe_can_touch_me
 /// deny=true) refuses the call-out, and this fixture proves the interpreter it hands the
 /// instruction back to actually raises the SAME fault from the SAME state rather than silently
 /// completing. Without this the "refusal costs only the call-out" claim would be untested on its
-/// own terms -- a call-out that refused every V86 OUT unconditionally would pass every other test
+/// own terms: a call-out that refused every V86 OUT unconditionally would pass every other test
 /// in this section too.
 #[test]
 fn out_dx_the_interpreter_raises_the_gp_the_call_out_refused() {
@@ -4141,8 +4141,8 @@ fn out_dx_the_interpreter_raises_the_gp_the_call_out_refused() {
         bus.memory[entry as usize + 1] = 0xf4;
         cpu.set_eip(entry);
 
-        // NOT unwrapped: with deny the #GP has no IDT to land in and nests. The subject -- the
-        // TSS probe and the permission decision -- has already run by then, which the page-walk
+        // NOT unwrapped: with deny the #GP has no IDT to land in and nests. The subject (the
+        // TSS probe and the permission decision) has already run by then, which the page-walk
         // assertion below pins.
         let outcome = cpu.cycle(&mut bus);
 
@@ -4224,7 +4224,7 @@ fn out_dx_a_v86_port_is_served_natively_once_the_tss_pages_are_tlb_resident() {
 }
 
 /// Build the three-slot block mov esi,esi / out dx,al / mov edi,edi, call-out MID-BLOCK, exactly
-/// as slot_block_out_imm8 does for 0xE6 -- but DX is a live register rather than a baked
+/// as slot_block_out_imm8 does for 0xE6, but DX is a live register rather than a baked
 /// immediate, so the reset loop has to preload it on both CPUs every run.
 fn slot_block_out_dx(port: u16, configure: impl Fn(&mut TestBus)) -> (Fixture, CpuGsw, TestBus) {
     let mut code = vec![0x89, 0xf6];
@@ -4313,8 +4313,8 @@ fn slot_block_out_dx(port: u16, configure: impl Fn(&mut TestBus)) -> (Fixture, C
 ///
 /// NIT-1: `port_write_al_dx` reads `cpu.read_gpr16(2)` at call time, after `emit_call_out`'s
 /// unconditional `emit_store_homes` has flushed every guest register (including DX) from its host
-/// home back to `cpu.registers`. This is the fixture that exercises that flush for DX specifically
-/// -- every other `out_dx_*` fixture seeds DX before the block ever runs, which cannot tell "the
+/// home back to `cpu.registers`. This is the fixture that exercises that flush for DX specifically:
+/// every other `out_dx_*` fixture seeds DX before the block ever runs, which cannot tell "the
 /// call-out reads the live register" apart from "the call-out reads whatever `set_edx` last wrote
 /// before compilation", because both would be the same value. Here the block's OWN first slot is
 /// what sets DX, so a call-out that baked the port at compile time (or read a stale host copy)
@@ -4408,8 +4408,8 @@ fn out_dx_uses_a_full_dx_write_from_the_same_block_not_a_stale_or_baked_value() 
 #[test]
 fn out_dx_uses_a_dl_only_write_from_the_same_block_combined_with_the_live_dh() {
     // `mov dl, imm8` (0xB2 ib) touches only the low byte. `initial_edx` seeds DH = 0x12 (and a
-    // DL the write must overwrite); the served port must be 0x1240 -- DH untouched by the write,
-    // DL the write's new value -- which is what a byte-partial home reload has to get right.
+    // DL the write must overwrite); the served port must be 0x1240: DH untouched by the write,
+    // DL the write's new value, which is what a byte-partial home reload has to get right.
     let dx_write = vec![0xb2, 0x40];
     let port = port_seen_after_dx_write_slot(&dx_write, 0x0000_1299);
     assert_eq!(
@@ -4421,8 +4421,8 @@ fn out_dx_uses_a_dl_only_write_from_the_same_block_combined_with_the_live_dh() {
 #[test]
 fn out_dx_call_out_matches_the_interpreter_mid_block() {
     // The emitted-slot differential: same guest bytes, native block against the block-free
-    // interpreter, from identical state. The block runs TWO slots -- the prefix and the call-out
-    // -- because the forced step break ends the native run at the boundary AFTER the OUT, so the
+    // interpreter, from identical state. The block runs TWO slots: the prefix and the call-out,
+    // because the forced step break ends the native run at the boundary AFTER the OUT, so the
     // interpreter twin is stepped twice to the same place. This is the fixture the task's "call-out
     // fires natively, assert retirement counters; device observes the write; wait-state cost
     // identical to interpreter" requirement names directly.
@@ -4560,7 +4560,7 @@ fn out_dx_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_e
 //
 // The port charge stopped being a constant: `IN`/`OUT` now cost what Intel's Appendix F says for
 // the column the access executes in, and epoch 1's flat 12/10 survives only as that table's
-// epoch-1 row. Three things could go wrong and only a matrix catches all three -- a column read
+// epoch-1 row. Three things could go wrong and only a matrix catches all three: a column read
 // off the wrong index, an epoch-1 build that moved, and the JIT call-out drifting from the
 // interpreter on exactly one column (the failure mode `IN_PORT_CORE_CLOCKS`'s doc comment was
 // written to prevent, now that the contract is a function of live CPU state rather than a
@@ -4568,7 +4568,7 @@ fn out_dx_an_abnormal_call_out_ends_the_run_at_the_instruction_with_no_partial_e
 // ---------------------------------------------------------------------------------------------
 
 /// Where the port-column fixtures put their two code bytes. Inside every fixture's identity-mapped
-/// low memory, on a page none of the paged fixtures uses for a page table or the TSS -- and,
+/// low memory, on a page none of the paged fixtures uses for a page table or the TSS, and,
 /// load-bearing, NOT `warm_the_tss_tlb`'s own 0x4000. That helper runs two throwaway `IN AL,DX`
 /// instructions at 0x4000 to settle the accessed bits, which leaves a DECODE-CACHE line there for
 /// `0xEC`; a fixture that then poked `0xEE` straight into `bus.memory` (no code-watch write, so no
@@ -4580,7 +4580,7 @@ const PORT_COLUMN_ENTRY: u32 = 0x5000;
 /// into. `level_timing(I586)` is `(1, 12)`, so a raw charge `R` deposited from a zeroed state
 /// lands as `elapsed_clocks = R / 12` and `timing_rem = R % 12`. Reading only `elapsed_clocks`
 /// would see 0 for every epoch-1 charge (12 and 10 both floor to 1 and 0); reading only
-/// `timing_rem` would see 0 for every epoch-2 charge that is a multiple of 12 -- which is all
+/// `timing_rem` would see 0 for every epoch-2 charge that is a multiple of 12, which is all
 /// eight of them.
 fn charged_raw_core_clocks(cpu: &CpuGsw) -> u64 {
     cpu.elapsed_clocks * 12 + cpu.timing_rem
@@ -4591,7 +4591,7 @@ fn charged_raw_core_clocks(cpu: &CpuGsw) -> u64 {
 ///
 /// The two bitmap columns are the SAME fixture with different EFLAGS: `warmed_tss_cpu` is CPL 3 /
 /// IOPL 0 (the `CPL > IOPL` column) as built, and adding VM with IOPL 3 moves it to the V86 column
-/// without touching the bitmap it consults. That is deliberate -- a fixture pair differing in more
+/// without touching the bitmap it consults. That is deliberate: a fixture pair differing in more
 /// than the column would not isolate the column.
 fn port_column_fixture(mode: crate::PortIoPrivMode) -> (CpuGsw, TestBus) {
     use crate::PortIoPrivMode as Column;
@@ -4694,7 +4694,7 @@ fn the_port_charge_uses_intels_privilege_column() {
 #[test]
 fn the_imm8_port_call_outs_take_the_same_column_as_their_dx_siblings() {
     // `PortReadAlImm8` (`0xE4`) and `PortWriteAlImm8` (`0xE6`) are separate helpers with their own
-    // return expressions, so the matrix above -- which exercises only the DX forms -- would pass
+    // return expressions, so the matrix above (which exercises only the DX forms) would pass
     // with either of them left on the old constant.
     use crate::PortIoPrivMode as Column;
     for column in [
@@ -4754,7 +4754,7 @@ fn the_word_port_forms_charge_the_same_column_as_the_byte_forms() {
 fn the_cross_mode_maximum_dominates_every_column_of_both_epochs() {
     // F5: three bounds that used to be sized
     // to the flat 12 now take `MAX_PORT_CORE_CLOCKS` instead. What makes them sound is that this
-    // constant really is the maximum over the whole table, DERIVED rather than written -- so the
+    // constant really is the maximum over the whole table, DERIVED rather than written, so the
     // property is asserted here against every cell, not against the literal 312.
     use crate::PortIoPrivMode as Column;
     for column in [
@@ -4795,15 +4795,15 @@ fn a_bitmap_denied_port_charges_no_column() {
     // Under TOKAEMM exactly one port has its bit set (0x92, `tokaemm.asm:819`), so on that port
     // the V86 guest's `IN`/`OUT` FAULTS instead of executing. The design's rule for that case
     // (§1.2, §5 T7) is that the charge follows the EXECUTED access: the faulting instruction pays
-    // no port column and no class bus cost, and the monitor's own 0x92 access -- a different
-    // instruction, in ring 0 -- pays the `IsaXBus` charge when it runs. No trap constant is added
+    // no port column and no class bus cost, and the monitor's own 0x92 access (a different
+    // instruction, in ring 0) pays the `IsaXBus` charge when it runs. No trap constant is added
     // either: Intel's 88-100 for the `#GP` is already covered by the `INT n` and `IRET` charges we
     // make on the delivery path.
     //
     // The claim is pinned as an INVARIANCE rather than a number: whatever the faulting instruction
     // costs, it must cost the SAME under both epochs, because none of what it charges is a port
-    // charge. A build that reached the column before the permission check -- the natural way to
-    // get this wrong, since the charge sits at the bottom of every arm -- would move.
+    // charge. A build that reached the column before the permission check (the natural way to
+    // get this wrong, since the charge sits at the bottom of every arm) would move.
     for is_out in [false, true] {
         // PERMITTED while warming, DENIED for the access under test: `warm_the_tss_tlb` runs
         // two real `IN`s to settle the accessed bits, which a denied bitmap would fault, so
@@ -4824,8 +4824,8 @@ fn a_bitmap_denied_port_charges_no_column() {
         cpu.elapsed_clocks = 0;
         cpu.timing_rem = 0;
 
-        // NOT unwrapped: the fixture's IVT is zeroed and the `#GP` nests. The subject -- the
-        // permission decision and the charge that did or did not precede it -- has already
+        // NOT unwrapped: the fixture's IVT is zeroed and the `#GP` nests. The subject (the
+        // permission decision and the charge that did or did not precede it) has already
         // happened by then.
         let _ = cpu.cycle(&mut bus);
 
@@ -4876,7 +4876,7 @@ fn the_string_port_singletons_charge_intels_four_columns() {
 #[test]
 fn a_rep_string_port_form_charges_intels_setup_plus_three_or_four_per_element() {
     // P3, the half the design's blocker (b) turns on. Intel's `REP INS` is `23 + 3c` in V86 and
-    // `REP OUTS` `25 + 4c` -- a SETUP charged once plus 3 or 4 clocks per ELEMENT, NOT the 22/25
+    // `REP OUTS` `25 + 4c`: a SETUP charged once plus 3 or 4 clocks per ELEMENT, NOT the 22/25
     // singleton per element, which would price a `REP INSW` at seven times its real cost. Both
     // figures are literals here.
     //
@@ -4917,13 +4917,13 @@ fn a_v86_rep_string_port_form_traps_on_its_first_element() {
     // P3, gap 3. `INS`/`OUTS` never consulted the TSS bitmap:
     // `strings.rs` called
     // `read_io`/`write_io` bare and `check_io_permission` appeared nowhere in the file, so string
-    // port I/O could not `#GP` under ANY monitor. Inert under TOKAEMM, which traps only 0x92 --
+    // port I/O could not `#GP` under ANY monitor. Inert under TOKAEMM, which traps only 0x92,
     // and wrong under any monitor trapping a port a driver reaches with `REP INSW`.
     //
     // A zero TSS limit puts the bitmap byte for `PORT / 8` past the limit, which is the `#GP(0)`
     // `check_io_permission` raises. The fault must land on the FIRST element: nothing reaches the
     // device, and `CX` still counts every element, which is what makes the instruction
-    // restartable. The `Result` is not unwrapped -- with no IDT the `#GP` nests, exactly as
+    // restartable. The `Result` is not unwrapped, with no IDT the `#GP` nests, exactly as
     // `a_denied_port_is_abnormal_with_zero_partial_effects` records.
     for (opcode, is_out) in [(0x6du8, false), (0x6f, true)] {
         let (mut cpu, mut bus) = port_column_fixture(crate::PortIoPrivMode::V86);

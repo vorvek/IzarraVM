@@ -4,8 +4,8 @@
 //! The CR0 code-translation flush predicate (`cr0_write_moves_code_translation`).
 //!
 //! A CR0 write only moves the linear->physical map through PG. Every other bit leaves the map
-//! identical, so the decode cache and the Direct link graph -- both of which are keyed on a
-//! linear address plus a mode key that already carries PE -- survive the write. Tyrian 2000's
+//! identical, so the decode cache and the Direct link graph (both of which are keyed on a
+//! linear address plus a mode key that already carries PE) survive the write. Tyrian 2000's
 //! real<->protected thunk writes CR0 464 times a guest second and paid a whole-cache flush for
 //! each one.
 //!
@@ -13,13 +13,13 @@
 //! section 7). Three families:
 //!
 //! 1. the KEEP rows (`cr0_pe_toggle_*`, `lmsw_never_flushes_for_any_operand`,
-//!    `pmode_entry_reuses_a_real_mode_decode_line_and_still_faults`) -- red before the slice;
+//!    `pmode_entry_reuses_a_real_mode_decode_line_and_still_faults`): red before the slice;
 //! 2. the ANTI-REGRESSION rows (`cr0_pg_*`, `cr0_wp_change_under_paging_still_flushes`,
-//!    `mov_cr3_still_flushes`) -- green before AND after, and they are what catches an inverted
+//!    `mov_cr3_still_flushes`): green before AND after, and they are what catches an inverted
 //!    predicate, or an `old_cr0` captured after the assignment instead of before it. They do NOT
 //!    catch a swapped old/new argument pair, which is provably inert; see the mutation ledger at
 //!    the foot of this file;
-//! 3. the LOAD-BEARING row (`retained_real_mode_chain_is_unreachable_under_pe`) -- green before
+//! 3. the LOAD-BEARING row (`retained_real_mode_chain_is_unreachable_under_pe`): green before
 //!    and after, pinning the section 3.2 argument the whole slice rests on: a retained real-mode
 //!    chain is not reachable under PE because `jit_mode_key` bit 1 is inside both `BlockKey` and
 //!    `LinkTarget`.
@@ -286,7 +286,7 @@ fn mov_cr3_still_flushes() {
 // ---- 5. LMSW, for every operand ----------------------------------------------------------------
 
 /// LMSW's switchable set is MP|EM|TS, plus an optional PE SET. It can therefore never change PG
-/// or WP, so the predicate is provably `false` at that site for EVERY operand -- which is also
+/// or WP, so the predicate is provably `false` at that site for EVERY operand, which is also
 /// why the old/new argument swap there is inert rather than caught (design section 8).
 ///
 /// RED before the slice: every combination flushes.
@@ -547,7 +547,7 @@ mod links {
         let blocks = cpu.jit_direct.len();
 
         // Enter protected mode with a flat code selector: the SAME linear address at the SAME
-        // `d`. This is what makes the row non-vacuous -- the linear address genuinely collides.
+        // `d`. This is what makes the row non-vacuous: the linear address genuinely collides.
         write_chain_cr0(&mut cpu, &mut bus, CR0_PE);
         cpu.registers.set_segment(
             SegmentIndex::Cs,
@@ -584,7 +584,7 @@ mod links {
         );
         // Not merely "different": different in EXACTLY the PE bit. `jit_mode_key` also carries
         // CS.D, V86, the SS B bit and PG, and a fixture that let any of those move would stay
-        // green with PE dropped from the key altogether -- which is the mutation this row is the
+        // green with PE dropped from the key altogether, which is the mutation this row is the
         // only catcher for.
         assert_eq!(
             pmode_key.mode_key ^ real_key.mode_key,
@@ -629,7 +629,7 @@ mod links {
 // SUPERSEDED IN PART by the CR3 data-side design, T1: `data_read_pages` /
 // `data_write_pages` are keyed by PHYSICAL page and a BUS mapping epoch alone, with no CR3, CPL
 // or PG-dependent bit in the entry (`DirectPageCacheEntry { physical_page, ptr }`), so they are
-// no longer wiped by ANY control-register write -- not only the PG-stays-0 case this section
+// no longer wiped by ANY control-register write, not only the PG-stays-0 case this section
 // originally pinned. The rows below that used to assert those caches WIPE under a PG-moving or
 // PG=1-but-unrelated write now assert they SURVIVE, for the SAME reason T1 gives at its own
 // deletion site (`core.rs`'s `flush_tlb_and_code_caches` and `flush_tlb_keep_code_caches`): a
@@ -639,8 +639,8 @@ mod links {
 //
 // The gate this section pins is narrower than the code-side one above: it fires ONLY when PG is 0
 // on both sides of the write, which `cr0_write_moves_code_translation` already forces whenever the
-// code-side predicate is false with a PG bit that was already clear (PG cannot be 1 with PE 0 --
-// see `execute_extended.rs`'s `#GP(0)` check on `mov cr0` -- so a PE-only toggle can only ever be
+// code-side predicate is false with a PG bit that was already clear (PG cannot be 1 with PE 0:
+// see `execute_extended.rs`'s `#GP(0)` check on `mov cr0`, so a PE-only toggle can only ever be
 // observed at PG=0 on both sides). Three structures, three arguments:
 //
 // - `self.tlb`: consulted only from `translate_linear_checked`'s PAGED branch
@@ -648,10 +648,10 @@ mod links {
 //   nothing a PE toggle could stale. `Tlb::flush_live_slot()` is free here, not skipped, because
 //   there is nothing to charge for either way; it stays unconditional as the cheap default.
 // - `data_read_pages` / `data_write_pages`: keyed by PHYSICAL address alone
-//   (`memory.rs::read_direct_page_cached` et al. -- see `DirectPageCacheEntry`), with no
+//   (`memory.rs::read_direct_page_cached` et al.: see `DirectPageCacheEntry`), with no
 //   permission or CPL bit stored in the entry, and (since T1) never touched by this path at all.
-// - the FastMap: `memory.rs::fast_map_permissions` returns `PagePermissions::UNPAGED` -- a fixed,
-//   fully-permissive tag -- for every population made while paging is off
+// - the FastMap: `memory.rs::fast_map_permissions` returns `PagePermissions::UNPAGED` (a fixed,
+//   fully-permissive tag) for every population made while paging is off
 //   (`!self.is_paging_enabled()`). The store/load bias supervisor tag bit that
 //   `jit/fast_map.rs` documents as "fast for cpl0 sites ONLY" is derived from that permission
 //   value, so under PG=0 it is always the permissive constant, never a stale privilege snapshot.
@@ -659,7 +659,7 @@ mod links {
 //   when paging (and therefore a real page-table permission) is in play, which this gate excludes
 //   by construction. It is also not new exposure: the Direct link graph already survives a PE
 //   toggle (`cr0_pe_toggle_keeps_direct_links`, merged before this slice), and compiled code is
-//   the one artifact whose emitted shape can bake in a CPL assumption -- the FastMap DATA entry it
+//   the one artifact whose emitted shape can bake in a CPL assumption: the FastMap DATA entry it
 //   reads carries none.
 //
 // RED before the slice: `flush_tlb_and_direct_pages` (now deleted) ran unconditionally from
@@ -804,7 +804,7 @@ mod data_caches {
     /// Renamed from `cr0_pg_set_still_wipes_the_data_read_page_cache` (CR3 data-side
     /// design T1): a write that moves the map (PG set) routes
     /// through the CODE-side `flush_tlb_and_code_caches` arm, which since T1 no longer touches
-    /// `data_read_pages`/`data_write_pages` at all -- they have no CR0/CR3/CPL-dependent bit to
+    /// `data_read_pages`/`data_write_pages` at all: they have no CR0/CR3/CPL-dependent bit to
     /// stale, PG-moving write or not. Can-it-fail control: this row and its clearing partner
     /// below share the fixture the OLD "still wipes" rows used, so a reader can see exactly what
     /// changed. See `cr0_ts_change_under_paging_still_flushes_the_tlb` below for the row that
@@ -854,7 +854,7 @@ mod data_caches {
         );
     }
 
-    /// `wipes_tlb_flush` counts flush EVENTS, not wipes performed -- the divergence check must
+    /// `wipes_tlb_flush` counts flush EVENTS, not wipes performed: the divergence check must
     /// keep counting on the gated arm exactly like the code-side gate does.
     #[test]
     fn wipes_tlb_flush_still_counts_elided_events() {
@@ -875,9 +875,9 @@ mod data_caches {
     /// the gate's TRUE arm ("PG stays 1, wipe anyway") had zero coverage from the PG rows above,
     /// which route through the CODE-side `flush_tlb_and_code_caches` predicate, never through
     /// `flush_tlb_keep_code_caches` (PG itself is moving there). The only shape that reaches the
-    /// gated function with PG=1 is a write where PG (and WP) are unchanged -- e.g. TS. Since T1,
+    /// gated function with PG=1 is a write where PG (and WP) are unchanged: e.g. TS. Since T1,
     /// what that arm still wipes is the TLB (`Tlb::flush_live_slot`) and the FastMap, NOT
-    /// `data_read_pages`/`data_write_pages` -- so this row now asserts the split directly: the
+    /// `data_read_pages`/`data_write_pages`, so this row now asserts the split directly: the
     /// physical-page cache survives, the TLB entry does not. Can-it-fail control: mutate the gate
     /// to `if false && ...` (always skip, "M2") and the TLB assertion is the one that goes red.
     #[test]
@@ -919,19 +919,19 @@ mod data_caches {
 //
 // | mutation | caught by |
 // |---|---|
-// | `cr0_write_moves_code_translation` -> always `true` | the five keep rows, and the split is EXACTLY the 6-pass/5-fail split this branch's first commit recorded against `0333d956` -- which is the design's requirement that the one-line kill switch be behaviour-identical to base, measured rather than assumed |
+// | `cr0_write_moves_code_translation` -> always `true` | the five keep rows, and the split is EXACTLY the 6-pass/5-fail split this branch's first commit recorded against `0333d956`, which is the design's requirement that the one-line kill switch be behaviour-identical to base, measured rather than assumed |
 // | -> always `false` | `cr0_pg_set_still_flushes`, `cr0_pg_clear_still_flushes`, `cr0_wp_change_under_paging_still_flushes` |
 // | `delta & CR0_PG` -> `new & CR0_PG` | `cr0_pg_clear_still_flushes` |
 // | `delta & CR0_PG` -> `old & CR0_PG` | `cr0_pg_set_still_flushes` |
 // | drop the WP disjunct | `cr0_wp_change_under_paging_still_flushes` |
 // | `CR0_PG` -> `CR0_PE` in the predicate | seven rows: both PE-keep rows, the link row, LMSW, the pmode-reuse row, and both PG rows |
 // | `old_cr0` captured AFTER the assignment at MOV CR0 | `cr0_pg_set_still_flushes`, `cr0_pg_clear_still_flushes`, `cr0_wp_change_under_paging_still_flushes` |
-// | `old_cr0` captured AFTER the assignment at LMSW | **NON-GATE** -- inert, see below |
-// | old/new arguments swapped at MOV CR0 | **NON-GATE** -- inert, see below |
-// | old/new arguments swapped at LMSW | **NON-GATE** -- inert, see below |
+// | `old_cr0` captured AFTER the assignment at LMSW | **NON-GATE**: inert, see below |
+// | old/new arguments swapped at MOV CR0 | **NON-GATE**: inert, see below |
+// | old/new arguments swapped at LMSW | **NON-GATE**: inert, see below |
 // | drop PE from `jit_mode_key` | `retained_real_mode_chain_is_unreachable_under_pe` |
 // | `BlockKey::new` keeps only `linear` | `retained_real_mode_chain_is_unreachable_under_pe`, `cr0_pe_toggle_keeps_direct_links` |
-// | decode-line hit test stops comparing `d` (whole-crate run) | `d_bit_change_at_the_same_linear_address_re_decodes`, `decode_cache_hits_only_on_matching_tag_and_generation` -- NOT by any row here, because every row in this file uses one `d` on both sides of the mode change |
+// | decode-line hit test stops comparing `d` (whole-crate run) | `d_bit_change_at_the_same_linear_address_re_decodes`, `decode_cache_hits_only_on_matching_tag_and_generation`, NOT by any row here, because every row in this file uses one `d` on both sides of the mode change |
 // | `flush_tlb_keep_code_caches` stops dropping the fetch frontend | `pe_toggle_still_drops_prefetch` |
 // | the gate applied to the MOV CR3 path too | `mov_cr3_still_flushes` |
 //
@@ -941,13 +941,13 @@ mod data_caches {
 // | mutation | result | caught by |
 // |---|---|---|
 // | M1: `if new_cr0 & CR0_PG != 0` -> `if true \|\| ...` (restore the unconditional wipe) | 3 failed | the three `cr0_pe_toggle_keeps_*` survival rows |
-// | M2: `if new_cr0 & CR0_PG != 0` -> `if false && ...` (always skip the wipe) | 1 failed | `cr0_ts_change_under_paging_still_flushes_the_tlb` -- the ONLY row that reaches the gate with PG=1; before this row was added M2 was a NON-GATE (18/18 green) |
+// | M2: `if new_cr0 & CR0_PG != 0` -> `if false && ...` (always skip the wipe) | 1 failed | `cr0_ts_change_under_paging_still_flushes_the_tlb`: the ONLY row that reaches the gate with PG=1; before this row was added M2 was a NON-GATE (18/18 green) |
 // | M3: `flush_tlb_and_direct_pages` stops calling `wipe_tlb_and_direct_pages` (ungated arm stops wiping) | HISTORICAL, pre-T1: caught by the two `cr0_pg_*_still_wipes_the_data_read_page_cache` rows this slice renamed to `cr0_pg_*_no_longer_wipes_the_data_read_page_cache`. T1 (CR3 data-side design) deleted the code this mutation targeted (`data_read_pages`/`data_write_pages` are no longer touched by any control-register flush), so the mutation no longer applies; kept for the historical record. |
 //
 // THE ARGUMENT SWAP IS INERT AT BOTH SITES, and this corrects the design's expectation that the
 // MOV CR0 swap would be caught by the PG rows. It is not, and it cannot be: `delta = old ^ new`
 // is symmetric, and the only asymmetric term (`new & CR0_PG`) is reached only when
-// `delta & CR0_PG == 0` -- at which point `old & CR0_PG == new & CR0_PG` by construction. So
+// `delta & CR0_PG == 0`, at which point `old & CR0_PG == new & CR0_PG` by construction. So
 // swapping the pair cannot change the predicate's answer for ANY input, at either site. The
 // ordering hazard the design was actually worried about is a capture taken AFTER the assignment,
 // which collapses both arguments to the new value; that one is real, it is caught at MOV CR0 by
@@ -959,7 +959,7 @@ mod data_caches {
 // protected mode with a flat 32-bit SS moved `jit_mode_key` bit 3 as well as bit 1. The row's
 // `assert_ne!` on the whole mode key was therefore satisfied by the SS bit alone and the mutation
 // ran green. The fixture now gives every segment a 32-bit default and the row asserts the two keys
-// differ in EXACTLY `1 << 1` -- an assertion that is stronger than the design asked for, and that
+// differ in EXACTLY `1 << 1`, an assertion that is stronger than the design asked for, and that
 // is what turns this row into the only catcher the mutation has.
 
 // ---- 8. the control-register attribution split -------------------------------------------------
@@ -968,8 +968,8 @@ mod data_caches {
 ///
 /// `decode_inval_other` aggregates every whole-cache code-translation teardown, so it cannot say
 /// which control-register write caused one. The Tyrian 586 diagnosis reached "the 155,144 events
-/// per guest second are `MOV CR3`" by ELIMINATION -- counter equalities plus TOKAEMM's own source
-/// forcing PG on across every CR0 write it lets through -- and set measuring it as the
+/// per guest second are `MOV CR3`" by ELIMINATION: counter equalities plus TOKAEMM's own source
+/// forcing PG on across every CR0 write it lets through, and set measuring it as the
 /// precondition for designing any gate. These rows are that measurement.
 ///
 /// The split is an attribution of `decode_inval_other`, not a second total. Every row asserts
@@ -1101,7 +1101,7 @@ mod flush_attribution {
     /// WEAKER THAN THE TWO ROWS ABOVE, deliberately and on the record: it drives the flush
     /// entry point directly instead of executing a hardware task switch under paging, because
     /// building a paged TSS fixture is a slice of its own and `monitor_trips_vec13` was 30 for
-    /// the entire Tyrian run -- the task-switch arm is not a candidate cause and this row exists
+    /// the entire Tyrian run; the task-switch arm is not a candidate cause and this row exists
     /// to keep the third bucket honest, not to price it. An implementer adding a CR3 gate should
     /// upgrade this to a `jmp_to_tss` fixture with PG set before relying on the bucket.
     #[test]

@@ -6,8 +6,8 @@
 //! patch of that byte keeps the compiled block.
 //!
 //! This is L2 arm 1 of the 2026-08-19 duke re-profile. The duke3d-586 SMC shape trace measures
-//! `0x80` at 4.73 M patch events on the long row — the largest of the three `imm_len == 1` shapes
-//! that together own 79% of all block kills — and it is the one whose emitted form has no
+//! `0x80` at 4.73 M patch events on the long row, the largest of the three `imm_len == 1` shapes
+//! that together own 79% of all block kills, and it is the one whose emitted form has no
 //! compile-time flag split, so it ships first. See `imm8_lane_for` for the full admission argument
 //! and `rotate_rows_enabled` for why `0xC1`/`0xC0` and `0x0FA4` are NOT in this arm.
 //!
@@ -17,7 +17,7 @@
 //! that no longer exists). Every fixture here still states its arm through the thread-local
 //! `set_imm8_lanes_for_test`, and the direction that matters flipped with the default: it used to
 //! be the positive fixtures that had to force it on, and it is now the REFUSAL fixture that must
-//! force `Some(false)` — `imm8_lane_is_refused_on_the_off_arm` — because one that read the ambient
+//! force `Some(false)` (`imm8_lane_is_refused_on_the_off_arm`) because one that read the ambient
 //! arm would register a lane and pass for the wrong reason.
 //! `imm8_lanes_ship_on_by_default` is the one test here that deliberately reads the ambient arm,
 //! and it applies the spelling table to the real environment rather than hard-asserting a
@@ -39,7 +39,7 @@ const ALU_OFFSET: u32 = 2;
 const LANE: u32 = ENTRY + ALU_OFFSET + 2;
 
 /// A `0x80 /r` fixture is described by its sub-opcode and its BYTE-register destination. Index
-/// 0..=3 are AL/CL/DL/BL and 4..=7 are AH/CH/DH/BH — the high-lane read/write-back path the
+/// 0..=3 are AL/CL/DL/BL and 4..=7 are AH/CH/DH/BH: the high-lane read/write-back path the
 /// emitter reaches through `emit_read_store_value`/`emit_write_gpr8`, which the lane arm shares
 /// verbatim with the baked arm.
 #[derive(Clone, Copy)]
@@ -251,7 +251,7 @@ fn lanes_registered_for(middle: &[u8], instructions: u8) -> usize {
 /// patches the immediate between executions. The interpreter side runs the same bytes with no
 /// block at all, so it re-decodes the patched instruction and is the reference by construction.
 ///
-/// Flags are asserted SEMANTICALLY — architectural `eflags()` and full CPU equality — because the
+/// Flags are asserted SEMANTICALLY (architectural `eflags()` and full CPU equality) because the
 /// lane arm reaches `emit_alu_byte_preloaded` on a path the baked arm does not (the operand
 /// arrives from memory rather than from a materialised constant). The raw `pending_flags` word is
 /// deliberately NOT compared: it is a REPRESENTATION of the flags, and the two roles are free to
@@ -343,7 +343,7 @@ fn imm8_lane_uses_the_current_immediate_not_the_compiled_one() {
 }
 
 /// The accept case: exactly ONE byte at exactly the lane start. The block stays installed, the
-/// next entry is still native, and — the property the whole class exists for — the interpreter's
+/// next entry is still native, and (the property the whole class exists for) the interpreter's
 /// decode line is still killed.
 #[test]
 fn imm8_lane_write_preserves_the_owning_block_and_its_native_entry() {
@@ -373,7 +373,7 @@ fn imm8_lane_write_preserves_the_owning_block_and_its_native_entry() {
 }
 
 /// The SLOW byte door. `write_linear_u8`'s direct-page arm called the value-less
-/// `note_code_write` until this slice, which refuses the lane exemption outright — so on a persona
+/// `note_code_write` until this slice, which refuses the lane exemption outright, so on a persona
 /// with no FastMap the lane would have registered, absorbed nothing, and read as a dead mechanism.
 ///
 /// This is the fixture for that plumbing: same store, same lane, FastMap off. Reverting
@@ -407,13 +407,13 @@ fn imm8_lane_absorbs_a_patch_on_the_slow_byte_write_path() {
 
 /// A lane write is not code churn. Enough patches to cross the heat threshold several times over
 /// must leave the heat map untouched, because that demotion pressure is what the lane exists to
-/// remove — `lane_only` at `core.rs`'s heat block is the suppression, and it is keyed on the
+/// remove: `lane_only` at `core.rs`'s heat block is the suppression, and it is keyed on the
 /// accept COUNT rather than on any lane's width, so the new class is covered by construction.
 /// This fixture is what turns "by construction" into a measurement.
 ///
 /// **THE DECODE LINE IS RE-FETCHED BETWEEN PATCHES, and without that this test cannot fail.**
 /// `heat_hit` is set by a narrow decode kill as well as by a block kill, and the first patch kills
-/// the line — so a fixture that just stores 64 times charges heat at most once, never reaches the
+/// the line, so a fixture that just stores 64 times charges heat at most once, never reaches the
 /// threshold of 4, and passes with the suppression deleted. Re-decoding restores the line each
 /// round, so every round produces a narrow kill and `smc_narrow_kills` climbs with the loop; the
 /// assertion below pins that, which is what makes the zero-heat assertion beside it mean
@@ -489,14 +489,14 @@ fn word_write_at_the_imm8_lane_start_retires_the_block() {
 /// width rejection and still kills the block. Only a lane that registered at width one accepts a
 /// width-one store.
 ///
-/// The fixture is the `0x81` shape, deliberately, with the imm8 arm forced ON — so the block holds
+/// The fixture is the `0x81` shape, deliberately, with the imm8 arm forced ON, so the block holds
 /// a four-byte lane while the one-byte class is live, which is exactly the state a naive
 /// "accept width 1 anywhere a lane starts" implementation would get wrong.
 #[test]
 fn byte_write_at_a_dword_lane_start_still_rejects_on_width() {
     jit::direct::set_imm8_lanes_for_test(Some(true));
     let mut cpu = flat_cpu();
-    // `81 c0 ii ii ii ii` — ADD EAX, imm32, the `imm_lane_for` shape, in the same block frame.
+    // `81 c0 ii ii ii ii`: ADD EAX, imm32, the `imm_lane_for` shape, in the same block frame.
     let mut bus = test_bus(image_from(&[0x81, 0xc0, 0x78, 0x56, 0x34, 0x12]));
     decode_at(&mut cpu, &mut bus, &block_starts(6));
     let id = install(&mut cpu, ENTRY, 3);
@@ -527,20 +527,20 @@ fn byte_write_at_a_dword_lane_start_still_rejects_on_width() {
 /// The slow byte path's door is arm-selected (`note_code_byte_write_hit`, core.rs). Taking the
 /// value-aware door unconditionally is the obvious simplification and it is WRONG: the permitting
 /// door also runs the lane-rejection accounting, so a byte store landing on a DWORD lane would
-/// start counting in `smc_lane_reject_width` on the SHIPPED arm — a counter
+/// start counting in `smc_lane_reject_width` on the SHIPPED arm: a counter
 /// the 2026-08-19 duke re-profile reads as a baseline ("reads 0 today") and compares the
 /// 08-16 census against. The kill is identical either way; only the counters and the choke's
 /// per-block lane walk differ, which is exactly what makes the mistake invisible without this
 /// fixture.
 ///
 /// So: same block, same store, same dword lane as
-/// `byte_write_at_a_dword_lane_start_still_rejects_on_width` — but with the arm OFF, both
+/// `byte_write_at_a_dword_lane_start_still_rejects_on_width`, but with the arm OFF, both
 /// rejection counters must stay at zero while the block still dies.
 ///
 /// **BOTH one-byte arms are forced off, and the second one had to be added when
 /// `IZARRAVM_COUNT_LANES` flipped to default ON on 2026-08-20.** The door's test is an OR over the
 /// two arms (`note_code_byte_write_hit`), so this fixture's claim was never about the imm8 arm
-/// alone — it is about the state in which NEITHER one-byte class is live. While the count arm was
+/// alone: it is about the state in which NEITHER one-byte class is live. While the count arm was
 /// default-off, forcing the imm8 arm was enough to reach that state by accident; it no longer is,
 /// and reading the ambient count arm here would test the permitting door while claiming to test
 /// the refusing one. The lesson generalises: a fixture that means "no lane class is live" has to
@@ -551,7 +551,7 @@ fn the_off_arm_moves_no_rejection_counter_on_a_byte_write() {
     jit::direct::set_count_lanes_for_test(Some(false));
     let mut cpu = flat_cpu();
     cpu.set_fast_map_enabled_for_test(false);
-    // `81 c0 ii ii ii ii` — ADD EAX, imm32, which takes a four-byte lane on every arm.
+    // `81 c0 ii ii ii ii`: ADD EAX, imm32, which takes a four-byte lane on every arm.
     let mut bus = test_bus(image_from(&[0x81, 0xc0, 0x78, 0x56, 0x34, 0x12]));
     decode_at(&mut cpu, &mut bus, &block_starts(6));
     let id = install(&mut cpu, ENTRY, 3);
@@ -580,7 +580,7 @@ fn the_off_arm_moves_no_rejection_counter_on_a_byte_write() {
     jit::direct::set_count_lanes_for_test(None);
 }
 
-/// A write to the instruction's OTHER bytes — its opcode and ModRM — is structural and retires the
+/// A write to the instruction's OTHER bytes (its opcode and ModRM) is structural and retires the
 /// block. It overlaps no lane byte, so it is not even a lane rejection.
 #[test]
 fn structural_write_to_the_same_instruction_retires_the_block() {
@@ -627,7 +627,7 @@ fn device_write_at_the_imm8_lane_retires_the_block() {
     let _ = &mut bus;
 }
 
-/// THE OFF ARM — the escape, and since the 2026-08-21 flip it is no longer the default. Without
+/// THE OFF ARM: the escape, and since the 2026-08-21 flip it is no longer the default. Without
 /// the thread-local forcing the very same block registers a lane and the very same patch is
 /// absorbed, which is what makes every fixture above a statement about the slice rather than about
 /// the backend it was already. **Renamed from `imm8_lane_is_refused_on_the_default_arm` in the
@@ -663,7 +663,7 @@ fn imm8_lane_is_refused_on_the_off_arm() {
 }
 
 /// The admission bars, one fixture per bar, each a near-miss of the admitted shape. Every one of
-/// these compiles a three-instruction block — `lanes_registered_for` asserts that — so a zero lane
+/// these compiles a three-instruction block (`lanes_registered_for` asserts that) so a zero lane
 /// count is a REFUSAL and not a truncated walk.
 #[test]
 fn near_miss_shapes_take_no_imm8_lane() {
@@ -678,8 +678,8 @@ fn near_miss_shapes_take_no_imm8_lane() {
         0,
         "prefixed 0x80"
     );
-    // An operand-size override does not change what `0x80` does — byte width is a property of the
-    // form — but it is still a prefix byte and still moves the immediate.
+    // An operand-size override does not change what `0x80` does (byte width is a property of the
+    // form) but it is still a prefix byte and still moves the immediate.
     assert_eq!(
         lanes_registered_for(&[0x66, 0x80, 0xc0, 0x11], 3),
         0,
@@ -704,7 +704,7 @@ fn near_miss_shapes_take_no_imm8_lane() {
 /// The page-kind guard, stated positively and verbatim from the dword class: a lane is created
 /// ONLY from the fetch-page cache, the one direct-page cache that cannot hold a device-aperture
 /// pointer. With the fetch entry gone but the data caches warm for the same page, the qualifying
-/// `0x80` must compile with a BAKED immediate — correct as ever, just not parameterized.
+/// `0x80` must compile with a BAKED immediate, correct as ever, just not parameterized.
 #[test]
 fn a_page_the_fetch_cache_cannot_see_gets_no_imm8_lane() {
     jit::direct::set_imm8_lanes_for_test(Some(true));
@@ -712,7 +712,7 @@ fn a_page_the_fetch_cache_cannot_see_gets_no_imm8_lane() {
     let mut bus = test_bus(image(Shape { op: 0, dst: 0 }, 5));
     decode_at(&mut cpu, &mut bus, &block_starts(3));
     // Warm the data-write cache for the code page (well past the block's bytes), then drop the
-    // fetch entry — the state every code write already leaves behind.
+    // fetch entry: the state every code write already leaves behind.
     guest_store_dword(&mut cpu, &mut bus, ENTRY + 0x40, 0x1234_5678);
     cpu.fetch_page.invalidate();
 
@@ -750,7 +750,7 @@ fn a_page_the_fetch_cache_cannot_see_gets_no_imm8_lane() {
 /// weakening of the claim: two compilations bake different host pointers (link-cell and portal
 /// addresses, and a lane's own host pointer), so a byte comparison across them fails on
 /// allocation noise whatever the arm. The length is stable, and it is exactly the quantity a
-/// stray lane moves — the lane arm emits `mov r64, imm64` plus `movzx r32, byte [r64]` where the
+/// stray lane moves: the lane arm emits `mov r64, imm64` plus `movzx r32, byte [r64]` where the
 /// baked arm emits one `mov r32, imm32`.
 fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
     jit::direct::set_imm8_lanes_for_test(Some(arm));
@@ -772,7 +772,7 @@ fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
 
 /// THE OFF ARM PAYS NOTHING, stated as emitted code rather than as an argument.
 ///
-/// The admitted shape's two arms must differ — otherwise the knob is decorative — and every OTHER
+/// The admitted shape's two arms must differ: otherwise the knob is decorative, and every OTHER
 /// shape must emit the same code under both arms, which is what says the arm is a lane admission
 /// and not a second code path that a non-`0x80` block also walks through.
 #[test]
@@ -803,7 +803,7 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
 
 /// The `IZARRAVM_IMM8_LANES` spelling table. `imm8_lanes_enabled` caches its env reading in a
 /// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
-/// never in an order the harness controls — hence the parse function is exercised directly.
+/// never in an order the harness controls, hence the parse function is exercised directly.
 #[test]
 fn imm8_lanes_spelling_table() {
     use std::env::VarError;
@@ -836,7 +836,7 @@ fn imm8_lanes_spelling_table() {
 /// fully non-overlapping and the short row corroborated at −7.623%; a default that moved back
 /// without a ladder would change every shipped binary's lane registration silently.
 ///
-/// It reads the AMBIENT knob deliberately — no override — and it therefore agrees with the
+/// It reads the AMBIENT knob deliberately (no override) and it therefore agrees with the
 /// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: a fixture that
 /// hard-asserted "on" would make the OFF-arm suite run impossible by construction, which is
 /// exactly the failure this flip had to fix in two other files. With the variable unset the

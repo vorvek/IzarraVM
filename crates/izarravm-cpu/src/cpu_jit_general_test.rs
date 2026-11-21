@@ -338,13 +338,13 @@ fn unit_sim_self_loop_keeps_entry_open() {
 
 /// F2: `finish_fast_map_write`'s fast BYTE-write path must feed the unit-sim
 /// diagnostic (`note_code_write_hit`'s unconditional first action) on every real change, exactly
-/// like the slow byte path (`write_linear_u8`'s `if changed { self.note_code_write(..) }`) --
+/// like the slow byte path (`write_linear_u8`'s `if changed { self.note_code_write(..) }`),
 /// even when the changed byte hits no watched code at all. The sim tracks unit ownership at PAGE
 /// granularity (`page_owners`), coarser than `code_watch`'s precise per-instruction/per-block
 /// spans, so "a byte the sim's unit owns but code_watch does not watch" is a real, constructible
 /// case, not a hypothetical one: this fixture builds a unit over the `usim_program` loop, then
 /// writes a DIFFERENT, never-decoded byte in the SAME page through the fast map. `IZARRAVM_UNIT_SIM`
-/// exists specifically to model 486/586 -- the personas where the fast path is armed -- so silently
+/// exists specifically to model 486/586 (the personas where the fast path is armed) so silently
 /// dropping this feed there defeats the diagnostic's purpose. Before this fix, gating on
 /// `watched && changed` for every width silently skipped the sim feed here (report.sim_invalidations
 /// would read 0); the fix keeps that gate for sized writes but not byte writes.

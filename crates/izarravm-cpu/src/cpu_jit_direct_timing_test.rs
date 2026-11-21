@@ -1619,7 +1619,7 @@ fn grp3_imul_memory_form_materializes_a_live_descriptor_first() {
 ///
 /// The 66-prefixed WORD memory IMUL used to be another. The S3 policy widening routes every
 /// Word group-3 form to an `InterpretOne` call-out BEFORE the /5 arm is reached, so it no
-/// longer stays out of the block -- but it still never reaches that arm, which is what this
+/// longer stays out of the block, but it still never reaches that arm, which is what this
 /// list is about. The claim moved to `group3_word_subops_join_as_call_outs_not_lowerings`
 /// (cpu_jit_test_imm_test.rs), which asserts the slot class directly rather than inferring it
 /// from the block ending.
@@ -1634,7 +1634,7 @@ fn grp3_imul_memory_form_materializes_a_live_descriptor_first() {
 ///
 /// **The arm is FORCED, not inherited.** `IZARRAVM_MUL_MEM_ROWS` gates the MUL /4 memory case
 /// below (2026-08-29, `DirectKind::MulMemAcc`), and this fixture is about the /5 arm rather
-/// than about the gate: the claim it makes -- that a /4 never reaches /5 -- has to hold in the
+/// than about the gate: the claim it makes (that a /4 never reaches /5) has to hold in the
 /// world where /4 memory has no lowering at all. Reading the ambient knob would also make this
 /// test order-dependent, because the positive MUL fixtures in this file force the arm ON on
 /// whatever libtest thread they land on.
@@ -1720,13 +1720,13 @@ fn grp3_imul_memory_form_is_lowered() {
 //
 // Deliberately the `grp3_imul_*` family above, case for case. That family is the SIGNED sibling of
 // this exact shape and it is what makes the address handling, the side exits, the segment
-// declaration and the flag contract admissible here at all -- so anything it pins, this must pin
+// declaration and the flag contract admissible here at all, so anything it pins, this must pin
 // too, and a MUL fixture the IMUL family has no counterpart for would be a claim nobody has
 // checked on the shipped form.
 //
 // WHAT THESE CATCH THAT THE IMUL FAMILY CANNOT: `emit_mul_mem_acc` calling `imul_r32`. That single
-// character passes every structural assertion -- same block length, same read declaration, same
-// segment, same clocks -- and is wrong only in EDX and in CF/OF, and only on operands where the
+// character passes every structural assertion (same block length, same read declaration, same
+// segment, same clocks) and is wrong only in EDX and in CF/OF, and only on operands where the
 // signed and unsigned answers differ. The differential fixture's first pair exists for it.
 // ---------------------------------------------------------------------------
 
@@ -1758,7 +1758,7 @@ fn grp3_mul_mem_case(target: u32) -> Vec<u8> {
 /// had to be added to, and both are correctness sites rather than accounting: a missing
 /// `dword_reads` under-charges the bus and the mode-13 read counter, and a missing `read_segment`
 /// keeps DS out of the block's `SegmentLayout`, so `data_matches` skips it and a cached block
-/// keeps matching after a guest DS reload -- reading through a STALE BASE.
+/// keeps matching after a guest DS reload, reading through a STALE BASE.
 ///
 /// The raw-clocks assertion runs the same way the /5 one does: the whole group-3 arm returns
 /// `clocks(2)` for every sub-opcode and both operand forms, which is already the `DirectKind`
@@ -1933,7 +1933,7 @@ fn grp3_mul_memory_form_matches_the_interpreter_and_its_bus_clocks() {
             );
 
             // Pin the concrete UNSIGNED product and the concrete CF and OF, so a SIGNED lowering
-            // fails here even if both sides agreed with each other -- which they would not, but
+            // fails here even if both sides agreed with each other, which they would not, but
             // the pin is what names the defect instead of reporting a register mismatch.
             let product = u64::from(seed_eax) * u64::from(seed_src);
             assert_eq!(native.registers.eax(), product as u32, "{label}: low half");
@@ -2220,7 +2220,7 @@ fn byte_mul_imul_memory_forms_join_as_call_outs_with_the_gate_on() {
     }
 }
 
-/// The shipped default, read AMBIENT on purpose -- no override -- so it also fails if
+/// The shipped default, read AMBIENT on purpose (no override) so it also fails if
 /// `IZARRAVM_MUL_MEM_ROWS=1` is exported in the environment running the suite. Every other MUL
 /// fixture here states its arm, so a fixture that means to pin the default has nowhere else to
 /// read it from.
@@ -2305,7 +2305,7 @@ fn select_loop_rows(enabled: bool) {
 }
 
 /// `mov esi,esi; mov edi,edi; loop +2`, then a HLT on each of the two paths. The LOOP target is
-/// ENTRY+8 and the fallthrough is ENTRY+6, so the two are distinguishable in EIP -- a lowering
+/// ENTRY+8 and the fallthrough is ENTRY+6, so the two are distinguishable in EIP: a lowering
 /// that took the wrong path fails on the register comparison rather than needing its own
 /// assertion.
 fn loop_case() -> Vec<u8> {
@@ -2324,7 +2324,7 @@ fn loop_matches_the_interpreter_across_the_counter_boundary() {
     const ENTRY: u32 = 0x101;
     select_loop_rows(true);
     // 1 -> 0, NOT taken. 2 -> 1, taken. 3 -> 2, taken.
-    // 0 -> 0xFFFFFFFF, TAKEN -- the wrap, and the case a pre-decrement test gets wrong.
+    // 0 -> 0xFFFFFFFF, TAKEN: the wrap, and the case a pre-decrement test gets wrong.
     for seed_ecx in [1u32, 2, 3, 0, 0xffff_ffff] {
         let code = loop_case();
         let mut memory = vec![0; 0x0004_0000];
@@ -2524,7 +2524,7 @@ fn loop_is_lowered_with_the_gate_on() {
 /// operand): a Word counter decremented as if it were Dword would clear the high half of ECX.
 /// `0x66` gives the other MIXED cell (Dword address / Word operand): a Dword counter paired with
 /// a Word target that `taken_delta` does not model wrapping for. `classify` refuses both cells by
-/// name -- see the `DirectKind::Loop` doc comment -- even though the Word/Word cell (both
+/// name (see the `DirectKind::Loop` doc comment) even though the Word/Word cell (both
 /// prefixes together, `loop_word_*` below) is admitted. `0xE0`/`0xE1` read ZF and belong to a
 /// different flag contract.
 #[test]
@@ -2533,7 +2533,7 @@ fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
     select_loop_rows(true);
     // STATED, not inherited, since the 2026-08-30 LOOPcc flip: 0xE0/0xE1 now lower through
     // their OWN knob (`DirectKind::LoopCc`, default ON). This fixture's claim was always that
-    // the LOOP arm does not admit them -- the flag contract splits the family -- and it keeps
+    // the LOOP arm does not admit them (the flag contract splits the family) and it keeps
     // meaning that only with the other slice's arm forced off. The same repair the
     // string-callout fixture's LOOP row needed when #771 flipped ITS default.
     jit::direct::set_loopcc_rows_for_test(Some(false));
@@ -2595,7 +2595,7 @@ fn loop_neighbouring_forms_remain_interpreter_only_with_the_gate_on() {
 //    shrinks `cs.limit` below the taken target and checks the terminal does not lower.
 // ---------------------------------------------------------------------------
 
-/// `mov si,si; mov di,di; loop +2`, identical bytes to `loop_case()` -- in a 16-bit code segment
+/// `mov si,si; mov di,di; loop +2`, identical bytes to `loop_case()`: in a 16-bit code segment
 /// the same encoding decodes as the Word forms with no prefix needed. Target ENTRY+8, fallthrough
 /// ENTRY+6, so a lowering that took the wrong path fails on EIP rather than needing its own check.
 fn loop_word_case() -> Vec<u8> {
@@ -2639,14 +2639,14 @@ fn install_fixture_block_word(cpu: &mut CpuGsw, linear: u32) -> jit::direct::Com
 
 /// THE DIFFERENTIAL, the Word twin of `loop_matches_the_interpreter_across_the_counter_boundary`.
 /// Every seed carries a non-zero high half in ECX (`0x1234_xxxx`), so a decrement that mistakenly
-/// used the Dword width -- clearing that high half -- fails on the register comparison even
+/// used the Dword width (clearing that high half) fails on the register comparison even
 /// though CX itself would still read correctly.
 #[test]
 fn loop_word_matches_the_interpreter_across_the_counter_boundary() {
     const ENTRY: u32 = 0x101;
     select_loop_rows(true);
     // 1 -> 0, NOT taken. 2 -> 1, taken. 3 -> 2, taken.
-    // 0 -> 0xFFFF, TAKEN -- the 16-bit wrap, CX's own boundary and not ECX's.
+    // 0 -> 0xFFFF, TAKEN: the 16-bit wrap, CX's own boundary and not ECX's.
     for seed_cx in [1u32, 2, 3, 0, 0xffff] {
         let seed_ecx = 0x1234_0000 | seed_cx;
         let code = loop_word_case();
@@ -2819,8 +2819,8 @@ fn loop_word_preserves_every_flag() {
 /// THE NAMED SILENT-FAILURE-MODE CATCHER, isolated from the counter-boundary sweep above so it
 /// reads as its own claim: ECX = 0x1234_0003 in, a Word LOOP that both takes and falls through,
 /// and bits 31..16 must read back exactly 0x1234 every time. `alu_r32_imm32(5, home(1), 1)`
-/// copy-pasted onto this cell passes every OTHER assertion in this file -- CX still decrements,
-/// the branch still goes the right way -- and only this one goes red.
+/// copy-pasted onto this cell passes every OTHER assertion in this file (CX still decrements,
+/// the branch still goes the right way) and only this one goes red.
 #[test]
 fn loop_word_preserves_ecx_high_half() {
     const ENTRY: u32 = 0x101;
@@ -2879,8 +2879,8 @@ fn loop_word_preserves_ecx_high_half() {
 /// THE BACKWARD SELF-LOOP SHAPE, which is what the corpus actually runs: a LOOP whose taken
 /// target is the block's own entry (`taken_delta == 0`) lowers through the `self_loop` arm at
 /// `direct.rs:18919-18980`, a host-native iteration loop that never returns to the dispatcher
-/// between counter decrements. No other fixture in this file reaches it for the Word cell -- every
-/// one above targets a FORWARD label two bytes ahead -- and the self-loop arm is the ONE emitter
+/// between counter decrements. No other fixture in this file reaches it for the Word cell: every
+/// one above targets a FORWARD label two bytes ahead, and the self-loop arm is the ONE emitter
 /// path with its own not-taken exit (`emit_advance_eip(.., span.guest_len)`) and its own taken
 /// exit through `STACK_QUOTA`, neither of which the forward-branch fixtures above ever execute.
 ///
@@ -2888,7 +2888,7 @@ fn loop_word_preserves_ecx_high_half() {
 /// taken target back to ENTRY exactly, so `taken_delta` is 0 and `self_loop` is true. ECX is
 /// seeded `0x1234_0003` per the review's request: three iterations (3->2 taken, 2->1 taken,
 /// 1->0 NOT taken) exit through the not-taken path with CX at 0, and the high half must still
-/// read 0x1234 -- the same silent-failure mode `loop_word_preserves_ecx_high_half` names, now
+/// read 0x1234, the same silent-failure mode `loop_word_preserves_ecx_high_half` names, now
 /// exercised through the OTHER emitter branch of this arm.
 #[test]
 fn loop_word_backward_self_loop_matches_the_interpreter() {
@@ -3028,8 +3028,8 @@ fn loop_word_target_beyond_the_limit_is_refused() {
     let outcome = jit::direct::compile(&mut cpu, ENTRY, false);
     // The specific outcome, not merely "not fully compiled": the LOOP slot is the first thing
     // the full-length walk meets that fails `static_control_target_within_limit`, so the walk
-    // stops there with the exact cause `control_target_limit`'s clamp produces --
-    // `RetryCause::AdmissionMatrix` -- and `compile` (unlike `compile_with_instruction_limit`'s
+    // stops there with the exact cause `control_target_limit`'s clamp produces
+    // (`RetryCause::AdmissionMatrix`) and `compile` (unlike `compile_with_instruction_limit`'s
     // binary search) propagates that cause straight through rather than falling back to a
     // shorter compiled prefix. `assert_ne!(.., Some(3))` alone would also pass on an unrelated
     // Retry or a StructuralReject, which states nothing about WHY the terminal was refused.
@@ -3044,7 +3044,7 @@ fn loop_word_target_beyond_the_limit_is_refused() {
 }
 
 /// The shipped default, read AMBIENT on purpose so it also fails if `IZARRAVM_LOOP_ROWS=0` is
-/// exported in the environment running the suite -- which is the correct outcome: the rest of
+/// exported in the environment running the suite, which is the correct outcome: the rest of
 /// these fixtures state their arm, and a fixture that means to pin the shipped default has
 /// nowhere else to read it from.
 #[test]
@@ -3092,13 +3092,13 @@ fn loop_rows_spelling_table_names_both_arms() {
 // ---------------------------------------------------------------------------
 // `0xE0`/`0xE1` LOOPNE/LOOPE as native terminals (`DirectKind::LoopCc`), behind
 // `IZARRAVM_LOOPCC_ROWS`. nascar-586's `0xE1` dword row at merged main: 2,639,630 hits /
-// 2,638,564 exits / NINE sites -- hits equal exits to 99.96%, every execution a termination.
+// 2,638,564 exits / NINE sites: hits equal exits to 99.96%, every execution a termination.
 // The NASCAR LOOPcc slice design pre-declares the WALL claim
 // expected-null; these fixtures carry the slice's whole case.
 //
 // WHAT THE DIFFERENTIAL COVERS IN ONE FIXTURE, by construction: slot 0 is an ADD that both
 // STAGES the guest ZF (the seeds choose whether the sum is zero) and leaves a LIVE PENDING
-// descriptor across the LOOPcc -- so every seed simultaneously tests the ZF axis, the
+// descriptor across the LOOPcc, so every seed simultaneously tests the ZF axis, the
 // lazy-flag read, and flag preservation. The emitter defects it catches, each a named
 // mutation: the LOOPE/LOOPNE condition swapped; `emit_load_host_flags` dropped (the ZF test
 // then reads the DECREMENT's host ZF); the load moved BEFORE the decrement (the counter test
@@ -3139,7 +3139,7 @@ fn loopcc_matches_the_interpreter_across_both_conditions() {
         // (seed_ecx, make_zf): the ADD's sum is zero exactly when make_zf, because
         // seed_eax = -seed_ecx (wrapping) in that case and 5 otherwise.
         for (seed_ecx, make_zf) in [
-            (2u32, true), // LOOPE taken; LOOPNE not -- the pair that separates the opcodes
+            (2u32, true), // LOOPE taken; LOOPNE not: the pair that separates the opcodes
             (2, false),   // LOOPNE taken; LOOPE not
             (1, true),    // counter dies: NOT taken even when ZF matches LOOPE
             (1, false),   // counter dies, ZF matches LOOPNE: still not taken
@@ -3265,7 +3265,7 @@ fn loopcc_is_lowered_with_the_gate_on() {
 
 /// The refusals, knob forced ON so the refusal cannot be the knob's doing: the two width
 /// prefixes (Loop's argument verbatim), and `0xE2`, which must route to `DirectKind::Loop`
-/// under ITS knob and never to this arm -- asserted by forcing THIS knob on and LOOP's OFF,
+/// under ITS knob and never to this arm, asserted by forcing THIS knob on and LOOP's OFF,
 /// under which a dword `0xE2` must not compile a terminal.
 #[test]
 fn loopcc_neighbouring_forms_remain_refused_with_the_gate_on() {
@@ -3692,9 +3692,9 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
         // because those still floor to the same value. An exact `raw_clocks()` compare is
         // two-sided by construction, and the review that caught the asymmetry is why both now
         // exist. The standing rule this amends: an accumulation fixture is NECESSARY for a
-        // block-scaled charge and NOT SUFFICIENT -- it must be paired with an exact pin.
+        // block-scaled charge and NOT SUFFICIENT: it must be paired with an exact pin.
         //
-        // `imul ebx, eax, imm` -- modrm 0b11_011_000 = 0xd8, reg = EBX is the destination and
+        // `imul ebx, eax, imm`: modrm 0b11_011_000 = 0xd8, reg = EBX is the destination and
         // rm = EAX the source. clocks(14) for the three-operand form against the two-operand
         // form's clocks(9) and the table default's 2, plus 2 each for the two register moves.
         DirectTimingCase {
@@ -3712,7 +3712,7 @@ fn direct_timing_cases() -> Vec<DirectTimingCase> {
             eflags: 0x202,
         },
         // The byte-lane register ALU, both operand orders. `execute_alu_decoded` returns one
-        // `Ok(clocks(2))` for all six ALU forms, so these ride the `_ => 2` default CORRECTLY --
+        // `Ok(clocks(2))` for all six ALU forms, so these ride the `_ => 2` default CORRECTLY,
         // and the pin is what says so. Without it, "the default is right here" is an argument
         // rather than a measurement, and an arm added later for the wrong reason would pass.
         // `cmp cl, al` (form 0: rm is the destination) and `cmp al, cl` (form 2: reg is).
@@ -3763,7 +3763,7 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
     // the whole XCHG family as `InterpretOne` call-outs, which grew every case's block from three
     // slots to four and put a call-out inside a matrix that compares `pending_flags` between the
     // two roles (the helper publishes a settled word where the interpreter leaves a descriptor).
-    // HLT cannot be admitted by any future slice -- it stops the machine -- so the fixture's
+    // HLT cannot be admitted by any future slice (it stops the machine) so the fixture's
     // boundary is a property of the instruction rather than of today's allowlist.
     code.push(0xf4);
     let mut pristine = vec![0; 0x7000];
@@ -3785,7 +3785,7 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
     // Declare the emission arm beside the bus that implies it. `install_fixture_block` calls
     // `direct::compile` straight through, so it never reaches the `try_direct_continuation`
     // synchronisation that production uses, and without this line the field would sit at its
-    // `true` seed for every case — leaving this whole interpreter-versus-native matrix testing
+    // `true` seed for every case, leaving this whole interpreter-versus-native matrix testing
     // only the WITH-preamble shape, on both arms of the `uniform_fetches` loop (review
     // finding). With it, the `uniform_fetches == true` half of the matrix now checks the
     // trace-elided emission lane by lane against the interpreter, which is the coverage the
@@ -5569,7 +5569,7 @@ fn iteration_upper_memo_is_dropped_by_a_dial_epoch_change_and_by_a_mode_change()
     // The persona timing pair is the other half of the key, and it is NOT separately testable
     // here: `key_for` admits the Direct backend on I486 and I586 only, and `level_timing` returns
     // the same (1, 12) for both, so no admissible persona pair prices a block differently. The
-    // epoch covers it regardless -- the persona cannot move without `CpuGsw::set_mode`, which
+    // epoch covers it regardless: the persona cannot move without `CpuGsw::set_mode`, which
     // reaches the `clear()` asserted above.
     let (mut on_486, bus_486, x87_486, _) = install_x87_and_integer_blocks(GswMode::Gsw486);
     let fresh_486 = on_486.recompute_iteration_upper_for_test(&bus_486, &x87_486);
@@ -6258,7 +6258,7 @@ fn fild_m64_matches_the_interpreter_in_ram_and_in_the_aperture() {
 /// dynamic dword reads for real, not just the state. An `inc eax` precedes the FILD so it is
 /// never the block's first instruction, and `block.span().instructions` is pinned to a literal
 /// (not merely compared to itself) so a classify regression that dropped FILD from the block
-/// would shrink the span below the pin rather than passing silently -- the insns-delta gate the
+/// would shrink the span below the pin rather than passing silently: the insns-delta gate the
 /// review outcome calls for.
 ///
 /// The first value, 5_000_000_000i64, is just above 2^32 (~4.29e9): a value that fit in 32 bits

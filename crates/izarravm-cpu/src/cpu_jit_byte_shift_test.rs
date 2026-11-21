@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! The BYTE shift/rotate register rows: `0xD0 /4..=7` (a whole opcode that had no classifier arm
-//! at all) and `0xC0 /5,/6,/7` -- behind `IZARRAVM_BYTE_SHIFT_ROWS`, plus the `0xC0`/`0xD0` entry
+//! at all) and `0xC0 /5,/6,/7`, behind `IZARRAVM_BYTE_SHIFT_ROWS`, plus the `0xC0`/`0xD0` entry
 //! on the `OperandSize::Word` allowlist that lets a 16-bit code segment reach either of them.
 //!
 //! # The rows, from the census that ranked them
@@ -18,7 +18,7 @@
 //!
 //! `0xD0 /5` is the hottest single rejected row on the fixture by 4x. tyrian's code segment is
 //! CS.D = 0, so its byte shifts decode at `OperandSize::Word` and were refused by the allowlist
-//! BEFORE any arm was reached -- which is why a row with no 16-bit anything about it is tagged
+//! BEFORE any arm was reached, which is why a row with no 16-bit anything about it is tagged
 //! `operand_size: word`.
 //!
 //! # What the lowering is: two `debug_assert`s
@@ -39,7 +39,7 @@
 //! | `/7` OF @1 | `false` | x86: SAR clears OF |
 //! | SF / ZF / PF | bit 7 / 8-bit result / parity of the result | computed against the 8-bit operand |
 //!
-//! The tempting wrong shape -- a 32-bit host shift over the zero-extended byte -- is wrong in the
+//! The tempting wrong shape (a 32-bit host shift over the zero-extended byte) is wrong in the
 //! same five ways `cpu_jit_word_shift_test.rs` enumerates at 16 bits, and for `/7` it is wrong in
 //! the VALUE and not merely the flags: a 32-bit arithmetic shift of a zero-extended byte shifts in
 //! zeros where the guest shifts in bit 7. That is M12 below.
@@ -57,8 +57,8 @@
 //!
 //! A shift DESTROYS a lazy descriptor rather than creating one, so a fixture that only compared
 //! `pending_flags` would pass on a lowering that published garbage into a field nothing reads.
-//! Every differential row therefore ends with five `SETcc` slots -- `setc`, `seto`, `sets`,
-//! `setz`, `setp` -- inside the SAME block, into byte registers that are not the shift's
+//! Every differential row therefore ends with five `SETcc` slots: `setc`, `seto`, `sets`,
+//! `setz`, `setp`, inside the SAME block, into byte registers that are not the shift's
 //! destination, so a wrong CF is a wrong BL.
 //!
 //! `0x0F9x` is deliberately NOT on the `OperandSize::Word` allowlist, so in a CS.D = 0 segment the
@@ -72,12 +72,12 @@
 //! # Mutation record
 //!
 //! Twenty-one applied BY HAND to the committed tree, run, observed, and restored with
-//! `git checkout -- <file>` -- which is exactly why each is applied to a COMMITTED tree: that
+//! `git checkout -- <file>`, which is exactly why each is applied to a COMMITTED tree: that
 //! command discards every uncommitted change to the file, not only the mutation, and during this
 //! slice it ate an uncommitted edit once before the rule was re-learned. Each was run against the whole `cpu_jit_byte_shift_test` module (its
 //! own 15 rows plus the 2,073 the filter excludes are unaffected by a byte-shift edit); the four
-//! SURVIVORS were then re-run against the WHOLE `izarravm-cpu` suite -- 2,067 tests, all green on
-//! each -- because a survivor is the only outcome a filtered run can get wrong in the direction
+//! SURVIVORS were then re-run against the WHOLE `izarravm-cpu` suite (2,067 tests, all green on
+//! each) because a survivor is the only outcome a filtered run can get wrong in the direction
 //! that matters.
 //!
 //! | # | mutation | outcome, and the row that fired first |
@@ -88,26 +88,26 @@
 //! | M4 | fold `0xd0` into the `0xc1 \| 0xd1` arm | RED, 7 rows |
 //! | M5 | drop `0xd0` from the allowlist term | RED, 7 rows incl. `a_sixteen_bit_segment_block_compiles_through_shr_r8_1` |
 //! | M6 | drop `0xc0` from the allowlist term | RED, 9 rows |
-//! | M7 | drop the sub-opcode key from the allowlist term | **SURVIVES -- see below** |
+//! | M7 | drop the sub-opcode key from the allowlist term | **SURVIVES: see below** |
 //! | M8 | delete the `4 if !rotate_rows_enabled()` arm from `0xc0` | RED, `the_two_group_two_knobs_are_independent` ALONE |
-//! | M9 | knob read moved below the `m.reg` test in the `0xD0` arm | **SURVIVES -- see below** |
+//! | M9 | knob read moved below the `m.reg` test in the `0xD0` arm | **SURVIVES: see below** |
 //! | M10 | `emit_shift_reg8` assert reverted to `op == 4` | RED, 8 rows (debug panic) |
 //! | M11 | `emit_shift_lane` Byte assert reverted to `op == 4` | RED, 10 rows (debug panic) |
 //! | M12 | `emit_shift_reg8` body -> `shift_r32_imm8(op, home(dst), count)` | RED, both differentials + the high-byte row |
 //! | M13 | widen `rotate_row_count_byte` to `0xc0 if matches!(reg, 4..=7)` | RED, `the_two_group_two_knobs_are_independent` ALONE |
 //! | M14 | `rotate_row_count_byte`'s `0xc0 if reg == 4` -> `_ => None` | RED, the same row alone |
-//! | M15 | drop the `count == 0` early return in `emit_shift` | RED, both differentials -- **but only after the fix below** |
-//! | M16 | `count = raw_count & 0x1f` -> `raw_count` in `emit_shift` | RED, both differentials -- **same** |
+//! | M15 | drop the `count == 0` early return in `emit_shift` | RED, both differentials, **but only after the fix below** |
+//! | M16 | `count = raw_count & 0x1f` -> `raw_count` in `emit_shift` | RED, both differentials, **same** |
 //! | M17 | swap `emit_commit_shift_flags` / `emit_write_gpr8` in `emit_shift_reg8` | RED, 3 rows |
 //! | M18 | `op: if m.reg == 6 { 4 }` -> `op: m.reg` (drop the normalisation) | **SURVIVES, by design** |
-//! | M19 | `byte_shift_rows_enabled()`'s ENV path returns `true`, override intact | **SURVIVES since the flip -- see below** |
+//! | M19 | `byte_shift_rows_enabled()`'s ENV path returns `true`, override intact | **SURVIVES since the flip: see below** |
 //! | M19b | the WHOLE of `byte_shift_rows_enabled()` returns `true` | RED, 4 rows |
 //! | M20 | `"" => DEFAULT_ARM` -> `"" => false` in the parse table | RED since the flip, `byte_shift_rows_spelling_table_names_every_arm` |
 //!
 //! **M15 and M16 caught a real hole in this file, and the hole is the more useful finding.** On
 //! the first run both SURVIVED. `emit_shift`'s count-0 return and its five-bit mask are reachable
 //! from the byte rows only through the BAKED emitter, and on the shipped `IZARRAVM_COUNT_LANES`
-//! arm every `0xC0` row here was taking a count lane instead -- while `0xD0`'s count is the
+//! arm every `0xC0` row here was taking a count lane instead, while `0xD0`'s count is the
 //! literal 1 and can never be 0 or 32. So the two rows that the design named as M15's and M16's
 //! killers were exercising a different emitter than the mutants edited. The differentials now
 //! force the count-lane arm OFF and the laned arm has sweeps of its own, which is
@@ -119,36 +119,36 @@
 //!   instruction, so no differential can separate them. Inventing a test that pinned
 //!   `DirectKind::Shift.op == 4` for a `/6` input would be a shape test dressed as a behaviour
 //!   test. The design predicted this survivor by name.
-//! * **M7 is behaviourally inert on this tree, which the design did NOT predict** -- it expected
+//! * **M7 is behaviourally inert on this tree, which the design did NOT predict**: it expected
 //!   the neighbour sweep to kill it. Dropping the sub-opcode key lets `0xC0 /0..=/3` and
 //!   `0xD0 /0..=/3` past the Word GATE, and they then hit `return None` inside their own arm one
 //!   step later: the same `classify` answer, the same `hard_boundary` census row, the same compile
 //!   outcome. There is nothing to assert on. The key stays in the source because it keeps both
 //!   halves of the refusal stated in one place, so a later widening of the arms cannot silently
-//!   widen what the Word gate admits -- but it buys no behaviour today and this record says so.
+//!   widen what the Word gate admits, but it buys no behaviour today and this record says so.
 //! * **M9 is inert for the same class of reason.** Both orderings return `None` for `/0..=/3`, and
 //!   the knob is a pure function of the environment with no side effect but its panic, which still
 //!   fires the first time any gated row is classified.
 //! * **M19 survives the ENV path alone, and only since the default flipped ON.** The mutant makes
 //!   the `OnceLock` read return `true` while leaving the `#[cfg(test)]` override intact, so the
-//!   only fixture that can see it is the default pin -- and with the knob unset the pin's expected
+//!   only fixture that can see it is the default pin, and with the knob unset the pin's expected
 //!   value is now `true` as well, so the two agree. It died while the default was OFF and it would
 //!   die again at any flip back. This is the blind spot EVERY default-ON knob in this file has,
 //!   `IZARRAVM_TEST_WORD_ROWS` included, and it is structural rather than an oversight: a fixture
 //!   cannot set the process-wide env the `OnceLock` reads without deciding the arm for every other
 //!   test in the process. What covers it instead is the ladder, whose A leg exports an explicit
-//!   `IZARRAVM_BYTE_SHIFT_ROWS=0` and records the RESOLVED arm -- a build that ignored the env
+//!   `IZARRAVM_BYTE_SHIFT_ROWS=0` and records the RESOLVED arm: a build that ignored the env
 //!   would show up there as an A leg that measured the B arm. **M19b is the faithful form the
-//!   design named** -- the whole function returns `true`, override included -- and it dies on four
+//!   design named**: the whole function returns `true`, override included, and it dies on four
 //!   rows, because `force_byte_shift_rows` asserts that its own selection took.
 //!
 //! **What the record says about where the coverage actually lives.** Three mutants are caught by
 //! exactly ONE row each, and two of them are the heat-gate pair: M13 and M14 die only on
 //! `the_two_group_two_knobs_are_independent`'s `(HeatGated, *)` cells, which is why that row is a
-//! 3x2 matrix over `RotateRowsArm` and not a 2x2 over booleans -- `rotate_row_count_byte` is
+//! 3x2 matrix over `RotateRowsArm` and not a 2x2 over booleans: `rotate_row_count_byte` is
 //! reached only under the `HeatGated` arm, so a boolean matrix would have been a gate that cannot
 //! fail. M19b dies on four rows because `force_byte_shift_rows` asserts that its own selection
-//! took, while the narrower M19 reaches only the default pin -- every other row forces the arm
+//! took, while the narrower M19 reaches only the default pin: every other row forces the arm
 //! through the thread-local override and so never touches the `OnceLock` that mutant edits.
 //!
 //! **The 2026-08-29 default flip traded two mutants, and neither trade is left silent.** M20 was
@@ -170,11 +170,11 @@ const FILL_B: [u8; 2] = [0x89, 0xff];
 /// a shift DEFINES. AL/CL/DL/BL/AH/CH/DH/BH are indices 0..7; the destinations here are chosen so
 /// a sweep can pick a shift destination that no consumer overwrites.
 const CONSUMERS: [(u8, u8); 5] = [
-    (0x2, 3), // setc bl  -- CF
-    (0x0, 6), // seto dh  -- OF
-    (0x8, 5), // sets ch  -- SF
-    (0x4, 2), // setz dl  -- ZF
-    (0xa, 7), // setp bh  -- PF
+    (0x2, 3), // setc bl: CF
+    (0x0, 6), // seto dh: OF
+    (0x8, 5), // sets ch: SF
+    (0x4, 2), // setz dl: ZF
+    (0xa, 7), // setp bh: PF
 ];
 
 /// Which code segment a row runs in. Both are required on every behavioural row: the census row
@@ -297,7 +297,7 @@ const ROL_ROR_SUB_OPS: [(&str, u8); 2] = [("/0 rol", 0), ("/1 ror", 1)];
 // Arm selection
 // ---------------------------------------------------------------------------------------------
 
-/// Restores every arm this file forces, on the way out of a fixture -- normally OR by panic.
+/// Restores every arm this file forces, on the way out of a fixture: normally OR by panic.
 ///
 /// A plain `set_*_for_test(Some(..))` LEAKS: the overrides are thread-local and the harness reuses
 /// threads, so the next fixture on that thread inherits an arm it never asked for.
@@ -317,7 +317,7 @@ impl Drop for ArmOverride {
 ///
 /// **The count-lane arm is left AMBIENT here and forced by the rows that care**, because it
 /// selects which of two emitters the `0xC0` rows reach and the two need separate sweeps. That is
-/// `cpu_jit_count_lane_test.rs`'s recorded lesson -- when `IZARRAVM_COUNT_LANES` flipped default
+/// `cpu_jit_count_lane_test.rs`'s recorded lesson: when `IZARRAVM_COUNT_LANES` flipped default
 /// ON, every unforced group-2 fixture in the tree quietly stopped exercising the baked emitter.
 /// It bit this file too: with the arm ambient, `emit_shift`'s `count == 0` early return and its
 /// five-bit mask were unreachable from the `0xC0` rows here (`0xD0`'s count is 1 and never zero),
@@ -427,7 +427,7 @@ fn compile_span(seg: Seg, body: &[u8]) -> Option<u8> {
 /// The span a three-slot block reports when the tested opcode JOINED it.
 const ADMITTED: Option<u8> = Some(3);
 /// A barrier in the body slot. The walk stops one slot in, which is shorter than the minimum
-/// installable block, so the outcome is a `StructuralReject` and the harness reports `None` --
+/// installable block, so the outcome is a `StructuralReject` and the harness reports `None`:
 /// the same idiom `cpu_jit_test_word_row_test.rs`'s refusal rows use.
 ///
 /// `None` also covers a `Retry`, which is why every fixture that asserts it also asserts the
@@ -497,7 +497,7 @@ struct Roles {
 /// on the interpreter role, and seed both identically.
 ///
 /// `slots` is the EXACT instruction count the block must cover. An exact count rather than a lower
-/// bound is what says the tested opcode joined the block instead of ending it -- a `>=` assertion
+/// bound is what says the tested opcode joined the block instead of ending it: a `>=` assertion
 /// is satisfied by the fillers alone with the form under test refused.
 fn build(seg: Seg, body: &[u8], slots: u8, seed: Seed) -> Roles {
     let mut code = FILL_A.to_vec();
@@ -611,8 +611,8 @@ enum Compare {
     /// weakening invented here: a guest write to a code byte invalidates the interpreter role's
     /// decode line, so it re-FETCHES the patched instruction where the native role runs a block
     /// that is already compiled. That is a two-clock bus difference the patch itself creates and
-    /// says nothing about the lowering. Everything the lane can get wrong -- the result, the
-    /// flags, the descriptor it publishes and any stray store -- is still compared.
+    /// says nothing about the lowering. Everything the lane can get wrong (the result, the
+    /// flags, the descriptor it publishes and any stray store) is still compared.
     ArchitecturalState,
 }
 
@@ -690,10 +690,10 @@ const CONSUMED_SLOTS: u8 = 2 + 1 + CONSUMERS.len() as u8;
 /// The count sweep for `0xC0`. 0 is the no-op that must touch no flag and no descriptor; 1 is the
 /// only count that defines OF; 7 is the last in-width count; 8 shifts the operand entirely away,
 /// where the SDM leaves CF undefined and the interpreter does not; 9/16/31 are the undefined
-/// range; 32 and 33 test that the five-bit mask is applied to the RAW immediate -- `shr al, 32`
+/// range; 32 and 33 test that the five-bit mask is applied to the RAW immediate: `shr al, 32`
 /// must be the no-op and `shr al, 33` a shift by 1.
 ///
-/// **This sweep is the ONLY evidence for counts 8..31 at `/5` and `/7`** -- `emit_shift_reg8`'s
+/// **This sweep is the ONLY evidence for counts 8..31 at `/5` and `/7`**, `emit_shift_reg8`'s
 /// header names it as such, because the 48-case host probe that paragraph used to cite covered
 /// `/4` alone. It may not be trimmed without rewriting that header.
 const COUNTS: [u8; 10] = [0, 1, 2, 7, 8, 9, 16, 31, 32, 33];
@@ -733,7 +733,7 @@ fn a_sixteen_bit_segment_block_compiles_through_shr_r8_1() {
 /// consumers reading the result back through emitted code.
 ///
 /// This is the census row's own shape: unprefixed, `operand_size: word`, `prefix_mask: 0`. The
-/// width must still come from the OPCODE -- M1 is the mutation that reads `operand_width` here and
+/// width must still come from the OPCODE: M1 is the mutation that reads `operand_width` here and
 /// shifts sixteen bits in a byte instruction.
 #[test]
 fn byte_shift_register_forms_match_the_interpreter_in_a_sixteen_bit_segment() {
@@ -800,7 +800,7 @@ fn byte_shift_differential(seg: Seg) {
 // R4: the high byte registers
 // =============================================================================================
 
-/// Destinations AH, CH, DH and BH -- byte-register indices 4..7 -- at both opcodes and in BOTH
+/// Destinations AH, CH, DH and BH (byte-register indices 4..7) at both opcodes and in BOTH
 /// segment kinds.
 ///
 /// `home(index)` is `GUEST_HOMES[index & 7]`, so index 4 is the guest ESP home and the set is
@@ -851,8 +851,8 @@ fn byte_shift_into_a_high_byte_register_matches_the_interpreter() {
 ///
 /// GREEN on `main`, and it is here for the implementation mistake it catches rather than for a
 /// census row: widening the new arms' sub-opcode match to admit `2 | 3` "to mirror the sibling
-/// sub-opcodes". RCL and RCR are refused for the standing structural reason `RotateReg`'s doc gives
-/// -- both take the incoming CF as a rotate INPUT -- which no emitter here reproduces.
+/// sub-opcodes". RCL and RCR are refused for the standing structural reason `RotateReg`'s doc gives:
+/// both take the incoming CF as a rotate INPUT, which no emitter here reproduces.
 #[test]
 fn byte_rcl_rcr_stay_a_hard_boundary_at_both_opcodes_and_both_segment_kinds() {
     let _arm = force_byte_shift_rows(true);
@@ -880,7 +880,7 @@ fn byte_rcl_rcr_stay_a_hard_boundary_at_both_opcodes_and_both_segment_kinds() {
     }
 }
 
-/// `0xD0 /0,/1` and `0xC0 /0,/1` (ROL, ROR) are ADMITTED with the knob on, in BOTH segment kinds --
+/// `0xD0 /0,/1` and `0xC0 /0,/1` (ROL, ROR) are ADMITTED with the knob on, in BOTH segment kinds:
 /// the positive half of the guard above, and the ONLY fixture that can detect the reachability gate
 /// (`classify`'s top-of-function `OperandSize::Word` allowlist) being unreachable for these two
 /// sub-opcodes.
@@ -945,8 +945,8 @@ fn byte_rotates_are_admitted_at_both_opcodes_and_both_segment_kinds() {
     }
 }
 
-/// Byte ROL/ROR ride `rotate_rows_enabled` -- the SAME knob the Dword ROL/ROR rows have always
-/// used -- rather than `IZARRAVM_BYTE_SHIFT_ROWS`. `force_byte_shift_rows` cannot show that on its
+/// Byte ROL/ROR ride `rotate_rows_enabled` (the SAME knob the Dword ROL/ROR rows have always
+/// used) rather than `IZARRAVM_BYTE_SHIFT_ROWS`. `force_byte_shift_rows` cannot show that on its
 /// own: it always forces `rotate_rows_arm` to `On` alongside whichever `byte_shift_rows` value the
 /// caller asks for, so a fixture built only on that helper could not tell "gated on
 /// `rotate_rows_enabled`" apart from "gated on `byte_shift_rows_enabled`, and `force_byte_shift_rows`
@@ -1002,7 +1002,7 @@ fn byte_rotates_follow_the_rotate_rows_knob_not_the_byte_shift_rows_knob() {
 /// boundary both ways, mirroring `cpu_jit_word_rotate_test.rs`'s `BOUNDARY_OPERANDS`.
 const ROTATE_OPERANDS: [u8; 8] = [0x00, 0x01, 0x7f, 0x80, 0xf0, 0xff, 0x55, 0xaa];
 
-/// A domain-real prior EFLAGS state with SF, ZF, PF and AF all SET, and bit 1 forced -- the byte
+/// A domain-real prior EFLAGS state with SF, ZF, PF and AF all SET, and bit 1 forced: the byte
 /// file's `0x8d7` seed used verbatim, established as reachable by
 /// `cpu_jit_word_shift_test.rs::an_eflags_image_with_bit_one_clear_is_not_reachable`. Used
 /// everywhere below that asserts PRESERVATION.
@@ -1106,7 +1106,7 @@ fn byte_rotates_match_the_interpreter_across_every_raw_count() {
     }
 }
 
-/// Destinations AH, CH, DH and BH -- byte-register indices 4..7 -- at both rotate opcodes and in
+/// Destinations AH, CH, DH and BH (byte-register indices 4..7) at both rotate opcodes and in
 /// BOTH segment kinds, mirroring `byte_shift_into_a_high_byte_register_matches_the_interpreter`.
 ///
 /// `home(index)` is `GUEST_HOMES[index & 7]`, so index 4 is the guest ESP home and the set is
@@ -1142,7 +1142,7 @@ fn byte_rotate_into_a_high_byte_register_matches_the_interpreter() {
 }
 
 /// A masked count of zero must leave EVERY flag and a live lazy descriptor exactly as they are, at
-/// both rotate opcodes and both segment kinds -- the byte sibling of
+/// both rotate opcodes and both segment kinds: the byte sibling of
 /// `a_zero_count_rotate_leaves_every_flag_and_a_live_descriptor_alone` in
 /// `cpu_jit_word_rotate_test.rs`.
 ///
@@ -1183,8 +1183,8 @@ fn a_zero_count_byte_rotate_leaves_every_flag_and_a_live_descriptor_alone() {
 /// The preservation claim, stated as its own assertion rather than left implicit in the
 /// differential above: from `ROTATE_SEEDED_EFLAGS` (SF, ZF, PF and AF all set), every count from 1
 /// to 31 leaves those four bits set in the resulting eflags, and every byte of the destination
-/// register OUTSIDE the rotated lane -- including the full upper 24 bits for a low register and the
-/// low 8 plus upper 16 for a high one -- survives from the seed untouched.
+/// register OUTSIDE the rotated lane (including the full upper 24 bits for a low register and the
+/// low 8 plus upper 16 for a high one) survives from the seed untouched.
 ///
 /// This is the row a fold into `Shift`'s byte arm (`emit_shift_reg8`, via `emit_commit_shift_flags`)
 /// would fail immediately: that path publishes the whole RBP shadow to `eflags` at every non-zero
@@ -1288,7 +1288,7 @@ fn count_lanes_for(seg: Seg, body: &[u8], slots: u8) -> usize {
 ///
 /// This is why the `emit_shift_lane` assert relaxation is not optional. `count_lane_for` bars on
 /// `matches!(insn.opcode, 0xc0 | 0xc1)`, `imm_len == 1` and `len == 3`, all of which the new rows
-/// pass -- so on the SHIPPED count-lane arm a debug build reaches the Byte arm's
+/// pass, so on the SHIPPED count-lane arm a debug build reaches the Byte arm's
 /// `debug_assert_eq!(op, 4)` and panics the compiler on ordinary DOS code, while a release build
 /// emits code that is already correct. A debug-only panic on a release-correct path is exactly the
 /// class of bug the `emit_shift_lane` Word `unreachable!` incident shipped once.
@@ -1297,7 +1297,7 @@ fn count_lanes_for(seg: Seg, body: &[u8], slots: u8) -> usize {
 /// `prefixes == default`, `disp_len == 0`, `imm_len == 1` and `len == 3`, which is the SAME shape
 /// that shipped a compiler panic for `0xC1` at Word. The outcome is opposite and safe here, because
 /// the kind's width is `Byte` rather than `Word` and `count_lane_for`'s width bar admits Byte
-/// deliberately -- pinned rather than left as an inference.
+/// deliberately: pinned rather than left as an inference.
 #[test]
 fn a_byte_shr_takes_a_count_lane_at_every_admitted_sub_opcode() {
     let _arm = force_byte_shift_rows(true);
@@ -1402,8 +1402,8 @@ fn a_patched_byte_shift_count_keeps_the_block_and_changes_the_result() {
 /// `0xD0` takes NO count lane, and the refusal is over-determined by three independent bars: the
 /// opcode bar (`0xc0 | 0xc1`), `imm_len == 1` (it is 0) and `len == 3` (it is 2).
 ///
-/// Pinned rather than inferred, because the opcode bar's own comment admits it is redundant today
-/// -- so a later widening that dropped it would leave the row's refusal resting on two bars nobody
+/// Pinned rather than inferred, because the opcode bar's own comment admits it is redundant today,
+/// so a later widening that dropped it would leave the row's refusal resting on two bars nobody
 /// stated.
 #[test]
 fn a_byte_shift_by_one_takes_no_count_lane() {
@@ -1434,7 +1434,7 @@ fn a_byte_shift_by_one_takes_no_count_lane() {
 // =============================================================================================
 
 /// Every row this slice claims is a boundary on the OFF arm and admitted on the ON arm, in both
-/// segment kinds -- and `0xC0 /4` at Word is the row that pins the two-axis rule.
+/// segment kinds, and `0xC0 /4` at Word is the row that pins the two-axis rule.
 ///
 /// Catches, in the `false` direction: an arm that forgot its `byte_shift_rows_enabled()` guard,
 /// i.e. a row that ships admitted while the knob says off, which would destroy the A/B base.
@@ -1495,7 +1495,7 @@ fn the_byte_shift_rows_flip_with_the_gate() {
 ///
 /// `0xD3` is the shift-by-CL group. It compiles at Dword unconditionally and, as of the S-B
 /// ALU-rows slice, also at Word under its own `IZARRAVM_WORD_SHIFT_CL_ROWS` knob (default ON,
-/// unaffected by `IZARRAVM_BYTE_SHIFT_ROWS`) -- this row now pins that the byte-shift knob does
+/// unaffected by `IZARRAVM_BYTE_SHIFT_ROWS`): this row now pins that the byte-shift knob does
 /// not gate it either way. `0xD2` is its byte twin and has no arm at any width.
 #[test]
 fn the_gate_does_not_sweep_in_its_neighbours() {
@@ -1515,7 +1515,7 @@ fn the_gate_does_not_sweep_in_its_neighbours() {
                 // term only in a 16-bit segment, while `/5..=7` are on
                 // `IZARRAVM_BYTE_SHIFT_ROWS` in the arm itself and refuse at both segment kinds.
                 // `force_byte_shift_rows` pins the rotate knob to `On` at both arms, so `/4` in a
-                // 32-bit segment is admitted either way -- exactly what the conjunction-row
+                // 32-bit segment is admitted either way: exactly what the conjunction-row
                 // assertion above says about the register form.
                 //
                 // `0xD0` does NOT share that exception: its own arm puts `/4..=7` on
@@ -1581,7 +1581,7 @@ fn the_gate_does_not_sweep_in_its_neighbours() {
             }
         }
         // `0xD3 /5` is admitted at Dword unconditionally and, since the S-B ALU-rows slice, at
-        // Word too under `IZARRAVM_WORD_SHIFT_CL_ROWS` (default ON) -- independent of
+        // Word too under `IZARRAVM_WORD_SHIFT_CL_ROWS` (default ON), independent of
         // `IZARRAVM_BYTE_SHIFT_ROWS`, so both arms of THIS knob admit it.
         assert_eq!(
             compile_span(Seg::ThirtyTwo, &[0xd3, 0xe8]),
@@ -1718,11 +1718,11 @@ fn the_two_group_two_knobs_are_independent() {
 
 /// The spelling table, every arm and the refusal.
 ///
-/// The `""` assertion is the one this knob needs most: `""` names the SAME arm as UNSET -- the
-/// default -- deliberately NOT `parse_rotate_rows_arm`'s shape, which folds `""` in with `0`/`off`.
+/// The `""` assertion is the one this knob needs most: `""` names the SAME arm as UNSET (the
+/// default) deliberately NOT `parse_rotate_rows_arm`'s shape, which folds `""` in with `0`/`off`.
 /// A wrapper that computes a leg value and produces `""` has MISSED a lookup; it has not said
 /// "off". It is asserted against `byte_shift_rows_default_arm_for_test()` rather than against a
-/// literal, so it keeps meaning what it says on the day the default flips -- which is the commit
+/// literal, so it keeps meaning what it says on the day the default flips, which is the commit
 /// that makes M20 (`"" => false`) a real defect rather than a synonym.
 #[test]
 fn byte_shift_rows_spelling_table_names_every_arm() {
@@ -1762,7 +1762,7 @@ fn byte_shift_rows_spelling_table_names_every_arm() {
 
 /// THE DEFAULT PIN, and it is the one assertion that decides what a shipped binary admits.
 ///
-/// It reads the AMBIENT knob deliberately -- no override -- and must agree with the ENVIRONMENT
+/// It reads the AMBIENT knob deliberately (no override) and must agree with the ENVIRONMENT
 /// rather than with a constant, because this suite is run on BOTH arms and a fixture that
 /// hard-asserted one of them would make that impossible by construction. With the variable unset
 /// the assertion reduces to "the default is what the parse table says", which is the claim.
@@ -1794,7 +1794,7 @@ fn byte_shift_rows_ship_the_default_arm() {
 ///
 /// With the knob OFF a `0xD0 /5` in a 16-bit segment produces a census row with
 /// `stop_reason == "hard_boundary"`, `modrm_reg == Some(5)`, `operand_form == "register"` and
-/// `operand_size == "word"` -- verbatim the tyrian-586 row this slice claims. With it ON, no row
+/// `operand_size == "word"`, verbatim the tyrian-586 row this slice claims. With it ON, no row
 /// for that shape exists.
 ///
 /// The `/6` half is here because §0.2's normalisation is a KIND-level fact and not a census-level

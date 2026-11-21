@@ -196,7 +196,7 @@ fn install_with_d(cpu: &mut CpuGsw, entry: u32, instructions: u8, d: bool) -> ji
 }
 
 // ============================================================================================
-// Row 1 and row 3: the Doom shape — two `ADD r32, imm32` sites patched in one block.
+// Row 1 and row 3: the Doom shape: two `ADD r32, imm32` sites patched in one block.
 // ============================================================================================
 
 /// `mov esi, esi` / `add ebp, immA` / `add edi, immB` / `mov esi, esi` / `hlt`. Both patch sites
@@ -396,7 +396,7 @@ fn partial_cases() -> Vec<PartialCase> {
 /// Matrix row 2. Every case writes a store whose bytes OUTSIDE the lane are byte-for-byte what is
 /// already there, so the program afterwards is always the same three instructions with a new
 /// immediate. That is deliberate and load-bearing: it removes "the program changed" as an
-/// explanation for any divergence and leaves exactly two things under test — that a partial or
+/// explanation for any divergence and leaves exactly two things under test: that a partial or
 /// straddling patch fails closed (the block retires), and that whatever runs next, interpreted or
 /// recompiled, uses the patched bytes.
 #[test]
@@ -464,7 +464,7 @@ fn partial_and_straddling_patches_fail_closed_and_then_run_the_patched_bytes() {
             &block_starts(),
         );
 
-        // Leg 1 — interpreted, because the retire left nothing to enter.
+        // Leg 1: interpreted, because the retire left nothing to enter.
         arm(&mut native, START_EBP);
         arm(&mut interpreter, START_EBP);
         for _ in 0..3 {
@@ -484,7 +484,7 @@ fn partial_and_straddling_patches_fail_closed_and_then_run_the_patched_bytes() {
             "{label}: the interpreted ADD must use the patched immediate"
         );
 
-        // Leg 2 — recompiled, so the new block's lane (or baked immediate) is the patched one.
+        // Leg 2: recompiled, so the new block's lane (or baked immediate) is the patched one.
         decode_starts(&mut native, &mut native_bus, ENTRY, &block_starts());
         let recompiled = install_with_d(&mut native, ENTRY, 3, true);
         arm(&mut native, START_EBP);
@@ -623,8 +623,8 @@ fn a_patch_through_a_linear_alias_still_hits_the_lane() {
 /// Matrix row 4, second half. Remap the block's OWN linear page onto a different physical frame
 /// carrying different code, then flush. This pins what the code actually does rather than what a
 /// design note claims: `BlockKey` carries the physical address, so the remapped entry produces a
-/// DIFFERENT key, the probe misses, and the stale block — whose lane still names the old frame's
-/// bytes — is simply unreachable from the new mapping. Execution follows the new frame.
+/// DIFFERENT key, the probe misses, and the stale block (whose lane still names the old frame's
+/// bytes) is simply unreachable from the new mapping. Execution follows the new frame.
 #[test]
 fn remapping_the_code_page_re_keys_instead_of_reusing_the_stale_lane() {
     const OLD_IMM: u32 = 0x0000_0005;
@@ -808,7 +808,7 @@ fn a_lane_at_a_page_boundary_applies_before_the_next_fetch_faults() {
 }
 
 /// Matrix row 5, second half. The patch store itself faults: the code page is read-only and CR0.WP
-/// is set, so a supervisor write to it is a #PF. Nothing may commit — not the bytes, and above all
+/// is set, so a supervisor write to it is a #PF. Nothing may commit: not the bytes, and above all
 /// not a lane accept, because an accept on an uncommitted write is exactly the state where the
 /// block's emitted code and the interpreter's decode could disagree.
 #[test]
@@ -921,7 +921,7 @@ fn loop_image(imm: u32) -> Vec<u8> {
 
 /// Matrix row 6. The budget boundary is swept across the patched loop. Whatever instruction the
 /// break lands on, the state must be exactly what a block-free interpreter reaches after the same
-/// number of retired instructions — which is the statement "the break never observes a
+/// number of retired instructions, which is the statement "the break never observes a
 /// half-applied patch or a stale immediate", made checkable.
 #[test]
 fn a_cap_break_never_observes_a_stale_or_half_applied_immediate() {
@@ -1064,8 +1064,8 @@ fn lane_then_store_image(imm: u32) -> Vec<u8> {
 /// `add ebp, imm32` / `mov esi, esi` / `hlt`, with no filler, so the immediate field starts 2 mod
 /// 4.
 ///
-/// Two of Doom's four real patch sites are exactly this — `0x1cae09` and `0x1cb03e` from the step-1
-/// trace — and between them they take this path on the order of a million times per run. The
+/// Two of Doom's four real patch sites are exactly this (`0x1cae09` and `0x1cb03e` from the step-1
+/// trace) and between them they take this path on the order of a million times per run. The
 /// emitted store reaches the wide-access page guard BEFORE the code-watch check, and that guard
 /// side-exits a misaligned dword store, so the in-flight chain runs through a DIFFERENT side exit
 /// than the aligned fixture. The rest of the chain has to hold identically: the interpreter replays
@@ -1123,17 +1123,17 @@ fn step_until(cpu: &mut CpuGsw, bus: &mut TestBus, target_eip: u32, context: &st
 /// Matrix row 7. The in-flight case the step-2 review reasoned about rather than measured: a
 /// block that writes its own lane while it is executing. The reasoning is that the emitted store
 /// side-exits BEFORE committing, the interpreter replays the store, and the write therefore
-/// reaches the choke with no block mid-execution. This makes each link observable — the side exit
+/// reaches the choke with no block mid-execution. This makes each link observable: the side exit
 /// fires, the lane still holds the old bytes at the exit, the replayed store is accepted, the
 /// block survives, and the re-entered block reads the new immediate.
 ///
-/// Four fixtures: both slot orders, at both alignments. The alignment split is not cosmetic — two
+/// Four fixtures: both slot orders, at both alignments. The alignment split is not cosmetic: two
 /// of Doom's four real patch sites are misaligned, so the aligned fixture alone would leave the
 /// path the guest actually takes about a million times a run unexercised.
 ///
 /// **All four now exit on the CODE WATCH, and the two misaligned rows changed meaning with guard 3
 /// rather than merely changing counters.** They used to exit on the wide-access page guard, which
-/// refused every misaligned store before the code-watch check could run — so the rows named for
+/// refused every misaligned store before the code-watch check could run, so the rows named for
 /// the Doom shape were in fact certifying the alignment refusal and never reaching the guard they
 /// were built to exercise. The lean store site now serves a page-local misaligned store through
 /// its slow stub, which runs `emit_watched_store_guard`, so the self-store really does meet the
@@ -1324,7 +1324,7 @@ fn code_segment_16(cpu: &mut CpuGsw) {
 ///
 /// Pinning the arm is the whole point. Two of the three controls never reach `imm_lane_for` at
 /// all, so for them `smc_lane_registrations == 0` is true by construction and would stay true if
-/// the classifier were later opened up to these encodings — the assertion would keep passing while
+/// the classifier were later opened up to these encodings, the assertion would keep passing while
 /// the thing it claims to protect had moved. Naming the arm makes the test fail on that change
 /// instead of sleeping through it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1336,7 +1336,7 @@ enum ControlArm {
     #[allow(dead_code)]
     RejectedBeforeTheLaneCheck,
     /// The block compiles, installs and is entered natively, and `imm_lane_for` DID see this ADD
-    /// and refused it — the word forms on their width, the prefix-carrying dword form on the
+    /// and refused it: the word forms on their width, the prefix-carrying dword form on the
     /// prefix and the seven-byte length.
     CompiledWithoutALane,
 }
@@ -1353,7 +1353,7 @@ enum ControlArm {
 /// `imm_lane_for` matches the width), so the two word forms and the prefix-carrying dword form
 /// all take `CompiledWithoutALane`. Each control pins its arm, so a lane-side change that started
 /// accepting any of them would fail here rather than pass quietly. All three must also execute
-/// correctly, patched or not — a patch of a lane-free immediate retires the block.
+/// correctly, patched or not: a patch of a lane-free immediate retires the block.
 #[test]
 fn sixteen_bit_add_forms_never_register_a_lane() {
     struct Control {
@@ -1552,8 +1552,8 @@ fn sixteen_bit_add_forms_never_register_a_lane() {
 
 /// The trace's `covering_line` probe runs BEFORE the lane classification in the same choke, so the
 /// two could in principle interfere. This runs one fixed patch/execute script twice, with the
-/// trace off and on, and requires the guest result and the whole lane counter trio to be identical
-/// — while the trace still records the events, so the comparison is not between two silent runs.
+/// trace off and on, and requires the guest result and the whole lane counter trio to be identical,
+/// while the trace still records the events, so the comparison is not between two silent runs.
 /// What one run of the trace script produced.
 struct TraceScriptOutcome {
     /// Registrations, accepts, width rejections, address rejections.
@@ -1631,11 +1631,11 @@ fn family_image(op: u8, a: u32, b: u32) -> Vec<u8> {
 }
 
 /// Every `0x81 /r` group member takes a lane and its laned execution matches the block-free
-/// interpreter across patch cycles — the widening measured out of duke3d's SMC shape census
+/// interpreter across patch cycles: the widening measured out of duke3d's SMC shape census
 /// (31.7M of its 37.2M imm-field patch events are `/3, /5, /2, /0`; the old lane admitted `/0`
 /// alone). Both carry polarities run: ADC (/2) and SBB (/3) consume the incoming CF, and a fixed
 /// arm state would leave one polarity of `emit_carry_alu_preloaded` unexecuted. CMP (/7) rides
-/// along as the non-writing member — the state compare is what validates it.
+/// along as the non-writing member: the state compare is what validates it.
 #[test]
 fn widened_alu_family_lanes_match_the_interpreter() {
     const SEED: u64 = 0x0808_2026_d00b_1e5e;

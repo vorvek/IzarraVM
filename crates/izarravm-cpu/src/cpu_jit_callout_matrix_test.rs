@@ -11,7 +11,7 @@
 //!
 //! Every row compares a native execution against a BLOCK-FREE interpreter running the same guest
 //! bytes from the same state, on registers (EIP included), lazy flags, EFLAGS, core clocks, bus
-//! clocks, guest RAM and -- wherever the fixture is driven through the run loop -- the
+//! clocks, guest RAM and (wherever the fixture is driven through the run loop) the
 //! device-visible read order and timestamps.
 //!
 //! Two drivers, and the difference matters:
@@ -30,7 +30,7 @@
 //! Mutation record for this matrix (verified by hand, both restored):
 //! * making the scripted device STICKY (`TestBus::read_io` returning `io_read_sequence[0]` forever
 //!   instead of advancing the cursor) fails four rows, and fails
-//!   `a_varying_device_is_read_fresh_on_every_native_re_entry` on exactly its subject -- "round 1:
+//!   `a_varying_device_is_read_fresh_on_every_native_re_entry` on exactly its subject: "round 1:
 //!   the block must see the CURRENT device value";
 //! * dropping the NATIVE role's lane patch from the composition row (patching only the
 //!   interpreter's memory) fails `a_lane_patch_and_a_call_out_compose_in_one_block` at the first
@@ -327,7 +327,7 @@ fn a_varying_device_is_read_fresh_on_every_native_re_entry() {
     // native block that skipped a read, cached a value, or charged the port's clocks once instead
     // of once per execution diverges on AL, on the read log, or on core clocks.
     //
-    // Lazy reads, so the bus asks for no step break and each execution runs all three slots --
+    // Lazy reads, so the bus asks for no step break and each execution runs all three slots:
     // the shape the whole slice exists for.
     let (code, starts) = program(&[&[IN_AL_DX]]);
     let mut roles = build(
@@ -542,7 +542,7 @@ fn a_block_takes_exactly_the_call_out_slot_cap_and_splits_at_the_next() {
 fn a_step_break_ends_the_run_and_the_interpreter_continues_identically() {
     // Quake's shape: the port touches time-dependent device state, so the helper reports the step
     // break and the run ends at the boundary AFTER the IN with two slots un-executed. The parent
-    // module pins that boundary; what this row adds is the CONTINUATION -- both roles are driven
+    // module pins that boundary; what this row adds is the CONTINUATION: both roles are driven
     // to HLT through the run loop from there, so the un-executed slots, the device timestamps and
     // every clock have to agree end to end.
     let (code, starts) = program(&[&[IN_AL_DX], &MOV_EDI_EDI]);
@@ -586,7 +586,7 @@ fn the_cap_boundary_lands_identically_with_and_without_the_block() {
     // from below the block's first slot to past its last walks the break through every position
     // including the call-out's. What has to hold is the exact-clocks contract's consequence: a
     // block is admitted only when the remaining budget covers `compute_iteration_upper`, which
-    // dominates the block's real charge INCLUDING the call-out's runtime deposit -- so a run that
+    // dominates the block's real charge INCLUDING the call-out's runtime deposit, so a run that
     // enters the block cannot overshoot a cap the interpreter would have respected, and a run
     // that cannot afford the block falls back to the very interpretation it is compared against.
     //
@@ -646,8 +646,8 @@ fn a_chained_entry_folds_its_prefix_into_the_devices_timestamp() {
     //
     // Block A is `add eax,1` / `test eax,eax` / `jz +N` with the branch NOT taken, so it links by
     // fall-through into block B, which carries the call-out. The device's timestamp therefore has
-    // to contain A's charge as well as B's prefix, and the block-free interpreter -- which reaches
-    // the same instruction with the same running total -- is what says so.
+    // to contain A's charge as well as B's prefix, and the block-free interpreter (which reaches
+    // the same instruction with the same running total) is what says so.
     const A: u32 = ENTRY;
     let mut code = Vec::new();
     let mut starts = Vec::new();
@@ -768,8 +768,8 @@ fn seed_protected_tables(memory: &mut [u8]) {
     memory[gate..gate + 4].copy_from_slice(&low.to_le_bytes());
     memory[gate + 4..gate + 8].copy_from_slice(&high.to_le_bytes());
     // The handler is a NOP, not a HLT: it runs at CPL 3, where HLT is itself a #GP and the
-    // fixture would fault forever. The run ends at the delivery anyway -- a control transfer is
-    // not continuable -- so one run is the whole observation.
+    // fixture would fault forever. The run ends at the delivery anyway (a control transfer is
+    // not continuable) so one run is the whole observation.
     memory[GP_HANDLER as usize] = 0x90;
 }
 
@@ -778,8 +778,8 @@ fn a_denied_port_delivers_the_same_general_protection_fault_with_the_block_insta
     // The dispatch gate's own cover (parent module) stops at `NotRun`. This row carries it to the
     // end: with the block installed and refused, the INTERPRETER executes the IN, its permission
     // check consults a zero-limit TSS, and the #GP is delivered. The block-free role does exactly
-    // the same thing from the same state, so every byte of the fault frame -- the pushed EFLAGS,
-    // CS, EIP and error code, the handler EIP, ESP -- plus the clocks and the bus trace have to
+    // the same thing from the same state, so every byte of the fault frame (the pushed EFLAGS,
+    // CS, EIP and error code, the handler EIP, ESP) plus the clocks and the bus trace have to
     // agree. A gate that let the block run instead would show up as a device read the block-free
     // role never made.
     let (code, starts) = program(&[&[IN_AL_DX]]);
@@ -832,7 +832,7 @@ fn a_denied_port_delivers_the_same_general_protection_fault_with_the_block_insta
     assert_eq!(native_outcome.halted, interp_outcome.halted);
 
     // GOVERNED as of round 2: this first pass is the governor's TRIAL, so the helper is entered
-    // once and refuses in phase P with nothing charged and nothing traced -- which is why the
+    // once and refuses in phase P with nothing charged and nothing traced, which is why the
     // guest-visible identity above still holds byte for byte.
     let stalls = roles.native.direct_stall_snapshot();
     assert_eq!(stalls.callout_governor_trials, 1);
@@ -961,7 +961,7 @@ fn lane_arm(cpu: &mut CpuGsw, ebp: u32) {
 }
 
 /// A guest dword store through the ordinary data-write path, so it reaches the SMC choke with the
-/// physical address already resolved -- the same path a `mov [addr], reg` takes.
+/// physical address already resolved: the same path a `mov [addr], reg` takes.
 fn lane_store(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, value: u32) {
     cpu.write_memory_bus_width(
         bus,
@@ -1008,7 +1008,7 @@ fn lane_and_call_out_fixture(imm: u32) -> (CpuGsw, TestBus, jit::direct::BlockId
 #[test]
 fn a_lane_patch_and_a_call_out_compose_in_one_block() {
     // The interaction the Task 1 review flagged: re-formation moved eleven doom blocks off their
-    // lanes, so FORMATION can separate the two. This row is about the MECHANISMS -- when a block
+    // lanes, so FORMATION can separate the two. This row is about the MECHANISMS: when a block
     // does hold both, a guest patch of the immediate must keep the block alive AND the next native
     // entry must run the call-out with the new immediate visible.
     //
@@ -1095,7 +1095,7 @@ fn a_lane_patch_and_a_call_out_compose_in_one_block() {
 fn a_structural_write_retires_a_lane_and_call_out_block_that_a_lane_write_kept() {
     // The two halves of the same claim, on the same fixture: a write to the immediate's four bytes
     // is absorbed and the block survives; a write to the instruction's opcode bytes is structural
-    // and retires it. A call-out slot changes neither answer -- which is the composition claim.
+    // and retires it. A call-out slot changes neither answer, which is the composition claim.
     let (mut cpu, mut bus, id) = lane_and_call_out_fixture(1);
     lane_store(&mut cpu, &mut bus, LANE, 0x0000_0020);
     assert_eq!(cpu.perf_counters().smc_lane_accepts, 1);
@@ -1120,13 +1120,13 @@ fn a_structural_write_retires_a_lane_and_call_out_block_that_a_lane_write_kept()
 // The MEMORY class: `0x60` PUSHAD and `0x61` POPAD.
 //
 // Every row here is mid-block against a block-free interpreter on the same bytes, and
-// `compare_state` already covers guest RAM byte-for-byte -- which is the whole point for a helper
+// `compare_state` already covers guest RAM byte-for-byte, which is the whole point for a helper
 // that moves thirty-two bytes of stack.
 // ---------------------------------------------------------------------------------------------
 
 const PUSHAD: u8 = 0x60;
 const POPAD: u8 = 0x61;
-/// `sub cx, 4` at Word operand size -- the third member of the census's coupled prologue family,
+/// `sub cx, 4` at Word operand size, the third member of the census's coupled prologue family,
 /// forty-seven exits from PUSHAD and lowered NATIVELY rather than as a call-out.
 const SUB_CX_IMM8: [u8; 4] = [0x66, 0x83, 0xe9, 0x04];
 
@@ -1225,7 +1225,7 @@ fn seed_registers(roles: &mut Roles, esp: u32) {
 #[test]
 fn pushad_mid_block_matches_the_interpreter() {
     // The memory class's headline row. Thirty-two bytes of stack, eight registers read, ESP
-    // written -- and `compare_state` compares guest RAM, so a wrong push ORDER, a wrong pushed SP
+    // written, and `compare_state` compares guest RAM, so a wrong push ORDER, a wrong pushed SP
     // value (PUSHAD pushes the PRE-instruction SP, not the decremented one) or a missing store
     // fails here rather than somewhere subtle.
     let (code, starts) = program(&[&[PUSHAD]]);
@@ -1272,7 +1272,7 @@ fn pushad_mid_block_matches_the_interpreter() {
 fn popad_mid_block_matches_the_interpreter_and_the_reload_publishes_all_eight_registers() {
     // The row the reload derivation exists for. `0xEC` wrote one byte of one register; POPAD
     // writes EIGHT plus ESP, so if the emitted slot's whole-set reload were partial this diverges
-    // on `registers` -- and the frame below is seeded with eight DISTINCT values, so a reload that
+    // on `registers`, and the frame below is seeded with eight DISTINCT values, so a reload that
     // dropped any one entry leaves a recognisable stale value rather than a zero.
     let (code, starts) = program(&[&[POPAD]]);
     let mut roles = build(&code, &starts, |_| {}, |_| {});
@@ -1360,8 +1360,8 @@ fn pushad_and_popad_in_one_block_match_the_interpreter() {
 #[test]
 fn a_page_crossing_pushad_frame_matches_the_interpreter() {
     // The frame spans two pages, so the eight slots are resolved against two different fast-map
-    // entries. `call_out_stack_frame_resident` does not special-case this -- it resolves each dword
-    // individually -- and this row is what says that is enough rather than an oversight.
+    // entries. `call_out_stack_frame_resident` does not special-case this: it resolves each dword
+    // individually, and this row is what says that is enough rather than an oversight.
     let (code, starts) = program(&[&[PUSHAD]]);
     let mut roles = build(&code, &starts, |_| {}, |_| {});
     warm_stack_frame_pages(&mut roles);
@@ -1391,12 +1391,12 @@ fn a_page_crossing_pushad_frame_matches_the_interpreter() {
 #[test]
 fn a_pushad_whose_frame_hits_watched_code_is_refused_and_left_to_the_interpreter() {
     // THE hazard this slice was designed around. A push whose range covers watched code would
-    // reach `note_code_write_hit` with this block's native code live on the stack -- the exact
+    // reach `note_code_write_hit` with this block's native code live on the stack: the exact
     // situation `note_code_write_inner`'s "no compiled block is mid-execution" proof rules out.
     //
     // The stack is aimed AT THE BLOCK'S OWN CODE, which is watched because the block is compiled
     // over it. The call-out must refuse (abnormal, EIP at the PUSHAD, nothing written) and the
-    // interpreter must then execute the whole instruction -- which is what the twin, stepped only
+    // interpreter must then execute the whole instruction, which is what the twin, stepped only
     // over the ONE slot the native run completed, pins.
     let (code, starts) = program(&[&[PUSHAD]]);
     let mut roles = build(&code, &starts, |_| {}, |_| {});
@@ -1411,7 +1411,7 @@ fn a_pushad_whose_frame_hits_watched_code_is_refused_and_left_to_the_interpreter
         ],
     );
     // ESP just past the block's last byte, 4-aligned, so the thirty-two bytes below it land ON the
-    // block's own code -- which is watched precisely because the block is compiled over it.
+    // block's own code, which is watched precisely because the block is compiled over it.
     let esp = (ENTRY + code.len() as u32 + 3) & !3;
     seed_registers(&mut roles, esp);
     let before_memory = roles.native_bus.memory.clone();
@@ -1457,7 +1457,7 @@ fn a_pushad_whose_frame_hits_watched_code_is_refused_and_left_to_the_interpreter
 fn a_pushad_whose_frame_is_not_resident_is_refused_and_left_to_the_interpreter() {
     // The cold half, deliberately measured: no `warm_stack_frame_pages`, so `lookup_access` misses
     // and the pre-check refuses on residency rather than on the code watch. Same fail-closed
-    // shape, different clause -- and this is the state EVERY PUSHAD is in the first time its stack
+    // shape, different clause, and this is the state EVERY PUSHAD is in the first time its stack
     // page is touched, so it is the common case rather than a corner.
     let (code, starts) = program(&[&[PUSHAD]]);
     let mut roles = build(&code, &starts, |_| {}, |_| {});
@@ -1516,7 +1516,7 @@ fn a_memory_call_out_composes_with_a_port_call_out_in_one_block() {
         3,
         "all three call-outs must run"
     );
-    // PUSHAD saved EAX, the IN overwrote AL, and POPAD restored the saved value -- so a
+    // PUSHAD saved EAX, the IN overwrote AL, and POPAD restored the saved value, so a
     // round-trip through all three classes leaves the SEEDED EAX, not the port byte. That is the
     // sharp end of the composition claim: the memory helpers' guest RAM and the port helper's
     // register write have to interleave in the right order for this to come out.

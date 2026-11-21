@@ -1,13 +1,13 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `0x85` TEST r/m16, r16, REGISTER form, at Word operand size -- behind `IZARRAVM_TEST_WORD_ROWS`.
+//! `0x85` TEST r/m16, r16, REGISTER form, at Word operand size, behind `IZARRAVM_TEST_WORD_ROWS`.
 //!
 //! The row is the top of the duke3d-586 rejected table at main `49c7ad97`, the first duke census
 //! taken after `IZARRAVM_ROTATE_ROWS`, `IZARRAVM_COUNT_LANES`, `IZARRAVM_FPU_LOOP_ROWS` and
 //! `IZARRAVM_V86_LOOP_ROWS` all became the shipped default
 //! (`.bench/results/duke-census-slice-20260821/`). Ranked by `runtime_hits`, twelve `0x85` rows
-//! carry **53,583,389 of the table's 126,933,336 hits -- 42.2%**, and 42,642,774 static unbound
+//! carry **53,583,389 of the table's 126,933,336 hits, 42.2%**, and 42,642,774 static unbound
 //! exits behind them. The next row is `0x8E /0` at 22,638,814, which this slice deliberately
 //! leaves alone; see `test_word_rows_enabled` for the suffix measurement that separates them.
 //!
@@ -36,7 +36,7 @@
 //! discriminates a correct Word lowering from a Dword one is entirely FLAGS, and the seed is built
 //! for that: every GPR carries `0xdead` in its high half, so `AND` over 32 bits and `AND` over 16
 //! bits disagree about ZF on the commonest case in the census (`test ax,ax` with a zero AX), about
-//! SF whenever bit 15 and bit 31 differ, and about PF never -- PF is the low byte at both widths,
+//! SF whenever bit 15 and bit 31 differ, and about PF never: PF is the low byte at both widths,
 //! which is why ZF and SF are the columns the operand table is chosen to exercise.
 
 // MUTATION EVIDENCE (2026-08-21). Each mutation below was applied BY HAND to the committed tree,
@@ -50,7 +50,7 @@
 // | M1 | the Word emit arm routed to `emit_test`, i.e. the Dword emitter reached through the new gate | `test_word_register_form_matches_the_interpreter_*` (both) | raw lazy-flags descriptor: `tag 0x8000_0202, result 0xdead_0000` against `tag 0x8000_0102, result 0` |
 // | M2 | the classify arm's `width: operand_width` reverted to `MemoryWidth::Dword` | the same two | the same descriptor pair, from the other end of the same path |
 // | M3 | the allowlist term widened from `insn.opcode == 0x85` to `matches!(.., 0x85 \| 0xa9)` | `the_gate_does_not_sweep_in_its_neighbours` | "0xA9 TEST AX,imm16 must stay a barrier at Word on the true arm": `Some(3)` against `None` |
-// | M4 | the allowlist term's `test_word_rows_enabled()` guard dropped | `the_word_test_row_flips_with_the_gate` | "unprefixed 85 /r ... must stay a barrier with the gate off": `Some(3)` against `None` -- the mutation that would destroy the A/B base |
+// | M4 | the allowlist term's `test_word_rows_enabled()` guard dropped | `the_word_test_row_flips_with_the_gate` | "unprefixed 85 /r ... must stay a barrier with the gate off": `Some(3)` against `None`, the mutation that would destroy the A/B base |
 // | M5 | the arm's `DecodedOperand::Reg` bind relaxed to fall back to register 0 on memory | `the_gate_does_not_sweep_in_its_neighbours` | "85 /r MEMORY form must stay a barrier at Dword on the false arm": `Some(3)` against `None` |
 //
 // All five were RE-RUN against the reworked `operand_seed` sweep on 2026-08-21 and all five still
@@ -114,7 +114,7 @@ fn sixteen_bit_cpu() -> CpuGsw {
 }
 
 /// Protected mode, flat, CS.D = 1. A `66`-prefixed `85 /r` decodes at Word here, which is the
-/// census's `operand_size=word, prefix_mask=1` half -- 37,840,230 runtime hits over eight rows and
+/// census's `operand_size=word, prefix_mask=1` half: 37,840,230 runtime hits over eight rows and
 /// the larger of the two halves by 2.4 to one. duke3d runs DOS4GW, so this is the mode that
 /// carries the row.
 fn flat_protected_cpu() -> CpuGsw {
@@ -222,7 +222,7 @@ fn compile32(body: &[u8]) -> Option<u8> {
 // ---------------------------------------------------------------------------------------------
 
 /// `TEST r/m, r` register form. `modrm` is `0b11_rrr_mmm`, so `reg` is the second operand's
-/// register number and `rm` the first's -- both are plain register numbers on this opcode, which
+/// register number and `rm` the first's: both are plain register numbers on this opcode, which
 /// is why the census reports twelve `modrm_reg` rows for one shape rather than a `/digit` group.
 fn test_reg(reg: u8, rm: u8) -> Vec<u8> {
     vec![0x85, 0xc0 | (reg << 3) | rm]
@@ -233,7 +233,7 @@ fn test_reg_66(reg: u8, rm: u8) -> Vec<u8> {
     [vec![0x66], test_reg(reg, rm)].concat()
 }
 
-/// `TEST [disp16], AX` -- the MEMORY form, which has no kind at either width and must stay a
+/// `TEST [disp16], AX`: the MEMORY form, which has no kind at either width and must stay a
 /// barrier on both arms.
 fn test_mem16() -> Vec<u8> {
     [vec![0x85, 0x06], OPERAND.to_le_bytes().to_vec()].concat()
@@ -248,7 +248,7 @@ fn test_ax_imm16() -> Vec<u8> {
 
 /// The mirror case finding 9 of the review names as load-bearing rather than decorative: `66 A9
 /// imm16` in a 32-BIT segment. `operand_size` there is `Word` (the prefix overrides CS.D), so
-/// this reaches the SAME gated arm `test_ax_imm16` reaches in a 16-bit segment -- refused with
+/// this reaches the SAME gated arm `test_ax_imm16` reaches in a 16-bit segment: refused with
 /// the gate off, admitted with it on, in EITHER segment default.
 fn test_ax_imm16_66() -> Vec<u8> {
     vec![0x66, 0xa9, 0x34, 0x12]
@@ -268,7 +268,7 @@ const CONTROL: [u8; 2] = [0x89, 0xc8];
 /// since the 2026-08-28 re-price; a default that moved without that decision would change every
 /// shipped binary's admission silently.
 ///
-/// It reads the AMBIENT knob deliberately -- no override -- and it must therefore agree with the
+/// It reads the AMBIENT knob deliberately, no override, and it must therefore agree with the
 /// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: the whole point
 /// of the `DIRECT_BARRIER` episode is that a knob's OFF arm has to be green too, and a fixture that
 /// hard-asserted "on" would make that impossible by construction. With the variable unset the
@@ -339,7 +339,7 @@ fn test_word_rows_spelling_table_names_both_arms() {
 /// The row flips with the gate, in BOTH of the modes the census measures, and nothing else does.
 ///
 /// Catches, in the `false` direction: an arm that forgot its `test_word_rows_enabled()` guard, i.e.
-/// a row that ships admitted while the knob says off -- which would make the gate-OFF census leg
+/// a row that ships admitted while the knob says off, which would make the gate-OFF census leg
 /// disagree with main and destroy the A/B base.
 ///
 /// Catches, in the `true` direction: a missing or wrongly-keyed allowlist term.
@@ -449,7 +449,7 @@ fn the_gate_does_not_sweep_in_its_neighbours() {
 
 /// `0xA9` TEST AX, imm16: refused at Word with the gate off (the pre-slice tree, byte-identical
 /// by inspection), admitted with it on. The Dword form (`0xA9` with no `0x66` prefix in a 32-bit
-/// segment) is UNGATED and must compile identically on both arms -- it never reached the Word
+/// segment) is UNGATED and must compile identically on both arms: it never reached the Word
 /// allowlist question at all, so the gate cannot move it.
 #[test]
 fn the_word_test_immediate_row_flips_with_the_gate() {
@@ -608,7 +608,7 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
         if seed.live_pending {
             // A descriptor produced BEFORE the tested instruction. TEST publishes a descriptor of
             // its own, so this is what proves the new one REPLACES the old rather than merging
-            // with it -- and it is the state a wrong width tag corrupts silently.
+            // with it, and it is the state a wrong width tag corrupts silently.
             let _ = cpu.alu(0, 0x7fff_ffff, 1, BusWidth::Dword);
         }
         cpu.set_eip(ENTRY);
@@ -695,13 +695,13 @@ const OPERANDS: [u32; 6] = [0x0000, 0x0001, 0x00ff, 0x7fff, 0x8000, 0xffff];
 /// Seed the two guest operands of `TEST rm, reg`, or `None` when the iteration is redundant.
 ///
 /// **When `reg == rm` there is only ONE guest register.** The first version of this file wrote
-/// both values into it —
+/// both values into it:
 ///
 /// ```ignore
 /// Seed::new().gpr(rm, 0xdead_0000 | a).gpr(reg, 0xbeef_0000 | b)
 /// ```
-///
-/// — so on every aliasing pair the second call overwrote the first, `a` was discarded, and the
+///,
+/// so on every aliasing pair the second call overwrote the first, `a` was discarded, and the
 /// advertised 6 x 36 sweep quietly collapsed to 6 distinct machine states. The assertions still
 /// fired (the surviving high half is nonzero, so the ZF discriminator survived) which is exactly
 /// why nothing caught it: it was coverage loss, not a hole. Found by the 2026-08-21 adversarial
@@ -745,7 +745,7 @@ fn operand_seed(reg: u8, rm: u8, a: u32, b: u32) -> Option<Seed> {
 /// **The sweep is 36 operand pairs on the four DISTINCT-register pairs and 6 on the two aliased
 /// ones**, because an aliased pair has one register and therefore one value; `operand_seed` says so
 /// and skips the redundant iterations rather than overwriting one value with the other. Do not
-/// restore the "6 x 36" reading — it was never true for `(0,0)` and `(6,6)`.
+/// restore the "6 x 36" reading: it was never true for `(0,0)` and `(6,6)`.
 #[test]
 fn test_word_register_form_matches_the_interpreter_in_a_sixteen_bit_segment() {
     select_test_word_rows(true);
@@ -832,7 +832,7 @@ fn test_dword_register_form_is_unchanged_on_both_arms() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 0xA9 TEST AX, imm16 -- the S-B ALU-rows slice
+// 0xA9 TEST AX, imm16: the S-B ALU-rows slice
 // ---------------------------------------------------------------------------------------------
 
 /// `TEST AX, imm16` (`0xA9`) with a given immediate.
@@ -842,7 +842,7 @@ fn test_ax_imm(imm: u16) -> Vec<u8> {
     body
 }
 
-/// `TEST EAX, imm32` -- the Dword-immediate encoding. NOT `test_ax_imm` with a widened type: the
+/// `TEST EAX, imm32`: the Dword-immediate encoding. NOT `test_ax_imm` with a widened type: the
 /// Dword form of `0xA9` fetches a four-byte immediate, and reusing the two-byte encoder against a
 /// 32-bit segment mis-lengths the decode (the walk reads two of the trailing filler's bytes as
 /// the top of the immediate), which reads back as a spurious refusal rather than the intended
@@ -885,7 +885,7 @@ fn test_ax_imm16_matches_the_interpreter_in_a_sixteen_bit_segment() {
 }
 
 /// The 32-bit-segment twin: `66 A9 imm16` in a 32-bit segment, the case that is
-/// load-bearing rather than decorative -- it reaches the same gated Word arm from the OTHER
+/// load-bearing rather than decorative: it reaches the same gated Word arm from the OTHER
 /// segment default, which `test_ax_imm16_66` sweeps for the compile-only question and this row
 /// sweeps for state.
 #[test]

@@ -1517,8 +1517,8 @@ fn prepare_rotate_reg(
     decode_fixture(&mut native, &mut native_bus, &starts);
     decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
     // FORCED ON rather than left to the ambient reading. The shipped default is now ON too
-    // (`rotate_rows_enabled` carries both A/Bs), so this is no longer what makes the ROL half run
-    // — it is what keeps it running if the default ever moves again. Off, the `op == 0` cases fail
+    // (`rotate_rows_enabled` carries both A/Bs), so this is no longer what makes the ROL half run;
+    // it is what keeps it running if the default ever moves again. Off, the `op == 0` cases fail
     // inside `install_block`'s three-slot assertion while the `op == 1` half keeps passing, which
     // reads as a ROL-specific emitter bug rather than as an arm selection.
     select_rotate_rows(true);
@@ -1559,7 +1559,7 @@ const ROR_COUNTS: [u8; 7] = [0, 1, 2, 7, 16, 31, 32];
 //
 // ROL by n leaves CF = bit 32-n of the input, and at count 1 OF is the result's top bit XOR that
 // carry. The mirror does NOT fall out of the same four seeds by luck and 0x4000_0000 is here to
-// close it -- an earlier version of this table used 0x0000_0002 in its place, which gives ROL the
+// close it: an earlier version of this table used 0x0000_0002 in its place, which gives ROL the
 // (CF=0, OF=0) corner a seed already covered and left (CF=0, OF=1) untested:
 //   0x0000_0001  rol 1 -> 0x0000_0002, CF=0 OF=0
 //   0x4000_0000  rol 1 -> 0x8000_0000, CF=0 OF=1
@@ -1613,7 +1613,7 @@ fn rotate_register_form_updates_a_live_descriptor_in_place_without_materialising
     // SF/ZF/PF/AF deferred. finish_and_compare asserts `eflags()` against the interpreter's, so a
     // lowering that set the wrong override bit, or that cleared a descriptor whose other five bits
     // the guest still owns, diverges here. What it no longer catches is a lowering that
-    // materialised EARLY and agrees on every architectural bit -- that is the representational
+    // materialised EARLY and agrees on every architectural bit: that is the representational
     // freedom this campaign released, not a gap that was overlooked.
     let pendings = [
         Some((0x7fff_ffffu32, 1u32)),
@@ -1898,7 +1898,7 @@ fn rotate_leaves_the_untouched_shadow_flags_alone_for_a_later_committer() {
 ///
 /// `dst` is a BYTE-register index: 0..3 name AL/CL/DL/BL and 4..7 name AH/CH/DH/BH, which live in
 /// the HIGH half of the same four homes. That aliasing is the whole reason this fixture exists
-/// separately from the rotate one -- `home(dst)` on a byte index of 5 reaches guest ESI.
+/// separately from the rotate one: `home(dst)` on a byte index of 5 reaches guest ESI.
 fn prepare_shl_reg8(
     mode: GswMode,
     dst: u8,
@@ -2007,8 +2007,8 @@ fn byte_shl_register_form_commits_and_clears_a_live_descriptor() {
     // A shift's flag contract is the opposite of a rotate's: `set_shift_result_flags` materialises
     // the descriptor and writes CF, OF, AF and SZP live, so the emitted form publishes the whole
     // RBP shadow and clears the pending word. finish_and_compare asserts `eflags()` against the
-    // interpreter's, so a byte lane that skipped the publish -- and therefore left a stale
-    // descriptor owning the five bits the shift just defined -- diverges here.
+    // interpreter's, so a byte lane that skipped the publish, and therefore left a stale
+    // descriptor owning the five bits the shift just defined, diverges here.
     for pending in [
         Some((0x7fff_ffffu32, 1u32)),
         Some((0x0000_00ff, 1)),
@@ -2064,7 +2064,7 @@ fn byte_shl_register_form_writes_only_its_own_lane() {
     // The write-back assertion the differential cannot make on its own: a lowering that wrote the
     // whole home, or the wrong half of it, would be caught by the interpreter comparison only if
     // the interpreter and the emitter disagreed about which bits move. This pins the surviving
-    // bits directly. `dst` 4..7 is the case that matters -- `emit_write_gpr8` shifts the value
+    // bits directly. `dst` 4..7 is the case that matters: `emit_write_gpr8` shifts the value
     // into the high lane, and dropping that shift writes AL where AH was asked for.
     for dst in 0..8u8 {
         let fixture = prepare_shl_reg8(GswMode::Gsw586, dst, 1, 0xdead_beef, 0x202, None);
@@ -2104,7 +2104,7 @@ fn byte_shl_register_form_matches_the_interpreter_in_486_mode() {
 
 #[test]
 fn group2_non_lowered_rotates_remain_interpreter_only() {
-    // FORCED ON, and this is the subtle one. Every row here is refused by a GUARD -- the `m.reg`
+    // FORCED ON, and this is the subtle one. Every row here is refused by a GUARD: the `m.reg`
     // tests and the register-only `let-else` (the Word `/0`,`/1` rows and the byte `/0`,`/1`
     // register rows all moved out of this file once `vorvek/direct-word-rot1` admitted them; see
     // `group2_word_rotate_register_form_is_lowered` and, in `cpu_jit_byte_shift_test.rs`,
@@ -2122,7 +2122,7 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
     // FORCED ON for the same reason, one knob later. The byte-shift-rows slice moved
     // `0xC0 /5,/6,/7` and the whole of `0xD0 /4..=7` out of this list and behind
     // `IZARRAVM_BYTE_SHIFT_ROWS`, so on that knob's OFF arm the rows below would be refused by the
-    // KNOB before any guard ran -- the exact vacuity the paragraph above describes. Forcing it ON
+    // KNOB before any guard ran, the exact vacuity the paragraph above describes. Forcing it ON
     // is what keeps the remaining byte rows a statement about `matches!(m.reg, 4..=7)` and about
     // the register-only `let-else` rather than about a gate.
     select_byte_shift_rows(true);
@@ -2178,7 +2178,7 @@ fn group2_non_lowered_rotates_remain_interpreter_only() {
     }
     // Restore the byte-shift arm rather than leaking it: the override is thread-local and the
     // harness reuses threads, so a leaked ON would decide the arm for whichever fixture runs next
-    // on this one -- including the refusal fixtures whose whole point is that it is off.
+    // on this one, including the refusal fixtures whose whole point is that it is off.
     jit::direct::set_byte_shift_rows_for_test(None);
 }
 
@@ -2193,7 +2193,7 @@ fn group2_dword_rotate_register_form_is_lowered() {
     // default OFF on that day's -3.44% and ships default ON since the 2026-08-19/20 re-measurement
     // (see `rotate_rows_enabled` for both), and the arm is forced here either way so this test does
     // not depend on which. The ROR and 0xD1 /1 rows below are outside the knob and would pass
-    // either way -- forcing is what stops this test from silently becoming a ROR-only pin.
+    // either way: forcing is what stops this test from silently becoming a ROR-only pin.
     select_rotate_rows(true);
     for code in [
         vec![0xc1u8, 0xcb, 0x10], // ror ebx, 16
@@ -2217,7 +2217,7 @@ fn group2_dword_rotate_register_form_is_lowered() {
 fn group2_word_rotate_register_form_is_lowered() {
     // The Word sibling of `group2_dword_rotate_register_form_is_lowered`, and the ONLY test that
     // can detect the classify arm's `insn.operand_size == OperandSize::Word` refusal being
-    // deleted from underneath a passing dword battery -- that refusal used to sit between the
+    // deleted from underneath a passing dword battery: that refusal used to sit between the
     // `m.reg` guard and the `Some(DirectKind::RotateReg { .. })` return, so a dword-only positive
     // test cannot see it. `123-talk-shareware`'s `0xD1 word register /1` (29.70M runtime hits, its
     // #1 census row) and `21-for-1-to-4`'s `0xD0 word register /1` (13.50M) are both this arm at
@@ -2251,7 +2251,7 @@ fn group2_byte_shl_register_form_is_lowered() {
     //
     // The arm is stated rather than inherited: on the off arm every assertion below fails rather
     // than going vacuous, but the failure names the wrong cause. That the shipped default has been
-    // ON since 2026-08-19/20 is not a reason to drop the force — it is what keeps this test tied to
+    // ON since 2026-08-19/20 is not a reason to drop the force: it is what keeps this test tied to
     // the emitter instead of to whichever arm ships.
     select_rotate_rows(true);
     for dst in 0..8u8 {
@@ -2373,7 +2373,7 @@ fn the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admis
 /// record keeps the shipped refusal, arm or no arm.
 ///
 /// This is the whole safety argument of the slice. The 2026-08-09 regression was block-kill
-/// amplification -- duke patches the group-2 COUNT byte, blocks that span it die, and they take
+/// amplification: duke patches the group-2 COUNT byte, blocks that span it die, and they take
 /// their live `0x81` immediate and `0x8A` displacement lanes down with them (-3.44% wall, coverage
 /// 0.7480 -> 0.7264; see `rotate_rows_enabled`). The gate says a site with a record is left as the
 /// hard boundary it has always been, so no block spans it for as long as the record stands. (Not
@@ -2381,7 +2381,7 @@ fn the_rotate_rows_knob_defaults_on_and_the_off_arm_restores_the_pre_slice_admis
 /// the self-correction. This fixture pins the gate, not the bound.) If the `has_record_range` term
 /// is deleted, every assertion here flips to `Some(3)`.
 ///
-/// The heat record is seeded at the count byte the way one real patch leaves one -- the same
+/// The heat record is seeded at the count byte the way one real patch leaves one, the same
 /// `bump` the disp-lane fixtures use, which is what `note_code_write_inner` does on a
 /// heat-charged kill.
 ///
@@ -2409,7 +2409,7 @@ fn the_heat_gated_arm_refuses_a_patched_count_byte() {
 }
 
 /// L1 from the ADMITTING side: the identical rows convert when their count byte has never been
-/// patched. Paired with the test above this is the slice in two assertions -- the gate splits one
+/// patched. Paired with the test above this is the slice in two assertions: the gate splits one
 /// census row by measured patch history and nothing else.
 ///
 /// The unpatched share of the `0xC1 /0` row is the number the whole slice exists to measure
@@ -2437,7 +2437,7 @@ fn the_heat_gated_arm_admits_an_unpatched_count_byte() {
 
 /// THE ADDRESS TEST. Every other fixture in this group sits at `ENTRY = 0x501`, where the whole
 /// instruction lives inside one 16-byte heat chunk, so all of them pass just as happily against a
-/// gate that probed the wrong byte of the instruction -- or any byte of it. This one places the
+/// gate that probed the wrong byte of the instruction, or any byte of it. This one places the
 /// gated instruction ACROSS a chunk boundary and seeds heat in one chunk only, which is the only
 /// shape that can see the count byte's address at all.
 ///
@@ -2449,7 +2449,7 @@ fn the_heat_gated_arm_admits_an_unpatched_count_byte() {
 ///   heat on `0x500` alone admits. Changing `checked_sub(1)` to `checked_sub(2)` in
 ///   `rotate_row_count_byte` moves the probe into the opcode's chunk and flips both halves.
 /// * `d1 c3` (rol ebx, 1) at `0x50f`: opcode `0x50f` in chunk `0x500`, modrm `0x510` in chunk
-///   `0x510`. `0xD1` has NO immediate -- its count is the literal 1 in the opcode -- so the
+///   `0x510`. `0xD1` has NO immediate: its count is the literal 1 in the opcode, so the
 ///   polarity is reversed: heat on `0x500` refuses and heat on `0x510` alone admits. Changing that
 ///   arm's `checked_sub(2)` to `checked_sub(1)` flips both halves of this pair.
 ///
@@ -2529,7 +2529,7 @@ fn the_heat_gate_does_not_reach_rows_outside_the_knob() {
 /// * `Off` must refuse a never-patched site as well as a patched one. This is the hard
 ///   requirement that the ESCAPE arm is bit-identical to the pre-L1 world: if the heat probe leaked
 ///   into the off arm, the base leg of every A/B would already carry the slice.
-/// * `On` must admit a PATCHED site -- that is precisely the admission the 2026-08-09 A/B measured
+/// * `On` must admit a PATCHED site: that is precisely the admission the 2026-08-09 A/B measured
 ///   at -3.44% and the 2026-08-19/20 re-measurement measured at -5.6% / -6.3%, and it is now the
 ///   SHIPPED DEFAULT. An `On` that quietly gained the gate would make the default agree with the
 ///   heat arm, so neither the historical legs nor the ladder would mean what they say.
@@ -2573,7 +2573,7 @@ fn the_off_and_on_arms_ignore_heat_entirely() {
 /// The env contract itself, asserted on the SHIPPED reading path with the override cleared: unset
 /// must mean `On`, as it has since the 2026-08-19/20 re-measurement (-5.6% short, -6.3% long; see
 /// `rotate_rows_enabled`). Everything above runs on the thread-local override, so without this
-/// nothing would notice the default flipping — which it now has, once, and this is the test that
+/// nothing would notice the default flipping, which it now has, once, and this is the test that
 /// makes the next flip a deliberate edit rather than a side effect.
 #[test]
 fn the_shipped_rotate_rows_default_is_the_on_arm() {
@@ -2637,7 +2637,7 @@ fn the_rotate_rows_spelling_table_is_exact() {
 }
 
 /// A MISSPELLED LADDER LEG MUST FAIL LOUDLY. The pre-L1 reading was "any value but 0 means on",
-/// which would quietly turn `IZARRAVM_ROTATE_ROWS=heat-gated` into the unconditional arm -- and
+/// which would quietly turn `IZARRAVM_ROTATE_ROWS=heat-gated` into the unconditional arm, and
 /// since 2026-08-19/20 that arm is also the SHIPPED DEFAULT, so the leg would run exactly what an
 /// unset environment runs and be read as "the arm I asked for changed nothing". That is the single
 /// wrong conclusion an arm ladder exists to avoid. So the parser panics instead of guessing, and
@@ -2645,7 +2645,7 @@ fn the_rotate_rows_spelling_table_is_exact() {
 ///
 /// `heat-gated` and `heatgated` are the near-misses that matter: both are one keystroke from the
 /// real spelling and both would previously have fallen through to the default arm. `off`/`on` are
-/// NOT in this list -- they are accepted design names, pinned by the table test above.
+/// NOT in this list: they are accepted design names, pinned by the table test above.
 #[test]
 fn an_unrecognised_rotate_rows_spelling_refuses_to_guess() {
     // The default hook prints a backtrace banner per panic, and this test raises seven on purpose.
@@ -2697,7 +2697,7 @@ fn select_rotate_rows_arm(arm: jit::direct::RotateRowsArm) {
 ///
 /// The fixture CPU is flat and unpaged, so linear and physical agree and the caller can name the
 /// count byte as an offset from `ENTRY` directly. The seed is one `bump`, which is exactly what
-/// `note_code_write_inner` leaves behind after one heat-charged kill -- the same seeding the
+/// `note_code_write_inner` leaves behind after one heat-charged kill, the same seeding the
 /// disp-lane fixtures use, on the other side of the same probe.
 fn compile_leading_block_with_heat(code: &[u8], heat_at: Option<u32>) -> Option<u8> {
     compile_leading_block_at_with_heat(ENTRY, code, heat_at)
@@ -2745,7 +2745,7 @@ fn compile_leading_block(code: &[u8]) -> Option<u8> {
 ///
 /// Split out when the S3 policy widening made "did it compile" and "how did it compile" different
 /// questions for the same bytes: a Word group-3 row now joins the block, and the claim the
-/// negative list below used to make about it -- that it is not lowered as a 32-bit operation -- is
+/// negative list below used to make about it (that it is not lowered as a 32-bit operation) is
 /// now the claim that it joined as a CALL-OUT.
 fn compile_leading_block_outcome(code: &[u8]) -> Option<jit::direct::Compilation> {
     let mut memory = vec![0; 0x5000];

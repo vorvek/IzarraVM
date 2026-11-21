@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! Mutable COUNT lanes: the group-2 shift/rotate count byte (`0xC1 /0` ROL, `0xC1 /1` ROR,
-//! `0xC1 /4..=7` the dword shifts, and `0xC0 /4` SHL r8 -- register forms, no prefixes) read out of
+//! `0xC1 /4..=7` the dword shifts, and `0xC0 /4` SHL r8, register forms, no prefixes) read out of
 //! guest RAM on every execution instead of being baked into host code, so a guest patch of that
 //! byte keeps the compiled block.
 //!
@@ -22,7 +22,7 @@
 //! `the_shipped_count_lanes_default_is_the_on_arm` is the one test here that deliberately reads the
 //! ambient arm.
 //!
-//! **AND IT IS TWO ARMS, NOT ONE — `force_count_lanes` alone is not enough for a refusal
+//! **AND IT IS TWO ARMS, NOT ONE: `force_count_lanes` alone is not enough for a refusal
 //! fixture.** `lanes_registered_for` reads `smc_lane_registrations`, which counts EVERY lane class,
 //! so a shape this file calls a "near miss" for the count lane can still register an IMM8 lane and
 //! read non-zero. That was harmless while `IZARRAVM_IMM8_LANES` was default-OFF and became a red
@@ -54,7 +54,7 @@
 //! freeze is unobservable: a mutation run widened the capture mask to `CF|ZF|SF` and the
 //! whole suite stayed green, because RBP is never published wholesale at block exit.
 //!
-//! Slot 3 is therefore `ror edi, 1` — the `0xD1 /1` two-byte form, which takes NO lane (no
+//! Slot 3 is therefore `ror edi, 1`: the `0xD1 /1` two-byte form, which takes NO lane (no
 //! immediate byte) and is outside the `IZARRAVM_ROTATE_ROWS` gate, so it adds no dependency on
 //! either arm. As a count-1 rotate it PUBLISHES RBP WHOLESALE to `eflags` with only `CF|OF`
 //! redefined, so every other bit of the architectural result comes straight out of the shadow the
@@ -167,14 +167,14 @@ const ROL: Shape = Shape {
 };
 
 /// Force both one-byte lane arms for the length of one fixture and restore the AMBIENT reading
-/// when it ends -- normally or by panic.
+/// when it ends: normally or by panic.
 ///
 /// A plain `set_*_for_test(Some(..))` at the top of a test LEAKS: the overrides are thread-local
 /// and the harness reuses threads, so the next fixture on that thread inherits an arm it never
 /// asked for. That was tolerable while the knob only selected lane admission. It is not tolerable
 /// now: `count_lanes_enabled()` also selects which door `note_code_byte_write_hit` takes, so a
 /// leaked ON override changes the SMC write path and the lane-rejection counters of every later
-/// test on the thread -- including the fixtures whose whole point is that those counters stay at
+/// test on the thread, including the fixtures whose whole point is that those counters stay at
 /// zero on the shipped arm.
 ///
 /// `Drop` rather than a trailing statement, because a `panic!` inside a fixture (an assertion
@@ -258,7 +258,7 @@ fn image_from(middle: &[u8]) -> Vec<u8> {
 ///   consumer overwrites the override anyway) and giving the count-1 arm the 2..31 flag path (the
 ///   consumer publishes and clears a moment later either way).
 /// * The CONSUMER-FREE frame ends with whatever the group-2 slot left, so the un-republished
-///   architectural EFLAGS are directly comparable — which catches those two. But nothing
+///   architectural EFLAGS are directly comparable, which catches those two. But nothing
 ///   reads RBP after the laned slot, so on this frame alone the RBP freeze is unobservable and a
 ///   widened capture mask survives.
 ///
@@ -287,9 +287,9 @@ fn block_starts_without_consumer() -> [u32; 4] {
 /// interpreter comparison runs on both.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Frame {
-    /// `.. / <group-2> / ror edi, 1 / mov edi, edi / hlt` — the shadow is published downstream.
+    /// `.. / <group-2> / ror edi, 1 / mov edi, edi / hlt`: the shadow is published downstream.
     WithConsumer,
-    /// `.. / <group-2> / mov edi, edi / hlt` — the descriptor the slot left survives to block exit.
+    /// `.. / <group-2> / mov edi, edi / hlt`: the descriptor the slot left survives to block exit.
     WithoutConsumer,
 }
 
@@ -534,7 +534,7 @@ fn assert_agrees(
     // The raw `pending_flags` word is deliberately NOT compared: it is a REPRESENTATION of the
     // flags, and two roles at the same architectural state are free to carry different
     // (base, descriptor) pairs for it. What still fails is a count-2 rotate that gets the
-    // architectural answer wrong -- `eflags()` above is what turns a descriptor into flags, and
+    // architectural answer wrong: `eflags()` above is what turns a descriptor into flags, and
     // the CONSUMER-BEARING frame reads the flags back through a real instruction.
     assert_eq!(
         native_bus.memory, interpreter_bus.memory,
@@ -599,15 +599,15 @@ fn count_lane_matches_the_interpreter_for_every_form_and_count() {
 /// THE BAKED EMITTERS, swept exactly as the lane emitters are, with the arm forced OFF.
 ///
 /// **This test exists because of the 2026-08-20 default flip and would have been redundant before
-/// it.** While the arm was default-off, every unforced group-2 fixture in the tree -- the
-/// rotate-rows admission fixtures, the lowering sweeps, the timing cases -- ran `emit_rotate_reg`
+/// it.** While the arm was default-off, every unforced group-2 fixture in the tree (the
+/// rotate-rows admission fixtures, the lowering sweeps, the timing cases) ran `emit_rotate_reg`
 /// and `emit_shift`. On today's default those same fixtures attach a lane and run
 /// `emit_rotate_reg_lane` / `emit_shift_lane` instead. Nothing failed when the default moved,
 /// because the two paths agree; what changed silently is WHICH path the tree covers. A future edit
 /// to the baked compile-time three-way split would then be caught by nothing.
 ///
 /// So the baked path gets its own sweep, over the same forms, the same counts and both frames, and
-/// the count is BAKED into the image rather than patched in -- on this arm a patch retires the
+/// the count is BAKED into the image rather than patched in: on this arm a patch retires the
 /// block instead of being absorbed, which is the whole point of the arm.
 #[test]
 fn the_baked_arm_matches_the_interpreter_for_every_form_and_count() {
@@ -857,13 +857,13 @@ fn the_count_arm_alone_opens_the_slow_byte_door() {
 
 /// A lane write is not code churn. Enough patches to cross the heat threshold several times over
 /// must leave the heat map untouched, because that demotion pressure is what the lane exists to
-/// remove -- `lane_only` at `core.rs`'s heat block is the suppression, and it is keyed on the
+/// remove: `lane_only` at `core.rs`'s heat block is the suppression, and it is keyed on the
 /// accept COUNT rather than on any lane's class, so the count lane inherits it by construction.
 /// This fixture is what turns "by construction" into a measurement.
 ///
 /// **THE DECODE LINE IS RE-FETCHED BETWEEN PATCHES, and without that this test cannot fail.**
 /// `heat_hit` is set by a narrow decode kill as well as by a block kill, and the first patch kills
-/// the line -- so a fixture that just stores 64 times charges heat at most once, never reaches the
+/// the line, so a fixture that just stores 64 times charges heat at most once, never reaches the
 /// threshold, and passes with the suppression deleted.
 #[test]
 fn count_lane_writes_contribute_no_smc_heat() {
@@ -929,7 +929,7 @@ fn straddling_write_over_the_count_lane_retires_the_block() {
     assert!(cpu.jit_direct.block(id).is_none());
 }
 
-/// A write to the instruction's OTHER bytes -- its opcode and ModRM -- is structural and retires
+/// A write to the instruction's OTHER bytes (its opcode and ModRM) is structural and retires
 /// the block. It overlaps no lane byte, so it is not even a lane rejection. This is the bar that
 /// keeps a `C1 -> D1` or a `/0 -> /2` patch (ROL to RCL, which is not lowered at all) from being
 /// absorbed by a lane that only ever meant the count.
@@ -967,7 +967,7 @@ fn device_write_at_the_count_lane_retires_the_block() {
 
 /// THE OFF ARM, which since the 2026-08-20 default flip must be FORCED rather than inherited. On
 /// this arm the very same block registers no lane, the baked count still applies, and the very same
-/// patch retires the block -- which is what makes every fixture above a statement about the slice
+/// patch retires the block, which is what makes every fixture above a statement about the slice
 /// rather than about the backend it was already, and what keeps the escape a true pre-slice world
 /// for the next A/B to be read against.
 ///
@@ -1015,7 +1015,7 @@ fn count_lane_is_refused_on_the_off_arm() {
 }
 
 /// The admission bars, one fixture per bar, each a near-miss of the admitted shape. Every one of
-/// these compiles a four-instruction block -- `lanes_registered_for` asserts that -- so a zero lane
+/// these compiles a four-instruction block (`lanes_registered_for` asserts that) so a zero lane
 /// count is a REFUSAL and not a truncated walk.
 #[test]
 fn near_miss_shapes_take_no_count_lane() {
@@ -1027,7 +1027,7 @@ fn near_miss_shapes_take_no_count_lane() {
     let _arm = force_both_lane_arms(true, false);
     // `0xD1 /0` ROL r32, 1: the SAME `RotateReg` kind, but its count is the literal 1 baked into
     // the opcode and it carries no immediate at all, so `physical + 2` would name the NEXT
-    // instruction's first byte. TWO bars refuse it -- the opcode test and `imm_len == 1` -- and
+    // instruction's first byte. TWO bars refuse it: the opcode test and `imm_len == 1`, and
     // this fixture cannot tell them apart; see `count_lane_for`, which says outright that the
     // opcode bar is redundant today and kept as defence in depth.
     assert_eq!(
@@ -1049,7 +1049,7 @@ fn near_miss_shapes_take_no_count_lane() {
         "prefixed 0xC1"
     );
     // An operand-size override makes this a WORD shift, whose emitter has no CL-form lane at all.
-    // THREE bars refuse it here -- the prefix bar, `len == 3`, and the kind's own width -- and only
+    // THREE bars refuse it here: the prefix bar, `len == 3`, and the kind's own width, and only
     // the last of those is load-bearing: in a 16-bit code segment the same instruction needs no
     // prefix at all and satisfies the first two. See
     // `a_word_group_two_shift_in_a_sixteen_bit_segment_takes_no_count_lane` in
@@ -1065,7 +1065,7 @@ fn near_miss_shapes_take_no_count_lane() {
     // `DirectKind::RotateShiftMem`, so the block compiles now and the claim is pinned where it
     // belongs: `count_lane_for` matches `RotateReg` and `Shift` BY NAME and ends in a catch-all
     // `return None`, so the new kind cannot reach a lane whatever its encoding looks like. This is
-    // the stronger assertion of the two -- the old one would have gone green again for the wrong
+    // the stronger assertion of the two: the old one would have gone green again for the wrong
     // reason the moment the memory form was admitted.
     assert_eq!(
         lanes_registered_for_warm(&[0xc1, 0x05, 0x00, 0x20, 0x00, 0x00, 0x03], 5, &[0x2000]),
@@ -1085,7 +1085,7 @@ fn near_miss_shapes_take_no_count_lane() {
 /// The page-kind guard, stated positively and verbatim from the other two classes: a lane is
 /// created ONLY from the fetch-page cache, the one direct-page cache that cannot hold a
 /// device-aperture pointer. With the fetch entry gone but the data caches warm for the same page,
-/// the qualifying `0xC1` must compile with a BAKED count -- correct as ever, just not
+/// the qualifying `0xC1` must compile with a BAKED count, correct as ever, just not
 /// parameterized.
 #[test]
 fn a_page_the_fetch_cache_cannot_see_gets_no_count_lane() {
@@ -1094,7 +1094,7 @@ fn a_page_the_fetch_cache_cannot_see_gets_no_count_lane() {
     let mut bus = test_bus(image(ROL, 4));
     decode_at(&mut cpu, &mut bus, &block_starts(3));
     // Warm the data-write cache for the code page (well past the block's bytes), then drop the
-    // fetch entry -- the state every code write already leaves behind.
+    // fetch entry: the state every code write already leaves behind.
     guest_store_dword(&mut cpu, &mut bus, ENTRY + 0x40, 0x1234_5678);
     cpu.fetch_page.invalidate();
 
@@ -1130,7 +1130,7 @@ fn a_page_the_fetch_cache_cannot_see_gets_no_count_lane() {
 /// The length rather than the bytes, and that is a limitation of the fixture rather than a
 /// weakening of the claim: two compilations bake different host pointers (link-cell and portal
 /// addresses, and a lane's own host pointer), so a byte comparison across them fails on allocation
-/// noise whatever the arm. The length is exactly the quantity a stray lane moves -- the lane arm
+/// noise whatever the arm. The length is exactly the quantity a stray lane moves: the lane arm
 /// emits a pointer load, a `movzx`, a mask and a three-way branch where the baked arm emits one
 /// shift and one flag path.
 fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
@@ -1157,7 +1157,7 @@ fn emitted_len_under_arm(middle: &[u8], arm: bool) -> usize {
 /// decorative and a build that hard-wired the lane off would still pass every refusal fixture.
 /// The other: every shape the arm does not admit must emit the SAME code under both arms, which is
 /// what says the arm is a lane admission and not a second code path that an unrelated block also
-/// walks through -- the failure a default flip would produce.
+/// walks through: the failure a default flip would produce.
 #[test]
 fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
     for admitted in [
@@ -1195,7 +1195,7 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
 /// The `IZARRAVM_COUNT_LANES` spelling table, and THE DEFAULT PIN, TWO-SIDED.
 ///
 /// `count_lanes_enabled` caches its env reading in a process-wide `OnceLock`, so the contract is
-/// otherwise assertable exactly once per process and never in an order the harness controls --
+/// otherwise assertable exactly once per process and never in an order the harness controls,
 /// hence the parse function is exercised directly.
 ///
 /// **Both directions are pinned here and each fails a different mutation**, which is what makes
@@ -1204,8 +1204,8 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
 /// * `unset -> ON` is the 2026-08-20 flip. Restoring `unset -> false` (the pre-flip mapping) fails
 ///   the first assertion. Without it, a default that silently reverted would leave the whole class
 ///   dormant in the shipped binary while every forced fixture in this file kept passing.
-/// * `0` / `off` / empty `-> OFF` is the escape. Making the off spellings select ON -- the obvious
-///   "simplify the table now that on is the default" edit -- fails the second loop. That escape is
+/// * `0` / `off` / empty `-> OFF` is the escape. Making the off spellings select ON (the obvious
+///   "simplify the table now that on is the default" edit) fails the second loop. That escape is
 ///   the base every future A/B on this class is read against, so it has to keep reproducing the
 ///   pre-slice world or the base stops being one.
 ///
@@ -1237,7 +1237,7 @@ fn count_lanes_spelling_table() {
 ///
 /// Everything else in this file runs on the thread-local override, so without this nothing would
 /// notice `count_lanes_enabled` growing a different default from the one `parse_count_lanes_arm`
-/// spells -- a `#[cfg]`, a stray `OnceLock` seed, an override that failed to clear. It also makes
+/// spells: a `#[cfg]`, a stray `OnceLock` seed, an override that failed to clear. It also makes
 /// the NEXT flip a deliberate edit rather than a side effect, which is exactly the job this test
 /// did for `IZARRAVM_ROTATE_ROWS`.
 ///
@@ -1256,7 +1256,7 @@ fn the_shipped_count_lanes_default_is_the_on_arm() {
 }
 
 /// A typo must not silently run the default. See `parse_count_lanes_arm` for why guessing is worse
-/// than failing -- and why the argument is STRONGER since the flip: a leg that quietly fell through
+/// than failing, and why the argument is STRONGER since the flip: a leg that quietly fell through
 /// would run exactly what an unset environment runs, and be read as the arm it named doing nothing.
 #[test]
 #[should_panic(expected = "names no arm")]
@@ -1264,8 +1264,8 @@ fn an_unrecognised_count_lanes_spelling_panics() {
     jit::direct::parse_count_lanes_arm_for_test(Ok("true".to_string()));
 }
 
-/// The two knobs are INDEPENDENT LEVERS, pinned as a test because the obvious simplification --
-/// hang the count lane off `IZARRAVM_IMM8_LANES`, they are both one-byte lanes -- would destroy the
+/// The two knobs are INDEPENDENT LEVERS, pinned as a test because the obvious simplification
+/// (hang the count lane off `IZARRAVM_IMM8_LANES`, they are both one-byte lanes) would destroy the
 /// 2x2 the ladder needs (see `rotate_rows_enabled`'s cross-term paragraph). Forcing one arm must
 /// leave the other's reading alone, in both directions.
 #[test]

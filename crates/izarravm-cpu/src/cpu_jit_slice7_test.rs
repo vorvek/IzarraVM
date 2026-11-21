@@ -20,7 +20,7 @@
 //! * **The byte lane is a different register file.** `dst`/`src` 4..=7 are AH/CH/DH/BH, the high
 //!   byte of the first four registers, which x86-64 cannot name alongside a REX prefix. The
 //!   high-byte rows below are the ones that fail if the emitter ever reaches its operands through
-//!   `home(index)` — index 5 is the host register holding guest EBP, so `cmp al, ch` would
+//!   `home(index)`: index 5 is the host register holding guest EBP, so `cmp al, ch` would
 //!   compare against the wrong register at the wrong width and, for a writing op, corrupt EBP.
 //!
 //! The aliasing rows (`add al, ah`, `xor ch, ch`, `sub bl, bl`) are not decoration: two byte
@@ -313,14 +313,14 @@ fn still_a_barrier(body: &[u8], context: &str) {
 // Three-operand IMUL (0x69 / 0x6B), register source.
 // ---------------------------------------------------------------------------
 
-/// `IMUL reg, rm, imm32` — 69 /r id, ModRM mod = 0b11.
+/// `IMUL reg, rm, imm32`: 69 /r id, ModRM mod = 0b11.
 fn imul_imm32(reg: u8, rm: u8, imm: u32) -> Vec<u8> {
     let mut bytes = vec![0x69, 0b1100_0000 | (reg << 3) | rm];
     bytes.extend_from_slice(&imm.to_le_bytes());
     bytes
 }
 
-/// `IMUL reg, rm, imm8` — 6B /r ib, ModRM mod = 0b11. The immediate is SIGN-EXTENDED by decode.
+/// `IMUL reg, rm, imm8`: 6B /r ib, ModRM mod = 0b11. The immediate is SIGN-EXTENDED by decode.
 fn imul_imm8(reg: u8, rm: u8, imm: u8) -> Vec<u8> {
     vec![0x6b, 0b1100_0000 | (reg << 3) | rm, imm]
 }
@@ -408,7 +408,7 @@ fn three_operand_imul_preserves_the_flags_it_does_not_define() {
     }
 }
 
-/// The CLOCK CHARGE, separated by accumulation -- **one half of a two-part check, and it is the
+/// The CLOCK CHARGE, separated by accumulation: **one half of a two-part check, and it is the
 /// one-sided half**.
 ///
 /// The three-operand IMUL charges `clocks(14)` where the two-operand form charges `clocks(9)` and
@@ -420,7 +420,7 @@ fn three_operand_imul_preserves_the_flags_it_does_not_define() {
 /// rather than checking one.
 ///
 /// One to four IMUL slots. At four the correct charge is `2 + 4*14 + 2 = 60` raw against 40 for
-/// `clocks(9)` and 16 for the default -- 5 scaled clocks against 3 and 1.
+/// `clocks(9)` and 16 for the default: 5 scaled clocks against 3 and 1.
 ///
 /// **What this cannot see, and what covers it.** The comparison is against the interpreter's
 /// accumulated clocks, so it is a floor comparison: `floor((14n + 4) / 12)` catches every
@@ -446,7 +446,7 @@ fn three_operand_imul_charge_matches_the_interpreter_across_slot_counts() {
 
 #[test]
 fn three_operand_imul_memory_form_is_still_a_barrier() {
-    // `IMUL eax, [ebx], 7` — 69 /r with mod = 0b00. The register arm must not have widened into
+    // `IMUL eax, [ebx], 7`: 69 /r with mod = 0b00. The register arm must not have widened into
     // the memory form: `ImulMemImm` does not exist and the `else` has to return None.
     let mut body = vec![0x69, 0b0000_0011];
     body.extend_from_slice(&7u32.to_le_bytes());
@@ -470,7 +470,7 @@ fn the_non_continuable_admission_is_narrow() {
     // census named at that arm, and each must stay refused for its own reason: IRET loads CS,
     // HLT stops the machine. `0xEE` left this list when its call-out helper
     // (`CallOutHelper::PortWriteAlDx`) gained the same V86-safe TSS-bitmap probe `0xEC`'s already
-    // has -- see `jit_admits_non_continuable`'s doc for the admission and
+    // has, see `jit_admits_non_continuable`'s doc for the admission and
     // `only_the_call_out_port_opcodes_are_admitted_at_word`
     // (`cpu_jit_compile_outcome_test.rs`) for its own coverage.
     still_a_barrier(&[0xcf], "0xCF IRETD");
@@ -480,7 +480,7 @@ fn the_non_continuable_admission_is_narrow() {
 #[test]
 fn out_dx_is_admitted_not_a_barrier() {
     // The narrow admission's positive control: `0xEE` alone, mid-block, must NOT take the
-    // `StructuralReject` path `still_a_barrier` asserts -- it is a call-out slot now, and its own
+    // `StructuralReject` path `still_a_barrier` asserts: it is a call-out slot now, and its own
     // suite (`cpu_jit_callout_test.rs`'s `out_dx_*` tests) covers the mechanism in full. This is
     // just the narrow-admission fixture's mirror image, built with the same `LEAD`/`TAIL` shape
     // `still_a_barrier` uses, so a future contributor reading this file top to bottom sees both
@@ -562,17 +562,17 @@ fn byte_lane_register_alu_matches_the_interpreter_in_both_operand_orders() {
     //
     // EVERY index appears as a DESTINATION at least once, and the row set is written out rather
     // than generated so that stays checkable by reading. An earlier version claimed to cover all
-    // eight and never made index 6 (DH) a destination -- structurally identical to 4, 5 and 7
+    // eight and never made index 6 (DH) a destination, structurally identical to 4, 5 and 7
     // under `emit_write_gpr8`'s `index - 4` lane, but "identical by construction" is the claim a
     // matrix exists to stop anyone having to make.
     for op in 0u8..8 {
         for (dst, src) in [
-            (0u8, 1u8), // AL, CL   -- low, low
-            (0, 5),     // AL, CH   -- low destination, HIGH source
-            (5, 0),     // CH, AL   -- HIGH destination, low source
-            (4, 7),     // AH, BH   -- high, high
-            (6, 1),     // DH, CL   -- the destination index the first draft never exercised
-            (6, 4),     // DH, AH   -- and again with a high source
+            (0u8, 1u8), // AL, CL: low, low
+            (0, 5),     // AL, CH: low destination, HIGH source
+            (5, 0),     // CH, AL: HIGH destination, low source
+            (4, 7),     // AH, BH: high, high
+            (6, 1),     // DH, CL: the destination index the first draft never exercised
+            (6, 4),     // DH, AH: and again with a high source
             (2, 3),     // DL, BL
             (1, 0),     // CL, AL
             (3, 6),     // BL, DH
@@ -611,7 +611,7 @@ fn byte_lane_register_alu_handles_lanes_of_the_same_home() {
     //
     // `op` sweeps ADC (2) and SBB (3) too, and `0x202`/`0x203` differ only in CF, an arithmetic
     // bit `flag(FLAG_CF)` (`core.rs`) reads through a live pending descriptor whenever one exists.
-    // `pending` used to be unconditional `true`, so the CF axis was entirely inert -- every aliased
+    // `pending` used to be unconditional `true`, so the CF axis was entirely inert: every aliased
     // pair here had zero real carry-in coverage. Sweeping `pending` adds the `(0x203, false)`
     // no-descriptor row that actually delivers CF=1.
     for op in 0u8..8 {
@@ -744,8 +744,8 @@ fn sixteen_bit_byte_alu_register_form_matches_its_unprefixed_encoding() {
     // slice put 0x00/0x02/../0x38/0x3A in `classify`'s OperandSize::Word allowlist, and what it
     // pinned was a CONSEQUENCE of that allowlist rather than a safety property of its own.
     //
-    // A 16-bit code segment is the case that matters -- `operand_size` comes from CS.D alone, so
-    // every instruction there reports Word, byte forms included -- and the 66 prefix is the same
+    // A 16-bit code segment is the case that matters: `operand_size` comes from CS.D alone, so
+    // every instruction there reports Word, byte forms included, and the 66 prefix is the same
     // condition reachable from 32-bit code. The prefix is inert on a byte-operand form: the
     // interpreter's arm reads `read_operand_u8`/`read_gpr8` without consulting `operand_size`,
     // and the classifier produces `AluRegByte`, which carries no width to get wrong. So the

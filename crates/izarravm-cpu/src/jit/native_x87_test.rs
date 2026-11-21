@@ -48,7 +48,7 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             // and must stay rejected, so this is an explicit rm list, not a range.
             | (0xd9, 3, 4, 0 | 1 | 4 | 5)
             // 0xD9 /7 rm=2 is FSQRT and rm=4 is FRNDINT (the FPU-loop slice's census row), the
-            // two members of that group with a host equivalent -- a `vsqrtsd` and a `vroundsd`
+            // two members of that group with a host equivalent: a `vsqrtsd` and a `vroundsd`
             // under a runtime branch on the control word's RC field. The other six encodings
             // (FPREM, FYL2XP1, FSINCOS, FSCALE, FSIN, FCOS) stay rejected.
             | (0xd9, 3, 7, 2 | 4)
@@ -58,7 +58,7 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             | (0xda, 0..=2, 0..=7, 0..=7)
             | (0xda, 3, 5, 1)
             // 0xDB memory /2 and /3: FIST/FISTP m32, one interpreter arm with a pop flag, plus
-            // `/7` FSTP m80. `/5` (FLD m80) stays rejected -- deferred, see `StoreExtended80` --
+            // `/7` FSTP m80. `/5` (FLD m80) stays rejected (deferred, see `StoreExtended80`)
             // and `/1`, `/4` and `/6` are undefined.
             | (0xdb, 0..=2, 0 | 2 | 3 | 7, 0..=7)
             // 0xDD memory forms: FLD/FST/FSTP m64 (`LoadF64`/`StoreF64`). `/1` (FISTTP,
@@ -71,9 +71,9 @@ fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
             // pattern is the negative assertion that FCOM/FCOMP with an ST(i) destination stay
             // on the interpreter, where they raise #UD.
             | (0xdc, 3, 0 | 1 | 4..=7, 0..=7)
-            // 0xDD mod=3 /4 and /5: FUCOM/FUCOMP ST(i). `/0` (FFREE) stays rejected -- it writes
+            // 0xDD mod=3 /4 and /5: FUCOM/FUCOMP ST(i). `/0` (FFREE) stays rejected: it writes
             // the tag word to Empty without touching a value, which `emit_store_physical` has no
-            // shape for -- and so do `/6`/`/7`, which are undefined.
+            // shape for, and so do `/6`/`/7`, which are undefined.
             | (0xdd, 3, 2..=5, 0..=7)
             | (0xde, 3, 0 | 1 | 4 | 5 | 6 | 7, 0..=7)
             | (0xde, 3, 3, 1)
@@ -465,7 +465,7 @@ fn classifier_rejects_bad_prefixes_and_malformed_decodes() {
     candidate.modrm = None;
     assert!(NativeX87Insn::classify(&candidate).is_none());
     // WAIT/FWAIT. `decode`'s FPU arm fetches a ModRM for every opcode EXCEPT 0x9b, so the ONLY
-    // shape that classifies is the one with neither a ModRM nor an operand -- and it classifies
+    // shape that classifies is the one with neither a ModRM nor an operand, and it classifies
     // as `Wait` since the FPU-loop slice, where it previously fell through the `insn.modrm?`
     // below it. Both halves are pinned: a 0x9b that arrives carrying either field is a decode
     // that did not happen, and admitting it would emit a slot whose `metadata().memory` says None
@@ -860,7 +860,7 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
         ),
         // FIST m32, the NON-popping half of the 0xDB /2-/3 pair. `pops` false against FISTP's
         // true is the only field that moves, and `IntConvert32` (272 at I586) must not drift to
-        // the `IntConvert16` its 0xDF sibling uses -- `execute_fpu` derives the class from the
+        // the `IntConvert16` its 0xDF sibling uses: `execute_fpu` derives the class from the
         // opcode byte, and 0xdb is the one escape that maps to IntConvert32.
         (
             insn(0xdb, 0, 2, 0),
@@ -892,7 +892,7 @@ fn metadata_matches_interpreter_timing_and_memory_effects() {
         ),
         // FISTP m64: `IntConvert16` like its FILD sibling and UNLIKE `StoreI32`'s
         // `IntConvert32`. The class comes from the opcode byte, so the two integer STORES
-        // disagree while the two 0xDF forms agree -- the opposite of what grouping by operation
+        // disagree while the two 0xDF forms agree, the opposite of what grouping by operation
         // would suggest, and the reason this row sits next to the FIST m32 one.
         (
             insn(0xdf, 0, 7, 0),

@@ -1154,7 +1154,7 @@ fn direct_push_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() {
         make_data_segments_flat(cpu);
         // A 32-bit STACK as well as 32-bit code. `stack_width_kind` refuses the (SS.B = 0, Dword)
         // cell outright, and `make_data_segments_flat` leaves `default_size_32` alone, so without
-        // this the fixture asks for a cell that does not exist and the block never compiles --
+        // this the fixture asks for a cell that does not exist and the block never compiles,
         // which looks exactly like the lowering being absent.
         for segment in [SegmentIndex::Cs, SegmentIndex::Ss] {
             let mut descriptor = cpu.registers.segment(segment);
@@ -1244,14 +1244,14 @@ fn direct_push_sreg_bakes_pinned_selectors_and_repins_when_a_segment_moves() {
     }
 }
 
-/// `MOV DS, r16` in real mode recomputes selector, base, access and B -- and leaves the cached
+/// `MOV DS, r16` in real mode recomputes selector, base, access and B, and leaves the cached
 /// LIMIT exactly where it was.
 ///
 /// The starting DS is UNREAL: base 0, limit 0xFFFF_FFFF, which is what a game gets after a
 /// protected-mode excursion sets a 4 GB limit and drops back. That seed is load-bearing in both
 /// directions now. A lowering that wrote only the selector and the base would leave a stale
-/// ACCESS byte live; a lowering that stamped the limit back to 0xFFFF -- which is what this
-/// emitter and `load_segment_real` both used to do -- would destroy unreal mode and turn every
+/// ACCESS byte live; a lowering that stamped the limit back to 0xFFFF (which is what this
+/// emitter and `load_segment_real` both used to do) would destroy unreal mode and turn every
 /// later >64 KB access into a #GP (the SpeedSys 4.78 hang). Neither error is local:
 /// `emit_segmented_linear_address` bakes the entry limit and omits its compare entirely when the
 /// limit is `u32::MAX`, so a divergence propagates into later blocks.
@@ -2367,7 +2367,7 @@ fn direct_ram_stores_cover_esp_sib_scales_displacements_and_disp_only() {
         &native_bus.memory[0x3400..0x3404],
         &0xa1b2_c3d4u32.to_le_bytes()
     );
-    // 5 on the one-lookup arm, 4 on the classic arm — and the difference IS the slice's size
+    // 5 on the one-lookup arm, 4 on the classic arm, and the difference IS the slice's size
     // mechanism, not noise: the classic emission of this six-slot span exceeds the one-host-page
     // install budget, so the compile walk splits the block and the fifth store retires
     // interpreted (compile_attempts 2, 5 insns/entry). The one-lookup sites are small enough
@@ -2948,7 +2948,7 @@ fn native_store_watch_covers_overlap_cross_chunk_and_same_value_cases() {
         // It used to exit on ALIGNMENT: `emit_wide_page_guard` refused the misaligned dword before
         // the watch guard could run, so the row asserted the refusal and never reached the thing it
         // was named for. The lean store site now serves a page-local misaligned store through its
-        // slow stub, which runs `emit_watched_store_guard` -- so the store at `0x410f` spans
+        // slow stub, which runs `emit_watched_store_guard`, so the store at `0x410f` spans
         // granules `0x10f..0x112`, the marked byte `0x4110` is one of them, and the guard's
         // multi-granule window arm catches it.
         //
@@ -3561,7 +3561,7 @@ fn word_jcc_loop_program() -> Vec<u8> {
 #[test]
 fn direct_block_matches_the_interpreter_across_a_word_operand_size_jcc() {
     // Both Jcc lowering arms. The Word block shape is `AddressWrap::Word`, whose terminator sits
-    // downstream of a 16-bit producer -- the one place where the shadow's upper bits and the
+    // downstream of a 16-bit producer: the one place where the shadow's upper bits and the
     // guest's operand size could be confused with each other.
     for on in [false, true] {
         jit::direct::set_jcc_shadow_for_test(Some(on));
@@ -4814,7 +4814,7 @@ fn a_mid_block_call_through_memory_matches_the_interpreter() {
 /// The interpreter reads the operand and only then pushes (`execute_extended.rs`, group 5 arm 2),
 /// so the target is the PRE-push contents. `emit_call_mem` emits the source read first for exactly
 /// that reason. Swap the two halves and the "target" becomes the return address the store just
-/// wrote, and the guest jumps to 0x106 instead of 0x300 -- a divergence no register-sourced or
+/// wrote, and the guest jumps to 0x106 instead of 0x300: a divergence no register-sourced or
 /// disjoint-address fixture can see, because in those the read is correct whichever order it runs
 /// in.
 ///
@@ -5015,7 +5015,7 @@ fn a_call_through_memory_whose_source_is_the_mode13_aperture_side_exits() {
 ///
 /// The sibling of the CallReg limit fixture above, and it pins the one thing that fixture cannot:
 /// the limit check's POSITION. `CallReg` can check first because its target needs no load.
-/// `CallMem` has to load first, so the check sits between the load and the store -- the only
+/// `CallMem` has to load first, so the check sits between the load and the store: the only
 /// position that is both after the value exists and before any guest byte moves. Emitted after the
 /// store instead, ESP and the pushed dword would both be live at the exit and the interpreter's
 /// re-run would push a second time.
@@ -5306,7 +5306,7 @@ fn a_call_through_memory_whose_push_lands_on_watched_code_side_exits() {
 /// not merely unexercised.
 #[test]
 fn cpl3_call_through_memory_does_not_panic_and_matches_the_interpreter() {
-    // Phase 1. `CallMem` is a terminal, so the block is just the filler plus the call -- no
+    // Phase 1. `CallMem` is a terminal, so the block is just the filler plus the call: no
     // `DIRECT_BARRIER` tail is needed the way the PushMem sibling needs one, and HLT (CPL0-only,
     // with no IDT in this harness) never enters the picture.
     const PHASE1_ENTRY: u32 = 0x100;
@@ -6336,7 +6336,7 @@ fn a_call_through_a_register_links_and_transfers_natively_on_the_second_entry() 
 ///
 /// This is mutation M2's fixture in execution terms, and it is where the retarget trap would
 /// actually bite. `LinkCell::clear` resets the portal, `entry_top` and spilling but NOT
-/// `target_eip`, and a static `set` writes only the portal — so a cell that carries both a static
+/// `target_eip`, and a static `set` writes only the portal, so a cell that carries both a static
 /// successor and a dynamic binding keeps a stale `target_eip` across a static rebind, and a later
 /// jump landing on that value transfers natively into whatever the static rebind pointed at. The
 /// compile-side fixture pins `successors == [None, None]`; this one proves the dynamic edge that
@@ -6445,15 +6445,15 @@ fn a_jmp_through_a_register_links_and_transfers_natively_on_the_second_entry() {
 /// record ZERO segment-limit side exits.
 ///
 /// Every other executing fixture for this kind uses `fresh()`, which is real mode with
-/// `cs.limit == 0xFFFF`, so the limit-check branch is present in all of them. Duke under DOS4GW —
-/// the workload the whole slice is ranked on — runs a flat CS, and `JmpReg` is the first emitter
+/// `cs.limit == 0xFFFF`, so the limit-check branch is present in all of them. Duke under DOS4GW
+/// (the workload the whole slice is ranked on) runs a flat CS, and `JmpReg` is the first emitter
 /// arm that allocates its side-exit label CONDITIONALLY on the limit being finite. So the shape
 /// production actually executes is the shape no fixture ran, and the two shapes differ in emitted
 /// code rather than only in a comparison result.
 ///
 /// WHAT IT CATCHES, established by mutation rather than asserted. Moving the target load
-/// `mov RDX, home(dst)` inside the `limit != u32::MAX` block — an ordinary refactor slip, since
-/// everything else in this arm lives there — makes this fixture fail with EIP 2 against 768 while
+/// `mov RDX, home(dst)` inside the `limit != u32::MAX` block (an ordinary refactor slip, since
+/// everything else in this arm lives there) makes this fixture fail with EIP 2 against 768 while
 /// EVERY other `JmpReg` fixture stays green. The finite-CS fixture cannot see it because its jump
 /// never completes; the compile-shape fixture cannot see it because it never executes.
 ///
@@ -6490,7 +6490,7 @@ fn flat_cs_jmp_through_a_register_runs_with_no_segment_limit_exit() {
     cpu.registers.set_ebx(TARGET);
     // Decoded by hand rather than by `drive`, unlike the real-mode link fixture. A flat CS lets
     // `run_straight_line` admit and install these very blocks during the warm-up, and the manual
-    // `install` below would then be refused as a duplicate -- an install failure that says nothing
+    // `install` below would then be refused as a duplicate: an install failure that says nothing
     // about the kind under test.
     for lin in [
         SOURCE,
@@ -6575,19 +6575,19 @@ fn flat_cs_jmp_through_a_register_runs_with_no_segment_limit_exit() {
 /// machine in a state the interpreter agrees with EXACTLY. This is mutation M4's fixture.
 ///
 /// WHAT IT PINS, stated precisely, because the earlier wording overclaimed. The interpreter side
-/// of this comparison executes the two `inc` fillers and STOPS — it never runs the jump. So this
+/// of this comparison executes the two `inc` fillers and STOPS: it never runs the jump. So this
 /// is not a fault-delivery test and says nothing about where the #GP eventually surfaces. It is a
 /// RESTART-STATE test: after the native block side exits at the jump, the register file, memory,
 /// `elapsed_clocks`, `trace.elapsed_clocks()` and the retired-instruction count must all equal an
 /// interpreter that executed only the two instructions before it. `jit_direct_insns` advancing by
-/// exactly 2 is the anti-vacuity half — it is what proves the jump did not retire.
+/// exactly 2 is the anti-vacuity half: it is what proves the jump did not retire.
 ///
 /// (The interpreter's own group-5 arm 4 performs no limit check, so the architectural fault
 /// surfaces on the following fetch. That is true and it is why the native exit must restart
 /// cleanly rather than deliver anything itself, but it is background for this fixture, not a
 /// claim this fixture verifies.)
 ///
-/// Why that catches M4. `JmpReg` writes exactly ONE piece of guest state — EIP — so unlike
+/// Why that catches M4. `JmpReg` writes exactly ONE piece of guest state (EIP) so unlike
 /// `CallReg` there is no pushed byte and no ESP to protect. The atomicity surface is entirely the
 /// accounting the side exit is published with. Move the publication after `completed` and
 /// `completed_raw` advance and the exit hands the interpreter the jump's 7 clocks as though it had
@@ -6890,7 +6890,7 @@ fn cpl3_call_through_a_register_permission_side_exit_is_counted() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Slice 6 -- explicit segment overrides on lowered memory kinds.
+// Slice 6: explicit segment overrides on lowered memory kinds.
 //
 // The admission is a change to `prefixes_supported_for` alone: `decode::parse_addressing_mode`
 // folds `segment_override` into `AddrMode.segment`, `classify::direct_addr` copies it verbatim,
@@ -6921,7 +6921,7 @@ fn segment_override_cpu() -> CpuGsw {
 }
 
 /// A load and a store through an explicit segment override, executed NATIVELY in the middle of a
-/// block, differentially against a block-free interpreter -- once per admitted segment.
+/// block, differentially against a block-free interpreter, once per admitted segment.
 ///
 /// Three separate things make this non-vacuous, and all three are needed:
 ///
@@ -6930,10 +6930,10 @@ fn segment_override_cpu() -> CpuGsw {
 ///  * **The override is load-bearing.** Every segment gets a distinct base, and the payload at the
 ///    overridden address differs from the payload at the DEFAULT segment's address, so a lowering
 ///    that silently used DS reads the wrong dword. Native-vs-interpreter equality alone could not
-///    catch that -- both could be wrong together -- so the loaded value is asserted absolutely and
+///    catch that (both could be wrong together) so the loaded value is asserted absolutely and
 ///    the stored word is asserted to have landed at the overridden address.
 ///  * **The store half is the doom row's shape.** `0x89 /6` `mov word [ss:m], si` carries 9,776,315
-///    doom exits and the load half `0x8B /2` `mov edx, [ss:m32]` another 9,776,202 -- together
+///    doom exits and the load half `0x8B /2` `mov edx, [ss:m32]` another 9,776,202, together
 ///    97.63% of doom's whole rejected class.
 #[test]
 fn a_mid_block_access_through_a_segment_override_matches_the_interpreter() {
@@ -6946,14 +6946,14 @@ fn a_mid_block_access_through_a_segment_override_matches_the_interpreter() {
     for (segment, selector, prefix) in OVERRIDE_CASES {
         let base = u32::from(selector) << 4;
         let mut code = vec![
-            0x90, // starter -- the entry position, deliberately not a tested opcode
+            0x90, // starter: the entry position, deliberately not a tested opcode
             0x40, // inc eax
         ];
-        // mov edx, [seg:OFFSET] -- the 0x8B /2 row
+        // mov edx, [seg:OFFSET]: the 0x8B /2 row
         code.push(prefix);
         code.extend_from_slice(&[0x8b, 0x15]);
         code.extend_from_slice(&OFFSET.to_le_bytes());
-        // mov word [seg:OFFSET+8], si -- the 0x89 /6 row, doom's prefix mask 97
+        // mov word [seg:OFFSET+8], si: the 0x89 /6 row, doom's prefix mask 97
         code.push(prefix);
         code.extend_from_slice(&[0x66, 0x89, 0x35]);
         code.extend_from_slice(&(OFFSET + 8).to_le_bytes());
@@ -7057,7 +7057,7 @@ fn a_mid_block_access_through_a_segment_override_matches_the_interpreter() {
         // The installed block starts at the INC, not at the NOP: `run_budgeted` retires a run's
         // first instruction through `cycle_no_interrupt_check_with_budget` and only then takes a
         // direct continuation, so the starter is interpreted and the block key is ENTRY+1. That is
-        // exactly what the starter is for -- it puts the overridden load and store at slots 2 and 3
+        // exactly what the starter is for: it puts the overridden load and store at slots 2 and 3
         // of a four-slot block, where the entry-position trap cannot hide an untested emitter arm.
         let key = jit::direct::key_for(&native, 0x101, true).unwrap();
         assert!(
@@ -7179,7 +7179,7 @@ fn a_ds_override_on_a_stack_relative_operand_matches_the_interpreter() {
 ///
 /// Before this slice the comment was untestable for anything but DS and SS, because those are the
 /// only segments a lowered kind could name. **A mutation that made `Load` answer `None` survived
-/// the whole crate** — every other fixture either has a Store declaring the same segment (which
+/// the whole crate**: every other fixture either has a Store declaring the same segment (which
 /// puts the bit back in `used`) or uses DS, which the block reads anyway.
 ///
 /// This fixture is the first that can see it. The block reads FS and nothing else touches FS, so
@@ -7197,7 +7197,7 @@ fn a_load_through_an_override_pins_that_segment_against_a_guest_reload() {
     let code = [
         0x90, // starter
         0x40, // inc eax
-        0x64, 0x8b, 0x15, 0x00, 0x18, 0x00, 0x00, // mov edx, [fs:0x1800] -- the ONLY FS user
+        0x64, 0x8b, 0x15, 0x00, 0x18, 0x00, 0x00, // mov edx, [fs:0x1800]: the ONLY FS user
         0x43, // inc ebx
         0xf4, // hlt
     ];
@@ -7276,7 +7276,7 @@ fn a_load_through_an_override_pins_that_segment_against_a_guest_reload() {
 /// wants. Both die in `segment_access_supported`, consulted from `kind_segment_access_supported`
 /// on every slot and again from `SegmentLayout::capture` at the end of the walk:
 ///
-///  * a segment loaded with a null selector installs `SegmentRegister::default()` — `access == 0`,
+///  * a segment loaded with a null selector installs `SegmentRegister::default()`: `access == 0`,
 ///    so the present bit is clear (`control.rs:1248`: "a later memory access through it faults with
 ///    #GP(0)"), and
 ///  * a CODE descriptor in a data segment register fails the `!write || (!code && writable)` clause
@@ -7287,8 +7287,8 @@ fn a_load_through_an_override_pins_that_segment_against_a_guest_reload() {
 /// fault its own rules say. That is what every already-admitted DS and SS access does today.
 ///
 /// **A NEVER-LOADED FS or GS is a different case and is NOT refused, deliberately.**
-/// `Registers::default` seeds all six data segments with `SegmentRegister::real(0)` — access 0x93,
-/// present, writable, base 0, limit 0xFFFF — so a guest that enters protected mode without ever
+/// `Registers::default` seeds all six data segments with `SegmentRegister::real(0)` (access 0x93,
+/// present, writable, base 0, limit 0xFFFF) so a guest that enters protected mode without ever
 /// loading FS has a perfectly accessible FS descriptor and an override through it COMPILES. That is
 /// correct twice over: the JIT and the interpreter read the same `registers.segment(segment)`, so
 /// they form the same linear address and take the same limit fault; and it matches real silicon,
@@ -7384,8 +7384,8 @@ fn an_override_naming_an_inaccessible_segment_refuses_to_compile_at_all() {
 /// `SegmentLimit` side exit when it fails, and the side exit rolls back to the instruction
 /// boundary so the INTERPRETER re-executes and faults by its own rules. Because the override is
 /// folded into `addr.segment` at decode, the interpreter's `segment_limit_fault(segment)` picks
-/// the vector off the OVERRIDDEN segment too -- **#SS(12) for an SS override, #GP(13) otherwise**
-/// -- which is the architectural rule, reached with no code written for it.
+/// the vector off the OVERRIDDEN segment too: **#SS(12) for an SS override, #GP(13) otherwise**,
+/// which is the architectural rule, reached with no code written for it.
 ///
 /// Both halves are load-bearing, and each pins something the other cannot.
 ///
@@ -7397,7 +7397,7 @@ fn an_override_naming_an_inaccessible_segment_refuses_to_compile_at_all() {
 ///    vectors have distinct real-mode IVT handlers, and the assertion reads the delivered vector
 ///    back out of EIP after the interpreter's re-run. An earlier draft asserted
 ///    `segment_limit_fault(segment)` against a loop constant, which is a table test of a `const fn`
-///    wearing a fixture's name -- it never touched either role's state and would have passed with
+///    wearing a fixture's name: it never touched either role's state and would have passed with
 ///    the whole slice reverted.
 #[test]
 fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_segment() {
@@ -7448,7 +7448,7 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
         }
         for cpu in [&mut native, &mut interp] {
             // Short enough to refuse the load, long enough that the SS case can still push the
-            // fault frame -- otherwise the SS half would measure a double fault instead.
+            // fault frame; otherwise the SS half would measure a double fault instead.
             let mut descriptor = cpu.registers.segment(segment);
             descriptor.limit = SHORT_LIMIT;
             cpu.registers.set_segment(segment, descriptor);
@@ -7563,7 +7563,7 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
         // THE VECTOR SPLIT, measured. EIP now holds whichever IVT handler the delivered vector
         // named, and the two handlers are distinct, so this reads the vector out of the machine
         // rather than asserting it from the loop's own constants. An SS override must take
-        // #SS(12) and an FS override #GP(13) -- the architectural rule, which falls out of the
+        // #SS(12) and an FS override #GP(13): the architectural rule, which falls out of the
         // decode fold putting the override into `addr.segment` before `segment_limit_fault` ever
         // sees it. Cross-checked against `segment_limit_fault`'s own answer so that a change to
         // either the delivery path or the classifier alone breaks this.
@@ -7592,13 +7592,13 @@ fn an_overridden_access_past_the_segment_limit_side_exits_and_faults_by_its_own_
 /// against `limit - (width - 1)`.
 ///
 /// The fixture above cannot see that. Its access is past the limit, so a compare against
-/// `base + offset` refuses it too -- by more, but a refusal is a refusal and every assertion there
+/// `base + offset` refuses it too, by more, but a refusal is a refusal and every assertion there
 /// still holds. What the fold breaks is the OTHER direction: an access INSIDE the limit whose
 /// LINEAR address is above `max_start` starts refusing where it must serve.
 ///
 /// So this fixture's constants are chosen for exactly that gap, `OFFSET <= max_start < base +
 /// OFFSET`. Every access here is architecturally legal and must be served natively with ZERO side
-/// exits, and it must read through the segment base rather than past it -- which is what the decoy
+/// exits, and it must read through the segment base rather than past it, which is what the decoy
 /// planted at the raw offset pins absolutely, the way native-vs-interpreter equality alone could
 /// not (both roles could be wrong together).
 #[test]
@@ -7724,11 +7724,11 @@ fn an_access_inside_a_based_segment_limit_is_served_natively_through_its_base() 
 }
 
 /// T4 of the watched-page-bit battery (the fast path really is fast): with the bit emission ON,
-/// an unwatched-by-bit store consults NOTHING — proven by deliberately constructing the
+/// an unwatched-by-bit store consults NOTHING: proven by deliberately constructing the
 /// incoherent state the strict-edge sweeps exist to prevent (a live bit-clear entry for a page
 /// the published tables say is watched, via a RAW `mark_range` that bypasses the sweep) and
 /// observing the store LAND natively with zero code-watch exits. The OFF arm emits the
-/// pre-slice unconditional guard against the identical state and takes the exit — which is what
+/// pre-slice unconditional guard against the identical state and takes the exit, which is what
 /// proves the ON arm's skip is the bit test, not an accident of the fixture.
 #[test]
 fn a_stale_clear_bit_skips_the_guard_and_the_off_arm_still_probes() {
@@ -7757,8 +7757,8 @@ fn a_stale_clear_bit_skips_the_guard_and_the_off_arm_still_probes() {
         ));
         assert!(!cpu.jit_fast_map.page_watched_bit_for_test(target));
         // The raw mark: the published table gains the page, no sweep runs, the entry above
-        // keeps its clear bit. Production cannot reach this state — T1/T2 in
-        // `cpu_jit_watch_bit_test.rs` are what pin that — so constructing it is the only way
+        // keeps its clear bit. Production cannot reach this state (T1/T2 in
+        // `cpu_jit_watch_bit_test.rs` are what pin that) so constructing it is the only way
         // to observe which of the two the emitted store believes.
         let _ = cpu.decode_cache.native_code_watch.mark_range(target, 1);
         bus.trace = BusTrace::default();
@@ -7815,7 +7815,7 @@ fn the_aperture_never_yields_a_block_key() {
 }
 
 /// E7 pin: the fast map is keyed by LINEAR address so a compiled block is
-/// deliberately shared across CS views of the same bytes -- but entering
+/// deliberately shared across CS views of the same bytes, but entering
 /// one must still respect the LIVE CS limit. This pins a PRE-EXISTING
 /// guard: every boundary passes through the fetch path, whose per-line
 /// limit recheck (`fetch_within_limit`, and decode's per-byte check on the
@@ -7827,7 +7827,7 @@ fn the_aperture_never_yields_a_block_key() {
 ///
 /// Phase 1 compiles a 16-bit loop at linear 0x10700 under CS=0x1000 (EIP
 /// 0x700, legal). Phase 2 re-enters the same linear bytes with CS=0 and
-/// EIP=0x10700 -- past the 0xFFFF real-mode limit (and not the wrap value
+/// EIP=0x10700, past the 0xFFFF real-mode limit (and not the wrap value
 /// 0x10000, so the run-off wrap stays out of the way). The fetch path must
 /// raise #GP(0), which real-mode delivery reflects through IVT[13] to the
 /// halting handler.
@@ -7890,7 +7890,7 @@ fn a_native_block_entry_past_the_live_cs_limit_raises_gp_instead_of_running() {
 }
 
 /// E7: sequential 16-bit code whose last instruction ends exactly at the
-/// 64K boundary wraps to CS:0000 (real IP arithmetic is mod 65536) -- it
+/// 64K boundary wraps to CS:0000 (real IP arithmetic is mod 65536): it
 /// must not run on into the next linear bytes, even when those bytes are
 /// warm compiled blocks under ANOTHER CS view.
 #[test]
@@ -7936,7 +7936,7 @@ fn e7_native_run_off_at_the_64k_boundary_wraps_instead_of_running_on() {
     );
 
     // The probe: enter A under CS=0, where A's last inc ends exactly at
-    // offset 0xFFFF. Real 16-bit IP arithmetic then wraps to CS:0000 -- it
+    // offset 0xFFFF. Real 16-bit IP arithmetic then wraps to CS:0000: it
     // does NOT run on into B's bytes at linear 0x10000, natively or
     // otherwise, and it does not fault (only a STRADDLING fetch #GPs).
     let entries_before = cpu.perf_counters().jit_direct_entries;

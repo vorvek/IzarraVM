@@ -27,7 +27,7 @@ fn cpuid_leaf0_reports_vendor_string_and_max_leaf() {
     assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
     assert_eq!(cpu.registers.edx().to_le_bytes(), *b"Bene");
     assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"tako");
-    // The 12 bytes are assembled EBX, then EDX, then ECX — the architectural order, the same one
+    // The 12 bytes are assembled EBX, then EDX, then ECX, the architectural order, the same one
     // that spells "GenuineIntel" on an Intel part. Pinning the assembled string as well as the
     // three registers is what makes a transposed pair (EDX/ECX swapped) fail.
     let mut vendor = [0u8; 12];
@@ -47,7 +47,7 @@ fn cpuid_leaf1_reports_the_modeled_gsw586_contract() {
         CPUID_FEATURE_FPU | CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_CX8
     );
     // Bit 23 is MMX. The GSW-586 has no SIMD extension, and correct software reads this bit
-    // before it executes an MMX encoding — so a clear bit here is what keeps the #UD those
+    // before it executes an MMX encoding, so a clear bit here is what keeps the #UD those
     // encodings now raise from ever being reached by a well-behaved program.
     assert_eq!(cpu.registers.edx() & (1 << 23), 0, "MMX bit must be clear");
     assert_eq!(cpu.registers.ebx(), 0);
@@ -318,7 +318,7 @@ fn mov_cr4_round_trips() {
 #[test]
 fn mov_cr_write_faults_at_cpl3() {
     // 0F 22 C0 = MOV CR0, EAX (reg=0, rm=EAX). A ring-3 write to CR0 must
-    // never silently succeed -- it is a privileged instruction like every
+    // never silently succeed: it is a privileged instruction like every
     // other 0F 00/01 system-register op (LLDT/LTR/LMSW/CLTS all gate on
     // require_cpl0). Mirrors the cpl3_code + vector-13 shape used by the
     // RDMSR/RDTSC privilege tests above.
@@ -406,7 +406,7 @@ fn lgdt_lidt_run_at_cpl0_in_real_mode() {
 #[test]
 fn mov_cr0_setting_pg_without_pe_is_general_protection() {
     // 0F 22 C0 = MOV CR0, EAX. 386 PRM 5.2.1: PG (bit 31) with PE (bit 0) clear is an
-    // invalid combination -- paging requires protection. Run at CPL 0 (real mode) so
+    // invalid combination: paging requires protection. Run at CPL 0 (real mode) so
     // the fault is specifically the PG/PE check, not the row-23 privilege gate.
     let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xc0], 0x20);
     cpu.registers.set_eax(CR0_PG);
@@ -508,7 +508,7 @@ fn mov_dr6_round_trips_with_reserved_bit_behavior() {
     // 0F 23 F0 = MOV DR6, EAX (reg=6, rm=EAX); 0F 21 F3 = MOV EBX, DR6 (reg=6, rm=EBX).
     // DR6 is plain storage here (breakpoint matching is ledger row 26, deferred), so
     // whatever is written reads back byte-for-byte, including into the high bits the
-    // PRM defines as fixed-1 on reset -- this core does not re-force them on write.
+    // PRM defines as fixed-1 on reset: this core does not re-force them on write.
     let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xf0, 0x0f, 0x21, 0xf3], 0x20);
     cpu.registers.set_eax(0x0000_000f); // B0-B3 all set
     let mut bus = TestBus::with_memory(memory);
@@ -535,7 +535,7 @@ fn mov_dr7_reset_value_matches_prm() {
 #[test]
 fn mov_dr4_aliases_dr6() {
     // 0F 23 E0 = MOV DR4, EAX (reg=4); 0F 21 E3 = MOV EBX, DR4. With CR4.DE clear (the
-    // default -- never behaviorally set by this core), DR4 aliases DR6.
+    // default, never behaviorally set by this core), DR4 aliases DR6.
     let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xe0, 0x0f, 0x21, 0xe3], 0x20);
     cpu.registers.set_eax(0x0000_000a);
     let mut bus = TestBus::with_memory(memory);
@@ -734,7 +734,7 @@ fn cmpxchg8b_unequal_loads_edx_eax_and_clears_zf() {
 #[test]
 fn cmpxchg8b_register_form_is_undefined_opcode() {
     // 0F C7 C9: mod=3 register form is #UD. CMPXCHG8B is converted (`DecodeGroup::Misc`), so
-    // drive it through the split — the executor re-detects the register form and #UDs.
+    // drive it through the split: the executor re-detects the register form and #UDs.
     let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xc7, 0xc9], 0x20);
     let mut bus = TestBus::with_memory(memory);
     let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
@@ -1270,7 +1270,7 @@ fn a_cached_line_is_not_served_past_a_shrunken_cs_limit() {
     // A CS load no longer flushes the decode cache, so the fetch limit must be re-checked
     // live at every hit: cache INC AX at eip 0x10 under a 64 KB CS, reload CS with an
     // identical base/D but a limit BELOW 0x10, and re-enter. The line is still in the cache
-    // (no flush) but must MISS to decode, which raises #GP on the out-of-limit fetch -- the
+    // (no flush) but must MISS to decode, which raises #GP on the out-of-limit fetch: the
     // stale INC AX must never run.
     let mut memory = vec![0u8; 0x40];
     memory[0x10] = 0x40; // INC AX
@@ -1418,7 +1418,7 @@ fn a_fetch_page_made_not_present_re_faults_after_invalidation() {
     // A cache hit must not execute an instruction whose fetch would now fault. Page linear
     // 0x1000 -> frame 0x5000 (present), cache INC AX there, then clear the PTE present bit and
     // flush (which bumps the decode generation). Re-entry must re-decode, fault on the absent
-    // fetch page, and leave AX untouched -- never replay the cached INC AX. (Observed via AX
+    // fetch page, and leave AX untouched, never replay the cached INC AX. (Observed via AX
     // rather than cr2 because, with no IDT mapped, delivering the #PF cascades a second fault.)
     let mut memory = vec![0u8; 0x8000];
     memory[0x6000..0x6004].copy_from_slice(&0x0000_7007u32.to_le_bytes()); // PD[0] -> PT 0x7000
@@ -1552,8 +1552,8 @@ fn every_mmx_opcode_is_invalid_on_every_persona() {
     // nothing at all. Assert #UD on all FOUR personas, the 586 included.
     //
     // "Everything #UDs" is the assertion here, so the vacuity hazard has flipped relative to the
-    // gate-era test this replaces: a harness that faulted on ANY input — a broken `run_at_mode`, a
-    // mis-seeded CPU, an operand that faults before the opcode is even classified — would satisfy
+    // gate-era test this replaces: a harness that faulted on ANY input (a broken `run_at_mode`, a
+    // mis-seeded CPU, an operand that faults before the opcode is even classified) would satisfy
     // it while proving nothing. Two guards close that off. First, the control below runs a
     // still-implemented 0F opcode through the SAME harness at each persona and requires it NOT to
     // fault, so the harness is demonstrably capable of returning Ok. Second, every arm pins vector
@@ -1561,7 +1561,7 @@ fn every_mmx_opcode_is_invalid_on_every_persona() {
     assert_eq!(MMX_SECOND_BYTES.len(), 52, "the byte list itself is intact");
 
     // Behaviour alone cannot tell the two #UD sources apart: an MMX byte left unclassified would
-    // fall to `IsaGeneration::I386`, route to `TwoByteFallback`, and #UD there instead — the same
+    // fall to `IsaGeneration::I386`, route to `TwoByteFallback`, and #UD there instead, the same
     // vector and the same frame, which is exactly the invariant
     // `a_never_gated_two_byte_opcode_delivers_the_same_ud_from_the_decode_gate` pins. So assert the
     // CLASSIFICATION as well. `Never` is the deliberate statement "this encoding names nothing on
@@ -2016,7 +2016,7 @@ fn undefined_two_byte_opcode_raises_ud() {
 /// End-to-end #UD delivery, the contract the raw-fault assertions above cannot see: a guest
 /// executing an undefined opcode must land in its own IVT[6] handler with the return frame's IP
 /// at the START of the invalid instruction, prefixes included. #UD is a FAULT (386 PRM 9.8), so
-/// the pushed CS:IP names the invalid instruction itself — that is what lets a real-mode handler
+/// the pushed CS:IP names the invalid instruction itself, that is what lets a real-mode handler
 /// inspect or emulate the opcode and IRET past it, and it is the same rewind contract the
 /// fault-site diagnostics were once one instruction late on.
 const UD_TRAP_CS: u16 = 0x0300;
@@ -2098,8 +2098,8 @@ fn a_never_gated_two_byte_opcode_delivers_the_same_ud_from_the_decode_gate() {
 #[test]
 fn an_mmx_opcode_delivers_a_real_ud_frame_on_every_persona_including_the_586() {
     // EMMS (`0F 77`) is the byte era software executes to probe for MMX when it skips CPUID. On a
-    // GSW-586 it must deliver exactly the #UD an unmapped 0F byte does — same vector, same IVT[6]
-    // retarget, same three-word real-mode frame, same rewind to the instruction START — on the
+    // GSW-586 it must deliver exactly the #UD an unmapped 0F byte does: same vector, same IVT[6]
+    // retarget, same three-word real-mode frame, same rewind to the instruction START, on the
     // 586 as much as on the 386. `every_mmx_opcode_is_invalid_on_every_persona` above proves the
     // vector for the whole block; this proves the DELIVERY is a genuine fault rather than a
     // swallowed error, which a plain `unwrap_err()` on the vector cannot distinguish.
@@ -2115,7 +2115,7 @@ fn an_mmx_opcode_delivers_a_real_ud_frame_on_every_persona_including_the_586() {
 
     // Control on the same harness: CPUID (`0F A2`) is in the 586's contract, so on the 586 it
     // EXECUTES and never reaches IVT[6]. Without this arm a `ud_trap_cycle` that trapped
-    // unconditionally — or an `assert_ud_frame` that checked nothing — would pass the loop above.
+    // unconditionally, or an `assert_ud_frame` that checked nothing, would pass the loop above.
     let (cpu, _bus) = ud_trap_cycle(&[0x0f, 0xa2, 0x90], GswMode::Gsw586);
     assert_eq!(
         cpu.registers.cs().selector,

@@ -21,7 +21,7 @@
 //! **Every fixture here states its arm through `set_direct_retf_v86_for_test`, in both
 //! directions**, and nothing reads the ambient knob except the default pin itself. The knob ships
 //! OFF, so a positive fixture that leaned on the ambient reading would be testing the refusal and
-//! calling it a lowering -- and the suite is run on BOTH arms, so a fixture that hard-asserted
+//! calling it a lowering, and the suite is run on BOTH arms, so a fixture that hard-asserted
 //! "off" would make the armed leg red by construction.
 //!
 //! The differential rows run the same guest bytes natively and through a BLOCK-FREE interpreter
@@ -423,7 +423,7 @@ fn differential(
 /// inert doom/quake/tombraid corpus and duke inside its own leg spread. A default that moved back
 /// without a ladder would change every shipped binary's admission silently.
 ///
-/// It reads the AMBIENT knob deliberately -- no override -- and must therefore agree with the
+/// It reads the AMBIENT knob deliberately, no override, and must therefore agree with the
 /// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: a fixture that
 /// hard-asserted one arm would make the other leg red by construction. So the assertion is the
 /// spelling table applied to the real environment, which with the variable unset reduces to "the
@@ -459,8 +459,8 @@ fn direct_retf_v86_ships_v86_by_default() {
 /// **THE EMPTY STRING IS THE ESCAPE AND UNSET IS THE DEFAULT, AND SINCE THE 2026-08-24 FLIP THEY
 /// ARE DIFFERENT ARMS.** That is not a hypothetical distinction: nulling an environment variable
 /// in PowerShell leaves it PRESENT and EMPTY, so a leg that nulls this variable gets `Off` where
-/// it may have meant the default. It happens to land on the arm such a leg usually wants -- the
-/// escape -- but three earlier evidence directories in this repository ran default-ON knobs off
+/// it may have meant the default. It happens to land on the arm such a leg usually wants (the
+/// escape) but three earlier evidence directories in this repository ran default-ON knobs off
 /// exactly this way, and the only true unset is `Remove-Item Env:`.
 #[test]
 fn direct_retf_v86_knob_spellings() {
@@ -540,7 +540,7 @@ fn direct_retf_v86_knob_spellings() {
 /// the spelling table ever stopped mapping `0` to the escape, this fixture would then be pinning
 /// the wrong arm's behaviour, and the assertion below is what stops that silently.
 ///
-/// Catches: an admission that forgot its arm test, i.e. a RETF lowered while the knob says off --
+/// Catches: an admission that forgot its arm test, i.e. a RETF lowered while the knob says off,
 /// which would make the escape leg disagree with `main` and destroy the A/B base every future
 /// measurement on this mechanism is read against.
 ///
@@ -624,7 +624,7 @@ fn retf_is_refused_in_protected_mode_and_on_a_32_bit_stack() {
 
 /// F1. The whole CS record, written from the popped selector, in V86.
 ///
-/// The stack is seeded exactly as `push cs; call near f` leaves it -- offset below selector -- and
+/// The stack is seeded exactly as `push cs; call near f` leaves it (offset below selector) and
 /// CS really changes across the return (selector 0 in, selector 0x0020 out), so every field of the
 /// record is observable in `registers`.
 ///
@@ -664,7 +664,7 @@ fn a_far_return_writes_the_whole_cs_record_and_matches_the_interpreter_in_v86() 
 /// trust everywhere else.
 ///
 /// `return_far_body` writes `self.cpl = 0` in real mode. That is claimed to be a no-op because
-/// every PE-clearing transfer sets `cpl = 0` and no real-mode path raises it -- true in this tree,
+/// every PE-clearing transfer sets `cpl = 0` and no real-mode path raises it, true in this tree,
 /// and exactly the kind of invariant this campaign has been burned by, so it is asserted rather
 /// than assumed.
 #[test]
@@ -792,7 +792,7 @@ fn native_retf_charges_exactly_what_the_interpreter_charges() {
 /// bus clocks on the way.
 ///
 /// The count rides the free HIGH half of `STACK_RAM_DWORD_WRITES`, a lane `run.rs` reads at TWO
-/// sites. Leaving the low half unmasked at the `writes` sum is the QUIET failure --
+/// sites. Leaving the low half unmasked at the `writes` sum is the QUIET failure:
 /// `jit_native_store_hits`, `data_direct_writes` and `direct_data_pointer_writes` inflate by 2^32
 /// per far return, plausibly, and read as the slice working. Leaving it unmasked at the Dword
 /// bus-clock charge is the LOUD, guest-visible one, and it would be misread as the timing change
@@ -914,7 +914,7 @@ fn a_far_block_counts_as_a_segment_write_block() {
 ///
 /// `emitted_static_targets` is built from `terminal_links` and is NOT masked by
 /// `segment_write_block`, so a `RetFar16` riding the catch-all would register a phantom static
-/// fallthrough on SLOT 0 -- which is the FAR cell. The campaign ranks and closes on censuses.
+/// fallthrough on SLOT 0, which is the FAR cell. The campaign ranks and closes on censuses.
 ///
 /// **The census is ARMED, and that is not optional.** `register_direct_link_refusal_cells`
 /// computes the id as `self.direct_link_refusal_census.as_mut().map_or(0, ..)`, so with the census
@@ -1158,7 +1158,7 @@ impl Chain {
     }
 }
 
-/// F3. The two-way PIC binds two far targets and the third misses -- and still lands correctly.
+/// F3. The two-way PIC binds two far targets and the third misses, and still lands correctly.
 ///
 /// The first return binds nothing (the cell is bound in the exit tail, so the first pass is always
 /// a miss), the second hits, and with three distinct targets the third displaces one of the two
@@ -1221,7 +1221,7 @@ fn retf_pic_binds_two_targets_and_the_third_misses() {
 /// The target carries a CS-override memory operand (`sub ax, cs:[m]`), which is admitted under
 /// `v86_loop_rows_enabled` and puts `segment_bit(Cs)` in `used` through `read_segment`.
 ///
-/// Catches: `merge_chain` or `link_merge` used in place of `far_merge` (M10) -- `link_merge`'s
+/// Catches: `merge_chain` or `link_merge` used in place of `far_merge` (M10): `link_merge`'s
 /// plain `cs` compare would refuse this edge too, but it would refuse EVERY far edge, which F3
 /// catches; what this row adds is that `far_merge` refuses the RIGHT ones.
 #[test]
@@ -1263,8 +1263,8 @@ fn a_far_edge_into_a_cs_descriptor_pinning_target_is_refused() {
 ///
 /// `0100:0000` and `00FF:0010` are the same linear 0x1000. A far cell keyed on the EIP would hit
 /// on the WRONG one of those two (M8/M9); a cell keyed on the linear names one block for both,
-/// which is correct precisely because the block's emitted arithmetic is CS-invariant -- unless it
-/// bakes CS. The aliased target here bakes it BOTH WAYS -- `push cs` and `mov ax, cs` -- so
+/// which is correct precisely because the block's emitted arithmetic is CS-invariant, unless it
+/// bakes CS. The aliased target here bakes it BOTH WAYS (`push cs` and `mov ax, cs`) so
 /// `BAKES_CS_BIT` is set and every far edge into it is refused.
 ///
 /// Catches: M18, the `BAKES_CS_BIT` term dropped from `far_merge`'s refusal, which would admit the
@@ -1337,7 +1337,7 @@ fn a_far_return_whose_target_block_overruns_the_segment_limit_is_not_linked() {
     // FOUR two-byte fillers, i.e. an eight-byte BLOCK, at linear 0x1000A. Eight and not seven:
     // the HLT the other targets end with is non-continuable and never joins the block, so a
     // `filler + hlt` target is a SIX-byte block and `0xFFFA + 6 - 1` is exactly the limit rather
-    // than past it -- which is how this fixture first went vacuous.
+    // than past it, which is how this fixture first went vacuous.
     let overrunning = Target::with_code(
         0x1000,
         0x000a,
@@ -1406,7 +1406,7 @@ fn smc_over_the_far_target_cuts_the_cell() {
 /// and drives the backward propagation into the far predecessor.
 ///
 /// Merging instead would compare the predecessor's PRE-RETF `data[1]` against a POST-RETF
-/// requirement -- two unrelated CS records -- which the ordinary `push cs; call; retf` shape would
+/// requirement (two unrelated CS records) which the ordinary `push cs; call; retf` shape would
 /// satisfy BY COINCIDENCE and then be wrong on a later rebind of the same cell.
 ///
 /// Catches: M16, the propagation cut dropped.
@@ -1501,8 +1501,8 @@ fn a_far_chain_leaves_cs_ip_and_sp_retired_at_the_boundary() {
 ///
 /// The design named `cpu_jit_differential_generator_test.rs` with the knob armed in V86. That
 /// generator emits 32-bit FLAT blocks and has no 16-bit or V86 mode, so arming the knob there
-/// exercises nothing; this sweeps the far return's own parameter space instead -- selector,
-/// offset, release and stack pointer, including the 16-bit wrap in each -- against the interpreter.
+/// exercises nothing; this sweeps the far return's own parameter space instead (selector,
+/// offset, release and stack pointer, including the 16-bit wrap in each) against the interpreter.
 #[test]
 fn far_returns_match_the_interpreter_across_a_swept_grid() {
     select_retf(jit::direct::RetfArm::V86);
@@ -1558,7 +1558,7 @@ fn far_dynamic_cannot_be_inherited_by_a_recycled_block_slot() {
 /// side-exit label, so a stack read that leaves the SS limit retires nothing: SP has not moved, CS
 /// still holds its old record and EIP still points at the RETF, and the interpreter re-runs it.
 ///
-/// Built in PLAIN REAL MODE with a deliberately short SS limit -- 0x0701, so the offset at
+/// Built in PLAIN REAL MODE with a deliberately short SS limit: 0x0701, so the offset at
 /// SS:0x0700 is inside it and the selector at SS:0x0702 is not. In V86 SS's limit is always
 /// 0xFFFF and `AddressWrap::Word` masks the effective address, so the fault is unreachable there;
 /// an unreal-mode SS is the one shape that can produce it.
@@ -1619,8 +1619,8 @@ fn a_fault_on_the_second_far_pop_leaves_the_instruction_unstarted() {
 /// produce the same bytes. Nothing was fixed by adding an assertion; what closes it is changing
 /// the STATE the assertions run against.
 ///
-/// The stale descriptor is an UNREAL CS -- a code-segment access byte, `default_size_32` true and
-/// a 4 GB limit -- which is what a real machine's CS cache holds after a protected-mode excursion
+/// The stale descriptor is an UNREAL CS (a code-segment access byte, `default_size_32` true and
+/// a 4 GB limit) which is what a real machine's CS cache holds after a protected-mode excursion
 /// that returned through a real-mode far transfer. The interpreter's `load_segment_real` writes
 /// the whole record unconditionally, so the far return must canonicalise all of it.
 ///
@@ -1688,7 +1688,7 @@ fn a_far_return_canonicalises_a_stale_cs_descriptor() {
 /// The bind-time fetch-limit compare is FAR-ONLY, and a near bind keeps main's exact refusal
 /// accounting (code review M-1).
 ///
-/// The compare is outcome-inert for a near edge in the normal path -- `link_merge` refuses any
+/// The compare is outcome-inert for a near edge in the normal path: `link_merge` refuses any
 /// near edge whose two chain layouts disagree on `cs`, and the compile walk's own limit test
 /// already bounds a linkable near target. It is NOT inert in ATTRIBUTION: ungated, the one case
 /// where it can fire (the two CS records differ) returns before `try_link_inner` is reached, and a
@@ -1697,7 +1697,7 @@ fn a_far_return_canonicalises_a_stale_cs_descriptor() {
 ///
 /// The shape is F17's, one segment over and with a NEAR `ret`: the target block lives at linear
 /// 0x1000A and was compiled under CS 0x1000 at offset 0x000A, while the source runs under CS
-/// 0x0001 and returns to offset 0xFFFA -- the same linear, an offset near the wrap, and an
+/// 0x0001 and returns to offset 0xFFFA: the same linear, an offset near the wrap, and an
 /// eight-byte block that runs one byte past a 0xFFFF limit.
 ///
 /// Catches: M25, the `if far` gate dropped.
@@ -1808,7 +1808,7 @@ fn a_near_bind_past_the_segment_limit_still_refuses_through_try_link_inner() {
 /// walk gained a third disjunct with this slice; the mirror had to gain it too. Without it the
 /// scan stops dead at every RETF on the ARMED arm while the walk carries on, so the
 /// counterfactual suffix is truncated for exactly the 274 M-execution population the slice
-/// creates -- and the armed and base censuses stop being comparable on the rows the ladder will
+/// creates, and the armed and base censuses stop being comparable on the rows the ladder will
 /// be read against.
 ///
 /// Guest-invisible and OFF-arm-inert, which is precisely why it needs a fixture: nothing else in
@@ -1819,7 +1819,7 @@ fn a_near_bind_past_the_segment_limit_still_refuses_through_try_link_inner() {
 fn the_barrier_census_suffix_scan_walks_through_an_admitted_retf() {
     // `0xCF` IRETD is the barrier: non-continuable, unlowered, and a census row of its own. (Was
     // `0xEE` OUT DX,AL before the corpus L2 slice gave it a `classify` arm and an unconditional
-    // admission -- it stopped being a barrier at all, so it stopped being usable as this
+    // admission. It stopped being a barrier at all, so it stopped being usable as this
     // fixture's filler opcode. IRETD is untouched by that slice and keeps the same role: it loads
     // CS, so a block cannot run past it, and `classify` refuses it independently of this
     // predicate.) After it: one filler, the RETF, then two more fillers. The scan's answer is how

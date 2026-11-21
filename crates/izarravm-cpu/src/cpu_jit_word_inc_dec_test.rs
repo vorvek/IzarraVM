@@ -47,13 +47,13 @@
 //!
 //! A flag reader INSIDE the block proves nothing. `emit_load_host_flags` reads RBP, the running
 //! materialized shadow that `emit_capture_flags` filled from the HOST flags of the sixteen-bit
-//! `alu_r16_r16` -- correct whatever the descriptor says. A natively lowered `SETcc` after a
+//! `alu_r16_r16`, correct whatever the descriptor says. A natively lowered `SETcc` after a
 //! natively lowered INC therefore agrees with the interpreter under the mutation as well as
 //! without it.
 //!
 //! The descriptor is authoritative for whoever reads it AFTER the block: the interpreter. That is
 //! the production shape (a block exits with a live descriptor and the next instruction is
-//! interpreted), and it is what `the_descriptor_a_word_*_leaves_behind_*` exercises -- the readers
+//! interpreted), and it is what `the_descriptor_a_word_*_leaves_behind_*` exercises: the readers
 //! sit at their own address and BOTH roles step them interpreted, so the native role's descriptor
 //! is the one driving its `SETO`/`SETS`.
 //!
@@ -65,7 +65,7 @@
 //! ## Mutation record
 //!
 //! `emit_pending_inc_dec`'s Word `width_tag` -> `0x200`, applied by hand, run against the WHOLE
-//! crate (never a filter -- a filtered run is what let this survive in the first place), and
+//! crate (never a filter: a filtered run is what let this survive in the first place), and
 //! restored. **4 failed, 1324 passed**, and the 1324 is exactly the pre-addition baseline, so the
 //! blast radius is these four tests and nothing else in the crate.
 //!
@@ -94,7 +94,7 @@
 //!
 //! 534 is `0x216` and 2710 is `0xa96`: the interpreter has SF (bit 7) and OF (bit 11) and the
 //! mutated native role has neither, with PF, AF and IF identical in both. That is the prediction
-//! above, confirmed -- and note that CF and ZF do NOT appear, which is why a row chosen for ZF
+//! above, confirmed, and note that CF and ZF do NOT appear, which is why a row chosen for ZF
 //! would have passed under the mutation.
 //!
 //! The two `registers` failures are the same fact one instruction later: EBX and EDX come back
@@ -445,7 +445,7 @@ fn operands(is_dec: bool) -> &'static [u16] {
 }
 
 // ---------------------------------------------------------------------------------------------
-// `66 FF /0` and `66 FF /1` -- INC/DEC m16
+// `66 FF /0` and `66 FF /1`: INC/DEC m16
 // ---------------------------------------------------------------------------------------------
 
 /// Under the `0x200` mutation this fails first at
@@ -501,7 +501,7 @@ fn the_descriptor_a_word_memory_inc_dec_leaves_behind_drives_the_next_flag_reade
 }
 
 // ---------------------------------------------------------------------------------------------
-// `66 40`..`66 4F` -- INC/DEC r16
+// `66 40`..`66 4F`: INC/DEC r16
 // ---------------------------------------------------------------------------------------------
 
 /// Every destination except ESP, which the fixture owns. The high half stays poisoned on both

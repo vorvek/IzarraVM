@@ -23,14 +23,14 @@
 //!
 //! **The bus-clock comparison against the interpreter is NOT a plain equality here, and the reason
 //! is a `TestBus` modelling artifact rather than a divergence.** The design's charge-equality claim
-//! -- a misaligned N-byte access costs N byte cycles natively and interpreted alike -- is a
+//! (a misaligned N-byte access costs N byte cycles natively and interpreted alike) is a
 //! property of `MachineBus`, where `BusCycle::clocks_for` ignores width. `TestBus`'s direct-page
 //! wait states are width-DEPENDENT (0/1/3 for Byte/Word/Dword), so the one wide cycle the native
 //! side charges is not the same size as the byte cycle the interpreted side charges in its place.
 //!
-//! Both sides now emit `N - 1` byte cycles for the split -- native from the stub deposit,
+//! Both sides now emit `N - 1` byte cycles for the split: native from the stub deposit,
 //! interpreted from `charge_direct_ram_split`, since `FastMap::lookup_access` no longer refuses a
-//! misaligned width -- so those terms cancel and the whole residual is `wide_cycle - byte_cycle`.
+//! misaligned width, so those terms cancel and the whole residual is `wide_cycle - byte_cycle`.
 //! On a real `MachineBus` that residual is exactly ZERO, which is the charge equality itself,
 //! asserted at the dial level in `izarravm-machine`'s `machine_bus_timing_test.rs`.
 //!
@@ -38,8 +38,8 @@
 //! deposit is matched term-for-term by the interpreter's own split, so an omitted, doubled or
 //! mis-sized deposit moves the number immediately.
 //!
-//! Everything else -- registers, lazy flags, EFLAGS, the halt latch, core clocks and the WHOLE of
-//! guest RAM -- is still compared against a block-free interpreted role, and the whole-array RAM
+//! Everything else (registers, lazy flags, EFLAGS, the halt latch, core clocks and the WHOLE of
+//! guest RAM) is still compared against a block-free interpreted role, and the whole-array RAM
 //! compare is what catches a wrong-value store.
 
 use super::*;
@@ -79,18 +79,18 @@ fn direct_cycle_clocks(bytes: u32) -> u64 {
 ///
 /// Derived, not measured, and the derivation is the interesting part:
 ///
-/// * **Native** charges one WIDE cycle — the one the block's static count already carries — plus
+/// * **Native** charges one WIDE cycle (the one the block's static count already carries) plus
 ///   `bytes - 1` byte cycles from the split deposit.
 /// * **Interpreted** now charges `bytes` BYTE cycles. `FastMap::lookup_access` no longer has an
 ///   alignment rung, so a misaligned page-local access is SERVED from the fast map rather than
-///   leaving it, and the charge routes to `CpuBus::charge_direct_ram_split` — whose default
+///   leaving it, and the charge routes to `CpuBus::charge_direct_ram_split`, whose default
 ///   implementation is `bytes` calls to `charge_direct_ram_memory` at `BusWidth::Byte`, which is
 ///   what `TestBus` inherits.
 ///
 /// So the difference collapses to `wide_cycle(bytes) - byte_cycle`: the `bytes - 1` byte cycles
 /// appear on BOTH sides and cancel. **Everything that remains is `TestBus`'s width-DEPENDENT
 /// direct dial** (0/1/3 wait states for Byte/Word/Dword). On a real `MachineBus`, where
-/// `BusCycle::clocks_for` ignores width, this quantity is exactly ZERO — which is the charge
+/// `BusCycle::clocks_for` ignores width, this quantity is exactly ZERO, which is the charge
 /// equality this slice rests on, asserted directly in `machine_bus_timing_test.rs`.
 ///
 /// That makes the residual here a pure fixture artifact rather than a divergence, and it is a
@@ -309,7 +309,7 @@ fn build(body: &[u8]) -> Roles {
 
 /// As `build`, but marks one byte as code on BOTH roles before the pages are mapped.
 ///
-/// Marking makes the page's PAGE_WATCHED bit set, which POISONS its store bias -- so an aligned
+/// Marking makes the page's PAGE_WATCHED bit set, which POISONS its store bias, so an aligned
 /// store to any other offset on that page reaches `emit_slow_stub` instead of the site's fast arm,
 /// passes the code-watch guard (its own granule is unmarked), and lands through the stub's RAM
 /// counter arm. That is the only way to build an aligned store that reaches the stub, and it is
@@ -318,7 +318,7 @@ fn build(body: &[u8]) -> Roles {
 /// The mark goes on BOTH roles: the watch is guest-visible through the interpreter's own SMC
 /// bookkeeping, so watching one role would compare two different machines. It goes BEFORE
 /// `map_page`, because the mark's edge sweep invalidates any live fast-map entry on the marked
-/// page whose watched bit is clear -- marking after populating would clear the entry just
+/// page whose watched bit is clear: marking after populating would clear the entry just
 /// installed.
 fn build_watching(body: &[u8], watch: Option<u32>) -> Roles {
     build_slots(&[body], watch, false)
@@ -353,7 +353,7 @@ fn user_cpu() -> CpuGsw {
 
 /// Each element of `bodies` is one tested opcode, and each gets its own warmed decode line: a
 /// missing one makes `compile` ask for a retry rather than produce a block. The compiled block
-/// must then cover `bodies.len() + 2` slots -- asserted rather than assumed, because a body that
+/// must then cover `bodies.len() + 2` slots, asserted rather than assumed, because a body that
 /// silently failed to compile as one block would leave the tested opcode on the interpreter and
 /// the fixture would certify nothing.
 fn build_slots(bodies: &[&[u8]], watch: Option<u32>, cpl3: bool) -> Roles {
@@ -487,7 +487,7 @@ fn compare_state(roles: &Roles, context: &str) {
 
 /// A row that completes NATIVELY through the misaligned recovery: all three slots retire in the
 /// block, the architectural state matches three interpreted steps, and the bus-clock delta is
-/// exactly the split charge for `bytes` -- one wide cycle plus `bytes - 1` byte cycles.
+/// exactly the split charge for `bytes`: one wide cycle plus `bytes - 1` byte cycles.
 fn lowered_misaligned(body: &[u8], bytes: u32, context: &str) {
     let mut roles = build(body);
     let retired = roles.native.perf_counters().jit_direct_insns;
@@ -519,8 +519,8 @@ fn lowered_misaligned(body: &[u8], bytes: u32, context: &str) {
 }
 
 /// A row that completes NATIVELY with no misaligned access at all: the aligned control. Bus clocks
-/// must match the interpreter EXACTLY here -- an aligned access takes the same one direct cycle in
-/// both roles -- which is what says the split deposit is conditional rather than unconditional.
+/// must match the interpreter EXACTLY here: an aligned access takes the same one direct cycle in
+/// both roles, which is what says the split deposit is conditional rather than unconditional.
 fn lowered_aligned(body: &[u8], context: &str) {
     let mut roles = build(body);
     assert!(
@@ -542,7 +542,7 @@ fn lowered_aligned(body: &[u8], context: &str) {
 }
 
 /// A row whose emitted memory guard REFUSES. The native run must end at the tested opcode with the
-/// instruction un-started -- no byte of guest RAM written, no register touched -- and the
+/// instruction un-started (no byte of guest RAM written, no register touched) and the
 /// interpreter must then execute it and reach the same state.
 fn guarded(body: &[u8], exits: fn(&CpuGsw) -> u64, context: &str) {
     let mut roles = build(body);
@@ -576,7 +576,7 @@ fn guarded_roles(roles: &mut Roles, exits: fn(&CpuGsw) -> u64, context: &str) {
     );
     // The refusal must be TRANSACTIONAL: not one byte of the access may have landed. This is the
     // assertion that separates "refused before the access" from "refused after it", and it is the
-    // whole content of the Mode 13h store row -- an aperture byte written before the refusal would
+    // whole content of the Mode 13h store row: an aperture byte written before the refusal would
     // be written a second time by the interpreter's re-execution.
     // Reported as the first differing index rather than as two 700 KiB arrays: a refusal that
     // wrote before exiting differs in one or two bytes, and the address is the diagnosis.
@@ -625,12 +625,12 @@ fn disp32(opcode_head: &[u8], reg: u8, at: u32) -> Vec<u8> {
     body
 }
 
-/// `movzx ebx, word [at]` — a Word READ through the lean one-lookup load site.
+/// `movzx ebx, word [at]`: a Word READ through the lean one-lookup load site.
 fn word_load(at: u32) -> Vec<u8> {
     disp32(&[0x0f, 0xb7], 3, at)
 }
 
-/// `mov ebx, dword [at]` — a Dword READ through the same site.
+/// `mov ebx, dword [at]`: a Dword READ through the same site.
 fn dword_load(at: u32) -> Vec<u8> {
     disp32(&[0x8b], 3, at)
 }
@@ -657,7 +657,7 @@ fn a_misaligned_word_read_runs_natively_and_charges_the_split() {
 ///
 /// It is a different lowering from the row above, not a duplicate: at Word operand size MOVZX
 /// defines the destination's low 16 bits and PRESERVES its high 16, so the register seeds' `0xdead`
-/// high halves are load-bearing. `word_memory` cannot host it any more -- that module's `lowered`
+/// high halves are load-bearing. `word_memory` cannot host it any more: that module's `lowered`
 /// asserts bus clocks EQUAL to the interpreter, and a natively-served misaligned access charges
 /// more than `TestBus`'s non-splitting slow path.
 #[test]
@@ -674,8 +674,8 @@ fn a_misaligned_word_read_into_a_sixteen_bit_destination_runs_natively() {
 ///
 /// `AluMemSource` reads through `emit_ram_read_pointer`, which dispatches to this slice's RELAXED
 /// lean read site whenever `one_lookup_load` is on (the default). So the form-3 word-memory
-/// admission does NOT convert a barrier into a per-execution side exit at misaligned addresses --
-/// it is served natively with the split charge, exactly like the MOVZX rows above. That is the
+/// admission does NOT convert a barrier into a per-execution side exit at misaligned addresses.
+/// It is served natively with the split charge, exactly like the MOVZX rows above. That is the
 /// economics claim the admission rests on, and it belongs here rather than in `word_memory`, whose
 /// `lowered` asserts bus clocks EQUAL to the interpreter.
 ///
@@ -695,7 +695,7 @@ fn a_misaligned_word_alu_memory_source_runs_natively() {
     // CROSSES. Alignment sends it to the counting-read stub, and the stub RAM arm refuses before
     // the pointer resolve. Without this row the test above would keep passing if the stub bound
     // were omitted, and the pointer would then be used across a page the FastMap entry does not
-    // cover. `guarded` also asserts the refusal is transactional -- EIP left AT the slot, guest RAM
+    // cover. `guarded` also asserts the refusal is transactional: EIP left AT the slot, guest RAM
     // untouched, and the interpreted re-execution agreeing on both roles.
     let at = OPERAND_PAGE + 0xfff;
     let mut body = vec![0x66u8];
@@ -717,8 +717,8 @@ fn a_misaligned_word_alu_memory_source_runs_natively() {
 /// deposit.
 ///
 /// What does work is a page whose HOST BACKING is not 4 KiB-aligned. `derive_load_bias` poisons
-/// the LOAD bias when `read_bias & PAGE_MASK != 0` -- the load bias carries the mode13 and
-/// supervisor tags in its low bits, so a bias with low bits of its own cannot be tagged -- while
+/// the LOAD bias when `read_bias & PAGE_MASK != 0`: the load bias carries the mode13 and
+/// supervisor tags in its low bits, so a bias with low bits of its own cannot be tagged, while
 /// `read_biases[index]` stays live and available. `FastMap::populate` does not require the pointer
 /// to be page-aligned, so the site's probe sees poison and jumps to the stub, and the stub's
 /// `emit_read_pointer` resolves the untagged read bias perfectly well. An aligned wide read then
@@ -907,7 +907,7 @@ fn a_misaligned_mode13_read_still_exits() {
 // The admission matrix: stores
 // ---------------------------------------------------------------------------------------------
 
-/// `mov word [at], imm16` — a Word STORE through the lean one-lookup store site.
+/// `mov word [at], imm16`: a Word STORE through the lean one-lookup store site.
 fn word_store(at: u32, value: u16) -> Vec<u8> {
     let mut body = vec![0x66u8];
     body.extend_from_slice(&disp32(&[0xc7], 0, at));
@@ -949,7 +949,7 @@ fn a_misaligned_store_runs_natively_and_charges_the_split() {
 /// This row exists for one specific wrong shape, and it was written and watched to FAIL against it
 /// before the fix landed. The slow stub's contract is "RAX = linear address, RDX = store value",
 /// and `emit_slow_stub` spills RDX as its second instruction. Hoist the alignment half before
-/// `emit_read_store_value` -- the obvious edit, and the one the read site takes -- and the jump
+/// `emit_read_store_value` (the obvious edit, and the one the read site takes) and the jump
 /// into the stub happens before the value exists: the stub spills, then stores, whatever RDX held
 /// from the PREVIOUS slot. Silent wrong-value store into guest RAM, no fault, no counter.
 ///
@@ -1037,13 +1037,13 @@ fn an_aligned_store_through_the_slow_stub_charges_no_split() {
     );
 }
 
-/// A misaligned Mode 13h aperture store stays refused, and -- the whole point of where the refusal
-/// sits -- writes NO byte before refusing.
+/// A misaligned Mode 13h aperture store stays refused, and (the whole point of where the refusal
+/// sits) writes NO byte before refusing.
 ///
 /// The read stub has separate mode13 and RAM tails; the slow STORE stub does not. Both kind arms
 /// fall into a shared `store` label and the kind is re-split only AFTER the write, so a refusal
 /// placed "in the mode13 tail" by analogy with the read side would land after the aperture byte
-/// had been written -- and the block would then side-exit, so the interpreter would re-execute the
+/// had been written, and the block would then side-exit, so the interpreter would re-execute the
 /// instruction and write it a SECOND time. The refusal therefore sits at the `mode13` label,
 /// before the permission check, and `guarded`'s whole-RAM snapshot is what proves it.
 #[test]
@@ -1155,7 +1155,7 @@ fn a_cpl3_page_local_misaligned_dword_store_is_served() {
 /// guard could run, so every input the watch guard had ever seen was aligned, and a span formula
 /// that only held for aligned accesses was indistinguishable from a correct one.
 ///
-/// Page offset 63 puts the store's four bytes at 63, 64, 65, 66 -- straddling the mask word
+/// Page offset 63 puts the store's four bytes at 63, 64, 65, 66, straddling the mask word
 /// boundary at bit 64 at the shipped one-byte granule, which is the guard's multi-granule window
 /// arm on a misaligned input.
 ///
@@ -1164,13 +1164,13 @@ fn a_cpl3_page_local_misaligned_dword_store_is_served() {
 ///
 /// | watched byte | shipped shift 0 | under the mutation (shift 1, aligned-span `n = 2`) |
 /// |---|---|---|
-/// | **66** — the access's LAST byte | granule 66, tested → exits | granule **33**, which `n = 2` never tests → does NOT exit. **The discriminating row** |
+/// | **66**: the access's LAST byte | granule 66, tested → exits | granule **33**, which `n = 2` never tests → does NOT exit. **The discriminating row** |
 /// | 65 | granule 65 → exits | granule 32, tested by both formulas → exits. A control, not evidence |
-/// | 62 — must NOT exit | granule 62, outside the access → does not exit | granule 31, which byte 63 also occupies, so a WATCHED verdict is CORRECT at 2-byte granules → exits, red for the right reason at the wrong granularity |
+/// | 62: must NOT exit | granule 62, outside the access → does not exit | granule 31, which byte 63 also occupies, so a WATCHED verdict is CORRECT at 2-byte granules → exits, red for the right reason at the wrong granularity |
 ///
 /// The byte-62 row is therefore **SHIPPED-SHIFT-ONLY**: it cannot be made shift-independent,
 /// because at any coarser granule some nearby non-member byte shares a member granule. Leaving it
-/// unqualified would be worse than having no row at all — the suite would go red under the
+/// unqualified would be worse than having no row at all: the suite would go red under the
 /// mutation without the granule bug being the cause, and that reads as passing evidence.
 #[test]
 fn a_straddling_misaligned_store_sees_every_granule_of_its_span() {
@@ -1196,7 +1196,7 @@ fn a_straddling_misaligned_store_sees_every_granule_of_its_span() {
         );
     }
 
-    // SHIPPED-SHIFT-ONLY. A byte outside the store's span must NOT be watched -- at ONE-BYTE
+    // SHIPPED-SHIFT-ONLY. A byte outside the store's span must NOT be watched, at ONE-BYTE
     // granules. At any coarser granule byte 62 shares a granule with byte 63, which the store does
     // occupy, so a watch exit here would be CORRECT rather than a defect. Do not read a failure of
     // this row under a granule-size change as evidence of anything.
@@ -1229,12 +1229,12 @@ fn a_straddling_misaligned_store_sees_every_granule_of_its_span() {
 fn the_non_relaxed_sites_still_refuse_a_misaligned_access() {
     let at = OPERAND_PAGE + 0x201;
 
-    // `add dword [at], 0x01` -- `emit_alu_mem_dest`, the read-modify-write site.
+    // `add dword [at], 0x01`: `emit_alu_mem_dest`, the read-modify-write site.
     let mut alu = disp32(&[0x83], 0, at);
     alu.push(0x01);
     guarded(&alu, alignment_exits, "add dword [odd], imm8");
 
-    // `inc dword [at]` -- `emit_rmw_inc_dec_dword`.
+    // `inc dword [at]`: `emit_rmw_inc_dec_dword`.
     let inc = disp32(&[0xff], 0, at);
     guarded(&inc, alignment_exits, "inc dword [odd]");
 }
@@ -1245,7 +1245,7 @@ fn the_non_relaxed_sites_still_refuse_a_misaligned_access() {
 /// on bytes. Nothing in this slice touches that, and this row says so.
 #[test]
 fn a_misaligned_x87_access_still_exits() {
-    // `fld qword [at]` -- DD /0.
+    // `fld qword [at]`: DD /0.
     for offset in [1u32, 2, 3] {
         let at = OPERAND_PAGE + 0x300 + offset;
         guarded(
@@ -1260,7 +1260,7 @@ fn a_misaligned_x87_access_still_exits() {
 // S1: the page-cross bound is DEAD CODE at the eleven refusing sites for a self-aligning width
 // ---------------------------------------------------------------------------------------------
 
-/// `mov edx, eax; and edx, 0xfff` -- the head of `emit_page_cross_bound`, and the half that no
+/// `mov edx, eax; and edx, 0xfff`: the head of `emit_page_cross_bound`, and the half that no
 /// other emission spells. Its absence is the elision; its presence is the bound.
 const PAGE_CROSS_HEAD: [u8; 8] = [0x89, 0xc2, 0x81, 0xe2, 0xff, 0x0f, 0x00, 0x00];
 
@@ -1300,7 +1300,7 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
 }
 
 /// The eleven refusing sites send BOTH guard halves to one label, and for a width that
-/// self-aligns the crossing set is a strict subset of the misaligned set -- `N` divides 0x1000, so
+/// self-aligns the crossing set is a strict subset of the misaligned set: `N` divides 0x1000, so
 /// the interval `[0x1000 - N + 1, 0xFFF]` holds no multiple of `N`. The bound can therefore only
 /// branch where the alignment test one instruction later branches, to the same place. Emitting it
 /// is dead code, and this row is what says it is not emitted.
@@ -1309,7 +1309,7 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
 /// whole content of the claim.
 ///
 /// The alignment half must still be there exactly once, which is what separates "the bound was
-/// elided" from "the whole guard was elided" -- and it is asserted on BOTH alignment arms, in each
+/// elided" from "the whole guard was elided", and it is asserted on BOTH alignment arms, in each
 /// arm's own spelling, because the bound is 20 bytes on both and the elision is therefore the same
 /// 20 bytes on both. The ON arm is the one with residual risk: its alignment half does not write
 /// scratch, so after the elision RDX is left untouched rather than holding `RAX & 0xFFF`.
@@ -1318,7 +1318,7 @@ fn a_self_aligning_width_skips_the_dead_page_cross_bound_at_a_refusing_site() {
     for on in [false, true] {
         jit::direct::set_align_test_al_for_test(Some(on));
         let arm = if on { "align-test-al ON" } else { "OFF" };
-        // `add dword [aligned], 0x01` -- `emit_alu_mem_dest`, a refusing site, Dword.
+        // `add dword [aligned], 0x01`: `emit_alu_mem_dest`, a refusing site, Dword.
         let mut alu = disp32(&[0x83], 0, OPERAND_PAGE + 0x200);
         alu.push(0x01);
         let dword = build(&alu);
@@ -1333,7 +1333,7 @@ fn a_self_aligning_width_skips_the_dead_page_cross_bound_at_a_refusing_site() {
             "{arm}: add dword [aligned]: the ALIGNMENT half must survive -- it decides"
         );
 
-        // `inc word [aligned]` -- `emit_rmw_inc_dec`, a refusing site, Word.
+        // `inc word [aligned]`: `emit_rmw_inc_dec`, a refusing site, Word.
         let word = build(&disp32(&[0x66, 0xff], 0, OPERAND_PAGE + 0x200));
         assert_eq!(
             occurrences(&word.code, &PAGE_CROSS_HEAD),
@@ -1383,14 +1383,14 @@ fn a_lean_mov_skips_the_page_cross_bound_and_keeps_the_alignment_half() {
     jit::direct::set_align_test_al_for_test(None);
 }
 
-/// THE MUTANT ROW. Widen the gate to `alignment_bytes() <= bytes()` -- a tautology over the five
-/// widths -- and Qword and Tbyte lose a bound that is genuinely LIVE for them, because their
+/// THE MUTANT ROW. Widen the gate to `alignment_bytes() <= bytes()` (a tautology over the five
+/// widths) and Qword and Tbyte lose a bound that is genuinely LIVE for them, because their
 /// `alignment_bytes()` is 4, below their size. A 4-aligned Qword may start at 0xFFC and a 4-aligned
 /// Tbyte from 0xFF8 up, and both then reach past the page their FastMap entry was resolved
 /// against. This row goes red on that mutation and the behavioural row below goes red with it.
 #[test]
 fn the_wide_widths_keep_the_page_cross_bound_at_a_refusing_site() {
-    // `fld qword [4-aligned]` -- DD /0, `emit_x87_memory_pointer`, a refusing site.
+    // `fld qword [4-aligned]`: DD /0, `emit_x87_memory_pointer`, a refusing site.
     let qword = build(&disp32(&[0xdd], 0, OPERAND_PAGE + 0x300));
     assert_eq!(
         occurrences(&qword.code, &PAGE_CROSS_HEAD),
@@ -1403,7 +1403,7 @@ fn the_wide_widths_keep_the_page_cross_bound_at_a_refusing_site() {
         "fld qword: and the bound must be sized by bytes(), i.e. cmp edx, 0xff8"
     );
 
-    // `fstp tbyte [4-aligned]` -- DB /7, the widest form and the one whose divergence is widest.
+    // `fstp tbyte [4-aligned]`: DB /7, the widest form and the one whose divergence is widest.
     let tbyte = build(&disp32(&[0xdb], 7, OPERAND_PAGE + 0x300));
     assert_eq!(
         occurrences(&tbyte.code, &PAGE_CROSS_HEAD),

@@ -94,7 +94,7 @@ fn brk_rep_resume_counts_budgeted_chunk_yields() {
 /// `brk_fatal`, in isolation: a guest `#DE` (DIV by zero) whose delivery itself cannot proceed
 /// because the IDT does not cover vector 0. `deliver_exception_body` reports that as
 /// `CpuError::IdtLimit` (`control.rs`), which `finish_instruction`'s exception arm returns
-/// directly rather than delivering -- exactly the "propagated hard `CpuError`" the ledger's old
+/// directly rather than delivering, exactly the "propagated hard `CpuError`" the ledger's old
 /// comment excused without counting. It propagates out of `run_budgeted_inner`'s first `?` and
 /// out of `run_budgeted` itself.
 #[test]
@@ -133,8 +133,8 @@ fn brk_fatal_counts_a_propagated_hard_cpu_error() {
     // TripleFault, not IdtLimit, since 2026-08-30: an out-of-limit vector is a
     // deliverable #GP(vector*8+2) per the PRM, so #DE escalates to #GP, which is
     // also out of limit here, then to #DF, and delivering THAT is the PRM's
-    // shutdown. The point of this test is unchanged -- a hard CpuError
-    // propagates out of run_budgeted and brk_fatal counts it -- only the way the
+    // shutdown. The point of this test is unchanged: a hard CpuError
+    // propagates out of run_budgeted and brk_fatal counts it; only the way the
     // fixture reaches one is now the architectural chain.
     assert!(
         matches!(
@@ -515,7 +515,7 @@ fn break_admission_error_keeps_successful_run_prefix() {
 }
 
 /// The real deliverable: the run-end ledger's identity, asserted EXACTLY, on one CPU driven
-/// through several distinct break reasons in the SAME session -- decode-cache miss, a port
+/// through several distinct break reasons in the SAME session: decode-cache miss, a port
 /// step-break, an interrupt-serviceable transition (STI's one-instruction shadow expiring),
 /// the scaled-clock cap, HLT, and a budgeted REP's chunk yield.
 ///

@@ -10,7 +10,7 @@ use super::*;
 
 /// The `IZARRAVM_DIRECT_ALIGN_TEST_AL` spelling table. The knob caches its env reading in a
 /// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process
-/// and never in an order the harness controls -- hence the parse function is exercised directly.
+/// and never in an order the harness controls, hence the parse function is exercised directly.
 #[test]
 fn align_test_al_spelling_table() {
     use std::env::VarError;

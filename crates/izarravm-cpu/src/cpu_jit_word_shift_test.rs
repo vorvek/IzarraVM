@@ -5,7 +5,7 @@
 //!
 //! This slice is a REPAIR rather than an opportunity. Slice 3 lowered quake's `0x0FB6` MOVZX
 //! memory-word row and 30,692 of its exits RELOCATED one instruction along, onto
-//! `0xC1 /4` SHL r16,imm8 -- the census names the pair to the unit as `movzx cx, byte [..]`
+//! `0xC1 /4` SHL r16,imm8: the census names the pair to the unit as `movzx cx, byte [..]`
 //! followed by `shl cx, imm8`. Quake's blocks now stop on a barrier the old boundary was hiding,
 //! which the Slice 3 ladder priced at +8.78% blocks installed, +48.08% arena compactions and
 //! roughly 1% of wall.
@@ -20,8 +20,8 @@
 //!
 //! ## What the lowering is, and the one thing that could have gone wrong
 //!
-//! `emit_shift` had no sixteen-bit lane. The tempting shape -- a 32-bit host shift over a
-//! zero-extended operand -- is wrong in five separate ways at once, and each of them is a rule
+//! `emit_shift` had no sixteen-bit lane. The tempting shape, a 32-bit host shift over a
+//! zero-extended operand, is wrong in five separate ways at once, and each of them is a rule
 //! `CpuGsw::shift_rotate` derives from its `BusWidth` argument:
 //!
 //! * **CF** is the last bit shifted OUT: bit 15 for SHL/SAL, bit 0 for SHR/SAR. A 32-bit shift
@@ -37,7 +37,7 @@
 //!
 //! The fix is one instruction: `66 C1 /op` narrows all five at once, because an x86-64 16-bit
 //! shift computes every flag against its own 16 bits and writes only the low 16 of the register.
-//! So the Word arm differs from the Dword arm by the encoder call and by nothing else -- the
+//! So the Word arm differs from the Dword arm by the encoder call and by nothing else: the
 //! `defined` mask, the eager publish to `eflags` and the `emit_clear_pending` are width-invariant,
 //! because `set_shift_result_flags` materializes and writes live at either width.
 //!
@@ -45,8 +45,8 @@
 //!
 //! A shift DESTROYS a lazy descriptor rather than creating one, so a fixture that only compared
 //! `pending_flags` at the end would pass on a lowering that published garbage into a field nothing
-//! reads. Every row here therefore ends with FIVE `SETcc` slots -- `setc`, `seto`, `sets`, `setz`,
-//! `setp` -- inside the SAME block, into five byte registers that are not the shift's destination.
+//! reads. Every row here therefore ends with FIVE `SETcc` slots (`setc`, `seto`, `sets`, `setz`,
+//! `setp`) inside the SAME block, into five byte registers that are not the shift's destination.
 //! `SETcc` lowers through `emit_load_host_flags`, which reloads the host flags from RBP, so those
 //! five slots read the shift's published flags back through EMITTED code and turn each one into an
 //! architectural byte the differential compares. A wrong CF is a wrong BL, not a subtle EFLAGS
@@ -59,7 +59,7 @@
 //! interpreter, and `word_shifts_match_the_interpreter_for_every_count` sweeps all 32 counts for
 //! exactly that reason: the host and `shift_rotate`'s single-bit loop agree across the whole range
 //! on this box, and pinning it as a test means a host that disagreed would fail the suite loudly
-//! rather than miscompile quietly. Refusing the range instead would have been safe but blind --
+//! rather than miscompile quietly. Refusing the range instead would have been safe but blind:
 //! the census cannot say which immediates quake's `shl cx, imm8` sites use, so a count-gated
 //! admission could have lowered nothing at all.
 //!
@@ -68,7 +68,7 @@
 //! `emit_shift` publishes the shadow with `store_r32_disp32(eflags, RBP)` and does NOT `or` in the
 //! reserved bit 1, where the interpreter's `set_flag_live` ends every write with
 //! `self.registers.eflags |= 0x2`. Seeding `registers.eflags` with bit 1 CLEAR therefore produces
-//! a one-bit disagreement -- and it does so on the DWORD lane identically, which is how this was
+//! a one-bit disagreement, and it does so on the DWORD lane identically, which is how this was
 //! established as pre-existing rather than as something this slice introduced: the first draft of
 //! the flag row used `0x8d5`, and a probe row built from the same seed against the unprefixed form
 //! failed the same way (2065 against 2067).
@@ -80,7 +80,7 @@
 //! both, so the seeds below are the guest's real domain rather than an assumption about it.
 //!
 //! Mutation record. Six, all applied by hand, observed, and restored, and every one re-checked
-//! against the WHOLE crate rather than under a test filter -- Slice 3 recorded that a filtered
+//! against the WHOLE crate rather than under a test filter: Slice 3 recorded that a filtered
 //! mutation run understates the blast radius as readily as it understates the catch, and this file
 //! took that lesson as a precondition rather than rediscovering it.
 //!
@@ -97,7 +97,7 @@
 //!
 //! The first row is the one that matters: it is the pre-slice emitter, so it says this fixture
 //! would have refused the admission had it been written before the `width` field rather than with
-//! it. The second is its mirror -- it says the fixture would also have caught the field wired the
+//! it. The second is its mirror: it says the fixture would also have caught the field wired the
 //! wrong way round, which is the failure mode `ExtendWidths` was introduced for one slice earlier.
 //!
 //! Two readings the numbers force, and both were guesses before the runs:
@@ -124,11 +124,11 @@ const MOV_EDI_EDI: [u8; 2] = [0x89, 0xff];
 /// and CH: the sweeps that use consumers shift CX, and a `SETcc` into either half of it would
 /// overwrite the result being compared.
 const CONSUMERS: [(u8, u8); 5] = [
-    (0x2, 3), // setc bl  -- CF
-    (0x0, 6), // seto dh  -- OF
-    (0x8, 4), // sets ah  -- SF
-    (0x4, 2), // setz dl  -- ZF
-    (0xa, 0), // setp al  -- PF
+    (0x2, 3), // setc bl: CF
+    (0x0, 6), // seto dh: OF
+    (0x8, 4), // sets ah: SF
+    (0x4, 2), // setz dl: ZF
+    (0xa, 0), // setp al: PF
 ];
 
 /// `0F 9x /r` with ModRM mod=11, so `rm` is the byte register AL/CL/DL/BL/AH/CH/DH/BH.
@@ -221,7 +221,7 @@ struct Roles {
 /// decode lines on the interpreter role, and seed both identically.
 ///
 /// `slots` is the EXACT instruction count the block must cover. An exact count rather than a
-/// lower bound is what says the tested opcode joined the block instead of ending it -- a `>=`
+/// lower bound is what says the tested opcode joined the block instead of ending it: a `>=`
 /// assertion is satisfied by the fillers alone with the form under test refused.
 fn build(body: &[u8], slots: u8, seed: Seed) -> Roles {
     let mut code = MOV_ESI_ESI.to_vec();
@@ -428,7 +428,7 @@ const SUB_OPS: [(&str, u8); 4] = [("/4 shl", 4), ("/5 shr", 5), ("/6 sal", 6), (
 /// back through emitted code.
 ///
 /// The count sweep is not decoration. Three of `emit_shift`'s four shapes are selected on the
-/// MASKED count -- 0 emits nothing, 1 adds OF to the defined mask, and 2..=31 do not -- and the
+/// MASKED count: 0 emits nothing, 1 adds OF to the defined mask, and 2..=31 do not. And the
 /// boundaries between them (0, 1, 2, 31, and the wrap at 32) are where a mask applied to the raw
 /// immediate instead of the architectural one diverges.
 ///
@@ -561,7 +561,7 @@ fn a_zero_count_shift_leaves_every_flag_and_a_live_descriptor_alone() {
 /// Every destination register at Word size, and the property that admits the opcode at all: the
 /// shift defines the destination's low 16 bits and PRESERVES its high 16.
 ///
-/// No consumers on this row, deliberately -- a `SETcc` writes a byte register and would overwrite
+/// No consumers on this row, deliberately: a `SETcc` writes a byte register and would overwrite
 /// the low byte of whichever destination it collides with, which is exactly the half of the
 /// result this row exists to compare. The seeds carry `0xdead` in every high half, so a lowering
 /// that ran the Dword shift here fails on `registers` at the first case.
@@ -615,12 +615,12 @@ fn dword_shifts_still_define_the_whole_destination() {
 /// The operands are chosen so that CF, OF, SF and ZF each disagree between a 16-bit and a 32-bit
 /// derivation on at least one of them:
 ///
-/// * `0x8000` at count 1 -- SHL carries out of bit 15 (CF set at Word, clear at Dword) and the
+/// * `0x8000` at count 1: SHL carries out of bit 15 (CF set at Word, clear at Dword) and the
 ///   result is zero at Word but not at Dword.
-/// * `0x0001` at count 15 -- SHL lands the bit on bit 15, so SF is set at Word and clear at Dword.
-/// * `0xffff` under SAR -- the guest shifts in bit 15, so the result stays `0xffff`; a Dword
+/// * `0x0001` at count 15: SHL lands the bit on bit 15, so SF is set at Word and clear at Dword.
+/// * `0xffff` under SAR: the guest shifts in bit 15, so the result stays `0xffff`; a Dword
 ///   arithmetic shift over the same zero-extended value shifts in zeros.
-/// * `0x4000` at count 1 -- SHL sets OF at Word (msb changes) and clears it at Dword.
+/// * `0x4000` at count 1: SHL sets OF at Word (msb changes) and clears it at Dword.
 #[test]
 fn word_shifts_derive_every_flag_from_sixteen_bits() {
     let cases: [(u16, u8); 8] = [
@@ -660,7 +660,7 @@ fn word_shifts_derive_every_flag_from_sixteen_bits() {
 /// The domain claim behind every EFLAGS seed in this file: bit 1 is never zero in a guest.
 ///
 /// `emit_shift` publishes RBP straight into `eflags` without re-asserting the reserved bit, so a
-/// state with bit 1 clear would diverge -- at BOTH widths, which is what makes this a property of
+/// state with bit 1 clear would diverge, at BOTH widths, which is what makes this a property of
 /// the seed rather than of this slice. The two writers that could produce such a state are pinned
 /// here instead of the claim being taken on trust: a single-flag write goes through
 /// `set_flag_live`, and every wholesale load (POPF, POPFD, IRET) goes through `load_flags`.

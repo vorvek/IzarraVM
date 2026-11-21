@@ -9,7 +9,7 @@ use super::*;
 ))]
 #[test]
 fn executes_a_trivial_emitted_function() {
-    // `mov eax, 42; ret` -- B8 2A 00 00 00 C3. Calling convention agnostic: it reads no
+    // `mov eax, 42; ret`: B8 2A 00 00 00 C3. Calling convention agnostic: it reads no
     // arguments and returns a 32-bit value in EAX/RAX on both win64 and sysv64.
     let code = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
     let buf = ExecutableBuffer::new(&code).expect("allocation must succeed on a supported host");

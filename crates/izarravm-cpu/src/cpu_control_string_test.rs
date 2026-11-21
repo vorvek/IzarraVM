@@ -50,7 +50,7 @@ fn controlflow_seed(cpu: &mut CpuGsw) {
 /// (the CS reload + SP delta), FF /0 INC and FF /1 DEC r/m (the memory write + the flag update),
 /// FF /6 PUSH r/m (the pushed value + SP drop), FF /2 near-indirect CALL (the pushed return +
 /// the new eip), FF /4 near-indirect JMP (the new eip, nothing pushed), CALL/JMP far direct
-/// (0x9a/0xea — the CS:eip transfer, plus CALL's pushed CS:IP), and the INT3/INT n/INTO/IRET
+/// (0x9a/0xea: the CS:eip transfer, plus CALL's pushed CS:IP), and the INT3/INT n/INTO/IRET
 /// deliveries (CS:eip from the IVT, the pushed FLAGS:CS:IP frame / the restored frame, IF
 /// cleared). The shared `controlflow_seed` plus each case's `setup` makes every input stable.
 fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
@@ -356,7 +356,7 @@ struct FlagsMiscGolden {
 
 /// Seed for the flags/misc golden battery: the same register file as `seam_seed` plus CF
 /// pre-set (so INC/DEC CF-preservation is visible and CMC/CLC/STC have a known starting CF),
-/// and AH=0xd7 (= 0b11010111: CF/PF/AF/ZF/SF all 1, bits 3/5 forced — so LAHF/SAHF transfer
+/// and AH=0xd7 (= 0b11010111: CF/PF/AF/ZF/SF all 1, bits 3/5 forced, so LAHF/SAHF transfer
 /// a non-trivial value). AH lives in the high byte of AX; write_gpr8(4, 0xd7) sets it.
 fn flags_misc_seed(cpu: &mut CpuGsw) {
     seam_seed(cpu);
@@ -641,8 +641,8 @@ fn sti_interrupt_shadow_defers_interrupt_by_one_instruction() {
     let mut memory = vec![0u8; 0x400];
     // STI (0xfb) followed by two NOPs (0x90).
     memory[0] = 0xfb; // STI
-    memory[1] = 0x90; // NOP — executes before interrupt is taken (shadow)
-    memory[2] = 0x90; // NOP — not reached; interrupt taken instead
+    memory[1] = 0x90; // NOP: executes before interrupt is taken (shadow)
+    memory[2] = 0x90; // NOP: not reached; interrupt taken instead
     // IVT entry for vector 0x08 (IRQ0) at byte offset 0x20 (0x0008 * 4):
     // offset=0x0200, segment=0x0000.
     memory[0x20..0x22].copy_from_slice(&0x0200u16.to_le_bytes());
@@ -705,7 +705,7 @@ fn sti_interrupt_shadow_defers_interrupt_by_one_instruction() {
 /// differential set plus the destination memory writes: end gpr (AX,CX,DX,BX,SP,BP,SI,DI),
 /// eflags (CMPS/SCAS set them; MOVS/STOS/LODS leave them), eip, the (offset,value) memory deltas
 /// (MOVS/STOS write the destination; CMPS/SCAS/LODS write nothing), and the InstructionPrefetch
-/// fetch count (prefix + opcode, charged once in `decode` — small and CX-independent even for the
+/// fetch count (prefix + opcode, charged once in `decode`: small and CX-independent even for the
 /// REP forms, since the per-element data accesses are bus reads/writes, not instruction fetches).
 struct StringGolden {
     name: &'static str,
@@ -1052,7 +1052,7 @@ struct PortIoGolden {
 /// `regen_port_io_goldens` after an intentional behavior change; never edit one by hand to make a test
 /// pass.
 ///
-/// Seed: seam_seed — EAX=0x0102 (AL=0x02, AH=0x01), CX=0x0304, DX=0x0506, BX=0x0010,
+/// Seed: seam_seed, EAX=0x0102 (AL=0x02, AH=0x01), CX=0x0304, DX=0x0506, BX=0x0010,
 /// SP=0, BP=0x0010, SI=0x0008, DI=0x0018, eflags=0x2. TestBus.read_io always returns 0.
 /// Covers: IN AL imm8, IN AX imm8 (byte vs word width); OUT imm8 AL, OUT imm8 AX (no-op on
 /// registers); IN AL DX, IN AX DX (port from DX=0x0506); OUT DX AL, OUT DX AX.

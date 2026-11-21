@@ -3,8 +3,8 @@
 
 //! Offline generator for the Direct-JIT coverage matrix.
 //!
-//! Enumerates the decoder's cell space — opcode x ModRM digit x register/memory form x operand
-//! size — and asks the REAL compile path whether each cell joins a block or ends it. The oracle
+//! Enumerates the decoder's cell space (opcode x ModRM digit x register/memory form x operand
+//! size) and asks the REAL compile path whether each cell joins a block or ends it. The oracle
 //! is `jit::direct::compile` over a warmed `inc; inc; inc; <candidate>` stream, the same idiom as
 //! the allowlist fixtures, so a cell reports `native` only when decode, `classify` AND the
 //! compile loop's admission gates (the stack-width matrix, the control-target clamp) all accept
@@ -34,7 +34,7 @@ enum Form {
     None,
     /// ModRM mod=3, rm=ECX.
     Reg,
-    /// ModRM mod=1, rm=ECX, disp8=0 — a plain `[ecx+0]` that never needs a SIB.
+    /// ModRM mod=1, rm=ECX, disp8=0: a plain `[ecx+0]` that never needs a SIB.
     Mem,
 }
 
@@ -103,8 +103,8 @@ fn probe_decode(bytes: &[u8]) -> Option<DecodedInsn> {
 
 /// Compile `inc eax; inc ecx; inc edx; <candidate>` and read the admission off the span: the
 /// fillers are unconditionally admitted, and `warm` seeds the decode cache for exactly these four
-/// starts, so growth stops at the candidate and `instructions >= 4` means it joined the block —
-/// as body or as terminator — while `3` means it was the barrier.
+/// starts, so growth stops at the candidate and `instructions >= 4` means it joined the block
+/// (as body or as terminator) while `3` means it was the barrier.
 fn probe_compile(candidate: &[u8]) -> (CellOutcome, u8) {
     let mut code = vec![0x40, 0x41, 0x42];
     code.extend_from_slice(candidate);

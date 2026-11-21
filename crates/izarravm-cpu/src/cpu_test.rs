@@ -17,7 +17,7 @@ use izarravm_bus::{DirectMemoryRead, DirectMemoryWrite};
 /// **They now routinely do, on every native role.** `run_direct_block` settles the flags into the
 /// memory copy at the last point before entering emitted code (E1), because emitted code reloads
 /// its RBP shadow from that word and a descriptor left standing by the interpreter would outrank
-/// every publish the block performs. The interpreter role does no such thing -- it keeps its lazy
+/// every publish the block performs. The interpreter role does no such thing: it keeps its lazy
 /// flags, which is the whole point of having them. So the two roles reach the same architectural
 /// flags through different pairs, and comparing the raw pair compares exactly the noise the
 /// lazy-flag optimisation exists to create.
@@ -25,7 +25,7 @@ use izarravm_bus::{DirectMemoryRead, DirectMemoryWrite};
 /// **What this does NOT weaken**, which is the same clause `run_generated_case`'s settled-clone
 /// block carries: a WRONG flag value still fails, because materialising is exactly what turns a
 /// descriptor into flags. Every non-flag field of `Registers` is still compared byte for byte, and
-/// so is every bit of EFLAGS outside the six arithmetic ones -- including bit 1, whose `| 0x2`
+/// so is every bit of EFLAGS outside the six arithmetic ones, including bit 1, whose `| 0x2`
 /// reproductions in `emit_sahf` and `emit_set_cf_only` therefore keep their gate:
 /// `materialized_eflags` ORs nothing on the `is_none()` path, so a lowering that dropped the OR
 /// still differs here.
@@ -101,15 +101,15 @@ fn cpu_registers_field_offset_is_stable() {
     // derived: rustc's field reordering does not guarantee the naive byte-count shift). The
     // emitter re-reads the offset, so updating this number is a documentation change, not a code
     // fix. The decode-line first-touch slice adds the packed side array's `Box` to `DecodeCache`,
-    // which sits ahead of `registers`, moving this pin from 464 to 480 -- measured, not derived.
+    // which sits ahead of `registers`, moving this pin from 464 to 480: measured, not derived.
     // The S2 `InterpretOne` call-out adds the deferred code-write list (16 entries of a `u32`, a
     // `u32` and a `bool`, plus a count and an overflow bit) and the window flag to `CpuGsw`,
-    // moving this pin from 480 to 520 -- measured, not derived. The list is sized for one
+    // moving this pin from 480 to 520: measured, not derived. The list is sized for one
     // instruction's stores plus a whole exception delivery's; see `MAX_DEFERRED_CODE_WRITES`.
     // The CR3 code-cache gate grows `DecodeCache` (which sits ahead of `registers`) with the
-    // two-slot ring and the `translation_pages` bitmap, moving this pin from 520 to 576 --
+    // two-slot ring and the `translation_pages` bitmap, moving this pin from 520 to 576:
     // measured, not derived. The TLB entries moved to the heap (one `Box` in `Tlb`), and the
-    // field order changed with it, moving this pin from 576 to 616 -- measured, not derived.
+    // field order changed with it, moving this pin from 576 to 616: measured, not derived.
     assert_eq!(
         off, 616,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
@@ -927,7 +927,7 @@ fn fast_map_same_tag_remap_replaces_residency_and_fault_keeps_read_mapping() {
 // The tests below exercise `CpuGsw::fast_map_data_slot` and its joined tails
 // (`finish_fast_map_read`/`finish_fast_map_write`) ONLY through the public interpreter API
 // (`read_memory_u8`/`write_memory_u8`/`read_memory_sized`/`write_memory_sized`) plus the
-// `fast_map_probe_counters()` hit/miss counters and `jit_fast_map` mapping queries --
+// `fast_map_probe_counters()` hit/miss counters and `jit_fast_map` mapping queries:
 // those private helpers are not reachable from this module. None of these fixtures compile or run
 // native code (no `jit_direct::compile`/`install`), so the JIT block-entry-position trap that has
 // bitten this repo before does not apply here.
@@ -1021,7 +1021,7 @@ fn flip_bits(width: BusWidth, value: u32) -> u32 {
 /// takes the hit on the measured access; `slow` never populates (auto-admit stays off), so it
 /// always takes the canonical translate+DirectPageCache path, including on the measured access.
 /// Both buses share the same wait-state model (`direct_page_clocks = true`), so
-/// `trace.elapsed_clocks()` is directly comparable -- this is the interpreter-side counterpart of
+/// `trace.elapsed_clocks()` is directly comparable: this is the interpreter-side counterpart of
 /// the design doc's "compare `trace.elapsed_clocks`, never `trace.cycles`" rule.
 #[cfg(all(
     feature = "jit",
@@ -1123,7 +1123,7 @@ fn fast_map_serve_path_matches_slow_path_for_ram_reads_and_writes() {
 /// `note_direct_write`-equivalent bookkeeping `TestBus::note_mode13_write` stands in for), never
 /// the flat RAM charge `charge_direct_ram_memory` takes. Same fast-vs-forced-slow differential as
 /// the RAM fidelity test above, at an address inside the FastMap's and the bus's Mode13 aperture
-/// (0xa0000..0xb0000 in both -- see `fast_map.rs::MODE13_BASE/END` and
+/// (0xa0000..0xb0000 in both: see `fast_map.rs::MODE13_BASE/END` and
 /// `bus.rs::charge_direct_memory`'s range test, which this test's agreement depends on).
 #[cfg(all(
     feature = "jit",
@@ -1202,7 +1202,7 @@ fn fast_map_mode13_write_charges_video_wait_states_like_the_slow_path() {
 ///
 /// This test asserted the opposite contract until the interpreter data-path slice: an unaligned
 /// probe used to miss by construction of the hit predicate. That refusal was one of five sites
-/// asking the same alignment question, and none of them was needed for the data move -- the hit
+/// asking the same alignment question, and none of them was needed for the data move: the hit
 /// tail's `bias.wrapping_add(linear)` is offset-agnostic and `read_fast_map_ptr` already used
 /// `read_unaligned`. The page is populated here by a prior ALIGNED dword read so that a served
 /// unaligned access is attributable to the predicate rather than to the page being cold.
@@ -1255,7 +1255,7 @@ fn fast_map_probe_serves_unaligned_widths_and_charges_them_as_a_split() {
         );
         assert_eq!(cpu.fast_map_probe_counters().misses, misses_before);
         // Served through an unaligned pointer, so the bytes must be the ones at the unaligned
-        // address -- not a rounded-down or byte-swapped read.
+        // address, not a rounded-down or byte-swapped read.
         assert_eq!(
             value, expected,
             "unaligned {width:?} at +{offset} returned the wrong bytes"
@@ -1265,9 +1265,9 @@ fn fast_map_probe_serves_unaligned_widths_and_charges_them_as_a_split() {
 
 /// A crossing dword decomposes into two page-local WORD fragments (`page_local_fragment_width`
 /// never returns a width that would itself cross a page), so no single FastMap probe ever sees a
-/// crossing width. This sets up two adjacent linear pages backed by DIFFERENT physical frames --
-/// so a bug that served all 4 bytes from one page's bias would read garbage across the boundary
-/// -- and checks both the combined value AND that both fragments independently took the fast path.
+/// crossing width. This sets up two adjacent linear pages backed by DIFFERENT physical frames,
+/// so a bug that served all 4 bytes from one page's bias would read garbage across the boundary,
+/// and checks both the combined value AND that both fragments independently took the fast path.
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -1441,7 +1441,7 @@ fn fast_map_hit_still_faults_a_cpl3_access_to_a_supervisor_page() {
 
 /// A write to a page whose PTE dirty bit is not yet set must take the slow (walk) path even with
 /// the FastMap armed, because a write bias is only ever created after `record_write_page`'s walk
-/// commits the dirty bit -- see `fast_map_permissions` (memory.rs), which requires `entry.dirty`
+/// commits the dirty bit, see `fast_map_permissions` (memory.rs), which requires `entry.dirty`
 /// for a write. This is the same fixture shape as `fast_map_same_tag_dirty_upgrade_keeps_read_
 /// residency` above, extended with the new hit/miss counters this slice adds.
 #[cfg(all(
@@ -1689,7 +1689,7 @@ fn fast_map_write_charge_failure_precedes_store_and_invalidation() {
 ///
 /// - a plain read and a plain store on the SAME page but in DIFFERENT instructions are two
 ///   accesses and ZERO read-modify-write pairs (the instruction epoch, not just the page, has to
-///   match -- otherwise every store into a page the previous instruction read would score),
+///   match: otherwise every store into a page the previous instruction read would score),
 /// - a read then a store at the same address WITHIN one instruction is one pair,
 /// - a read then a store to a DIFFERENT page within one instruction is not (page equality is the
 ///   condition an interleaved entry would exploit; different pages are different table indices).
@@ -1801,7 +1801,7 @@ fn rmw_census_stays_silent_when_the_gate_is_off() {
 }
 
 /// A20 toggles and TLB flushes wipe the whole FastMap but are NOT counted by
-/// `direct_map_invalidations` -- that counter sits on only two of the five wipe sites. The N5
+/// `direct_map_invalidations`: that counter sits on only two of the five wipe sites. The N5
 /// audit exists because nothing said so; this pins the gap rather than the fix.
 #[cfg(feature = "jit")]
 #[test]
@@ -1828,7 +1828,7 @@ fn fast_map_wipe_causes_split_out_the_sites_direct_map_invalidations_misses() {
 /// assuming it: 386-slow and 386 (Accurate) never record a single FastMap hit, and never even
 /// probe (the miss counter also stays at zero, since `fast_map_serve_enabled` is false and
 /// `fast_map_data_slot` is never entered), even with native admission force-armed and repeated
-/// reads/writes at the same address. `FastMap::has_storage()` (a coarser, separate diagnostic --
+/// reads/writes at the same address. `FastMap::has_storage()` (a coarser, separate diagnostic:
 /// "has population ever run at all") also stays false, since population never runs either.
 /// Vacuousness is ruled out by checking that the accesses actually reached the direct-page path
 /// (`data_direct_reads`/`data_direct_writes` move).
@@ -1899,12 +1899,12 @@ fn accurate_timing_personas_never_take_the_interpreter_fast_path() {
 }
 
 /// BLOCKING regression test (lever-1 slice): a LIVE mode switch away
-/// from an Approximate persona -- e.g. `OUT 0xE1` selecting 386-slow mid-run, izarravm-machine
-/// `bus.rs`/`run.rs` -- must stop the interpreter's FastMap serve path immediately, both the hits
+/// from an Approximate persona (e.g. `OUT 0xE1` selecting 386-slow mid-run, izarravm-machine
+/// `bus.rs`/`run.rs`) must stop the interpreter's FastMap serve path immediately, both the hits
 /// AND the probe itself (misses), proving `fast_map_serve_enabled` gates ENTRY to
 /// `fast_map_data_slot`, not merely population. Before this fix, `set_mode` never touched the
 /// FastMap at all: `FastMap::storage` stays allocated forever once created, so gating on
-/// `has_storage()` stayed true after the switch -- every post-switch access on the Accurate
+/// `has_storage()` stayed true after the switch: every post-switch access on the Accurate
 /// persona kept paying the full preamble (reinstating the steady-state regression this whole
 /// slice exists to fix) while surviving live entries could even keep SERVING from the wrong
 /// persona (a transient violation of "386-slow/386 Accurate never enter it, by construction").
@@ -2015,7 +2015,7 @@ fn pending_flags_offset() {
 }
 
 /// L8's far-CALL ledger is diagnostic, not guest state, exactly like `FaultSite` and
-/// `CallOutTable` beside it -- see `FarCallLedger`'s own doc. `PartialEq` must return `true`
+/// `CallOutTable` beside it, see `FarCallLedger`'s own doc. `PartialEq` must return `true`
 /// regardless of the two values compared, or a differential test's whole-`CpuGsw` equality
 /// would start failing on a field no guest instruction can observe.
 #[cfg(feature = "jit")]
@@ -2171,7 +2171,7 @@ fn test_bus_compiled_window_applies_fixed_costs_and_vga_effects() {
 
 /// The defining property of the scoped VGA aperture invalidation: the aperture's cached pointers
 /// go, and NOTHING else does. A VGA register write cannot move a RAM host pointer, and keeping
-/// those is the entire win -- 88.1% of the 43.3M entries a doom timedemo used to discard here were
+/// those is the entire win: 88.1% of the 43.3M entries a doom timedemo used to discard here were
 /// RAM. The epoch check is the load-bearing half: `has_read_mapping` alone would still pass if the
 /// machine had advanced the global mapping epoch, and every surviving entry would then be dead on
 /// the next interpreter probe anyway.
@@ -2279,7 +2279,7 @@ pub(crate) struct TestBus {
     core_events: Option<Vec<TestCoreEvent>>,
     // Aligned like the production `Memory` backing, and for the same reason: `direct_page`
     // below hands `memory.as_mut_ptr()` pages to the fast map, and an unaligned backing would
-    // silently poison every store-bias entry — the whole one-lookup fixture suite would pass
+    // silently poison every store-bias entry: the whole one-lookup fixture suite would pass
     // while exercising only the slow path (the fixtures-that-cannot-fail trap, design D7).
     memory: izarravm_bus::PageAlignedBytes,
     trace: BusTrace,
@@ -2295,10 +2295,10 @@ pub(crate) struct TestBus {
     // differential fixture see a byte actually land in AL (a call-out that never wrote the
     // destination would pass against a bus that always returns 0).
     io_read_value: Option<u32>,
-    // When true, `read_io` fails with `UnsupportedPort` -- the machine bus's only `read_io` error
+    // When true, `read_io` fails with `UnsupportedPort`, the machine bus's only `read_io` error
     // producer, and the second member of the call-out helper's abnormal set.
     io_read_fails: bool,
-    // When true, `read_io` arms `pending_irq` as a side effect of the READ -- a device that is NOT
+    // When true, `read_io` arms `pending_irq` as a side effect of the READ: a device that is NOT
     // a pure peek, the opposite of the PIT/lazy-VGA case the port call-out pendency proof rests on
     // (gp2 in-imm8 callout design mutant table, "pendency / mid-block visibility"). Default false,
     // so every existing fixture's device stays a pure peek unless it opts in.
@@ -2310,7 +2310,7 @@ pub(crate) struct TestBus {
     // `0xE6` call-out's UNCONDITIONAL step break be told apart from one inherited from the bus.
     // Default false, so every existing fixture keeps the strict behaviour it was written against.
     lazy_io_writes: bool,
-    // When true, `write_io` fails with `UnsupportedPort` -- the machine bus's only `write_io` error
+    // When true, `write_io` fails with `UnsupportedPort`, the machine bus's only `write_io` error
     // producer, and the `0xE6` call-out helper's abnormal set.
     io_write_fails: bool,
     // When true, `write_io` arms `pending_irq` as a side effect of the WRITE. This is not a
@@ -2351,7 +2351,7 @@ pub(crate) struct TestBus {
     direct_pages_writable: bool,
     direct_write_denied_page: Option<u32>,
     // Every 4 KiB page listed here is refused by `direct_memory_bytes` for `DataRead` while `read_memory`
-    // still serves it -- so the read succeeds but comes back `direct: false` and lands in
+    // still serves it, so the read succeeds but comes back `direct: false` and lands in
     // `data_slow_reads`. This is exactly the production shape `ram_lookup_page_is_direct` produces
     // for `0x000A_0000..0x0010_0000` (VGA aperture, ROM shadow, and any UMB the memory manager put
     // there), which is the situation the slow-read page histogram exists to take apart. Without it
@@ -2382,7 +2382,7 @@ pub(crate) struct TestBus {
     // `TestBus`'s dial charges 0/1/3 wait states for Byte/Word/Dword, which `MachineBus` does not:
     // there, `BusCycle::clocks_for` ignores width entirely and one byte cycle costs exactly what
     // one dword cycle costs. That difference is invisible until something charges the SAME access
-    // two different ways -- which is exactly what a natively-served MISALIGNED access does. The
+    // two different ways, which is exactly what a natively-served MISALIGNED access does. The
     // JIT charges it as one wide cycle plus `bytes - 1` byte cycles; the interpreter charges it as
     // `bytes` byte cycles through `charge_direct_ram_split`. Those are equal on the production bus
     // and differ by `wide - byte` here, so a differential fixture asserting bus-clock EQUALITY
@@ -2391,7 +2391,7 @@ pub(crate) struct TestBus {
     // Setting this makes the fixture satisfy the premise the production charge model is built on,
     // so the equality assertion means what it says. The trade, stated rather than hidden: with a
     // flat dial the bus-clock axis can no longer distinguish an access's WIDTH, so a lowering that
-    // widened an access would have to be caught by guest RAM or by the registers instead -- which
+    // widened an access would have to be caught by guest RAM or by the registers instead, which
     // is where a widened access shows up anyway, and every fixture that keeps the default dial
     // still has the clock axis too. Default false, so no existing test's numbers move.
     flat_direct_page_clocks: bool,
@@ -3097,7 +3097,7 @@ impl CpuBus for TestBus {
     // serve path calls this instead of `charge_direct_memory` once it already knows (from the
     // FastMap's own `PageKind`) that the hit is plain RAM, so a fast-path RAM access and a
     // forced-slow-path RAM access must charge byte-identical clocks through this and the sibling
-    // method respectively -- that equivalence is exactly what the lever-1 fidelity tests check.
+    // method respectively: that equivalence is exactly what the lever-1 fidelity tests check.
     fn charge_direct_ram_memory(
         &mut self,
         address: u32,
@@ -3392,7 +3392,7 @@ impl CpuBus for TestBus {
 
 /// Give a real-mode `TestBus` a full 1 MiB image (room for a wrap-safe stack and every
 /// vector's IVT slot) and point vector 0 (#DE) at a distinguishing trap address, then run
-/// one `cycle` and assert the CPU landed there -- i.e. the fault was DELIVERED through
+/// one `cycle` and assert the CPU landed there, i.e. the fault was DELIVERED through
 /// `real_mode_interrupt`, not raised as a host-fatal error. Batch A converted #DE from
 /// `CpuError::DivideError` (host-fatal) to `InternalFault::Exception { vector: 0, .. }`
 /// (guest-deliverable), so a real-mode DIV-by-zero now runs to completion (`cycle` returns
@@ -3695,7 +3695,7 @@ mod jit_general;
 /// `classify`, so the stop reason is `unclassifiable` and the rejected span is exactly one byte.
 ///
 /// It used to be 0x90, until NOP was lowered. Then it was 0xF8, until CLC was lowered by the
-/// V86 loop-A slice — which is exactly what the previous version of this comment predicted, in
+/// V86 loop-A slice, which is exactly what the previous version of this comment predicted, in
 /// these words: *"Whatever this byte is, it will eventually be lowered too, and CLC is a likelier
 /// candidate than most now that `emit_set_cf_only` exists."* It was, by that very helper, and the
 /// tripwire below is what caught it: with the byte left at 0xF8 the ON arm of
@@ -3731,7 +3731,7 @@ mod jit_general;
 /// 2. **2026-08-21, `word_size_dword_siblings_stay_refused`.** It listed `0x85` as an
 ///    unconditionally-refused Word sibling; the TEST-word slice made that gate-dependent, and the
 ///    ON arm went red. Fixed by stating `IZARRAVM_TEST_WORD_ROWS=off` in the table and asserting
-///    the flip separately — that table is the worked example to copy.
+///    the flip separately. That table is the worked example to copy.
 /// 3. **2026-08-21, the `IZARRAVM_IMM8_LANES` flip.** Two fixtures asserted "the default arm
 ///    registers no one-byte lane" while reading the ambient knob
 ///    (`generated_direct_blocks_match_interpreter_in_486_and_586_modes` and
@@ -3739,8 +3739,8 @@ mod jit_general;
 ///    nothing. Note the second one's extra trap: it stated ONE arm and needed TWO, because
 ///    `smc_lane_registrations` counts every lane class rather than the one the fixture is about.
 ///
-/// The corollary for a DEFAULT PIN — the one fixture per gate that is *supposed* to read the
-/// ambient arm — is that it must apply the gate's own spelling table to the real environment
+/// The corollary for a DEFAULT PIN, the one fixture per gate that is *supposed* to read the
+/// ambient arm, is that it must apply the gate's own spelling table to the real environment
 /// rather than hard-asserting a constant, or the suite cannot be green on both arms by
 /// construction. `imm8_lanes_ship_on_by_default` and `test_word_rows_ship_on_by_default` are the
 /// two shapes of that.
@@ -4131,15 +4131,15 @@ fn pod_key_hasher_spreads_the_low_bits_hashbrown_indexes_with() {
 
 /// A4: `is_ring0_protected()` folds out a redundant CR0.PE test. It is asked on every retired
 /// instruction, so the fold has to be exactly equivalent, not merely equivalent on the states a
-/// game happens to reach. This walks the whole reachable CPU state space for the predicate --
+/// game happens to reach. This walks the whole reachable CPU state space for the predicate:
 /// CR0.PE x EFLAGS.VM x CPL, restricted to architecturally consistent combinations (real mode is
-/// always CPL 0, a V86 task is always CPL 3, which `current_privilege_level` itself asserts) --
+/// always CPL 0, a V86 task is always CPL 3, which `current_privilege_level` itself asserts),
 /// and compares against the pre-fold expression spelled out independently.
 #[test]
 fn is_ring0_protected_matches_the_unfolded_predicate_over_the_state_space() {
     let states: [(bool, bool, u8); 6] = [
         (false, false, 0), // real mode
-        (true, false, 0),  // protected, ring 0 -- the only true case
+        (true, false, 0),  // protected, ring 0: the only true case
         (true, false, 1),
         (true, false, 2),
         (true, false, 3), // protected, ring 3
@@ -4183,8 +4183,8 @@ fn is_ring0_protected_matches_the_unfolded_predicate_over_the_state_space() {
 }
 
 /// A6: `record_write_page` early-outs on `last_written_page` before its two linear scans of the
-/// 8-slot `written_pages` array. The early-out is only sound if it is EXACT -- a skipped call
-/// must be one that would have changed nothing -- so this pins the array and the count against
+/// 8-slot `written_pages` array. The early-out is only sound if it is EXACT: a skipped call
+/// must be one that would have changed nothing, so this pins the array and the count against
 /// every shape that could expose a difference: repeats, alternation (where the one-entry memory
 /// must not help), overflow, and the instruction boundary that clears it.
 ///

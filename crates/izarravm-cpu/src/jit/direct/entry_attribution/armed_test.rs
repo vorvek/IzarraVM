@@ -15,8 +15,8 @@ include!(concat!(
     "/build/site_line_scan.rs"
 ));
 
-/// The tables are indexed by enum discriminant, so a phase added without a name -- or named
-/// out of order -- mis-labels every export from then on. Checking `len()` against the constant
+/// The tables are indexed by enum discriminant, so a phase added without a name, or named
+/// out of order, mis-labels every export from then on. Checking `len()` against the constant
 /// beside it proves nothing (the arrays are DECLARED at that length); checking that each name
 /// carries its own index does.
 #[test]
@@ -39,7 +39,7 @@ fn phase_names_are_in_discriminant_order() {
 }
 
 /// Every refusal and compile site must name a DISTINCT `run.rs` line, and the lines must be
-/// non-decreasing down each table -- the tables are read as source order by the report and by
+/// non-decreasing down each table: the tables are read as source order by the report and by
 /// `PRE_P0_REFUSAL_SITES`.
 #[test]
 fn site_tables_are_distinct_and_in_source_order() {
@@ -149,8 +149,8 @@ fn the_p0_mark_line_is_where_the_p0_mark_is() {
     );
 }
 
-/// Every refusal and compile site name is unique, and `Phase::DispatchGates` -- the one phase
-/// `P0_MARK_LINE` depends on being unambiguous -- is marked from exactly one place in `run.rs`.
+/// Every refusal and compile site name is unique, and `Phase::DispatchGates`, the one phase
+/// `P0_MARK_LINE` depends on being unambiguous, is marked from exactly one place in `run.rs`.
 /// `REFUSAL_SITES`/`COMPILE_SITES` are `build.rs`-generated now (see `jit/direct.rs`), so a
 /// duplicate name or a second `mark(P0)` would no longer surface as a hand-table typo; this is
 /// what still catches it.
@@ -185,8 +185,8 @@ fn every_site_name_is_unique_and_dispatch_gates_is_marked_exactly_once() {
     );
 }
 
-/// `build.rs`'s `scan_forward` -- the primitive that turns an `ea_refusal!`/`ea_compile_site!`
-/// call line into the `return` line the generated tables cite -- is `include!`d here too (not
+/// `build.rs`'s `scan_forward`, the primitive that turns an `ea_refusal!`/`ea_compile_site!`
+/// call line into the `return` line the generated tables cite, is `include!`d here too (not
 /// re-typed), so this exercises the SAME code the generator runs, against a ground truth this
 /// test computes independently: `line!()` on the sibling `return` below a real `ea_mark!` /
 /// `ea_refusal!` pair, arranged exactly the way `run.rs`'s sites are.

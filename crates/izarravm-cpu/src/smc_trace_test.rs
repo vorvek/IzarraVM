@@ -197,8 +197,8 @@ fn mov_disp32(opcode: u16) -> DecodedInsn {
     }
 }
 
-/// THE `disp_store` CENSUS ROW: per (opcode, modrm reg) events, block kills, narrow kills and --
-/// the reason it exists -- `newly_hot` PER OPCODE.
+/// THE `disp_store` CENSUS ROW: per (opcode, modrm reg) events, block kills, narrow kills and
+/// (the reason it exists) `newly_hot` PER OPCODE.
 ///
 /// Capture has until now been estimated as joined un-laned-disp crossings over the whole run's
 /// `smc_heat_chunks_hot`, a denominator an already-laned family inflated 22% between two legs with
@@ -265,8 +265,8 @@ fn disp_store_rows_attribute_crossings_per_opcode() {
     assert_eq!(second[11], "3", "newly_hot");
 }
 
-/// THE SUPERSET TRAP the key exists to close: a `0x89 /3` the store arm CANNOT admit — a disp8
-/// form, and a `0x66`-prefixed disp32 one — must land in their own cells, marked inadmissible,
+/// THE SUPERSET TRAP the key exists to close: a `0x89 /3` the store arm CANNOT admit (a disp8
+/// form, and a `0x66`-prefixed disp32 one) must land in their own cells, marked inadmissible,
 /// rather than inflating the disp32 cell's `newly_hot`.
 ///
 /// Keyed on (opcode, modrm reg) alone all three writes below share one row and its capture
@@ -302,7 +302,7 @@ fn inadmissible_disp_shapes_do_not_share_a_cell_with_the_admitted_one() {
         SmcTracePre::new(Some((0x5_0100, disp8)), 1_000),
         action,
     );
-    // Same opcode, same modrm reg, disp32 — but behind a `0x66`.
+    // Same opcode, same modrm reg, disp32, but behind a `0x66`.
     let mut prefixed = mov_disp32(0x89);
     prefixed.len = 7;
     prefixed.prefixes = Prefixes {

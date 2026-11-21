@@ -9,7 +9,7 @@
 //! path (a marked page's native store taking the code-watch exit with the bit SET) is the
 //! existing watched-store suites, whose fixtures now mark before they populate; the fast-path
 //! skip differential (T4) sits beside the store-driving helpers in `cpu_jit_direct_test.rs`;
-//! and the mid-block synchronicity obligation (T7) is discharged structurally — the E1 sweep
+//! and the mid-block synchronicity obligation (T7) is discharged structurally: the E1 sweep
 //! runs inside `fetch_decoded` itself, which is the ONLY decode insert path, callout or not,
 //! so a callout that decodes fresh code has swept before it can return into its caller block.
 
@@ -64,7 +64,7 @@ fn a_sticky_mark_sweeps_bit_clear_entries_and_the_refill_carries_the_bit() {
 }
 
 /// T2: the block-watch strict edge (E2), through the same pending/sweep choke `install` and
-/// `reject` use (the test hook routes through it — design H7).
+/// `reject` use (the test hook routes through it, design H7).
 #[test]
 fn a_block_watch_acquire_sweeps_bit_clear_entries() {
     let (mut cpu, mut bus) = watched_fixture();
@@ -140,8 +140,8 @@ fn translation_watch_acquisition_sweeps_every_clear_alias() {
     }
 }
 
-/// T6: the lazy edges (E4 here) leave bits STALE-SET with no sweep — the doom generation
-/// pattern — and the next generation's strict edge SKIPS stale-set entries while clearing the
+/// T6: the lazy edges (E4 here) leave bits STALE-SET with no sweep (the doom generation
+/// pattern) and the next generation's strict edge SKIPS stale-set entries while clearing the
 /// bit-clear ones filled during the unwatched window. The skip rule is what bounds the E1
 /// sweep's cost at doom's churn; deleting it turns every generation into a full re-fill of the
 /// code working set's entries.
@@ -153,7 +153,7 @@ fn stale_set_bits_survive_the_lazy_edges_and_the_skip_rule_spares_them() {
     populate_target(&mut cpu, &mut bus, PHYS);
     assert!(cpu.jit_fast_map.page_watched_bit_for_test(PHYS));
 
-    // E4: a sticky generation clear is LAZY — no sweep, the entry survives with the bit
+    // E4: a sticky generation clear is LAZY. No sweep, the entry survives with the bit
     // stale-set (a set bit over empty tables just routes stores through the slow guard).
     cpu.decode_cache.native_code_watch.clear();
     assert!(cpu.jit_fast_map.has_write_mapping(PHYS, PHYS));
@@ -178,9 +178,9 @@ fn stale_set_bits_survive_the_lazy_edges_and_the_skip_rule_spares_them() {
 }
 
 /// T2b (review gap 1): the PRODUCTION install path's edge extend, not the test hook's. The
-/// bit-clear entry on the block's own page is constructed with an explicit `false` — production
+/// bit-clear entry on the block's own page is constructed with an explicit `false`: production
 /// cannot reach this state (decode marks the page before compile, so honest populates carry the
-/// bit) — which is exactly why the E2 sweep is near-vacuous in production and why deleting the
+/// bit), which is exactly why the E2 sweep is near-vacuous in production and why deleting the
 /// `pending_watch_edges.extend` in `BlockCache::install` would otherwise survive the suite.
 #[test]
 fn a_real_install_records_the_edge_that_sweeps_a_bit_clear_entry() {
@@ -226,7 +226,7 @@ fn a_real_install_records_the_edge_that_sweeps_a_bit_clear_entry() {
     );
 }
 
-/// T7-lite (review gap 2): the decode-insert sweep is SYNCHRONOUS — `fetch_decoded` itself
+/// T7-lite (review gap 2): the decode-insert sweep is SYNCHRONOUS. `fetch_decoded` itself
 /// drains the sticky edges it creates, which is the one placement the mid-block-callout
 /// argument leans on. Deleting the sweep call in `decode.rs` leaves the edge parked and this
 /// fails; the native-entry backstop must never become the only drain.

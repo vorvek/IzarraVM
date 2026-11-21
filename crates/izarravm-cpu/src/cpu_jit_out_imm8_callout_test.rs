@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! `0xE6` OUT imm8,AL -- the `PortWriteAlImm8` call-out, behind `IZARRAVM_OUT_IMM8_ROWS`
+//! `0xE6` OUT imm8,AL: the `PortWriteAlImm8` call-out, behind `IZARRAVM_OUT_IMM8_ROWS`
 //! (Option B of the gp2 OUT 0xE6 research, gp2's 59,968,424-exit row).
 //!
 //! This file covers the KNOB and the `classify` ARM: whether `0xE6` reaches the compile walk at
@@ -47,7 +47,7 @@ fn flat_cpu() -> CpuGsw {
     cpu
 }
 
-/// Resets the thread-local override to the ambient reading when dropped -- including on unwind,
+/// Resets the thread-local override to the ambient reading when dropped, including on unwind,
 /// which is what a plain trailing `set_out_imm8_rows_for_test(None)` does not do: a panic partway
 /// through a fixture would skip it, and under `--test-threads=1` a leaked `Some(true)` could
 /// silently arm a later fixture that meant to read the shipped default.
@@ -103,7 +103,7 @@ fn out_imm8_rows_ship_on_since_the_20260830_ladder() {
 /// `1`/`on` must name the same arm stated, `0`/`off` the pre-slice base, and anything else must
 /// PANIC.
 ///
-/// Catches: a `_ => false` fallthrough replacing the panic -- a mistyped ladder leg would silently
+/// Catches: a `_ => false` fallthrough replacing the panic: a mistyped ladder leg would silently
 /// run the base and be read as "the slice under test changed nothing".
 #[test]
 fn out_imm8_rows_spelling_table_names_both_arms() {
@@ -171,7 +171,7 @@ fn compile_out_imm8_block(port: u8) -> Option<jit::direct::Compilation> {
     }
 }
 
-/// With the knob OFF, `0xE6` must stay a barrier -- byte-identical to the pre-slice tree, which is
+/// With the knob OFF, `0xE6` must stay a barrier, byte-identical to the pre-slice tree, which is
 /// what makes the census row PRESENT on the OFF arm and ABSENT on the ON arm the campaign's proof
 /// the admission took.
 ///
@@ -216,7 +216,7 @@ fn out_imm8_joins_the_block_and_terminates_it_with_the_gate_on() {
     );
 }
 
-/// `classify` admits `0xE6` for ANY immediate port, unconditionally -- there is no per-port
+/// `classify` admits `0xE6` for ANY immediate port, unconditionally: there is no per-port
 /// allowlist, because the forced step break discharges the pendency obligation for every port at
 /// once rather than per device. Four ports, including the PIT control port and the PIC command
 /// port, the two whose writes can move an IRQ line from inside `write_io`.
@@ -293,7 +293,7 @@ fn out_imm8_is_barred_off_and_admitted_on_in_a_sixteen_bit_segment() {
 ///
 /// Before the corpus L2 slice, the historical defect this fixture guarded against was admitting
 /// `0xE6` on the opcode ALONE and having a 16-bit site stop with `BarrierStop::HardBoundary` on
-/// the ON arm where the OFF arm stopped it with `NonContinuable` -- a relocated row rather than a
+/// the ON arm where the OFF arm stopped it with `NonContinuable`, a relocated row rather than a
 /// vanished one, which the two-arm reconciliation
 /// ([[overlapping-slices-measure-leftovers]]) would have misread. Now that the Word admission is
 /// real and knob-gated in `classify` itself (not just in `jit_admits_non_continuable`), the ON
@@ -354,7 +354,7 @@ fn out_imm8_off_arm_keeps_its_pre_slice_barrier_row() {
     {
         // The ON arm's counterpart: it must not leave a barrier row behind AT ALL, because it
         // compiles. A stray row here would mean the Word admission is real in `classify` but the
-        // compile walk still stopped short of it on some path -- the exact relocation defect this
+        // compile walk still stopped short of it on some path: the exact relocation defect this
         // fixture used to detect by comparing two barrier rows, now detected instead by there
         // being only one to find.
         let _guard = select_out_imm8_rows(true);

@@ -15,7 +15,7 @@
 //!    the OFF arm by construction, and exactly one site in the expected CLASS on the ON arm. A
 //!    row that silently ran the base arm cannot pass.
 //! 2. **Checks against an INDEPENDENT oracle**, `predicate` below, written from the Intel
-//!    condition table rather than from the emitter — so a shared misunderstanding cannot make
+//!    condition table rather than from the emitter, so a shared misunderstanding cannot make
 //!    both sides of a differential agree.
 //! 3. **Checks against the interpreter**, which carries the rest of the architectural state
 //!    (registers, `pending_flags`, EFLAGS, core clocks) that the branch outcome alone would miss.
@@ -29,7 +29,7 @@
 //! `Shape::Terminal` puts the Jcc at the block's FIRST and ONLY slot, so the seeded EFLAGS reaches
 //! RBP unmodified through `materialized_eflags()` and the prologue's shadow load. That is what
 //! makes a seed set mean anything. A producer between the seed and the terminator overwrites every
-//! flag its own `defined` mask covers -- a `TEST` writes CF = 0 and OF = 0 through `LOGIC_FLAGS`,
+//! flag its own `defined` mask covers: a `TEST` writes CF = 0 and OF = 0 through `LOGIC_FLAGS`,
 //! which would silently collapse JO/JNO and JB/JAE to constants and reduce the signed four to half
 //! their input space. The producer-bearing shapes below exist to pin DIFFERENT properties and say
 //! so in their own comments.
@@ -87,7 +87,7 @@ fn predicate(condition: u8, eflags: u32) -> bool {
 
 /// The eight (SF, OF, ZF) points, every one of them reachable at a block ENTRY even though a
 /// producer can only deliver six (ZF = 1 forces SF = 0 for any ADD or SUB, so (SF=1, ZF=1) has no
-/// producer -- but POPF, IRET and an interpreted partial write all reach it, and the entry shadow
+/// producer, but POPF, IRET and an interpreted partial write all reach it, and the entry shadow
 /// is `materialized_eflags()` verbatim).
 ///
 /// `(SF=0, OF=1)` is load-bearing and must never be pruned as redundant: it is the ONLY point that
@@ -97,24 +97,24 @@ const SIGNED_POINTS: [u32; 8] = [
     0x002, // SF=0 OF=0 ZF=0
     0x042, // SF=0 OF=0 ZF=1
     0x082, // SF=1 OF=0 ZF=0
-    0x0c2, // SF=1 OF=0 ZF=1  -- producer-unreachable, and M9's killer
-    0x802, // SF=0 OF=1 ZF=0  -- M5's only killer
+    0x0c2, // SF=1 OF=0 ZF=1: producer-unreachable, and M9's killer
+    0x802, // SF=0 OF=1 ZF=0: M5's only killer
     0x842, // SF=0 OF=1 ZF=1
     0x882, // SF=1 OF=1 ZF=0
-    0x8c2, // SF=1 OF=1 ZF=1  -- producer-unreachable
+    0x8c2, // SF=1 OF=1 ZF=1: producer-unreachable
 ];
 
 /// The full seed set for the sixteen-condition sweep: the eight signed points above, plus single-
 /// flag points that separate CF, PF and ZF from each other and from SF, plus the seven seeds
 /// `setcc_register_form_matches_the_interpreter_for_every_condition` already justifies flag by
-/// flag. Every seed carries bit 1, which real EFLAGS always reads as set -- and which is exactly
+/// flag. Every seed carries bit 1, which real EFLAGS always reads as set, and which is exactly
 /// why no predicate mask may ever carry `0x2`: it would make its condition unconditionally taken.
 const SEEDS: [u32; 20] = [
     0x002, 0x042, 0x082, 0x0c2, 0x802, 0x842, 0x882, 0x8c2, // the eight signed points
     0x003, // CF alone
     0x006, // PF alone
     0x043, // CF and ZF together
-    0x041, // ZF with CF clear -- JBE's ZF term, with bit 1 deliberately absent
+    0x041, // ZF with CF clear: JBE's ZF term, with bit 1 deliberately absent
     0x012, // AF alone: no condition may read it
     0x202, 0x206, 0x246, 0x282, 0x8d7, 0xa02, 0xed7, // the SETcc seed set
 ];
@@ -125,7 +125,7 @@ enum Shape {
     /// Nothing: the Jcc is the block's first and only slot. The seeded EFLAGS reaches RBP intact.
     Terminal,
     /// `and eax, eax` (0x21 0xC0). Lowers through `emit_capture_flags(e, LOGIC_FLAGS)`, which
-    /// writes CF/OF/ZF/SF/PF and leaves AF STALE -- the shape the AF fixture needs.
+    /// writes CF/OF/ZF/SF/PF and leaves AF STALE: the shape the AF fixture needs.
     AndProducer,
     /// `add eax, ebx` (0x01 0xD8). A full `ARITH_FLAGS` producer, for the six (SF, OF, ZF) points
     /// a real arithmetic result can reach.
@@ -351,7 +351,7 @@ fn run_row(
         cpu.registers.set_ebx(ebx);
         if shape == Shape::PortCallOut {
             // The port the call-out fixtures already use. Port 0 is not claimed by this bus, and
-            // an unclaimed port takes the ABNORMAL side exit -- which leaves EIP on the `IN` and
+            // an unclaimed port takes the ABNORMAL side exit, which leaves EIP on the `IN` and
             // means the Jcc never ran at all.
             cpu.registers.set_edx(0x03da);
         }
@@ -474,7 +474,7 @@ fn sweep(range: std::ops::Range<u8>, label: &str) {
     jit::direct::set_jcc_shadow_for_test(None);
 }
 
-/// 6.1, first half. The ten single-bit and CF|ZF conditions plus JO/JNO -- the twelve that lower
+/// 6.1, first half. The ten single-bit and CF|ZF conditions plus JO/JNO: the twelve that lower
 /// to one `test` and one branch, and the bulk of the executed volume.
 #[test]
 fn jcc_shadow_matches_the_interpreter_for_the_twelve_simple_conditions() {
@@ -490,12 +490,12 @@ fn jcc_shadow_matches_the_interpreter_for_the_four_signed_conditions() {
 }
 
 /// 6.2, seeded shape. The eight (SF, OF, ZF) points against an EXPLICIT expected-taken table,
-/// rather than against the interpreter -- so a fault shared by both lowerings cannot hide here.
+/// rather than against the interpreter, so a fault shared by both lowerings cannot hide here.
 ///
 /// This is the fixture that separates XOR7 from XOR6 and that no misaligned shift survives.
 #[test]
 fn signed_jcc_boundary_enumerates_sf_of_zf() {
-    // (seed, JL, JGE, JLE, JG) -- worked out by hand from SF^OF and ZF|(SF^OF).
+    // (seed, JL, JGE, JLE, JG): worked out by hand from SF^OF and ZF|(SF^OF).
     const TABLE: [(u32, bool, bool, bool, bool); 8] = [
         (0x002, false, true, false, true), // SF=0 OF=0 ZF=0
         (0x042, false, true, true, false), // SF=0 OF=0 ZF=1
@@ -537,7 +537,7 @@ fn signed_jcc_boundary_enumerates_sf_of_zf() {
     jit::direct::set_jcc_shadow_for_test(None);
 }
 
-/// 6.2, producer shape. The six (SF, OF, ZF) points a real ADD can reach -- ZF = 1 forces SF = 0,
+/// 6.2, producer shape. The six (SF, OF, ZF) points a real ADD can reach: ZF = 1 forces SF = 0,
 /// so (SF=1, ZF=1) has no producer at either OF polarity and lives in the seeded table above.
 ///
 /// Pins that the terminator reads what `emit_capture_flags` merged, on the same axis the seeded
@@ -595,16 +595,16 @@ fn signed_jcc_boundary_through_an_add_producer() {
 fn jcc_reads_the_last_producers_shadow_not_the_entry_shadow() {
     // eax = 0x8000_0000: the AND leaves SF=1, ZF=0, PF=1 (low byte 0), CF=0, OF=0.
     const EAX: u32 = 0x8000_0000;
-    // Entry seed: SF=0, ZF=1, PF=0, CF=1, OF=1 -- the opposite of every one of those.
+    // Entry seed: SF=0, ZF=1, PF=0, CF=1, OF=1: the opposite of every one of those.
     const SEED: u32 = 0x843;
     // (condition, taken under the MERGED shadow). Under the entry shadow every one of these flips.
     const EXPECT: [(u8, bool); 6] = [
-        (0x0, false), // JO   -- OF cleared by the AND, set in the seed
-        (0x2, false), // JB   -- CF cleared by the AND, set in the seed
-        (0x4, false), // JZ   -- result non-zero, seed had ZF
-        (0x8, true),  // JS   -- result negative, seed had SF clear
-        (0xa, true),  // JP   -- low byte 0 is even parity, seed had PF clear
-        (0x6, false), // JBE  -- both its terms cleared by the AND
+        (0x0, false), // JO: OF cleared by the AND, set in the seed
+        (0x2, false), // JB: CF cleared by the AND, set in the seed
+        (0x4, false), // JZ: result non-zero, seed had ZF
+        (0x8, true),  // JS: result negative, seed had SF clear
+        (0xa, true),  // JP: low byte 0 is even parity, seed had PF clear
+        (0x6, false), // JBE: both its terms cleared by the AND
     ];
     for on in [false, true] {
         jit::direct::set_jcc_shadow_for_test(Some(on));
@@ -678,11 +678,11 @@ fn jcc_ignores_a_stale_af_left_by_a_logic_producer() {
 fn jcc_at_the_block_entry_slot_reads_the_materialized_shadow() {
     const SEED: u32 = 0x043;
     const EXPECT: [(u8, bool); 5] = [
-        (0x0, true),  // JO  -- 0x7fffffff + 1 overflows
-        (0x2, false), // JB  -- no carry out, seed says CF
-        (0x4, false), // JZ  -- result non-zero, seed says ZF
-        (0x8, true),  // JS  -- result 0x80000000
-        (0xa, true),  // JP  -- low byte 0
+        (0x0, true),  // JO: 0x7fffffff + 1 overflows
+        (0x2, false), // JB: no carry out, seed says CF
+        (0x4, false), // JZ: result non-zero, seed says ZF
+        (0x8, true),  // JS: result 0x80000000
+        (0xa, true),  // JP: low byte 0
     ];
     for on in [false, true] {
         jit::direct::set_jcc_shadow_for_test(Some(on));
@@ -717,7 +717,7 @@ fn jcc_at_the_block_entry_slot_reads_the_materialized_shadow() {
 /// `emit_accounting`, and edited without thought, which is how a ledger stops being a ledger.
 ///
 /// This is also the ONLY killer for a mutation of `emit_shadow_test`'s form rule, which is
-/// semantically INERT -- `test ebp,0x40` and `test bpl,0x40` set ZF identically, so no
+/// semantically INERT: `test ebp,0x40` and `test bpl,0x40` set ZF identically, so no
 /// differential can see the difference and no differential is pre-registered as if it could.
 #[test]
 fn jcc_shadow_emission_delta_matches_the_ledger() {
@@ -824,8 +824,8 @@ fn jcc_shadow_sites_count_by_class_at_install() {
 
 /// 6.10. An x87-BEARING block terminated by a Jcc, on both arms.
 ///
-/// Pins that neither shadow sequence disturbs RSI -- the Windows x87 tag-cache scratch, spilled
-/// into the frame by the prologue and restored on the way out -- and that the x87 boundary work on
+/// Pins that neither shadow sequence disturbs RSI (the Windows x87 tag-cache scratch, spilled
+/// into the frame by the prologue and restored on the way out) and that the x87 boundary work on
 /// the completed path still sees what it expects. The two signed folds are the only shadow
 /// sequences that name a general register at all, so all four conditions that touch RAX are run
 /// here alongside a representative of each of the other two classes.
@@ -865,7 +865,7 @@ fn jcc_shadow_survives_an_x87_bearing_block() {
 ///
 /// The terminator therefore reads the RBP that the call-out RESUME path reloaded from
 /// `registers.eflags`, after `publish_flags` set that word to `materialized_eflags()`. `IN` defines
-/// no flag, so the seeded shadow must come out of the round trip byte for byte -- which makes the
+/// no flag, so the seeded shadow must come out of the round trip byte for byte, which makes the
 /// independent oracle the exact check here, and a lost or truncated republish visible as a wrong
 /// branch rather than as a subtly wrong flag word nobody reads.
 #[test]
@@ -899,7 +899,7 @@ fn jcc_after_a_call_out_resume_reads_the_republished_shadow() {
 
 /// The `IZARRAVM_JCC_SHADOW` spelling table. The knob caches its env reading in a process-wide
 /// `OnceLock`, so the contract is otherwise assertable exactly once per process and never in an
-/// order the harness controls -- hence the parse function is exercised directly.
+/// order the harness controls, hence the parse function is exercised directly.
 #[test]
 fn jcc_shadow_spelling_table() {
     use std::env::VarError;
@@ -935,7 +935,7 @@ fn a_mistyped_jcc_shadow_arm_panics() {
 }
 
 /// THE DEFAULT PIN, and it is the assertion that decides what a shipped binary does at every Jcc
-/// terminator. Catches a flip of `parse_jcc_shadow_arm`'s `NotPresent` arm -- the exact accident
+/// terminator. Catches a flip of `parse_jcc_shadow_arm`'s `NotPresent` arm: the exact accident
 /// changing a default introduces.
 ///
 /// Reads the AMBIENT knob deliberately, so the assertion agrees with the ENVIRONMENT rather than

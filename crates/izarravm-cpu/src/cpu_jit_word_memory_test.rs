@@ -31,8 +31,8 @@
 //! * **The code-watch guard cannot report a straddle at ALIGNED Word.** `emit_code_watch_table_
 //!   branch` tests every granule the access spans, as one shifted mask against a 32-bit window
 //!   over the page's watch bitmap. A 2-aligned two-byte access spans two one-byte granules whose
-//!   bits are adjacent in that window, so the fixture below asserts the TRANSACTIONAL exit -- the
-//!   store refused before any byte landed -- rather than a cross-word straddle, which this
+//!   bits are adjacent in that window, so the fixture below asserts the TRANSACTIONAL exit (the
+//!   store refused before any byte landed) rather than a cross-word straddle, which this
 //!   fixture's addresses cannot construct.
 //!
 //!   This bullet used to say something different and wrong on both clauses, and the correction is
@@ -54,7 +54,7 @@
 //! | `emit_alu_mem_dest`'s Word READ -> `load_r32_disp8` | `the_word_memory_alu_*` | lazy flags |
 //! | `emit_alu_candidate`'s Word arm -> `alu_r32_r32` | `the_word_memory_alu_*` | lazy flags, at `add ..., 0x80` |
 //! | `emit_commit_alu_candidate`'s Word `width_tag` -> `0x200` | `the_word_memory_alu_*` | lazy flags |
-//! | `needs_alignment_guard` -> `!matches!(self, Byte \| Word)` | `a_misaligned_word_read_modify_write_still_exits_*` | retirement count, 3 where 1 is allowed. **Re-derived after guard 3**, and the row changed shape: it used to be caught by three fixtures at once, and two of those now run misaligned Word accesses NATIVELY. What still discriminates is the read-modify-write row, which lowers through a site guard 3 did not relax — so the mutation removes the only guard that row has |
+//! | `needs_alignment_guard` -> `!matches!(self, Byte \| Word)` | `a_misaligned_word_read_modify_write_still_exits_*` | retirement count, 3 where 1 is allowed. **Re-derived after guard 3**, and the row changed shape: it used to be caught by three fixtures at once, and two of those now run misaligned Word accesses NATIVELY. What still discriminates is the read-modify-write row, which lowers through a site guard 3 did not relax, so the mutation removes the only guard that row has |
 //! | dropping `emit_watched_store_guard` from `emit_store`'s RAM arm | `a_watched_word_store_*` | retirement count, 3 where 1 is allowed |
 //!
 //! The first row is the one that matters most: it is the pre-slice emitter verbatim, so it says
@@ -62,7 +62,7 @@
 //! rather than with it.
 //!
 //! Two of these are worth reading as a pair. The write-back and the read mutations BOTH widen the
-//! `0x83` row, and they fail on different assertions -- guest RAM for the write, lazy flags for the
+//! `0x83` row, and they fail on different assertions: guest RAM for the write, lazy flags for the
 //! read. Neither alone would have covered the other.
 //!
 //! A tenth mutation was tried, did not fail, and is recorded here in CORRECTED form. An earlier
@@ -75,7 +75,7 @@
 //!
 //! * **The attribution.** `emit_pending_inc_dec` has FOUR calling functions, not one:
 //!   `emit_rmw_inc_dec` (memory RMW, Word or Dword from the kind), `emit_rmw_inc_dec_dword`
-//!   (Dword literal), `emit_inc_dec_reg` (register INC/DEC -- two textual call sites, one per
+//!   (Dword literal), `emit_inc_dec_reg` (register INC/DEC: two textual call sites, one per
 //!   width arm) and `emit_inc_dec_reg8` (Byte literal). So the Word tag serves `RmwIncDec` at Word
 //!   AND `IncDecReg` at Word, and both are production-reachable: `0xff` and `0x40..=0x4f` are both
 //!   on classify's Word allowlist.
@@ -86,7 +86,7 @@
 //!   operation over word operands, and the divergence only surfaces when a later instruction reads
 //!   a flag lazily.
 //!
-//! That gap is PRE-EXISTING and outside this slice -- nothing here touches INC or DEC -- so it is
+//! That gap is PRE-EXISTING and outside this slice: nothing here touches INC or DEC, so it is
 //! flagged for its own change rather than fixed in passing. It is written down because the two
 //! tables are byte-identical for four lines and the next person to mutate one will land on the
 //! wrong one exactly as this did.
@@ -102,7 +102,7 @@
 //! | mutation | caught by | assertion |
 //! |---|---|---|
 //! | `emit_alu_preloaded`'s Word write-back -> `mov_r32_r32(home(dst), RDX)` | the memory-SOURCE row | registers: EAX `0x0000_3435` against the interpreter's `0xdead_3435`, at `add r16 dst=0 reg=0x0001, word [0x3010] operand=0x1234` |
-//! | `emit_alu_preloaded`'s source mask `and_r32_imm32(RCX, 0xffff)` -> `0xffff_ffff` | NOT this row -- `word_alu_register_forms_*` and `word_alu_immediate_forms_*` | lazy flags: `b: 3203334145` against `1`, at `0x01 /0 add cx,ax` |
+//! | `emit_alu_preloaded`'s source mask `and_r32_imm32(RCX, 0xffff)` -> `0xffff_ffff` | NOT this row: `word_alu_register_forms_*` and `word_alu_immediate_forms_*` | lazy flags: `b: 3203334145` against `1`, at `0x01 /0 add cx,ax` |
 //!
 //! The first is the miscompile the old form-3 refusal existed to prevent, and it fails on the
 //! poisoned high half, which is why the seed carries one.
@@ -110,8 +110,8 @@
 //! The second is recorded for the SHAPE of its escape rather than for the catch. It survives this
 //! row for the same reason the review gave for not mutating the READ: at a memory source RCX is
 //! filled by `movzx_r32_word_disp8` and is ALREADY zero-extended, so masking it again is a no-op
-//! here. It is the register and immediate forms -- where RCX carries a full 32-bit register or a
-//! sign-extended imm8 -- that the mask is load-bearing for, and they catch it immediately.
+//! here. It is the register and immediate forms, where RCX carries a full 32-bit register or a
+//! sign-extended imm8, that the mask is load-bearing for, and they catch it immediately.
 //!
 //! For the same reason, mutating the row's own read (`movzx_r32_word_disp8` -> `load_r32_disp8`)
 //! canNOT fail HERE and was not attempted: the `and RAX, 0xffff` / `and RCX, 0xffff` pair discards
@@ -121,7 +121,7 @@
 //! That is a statement about THIS FIXTURE'S OPERANDS, not about the lane. Every address these rows
 //! read is page-INTERIOR, so the two extra bytes a four-byte host load would touch are inside the
 //! same mapped page. A guest Word read of the last two bytes of a FastMap page is a different
-//! matter entirely -- the widened host load would read past the page the entry covers -- and the
+//! matter entirely: the widened host load would read past the page the entry covers, and the
 //! emitted guard that keeps it from doing so is the page-CROSSING bound, which
 //! `cpu_jit_misaligned_memory_test.rs` pins at the page edge on this very slot. Nobody should read
 //! the paragraph above as "the read's width does not matter".
@@ -413,7 +413,7 @@ fn lowered(body: &[u8], seed: Seed, context: &str) {
 }
 
 /// A row whose emitted memory guard REFUSES. The native run must end at the tested opcode with the
-/// instruction un-started -- no byte of guest RAM written, no register touched -- and the
+/// instruction un-started (no byte of guest RAM written, no register touched) and the
 /// interpreter must then execute it and reach the same state.
 fn guarded(body: &[u8], seed: Seed, exits: fn(&CpuGsw) -> u64, context: &str) {
     let mut roles = build(body, seed);
@@ -470,7 +470,7 @@ fn disp32(opcode_head: &[u8], reg: u8, at: u32) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// `0x0FB6` / `0x0FB7` / `0x0FBE` / `0x0FBF` -- the extending loads
+// `0x0FB6` / `0x0FB7` / `0x0FBE` / `0x0FBF`: the extending loads
 // ---------------------------------------------------------------------------------------------
 
 /// The slice's headline row, and the property that admits it: at Word operand size MOVZX and MOVSX
@@ -515,7 +515,7 @@ fn extending_loads_write_the_operand_size_and_preserve_what_is_above_it() {
 /// arm cannot be widened for one without the other. Two shapes here are not reachable from the
 /// memory rows above:
 ///
-/// * a byte source in lane 4..=7, which is AH/CH/DH/BH -- bits 8-15 of `home(src - 4)`, and no
+/// * a byte source in lane 4..=7, which is AH/CH/DH/BH: bits 8-15 of `home(src - 4)`, and no
 ///   host home's second byte is addressable as an x86-64 high-byte register;
 /// * `dst == src`, where the destination is also the source of the extension.
 #[test]
@@ -540,7 +540,7 @@ fn extending_register_forms_write_the_operand_size_at_word() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// `0xC7 /0` -- MOV m16, imm16
+// `0xC7 /0`: MOV m16, imm16
 // ---------------------------------------------------------------------------------------------
 
 /// A two-byte immediate store writes exactly two bytes.
@@ -551,7 +551,7 @@ fn extending_register_forms_write_the_operand_size_at_word() {
 ///
 /// The immediates cover the two ways the width can leak. `decode` fetches this immediate with
 /// `fetch_immediate(Word)`, which is `u32::from(fetch_u16(..))`, so `insn.imm`'s upper half is
-/// ZERO whatever the guest bytes say -- a widened store would write zeros over the fill rather
+/// ZERO whatever the guest bytes say: a widened store would write zeros over the fill rather
 /// than garbage, which is the quieter of the two failures and the one the fill is sized for.
 #[test]
 fn the_word_immediate_store_writes_exactly_two_bytes() {
@@ -575,7 +575,7 @@ fn the_word_immediate_store_writes_exactly_two_bytes() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// `0x83` memory word -- the sixteen-bit read-modify-write
+// `0x83` memory word: the sixteen-bit read-modify-write
 // ---------------------------------------------------------------------------------------------
 
 /// Every admitted sub-op of `83 /r ib` at Word operand size, memory destination.
@@ -594,7 +594,7 @@ fn the_word_immediate_store_writes_exactly_two_bytes() {
 /// THREE `(eflags, pending)` pairs below rather than two. `flag(FLAG_CF)` (`core.rs`) routes CF
 /// through the live pending descriptor whenever one exists, so a `pending: true` row delivers
 /// whatever CF the PRIMING op left (always clear; see `build`'s comment on the `cpu.alu` call), not
-/// `seed.eflags`'s CF bit -- `(0x8d5, true)` alone would silently never exercise a real carry-in.
+/// `seed.eflags`'s CF bit: `(0x8d5, true)` alone would silently never exercise a real carry-in.
 /// `(0x8d7, false)` is what actually delivers CF=1: no descriptor is in the way, so it comes
 /// straight out of `registers.eflags`. All three pairs still matter for the non-carry six: `(0x202,
 /// false)` and `(0x8d5, true)` are the pending-descriptor-replacement coverage every op needs, and
@@ -637,7 +637,7 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Form 3 memory word -- the sixteen-bit memory-SOURCE ALU (the B2 peachdrm row)
+// Form 3 memory word: the sixteen-bit memory-SOURCE ALU (the B2 peachdrm row)
 // ---------------------------------------------------------------------------------------------
 
 /// Every admitted opcode of the form-3 family at Word operand size, memory source.
@@ -650,7 +650,7 @@ fn the_word_memory_alu_matches_the_interpreter_for_every_admitted_sub_op() {
 ///
 /// `0x13` ADC and `0x1b` SBB joined this loop on the L1 width lift: their register-form guard was
 /// classify's only reason to refuse them, so lifting it opens the memory-source shape too, through
-/// the SAME `emit_alu_preloaded` word-carry lane the register rows use -- `emit_alu_mem_source`'s
+/// the SAME `emit_alu_preloaded` word-carry lane the register rows use: `emit_alu_mem_source`'s
 /// Word arm already stages RAX/RCX exactly as the register callers do before dispatching there.
 /// 123-talk-shareware ranks a `0x13 word` row at 13.72 M runtime hits, this shape exactly.
 ///
@@ -686,7 +686,7 @@ fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
                 // the incoming flags, so repeating them there would buy nothing.
                 //
                 // `[ebp+0x10]` is ModRM mod 01 / rm 101, whose DEFAULT segment is SS rather than
-                // DS. The fixture's SS is flat with base 0, so it resolves to the same operand --
+                // DS. The fixture's SS is flat with base 0, so it resolves to the same operand,
                 // which is the point: an address path that silently used the wrong segment base
                 // would still land here, and what this row actually pins is that the base-plus-
                 // displacement form compiles and reads the same two bytes.
@@ -699,7 +699,7 @@ fn the_word_memory_source_alu_matches_the_interpreter_for_every_admitted_op() {
                 // NO PENDING here: without it, this loop's two addressing shapes would only ever
                 // exercise `emit_alu_mem_source`'s Word arm through the carry lane's NO-CARRY
                 // branch, and the `reg_low` loop below runs only the plain `[disp32]` form, never
-                // these two. `pending: false` is load-bearing, not incidental -- `flag(FLAG_CF)`
+                // these two. `pending: false` is load-bearing, not incidental: `flag(FLAG_CF)`
                 // (`core.rs`) routes CF through a live pending descriptor when one exists, so a
                 // `pending: true` row would deliver the priming op's own CF (always clear) rather
                 // than this seed's, and never actually reach the carry branch.
@@ -803,7 +803,7 @@ fn a_misaligned_word_read_modify_write_still_exits_to_the_interpreter() {
 /// A word STORE into a watched chunk exits transactionally.
 ///
 /// The guard tests every granule the access spans as one shifted mask, so a two-byte access whose
-/// first byte is marked is watched whatever its alignment -- see the module docs, and note that
+/// first byte is marked is watched whatever its alignment, see the module docs, and note that
 /// the "last-byte probe" this comment used to appeal to has not existed since the guard became a
 /// window test. What this row certifies is the part that is not a tautology: the exit happens
 /// BEFORE any byte is written, so `compare_state` at the guard sees the operand untouched, and the
@@ -836,7 +836,7 @@ fn a_watched_word_store_exits_before_writing() {
 /// memory-ALU slots once `memory_alu_slots == MAX_MEMORY_ALU_SLOTS` (3), the same way the
 /// call-out slot cap ends a block early (`cpu_jit_out_imm8_callout_test.rs`'s
 /// `MAX_BLOCK_CALLOUT_SLOTS` fixture): the cap always fires with three or more slots already
-/// admitted, so the post-walk min-length rule never turns it into a `CompileOutcome::Retry` --
+/// admitted, so the post-walk min-length rule never turns it into a `CompileOutcome::Retry`:
 /// the walk lands on a Boundary and the block installs SHORT, at the filler plus the three
 /// admitted ALU slots, with the fourth `and` becoming the next block's entry. This is the
 /// block-shape cap the design's review (finding 3) says the entry-count prediction has to

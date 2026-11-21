@@ -465,7 +465,7 @@ fn variable_shift_form_has_known_bytes() {
 
 /// `shift_r16_imm8` against its Dword sibling, byte for byte.
 ///
-/// The 0x66 prefix must come BEFORE the REX byte -- a REX that precedes a legacy prefix is
+/// The 0x66 prefix must come BEFORE the REX byte: a REX that precedes a legacy prefix is
 /// ignored by the CPU, so `41 66 C1 E1 03` would shift CX instead of R9W and the miscompile would
 /// be silent. The extended-register rows are the only ones that can see that ordering, which is
 /// why both an extended and a non-extended destination are pinned for each shape.
@@ -587,12 +587,12 @@ fn x87_integer_support_forms_have_known_bytes() {
 
 #[test]
 fn mov_r32_r32_known_bytes() {
-    // Non-extended pair: mov eax, ecx -- no REX byte at all.
+    // Non-extended pair: mov eax, ecx: no REX byte at all.
     let mut e = Encoder::new();
     e.mov_r32_r32(Reg::RAX, Reg::RCX);
     assert_eq!(e.finish(), vec![0x89, 0xC8]);
 
-    // Extended pair: mov r12d, r9d -- REX present (R from src ext, B from dst ext).
+    // Extended pair: mov r12d, r9d: REX present (R from src ext, B from dst ext).
     let mut e = Encoder::new();
     e.mov_r32_r32(Reg::R12, Reg::R9);
     assert_eq!(e.finish(), vec![0x45, 0x89, 0xCC]);
@@ -600,7 +600,7 @@ fn mov_r32_r32_known_bytes() {
 
 #[test]
 fn mov_r32_imm32_known_bytes() {
-    // mov r9d, 0x12345678 -- REX.B set (R9 is extended), then B8+1, then imm32 LE.
+    // mov r9d, 0x12345678: REX.B set (R9 is extended), then B8+1, then imm32 LE.
     let mut e = Encoder::new();
     e.mov_r32_imm32(Reg::R9, 0x1234_5678);
     assert_eq!(e.finish(), vec![0x41, 0xB9, 0x78, 0x56, 0x34, 0x12]);
@@ -608,7 +608,7 @@ fn mov_r32_imm32_known_bytes() {
 
 #[test]
 fn mov_r64_imm64_known_bytes() {
-    // mov rbx, 0x0102030405060708 -- REX.W only (RBX not extended), B8+3, imm64 LE.
+    // mov rbx, 0x0102030405060708: REX.W only (RBX not extended), B8+3, imm64 LE.
     let mut e = Encoder::new();
     e.mov_r64_imm64(Reg::RBX, 0x0102_0304_0506_0708);
     assert_eq!(
@@ -619,7 +619,7 @@ fn mov_r64_imm64_known_bytes() {
 
 #[test]
 fn cmp_r64_imm32_known_bytes() {
-    // cmp rcx, 10 -- ModRM reg field is /7, distinct from add's /0 and sub's /5.
+    // cmp rcx, 10: ModRM reg field is /7, distinct from add's /0 and sub's /5.
     let mut e = Encoder::new();
     e.cmp_r64_imm32(Reg::RCX, 10);
     assert_eq!(e.finish(), vec![0x48, 0x81, 0xF9, 0x0A, 0x00, 0x00, 0x00]);
@@ -663,7 +663,7 @@ fn store_disp8_known_bytes() {
 
 #[test]
 fn load_r32_disp8_known_bytes() {
-    // mov eax, [r15+0] -- REX.B only (r15 extended), no REX.W (32-bit operand). The 32-bit load
+    // mov eax, [r15+0]: REX.B only (r15 extended), no REX.W (32-bit operand). The 32-bit load
     // zero-extends to 64 bits, exactly what the inline slot wants when reading a guest gpr.
     let mut e = Encoder::new();
     e.load_r32_disp8(Reg::RAX, Reg::R15, 0);
@@ -672,7 +672,7 @@ fn load_r32_disp8_known_bytes() {
 
 #[test]
 fn store_r32_disp8_known_bytes() {
-    // mov [r15+32], eax -- REX.B only (r15 extended), no REX.W.
+    // mov [r15+32], eax: REX.B only (r15 extended), no REX.W.
     let mut e = Encoder::new();
     e.store_r32_disp8(Reg::R15, 32, Reg::RAX);
     assert_eq!(e.finish(), vec![0x41, 0x89, 0x47, 0x20]);
@@ -680,16 +680,16 @@ fn store_r32_disp8_known_bytes() {
 
 #[test]
 fn load_store_r32_disp32_known_bytes() {
-    // mov eax, [r14+128] -- REX.B (r14 extended), no REX.W. 8B; ModRM mod=10,reg=eax(0),
+    // mov eax, [r14+128]: REX.B (r14 extended), no REX.W. 8B; ModRM mod=10,reg=eax(0),
     // rm=r14&7=6 = 10_000_110 = 0x86; disp32 128 LE.
     let mut e = Encoder::new();
     e.load_r32_disp32(Reg::RAX, Reg::R14, 128);
     assert_eq!(e.finish(), vec![0x41, 0x8B, 0x86, 0x80, 0x00, 0x00, 0x00]);
-    // mov [r14+128], eax -- 89; ModRM 0x86; same disp32.
+    // mov [r14+128], eax: 89; ModRM 0x86; same disp32.
     let mut e = Encoder::new();
     e.store_r32_disp32(Reg::R14, 128, Reg::RAX);
     assert_eq!(e.finish(), vec![0x41, 0x89, 0x86, 0x80, 0x00, 0x00, 0x00]);
-    // mov eax, [r12+200] -- r12&7=4 forces a SIB byte (0x24); REX.B. ModRM mod=10 = 0x84.
+    // mov eax, [r12+200]: r12&7=4 forces a SIB byte (0x24); REX.B. ModRM mod=10 = 0x84.
     let mut e = Encoder::new();
     e.load_r32_disp32(Reg::RAX, Reg::R12, 200);
     assert_eq!(
@@ -730,14 +730,14 @@ fn store_then_load_r32_disp32_round_trips() {
 
 #[test]
 fn load_r32_sib_known_bytes() {
-    // mov r11d, [r12 + r9] -- REX.W=0,R=1(r11),X=1(r9 index),B=1(r12 base) = 0100_0111 = 0x47;
+    // mov r11d, [r12 + r9]: REX.W=0,R=1(r11),X=1(r9 index),B=1(r12 base) = 0100_0111 = 0x47;
     // 8B; ModRM mod=00,reg=r11&7=3,rm=100(SIB) = 00_011_100 = 0x1C; SIB scale=0,index=r9&7=1,
     // base=r12&7=4 = 00_001_100 = 0x0C.
     let mut e = Encoder::new();
     e.load_r32_sib(Reg::R11, Reg::R12, Reg::R9);
     assert_eq!(e.finish(), vec![0x47, 0x8B, 0x1C, 0x0C]);
 
-    // mov eax, [esi + ecx] -- no extended regs, so no REX. 8B; ModRM mod=00,reg=eax(0),rm=100 =
+    // mov eax, [esi + ecx]: no extended regs, so no REX. 8B; ModRM mod=00,reg=eax(0),rm=100 =
     // 0x04; SIB scale=0,index=ecx(1),base=esi(6) = 00_001_110 = 0x0E. Matches the guest bytes
     // `8B 04 0E` the probe's interpreter side executes for the same operation.
     let mut e = Encoder::new();
@@ -751,7 +751,7 @@ fn load_r32_sib_known_bytes() {
 /// silently start depending on the guest homes' upper halves.
 #[test]
 fn lea_r32_known_bytes() {
-    // lea eax, [r11d + disp32] -- 67; REX.B=1 = 0x41; 8D; ModRM mod=10,reg=eax(0),rm=r11&7=3.
+    // lea eax, [r11d + disp32]: 67; REX.B=1 = 0x41; 8D; ModRM mod=10,reg=eax(0),rm=r11&7=3.
     let mut e = Encoder::new();
     e.lea_r32(Reg::RAX, Some(Reg::R11), None, 0x1234_5678);
     assert_eq!(
@@ -759,7 +759,7 @@ fn lea_r32_known_bytes() {
         vec![0x67, 0x41, 0x8D, 0x83, 0x78, 0x56, 0x34, 0x12]
     );
 
-    // lea eax, [r11d + r14d*4 + disp32] -- 67; REX.X=1,B=1 = 0x43; 8D; ModRM mod=10,reg=0,
+    // lea eax, [r11d + r14d*4 + disp32]: 67; REX.X=1,B=1 = 0x43; 8D; ModRM mod=10,reg=0,
     // rm=100(SIB); SIB scale=4(10),index=r14&7=6,base=r11&7=3 = 10_110_011 = 0xB3.
     let mut e = Encoder::new();
     e.lea_r32(Reg::RAX, Some(Reg::R11), Some((Reg::R14, 4)), 0x1234_5678);
@@ -768,7 +768,7 @@ fn lea_r32_known_bytes() {
         vec![0x67, 0x43, 0x8D, 0x84, 0xB3, 0x78, 0x56, 0x34, 0x12]
     );
 
-    // lea edx, [ebx + esi*2 + 4] -- no extended register, so no REX at all; disp8.
+    // lea edx, [ebx + esi*2 + 4]: no extended register, so no REX at all; disp8.
     // ModRM mod=01,reg=edx(2),rm=100 = 0x54; SIB scale=2(01),index=esi(6),base=ebx(3) = 0x73.
     let mut e = Encoder::new();
     e.lea_r32(Reg::RDX, Some(Reg::RBX), Some((Reg::RSI, 2)), 4);
@@ -810,7 +810,7 @@ fn lea_r32_encoding_traps() {
     );
 }
 
-/// The disp8 predicate is `disp <= 0x7F || disp >= 0xFFFF_FF80`, exact mod 2^32 -- the only
+/// The disp8 predicate is `disp <= 0x7F || disp >= 0xFFFF_FF80`, exact mod 2^32: the only
 /// arithmetic a guest effective address has. Both boundaries and both first values outside them.
 #[test]
 fn lea_r32_disp8_boundaries() {
@@ -850,7 +850,7 @@ fn load_r64_sib_scale8_known_bytes() {
 
 #[test]
 fn add_r32_imm32_known_bytes() {
-    // add eax, 0xa0 -- no REX (eax not extended), 81 /0 id. ModRM mod=11,reg=0(/0),rm=0(eax)
+    // add eax, 0xa0: no REX (eax not extended), 81 /0 id. ModRM mod=11,reg=0(/0),rm=0(eax)
     // = 11_000_000 = 0xC0.
     let mut e = Encoder::new();
     e.add_r32_imm32(Reg::RAX, 0xa0);
@@ -859,7 +859,7 @@ fn add_r32_imm32_known_bytes() {
 
 #[test]
 fn shr_r32_imm8_known_bytes() {
-    // shr ecx, 25 -- no REX (ecx not extended), C1 /5 ib. ModRM mod=11,reg=5(/5),rm=1(ecx)
+    // shr ecx, 25: no REX (ecx not extended), C1 /5 ib. ModRM mod=11,reg=5(/5),rm=1(ecx)
     // = 11_101_001 = 0xE9; count 25 = 0x19. This is the drawcolumn shift slot.
     let mut e = Encoder::new();
     e.shr_r32_imm8(Reg::RCX, 25);
@@ -868,11 +868,11 @@ fn shr_r32_imm8_known_bytes() {
 
 #[test]
 fn and_r32_imm32_known_bytes() {
-    // and eax, 0xfffff000 -- no REX, 81 /4 id. ModRM mod=11,reg=4(/4),rm=0(eax) = 0xE0.
+    // and eax, 0xfffff000: no REX, 81 /4 id. ModRM mod=11,reg=4(/4),rm=0(eax) = 0xE0.
     let mut e = Encoder::new();
     e.and_r32_imm32(Reg::RAX, 0xffff_f000);
     assert_eq!(e.finish(), vec![0x81, 0xE0, 0x00, 0xF0, 0xFF, 0xFF]);
-    // and r12d, 0xff -- REX.B (r12 extended). ModRM rm=r12&7=4 -> 0xE4.
+    // and r12d, 0xff: REX.B (r12 extended). ModRM rm=r12&7=4 -> 0xE4.
     let mut e = Encoder::new();
     e.and_r32_imm32(Reg::R12, 0xff);
     assert_eq!(e.finish(), vec![0x41, 0x81, 0xE4, 0xFF, 0x00, 0x00, 0x00]);
@@ -880,11 +880,11 @@ fn and_r32_imm32_known_bytes() {
 
 #[test]
 fn cmp_r32_imm32_known_bytes() {
-    // cmp eax, 3 -- no REX, 81 /7 id. ModRM 11_111_000 = 0xF8.
+    // cmp eax, 3: no REX, 81 /7 id. ModRM 11_111_000 = 0xF8.
     let mut e = Encoder::new();
     e.cmp_r32_imm32(Reg::RAX, 3);
     assert_eq!(e.finish(), vec![0x81, 0xF8, 0x03, 0x00, 0x00, 0x00]);
-    // cmp r12d, 0xff -- REX.B.
+    // cmp r12d, 0xff: REX.B.
     let mut e = Encoder::new();
     e.cmp_r32_imm32(Reg::R12, 0xff);
     assert_eq!(e.finish(), vec![0x41, 0x81, 0xFC, 0xFF, 0x00, 0x00, 0x00]);
@@ -892,11 +892,11 @@ fn cmp_r32_imm32_known_bytes() {
 
 #[test]
 fn or_r32_r32_known_bytes() {
-    // or eax, ecx -- no REX, 09 /r. ModRM mod=11,reg=ecx(1),rm=eax(0) = 0xC8.
+    // or eax, ecx: no REX, 09 /r. ModRM mod=11,reg=ecx(1),rm=eax(0) = 0xC8.
     let mut e = Encoder::new();
     e.or_r32_r32(Reg::RAX, Reg::RCX);
     assert_eq!(e.finish(), vec![0x09, 0xC8]);
-    // or r12d, eax -- REX.B on dst (r12), reg=eax(0) so ModRM rm=4 (r12), reg=0 -> 0xC4 ; REX 0x41.
+    // or r12d, eax: REX.B on dst (r12), reg=eax(0) so ModRM rm=4 (r12), reg=0 -> 0xC4 ; REX 0x41.
     let mut e = Encoder::new();
     e.or_r32_r32(Reg::R12, Reg::RAX);
     assert_eq!(e.finish(), vec![0x41, 0x09, 0xC4]);
@@ -904,7 +904,7 @@ fn or_r32_r32_known_bytes() {
 
 #[test]
 fn or_r32_imm32_known_bytes() {
-    // or eax, 0x00000fff -- no REX, 81 /1 . ModRM 11_001_000 = 0xC8.
+    // or eax, 0x00000fff: no REX, 81 /1 . ModRM 11_001_000 = 0xC8.
     let mut e = Encoder::new();
     e.or_r32_imm32(Reg::RAX, 0x0000_0fff);
     assert_eq!(e.finish(), vec![0x81, 0xC8, 0xFF, 0x0F, 0x00, 0x00]);
@@ -912,7 +912,7 @@ fn or_r32_imm32_known_bytes() {
 
 #[test]
 fn shl_r32_imm8_known_bytes() {
-    // shl eax, 4 -- no REX, C1 /4 ib (reg field /4, vs shr's /5). ModRM 11_100_000 = 0xE0.
+    // shl eax, 4: no REX, C1 /4 ib (reg field /4, vs shr's /5). ModRM 11_100_000 = 0xE0.
     let mut e = Encoder::new();
     e.shl_r32_imm8(Reg::RAX, 4);
     assert_eq!(e.finish(), vec![0xC1, 0xE0, 0x04]);
@@ -920,7 +920,7 @@ fn shl_r32_imm8_known_bytes() {
 
 #[test]
 fn shift_r8_imm8_known_bytes() {
-    // shl dl, 3 -- no REX, C0 /4 ib. ModRM 11_100_010 = 0xE2. The absence of a 0x66 and of a REX
+    // shl dl, 3: no REX, C0 /4 ib. ModRM 11_100_010 = 0xE2. The absence of a 0x66 and of a REX
     // is the whole assertion: this is the ONE encoding whose operand is eight bits wide, and the
     // flags the emitter captures after it are the host's answer for an 8-bit operand.
     let mut e = Encoder::new();
@@ -935,7 +935,7 @@ fn shift_r8_imm8_known_bytes() {
 
 #[test]
 fn shift_r8_cl_known_bytes() {
-    // shl dl, cl -- no REX, D2 /4. ModRM 11_100_010 = 0xE2. The absence of a 0x66 and of a REX is
+    // shl dl, cl: no REX, D2 /4. ModRM 11_100_010 = 0xE2. The absence of a 0x66 and of a REX is
     // the same assertion `shift_r8_imm8_known_bytes` makes: the operand is eight bits wide, so the
     // host computes CF from bit 7, SF from bit 7 and ZF/PF from the 8-bit result, which is what
     // lets the count-lane emitter take the flags rather than reconstruct them.
@@ -965,11 +965,11 @@ fn shift_r8_imm8_refuses_a_high_register() {
 
 #[test]
 fn add_r32_r32_known_bytes() {
-    // add eax, ecx -- no REX, 01 /r. ModRM mod=11,reg=ecx(1),rm=eax(0) = 0xC8.
+    // add eax, ecx: no REX, 01 /r. ModRM mod=11,reg=ecx(1),rm=eax(0) = 0xC8.
     let mut e = Encoder::new();
     e.add_r32_r32(Reg::RAX, Reg::RCX);
     assert_eq!(e.finish(), vec![0x01, 0xC8]);
-    // add r12d, r9d -- REX (R from src r9 ext, B from dst r12 ext) = 0x45. ModRM 11_001_100 = 0xCC.
+    // add r12d, r9d: REX (R from src r9 ext, B from dst r12 ext) = 0x45. ModRM 11_001_100 = 0xCC.
     let mut e = Encoder::new();
     e.add_r32_r32(Reg::R12, Reg::R9);
     assert_eq!(e.finish(), vec![0x45, 0x01, 0xCC]);
@@ -992,12 +992,12 @@ fn byte_alu_register_forms_have_known_bytes() {
 
 #[test]
 fn movzx_r32_byte_sib_known_bytes() {
-    // movzx eax, byte [rsi+rcx] -- no REX. 0F B6; ModRM mod=00,reg=eax(0),rm=100(SIB)=0x04;
+    // movzx eax, byte [rsi+rcx]: no REX. 0F B6; ModRM mod=00,reg=eax(0),rm=100(SIB)=0x04;
     // SIB scale=0,index=rcx(1),base=rsi(6) = 0x0E.
     let mut e = Encoder::new();
     e.movzx_r32_byte_sib(Reg::RAX, Reg::RSI, Reg::RCX);
     assert_eq!(e.finish(), vec![0x0F, 0xB6, 0x04, 0x0E]);
-    // movzx r11d, byte [r12+r9] -- REX.R(r11)+X(r9)+B(r12) = 0x47; ModRM reg=r11&7=3,rm=100 = 0x1C;
+    // movzx r11d, byte [r12+r9]: REX.R(r11)+X(r9)+B(r12) = 0x47; ModRM reg=r11&7=3,rm=100 = 0x1C;
     // SIB index=r9&7=1,base=r12&7=4 = 0x0C.
     let mut e = Encoder::new();
     e.movzx_r32_byte_sib(Reg::R11, Reg::R12, Reg::R9);
@@ -1017,14 +1017,14 @@ fn movzx_r32_byte_disp8_known_bytes() {
 
 #[test]
 fn movsx_r32_byte_disp8_known_bytes() {
-    // movsx edx, byte [rdi] -- no REX. 0F BE; ModRM mod=01,reg=edx(2),rm=rdi(7) = 0x57; disp 0.
+    // movsx edx, byte [rdi]: no REX. 0F BE; ModRM mod=01,reg=edx(2),rm=rdi(7) = 0x57; disp 0.
     // The only difference from the movzx sibling is the 0xBE opcode byte against 0xB6, which is
     // the entire zero-extend versus sign-extend decision.
     let mut e = Encoder::new();
     e.movsx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0);
     assert_eq!(e.finish(), vec![0x0F, 0xBE, 0x57, 0x00]);
 
-    // movsx r9d, byte [r12-4] -- REX.R (r9) + REX.B (r12) = 0x45. r12 as a base forces a SIB byte
+    // movsx r9d, byte [r12-4]: REX.R (r9) + REX.B (r12) = 0x45. r12 as a base forces a SIB byte
     // 0x24, the case the disp8 form gets wrong if the SIB is omitted.
     let mut e = Encoder::new();
     e.movsx_r32_byte_disp8(Reg::R9, Reg::R12, -4);
@@ -1033,7 +1033,7 @@ fn movsx_r32_byte_disp8_known_bytes() {
 
 #[test]
 fn movsx_r32_word_disp8_known_bytes() {
-    // movsx edx, word [rdi] -- 0F BF, same ModRM as the byte form.
+    // movsx edx, word [rdi]: 0F BF, same ModRM as the byte form.
     let mut e = Encoder::new();
     e.movsx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
     assert_eq!(e.finish(), vec![0x0F, 0xBF, 0x57, 0x00]);
@@ -1045,15 +1045,15 @@ fn movsx_r32_word_disp8_known_bytes() {
 
 #[test]
 fn store_r8_disp8_known_bytes() {
-    // mov [r14+8], al -- REX.B (r14 extended). 88; ModRM mod=01,reg=al(0),rm=r14&7=6 = 0x46; disp 8.
+    // mov [r14+8], al: REX.B (r14 extended). 88; ModRM mod=01,reg=al(0),rm=r14&7=6 = 0x46; disp 8.
     let mut e = Encoder::new();
     e.store_r8_disp8(Reg::R14, 8, Reg::RAX);
     assert_eq!(e.finish(), vec![0x41, 0x88, 0x46, 0x08]);
-    // mov [r12+8], al -- r12&7=4 forces a SIB byte (0x24). REX.B. ModRM 0x44.
+    // mov [r12+8], al: r12&7=4 forces a SIB byte (0x24). REX.B. ModRM 0x44.
     let mut e = Encoder::new();
     e.store_r8_disp8(Reg::R12, 8, Reg::RAX);
     assert_eq!(e.finish(), vec![0x41, 0x88, 0x44, 0x24, 0x08]);
-    // mov [rax+1], cl -- no REX, no SIB. ModRM mod=01,reg=cl(1),rm=rax(0) = 0x48; disp 1.
+    // mov [rax+1], cl: no REX, no SIB. ModRM mod=01,reg=cl(1),rm=rax(0) = 0x48; disp 1.
     let mut e = Encoder::new();
     e.store_r8_disp8(Reg::RAX, 1, Reg::RCX);
     assert_eq!(e.finish(), vec![0x88, 0x48, 0x01]);
@@ -1061,11 +1061,11 @@ fn store_r8_disp8_known_bytes() {
 
 #[test]
 fn test_byte_disp8_imm8_known_bytes() {
-    // test byte [rax+12], 1 -- no REX, no SIB. ModRM mod=01,reg=0,rm=rax(0) = 0x40; disp 12.
+    // test byte [rax+12], 1: no REX, no SIB. ModRM mod=01,reg=0,rm=rax(0) = 0x40; disp 12.
     let mut e = Encoder::new();
     e.test_byte_disp8_imm8(Reg::RAX, 12, 1);
     assert_eq!(e.finish(), vec![0xF6, 0x40, 0x0C, 0x01]);
-    // test byte [r12+8], 1 -- REX.B (r12 extended) forces a SIB byte too (r12&7 = 4).
+    // test byte [r12+8], 1: REX.B (r12 extended) forces a SIB byte too (r12&7 = 4).
     let mut e = Encoder::new();
     e.test_byte_disp8_imm8(Reg::R12, 8, 1);
     assert_eq!(e.finish(), vec![0x41, 0xF6, 0x44, 0x24, 0x08, 0x01]);
@@ -1097,7 +1097,7 @@ fn movzx_byte_sib_reads_the_right_byte() {
 #[test]
 fn store_r8_writes_only_the_low_byte() {
     // End-to-end: fn(dst, val) stores the low byte of `val` to dst[1], leaving dst[0]/dst[2]
-    // untouched -- the write_gpr8 byte-lane semantics the probe relies on.
+    // untouched: the write_gpr8 byte-lane semantics the probe relies on.
     use super::super::exec_mem::ExecutableBuffer;
     let mut e = Encoder::new();
     #[cfg(windows)]
@@ -1125,15 +1125,15 @@ fn store_r8_writes_only_the_low_byte() {
 
 #[test]
 fn cmp_r32_disp8_known_bytes() {
-    // cmp ecx, [rdx+0] -- no REX, 3B /r. ModRM mod=01,reg=ecx(1),rm=rdx(2) = 0x4A; disp 0.
+    // cmp ecx, [rdx+0]: no REX, 3B /r. ModRM mod=01,reg=ecx(1),rm=rdx(2) = 0x4A; disp 0.
     let mut e = Encoder::new();
     e.cmp_r32_disp8(Reg::RCX, Reg::RDX, 0);
     assert_eq!(e.finish(), vec![0x3B, 0x4A, 0x00]);
-    // cmp ecx, [r15+8] -- REX.B (r15 base extended). ModRM rm=r15&7=7 -> 0x4F; disp 8.
+    // cmp ecx, [r15+8]: REX.B (r15 base extended). ModRM rm=r15&7=7 -> 0x4F; disp 8.
     let mut e = Encoder::new();
     e.cmp_r32_disp8(Reg::RCX, Reg::R15, 8);
     assert_eq!(e.finish(), vec![0x41, 0x3B, 0x4F, 0x08]);
-    // cmp eax, [r12+0] -- r12&7=4 forces a SIB byte (0x24); REX.B. ModRM 0x44.
+    // cmp eax, [r12+0]: r12&7=4 forces a SIB byte (0x24); REX.B. ModRM 0x44.
     let mut e = Encoder::new();
     e.cmp_r32_disp8(Reg::RAX, Reg::R12, 0);
     assert_eq!(e.finish(), vec![0x41, 0x3B, 0x44, 0x24, 0x00]);
@@ -1168,18 +1168,18 @@ fn cmp_r32_disp8_reads_the_memory_dword() {
 
 #[test]
 fn load_store_disp8_through_rsp_emits_a_sib_byte() {
-    // RSP (low3 == 0b100) can NEVER be a ModRM base directly -- the encoding is reserved to
+    // RSP (low3 == 0b100) can NEVER be a ModRM base directly: the encoding is reserved to
     // mean "a SIB byte follows" regardless of mod or REX.B. Omitting the SIB byte here would
     // silently shift every following byte by one and corrupt the rest of the instruction
     // stream (this is exactly the bug that originally broke the strcpy block's stack-scratch
     // spill/reload with a host access violation instead of a clean assertion failure).
     let mut e = Encoder::new();
-    // mov [rsp+32], rax -- REX.W only (neither RSP nor RAX extended), opcode 89,
+    // mov [rsp+32], rax: REX.W only (neither RSP nor RAX extended), opcode 89,
     // modrm mod=01,reg=rax&7=0,rm=rsp&7=4 -> 01_000_100 = 0x44, SIB 0x24, disp8 0x20.
     e.store_r64_disp8(Reg::RSP, 32, Reg::RAX);
     assert_eq!(e.finish(), vec![0x48, 0x89, 0x44, 0x24, 0x20]);
 
-    // mov rcx, [rsp+32] -- modrm mod=01,reg=rcx&7=1,rm=rsp&7=4 -> 01_001_100 = 0x4C.
+    // mov rcx, [rsp+32]: modrm mod=01,reg=rcx&7=1,rm=rsp&7=4 -> 01_001_100 = 0x4C.
     let mut e = Encoder::new();
     e.load_r64_disp8(Reg::RCX, Reg::RSP, 32);
     assert_eq!(e.finish(), vec![0x48, 0x8B, 0x4C, 0x24, 0x20]);
@@ -1208,7 +1208,7 @@ fn store_then_load_through_rsp_round_trips_a_real_value() {
 
 #[test]
 fn cmp_r64_r64_known_bytes() {
-    // cmp r14, rbx -- REX.W=1,R=0(rbx not extended),B=1(r14 extended) = 0100_1001 = 0x49;
+    // cmp r14, rbx: REX.W=1,R=0(rbx not extended),B=1(r14 extended) = 0100_1001 = 0x49;
     // opcode 39; modrm mod=11,reg=rbx&7=3,rm=r14&7=6 -> 11_011_110 = 0xDE
     let mut e = Encoder::new();
     e.cmp_r64_r64(Reg::R14, Reg::RBX);
@@ -1217,7 +1217,7 @@ fn cmp_r64_r64_known_bytes() {
 
 #[test]
 fn add_r64_r64_known_bytes() {
-    // add r14, rbx -- same register/REX/ModRM pattern as cmp, opcode 01 instead of 39.
+    // add r14, rbx: same register/REX/ModRM pattern as cmp, opcode 01 instead of 39.
     let mut e = Encoder::new();
     e.add_r64_r64(Reg::R14, Reg::RBX);
     assert_eq!(e.finish(), vec![0x49, 0x01, 0xDE]);
@@ -1225,7 +1225,7 @@ fn add_r64_r64_known_bytes() {
 
 #[test]
 fn sub_r64_r64_known_bytes() {
-    // sub r14, rbx -- same pattern, opcode 29.
+    // sub r14, rbx: same pattern, opcode 29.
     let mut e = Encoder::new();
     e.sub_r64_r64(Reg::R14, Reg::RBX);
     assert_eq!(e.finish(), vec![0x49, 0x29, 0xDE]);
@@ -1233,7 +1233,7 @@ fn sub_r64_r64_known_bytes() {
 
 #[test]
 fn imul_r64_r64_known_bytes() {
-    // imul r14, rbx -- REX.W=1,R=1(r14 is reg/ext),B=0(rbx not ext) = 0100_1100 = 0x4C;
+    // imul r14, rbx: REX.W=1,R=1(r14 is reg/ext),B=0(rbx not ext) = 0100_1100 = 0x4C;
     // opcode 0F AF; modrm mod=11,reg=r14&7=6,rm=rbx&7=3 -> 11_110_011 = 0xF3
     let mut e = Encoder::new();
     e.imul_r64_r64(Reg::R14, Reg::RBX);
@@ -1242,25 +1242,25 @@ fn imul_r64_r64_known_bytes() {
 
 #[test]
 fn imul_r32_r32_known_bytes() {
-    // imul eax, ecx -- no REX at all: neither register is extended.
+    // imul eax, ecx: no REX at all: neither register is extended.
     // opcode 0F AF; modrm mod=11,reg=eax&7=0,rm=ecx&7=1 -> 11_000_001 = 0xC1.
     let mut e = Encoder::new();
     e.imul_r32_r32(Reg::RAX, Reg::RCX);
     assert_eq!(e.finish(), vec![0x0F, 0xAF, 0xC1]);
 
-    // imul r8d, eax -- R=1(r8 is reg/ext),B=0(eax not ext) = 0100_0100 = 0x44;
+    // imul r8d, eax: R=1(r8 is reg/ext),B=0(eax not ext) = 0100_0100 = 0x44;
     // opcode 0F AF; modrm mod=11,reg=r8&7=0,rm=eax&7=0 -> 11_000_000 = 0xC0.
     let mut e = Encoder::new();
     e.imul_r32_r32(Reg::R8, Reg::RAX);
     assert_eq!(e.finish(), vec![0x44, 0x0F, 0xAF, 0xC0]);
 
-    // imul eax, r8d -- R=0(eax not ext),B=1(r8 is rm/ext) = 0100_0001 = 0x41;
+    // imul eax, r8d: R=0(eax not ext),B=1(r8 is rm/ext) = 0100_0001 = 0x41;
     // opcode 0F AF; modrm mod=11,reg=eax&7=0,rm=r8&7=0 -> 11_000_000 = 0xC0.
     let mut e = Encoder::new();
     e.imul_r32_r32(Reg::RAX, Reg::R8);
     assert_eq!(e.finish(), vec![0x41, 0x0F, 0xAF, 0xC0]);
 
-    // imul r14d, r9d -- REX.W=0 here (unlike imul_r64_r64): R=1(r14),B=1(r9) = 0100_0101 = 0x45;
+    // imul r14d, r9d: REX.W=0 here (unlike imul_r64_r64): R=1(r14),B=1(r9) = 0100_0101 = 0x45;
     // opcode 0F AF; modrm mod=11,reg=r14&7=6,rm=r9&7=1 -> 11_110_001 = 0xF1. This is the pair
     // that would be silently wrong if imul_r32_r32 forwarded to imul_r64_r64 (REX.W would be
     // forced to 1 instead of staying 0).
@@ -1271,26 +1271,26 @@ fn imul_r32_r32_known_bytes() {
 
 #[test]
 fn mul_r32_known_bytes() {
-    // mul ecx -- no REX: ecx is not extended. opcode F7; modrm mod=11,reg=4(the /4 sub-opcode),
+    // mul ecx: no REX: ecx is not extended. opcode F7; modrm mod=11,reg=4(the /4 sub-opcode),
     // rm=ecx&7=1 -> 11_100_001 = 0xE1. reg=4 is what makes this MUL rather than NEG (/3) or the
     // signed IMUL (/5), so this byte is the whole difference between three instructions.
     let mut e = Encoder::new();
     e.mul_r32(Reg::RCX);
     assert_eq!(e.finish(), vec![0xF7, 0xE1]);
 
-    // mul r9d -- B=1 (r9 is the rm operand and is extended) = 0100_0001 = 0x41; modrm
+    // mul r9d: B=1 (r9 is the rm operand and is extended) = 0100_0001 = 0x41; modrm
     // mod=11,reg=4,rm=r9&7=1 -> 0xE1. Same modrm byte as above, which is exactly why the REX
     // prefix has to be right: without it this would multiply by ECX instead of R9D.
     let mut e = Encoder::new();
     e.mul_r32(Reg::R9);
     assert_eq!(e.finish(), vec![0x41, 0xF7, 0xE1]);
 
-    // mul ebx -- rm=ebx&7=3 -> 11_100_011 = 0xE3, no REX.
+    // mul ebx: rm=ebx&7=3 -> 11_100_011 = 0xE3, no REX.
     let mut e = Encoder::new();
     e.mul_r32(Reg::RBX);
     assert_eq!(e.finish(), vec![0xF7, 0xE3]);
 
-    // mul r14d -- B=1 = 0x41; rm=r14&7=6 -> 11_100_110 = 0xE6. REX.W stays 0: a REX.W form would
+    // mul r14d: B=1 = 0x41; rm=r14&7=6 -> 11_100_110 = 0xE6. REX.W stays 0: a REX.W form would
     // be MUL r/m64 and would write the whole RDX:RAX pair from a 64-bit multiply.
     let mut e = Encoder::new();
     e.mul_r32(Reg::R14);
@@ -1299,7 +1299,7 @@ fn mul_r32_known_bytes() {
 
 #[test]
 fn imul_r32_known_bytes() {
-    // imul ecx -- the SIGNED sibling of mul_r32 above. Every byte is identical except the modrm
+    // imul ecx: the SIGNED sibling of mul_r32 above. Every byte is identical except the modrm
     // reg field, 5 instead of 4: mod=11,reg=5,rm=ecx&7=1 -> 11_101_001 = 0xE9 against MUL's 0xE1.
     // That single nibble is the difference between "the high half is nonzero" and "the product
     // does not sign-extend back from the low half" as the CF and OF rule, so it is asserted here
@@ -1308,17 +1308,17 @@ fn imul_r32_known_bytes() {
     e.imul_r32(Reg::RCX);
     assert_eq!(e.finish(), vec![0xF7, 0xE9]);
 
-    // imul r9d -- B=1 = 0x41; modrm mod=11,reg=5,rm=r9&7=1 -> 0xE9.
+    // imul r9d: B=1 = 0x41; modrm mod=11,reg=5,rm=r9&7=1 -> 0xE9.
     let mut e = Encoder::new();
     e.imul_r32(Reg::R9);
     assert_eq!(e.finish(), vec![0x41, 0xF7, 0xE9]);
 
-    // imul ebx -- rm=ebx&7=3 -> 11_101_011 = 0xEB, no REX.
+    // imul ebx: rm=ebx&7=3 -> 11_101_011 = 0xEB, no REX.
     let mut e = Encoder::new();
     e.imul_r32(Reg::RBX);
     assert_eq!(e.finish(), vec![0xF7, 0xEB]);
 
-    // imul r14d -- B=1 = 0x41; rm=r14&7=6 -> 11_101_110 = 0xEE. REX.W stays 0: a REX.W form would
+    // imul r14d: B=1 = 0x41; rm=r14&7=6 -> 11_101_110 = 0xEE. REX.W stays 0: a REX.W form would
     // be IMUL r/m64 and would write the whole RDX:RAX pair from a 64-bit multiply.
     let mut e = Encoder::new();
     e.imul_r32(Reg::R14);
@@ -1327,7 +1327,7 @@ fn imul_r32_known_bytes() {
 
 #[test]
 fn imul_r64_imm32_known_bytes() {
-    // imul rax, rax, 12 -- REX.W=1, 69 /r id. modrm mod=11,reg=0(rax),rm=0(rax) = 0xC0.
+    // imul rax, rax, 12: REX.W=1, 69 /r id. modrm mod=11,reg=0(rax),rm=0(rax) = 0xC0.
     let mut e = Encoder::new();
     e.imul_r64_imm32(Reg::RAX, 12);
     assert_eq!(e.finish(), vec![0x48, 0x69, 0xC0, 0x0C, 0x00, 0x00, 0x00]);
@@ -1335,7 +1335,7 @@ fn imul_r64_imm32_known_bytes() {
 
 #[test]
 fn load_r64_disp32_known_bytes() {
-    // mov rax, [r15 + 200] -- REX.W=1,R=0(rax),B=1(r15) = 0x49; 8B; mod=10,reg=rax&7=0,rm=r15&7=7
+    // mov rax, [r15 + 200]: REX.W=1,R=0(rax),B=1(r15) = 0x49; 8B; mod=10,reg=rax&7=0,rm=r15&7=7
     // = 10_000_111 = 0x87; disp32 = 200 = 0xC8 0x00 0x00 0x00.
     let mut e = Encoder::new();
     e.load_r64_disp32(Reg::RAX, Reg::R15, 200);
@@ -1344,7 +1344,7 @@ fn load_r64_disp32_known_bytes() {
 
 #[test]
 fn store_r64_disp32_known_bytes() {
-    // mov [r15 + 200], rax -- same as load but opcode 89.
+    // mov [r15 + 200], rax: same as load but opcode 89.
     let mut e = Encoder::new();
     e.store_r64_disp32(Reg::R15, 200, Reg::RAX);
     assert_eq!(e.finish(), vec![0x49, 0x89, 0x87, 0xC8, 0x00, 0x00, 0x00]);
@@ -1359,7 +1359,7 @@ fn call_indirect_known_bytes() {
 
 #[test]
 fn call_m64_disp32_known_bytes() {
-    // call qword [r15 + 200] -- REX.B=1 (r15) = 0x41; FF; mod=10,reg=/2,rm=r15&7=7 ->
+    // call qword [r15 + 200]: REX.B=1 (r15) = 0x41; FF; mod=10,reg=/2,rm=r15&7=7 ->
     // 10_010_111 = 0x97; disp32. No REX.W: FF /2 defaults to 64-bit in long mode.
     let mut e = Encoder::new();
     e.call_m64_disp32(Reg::R15, 200);
@@ -1375,7 +1375,7 @@ fn ret_near_known_bytes() {
 
 #[test]
 fn and_r64_imm32_known_bytes() {
-    // and rdi, -4 -- REX.W = 0x48; 81; mod=11,reg=/4,rm=7 -> 0xE7; imm32 0xFFFFFFFC.
+    // and rdi, -4: REX.W = 0x48; 81; mod=11,reg=/4,rm=7 -> 0xE7; imm32 0xFFFFFFFC.
     let mut e = Encoder::new();
     e.and_r64_imm32(Reg::RDI, 0xFFFF_FFFC);
     assert_eq!(e.finish(), vec![0x48, 0x81, 0xE7, 0xFC, 0xFF, 0xFF, 0xFF]);
@@ -1383,12 +1383,12 @@ fn and_r64_imm32_known_bytes() {
 
 #[test]
 fn pop_and_jmp_m64_disp32_known_bytes() {
-    // pop qword [rsp + 128] -- 8F /0; mod=10,rm=rsp needs SIB 0x24; disp32 128.
+    // pop qword [rsp + 128]: 8F /0; mod=10,rm=rsp needs SIB 0x24; disp32 128.
     let mut e = Encoder::new();
     e.pop_m64_disp32(Reg::RSP, 128);
     assert_eq!(e.finish(), vec![0x8F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]);
 
-    // jmp qword [rsp + 128] -- FF /4; same addressing.
+    // jmp qword [rsp + 128]: FF /4; same addressing.
     let mut e = Encoder::new();
     e.jmp_m64_disp32(Reg::RSP, 128);
     assert_eq!(e.finish(), vec![0xFF, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00]);
@@ -1396,18 +1396,18 @@ fn pop_and_jmp_m64_disp32_known_bytes() {
 
 #[test]
 fn test_r8_low_imm8_known_bytes() {
-    // test dil, 3 -- empty REX 0x40 selects DIL (without it, rm=7 at byte width is BH);
+    // test dil, 3: empty REX 0x40 selects DIL (without it, rm=7 at byte width is BH);
     // F6 /0 ib; modrm mod=11,reg=0,rm=7 -> 0xC7.
     let mut e = Encoder::new();
     e.test_r8_low_imm8(Reg::RDI, 3);
     assert_eq!(e.finish(), vec![0x40, 0xF6, 0xC7, 0x03]);
 
-    // test r9b, 1 -- REX.B form; no ambiguity but the prefix is still required.
+    // test r9b, 1: REX.B form; no ambiguity but the prefix is still required.
     let mut e = Encoder::new();
     e.test_r8_low_imm8(Reg::R9, 1);
     assert_eq!(e.finish(), vec![0x41, 0xF6, 0xC1, 0x01]);
 
-    // test al, 1 -- no prefix at all for the legacy low lanes.
+    // test al, 1: no prefix at all for the legacy low lanes.
     let mut e = Encoder::new();
     e.test_r8_low_imm8(Reg::RAX, 1);
     assert_eq!(e.finish(), vec![0xF6, 0xC0, 0x01]);
@@ -1419,14 +1419,14 @@ fn test_r8_low_imm8_known_bytes() {
 /// byte-sized mask would be semantically INERT while costing two bytes at every simple condition.
 #[test]
 fn test_r32_imm32_known_bytes() {
-    // test ebp, 0x800 (FLAG_OF) -- no REX, F7 /0 id. ModRM mod=11,reg=0(/0),rm=5(ebp) = 0xC5.
+    // test ebp, 0x800 (FLAG_OF): no REX, F7 /0 id. ModRM mod=11,reg=0(/0),rm=5(ebp) = 0xC5.
     // At DWORD width rm=5 names EBP with no prefix; the empty REX that `test_r8_low_imm8` needs
     // exists only because BYTE-width rm=5 would otherwise name CH.
     let mut e = Encoder::new();
     e.test_r32_imm32(Reg::RBP, 0x800);
     assert_eq!(e.finish(), vec![0xF7, 0xC5, 0x00, 0x08, 0x00, 0x00]);
 
-    // test r12d, 0x800 -- REX.B (r12 extended). ModRM rm=r12&7=4 -> 0xC4.
+    // test r12d, 0x800: REX.B (r12 extended). ModRM rm=r12&7=4 -> 0xC4.
     let mut e = Encoder::new();
     e.test_r32_imm32(Reg::R12, 0x800);
     assert_eq!(e.finish(), vec![0x41, 0xF7, 0xC4, 0x00, 0x08, 0x00, 0x00]);
@@ -1579,7 +1579,7 @@ fn finish_panics_on_an_unresolved_forward_label() {
     let mut e = Encoder::new();
     let exit = e.label();
     e.jmp(exit); // forward reference, queued as a patch
-    // `exit` is never `place`d -- `finish` must panic resolving the queued patch.
+    // `exit` is never `place`d: `finish` must panic resolving the queued patch.
     let _ = e.finish();
 }
 
@@ -1613,11 +1613,11 @@ fn executes_an_emitted_increment_function() {
 
 #[test]
 fn bt_r32_r32_known_bytes() {
-    // bt eax, ecx -- no REX, 0F A3 /r. ModRM mod=11, reg=1(ecx), rm=0(eax) = 0xC8.
+    // bt eax, ecx: no REX, 0F A3 /r. ModRM mod=11, reg=1(ecx), rm=0(eax) = 0xC8.
     let mut e = Encoder::new();
     e.bt_r32_r32(Reg::RAX, Reg::RCX);
     assert_eq!(e.finish(), vec![0x0F, 0xA3, 0xC8]);
-    // bt r13d, r12d -- REX.R and REX.B, and NOT REX.W. rm=r13&7=5, reg=r12&7=4 -> 0xE5.
+    // bt r13d, r12d: REX.R and REX.B, and NOT REX.W. rm=r13&7=5, reg=r12&7=4 -> 0xE5.
     // The memory form asserts on an RBP/R13 base; the register form must not, which is why this
     // case is here.
     let mut e = Encoder::new();

@@ -18,7 +18,7 @@ fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction_in_the_acc
     // In the Accurate 386 class `block_continuable` never admits
     // `DecodeGroup::PortIo`, so an IN can only
     // ever be `run_straight_line`'s FIRST instruction there, never a
-    // continuation -- every port access still sets `io_touched` unconditionally
+    // continuation: every port access still sets `io_touched` unconditionally
     // in the Accurate class's read_io dispatch, ending the run right after it
     // runs. This test pins core_clocks_so_far == 0 for that first-instruction
     // position, explicitly on I386 so it does not silently start exercising the
@@ -93,7 +93,7 @@ fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approxima
     // case pinned in `core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation`.
     // Eight INCs then an IN: the IN's core_clocks_so_far must equal the eight
     // INCs' combined charge. Eight (not two, unlike the sibling Accurate-class
-    // test) because I586's `level_timing` factor is (1, 12) -- a single cheap
+    // test) because I586's `level_timing` factor is (1, 12): a single cheap
     // INC can legitimately round to 0 charged clocks under the fractional
     // remainder carry (see `scale_clocks`'s doc comment), so a short run risks
     // a degenerate all-zero total that cannot distinguish "tracks the running
@@ -170,7 +170,7 @@ fn poll_loop_with_test_imm_chains_end_to_end_in_the_approximate_class() {
     // The canonical vretrace poll idiom: IN; TEST AL,imm8; JZ back; (JMP back,
     // unreachable here since AL reads 0 so ZF is always set). With 0xa8
     // admitted alongside the IN forms in the Approximate class, the WHOLE
-    // loop must chain as one run_straight_line call up to the clock cap --
+    // loop must chain as one run_straight_line call up to the clock cap:
     // no run restart per iteration. The bus models the machine's lazy
     // status-port path (lazy_io_reads: reads do not set io_touched), since
     // chaining across the IN is only reachable when the port read is lazy.
@@ -185,7 +185,7 @@ fn poll_loop_with_test_imm_chains_end_to_end_in_the_approximate_class() {
     let mut bus = TestBus::with_memory(memory);
     bus.lazy_io_reads = true;
     // Warm the decode cache: one single-step per loop instruction (IN, TEST,
-    // JZ -- the JMP is unreachable and irrelevant to the chain).
+    // JZ: the JMP is unreachable and irrelevant to the chain).
     for _ in 0..3 {
         let _ = cpu.cycle(&mut bus).unwrap();
     }
@@ -275,8 +275,8 @@ fn in_stays_a_run_terminator_not_a_continuation_in_the_accurate_class() {
     // sibling poll-loop test cannot: there the run ends at the TEST before
     // any continuation attempt ever reaches an IN, so deleting the level
     // gate from the PortIo arm alone would not fail it (the spec review
-    // proved the earlier Accurate-class test -- a single IN at eip 0,
-    // trivially the run's first instruction -- pinned nothing). Here two
+    // proved the earlier Accurate-class test (a single IN at eip 0,
+    // trivially the run's first instruction) pinned nothing). Here two
     // continuable INCs precede the IN: at I386 the run must chain the INCs
     // and stop at the continuation-admission check BEFORE the IN executes,
     // observable as read_io never having been called during the run. The
@@ -326,7 +326,7 @@ fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation()
     // Directly checks the CpuGsw field set to
     // run_straight_line's running `total` before every continuation dispatch,
     // read by read_io) using a continuable instruction group (INC, DataMove/
-    // Alu-adjacent -- specifically Group) as the observation point, since
+    // Alu-adjacent, specifically Group) as the observation point, since
     // PortIo itself cannot reach the continuation path (see the sibling test).
     // Two INCs then a third INC: after the run, core_clocks_so_far must equal
     // whatever `total` was immediately before the LAST instruction executed
@@ -1109,7 +1109,7 @@ fn user_mode_paging_respects_the_supervisor_bit() {
 #[test]
 fn v86_paging_is_always_user_regardless_of_cs_low_bits() {
     // 386 PRM 5-24 / 15-6: a V86 task always executes at CPL 3, so paging
-    // privilege (PRM ch5's U/S check) must classify every V86 access as user --
+    // privilege (PRM ch5's U/S check) must classify every V86 access as user,
     // independent of the V86 CS selector's low two bits, which are NOT an RPL (a
     // V86 CS is a real-mode-style segment, not a descriptor selector; see
     // `current_privilege_level`'s doc comment). A monitor that maps its own
@@ -1127,7 +1127,7 @@ fn v86_paging_is_always_user_regardless_of_cs_low_bits() {
     cpu.control.cr3 = 0x1000;
     let mut bus = TestBus::with_memory(memory);
 
-    // Enter V86 with a real-mode-style CS whose low bits are 0, not 3 -- the
+    // Enter V86 with a real-mode-style CS whose low bits are 0, not 3: the
     // exact case a live `CS.selector & 3` formula would misclassify as
     // supervisor. `current_privilege_level` must still answer 3 here because
     // `self.cpl` is the transition-pinned cache, not a live read of CS.
@@ -1218,7 +1218,7 @@ fn tlb_caches_translations_and_is_non_snooping_until_flushed() {
     bus.memory[0x200c..0x2010].copy_from_slice(&0x0000_6007u32.to_le_bytes());
 
     // Real x86 TLBs do not snoop page-table writes: the stale cached frame is
-    // returned until an explicit flush -- the faithful behavior a guest relies
+    // returned until an explicit flush: the faithful behavior a guest relies
     // on (it must INVLPG / reload CR3 after editing a PTE).
     assert_eq!(
         cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),

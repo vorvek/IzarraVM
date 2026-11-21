@@ -1250,7 +1250,7 @@ fn unresolved_waiting_edge_survives_arena_compaction() {
     let mut source_compilation =
         trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
     // Published successor: always the sentinel (S1a). The live-slot lookup/park key below is a
-    // SEPARATE value -- they only happen to share every field but `context` because this test
+    // SEPARATE value: they only happen to share every field but `context` because this test
     // never switches slots, so the live slot at resolve time is 0 either way.
     source_compilation.successors[0] = Some(LinkTarget {
         linear: target.linear,
@@ -1564,7 +1564,7 @@ fn physical_invalidation_window_skips_far_keys_and_reaches_span_tails() {
 
 /// Non-vacuity guard for the stage-A SMC census. Every assert here would still pass against a
 /// census that counted nothing, EXCEPT the four that demand non-zero rows and the one that demands
-/// the window filter exclude a call — which is the point (see the "fixtures that cannot fail"
+/// the window filter exclude a call, which is the point (see the "fixtures that cannot fail"
 /// rule: prove the new guard fires).
 #[cfg(all(
     feature = "smc-census",
@@ -1761,7 +1761,7 @@ fn inline_span_prefilter_elides_point_keys_the_write_cannot_reach() {
 }
 
 /// PROVE THE GATE GOES RED. `probe_divergences == 0` and the pre-filter's `debug_assert!` read the
-/// same predicate — "a skipped row the authoritative per-state test would have killed" — and a
+/// same predicate ("a skipped row the authoritative per-state test would have killed") and a
 /// predicate that cannot fail is not an instrument. Hand-corrupt one `lens` element so the filter
 /// under-bounds a live 16-byte block to a point, then write inside the span it no longer claims.
 #[cfg(debug_assertions)]
@@ -2092,7 +2092,7 @@ fn lane_trial_cache(budget: u32) -> JitState {
 }
 
 /// INV-B1 and INV-B2. The budget is a HARD per-`(key, epoch)` count, and the ONLY thing that
-/// restores it is the epoch turning over — not a probe, not a kill, not a demote. A per-probe reset
+/// restores it is the epoch turning over: not a probe, not a kill, not a demote. A per-probe reset
 /// would make the budget unbounded per epoch, which IS the recompile storm the G1 gate exists to
 /// prevent.
 ///
@@ -2139,7 +2139,7 @@ fn lane_trial_budget_is_exactly_the_configured_number_per_epoch() {
 
 /// INV-B3, the nascar guard, in both halves. 86.1% of nascar's trials never install: its parked
 /// keys are overwhelmingly compilations that registered no lane at all, and re-granting there would
-/// recompile identical code to fail identically — a recompile storm with extra steps. The earned
+/// recompile identical code to fail identically, a recompile storm with extra steps. The earned
 /// gate is what makes a raised budget worth nothing to that population.
 ///
 /// The SECOND half is what pins the per-GRANT clear rather than a sticky `earned`: without it, one
@@ -2270,14 +2270,14 @@ fn lane_trial_records_are_cleared_with_cache_storage() {
 fn task0_counters_split_the_spent_population() {
     let mut cache = lane_trial_cache(1);
 
-    // One key whose trial INSTALLED and was then killed — convertible.
+    // One key whose trial INSTALLED and was then killed: convertible.
     let earner = key(0x9000);
     assert!(cache.lane_trial_spend(earner, 4));
     cache.note_lane_trial_install(earner);
     assert!(!cache.lane_trial_spend(earner, 4));
     cache.note_heat_demote_trial_spent(earner, 4);
 
-    // One key whose trial's compile FAILED — spent, unconvertible.
+    // One key whose trial's compile FAILED: spent, unconvertible.
     let failed = key(0xa000);
     assert!(cache.lane_trial_spend(failed, 4));
     assert!(!cache.lane_trial_spend(failed, 4));
@@ -2293,7 +2293,7 @@ fn task0_counters_split_the_spent_population() {
 }
 
 /// The park-LENGTH diagnostic, in EPOCHS and honest about what it cannot see. The second half is
-/// what makes "record an unlifted park as length 0" killable — a mutation that would bias the
+/// what makes "record an unlifted park as length 0" killable: a mutation that would bias the
 /// campaign's steering number toward the answer §1.5 says is most dangerous to get wrong.
 #[cfg(feature = "direct-admission-census")]
 #[test]
@@ -2334,7 +2334,7 @@ fn park_length_counts_epochs_and_censors_honestly() {
 }
 
 /// INV-B7: the stale-epoch reset runs ABOVE the grant decision, never below it. This is the ENTIRE
-/// defence against cross-epoch `earned` leakage — with the reset below the decision, a key that
+/// defence against cross-epoch `earned` leakage: with the reset below the decision, a key that
 /// earned an install at epoch E arrives at E+1 and is granted as an earned RE-grant rather than as
 /// a first trial, silently doubling the per-epoch budget for every key that ever earns.
 #[test]
@@ -2379,8 +2379,8 @@ fn note_lane_trial_install_on_a_missing_slot_is_a_silent_no_op() {
     );
 }
 
-/// The knob's spelling table. A PARAMETER has no `0` or `off` spelling — `1` is how the pre-slice
-/// arm is named — and a typo must PANIC rather than fall through to the default, which a ladder leg
+/// The knob's spelling table. A PARAMETER has no `0` or `off` spelling: `1` is how the pre-slice
+/// arm is named, and a typo must PANIC rather than fall through to the default, which a ladder leg
 /// would read as "the arm I asked for changed nothing".
 ///
 /// The unset row MOVED with the 2026-08-29 flip (1 -> 4). It is asserted against the constant and
@@ -2670,8 +2670,8 @@ fn prefix_gate_is_relative_to_the_code_segment_default_size() {
 /// gate at both operand sizes and in both code widths; a CS override does not.
 ///
 /// The CS half is the load-bearing one. Refusing CS is a DECISION (12,674 doom exits stay a
-/// barrier), taken because CS is the only segment `SegmentLayout` homes twice — in its own `cs`
-/// field and at index 1 of `data` — so it is the only one where admitting a memory kind would make
+/// barrier), taken because CS is the only segment `SegmentLayout` homes twice, in its own `cs`
+/// field and at index 1 of `data`, so it is the only one where admitting a memory kind would make
 /// a lowered access depend on the two homes agreeing. A future edit that "tidied" the gate into
 /// admitting every `Option<SegmentIndex>` would silently take that decision back, and only this
 /// assertion would notice.
@@ -3012,7 +3012,7 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
 ///
 /// The CR3 JIT-half gate (CR3 JIT-half design, L2) adds a `context: u8` field to
 /// `LinkTarget`, and `successors: [Option<LinkTarget>; 2]` is a `CompiledBlock` field, so the
-/// struct grows with it -- 120 -> 128, measured off a failing-test readout, not derived. The
+/// struct grows with it: 120 -> 128, measured off a failing-test readout, not derived. The
 /// added byte is read only at link-resolution time (`resolve_successors`,
 /// `make_link_visible`), never on the uniform-fetch entry path itself, so the per-entry copy
 /// cost this test guards is unaffected in kind, only in the fixed size of the copy.
@@ -3021,7 +3021,7 @@ fn a_sixteen_bit_effective_address_is_masked_and_a_thirty_two_bit_one_is_not() {
 /// (`0..=MAX_BLOCK_CALLOUT_SLOTS`, a 3-bit quantity), but NOT a new field: `dynamic_flags`
 /// (renamed `block_flags`) used only its bottom two bits for `DYNAMIC_SUCCESSOR`/`FAR_DYNAMIC`,
 /// read exclusively through masks, so the count packs into bits 2..4 of the byte already there.
-/// The struct stays at 128 -- see `block_flags`'s own doc and `CompiledBlock::callout_lar_lsl_slots`.
+/// The struct stays at 128, see `block_flags`'s own doc and `CompiledBlock::callout_lar_lsl_slots`.
 #[test]
 fn compiled_block_stays_small_enough_to_copy_per_entry() {
     assert_eq!(
@@ -3077,7 +3077,7 @@ fn lar_lsl_count_round_trips_through_block_flags_without_disturbing_the_flag_bit
 }
 
 /// T9 (code-smell batch 2, S1). `entry_ptr_for` must agree with `block(id).entry_ptr()` for a
-/// live id and must miss exactly when `block()` misses, through the same generational check --
+/// live id and must miss exactly when `block()` misses, through the same generational check,
 /// not a weaker one that would keep serving a retired slot's stale pointer.
 ///
 /// Mutation bite performed by hand: dropping the generational check (returning
@@ -3109,7 +3109,7 @@ fn entry_ptr_for_matches_block_and_misses_after_retirement() {
     );
 
     // Reuse the freed slot at a fresh id and confirm the OLD id still misses through the new
-    // occupant -- the generational check, not merely "is this index installed".
+    // occupant: the generational check, not merely "is this index installed".
     let replacement = install_trivial(&mut cache, key(0x1a00), 1);
     assert_eq!(replacement.index(), id.index());
     assert_ne!(replacement, id);
@@ -3180,8 +3180,8 @@ fn census_bucket(buckets: &[(&'static str, u64)], label: &str) -> u64 {
 /// (Tyrian S1b refusals design): pure logic, no OS/arch gate needed,
 /// only the census feature that compiles the method in at all.
 ///
-/// Feeds a known mask set -- ES and DS pinned by the target, source agrees on ES only, and CS is
-/// present on both sides but must never contribute a bit -- and asserts both the raw mask and its
+/// Feeds a known mask set: ES and DS pinned by the target, source agrees on ES only, and CS is
+/// present on both sides but must never contribute a bit, and asserts both the raw mask and its
 /// popcount.
 #[cfg(feature = "direct-link-refusal-census")]
 #[test]
@@ -3230,7 +3230,7 @@ fn guard_mask_is_the_targets_unagreed_data_segments_with_cs_excluded() {
     assert_eq!(mask.count_ones(), 2);
 
     // A source that pins nothing at all must produce the target's FULL data-segment `used`,
-    // CS still excluded -- the "every data segment" row of the design's section 4.3 table.
+    // CS still excluded: the "every data segment" row of the design's section 4.3 table.
     let empty_source = SegmentLayout {
         cs,
         data: [SegmentRegister::real(0); 6],
@@ -3284,7 +3284,7 @@ fn guard_mask_popcount_histogram_buckets_refusal_events_by_popcount() {
     // DISTINCT popcounts through full block installs would need three separately shaped
     // targets: 1, 2 and 5 bits set, plus a repeat of the 1-bit case to prove counts accumulate
     // rather than overwrite. `target_generation` (the second `u64` argument) is arbitrary here,
-    // 0..=4 chosen only to be visibly distinct from the masks -- it is not a popcount.
+    // 0..=4 chosen only to be visibly distinct from the masks: it is not a popcount.
     if let Some(census) = cache.direct_link_refusal_census.as_mut() {
         census.refused(1, LinkRefusal::SegmentLayout, 0, Some(0b0000_1000)); // popcount 1
         census.refused(1, LinkRefusal::SegmentLayout, 1, Some(0b0000_1001)); // popcount 2
@@ -3311,7 +3311,7 @@ fn guard_mask_popcount_histogram_buckets_refusal_events_by_popcount() {
 /// N3 (review of `338fcf08`): the call site's
 /// `matches!(refusal, LinkRefusal::SegmentLayout)` gate (`direct.rs:32408`) is what keeps
 /// `guard_mask` un-computed, `None`, for every OTHER refusal reason. The two tests above call
-/// `census.refused` directly, so neither one exercises that gate -- a mutant threading
+/// `census.refused` directly, so neither one exercises that gate: a mutant threading
 /// `Some(mask)` for `Declined`/`BlockShape`/`StaleEpoch` would survive both. This one drives a
 /// REAL `BlockShape` refusal through `try_link_inner` (via `install`'s successor resolution) and
 /// asserts the histogram and the row's popcount are both untouched by it.
@@ -3334,8 +3334,8 @@ fn a_non_segment_layout_refusal_does_not_thread_a_mask_into_the_histogram() {
         trivial_compilation(BlockSpan::new(target, 1, 1).expect("target span"));
     // Both ends' segment layouts have `used == 0` (`trivial_compilation`'s default), so
     // `merge_chain` admits the edge trivially regardless of `memory_cpl3`. The refusal this
-    // mismatch produces is `link_compatible`'s cpl3 check -- `LinkRefusal::BlockShape`, not
-    // `LinkRefusal::SegmentLayout` -- so the call site's gate must keep `guard_mask` at `None`.
+    // mismatch produces is `link_compatible`'s cpl3 check: `LinkRefusal::BlockShape`, not
+    // `LinkRefusal::SegmentLayout`, so the call site's gate must keep `guard_mask` at `None`.
     target_compilation.memory_cpl3 = true;
     cache.install(&target_compilation).expect("target install");
 
@@ -3671,7 +3671,7 @@ fn segment_write_static_cell_is_registered_as_suppressed_fallthrough() {
 /// while `link_compatible` compared all six frozen descriptors unconditionally. Under the chain
 /// mask a segment NOBODY in the chain pins is not a reason to refuse, so that edge now links and
 /// the row would have been testing generation history through a path it never takes. Both ends
-/// therefore PIN DS here — a genuine class-D conflict, refused before and after the mask.
+/// therefore PIN DS here: a genuine class-D conflict, refused before and after the mask.
 #[test]
 fn link_refusal_census_preserves_generation_history_through_retry_and_source_retire() {
     let mut cache = BlockCache::default();
@@ -3937,7 +3937,7 @@ fn admission_census_rejected_probe_classifier_covers_every_cache_state_and_disab
 
 /// The six link-clear causes account for every cleared link: their sum equals the aggregate
 /// `BlockCacheStats::unlinks` that feeds `jit_direct_links_cleared`. The aggregate is fed
-/// independently rather than derived, so this is the cross-check that they have not drifted --
+/// independently rather than derived, so this is the cross-check that they have not drifted:
 /// a new unlink site that forgets its cause would show up here as a shortfall.
 #[cfg(any(
     all(target_os = "windows", target_arch = "x86_64"),
@@ -4208,9 +4208,9 @@ fn a_second_directory_gets_its_own_link_graph() {
 
 /// N1. RED against the pre-fix seed `link_epochs: [1, 0]`: 0 is the
 /// unstamped-block sentinel (`block_link_epochs.push(0)` on install), so a VIRGIN cache's
-/// first `MOV CR3` to a second directory -- which, in production, ALWAYS reaches
+/// first `MOV CR3` to a second directory, which, in production, ALWAYS reaches
 /// `select_link_context`, never `allocate_link_context` (`core.rs`'s `Skipped` arm covers
-/// both R1 and R2) -- made the live epoch under slot 1 read 0, and `make_link_visible` took
+/// both R1 and R2), made the live epoch under slot 1 read 0, and `make_link_visible` took
 /// its same-epoch fast path for every block compiled there: republish the portal, never
 /// insert into `linear_blocks`, never `resolve_successors`/`resolve_waiting`. A silent loss
 /// of the whole JIT-half win for that context, with no cross-context corruption for any
@@ -4221,7 +4221,7 @@ fn a_second_directory_gets_its_own_link_graph() {
 fn a_virgin_second_context_still_forms_links() {
     let mut cache = BlockCache::default();
     // A fresh cache's slot 0 is already "selected" (R8's seed), so this is the first-ever
-    // reselect to slot 1 -- exactly the shape `core.rs`'s R2 arm produces on the very first
+    // reselect to slot 1, exactly the shape `core.rs`'s R2 arm produces on the very first
     // `MOV CR3` to a second directory.
     cache.select_link_context(1);
     let source = key(0x2350);
@@ -4345,7 +4345,7 @@ fn an_inert_operation_does_not_retire_the_link_graph() {
 /// G-5. Section (c): the pre-existing `mode_key` partition and the NEW `context` (ring slot)
 /// partition are independent, and neither substitutes for the other. Two blocks at the same
 /// linear, the same slot, differing only in the V86 mode-key bit, occupy separate
-/// `linear_blocks` entries -- the same property `core.rs:359` already asserts for the CR0 arm
+/// `linear_blocks` entries, the same property `core.rs:359` already asserts for the CR0 arm
 /// (`retained_real_mode_chain_is_unreachable_under_pe`), restated here for the slice's own key.
 #[test]
 fn the_same_slot_keeps_two_mode_key_graphs_separately() {
@@ -4481,12 +4481,12 @@ fn a_retained_link_is_never_entered_from_the_other_context() {
 /// N6, the complement of A-3: `BlockKey` does NOT carry the ring context, and
 /// this pins that on purpose rather than leaving it an implicit property a future refactor could
 /// silently change. A block admitted under one ring slot is still ENTERED (`probe` returns
-/// `Ready`, a genuine cache hit) under the OTHER slot when the physical matches -- entry is
+/// `Ready`, a genuine cache hit) under the OTHER slot when the physical matches: entry is
 /// physical-keyed, full stop, and the link-graph partition (L2's `context` field) is the ONLY
 /// thing slot-scoped. Putting `context` into `BlockKey` as well is the design's own documented
 /// non-gate for soundness (it is strictly stricter, no correctness row can fail it) but it WOULD
 /// halve native coverage on a workload where the two ring slots share code, by forcing a second
-/// compile under the second slot for bytes already compiled under the first -- and this is the
+/// compile under the second slot for bytes already compiled under the first, and this is the
 /// row that would catch a silent regression to that shape, because it fails the moment `probe`
 /// stops hitting.
 #[test]
@@ -4504,7 +4504,7 @@ fn entry_is_still_a_probe_hit_under_the_other_ring_slot() {
 
 /// A-5 (FS2's row, rewritten per design review J3). `try_link_inner`'s `stale_epoch` refusal
 /// already blocks any cross-context bind on its own, so "the bind is refused" cannot fail even
-/// with `LinkTarget.context` dropped -- J3. What the field actually buys is MAP CARDINALITY:
+/// with `LinkTarget.context` dropped. J3. What the field actually buys is MAP CARDINALITY:
 /// `waiting` keeps A's parked source and B's install in separate entries instead of one
 /// colliding key silently displacing the other.
 #[test]
@@ -4551,7 +4551,7 @@ fn a_parked_source_keeps_its_own_slots_waiting_entry() {
 
 /// A-6 (FS3's row, rewritten per design review J3). `bind_dynamic_successor` returns
 /// `try_link_inner`'s verdict either way, so "the bind is refused" is true regardless of
-/// whether `LinkTarget` carries `context` -- the row that actually gates the field is
+/// whether `LinkTarget` carries `context`: the row that actually gates the field is
 /// cardinality: A's own `linear_blocks` entry must survive B's install at the SAME linear
 /// untouched, which is exactly what `bind_dynamic_successor`'s lookup reads.
 #[test]
@@ -4599,7 +4599,7 @@ fn linear_blocks_holds_separate_entries_per_slot_for_the_same_linear() {
 // baked the ring slot live AT COMPILE TIME into every published successor, and `resolve_successors`
 // used that baked value unchanged for both the `linear_blocks` lookup and the `waiting` park. The
 // two halves of one rendezvous agreed only until a block was re-stamped under the other slot, and
-// then the edge was unreachable for the block's whole life -- `cleared_flushed`, 5.19 M unbound
+// then the edge was unreachable for the block's whole life: `cleared_flushed`, 5.19 M unbound
 // exits per guest second on the Tyrian dwell, 54.53% of the compiled subset. The fix deletes the
 // bake (`LINK_CONTEXT_UNSTAMPED` is published instead, a value no live slot can equal) and builds
 // the resolve-time key from `self.link_slot` once, at the top of `resolve_successors`, for both
@@ -4661,7 +4661,7 @@ fn a_source_restamped_under_the_other_ring_slot_resolves_its_successor() {
 /// Design test 2, corrected by design review S1-6: the ORIGINAL bind-outcome framing ("not
 /// linked, and still parked") cannot fail even with `context` deleted from `LinkTarget` entirely,
 /// because `try_link_inner`'s `stale_epoch` arm refuses a cross-context bind on its own and
-/// `resolve_waiting` re-parks any refused-but-still-active source -- so both "not linked" and
+/// `resolve_waiting` re-parks any refused-but-still-active source, so both "not linked" and
 /// "still parked" hold either way. The row instead asserts MAP STATE (which key `waiting` holds
 /// the park under) and whether `try_link_inner` was even REACHED
 /// (`link_refusals[stale_epoch]`): with the field, an install under the WRONG slot never looks
@@ -4755,14 +4755,14 @@ fn a_park_is_drained_only_by_an_install_under_the_slot_it_parked_in() {
 /// Design test 3, the load-bearing row, corrected by design review S1-7 (prove the premise
 /// first) and S1-8 (name the test-only reachable state). What actually stands between a bound
 /// cross-context edge and a wrong-context jump is NOT the key partition `LinkTarget.context`
-/// adds -- it is `try_link_inner`'s pre-existing `stale_epoch` arm, compared against the LIVE
+/// adds; it is `try_link_inner`'s pre-existing `stale_epoch` arm, compared against the LIVE
 /// slot's epoch alone (CR3 JIT-half design L4). S1a enlarges the
 /// population that reaches this barrier; it does not weaken it.
 #[test]
 fn an_edge_whose_ends_are_stamped_under_different_slots_refuses_stale_epoch() {
     let mut cache = BlockCache::default();
 
-    // S1-7: prove the premise. Under ONE live slot, an ordinary edge forms -- ruling out that
+    // S1-7: prove the premise. Under ONE live slot, an ordinary edge forms, ruling out that
     // the refusal below is a fixture artefact (a layout mismatch, a missing target) rather than
     // the epoch barrier actually firing.
     let premise_source = key(0x3e00);
@@ -4788,7 +4788,7 @@ fn an_edge_whose_ends_are_stamped_under_different_slots_refuses_stale_epoch() {
     // The row itself. S is made link-visible while slot 0 is live, so its OWN stamp is
     // `link_epochs[0]`, and it is never touched again. In production `resolve_successors` is
     // reached only from `make_link_visible`, which re-stamps the SOURCE's own epoch on the line
-    // immediately before calling it -- so a source can never be stale at that call on any guest
+    // immediately before calling it, so a source can never be stale at that call on any guest
     // path. Calling `resolve_successors_for_test` directly below, skipping that re-stamp, is a
     // deliberate TEST-ONLY pin of the epoch barrier (design review S1-8), not a shape any guest
     // instruction sequence reaches.
@@ -4873,7 +4873,7 @@ fn an_idempotent_republish_is_accepted() {
     assert_eq!(slots.slots[TABLE_SLOT_FLAGS], 0x1000);
 }
 
-/// The write-once invariant's alarm must actually fire — a changed base with
+/// The write-once invariant's alarm must actually fire: a changed base with
 /// live emitted code is a miscompile on the imm64 arm and a desync on the R15
 /// arm, and this panic is the only place either becomes visible.
 #[test]
@@ -4893,7 +4893,7 @@ fn a_changed_republish_panics() {
 ///
 /// `Qword`/`Tbyte` are DELIBERATELY absent from this test: `alignment_bytes()` is BELOW the
 /// access size for those two (both answer 4), because a 4-aligned Qword at page offset 0xFFC
-/// still crosses and a Tbyte at 0xFF8 does -- see `emit_wide_page_guard`'s comment. Folding the
+/// still crosses and a Tbyte at 0xFF8 does, see `emit_wide_page_guard`'s comment. Folding the
 /// two predicates would either break that or contaminate the shared one. What the carve-out owes
 /// is exactly this: agreement on the overlapping domain, so the two cannot drift where a reader
 /// would assume they match.
@@ -4984,7 +4984,7 @@ fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
 // Chain-used link mask (NON-ADOPTING slice)
 //
 // The contract these rows pin: a static edge is refused over a frozen `data` descriptor only when
-// some block in the CHAIN — the source's requirement or the target's — actually pins that
+// some block in the CHAIN, the source's requirement or the target's, actually pins that
 // segment. A descriptor nobody pins is not a reason to refuse (class B); a descriptor both ends
 // pin with different values still is (class D). Because the requirement is transitive, a link
 // made downstream can widen a block's requirement and retroactively invalidate an already-live
@@ -5003,7 +5003,7 @@ fn memory_width_alignment_matches_bus_width_bytes_where_both_exist() {
 // | run.rs's linked entry arm relaxed to `data_matches` | `direct_chain_entry_validates_a_segment_only_the_successor_uses` (execution level) |
 //
 // Two findings worth keeping. FIRST: the transitive row does NOT catch the `segment_layouts`
-// predicate on its own -- the worklist still cuts the edge behind it -- which is why the
+// predicate on its own: the worklist still cuts the edge behind it, which is why the
 // new-predecessor row exists. SECOND: the run.rs mutation survived the ENTIRE crate until the
 // execution-level row was written; no BlockCache fixture can see it, because that hole is in what
 // the dispatcher proves, not in which edges form.
@@ -5096,8 +5096,8 @@ fn link_mask_admits_class_b_difference_on_a_segment_nobody_pins() {
 }
 
 /// prince-586's hot pair, modelled as what it is: a 2-CYCLE whose two members differ on an ES
-/// neither of them pins. Both edges must form, because it is the pair being chain-eligible — not
-/// one edge existing — that lifts the quota clamp at run.rs:2294.
+/// neither of them pins. Both edges must form, because it is the pair being chain-eligible, not
+/// one edge existing, that lifts the quota clamp at run.rs:2294.
 #[cfg(any(
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")
@@ -5130,8 +5130,8 @@ fn link_mask_chains_the_prince_hot_pair_two_cycle() {
     assert!(cache.has_linked_successor(second_id));
 }
 
-/// Class D: both ends pin ES and disagree about it. This is a REAL conflict — one of the two
-/// blocks would run against a base the other's entry check never validated — and it must stay
+/// Class D: both ends pin ES and disagree about it. This is a REAL conflict: one of the two
+/// blocks would run against a base the other's entry check never validated, and it must stay
 /// refused. The guard against over-admission; it passes before and after the mask lands.
 #[cfg(any(
     all(target_os = "windows", target_arch = "x86_64"),
@@ -5171,8 +5171,8 @@ fn link_mask_still_refuses_class_d_conflict_on_a_segment_both_pin() {
 /// pins. Admitting both and stopping there is the depth-2 miscompile: entering at `R` validates
 /// `R`'s ES, and the chain then runs `T`'s body against `S`'s ES base.
 ///
-/// A shallow implementation — one that computes each block's requirement from its own snapshot,
-/// or from its direct successors without walking back to predecessors — leaves `R -> S` live and
+/// A shallow implementation, one that computes each block's requirement from its own snapshot,
+/// or from its direct successors without walking back to predecessors, leaves `R -> S` live and
 /// FAILS here. The only sound outcomes are widen-`R` (impossible in this row: `R`'s own ES
 /// descriptor disagrees) or CUT `R -> S`.
 #[cfg(any(
@@ -5589,11 +5589,11 @@ fn a_deterministic_retry_cause_is_never_lifted() {
 ///
 /// The lift is an offer to re-walk once. A key that takes it and lands on the same gate has
 /// supplied the evidence that re-walking does not help, and without this rule it would buy
-/// another window and another compile for ever -- which is precisely the treadmill
+/// another window and another compile for ever, which is precisely the treadmill
 /// `note_demoted_callout_site` exists to avoid one level down.
 ///
 /// A DIFFERENT cause is a different question and gets its own window, which is the boundary this
-/// also pins -- and the THIRD leg is what makes the bound real: the key comes back to the first
+/// also pins, and the THIRD leg is what makes the bound real: the key comes back to the first
 /// cause, and that is a repark too. `clearable_by_retry` names two causes, so a key can spend at
 /// most two lifts, and an alternating key runs out rather than looping. That leg fails against a
 /// per-key record, which remembers only the last cause.
@@ -5649,7 +5649,7 @@ fn a_lifted_key_that_reparks_with_the_same_cause_is_never_lifted_again() {
 
     // THE THIRD LEG, and the one the bound actually rests on: back to the FIRST cause. Both
     // `DecodeMiss` and `TranslationMismatch` are clearable, so a key that alternates them was the
-    // one shape a per-key record could not stop -- it remembered only the last cause and was
+    // one shape a per-key record could not stop: it remembered only the last cause and was
     // overwritten every time, which is a lift every window for ever. The record is a set of
     // (key, cause) PAIRS, so this key has now spent both of the two causes there are.
     cache.dormant(
@@ -5725,7 +5725,7 @@ fn the_retry_lift_knob_spellings() {
 /// permanence.
 ///
 /// `entries` is the map every probe, every invalidation and every classify walks, so a wider value
-/// is a broader cache-miss cost than anything the payload buys -- and it would be an
+/// is a broader cache-miss cost than anything the payload buys, and it would be an
 /// everywhere-regression with exactly the shape the duke numbers have, which is why this is pinned
 /// rather than argued. It is free because `Rejected(RejectedSpan)` already carries a `BlockKey`
 /// plus a `u16` and `Compiled(BlockId)` already forces 8-byte alignment: the four bytes
@@ -5773,8 +5773,8 @@ impl Drop for ChainEntryCheckArm {
 #[test]
 fn the_chain_entry_check_spelling_table_is_exact() {
     use parse_chain_entry_check_arm_for_test as parse;
-    // DEFAULT ON since the 2026-08-25 flip. Unset and `` still reach the SAME arm as each other
-    // -- the flip moved the default, not the rule -- but that arm is now the ARMED one, so an
+    // DEFAULT ON since the 2026-08-25 flip. Unset and `` still reach the SAME arm as each other:
+    // the flip moved the default, not the rule, but that arm is now the ARMED one, so an
     // OFF leg must EXPORT `0`.
     assert!(
         parse(Err(std::env::VarError::NotPresent)),
@@ -5799,7 +5799,7 @@ fn the_chain_entry_check_spelling_table_is_exact() {
 }
 
 /// A MISSPELLED LADDER LEG MUST FAIL LOUDLY rather than silently running the default, which for
-/// this knob is also the base arm of the A/B -- so a typo would be read as "the slice I asked for
+/// this knob is also the base arm of the A/B, so a typo would be read as "the slice I asked for
 /// changed nothing", the one wrong conclusion an arm ladder exists to avoid.
 #[test]
 fn an_unrecognised_chain_entry_check_spelling_refuses_to_guess() {
@@ -5831,7 +5831,7 @@ fn an_unrecognised_chain_entry_check_spelling_refuses_to_guess() {
 /// no live edge the cone is `P` alone.
 ///
 /// **THE CUT SITE THIS ROW GUARDS IS NOT `unlink_outbound`.** `unlink_block`'s inbound walk clears
-/// each predecessor's cell INLINE and never calls that helper, and it is the `Retired` cause --
+/// each predecessor's cell INLINE and never calls that helper, and it is the `Retired` cause,
 /// the largest cut population on every row. A narrowing wired only into `unlink_outbound` passes
 /// every other row in this file and fails here.
 #[cfg(any(
@@ -5943,8 +5943,8 @@ fn chain_requirement_narrows_on_both_arms() {
 /// root, re-show the successor, enter the root under the narrowed mask, chain into a body against
 /// a base nobody validated.
 ///
-/// The row builds exactly that window -- both successors portal-hidden while both `outbound` slots
-/// are still `Some` -- and then runs a cut on the OTHER slot, which is what calls the helper. The
+/// The row builds exactly that window: both successors portal-hidden while both `outbound` slots
+/// are still `Some`, and then runs a cut on the OTHER slot, which is what calls the helper. The
 /// requirement must not move.
 #[cfg(any(
     all(target_os = "windows", target_arch = "x86_64"),
@@ -6021,7 +6021,7 @@ fn hiding_a_successor_does_not_narrow_the_chain_requirement() {
 /// **R2-1, the round-2 finding, and the row that fails on the unfixed code.**
 ///
 /// `try_link_inner` snapshots the source's chain requirement BEFORE its refusal chain, then calls
-/// `unlink_outbound` on the relink-replace path -- which narrows -- and then hands the merge to
+/// `unlink_outbound` on the relink-replace path, which narrows, and then hands the merge to
 /// `widen_chain_requirement`. Handing it the PRE-CUT snapshot writes the cut edge's bits straight
 /// back and silently undoes the narrowing, and nothing asserts against it: the monotonicity check
 /// passes because the pre-cut value contains the narrowed one, and the non-adoption check compares
@@ -6103,7 +6103,7 @@ fn a_replaced_edge_does_not_restore_the_cut_successors_requirement() {
 
 /// A wholesale flush resets every requirement, and it may only do that once every edge is gone.
 /// Resetting first would leave an armed cell able to reach a body under a requirement that no
-/// longer names the segment that body's cone pins -- stale-too-NARROW, the miscompile direction.
+/// longer names the segment that body's cone pins: stale-too-NARROW, the miscompile direction.
 /// The `debug_assert!` in `invalidate_translation` is what makes the reordering fail; this row is
 /// what makes the assert run on a shape that has edges to drop.
 #[cfg(any(

@@ -8,7 +8,7 @@ use super::*;
 
 /// One golden end-state for a bit-manipulation case (task A10). BT/BTS/BTR/BTC, BSF/BSR,
 /// SHLD/SHRD, CMPXCHG, and XADD all set flags (CF for BT-family, ZF for BSF/BSR/CMPXCHG, the
-/// full ALU set for SHLD/SHRD/CMPXCHG/XADD), write registers, and — for the memory r/m forms —
+/// full ALU set for SHLD/SHRD/CMPXCHG/XADD), write registers, and, for the memory r/m forms,
 /// write memory, so this captures the full register file, eflags, eip, memory-write deltas, and
 /// the InstructionPrefetch fetch count. `eip` proves decode consumed the right number of bytes
 /// (incl. the 0F second byte and the imm8 for 0F BA/A4/AC); `fetch` proves each instruction byte
@@ -303,7 +303,7 @@ fn bitmanip_split_matches_golden_across_ops() {
     // the pre-split fused path via `regen_bitmanip_goldens`. The register file proves the
     // set/reset/toggle write-backs, BSF/BSR indices, double-shift results, and the CMPXCHG/XADD
     // exchanges; eflags proves CF (BT-family), ZF (BSF/BSR/CMPXCHG), and the ALU flags
-    // (SHLD/SHRD/CMPXCHG/XADD); the memory deltas prove the memory r/m write path — crucially
+    // (SHLD/SHRD/CMPXCHG/XADD); the memory deltas prove the memory r/m write path, crucially
     // the BT-memory walk lands the write in the ADJACENT word, not the base word; eip + fetch
     // prove decode consumed and charged every byte (0F prefix + ModRM + imm8) exactly once.
     for g in bitmanip_golden_cases() {
@@ -591,11 +591,11 @@ fn regen_condmove_goldens() {
 // ── Task A12: system / descriptor-table / segment-load golden battery ──────────────────────────
 
 /// One golden end-state for a system / descriptor-table / segment-load case (task A12). These
-/// opcodes change a heterogeneous set of architectural state — GPRs (SLDT/STR/SMSW/LAR/LSL store
+/// opcodes change a heterogeneous set of architectural state: GPRs (SLDT/STR/SMSW/LAR/LSL store
 /// a selector/limit; LES/LDS load the offset), eflags (VERR/VERW/LAR/LSL set ZF), memory
 /// (SGDT/SIDT store the pseudo-descriptor, SMSW r/m16 stores to memory), the descriptor tables
 /// (LGDT/LIDT), the control registers (MOV CR, LMSW, CLTS), the LDTR/TR selectors (LLDT/LTR), and
-/// the ES/DS segment registers (LES/LDS) — so the golden captures all of them. `eip` proves
+/// the ES/DS segment registers (LES/LDS), so the golden captures all of them. `eip` proves
 /// decode consumed the right byte count (incl. the 0F second byte + ModRM + displacement);
 /// `fetch` proves each instruction byte was charged exactly once.
 struct SystemSegGolden {
@@ -1137,8 +1137,8 @@ fn system_seg_split_matches_golden_across_ops() {
     // The system / descriptor-table / segment-load opcodes (0F 00/01/02/03/06/20/22, BOUND,
     // LES/LDS) are converted to the decode/execute split, so their fused arms are deleted and
     // they can no longer be diffed against a fused executor in-tree. Run each case through the
-    // split (`exec_one_split`) and assert the architectural end-state — GPRs, eflags, the
-    // control register, the GDTR/IDTR, the LDTR/TR selectors, and the ES/DS segment selectors —
+    // split (`exec_one_split`) and assert the architectural end-state (GPRs, eflags, the
+    // control register, the GDTR/IDTR, the LDTR/TR selectors, and the ES/DS segment selectors)
     // against goldens captured from the pre-split fused path (parent b0a4262d) via
     // `regen_system_seg_goldens`. eip + fetch prove decode consumed and charged every byte (0F
     // prefix + ModRM + displacement) exactly once; the memory deltas prove the SGDT/SIDT/SMSW

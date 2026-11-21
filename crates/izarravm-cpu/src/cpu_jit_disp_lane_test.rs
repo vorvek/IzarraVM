@@ -190,7 +190,7 @@ fn guest_store_word(cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32, value: u32
 
 /// Seed a heat RECORD (not hotness) for the four bytes at `lane`, the way one real patch of a
 /// decoded instruction leaves one: `note_code_write_inner` bumps the written chunk on every
-/// heat-charged kill. Admission (`disp_lane_for`) requires this measured patch history — a
+/// heat-charged kill. Admission (`disp_lane_for`) requires this measured patch history: a
 /// never-patched load compiles baked, which is the doom-gate cut.
 fn seed_patch_history(cpu: &mut CpuGsw, lane: u32) {
     cpu.sync_smc_heat();
@@ -347,7 +347,7 @@ fn disp_lane_writes_contribute_no_smc_heat() {
 /// The width check, fail-closed: a two-byte patch of the dword field starts at the lane but is
 /// not the admitted shape, so it takes the normal invalidation path.
 ///
-/// This pins the shared choke term (`width == IMM_LANE_WIDTH`) FOR A DISP-FIELD LANE — it is
+/// This pins the shared choke term (`width == IMM_LANE_WIDTH`) FOR A DISP-FIELD LANE: it is
 /// deliberate duplicate coverage of logic the imm-lane suite already pins, not this slice's
 /// mutation record. The slice's own records are the emit seam (baking the displacement back in
 /// fails the two read-through tests) and the admission fixtures (`a_disp8_form_takes_no_lane`
@@ -368,7 +368,7 @@ fn word_write_at_the_disp_lane_start_retires_the_block() {
     );
 }
 
-/// A four-byte write that overlaps the lane but starts one byte early — the ModRM byte plus
+/// A four-byte write that overlaps the lane but starts one byte early: the ModRM byte plus
 /// three displacement bytes. The resulting instruction is not the one that compiled.
 #[test]
 fn straddling_write_over_the_disp_lane_retires_the_block() {
@@ -388,7 +388,7 @@ fn straddling_write_over_the_disp_lane_retires_the_block() {
 /// A disp8 form is refused, and the fixture is chosen to pin the `disp_len == 4` term rather
 /// than ride on arithmetic accident: `8a 5c 24 10` is `MOV BL, [ESP+0x10]` (mod 01, SIB), a
 /// FOUR-byte instruction, so with the term deleted `len - 4` is 0 and the lane would land on
-/// the OPCODE byte — a 4-byte guest write rewriting the instruction itself would then be
+/// the OPCODE byte: a 4-byte guest write rewriting the instruction itself would then be
 /// absorbed as a lane accept while the block keeps running the old code. A 3-byte disp8 form
 /// (the first version of this fixture) never reaches that state, because `checked_sub(4)`
 /// underflows and refuses for the wrong reason; a mutation run proved
@@ -413,14 +413,14 @@ fn a_disp8_form_takes_no_lane() {
 }
 
 /// The SIB disp32 shape (`8a 1c 85 dd dd dd dd`, `MOV BL, [EAX*4 + disp32]`, SEVEN bytes with
-/// the displacement at offset 3) — the one admitted encoding whose displacement is NOT two
+/// the displacement at offset 3), the one admitted encoding whose displacement is NOT two
 /// bytes into the instruction. It pins the `len - 4` lane-start arithmetic: the review's
 /// mutation run replaced it with a fixed `+2` the six-byte fixture cannot distinguish, and
 /// every other test stayed green while the emitted code read its address out of the ModRM and
 /// SIB bytes. EAX is zero on entry (`arm` clears the file), so the load resolves to the bare
 /// displacement and the patched-read assertion is the same one the mod-0 fixture makes.
 ///
-/// Indexed forms are IN deliberately (iteration 2 cut them and duke3d's whole win vanished —
+/// Indexed forms are IN deliberately (iteration 2 cut them and duke3d's whole win vanished:
 /// Build patches these too); what keeps doom's never-patched `[base+disp32]` renderer loads
 /// untaxed is the heat gate, pinned by `a_cold_chunk_load_takes_no_lane` below.
 #[test]
@@ -468,7 +468,7 @@ fn a_sib_disp32_form_lanes_at_the_right_offset() {
 
 /// The heat gate, pinned from the refusing side: the SAME instruction that takes a lane in
 /// every fixture above compiles BAKED when its displacement bytes carry no heat record. This
-/// is the doom-gate cut made testable — iteration 1 laned every disp32 load unconditionally
+/// is the doom-gate cut made testable: iteration 1 laned every disp32 load unconditionally
 /// and the formal gate failed on doom's never-patched renderer loads (paired RTF 0.978/0.975).
 /// Deleting the `has_record_range` term in `disp_lane_for` makes this fail on the
 /// registration counter.
@@ -494,7 +494,7 @@ fn a_cold_chunk_load_takes_no_lane() {
         "a never-patched displacement must compile baked (the doom-gate cut)"
     );
 
-    // And with no lane, the patch a lane would have absorbed retires the block instead — after
+    // And with no lane, the patch a lane would have absorbed retires the block instead, after
     // which the RECOMPILE picks the lane up, because the kill is exactly what writes the heat
     // record admission reads. That convergence is the mechanism's whole story in one fixture.
     let id = cpu
@@ -546,7 +546,7 @@ fn a_prefixed_form_takes_no_lane() {
 /// The `IZARRAVM_DISP_LANES` spelling table, and THE DEFAULT PIN, TWO-SIDED.
 ///
 /// `disp_lanes_enabled` caches its env reading in a process-wide `OnceLock`, so the contract is
-/// otherwise assertable exactly once per process and never in an order the harness controls --
+/// otherwise assertable exactly once per process and never in an order the harness controls,
 /// hence the parse function is exercised directly.
 ///
 /// THE BUG THIS PINS. Until the lane-cap fix this knob read `!= "0"` with no table at all, so
