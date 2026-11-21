@@ -39868,15 +39868,45 @@ thread_local! {
     // `const`-initialised, no `Drop`: access compiles to a segment-relative load rather than the
     // lazy-init check a non-const TLS carries (L4).
     static TALLY: UnsafeCell<Tally> = const { UnsafeCell::new(Tally::new()) };
+    // Set while `with` holds the tally. Debug builds only.
+    #[cfg(debug_assertions)]
+    static TALLY_BORROWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Marks the tally as borrowed for the life of one `with` call. Debug builds only.
+#[cfg(all(feature = "direct-entry-attribution", debug_assertions))]
+struct TallyBorrow;
+
+#[cfg(all(feature = "direct-entry-attribution", debug_assertions))]
+impl TallyBorrow {
+    fn enter() -> Self {
+        let was_borrowed = TALLY_BORROWED.with(|flag| flag.replace(true));
+        assert!(!was_borrowed, "a tally accessor re-entered `with`");
+        Self
+    }
+}
+
+#[cfg(all(feature = "direct-entry-attribution", debug_assertions))]
+impl Drop for TallyBorrow {
+    fn drop(&mut self) {
+        TALLY_BORROWED.with(|flag| flag.set(false));
+    }
+}
+
+/// Run `f` with the tally of this thread.
+///
+/// `f` must not call `with`. Each accessor below changes some integers and returns. No accessor
+/// calls guest code or another accessor. A debug build asserts this rule.
 #[cfg(feature = "direct-entry-attribution")]
-/// SAFETY: the tally is thread-local, and every accessor below takes the borrow, mutates a few
-/// integers and drops it before returning. Nothing in here calls guest code, allocates, or
-/// re-enters an accessor, so a second `&mut` cannot exist while one is live.
 #[inline(always)]
 fn with<R>(f: impl FnOnce(&mut Tally) -> R) -> R {
-    TALLY.with(|cell| f(unsafe { &mut *cell.get() }))
+    #[cfg(debug_assertions)]
+    let _borrow = TallyBorrow::enter();
+    TALLY.with(|cell| {
+        // SAFETY: the tally is thread-local, so no other thread can reach it. `f` does not
+        // call `with`, so this is the only reference to the tally while `f` runs.
+        f(unsafe { &mut *cell.get() })
+    })
 }
 
 #[cfg(feature = "direct-entry-attribution")]

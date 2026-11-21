@@ -488,12 +488,18 @@ mod os {
     const _: () = assert!(std::mem::align_of::<SystemInfo>() == 8);
 
     pub(super) fn page_size() -> usize {
+        // SAFETY: `SystemInfo` holds only integers and byte arrays, so all-zero bytes are a
+        // valid value.
         let mut info: SystemInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, writable `SystemInfo` with the size and alignment that the
+        // assertions above check. The call writes only to it.
         unsafe { GetSystemInfo(&mut info) };
         info.page_size.max(4096) as usize
     }
 
     pub(super) fn alloc_rw(len: usize) -> Option<*mut u8> {
+        // SAFETY: a null address asks the system for a new region, so the call touches no
+        // memory that the program owns. The result is checked for null before use.
         let p = unsafe {
             VirtualAlloc(
                 std::ptr::null_mut(),
@@ -511,14 +517,21 @@ mod os {
 
     pub(super) fn make_rx(ptr: *mut u8, len: usize) -> bool {
         let mut old = 0u32;
+        // SAFETY: the call does not read or write through `ptr`, and it fails for a range that
+        // is not mapped. Each caller in this file passes a range inside a region from
+        // `alloc_rw`. `old` is a live `u32`.
         unsafe { VirtualProtect(ptr as *mut c_void, len, PAGE_EXECUTE_READ, &mut old) != 0 }
     }
 
     pub(super) fn flush_instruction_cache(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: the call does not write through `ptr`. Each caller in this file passes a
+        // range inside a region from `alloc_rw`.
         unsafe { FlushInstructionCache(GetCurrentProcess(), ptr as *const c_void, len) != 0 }
     }
 
     pub(super) unsafe fn free(ptr: *mut u8, _len: usize) {
+        // SAFETY: the caller guarantees that `ptr` is the base of a region from `alloc_rw`
+        // and that no reference to the region remains.
         unsafe {
             VirtualFree(ptr as *mut c_void, 0, MEM_RELEASE);
         }
@@ -553,11 +566,15 @@ mod os {
     const _SC_PAGESIZE: i32 = 30;
 
     pub(super) fn page_size() -> usize {
+        // SAFETY: `sysconf` takes no pointer and has no precondition.
         let n = unsafe { sysconf(_SC_PAGESIZE) };
         if n > 0 { n as usize } else { 4096 }
     }
 
     pub(super) fn alloc_rw(len: usize) -> Option<*mut u8> {
+        // SAFETY: a null address with `MAP_PRIVATE | MAP_ANONYMOUS` asks the system for a new
+        // region, so the call touches no memory that the program owns. The result is checked
+        // against `MAP_FAILED` before use.
         let p = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -576,6 +593,9 @@ mod os {
     }
 
     pub(super) fn make_rx(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: the call does not read or write through `ptr`, and it fails for a range that
+        // is not mapped. Each caller in this file passes a range inside a region from
+        // `alloc_rw`.
         unsafe { mprotect(ptr as *mut c_void, len, PROT_READ | PROT_EXEC) == 0 }
     }
 
@@ -584,6 +604,8 @@ mod os {
     }
 
     pub(super) unsafe fn free(ptr: *mut u8, len: usize) {
+        // SAFETY: the caller guarantees that `ptr` and `len` name a whole region from
+        // `alloc_rw` and that no reference to the region remains.
         unsafe {
             munmap(ptr as *mut c_void, len);
         }
