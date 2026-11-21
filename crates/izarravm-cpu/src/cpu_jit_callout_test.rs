@@ -990,6 +990,14 @@ fn every_phase_p_lane_refuses_with_zero_partial_effects() {
     #[allow(clippy::type_complexity)]
     let lanes: Vec<(&str, u16, u32, Box<dyn Fn(&mut CpuGsw, &mut TestBus)>)> = vec![
         (
+            // P0: a 16-bit TSS holds no I/O permission bitmap, so the interpreter denies every
+            // port. The bitmap bytes still permit the port, so only the type test can refuse.
+            "P0 16-bit TSS",
+            TSS_IO_MAP_OFFSET,
+            0x1000,
+            Box::new(|cpu: &mut CpuGsw, _: &mut TestBus| cpu.tr.access = 0x83),
+        ),
+        (
             // P1: the TSS cannot even hold the io_base word.
             "P1 limit below 0x67",
             TSS_IO_MAP_OFFSET,
@@ -1110,6 +1118,80 @@ fn the_interpreter_raises_the_gp_the_denied_lanes_refused() {
             0xdead_beef,
             "{lane}: the interpreter served a port the helper refused as denied"
         );
+    }
+}
+
+#[test]
+fn a_tss_that_is_not_a_32_bit_tss_faults_the_same_way_on_both_paths() {
+    // 0x83 is a busy 16-bit TSS and 0x81 is an available one. Neither holds an I/O permission
+    // bitmap, so the interpreter raises #GP(0) for every port at CPL > IOPL. The bitmap bytes of
+    // the fixture permit the port, so a probe without the type test serves it.
+    for access in [0x83, 0x81] {
+        let entry = 0x4000u32;
+
+        // The interpreter leg.
+        let (mut interp, mut interp_bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+        interp.tr.access = access;
+        interp.set_eip(entry);
+        assert!(
+            matches!(
+                interp.check_io_permission(&mut interp_bus, PORT, BusWidth::Byte),
+                Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0)
+                })
+            ),
+            "access={access:#x}: the interpreter must raise #GP(0)"
+        );
+        assert_eq!(
+            interp_bus.trace.cycles().len(),
+            0,
+            "access={access:#x}: the type test must come before each TSS read"
+        );
+        // Not unwrapped: the #GP has no IDT to land in and nests.
+        let _ = interp.cycle(&mut interp_bus);
+
+        // The native leg: the helper declines, then the interpreter executes the instruction.
+        let (mut native, mut native_bus) = warmed_tss_cpu(TSS_IO_MAP_OFFSET, 0x1000);
+        native.tr.access = access;
+        native.set_eip(entry);
+        let before = native.registers.clone();
+        let before_cr2 = native.control.cr2;
+        let status = jit::direct::port_read_al_dx_for_test(&mut native, &mut native_bus, 0, 0, 0);
+        assert_refused_with_zero_partial_effects(
+            "16-bit TSS",
+            status,
+            &native,
+            &native_bus,
+            &before,
+            before_cr2,
+        );
+        let _ = native.cycle(&mut native_bus);
+
+        assert_eq!(
+            native.registers, interp.registers,
+            "access={access:#x}: the two paths must end in the same register state"
+        );
+        assert_eq!(
+            native.registers.eax(),
+            0xdead_beef,
+            "access={access:#x}: a denied port must not write AL"
+        );
+        assert_eq!(
+            page_walk_writes(&native_bus),
+            page_walk_writes(&interp_bus),
+            "access={access:#x}: the two paths must write the same page-table entries"
+        );
+        for (leg, bus) in [("interpreter", &interp_bus), ("native", &native_bus)] {
+            assert_eq!(
+                bus.last_read_io_core_clocks_so_far, None,
+                "access={access:#x}: the {leg} leg reached the device"
+            );
+            assert!(
+                bus.io_reads.is_empty(),
+                "access={access:#x}: the {leg} leg read a port"
+            );
+        }
     }
 }
 

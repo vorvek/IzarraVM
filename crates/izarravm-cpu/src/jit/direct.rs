@@ -30797,14 +30797,16 @@ struct PortPermissionProbe {
 /// runs before the helper is allowed to commit anything" is enforced by the compiler rather than
 /// argued. Each `None` is one lane of the design's abnormal set:
 ///
-/// * P1 the TSS is too small to hold the io_base word;
+/// * P0 the TSS is not a 32-bit TSS, so it holds no I/O permission bitmap -- the interpreter's
+///   `#GP(0)` for every port;
+/// * P1 the TSS is too small to hold the io_base word -- also the interpreter's `#GP(0)`;
 /// * P2 that word straddles a page (so one translate could not cover it);
 /// * P3/P7 a TLB MISS -- the interpreter would walk here, which is the whole hazard;
 /// * P4/P8 the physical is not aligned, page-local, A20-clean plain RAM;
 /// * P5 the bitmap byte is past the TSS limit -- the interpreter's `#GP(0)`;
 /// * P9 the bit is set -- the interpreter's other `#GP(0)`.
 ///
-/// The two `#GP` lanes refuse rather than fault for the reason the caller states: raising from
+/// The `#GP` lanes refuse rather than fault for the reason the caller states: raising from
 /// inside a live block is the hazard class this design will not open, and the interpreter raises
 /// the identical fault one instruction boundary later.
 ///
@@ -30815,7 +30817,9 @@ fn port_permission_resident<B: CpuBus>(
     bus: &B,
     port: u16,
 ) -> Option<PortPermissionProbe> {
-    if cpu.tr.limit < 0x67 {
+    // The same predicate as `check_io_permission`: only a 32-bit TSS, available or busy, holds
+    // an I/O permission bitmap, and it must be long enough for the I/O map base field.
+    if !matches!(cpu.tr.access & 0x1f, 0x09 | 0x0b) || cpu.tr.limit < 0x67 {
         return None;
     }
     let io_base_linear = cpu.tr.base.wrapping_add(0x66);
