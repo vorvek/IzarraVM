@@ -1595,9 +1595,9 @@ fn a_deferred_write_overflow_drops_the_whole_cache() {
 /// An UNWATCHED write made inside the window still reaches the body's diagnostics.
 ///
 /// The window branch's own comment says an unwatched write falls through to the ordinary body, so
-/// the unit-sim feed, the SMC trace and the smc-census choke keep observing while a call-out runs.
+/// the SMC trace and the smc-census choke keep observing while a call-out runs.
 /// It shipped as a nested early return, which made that sentence false: for as long as a window
-/// was open those three stopped seeing anything. Nothing was unsound (none of them invalidates)
+/// was open those two stopped seeing anything. Nothing was unsound (neither invalidates)
 /// but a diagnostic that goes blind during exactly the mechanism under measurement is worse than
 /// one that was never turned on.
 ///

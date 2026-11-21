@@ -513,7 +513,6 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         MachineProfile::from_hardware_profile(hardware),
         boot_test_image(),
     )?;
-    maybe_enable_unit_sim(&mut machine);
     // The suite is wall-time-bound (PIT ticks and device-settle delays), so the
     // cycle budget scales with the clock to cover the same span at any GSW mode.
     // Half a second covers the timer probe and the 453-byte report at 38400 baud.
@@ -525,7 +524,6 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     print_suite_records(&results);
     println!("stop: {stop_reason:?}");
     print_com1(&machine.serial_text());
-    maybe_report_unit_sim(&mut machine);
     if stop_reason != StopReason::Halted {
         return Err(format!("boot suite did not halt: {stop_reason:?}").into());
     }
@@ -632,7 +630,6 @@ fn run_test_rom(
 ) -> Result<(), Box<dyn Error>> {
     let rom = select_rom(bios)?;
     let mut machine = Machine::new(MachineProfile::from_hardware_profile(hardware), &rom)?;
-    maybe_enable_unit_sim(&mut machine);
     let budget = cycles.unwrap_or(DEFAULT_TEST_ROM_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     let screen = machine.screen_text();
@@ -649,7 +646,6 @@ fn run_test_rom(
     let post = machine.io_port(0x80).unwrap_or(0);
     println!("post: {post:#04x}");
     println!("stop: {stop_reason:?}");
-    maybe_report_unit_sim(&mut machine);
     if bios.is_none()
         && let Some(message) = test_rom_failure_summary(&stop_reason, post, &screen_text)
     {
@@ -1726,7 +1722,6 @@ fn run_boot_hdd_folder(
     if let Some(path) = cd_image {
         machine.mount_cd(gui::load_cd_image_from_path(path)?);
     }
-    maybe_enable_unit_sim(&mut machine);
     maybe_enable_smc_trace(&mut machine);
     // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
     // sampled per-opcode CPU profile the bench harness uses, dumped after the
@@ -2049,7 +2044,6 @@ fn run_boot_hdd_folder(
         machine.cpu().perf_counters(),
         machine.cpu().fast_map_probe_counters(),
     );
-    maybe_report_unit_sim(&mut machine);
     maybe_report_smc_trace(&mut machine);
     maybe_report_slow_read_histo(&machine);
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
@@ -4266,25 +4260,6 @@ fn rip_profile_path() -> Option<std::ffi::OsString> {
     rip_profile_path_from(std::env::var_os("IZARRAVM_RIP_PROFILE"))
 }
 
-/// True when IZARRAVM_UNIT_SIM requests the trace-driven unit-growth simulator (any value other
-/// than "" or "0"). The simulator only observes retired interpreter instructions and never touches
-/// guest-visible state, so a headless game/binary run stays byte-identical whether it is on or off.
-fn unit_sim_requested() -> bool {
-    std::env::var("IZARRAVM_UNIT_SIM")
-        .ok()
-        .as_deref()
-        .is_some_and(|value| !matches!(value, "" | "0"))
-}
-
-/// Turn on the unit simulator before a headless run when IZARRAVM_UNIT_SIM asks for it. Enabling
-/// early means the sim observes the whole run. A no-op when the env var is unset or the binary was
-/// built without feature `jit`.
-fn maybe_enable_unit_sim(machine: &mut Machine) {
-    if unit_sim_requested() {
-        machine.set_unit_sim_enabled(true);
-    }
-}
-
 /// Turn on the CPU's SMC trace before a headless run when `IZARRAVM_SMC_TRACE` asks for it (any
 /// value other than "" or "0"). The trace only observes the invalidation choke and never touches
 /// guest-visible state, so a headless run stays byte-identical whether it is on or off.
@@ -4327,40 +4302,6 @@ fn maybe_report_smc_trace(machine: &mut Machine) {
         }
     }
 }
-
-/// Take the unit simulator's ladder report at the end of a headless run and print its per-rung
-/// evidence lines (two per rung, eight total for the four-rung measurement set `{L0, L4, L6, P}`),
-/// followed by the per-port io histogram lines when `IZARRAVM_IO_HIST=1`. A no-op when the sim was
-/// never enabled (`take_unit_sim_report` returns `None`) or the binary was built without feature
-/// `jit`.
-#[cfg(feature = "jit")]
-fn maybe_report_unit_sim(machine: &mut Machine) {
-    // Read the io histogram FIRST (it borrows the sim); `take_unit_sim_report` then consumes it.
-    let io_hist_lines = machine.unit_sim_io_hist().map(|hist| io_hist_lines(&hist));
-    if let Some(reports) = machine.take_unit_sim_report() {
-        for line in unit_sim_report_lines(&reports) {
-            println!("{line}");
-        }
-    }
-    if let Some(lines) = io_hist_lines {
-        for line in lines {
-            println!("{line}");
-        }
-    }
-}
-
-/// Format the per-port io-read histogram (`IZARRAVM_IO_HIST=1`): one `io_hist port=0xNNN count=...`
-/// line per port, sorted by count descending, capped at the top 16. `hist` is already sorted.
-#[cfg(feature = "jit")]
-fn io_hist_lines(hist: &[(u16, u64)]) -> Vec<String> {
-    hist.iter()
-        .take(16)
-        .map(|&(port, count)| format!("io_hist port={port:#06x} count={count}"))
-        .collect()
-}
-
-#[cfg(not(feature = "jit"))]
-fn maybe_report_unit_sim(_machine: &mut Machine) {}
 
 /// Print the non-direct data-read page histogram at the end of a headless run
 /// (`IZARRAVM_SLOW_READ_HISTO=1`). A no-op when the instrument was never armed.
@@ -4442,120 +4383,6 @@ fn slow_read_histo_lines(
         pages.len()
     ));
     lines
-}
-
-/// Nearest-rank percentile of an ascending-sorted slice. `p` is a whole percent (50, 90). Empty
-/// input yields 0.
-#[cfg(feature = "jit")]
-fn nearest_rank_percentile(sorted_ascending: &[usize], p: u32) -> u64 {
-    if sorted_ascending.is_empty() {
-        return 0;
-    }
-    let n = sorted_ascending.len();
-    let rank = ((f64::from(p) / 100.0) * n as f64).ceil() as usize;
-    let index = rank.saturating_sub(1).min(n - 1);
-    sorted_ascending[index] as u64
-}
-
-/// Format the unit-simulator ladder's evidence lines: two lines per rung, so the four-rung
-/// measurement set `{L0, L4, L6, P}` emits eight lines. The `cfg=` tag is the SECOND field of every
-/// line (tag first, so the rungs eyeball-diff against the C-pre evidence). See [`unit_sim_rung_lines`]
-/// for the per-rung field layout.
-#[cfg(feature = "jit")]
-#[allow(clippy::type_complexity)] // Signature fixed by the Track C task 3 reporting contract.
-pub(crate) fn unit_sim_report_lines(
-    reports: &[(&'static str, izarravm_cpu::SimReport, Vec<(usize, u32)>)],
-) -> Vec<String> {
-    reports
-        .iter()
-        .flat_map(|(cfg, report, histogram)| unit_sim_rung_lines(cfg, report, histogram))
-        .collect()
-}
-
-/// Format one ladder rung's two evidence lines from its label, headline report, and per-unit
-/// `(member_count, entry_physical_page)` histogram. The first line is the headline counters plus the
-/// structural `insns_per_entry` metric (`retired_in_units / entries`, 0.000000 when `entries == 0`).
-/// The second line summarizes the member-count distribution so the evaluation step can reason about
-/// member caps without a per-unit retired count (which the API does not expose). `excl_units` counts
-/// units whose entry sits in the BIOS/UMA physical window (page 0xF0, or pages 0xA0..=0xFF).
-#[cfg(feature = "jit")]
-fn unit_sim_rung_lines(
-    cfg: &str,
-    report: &izarravm_cpu::SimReport,
-    histogram: &[(usize, u32)],
-) -> Vec<String> {
-    let insns_per_entry = if report.entries == 0 {
-        0.0
-    } else {
-        report.retired_in_units as f64 / report.entries as f64
-    };
-    // The active-stream residency (rung P): the must-execute stream with elided poll iterations
-    // removed. `ipe_active` prices a wait entry at one dispatch per deadline slice (the primary
-    // quotient); `ipe_active_slice` additionally charges one dispatch per absorbed budget yield (the
-    // pessimistic quotient). Both equal `insns_per_entry` on every non-P rung (all elision counters
-    // are zero there).
-    let active = report.retired_in_units.saturating_sub(report.elided_insns);
-    let ipe_active = if report.entries == 0 {
-        0.0
-    } else {
-        active as f64 / report.entries as f64
-    };
-    let slice_denom = report.entries + report.wait_batch_ends;
-    let ipe_active_slice = if slice_denom == 0 {
-        0.0
-    } else {
-        active as f64 / slice_denom as f64
-    };
-    let headline = format!(
-        "unit_sim cfg={cfg} entries={} retired_in_units={} linked_transfers={} loop_links={} \
-call_links={} ret_links={} itc_hits={} ght_hits={} ght_ret_hits={} unresolved_exits={} \
-side_exits_io={} side_exits_async={} io_callouts={} sim_invalidations={} sim_restamps={} \
-units_built={} units_rebuilt={} elided_insns={} elided_waits={} wait_batch_ends={} \
-spin_noio_insns={} insns_per_entry={insns_per_entry:.6} ipe_active={ipe_active:.6} \
-ipe_active_slice={ipe_active_slice:.6}",
-        report.entries,
-        report.retired_in_units,
-        report.linked_transfers,
-        report.loop_links,
-        report.call_links,
-        report.ret_links,
-        report.itc_hits,
-        report.ght_hits,
-        report.ght_ret_hits,
-        report.unresolved_exits,
-        report.side_exits_io,
-        report.side_exits_async,
-        report.io_callouts,
-        report.sim_invalidations,
-        report.sim_restamps,
-        report.units_built,
-        report.units_rebuilt,
-        report.elided_insns,
-        report.elided_waits,
-        report.wait_batch_ends,
-        report.spin_noio_insns,
-    );
-
-    let mut members: Vec<usize> = histogram.iter().map(|&(count, _)| count).collect();
-    members.sort_unstable();
-    let members_max = members.last().copied().unwrap_or(0) as u64;
-    let over = |threshold: usize| members.iter().filter(|&&m| m > threshold).count();
-    let excl_units = histogram
-        .iter()
-        .filter(|&&(_, page)| page == 0xF0 || (0xA0..=0xFF).contains(&page))
-        .count();
-    let hist = format!(
-        "unit_sim_hist cfg={cfg} units={} members_p50={} members_p90={} members_max={members_max} \
-units_over_64={} units_over_128={} units_over_256={} excl_units={excl_units}",
-        histogram.len(),
-        nearest_rank_percentile(&members, 50),
-        nearest_rank_percentile(&members, 90),
-        over(64),
-        over(128),
-        over(256),
-    );
-
-    vec![headline, hist]
 }
 
 fn validate_profile_json_parent(path: &Path) -> Result<(), Box<dyn Error>> {

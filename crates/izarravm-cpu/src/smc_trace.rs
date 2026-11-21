@@ -513,7 +513,7 @@ impl SmcTrace {
     }
 }
 
-/// Non-architectural slot holding the optional SMC trace, mirroring `UnitSimSlot`: always-equal,
+/// Non-architectural slot holding the optional SMC trace: always-equal,
 /// clones disabled, prints opaquely, so enabling a diagnostic never makes two otherwise-identical
 /// CPUs compare unequal.
 #[derive(Default)]

@@ -1313,7 +1313,7 @@ impl CpuGsw {
     /// it for same-value sized stores). These are the only writes allowed to take the mutable-lane
     /// exemption; `note_code_write` is the value-less door and refuses it.
     ///
-    /// The unit-sim feed lives in the shared body below, behind the elision choke, so the
+    /// The SMC trace lives in the shared body below, behind the elision choke, so the
     /// diagnostic mirrors the post-elision production invalidation path exactly.
     #[inline]
     pub(super) fn note_code_write_hit(&mut self, physical: u32, width: u32) -> bool {
@@ -1393,8 +1393,8 @@ impl CpuGsw {
         // An unwatched write FALLS THROUGH to the body, and the `&&` below rather than a nested
         // early return is what makes that true. It shipped as a nested `return false`, which the
         // paragraph after it already claimed was a fall-through: the two disagreed and the code
-        // won, so a store made inside a window skipped the unit-sim feed, the SMC trace and the
-        // smc-census choke for as long as the window was open. None of those three invalidates
+        // won, so a store made inside a window skipped the SMC trace and the
+        // smc-census choke for as long as the window was open. Neither invalidates
         // anything, so nothing was unsound; they are DIAGNOSTICS, and a diagnostic that silently
         // stops observing during exactly the mechanism under measurement is worse than one that
         // never ran.
@@ -1422,17 +1422,6 @@ impl CpuGsw {
         if self.deferred_code_writes.is_open() && self.code_write_watched(physical, width) {
             self.record_deferred_code_write(physical, width, lanes);
             return true;
-        }
-        // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
-        // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
-        // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
-        // The sim takes the whole store range and internally visits the first byte's page and, when
-        // the store spans a page boundary, the last byte's page too (a store touches at most two
-        // pages here); the two-page visit lives inside the sim so it can classify the store's byte
-        // range against unit members (L3 restamp) rather than kill unconditionally.
-        #[cfg(feature = "jit")]
-        if let Some(sim) = self.unit_sim.0.as_mut() {
-            sim.note_code_write(physical, width);
         }
         // SMC trace (diagnostic, off by default). The gate is HERE, at the call site: with the
         // trace disabled the slot is `None` and neither the decode-line probe nor the action
@@ -2430,7 +2419,7 @@ impl CpuGsw {
     }
 
     /// Commit complete poll-loop iterations through the same remainder-carry scaler
-    /// used by normal execution. Retired-instruction and unit-simulator counts stay
+    /// used by normal execution. Retired-instruction counts stay
     /// unchanged because these instructions did not execute.
     #[cfg(feature = "jit")]
     pub fn commit_poll_skip_core(

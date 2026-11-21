@@ -45,10 +45,6 @@ pub use jit::direct::{
     N_BINS, N_HOP_BINS, N_INSN_BINS, N_LOOP_BINS, OUTLIER_TICKS, P0_MARK_LINE, PHASE_NAMES,
     POPULATION_NAMES, PRE_P0_REFUSAL_SITES, REFUSAL_SITES, native_bin_index, native_bin_parts,
 };
-/// The unit simulator's headline report, returned by `CpuGsw::take_unit_sim_report` (a diagnostic
-/// measurement aid; see `jit::unit_sim`).
-#[cfg(feature = "jit")]
-pub use jit::unit_sim::SimReport;
 mod memory;
 mod paging;
 #[cfg(any(feature = "reflected-call-diagnostic", feature = "reflected-call-memo"))]
@@ -1608,9 +1604,9 @@ fn slow_read_histo_default() -> bool {
 /// `CpuGsw::slow_read_histo_armed`, whose doc comment owns that ordering rule: it MUST be the last
 /// conjunct, and a call site that hoists it in front of `read.direct` puts this load back on every
 /// direct read. Non-architectural: excluded from CPU equality and cloned off, exactly like
-/// `unit_sim` and `smc_trace`.
+/// `smc_trace`.
 ///
-/// The `Box` is deliberate for the same reason `unit_sim` and `smc_trace` box theirs: this slot
+/// The `Box` is deliberate for the same reason `smc_trace` boxes its slot: this slot
 /// lives on `CpuGsw`, whose field layout the hot paths depend on (see `FastMapProbeCounters` and
 /// `rmw_census_enabled`), and an inline `Option<SlowReadTally>` would put the whole tally -- a
 /// `HashMap` plus two `u64`s, about 64 bytes -- of a default-OFF diagnostic in that struct where a
@@ -3222,17 +3218,10 @@ pub struct CpuGsw {
     /// method for the chokepoint inventory). `Default`/`reset` leave it `false`, matching
     /// the reset images (CR0 without AM, EFLAGS 0x2); `Clone` copies it consistently.
     alignment_armed: bool,
-    /// Optional trace-driven unit simulator (feature `jit`, diagnostic). Off by default and enabled
-    /// per-CPU via `set_unit_sim_enabled`; when on it observes every retired interpreter instruction
-    /// to measure hypothetical superblock units. Non-architectural: excluded from CPU equality (a
-    /// `UnitSimSlot`'s always-true `PartialEq`, like the decode cache) and cloned off, so enabling it
-    /// never makes an otherwise-identical CPU compare unequal. See `jit::unit_sim`.
-    #[cfg(feature = "jit")]
-    unit_sim: UnitSimSlot,
     /// Optional SMC trace (diagnostic, off by default; `set_smc_trace_enabled`). When on, the
     /// invalidation choke records every self-modifying write: the overwritten instruction's
     /// decoded identity, which of its fields the write landed in, and which invalidation ran.
-    /// Non-architectural, excluded from CPU equality and cloned off, exactly like `unit_sim`.
+    /// Non-architectural, excluded from CPU equality and cloned off, like the decode cache.
     /// See `smc_trace`.
     smc_trace: smc_trace::SmcTraceSlot,
     /// Optional non-direct-read page histogram (diagnostic, off by default;
@@ -3437,8 +3426,6 @@ impl Default for CpuGsw {
             profile: CpuProfileState::default(),
             pending_flags: PendingFlags::default(),
             alignment_armed: false,
-            #[cfg(feature = "jit")]
-            unit_sim: UnitSimSlot::default(),
             smc_trace: smc_trace::SmcTraceSlot::default(),
             slow_read_histo: SlowReadHisto::from_env(),
             cpl: 0,
@@ -3496,43 +3483,6 @@ impl CpuGsw {
     /// IZARRAVM_POLL_SKIP_NEG_CACHE environment. Host bookkeeping only.
     pub fn set_poll_neg_cache_enabled_for_test(&mut self, enabled: bool) {
         self.poll_neg_cache_enabled = enabled;
-    }
-}
-
-/// Non-architectural slot holding the optional unit simulator (feature `jit`). Wrapping the boxed
-/// `UnitSim` lets `CpuGsw` keep its derived `PartialEq`/`Eq`/`Clone`/`Debug`: this type reports
-/// always-equal (two CPUs differing only in diagnostic sim state are the same machine), clones with
-/// the sim disabled (a transparent diagnostic, like the decode and region caches that clone empty),
-/// and prints opaquely. See `jit::unit_sim`.
-#[cfg(feature = "jit")]
-#[derive(Default)]
-struct UnitSimSlot(Option<Box<jit::unit_sim::SimLadder>>);
-
-#[cfg(feature = "jit")]
-impl PartialEq for UnitSimSlot {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-#[cfg(feature = "jit")]
-impl Eq for UnitSimSlot {}
-
-#[cfg(feature = "jit")]
-impl Clone for UnitSimSlot {
-    fn clone(&self) -> Self {
-        // Diagnostic accelerator: a clone starts with the sim disabled, matching the decode/region
-        // caches that clone empty. Re-enable it on the clone if measurement is wanted there.
-        Self(None)
-    }
-}
-
-#[cfg(feature = "jit")]
-impl std::fmt::Debug for UnitSimSlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnitSimSlot")
-            .field("enabled", &self.0.is_some())
-            .finish()
     }
 }
 
