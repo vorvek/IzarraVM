@@ -4,8 +4,10 @@
 //! Host audio output at 44.1 kHz stereo.
 //!
 //! The emulation thread writes PCM into a bounded lock-free queue. The cpal
-//! callback drains it without taking a mutex and resamples to the host rate.
+//! callback drains it without taking a mutex and resamples to the host rate
+//! with a band-limited filter. A host at the mixer rate gets a straight copy.
 
+use crate::StreamResampler;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use crossbeam_queue::ArrayQueue;
@@ -543,7 +545,46 @@ fn scale_frame(frame: StereoFrame, gain: u16) -> StereoFrame {
     (scale(frame.0), scale(frame.1))
 }
 
-/// Build a stream that linearly resamples the mixer output to the host rate.
+/// Turns the mixer-rate frames the callback pops into host-rate frames. Built
+/// once per stream, so a device change that opens a stream at another rate gets
+/// a new one. `next_frame` does not allocate.
+enum HostConverter {
+    /// The host runs at the mixer rate.
+    Copy,
+    Sinc(Box<StreamResampler>),
+}
+
+impl HostConverter {
+    fn new(out_hz: u32) -> Self {
+        if out_hz == SOURCE_HZ {
+            Self::Copy
+        } else {
+            Self::Sinc(Box::new(StreamResampler::new(SOURCE_HZ, out_hz)))
+        }
+    }
+
+    /// One host-rate frame as floats in -1.0..1.0, pulling mixer frames from
+    /// `source` as the filter needs them.
+    fn next_frame(&mut self, source: &mut impl FnMut() -> StereoFrame) -> (f32, f32) {
+        let (left, right) = match self {
+            Self::Copy => {
+                let (l, r) = source();
+                (i32::from(l), i32::from(r))
+            }
+            Self::Sinc(filter) => loop {
+                if let Some(frame) = filter.pull() {
+                    break frame;
+                }
+                let (l, r) = source();
+                filter.push((i32::from(l), i32::from(r)));
+            },
+        };
+        let scale = |sample: i32| sample.clamp(-32768, 32767) as f32 / 32768.0;
+        (scale(left), scale(right))
+    }
+}
+
+/// Build a stream that resamples the mixer output to the host rate.
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -558,9 +599,7 @@ where
     let channels = config.channels as usize;
     let out_hz = config.sample_rate.0 as i64;
     let mut source = CallbackSource::with_debug(ring, debug.clone());
-    let mut cur = (0i16, 0i16);
-    let mut next = (0i16, 0i16);
-    let mut phase = 0i64;
+    let mut converter = HostConverter::new(config.sample_rate.0);
     let mut out_frames = 0u64;
     let mut reported = AudioDebugSnapshot::default();
     let mut previous_callback = None;
@@ -585,24 +624,15 @@ where
             }
 
             for frame in data.chunks_mut(channels) {
-                let fraction = phase as f32 / out_hz as f32;
-                let left = f32::from(cur.0) + (f32::from(next.0) - f32::from(cur.0)) * fraction;
-                let right = f32::from(cur.1) + (f32::from(next.1) - f32::from(cur.1)) * fraction;
+                let (left, right) = converter.next_frame(&mut || source.next());
                 if let Some(sample) = frame.get_mut(0) {
-                    *sample = T::from_sample(left / 32768.0);
+                    *sample = T::from_sample(left);
                 }
                 if let Some(sample) = frame.get_mut(1) {
-                    *sample = T::from_sample(right / 32768.0);
+                    *sample = T::from_sample(right);
                 }
                 for sample in frame.iter_mut().skip(2) {
                     *sample = T::from_sample(0.0);
-                }
-
-                phase += i64::from(SOURCE_HZ);
-                while phase >= out_hz {
-                    phase -= out_hz;
-                    cur = next;
-                    next = source.next();
                 }
             }
             source.flush_debug_callback(queue_depth_before);

@@ -79,3 +79,41 @@ fn streaming_matches_single_shot() {
     split.extend(split_rs.process(&input[20_000..]));
     assert_eq!(whole, split, "chunked input must match one-shot");
 }
+
+#[test]
+fn stream_resampler_returns_exactly_the_frames_process_returns() {
+    for (input, output) in [
+        (44_100, 48_000),
+        (44_100, 96_000),
+        (44_100, 192_000),
+        (44_100, 22_050),
+        (49_716, 44_100),
+    ] {
+        let input_frames: Vec<(i32, i32)> = (0..5_000)
+            .map(|n| ((n * 37 % 20_001) - 10_000, (n * 91 % 20_001) - 10_000))
+            .collect();
+        let expected = Resampler::new(input, output).process(&input_frames);
+        let mut stream = StreamResampler::new(input, output);
+        let mut actual = Vec::new();
+        let mut fed = input_frames.iter();
+        while actual.len() < expected.len() {
+            match stream.pull() {
+                Some(frame) => actual.push(frame),
+                None => stream.push(*fed.next().expect("input ran out")),
+            }
+        }
+        assert_eq!(actual, expected, "{input} -> {output}");
+    }
+}
+
+#[test]
+fn process_into_appends_and_matches_process() {
+    let input: Vec<(i32, i32)> = (0..3_000).map(|n| (n % 977, -(n % 613))).collect();
+    let expected = Resampler::new(44_100, 48_000).process(&input);
+    let mut resampler = Resampler::new(44_100, 48_000);
+    let mut out = vec![(7, 7)];
+    resampler.process_into(&input[..1_000], &mut out);
+    resampler.process_into(&input[1_000..], &mut out);
+    assert_eq!(out[0], (7, 7));
+    assert_eq!(&out[1..], &expected[..]);
+}

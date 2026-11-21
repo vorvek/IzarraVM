@@ -377,3 +377,145 @@ fn a_failed_open_re_arms_and_backs_off() {
         "the device appearing later is picked up"
     );
 }
+
+// The converter tests below drive the real conversion path with a mixer-rate
+// source and read back host-rate frames.
+
+fn tone_source(freq: f64, amp: f64) -> impl FnMut() -> StereoFrame {
+    let mut n = 0u64;
+    move || {
+        let s = (amp * (2.0 * std::f64::consts::PI * freq * n as f64 / 44_100.0).sin()).round();
+        n += 1;
+        (s as i16, s as i16)
+    }
+}
+
+fn convert(out_hz: u32, frames: usize, mut source: impl FnMut() -> StereoFrame) -> Vec<f32> {
+    let mut converter = HostConverter::new(out_hz);
+    (0..frames)
+        .map(|_| converter.next_frame(&mut source).0)
+        .collect()
+}
+
+// The old callback arithmetic, kept here as the baseline the new path is
+// measured against.
+fn linear_convert(out_hz: i64, frames: usize, mut source: impl FnMut() -> StereoFrame) -> Vec<f32> {
+    let (mut cur, mut next, mut phase) = ((0i16, 0i16), (0i16, 0i16), 0i64);
+    let mut out = Vec::new();
+    for _ in 0..frames {
+        let fraction = phase as f32 / out_hz as f32;
+        out.push((f32::from(cur.0) + (f32::from(next.0) - f32::from(cur.0)) * fraction) / 32768.0);
+        phase += i64::from(SOURCE_HZ);
+        while phase >= out_hz {
+            phase -= out_hz;
+            cur = next;
+            next = source();
+        }
+    }
+    out
+}
+
+/// Level of `freq` in `samples` relative to full scale, in dB, with a Hann window.
+fn level_db(samples: &[f32], freq: f64, rate: f64) -> f64 {
+    let (mut re, mut im, mut norm) = (0.0f64, 0.0f64, 0.0f64);
+    let n = samples.len() as f64;
+    for (i, &x) in samples.iter().enumerate() {
+        let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n).cos();
+        let angle = 2.0 * std::f64::consts::PI * freq * i as f64 / rate;
+        re += f64::from(x) * w * angle.cos();
+        im -= f64::from(x) * w * angle.sin();
+        norm += w;
+    }
+    20.0 * ((re * re + im * im).sqrt() * 2.0 / norm).max(1e-12).log10()
+}
+
+// A 16 kHz tone sampled at 44.1 kHz leaves an image at 28.1 kHz. A 48 kHz host
+// folds it down to 19.9 kHz, inside the audible band.
+fn image_dbc(samples: &[f32]) -> f64 {
+    let steady = &samples[2_000..2_000 + 4_800];
+    level_db(steady, 19_900.0, 48_000.0) - level_db(steady, 16_000.0, 48_000.0)
+}
+
+#[test]
+fn sinc_conversion_pushes_the_image_of_a_high_tone_below_minus_sixty_dbc() {
+    let sinc = convert(48_000, 8_000, tone_source(16_000.0, 20_000.0));
+    let linear = linear_convert(48_000, 8_000, tone_source(16_000.0, 20_000.0));
+    let (sinc_db, linear_db) = (image_dbc(&sinc), image_dbc(&linear));
+    eprintln!("image at 19.9 kHz: sinc {sinc_db:.1} dBc, linear {linear_db:.1} dBc");
+    assert!(linear_db > -30.0, "the baseline has a strong image");
+    assert!(sinc_db < -60.0, "sinc image {sinc_db:.1} dBc");
+    // The tone itself must come through at about its input level.
+    let tone = level_db(&sinc[2_000..6_800], 16_000.0, 48_000.0);
+    let expected = 20.0 * (20_000.0f64 / 32_768.0).log10();
+    assert!((tone - expected).abs() < 0.5, "{tone}");
+}
+
+#[test]
+fn a_host_at_the_mixer_rate_gets_a_straight_copy() {
+    let mut n = 0i16;
+    let mut ramp = || {
+        n = n.wrapping_add(257);
+        (n, n.wrapping_neg())
+    };
+    let mut converter = HostConverter::new(SOURCE_HZ);
+    assert!(matches!(converter, HostConverter::Copy));
+    let mut reference = 0i16;
+    for _ in 0..1_000 {
+        reference = reference.wrapping_add(257);
+        let (left, right) = converter.next_frame(&mut ramp);
+        assert_eq!(left, f32::from(reference) / 32768.0);
+        assert_eq!(right, f32::from(reference.wrapping_neg()) / 32768.0);
+    }
+}
+
+#[test]
+fn a_new_converter_for_a_new_rate_keeps_level_and_rate() {
+    // A device change reopens the stream, which builds a new converter.
+    for out_hz in [48_000u32, 96_000] {
+        let frames = out_hz as usize / 2;
+        let mut consumed = 0usize;
+        let mut inner = tone_source(1_000.0, 20_000.0);
+        let out = convert(out_hz, frames, || {
+            consumed += 1;
+            inner()
+        });
+        // Mixer frames drawn follow the rate ratio to within the filter lead-in.
+        let expected = frames as f64 * 44_100.0 / f64::from(out_hz);
+        assert!(
+            (consumed as f64 - expected).abs() < 40.0,
+            "{out_hz}: {consumed}"
+        );
+        let peak = out[out.len() / 2..]
+            .iter()
+            .fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!(
+            (peak - 20_000.0 / 32_768.0).abs() < 0.01,
+            "{out_hz}: peak {peak}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "cost report, no assertion"]
+fn conversion_cost_report() {
+    for out_hz in [48_000u32, 192_000] {
+        let reps = 20u32;
+        let mut sink = 0.0f32;
+        let mut converter = HostConverter::new(out_hz);
+        let mut source = tone_source(440.0, 10_000.0);
+        let start = Instant::now();
+        for _ in 0..reps {
+            for _ in 0..out_hz {
+                sink += converter.next_frame(&mut source).0;
+            }
+        }
+        let sinc = start.elapsed() / reps;
+        let start = Instant::now();
+        for _ in 0..reps {
+            let mut source = tone_source(440.0, 10_000.0);
+            sink += linear_convert(i64::from(out_hz), out_hz as usize, &mut source)[0];
+        }
+        let linear = start.elapsed() / reps;
+        eprintln!("{out_hz} Hz: sinc {sinc:?} per audio second, linear {linear:?} (sink {sink})");
+    }
+}
