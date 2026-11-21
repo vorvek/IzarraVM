@@ -625,17 +625,6 @@ impl CpuGsw {
     /// arm must keep the refusing one, counters included. This function is unaffected: it has
     /// taken the permitting door at both widths since long before the arm existed, so its
     /// behaviour is the same on either.
-    ///
-    /// `note_code_write_hit`'s FIRST action, before any invalidation logic, is an
-    /// unconditional unit-sim feed (`core.rs`) -- diagnostic only, but the one place
-    /// `IZARRAVM_UNIT_SIM` observes SMC. An earlier version of this function used `watched &&
-    /// changed` for every width, which silently dropped that sim feed for a changed byte write
-    /// that hits no watched code, exactly the persona (486/586, where the FastMap is armed) the
-    /// simulator exists to model. So: byte writes call `note_code_write_hit` on `changed` alone,
-    /// matching the slow byte path; sized writes keep the `watched && changed` pre-gate, matching
-    /// the slow sized path. `note_code_write_hit` re-derives whether anything is actually watched
-    /// on its own regardless of the caller's gate, so calling it for an unwatched byte write is
-    /// safe -- the invalidation half is then a harmless no-op and only the sim feed fires.
     #[cfg(all(
         feature = "jit",
         target_arch = "x86_64",
@@ -690,16 +679,8 @@ impl CpuGsw {
         // with the condition below, and the read has to precede the store, so an ungated read-back
         // put a load, a compare and a live register across the charge on every guest store served
         // by the fast map -- for an answer the common unwatched store never looks at.
-        let consumer = watched || (width == BusWidth::Byte && self.unit_sim.0.is_some());
-        let changed = consumer && Self::read_fast_map_ptr(ptr, width) != value;
+        let changed = watched && Self::read_fast_map_ptr(ptr, width) != value;
         Self::write_fast_map_ptr(ptr, width, value);
-        // `note_code_write_hit` is a total no-op when `watched` is false and no unit sim is
-        // attached: `code_write_watched` being false means both `range_hits_compiled_code` and
-        // `decode_cache.range_hits_code` are false, so every branch inside is skipped and nothing
-        // is incremented. The `width == BusWidth::Byte` half of the gate calls it anyway on every
-        // unwatched byte write, only to feed the diagnostic unit sim; narrowing that half to
-        // "only when a unit sim is actually attached" keeps the diagnostic feed working while
-        // dropping the call entirely on the default build's unwatched byte-write path.
         if changed {
             self.note_code_write_hit(physical, width.bytes());
         }

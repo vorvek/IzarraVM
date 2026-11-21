@@ -52,7 +52,6 @@ pub(crate) mod poll;
 )]
 pub(crate) mod smc_heat;
 pub(crate) mod step;
-pub(crate) mod unit_sim;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod unwind;
 #[cfg(all(

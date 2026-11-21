@@ -61,7 +61,6 @@ build feature. This is stated in the Effect column.
 | `IZARRAVM_VBE_TRACE` | Any value except empty, `0`, `off` and `false`. | Not set | Prints the VBE mode set requests. |
 | `IZARRAVM_SMC_TRACE` | Any value other than empty or `0` turns it on. | Off | Records the self-modifying code invalidations in a headless run. |
 | `IZARRAVM_SMC_TRACE_OUT` | A file path. | Standard output | Names the file for the report of `IZARRAVM_SMC_TRACE`. |
-| `IZARRAVM_UNIT_SIM` | Any value other than empty or `0` turns it on. | Off | Runs the unit-growth simulator in a headless run. |
 | `IZARRAVM_IPE_WINDOW_TRACE` | A file path. | Not set | Writes a windowed trace of instructions per native entry. The parent directory must exist. |
 | `IZARRAVM_DUMP_LINEAR` | `<hex address>[,<hex length>]` | Around the hottest address | Chooses the memory window that the CPU profile dumps. The default length is `0x180`. |
 | `IZARRAVM_GUI_INJECT_KEYS` | `<guest ms>:<text>` steps, separated by `;`. | Not set | Types keys into the guest at fixed times in the GUI. A bad value is ignored with a warning. |
@@ -84,7 +83,6 @@ diagnostics when you compare timing.
 | `IZARRAVM_RMW_CENSUS` | Any value other than empty or `0` turns it on. | Off | Counts the read, write, and read-modify-write shapes of memory access. |
 | `IZARRAVM_SLOT_CENSUS` | Any value other than empty or `0` turns it on. | Off | Counts the instruction slots that the recompiler rejects. |
 | `IZARRAVM_SLOW_READ_HISTO` | Any value other than empty or `0` turns it on. | Off | Counts slow data reads for each 4 KiB page. |
-| `IZARRAVM_IO_HIST` | Any value other than empty or `0` turns it on. | Off | Counts port reads for each port. |
 | `IZARRAVM_DIRECT_BARRIER_CENSUS` | `1` | Off | Arms the census of the places where native blocks end. The `direct-admission-census` build feature compiles in the hooks. |
 | `IZARRAVM_DIRECT_LINK_REFUSAL_CENSUS` | `1` | Off | Counts refused block links. Needs the `direct-link-refusal-census` build feature. |
 | `IZARRAVM_SMC_CENSUS` | `1` | Off | Counts self-modifying code invalidations. Needs the `smc-census` build feature. |

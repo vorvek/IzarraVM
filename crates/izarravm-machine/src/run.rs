@@ -968,15 +968,6 @@ impl Machine {
         }
     }
 
-    /// Enable or disable the trace-driven unit-growth simulator on the CPU (feature `jit`,
-    /// diagnostic). A no-op without feature `jit`. See `CpuGsw::set_unit_sim_enabled`.
-    pub fn set_unit_sim_enabled(&mut self, on: bool) {
-        #[cfg(feature = "jit")]
-        self.cpu.set_unit_sim_enabled(on);
-        #[cfg(not(feature = "jit"))]
-        let _ = on;
-    }
-
     /// Enable or disable the CPU's off-by-default SMC trace (diagnostic). See
     /// `CpuGsw::set_smc_trace_enabled`.
     pub fn set_smc_trace_enabled(&mut self, on: bool) {
@@ -987,27 +978,6 @@ impl Machine {
     /// See `CpuGsw::take_smc_trace_report`.
     pub fn take_smc_trace_report(&mut self) -> Option<Vec<String>> {
         self.cpu.take_smc_trace_report()
-    }
-
-    /// Take the unit-simulator ladder's per-rung reports, disabling the sim in the process. Each
-    /// element is `(cfg_label, headline, histogram)` for one ladder rung (the measurement set
-    /// `{L0, L4, L6, P}`), where the histogram entries are `(member_count, entry_physical_page)`.
-    /// `None` when the sim was not enabled. Only present with feature `jit`; see
-    /// `CpuGsw::take_unit_sim_report`.
-    #[cfg(feature = "jit")]
-    #[allow(clippy::type_complexity)] // Signature fixed by the Track C task 3 reporting contract.
-    pub fn take_unit_sim_report(
-        &mut self,
-    ) -> Option<Vec<(&'static str, izarravm_cpu::SimReport, Vec<(usize, u32)>)>> {
-        self.cpu.take_unit_sim_report()
-    }
-
-    /// The per-port io-read histogram (behind `IZARRAVM_IO_HIST=1`), sorted by count descending.
-    /// `None` without the histogram. Must be read before `take_unit_sim_report` (it borrows the sim);
-    /// only present with feature `jit`. See `CpuGsw::unit_sim_io_hist`.
-    #[cfg(feature = "jit")]
-    pub fn unit_sim_io_hist(&self) -> Option<Vec<(u16, u64)>> {
-        self.cpu.unit_sim_io_hist()
     }
 
     /// The non-direct data-read page histogram (behind `IZARRAVM_SLOW_READ_HISTO=1`), sorted by
