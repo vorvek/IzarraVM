@@ -47,12 +47,12 @@ impl CpuGsw {
             DecodeGroup::FlagsMisc => self.execute_flags_misc_decoded(insn, bus),
             // The string-operation block (MOVS/CMPS/STOS/LODS/SCAS, byte and word/dword) runs through
             // its split executor, a thin call to the existing `run_string` helper with the pre-decoded
-            // `insn.prefixes` (REP/REPNE + segment override) passed through — the REP loop, ZF
+            // `insn.prefixes` (REP/REPNE + segment override) passed through: the REP loop, ZF
             // termination, DF direction, and per-iteration clocks all stay in `run_string` unchanged.
             DecodeGroup::StringOps => self.execute_string_decoded(insn, bus, work),
             // The port I/O block (IN AL/AX/EAX, OUT AL/AX/EAX, both imm8-port and DX-port forms)
             // runs through its split executor, which calls `bus.read_io`/`bus.write_io` on the same
-            // port-dispatch path as the fused arms — so `io_touched` is set exactly as before.
+            // port-dispatch path as the fused arms, so `io_touched` is set exactly as before.
             DecodeGroup::PortIo => self.execute_port_io_decoded(insn, bus),
             // The two-byte bit-manipulation block (BT/BTS/BTR/BTC, BSF/BSR, SHLD/SHRD, CMPXCHG,
             // XADD) runs through its split executor, consuming the pre-decoded ModRM/operand (and
@@ -73,7 +73,7 @@ impl CpuGsw {
             // The x87 FPU block (0xD8-0xDF) + WAIT/FWAIT (0x9B) runs through its split executor: a
             // thin wrapper that reproduces the fused pending-#MF gate, then resolves the pre-decoded
             // ModRM/operand (for the memory forms) and calls the existing `execute_fpu_register` /
-            // `execute_fpu_memory` verbatim — the entire x87 stack/control/status logic stays in
+            // `execute_fpu_memory` verbatim: the entire x87 stack/control/status logic stays in
             // those leaf helpers unchanged.
             DecodeGroup::Fpu => self.execute_fpu_decoded(insn, bus),
             // The heterogeneous one-off block (BCD adjust, AAM/AAD, SALC/XLAT, TEST imm, three-
@@ -97,9 +97,9 @@ impl CpuGsw {
                 // any prefix byte `read_prefixes` failed to consume. Raise the architectural #UD
                 // (vector 6); `deliver_exception` traces CS:IP/bytes/CR0/EFLAGS for it when #UD
                 // tracing is enabled, so the diagnostic detail the old `UnsupportedOpcode` error
-                // fields carried is not lost. `execute_two_byte` still STAYS — it is the leaf for
+                // fields carried is not lost. `execute_two_byte` still STAYS: it is the leaf for
                 // the no-operand 0F ops (`execute_misc_decoded`) and the TwoByteFallback #UD handler
-                // above — but the single-byte fused dispatch is gone.
+                // above, but the single-byte fused dispatch is gone.
                 Err(self.unsupported_single_byte_opcode())
             }
         }
@@ -198,8 +198,8 @@ impl CpuGsw {
 
     /// The data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms, plus the two-byte
     /// MOVZX/MOVSX) through the decode/execute split. Each arm mirrors the former fused handler
-    /// verbatim — same operand wiring, same segment-load path for 0x8e, same XCHG read/write order,
-    /// same clocks — but consumes the ModRM/operand/immediate `decode` already parsed (so the
+    /// verbatim: same operand wiring, same segment-load path for 0x8e, same XCHG read/write order,
+    /// same clocks, but consumes the ModRM/operand/immediate `decode` already parsed (so the
     /// executor never re-fetches an instruction byte). Memory operands resolve from the pre-decoded
     /// descriptor, so the effective address is recomputed against the live registers each call.
     pub(super) fn execute_datamove_decoded<B: CpuBus>(
@@ -635,7 +635,7 @@ impl CpuGsw {
                 // agrees: JEMM's DisableInts `pop [esp+4]` gadget only works if the EA is
                 // resolved from the POST-increment (E)SP. `resolve_decoded_modrm_operand`
                 // reads live GPRs, so it must run after `self.pop`, not before (the PUSH
-                // r/m32-with-ESP-base analog -- see the PUSH SP note in the same manual -- is
+                // r/m32-with-ESP-base analog, see the PUSH SP note in the same manual, is
                 // the mirror-image caution: that source read happens before the decrement, so
                 // PUSH keeps its EA-then-op order and only POP's is swapped here).
                 let esp_before = self.registers.esp();
@@ -731,7 +731,7 @@ impl CpuGsw {
     /// restarts whole; individual committed sub-pushes are just re-written on the restart). There
     /// is NO pre-validation of the eight-slot range: the interpreter discovers a fault by taking
     /// it, part-way, with sub-pushes already committed to memory. That is why the call-out cannot
-    /// simply run this and hope — see `call_out_stack_frame_resident`, which is the pre-check the
+    /// simply run this and hope. See `call_out_stack_frame_resident`, which is the pre-check the
     /// interpreter does not have and the call-out must.
     pub(crate) fn push_all_gpr<B: CpuBus>(
         &mut self,
@@ -946,7 +946,7 @@ impl CpuGsw {
 
     /// The relative-displacement + loop control-flow block (Jcc short/near, JMP short/near, CALL
     /// near, LOOP/LOOPE/LOOPNE/JCXZ) through the decode/execute split. Each arm mirrors its former
-    /// fused handler verbatim — same condition/count test, same push order for CALL, same clocks —
+    /// fused handler verbatim: same condition/count test, same push order for CALL, same clocks,
     /// but takes the relative displacement from `insn.imm` (decode already fetched + sign-extended +
     /// charged it) instead of re-reading it. eip is already at the instruction end here (decode
     /// advanced it), so `relative_jump(disp, operand_size)` reproduces the fused eip-relative target
@@ -962,7 +962,7 @@ impl CpuGsw {
         let rel = insn.imm as i32;
 
         // The two-byte Jcc near (0x0F80-0x0F8F) must be matched on the FULL u16 BEFORE any `as u8`
-        // narrowing — `insn.opcode as u8` would alias 0x0F8x onto the single-byte 0x8x opcodes. Both
+        // narrowing: `insn.opcode as u8` would alias 0x0F8x onto the single-byte 0x8x opcodes. Both
         // the single-byte Jcc short (0x70-0x7f) and the two-byte Jcc near share the same condition
         // mapping (the low nibble), so handle them together off `insn.opcode & 0x0f`. Same clocks (3)
         // as the fused Jcc handlers.
@@ -1027,7 +1027,7 @@ impl CpuGsw {
             }
             0xe8 => {
                 // CALL near, relative. Push the return address (eip, already at the instruction
-                // end) before branching — the same order the fused handler used.
+                // end) before branching: the same order the fused handler used.
                 self.push(bus, self.registers.eip, operand_size)?;
                 self.relative_jump(rel, operand_size);
                 Ok(self.charge(TimingClass::CallJmpRel))
@@ -1047,10 +1047,10 @@ impl CpuGsw {
     }
 
     /// The flags + misc register block (task A7) through the decode/execute split. Each arm mirrors
-    /// the former fused handler verbatim — same `alu` call for TEST (op=4, AND-for-flags, no
+    /// the former fused handler verbatim: same `alu` call for TEST (op=4, AND-for-flags, no
     /// write-back), same `inc_dec` for INC/DEC reg (CF preserved), same sign-extend logic for
     /// CBW/CWDE and CWD/CDQ, same flag-byte masking for SAHF/LAHF, same `set_flag` + `check_v86_iopl`
-    /// for the flag-bit ops, and same STI interrupt shadow — but consumes the ModRM/operand
+    /// for the flag-bit ops, and same STI interrupt shadow, but consumes the ModRM/operand
     /// `decode` pre-parsed for TEST (so the executor re-fetches nothing). The r/m operand for TEST
     /// is resolved from the pre-decoded descriptor against the live registers each call.
     pub(super) fn execute_flags_misc_decoded<B: CpuBus>(
@@ -1213,7 +1213,7 @@ impl CpuGsw {
 
     /// The string-operation block (MOVS/CMPS/STOS/LODS/SCAS) through the decode/execute split. This
     /// is intentionally a thin wrapper: every opcode here is implicit-operand, so `decode` pre-parsed
-    /// nothing, and the executor simply re-dispatches to the existing `run_string` helper VERBATIM —
+    /// nothing, and the executor simply re-dispatches to the existing `run_string` helper VERBATIM:
     /// the same `(StringOp, BusWidth)` pairing each fused arm used, with `insn.prefixes` passed
     /// straight through. All the load-bearing semantics live in the unchanged helper and are NOT
     /// reimplemented here:
@@ -1529,9 +1529,8 @@ impl CpuGsw {
 ///
 /// The interpreter serves all six ALU forms from one arm and one
 /// `Ok(clocks(2))`, so the class has to be recovered here from the form number
-/// and the decoded operand. Both references split them three ways
-/// (`dev_docs/2026-09-05-86box-pentium-timing-comparison.md` section 3 rows 1,
-/// 3 and 4): a register-only form is 1 clock, a memory SOURCE is the 2-clock
+/// and the decoded operand. Both references split them three ways:
+/// a register-only form is 1 clock, a memory SOURCE is the 2-clock
 /// load form, and a memory DESTINATION that writes back is the 3-clock
 /// read/modify/write. `CMP`/`TEST` against memory write nothing, so they are a
 /// load however the operand is addressed.
@@ -1602,7 +1601,7 @@ pub(crate) fn test_rm_class(insn: &DecodedInsn) -> TimingClass {
 ///
 /// This is design section 9.1's headline row. One `clocks(2)` used to cover
 /// `TEST`, `NOT`, `NEG`, `MUL`, `IMUL`, `DIV` and `IDIV` at every width, which
-/// gave `DIV EAX, ECX` the cost of `MOV EAX, EBX` -- 0.167 guest clocks against
+/// gave `DIV EAX, ECX` the cost of `MOV EAX, EBX`: 0.167 guest clocks against
 /// Intel's 41, a 246x under-charge and the largest single error in the old
 /// table.
 ///
@@ -1614,7 +1613,7 @@ pub(crate) fn test_rm_class(insn: &DecodedInsn) -> TimingClass {
 ///
 /// The JIT reaches the same classes from `DirectKind`, which `classify` already
 /// splits into `TestImmReg`/`TestImmMem`/`NegReg`/`MulReg`/`MulMemAcc`/
-/// `ImulRegAcc`/`ImulMemAcc`/`DivReg`/`DivMem` -- all admitted at Dword only --
+/// `ImulRegAcc`/`ImulMemAcc`/`DivReg`/`DivMem` (all admitted at Dword only)
 /// so the two arms agree instruction for instruction.
 pub(crate) fn group3_class(sub_opcode: u8, width: BusWidth, operand: RmOperand) -> TimingClass {
     let memory = matches!(operand, RmOperand::Memory(_));
@@ -1648,7 +1647,7 @@ impl CpuGsw {
     /// Slice 8, and the reason the wrapper exists at all: the exception arm in
     /// `finish_instruction` REPLACES the faulting instruction's charge with the
     /// delivery cost, so a reflected V86 `IN` used to cost 4.92 guest clocks
-    /// where a real one costs the trap gate PLUS the `IN` -- census row 7. The
+    /// where a real one costs the trap gate PLUS the `IN`. Census row 7. The
     /// class is stashed only on the path that is about to return `Err`, so the
     /// success path pays nothing and no stale value can survive: the Err arm
     /// `take`s it, and nothing else writes it.

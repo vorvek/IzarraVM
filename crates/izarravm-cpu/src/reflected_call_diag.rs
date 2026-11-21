@@ -1,10 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 0b/0c of the reflected-call HLE design
-//! (`dev_docs/2026-09-03-reflected-call-hle-design.md`, `dev_docs/2026-09-03-
-//! reflected-call-hle-review.md`, `dev_docs/2026-09-04-reflected-call-slice0b-
-//! plan.md`, `dev_docs/2026-09-04-reflected-call-slice0b-review.md`): the
+//! Slice 0b/0c of the reflected-call HLE design: the
 //! CORRECTED trip-shape INSTRUMENT. Compiled in only under
 //! `--features reflected-call-diagnostic`; a plain build carries none of this
 //! code and is byte-identical to `main`. Armed by
@@ -20,9 +17,9 @@
 //! # 0c's corrections over 0b (the slice0b review's D1-D7)
 //!
 //! * **D1**: a far RETURN (never a far transfer) that lands on the entry's
-//!   own CS:EIP:SS with SP at exactly the entry width minus 2 -- the shape of
+//!   own CS:EIP:SS with SP at exactly the entry width minus 2: the shape of
 //!   a handler that returns by `RETF` and leaves the `INT`-pushed FLAGS word
-//!   on the caller's stack -- closes as a NEW `return_match_retf_flags`
+//!   on the caller's stack, closes as a NEW `return_match_retf_flags`
 //!   bucket, reported separately from `return_match`. Rule 2/3 stay
 //!   classification-only.
 //! * **D2**: `peek_direct_ram` declines (returns `None`) on a misaligned
@@ -32,14 +29,14 @@
 //! * **D3**: `TSS.ESP0` is read at the RIGHT offset for the TR descriptor's
 //!   actual type (16-bit TSS: `SP0` at `tr.base+2`; 32-bit TSS: `ESP0` at
 //!   `tr.base+4`), and the ESP0-anchored dead-stack window is applied ONLY to
-//!   the tracked segment whose selector equals the TSS's own `SS0` -- every
+//!   the tracked segment whose selector equals the TSS's own `SS0`: every
 //!   other non-client segment keeps using its own observed high-water mark,
 //!   as it always should have.
 //! * **D4**: the stack-segment cap is raised (`MAX_STACK_SEGMENTS`, plan §8)
 //!   to cover a reflected trip's observed seven concurrent segments, and
 //!   `classify` no longer resolves an address-range match against every
 //!   tracked segment (ambiguous when two segments share a base or one is
-//!   nested inside another's 64 KiB span) -- it classifies by the `SS`
+//!   nested inside another's 64 KiB span), it classifies by the `SS`
 //!   selector actually in force at the access.
 //! * **D5**: `on_batch_boundary` now takes a `real_boundary: bool` (plan:
 //!   "the machine loop needs a one-line cfg-gated tag on the break reason"):
@@ -51,8 +48,8 @@
 //! * **D6**: the answer-cost report now prices TWO different things
 //!   separately: `probe_ns_per_read` (the diagnostic's own page-walking probe
 //!   cost, `probe_physical` + `peek_direct_ram`) and NEW `compare_ns_per_read`
-//!   (a pre-resolved physical dword compare -- one `peek_direct_ram` per
-//!   dword, no page walk -- which is what an HLE answer path would actually
+//!   (a pre-resolved physical dword compare: one `peek_direct_ram` per
+//!   dword, no page walk, which is what an HLE answer path would actually
 //!   pay, since CR3 never varies on the dominant keys).
 //! * **D7**: dead parameters/fields removed (`note_near_miss`'s unused
 //!   `boundary` argument, `WriteRecord::sp_at_first_write`, `Walk`'s
@@ -60,7 +57,7 @@
 //!   described as a device-window proxy in its own doc comment (see below):
 //!   after D2, most of what used to be misclassified `NotPlainRam` was
 //!   ordinary misaligned RAM, so the class now means exactly what its peek
-//!   says -- "a byte-wise `peek_direct_ram` failed here" -- and nothing about
+//!   says ("a byte-wise `peek_direct_ram` failed here") and nothing about
 //!   *why*.
 //!
 //! # 0b's corrections over slice 0 (see the plan doc, section headers below)
@@ -78,7 +75,7 @@
 //! * **§2.3**: rules 2 (frame-gone) and 3 (re-entry) close a trip but never
 //!   count as a match; only rule 1 (`return_match`) does.
 //! * **§2.4**: two near-miss histograms, `near_match[]` (CS/EIP already
-//!   agree) and `near_match_cs_eip[]` (they do not -- without this bucket a
+//!   agree) and `near_match_cs_eip[]` (they do not: without this bucket a
 //!   C3-shaped failure was invisible, since the old code never inspected a
 //!   far transfer for a match at all).
 //! * **§3**: write disposition is now R (restored) / D (dead stack, derived
@@ -148,7 +145,7 @@ const WARM_CLOCK_SAMPLES: usize = 32;
 /// §3.2/§8).
 const REFLECTED_CALL_MAX_TRANSLATIONS: usize = 64;
 
-/// Merge-review nit 6: per-trip `reads`/`writes` had no cap of their own --
+/// Merge-review nit 6: per-trip `reads`/`writes` had no cap of their own:
 /// `MAX_TRIP_INSNS` bounds INSTRUCTIONS, not memory accesses, so a single
 /// budgeted `REP` string op inside a trip could add a very large read or
 /// write set. Give both the same `_over_cap` treatment `translations` already
@@ -160,7 +157,7 @@ const REFLECTED_CALL_MAX_TRIP_WRITES: usize = 8_192;
 
 /// Merge-review nit 6: per-key `entry_images`/`write_addresses`/
 /// `class_n_addresses` grew for the life of the process with no cap of their
-/// own -- `MAX_SAMPLES_PER_KEY`/`TOP_IMAGES`/`CLASS_N_ADDRESSES` bound only
+/// own: `MAX_SAMPLES_PER_KEY`/`TOP_IMAGES`/`CLASS_N_ADDRESSES` bound only
 /// what is SAMPLED or REPORTED, not the underlying accumulator. Capped with
 /// generous headroom over `TOP_IMAGES`/`TOP_ADDRESSES`/`CLASS_N_ADDRESSES`
 /// (16-32) so the cap is never reached by a workload with a genuinely small
@@ -171,7 +168,7 @@ const REFLECTED_CALL_MAX_ENTRY_IMAGES: usize = 4_096;
 const REFLECTED_CALL_MAX_WRITE_ADDRESSES: usize = 4_096;
 const REFLECTED_CALL_MAX_CLASS_N_ADDRESSES_TRACKED: usize = 4_096;
 
-// The fixed legacy VGA aperture (`memory.rs`, `jit/direct.rs`), physical --
+// The fixed legacy VGA aperture (`memory.rs`, `jit/direct.rs`), physical:
 // `FRAMEBUFFER_APERTURE_LO`/`_HI`, moved to `crate::reflected_call` (slice1).
 // Plan §3.1: no linear-framebuffer base is resolvable from this crate alone
 // (UNVERIFIED base for any LFB aperture vega may expose), so only the
@@ -182,7 +179,7 @@ const REFLECTED_CALL_MAX_CLASS_N_ADDRESSES_TRACKED: usize = 4_096;
 /// (`IZARRAVM_REFLECTED_CALL_DIAG_WINDOW=<start_insns>:<end_insns>`, orchestrator
 /// decision, plan §14 Q1). Unset means "whole run only". Verified against a
 /// short run: `cpu.perf.instructions` and the `--cycles` budget do NOT share a
-/// unit (clocks vs. retired instructions) -- this is exactly why the window is
+/// unit (clocks vs. retired instructions): this is exactly why the window is
 /// keyed on retired instructions rather than clocks: it is the one counter
 /// this module already samples every trip against (`Trip::start_instructions`
 /// / `cpu.perf.instructions`), with no ambiguity about what "instructions"
@@ -305,7 +302,7 @@ struct FieldVariance {
 /// N6: this array has 22 entries (one per `EntryImage` field group); an
 /// earlier revision of this module's doc comment said "sixteen", which was
 /// simply wrong (uncorrected transcription from an earlier draft with fewer
-/// fields) -- fixed here rather than left to drift further.
+/// fields), fixed here rather than left to drift further.
 const FIELD_NAMES: [&str; 22] = [
     "eax",
     "ebx",
@@ -380,7 +377,7 @@ impl FieldVariance {
 // Address classification (journal mode)
 // ---------------------------------------------------------------------------
 
-/// N6/A.4: length 11 (was 9 in slice 0 -- two new device-window classes).
+/// N6/A.4: length 11 (was 9 in slice 0: two new device-window classes).
 /// Every `[u64; 11]` and every JSON zip over `ALL_CLASSES` below must stay in
 /// step with this list or classes silently drop off the report.
 const ALL_CLASSES: [AddressClass; 11] = [
@@ -462,7 +459,7 @@ fn classify(
     // segment. A range scan is ambiguous the moment two tracked segments
     // share a base (a ring-0 flat SS aliasing the TSS's own base) or one's
     // 64 KiB span nests inside another's (a V86 real-mode stack sitting
-    // inside a flat protected-mode segment) -- the review traced exactly
+    // inside a flat protected-mode segment), the review traced exactly
     // that overlap misclassifying V86-stack writes under the wrong window.
     for seg in trip.stacks.iter().flatten() {
         if seg.selector != ss_selector {
@@ -488,14 +485,14 @@ fn classify(
 // never consulting the cached TLB) was ported to that copy.
 
 /// D2 (slice0b review §3): `CpuBus::peek_direct_ram(phys, width)` declines
-/// (returns `None`) on a misaligned word/dword access -- `direct_page_ram_bytes`'s
-/// `should_split` term, `bus.rs:4159`/`:4586` -- even when every byte in the
+/// (returns `None`) on a misaligned word/dword access: `direct_page_ram_bytes`'s
+/// `should_split` term, `bus.rs:4159`/`:4586`, even when every byte in the
 /// range is ordinary RAM. 0b's classifier called every one of those `None`s
 /// `NotPlainRam`; the slice0b review traced every top `not_plain_ram` address
 /// in every leg to an ODD address of the DPMI host's own real-mode register
 /// block, which is plain RAM the width-native peek merely declined to read.
 /// Try the width-native peek first (the common, aligned case costs nothing
-/// extra); on a decline, fall back to a byte-wise peek and reassemble --
+/// extra); on a decline, fall back to a byte-wise peek and reassemble,
 /// `None` only when even THAT fails (a genuine device window or unmapped
 /// page).
 fn peek_ram_width_safe<B: CpuBus>(bus: &B, phys: u32, width: BusWidth) -> Option<u32> {
@@ -539,7 +536,7 @@ struct ReadRecord {
 enum CloseRule {
     ReturnMatch,
     /// NEW (0c, D1): a far RETURN (never a far transfer) lands exactly on the
-    /// entry's CS:EIP:SS with SP at the entry width minus 2 -- the shape of a
+    /// entry's CS:EIP:SS with SP at the entry width minus 2: the shape of a
     /// handler that returns by `RETF`, popping only CS:IP and leaving the
     /// `INT`-pushed FLAGS word on the caller's own stack (slice0b review §1:
     /// RTM's protected-mode `INT 21h` hook does exactly this; the client's
@@ -565,7 +562,7 @@ impl CloseRule {
     }
 
     /// Whether this rule counts as a genuine matching return (plan §2.3: only
-    /// rule 1 counts as a match -- 0c extends "rule 1" to include the
+    /// rule 1 counts as a match; 0c extends "rule 1" to include the
     /// RETF-with-flags arm, which is architecturally the SAME return, just
     /// caught one `RETF` earlier).
     fn is_match(self) -> bool {
@@ -618,7 +615,7 @@ struct Trip {
     tss_esp0_at_entry: Option<u32>,
     /// The TR descriptor's own SS0 field (D3, slice0b review): the ESP0
     /// window in `is_dead_stack_derived` may only be applied to the tracked
-    /// stack SEGMENT this selector names -- not, as 0b did, to every
+    /// stack SEGMENT this selector names, not, as 0b did, to every
     /// non-client segment indiscriminately.
     tss_ss0_selector_at_entry: Option<u16>,
     start_instructions: u64,
@@ -682,15 +679,15 @@ impl Trip {
             .and_then(|(phys, _)| bus.peek_direct_ram(phys, BusWidth::Byte))
             .map(|access| (access & 0x1f) == 0x05);
         // TSS.ESP0: no `CpuGsw` accessor exists for it (verified by source
-        // search -- there is no `esp0`/`ESP0` field or method anywhere in
-        // this crate), so peek it directly -- at the offset for the TR
+        // search: there is no `esp0`/`ESP0` field or method anywhere in
+        // this crate), so peek it directly, at the offset for the TR
         // descriptor's ACTUAL type (D3, slice0b review): a 32-bit TSS has
         // ESP0 at offset 4 and SS0 at offset 8 (386 PRM figure 7-2); a
         // 16-bit (286-style) TSS has SP0 at offset 2 and SS0 at offset 4.
         // Bit 3 of the TR descriptor's type nibble distinguishes them (32-bit
         // avail/busy TSS = type 0x9/0xB, 16-bit avail/busy TSS = 0x1/0x3).
         // 0b always read offset 4 as a dword, which on a 16-bit TSS reads
-        // SS0 (a word) as if it were ESP0 -- exactly the traced `Some(0x18)`
+        // SS0 (a word) as if it were ESP0, exactly the traced `Some(0x18)`
         // on every trip, `0x18` being the ring-0 SS selector, not a stack
         // pointer.
         let tss_is_32bit = cpu.tr.access & 0x08 != 0;
@@ -812,7 +809,7 @@ impl Trip {
         }
     }
 
-    /// The entry SP itself, at the entry width -- reads the stored
+    /// The entry SP itself, at the entry width: reads the stored
     /// `entry_sp16` directly on a 16-bit stack rather than re-truncating
     /// `entry_esp` a second time.
     fn entry_sp_at_width(&self) -> u32 {
@@ -840,13 +837,13 @@ impl Trip {
         if cs_matches && eip_matches && ss_matches && sp_here == entry_sp {
             return Some(CloseRule::ReturnMatch);
         }
-        // D1 (slice0b review §1): a far RETURN -- never a far transfer, which
-        // has no FLAGS word of its own to leave behind -- that lands on the
+        // D1 (slice0b review §1): a far RETURN (never a far transfer, which
+        // has no FLAGS word of its own to leave behind) that lands on the
         // entry's own CS:EIP:SS with SP sitting exactly at entry-width minus
         // 2 has already popped the return CS:IP the `INT` pushed and left
         // only the FLAGS word un-popped. Architecturally this IS the trip's
         // matching return; a caller-side epilogue may pop the FLAGS word many
-        // instructions later (that pop is not this trip's concern -- the
+        // instructions later (that pop is not this trip's concern: the
         // trip already closed here).
         if boundary == BoundaryKind::FarReturn
             && cs_matches
@@ -857,7 +854,7 @@ impl Trip {
             return Some(CloseRule::ReturnMatchRetfFlags);
         }
         // Rule 2, frame-gone: CS/SS match the entry but SP has moved PAST it
-        // (at the entry width) -- the client's own frame is already gone,
+        // (at the entry width), the client's own frame is already gone,
         // so this cannot be its matching return, but the trip is over.
         if cs_matches && ss_matches && sp_here > entry_sp {
             return Some(CloseRule::FrameGone);
@@ -879,7 +876,7 @@ impl Trip {
     /// arriving while this trip is still open: the new `INT`'s own
     /// (vector, CS.selector, EIP) exactly reproduce this trip's own entry
     /// signature (the same call site firing again) AND SP is back at the
-    /// entry value (at the entry width) -- a re-entry, not a nested call.
+    /// entry value (at the entry width), a re-entry, not a nested call.
     fn is_re_entry<B: CpuBus>(&self, cpu: &CpuGsw, _bus: &B, vector: u8) -> bool {
         if vector != self.vector {
             return false;
@@ -896,7 +893,7 @@ impl Trip {
     /// histograms this boundary feeds. D7 (slice0b review): both kinds share
     /// one set of per-trip counters; the split by `boundary_kind` happens in
     /// the reported table via `record_near_miss_by_boundary`, whose CALLER
-    /// already knows which kind of boundary this is -- so this function no
+    /// already knows which kind of boundary this is, so this function no
     /// longer takes a `boundary` parameter of its own to ignore.
     fn note_near_miss(&mut self, cpu: &CpuGsw, cs_eip_matched: bool) {
         let regs = &cpu.registers;
@@ -1110,9 +1107,9 @@ struct State {
     /// cost (`probe_physical` + `peek_direct_ram`), not an answer-path cost
     /// (D6, slice0b review §4).
     probe_ns_per_read: Option<f64>,
-    /// NEW (0c, D6): the pre-resolved physical COMPARE cost -- one
+    /// NEW (0c, D6): the pre-resolved physical COMPARE cost: one
     /// `peek_direct_ram(phys, Dword)` per distinct physical dword, no page
-    /// walk at all -- filled in alongside `probe_ns_per_read` from the same
+    /// walk at all, filled in alongside `probe_ns_per_read` from the same
     /// trip's read set. This is what an HLE answer path would actually pay:
     /// the design's dominant keys never vary CR3, so physical addresses can
     /// be pre-resolved once at learn time and the answer path never walks
@@ -1256,7 +1253,7 @@ fn on_far_transfer_boundary_on<B: CpuBus>(state: &mut State, cpu: &mut CpuGsw, b
     }
 }
 
-/// Fold a just-recorded per-trip near-miss into the OPEN trip's key -- but
+/// Fold a just-recorded per-trip near-miss into the OPEN trip's key, but
 /// the key is not known until the trip closes (it is keyed by
 /// `(vector, ah)`, fixed at `Trip::start`). Rather than delay attribution,
 /// this reads the still-open trip's `(vector, ah)` and near-miss deltas
@@ -1367,13 +1364,13 @@ pub(crate) fn on_x87() {
 /// `real_boundary` is D5 (slice0b review §2): 0b counted EVERY batch entry
 /// while a trip was open, including the ones caused by the trip's OWN nested
 /// `IRET`s re-enabling IF (`run.rs`'s `can_take_before` check at the top of
-/// its inner run loop) -- a reflected trip is BY CONSTRUCTION a chain of gate
+/// its inner run loop), a reflected trip is BY CONSTRUCTION a chain of gate
 /// entries and `IRET`s, so that counter was 100% tautological (a trip cannot
 /// help but contain the very edges it is being blamed for straddling). The
 /// caller now tags whether the PREVIOUS batch ended for a reason independent
 /// of this trip's own instructions (the cap, a cached device deadline, a
-/// fault, HLT, an HLE INT post) -- `true` -- or purely on that IF-enable edge
-/// -- `false`. Only `true` calls advance `batch_boundaries_seen`, so
+/// fault, HLT, an HLE INT post): `true`, or purely on that IF-enable edge:
+/// `false`. Only `true` calls advance `batch_boundaries_seen`, so
 /// `batch_straddle_trips` now means "this trip's execution spanned more than
 /// one REAL batch", not "this trip contains an `IRET`".
 pub fn on_batch_boundary(real_boundary: bool) {
@@ -1394,7 +1391,7 @@ fn on_batch_boundary_on(state: &mut State, real_boundary: bool) {
 }
 
 /// Called once per retired instruction where the native backend charges
-/// `elapsed_clocks` (plan §5, R10 item 2 -- the clock/instruction anchor
+/// `elapsed_clocks` (plan §5, R10 item 2: the clock/instruction anchor
 /// defect). Present so the result document can cross-check shape-mode clocks
 /// against journal mode's interpreted clocks on the same key; if the anchor
 /// cannot be reconciled, the plan orders clocks reported as UNUSABLE rather
@@ -1479,7 +1476,7 @@ fn record_translation(open: &mut Trip, cr3: u32, linear: u32, walk: Option<Walk>
         .insert(key, (walk.pde_phys, walk.pte_phys));
 }
 
-// N7: `#[allow(clippy::too_many_arguments)]` justified -- each production
+// N7: `#[allow(clippy::too_many_arguments)]` justified: each production
 // write seam hands this the same six architectural facts (cpu, bus, address,
 // width, value, and the two page-walk-entry escape hatches `already_physical`
 // / `forced_class` that only `write_page_walk_entry` needs); splitting into a
@@ -1706,14 +1703,14 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
 
     // Any near-miss diagnostics this trip accumulated were already folded
     // into `stats.near_miss` per boundary kind by `record_near_miss_by_boundary`,
-    // immediately after each `note_near_miss` call -- nothing left to do here.
+    // immediately after each `note_near_miss` call: nothing left to do here.
 
     if probe_bench_armed() && guard.probe_ns_per_read.is_none() && !trip.read_phys_dwords.is_empty()
     {
         let ns = run_probe_bench(cpu, bus, &trip.read_phys_dwords);
         guard.probe_ns_per_read = Some(ns);
         // D6: the SAME read set, priced as a pre-resolved physical compare
-        // instead of a page-walking probe -- the answer-cost estimate, kept
+        // instead of a page-walking probe: the answer-cost estimate, kept
         // separate from the probe cost above.
         let compare_ns = run_compare_bench(bus, &trip.read_phys_dwords);
         guard.compare_ns_per_read = Some(compare_ns);
@@ -1784,7 +1781,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
             WriteDisposition::Refused => {
                 stats.write_class_n += 1;
                 trip_has_class_n = true;
-                // Physical, when the walker resolved one -- the whole point
+                // Physical, when the walker resolved one: the whole point
                 // of naming the refusing set (plan §3) is for the reviewer
                 // to look the address up against the guest's real memory
                 // map, which is physical.
@@ -1814,7 +1811,7 @@ fn finish_trip<B: CpuBus>(cpu: &mut CpuGsw, bus: &B, guard: &mut State, rule: Cl
 /// Shape mode only tags trips with an empty read/write journal (the hooks
 /// early-return before the lock there); this just guards the warm-clock ring
 /// against journal-mode noise (journal forces the interpreter, whose clocks
-/// the design says mean nothing for this question -- plan §5, Q5).
+/// the design says mean nothing for this question, plan §5, Q5).
 fn mode_is_shape_relevant(_trip: &Trip) -> bool {
     !journal_mode()
 }
@@ -1830,7 +1827,7 @@ enum WriteDisposition {
 /// R even when byte-identical (an intermediate value there is observable
 /// on-screen or by a device with no arming step). D (dead stack) is derived
 /// SOLELY from the trip's own observed low-water mark on the segment the
-/// write fell in -- the literal 8 KB constant plays no part in this
+/// write fell in: the literal 8 KB constant plays no part in this
 /// decision (`is_dead_stack_8kb` reports it separately, as a cross-check
 /// only). Everything else is N.
 fn classify_disposition(
@@ -1849,7 +1846,7 @@ fn classify_disposition(
 }
 
 /// Class D (plan §3): `addr` falls within `[low_water_SP(seg), SP_at_close(seg))`
-/// for whichever tracked stack segment it belongs to -- the constant 8 KB cap
+/// for whichever tracked stack segment it belongs to: the constant 8 KB cap
 /// plays no part here. Also covers the ring-0 monitor-stack window
 /// `[observed_low_water, TSS.ESP0)` when the write fell on a segment this
 /// trip tracked separately from the client's own SS AND `tss_esp0_at_entry`
@@ -1858,7 +1855,7 @@ fn classify_disposition(
 /// `touch_stack` already does, so a ring-0 handler that switches to its own
 /// TSS-named stack is covered by the SAME per-segment low-water logic, with
 /// `TSS.ESP0` substituted for that segment's own `last_esp` as the window's
-/// upper bound when available -- see the result document for how often this
+/// upper bound when available. See the result document for how often this
 /// branch actually fires).
 fn is_dead_stack_derived(trip: &Trip, addr: u32) -> bool {
     for seg in trip.stacks.iter().flatten() {
@@ -1866,7 +1863,7 @@ fn is_dead_stack_derived(trip: &Trip, addr: u32) -> bool {
             continue;
         }
         // D3 (slice0b review §3): the ESP0-anchored window only applies to
-        // the ONE tracked segment whose selector is the TSS's own SS0 -- not,
+        // the ONE tracked segment whose selector is the TSS's own SS0, not,
         // as 0b did, to every non-client segment. Every other non-client
         // stack (a V86 real-mode excursion, a DOS-kernel stack, TOKAEMM's
         // flat monitor stack) keeps using its OWN observed high-water mark,
@@ -1946,7 +1943,7 @@ fn run_probe_bench<B: CpuBus>(
 /// D6 (slice0b review §4): the ANSWER-cost estimate, as opposed to
 /// `run_probe_bench`'s diagnostic-probe cost. `addrs_set` already holds
 /// PHYSICAL dwords (`Trip::read_phys_dwords`), pre-resolved once when the
-/// read happened -- exactly what an HLE answer path would have cached at
+/// read happened, exactly what an HLE answer path would have cached at
 /// learn time, since the design's dominant keys never vary CR3. Prices ONE
 /// `peek_direct_ram(phys, Dword)` per iteration, no page walk at all.
 fn run_compare_bench<B: CpuBus>(bus: &B, addrs_set: &std::collections::HashSet<u32>) -> f64 {
@@ -2072,7 +2069,7 @@ pub struct ReflectedCallDiagnosticSnapshot {
     /// D6: the pre-resolved physical compare cost, separate from the probe cost above.
     pub compare_ns_per_read: Option<f64>,
     /// `IZARRAVM_REFLECTED_CALL_DIAG_WINDOW`'s bounds (retired guest
-    /// instructions), when configured -- `None` means every key's
+    /// instructions), when configured: `None` means every key's
     /// `_windowed` field is empty (not armed), not a silent duplicate of the
     /// whole-run numbers (plan §14 Q1).
     pub window_start_insns: Option<u64>,

@@ -1,11 +1,11 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The one-lookup load-path battery (`dev_docs/2026-08-07-one-lookup-load-design.md` §5),
+//! The one-lookup load-path battery (load design §5),
 //! split from `cpu_jit_direct_test.rs` for the source-line ceiling; it borrows that battery's
 //! read-driving helpers. The derivation unit tests (L1-L3) live with the map in
 //! `fast_map_test.rs`. What lives HERE is the emitted differential set: the fast path consults
-//! nothing but the one table (L4, via the PAGE_USER injector — reads have no watch dimension,
+//! nothing but the one table (L4, via the PAGE_USER injector: reads have no watch dimension,
 //! so the flags byte's permission bit is the one thing the classic arm reads that the fast arm
 //! must not), the cpl0 supervisor tag strips before the pointer forms (L7, the store slice's
 //! round-one miscompile class), the trio's deferred mode13 lane survives the probe swap on both
@@ -83,13 +83,13 @@ fn enter_cpl3(cpu: &mut CpuGsw) {
 }
 
 /// L4, the anchor differential: with the one-lookup emission ON, a ring-3 load through an entry
-/// whose LOAD BIAS is untagged completes natively even when the flags byte says supervisor —
+/// whose LOAD BIAS is untagged completes natively even when the flags byte says supervisor:
 /// a state only `force_fast_load_bias_for_test` can construct, because the derivation reads the
 /// same byte. The classic arm's permission check reads the flags byte against the identical
 /// state and refuses. Together the two arms prove the fast load path reads nothing but the one
 /// table. Fixture ordering (a simplification of the design's F6 prescription): the supervisor
 /// state is built by an explicit `populate_read` refill rather than a real permission flip, and
-/// the injection happens BEFORE the cpl3 compile — equivalent because the compile never touches
+/// the injection happens BEFORE the cpl3 compile: equivalent because the compile never touches
 /// the data page's entry. The binding constraint is unchanged: no repopulate may intervene
 /// between the injection and the run (it would re-derive and poison the differential toward
 /// false failure), and the differential targets the exit REASON since the real PTE stays user.
@@ -157,7 +157,7 @@ fn a_fast_load_bias_overrides_the_flags_byte_and_the_classic_arm_still_checks() 
 }
 
 /// L7: a ring-0 load through a supervisor-tagged entry (bit 1) must strip the tag and read the
-/// RIGHT address, natively — the load twin of the store battery's round-one miscompile pin. A
+/// RIGHT address, natively, the load twin of the store battery's round-one miscompile pin. A
 /// leaked tag reads [0x302] (0x0000_1122 through the moffs dword) instead of [0x300]; the
 /// zero-side-exit assert is what makes the cell non-vacuous.
 #[test]
@@ -222,7 +222,7 @@ fn the_one_lookup_arm_shrinks_the_read_block_and_reads_identically() {
 }
 
 /// The program behind the two trio cells below: `mov eax, imm32; ret` (no other memory read in
-/// the block, so the static dword snapshot at a RET side exit is ZERO — an eagerly-incremented
+/// the block, so the static dword snapshot at a RET side exit is ZERO, an eagerly-incremented
 /// mode13 lane then trips run.rs's `mode13 <= static` debug_assert instead of hiding inside
 /// another slot's allowance) with the stack parked IN the mode13 aperture.
 fn mode13_ret_program(target: u32) -> Vec<u8> {
@@ -243,7 +243,7 @@ fn arm_mode13_ret(cpu: &mut CpuGsw) {
     cpu.registers.eflags = 0x202;
     cpu.pending_flags = PendingFlags::default();
     // A 32-bit stack: with SS.B = 0 the pop addresses SS:SP (the low 16 bits alone), which
-    // lands in the CODE bytes at 0x100 and rides a garbage target into vector 0 — and the
+    // lands in the CODE bytes at 0x100 and rides a garbage target into vector 0, and the
     // stack-width admission matrix would refuse the 32-bit RET on a 16-bit stack anyway.
     let mut ss = cpu.registers.segment(SegmentIndex::Ss);
     ss.default_size_32 = true;
@@ -251,7 +251,7 @@ fn arm_mode13_ret(cpu: &mut CpuGsw) {
 }
 
 /// L5, the completing path: a RET whose stack dword lives in the mode13 aperture completes
-/// natively with the mode13 read lane moving exactly once — asserted through the bus-clock
+/// natively with the mode13 read lane moving exactly once, asserted through the bus-clock
 /// identity against the interpreter, because the lane IS the video-wait-state charge in run.rs
 /// and a phantom or missing increment shows up as a clock skew, not a value error.
 #[test]
@@ -301,7 +301,7 @@ fn a_ret_through_the_aperture_charges_the_mode13_lane_exactly_once() {
     );
 }
 
-/// L5, the limit-exit path — the deferred-increment ordering the trio was built around: a RET
+/// L5, the limit-exit path: the deferred-increment ordering the trio was built around: a RET
 /// whose stack read lands in the aperture but whose target FAILS the CS limit must NOT move
 /// the mode13 lane. The block's static dword snapshot at that side exit is zero (see
 /// `mode13_ret_program`), so an eager increment in the parking probe panics run.rs's
@@ -351,14 +351,14 @@ fn a_ret_limit_exit_from_the_aperture_moves_no_mode13_lane() {
 
 /// The F1 park-domination cell: block A ends in a JmpMem through the APERTURE (its parking
 /// probe parks MODE13 and its completion charges A's own lane), and chains into block B, which
-/// ends in a RET through a SUPERVISOR RAM stack page at ring 0 — the strip-and-rejoin arm. If
+/// ends in a RET through a SUPERVISOR RAM stack page at ring 0: the strip-and-rejoin arm. If
 /// B's RAM park does not dominate the strip arm, B's completion reads A's stale MODE13 and
-/// charges a phantom video read — caught here as a bus clock skew against the interpreter
+/// charges a phantom video read, caught here as a bus clock skew against the interpreter
 /// (the park-hoist mutation reads 4 clocks high).
 ///
 /// The cell does NOT assert that A->B chained: the stale value reaches B's frame either way,
 /// because consecutive native entries from one `drive` loop rebuild the frame at the SAME host
-/// RSP depth and the prologue zeroes only the seven counter lanes, never `STACK_READ_KIND` —
+/// RSP depth and the prologue zeroes only the seven counter lanes, never `STACK_READ_KIND`,
 /// so the differential survives a lost link. If a future change starts zeroing the slot per
 /// entry, this cell weakens to chained-only coverage and should gain a chain assert.
 #[test]
@@ -383,7 +383,7 @@ fn a_chained_aperture_park_does_not_leak_into_a_supervisor_ret() {
         cpu.registers.set_esp(0x3000);
         cpu.registers.eflags = 0x202;
         cpu.pending_flags = PendingFlags::default();
-        // 32-bit stack for the 32-bit RET — see `arm_mode13_ret`.
+        // 32-bit stack for the 32-bit RET: see `arm_mode13_ret`.
         let mut ss = cpu.registers.segment(SegmentIndex::Ss);
         ss.default_size_32 = true;
         cpu.registers.set_segment(SegmentIndex::Ss, ss);
@@ -412,7 +412,7 @@ fn a_chained_aperture_park_does_not_leak_into_a_supervisor_ret() {
         "both chain blocks must compile"
     );
     // The supervisor stack entry: ring 0 may read it, so B's RET takes the cpl0
-    // strip-and-rejoin arm — the arm review F1 named as the park's blind spot.
+    // strip-and-rejoin arm, the arm review F1 named as the park's blind spot.
     let page = native_bus
         .direct_page(0x3000, BusAccessKind::DataRead)
         .unwrap()
@@ -458,7 +458,7 @@ fn a_chained_aperture_park_does_not_leak_into_a_supervisor_ret() {
 
 /// The x87 read-resolve stub's unavailable status: an FLD m64 through a DEAD entry (INVLPG'd
 /// between runs) must side-exit unavailable through the stub, land the value via the
-/// interpreter re-run, and heal — and the same program with the entry left alive completes
+/// interpreter re-run, and heal, and the same program with the entry left alive completes
 /// natively, which is what proves the exit above came from the stub's status.
 #[test]
 fn an_x87_load_from_a_dead_entry_resolves_through_the_read_stub() {
@@ -517,8 +517,8 @@ fn an_x87_load_from_a_dead_entry_resolves_through_the_read_stub() {
     }
 }
 
-/// Round-2 review finding 1a: the counting stub's WORD variant was the one untested lane
-/// branch — the classic emission shared one `emit_mode13_read_completion`, so the trio's word
+/// The counting stub's WORD variant was the one untested lane
+/// branch: the classic emission shared one `emit_mode13_read_completion`, so the trio's word
 /// cells covered the word lane for every site, but the counting stubs re-implement the
 /// width -> lane choice per stub and a wrong-lane mutation (word charged as dword) underflows
 /// run.rs's dword subtraction. A word load from the aperture at a lean site drives exactly that
@@ -586,7 +586,7 @@ fn a_word_aperture_load_charges_the_word_lane_through_the_counting_stub() {
     );
 }
 
-/// Round-2 review finding 1c: the trio's PARK-ONLY stub was never entered by any cell. A RET
+/// The trio's PARK-ONLY stub was never entered by any cell. A RET
 /// through a DEAD stack entry (INVLPG between runs) drives it: probe -> poison -> park stub ->
 /// classify reads a cleared flags byte -> status 1 -> unavailable exit -> the interpreter
 /// re-runs the RET and heals the entry. The healed re-run then completes natively, which is

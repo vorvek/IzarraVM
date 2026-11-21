@@ -298,7 +298,7 @@ impl CpuGsw {
     ) -> Option<u32> {
         let budget = self.rep_execution.budget?;
         // Recomputes the whole plan from scratch on every call (once per fast chunk, once
-        // per slow REP iteration) in debug builds only -- the same idiom run.rs:3040 uses
+        // per slow REP iteration) in debug builds only: the same idiom run.rs:3040 uses
         // for global_block_upper's memo, so this is house style, not an oversight. Kept
         // rather than demoted to a separate test-only check because the hazard it catches
         // (a bus cost dial or the paging mode moving mid-REP) can only be exercised through
@@ -317,7 +317,7 @@ impl CpuGsw {
                 // budget is Some here (the `?` above would have returned), so a plan computed
                 // as Unbounded (which only happens when budget is None) cannot reach this arm
                 // unless budget flipped mid-loop, which run_string's single pre-loop compute
-                // and CpuGsw's own write sites (run.rs:408, :410 -- set before, cleared after,
+                // and CpuGsw's own write sites (run.rs:408, :410: set before, cleared after,
                 // never inside) both rule out. Fail closed rather than divide by a bound that
                 // was never priced.
                 return Some(0);
@@ -546,9 +546,9 @@ impl CpuGsw {
             StringOp::Ins => {
                 // INS: [ES:DI] <- port[DX]. ES cannot be overridden.
                 let port = self.read_gpr16(2);
-                // P3, gap 3. String port I/O never consulted the TSS bitmap
-                // (`dev_docs/2026-09-05-v86-port-io-timing-research.md` section 5), so it could
-                // not `#GP` under ANY monitor -- wrong under one trapping a port a driver reaches
+                // P3, gap 3. String port I/O never consulted the TSS bitmap,
+                // so it could
+                // not `#GP` under ANY monitor: wrong under one trapping a port a driver reaches
                 // with `REP INSW`. Ordered BEFORE the access and before any index adjustment, so
                 // a denied element faults with the string state untouched and `CX` still counting
                 // it, which is what a restartable string instruction requires.
@@ -697,7 +697,7 @@ impl CpuGsw {
                 // Heap scratch on rep_execution, not a `[0u8; 4096]` local: see RepBulkScratch's
                 // doc. The mutable borrow below ends at its last use (the read call, or the
                 // copy if `bytes == access`), so the early-return bail and the later
-                // watch_bulk_write/write calls below -- both needing `self` again -- are fine
+                // watch_bulk_write/write calls below (both needing `self` again) are fine
                 // under NLL without moving any statement.
                 let buf = &mut self.rep_execution.bulk.0[..bytes];
                 let first_bytes = first.to_le_bytes();
@@ -880,7 +880,7 @@ impl CpuGsw {
                     // buckets a LINEAR page, and `dst` here is already translated. Mixing the two
                     // address spaces in one table would be worse than the omission, which the
                     // report makes visible by printing the histogram total against
-                    // `data_slow_reads` -- a REP CMPS-heavy workload shows up as a shortfall
+                    // `data_slow_reads`: a REP CMPS-heavy workload shows up as a shortfall
                     // rather than as a silently mislabelled bucket.
                     read.value
                 };

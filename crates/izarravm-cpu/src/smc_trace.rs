@@ -174,14 +174,14 @@ pub(crate) struct SmcTrace {
     /// against unmeasured admissions and by the 2026-08-23 settling census §6.3.
     ///
     /// One row per (opcode, modrm reg, `disp_len`, prefix state) over the four MOV displacement
-    /// opcodes -- `0x88`, `0x89`, `0x8A`, `0x8B` -- inside the `disp` class, carrying `events`,
+    /// opcodes (`0x88`, `0x89`, `0x8A`, `0x8B`) inside the `disp` class, carrying `events`,
     /// `blocks_killed`, `narrow_kills` and, decisively, `newly_hot`. Complete per event the way
     /// the class totals are, and joinable to `smc_shape` on `opcode` + `modrm_reg` by summing the
     /// cells that share those two fields.
     ///
     /// `disp_len` and the prefix state are IN THE KEY because the matchers bar on them. A row
-    /// keyed on (opcode, modrm reg) alone is a SUPERSET of what any arm can admit -- it sums the
-    /// disp8 and `0x66`-prefixed forms into the same cell -- and its `newly_hot` would then
+    /// keyed on (opcode, modrm reg) alone is a SUPERSET of what any arm can admit: it sums the
+    /// disp8 and `0x66`-prefixed forms into the same cell, and its `newly_hot` would then
     /// overstate the capture numerator. The `admissible` column reports the two bars per row.
     ///
     /// WHY `newly_hot` PER OPCODE IS THE POINT. Option D's capture fraction has until now been
@@ -407,7 +407,7 @@ impl SmcTrace {
             ));
         }
         let mut disp_store: Vec<(&u32, &DispStoreRow)> = self.disp_store_rows.iter().collect();
-        // Events first, then the packed key, so the ranking is stable across runs -- the
+        // Events first, then the packed key, so the ranking is stable across runs, the
         // `smc_shape` convention one table up.
         disp_store.sort_by(|a, b| b.1.events.cmp(&a.1.events).then(a.0.cmp(b.0)));
         lines.push(
@@ -421,7 +421,7 @@ impl SmcTrace {
             let default_prefixes = *key & 1 != 0;
             // The matchers' two static bars, restated as a column so a reader does not have to
             // recompute them: a cell is admissible to its arm only at disp32 with no prefixes.
-            // (`imm_len == 0` and the memory-form test are implied -- no `0x88`/`0x89`/`0x8B`
+            // (`imm_len == 0` and the memory-form test are implied: no `0x88`/`0x89`/`0x8B`
             // encoding carries an immediate, and a register form has no displacement field to
             // classify as one.) The arm's KNOB is a separate question and is not in this table.
             let admissible = disp_len == 4 && default_prefixes;

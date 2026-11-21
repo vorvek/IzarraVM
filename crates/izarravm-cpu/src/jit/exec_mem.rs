@@ -27,7 +27,7 @@ pub(crate) struct ExecutableBuffer {
 /// 95.9%: each rebuild copied 14.7 MB of live code to reclaim ~4% of the slots, and the next ~335
 /// installs refilled it. Compaction cost scales with LIVE bytes copied, not with arena size, so
 /// capacity is the cheap dial. Two independent A/B/B/A rounds against `IZARRAVM_JIT_ARENA_MIB`,
-/// one binary, `dev_docs/duke3d-open-area-profile-results.md` §9:
+/// one binary, duke3d open-area profile results §9:
 ///
 /// | | compactions | `arena_compaction_ns` | installs | min wall |
 /// |---|---|---|---|---|
@@ -41,8 +41,8 @@ pub(crate) struct ExecutableBuffer {
 /// counters differ, 2 compactions/3.48 ms at 32 MiB vs 0/0 at 128 MiB, as the size change forces).
 ///
 /// What it COSTS, because a default is a posture: 128 MiB of commit charge instead of 32, and two
-/// arenas (256 MiB) live for the duration of a rebuild. Commit, not working set -- untouched slots
-/// have no physical backing -- but a long duke run does eventually touch most of it. Allocation
+/// arenas (256 MiB) live for the duration of a rebuild. Commit, not working set (untouched slots
+/// have no physical backing) but a long duke run does eventually touch most of it. Allocation
 /// failure still degrades rather than breaks: `ExecutableArena::new` returning `None` disables the
 /// backend, and `compact_arena` returning false falls back to `reset_storage`.
 ///
@@ -56,7 +56,7 @@ const MIN_ARENA_MIB: usize = 8;
 /// - `BlockId` carries a **u16** metadata-slot index, and a live block owns exactly one arena
 ///   slot, so `blocks.len()` can reach the slot capacity. At the 4 KiB minimum page size a
 ///   256 MiB arena is exactly 65,536 slots (indices 0..=65,535 all fit u16; the first
-///   `u16::try_from` failure is at index 65,536, i.e. strictly beyond 256 MiB) — so the clamp
+///   `u16::try_from` failure is at index 65,536, i.e. strictly beyond 256 MiB), so the clamp
 ///   below is conservative in the safe direction. Crossing the real cliff would permanently set
 ///   `BlockCache::disabled`, silently dropping the run to the interpreter.
 /// - `DEFAULT_ENTRY_CAP` (131,072 metadata entries) is required to stay strictly above the slot
@@ -140,7 +140,7 @@ unsafe impl Send for ExecutableArena {}
 impl ExecutableBuffer {
     /// Allocate `len` bytes (rounded up to a page), write `code` into it, then flip the page to
     /// Read+Execute. `len` must be >= `code.len()`. Returns `None` on an unsupported host or an
-    /// OS allocation failure -- both are "compile nothing, fall back to the interpreter".
+    /// OS allocation failure: both are "compile nothing, fall back to the interpreter".
     pub(crate) fn new(code: &[u8]) -> Option<Self> {
         let page = page_size();
         let len = code.len().div_ceil(page) * page;

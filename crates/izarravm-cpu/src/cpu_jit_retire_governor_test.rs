@@ -3,12 +3,12 @@
 
 //! The data-segment reject governor (`IZARRAVM_SEGMENT_RETIRE_GOVERNOR`).
 //!
-//! Design: `dev_docs/specs/2026-08-23-data-segment-reject-treadmill-design.md` (rev 3), section 6.
+//! Design: the data-segment reject treadmill design, rev 3, section 6.
 //! Every fixture here is named for the mutant it kills, and the mutant is stated in its own doc
 //! comment rather than left to be inferred from the assertions.
 //!
 //! THE SHAPE EVERY FIXTURE IS BUILT FROM. A block bakes six segment descriptors at compile time.
-//! The dispatcher entry check compares them against the live records and refuses on a mismatch --
+//! The dispatcher entry check compares them against the live records and refuses on a mismatch:
 //! all six when the block has a live outbound link (the STRICT arm, because a chained transfer
 //! runs the successor's body without ever re-entering the dispatcher), only the block's own pinned
 //! set when it does not (the MASKED arm). Today's refusal also RETIRES the key, betting that the
@@ -19,7 +19,7 @@
 //! duke3d-586 short +4.3%). `off` is the escape and the A/B base; `on` is opt-in, because it beats
 //! `cap` on the loader and LOSES to it on duke. EVERY fixture in this file forces its arm
 //! explicitly through `set_segment_retire_governor_for_test` and none reads the ambient default,
-//! which is what kept the whole file valid across the flip -- a fixture that had relied on "unset
+//! which is what kept the whole file valid across the flip: a fixture that had relied on "unset
 //! means off" would have started measuring `cap` and passing for the wrong reason.
 //!
 //! The override is per-thread, and every fixture that forces an arm holds an `ArmGuard` so a
@@ -64,7 +64,7 @@ const SHIFTED_VALUE: u32 = 0xcafe_babe;
 /// The measured shape, in three blocks.
 ///
 /// `HEAD_PRED` and `ENTRY` neither write nor use any data segment; `SECOND` reads through ES. So
-/// `ENTRY`'s own pinned mask is EMPTY and it can only ever reject on the strict arm -- which is
+/// `ENTRY`'s own pinned mask is EMPTY and it can only ever reject on the strict arm, which is
 /// the population stage 2 exists for, and the one a masked-arm-only reading of the mechanism
 /// would silently miss.
 fn strict_memory() -> Vec<u8> {
@@ -74,7 +74,7 @@ fn strict_memory() -> Vec<u8> {
         0xe9, 0x16, 0x00, 0x00, 0x00, // jmp 0x200
     ]);
     // TWO successors, deliberately. `xor eax,eax` sets ZF, so the branch is always taken and the
-    // executed path is exactly what an unconditional jump would give -- but the block now carries
+    // executed path is exactly what an unconditional jump would give, but the block now carries
     // a SECOND successor slot, the fallthrough at 0x204, that nothing ever installs. That is what
     // makes the head simultaneously LINKED (slot 0, into the ES-baking successor, so it is entered
     // on the strict arm) and PARKED in `waiting` (slot 1, unresolved), which is the only state in
@@ -83,7 +83,7 @@ fn strict_memory() -> Vec<u8> {
     memory[ENTRY as usize..ENTRY as usize + 9].copy_from_slice(&[
         0x31, 0xc0, // xor eax,eax   (sets ZF)
         0x74, 0x1c, // jz 0x220
-        0xe9, 0x37, 0x00, 0x00, 0x00, // jmp 0x240 -- the fallthrough, never executed
+        0xe9, 0x37, 0x00, 0x00, 0x00, // jmp 0x240: the fallthrough, never executed
     ]);
     memory[SECOND as usize..SECOND as usize + 12].copy_from_slice(&[
         0x26, 0x8b, 0x15, 0x00, 0x30, 0x00, 0x00, // mov edx,[es:0x3000]
@@ -205,7 +205,7 @@ fn clears_by_cause(cpu: &CpuGsw, label: &str) -> u64 {
 ///
 /// `SECOND` bakes ES at whatever base it was first compiled under and is never retired, so the
 /// CHAIN requirement is permanently that base. The head therefore has to be (re)compiled under
-/// that base to link at all, and is then entered under the OTHER one -- which is precisely the
+/// that base to link at all, and is then entered under the OTHER one, which is precisely the
 /// alternating record the design measured, reproduced in two statements.
 fn strict_turn(cpu: &mut CpuGsw, bus: &mut TestBus, baked_base: u32) -> bool {
     set_base(cpu, SegmentIndex::Es, baked_base);
@@ -284,7 +284,7 @@ fn data_segment_reject_still_refuses_after_the_retire_cap() {
 /// of the governor's two inputs.
 ///
 /// **This fixture got MORE load-bearing when the default flipped to `cap`, not less.** OFF is no
-/// longer what everybody runs by accident -- it is the ESCAPE and the A/B BASE, the leg every
+/// longer what everybody runs by accident. It is the ESCAPE and the A/B BASE, the leg every
 /// future ladder on this mechanism subtracts from. A base that has quietly acquired a map write or
 /// an extra six-descriptor compare is a base that hides the thing it is supposed to isolate, and
 /// nothing else in the suite would notice.
@@ -295,16 +295,16 @@ fn data_segment_reject_still_refuses_after_the_retire_cap() {
 /// and the block bytes come out of the same compile walk on all three arms. What the arms change
 /// is WHICH blocks exist and for how long. The executable half of that claim is
 /// `section_two_refusal_fixtures_hold_on_every_governor_arm`, which runs the two shipped refusal
-/// fixtures -- both of which compare native execution against the interpreter instruction for
-/// instruction -- unmodified on all three arms.
+/// fixtures, both of which compare native execution against the interpreter instruction for
+/// instruction, unmodified on all three arms.
 ///
-/// The first half is assertable directly -- the cap map and the declined set stay empty, and all
+/// The first half is assertable directly: the cap map and the declined set stay empty, and all
 /// three stall counters read zero, through more rejects than the cap would ever allow. The second
 /// half is the reason `run_direct_block` tests the knob at the reject site rather than inside
 /// `retire_key_for_data_segment`: the second `data_matches` (a six-descriptor compare) and the
 /// 96-byte `live` copy are work `main` does not do, and building them above the branch would have
 /// charged every OFF leg for a governor it is not running. That is pinned from the other side, by
-/// the `debug_assert` at the top of `retire_key_for_data_segment` -- reachable only if some caller
+/// the `debug_assert` at the top of `retire_key_for_data_segment`, reachable only if some caller
 /// routes the OFF arm through the governor after all, and this fixture is the one that would then
 /// trip it.
 ///
@@ -419,7 +419,7 @@ fn capped_key_still_runs_natively_on_the_layout_it_froze_on() {
 /// against a fresh interpreter, with canonical state compared every round.
 ///
 /// The head neither writes nor uses ES; its bound successor reads through ES; ES alternates. On
-/// the `on` arm the head is DECLINED, drops to the masked arm and RUNS -- and this fixture is what
+/// the `on` arm the head is DECLINED, drops to the masked arm and RUNS, and this fixture is what
 /// says that is sound. Section 2's shipped strict-arm fixture cannot carry the obligation: it
 /// enters below the cap, so it never reaches the decline, and "it passes on all three arms" there
 /// is an artifact of the entry count.
@@ -571,7 +571,7 @@ fn alternating_es_with_a_successor_that_bakes_es_is_state_identical_on_both_arms
 /// Two mutants in one row. The REBIND HOLE: a decline that only cleared the cells would be undone
 /// by the next `resolve_successors`, and the mechanism would be inert while every counter still
 /// looked right. The PARK TREADMILL (review M4): a declined source left in `waiting` is retried by
-/// every later install at that `LinkTarget` and refused every time -- bounded in size, unbounded in
+/// every later install at that `LinkTarget` and refused every time: bounded in size, unbounded in
 /// count, and `link_refusals["declined"]` would stop meaning "stage 2 trips".
 #[test]
 fn link_declined_block_is_never_relinked_and_is_never_re_parked() {
@@ -654,8 +654,8 @@ fn link_declined_block_is_never_relinked_and_is_never_re_parked() {
 
 /// FIXTURE 5. The decline cuts OUTBOUND edges only.
 ///
-/// Kills "clear all cells, inbound too" -- which would cost the predecessor its chaining for its
-/// successor's judgement -- and, from the other side, the unsound relaxation that drops the
+/// Kills "clear all cells, inbound too" (which would cost the predecessor its chaining for its
+/// successor's judgement) and, from the other side, the unsound relaxation that drops the
 /// predecessor to its own masked arm while its cone still bakes ES. `HEAD_PRED` keeps its edge
 /// into the declined block, so it keeps a live outbound cell, so it is still entered on the STRICT
 /// arm and still refuses when ES moves.
@@ -887,7 +887,7 @@ fn a_cs_layout_retire_clears_the_decline_so_the_recompile_is_not_born_declined()
 
 /// FIXTURE 8. The governor's maps are empty when `entries` is.
 ///
-/// Exercises the containment `debug_assert` in `BlockCache::clear` -- the bound the memory
+/// Exercises the containment `debug_assert` in `BlockCache::clear`: the bound the memory
 /// argument rests on, since neither structure has an eviction policy. The first `clear` takes the
 /// full reset path; the second takes the early-return path where the assertion lives, so removing
 /// the reset hook makes this fixture panic rather than pass quietly.
@@ -954,7 +954,7 @@ fn segment_retire_governor_knob_spellings() {
 /// The other direction: a spelling the table does not name must PANIC rather than fall back to the
 /// default. That got worse, not better, when the default became an ARMED arm: a typo used to run
 /// a leg as `off` while its report named an arm, and now it runs the leg as `cap` while its report
-/// names `on` -- a wrong number that looks like a plausible one.
+/// names `on`, a wrong number that looks like a plausible one.
 #[test]
 #[should_panic(expected = "names no arm")]
 fn segment_retire_governor_refuses_an_unknown_spelling() {
@@ -985,7 +985,7 @@ fn section_two_refusal_fixtures_hold_on_every_governor_arm() {
 /// FIXTURE 11. The layout census counts the MASKED tuple, not the live one.
 ///
 /// Review H3. Unmasked, a key on this loader saturates at eight within a few hundred rejects on
-/// records nothing in the chain pins, and slice (a) -- per-layout block variants -- would read a
+/// records nothing in the chain pins, and slice (a) (per-layout block variants) would read a
 /// false no-go off it. Here DS alternates between exactly two values while FS, which the block's
 /// mask does NOT cover, moves to a fresh base on every single entry: more than eight of them, so
 /// an unmasked fingerprint saturates and this fixture FAILS. That is the point; as first written
@@ -1067,8 +1067,8 @@ fn distinct_layout_census_counts_two_while_an_unpinned_record_wobbles() {
 /// The hand fixtures above each pin one mechanism; this one pins the composition. Both shapes are
 /// driven for many rounds with ES, DS and FS moved on a deterministic pseudo-random schedule that
 /// crosses the cap many times over, native against a fresh interpreter, comparing canonical state
-/// every round. Anything the hand fixtures missed -- an ordering, an interaction between the
-/// decline and a recompile, a wrong base surviving one round in twenty -- shows up as a state
+/// every round. Anything the hand fixtures missed (an ordering, an interaction between the
+/// decline and a recompile, a wrong base surviving one round in twenty) shows up as a state
 /// difference here.
 #[test]
 fn governor_on_is_state_identical_to_the_interpreter_over_a_segment_moving_sweep() {
@@ -1200,14 +1200,14 @@ impl Drop for EntryCheckGuard {
 ///
 /// `ENTRY` pins nothing at all and `SECOND` bakes ES, so on the armed arm the head rejects
 /// against the CHAIN's `{ES}` while its own (empty) mask passes everything. Compute
-/// `own_mask_matches` from the layout the entry check just used -- the chain one -- and it asks
+/// `own_mask_matches` from the layout the entry check just used (the chain one) and it asks
 /// "would the chain check have passed?", which is what the reject answered NO to. It would be
 /// identically false, `decline_links_for_data_segment` would never fire on ANY row, and the
 /// decline is the only shipped mechanism that reaches the own_pass - chain_pass residual.
 ///
 /// REPAIR 1, the decline's EFFECT, rides the same row. The decline's promise is "the next entry
 /// takes the check this block would have had if it had never linked". Under the chain entry check
-/// that is only true if cutting the last cell also narrows the requirement -- otherwise the
+/// that is only true if cutting the last cell also narrows the requirement; otherwise the
 /// declined block is re-checked against its stale-wide `{ES}` and rejects again, and the decline
 /// buys nothing. The final third of this fixture is that claim, stated as a run.
 #[test]
@@ -1283,8 +1283,8 @@ fn governor_own_mask_input_is_the_blocks_own_mask() {
 /// under, and on the armed arm that is the chain requirement on BOTH arms of the reject.
 ///
 /// The shape is the residual the narrowing deliberately cannot remove. `SECOND`'s portal is
-/// cleared while the edge itself stays in the link graph -- what `suspend_decode_slot` and
-/// `compact_arena` do -- so the head is entered with `has_link == false` and rejects on the MASKED
+/// cleared while the edge itself stays in the link graph (what `suspend_decode_slot` and
+/// `compact_arena` do) so the head is entered with `has_link == false` and rejects on the MASKED
 /// arm while still carrying its successor's `{ES}`. Leave that arm reading `segment_layouts` and
 /// the mask is EMPTY, so every live ES folds to the same fingerprint and the per-key census
 /// collapses to one layout. Two entries under two different ES bases separate the two readings.

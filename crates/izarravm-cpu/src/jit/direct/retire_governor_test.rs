@@ -23,15 +23,15 @@ fn live_records() -> [SegmentRegister; 6] {
     ]
 }
 
-/// F20. Two blocks that differ ONLY in whether they bake CS's selector -- i.e. whose `used`
-/// bytes differ only in `BAKES_CS_BIT` -- must produce the same layout fingerprint, so the OFF
+/// F20. Two blocks that differ ONLY in whether they bake CS's selector, i.e. whose `used`
+/// bytes differ only in `BAKES_CS_BIT`, must produce the same layout fingerprint, so the OFF
 /// arm's `distinct_layouts` and `data_segment_layout_histogram` are untouched by the bit.
 ///
-/// This asserts the MASKED value the reject site hands in, through `census_mask` -- the one line
+/// This asserts the MASKED value the reject site hands in, through `census_mask`, the one line
 /// the reject site calls, so the fixture tests the production expression rather than a copy of
 /// it. That is the exact edit mutant M24 deletes. Asserted here rather than through
 /// `data_segment_retire_record_for_test`, because `distinct_layouts` is per BlockKey and two
-/// blocks differing by a `push cs` have different linears -- two keys, two records, each reading
+/// blocks differing by a `push cs` have different linears: two keys, two records, each reading
 /// 1 under both arms. The record accessor cannot see the fingerprint at all (`layouts` is
 /// private), so a fixture written that way could not fail.
 #[test]

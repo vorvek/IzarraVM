@@ -126,12 +126,12 @@ impl TlbEntry {
 /// One half of that hazard is closed at the consumer: `translate_linear_checked` never raises a
 /// page fault from a hit, only from the walk, so an entry that is stale in the RESTRICTIVE
 /// direction (the guest relaxed a PTE and skipped its flush) costs a walk instead of a spurious
-/// #PF. The permissive direction -- the guest tightened a PTE and skipped its flush -- is still
+/// #PF. The permissive direction (the guest tightened a PTE and skipped its flush) is still
 /// live, and is the one this capacity note is about.
 ///
-/// Per-slot generation, mirroring `DecodeCache`'s two-slot ring (design
-/// `2026-09-02-cr3-data-side-design.md` T2). `generation` stays the HOT field every `lookup` and
-/// `insert` compares -- unchanged from the single-slot form -- and is kept in sync with
+/// Per-slot generation, mirroring `DecodeCache`'s two-slot ring (CR3 data-side
+/// design T2). `generation` stays the HOT field every `lookup` and
+/// `insert` compares (unchanged from the single-slot form) and is kept in sync with
 /// `generations[live]` by every method below; nothing on the hot path reads `generations` or
 /// `live` directly. Capacity stays shared (1024 entries for both directories together); only
 /// LIVENESS is partitioned, exactly as design section (a) A4 argues.
@@ -157,7 +157,7 @@ pub(crate) struct Tlb {
     /// review J2/D3): every mint, whether a single-slot flush, a ring allocation, or a wholesale
     /// retire-all, draws from this ONE counter, so a value handed to one slot can never collide
     /// with the other's. Starts at 3 because `generations` is seeded `[1, 2]`; NEVER mints 0,
-    /// which is `TlbEntry::EMPTY`'s sentinel (design review D3) -- a slot holding it would make
+    /// which is `TlbEntry::EMPTY`'s sentinel (design review D3), a slot holding it would make
     /// every empty entry read as live the moment that slot is selected.
     next_generation: u32,
     /// Set when `mint_generation` wrapped and cleared both arrays; `take_wrapped` reads and resets it.
@@ -244,15 +244,15 @@ impl Tlb {
     ///
     /// Reports `previous` whenever `previous.generation != 0` (D3: 0 is `TlbEntry::EMPTY`'s own
     /// sentinel and is never a live generation), NOT only when `previous.generation ==
-    /// self.generation`. The narrower, generation-matching check was sound before T2 (design
-    /// `2026-09-02-cr3-data-side-design.md`): every generation bump was ALSO a wholesale FastMap
+    /// self.generation`. The narrower, generation-matching check was sound before T2 (CR3 data-side
+    /// design): every generation bump was ALSO a wholesale FastMap
     /// wipe (`record_fast_map_wipe_extent`, tied to the same CR3/CR0 flush), so a displaced entry
     /// from an OLDER generation was already covered by that wipe and reporting it again would
     /// have been redundant work, not a correctness gap. T2 breaks that pairing: the translation-
     /// page and SMC-wholesale retires now bump the generation WITHOUT touching the FastMap at
     /// all, so a displaced entry from a generation this same walk just retired (a live entry one
     /// statement ago) would silently stop being reported, and the caller's FastMap-invalidate-on-
-    /// eviction (`memory.rs`'s `same_residency` check) would never run for it -- measured on
+    /// eviction (`memory.rs`'s `same_residency` check) would never run for it: measured on
     /// `active_fast_map_tracks_tlb_collision_and_rewalks_canonically` (`cpu_test.rs`): a second
     /// linear page colliding into the same array slot, walked immediately after a translation-
     /// page retire fired on the SAME walk, stopped invalidating the evicted page's FastMap entry.
@@ -417,7 +417,7 @@ impl Tlb {
     }
 
     /// R1: reselect a ring slot the caller already knows is occupied. Restores that slot's
-    /// stored generation with no other work -- every entry inserted while it was last live is
+    /// stored generation with no other work: every entry inserted while it was last live is
     /// live again for free, because the generation comparison in `lookup`/`insert` IS the
     /// restore. Never walks or re-checks an entry at this point; the whole soundness argument
     /// for that is design section (d).
@@ -443,7 +443,7 @@ impl Tlb {
 
     /// The `flush_tlb_keep_code_caches` PG-stays-1 CR0 path (design review D4): that caller does
     /// NOT retire the decode ring (`DecodeCache::contexts` is untouched, so no slot renumbering
-    /// happens), so only the CURRENTLY LIVE slot's generation may be retired -- the dormant
+    /// happens), so only the CURRENTLY LIVE slot's generation may be retired: the dormant
     /// slot's entries are still valid under their own directory and must survive. Mirrors the
     /// pre-T2 single-slot `flush()` exactly, scoped to the live slot's bookkeeping entry too.
     pub(crate) fn flush_live_slot(&mut self) {
@@ -456,14 +456,14 @@ impl Tlb {
     /// slots (`contexts = [None, None]`, so the next `select_context` allocates into slot 0
     /// regardless of who held it before), and slot INDEX is the only thing tying a `Tlb`
     /// generation to a directory. A retire therefore invalidates the correspondence, not merely
-    /// the contents, independent of what caused it -- A20, a direct-map change, an SMC wholesale
+    /// the contents, independent of what caused it: A20, a direct-map change, an SMC wholesale
     /// kill, a translation-page store, or a real ring retire (R3/R5) all renumber the same way.
     /// Takes the `RingRetired` token `retire_ring` returns so an implementer who forgets to call
     /// this where a ring retire happened gets an `unused_must_use` warning, promoted to a build
     /// failure under this crate's `-D warnings` gate, instead of a silent stale-generation bug.
     /// Unconditional at every call site: a translation-page write or an SMC kill can fire on a
     /// ring that was never seeded at all (no `MOV CR3` has run yet), and the retire is still
-    /// needed there for CONTENT reasons -- the edited PTE makes an existing cached translation
+    /// needed there for CONTENT reasons: the edited PTE makes an existing cached translation
     /// wrong regardless of ring bookkeeping (`pte_edit_under_a_live_cr3_forces_a_redecode` and
     /// its siblings exercise exactly that shape). See `Tlb::insert`'s doc comment for the OTHER
     /// half of this: an eviction whose victim carries a generation this call already retired must
@@ -622,7 +622,7 @@ impl DirectPageCache {
     ///
     /// RECORDED, NOT BUILT: this scans all 64 entries, and the VGA aperture is only 16 pages, which
     /// can occupy only slots `0x20..=0x2F` (`slot` keeps bits 12..17 of the page). Walking those 16
-    /// slots instead would be a 4x cut on a path that runs twice per direct-write-token move --
+    /// slots instead would be a 4x cut on a path that runs twice per direct-write-token move:
     /// 6.8M times in a doom timedemo. It is left unbuilt because it is worth roughly 0.1% of wall,
     /// which is below this rig's layout confound and therefore cannot be validated on a ladder; it
     /// belongs with whatever next change to this path can be. The physical-page equality test must

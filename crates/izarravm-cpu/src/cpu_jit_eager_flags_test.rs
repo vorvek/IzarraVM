@@ -9,7 +9,7 @@
 //!
 //! The arm's failure mode is a GRACEFUL AGREEMENT. A publish that commits the wrong bits, or a
 //! producer that publishes nothing at all, is invisible to any row where a LATER slot in the same
-//! block publishes the same flags again -- which is most rows, because flag producers cluster. So
+//! block publishes the same flags again, which is most rows, because flag producers cluster. So
 //! every row here does four independent things:
 //!
 //! 1. **Proves the arm ENGAGED.** `Compilation::eager_flags_sites()` is an exact oracle: all six
@@ -269,7 +269,7 @@ fn build_with_arm(body: &[u8], seed: Seed, arm: Option<bool>) -> Roles {
     ] {
         // ESP must be live BEFORE compiling, not only before running: a stack-touching slot
         // resolves its store page at compile time, and the default ESP of 0 makes that page
-        // 0xFFFFFFFC, which cannot resolve and returns the whole block as `Retry` --
+        // 0xFFFFFFFC, which cannot resolve and returns the whole block as `Retry`,
         // indistinguishable from the shape still being a barrier.
         cpu.registers.set_esp(STACK_TOP);
         for &linear in &starts {
@@ -424,7 +424,7 @@ fn run_and_compare(mut roles: Roles, on: bool, context: &str) -> Roles {
     if on {
         // I1, ON-ARM ONLY, and on a role that ENTERED native code. Nothing in the tree before
         // this slice asserted that native execution leaves the descriptor dead, so this is real
-        // new coverage -- on this arm. On the shipped default arm it is FALSE by construction (a
+        // new coverage, on this arm. On the shipped default arm it is FALSE by construction (a
         // native `AND r32,r32` leaves 0x8000_0202 in the descriptor), which is why it is gated.
         //
         // On the NATIVE role, never on a role a clone-and-settle step has already touched: a
@@ -458,7 +458,7 @@ fn finish() {
 // ---------------------------------------------------------------------------------------------
 
 /// The spelling table, including that `0` is a legal OFF spelling. Stated as its own row because
-/// the `parameter-knobs-have-no-off-spelling` trap -- a PARAMETER knob whose `=0` ARMS it -- cost
+/// the `parameter-knobs-have-no-off-spelling` trap: a PARAMETER knob whose `=0` ARMS it, cost
 /// a whole census, and both conventions now live in `jit/direct.rs`.
 #[test]
 fn eager_flags_arm_spelling_table() {
@@ -497,7 +497,7 @@ fn eager_flags_arm_refuses_to_guess() {
 ///
 /// It reads the arm TWICE and the two readings are not the same check. `build_with_arm(.., None)`
 /// clears the override and compiles under the ambient reading, so the shipped default is read
-/// THROUGH EMISSION -- a default flip that somehow failed to reach the emitters would still fail
+/// THROUGH EMISSION: a default flip that somehow failed to reach the emitters would still fail
 /// here. The closing `assert!` reads the arm function directly, which is what catches a flip that
 /// reached emission but was masked by some future short-circuit.
 #[test]
@@ -1007,7 +1007,7 @@ fn the_eager_arm_needs_the_entry_clear() {
 /// A refused entry must leave the interpreter's descriptor UNTOUCHED, not settled.
 ///
 /// E1 sits below every refusal return in `run_direct_block`, and this is what catches an E1 that
-/// drifted above one: a refused entry runs no guest code, so it must move no state at all -- the
+/// drifted above one: a refused entry runs no guest code, so it must move no state at all, the
 /// raw descriptor included, which is why this is the one fixture class that still compares it.
 #[test]
 fn a_refused_entry_leaves_the_descriptor_untouched_on_both_arms() {
@@ -1080,7 +1080,7 @@ fn a_dropped_publish_is_not_masked_by_a_later_slot() {
 /// The mechanism this guards, stated so the fixture is not guesswork: the host flags register is
 /// SCRATCH across a block, and a rotate at count >= 2 writes neither SF/ZF/PF/AF nor a defined OF.
 /// Widening either caller's `emit_capture_flags(FLAG_CF)` to `ARITH_FLAGS` therefore imports HOST
-/// SCRATCH into the guest's five preserved flags -- and on the eager arm the publish commits it
+/// SCRATCH into the guest's five preserved flags, and on the eager arm the publish commits it
 /// straight to `registers.eflags`, where before it would have been overridden by a live
 /// descriptor. Asserting against the interpreter avoids having to predict what the host left.
 ///
@@ -1168,7 +1168,7 @@ fn build_multi(bodies: &[&[u8]], seed: Seed, on: bool) -> Roles {
     ] {
         // ESP must be live BEFORE compiling, not only before running: a stack-touching slot
         // resolves its store page at compile time, and the default ESP of 0 makes that page
-        // 0xFFFFFFFC, which cannot resolve and returns the whole block as `Retry` --
+        // 0xFFFFFFFC, which cannot resolve and returns the whole block as `Retry`,
         // indistinguishable from the shape still being a barrier.
         cpu.registers.set_esp(STACK_TOP);
         for &linear in &starts {
@@ -1261,7 +1261,7 @@ fn build_multi(bodies: &[&[u8]], seed: Seed, on: bool) -> Roles {
 /// BLOCKER 1's fixture: the byte-logic arm's RDX reload carries the guest ALU RESULT, not a flag.
 ///
 /// Asserted on `registers`, deliberately. Deleting the descriptor producer at that arm while
-/// leaving the reload does not merely lose flags -- it writes whatever the descriptor slot holds
+/// leaving the reload does not merely lose flags: it writes whatever the descriptor slot holds
 /// into the guest's byte register, so the failure arrives as a WRONG REGISTER VALUE. A flags-only
 /// assertion would miss it entirely on any seed where the wrong result happened to carry the same
 /// flags.

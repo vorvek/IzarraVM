@@ -13,7 +13,7 @@
 //! `emit_shift_cl`'s width argument selects `shift_r16_cl` in place of `shift_r32_cl`; nothing
 //! else in the emitter is width-dependent (see that function's doc). The shift itself is emitted
 //! UNCONDITIONALLY before the count test, and a masked count of 0 is a no-op only because the
-//! host applies its own five-bit CL mask -- there is no count-0 branch in the emitted code, so
+//! host applies its own five-bit CL mask: there is no count-0 branch in the emitted code, so
 //! `a_zero_count_leaves_every_flag_and_a_live_descriptor_alone` is a fixture concern, not a
 //! control-flow one.
 //!
@@ -37,11 +37,11 @@ const MOV_EDI_EDI: [u8; 2] = [0x89, 0xff];
 /// The five flag consumers, as `(condition, byte destination)`. Deliberately avoids CL/CH: the
 /// count lives in CL and a `SETcc` into it would overwrite the value being read.
 const CONSUMERS: [(u8, u8); 5] = [
-    (0x2, 3), // setc bl  -- CF
-    (0x0, 6), // seto dh  -- OF
-    (0x8, 4), // sets ah  -- SF
-    (0x4, 2), // setz dl  -- ZF
-    (0xa, 0), // setp al  -- PF
+    (0x2, 3), // setc bl: CF
+    (0x0, 6), // seto dh: OF
+    (0x8, 4), // sets ah: SF
+    (0x4, 2), // setz dl: ZF
+    (0xa, 0), // setp al: PF
 ];
 
 fn consumer_bytes() -> Vec<u8> {
@@ -319,7 +319,7 @@ fn word_shift_cl_matches_the_interpreter_for_every_count() {
     }
 }
 
-/// CL 32, 33, 63, 64, 0xff -- the five-bit mask wrap. CL 32 masks to a no-op and must move
+/// CL 32, 33, 63, 64, 0xff: the five-bit mask wrap. CL 32 masks to a no-op and must move
 /// NOTHING, including the descriptor; the others mask into the range OF is or is not defined for.
 #[test]
 fn word_shift_cl_masks_a_count_above_thirty_one() {
@@ -362,7 +362,7 @@ fn a_zero_count_leaves_every_flag_and_a_live_descriptor_alone() {
 }
 
 /// The aliasing case: destination is ECX itself, so CL is the low byte of the register being
-/// shifted. This is what proves the read of `home(1)` happens before anything writes it -- the
+/// shifted. This is what proves the read of `home(1)` happens before anything writes it: the
 /// emitter's own comment states RCX can never clobber `home(dst)`, and this row exercises the one
 /// case where `dst` IS the register CL lives in.
 #[test]

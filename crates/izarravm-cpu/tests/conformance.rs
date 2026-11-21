@@ -446,7 +446,7 @@ enum Outcome {
 // returns `Ok`, retargeting CS:IP at the guest's own IVT handler instead of erroring. There is
 // no error type left to pattern-match for the vector, so the harness instead installs a
 // distinct, unmistakable CS:IP trampoline at the ONE IVT slot a given test's expected vector
-// uses (never all 256 -- the corpus's non-faulting tests legitimately read/write low memory
+// uses (never all 256: the corpus's non-faulting tests legitimately read/write low memory
 // that overlaps most other IVT slots) and, after running the instruction, checks whether the
 // CPU landed on that trampoline.
 // Real-mode CS base 0xf8000..0xf8ff00: far above any address a 386 conformance vector's
@@ -455,7 +455,7 @@ enum Outcome {
 //
 // Known harness limitation (2 of 664200 vectors, both pre-existing div-by-zero cases with
 // SS:SP deliberately parked at/near 0): the interrupt frame `real_mode_interrupt` pushes can
-// land ON TOP of the just-installed IVT slot before the delivery code reads it back -- this is
+// land ON TOP of the just-installed IVT slot before the delivery code reads it back: this is
 // architecturally faithful (real 8086 silicon has the identical hazard), not a Batch A
 // correctness bug, so these two report `VectorMismatch` ("did not halt") rather than a false
 // pass or a spurious regression signal.
@@ -463,7 +463,7 @@ const TRAP_SEGMENT_BASE: u16 = 0xf800;
 const TRAP_IP: u16 = 0x0000;
 
 fn trap_cs_for_vector(vector: u8) -> u16 {
-    // One CS per vector, all sharing IP 0 -- distinct and trivially decodable back to a vector.
+    // One CS per vector, all sharing IP 0, distinct and trivially decodable back to a vector.
     TRAP_SEGMENT_BASE.wrapping_add(u16::from(vector))
 }
 

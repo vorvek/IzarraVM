@@ -1,14 +1,14 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Gate N of `dev_docs/sticky-decline-memo-design.md`: the sticky-decline memo's non-vacuity
+//! Gate N of the sticky-decline memo design: the sticky-decline memo's non-vacuity
 //! battery.
 //!
 //! The memo short-circuits the admission chain for a decline it can prove repeatable, so the only
 //! thing standing between it and a wrong answer is its guard: the pack must still be live for the
 //! same `(linear, d)`, the era stamp must still read what the memo was written under, and the two
 //! uncovered `jit_mode_key` bits must still match. Every fixture below therefore has to be able to
-//! FAIL when one of those terms is removed — the recorded lesson is six fixtures that passed while
+//! FAIL when one of those terms is removed: the recorded lesson is six fixtures that passed while
 //! proving nothing, and the design's own Gate N test 1 was one of them (review N5: it asserted
 //! `BlockCacheStats` deltas that a Dormant probe never moves on `main` either).
 //!
@@ -130,9 +130,9 @@ fn cross_an_epoch(cpu: &mut CpuGsw) {
     cpu.perf.instructions += 1 << SMC_HEAT_EPOCH_SHIFT;
 }
 
-/// Write a memo at `slot` exactly the way the production write site does — advance the era FIRST,
+/// Write a memo at `slot` exactly the way the production write site does: advance the era FIRST,
 /// because an advance that wraps sweeps the whole array and a sweep after the store would erase
-/// what the store just earned — and prove it answers before the fixture attacks it.
+/// what the store just earned, and prove it answers before the fixture attacks it.
 fn arm(cpu: &mut CpuGsw, slot: u32) {
     let _ = cpu.advance_decline_memo_era();
     let live = cpu.decline_memo_comparand();
@@ -150,7 +150,7 @@ fn arm(cpu: &mut CpuGsw, slot: u32) {
 /// The era guard, end to end, on the transition that makes it BLOCKING rather than tidy.
 ///
 /// `BlockCache::clear` empties `entries` without touching the decode cache, so every Dormant key
-/// vanishes while its pack — and its memo — survives. A memo that outlived that clear would keep
+/// vanishes while its pack (and its memo) survives. A memo that outlived that clear would keep
 /// replaying `DormantProbe` for a key whose true next verdict is `BlockProbe::Interpret` with a
 /// `Seen` insert, and the address would never be admitted again until the next epoch rolled.
 ///
@@ -220,7 +220,7 @@ fn an_epoch_change_kills_a_live_memo() {
         advances + 1,
         "exactly one era advance"
     );
-    // The stamp moved, so the pack's byte is stale for good — not merely suppressed for one ask.
+    // The stamp moved, so the pack's byte is stale for good, not merely suppressed for one ask.
     assert!(
         !cpu.decline_memo_hit(slot),
         "the memo must stay dead after the advance, not just miss the ask that advanced"
@@ -358,7 +358,7 @@ fn the_era_stamp_wrap_sweeps_every_memo() {
         "the byte must still carry stamp 1, or the alias this test exists for cannot arise"
     );
 
-    // The sixty-third wraps back to 1 — the stamp the surviving byte carries.
+    // The sixty-third wraps back to 1: the stamp the surviving byte carries.
     cpu.perf.instructions = epoch << SMC_HEAT_EPOCH_SHIFT;
     assert!(!cpu.decline_memo_hit(slot));
     assert_eq!(cpu.jit_direct.decline_memo_stamp, 1);
@@ -386,7 +386,7 @@ fn the_era_stamp_wrap_sweeps_every_memo() {
 /// guest write that drops a Dormant key from `entries` must CONTAIN the key's own first byte, that
 /// byte is a marked code byte because the line was published, so the write reaches the SMC choke
 /// and retires the line. A retired line is never reached with a slot in hand, so the memo behind
-/// it is unreachable — and the republish that brings the line back writes `decline_memo: 0`.
+/// it is unreachable, and the republish that brings the line back writes `decline_memo: 0`.
 #[test]
 fn a_guest_write_to_the_entry_byte_retires_the_slot() {
     let (mut cpu, mut bus, slot) = cpu_with_a_live_memo();
@@ -423,7 +423,7 @@ fn a_guest_write_to_the_entry_byte_retires_the_slot() {
 
 /// The whole claim of the slice is that a memo hit is indistinguishable from the chain it
 /// replaces. The census arm is the counter that would say otherwise, so run the identical program
-/// twice — once with the memo answering, once with it switched off — and require the arm to match
+/// twice: once with the memo answering, once with it switched off, and require the arm to match
 /// byte for byte, with both terms of the closure non-zero.
 ///
 /// Both directions can fail: a memo that forgets to increment `DormantProbe` under-counts, and one

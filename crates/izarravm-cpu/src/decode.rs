@@ -26,13 +26,13 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// Whether a decoded instruction may run as a cached continuation. Group-keyed for the
 /// straight-line groups (`block_straight_line`); additionally admits, BY OPCODE within the
 /// `ControlFlow` group, the forms that cannot halt, touch a port, or change CS:
-/// near RET (0xC3), near RET imm16 (0xC2), and the 0xFF group-5 forms that stay near —
+/// near RET (0xC3), near RET imm16 (0xC2), and the 0xFF group-5 forms that stay near:
 /// the plain fall-through INC r/m (/0), DEC r/m (/1), and PUSH r/m (/6) plus the near
 /// indirect CALL (/2) and JMP (/4). (The bench probe showed /6 PUSH r/m alone was ~360k
 /// of whetstone's ~360k run breaks: procedure-argument pushes, not transfers at all.)
 /// Still ending the run: far RET (0xCA/0xCB), the far directs (0x9A/0xEA), the far
 /// indirects (0xFF /3 and /5), the undefined /7 (#UD path), and INT3/INT n/INTO
-/// (0xCC-0xCE) / IRET (0xCF) — they load CS or dispatch through the IDT. The continuation
+/// (0xCC-0xCE) / IRET (0xCF): they load CS or dispatch through the IDT. The continuation
 /// follows the new EIP exactly as taken relative branches already do; every
 /// per-continuation break check (step break, interrupt transition, clock cap,
 /// decode-cache re-peek at the new linear EIP, page-local decode) is unchanged, and a
@@ -55,7 +55,7 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// with the BCD/string/HLT one-offs (see `route_group`'s A14 block), not a semantic
 /// property: they are pure flag-writing ALU ops (AND-for-flags, no write-back), no memory,
 /// no ModRM, no port, no control transfer, and their immediate is fully pre-parsed at
-/// decode -- strictly simpler than the ALU forms `block_straight_line` already admits.
+/// decode: strictly simpler than the ALU forms `block_straight_line` already admits.
 /// They matter because the canonical vretrace poll idiom is `IN; TEST AL,imm8; Jcc; JMP`:
 /// with IN admitted but TEST still a terminator, every poll iteration ends its run at the
 /// TEST and pays a full run restart, which measured at about the cost of the batch
@@ -67,8 +67,8 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// byte-identical batch structure: `block_continuable` is called once
 /// per decode, and `CpuGsw::set_mode` unconditionally invalidates the decode cache
 /// (`self.decode_cache.invalidate_and_clear_code_marks()`), so every decode-cache line is
-/// re-decoded -- and this
-/// admission re-resolved -- after any mode change.
+/// re-decoded (and this
+/// admission re-resolved) after any mode change.
 fn block_continuable(
     group: DecodeGroup,
     opcode: u16,
@@ -111,7 +111,7 @@ impl CpuGsw {
     /// lives in exactly one place. `prefixes` is taken (unused for the ALU group) because future
     /// groups route on it (e.g. the 0x0F two-byte map, or operand-size-sensitive forms).
     pub(super) fn route_group(opcode: u16, _prefixes: Prefixes) -> DecodeGroup {
-        // Two-byte (0F) map — the ONE place the `& 0xff00 == 0x0f00` predicate lives. `decode`
+        // Two-byte (0F) map: the ONE place the `& 0xff00 == 0x0f00` predicate lives. `decode`
         // folds the second byte into `opcode` as 0x0F00 | second, so a 0F opcode is classified by
         // its low byte. MOVZX/MOVSX (0F B6/B7/BE/BF) are data movement and run through the split;
         // every other 0F opcode is `TwoByteFallback` (the un-converted fused `execute_two_byte`).
@@ -187,7 +187,7 @@ impl CpuGsw {
         }
         // Stack block: PUSH/POP reg, PUSH/POP seg, PUSH imm, POP r/m, PUSHA/POPA,
         // PUSHF/POPF, ENTER/LEAVE. 0xFF (group 5, which includes PUSH r/m /6) is a
-        // separate multi-sub-op group handled as a unit by task A5 — do NOT list it here.
+        // separate multi-sub-op group handled as a unit by task A5. Do NOT list it here.
         if matches!(
             opcode,
             0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f | 0x50
@@ -198,7 +198,7 @@ impl CpuGsw {
         // Arithmetic /ext groups 1-4 (every one a ModRM whose `reg` selects the sub-op): group 1
         // ALU r/m,imm (0x80-0x83), group 2 shift/rotate (0xc0/0xc1/0xd0-0xd3), group 3 TEST/NOT/
         // NEG/MUL/IMUL/DIV/IDIV (0xf6/0xf7), group 4 INC/DEC byte (0xfe). 0xff (group 5) is the
-        // indirect-CALL/JMP control-flow group and stays on Fallback — do NOT list it here.
+        // indirect-CALL/JMP control-flow group and stays on Fallback. Do NOT list it here.
         if matches!(
             opcode,
             0x80..=0x83 | 0xc0 | 0xc1 | 0xd0..=0xd3 | 0xf6 | 0xf7 | 0xfe
@@ -247,7 +247,7 @@ impl CpuGsw {
         }
         // String operations (task A8): MOVS (0xa4/0xa5), CMPS (0xa6/0xa7), STOS (0xaa/0xab), LODS
         // (0xac/0xad), SCAS (0xae/0xaf). None carry a ModRM or an immediate. 0xa8/0xa9 (TEST AL/AX,imm)
-        // sit between them and are deliberately excluded — they are not string ops and route to Misc.
+        // sit between them and are deliberately excluded: they are not string ops and route to Misc.
         if matches!(opcode, 0xa4..=0xa7 | 0xaa..=0xaf) {
             return DecodeGroup::StringOps;
         }
@@ -255,7 +255,7 @@ impl CpuGsw {
         // OUT imm8 AX/EAX (0xe7), IN AL DX (0xec), IN AX/EAX DX (0xed), OUT DX AL (0xee),
         // OUT DX AX/EAX (0xef). 0xe0-0xe3 are the loop/JCXZ branches (DecodeGroup::Branch) and are
         // already routed above; 0xe8/0xe9/0xeb are CALL/JMP (also Branch). The INS/OUTS forms
-        // (0x6c-0x6f) are NOT listed here — they route to Misc.
+        // (0x6c-0x6f) are NOT listed here: they route to Misc.
         if matches!(opcode, 0xe4..=0xe7 | 0xec..=0xef) {
             return DecodeGroup::PortIo;
         }
@@ -333,7 +333,7 @@ impl CpuGsw {
             }
             // E1 sweep, synchronous with the mark (watched-page-bit design D4): `put` may have
             // crossed a page's unwatched -> watched edge, and a native block's CALLOUT can be
-            // the caller here, returning into emitted code that keeps storing — so the
+            // the caller here, returning into emitted code that keeps storing, so the
             // bit-clear fast-map entries must be gone before this function returns.
             #[cfg(all(
                 feature = "jit",
@@ -508,7 +508,7 @@ impl CpuGsw {
         let (prefixes, opcode) = self.read_prefixes(bus)?;
         if prefixes.lock {
             // The LOCK check runs on the first opcode byte and peeks (does not consume) the byte
-            // after it — for 0F that peek is the second opcode byte, so it must happen before the
+            // after it: for 0F that peek is the second opcode byte, so it must happen before the
             // second-byte fetch below, exactly as the fused path ordered it.
             self.check_lock_target(bus, opcode)?;
         }
@@ -516,7 +516,7 @@ impl CpuGsw {
         let address_size = self.address_size(prefixes);
 
         // The two-byte (0F) decode convention. When the first byte is 0F, read the second byte
-        // here — charging its instruction-fetch exactly once — and fold it into `insn.opcode` as
+        // here (charging its instruction-fetch exactly once) and fold it into `insn.opcode` as
         // `0x0F00 | second`. Every later 0F group routes on this combined value, and the fused
         // fallback (`execute_two_byte`) consumes the second byte from `insn.opcode as u8` rather
         // than re-reading it. The persona #UD gate applies once, right after the read.
@@ -731,7 +731,7 @@ impl CpuGsw {
                 // Far/indirect/RET/INT control flow + 0xff group 5. Each form reads exactly the bytes
                 // its fused handler read, in the same order, so the fetch clocks are byte-identical:
                 match insn.opcode as u8 {
-                    // 0x9a CALL far direct / 0xea JMP far direct: a far pointer immediate — the
+                    // 0x9a CALL far direct / 0xea JMP far direct: a far pointer immediate: the
                     // offset (operand-size wide) THEN the 16-bit selector, exactly as the fused
                     // handler fetched them. Store the offset in `imm` and the selector in `imm2`; the
                     // executor reconstructs the same far target.
@@ -756,7 +756,7 @@ impl CpuGsw {
                     // 0xff group 5: parse the ModRM + addressing descriptor (instruction bytes only,
                     // so it stays cacheable). The /ext is `modrm.reg`. The indirect CALL/JMP read
                     // their target FROM MEMORY at execute time (resolved against live registers), so
-                    // decode captures ONLY the descriptor here — never the target.
+                    // decode captures ONLY the descriptor here, never the target.
                     0xff => {
                         let modrm = self.fetch_modrm(bus)?;
                         let operand =
@@ -771,7 +771,7 @@ impl CpuGsw {
             DecodeGroup::FlagsMisc => {
                 // Flags + misc register block. Only TEST r/m,reg (0x84/0x85) carries a ModRM; parse
                 // it + the addressing-mode descriptor here (instruction bytes only, stays cacheable).
-                // Every other A7 opcode carries no encoded operand after the opcode byte — the
+                // Every other A7 opcode carries no encoded operand after the opcode byte: the
                 // register/flag operands are implicit (reg field encoded in the opcode or implied).
                 match opcode {
                     0x84 | 0x85 => {
@@ -797,7 +797,7 @@ impl CpuGsw {
             DecodeGroup::PortIo => {
                 // Port I/O block. The imm8 forms (0xe4-0xe7) carry one port-number byte after the
                 // opcode; read it here (charging its instruction-fetch exactly once) and store it in
-                // `insn.imm`. The DX forms (0xec-0xef) carry no extra bytes — the port comes from DX
+                // `insn.imm`. The DX forms (0xec-0xef) carry no extra bytes: the port comes from DX
                 // at execute time. No ModRM in any form.
                 // The imm8 forms carry one port-number byte; the DX forms (0xec..=0xef) do not.
                 if let 0xe4..=0xe7 = opcode {
@@ -864,7 +864,7 @@ impl CpuGsw {
                 }
             }
             DecodeGroup::Fpu => {
-                // x87 FPU block (task A13). WAIT/FWAIT (0x9B) has no ModRM — nothing to pre-parse.
+                // x87 FPU block (task A13). WAIT/FWAIT (0x9B) has no ModRM: nothing to pre-parse.
                 // Each escape opcode (0xD8-0xDF) carries a ModRM: fetch it once here. The fused
                 // handler treated `mod == 3` as the register form (it dispatched on the raw ModRM
                 // byte WITHOUT decoding an addressing mode) and `mod != 3` as a memory operand (it
@@ -962,7 +962,7 @@ impl CpuGsw {
     }
 
     /// Resolve a pre-decoded ModRM r/m form into its `(ModRm, RmOperand)`: the ModRM (for its `reg`
-    /// field) plus the r/m operand resolved against the live registers — a register operand as-is, a
+    /// field) plus the r/m operand resolved against the live registers: a register operand as-is, a
     /// memory descriptor with its effective address recomputed now (`resolve_addr_mode` reads only
     /// base/index registers, no instruction bytes). Centralizes the `decode`-populated `.expect`s so
     /// each group executor doesn't repeat them.
@@ -987,8 +987,8 @@ impl CpuGsw {
     /// additions, the 486 rejects P55C additions, and instructions outside the P55C contract
     /// always #UD.
     ///
-    /// `decode` applies this once, right after reading the second 0F byte — the same logical point
-    /// (and eip) the fused path faulted at — so both the converted split path and the un-converted
+    /// `decode` applies this once, right after reading the second 0F byte: the same logical point
+    /// (and eip) the fused path faulted at, so both the converted split path and the un-converted
     /// fused fallback share a single gate.
     pub(super) fn require_isa_generation(&self, required: IsaGeneration) -> ExecResult<()> {
         if persona_supports(self.persona(), required) {

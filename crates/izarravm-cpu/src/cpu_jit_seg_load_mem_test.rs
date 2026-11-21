@@ -11,7 +11,7 @@
 //!
 //! The differential rows run the same guest bytes natively and through a BLOCK-FREE interpreter
 //! from identical seeded state and compare registers (segment registers included), materialized
-//! EFLAGS, the halt latch, clocks and the whole of guest RAM -- the shape
+//! EFLAGS, the halt latch, clocks and the whole of guest RAM, the shape
 //! `cpu_jit_v86_loop_rows_test.rs` established. `Seed::stale_segments` gives ES and DS an
 //! already-real-mode-INCOMPATIBLE descriptor (an unreal-mode limit, a code access byte,
 //! `default_size_32` true) before the run, so a lowering that dropped the access store, or that
@@ -71,7 +71,7 @@ fn protected_word_cpu() -> CpuGsw {
     cpu.set_mode(GswMode::Gsw586);
     cpu.control.cr0 |= CR0_PE;
     // NOT `SegmentRegister::flat`: that constructor hard-codes `default_size_32 = true`, which
-    // would make this CS.D = 1 -- a 32-bit code segment reached with `d = true`, defeating the
+    // would make this CS.D = 1: a 32-bit code segment reached with `d = true`, defeating the
     // whole point of a 16-bit-code protected-mode fixture. `default_size_32: false` here is what
     // makes `d = false` the correct compile argument and what puts every unprefixed instruction
     // at `OperandSize::Word`, matching `sixteen_bit_cpu`'s real-mode configuration.
@@ -207,12 +207,12 @@ fn w(value: u16) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
-/// `MOV Sreg, [OPERAND]` -- direct addressing, `mod = 00`, `rm = 110`.
+/// `MOV Sreg, [OPERAND]`: direct addressing, `mod = 00`, `rm = 110`.
 fn mov_sreg_mem(reg_field: u8) -> Vec<u8> {
     [vec![0x8e, reg_field << 3 | 0x06], w(OPERAND)].concat()
 }
 
-/// `LES`/`LDS reg, [OPERAND]` -- direct addressing, `mod = 00`, `rm = 110`.
+/// `LES`/`LDS reg, [OPERAND]`: direct addressing, `mod = 00`, `rm = 110`.
 fn les_lds_mem(opcode: u8, dst: u8) -> Vec<u8> {
     les_lds_mem_at(opcode, dst, OPERAND)
 }
@@ -236,12 +236,12 @@ struct Seed {
     read_offset: u16,
     /// The word at LINEAR `DS_BASE + read_offset`, placed there UNWRAPPED (the far pointer's
     /// offset half every row here reads first). A disp16 is already a plain 16-bit value, so
-    /// this is where `AddressWrap::Word`'s mask leaves it -- and neither engine re-wraps an
+    /// this is where `AddressWrap::Word`'s mask leaves it, and neither engine re-wraps an
     /// individual word access that straddles the top of the segment (86Box's `readmemw` is a
     /// flat fetch), so `read_offset = 0xFFFF` places this word's second byte one PAST the
     /// segment rather than wrapping it back to offset 0. See `build`.
     offset_word: u16,
-    /// The word at LINEAR `DS_BASE + ((read_offset + 2) & 0xffff)` -- the far pointer's selector
+    /// The word at LINEAR `DS_BASE + ((read_offset + 2) & 0xffff)`, the far pointer's selector
     /// half, whose START wraps mod 0x10000 (`far_pointer_second_word_offset`'s whole point) but
     /// whose own two bytes are then placed linearly from there, for the same reason
     /// `offset_word` is. Unused by `LoadSegRealMem`, which performs only the one read.
@@ -293,15 +293,15 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
     let mut memory = memory_fill();
     memory[(ENTRY - 1) as usize] = 0x90;
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
-    // The offset word sits at `read_offset` unwrapped -- a disp16 is already a plain 16-bit
+    // The offset word sits at `read_offset` unwrapped: a disp16 is already a plain 16-bit
     // value, so a linear two-byte placement there is exactly what a wrapping AddressWrap::Word
     // mask leaves it as (a no-op below 0x10000). It is placed LINEARLY from there, not wrapped
     // byte by byte: neither engine re-wraps an individual word access that straddles the top of
     // the segment (86Box's `readmemw` is a flat `easeg + a` fetch; matching that is what makes
     // `read_offset = 0xFFFF` exercise something real rather than a fixture invention).
     //
-    // The selector word's START wraps mod 0x10000 -- `far_pointer_second_word_offset`'s whole
-    // point -- and is placed linearly from THAT wrapped start. For `read_offset = 0xFFFE` this
+    // The selector word's START wraps mod 0x10000 (`far_pointer_second_word_offset`'s whole
+    // point) and is placed linearly from THAT wrapped start. For `read_offset = 0xFFFE` this
     // is offset 0x0000; for `0xFFFF` it is 0x0001 (`0xFFFF + 2 = 0x10001`, masked).
     let offset_at = (DS_BASE + u32::from(seed.read_offset)) as usize;
     memory[offset_at..offset_at + 2].copy_from_slice(&seed.offset_word.to_le_bytes());
@@ -321,7 +321,7 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
         // Applied BEFORE compilation, not after: `LoadSegRealMem`/`LesLds` PIN the memory
         // SOURCE segment (DS here) into the block's `SegmentLayout`, so a stale descriptor
         // installed after compile would fail the entry `data_matches` check and the block
-        // would correctly refuse to run at all -- a harness bug, not a row under test. Staling
+        // would correctly refuse to run at all, a harness bug, not a row under test. Staling
         // both roles identically before either warms its decode cache or compiles keeps the
         // compiled record and the live one in agreement.
         if seed.stale_segments {
@@ -393,12 +393,12 @@ fn build(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed) -> Roles {
 }
 
 /// What a natively-served MISALIGNED word access costs OVER the interpreted role, at `TestBus`'s
-/// dials -- a `TestBus` modelling artifact, not a divergence, per
+/// dials, a `TestBus` modelling artifact, not a divergence, per
 /// `cpu_jit_misaligned_memory_test.rs`'s module header (which this is a narrow copy of: native
 /// charges one WIDE cycle where the interpreted role charges two BYTE cycles for the same split
 /// access, and `TestBus`'s direct-page wait states are width-dependent where a real `MachineBus`'s
 /// are not, so the residual is a fixture artifact rather than a real cost). `LesLds` can trigger
-/// it TWICE in one instruction -- once per word read -- where every other kind in that file
+/// it TWICE in one instruction (once per word read) where every other kind in that file
 /// triggers it at most once, which is why this lives here rather than being imported.
 const MISALIGNED_WORD_BUS_CLOCK_DELTA: u64 = 1; // TestBus: 3 (word) - 2 (byte)
 
@@ -481,12 +481,12 @@ fn lowered_v86(body: &[u8], seed: Seed, context: &str) {
 /// other does not.
 ///
 /// Native: the side exit must fire AT `body`, so only `FILL_A` retires (`jit_direct_insns`
-/// advances by exactly 1) -- the same "leaves the instruction un-started" proof the ordinary
+/// advances by exactly 1): the same "leaves the instruction un-started" proof the ordinary
 /// fault-ordering tests use, here read the other way around: a native lowering that silently
 /// wrapped the limit check right along with the address would complete all three slots instead.
 ///
 /// Interpreter: EIP after stepping past `body` must NOT be `tail_at` (where completing `body`
-/// normally would leave it) -- it faulted and got redirected somewhere else, whatever this
+/// normally would leave it): it faulted and got redirected somewhere else, whatever this
 /// fixture's IVT (the same pseudo-random `memory_fill` bytes both engines share) sends it to.
 /// This does not chase the fault to a specific vector or delivery site; it only has to disagree
 /// with "the instruction ran to completion," which is the property a real-address-past-the-mask
@@ -511,7 +511,7 @@ fn fault_parity_on(builder: fn() -> CpuGsw, d: bool, body: &[u8], seed: Seed, co
     roles.interp.cycle(&mut roles.interp_bus).unwrap(); // FILL_A
     // `body`: expected to fault. This fixture's IVT is the same pseudo-random `memory_fill`
     // bytes every other row here shares, not a real handler, so delivering the #GP can itself
-    // escalate into a double or triple fault (`CpuError`) rather than a clean redirect -- either
+    // escalate into a double or triple fault (`CpuError`) rather than a clean redirect: either
     // outcome is equally good proof the row did NOT complete normally, which is the only claim
     // this helper makes.
     if roles.interp.cycle(&mut roles.interp_bus).is_ok() {
@@ -531,7 +531,7 @@ fn fault_parity_on_v86(body: &[u8], seed: Seed, context: &str) {
 }
 
 // -------------------------------------------------------------------------------------------
-// `MOV Sreg, m16` -- `DirectKind::LoadSegRealMem`
+// `MOV Sreg, m16`: `DirectKind::LoadSegRealMem`
 // -------------------------------------------------------------------------------------------
 
 /// ES and DS, real mode and V86, both matching the interpreter's `load_segment_real_mode`:
@@ -543,7 +543,7 @@ fn mov_sreg_memory_matches_the_interpreter_in_real_mode_and_v86() {
         // Real mode gets the STALE seed, which is what makes the access/limit stores
         // observable. V86 does not: `load_segment_checked`'s V86 branch always canonicalizes
         // through `load_segment_real` (limit = 0xFFFF unconditionally), so nothing in a real V86
-        // run ever leaves a stale limit behind for this instruction to inherit -- the doc on
+        // run ever leaves a stale limit behind for this instruction to inherit: the doc on
         // `DirectKind::LoadSegReal`'s emit arm states the invariant this leans on. Staling ES/DS
         // there would assert a precondition V86 execution can never produce.
         lowered16(
@@ -559,7 +559,7 @@ fn mov_sreg_memory_matches_the_interpreter_in_real_mode_and_v86() {
     }
 }
 
-/// Protected mode, 16-bit code segment: the memory form must still compile -- through the SAME
+/// Protected mode, 16-bit code segment: the memory form must still compile, through the SAME
 /// `InterpretOne` call-out it always used, since `stack_width_kind` rewrites `LoadSegRealMem`
 /// back into it there. This is the regression check for "a protected-mode compile sees no change
 /// at all."
@@ -568,7 +568,7 @@ fn mov_sreg_memory_matches_the_interpreter_in_real_mode_and_v86() {
 /// gives: an `InterpretOne` block's resume predicate can legitimately resync after one execution
 /// while the call-out admission governor is still learning it, which is that mechanism's own
 /// behavior and not something this row's admission changed. `load_protected_segment`'s own
-/// correctness -- a real descriptor fetch, privilege checks, #GP/#NP -- is that helper's coverage,
+/// correctness (a real descriptor fetch, privilege checks, #GP/#NP) is that helper's coverage,
 /// not this one's.
 #[test]
 fn mov_sreg_memory_still_matches_the_interpreter_in_protected_mode() {
@@ -583,12 +583,12 @@ fn mov_sreg_memory_still_matches_the_interpreter_in_protected_mode() {
 
 /// `MOV SS, [m]` stays on its own `InterpretOne` row (`MovSsReg`) in every mode: `classify`
 /// returns that call-out for `/2` before it ever looks at the operand form, so the memory
-/// admission this slice adds cannot reach it -- proved here by the block still COMPILING (the
+/// admission this slice adds cannot reach it: proved here by the block still COMPILING (the
 /// `/2` arm never falls through to a `None` the way an unmatched form would).
 ///
 /// Not a full differential: `MovSsReg`'s row arms the one-instruction interrupt shadow
 /// (`load_segment_arming_ss_shadow`), and the resume predicate correctly ends the run right
-/// after it -- a real, expected two-of-three partial retirement rather than a bug. That
+/// after it: a real, expected two-of-three partial retirement rather than a bug. That
 /// behavior predates this slice and belongs to `MovSsReg`'s own test coverage, not this one.
 #[test]
 fn mov_ss_memory_keeps_its_own_call_out_row_in_every_mode() {
@@ -605,7 +605,7 @@ fn mov_ss_memory_keeps_its_own_call_out_row_in_every_mode() {
 }
 
 // -------------------------------------------------------------------------------------------
-// LES / LDS -- `DirectKind::LesLds`
+// LES / LDS: `DirectKind::LesLds`
 // -------------------------------------------------------------------------------------------
 
 /// LES (dst <- offset, ES <- selector) and LDS (dst <- offset, DS <- selector), real mode and
@@ -632,7 +632,7 @@ fn les_lds_match_the_interpreter_in_real_mode_and_v86() {
 }
 
 /// The selector address at the top of a 16-bit segment WRAPS mod 0x10000, matching 86Box's
-/// `opLDS_w_a16` (`src/cpu/x86_ops_mov_seg.h`, `dev_docs/reference/86box`) and this codebase's
+/// `opLDS_w_a16` (86Box `src/cpu/x86_ops_mov_seg.h`) and this codebase's
 /// own `far_call_via_memory_wraps_selector_offset_at_64k` (`cpu_strings_segments_test.rs`), which
 /// already pinned the identical shape for `CALL FAR [m]` against a SingleStepTests 80386
 /// conformance vector.
@@ -642,13 +642,13 @@ fn les_lds_match_the_interpreter_in_real_mode_and_v86() {
 ///
 /// * `0xFFFE`: the offset word sits entirely inside the segment (bytes 0xFFFE, 0xFFFF); the
 ///   selector word wraps to 0x0000, 0x0001. Neither engine has a legitimate reason to fault here
-///   in EITHER fixture -- this is the case a `u32` `wrapping_add(2)` with no re-mask would get
+///   in EITHER fixture: this is the case a `u32` `wrapping_add(2)` with no re-mask would get
 ///   wrong SILENTLY (reading the selector from a linear byte one past the segment instead of the
 ///   wrapped one), which is exactly why it needs a full differential rather than a fault-shape
 ///   assertion. Both fixtures run it through `lowered16`/`lowered_v86` and must complete.
 /// * `0xFFFF`: the OFFSET word itself straddles the segment top (bytes 0xFFFF, then one past the
 ///   limit). Under the DEFAULT limit-0xFFFF fixture this is a LEGITIMATE segment-limit
-///   violation, not a wrap question at all -- 86Box's flat `readmemw(easeg, a)` fetch does not
+///   violation, not a wrap question at all: 86Box's flat `readmemw(easeg, a)` fetch does not
 ///   re-wrap an individual straddling word access, and neither does this codebase's own
 ///   `MemorySideExits` limit compare, so a correct engine on either side must FAULT here rather
 ///   than complete. `fault_parity_on` is what proves neither engine silently disagrees and
@@ -697,12 +697,12 @@ fn les_lds_second_word_wraps_at_the_sixty_four_k_boundary() {
             &format!("{name} [0xffff] (v86, limit 0xffff)"),
         );
 
-        // 0xFFFF, stretched limit: nothing to violate, so this is a full differential again --
+        // 0xFFFF, stretched limit: nothing to violate, so this is a full differential again:
         // the row that would catch a wrap bug in the FIRST word's own straddling address.
         //
         // BOTH word reads land at an odd address here (the offset word at 0xFFFF itself, and the
         // wrapped selector word at 0x0001), so this is `MISALIGNED_WORD_BUS_CLOCK_DELTA` TWICE
-        // over -- the one row in this file that needs the slack at all.
+        // over, the one row in this file that needs the slack at all.
         lowered_on_with_bus_slack(
             sixteen_bit_cpu,
             false,
@@ -744,7 +744,7 @@ fn les_lds_dword_form_stays_a_barrier() {
     assert_eq!(compile16(&les_lds_mem(0xc4, 3)), Some(3));
 }
 
-/// `mod = 3` (a register r/m) is #UD for LES/LDS -- `execute_system_seg_decoded`'s own comment
+/// `mod = 3` (a register r/m) is #UD for LES/LDS: `execute_system_seg_decoded`'s own comment
 /// states it. `classify`'s `Mem` match must refuse it rather than treat `m.reg` as an address.
 #[test]
 fn les_lds_with_a_register_operand_stays_a_barrier() {
@@ -804,7 +804,7 @@ fn mov_sreg_memory_leaves_the_segment_untouched_when_the_read_faults() {
 /// `LES`/`LDS`: DS's cached limit is dropped between the offset word and the selector word, so
 /// the FIRST read succeeds and the SECOND takes the segment-limit side exit. Neither the
 /// destination GPR nor the segment record may show any trace of the first read having
-/// succeeded -- the interpreter's own order (`execute_system_seg_decoded`) commits nothing until
+/// succeeded: the interpreter's own order (`execute_system_seg_decoded`) commits nothing until
 /// BOTH reads are in hand.
 #[test]
 fn les_lds_leaves_both_writes_untouched_when_the_second_read_faults() {

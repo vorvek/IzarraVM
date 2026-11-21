@@ -1,14 +1,14 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 1's tests (`dev_docs/2026-09-04-reflected-call-slice1-plan.md`
+//! Slice 1's tests (slice 1 plan
 //! Revision 2, "Revision 2 amendments" item 6): section 8's tests 1, 2, 3, 8,
 //! 13, 14, 15, plus the two new tests item 6 names. Unlike
 //! `reflected_call_diag_test.rs` (which drives private `*_on` functions
 //! against a locally constructed `State` because the diagnostic's `armed()`
 //! is a process-global `OnceLock`), this module's state lives on `CpuGsw`
 //! itself, so a test simply builds a `CpuGsw`, sets `cpu.reflected_call =
-//! Some(...)` directly, and drives the real hook functions -- no process
+//! Some(...)` directly, and drives the real hook functions: no process
 //! state, no test-only override needed.
 
 use super::*;
@@ -63,7 +63,7 @@ struct FlatMemBus {
     /// the trait's own refuse-by-default answer standing, which is the property
     /// `an_unarmed_test_double_can_never_fake_a_hit` pins.
     gate_allowance: Option<u64>,
-    /// Every `interrupt_acknowledge` this bus saw, in order -- the replayed nested acks
+    /// Every `interrupt_acknowledge` this bus saw, in order: the replayed nested acks
     /// land here, so their ORDER and their `(vector, ax)` pairs are assertable.
     acks: Vec<(u8, u16)>,
     /// What `reflected_call_commit_bus` was handed, and whether
@@ -74,12 +74,12 @@ struct FlatMemBus {
     dma_visible: bool,
     /// `CpuBus::reflected_call_soft_int_posted` DEFAULTS to `true` (posted, therefore
     /// refuse), the safe answer for a bus that cannot tell. This double genuinely models a
-    /// machine with no HLE poster at all, so it answers `false` -- and the field lets one
+    /// machine with no HLE poster at all, so it answers `false`, and the field lets one
     /// test flip it to prove the refusal is live.
     soft_int_posted: bool,
-    /// Test-controllable cumulative raw bus clock counter (Fable review 2026-09-03, finding
-    /// 1's regression test): unlike `in_batch_raw_bus_clocks`, this must NEVER reset, even
-    /// across a simulated machine-batch re-entry -- the test drives it directly to prove the
+    /// Test-controllable cumulative raw bus clock counter (the
+    /// cumulative-clock regression test): unlike `in_batch_raw_bus_clocks`, this must NEVER reset, even
+    /// across a simulated machine-batch re-entry: the test drives it directly to prove the
     /// memo samples `cumulative_raw_bus_clocks`, not the batch-relative figure.
     bus_clock: u64,
 }
@@ -408,7 +408,7 @@ fn a_retf_return_leaving_the_flags_word_closes_as_a_return_match() {
     };
     // The RETF popped only CS:IP, leaving the `INT`-pushed FLAGS word:
     // SP == entry SP - 2 (a 32-bit stack, so 4 bytes actually pop for a
-    // dword IRET-shape return but only 2 for a 16-bit RETF pop -- the
+    // dword IRET-shape return but only 2 for a 16-bit RETF pop: the
     // synthetic client here uses a 32-bit stack and models the FLAGS word as
     // 2 bytes per the plan's own "-2" constant, which is generic (the
     // client's own operand size, not hardcoded per-vector).
@@ -483,7 +483,7 @@ fn test_open_trip(cpu: &CpuGsw) -> OpenTrip {
 
 // ---------------------------------------------------------------------------
 // Test 3: rule 2 (frame-gone) and rule 3 (re-entry) never produce a "learned"
-// outcome -- they close the trip, but only as `closed_without_return`.
+// outcome: they close the trip, but only as `closed_without_return`.
 // ---------------------------------------------------------------------------
 
 /// **Mutation bite**: let a frame-gone or re-entry close increment `learned`
@@ -614,7 +614,7 @@ fn a_write_of_a_constant_the_trip_never_read_is_class_w_not_class_r() {
             linear: 0x9000,
             ss_selector: DATA_SELECTOR,
             ss_base: 0,
-            // A perfect restoration -- but the trip never READ the address, and
+            // A perfect restoration, but the trip never READ the address, and
             // `open.reads` is empty, so it is not pinned and must not count as R.
             latest_dword: 0,
             mask: u32::MAX,
@@ -644,7 +644,7 @@ fn a_write_of_a_constant_the_trip_never_read_is_class_w_not_class_r() {
 #[test]
 fn the_charged_total_and_timing_rem_match_the_real_trip_when_raw_is_not_a_multiple_of_the_denominator()
  {
-    // I386: level_timing = (num=2, den=5) -- the one persona where `num` is
+    // I386: level_timing = (num=2, den=5): the one persona where `num` is
     // not 1, so the forward scaling actually carries a remainder step to
     // step (I486/I586 have num=1, where every raw*num is trivially a
     // multiple of nothing interesting).
@@ -700,7 +700,7 @@ fn port_io_rdtsc_x87_and_a_pending_soft_int_inside_a_trip_all_refuse() {
         cpu.reflected_call.as_mut().unwrap().open = Some(open);
         hook(&mut cpu);
         // Close the trip as a (non-)match; the hazard must dominate.
-        on_far_transfer(&mut cpu, &bus); // no-op close path (not frame-gone) --
+        on_far_transfer(&mut cpu, &bus); // no-op close path (not frame-gone):
         // force the close directly instead, since the synthetic client's SP
         // has not moved:
         let open = cpu.reflected_call.as_mut().unwrap().open.take();
@@ -773,7 +773,7 @@ fn the_knob_spelling_table() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 15: the off arm is bit-identical -- no state moves when the knob is
+// Test 15: the off arm is bit-identical. No state moves when the knob is
 // off.
 // ---------------------------------------------------------------------------
 
@@ -805,7 +805,7 @@ fn the_off_arm_is_bit_identical() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 1: raw bus clocks must be recovered from
+// Raw bus clocks must be recovered from
 // a cumulative (whole-run) counter, never a per-batch one that resets at
 // every IF-edge machine-batch re-entry.
 // ---------------------------------------------------------------------------
@@ -851,7 +851,7 @@ fn open_trip_samples_the_cumulative_bus_accessor() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 2 (plan section 4.2 point 2): only
+// Plan section 4.2 point 2: only
 // `clocks_unstable` counts toward the consecutive-failure disarm budget.
 // ---------------------------------------------------------------------------
 
@@ -901,7 +901,7 @@ fn journal_mismatch_and_boundary_refusals_do_not_disarm_only_clocks_unstable_doe
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 5: Class D must be tested against the SS
+// Class D must be tested against the SS
 // selector actually in force at the write, and HostStack writes are
 // eligible for Class D exactly like ClientStack ones.
 // ---------------------------------------------------------------------------
@@ -918,7 +918,7 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
         limit: 0xffff,
         // OFFSETS from `base`, which is what `OpenTrip::start` and `touch_stack` store
         // (both take `regs.esp()`). Spelling them as linear addresses here is what let the
-        // unit bug in `is_dead_stack` -- a second subtraction of the base -- go unseen.
+        // unit bug in `is_dead_stack` (a second subtraction of the base) go unseen.
         low_water_esp: 0x100,
         last_esp: 0x200,
     });
@@ -949,7 +949,7 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
 /// The Class D rule against a stack segment with a **NON-ZERO BASE**, which is the only
 /// shape in which the unit bug this test names is visible.
 ///
-/// `StackTrack::low_water_esp` is an ESP -- an offset from the segment base -- because
+/// `StackTrack::low_water_esp` is an ESP, an offset from the segment base, because
 /// that is what `OpenTrip::start` (`regs.esp()`) and `touch_stack` put there. The linear
 /// address of a write has to have the base taken off it to reach that space, and that is
 /// the ONLY subtraction the test may make.
@@ -958,7 +958,7 @@ fn a_write_on_the_hosts_own_stack_segment_is_eligible_for_class_d() {
 /// `let low_from_base = seg.low_water_esp.wrapping_sub(seg.base);`, and this test fails on
 /// its live assertion. With the DPMI client stack's measured base `0x0009_d3e0` against a
 /// low-water ESP well below it, that subtraction wraps to `0xfff6_3c20` and EVERY address
-/// in the segment answers "dead" -- which is what classified the dominant key's whole
+/// in the segment answers "dead", which is what classified the dominant key's whole
 /// stack write set (~100 dwords per trip) as Class D, "recorded nowhere", on
 /// `tyrian-specs-586`, and what the runtime audit then reported as `write_value` on 27 of
 /// 27 audits from the other side.
@@ -987,7 +987,7 @@ fn class_d_compares_offsets_against_a_segment_whose_base_exceeds_the_low_water_e
     assert!(!open.is_dead_stack(DPMI_SS, DPMI_BASE, 0x10));
 }
 
-/// One SELECTOR VALUE can name two descriptors inside a single reflected trip -- measured
+/// One SELECTOR VALUE can name two descriptors inside a single reflected trip, measured
 /// on `tyrian-specs-586`, where `0x18` appears with the client stack's base `0x0009d3e0`
 /// and with a second, unrelated one whose ESPs live four orders of magnitude away.
 ///
@@ -1043,7 +1043,7 @@ fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
         limit: 0xffff,
         // OFFSETS from `base`, which is what `OpenTrip::start` and `touch_stack` store
         // (both take `regs.esp()`). Spelling them as linear addresses here is what let the
-        // unit bug in `is_dead_stack` -- a second subtraction of the base -- go unseen.
+        // unit bug in `is_dead_stack` (a second subtraction of the base) go unseen.
         low_water_esp: 0x100,
         last_esp: 0x200,
     });
@@ -1068,7 +1068,7 @@ fn a_live_host_stack_write_above_the_low_water_mark_is_not_class_d() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 5 (the aperture/device-window classes):
+// The aperture/device-window classes:
 // classify_write must actually return them.
 // ---------------------------------------------------------------------------
 
@@ -1101,7 +1101,7 @@ fn classify_write_returns_the_two_never_restored_device_classes() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable review 2026-09-03, finding 6(iii): trips_seen/disarmed_returns must
+// trips_seen/disarmed_returns must
 // be visible per key.
 // ---------------------------------------------------------------------------
 
@@ -1123,15 +1123,15 @@ fn disarmed_key_still_counts_trips_seen_and_disarmed_returns() {
 }
 
 // ---------------------------------------------------------------------------
-// Fable re-review 2026-09-03, nit (i): a hardware interrupt inside a trip
+// A hardware interrupt inside a trip
 // must report as `hardware_interrupt`, not whatever hazard its own EOI
 // (an `OUT`) happens to also set.
 // ---------------------------------------------------------------------------
 
 /// **Mutation bite**: swap the order back (test `open.hazard` before
 /// `open.hw_interrupt_seen`) and this test fails: the trip reports
-/// `port_io` instead of `hardware_interrupt`, exactly the defect the
-/// re-review traced (447 misattributed refusals on one recipe-A run).
+/// `port_io` instead of `hardware_interrupt`, exactly the defect that
+/// produced 447 misattributed refusals on one recipe-A run.
 #[test]
 fn a_hardware_interrupt_inside_a_trip_reports_as_hardware_interrupt_not_port_io() {
     let (mut cpu, bus) = synthetic_reflected_client();
@@ -1153,7 +1153,7 @@ fn a_hardware_interrupt_inside_a_trip_reports_as_hardware_interrupt_not_port_io(
 }
 
 // ---------------------------------------------------------------------------
-// Fable re-review 2026-09-03, campaign verdict (2c): a disarmed key must
+// A disarmed key must
 // re-arm after MEMO_REARM_TRIPS_SEEN more trips are seen, so a budget spent
 // entirely in a menu phase cannot blind the dwell for the rest of the run.
 // ---------------------------------------------------------------------------
@@ -1258,7 +1258,7 @@ fn fake_memo() -> Arc<Memo> {
 /// **Mutation bite**: skip the retire call in `CpuGsw::note_a20_changed` (or leave the memo
 /// cache untouched) and this test fails: a memo built while A20 was open (or closed) survives
 /// a gate toggle and the answer path would go on comparing and replaying cells resolved under
-/// the STALE gate state -- silent guest-memory corruption near the 1 MB wrap.
+/// the STALE gate state: silent guest-memory corruption near the 1 MB wrap.
 #[test]
 fn an_a20_toggle_retires_every_memo() {
     let (mut cpu, _bus) = synthetic_reflected_client();
@@ -1346,10 +1346,10 @@ fn note_a20_changed_is_the_seam_that_retires() {
 const CLASS_W_ADDR: u32 = 0x7000;
 
 /// Drives one synthetic trip through the real hooks: `on_int` opens it, one write lands at
-/// `CLASS_W_ADDR` (never read first, so it is Class W -- deterministic, not pinned-restored),
+/// `CLASS_W_ADDR` (never read first, so it is Class W: deterministic, not pinned-restored),
 /// the `RETF`-with-flags shape closes it (`SP == entry SP - 2`). `journal` selects whether the
 /// write is actually observed (matches `cpu.reflected_call_journal`, which `on_int` sets from
-/// the key's own learn slot -- Warm trips never journal).
+/// the key's own learn slot: Warm trips never journal).
 fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u32) {
     cpu.registers.set_esp(STACK_TOP);
     cpu.set_eip(CLIENT_RETURN_EIP);
@@ -1369,7 +1369,7 @@ fn run_one_synthetic_trip(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u
         None,
     );
     bus.write_raw(CLASS_W_ADDR, BusWidth::Dword, write_value);
-    // What real instruction execution would have charged between the `INT` and the return --
+    // What real instruction execution would have charged between the `INT` and the return:
     // applied HERE, between open and close, is what the raw-clock recovery (an
     // open/close DELTA) actually measures.
     cpu.elapsed_clocks += 100;
@@ -1393,7 +1393,7 @@ fn a_full_learn_cycle_produces_an_armed_memo_for_the_key() {
     // (must all report identical raw clocks). Sixteen fixed, deterministic increments to
     // `elapsed_clocks`/`perf.instructions`/the bus clock between open and close, applied via
     // `run_one_synthetic_trip`'s bracketing below, standing in for what real instruction
-    // execution would charge -- the SAME amount every trip is exactly what "the clocks are
+    // execution would charge: the SAME amount every trip is exactly what "the clocks are
     // stable" means.
     for _ in 0..11 {
         run_one_synthetic_trip(&mut cpu, &mut bus, 0xCAFEBABE);
@@ -1408,7 +1408,7 @@ fn a_full_learn_cycle_produces_an_armed_memo_for_the_key() {
     // The telescoping-carry scaler (R2.2/R2.15): `raw = den * elapsed_delta / num`. This test
     // drives the SAME 100-tick delta on every one of the 8 natural samples, so whatever the
     // scaler's ratio is for this persona, the recovered raw total must be identical across
-    // all 8 and equal to this formula applied once -- the memo's own value proves it, since
+    // all 8 and equal to this formula applied once: the memo's own value proves it, since
     // `finish_trip` only reaches `Slot::Natural` success when all 8 samples agreed exactly.
     let (num, den) = crate::level_timing(cpu.persona());
     assert_eq!(memo.raw_core_clocks, 100 * u64::from(den) / u64::from(num));
@@ -1428,7 +1428,7 @@ fn a_full_learn_cycle_produces_an_armed_memo_for_the_key() {
 
 /// **Mutation bite**: skip the read-set compare in `screen_memo` (return `Ok(())` once the
 /// entry image matches): the answer path would apply an epilogue built from a trip whose
-/// inputs the CURRENT trip never actually presented -- the exact bug the plan's own worked
+/// inputs the CURRENT trip never actually presented, the exact bug the plan's own worked
 /// example (a re-vectored `INT`, or a pending key in the BDA tail) depends on this screen to
 /// catch. This test drains the invariant to its purest form: a single poisoned read cell, with
 /// nothing else about the machine touched, must be rejected before any state changes, and the
@@ -1824,11 +1824,11 @@ fn public_reflected_int_answers_once_from_cycle_and_cached_head() {
 }
 
 /// **Mutation bites, four, each verified red on its own**: (a) drop the epilogue's
-/// segment restore -- DS keeps the caller's selector and the next reflected call runs
-/// the DOS half against the wrong data segment (BLOCKING finding 1's shape); (b) drop
-/// the `ESP` restore -- the `RETF`-with-flags SP delta is lost and the client stack
-/// walks; (c) drop the EFLAGS restore -- the answer returns the wrong carry, which
-/// `AH=0Bh` uses as its result; (d) drop the `set_eip` -- the guest re-executes the
+/// segment restore: DS keeps the caller's selector and the next reflected call runs
+/// the DOS half against the wrong data segment; (b) drop
+/// the `ESP` restore: the `RETF`-with-flags SP delta is lost and the client stack
+/// walks; (c) drop the EFLAGS restore: the answer returns the wrong carry, which
+/// `AH=0Bh` uses as its result; (d) drop the `set_eip`: the guest re-executes the
 /// `INT`.
 #[test]
 fn the_answer_reproduces_the_epilogue_registers_flags_segments_and_sp() {
@@ -1888,10 +1888,10 @@ fn the_answer_reproduces_the_epilogue_registers_flags_segments_and_sp() {
     assert_eq!(cpu.reflected_call.as_ref().unwrap().answered, 1);
 }
 
-/// **Mutation bite**: delete the `bus.interrupt_acknowledge` loop in `apply_answer` --
+/// **Mutation bite**: delete the `bus.interrupt_acknowledge` loop in `apply_answer`:
 /// the trip's nested `INT 16h`/`INT 28h` acks vanish, so the bus trace, its I/O wait
-/// states and `last_int_vector` all diverge from the real trip (BLOCKING finding 6).
-/// A second bite: replay the list in reverse -- the ORDER assertion below fails.
+/// states and `last_int_vector` all diverge from the real trip.
+/// A second bite: replay the list in reverse: the ORDER assertion below fails.
 #[test]
 fn nested_acks_are_re_issued_in_trip_order() {
     let (mut cpu, mut bus) = synthetic_reflected_client();
@@ -1914,10 +1914,10 @@ fn nested_acks_are_re_issued_in_trip_order() {
     );
 }
 
-/// **Mutation bite**: skip the `memo.replay` loop -- the deterministic net writes the
+/// **Mutation bite**: skip the `memo.replay` loop: the deterministic net writes the
 /// trip made (the DPMI host's register block, a DOS data byte) are never made, and the
 /// guest reads stale data with nothing in the read set to catch it. A second bite:
-/// write `BusWidth::Dword` regardless of the recorded width -- the two bytes above the
+/// write `BusWidth::Dword` regardless of the recorded width: the two bytes above the
 /// word are clobbered, which the neighbour assertion below catches.
 #[test]
 fn a_class_w_write_is_replayed_at_its_own_address_and_width() {
@@ -1941,10 +1941,10 @@ fn a_class_w_write_is_replayed_at_its_own_address_and_width() {
     );
 }
 
-/// **Mutation bite**: drop `memo.control_effects` from the apply path -- an answered
+/// **Mutation bite**: drop `memo.control_effects` from the apply path: an answered
 /// trip leaves CR3 (and therefore the TLB and the decode ring) where the CALLER left
 /// it, so a guest that edits a page table and relies on the reflected call's own mode
-/// switch to publish the edit reads through a stale translation (BLOCKING finding 5).
+/// switch to publish the edit reads through a stale translation.
 #[test]
 fn an_answered_trip_replays_the_cr3_writes() {
     let (mut cpu, mut bus) = synthetic_reflected_client();
@@ -1973,7 +1973,7 @@ fn an_answered_trip_replays_the_cr3_writes() {
 }
 
 /// **Mutation bite**: feed `commit_reflected_call_core` a pre-scaled delta instead of
-/// the RAW total (BLOCKING finding 2's double-scale). With `raw = 1,000` and
+/// the RAW total (a double-scale). With `raw = 1,000` and
 /// `den = 12` the charge is `1000/12 = 83` and the carry left behind is `1000 % 12 =
 /// 4`; a double-scale charges 6 and leaves 11, and both halves of this assertion move.
 /// The raw total is deliberately not a multiple of `den`, or the carry check is vacuous
@@ -2027,7 +2027,7 @@ fn the_answer_charges_raw_core_clocks_through_the_carry_scaler() {
 }
 
 /// **Mutation bite**: remove the clamp (the `reflected_call_gate` call, or its `Err`
-/// arm) -- a lump the remaining batch allowance cannot hold is applied anyway, running
+/// arm), a lump the remaining batch allowance cannot hold is applied anyway, running
 /// the batch past the next device edge, and the guest's timer ISR loses ticks the real
 /// PIT delivers. The assertion is on the FALL-THROUGH, not merely on a counter: every
 /// register, the memory image, the clock and the carry must be untouched.
@@ -2068,7 +2068,7 @@ fn a_lump_that_does_not_fit_the_remaining_allowance_falls_through() {
     );
 }
 
-/// **Mutation bite**: move the observer test AFTER the apply (or delete it) -- a Class R
+/// **Mutation bite**: move the observer test AFTER the apply (or delete it): a Class R
 /// write inside a device window or the framebuffer aperture is SKIPPED, so the device
 /// never sees the intermediate value the real trip showed it (review A.4, plan 5.7).
 #[test]
@@ -2103,8 +2103,8 @@ fn a_class_r_range_a_device_can_observe_falls_through_at_answer_time() {
 /// answer is one poisoned read cell.
 ///
 /// **Mutation bite**: apply the replay before the read-set compare (partial
-/// application) -- the memory assertion fails; charge the clocks before the compare --
-/// the clock assertions fail; bump `answered` before the screens -- the counter
+/// application): the memory assertion fails; charge the clocks before the compare:
+/// the clock assertions fail; bump `answered` before the screens: the counter
 /// assertion fails.
 #[test]
 fn a_poisoned_read_cell_leaves_every_register_memory_clock_and_counter_untouched() {
@@ -2157,7 +2157,7 @@ fn a_poisoned_read_cell_leaves_every_register_memory_clock_and_counter_untouched
 
 /// **Mutation bite**: give `CpuBus::reflected_call_gate` a permissive default
 /// (`Ok(())`) instead of `Err(NotArmed)`. Every clamp fixture in this file, and every
-/// test double in the whole CPU crate, would then silently ADMIT answers -- the
+/// test double in the whole CPU crate, would then silently ADMIT answers, the
 /// vacuity `callout_poll_skip`'s own default-to-decline exists to rule out.
 #[test]
 fn an_unarmed_test_double_can_never_fake_a_hit() {
@@ -2210,13 +2210,13 @@ fn a_nested_int_outside_the_opening_window_is_still_recorded_as_an_ack() {
 }
 
 // ---------------------------------------------------------------------------
-// Amendment 4: the code-watch retire (plan R2.4 / BLOCKING finding 4).
+// Amendment 4: the code-watch retire (plan R2.4).
 // ---------------------------------------------------------------------------
 
 /// **Mutation bite**: delete the `note_code_hit` call from the tail of
 /// `CpuGsw::note_code_write_inner`. A TSR chaining `INT 21h`, a DPMI host rewriting its
 /// own hook, or ordinary self-modifying code then patches the handler and the memo goes
-/// on answering from the code that USED to be there, for the rest of the run -- and
+/// on answering from the code that USED to be there, for the rest of the run, and
 /// nothing in any screen can see it, because the read set covers DATA and never
 /// instruction fetch.
 ///
@@ -2267,8 +2267,8 @@ fn a_write_that_hits_cached_code_retires_every_memo() {
 
 /// **Mutation bite**: freeze `reflected_call_code_mark_epoch`, or drop the
 /// `sync_code_mark_epoch` call from `try_answer`. The write-hit retire above rests on the
-/// memo's code pages still being MARKED -- marks are what route a write into
-/// `note_code_write_inner` at all -- and a wholesale mark clear silently removes that
+/// memo's code pages still being MARKED: marks are what route a write into
+/// `note_code_write_inner` at all, and a wholesale mark clear silently removes that
 /// routing while the memo lives on. This is the half of the code watch that no write-hit
 /// test can cover.
 #[test]
@@ -2302,7 +2302,7 @@ fn a_wholesale_decode_mark_clear_retires_every_memo() {
 
 /// **Mutation bite**: make `""` (or an unset variable) mean OFF instead of the default.
 /// A ladder leg that forgot to export the knob would then run with no audit at all and
-/// report `audit_mismatch = 0` for the best possible reason -- nothing was ever checked.
+/// report `audit_mismatch = 0` for the best possible reason: nothing was ever checked.
 /// The numeric-knob convention is that `=0` is the ONLY off spelling.
 #[test]
 fn the_audit_knob_spelling_table() {
@@ -2357,7 +2357,7 @@ fn set_audit_period(cpu: &mut CpuGsw, period: u64) {
 }
 
 /// **Mutation bite**: make the audit ANSWER first and compare afterwards. There is then
-/// nothing left to compare against -- the memo's own epilogue IS the state -- and the
+/// nothing left to compare against: the memo's own epilogue IS the state, and the
 /// audit reports agreement on every trip forever (plan R2.7: "AUDIT is record-and-compare
 /// ... `AUDIT=1` therefore answers nothing").
 ///
@@ -2400,7 +2400,7 @@ fn an_audit_refuses_the_answer_and_runs_the_real_trip() {
 /// memo is still there to answer the next trip.
 ///
 /// **Mutation bite**: compare the write SETS instead of the values by the formula, or
-/// drop the `pre_dword` capture -- an agreeing trip then reports a `write_value`
+/// drop the `pre_dword` capture: an agreeing trip then reports a `write_value`
 /// mismatch and the mechanism retires its own memo on every audit.
 #[test]
 fn an_agreeing_audit_leaves_the_memo_standing() {
@@ -2431,8 +2431,8 @@ fn an_agreeing_audit_leaves_the_memo_standing() {
 
 /// **Mutation bite**: let a core-clock or instruction-count disagreement pass. The memo
 /// then goes on charging a constant the real trip no longer costs, and the accumulated
-/// error slips an `irq0` edge -- the exact failure the measure-first review's section 2
-/// derived (a persistent one-clock error moves `irq0_edges` on a 31 s row with ~22%
+/// error slips an `irq0` edge: the exact failure the measure-first
+/// estimate derived (a persistent one-clock error moves `irq0_edges` on a 31 s row with ~22%
 /// probability).
 #[test]
 fn a_core_clock_disagreement_retires_the_memo_and_relearns() {
@@ -2473,8 +2473,8 @@ fn a_core_clock_disagreement_retires_the_memo_and_relearns() {
     );
 }
 
-/// The formula's load-bearing case (plan R2.18): an address the memo classified R --
-/// predicted "no change" -- that the real trip WRITES. A set comparison would see the
+/// The formula's load-bearing case (plan R2.18): an address the memo classified R,
+/// predicted "no change", that the real trip WRITES. A set comparison would see the
 /// address in both worlds and report agreement.
 ///
 /// **Mutation bite**: predict `observed_now` instead of the trip's ENTRY value for a
@@ -2508,7 +2508,7 @@ fn an_address_the_memo_predicts_unchanged_but_the_trip_writes_is_a_mismatch() {
 /// unattainable in principle (an answered trip touches no cache line, so the cache model
 /// sees a different access stream whatever is charged), so an exact bar would retire the
 /// memo on the 0.007% of trips that jitter and the mechanism would thrash.
-/// The opposite bite -- no band at all -- lets an arbitrarily wrong bus total stand.
+/// The opposite bite, no band at all, lets an arbitrarily wrong bus total stand.
 #[test]
 fn the_bus_total_is_graded_against_a_band_not_an_equality() {
     for (delta, expect_mismatch) in [
@@ -2629,7 +2629,7 @@ fn accumulated_bus_drift_forces_an_audit_before_half_an_edge_is_lost() {
 
 /// **Mutation bite**: drop the `reflected_call_soft_int_posted` screen from `try_answer`.
 /// The machine services a posted HLE software interrupt at the next batch boundary, so a
-/// lump taken with one pending runs guest work past the instant it was posted at -- and
+/// lump taken with one pending runs guest work past the instant it was posted at, and
 /// nothing in the entry image or the read set can see it, because `pending_soft_int` is
 /// the MACHINE's field, not the CPU's.
 #[test]
@@ -2681,7 +2681,7 @@ fn a_trip_that_posts_a_soft_int_is_never_learned_from() {
 
 /// **Mutation bite**: delete the `note_task_switch` call from `CpuGsw::task_switch`. A
 /// trip containing a task gate, a TSS `CALL`/`JMP` or an `IRET` back-link return would
-/// then be learned from, and the memo's epilogue -- registers, segments, CPL -- cannot
+/// then be learned from, and the memo's epilogue (registers, segments, CPL) cannot
 /// reproduce a TSS load, so answering it would leave the guest in the WRONG TASK.
 #[test]
 fn a_task_switch_inside_a_trip_refuses_the_memo() {
@@ -2694,7 +2694,7 @@ fn a_task_switch_inside_a_trip_refuses_the_memo() {
     // Reach the REAL seam, not the hook function: an `IRET` with `EFLAGS.NT` set in
     // protected mode is a task RETURN through the current TSS's back-link
     // (`iret_body`, 386 PRM 9.5), and it calls `CpuGsw::task_switch`. The switch itself
-    // is expected to FAULT here -- this fixture has no valid back-link TSS -- and that is
+    // is expected to FAULT here (this fixture has no valid back-link TSS) and that is
     // exactly what makes the test cheap AND sharp: `note_task_switch` is the first
     // statement of `task_switch`, so reaching the function at all is what has to be
     // proved, and a fault on the way out cannot un-record the refusal.
@@ -2741,7 +2741,7 @@ fn the_mmx_refusal_is_the_isa_gate_not_a_memo_lane() {
 ///
 /// **Mutation bite**: screen `open.writes` with the LINEAR address instead of the
 /// resolved physical dword. `writes` is keyed by aligned PHYSICAL dword, so UNDER PAGING
-/// the two differ and the screen never fires -- which is the shipped defect this test was
+/// the two differ and the screen never fires, which is the shipped defect this test was
 /// written for, and why this fixture pays for a real page table instead of running
 /// unpaged like every other one in this file. Measured on `tyrian-specs-586`
 /// (2026-09-03) the defect cost the mechanism EVERYTHING: 1,387,638 of 1,459,463 answer
@@ -2784,7 +2784,7 @@ fn a_cell_the_trip_wrote_before_reading_is_not_in_the_read_set() {
     open.journaling = true;
     cpu.reflected_call.as_mut().unwrap().open = Some(open);
 
-    // Write, then read the same address -- the shape a stack slot takes inside a trip.
+    // Write, then read the same address: the shape a stack slot takes inside a trip.
     note_write(
         &mut cpu,
         &bus,
@@ -2821,8 +2821,8 @@ fn a_cell_the_trip_wrote_before_reading_is_not_in_the_read_set() {
 /// A byte read must pin ONE byte, not four.
 ///
 /// **Mutation bite**: record `u32::MAX` as the mask regardless of the access width. The
-/// screen then pins three bytes the trip never looked at, and any neighbour that moves --
-/// a DOS counter sharing the dword -- fails the screen on every occurrence. Measured on
+/// screen then pins three bytes the trip never looked at, and any neighbour that moves,
+/// a DOS counter sharing the dword, fails the screen on every occurrence. Measured on
 /// `tyrian-specs-586` (2026-09-03), that was worth the entire mechanism: physical
 /// `0x17cc` mismatched on 726,117 of 726,134 answer attempts on the dominant key, on a
 /// single differing byte, and `answered` was 0.
@@ -2901,7 +2901,7 @@ fn a_byte_read_pins_one_byte_not_the_whole_dword() {
 /// POST-trip value: the answer's screen runs BEFORE the trip, and in steady state the cell
 /// holds what the previous occurrence of this trip left there.
 ///
-/// **This is a HIT-RATE decision, not a soundness one, and it has no unit bite** -- said
+/// **This is a HIT-RATE decision, not a soundness one, and it has no unit bite**, said
 /// plainly rather than dressed up as a mutation the fixture cannot actually distinguish.
 /// Whichever value is pinned, the screen still runs and a cell that does not match still
 /// falls through to the guest; the only thing at stake is how often. What decided it is
@@ -2909,7 +2909,7 @@ fn a_byte_read_pins_one_byte_not_the_whole_dword() {
 /// offender dump named physical `0x17b0` in DOS data on `AH=0Bh` and 726,123 of 726,134
 /// answer attempts fell through on that one cell; with the post-trip value pinned the
 /// same cell accounts for 6. A unit fixture cannot tell the two apart, because in steady
-/// state the value a trip reads IS what the previous occurrence wrote -- which is the
+/// state the value a trip reads IS what the previous occurrence wrote, which is the
 /// whole point.
 ///
 /// What this test does pin: the cell stays IN the read set (dropping it would weaken the
@@ -2922,7 +2922,7 @@ fn a_cell_read_then_written_is_pinned_at_its_post_trip_value() {
     let key = key_for(&cpu, VECTOR, 0);
 
     // Run one full learn cycle whose trip READS `CELL` (value 0x1111) and then WRITES it
-    // (value 0x2222) -- the DOS-data shape the measurement named.
+    // (value 0x2222), the DOS-data shape the measurement named.
     for _ in 0..11 {
         cpu.registers.set_esp(STACK_TOP);
         cpu.set_eip(CLIENT_RETURN_EIP);
@@ -2937,7 +2937,7 @@ fn a_cell_read_then_written_is_pinned_at_its_post_trip_value() {
         cpu.set_eip(CLIENT_RETURN_EIP);
         on_far_return(&mut cpu, &bus);
         // The next occurrence starts from what this one left, and the trip restores its
-        // own read value before reading again -- exactly the steady state the memo has to
+        // own read value before reading again, exactly the steady state the memo has to
         // screen against.
         bus.write_raw(CELL, BusWidth::Dword, 0x2222);
     }
@@ -2955,14 +2955,14 @@ fn a_cell_read_then_written_is_pinned_at_its_post_trip_value() {
     );
 }
 
-/// A trip that writes TWO different fields of the same aligned dword -- a byte here, a
-/// word there -- must have BOTH replayed. The write journal is keyed by dword, so a model
+/// A trip that writes TWO different fields of the same aligned dword, a byte here, a
+/// word there, must have BOTH replayed. The write journal is keyed by dword, so a model
 /// that keeps only the LAST write at each key replays half the dword and leaves the other
 /// half holding whatever the previous occurrence put there.
 ///
 /// **Mutation bite**: overwrite `latest_dword`/`mask` on a repeat write instead of
 /// splicing and OR-ing. This is not hypothetical: it is the shipped shape, and the
-/// fixture-scale AUDIT is what caught it -- `tyrian-specs-586` (2026-09-03) reported
+/// fixture-scale AUDIT is what caught it: `tyrian-specs-586` (2026-09-03) reported
 /// `audit_mismatch[write_value]` on 13,768 of 13,768 audited trips while the epilogue, the
 /// core clocks and the instruction count all agreed exactly.
 #[test]
@@ -3008,9 +3008,9 @@ fn two_writes_to_one_dword_are_both_replayed() {
 ///
 /// **Mutation bite**: test dword MEMBERSHIP (`reads.contains_key(&dword)`) instead of mask
 /// coverage. That is the shipped shape, and the fixture-scale AUDIT is what named it: on
-/// `tyrian-specs-586` (2026-09-03) it left exactly one divergent address per dominant key
-/// -- `0x1a3ea4` on `INT 33h`, 54,988 of 55,188 audits, and `0x127150` on `AH=0Bh`, 60,243
-/// of 60,243 -- while the epilogue, the core clocks, the instruction count and the bus
+/// `tyrian-specs-586` (2026-09-03) it left exactly one divergent address per dominant key:
+/// `0x1a3ea4` on `INT 33h`, 54,988 of 55,188 audits, and `0x127150` on `AH=0Bh`, 60,243
+/// of 60,243, while the epilogue, the core clocks, the instruction count and the bus
 /// total all agreed exactly.
 #[test]
 fn a_write_whose_bytes_the_trip_never_read_is_not_pinned() {
@@ -3022,7 +3022,7 @@ fn a_write_whose_bytes_the_trip_never_read_is_not_pinned() {
     cpu.reflected_call.as_mut().unwrap().open = Some(open);
 
     bus.write_raw(CELL, BusWidth::Dword, 0xAABB_CCDD);
-    // Read the HIGH word, write the LOW word -- and restore it, so `restored` is true and
+    // Read the HIGH word, write the LOW word, and restore it, so `restored` is true and
     // only the pinned test can keep this out of Class R.
     note_read(&mut cpu, &bus, CELL + 2, BusWidth::Word);
     note_write(&mut cpu, &bus, CELL, BusWidth::Word, 0xCCDD, false, None);
@@ -3043,11 +3043,10 @@ fn a_write_whose_bytes_the_trip_never_read_is_not_pinned() {
 }
 
 // ---------------------------------------------------------------------------
-// The learn protocol, option E + D
-// (`dev_docs/2026-09-05-reflected-call-learn-protocol-design.md`).
+// The learn protocol, option E + D.
 //
-// A trip's write MODEL is confirmed on the eight natural samples by PEEK -- no journal,
-// no extra trip, no clock sample spent -- and the period-64 runtime audit stays on as the
+// A trip's write MODEL is confirmed on the eight natural samples by PEEK, no journal,
+// no extra trip, no clock sample spent, and the period-64 runtime audit stays on as the
 // permanent net for what eight samples cannot see.
 // ---------------------------------------------------------------------------
 
@@ -3083,7 +3082,7 @@ fn run_trip_writing(cpu: &mut CpuGsw, bus: &mut FlatMemBus, write_value: u32, al
 /// Test 1. **Mutation bite**: delete `confirm_write_model_at_close`, or the
 /// `write_model_unstable` clause in `finish_trip`'s natural-success arm. A memo is then
 /// built carrying `0xCAFEBABE` for a cell that took `0xDEADBEEF` on one of the eight
-/// natural samples -- which is exactly the shape the fixture-scale audit caught on
+/// natural samples, which is exactly the shape the fixture-scale audit caught on
 /// `tyrian-specs-586`: `0x1a3ea4`, replayed as `…1f96` while the trip wrote `…1f99`,
 /// 54,988 of 55,188 audits.
 #[test]
@@ -3116,12 +3115,12 @@ fn a_class_w_value_that_moves_on_a_natural_sample_refuses_the_learn() {
 /// Test 2. The cadence sweep the task asks for: a cell that moves on every `k`-th trip,
 /// for every `k` the eight natural samples can see.
 ///
-/// **Mutation bite**: the same as test 1 -- without the confirmation every `k` builds a
+/// **Mutation bite**: the same as test 1: without the confirmation every `k` builds a
 /// memo carrying a value the trip does not always write.
 ///
 /// **The residual hole is documented here rather than asserted**: a cadence LONGER than
 /// the natural-sample window (say `k = 12`) is invisible to option E, and a test for it
-/// would be green both before and after the fix -- an assertion that cannot fail. Its
+/// would be green both before and after the fix, an assertion that cannot fail. Its
 /// owner is option D, the period-64 runtime audit, which stays on permanently for exactly
 /// this reason and disarms the key on the second strike.
 #[test]
@@ -3161,7 +3160,7 @@ fn a_cell_moving_every_kth_trip_is_caught_for_every_k_up_to_the_sample_count() {
 ///
 /// **Mutation bite**: drop the Class R demotion arm from
 /// `confirm_write_model_at_close` (refuse instead of demote). The key stops answering
-/// altogether, which is a correctness-preserving but needlessly expensive outcome -- and
+/// altogether, which is a correctness-preserving but needlessly expensive outcome, and
 /// it is the difference between this design and options A/B/C.
 #[test]
 fn a_class_r_write_whose_pre_value_alternates_is_demoted_to_class_w() {
@@ -3318,7 +3317,7 @@ fn two_write_value_audit_strikes_disarm_the_key_one_does_not() {
 ///
 /// **Mutation bite**: add a variant to `LearnRefused` without adding it to
 /// `LEARN_REFUSED_ALL`. `index()` panics on it at runtime, in production, on a cold
-/// refusal path -- which is the worst possible place to find out.
+/// refusal path, which is the worst possible place to find out.
 #[test]
 fn the_new_refusal_lane_is_in_learn_refused_all_and_the_array_is_sized_for_it() {
     let ks = KeyState::default();
@@ -3346,7 +3345,7 @@ fn the_new_refusal_lane_is_in_learn_refused_all_and_the_array_is_sized_for_it() 
 ///
 /// A learn cycle's journal trips are forced onto the interpreter and see every store, so
 /// the low-water mark their Class D rule rests on is complete. An audit trip deliberately
-/// runs NATIVE -- its clock triple is graded against a memo learned from native samples --
+/// runs NATIVE: its clock triple is graded against a memo learned from native samples,
 /// so its own journal holds only the interpreted subset and its low-water mark is
 /// shallower. This fixture is that asymmetry in miniature: the audited trip journals ONE
 /// write, deep in its stack, with no earlier push to pull the low-water mark down, so its
@@ -3355,7 +3354,7 @@ fn the_new_refusal_lane_is_in_learn_refused_all_and_the_array_is_sized_for_it() 
 /// **Mutation bite**: delete the `ranges_contain(&memo.class_d_ranges, dword)` skip from
 /// `audit_write_values_disagree` (or restore the re-derivation,
 /// `open.is_dead_stack(obs.ss_selector, obs.ss_base, obs.linear)`). The audit grades the
-/// dword against `WriteObs::pre_dword` -- a mid-trip instant -- and reports a divergence
+/// dword against `WriteObs::pre_dword`, a mid-trip instant, and reports a divergence
 /// about a cell the memo deliberately excluded and the answer never touches. On
 /// `tyrian-specs-586` that was physical `0x17ac`, class `host_stack`, on 26 of 27 audits.
 #[test]
@@ -3384,7 +3383,7 @@ fn the_audit_skips_the_memos_own_class_d_set_not_one_it_re_derives() {
     );
 
     // The audit trip pushes PAST the cell before writing it, so its OWN low-water mark
-    // sits below the cell and its own `is_dead_stack` answers "live" -- the disagreement
+    // sits below the cell and its own `is_dead_stack` answers "live": the disagreement
     // this test exists to make harmless.
     cpu.registers.set_esp(STACK_TOP - 0x80);
     note_write(
@@ -3472,11 +3471,11 @@ fn a_written_dword_outside_the_memos_class_d_set_is_still_graded() {
 ///
 /// The shape here is the measured one: a Class R cell that is `0` at trip entry, is moved
 /// to `0x1a` mid-trip by something the journal does not see, is written back to `0` by the
-/// trip, and is `0` again at exit. The memo SKIPS it, and skipping is CORRECT -- an
+/// trip, and is `0` again at exit. The memo SKIPS it, and skipping is CORRECT: an
 /// answered trip leaves it at `0`, exactly as the real trip does.
 ///
 /// **Mutation bite**: prefer `pre_dword` over the trip-entry snapshot. The audit then
-/// reports a divergence on a cell the memo handles correctly -- 60,243 of 60,243 audits of
+/// reports a divergence on a cell the memo handles correctly: 60,243 of 60,243 audits of
 /// the dominant key on `tyrian-specs-586` (`0x127150`, predicted `0x1a`, observed `0x0`),
 /// which retires and re-learns the memo forever and collapses the answer rate.
 #[test]
@@ -3527,14 +3526,14 @@ fn the_audit_compares_against_the_value_at_trip_entry_not_before_the_first_write
 }
 
 /// An answered trip writes the bytes its model claims and touches nothing else, so what it
-/// leaves behind is `(entry & !mask) | (value & mask)` -- the WHOLE dword. A real trip that
+/// leaves behind is `(entry & !mask) | (value & mask)`: the WHOLE dword. A real trip that
 /// moves a byte OUTSIDE the claimed mask therefore diverges from the answer just as surely
 /// as one that moves a byte inside it, and the natural-sample confirmation has to compare
 /// the whole dword to see it.
 ///
 /// **Mutation bite**: compare under `check.mask` instead of the full dword. The
-/// confirmation then passes a trip whose unclaimed bytes move, and the runtime audit --
-/// which does compare the whole dword -- rejects it later. Measured on `tyrian-specs-586`:
+/// confirmation then passes a trip whose unclaimed bytes move, and the runtime audit,
+/// which does compare the whole dword, rejects it later. Measured on `tyrian-specs-586`:
 /// the DPMI host's register block at `0xd058`, where each key's memo carried the OTHER
 /// interleaved key's byte in a position JournalB never recorded a write to, passed eight
 /// natural samples and then failed 22 of 24 audits.
@@ -3594,7 +3593,7 @@ fn a_byte_moving_outside_the_claimed_mask_widens_the_claim_and_is_confirmed() {
 }
 
 // ---------------------------------------------------------------------------
-// The Fable review's two BLOCKING findings (2026-09-05).
+// The two BLOCKING defects: native stores (F1) and the HLE seam (F2).
 // ---------------------------------------------------------------------------
 
 /// F1. A journaled trip whose compiled block STORED anything has an incomplete write set:
@@ -3604,7 +3603,7 @@ fn a_byte_moving_outside_the_claimed_mask_widens_the_claim_and_is_confirmed() {
 ///
 /// **Mutation bite**: delete the `note_native_stores` call at the block-exit accounting, or
 /// gate it on anything but `reflected_call_journal`. The trip is then learned from a write
-/// set with a hole in it -- and the audit cannot see the hole either, because
+/// set with a hole in it, and the audit cannot see the hole either, because
 /// `audit_write_values_disagree` walks the audited trip's OWN journal, which has the same
 /// one. E, D and the audit become three views of a single incomplete record.
 #[test]
@@ -3635,13 +3634,13 @@ fn a_journaled_trip_whose_native_block_stored_is_refused() {
 }
 
 /// F1, the other half: the batch loop is ASKED for the interpreter while a key is in a
-/// journal slot, so the refusal above stays rare. Armed by the WARM trip's own close --
-/// which is what makes the JournalA trip's batch already interpreted when it opens -- and
+/// journal slot, so the refusal above stays rare. Armed by the WARM trip's own close,
+/// which is what makes the JournalA trip's batch already interpreted when it opens, and
 /// disarmed the moment the key leaves the journal slots.
 ///
 /// **Mutation bite**: never arm the window (the state this branch shipped in until the
 /// review). Every journaled trip then runs natively, `note_native_stores` refuses every
-/// one, and the mechanism goes inert -- which is the safe direction, and exactly why the
+/// one, and the mechanism goes inert, which is the safe direction, and exactly why the
 /// refusal is the belt and this is the braces.
 #[test]
 fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
@@ -3663,7 +3662,7 @@ fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
         "the JournalA trip's batch must already be interpreted when it opens"
     );
 
-    // Leaving the journal slots disarms it at once -- the forcing lasts the two journaled
+    // Leaving the journal slots disarms it at once: the forcing lasts the two journaled
     // trips, not a fixed window.
     let mut open2 = OpenTrip::start(&cpu, &bus, key, Slot::JournalA);
     open2.hazard = Some(LearnRefused::PortIo);
@@ -3678,8 +3677,8 @@ fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
         "and it lifts the moment the key leaves the journal slots"
     );
 
-    // The bound exists for the STRANDED case -- a key that enters JournalA and whose next
-    // trip never comes -- so the window cannot pin the interpreter on for the whole run.
+    // The bound exists for the STRANDED case: a key that enters JournalA and whose next
+    // trip never comes, so the window cannot pin the interpreter on for the whole run.
     let open3 = OpenTrip::start(&cpu, &bus, key, Slot::Warm);
     cpu.reflected_call.as_mut().unwrap().open = Some(open3);
     on_far_return(&mut cpu, &bus);
@@ -3695,14 +3694,14 @@ fn a_key_entering_a_journal_slot_asks_the_batch_loop_for_the_interpreter() {
 
 /// F2. An HLE software interrupt SERVICED inside a trip writes guest registers and memory
 /// from the machine, outside every CPU seam, and the posted flag is cleared at the next
-/// batch entry -- long before `finish_trip` or the answer screen could ask the bus about
+/// batch entry, long before `finish_trip` or the answer screen could ask the bus about
 /// it. A reflected trip straddles 6-8 batch boundaries, so a nested `INT 1Ah`/`INT 10h`/
 /// `INT 13h`/`INT 2Fh` is serviced mid-trip and vanishes.
 ///
 /// **Mutation bite**: delete the `reflected_call_note_soft_int_serviced` call at the
 /// machine's service site. The trip is then learned as if nothing happened; an answered
 /// trip skips the service entirely, and an `INT 1Ah` tick read inside a trip freezes in the
-/// epilogue -- caught, if at all, only by the period-64 audit and only when a tick boundary
+/// epilogue, caught, if at all, only by the period-64 audit and only when a tick boundary
 /// falls inside its window.
 #[test]
 fn an_hle_soft_int_serviced_inside_a_trip_refuses_the_memo() {
@@ -3736,7 +3735,7 @@ fn an_hle_soft_int_serviced_inside_a_trip_refuses_the_memo() {
 ///
 /// **What this test does NOT cover, said plainly**: that the call site at the block exit
 /// still exists. Reaching it needs a real compiled block with real stores, which this
-/// fixture has no scaffolding for. The fixture-scale evidence is what covers it -- the
+/// fixture has no scaffolding for. The fixture-scale evidence is what covers it: the
 /// acceptance run reports `learn_refused[native_store]` per key, and the interpreter
 /// forcing is what keeps that number small rather than zero-by-absence.
 #[test]

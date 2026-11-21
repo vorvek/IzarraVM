@@ -32,7 +32,7 @@
 //!   masked count of 1. This is `emit_commit_shift_flags`'s `SHIFT_DEFINED`, shared with the
 //!   register lanes so the two cannot drift.
 //!
-//! Every behavioural row below seeds EFLAGS at `0x8d7` -- SF, ZF, PF and AF all SET, bit 1 forced,
+//! Every behavioural row below seeds EFLAGS at `0x8d7`: SF, ZF, PF and AF all SET, bit 1 forced,
 //! and NO live descriptor. The no-descriptor half is load-bearing: a seed of `(0x8d5, pending)`
 //! never delivers a seeded CF, because the live descriptor swallows it, so a CF assertion made
 //! under that seed passes whatever the emitter does with CF.
@@ -54,7 +54,7 @@
 //! slot never meets a live descriptor. It is a blind spot the register lanes share, not a hole
 //! this kind opened.
 //!
-//! ## N1 (review finding, closed): the aperture's misaligned tail
+//! ## N1 (closed): the aperture's misaligned tail
 //!
 //! `a_misaligned_mode13_group_two_memory_form_side_exits` closes a gap the review found: before
 //! it, `emit_rotate_shift_mem` admitted a misaligned Mode 13h access at every width, dropping
@@ -83,11 +83,11 @@ const DATA: u32 = 0x3010;
 /// The five flag consumers, as `(condition, byte destination)`. Between them they read every flag
 /// this family can define.
 const CONSUMERS: [(u8, u8); 5] = [
-    (0x2, 3), // setc bl  -- CF
-    (0x0, 6), // seto dh  -- OF
-    (0x8, 5), // sets ch  -- SF
-    (0x4, 2), // setz dl  -- ZF
-    (0xa, 7), // setp bh  -- PF
+    (0x2, 3), // setc bl: CF
+    (0x0, 6), // seto dh: OF
+    (0x8, 5), // sets ch: SF
+    (0x4, 2), // setz dl: ZF
+    (0xa, 7), // setp bh: PF
 ];
 
 /// Which code segment a row runs in. Both are required on every behavioural row: the census row
@@ -283,7 +283,7 @@ const REFUSED_SUB_OPS: [(&str, u8); 2] = [("/2 rcl", 2), ("/3 rcr", 3)];
 // Arm selection
 // ---------------------------------------------------------------------------------------------
 
-/// Restores every arm this file forces, on the way out of a fixture -- normally OR by panic.
+/// Restores every arm this file forces, on the way out of a fixture: normally OR by panic.
 ///
 /// A plain `set_*_for_test(Some(..))` LEAKS: the overrides are thread-local and the harness reuses
 /// threads, so the next fixture on that thread inherits an arm it never asked for.
@@ -302,7 +302,7 @@ impl Drop for ArmOverride {
 /// The lane arm is forced rather than left ambient for `cpu_jit_count_lane_test.rs`'s recorded
 /// reason: when `IZARRAVM_COUNT_LANES` flipped default ON, every unforced group-2 fixture in the
 /// tree quietly stopped exercising the baked emitter. `count_lane_for` bars memory destinations
-/// today, so forcing it OFF is a pin on that bar rather than a selection between two emitters --
+/// today, so forcing it OFF is a pin on that bar rather than a selection between two emitters,
 /// and it is the pin that would catch a future relaxation reaching this kind.
 #[must_use]
 fn force_rows(on: bool) -> ArmOverride {
@@ -585,8 +585,8 @@ fn direct_cycle_clocks(bytes: u32) -> u64 {
 /// What a natively served MISALIGNED read-modify-write costs over the interpreted role, at
 /// `TestBus`'s dials.
 ///
-/// Per access the native role charges one WIDE cycle -- the one the block's static count carries
-/// -- plus `bytes - 1` byte cycles from the split deposit, where the interpreted role charges
+/// Per access the native role charges one WIDE cycle (the one the block's static count carries)
+/// plus `bytes - 1` byte cycles from the split deposit, where the interpreted role charges
 /// `bytes` byte cycles through `charge_direct_ram_split`. The `bytes - 1` cancel and what remains
 /// is `wide_cycle(bytes) - byte_cycle`, which is a pure `TestBus` artifact: on a real `MachineBus`
 /// `BusCycle::clocks_for` ignores width and the quantity is exactly zero.
@@ -683,7 +683,7 @@ const CONSUMED_SLOTS: u8 = 2 + 1 + CONSUMERS.len() as u8;
 
 /// The count sweep for the imm8 opcodes. 1 is the only count that defines OF; 7 is the last
 /// in-width count at Byte; 8, 9, 16 and 31 walk the range where the SDM leaves CF undefined and
-/// this tree's oracle -- the interpreter -- does not; 33 tests that the five-bit mask is applied
+/// this tree's oracle (the interpreter) does not; 33 tests that the five-bit mask is applied
 /// to the RAW immediate, so `shr byte [m], 33` is a shift by 1.
 ///
 /// Zero and 32 are absent on purpose: both mask to zero and are REFUSED at classify, which
@@ -829,8 +829,8 @@ fn a_count_that_masks_to_zero_stays_a_barrier() {
 ///   `IZARRAVM_ROTATE_ROWS` and `/4..=7` on `IZARRAVM_BYTE_SHIFT_ROWS`, and the arm reads both
 ///   above the operand bind, so the memory form goes with the register form.
 /// * `0xC1`/`0xD1` refuse `/0` ALONE. `/1` ROR was lowered before the rotate-rows slice and stays
-///   ungated by design -- the off arm has to restore the PRE-SLICE world, not a no-rotates world,
-///   or an A/B prices two slices as one -- and `/4..=7` are older still.
+///   ungated by design: the off arm has to restore the PRE-SLICE world, not a no-rotates world,
+///   or an A/B prices two slices as one, and `/4..=7` are older still.
 ///
 /// A uniform expectation here would be the easier assertion and the wrong one: it would force a
 /// knob read into the `0xc1 | 0xd1` arm that the register lane does not have, and the off arm
@@ -999,8 +999,8 @@ fn a_page_crossing_group_two_memory_form_side_exits_and_still_agrees() {
 /// N1 from the review: `memory.rs`'s `is_mode13_aperture` and `run.rs`'s split-cost comment both
 /// assert that a misaligned access to the aperture is refused elsewhere in the tree, so
 /// `run.rs`'s RAM split-cost pool never carries an aperture byte. This emitter's whole point is to
-/// SERVE a misaligned in-page RAM access -- see `a_misaligned_group_two_memory_form_runs_natively`
-/// -- but that service must stop at the aperture boundary: `emit_alu_mem_dest`,
+/// SERVE a misaligned in-page RAM access: see `a_misaligned_group_two_memory_form_runs_natively`,
+/// but that service must stop at the aperture boundary: `emit_alu_mem_dest`,
 /// `emit_rmw_inc_dec_dword` and `emit_push_mem` all refuse Mode 13h outright or refuse it whenever
 /// it is misaligned, and this kind must not be the first native site that bills an aperture access
 /// through the RAM-only pool.
@@ -1011,7 +1011,7 @@ fn a_page_crossing_group_two_memory_form_side_exits_and_still_agrees() {
 ///
 /// 32-bit segments only. `by_one_mem_at`'s Sixteen arm encodes a disp16-only operand against a
 /// FLAT (base-zero) real-mode segment, so `MODE13_BASE + 1` truncates to `0x0001` and never
-/// reaches the aperture at all -- the emitter-level guard this row proves is segment-width
+/// reaches the aperture at all: the emitter-level guard this row proves is segment-width
 /// independent, so the 32-bit segment alone is enough to exercise it.
 #[test]
 fn a_misaligned_mode13_group_two_memory_form_side_exits() {
@@ -1122,7 +1122,7 @@ fn group_two_memory_imm8_forms_match_the_interpreter_for_every_count() {
     }
 }
 
-/// Restores the ambient `IZARRAVM_DIRECT_EAGER_FLAGS` reading on the way out of a fixture --
+/// Restores the ambient `IZARRAVM_DIRECT_EAGER_FLAGS` reading on the way out of a fixture:
 /// normally OR by panic. The override is thread-local and the harness reuses threads.
 struct EagerOverride;
 
@@ -1137,8 +1137,8 @@ impl Drop for EagerOverride {
 /// four stores, in place of one publish each.
 ///
 /// **A recorded SURVIVOR sits here, and it is recorded rather than papered over.** Replacing the
-/// rotate-above-1 tail's `emit_set_cf_only(e)` with a wholesale `store eflags, RBP` -- the publish
-/// a rotate must NOT do, since it architecturally preserves SF, ZF, PF and AF -- leaves this file
+/// rotate-above-1 tail's `emit_set_cf_only(e)` with a wholesale `store eflags, RBP` (the publish
+/// a rotate must NOT do, since it architecturally preserves SF, ZF, PF and AF) leaves this file
 /// green on BOTH arms. Two reasons stack:
 ///
 /// * on the shipped eager arm `emit_set_cf_only` IS that store, so the two spellings are the same
@@ -1149,7 +1149,7 @@ impl Drop for EagerOverride {
 ///   `InterpretOne` call-out can install one mid-block, and this kind emits none.
 ///
 /// The call therefore stays because it is the shared idiom for a CF-only write and because the
-/// descriptor branch is the correct answer if a future mid-block producer ever creates one -- not
+/// descriptor branch is the correct answer if a future mid-block producer ever creates one, not
 /// because a fixture can currently tell. The register lanes carry the identical blind spot. What
 /// this row DOES buy is that the lazy arm's emitted tail is executed and differentially compared
 /// at every cell, rather than being shipped untested behind a default-on knob.
@@ -1217,7 +1217,7 @@ fn group_two_memory_forms_agree_with_a_live_descriptor() {
 /// through the consumers.
 ///
 /// The seed sets all four bits and the operands are chosen so an emitter that published the whole
-/// shadow -- what `emit_commit_shift_flags` does, and what a rotate must NOT do -- would clear at
+/// shadow (what `emit_commit_shift_flags` does, and what a rotate must NOT do) would clear at
 /// least one of them.
 #[test]
 fn memory_rotates_preserve_sf_zf_pf_and_af() {

@@ -1,9 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The CR3 DATA-side gate, T1+T2 (`dev_docs/2026-09-02-cr3-data-side-design.md`, amended by
-//! `dev_docs/2026-09-02-cr3-code-cache-gate-review.md`'s "Review of the data-side design"
-//! section, findings D1 through D5, and by that same document's "Review of PR #826", finding P1).
+//! The CR3 DATA-side gate, T1+T2 (the CR3 data-side design, amended by findings D1
+//! through D5 of its review and by finding P1 of the review of PR #826).
 //!
 //! P1 (PR #826, BLOCKING, fixed in the same PR): `ContextSelect::Skipped(slot)` used to cover
 //! both R1 (reselect: an occupied slot's saved generation/epoch must be RESTORED) and R2
@@ -11,7 +10,7 @@
 //! (`retire_dormant_slot`) re-mints only the dormant generation while its wholesale decode/link
 //! teardown empties the whole ring, so a `MOV CR3` to a brand-new directory right after an
 //! INVLPG could take R2 into the reoccupied (formerly live) slot and RESTORE its untouched
-//! generation instead of minting -- silently serving one directory's TLB entries to another.
+//! generation instead of minting, silently serving one directory's TLB entries to another.
 //! `ContextSelect` now distinguishes `Reselected` (R1, restore) from `Allocated` (R2, mint); see
 //! `core.rs`'s `ContextSelect` doc comment and `flush_tlb_and_code_caches_for_cr3_write`'s match
 //! arms for the fix, and
@@ -19,7 +18,7 @@
 //! red-first row.
 //!
 //! T1: `data_read_pages`/`data_write_pages` are physical-page-and-bus-epoch keyed with no CR3
-//! dependence at all, so they are removed from the `MOV CR3` wipe unconditionally -- and, as a
+//! dependence at all, so they are removed from the `MOV CR3` wipe unconditionally, and, as a
 //! consequence of the shared helper T1 deletes from, from the CR0/task-switch full flush and the
 //! `flush_tlb_keep_code_caches` PG=1 arm too.
 //!
@@ -56,14 +55,14 @@ fn data_flush_fixture() -> (CpuGsw, TestBus) {
 
 /// Touch BOTH `WRITER`'s linear page (0) and `TLB_DATA`'s (3) together, in one call, before
 /// anything else in a fixture that will call `write_cr3`. This is NOT merely about which of the
-/// two is walked first -- marking is PAGE-granular over the WHOLE shared table (`0x9000`), so
+/// two is walked first: marking is PAGE-granular over the WHOLE shared table (`0x9000`), so
 /// the SECOND distinct page ever walked through it retires the ring no matter which one goes
 /// first (the first walk's own accessed-bit store always lands before that walk's own mark; the
 /// second walk's store always lands after the first walk's mark). One retire is therefore
 /// unavoidable the first time two different pages sharing this table are both touched, and this
 /// helper is where it happens: called before ANY `write_cr3`, the ring is not yet seeded, so a
 /// mid-call retire disrupts nothing. Calling `write_cr3` BEFORE this helper, instead of after,
-/// is the mistake this file's tests must avoid -- `cpu_cr3_flush_test.rs`'s own doc comment on
+/// is the mistake this file's tests must avoid: `cpu_cr3_flush_test.rs`'s own doc comment on
 /// `pte_edit_with_a_tlb_warm_target_still_retires` explains the same mechanism from the
 /// decode-line side.
 fn warm_writer_and_tlb_data(cpu: &mut CpuGsw, bus: &mut TestBus) {
@@ -83,8 +82,8 @@ fn warm_writer_and_tlb_data(cpu: &mut CpuGsw, bus: &mut TestBus) {
 /// (R1: `write_cr3` to the SAME directory `cr3_fixture` already set). Red before T1 (the old
 /// unconditional wipe emptied the cache on every write); green after.
 ///
-/// `direct_page_hits` counts BUS REFILLS on a miss, not cache hits (review D7) -- a HIT bumps
-/// `direct_data_pointer_reads` instead -- so "does not move on the next read of the same
+/// `direct_page_hits` counts BUS REFILLS on a miss, not cache hits (review D7): a HIT bumps
+/// `direct_data_pointer_reads` instead, so "does not move on the next read of the same
 /// physical page" is the correct assertion for "the entry was served from cache, no refill ran".
 #[test]
 fn r_d1_direct_page_cache_survives_a_same_directory_reselect() {
@@ -105,7 +104,7 @@ fn r_d1_direct_page_cache_survives_a_same_directory_reselect() {
     // `direct_page_hits` is shared with a SEPARATE consumer, the code-fetch direct-page probe
     // (`decode.rs:1221`): `write_cr3` itself fetches the `MOV CR3` instruction at WRITER, and
     // `invalidate_fetch_frontend` drops the fetch-page cache on EVERY CR3 write, unconditionally,
-    // by design -- so the write above always costs exactly one refill on THAT cache, unrelated
+    // by design, so the write above always costs exactly one refill on THAT cache, unrelated
     // to `data_read_pages` and to T1. Captured AFTER the write, `hits_before` already includes
     // that one-time cost, so the comparison below isolates the READBACK alone, which touches no
     // fetch frontend.
@@ -127,8 +126,8 @@ fn r_d1_direct_page_cache_survives_a_same_directory_reselect() {
     );
 }
 
-/// The `Taken` arm (a third distinct directory) is the strongest ring event there is -- it fully
-/// retires the decode ring and the TLB -- and T1's claim is that even THIS never touches the
+/// The `Taken` arm (a third distinct directory) is the strongest ring event there is: it fully
+/// retires the decode ring and the TLB, and T1's claim is that even THIS never touches the
 /// physical-page caches, because they have no CR3 dependence to protect.
 #[test]
 fn r_d1_direct_page_cache_survives_the_taken_arm_too() {
@@ -204,7 +203,7 @@ fn r_d2_tlb_entry_survives_a_directory_round_trip() {
 
 /// The ring is real for the TLB too, mirroring `a_second_directory_gets_its_own_generation`: a
 /// virgin slot 1 (DIR_B, never before selected) must not accidentally read A's entry live. DIR_B
-/// shares A's page table, so this cannot be proven by physical divergence -- only by the
+/// shares A's page table, so this cannot be proven by physical divergence, only by the
 /// generation itself never having been touched under B before this row inserts into it.
 #[test]
 fn a_second_directory_starts_with_no_tlb_entries_of_its_own() {
@@ -221,7 +220,7 @@ fn a_second_directory_starts_with_no_tlb_entries_of_its_own() {
 }
 
 /// R-D3, the control that must stay red forever (design review D6 corrects the design's own
-/// wording: R-D3 is a GREEN-FOREVER control, not a "must pass on shipped code" line -- the
+/// wording: R-D3 is a GREEN-FOREVER control, not a "must pass on shipped code" line: the
 /// property under test never changes, before or after T2). Same shape as R-D2, but with a store
 /// into the PAGE-TABLE page between the two writes. DIR_B shares A's table
 /// (`plant_two_directory_paging`), so the store is a genuine cross-context PTE edit and the
@@ -254,8 +253,8 @@ fn r_d3_a_pte_edit_between_the_two_writes_still_kills_the_entry() {
 }
 
 /// D3: `generations` must never seed a slot with 0, `TlbEntry::EMPTY`'s own sentinel. The FIRST
-/// ever switch to a second directory (DIR_B) takes R2, which calls `select_generation` -- NOT
-/// `allocate_generation` -- exactly like the JIT link graph's R2 arm (design (b) L1's argument,
+/// ever switch to a second directory (DIR_B) takes R2, which calls `select_generation` (NOT
+/// `allocate_generation`) exactly like the JIT link graph's R2 arm (design (b) L1's argument,
 /// mirrored). A virgin slot's generation is therefore whatever `Tlb::default()` seeded, never
 /// minted at select time. If that seed were `0`, EVERY untouched array slot (`TlbEntry::EMPTY`
 /// has `generation: 0, tag: 0`) would read as a live hit for linear page 0 the instant B is
@@ -300,11 +299,11 @@ fn generation_wrap_never_lets_two_ring_slots_alias() {
 /// warms the entry, A (now live) invalidates the same page. `execute_extended.rs`'s INVLPG
 /// handler ALSO runs a wholesale decode/link teardown afterward
 /// (`invalidate_translation_code_caches`), which retires both TLB generations as a side effect of
-/// retiring the ring (review D2) and would mask this specific mutation in an end-to-end row --
+/// retiring the ring (review D2) and would mask this specific mutation in an end-to-end row,
 /// so this row calls the two lines directly, in the same order the handler does, to isolate the
 /// obligation `retire_dormant_slot` exists for. Verified by hand: commenting out
 /// `execute_extended.rs`'s `self.tlb.retire_dormant_slot();` call does NOT redden any
-/// end-to-end INVLPG row for exactly that masking reason -- recorded in the mutation ledger below
+/// end-to-end INVLPG row for exactly that masking reason, recorded in the mutation ledger below
 /// rather than claimed as coverage it is not.
 #[test]
 fn invlpg_retires_the_dormant_generation_too() {
@@ -330,7 +329,7 @@ fn invlpg_retires_the_dormant_generation_too() {
 
     write_cr3(&mut cpu, &mut bus, PAGE_DIRECTORY);
     // The array slot TLB_DATA collides on still carries B's generation (A never touched it), so
-    // this call alone is a no-op -- the gap the design names.
+    // this call alone is a no-op: the gap the design names.
     cpu.tlb.invalidate(TLB_DATA >> 12);
     cpu.tlb.retire_dormant_slot();
 
@@ -427,7 +426,7 @@ fn frame_remap_shaped_row_uses_the_new_mapping_after_a_same_value_reload() {
 /// fix, `select_context`'s R1 (reselect: restore) and R2 (allocate: mint) both returned one
 /// `Skipped(slot)`, so a `MOV CR3` to a brand-new directory right after an INVLPG took R2 into
 /// the now-empty ring and "restored" (`select_generation`, not `allocate_generation`) slot 0's
-/// UNTOUCHED generation -- silently serving directory A's surviving TLB entries to a directory
+/// UNTOUCHED generation, silently serving directory A's surviving TLB entries to a directory
 /// the ring had never seen. It bites on exactly the entry states an INVLPG's own `invalidate`
 /// did NOT touch, which is why this row invalidates an UNRELATED page (`WRITER`'s) and checks
 /// `TLB_DATA`'s survives the INVLPG only to be required gone after the reoccupation.
@@ -460,7 +459,7 @@ fn a_reoccupied_slot_after_invlpg_never_serves_the_vacating_directorys_entries()
     // TLB_DATA's entry survives the `invalidate` call, still stamped with A's generation. The
     // decode/link teardown that follows every real INVLPG then empties the ring regardless of
     // which page was addressed; `ring_seeded` (set above) stays true, so the ring's next
-    // `select_context` call does NOT re-seed slot 0 -- it lands the next directory in whichever
+    // `select_context` call does NOT re-seed slot 0: it lands the next directory in whichever
     // slot is free first, which is slot 0, the one INVLPG's narrow fix did not touch.
     cpu.tlb.invalidate(WRITER >> 12);
     cpu.tlb.retire_dormant_slot();
@@ -1592,7 +1591,7 @@ mod partition_and_two_tables {
 // | P1: revert `core.rs`'s `ContextSelect::Allocated` arm from `self.tlb.allocate_generation(slot)` back to `self.tlb.select_generation(slot)` (the pre-fix shape, indistinguishable from the `Reselected` arm) | `a_reoccupied_slot_after_invlpg_never_serves_the_vacating_directorys_entries` | by hand |
 // | M6: re-add `data_read_pages.invalidate()`/`data_write_pages.invalidate()` to the CR3 path | `r_d1_direct_page_cache_survives_a_same_directory_reselect`, `r_d1_direct_page_cache_survives_the_taken_arm_too` | by hand |
 // | M1: retire only the live TLB generation at the translation-page arm in `note_code_write_inner` (`self.tlb.retire_all_slots(retired)` -> `self.tlb.flush_live_slot()`) | `r_d3_a_pte_edit_between_the_two_writes_still_kills_the_entry` | by hand |
-// | M1, the SMC-wholesale arm's twin: same substitution at the second `note_code_write_inner` call site | `cross_context_smc_store_kills_the_other_context` (parent file) continues to pass at the DECODE layer regardless, since it never reads `cpu.tlb`; the TLB-specific catch for this exact site is `invlpg_retires_the_dormant_generation_too`'s sibling shape is not built here, because the parent file's `cross_context_smc_store_kills_the_other_context` fixture does not warm a TLB entry -- recorded as an untested site rather than claimed. See "Open items" below. |
+// | M1, the SMC-wholesale arm's twin: same substitution at the second `note_code_write_inner` call site | `cross_context_smc_store_kills_the_other_context` (parent file) continues to pass at the DECODE layer regardless, since it never reads `cpu.tlb`; the TLB-specific catch for this exact site is `invlpg_retires_the_dormant_generation_too`'s sibling shape is not built here, because the parent file's `cross_context_smc_store_kills_the_other_context` fixture does not warm a TLB entry, recorded as an untested site rather than claimed. See "Open items" below. |
 // | M2: the `Skipped` arm allocates a fresh TLB generation instead of restoring (`select_generation` -> `allocate_generation`) | `r_d2_tlb_entry_survives_a_directory_round_trip` (green would be impossible: a fresh mint can never equal the entry's stored generation) | by hand |
 // | D3: seed `Tlb::default()`'s `generations: [1, 2]` -> `[1, 0]` | `a_virgin_ring_slot_never_serves_an_untouched_tlb_entry` | by hand |
 // | M3/R6: `retire_all_slots` mints both slots from independent counters instead of one shared monotonic allocator (so a wrap can alias) | `generation_wrap_never_lets_two_ring_slots_alias` | by construction: `mint_generation` is the SOLE minter, so this mutation cannot even be expressed without restructuring the type; recorded as a structural non-gate the way `cpu_cr0_flush_test.rs` records its inert argument swap |

@@ -11,7 +11,7 @@
 //! The corpus measured what that costs. On `100-000-pyramid` the `INT 16h` keyboard-poll head at
 //! guest linear `0x10E3D` carries 25,750,933 static unbound exits, 87.2% of that game's whole
 //! `absent` class, and the per-edge link census records the edge `0x00010E37 -> 0x00010E3D` as
-//! `not_attempted` -- the predecessor block ends three instructions short of the INT and its
+//! `not_attempted`: the predecessor block ends three instructions short of the INT and its
 //! successor is never keyed at all. The other three 486 laggards pay the same instruction through
 //! the `0xCD` `non_continuable` census row instead: `15-move-hole-puzzle` 23,474,587,
 //! `21-for-1-to-4` 4,858,277 static plus 11,869,917 dynamic, `10rogue` 1,703,556. Same
@@ -264,7 +264,7 @@ fn int_imm8_joins_the_walk_candidate_set_only() {
 // The knob, in both directions
 // ------------------------------------------------------------------------------------------
 
-/// Restore the ambient reading when dropped, INCLUDING on unwind -- a trailing
+/// Restore the ambient reading when dropped, INCLUDING on unwind: a trailing
 /// `set_int_imm8_rows_for_test(None)` would be skipped by a panicking fixture and could leak a
 /// forced arm into a later one under `--test-threads=1`.
 #[must_use]
@@ -308,12 +308,12 @@ fn the_off_arm_keeps_int_imm8_a_structural_barrier() {
 
 /// **THE ROW MUST NOT RELOCATE.** The fixture above says the OFF arm refuses, and that assertion
 /// would pass whether the refusal is made by `int_imm8_admitted_here` or one step later by
-/// `classify` returning `None` -- so on its own it cannot see the defect this exists for.
+/// `classify` returning `None`, so on its own it cannot see the defect this exists for.
 ///
 /// The defect: refuse `0xCD` in `classify` instead, and the OFF arm stops with
 /// `BarrierStop::HardBoundary` where main stopped it with `NonContinuable`. Neither arm compiles
 /// the block, so nothing about the guest moves, but the barrier census row MOVES BETWEEN STOP
-/// ARMS -- and a two-arm reconciliation reading "exactly one row removed, zero rows new" reads a
+/// ARMS, and a two-arm reconciliation reading "exactly one row removed, zero rows new" reads a
 /// relocated row as a new one. `retf_admitted_here`'s own doc states the rule this enforces.
 ///
 /// So the OFF arm's recorded `stop_reason` is pinned, and the ON arm is required to leave no row
@@ -617,7 +617,7 @@ fn the_int_call_out_pushes_the_real_mode_frame_and_lands_on_the_vector() {
 ///
 /// The interpreter arm for `0xCD` notifies the bus and then raises #GP through `check_v86_iopl`
 /// on EVERY execution in that state. Admitted there, the slot would take the call-out fault path
-/// on every single visit -- spill, call, delivery, side exit, dispatcher trip -- buying the guest
+/// on every single visit (spill, call, delivery, side exit, dispatcher trip) buying the guest
 /// nothing, and it would charge a permanent demoted-site entry for every distinct INT site in an
 /// EMM386-style guest before the governor caught up.
 ///
@@ -721,8 +721,8 @@ fn the_governor_does_not_demote_the_int_row_for_resyncing() {
 /// A row exempted from demotion on every path would be a Trojan horse: a site that faults on every
 /// execution would keep paying a call-out frame forever. The exemption covers the RETIRED path
 /// only, so `note_execution(true)` on the fault arm still runs. This fixture states the predicate
-/// rather than driving a faulting guest, because the state that produces a systematic fault --
-/// V86 below IOPL 3 -- is refused at admission by the fixture above and is therefore unreachable
+/// rather than driving a faulting guest, because the state that produces a systematic fault
+/// (V86 below IOPL 3) is refused at admission by the fixture above and is therefore unreachable
 /// from a compiled slot at all. Both bounds are real and they are independent.
 #[test]
 fn only_the_int_row_claims_the_never_resumes_property() {
@@ -751,7 +751,7 @@ fn seed_ivt(program: &mut [u8], vector: u8, segment: u16, offset: u16) {
 /// The fall-through address: the byte right after the `INT` in `INT_CODE`.
 const INT_FALL_THROUGH: u32 = INT_ENTRY + INT_CODE.len() as u32;
 
-/// The same program, but with vector `0x21` pointing at `CS:INT_FALL_THROUGH` -- the very address
+/// The same program, but with vector `0x21` pointing at `CS:INT_FALL_THROUGH`: the very address
 /// the block would have carried on to. A `HLT` lives there so both legs still halt.
 fn fall_through_handler_program() -> Vec<u8> {
     let mut program = int_program();
@@ -768,11 +768,11 @@ fn fall_through_handler_program() -> Vec<u8> {
 ///
 /// * R1 compares `cpu.registers.eip` against `end_eip` and `cpu.registers.cs()` against the
 ///   snapshot. The handler IS `end_eip` and the handler's segment IS the snapshot's, so both halves
-///   pass -- which is the whole point: R1 is a reading of the guest's IVT, not a fact about the
+///   pass: which is the whole point: R1 is a reading of the guest's IVT, not a fact about the
 ///   mechanism.
 /// * R2 compares CS and SS (the row answers `may_write_segment`), and a same-CS delivery with no
 ///   privilege change moves neither.
-/// * R3's TF clause passes because `INT` CLEARS TF, and its IF clause is DIRECTIONAL -- it refuses a
+/// * R3's TF clause passes because `INT` CLEARS TF, and its IF clause is DIRECTIONAL: it refuses a
 ///   0-to-1 edge, and `INT` clears IF, which is the arm that resumes.
 ///
 /// So without the structural gate the resume tail would restore the block's ENTRY EIP and carry on
@@ -784,7 +784,7 @@ fn fall_through_handler_program() -> Vec<u8> {
 /// guest that would have tripped it. It is gone, and this test is what owns the claim now.
 ///
 /// RED-FIRST, measured: change `InterpretOneRow::always_resyncs` to name any other row and this
-/// fixture goes red at the resync assertion below with `left: 0` -- the slot RESUMED, the block
+/// fixture goes red at the resync assertion below with `left: 0`: the slot RESUMED, the block
 /// carried on from its entry EIP, and the control transfer was undone. The real-mode differential
 /// above stays GREEN under that same mutation, because its zeroed IVT sends the handler to
 /// `0000:0000` and R1 refuses on its own. That contrast is the fixture's whole reason to exist.
@@ -905,7 +905,7 @@ fn a_handler_at_the_fall_through_address_still_resyncs() {
 // four words read, three pushed, no descriptor walked.
 //
 // Review N3 asked for the other two. Protected mode walks an IDT gate AND a GDT descriptor, writes
-// an Accessed bit back into the table, and pushes dwords -- and it is what
+// an Accessed bit back into the table, and pushes dwords, and it is what
 // `INT_IMM8_MAX_DATA_ACCESSES`' derivation is about, which until now was arithmetic on paper with
 // nothing executing it. And a delivery that FAILS is the one path where the call-out has bespoke
 // code of its own rather than the interpreter's arm: `interpret_one_step`'s fault tail names the
@@ -1086,7 +1086,7 @@ struct PmLegs {
 ///
 /// `native_insns` is a PARAMETER and not a constant, because the two fixtures differ in it and the
 /// difference is the point: a successful delivery retires the `INT`, and a delivery that faults
-/// does not. `interpret_one_step`'s fault arm reports the PREFIX ONLY -- `finish_instruction` has
+/// does not. `interpret_one_step`'s fault arm reports the PREFIX ONLY: `finish_instruction` has
 /// already counted the faulting instruction in `perf.instructions`, so the block must not count it
 /// again. A fault leg reporting 2 here would be that double count.
 fn pm_both_legs(idt_limit: u16, native_insns: u64) -> PmLegs {
@@ -1167,7 +1167,7 @@ fn pm_dword(bus: &TestBus, at: u32) -> u32 {
 }
 
 /// **THE PROTECTED-MODE DIFFERENTIAL.** A real IDT gate, a real GDT descriptor, dword pushes, and
-/// the Accessed-bit write-back the gate's CS load performs -- against the interpreter running the
+/// the Accessed-bit write-back the gate's CS load performs, against the interpreter running the
 /// identical guest.
 ///
 /// The RAM comparison is the load-bearing one here rather than the register comparison: the
@@ -1222,7 +1222,7 @@ fn the_int_call_out_matches_the_interpreter_in_protected_mode() {
 }
 
 /// **THE FAULT PATH.** The IDT limit refuses vector `0x21`, so the delivery itself raises
-/// `#GP(0x21 * 8 + 2)` instead of transferring control -- and the call-out's fault tail has to
+/// `#GP(0x21 * 8 + 2)` instead of transferring control, and the call-out's fault tail has to
 /// produce exactly the frame the interpreter's own tail produces.
 ///
 /// This is the one shape where the call-out is NOT simply the interpreter's arm.
@@ -1241,13 +1241,13 @@ fn the_int_call_out_matches_the_interpreter_in_protected_mode() {
 ///
 /// WHAT THE MUTATION ALSO SHOWED, and it is worth stating rather than hiding: seven existing
 /// `interpret_one` fault fixtures go red on it too. The fault tail is SHARED by every
-/// `InterpretOne` row, so there is no INT-specific fault code to mutate -- which is exactly review
+/// `InterpretOne` row, so there is no INT-specific fault code to mutate, which is exactly review
 /// N3's structural point and the reason this is a nit rather than a hole. Mutating the delivery
 /// itself (skipping the IDT-limit check in `execute_extended.rs`) would move BOTH legs identically
 /// and prove nothing, which is why this fixture does not rest on the differential alone: the frame
 /// reads above it are absolute values, not a comparison, and they are what stays red when both legs
 /// move together. What the fixture adds over the existing seven is the `IntImm8` row driving that
-/// tail at all, in protected mode, through a delivery that fails with an ERROR CODE -- the shape
+/// tail at all, in protected mode, through a delivery that fails with an ERROR CODE: the shape
 /// the row's own `INT_IMM8_MAX_DATA_ACCESSES` bound is derived against.
 #[test]
 fn a_failed_int_delivery_faults_exactly_as_the_interpreter_does() {

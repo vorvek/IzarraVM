@@ -1,14 +1,14 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 0b's tests (`dev_docs/2026-09-04-reflected-call-slice0b-plan.md` §10).
+//! Slice 0b's tests (slice 0b plan §10).
 //! Drives the module's PRIVATE `*_on` functions against a LOCALLY constructed
-//! `State`, exactly as slice 0's test file did -- see `reflected_call_diag.rs`'s
+//! `State`, exactly as slice 0's test file did, see `reflected_call_diag.rs`'s
 //! "Hooks" section comment for why: this crate's test suite runs many tests
 //! in parallel in one binary, and the process-wide `armed()`/`journal_mode()`
 //! `OnceLock`s cannot be re-armed per test. The one exception is
 //! `one_production_write_seam_reaches_the_instrument` (N4's row), which uses
-//! the module's `thread_local` test override instead of those `OnceLock`s --
+//! the module's `thread_local` test override instead of those `OnceLock`s,
 //! see that test's own doc comment.
 
 use super::*;
@@ -28,7 +28,7 @@ fn write_flat_descriptor(mem: &mut [u8], at: u32, access: u8) {
     write_flat_descriptor_sized(mem, at, access, true);
 }
 
-/// As `write_flat_descriptor`, with the D/B bit chosen explicitly -- `false`
+/// As `write_flat_descriptor`, with the D/B bit chosen explicitly: `false`
 /// builds a 16-bit-stack descriptor (plan §2.1: the entry stack's OWN `B`
 /// bit is what decides the SP-compare width).
 fn write_flat_descriptor_sized(mem: &mut [u8], at: u32, access: u8, big: bool) {
@@ -63,7 +63,7 @@ fn write_interrupt_gate(mem: &mut [u8], vector: u8, offset: u32) {
 }
 
 /// A minimal flat-memory `CpuBus`: no devices, no fast map, no charge
-/// tracking -- just enough for the interrupt-delivery / push / pop / IRET
+/// tracking: just enough for the interrupt-delivery / push / pop / IRET
 /// machinery to read and write real bytes, and for `peek_direct_ram` to serve
 /// the instrument's pre-value peeks.
 struct FlatMemBus {
@@ -236,14 +236,14 @@ fn synthetic_reflected_client() -> (CpuGsw, FlatMemBus) {
     synthetic_reflected_client_with(MEM_SIZE, STACK_TOP, true)
 }
 
-/// THE RED PROOF. Runs the synthetic trip end to end -- `INT`, one push, one
-/// matching pop, `IRET` -- through the REAL `CpuGsw::software_interrupt`,
+/// THE RED PROOF. Runs the synthetic trip end to end (`INT`, one push, one
+/// matching pop, `IRET`) through the REAL `CpuGsw::software_interrupt`,
 /// `push`, `pop` and `iret`, journaling each step the same way the compiled-in
 /// hooks would.
 ///
 /// **Mutation bite**: in `classify_disposition` (`reflected_call_diag.rs`),
 /// flip `restored == Some(true)` to `restored == Some(false)` and this test
-/// goes red on the `write_class_r`/`write_class_d` assertions below -- a push
+/// goes red on the `write_class_r`/`write_class_d` assertions below: a push
 /// immediately followed by a matching pop is the textbook "restored" case.
 #[test]
 fn a_synthetic_reflected_trip_is_journaled_with_the_expected_write_class_and_restored_verdict() {
@@ -355,7 +355,7 @@ fn an_int_with_no_matching_return_is_recorded_as_unmatched_once_it_goes_stale() 
     assert!(state.open.is_some());
 
     // A genuinely NESTED INT is issued from somewhere INSIDE the handler
-    // body, not from the client's own return site -- move EIP so this
+    // body, not from the client's own return site. Move EIP so this
     // second INT does not also satisfy rule 3's re-entry signature (same
     // vector, CS.selector and EIP as the trip's own entry), which is a
     // different, correctly-handled case (see
@@ -391,7 +391,7 @@ fn an_int_with_no_matching_return_is_recorded_as_unmatched_once_it_goes_stale() 
 ///
 /// **Mutation bite**: in `Trip::sp_at_entry_width`, replace the body with
 /// `esp` unconditionally (restoring slice 0's full 32-bit compare) and this
-/// test goes red -- this is the slice-0 defect and this test is the
+/// test goes red: this is the slice-0 defect and this test is the
 /// deliverable.
 #[test]
 fn sp_is_compared_at_sixteen_bits_when_the_entry_stack_is_not_big() {
@@ -423,13 +423,13 @@ fn sp_is_compared_at_sixteen_bits_when_the_entry_stack_is_not_big() {
 
 /// Test 2 (plan §10 item 2): on a 32-bit ("big") stack, where the upper ESP
 /// half IS architecturally significant, a differing upper half correctly
-/// fails to match -- and is recorded in the `near_match[]` `sp_high16`
+/// fails to match, and is recorded in the `near_match[]` `sp_high16`
 /// bucket (candidate C1's signature), not silently dropped.
 #[test]
 fn a_stale_upper_esp_half_is_recorded_in_near_match_sp_high16() {
     // The entry ESP needs bit 16 SET so the "dirty" half can be CLEARED
     // (making the corrupted ESP smaller than the entry, so rule 2's
-    // frame-gone condition -- SP > entry SP -- does not also fire and
+    // frame-gone condition, SP > entry SP, does not also fire and
     // swallow this as a real close; that is a separate, correctly-handled
     // case, not the near-miss this test means to isolate).
     const BIG_STACK_TOP: u32 = 0x0001_4000;
@@ -483,7 +483,7 @@ fn frame_gone_and_re_entry_close_the_trip_without_counting_a_match() {
     on_int_entry_on(&mut state, &mut cpu, &bus, VECTOR);
     let entry_esp = cpu.registers.esp();
     // CS/SS still match the entry; SP has moved PAST it (higher, at the
-    // entry width) -- the client's own frame is already gone.
+    // entry width): the client's own frame is already gone.
     cpu.registers.set_esp(entry_esp + 4);
     on_far_return_on(&mut state, &mut cpu, &bus);
 
@@ -519,7 +519,7 @@ fn frame_gone_and_re_entry_close_the_trip_without_counting_a_match() {
 }
 
 /// Test 4 (plan §10 item 4), closing C3: a far `JMP`/`CALL` landing exactly
-/// on the client's own return site now counts as `return_match` -- slice 0's
+/// on the client's own return site now counts as `return_match`: slice 0's
 /// counter-only `on_far_transfer` could never see this.
 #[test]
 fn a_far_jmp_can_close_a_trip_as_a_return_match() {
@@ -542,7 +542,7 @@ fn a_far_jmp_can_close_a_trip_as_a_return_match() {
 }
 
 /// Test 5 (plan §10 item 5 / §3.1): a byte-identical (pre == post) write to
-/// the legacy VGA aperture is Class N, never Class R -- the CRTC reads guest
+/// the legacy VGA aperture is Class N, never Class R: the CRTC reads guest
 /// memory every scanline with no arming step, so even an intermediate value
 /// there is observable on screen.
 #[test]
@@ -582,7 +582,7 @@ fn a_restored_write_to_the_framebuffer_aperture_is_class_n_not_class_r() {
 
 /// Test 6 (plan §10 item 6 / B2's deletion bite): a write 16 KB below the
 /// FINAL SP, but inside the trip's own observed low-water excursion, is
-/// Class D -- the literal 8 KB cap plays no part in the decision (it is
+/// Class D: the literal 8 KB cap plays no part in the decision (it is
 /// reported separately, as a cross-check only, and must NOT have admitted
 /// this write).
 ///
@@ -599,7 +599,7 @@ fn a_write_below_the_low_water_mark_is_class_d_with_no_constant_cap() {
     let entry_esp = cpu.registers.esp();
 
     // The trip's own excursion reaches far below entry SP at some point (a
-    // deep nested call), tracked purely by observation -- no constant is
+    // deep nested call), tracked purely by observation: no constant is
     // consulted here.
     cpu.registers.set_esp(entry_esp - 20_000);
     let low_water_addr = base + cpu.registers.esp();
@@ -638,7 +638,7 @@ fn a_write_below_the_low_water_mark_is_class_d_with_no_constant_cap() {
 
 /// Test 7 (plan §10 item 7 / plan §4): the non-charging walker resolves a
 /// physical address on a cold TLB (paging enabled, no prior translation has
-/// ever run, so `probe_linear_read_physical` alone -- slice 0's only path --
+/// ever run, so `probe_linear_read_physical` alone, slice 0's only path,
 /// would decline).
 ///
 /// **Mutation bite**: revert `probe_physical` to `cpu.probe_linear_read_physical(linear).map(|p| (p, None))`
@@ -684,7 +684,7 @@ fn the_walker_resolves_a_physical_address_on_a_tlb_miss() {
 /// through `CpuGsw::write_memory_u8`, which reaches the private
 /// `write_linear_u8`'s `note_write` call) reaches the instrument's OPEN
 /// trip in the process-global singleton. Today deleting every hook turns no
-/// OTHER test in this file red -- they all drive `note_write_on` directly --
+/// OTHER test in this file red: they all drive `note_write_on` directly,
 /// so this is the one test that actually exercises the `#[cfg(...)]` call
 /// site itself.
 ///
@@ -701,7 +701,7 @@ fn one_production_write_seam_reaches_the_instrument() {
     let (mut cpu, mut bus) = synthetic_reflected_client();
 
     // Seed the global singleton's open trip directly (not through
-    // `on_int_entry`'s `armed()`-gated wrapper -- this test does not need
+    // `on_int_entry`'s `armed()`-gated wrapper: this test does not need
     // the real INT/IDT machinery, only an already-open trip to write into).
     let trip = Trip::start(&mut cpu, &bus, VECTOR, 0);
     {
@@ -741,13 +741,13 @@ fn one_production_write_seam_reaches_the_instrument() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice 0c tests (dev_docs/2026-09-04-reflected-call-slice0b-review.md, D1-D6)
+// Slice 0c tests (D1-D6)
 // ---------------------------------------------------------------------------
 
 /// D1: a far RETURN that lands exactly on the entry's own CS:EIP:SS, but with
-/// SP sitting at the entry width MINUS TWO -- the shape of a handler that
+/// SP sitting at the entry width MINUS TWO, the shape of a handler that
 /// returns by `RETF`, popping only CS:IP and leaving the `INT`-pushed FLAGS
-/// word behind on the caller's own stack -- must close as the NEW
+/// word behind on the caller's own stack, must close as the NEW
 /// `return_match_retf_flags` bucket, and must count as a MATCH (not go
 /// through rule 2's `frame_gone`, which needs SP > entry, not SP < entry).
 ///
@@ -785,7 +785,7 @@ fn a_retf_landing_at_entry_minus_two_closes_as_return_match_retf_flags() {
 }
 
 /// D1: the RETF-with-flags arm is defined only for a far RETURN boundary
-/// (`BoundaryKind::FarReturn`) -- a far `JMP`/`CALL` has no FLAGS word of its
+/// (`BoundaryKind::FarReturn`): a far `JMP`/`CALL` has no FLAGS word of its
 /// own to leave behind, so the SAME "SP = entry - 2" shape at a far
 /// TRANSFER must NOT match.
 #[test]
@@ -807,7 +807,7 @@ fn the_retf_with_flags_arm_never_fires_on_a_far_transfer() {
 
 /// D2: `peek_direct_ram(phys, width)` declines on a misaligned word/dword
 /// access even over ordinary RAM (`should_split`). A misaligned RAM write
-/// must still classify plain RAM -- never `not_plain_ram` -- once the
+/// must still classify plain RAM, never `not_plain_ram`, once the
 /// byte-wise fallback is in place.
 ///
 /// **Mutation bite**: in `note_write_on`, replace `peek_ram_width_safe(bus,
@@ -849,7 +849,7 @@ fn a_misaligned_ram_write_is_not_classified_not_plain_ram() {
 }
 
 /// D3: `TSS.ESP0`/`SS0` must be read at the offset for the TR descriptor's
-/// ACTUAL type -- a 16-bit (286-style) TSS has SP0 at offset 2 and SS0 at
+/// ACTUAL type: a 16-bit (286-style) TSS has SP0 at offset 2 and SS0 at
 /// offset 4, NOT ESP0 at offset 4 as a 32-bit TSS does.
 ///
 /// **Mutation bite**: hardcode `esp0_off`/`ss0_off`/`esp0_width` to the
@@ -866,7 +866,7 @@ fn tss_esp0_is_read_from_the_right_offset_for_a_sixteen_bit_tss() {
     bus.write_raw(TSS_BASE + 4, BusWidth::Word, u32::from(SS0));
     cpu.tr.base = TSS_BASE;
     cpu.tr.limit = 0x2c;
-    // P=1, DPL=00, S=0, TYPE=0001 (16-bit available TSS) -- bit 3 of the
+    // P=1, DPL=00, S=0, TYPE=0001 (16-bit available TSS): bit 3 of the
     // type nibble (0x08) is the 32-bit/16-bit discriminator this fixture
     // means to exercise.
     cpu.tr.access = 0x81;
@@ -885,7 +885,7 @@ fn tss_esp0_is_read_from_the_right_offset_for_a_sixteen_bit_tss() {
 }
 
 /// D5: `on_batch_boundary` must only advance `batch_boundaries_seen` when
-/// the caller tags the boundary `real_boundary: true` -- a `false` tag (the
+/// the caller tags the boundary `real_boundary: true`: a `false` tag (the
 /// trip's own IF-enable edge) must be a no-op, so `batch_straddle_trips`
 /// stops being tautological over a reflected trip's own nested `IRET`s.
 /// Drives the private `on_batch_boundary_on` against a LOCALLY constructed

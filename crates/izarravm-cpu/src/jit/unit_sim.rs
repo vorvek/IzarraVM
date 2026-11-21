@@ -830,7 +830,7 @@ impl UnitSim {
 
     /// L2+ near RET. A non-empty shadow stack pops and arms a deferred return-link check (stage-1
     /// shadow compare, then the L5 table). An empty shadow stack closes unresolved at L2-L4 (v1
-    /// parity, nothing to defer); at L5 (review finding M2) it instead arms a plain `Ght` check so
+    /// parity, nothing to defer); at L5 (M2) it instead arms a plain `Ght` check so
     /// the return can still resolve via the global table, matching pure QEMU's per-ret lookup.
     fn handle_return(&mut self) {
         match self.shadow.pop() {

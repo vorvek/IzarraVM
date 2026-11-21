@@ -35,12 +35,12 @@
 //!
 //! # Mutation record
 //!
-//! Recorded in `dev_docs/2026-08-23-option-d-step-3-log.md` alongside the results, so the log and
+//! Recorded in the option D step 3 log alongside the results, so the log and
 //! the record cannot drift apart.
 
 use super::*;
 
-/// Block entry, chosen so the lane lands 4-byte aligned — the alignment a real Build-engine patch
+/// Block entry, chosen so the lane lands 4-byte aligned: the alignment a real Build-engine patch
 /// store has, and the one that takes the FastMap write path.
 const ENTRY: u32 = 0x500;
 /// Offset of the subject inside the block: after the two-byte `mov esi, esi`.
@@ -77,7 +77,7 @@ type CapRefusals = [u64; jit::direct::LANE_CAP_FAMILIES];
 
 /// Every arm this file can force, restored on drop. `Drop` rather than trailing statements
 /// because an assertion failure is the normal way a fixture ends when something is wrong, and a
-/// panic skips trailing statements — the thread is reused by the harness and a leaked override
+/// panic skips trailing statements: the thread is reused by the harness and a leaked override
 /// would corrupt an unrelated test.
 struct ArmOverride {
     /// The STORE-PATH arm, which is not an environment knob but a per-`JitState` field
@@ -215,7 +215,7 @@ fn block_starts() -> [u32; 3] {
 }
 
 /// Seed a heat RECORD (not hotness) for the four bytes at `lane`, the way one real patch of a
-/// decoded instruction leaves one. Both arms demand this measured patch history — a never-patched
+/// decoded instruction leaves one. Both arms demand this measured patch history: a never-patched
 /// slot compiles baked, which is the doom cut, inherited verbatim from `disp_lane_for`.
 fn seed_patch_history(cpu: &mut CpuGsw, lane: u32) {
     cpu.sync_smc_heat();
@@ -323,7 +323,7 @@ fn lane_fixture(
 
 /// THE STATE-IDENTITY FIXTURE, parameterised over the three admitted opcodes.
 ///
-/// Runs the same code twice — once as an installed native block, once with no block at all — and
+/// Runs the same code twice (once as an installed native block, once with no block at all) and
 /// compares the FULL architectural state (registers, EFLAGS, lazy flags, all of guest memory)
 /// after every round, patching the displacement between rounds. The interpreter re-decodes the
 /// patched instruction, so it is the reference by construction, and comparing whole memory rather
@@ -390,7 +390,7 @@ fn state_identity(subject: [u8; 2], store: bool, widen: bool, one_lookup_store: 
     }
 }
 
-/// `0x89 MOV [disp32], r32` — the prize. 89% of the un-laned displacement mass by events and
+/// `0x89 MOV [disp32], r32`: the prize. 89% of the un-laned displacement mass by events and
 /// 96.8% of its joined block kills.
 #[test]
 fn dword_store_lane_matches_the_interpreter_across_patches() {
@@ -399,7 +399,7 @@ fn dword_store_lane_matches_the_interpreter_across_patches() {
     }
 }
 
-/// `0x88 MOV [disp32], r8` — the same instruction one width down, and the second width the
+/// `0x88 MOV [disp32], r8`: the same instruction one width down, and the second width the
 /// admission covers. It shares `emit_store` with `0x89`, so a width-dependent regression in the
 /// lane arm shows here and not above.
 #[test]
@@ -409,7 +409,7 @@ fn byte_store_lane_matches_the_interpreter_across_patches() {
     }
 }
 
-/// `0x8B MOV r32, [disp32]` — the load widening, which is a different KIND and a different
+/// `0x8B MOV r32, [disp32]`: the load widening, which is a different KIND and a different
 /// emitter from the two above and is separately knobbed.
 #[test]
 fn dword_load_widen_lane_matches_the_interpreter_across_patches() {
@@ -427,7 +427,7 @@ const BASED_DS_BASE: u32 = 0x1000;
 
 /// The based-flat displacements, as SEGMENT OFFSETS. `BASED_DS_BASE + offset` is `TARGETS`
 /// permuted, so every access lands on a mapped, writable, 4-byte-aligned address off the block's
-/// own code page -- and every one of them lands somewhere DIFFERENT from the raw offset, which is
+/// own code page, and every one of them lands somewhere DIFFERENT from the raw offset, which is
 /// what makes a dropped base add a memory difference rather than a silent no-op.
 const BASED_OFFSETS: [u32; 4] = [0x1000, 0x2000, 0x3440, 0x0000];
 
@@ -445,7 +445,7 @@ fn based_flat_ds_cpu(arms: &ArmOverride) -> CpuGsw {
     cpu
 }
 
-/// THE FLAT-LIMIT, NON-ZERO-BASE, LIVE-LANE SHAPE -- the one combination no fixture in this tree
+/// THE FLAT-LIMIT, NON-ZERO-BASE, LIVE-LANE SHAPE: the one combination no fixture in this tree
 /// compiled before, and the one the effective-address fusion's `foldable` predicate has to refuse.
 ///
 /// `emit_segmented_linear_address` may fold the segment base into the address-forming instruction's
@@ -454,7 +454,7 @@ fn based_flat_ds_cpu(arms: &ArmOverride) -> CpuGsw {
 /// hold here. The third condition is the one that is invisible from the descriptor: a live
 /// displacement LANE forms the address through a runtime load out of guest RAM and has **no
 /// immediate field to fold into**, so a `foldable` that consults only the descriptor and the wrap
-/// computes the fold, passes it down, and has it silently dropped -- and every execution of the
+/// computes the fold, passes it down, and has it silently dropped, and every execution of the
 /// block then addresses `patched_disp` instead of `BASED_DS_BASE + patched_disp`.
 ///
 /// `cpu_jit_disp_store_lane_test.rs`'s finite-limit fixture cannot catch that: its limit is finite,
@@ -726,8 +726,8 @@ fn the_thirteenth_store_slot_charges_exactly_one_store_cap_refusal() {
 /// THE CAP SITS BELOW THE HEAT GATE, stated as a counter reading rather than as an argument.
 ///
 /// Same twelve fillers, same thirteenth `0x89` slot, and the ONLY difference is that its
-/// displacement carries no patch history. The heat gate refuses it first, so nothing is charged
-/// — not even to its own family. Invert the two and this fixture reads `[0, 0, 0, 0, 1, 0]`,
+/// displacement carries no patch history. The heat gate refuses it first, so nothing is charged,
+/// not even to its own family. Invert the two and this fixture reads `[0, 0, 0, 0, 1, 0]`,
 /// which is the whole `0x89` population being reported as budget pressure on any real workload.
 #[test]
 fn a_store_slot_the_heat_gate_refuses_charges_no_cap_refusal() {
@@ -756,8 +756,8 @@ fn the_thirteenth_load_widen_slot_charges_exactly_one_widen_cap_refusal() {
 /// one on the ladder legs these counters exist for.
 ///
 /// The knob is tested above the budget in both arms, so a capped thirteenth slot of either shape
-/// reads zero everywhere with its arm off. Fusing the knob into the cap's disjunction — the shape
-/// three matchers used to have — makes both of these read a refusal.
+/// reads zero everywhere with its arm off. Fusing the knob into the cap's disjunction (the shape
+/// three matchers used to have) makes both of these read a refusal.
 #[test]
 fn the_off_arms_charge_no_cap_refusal_at_the_thirteenth_slot() {
     for subject in [STORE_DWORD, LOAD_DWORD] {
@@ -782,13 +782,13 @@ fn the_off_arms_charge_no_cap_refusal_at_the_thirteenth_slot() {
 /// weakening of the claim: two compilations bake different host pointers (link-cell and portal
 /// addresses, and a lane's own host pointer), so a byte comparison across them fails on
 /// allocation noise whatever the arm. The length is stable, and it is exactly the quantity a
-/// stray lane moves — the lane arm emits `mov r64, imm64` plus `mov eax, [r64]` where the baked
+/// stray lane moves: the lane arm emits `mov r64, imm64` plus `mov eax, [r64]` where the baked
 /// arm emits one `mov eax, imm32`.
 fn emitted_len_under_arms(middle: &[u8], store: bool, widen: bool) -> usize {
     emitted_len_on_store_path(middle, store, widen, SHIPPED_STORE_PATH, true)
 }
 
-/// The same, with NO heat record seeded — the state main was always in for a store, because main
+/// The same, with NO heat record seeded: the state main was always in for a store, because main
 /// had no store matcher to consult a record with. Used only by the "the OFF arm is main" claim.
 fn emitted_len_unseeded(middle: &[u8], store: bool, widen: bool) -> usize {
     emitted_len_on_store_path(middle, store, widen, SHIPPED_STORE_PATH, false)
@@ -829,7 +829,7 @@ fn emitted_len_on_store_path(
     }
 }
 
-/// THE OFF ARM IS MAIN, stated as emitted code rather than as an argument — and since the
+/// THE OFF ARM IS MAIN, stated as emitted code rather than as an argument, and since the
 /// 2026-08-23 flip that arm is the ESCAPE rather than the default, which is exactly when this
 /// fixture starts earning its keep.
 ///
@@ -840,7 +840,7 @@ fn emitted_len_on_store_path(
 ///    whatever its patch history. This fixture reproduces that build's emission twice over, from
 ///    two independent directions: with the arm OFF and a heat record present, and with the arm ON
 ///    and no heat record. Both must equal each other, which they can only do by baking. A regression
-///    that made the escape emit lane code — or that made the heat gate admit an unpatched slot —
+///    that made the escape emit lane code (or that made the heat gate admit an unpatched slot)
 ///    breaks the equality;
 /// 2. the admitted shapes' two arms must DIFFER, or the escape is decorative;
 /// 3. every OTHER shape must emit the same code under both arms, which is what says the arm is a
@@ -853,7 +853,7 @@ fn emitted_len_on_store_path(
 /// * `0x8A`, which has its own lane, its own knob and its own counter;
 /// * a `0x66`-prefixed store, the prefix bar that pins the width argument;
 /// * a disp8 store, the `disp_len == 4` bar;
-/// * an `ADD [disp32], r32`, an `AluMemDest` — a memory-WRITING kind the store arm deliberately
+/// * an `ADD [disp32], r32`, an `AluMemDest`, a memory-WRITING kind the store arm deliberately
 ///   does not admit, and the one refusal that says the arm is keyed on KIND and not on "does it
 ///   write memory".
 #[test]
@@ -925,7 +925,7 @@ fn the_off_arm_emits_the_same_code_for_everything_it_does_not_admit() {
 /// attributed to the counter it would have moved.
 ///
 /// EVERY ENTRY IS CHOSEN SO THAT DELETING THE BAR IT TESTS ADMITS A LANE AT A WRONG ADDRESS
-/// rather than merely failing some other way — the trap the `0x8A` suite's review found and the
+/// rather than merely failing some other way, the trap the `0x8A` suite's review found and the
 /// reason a three-byte disp8 form is NOT in this list. Each is named on its own line.
 #[test]
 fn the_store_arm_refuses_every_shape_outside_its_bars() {
@@ -949,13 +949,13 @@ fn the_store_arm_refuses_every_shape_outside_its_bars() {
     store_imm.extend_from_slice(&0x1122_3344u32.to_le_bytes());
     // `mov [moffs32], eax`. A `Store` whose absolute address is the IMMEDIATE field and whose
     // `disp_len` is zero: with the `disp_len == 4` term deleted this five-byte form would lane
-    // its last four bytes, which are the moffs — an address the emitted code does not read
+    // its last four bytes, which are the moffs, an address the emitted code does not read
     // through the disp seam at all.
     let mut moffs = vec![0xa3];
     moffs.extend_from_slice(&TARGETS[0].to_le_bytes());
     for middle in [
         &prefixed[..],
-        // `mov [esp+0x10], ebx` — disp8, and a FOUR-byte instruction, so with `disp_len == 4`
+        // `mov [esp+0x10], ebx`: disp8, and a FOUR-byte instruction, so with `disp_len == 4`
         // deleted `len - 4` lands on the OPCODE byte and a 4-byte guest write rewriting the
         // instruction itself would be absorbed as a lane accept while the block ran the old code.
         // A three-byte disp8 form would refuse for the wrong reason (`checked_sub(4)` underflows).
@@ -998,8 +998,8 @@ fn the_store_arm_refuses_every_shape_outside_its_bars() {
 }
 
 /// The `0x8A` family must be untouched by either arm: same lane, same counter, on all four
-/// combinations. This is the regression that a widened opcode set inside `disp_lane_for` — the
-/// implementation the design's "opcode-set widening" phrase invites — would produce.
+/// combinations. This is the regression that a widened opcode set inside `disp_lane_for` (the
+/// implementation the design's "opcode-set widening" phrase invites) would produce.
 #[test]
 fn the_shipped_8a_lane_is_unchanged_by_both_arms() {
     for (store, widen) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -1061,14 +1061,14 @@ fn limited_ds_cpu(arms: &ArmOverride) -> CpuGsw {
 /// THE LANE UNDER A FINITE SEGMENT, which is the one emission shape no other fixture here
 /// compiles: `emit_segmented_linear_address` emits its limit compare only when
 /// `limit != u32::MAX` and its base add only when `base != 0`, and both sit DOWNSTREAM of
-/// `emit_effective_address` — so with a lane they run on the PATCHED displacement.
+/// `emit_effective_address`, so with a lane they run on the PATCHED displacement.
 ///
 /// Two claims, and the second is the one that would be a miscompile:
 ///
 /// 1. inside the limit, a laned store lands at `base + patched_disp` and the whole architectural
 ///    state matches an interpreter running the same bytes with no block;
-/// 2. patched PAST the limit, the native block takes the `SegmentLimit` side exit — one exit,
-///    that guard and no other — leaves EIP on the store with no effect, and writes nothing at the
+/// 2. patched PAST the limit, the native block takes the `SegmentLimit` side exit (one exit,
+///    that guard and no other) leaves EIP on the store with no effect, and writes nothing at the
 ///    linear address the store would otherwise have reached.
 ///
 /// Claim 2 is what a lane arm that formed the address after the compare, or that skipped the
@@ -1117,7 +1117,7 @@ fn a_laned_store_under_a_finite_segment_limit_matches_the_interpreter_and_exits(
 
             let past_limit = offset > LIMITED_DS_LIMIT - 3;
             // The interpreter runs the whole block inside the limit, and stops BEFORE the store
-            // on the last round -- the native leg side-exits there, so one cycle is the state the
+            // on the last round, the native leg side-exits there, so one cycle is the state the
             // two are compared at. The fault itself is the interpreter's on the re-run and is not
             // this fixture's subject.
             for _ in 0..if past_limit { 1 } else { 3 } {
@@ -1165,7 +1165,7 @@ fn a_laned_store_under_a_finite_segment_limit_matches_the_interpreter_and_exits(
     }
 }
 
-/// THE SIB disp32 STORE (`89 1c 85 dd dd dd dd`, `MOV [EAX*4 + disp32], EBX`) — SEVEN bytes with
+/// THE SIB disp32 STORE (`89 1c 85 dd dd dd dd`, `MOV [EAX*4 + disp32], EBX`): SEVEN bytes with
 /// the displacement at offset 3, the one admitted encoding whose disp is NOT two bytes in.
 ///
 /// It pins the `physical + len - 4` lane-start arithmetic, which every six-byte fixture in this
@@ -1223,7 +1223,7 @@ fn a_sib_disp32_store_lanes_at_the_right_offset() {
 
 /// The `IZARRAVM_DISP_STORE_LANES` spelling table. The knob caches its env reading in a
 /// process-wide `OnceLock`, so the contract is otherwise assertable exactly once per process and
-/// never in an order the harness controls — hence the parse function is exercised directly.
+/// never in an order the harness controls, hence the parse function is exercised directly.
 #[test]
 fn disp_store_lanes_spelling_table() {
     use std::env::VarError;
@@ -1234,7 +1234,7 @@ fn disp_store_lanes_spelling_table() {
     );
     // THE EMPTY STRING IS OFF WHILE UNSET IS ON, and the two must not be confused. The trap
     // flipped with the default: before it an ON leg had to export `1`, now it is the OFF leg that
-    // must export `0`, because nulling a variable in PowerShell leaves it PRESENT and EMPTY --
+    // must export `0`, because nulling a variable in PowerShell leaves it PRESENT and EMPTY,
     // which this table spells OFF. `Remove-Item Env:` is the only true unset.
     assert!(
         !parse(Ok(String::new())),
@@ -1286,7 +1286,7 @@ fn a_mistyped_load_widen_arm_panics() {
 /// deciding long row with the corpus inert; a default that moved back without a ladder would
 /// change every shipped binary's lane registration silently.
 ///
-/// It reads the AMBIENT knob deliberately — no override — so the assertion agrees with the
+/// It reads the AMBIENT knob deliberately (no override) so the assertion agrees with the
 /// ENVIRONMENT rather than with a constant, because this suite is run on BOTH arms: a fixture
 /// that hard-asserted "on" would make the OFF-arm suite run impossible by construction. With the
 /// variable unset it reduces to "the default is ON", which is the claim it exists for.

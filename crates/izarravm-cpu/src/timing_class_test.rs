@@ -214,7 +214,7 @@ fn i386_charges_the_pinned_literal_for_every_class() {
 
 /// The mutation this catches: a class added to the enum and forgotten in a
 /// persona column, which the macro makes impossible for the SHAPE but not for
-/// the VALUE -- a `0` entry would silently make an instruction free.
+/// the VALUE: a `0` entry would silently make an instruction free.
 #[test]
 fn every_class_charges_something_in_every_persona_table() {
     for table in [&I386, &I486, &I586] {
@@ -277,18 +277,18 @@ fn class_names_are_unique() {
     assert_eq!(names.len(), count, "two classes share a name");
 }
 
-/// The unsourced census, pinned -- and it is now ZERO.
+/// The unsourced census, pinned, and it is now ZERO.
 ///
 /// A class whose provenance says `UNSOURCED x12` has NO reference count behind
 /// its epoch-2 entry: it is the epoch-1 literal times twelve, a default that
 /// preserves today's relative cost and errs slow. Slice 1a shipped 78 of them.
-/// `dev_docs/2026-09-05-class-table-sources.md` sourced every one against
+/// The class-table source survey checked every one against
 /// Intel's Pentium Table F-2/F-3/F-5, the Optimization Manual's Table A-1 for
 /// the pairing letters, and the i486 DX2 Data Book's Tables 10.1-10.3, so the
 /// count is now 0 and a row that reappears has to say why in the diff.
 ///
 /// `PLACEHOLDER` is the stronger admission: the row is not merely unsourced, its
-/// SHAPE is wrong. One remains -- `StringElem`, which still fuses a per-element
+/// SHAPE is wrong. One remains: `StringElem`, which still fuses a per-element
 /// cost with a setup cost. The sources doc supplies both terms for all seven
 /// string families; spending them is slice 1's REP item
 /// (`RepLimitPlan::compute`), not this commit's.
@@ -319,18 +319,18 @@ fn the_unsourced_and_placeholder_census_is_pinned() {
 /// Every epoch-2 entry is an exact multiple of twelve, because design section
 /// 3.1 fixes the unit: `level_timing` stays `(1, 12)` and one raw clock is one
 /// twelfth of a core clock, so every Intel count lands on a twelfth boundary. A
-/// non-multiple is a transcription slip, not a finer measurement -- UNLESS it is
+/// non-multiple is a transcription slip, not a finer measurement: UNLESS it is
 /// a declared blend, and the blend list is pinned exactly so a fabricated value
 /// cannot hide behind the word.
 ///
 /// The declared blends, and there are now only two families of them:
-/// * I586 `Jcc` raw 16 (1.33 clk, a third of a clock) -- design section 3.4:
+/// * I586 `Jcc` raw 16 (1.33 clk, a third of a clock), design section 3.4:
 ///   Intel's 1-clock predicted cost plus an amortized mispredict, not any single
 ///   count.
-/// * I586 `Loop` / `LoopCc` / `Jcxz` raw 66 / 90 / 66 (5.5 / 7.5 / 5.5) --
+/// * I586 `Loop` / `LoopCc` / `Jcxz` raw 66 / 90 / 66 (5.5 / 7.5 / 5.5):
 ///   section 3.2's midpoints of Intel's taken/not-taken ranges (5-6, 7-8, 6-5),
 ///   which the interpreter's one-arm charge cannot separate.
-/// * I486 `X87MemArithIntDiv32` raw 1026 (85.5 clk) -- Intel's OWN printed
+/// * I486 `X87MemArithIntDiv32` raw 1026 (85.5 clk): Intel's OWN printed
 ///   average of the DX2's 84-86 range for `FIDIV m32` (Table 10.3's "Cache Hit"
 ///   column is an average), not a midpoint we chose.
 ///
@@ -517,7 +517,7 @@ fn max_raw_is_the_largest_entry_in_the_table() {
 /// epoch 2 where the epoch-1 constant is 7.
 ///
 /// Without this the chain quota's DIVISOR would price a group-3 call-out at
-/// 7/12ths of a clock while the slot charged 46 -- an under-budget of 78x, in
+/// 7/12ths of a clock while the slot charged 46, an under-budget of 78x, in
 /// the release builds the campaign measures.
 #[test]
 fn the_interpret_one_budget_term_covers_the_group_three_rows() {

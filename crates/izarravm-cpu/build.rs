@@ -16,14 +16,14 @@
 //! This IS that generator. It reads `run.rs` and `jit/direct.rs` at build time, finds every
 //! `ea_refusal!`/`ea_compile_site!` call site and the `mark(P0)` call, and writes their real,
 //! current line numbers to an `OUT_DIR` file that `jit/direct.rs` splices in with `include!`.
-//! There is no longer a literal for an edit to shift out from under -- the table is recomputed
+//! There is no longer a literal for an edit to shift out from under: the table is recomputed
 //! on every build that touches either file.
 //!
 //! Runs (and re-parses both files) on every build, feature or no feature: the cost is a couple
 //! of linear text scans over two source files, and running it unconditionally means the plain
 //! build's `OUT_DIR` never lacks the generated file. Nothing this script writes is READ unless
-//! `direct-entry-attribution` is selected -- `jit/direct.rs`'s `include!` of the generated file
-//! sits behind that `#[cfg]` -- so a plain build's compiled output is exactly as if this script
+//! `direct-entry-attribution` is selected: `jit/direct.rs`'s `include!` of the generated file
+//! sits behind that `#[cfg]`, so a plain build's compiled output is exactly as if this script
 //! did not exist.
 
 use std::collections::{HashMap, HashSet};
@@ -47,7 +47,7 @@ fn count_occurrences(text: &str, needle: &str) -> usize {
 
 /// Parse `pub(crate) const NAME: usize = N;` lines out of the named `pub(crate) mod MODULE { ...
 /// }` block in `direct_rs`, returning `{lowercased NAME: N}`. This is the authority for which
-/// array INDEX a site's name owns -- `run.rs` addresses the perf histograms by `site::NAME` /
+/// array INDEX a site's name owns: `run.rs` addresses the perf histograms by `site::NAME` /
 /// `compile_site::NAME`, so the generated table has to place each site at the same index the
 /// `mod` block already assigns it, not at wherever the scan happens to encounter it.
 fn parse_index_module(direct_rs: &str, module: &str) -> HashMap<String, usize> {
@@ -106,7 +106,7 @@ fn find_calls(run_rs: &str, macro_name: &str, module: &str) -> HashMap<String, u
 
 /// Build one `(label, line)` table, in index order, from a name->index authority (the `mod
 /// site`/`mod compile_site` block) and a name->call-line map (the `run.rs` scan). Panics with a
-/// specific, actionable message the moment the two disagree about which sites exist -- that is
+/// specific, actionable message the moment the two disagree about which sites exist: that is
 /// the one drift class this generator cannot self-heal, because it means a site was added or
 /// removed on only one side.
 fn build_table(
@@ -183,7 +183,7 @@ fn main() {
 
     // Every `ea_refusal!`/`ea_compile_site!` call is immediately followed (within a handful of
     // bookkeeping lines) by the `return` it belongs to; that `return`'s line is what the table
-    // cites. `RETURN_WINDOW` is generous on purpose -- wide enough that a bookkeeping line added
+    // cites. `RETURN_WINDOW` is generous on purpose: wide enough that a bookkeeping line added
     // between the macro and its `return` does not itself require widening this constant.
     const RETURN_WINDOW: usize = 12;
 
@@ -207,7 +207,7 @@ fn main() {
 
     let compile_indices = parse_index_module(&direct_rs, "compile_site");
     // `installed_fall_through` is the one compile site with no `ea_compile_site!` call of its
-    // own in run.rs -- it is bumped INSIDE the `ea_mark_probe_tail!` macro, so its cited line is
+    // own in run.rs: it is bumped INSIDE the `ea_mark_probe_tail!` macro, so its cited line is
     // that macro's own call site in run.rs, not a scanned-for `return`.
     let fall_through_line = find_line(&run_rs, "ea_mark_probe_tail!(").unwrap_or_else(|| {
         panic!("run.rs has no `ea_mark_probe_tail!` call for `installed_fall_through`")

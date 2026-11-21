@@ -434,13 +434,13 @@ fn global_invalidation_and_clone_leave_no_live_entries() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The one-lookup store-bias derivation battery (design T1-T3,
-// `dev_docs/2026-08-07-one-lookup-store-design.md`). The CPU-level halves — watch-edge sweeps
-// poisoning through `clear_entry`, and the emitted differential — live in
+// The one-lookup store-bias derivation battery (store design
+// T1-T3). The CPU-level halves (watch-edge sweeps
+// poisoning through `clear_entry`, and the emitted differential) live in
 // `cpu_jit_store_bias_test.rs`.
 
 /// A 4096-aligned page backing. The plain `Box<[u8; PAGE_SIZE]>` helper above is align-1, which
-/// is exactly the misaligned-backing case `derive_store_bias` must DEGRADE on — so the fast
+/// is exactly the misaligned-backing case `derive_store_bias` must DEGRADE on, so the fast
 /// encodings need this aligned twin, and the degradation test uses the unaligned one on purpose.
 #[repr(align(4096))]
 struct AlignedPage([u8; PAGE_SIZE]);
@@ -626,14 +626,14 @@ fn a_same_mapping_refill_with_dropped_permissions_rederives_the_bias() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The one-lookup LOAD-bias derivation battery (load design L1-L3,
-// `dev_docs/2026-08-07-one-lookup-load-design.md`). The CPU-level halves — the emitted
-// differential, the counter-identity cells, the trio ordering — live in
+// The one-lookup LOAD-bias derivation battery (load design
+// L1-L3). The CPU-level halves (the emitted
+// differential, the counter-identity cells, the trio ordering) live in
 // `cpu_jit_load_bias_test.rs`.
 
 /// L1's twin-difference pin, the load design's core claim held in ONE test so the two
 /// derivations cannot drift apart silently: a WATCHED user page derives a POISONED store bias
-/// and a FAST load bias from the identical flags byte — reads have no code-watch dimension.
+/// and a FAST load bias from the identical flags byte: reads have no code-watch dimension.
 #[test]
 fn a_watched_page_derives_a_poisoned_store_bias_and_a_fast_load_bias() {
     let mut ram = aligned_page();
@@ -685,7 +685,7 @@ fn load_bias_fast_encodings_for_ram_mode13_supervisor_and_read_only() {
     assert_eq!(vga_bias & LOAD_BIAS_TAG_MASK, LOAD_BIAS_MODE13);
     assert_ne!(vga_bias, LOAD_BIAS_POISON);
 
-    // Supervisor RAM (PAGE_USER clear): bias | bit 1. PAGE_WRITABLE is irrelevant to loads —
+    // Supervisor RAM (PAGE_USER clear): bias | bit 1. PAGE_WRITABLE is irrelevant to loads:
     // a writable-but-not-user page still tags bit 1, and a user read-only page does NOT.
     assert!(map.populate_read(
         0x0041_0000,
@@ -774,7 +774,7 @@ fn load_bias_rides_clear_entry_and_rederives_on_refill() {
 
     // Every entry-death path funnels through `clear_entry`; INVLPG is the cheapest to drive.
     // For loads a sweep-driven clear is PERF-ONLY over-invalidation (a watched page's loads
-    // were legal), healed here by the natural refill — which must re-derive FAST even when the
+    // were legal), healed here by the natural refill, which must re-derive FAST even when the
     // refill carries the watched bit.
     map.invalidate_page(0x0040_0000);
     assert_eq!(map.load_bias_for_test(0x0040_0000), LOAD_BIAS_POISON);
@@ -791,7 +791,7 @@ fn load_bias_rides_clear_entry_and_rederives_on_refill() {
 }
 
 /// L3's derivation half (hazard R1): a same-mapping refill that drops PAGE_USER must flip the
-/// load bias to the supervisor tag in the SAME populate — including a WRITE refill, whose
+/// load bias to the supervisor tag in the SAME populate, including a WRITE refill, whose
 /// derivation reads the KEPT read bias against the fresh flags byte.
 #[test]
 fn a_same_mapping_refill_that_drops_user_flips_the_load_bias_tag() {
@@ -829,8 +829,8 @@ fn a_same_mapping_refill_that_drops_user_flips_the_load_bias_tag() {
 /// `classify_reject` must attribute a refusal to the clause `lookup_access` reaches FIRST.
 ///
 /// This is the coupling between the two ladders. They are written adjacently in `fast_map.rs`
-/// and cannot share code (`lookup_access` must not widen its hot return value to carry a reason
-/// -- that taxes the DISARMED path through the return ABI), so the parity is pinned here
+/// and cannot share code (`lookup_access` must not widen its hot return value to carry a reason,
+/// that taxes the DISARMED path through the return ABI), so the parity is pinned here
 /// instead. Every case below is DOUBLY rejecting on purpose: the single-cause cases would pass
 /// under any ordering and prove nothing.
 #[test]
@@ -851,8 +851,8 @@ fn classify_reject_follows_lookup_access_ladder_order() {
         false,
     ));
 
-    // Misaligned AND epoch-stale. There is no alignment rung any more -- `lookup_access` SERVES
-    // misaligned accesses -- so the refusal is the epoch's and must be attributed to it. Before
+    // Misaligned AND epoch-stale. There is no alignment rung any more: `lookup_access` SERVES
+    // misaligned accesses, so the refusal is the epoch's and must be attributed to it. Before
     // the admission slice this case read `Misaligned`; that it now reads `Epoch` is the two
     // ladders staying coupled THROUGH a change to one of them, which is this test's whole job.
     assert_eq!(
@@ -933,7 +933,7 @@ fn classify_reject_follows_lookup_access_ladder_order() {
         SlotReject::Permission,
     );
 
-    // No write bias was ever published for this page, so a write is Absent -- and Absent is
+    // No write bias was ever published for this page, so a write is Absent, and Absent is
     // reached only AFTER the epoch test, which this case also has to pass.
     assert_eq!(
         map.classify_reject(

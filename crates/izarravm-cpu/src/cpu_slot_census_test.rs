@@ -8,7 +8,7 @@
 //! and deliberately independent: the histogram is page-granular, boxed and default-off with a
 //! `Box` behind it; this one is reason-granular, always-compiled and gated on a bare `CpuGsw`
 //! byte. The cross-check that ties them together is `slot_reject_misaligned` against
-//! `data_slow_reads` -- NOT against `interp_fast_map_misses`, because
+//! `data_slow_reads`, NOT against `interp_fast_map_misses`, because
 //! `call_out_stack_frame_resident` calls `lookup_access` directly and deliberately bypasses the
 //! probe counters.
 //!
@@ -17,7 +17,7 @@
 //! 1. **It is off unless armed.** An unarmed run must leave every reject counter at zero while
 //!    the refusals themselves still happen, and `slot_reject_enabled` must report the LIVE gate,
 //!    so five zeroes can never be read as "nothing was refused".
-//! 2. **Each reason lands in its own bucket**, against a FastMap that is genuinely populated --
+//! 2. **Each reason lands in its own bucket**, against a FastMap that is genuinely populated:
 //!    a census run against an empty map would attribute everything to `Absent` and would pass
 //!    under any classifier at all. That is the fixtures-that-cannot-fail shape this file has to
 //!    avoid, so every case below first proves the SAME page serves an aligned access.
@@ -88,7 +88,7 @@ fn the_census_is_silent_until_it_is_armed() {
     let audit = cpu.fast_map_audit_counters();
     assert_eq!(audit.slot_reject_absent, 0);
     assert!(!audit.slot_reject_enabled);
-    // The refusal DID happen -- this is what stops the assertion above from being vacuous.
+    // The refusal DID happen: this is what stops the assertion above from being vacuous.
     let misses_unarmed = cpu.fast_map_probe_counters().misses;
     assert!(misses_unarmed > 0);
 

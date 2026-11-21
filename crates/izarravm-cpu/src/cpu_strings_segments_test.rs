@@ -1066,7 +1066,7 @@ fn paged_rep_without_a_walk_bound_advances_once_per_resumed_batch() {
 /// Code-smell batch 2, S2's `RepLimitPlan` hoist must keep "the bus could not price a page walk"
 /// a YIELD outcome, distinct from "the page walk is known to cost zero". The test above pins
 /// that with a cap of 1, which is tight enough that `available` saturates to 0 whether or not
-/// the paging term is folded in, so it cannot by itself tell the two outcomes apart -- a hoist
+/// the paging term is folded in, so it cannot by itself tell the two outcomes apart: a hoist
 /// that silently substituted a zero-cost walk for the unpriced one would still pass it. This
 /// gives the yield a budget generous enough to complete the whole REP in one call if the unpriced
 /// walk were ever treated as free, so the two outcomes diverge observably.
@@ -1597,7 +1597,7 @@ fn bulk_scratch_does_not_affect_equality_and_clone_zeroes_it() {
 /// batch 2, S4): DF=1 must never reach the bulk path at all, and an overlapping MOVS range must
 /// fall back to the single-step path instead of the bulk one. Both pin the OBSERVABLE consequence
 /// (`rep_string_fast_iterations` stays 0 while `rep_string_iterations` still makes progress on
-/// the slow path), because both bails sit ahead of every touch of the scratch buffer -- if either
+/// the slow path), because both bails sit ahead of every touch of the scratch buffer: if either
 /// were ever weakened, this is what would move. The third bail, the one-page clamp on chunk size,
 /// needs no bus and is pinned directly in strings_test.rs.
 #[test]
@@ -1645,7 +1645,7 @@ fn df_and_overlap_bails_never_reach_the_bulk_path() {
     // processes one byte at a time, so each write becomes the NEXT iteration's read and the
     // first source byte "smears" forward. Reading the whole span first and writing it back in
     // one shot (what the bulk path does, and exactly why it gates on `!ranges_overlap`) would
-    // instead copy the ORIGINAL bytes verbatim, one position over -- a different, wrong answer.
+    // instead copy the ORIGINAL bytes verbatim, one position over, a different, wrong answer.
     {
         let memory = vec![0u8; 2048];
         let mut cpu = CpuGsw::default();
@@ -1907,8 +1907,8 @@ fn lss_interrupt_shadow_defers_a_pending_irq_by_one_instruction() {
     // instruction AFTER LSS has run.
     let mut memory = vec![0u8; 0x300];
     memory[0..5].copy_from_slice(&[0x0f, 0xb2, 0x1e, 0x00, 0x02]); // lss bx, [0x200]
-    memory[5] = 0x90; // NOP -- executes before the interrupt is taken (shadow)
-    memory[6] = 0x90; // NOP -- not reached; interrupt taken instead
+    memory[5] = 0x90; // NOP: executes before the interrupt is taken (shadow)
+    memory[6] = 0x90; // NOP: not reached; interrupt taken instead
     memory[0x200] = 0x00; // offset -> 0x0000
     memory[0x201] = 0x00;
     memory[0x202] = 0x00; // selector -> 0x0000 (SS stays flat at base 0 in real mode)
@@ -1928,7 +1928,7 @@ fn lss_interrupt_shadow_defers_a_pending_irq_by_one_instruction() {
 
     let mut bus = TestBus::with_memory(memory);
     // No interrupt pending yet: it "arrives" during LSS's execution window, which is
-    // exactly the case the shadow exists to cover -- an IRQ landing between the LSS
+    // exactly the case the shadow exists to cover: an IRQ landing between the LSS
     // and the next instruction boundary must wait for that boundary.
 
     // Cycle 1: LSS. SS reloads; the shadow arms. eip advances normally.
@@ -1966,7 +1966,7 @@ fn lss_interrupt_shadow_defers_a_pending_irq_by_one_instruction() {
 
 #[test]
 fn lss_32bit_operand_size_loads_esp_wide_offset() {
-    // 66 0F B2 1E 00 02 -- lss ebx, [0x200] (operand-size override to 32-bit).
+    // 66 0F B2 1E 00 02: lss ebx, [0x200] (operand-size override to 32-bit).
     // EBX <- dword[0x200], SS <- word[0x204].
     let mut memory = vec![0u8; 0x1000];
     memory[0..6].copy_from_slice(&[0x66, 0x0f, 0xb2, 0x1e, 0x00, 0x02]);
@@ -1987,7 +1987,7 @@ fn lss_32bit_operand_size_loads_esp_wide_offset() {
 
 #[test]
 fn lfs_loads_offset_and_fs() {
-    // lfs bx, [0x200]  (0F B4 1E 00 02). No interrupt shadow -- only LSS arms it.
+    // lfs bx, [0x200]  (0F B4 1E 00 02). No interrupt shadow: only LSS arms it.
     let mut memory = vec![0u8; 0x1000];
     memory[0..5].copy_from_slice(&[0x0f, 0xb4, 0x1e, 0x00, 0x02]);
     memory[0x200] = 0x34;
@@ -2097,7 +2097,7 @@ fn lgs_with_register_operand_delivers_ud() {
 
 #[test]
 fn lss_null_selector_faults_general_protection() {
-    // In protected mode, LSS with a null selector must #GP -- SS can never be null,
+    // In protected mode, LSS with a null selector must #GP: SS can never be null,
     // the same rule any other SS load enforces (`null_selector_into_ss_still_faults`).
     let (mut cpu, mut memory) = protected_cpu(&[0x0f, 0xb2, 0x1e, 0x80, 0x01], 0, 0);
     // Far pointer at 0x180: offset 0x1234, selector 0x0000 (null).
@@ -2120,7 +2120,7 @@ fn lss_null_selector_faults_general_protection() {
 #[test]
 fn lss_protected_mode_refreshes_the_ss_b_bit() {
     // Load SS via LSS from a 32-bit (B=1) data descriptor (selector 0x08, GDT). The cached
-    // `default_size_32` (the B bit) must flip to match the new descriptor -- it comes free
+    // `default_size_32` (the B bit) must flip to match the new descriptor: it comes free
     // through `load_segment` -> `descriptor_to_segment`, exactly like any other segment load.
     let descriptor_low = 0x0000_ffffu32; // limit low = 0xffff, base = 0
     let descriptor_high = 0x00cf_9200u32; // access=0x92 (present, data, writable), B=1, G=1
@@ -2558,7 +2558,7 @@ fn pop_rm_reg_nonzero_is_illegal() {
 #[test]
 fn pop_rm32_esp_relative_destination_uses_post_increment_esp() {
     // The falsifier: push A; push B; pop dword [esp+4] must write B to the
-    // POST-increment [esp+4] (the original pre-push top of stack, 0x0200) --
+    // POST-increment [esp+4] (the original pre-push top of stack, 0x0200),
     // not the pre-pop [esp+4] (0x01fc, the slot that holds A), which is what
     // resolving the EA before the pop would compute.
     //
@@ -2600,8 +2600,8 @@ fn pop_rm32_esp_relative_destination_uses_post_increment_esp() {
 #[test]
 fn pop_rm16_esp_relative_destination_uses_post_increment_esp() {
     // 16-bit variant of the falsifier above. 8F /0 mod=01 rm=100 (SIB: base=SP
-    // is not directly encodable in 16-bit addressing -- 16-bit ModRM has no SIB
-    // byte -- so this uses 32-bit addressing with a 16-bit operand: 0x67 8F /0
+    // is not directly encodable in 16-bit addressing: 16-bit ModRM has no SIB
+    // byte, so this uses 32-bit addressing with a 16-bit operand: 0x67 8F /0
     // mod=01 rm=100 disp8=0x02, POP word [esp+2].
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0x67, 0x8f, 0x44, 0x24, 0x02]);
@@ -2666,7 +2666,7 @@ fn pop_rm32_esp_relative_destination_restores_esp_on_page_fault() {
     cpu.control.cr3 = 0x1000;
     cpu.control.cr0 |= CR0_PG;
     // ESP = 0x2ffc: the pop reads from here (mapped), advances to 0x3000, and
-    // the destination EA [esp+4] (post-increment) is 0x3004 -- inside the
+    // the destination EA [esp+4] (post-increment) is 0x3004, inside the
     // unmapped page 0x3000, so the write faults.
     cpu.registers.set_esp(0x2ffc);
     let esp_before = cpu.registers.esp();
@@ -2989,7 +2989,7 @@ fn ss_load_populates_the_cached_b_bit_from_the_descriptor() {
 }
 
 /// A flat protected-mode CPU with code at linear 0, CS.D from `code_d32`, and SS.B
-/// from `stack_b32` -- for exercising ENTER/LEAVE's SS.B-vs-operand-size split.
+/// from `stack_b32`, for exercising ENTER/LEAVE's SS.B-vs-operand-size split.
 fn protected_cpu_with_cs_d_and_ss_b(
     code: &[u8],
     mem_len: usize,

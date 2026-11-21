@@ -3,11 +3,11 @@
 
 //! `vorvek/direct-word-rot1`: the sixteen-bit REGISTER rotate lane, `0xC1`/`0xD1 /0,/1`.
 //!
-//! `dev_docs/2026-08-31-corpus-lever-plan.md`'s L3: `123-talk-shareware`'s `0xD1 word memory /1`
+//! The corpus lever plan's L3: `123-talk-shareware`'s `0xD1 word memory /1`
 //! and `0xD0 word register /1` rows are 29,698,883 + 24,856,330 runtime hits, its #1 and #3 census
 //! rows and 3.4% of everything it executes; `21-for-1-to-4`'s `0xD0 word register /1` is
 //! 13,496,909. The census names are the by-one encoding and the decoded segment default width, not
-//! a literal `0xD0` opcode with a rotate sub-opcode -- `0xD0` stays byte-only and its rotate
+//! a literal `0xD0` opcode with a rotate sub-opcode: `0xD0` stays byte-only and its rotate
 //! sub-opcodes stay refused, see `jit::direct`'s `0xd0` classify arm. What this file certifies is
 //! the `0xc1 | 0xd1` arm's Word admission, `RotateReg { width: MemoryWidth::Word, .. }`.
 //!
@@ -15,22 +15,22 @@
 //!
 //! A rotate by 1 defines exactly two flags and leaves the rest exactly where they were:
 //!
-//! * **CF** is the bit rotated OUT across the boundary -- the MSB for ROL, bit 0 for ROR. At Word
+//! * **CF** is the bit rotated OUT across the boundary: the MSB for ROL, bit 0 for ROR. At Word
 //!   that boundary is bit 15, not bit 31.
 //! * **OF** is defined ONLY at a masked count of exactly 1: `MSB(result) XOR CF` for ROL,
 //!   `MSB(result) XOR MSB-1(result)` for ROR (`core.rs::shift_rotate`'s `1 | 3 => top ^ ((v &
 //!   (msb >> 1)) != 0)`, which is bit 15 XOR bit 14 at Word). Above count 1 it is undefined and this
-//!   tree's oracle -- the interpreter -- leaves the PREVIOUS value in place, which the host
+//!   tree's oracle, the interpreter, leaves the PREVIOUS value in place, which the host
 //!   reproduces by construction: `emit_rotate_reg` does not capture OF at all past count 1.
 //! * **SF, ZF, PF and AF are UNTOUCHED at every count**, including 1. This is the property `Shift`
-//!   does NOT have -- a shift redefines SF/ZF/PF at every non-zero count -- and it is why
+//!   does NOT have: a shift redefines SF/ZF/PF at every non-zero count, and it is why
 //!   `RotateReg` is a separate `DirectKind` with a separate emitter rather than a fold into
 //!   `Shift`'s Word arm. `emit_rotate_reg`'s count-1 branch captures `CF|OF` only and its 2..=31
 //!   branch captures CF alone through `emit_set_cf_only`, which is the whole reason a rotate cannot
 //!   share `emit_commit_shift_flags`.
 //!
 //! Every fixture below therefore seeds EFLAGS with a domain-real prior state (SF, ZF, PF and AF all
-//! set, bit 1 forced -- `0x8d7`, the same seed `cpu_jit_word_shift_test.rs` establishes as reachable
+//! set, bit 1 forced: `0x8d7`, the same seed `cpu_jit_word_shift_test.rs` establishes as reachable
 //! and non-vacuous) and asserts those four bits survive the rotate UNCHANGED, on top of the
 //! ordinary differential against the interpreter.
 //!
@@ -63,11 +63,11 @@ const MOV_EDI_EDI: [u8; 2] = [0x89, 0xff];
 /// destinations avoid CL and CH: the sweeps below rotate CX, and a `SETcc` into either half of it
 /// would overwrite the very result being compared.
 const CONSUMERS: [(u8, u8); 5] = [
-    (0x2, 3), // setc bl  -- CF
-    (0x0, 6), // seto dh  -- OF
-    (0x8, 4), // sets ah  -- SF
-    (0x4, 2), // setz dl  -- ZF
-    (0xa, 0), // setp al  -- PF
+    (0x2, 3), // setc bl: CF
+    (0x0, 6), // seto dh: OF
+    (0x8, 4), // sets ah: SF
+    (0x4, 2), // setz dl: ZF
+    (0xa, 0), // setp al: PF
 ];
 
 /// `0F 9x /r` with ModRM mod=11, so `rm` is the byte register AL/CL/DL/BL/AH/CH/DH/BH.
@@ -160,7 +160,7 @@ struct Roles {
 /// decode lines on the interpreter role, and seed both identically.
 ///
 /// `slots` is the EXACT instruction count the block must cover. An exact count rather than a lower
-/// bound is what says the tested opcode joined the block instead of ending it -- a `>=` assertion
+/// bound is what says the tested opcode joined the block instead of ending it: a `>=` assertion
 /// is satisfied by the fillers alone with the form under test refused.
 fn build(body: &[u8], slots: u8, seed: Seed) -> Roles {
     let mut code = MOV_ESI_ESI.to_vec();
@@ -356,7 +356,7 @@ const CONSUMED_SLOTS: u8 = 2 + 1 + CONSUMERS.len() as u8;
 /// The two admitted sub-ops, `(label, reg field)`.
 const SUB_OPS: [(&str, u8); 2] = [("/0 rol", 0), ("/1 ror", 1)];
 
-/// A domain-real prior EFLAGS state with SF, ZF, PF and AF all SET, and bit 1 forced -- the same
+/// A domain-real prior EFLAGS state with SF, ZF, PF and AF all SET, and bit 1 forced: the same
 /// `0x8d7` seed `cpu_jit_word_shift_test.rs` establishes as reachable
 /// (`an_eflags_image_with_bit_one_clear_is_not_reachable`'s sibling in that file). Used everywhere
 /// this file asserts PRESERVATION: a rotate must leave these four bits exactly here.
@@ -487,7 +487,7 @@ fn a_zero_count_rotate_leaves_every_flag_and_a_live_descriptor_alone() {
 /// Every destination register at Word size, and the property that admits the opcode at all: the
 /// rotate defines the destination's low 16 bits and PRESERVES its high 16.
 ///
-/// No consumers on this row, deliberately -- a `SETcc` writes a byte register and would overwrite
+/// No consumers on this row, deliberately: a `SETcc` writes a byte register and would overwrite
 /// the low byte of whichever destination it collides with, which is exactly the half of the result
 /// this row exists to compare. The seeds carry `0xdead` in every high half, so a lowering that ran
 /// the Dword rotate here fails on `registers` at the first case.
@@ -536,14 +536,14 @@ fn dword_rotates_still_define_the_whole_destination() {
 // ---------------------------------------------------------------------------------------------
 
 /// The sixteen-bit CF/OF boundaries, over both incoming EFLAGS polarities and both descriptor
-/// states, plus an EXPLICIT check that SF, ZF, PF and AF survive from the seed unchanged -- the
+/// states, plus an EXPLICIT check that SF, ZF, PF and AF survive from the seed unchanged: the
 /// property that separates a rotate from a shift.
 ///
-/// * `0x8000` at count 1 ROL -- CF set (bit 15 rotated out), result `0x0001`, OF = MSB(result) XOR
+/// * `0x8000` at count 1 ROL: CF set (bit 15 rotated out), result `0x0001`, OF = MSB(result) XOR
 ///   CF = `0 XOR 1` = 1.
-/// * `0x0001` at count 1 ROR -- CF set (bit 0 rotated out), result `0x8000`, OF = MSB(result) XOR
+/// * `0x0001` at count 1 ROR: CF set (bit 0 rotated out), result `0x8000`, OF = MSB(result) XOR
 ///   MSB-1(result) = `1 XOR 0` = 1.
-/// * `0x5555`/`0xaaaa` at count 1 -- CF and OF both defined, and the alternating pattern means every
+/// * `0x5555`/`0xaaaa` at count 1: CF and OF both defined, and the alternating pattern means every
 ///   rotate amount up to 15 lands a different bit on the MSB, so the SF a shift would recompute
 ///   (and a rotate must NOT) would disagree with the seed at some count if this file's own claim
 ///   were false.

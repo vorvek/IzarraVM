@@ -1,8 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The four UNPREFIXED STRING FAMILIES as `InterpretOne` call-out rows -- `0xA4`/`0xA5` MOVS,
-//! `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS -- behind
+//! The four UNPREFIXED STRING FAMILIES as `InterpretOne` call-out rows (`0xA4`/`0xA5` MOVS,
+//! `0xA6`/`0xA7` CMPS, `0xAA`/`0xAB` STOS, `0xAC`/`0xAD` LODS and `0xAE`/`0xAF` SCAS) behind
 //! `IZARRAVM_GENERIC_CALLOUT`, **default ON since the 2026-08-29 ladder** (nascar-586 min-wall
 //! -2.9%, 56.16 s -> 54.55 s, entries -10%, unbound exits -15.4 M; duke3d-586 the expected-zero
 //! control at +0.16% wall with identical guest instruction counts).
@@ -25,7 +25,7 @@
 //! # SLOT 0 is the production shape
 //!
 //! `0xAD`'s prefix of 9 means the block BEFORE it installs fine and the damage is the SECOND
-//! compile unit -- LODSD plus the eight instructions behind it -- which forms fewer than three
+//! compile unit, LODSD plus the eight instructions behind it, which forms fewer than three
 //! slots and rejects wholesale. So with the gate ON the converted call-out is at slot 0 in 100% of
 //! the measured population. Every behavioural row here runs BOTH positions: slot 0 because that is
 //! what production does, and mid-block because that is what proves the emitter
@@ -38,14 +38,14 @@
 //! rule phrased as "the string opcodes". They perform PORT I/O, bypassing both the port helper's
 //! two-phase TSS-bitmap probe and `run_direct_block`'s entry privilege gate on
 //! `callout_port_slots()`. FOUR independent bars stop them, and the mutation table below is what
-//! established the ORDER -- which matters, because the first bar is not the one the design named:
+//! established the ORDER, which matters, because the first bar is not the one the design named:
 //!
 //! 1. **`block_continuable`, above `classify`.** `route_group` puts INS/OUTS in
 //!    `DecodeGroup::Misc`, whose `block_continuable` arm admits only `0xa8`/`0xa9`, so the compile
 //!    walk refuses them one test EARLIER than the classifier and their census arm is
 //!    `non_continuable`. This is the bar that actually holds today.
 //! 2. `classify`'s two explicit byte ranges cannot reach `0x6C..=0x6F`. Real, and currently
-//!    unreachable -- M2 widens it and nothing changes.
+//!    unreachable. M2 widens it and nothing changes.
 //! 3. `execute_string_decoded`'s match is `unreachable!` outside `0xa4..=0xaf`, so they could
 //!    never pick up the flat `clocks(4)` even if admitted.
 //! 4. Their charge (12/10 through the port arm, 15/14 through the REP model) would raise the fold
@@ -69,16 +69,16 @@
 //! | # | mutation | outcome, and the rows that fired |
 //! |---|---|---|
 //! | M1 | the `0xac \| 0xad` classify arm returns `None` | RED, 8 rows, led by `a_lodsd_at_slot_zero_compiles_only_with_the_gate` |
-//! | M2 | widen the `0xa4 \| 0xa5` arm to `0x6c..=0x6f` | **SURVIVES -- and the survival is a FINDING, see below** |
+//! | M2 | widen the `0xa4 \| 0xa5` arm to `0x6c..=0x6f` | **SURVIVES, and the survival is a FINDING, see below** |
 //! | M2b | M2 **plus** `0x6c..=0x6f` added to `jit_admits_non_continuable` | RED, `the_denied_neighbours_...` and `the_gate_admits_exactly_the_ten_string_opcodes` |
 //! | M3 | `STRING_CORE_CLOCKS` 4 -> 8 | RED **at compile time**: T6's `const` block refuses to evaluate |
 //! | M3b | `POP_SS_CORE_CLOCKS` 7 -> 9 (the fold moves, the string term does not) | RED, `interpret_one_fold_is_unmoved_by_the_string_rows`, with the "re-ladder" message |
-//! | M4 | drop the `STRING_CORE_CLOCKS` term from the `INTERPRET_ONE_MAX_CORE_CLOCKS` fold | SURVIVES, by design -- see below |
+//! | M4 | drop the `STRING_CORE_CLOCKS` term from the `INTERPRET_ONE_MAX_CORE_CLOCKS` fold | SURVIVES, by design: see below |
 //! | M5 | give `StringStore` `may_write_segment() == true` | RED, `the_resume_matrix_holds_for_every_string_row` |
 //! | M6 | delete the memory-eflags half of `emit_direction_flag` | RED, `a_string_slot_reads_the_direction_flag_from_a_cld_std_slot` |
-//! | M7 | delete the call-out's runtime clock add | RED, 5 rows incl. BOTH differential positions -- **but only after the `timing_rem` fix below** |
+//! | M7 | delete the call-out's runtime clock add | RED, 5 rows incl. BOTH differential positions, **but only after the `timing_rem` fix below** |
 //! | M8 | the `0xa6/0xa7/0xae/0xaf` arm charges `StringLoad` instead | RED, `each_string_execution_is_attributed_to_its_own_row` |
-//! | M9 | `generic_callout_enabled()`'s ENV path returns a literal `true` | **SURVIVES since the flip** -- see below |
+//! | M9 | `generic_callout_enabled()`'s ENV path returns a literal `true` | **SURVIVES since the flip**: see below |
 //! | M9b | the WHOLE of `generic_callout_enabled()` returns `true`, override bypassed | RED, every refusal row |
 //! | M10 | `"" => GENERIC_CALLOUT_DEFAULT_ARM` -> `"" => false` | RED, `generic_callout_spelling_table_names_every_arm` |
 //!
@@ -86,7 +86,7 @@
 //! *"widen the classify arm to `0x6C..=0x6F` -> INS/OUTS compile -> red"*. They do not compile,
 //! and the classify arm is not what stops them: `route_group` puts INS/OUTS in
 //! `DecodeGroup::Misc`, `block_continuable`'s `Misc` arm admits only `0xa8`/`0xa9`, and the
-//! compile walk refuses a non-continuable shape ABOVE `classify` -- so a widened classify arm for
+//! compile walk refuses a non-continuable shape ABOVE `classify`, so a widened classify arm for
 //! them is unreachable code and no fixture can see it. The exclusion is enforced FOUR ways, not
 //! three, and the byte-range bar is the *fourth* rather than the first. M2b is the mutation that
 //! is actually discriminating: widen the arm AND make the shape continuable, which is the shape a
@@ -96,8 +96,8 @@
 //!
 //! **M4 SURVIVES and is recorded rather than papered over.** `STRING_CORE_CLOCKS` is 4 and the
 //! fold's other terms already reach 7, so removing the term changes no value today. That is
-//! precisely the shape the fold exists to prevent LATER -- a row admitted without a term is an
-//! under-budgeted chain hop the day its arm's charge rises -- and no fixture can separate a
+//! precisely the shape the fold exists to prevent LATER: a row admitted without a term is an
+//! under-budgeted chain hop the day its arm's charge rises, and no fixture can separate a
 //! present term from an absent one while the term is dominated. Pinning it would mean asserting
 //! the text of the constant, which is a shape test dressed as a behaviour test. The term is in the
 //! fold, the reason is in its doc, and M3/M3b cover the two ways the VALUE can move.
@@ -106,7 +106,7 @@
 //! written against a default-OFF knob, where a literal `true` on the env path contradicted it and
 //! the default pin died. Now that the default IS `true` the two coincide and the mutant is inert:
 //! it changes no behaviour any fixture can observe. It is recorded at its CURRENT outcome rather
-//! than at the one the pre-flip run measured, and M9b is what covers the ground it used to --
+//! than at the one the pre-flip run measured, and M9b is what covers the ground it used to,
 //! bypassing the thread-local override entirely, which every refusal row then catches, because
 //! `force_generic_callout` asserts its own selection took. M10 was the mirror case: before the
 //! flip the parse table spelled `"" => false` and the mutant flipping it to `true` died on the
@@ -118,7 +118,7 @@
 //! during this slice.** The mutation loop restores with `git checkout -- <file>`, which discards
 //! EVERY uncommitted change to that file and not only the mutation. Running the flip's mutants
 //! against an UNCOMMITTED flip ate the whole flip out of `direct.rs` mid-loop; the fixture file
-//! survived only because it was a different path. The rule the byte-shift header already states --
+//! survived only because it was a different path. The rule the byte-shift header already states:
 //! apply mutations to a COMMITTED tree - is the reason, and it now has two independent scars
 //! behind it.
 //!
@@ -144,7 +144,7 @@ const SRC: u32 = 0x2000;
 const DST: u32 = 0x3000;
 
 /// `mov ebp,ebp`: the filler slot. EBP is chosen because it is the one register no string
-/// primitive reads or writes -- ESI, EDI, ECX, EAX and the flags are all in play, and a filler
+/// primitive reads or writes: ESI, EDI, ECX, EAX and the flags are all in play, and a filler
 /// that touched any of them would make the differential compare the filler.
 const FILL: [u8; 2] = [0x89, 0xed];
 
@@ -215,7 +215,7 @@ fn map_page(cpu: &mut CpuGsw, bus: &mut TestBus, page: u32) {
 // Arm selection
 // ---------------------------------------------------------------------------------------------
 
-/// Restores the arm on the way out of a fixture -- normally OR by panic. A plain
+/// Restores the arm on the way out of a fixture, normally OR by panic. A plain
 /// `set_generic_callout_for_test(Some(..))` LEAKS: the override is thread-local and the harness
 /// reuses threads, so the next fixture on that thread would inherit an arm it never asked for.
 struct ArmOverride;
@@ -252,9 +252,9 @@ fn force_generic_callout(on: bool) -> ArmOverride {
 /// unit), and mid-block is what proves the emitter rather than the dispatcher.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Position {
-    /// `<string> FILL FILL FILL hlt` -- the shape the census measures.
+    /// `<string> FILL FILL FILL hlt`: the shape the census measures.
     SlotZero,
-    /// `FILL <string> FILL hlt` -- the shape [[jit-fixture-entry-position-trap]] asks for.
+    /// `FILL <string> FILL hlt`: the shape [[jit-fixture-entry-position-trap]] asks for.
     MidBlock,
 }
 
@@ -402,7 +402,7 @@ impl Seed {
 
     /// A lazy arithmetic descriptor live at block entry. MOVS/STOS/LODS define NO flags, so a
     /// call-out that published a settled word where the interpreter kept a descriptor would be
-    /// visible only through `eflags()` -- which `compare_state` reads.
+    /// visible only through `eflags()`, which `compare_state` reads.
     fn pending(mut self) -> Self {
         self.live_pending = true;
         self
@@ -528,7 +528,7 @@ fn compare_state(roles: &mut Roles, context: &str) {
     // 586 is 1/12, so a whole string primitive's four raw clocks scale to ZERO elapsed clocks and
     // land entirely in this carry. Both roles start it at 0. Without this line the mutation that
     // deletes the call-out's runtime clock add SURVIVES every three-and-four-slot row in this
-    // file -- which is what the first run of the mutation table measured, and the reason the
+    // file, which is what the first run of the mutation table measured, and the reason the
     // deletion was caught by one longer block by luck rather than by design.
     assert_eq!(
         roles.native.timing_rem, roles.interp.timing_rem,
@@ -588,7 +588,7 @@ fn row_counts(cpu: &CpuGsw, label: &str) -> crate::InterpretOneRowCounts {
 /// The anti-vacuity gate for the whole slice, in the position production takes.
 ///
 /// With the gate OFF a `lodsd` at slot 0 stops the walk at slot 0, which cannot form a block, so
-/// the outcome is a `StructuralReject` and the harness reports `None` -- verbatim the mechanism
+/// the outcome is a `StructuralReject` and the harness reports `None`, verbatim the mechanism
 /// that produces nascar's 40.7 M `rejected` class. With it ON the block covers all four slots and
 /// carries exactly one `InterpretOne` slot.
 ///
@@ -671,38 +671,38 @@ fn every_string_opcode_is_admitted_by_the_gate_and_by_nothing_else() {
 // T2: the deny rows, each pinned at ITS OWN census arm
 // =============================================================================================
 
-/// With the gate ON, every neighbour of the admitted set stays a barrier -- and stays a barrier in
+/// With the gate ON, every neighbour of the admitted set stays a barrier, and stays a barrier in
 /// the census arm the CODE puts it in, not in one arm asserted for all of them.
 ///
 /// The arms differ and the difference is the point (review round 2, R2-m2). Each expectation below
 /// is READ OFF THE CODE, opcode by opcode, rather than asserted once for the set:
 ///
-/// * **`prefix_unsupported`** -- `REP MOVSD`, `REPNE SCASD`. `prefixes_supported_for` refuses the
+/// * **`prefix_unsupported`**: `REP MOVSD`, `REPNE SCASD`. `prefixes_supported_for` refuses the
 ///   prefix in the compile walk, which is ABOVE `classify`, so a REP string never reaches the arms
 ///   at all. It is a different census row from the unprefixed one and a slice that read the two
 ///   together would double-count its own population.
-/// * **`non_continuable`** -- `0x6C`-`0x6F` INS/OUTS and `0xC4`/`0xC5` LES/LDS. `route_group`
+/// * **`non_continuable`**: `0x6C`-`0x6F` INS/OUTS and `0xC4`/`0xC5` LES/LDS. `route_group`
 ///   (decode.rs) puts INS/OUTS in `DecodeGroup::Misc` and LES/LDS in `DecodeGroup::SystemSeg`;
 ///   `block_straight_line` names neither, and `block_continuable`'s `Misc` arm admits only
 ///   `0xa8`/`0xa9`. So the walk refuses both one test EARLIER than `classify`, in the same
 ///   condition as the prefix refusal and with prefix winning the tie.
-/// * **`hard_boundary`** -- `0x9D` POPFD (`DecodeGroup::Stack`) and `0xE2` LOOP
+/// * **`hard_boundary`**: `0x9D` POPFD (`DecodeGroup::Stack`) and `0xE2` LOOP
 ///   (`DecodeGroup::Branch`). Both groups ARE straight-line, so both are continuable, both reach
-///   `classify`, and both are ordinary opcode-coverage refusals -- the same arm the ten admitted
+///   `classify`, and both are ordinary opcode-coverage refusals, the same arm the ten admitted
 ///   opcodes leave when the gate is off.
 ///
 ///   This fixture compiles at `d = true` (`Position::MidBlock.program` below), so `0x9D` decodes
-///   at `OperandSize::Dword` here -- POPFD, not POPF. POPFD still has no `classify` arm at any
+///   at `OperandSize::Dword` here: POPFD, not POPF. POPFD still has no `classify` arm at any
 ///   width and stays a barrier, unmeasured and out of scope (N2). The WORD form left this deny
 ///   set on N2: it is now an `InterpretOne` call-out (`InterpretOneRow::Popf`,
 ///   `cpu_jit_interpret_one_test.rs`), and this generic-callout gate has no opinion on it one way
-///   or the other -- the row's admission lives in `classify`'s Word allowlist, upstream of the
+///   or the other: the row's admission lives in `classify`'s Word allowlist, upstream of the
 ///   knob this fixture is about.
 ///
 /// The first run of this fixture had LES/LDS pinned at `hard_boundary` and went red on exactly
 /// that row. The expectation was corrected against `route_group`, not against the failure message.
 ///
-/// The set is the one an adversarial reviewer attacks first: the port-string hole this design
+/// The set is the one most likely to break first: the port-string hole this design
 /// found (`0x6C`-`0x6F`), the far-pointer segment loads that break both the interrupt-shadow latch
 /// and the four-access budget proof, POPF's IOPL hazard, and a control transfer.
 #[cfg(all(
@@ -726,15 +726,15 @@ fn the_denied_neighbours_stay_barriers_in_their_own_census_arm() {
         ("les eax,[ecx]", &[0xc4, 0x01], 0xc4, "non_continuable"),
         ("lds eax,[ecx]", &[0xc5, 0x01], 0xc5, "non_continuable"),
         // POPFD (Dword; the Word form is an InterpretOne call-out since N2, tested in
-        // cpu_jit_interpret_one_test.rs, not here): one stack read, no transfer, not privileged
-        // -- and it writes IOPL.
+        // cpu_jit_interpret_one_test.rs, not here): one stack read, no transfer, not privileged,
+        // and it writes IOPL.
         ("popfd (dword only)", &[0x9d], 0x9d, "hard_boundary"),
-        // A control transfer. R1 refuses resume for every one of them, forever -- so LOOP can
+        // A control transfer. R1 refuses resume for every one of them, forever, so LOOP can
         // never be a CALL-OUT, which is this fixture's claim. It stopped being a BARRIER on
         // 2026-08-30: `IZARRAVM_LOOP_ROWS` (default ON) lowers it as a native TERMINAL through
         // `DirectKind::Loop`, a different mechanism from the one this gate guards. The arm is
-        // forced OFF below so this row keeps asserting what it was written to assert -- that the
-        // STRING gate does not admit it -- rather than silently testing the other slice's knob.
+        // forced OFF below so this row keeps asserting what it was written to assert (that the
+        // STRING gate does not admit it) rather than silently testing the other slice's knob.
         ("loop", &[0xe2, 0x00], 0xe2, "hard_boundary"),
     ];
     let _arm = force_generic_callout(true);
@@ -772,7 +772,7 @@ fn the_denied_neighbours_stay_barriers_in_their_own_census_arm() {
 ///
 /// `0x0F B2` LSS is the one that ARMS the interrupt shadow. Carried as a non-arming
 /// `InterpretOne` row it would leave `cpu.interrupt_shadow` set, R3 would resync, and the boundary
-/// would then clear a shadow an EARLIER `Sti` slot latched -- delivery one instruction early,
+/// would then clear a shadow an EARLIER `Sti` slot latched, delivery one instruction early,
 /// which the arming-count `debug_assert` at the boundary cannot see.
 #[cfg(all(
     feature = "jit",
@@ -805,8 +805,8 @@ fn the_two_byte_far_pointer_loads_stay_barriers() {
 /// The block body holds EIP at the block's ENTRY value throughout and only exits advance it, so
 /// the helper compares the post-step EIP against `start + len`. A TAKEN transfer always leaves a
 /// different value, resyncs on every execution, and the governor demotes it within eight. That is
-/// 9.2 M of nascar's rejected class permanently out of reach of any allowlist widening -- the
-/// LOOP rows need a `DirectKind` lowering, not a call-out -- and this row is why.
+/// 9.2 M of nascar's rejected class permanently out of reach of any allowlist widening: the
+/// LOOP rows need a `DirectKind` lowering, not a call-out, and this row is why.
 #[test]
 fn a_transferred_eip_can_never_resume_on_any_string_row() {
     for (label, row) in ROWS {
@@ -840,7 +840,7 @@ fn a_transferred_eip_can_never_resume_on_any_string_row() {
 /// in twenty" shape that permanently admits a bad slot after its governor window freezes.
 ///
 /// R2 is the row that matters most here. `may_write_segment()` is false for all four, so R2
-/// compares ALL SIX records -- the strict side -- and a moved DS record resyncs. A row that leaked
+/// compares ALL SIX records, the strict side, and a moved DS record resyncs. A row that leaked
 /// into `may_write_segment` would relax that compare to the mask and the moved-DS leg would
 /// resume, which is the mutation this row exists for.
 #[test]
@@ -931,7 +931,7 @@ fn the_resume_matrix_holds_for_every_string_row() {
 /// The store commits through the interpreter's ordinary path, `note_code_write_inner` records it
 /// instead of invalidating (the block's native frame is still on the host stack), R5 sees a
 /// non-empty deferred list and the block RESYNCS, and `run_direct_block` drains the list on the way
-/// out -- which is what kills the block. The assertions are ordered accordingly: the block ran and
+/// out, which is what kills the block. The assertions are ordered accordingly: the block ran and
 /// returned, and only afterwards is it gone.
 ///
 /// This is one of exactly two resyncs the design expects these rows to take at all, and it is
@@ -993,7 +993,7 @@ fn a_stos_into_the_blocks_own_page_resyncs_and_retires_it() {
 fn a_string_slot_reads_the_direction_flag_from_a_cld_std_slot() {
     let _arm = force_generic_callout(true);
     for (label, df) in [("cld", 0xfcu8), ("std", 0xfd)] {
-        // `<df>; lodsd; FILL; hlt` -- the DF writer at slot 0, the string slot behind it.
+        // `<df>; lodsd; FILL; hlt`: the DF writer at slot 0, the string slot behind it.
         let mut program = vec![df, 0xad];
         program.extend_from_slice(&FILL);
         program.push(0xf4);
@@ -1012,7 +1012,7 @@ fn a_string_slot_reads_the_direction_flag_from_a_cld_std_slot() {
 
 /// T5b (review round 2, R2-m3): the leg that is load-bearing for the PRODUCTION population.
 ///
-/// The converted spans nascar measures contain no `cld`/`std` at all -- DF was set by some earlier
+/// The converted spans nascar measures contain no `cld`/`std` at all: DF was set by some earlier
 /// instruction, outside this block. So the block has NO `DirectionFlag` slot to keep the two
 /// copies in step, and the invariant that has to hold instead is **RBP.DF == memory.DF at every
 /// point inside a block**: RBP is loaded at entry from the materialized eflags, DF included.
@@ -1071,7 +1071,7 @@ fn a_string_slot_reads_a_direction_flag_set_outside_the_block() {
 /// quota's DIVISOR". That is true of `INTERPRET_ONE_MAX_CORE_CLOCKS` and FALSE of
 /// `MAX_CALL_OUT_CORE_CLOCKS`, and `run.rs` already says so in a comment that was itself a review
 /// correction: the latter's only reader is `compute_global_block_upper`, whose result is read at
-/// exactly two places -- a memo store and the `debug_assert!(per_hop_estimate <= global_block_upper)`
+/// exactly two places: a memo store and the `debug_assert!(per_hop_estimate <= global_block_upper)`
 /// beside it. The chain quota's divisor is `per_hop_estimate`, i.e. `iteration_upper`, and has been
 /// since the per-hop re-pricing. So in a release build "inflating this eight times over would
 /// change no guest-visible behaviour at all; it would only make the debug assertion weaker".
@@ -1080,8 +1080,8 @@ fn a_string_slot_reads_a_direction_flag_set_outside_the_block() {
 /// `INTERPRET_ONE_*` constants deliberately did not.** That asymmetry IS the slice's design: INT
 /// charges 37 core clocks against the allowlist's 7 and presents more data accesses than its 4, so
 /// it takes its OWN slot class (`CompiledBlock::callout_int_imm8_slots`) and its own budget terms.
-/// The per-class constants therefore stay exactly where they were -- no CLI, STI, segment or string
-/// block's bound moves, and no block's ADMISSION changes -- while the global ceiling rises because
+/// The per-class constants therefore stay exactly where they were: no CLI, STI, segment or string
+/// block's bound moves, and no block's ADMISSION changes, while the global ceiling rises because
 /// a ceiling that failed to dominate an admitted helper would stop catching what it exists to
 /// catch. Raising the ceiling costs slack in a debug assertion; raising the per-class terms would
 /// have cost guest-visible admission, and that is the trade this fixture is here to keep visible.
@@ -1145,13 +1145,13 @@ fn interpret_one_fold_is_unmoved_by_the_string_rows() {
 /// claims a relaxation it cannot use.
 ///
 /// `interpret_one_row_labels_cover_every_variant` derives its length from `COUNT` and so
-/// self-adjusts from 12 to 16 -- VERIFIED rather than assumed, which is what this row is for: it
+/// self-adjusts from 12 to 16, VERIFIED rather than assumed, which is what this row is for: it
 /// names the new count explicitly, so a variant added without an `ALL` entry fails here as well as
 /// there.
 ///
 /// 21 rather than 16 as of N2, the `0xCD` slice and the LAR/LSL slice: `Pushf` and `Popf` joined
 /// after the string families, `IntImm8` after them, and `Lar`/`Lsl` after that. The count is a
-/// floor for THIS slice's four rows, not a ceiling on the enum -- it moves again the next time a
+/// floor for THIS slice's four rows, not a ceiling on the enum: it moves again the next time a
 /// row is added, and this comment moves with it.
 #[test]
 fn the_four_string_rows_are_on_the_allowlist() {
@@ -1186,8 +1186,8 @@ fn the_four_string_rows_are_on_the_allowlist() {
 ///
 /// The comparison is the whole of it: registers, EIP, EFLAGS, the WHOLE of guest RAM, core clocks
 /// and bus clocks. The clock columns are what catch a call-out that forgot to add the helper's
-/// returned `core_clocks` -- deleting that add fails by exactly `STRING_CORE_CLOCKS` per slot
-/// execution -- and the RAM compare is what catches a MOVS that moved the wrong width or walked
+/// returned `core_clocks`: deleting that add fails by exactly `STRING_CORE_CLOCKS` per slot
+/// execution, and the RAM compare is what catches a MOVS that moved the wrong width or walked
 /// the wrong way.
 ///
 /// Both DF polarities and a live lazy descriptor on every row. MOVS/STOS/LODS define NO flags, so
@@ -1304,7 +1304,7 @@ fn each_string_execution_is_attributed_to_its_own_row() {
 /// The census rows the campaign grades against, from both ends of the gate.
 ///
 /// With the knob OFF a `0xAD` in a 32-bit segment produces a `hard_boundary` row with
-/// `operand_size: dword` and `prefix_mask: 0` -- verbatim the nascar-586 row this slice claims.
+/// `operand_size: dword` and `prefix_mask: 0`, verbatim the nascar-586 row this slice claims.
 /// With it ON no row for that shape exists, because the walk no longer stops there.
 #[cfg(all(
     feature = "jit",
@@ -1353,7 +1353,7 @@ fn the_census_rows_disappear_with_the_gate() {
 /// whose outcome CHANGED must be exactly `0xA4`-`0xA7` and `0xAA`-`0xAF`.
 ///
 /// A sweep rather than a list of neighbours, because the failure this catches is a widened arm
-/// reaching something nobody thought to name -- `0x6C..=0x6F` is the one this design found, and
+/// reaching something nobody thought to name: `0x6C..=0x6F` is the one this design found, and
 /// the whole point is that the next one will not be predicted either. Single-byte space suffices
 /// for this slice: both classify arms are single-byte ranges below the `u8::try_from` truncation,
 /// so no two-byte opcode can reach them.
@@ -1406,7 +1406,7 @@ fn the_gate_admits_exactly_the_ten_string_opcodes() {
 ///
 /// **`""` tracks the DEFAULT rather than restating it.** The 2026-08-29 flip moved that arm from
 /// OFF to ON, and the assertion reads `generic_callout_default_arm_for_test()` so it moved with it
-/// instead of going stale -- which is also what keeps the row honest the next time the default
+/// instead of going stale, which is also what keeps the row honest the next time the default
 /// moves in either direction.
 #[test]
 fn generic_callout_spelling_table_names_every_arm() {
@@ -1449,7 +1449,7 @@ fn generic_callout_spelling_table_names_every_arm() {
 /// what would catch `generic_callout_enabled`'s env path disagreeing with the parse table while
 /// every forcing fixture kept passing.
 ///
-/// **ON since the 2026-08-29 ladder** -- nascar-586 min-wall -2.9% (56.16 s -> 54.55 s), entries
+/// **ON since the 2026-08-29 ladder**: nascar-586 min-wall -2.9% (56.16 s -> 54.55 s), entries
 /// -10%, unbound exits -15.4 M, with duke3d-586 holding its expected-near-zero control at +0.16%
 /// wall and IDENTICAL guest instruction counts. Asserted against the named constant rather than
 /// against a literal, so this row states the default instead of duplicating it.

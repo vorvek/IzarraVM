@@ -295,7 +295,7 @@ fn direct_doom_drawcolumn_runs_four_iterations_with_dec_rmw() {
     // A headroom canary under the real one-host-page install cap (4096), not a page-size claim.
     // History: the per-granule watch probe once pushed this loop to 4039 bytes and the ceiling
     // was 4000 after the window-probe fix. The watched-page bit (D3) consciously spends ~20
-    // bytes per store site on its re-read + skip test — measured 4007 on this loop — buying a
+    // bytes per store site on its re-read + skip test (measured 4007 on this loop) buying a
     // 16-instruction hot-path saving per unwatched store; the design's carry-by-duplication
     // first draft cost 4081 here and was rejected for exactly this canary. If this ceiling is
     // hit again, check installs-refused-for-size before widening: growth that spends the LAST
@@ -963,7 +963,7 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
     );
 
     // S1d slice 2 (shadow-cache-probe feature): the entry-sampling diversion is its own
-    // refusal reason, sitting right beside aggregate_accounting in run.rs -- same NotRun
+    // refusal reason, sitting right beside aggregate_accounting in run.rs: same NotRun
     // contract, same counter-bump shape as every other refusal proved in this test.
     #[cfg(feature = "shadow-cache-probe")]
     {
@@ -989,7 +989,7 @@ fn direct_self_loop_entry_rejects_interrupt_shadow_and_segment_preconditions() {
     // THE RAW DESCRIPTOR, and this is the one fixture class where that is still the right oracle.
     // These entries are REFUSED BEFORE ENTRY, and `run_direct_block`'s entry clear (E1) sits below
     // every refusal return, so a refused entry must leave the interpreter's lazy flags exactly as
-    // it found them -- untouched, not settled. An E1 that drifted above a refusal return would
+    // it found them: untouched, not settled. An E1 that drifted above a refusal return would
     // move the descriptor on a path that ran no guest code, and this is what would catch it.
     assert_eq!(cpu.pending_flags, pending);
 
@@ -2441,7 +2441,7 @@ fn bt_and_byte_inc_dec_charge_the_interpreter_clocks() {
 /// The class counters close on `jit_direct_unresolved_static_unbound` on the REAL exit path, not
 /// just as a match arm. The two unit pins in `jit/direct_test.rs` check the classifier and the
 /// unlink sites in isolation, and both of them still pass if `classify_unbound_exit` goes back to
-/// dropping the `key_for` refusal on the floor -- which is precisely the hole that made the class
+/// dropping the `key_for` refusal on the floor, which is precisely the hole that made the class
 /// totals fall short of the counter they are meant to attribute. This drives the dispatcher.
 ///
 /// Both exit sites are covered: an ordinary uncompiled successor (`absent`) and a successor whose
@@ -2653,7 +2653,7 @@ fn link_refusal_census_routes_both_segment_write_jcc_arms() {
                 linear: FALLTHROUGH,
                 mode_key: compilation.span.key.mode_key,
                 // S1a: a compiled successor's `context` is never a real ring slot, only the
-                // sentinel -- `resolve_successors` reads the LIVE slot at resolve time instead.
+                // sentinel: `resolve_successors` reads the LIVE slot at resolve time instead.
                 context: jit::direct::LINK_CONTEXT_UNSTAMPED,
             }),
             Some(jit::links::LinkTarget {
@@ -2882,7 +2882,7 @@ fn link_refusal_census_registers_ordinary_fallthrough() {
 }
 
 /// The dynamic-miss lane closes on its own counter the same way. Same classifier, separate
-/// census array, and the same `key_for` hole -- so it needs its own witness rather than an
+/// census array, and the same `key_for` hole, so it needs its own witness rather than an
 /// argument by symmetry.
 #[test]
 fn dynamic_miss_classes_sum_to_the_dynamic_miss_counter() {
@@ -2955,7 +2955,7 @@ fn dynamic_miss_classes_sum_to_the_dynamic_miss_counter() {
 /// A dynamic miss into a REJECTED block is attributed back to the barrier that refused it.
 ///
 /// `note_dynamic_miss_target` used to take the class and discard the entry linear, so this whole
-/// lane landed on no row at all — 2.86M exits per quake run, larger than its entire attributed
+/// lane landed on no row at all: 2.86M exits per quake run, larger than its entire attributed
 /// static row set, and the lane Slice 4 measured at 65% of the static one for the row it lowered.
 /// The two columns are asserted apart: a row must not report a dynamic miss as a static unbound.
 #[test]
@@ -2963,7 +2963,7 @@ fn a_dynamic_miss_into_a_rejected_block_is_attributed_to_its_barrier() {
     const ENTRY: u32 = 0x300;
     const REJECTED_TARGET: u32 = 0x400;
     const INITIAL_ESP: u32 = 0x3000;
-    const BARRIER: u8 = 0xf4; // HLT — refused by the non-continuable arm, not by `classify`
+    const BARRIER: u8 = 0xf4; // HLT: refused by the non-continuable arm, not by `classify`
 
     let mut memory = vec![0; 0x0010_0000];
     memory[ENTRY as usize] = 0xc3; // ret
@@ -3037,13 +3037,13 @@ fn a_dynamic_miss_into_a_rejected_block_is_attributed_to_its_barrier() {
     );
 }
 
-/// The chain-used link mask, at the machine rather than at `BlockCache`
-/// (dev_docs/plans/2026-08-18-chain-used-link-mask.md). Two blocks compiled under DIFFERENT ES
+/// The chain-used link mask, at the machine rather than at `BlockCache`.
+/// Two blocks compiled under DIFFERENT ES
 /// descriptors, neither of which touches ES: whole-array snapshot equality refused this edge, the
 /// source exited `StaticUnbound` on every iteration, and prince-586 paid a dispatcher round trip
 /// per 1.58 guest instructions for it.
 ///
-/// The edge must now form and the transfer must happen NATIVELY -- and the result must still be
+/// The edge must now form and the transfer must happen NATIVELY, and the result must still be
 /// the interpreter's, because a chained successor runs no entry check of its own.
 #[test]
 fn direct_chain_links_across_a_segment_descriptor_neither_block_uses() {
@@ -3124,7 +3124,7 @@ fn direct_chain_links_across_a_segment_descriptor_neither_block_uses() {
 ///
 /// The root reads no memory at all. Its successor reads through ES, so the chain requirement
 /// carries ES even though the root's own pinned mask is empty. Enter with a live ES whose BASE
-/// differs from the one the successor baked, and the entry must be REFUSED -- relaxing the linked
+/// differs from the one the successor baked, and the entry must be REFUSED: relaxing the linked
 /// arm to the root's own mask would let the chain run and read the wrong address, silently.
 #[test]
 pub(super) fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
@@ -3285,13 +3285,13 @@ pub(super) fn direct_chain_entry_validates_a_segment_only_the_successor_uses() {
 /// **M-PRE, and it is a statement about `main`, not about the chain entry check.**
 ///
 /// Every `DirectKind` that bakes a stack access must report SS in `pinned_segments`, or the
-/// MASKED arm -- which `main` has always taken for an unlinked root -- lets a block run against a
+/// MASKED arm (which `main` has always taken for an unlinked root) lets a block run against a
 /// stack descriptor its snapshot does not match. The chain entry check inherits that dependency
 /// and does not create it, which is why a failure here opens a shipped-defect report against
 /// `main` rather than stopping this slice (review round 1, M4).
 ///
 /// Stated end to end rather than by inspecting the mask: each row is compiled, installed with no
-/// successor -- so its entry takes exactly the masked check -- and then entered with SS's BASE
+/// successor (so its entry takes exactly the masked check) and then entered with SS's BASE
 /// moved. A row that runs is a row whose stack segment is not pinned.
 ///
 /// `ENTER` is absent because there is no 32-bit `Enter` kind to test: `0xC8` in a 32-bit segment
@@ -3391,7 +3391,7 @@ const CHAIN_ENTRY_BAKED: u32 = 0x3000;
 ///
 /// * The root's OWN mask is empty, so `data_matches` on it proves nothing.
 /// * The root's CHAIN REQUIREMENT is `{ES}`, because the successor pins ES.
-/// * `all_data_matches` on the root proves all six, ES included -- sound, and far stronger.
+/// * `all_data_matches` on the root proves all six, ES included, sound, and far stronger.
 ///
 /// So moving ES must refuse on BOTH arms (the chain needs it) and moving a segment neither block
 /// pins must refuse on the OFF arm and be ADMITTED on the armed one. Returned already run once,
@@ -3466,7 +3466,7 @@ fn shift_segment_base(cpu: &mut CpuGsw, segment: SegmentIndex, delta: u32) {
 ///
 /// This is the soundness row for the armed arm. A mutant that reads `segment_layouts` here instead
 /// of `chain_layouts` sees an EMPTY mask, admits the entry, and lets the successor's chained body
-/// read through a base nobody validated -- the miscompile the strict arm existed to prevent.
+/// read through a base nobody validated: the miscompile the strict arm existed to prevent.
 #[test]
 fn chain_entry_check_refuses_a_root_whose_successor_pins_a_moved_segment() {
     let _arm = ChainEntryCheckArm::forced(true);
@@ -3504,7 +3504,7 @@ fn chain_entry_check_refuses_a_root_whose_successor_pins_a_moved_segment() {
 ///
 /// This is the whole point of the slice, and it is the row `all_data_matches` cannot pass: on the
 /// OFF arm the identical state refuses (see the row below). A mutant that calls
-/// `all_data_matches` on the chain layout -- keeping the array swap and dropping the mask -- is
+/// `all_data_matches` on the chain layout (keeping the array swap and dropping the mask) is
 /// green everywhere else and red here.
 #[test]
 fn chain_entry_check_admits_a_root_whose_chain_pins_nothing_on_the_moved_segment() {
@@ -3653,7 +3653,7 @@ fn the_page_budget_ends_the_walk_before_the_recovery_search_runs() {
     //    `mov eax,[disp32]` is the cheapest memory shape there is. R2b moved the 20-byte page-cross
     //    bound off that lean load, so the slot is ~230 rather than the 250 this pin first measured.
     //    The model still prices every memory slot at 352, so it still ends the block at 10 slots
-    //    where 14 now fit. This pins BY HOW MUCH -- four slots of a fourteen-slot maximum.
+    //    where 14 now fit. This pins BY HOW MUCH: four slots of a fourteen-slot maximum.
     //    Re-calibrating the constants moves this number; a broken budget moves it a lot.
     let n = usize::from(budgeted.span.instructions);
     let mut longest = 0usize;

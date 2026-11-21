@@ -13,13 +13,13 @@
 //! COST, stated honestly because this hangs off the hottest path in the backend
 //! (`CpuGsw::run_direct_block`, at the site that increments `jit_direct_entries`):
 //!
-//!   * DISARMED — the default, and every benchmark run — is one `Option<Box<..>>` null test on a
+//!   * DISARMED (the default, and every benchmark run) is one `Option<Box<..>>` null test on a
 //!     `JitState` field. `JitState` is already loaded and written at that site
 //!     (`note_segment_write_block_entry` two lines down), so the test adds no cache line and no
 //!     allocation, and the body is `#[inline(never)]` so the hot path grows by a load, a compare
 //!     and a not-taken branch. Nothing else changes: no counter moves, no run boundary moves,
 //!     and a disarmed run executes the same guest instruction stream it did before v2.
-//!   * ARMED costs a `HashMap<u32, u64>` probe per direct entry — a hash, a bucket load, and on
+//!   * ARMED costs a `HashMap<u32, u64>` probe per direct entry: a hash, a bucket load, and on
 //!     the common repeat-entry path one increment. That is REAL: expect a wall regression on the
 //!     order of a few percent on an entry-heavy fixture. An armed run is therefore a MAP of the
 //!     workload, never a timing measurement of it, and no wall number may be taken from one.

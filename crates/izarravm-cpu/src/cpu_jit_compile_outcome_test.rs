@@ -73,8 +73,8 @@ fn admission_declines(cpu: &CpuGsw) -> [u64; 4] {
     std::array::from_fn(|index| snapshot.admission_declines[index].1)
 }
 
-/// The `RetryCause::AdmissionMatrix` per-reason split, as a label -> count map. See
-/// `dev_docs/descent2-l1-stack-width-design-2026-08-30.md` §2(H): `stack_width_kind` has two
+/// The `RetryCause::AdmissionMatrix` per-reason split, as a label -> count map.
+/// `stack_width_kind` has two
 /// producers, and this is the instrument that tells them apart.
 #[cfg(feature = "direct-admission-census")]
 fn stack_width_declines(cpu: &CpuGsw) -> std::collections::HashMap<&'static str, u64> {
@@ -147,13 +147,13 @@ fn three_supported_slots_compile_before_an_unsupported_barrier() {
     assert_eq!(compilation.span.guest_len, 3);
 }
 
-/// Design test 4 (`2026-09-02-tyrian-unbound-to-compiled-design.md` section 4.1): the compile
+/// Design test 4 (Tyrian unbound-to-compiled design, section 4.1): the compile
 /// side of S1a, exercised through the REAL `compile_with_budget` (via `jit::direct::compile`)
-/// rather than a hand-built `direct_test.rs` fixture -- this is the only level that can drive the
+/// rather than a hand-built `direct_test.rs` fixture: this is the only level that can drive the
 /// five successor-baking sites the defect actually lived in. `compile_with_budget` must never
 /// publish a real ring slot into a successor's `context`; every reader of that field is now at
 /// RESOLVE time (`resolve_successors`), against the LIVE slot at that instant. Selecting slot 1
-/// before compiling is not load-bearing for the assertion below -- it demonstrates that the
+/// before compiling is not load-bearing for the assertion below: it demonstrates that the
 /// published value is independent of which slot happens to be live, rather than causing it.
 #[test]
 fn compile_time_successors_carry_the_unstamped_link_context() {
@@ -178,7 +178,7 @@ fn compile_time_successors_carry_the_unstamped_link_context() {
 
 /// gp2 in-imm8 callout design rev 3 §8.1's `StructuralReject` gate, THE THREE-CASE FORM: a hard
 /// boundary reached at 1, 2 and 5 slots into the walk. `direct.rs:7215-7216`'s min-length guard
-/// (`slots.len() < 3`) is read ONLY below 3 slots -- `stop` is consulted there and there alone --
+/// (`slots.len() < 3`) is read ONLY below 3 slots (`stop` is consulted there and there alone)
 /// so 1 and 2 slots must file `StructuralReject` and 5 slots must instead COMPILE, because the
 /// guard is never reached at 5. This is a BETTER gate than a single-case one (which
 /// `structural_rejection_includes_the_complete_short_prefix_and_barrier` and
@@ -223,15 +223,15 @@ fn structural_reject_boundary_sits_at_exactly_three_slots() {
 #[test]
 fn barrier_census_is_opt_in_and_counts_runtime_hits_for_an_interior_shape() {
     // Not 0xFC (CLD, natively lowered already) and not 0x99/CDQ (the CHOICE THIS TEST USED TO
-    // MAKE, until the adversarial review on the PreciseHelper-scaffolding deletion caught that
-    // Task 4 -- the very next slice in this phase -- teaches `classify` to admit 0x98/0x99,
+    // MAKE, until the work on the PreciseHelper-scaffolding deletion found that
+    // Task 4 (the very next slice in this phase) teaches `classify` to admit 0x98/0x99,
     // which would silently turn this fixture's span from 4 instructions to 8, drop its census
     // row, and panic the `.expect` below. That is the exact 0xFC failure class the sibling
     // `DIRECT_BARRIER` constant's own doc comment (`cpu_test.rs`) narrates: "it will eventually
     // be lowered too". `DIRECT_BARRIER` is durable FOR THIS TEST specifically because, unlike
     // 0x99, it carries its own certifying test (`direct_barrier_opcode_is_still_unclassifiable`,
     // below in this file) that fails LOUDLY the day it stops being a barrier, rather than degrading
-    // silently -- so reusing it here means a future re-classification is caught upstream, not
+    // silently, so reusing it here means a future re-classification is caught upstream, not
     // discovered here first. This is the same shape the old
     // `..._scores_an_interior_helper_shape` test used before the `PreciseHelper` scaffolding
     // (`HelperFamily`/`eligible_shapes`/`selected`) it exercised was deleted: `runtime_hits`,
@@ -590,16 +590,16 @@ fn census_row_for(code: &[u8], warm_offsets: &[u32], opcode: u16) -> crate::Dire
 /// mirror it walks straight through the instruction the compile walk stops at.
 ///
 /// That over-report is the worst possible shape for this particular slice rather than a generic
-/// inaccuracy: it appears only at PATCHED sites, so its size is proportional to `(1 - u)` — and
+/// inaccuracy: it appears only at PATCHED sites, so its size is proportional to `(1 - u)`, and
 /// `u`, the unpatched share, is the single number the arm exists to measure. A suffix column that
 /// moved with `(1 - u)` would corrupt the heat-vs-off census difference the ladder's non-vacuity
-/// check reads (dev_docs/duke-reprofile-2026-08-19.md §6.2).
+/// check reads.
 ///
 /// One fixture, two legs, differing ONLY in whether the count byte carries a record:
 ///
-/// * cold count byte — the ROL is admitted by both the compile walk and the scan, so the scan
+/// * cold count byte: the ROL is admitted by both the compile walk and the scan, so the scan
 ///   reaches every warmed instruction after the barrier: 4;
-/// * hot count byte — the compile walk stops at the ROL, so the scan must too: 2, the two `inc`s
+/// * hot count byte: the compile walk stops at the ROL, so the scan must too: 2, the two `inc`s
 ///   between the barrier and the ROL.
 ///
 /// Deleting the mirror in `census_native_suffix` makes the second leg read 4, which is exactly the
@@ -662,7 +662,7 @@ fn heat_gated_barrier_suffix(code: &[u8], warm_offsets: &[u32], heat_at: Option<
 /// regardless of what that instruction turns out to be. The forward scan applied the same bound
 /// only when the next kind was ITSELF memory-ALU, so any barrier whose prefix held one
 /// read-modify-write slot over-reported its suffix by up to 28 instructions against a
-/// 32-instruction ceiling — on the very column the campaign ranks rows by.
+/// 32-instruction ceiling, on the very column the campaign ranks rows by.
 ///
 /// The two fixtures are `add [ebx], eax` and `add eax, ecx`: SAME opcode, SAME length, differing
 /// only in the ModRM mod field. So the pair isolates `is_memory_alu` and nothing else, and a
@@ -857,8 +857,8 @@ fn the_word_flag_never_admits_the_386_class() {
 /// trips first in a debug build; this test is the one that still fails when asserts are off.)
 ///
 /// The oracle is the predicate itself rather than a literal `true`, so the test says the same
-/// thing on a host without AVX2 — where every arm is refused and the whole Direct suite is
-/// vacuous anyway — while still separating the personas on the hosts that run the campaign.
+/// thing on a host without AVX2 (where every arm is refused and the whole Direct suite is
+/// vacuous anyway) while still separating the personas on the hosts that run the campaign.
 #[test]
 fn key_admission_follows_a_live_persona_switch() {
     let code = [0x40, 0x41, 0x42];
@@ -938,14 +938,14 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 ///
 /// V86 code is always CS.D = 0, so every instruction it executes decodes at Word. That makes the
 /// Word-size path the one that matters for V86 safety, and for most of these opcodes the ONLY
-/// remaining gate is "no `classify` arm exists" -- a gate this campaign's whole method is to
+/// remaining gate is "no `classify` arm exists", a gate this campaign's whole method is to
 /// widen. A list defended by nothing but the absence of code needs a test that names each member,
 /// or the arm that admits one of them lands without anything failing.
 ///
 /// The table carries one outcome PER WIDTH rather than the "admitted at Dword" / "call-out at
 /// every width" pair of bools an earlier revision used, because N2 needed a shape neither bool
 /// could express: PUSHF and POPF each answer DIFFERENTLY at Dword than at Word, and the two
-/// widths are not "barrier" and "not barrier" -- one of them is a lowering and the other a
+/// widths are not "barrier" and "not barrier": one of them is a lowering and the other a
 /// call-out.
 ///
 /// PUSHF (0x9c) HAS a classify arm at Dword (PUSHFD, a runtime-weighted top-five reject before it
@@ -961,7 +961,7 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 ///
 /// CLI (0xfa) LEFT the barrier list with the S3 policy widening and is asserted from the other
 /// side in the same table: it joins the block at both widths as an `InterpretOne` call-out. Its
-/// V86 cover is not a compile-time refusal at all but the helper's fault arm -- `check_v86_iopl`
+/// V86 cover is not a compile-time refusal at all but the helper's fault arm: `check_v86_iopl`
 /// is the interpreter's own first statement in that opcode's arm, so a V86 task below IOPL 3
 /// raises the same #GP from inside the call-out that it raises at a barrier, delivered by
 /// `finish_instruction` with the block reporting the prefix only.
@@ -971,14 +971,14 @@ fn the_census_suffix_scan_shares_the_word_predicate() {
 enum SensitiveOutcome {
     /// No `classify` arm reaches an `Ok` at this width; the block stops at three slots.
     Barrier,
-    /// A `classify` arm produces a native, emitted lowering -- no `InterpretOne` slot.
+    /// A `classify` arm produces a native, emitted lowering: no `InterpretOne` slot.
     Lowered,
     /// A `classify` arm produces an `InterpretOne` call-out.
     CallOut,
     /// A `classify` arm produces an `InterpretOne` call-out that ENDS the block.
     ///
     /// `0xCD` INT imm8 alone. It shares the generic helper with the `CallOut` rows, so it is not a
-    /// lowering -- but `DirectKind::is_terminal` names its row, because `INT` loads CS:EIP through
+    /// lowering, but `DirectKind::is_terminal` names its row, because `INT` loads CS:EIP through
     /// the IDT and no continuation of the span is reachable. So the block is exactly the three
     /// lead slots plus the INT, where a `CallOut` row leaves the walk free to carry on. It is also
     /// counted in its OWN slot class, for the budget reason on
@@ -1128,7 +1128,7 @@ fn the_census_suffix_scan_applies_the_x87_block_cap() {
 /// `0xEC` and `0xEE` LEFT that argument on purpose, and their safety is now the helpers' rather
 /// than the list's: `port_read_al_dx` and `port_write_al_dx` prove the TSS I/O-permission answer
 /// purely before they commit anything, and refuse whatever they cannot prove. The Word admission
-/// and the helper arm are ONE change and must revert together for each opcode -- the admission
+/// and the helper arm are ONE change and must revert together for each opcode: the admission
 /// alone is measured negative (`classify.rs`, the 2026-08-11 note, for `0xEC`; the corpus campaign
 /// L2 slice, for `0xEE`). This row pins both admissions so a revert of one half cannot pass
 /// silently.
@@ -1140,7 +1140,7 @@ fn only_the_call_out_port_opcodes_are_admitted_at_word() {
     for opcode in [0xecu8, 0xed, 0xee, 0xef] {
         // The un-prefixed CONTROL, and it is asserted, not just built. An earlier revision
         // constructed, configured and warmed this pair and then dropped it, so the test could not
-        // distinguish "refused at Word" from "refused at every size" -- it compiled cleanly and
+        // distinguish "refused at Word" from "refused at every size": it compiled cleanly and
         // read like a positive control while asserting nothing.
         //
         // The control's meaning differs by opcode, and pretending otherwise is how the vacuity
@@ -1150,7 +1150,7 @@ fn only_the_call_out_port_opcodes_are_admitted_at_word() {
         // exactly. `0xEE` has a call-out helper too (`CallOutHelper::PortWriteAlDx`), but its
         // unconditional step break makes `DirectKind::is_terminal` true, so the walk stops AT the
         // call-out and the four-slot prefix (three plain instructions plus the OUT slot itself)
-        // is the whole span -- the same shape `0xE6`'s admission produces. `0xED`/`0xEF` have no
+        // is the whole span, the same shape `0xE6`'s admission produces. `0xED`/`0xEF` have no
         // `classify` arm at any size, so their un-prefixed arm stops at the same three slots and
         // proves the stronger fact that carries their V86 safety: refused everywhere, with the
         // Word gate as redundant cover rather than the only gate.
@@ -1177,8 +1177,8 @@ fn only_the_call_out_port_opcodes_are_admitted_at_word() {
         }
         // The 0x66 prefix in a 32-bit segment is what makes the decoded operand size Word here;
         // in real 16-bit code CS.D does it, and `classify` cannot tell the two apart. The
-        // `set_word_operands_at_486` calls the earlier revision made were inert -- `fixture()`
-        // builds a 586, where Word operands are admitted unconditionally -- and are gone.
+        // `set_word_operands_at_486` calls the earlier revision made were inert (`fixture()`
+        // builds a 586, where Word operands are admitted unconditionally) and are gone.
         let (mut word_cpu, mut word_bus) =
             fixture(&[0x40, 0x41, 0x42, 0x66, opcode, 0x43, 0x44, 0x45]);
         let word_addresses: Vec<_> = [0u32, 1, 2, 3, 5, 6, 7]
@@ -1235,7 +1235,7 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     let writes = [0x40, 0x41, 0x8e, 0xd8, DIRECT_BARRIER, 0x43, 0x44];
     // The SECOND producer of a segment write, added with S4f: an `InterpretOne` row whose
     // `may_write_segment` says yes. `mov fs,ax` is a call-out in every mode, so it reaches the bar
-    // through `callout_segment_writes` rather than through the `LoadSegReal` lowering above --
+    // through `callout_segment_writes` rather than through the `LoadSegReal` lowering above,
     // and the bar is what pays for the whole-block segment mask.
     //
     // `mov fs,ax` is `InterpretOneRow::MovSreg`, which feeds `callout_segment_writes` outside
@@ -1393,7 +1393,7 @@ fn the_suffix_seed_carries_a_barred_segment_write() {
     );
 }
 
-/// The prefix arm of the compile walk is ATTRIBUTED, not silent — and, since slice 6, the arm is
+/// The prefix arm of the compile walk is ATTRIBUTED, not silent, and, since slice 6, the arm is
 /// reached by a CS override rather than by any segment override.
 ///
 /// Before the completeness slice, `record_barrier` fired on the `HardBoundary` arm alone, so a
@@ -1543,7 +1543,7 @@ fn barrier_census_attributes_the_non_continuable_arm() {
 ///
 /// It would have been cheap to disclose this arm as instrumented-but-untested. The campaign's own
 /// ledger says the opposite: "no fixture can see this" is a claim requiring evidence, and it is
-/// cheaper to add the fixture than to justify its absence. It is reachable — a 66-prefixed Word
+/// cheaper to add the fixture than to justify its absence. It is reachable: a 66-prefixed Word
 /// instruction in a 32-bit code segment passes the prefix arm above it (a 66 override IS what
 /// `prefixes_supported_for` expects for Word under `d == true`) and lands here on I486.
 #[test]
@@ -2174,7 +2174,7 @@ fn smc_heat_pre_compile_gate_demotes_a_hot_entry_chunk() {
             .expect("gate");
     }
     // The cheap entry-chunk gate refuses admission before a compile is even attempted. This
-    // is the TRIAL-OFF arm (pinned above — the trial defaults ON since the disp lanes made
+    // is the TRIAL-OFF arm (pinned above: the trial defaults ON since the disp lanes made
     // its installs survive); the trial's own semantics are pinned by
     // `lane_trial_compiles_once_and_installs_through_a_hot_span` (cpu_jit_imm_lane_test.rs,
     // whose fixtures are the proven lane-compiling environment).
@@ -2482,7 +2482,7 @@ fn a_word_jcc_above_the_wrap_is_refused_while_the_same_block_below_it_compiles()
 
 /// The §2(H) instrument, first producer: `stack_width_kind`'s own matrix. `PUSH EAX` (0x50) has
 /// no prefix at all, so the operand size comes straight from CS.D (32-bit here, so Dword), and
-/// SS.B is forced to 0 (16-bit stack) after the fixture's default 32-bit setup -- exactly the
+/// SS.B is forced to 0 (16-bit stack) after the fixture's default 32-bit setup, exactly the
 /// DOS/4GW shape the design note's own prediction names: a 32-bit client on a 16-bit kernel
 /// stack. That is cell A, `PushDwordSs16`, and it has no emitter, so the walk must decline it and
 /// the census must name the reason `push_dword_ss16`.
@@ -2521,7 +2521,7 @@ fn push_dword_on_a_16bit_stack_declines_the_matrix_cell_by_name() {
 /// The §2(H) instrument, second producer: the `control_target`/`segment_access` check that runs
 /// AFTER `stack_width_kind` in the compile walk. Same fixture as
 /// `a_word_jcc_above_the_wrap_is_refused_while_the_same_block_below_it_compiles`, which already
-/// proves this exact site refuses the block -- this test additionally proves the census names it
+/// proves this exact site refuses the block; this test additionally proves the census names it
 /// `control_target_limit` rather than folding it into a stack-matrix cell, which is precisely the
 /// correction the design note's §0(c) makes over the research note.
 #[cfg(feature = "direct-admission-census")]
@@ -2534,7 +2534,7 @@ fn word_control_target_above_the_wrap_declines_via_the_second_producer() {
     cpu.enable_direct_barrier_census(true);
     warm(&mut cpu, &mut bus, &[HIGH, HIGH + 1, HIGH + 2, HIGH + 3]);
 
-    // The block still compiles -- a truncated 3-instruction prefix, per the existing fixture --
+    // The block still compiles: a truncated 3-instruction prefix, per the existing fixture,
     // because the decline lands after >= 3 admitted slots. The census records the refusal at the
     // moment it happens regardless of what the walk does with the rest of the block.
     let compilation = compiled(jit::direct::compile(&mut cpu, HIGH, true));
@@ -2583,7 +2583,7 @@ fn invalid_segment_descriptor_declines_via_the_second_producer() {
 ///
 /// Drives `compile_with_instruction_limit` directly at both a short and the full limit, on a
 /// fixture (`PUSH EAX` on a 16-bit stack) that declines on its very first instruction regardless
-/// of the limit -- so the SAME refusal is reachable at every limit, and only the gate keeps the
+/// of the limit, so the SAME refusal is reachable at every limit, and only the gate keeps the
 /// short pass from counting.
 #[cfg(feature = "direct-admission-census")]
 #[test]
@@ -2620,7 +2620,7 @@ fn stack_width_decline_is_not_counted_below_the_full_length_pass() {
     assert_eq!(stack_width_declines(&cpu).values().sum::<u64>(), 1);
 
     // A second genuine full-length observation is a real, separate compile attempt and must
-    // count again -- the gate suppresses the SEARCH's inner re-walks, not repeated top-level
+    // count again: the gate suppresses the SEARCH's inner re-walks, not repeated top-level
     // compiles of the same key.
     assert!(matches!(
         jit::direct::compile_outcome_with_instruction_limit_for_test(
@@ -3281,9 +3281,9 @@ fn a_push_through_memory_is_lowered_with_both_accesses_registered() {
     );
     // The static access counts PushMem feeds into the bus charge: one dword read (the source) and
     // one dword store (the stack write), with every byte and word count at zero since this kind
-    // is dword-only. This does NOT pin the segment-mask scenario -- `SegmentLayout`'s mask is
+    // is dword-only. This does NOT pin the segment-mask scenario: `SegmentLayout`'s mask is
     // built from `read_segment()`/`write_segment()`, an independent accessor, not from these
-    // counts -- that is covered instead by the mid-block execution fixture
+    // counts: that is covered instead by the mid-block execution fixture
     // (`a_mid_block_push_through_memory_matches_the_interpreter` in `cpu_jit_direct_test.rs`),
     // whose DS-based source is what actually exercises a `read_segment` that could leave DS out
     // of the mask.
@@ -3564,7 +3564,7 @@ fn a_call_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor()
 /// wrong.
 ///
 /// * `raw_clocks` 7. `execute_extended.rs` group-5 arm 4 reads its target through
-///   `read_operand_sized` -- which serves both operand forms -- and returns `Ok(clocks(7))`
+///   `read_operand_sized` (which serves both operand forms) and returns `Ok(clocks(7))`
 ///   without branching on the shape, so the register form charges what the memory form charges.
 ///   A missing arm rides the `_ => 2` default and undercharges every indirect jump by exactly 5,
 ///   which is mutation M3 and which nothing else in the tree can see.
@@ -3573,7 +3573,7 @@ fn a_call_through_a_register_is_lowered_as_a_terminal_with_a_dynamic_successor()
 ///   mode-13 counts from a static total that was never issued.
 /// * `dynamic_successor` with `successors == [None, None]`. This is mutation M2: recording a
 ///   static successor alongside the dynamic binding arms the `LinkCell` retarget trap documented
-///   on `JmpMem`'s doc comment -- `LinkCell::clear` does not reset `target_eip`, so a cell that
+///   on `JmpMem`'s doc comment: `LinkCell::clear` does not reset `target_eip`, so a cell that
 ///   was dynamically bound and is later statically rebound transfers a later jump natively into
 ///   the wrong block. The fall-through arm would record the bytes AFTER the jump as a successor,
 ///   which is precisely that phantom edge.
@@ -3676,7 +3676,7 @@ fn a_call_through_memory_is_lowered_as_a_terminal_with_a_dynamic_successor() {
 /// mechanism of this slice rather than an edge case.
 ///
 /// The census attributes 1,847,385 doom exits to entry points whose compile walk stopped at this
-/// opcode, and their mean native prefix is 1.86 instructions -- under the three-slot minimum. What
+/// opcode, and their mean native prefix is 1.86 instructions, under the three-slot minimum. What
 /// admits them is `slots.len() < 3 && !terminal`: a terminal excuses the minimum. Before the
 /// lowering the walk produced a non-terminal prefix of one or two slots and the whole entry became
 /// a `StructuralReject`, so every static link into it stayed unbound forever. After it, the same
@@ -4152,7 +4152,7 @@ fn barrier_census_closure_dormant_heat_histogram_carries_its_truncated_tail() {
 /// at all. A single boolean conflating them would answer neither question.
 ///
 /// WALK, not trial: the compile below is an ordinary `jit::direct::compile`, not the heat gate's
-/// one-per-key-per-epoch lane trial. That is the point — the map records walks of either kind, and
+/// one-per-key-per-epoch lane trial. That is the point: the map records walks of either kind, and
 /// this fixture pins that an ordinary one sets the bit.
 #[cfg(feature = "barrier-census-closure")]
 #[test]
@@ -4225,7 +4225,7 @@ fn barrier_census_closure_dormant_heat_site_reports_whether_a_walk_ever_reached_
 /// The eighth divergence in `census_native_suffix`'s ledger. The budget ends the walk when the
 /// running emitted-size estimate reaches one host page, which on a memory-heavy path binds long
 /// before `MAX_BLOCK_INSTRUCTIONS`; a scan without the mirror walks on to the instruction cap and
-/// reports a block nothing will ever build. It is not a bounded over-report either -- it grows
+/// reports a block nothing will ever build. It is not a bounded over-report either: it grows
 /// with how memory-heavy the path is, which is the axis this column ranks on.
 ///
 /// Both legs are the same instruction stream. The census leg puts the barrier in front of it, and
@@ -4235,7 +4235,7 @@ fn barrier_census_closure_dormant_heat_site_reports_whether_a_walk_ever_reached_
 fn census_suffix_stops_where_the_page_budget_does() {
     const COUNT: usize = 31;
     // `mov eax,[0x3000]`: a memory load, so the block hits the page budget well inside
-    // `MAX_BLOCK_INSTRUCTIONS`. A register-only stream could not -- at forty bytes a slot the
+    // `MAX_BLOCK_INSTRUCTIONS`. A register-only stream could not: at forty bytes a slot the
     // instruction cap binds first, and the fixture would pass with the mirror deleted.
     const LOAD: [u8; 6] = [0x8b, 0x05, 0x00, 0x30, 0x00, 0x00];
 
@@ -4457,7 +4457,7 @@ fn every_retry_cause_has_a_distinct_label_and_a_stated_clearability() {
 ///
 /// The memo is what makes a declined address cheap: it short-circuits the admission chain before
 /// `key_for_phys` and the probe. A lifted key has to lose its own memo, or it would be re-admitted
-/// and then never looked at again for the rest of the era -- but the era stamp is GLOBAL, so
+/// and then never looked at again for the rest of the era, but the era stamp is GLOBAL, so
 /// advancing it to achieve that invalidates all 65,536 slots at once and sends every declined
 /// address in the process back through the full chain. On a workload with thousands of lifts that
 /// is thousands of whole-array invalidations, and it would show up as a decline storm rather than
@@ -4469,18 +4469,18 @@ fn every_retry_cause_has_a_distinct_label_and_a_stated_clearability() {
 ///
 /// The lifted slot carries a STALE memo rather than none, which is what makes the clear
 /// observable: parked by hand it would have had no memo at all and the assertion would have been
-/// reading a byte nobody wrote. It is made stale the way production makes one stale -- cross an
-/// epoch, let the next ask advance the era -- and the bystander's is then written fresh under the
+/// reading a byte nobody wrote. It is made stale the way production makes one stale: cross an
+/// epoch, let the next ask advance the era, and the bystander's is then written fresh under the
 /// new stamp, so the two differ in exactly the thing under test.
 ///
 /// MUTATIONS: drop the `set_decline_memo_at(slot, 0)` on the lift path and the lifted slot keeps
-/// its stale byte; replace it with `sweep_decline_memos()` -- which is what an era advance amounts
-/// to once the era term has moved -- and the bystander stops answering.
+/// its stale byte; replace it with `sweep_decline_memos()`, which is what an era advance amounts
+/// to once the era term has moved, and the bystander stops answering.
 ///
 /// A NOTE ON THE OBVIOUS MUTANT: swapping the clear for a bare `advance_decline_memo_era()` does
 /// NOT fail this fixture, and that is a fact about the era rather than a hole. The advance is
-/// conditional -- it fires only when the heat epoch or `heat_resets` has moved since the last one
-/// -- so on a quiet CPU it is a no-op that clears nothing at all, the lifted slot included. An era
+/// conditional: it fires only when the heat epoch or `heat_resets` has moved since the last one,
+/// so on a quiet CPU it is a no-op that clears nothing at all, the lifted slot included. An era
 /// advance is a wipe only when the term happens to have moved.
 #[test]
 fn a_lift_clears_only_its_own_decline_memo() {
@@ -4729,13 +4729,13 @@ fn a_dormant_keys_unbound_exits_are_attributed_to_its_retry_cause() {
 /// the block installs with four and the cap counter moves.
 ///
 /// PRE-EXISTING at the base commit (`218699f8`), predating the gp2 in-imm8 callout design (rev 3)
-/// entirely. It is what satisfies rev 3 §8.1's `CalloutCap` mutant-table row -- (a)
+/// entirely. It is what satisfies rev 3 §8.1's `CalloutCap` mutant-table row: (a)
 /// `callout_slot_cap_hits` bumps once, (b) a block installs holding exactly four call-out slots,
-/// (c) no retry cause is filed -- even though it drives the row with `0x8F` (`InterpretOne` class)
+/// (c) no retry cause is filed, even though it drives the row with `0x8F` (`InterpretOne` class)
 /// rather than the row's own suggested "five `0xE4`s" shape. That transfers by construction: the
-/// cap is CLASS-BLIND -- `callout_slots += u8::from(kind.is_call_out())` (`direct.rs:6971`) sums
-/// every call-out class into ONE local, and the cap trip at `direct.rs:6891` reads that same local
-/// -- so a port-class instance of this row would exercise the identical code path and assert the
+/// cap is CLASS-BLIND: `callout_slots += u8::from(kind.is_call_out())` (`direct.rs:6971`) sums
+/// every call-out class into ONE local, and the cap trip at `direct.rs:6891` reads that same local,
+/// so a port-class instance of this row would exercise the identical code path and assert the
 /// identical three facts. ROUND-3 review M3-2: no fixture naming `PortReadAlImm8` or five `0xE4`s
 /// was ever added for this slice; this comment is the citation the review asked for in place of
 /// that fixture, not a claim that one was written.

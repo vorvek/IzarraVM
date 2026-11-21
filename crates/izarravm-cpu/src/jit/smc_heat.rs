@@ -3,8 +3,7 @@
 
 //! G1 self-modifying-code heat map. A separate structure from the refcounted watch pages: the
 //! review proved a counter living in a refcounted page ping-pongs (demotion zeroes refcounts, the
-//! page resets, the heat is lost, the code re-admits). See
-//! dev_docs/specs/2026-07-15-smc-hardening-design.md.
+//! page resets, the heat is lost, the code re-admits).
 //!
 //! Ownership (Track C C1a-pre hoist): the map is a PLAIN FIELD on `CpuGsw`, reached through SPLIT
 //! BORROWS so a future backend could share it the way the (now-removed) clif backend once did.
@@ -112,7 +111,7 @@ impl SmcHeatMap {
     /// ANY epoch (count > 0). Read-only and non-consuming, unlike `take_stale_stamp`: this is
     /// the disp-lane admission probe, and consuming here would fight `lift_cold_smc_dormant`'s
     /// recovery contract. A record means the chunk took at least one heat-charged kill (a
-    /// killed block or a narrow decode kill — `note_code_write_inner` bumps on nothing else),
+    /// killed block or a narrow decode kill: `note_code_write_inner` bumps on nothing else),
     /// i.e. the bytes have measured patch history; lane-absorbed patches deliberately stop
     /// refreshing it, so "no record" stays the steady state of code that never needed lanes.
     pub(crate) fn has_record_range(&self, physical: u32, len: u32) -> bool {

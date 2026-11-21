@@ -560,8 +560,8 @@ fn oversized_x87_block_compiles_and_runs_as_fitting_prefixes() {
     // The eight slots are `fld QWORD`, and the width is load-bearing rather than incidental: a
     // Qword's `alignment_bytes()` is 4, below its size, so its page-crossing bound is LIVE and
     // `emit_wide_page_guard` keeps emitting it. A Dword slot's bound is dead code and is elided,
-    // which took 20 bytes off each of eight sites and dropped this fixture's block to 3999 bytes
-    // -- under a host page, so the oversize premise silently evaporated. Pinning the fixture on a
+    // which took 20 bytes off each of eight sites and dropped this fixture's block to 3999 bytes,
+    // under a host page, so the oversize premise silently evaporated. Pinning the fixture on a
     // width whose guard is not elidable keeps the premise a property of the block rather than of
     // whatever the guard currently spells.
     assert!(
@@ -1340,7 +1340,7 @@ fn linked_integer_to_float_chain_is_refused_and_the_float_block_still_runs_corre
     const END: u32 = SECOND + 6;
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;
-    let first = [0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0]; // three mov eax,eax -- pure integer
+    let first = [0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0]; // three mov eax,eax: pure integer
     // Three instructions, same reason as the float-to-integer test's second block: a
     // non-terminal block needs at least three to be worth compiling at all.
     let second = [0xd9, 0xe8, 0xd9, 0xe8, 0xde, 0xc9]; // fld1; fld1; fmulp st(1),st(0)
@@ -1725,7 +1725,7 @@ fn fcompp_and_fucompp_match_the_interpreter_and_pop_twice() {
 ///
 /// `a` lands in ST(1) and `b` in ST(0), so the compare is `b` against `a`. The trailing FSTP
 /// stores whatever the compare left as ST(0): `b` for the non-popping form, `a` for the popping
-/// one. That difference is the `top_delta` pin -- a shape that claimed the wrong stack effect
+/// one. That difference is the `top_delta` pin: a shape that claimed the wrong stack effect
 /// would store the other value or trip the empty-tag guard, and neither survives the state
 /// comparison or the exact-retirement gate.
 fn fucom_program(pop: bool, a: f32, b: f32) -> Vec<u8> {
@@ -1769,7 +1769,7 @@ fn fucom_and_fucomp_condition_bits_and_pop_match_the_interpreter() {
                     mode,
                     fucom_program(pop, a, b),
                     0x0f7f,
-                    7, // mov, fld, fld, fucom, fnstsw, fstp, mov -- hlt never retires natively
+                    7, // mov, fld, fld, fucom, fnstsw, fstp, mov; hlt never retires natively
                 );
                 assert_eq!(
                     cpu.fpu.status & 0x4500,
@@ -1827,7 +1827,7 @@ fn fist_m32_stores_without_popping_and_matches_the_interpreter() {
                 mode,
                 fist_then_fistp_program(value),
                 0x0f7f,
-                5, // mov, fld, fist, fistp, mov -- hlt never retires natively
+                5, // mov, fld, fist, fistp, mov; hlt never retires natively
             );
             for slot in [DATA + 4, DATA + 8] {
                 assert_eq!(
@@ -1871,7 +1871,7 @@ fn d9_sign_and_classify_program(op: u8, value: f32) -> Vec<u8> {
 ///
 /// -0.0 is the load-bearing input. It is the one value where the zero test and the sign test
 /// disagree, so it separates FXAM's C3 (set: the value IS zero) from its C1 (set: the sign bit is
-/// on) -- a lowering that derived C1 from the comparison rather than from bit 63 passes every
+/// on), a lowering that derived C1 from the comparison rather than from bit 63 passes every
 /// other row here and fails this one. It also catches an FCHS written as a subtraction from zero,
 /// which would turn -0.0 into +0.0 and land different bytes in the stored dword.
 #[test]
@@ -1903,7 +1903,7 @@ fn fchs_fabs_ftst_and_fxam_match_the_interpreter() {
                 mode,
                 d9_sign_and_classify_program(op, value),
                 0x0f7f,
-                6, // mov, fld, op, fnstsw, fstp, mov -- hlt never retires natively
+                6, // mov, fld, op, fnstsw, fstp, mov; hlt never retires natively
             );
             assert_eq!(
                 u32::from_le_bytes(bus.memory[DATA + 4..DATA + 8].try_into().unwrap()),
@@ -1952,7 +1952,7 @@ fn fsqrt_matches_the_interpreter_for_non_negative_operands() {
                 mode,
                 fsqrt_program(value),
                 0x0f7f,
-                5, // mov, fld, fsqrt, fstp, mov -- hlt never retires natively
+                5, // mov, fld, fsqrt, fstp, mov; hlt never retires natively
             );
             assert_eq!(
                 f32::from_bits(u32::from_le_bytes(
@@ -2027,7 +2027,7 @@ fn fistp_m64_matches_the_interpreter_inside_the_admitted_range() {
                 mode,
                 fistp_m64_program(value),
                 0x0f7f,
-                4, // mov, fld, fistp, mov -- hlt never retires natively
+                4, // mov, fld, fistp, mov; hlt never retires natively
             );
             assert_eq!(
                 i64::from_le_bytes(bus.memory[DATA + 8..DATA + 16].try_into().unwrap()),
@@ -2075,7 +2075,7 @@ fn fistp_m64_out_of_range_exits_before_touching_x87_state() {
 
 /// FLD m64 then FSTP m80 into `at`. The destination displacement is a parameter so the same
 /// program can be pointed at an admitted alignment and at a refused one: 0x208 and 0x20c
-/// exercise the two admitted cases, and 2-aligned is REFUSED -- see
+/// exercise the two admitted cases, and 2-aligned is REFUSED: see
 /// `fstp_m80_at_a_two_aligned_address_exits` for why that cut exists.
 fn fstp_m80_program(value: f64, at: u32) -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
@@ -2138,7 +2138,7 @@ fn fstp_m80_matches_the_interpreter_and_the_extended_encoding() {
                     mode,
                     fstp_m80_program(value, at),
                     0x0f7f,
-                    4, // mov, fld, fstp, mov -- hlt never retires natively
+                    4, // mov, fld, fstp, mov; hlt never retires natively
                 );
                 let base = at as usize;
                 assert_eq!(
@@ -2176,7 +2176,7 @@ fn fstp_m80_at_a_two_aligned_address_exits() {
         GswMode::Gsw586,
         fstp_m80_program(1.0, 0x20a),
         0x0f7f,
-        2, // mov, fld -- the store exits at the alignment guard on every pass
+        2, // mov, fld: the store exits at the alignment guard on every pass
     );
     assert_eq!(
         cpu.perf_counters().jit_direct_exit_cross_page_or_alignment,
@@ -2861,7 +2861,7 @@ fn fiadd_fimul_and_fidiv_with_a_nonzero_operand_match_the_interpreter() {
                 mode,
                 fi_arith_program(extension, operand),
                 0x0f7f,
-                7, // fld, fld, fadd, mov, fi<op>, mov, fstp -- hlt never retires natively
+                7, // fld, fld, fadd, mov, fi<op>, mov, fstp; hlt never retires natively
             );
             assert_eq!(
                 f32::from_bits(u32::from_le_bytes(
@@ -2940,7 +2940,7 @@ fn ficomp_followed_by_another_x87_slot_addresses_the_popped_stack_correctly() {
             mode,
             ficomp_followed_by_fstp_program(),
             0x0f7f,
-            6, // mov, fld, fld, ficomp, fstp, mov -- hlt never retires natively
+            6, // mov, fld, fld, ficomp, fstp, mov; hlt never retires natively
         );
         assert_eq!(
             f32::from_bits(u32::from_le_bytes(
@@ -3039,7 +3039,7 @@ fn fld_fadd_fdiv_and_fstp_m64_match_the_interpreter_and_preserve_the_full_range_
             mode,
             m64_arith_program(),
             0x037f,
-            8, // fld, fld, fadd, fdiv, fstp, fstp, fnstsw, mov -- hlt never retires natively
+            8, // fld, fld, fadd, fdiv, fstp, fstp, fnstsw, mov; hlt never retires natively
         );
         assert_eq!(
             f64::from_bits(u64::from_le_bytes(
@@ -3097,7 +3097,7 @@ fn fcom_m64_condition_bits_match_the_interpreter_above_equal_and_below() {
                 mode,
                 fcom_m64_program(operand),
                 0x037f,
-                6, // mov, fld, fcom, fnstsw, mov, mov -- hlt never retires natively
+                6, // mov, fld, fcom, fnstsw, mov, mov; hlt never retires natively
             );
             assert_eq!(
                 cpu.fpu.status & 0x4500,
@@ -3139,7 +3139,7 @@ fn a_four_aligned_not_eight_aligned_m64_access_lowers_and_matches() {
         GswMode::Gsw586,
         four_aligned_m64_program(),
         0x037f,
-        4, // fld, fstp, mov, mov -- hlt never retires natively
+        4, // fld, fstp, mov, mov; hlt never retires natively
     );
     assert_eq!(
         cpu.perf_counters().jit_direct_exit_cross_page_or_alignment,
@@ -3334,7 +3334,7 @@ fn fcomp_m64_followed_by_another_x87_slot_addresses_the_popped_stack_correctly()
             mode,
             fcomp_m64_followed_by_fstp_program(),
             0x037f,
-            6, // mov, fld, fld, fcomp, fstp, mov -- hlt never retires natively
+            6, // mov, fld, fld, fcomp, fstp, mov; hlt never retires natively
         );
         assert_eq!(
             f64::from_bits(u64::from_le_bytes(
@@ -3380,7 +3380,7 @@ fn fld_m64_with_a_nan_operand_side_exits_before_pushing_it() {
         GswMode::Gsw586,
         fld_m64_nan_program(),
         0x037f,
-        1, // mov -- the fld itself must side-exit rather than retire natively
+        1, // mov: the fld itself must side-exit rather than retire natively
     );
     assert!(
         cpu.direct_stall_snapshot().side_exit_x87_eligibility > 0,
@@ -3428,7 +3428,7 @@ fn fild_m64_followed_by_another_x87_slot_addresses_the_pushed_stack_correctly() 
             mode,
             fild_m64_followed_by_fstp_program(),
             0x0f7f,
-            5, // mov, fld, fild, fstp, mov -- hlt never retires natively
+            5, // mov, fld, fild, fstp, mov; hlt never retires natively
         );
         assert_eq!(
             f64::from_bits(u64::from_le_bytes(
@@ -3452,7 +3452,7 @@ fn fild_m64_followed_by_another_x87_slot_addresses_the_pushed_stack_correctly() 
 
 // The x87 TOP-mismatch retire cap.
 //
-// A block whose baked entry TOP no longer matches the live TOP must not be entered -- that half is
+// A block whose baked entry TOP no longer matches the live TOP must not be entered: that half is
 // unconditional and is asserted below on every round. What the cap governs is the RE-SPECIALIZATION
 // that used to follow every refusal: on a guest that cycles TOPs through one key it recompiles
 // forever and buys nothing, so each key gets `X87_TOP_RETIRE_CAP` retires and then goes sticky.
@@ -3468,7 +3468,7 @@ fn top_cap_memory() -> Vec<u8> {
     let program = [
         0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89,
         0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, // eleven mov eax,eax
-        0xd9, 0xe8, // fld1 -- lowers TOP from 0 to 7
+        0xd9, 0xe8, // fld1: lowers TOP from 0 to 7
     ];
     memory[ENTRY as usize..TOP_CAP_END as usize].copy_from_slice(&program);
     memory[TOP_CAP_END as usize] = 0xf4;
@@ -3656,7 +3656,7 @@ fn wait_program() -> Vec<u8> {
 /// WAIT retires NATIVELY when nothing is pending, in both the gate-emitting and the
 /// gate-inherited position.
 ///
-/// Catches: a `Wait` that never reached `emit_native_x87` at all -- the block would stop short and
+/// Catches: a `Wait` that never reached `emit_native_x87` at all: the block would stop short and
 /// `Exact(5)` fails. It also catches a `raw_clocks`/`fp_class` mistake, because
 /// `assert_program_matches_impl` compares `elapsed_clocks`, `fp_rem` and the per-run `core_clocks`
 /// vector, and WAIT is the only user of `FpOpClass::Wait`: copying `Register` there moves the
@@ -3752,16 +3752,16 @@ fn frndint_program(value: f32) -> Vec<u8> {
 ///
 /// Catches, and each is a real mutation of `emit_native_x87`'s `RoundToInt` arm:
 ///
-/// * a BAKED immediate instead of the runtime branch -- three of the four RC arms then round the
+/// * a BAKED immediate instead of the runtime branch: three of the four RC arms then round the
 ///   wrong way, and `+/-2.5`, `+/-0.5` and `+/-1.5` each separate a different pair of modes;
 /// * the RC field read from the wrong bits. `>> 10 & 3` is the only correct extraction; a `>> 8`
 ///   picks up the PRECISION-control field instead, which is why the `precision` loop varies it;
-/// * the four immediates permuted -- `fpu_round_rc`'s arms are nearest/floor/ceil/trunc in that
+/// * the four immediates permuted: `fpu_round_rc`'s arms are nearest/floor/ceil/trunc in that
 ///   order and `vroundsd`'s encoding agrees, so any permutation shows on a negative value;
 /// * a missing `emit_store_physical`, which leaves ST(0) unrounded.
 ///
 /// `assert_program_matches_exact_insns` pins FOUR native retirements, so a slot that quietly fell
-/// back to the interpreter -- which would compare EQUAL on every value -- fails instead.
+/// back to the interpreter, which would compare EQUAL on every value, fails instead.
 #[test]
 fn frndint_matches_the_interpreter_under_every_rounding_mode() {
     select_fpu_loop_rows(true);
@@ -3809,7 +3809,7 @@ fn frndint_side_exits_on_an_empty_stack_slot() {
     memory[ENTRY as usize - 1] = 0x90;
     let code = [
         0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]
-        0xdd, 0xd8, // fstp st(0) -- pops, leaving ST(0) empty
+        0xdd, 0xd8, // fstp st(0): pops, leaving ST(0) empty
         0xd9, 0xfc, // frndint
         0x89, 0xc0, // mov eax,eax
         0xf4,
