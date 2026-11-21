@@ -141,3 +141,26 @@ fn hotplug_seeds_state_and_disconnects_once() {
             .selected_disconnected
     );
 }
+
+#[test]
+fn system_xinput_path_is_absolute_under_the_system_directory() {
+    let path = system_xinput_path(std::path::Path::new(r"C:\Windows\System32"));
+    assert_eq!(
+        path,
+        std::path::PathBuf::from(r"C:\Windows\System32\xinput1_4.dll")
+    );
+    assert!(path.is_absolute());
+}
+
+#[test]
+fn system_directory_from_wide_rejects_empty_and_truncated_results() {
+    let buffer = [0u16; 8];
+    assert_eq!(system_directory_from_wide(&buffer, 0), None);
+    assert_eq!(system_directory_from_wide(&buffer, 8), None);
+    assert_eq!(system_directory_from_wide(&buffer, 9), None);
+    let text: Vec<u16> = r"C:\Win".encode_utf16().chain([0, 0]).collect();
+    assert_eq!(
+        system_directory_from_wide(&text, 6),
+        Some(std::path::PathBuf::from(r"C:\Win"))
+    );
+}

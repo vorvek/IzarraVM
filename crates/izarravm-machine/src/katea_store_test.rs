@@ -279,3 +279,64 @@ fn was_written_span_agrees_with_the_per_sector_loop() {
     assert!(!store.was_written_span(900_000, 4_096), "past every write");
     assert!(store.was_written_span(4_000, 200), "reaches the last write");
 }
+
+fn scratch_file(name: &str) -> (File, PathBuf) {
+    let path = std::env::temp_dir().join(format!(
+        "izarravm-portable-at-{}-{name}",
+        std::process::id()
+    ));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    (file, path)
+}
+
+#[test]
+fn portable_positioned_io_round_trips_out_of_order() {
+    let (file, path) = scratch_file("round-trip");
+    portable_at::write_all_at(&file, &[1, 2, 3, 4], 4096).unwrap();
+    portable_at::write_all_at(&file, &[9, 8], 0).unwrap();
+    portable_at::write_all_at(&file, &[5, 6, 7], 512).unwrap();
+    let mut out = [0u8; 4];
+    portable_at::read_exact_at(&file, &mut out, 4096).unwrap();
+    assert_eq!(out, [1, 2, 3, 4]);
+    let mut out = [0u8; 2];
+    portable_at::read_exact_at(&file, &mut out, 0).unwrap();
+    assert_eq!(out, [9, 8]);
+    let mut out = [0u8; 3];
+    portable_at::read_exact_at(&file, &mut out, 512).unwrap();
+    assert_eq!(out, [5, 6, 7]);
+    drop(file);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn portable_positioned_read_past_the_end_is_unexpected_eof() {
+    let (file, path) = scratch_file("eof");
+    portable_at::write_all_at(&file, &[1, 2], 0).unwrap();
+    let mut out = [0u8; 4];
+    let error = portable_at::read_exact_at(&file, &mut out, 0).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    drop(file);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn portable_positioned_io_survives_a_poisoned_lock() {
+    let (file, path) = scratch_file("poison");
+    let _ = std::thread::spawn(|| {
+        let _guard = portable_at::SEEK_LOCK.lock().unwrap();
+        panic!("poison the seek lock");
+    })
+    .join();
+    portable_at::write_all_at(&file, &[7], 0).unwrap();
+    let mut out = [0u8; 1];
+    portable_at::read_exact_at(&file, &mut out, 0).unwrap();
+    assert_eq!(out, [7]);
+    drop(file);
+    let _ = std::fs::remove_file(path);
+}

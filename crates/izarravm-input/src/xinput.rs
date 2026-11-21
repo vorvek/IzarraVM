@@ -176,10 +176,45 @@ pub(super) struct NativeXInputSource {
 
 impl NativeXInputSource {
     fn load() -> Option<Self> {
-        XInputHandle::load_default()
+        let path = system_xinput_path(&system_directory()?);
+        // Only xinput1_4.dll is tried. xinput9_1_0.dll lacks the XInputEnable
+        // export that rusty-xinput requires, so loading it can never succeed.
+        XInputHandle::load(path.to_str()?)
             .ok()
             .map(|handle| Self { handle })
     }
+}
+
+/// The absolute path of the XInput DLL inside the system directory. An absolute
+/// path bypasses the DLL search order, so a DLL planted next to the executable
+/// is never loaded.
+fn system_xinput_path(system_directory: &std::path::Path) -> std::path::PathBuf {
+    system_directory.join("xinput1_4.dll")
+}
+
+/// Turn the result of `GetSystemDirectoryW` into a path. A length of 0 is a
+/// failure. A length that does not fit the buffer means the text was cut, so
+/// the path would be wrong.
+fn system_directory_from_wide(buffer: &[u16], length: u32) -> Option<std::path::PathBuf> {
+    let length = length as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    let text = String::from_utf16(&buffer[..length]).ok()?;
+    Some(std::path::PathBuf::from(text))
+}
+
+fn system_directory() -> Option<std::path::PathBuf> {
+    let mut buffer = [0u16; 260];
+    #[allow(unsafe_code)]
+    // SAFETY: the pointer and length describe `buffer`, which outlives the call.
+    let length = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
+    system_directory_from_wide(&buffer, length)
 }
 
 impl XInputSource for NativeXInputSource {

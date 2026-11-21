@@ -1132,3 +1132,42 @@ fn a_pregap_between_tracks_does_not_stop_the_next_one_being_warmed() {
         "the track after a pregap was never warmed"
     );
 }
+
+fn backing_bytes(img: &CdImage) -> &Vec<u8> {
+    match &img.backing {
+        Backing::Bytes(bytes) => bytes,
+        Backing::Folder { .. } => panic!("expected a resident backing"),
+    }
+}
+
+#[test]
+fn one_file_cue_mount_moves_the_file_without_a_copy() {
+    let cue = "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n";
+    let mut bin = vec![0u8; 3 * RAW_SECTOR];
+    for (i, b) in bin.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let expected = bin.clone();
+    let before = bin.as_ptr();
+    let img = CdImage::from_cue_files(cue, vec![("d.bin".to_string(), bin)]).unwrap();
+    assert_eq!(backing_bytes(&img), &expected);
+    assert_eq!(backing_bytes(&img).as_ptr(), before);
+}
+
+#[test]
+fn two_file_cue_mount_keeps_the_concatenated_bytes_identical() {
+    let cue = "FILE \"a.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n\
+               FILE \"b.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n";
+    let a: Vec<u8> = (0..2 * RAW_SECTOR).map(|i| (i % 249) as u8).collect();
+    let b: Vec<u8> = (0..3 * RAW_SECTOR).map(|i| (i % 241) as u8).collect();
+    let mut expected = a.clone();
+    expected.extend_from_slice(&b);
+    let img = CdImage::from_cue_files(
+        cue,
+        vec![("a.bin".to_string(), a), ("b.bin".to_string(), b)],
+    )
+    .unwrap();
+    assert_eq!(backing_bytes(&img), &expected);
+    assert_eq!(img.tracks()[1].image_offset, 2 * RAW_SECTOR);
+    assert_eq!(img.total_sectors(), 5);
+}

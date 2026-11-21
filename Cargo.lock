@@ -1847,6 +1847,7 @@ dependencies = [
  "gilrs",
  "rusty-xinput",
  "serde",
+ "windows-sys 0.59.0",
  "winit",
 ]
 

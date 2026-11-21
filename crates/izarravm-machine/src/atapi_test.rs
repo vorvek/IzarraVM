@@ -827,3 +827,70 @@ fn mode_select_malformed_list_is_illegal() {
     assert!(matches!(dev.mode_select_data(&[0u8; 4]), CmdResult::Error));
     assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
 }
+
+fn read12(lba: u32, count: u32) -> [u8; 12] {
+    let mut c = cdb(0xA8);
+    c[2..6].copy_from_slice(&lba.to_be_bytes());
+    c[6..10].copy_from_slice(&count.to_be_bytes());
+    c
+}
+
+#[test]
+fn read12_above_the_cap_is_refused_before_the_range_check() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(4));
+    // The disc is tiny, so a range check would answer LBA out of range. The cap
+    // answers invalid field in CDB, which shows the cap ran first.
+    assert!(matches!(
+        dev.execute(&read12(0, MAX_READ_SECTORS + 1)),
+        CmdResult::Error
+    ));
+    assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+    assert_eq!((dev.asc, dev.ascq), asc::INVALID_FIELD_IN_CDB);
+}
+
+#[test]
+fn read12_at_the_cap_passes_the_cap_check() {
+    // 65535 sectors is the largest READ(10) count. A 128 MiB test image is too
+    // large for a unit test, so a tiny disc shows the cap check lets the
+    // command through: it then fails the range check, not the cap.
+    assert_eq!(MAX_READ_SECTORS, u32::from(u16::MAX));
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(4));
+    assert!(matches!(
+        dev.execute(&read12(0, MAX_READ_SECTORS)),
+        CmdResult::Error
+    ));
+    assert_eq!((dev.asc, dev.ascq), asc::LBA_OUT_OF_RANGE);
+}
+
+#[test]
+fn read12_of_a_large_allowed_count_returns_every_sector() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(4096));
+    let buf = data(dev.execute(&read12(0, 4096)));
+    assert_eq!(buf.len(), 4096 * DATA_SECTOR);
+    assert_eq!(buf[4095 * DATA_SECTOR], (4095u32 as u8).wrapping_add(0x40));
+}
+
+#[test]
+fn read_cd_above_the_cap_is_refused() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(4));
+    let mut c = cdb(0xBE);
+    let count = (MAX_READ_SECTORS + 1).to_be_bytes();
+    c[6..9].copy_from_slice(&count[1..4]);
+    c[9] = 0x10;
+    assert!(matches!(dev.execute(&c), CmdResult::Error));
+    assert_eq!((dev.asc, dev.ascq), asc::INVALID_FIELD_IN_CDB);
+}
+
+#[test]
+fn read10_across_into_an_audio_track_is_refused() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(audio_disc());
+    let mut c = cdb(0x28);
+    c[8] = 50; // starts in the data sector at LBA 0, runs into the audio frames
+    assert!(matches!(dev.execute(&c), CmdResult::Error));
+    assert_eq!((dev.asc, dev.ascq), asc::INVALID_FIELD_IN_CDB);
+}

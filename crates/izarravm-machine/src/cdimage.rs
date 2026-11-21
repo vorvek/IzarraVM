@@ -395,15 +395,14 @@ impl CdImage {
         // The one BIN is raw by construction: this entry point takes bytes, and
         // an encoded file reaches the disc model only through
         // [`CdImage::from_cue_sources`], which is where sniffing happens.
-        let source = CueSource::Raw(bin);
         Self::build(
             tracks,
-            &[BuildFile {
+            vec![BuildFile {
                 // This entry point takes bytes, not a path, so there is no file
                 // name to report, and the checks that would name one are the
                 // encoded-audio ones, which a `Raw` source cannot reach anyway.
                 name: "the CUE's BIN",
-                source: &source,
+                source: CueSource::Raw(bin),
                 file_type,
             }],
         )
@@ -429,7 +428,10 @@ impl CdImage {
     /// [`CdImage::from_cue_files`] is the all-raw case expressed through it.
     /// Guards belong here rather than in that wrapper, or they sit off the
     /// production path.
-    pub fn from_cue_sources(cue: &str, files: Vec<(String, CueSource)>) -> Result<Self, String> {
+    pub fn from_cue_sources(
+        cue: &str,
+        mut files: Vec<(String, CueSource)>,
+    ) -> Result<Self, String> {
         let (files_in_sheet, tracks) = parse_cue(cue)?;
         // A repeated FILE name is not the "two tracks share one file" layout
         // (that is a single FILE section followed by multiple TRACK/INDEX
@@ -458,12 +460,15 @@ impl CdImage {
         let mut build_files: Vec<BuildFile<'_>> = Vec::with_capacity(files_in_sheet.len());
         for (name, file_type) in &files_in_sheet {
             let found = files
-                .iter()
+                .iter_mut()
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 .ok_or_else(|| format!("CUE names a file that was not supplied: {name}"))?;
+            // Names are unique per section (checked above), so each supplied
+            // source is taken once. The placeholder left behind is empty and
+            // never read: only the name is used after this loop.
             build_files.push(BuildFile {
                 name: name.as_str(),
-                source: &found.1,
+                source: std::mem::replace(&mut found.1, CueSource::Raw(Vec::new())),
                 file_type: file_type.clone(),
             });
         }
@@ -510,7 +515,7 @@ impl CdImage {
                 files_in_sheet.len()
             ));
         }
-        Self::build(tracks, &build_files)
+        Self::build(tracks, build_files)
     }
 
     /// Mount from a CUE sheet and the raw bytes its FILEs name: the all-raw
@@ -553,7 +558,7 @@ impl CdImage {
     /// erroring); a sheet that violates this, within one file, mounts with a
     /// track table and `total_sectors` that no longer match the on-disc
     /// reality.
-    fn build(tracks_in: Vec<CueTrack>, files: &[BuildFile<'_>]) -> Result<Self, String> {
+    fn build(tracks_in: Vec<CueTrack>, files: Vec<BuildFile<'_>>) -> Result<Self, String> {
         if tracks_in.is_empty() {
             return Err("CUE sheet declared no tracks".to_string());
         }
@@ -570,12 +575,14 @@ impl CdImage {
         // same offset as its successor's: harmless, because nothing ever
         // reads a source-backed track's `image_offset`.
         let mut cursors = vec![0usize; files.len()];
-        let total_bytes = files.iter().map(|f| f.raw_bytes().len()).sum();
-        let mut concatenated: Vec<u8> = Vec::with_capacity(total_bytes);
+        //
+        // The bytes themselves are joined after the track loop, by moving the
+        // files in, so the base offsets come from the lengths alone.
         let mut file_base = Vec::with_capacity(files.len());
-        for file in files {
-            file_base.push(concatenated.len());
-            concatenated.extend_from_slice(file.raw_bytes());
+        let mut total_bytes = 0usize;
+        for file in &files {
+            file_base.push(total_bytes);
+            total_bytes += file.raw_len();
         }
 
         let mut tracks = Vec::with_capacity(tracks_in.len());
@@ -601,7 +608,7 @@ impl CdImage {
             // rather than each remembering to do it.
             disc_lba += p.pregap_frames;
 
-            let (sectors, image_offset, byte_swapped) = match file.source {
+            let (sectors, image_offset, byte_swapped) = match &file.source {
                 CueSource::Audio(audio) => {
                     // Two layouts an encoded file cannot represent, refused
                     // here rather than mounted approximately. Both are checked
@@ -695,6 +702,19 @@ impl CdImage {
                 byte_swapped,
             });
             disc_lba += sectors;
+        }
+
+        // One raw file moves in as the backing with no copy. With several, the
+        // first Vec grows once to the total and each later file is appended and
+        // freed at once, so the peak stays near one disc, not two.
+        let mut raws = files.into_iter().filter_map(|f| match f.source {
+            CueSource::Raw(bytes) => Some(bytes),
+            CueSource::Audio(_) => None,
+        });
+        let mut concatenated = raws.next().unwrap_or_default();
+        concatenated.reserve_exact(total_bytes - concatenated.len());
+        for bytes in raws {
+            concatenated.extend_from_slice(&bytes);
         }
 
         Ok(Self {
@@ -1053,19 +1073,19 @@ struct BuildFile<'a> {
     /// it. `from_cue` is handed a blob rather than a named file, so it supplies
     /// a description of that blob instead.
     name: &'a str,
-    source: &'a CueSource,
+    source: CueSource,
     file_type: CueFileType,
 }
 
 impl BuildFile<'_> {
-    /// The bytes this file contributes to the concatenated backing. An encoded
-    /// audio file contributes none: its frames come from its decoder, and the
-    /// empty slice here is the literal truth about the backing rather than a
-    /// stand-in for absent data.
-    fn raw_bytes(&self) -> &[u8] {
-        match self.source {
-            CueSource::Raw(bytes) => bytes,
-            CueSource::Audio(_) => &[],
+    /// The length of the bytes this file contributes to the concatenated
+    /// backing. An encoded audio file contributes none: its frames come from its
+    /// decoder, and zero here is the literal truth about the backing rather
+    /// than a stand-in for absent data.
+    fn raw_len(&self) -> usize {
+        match &self.source {
+            CueSource::Raw(bytes) => bytes.len(),
+            CueSource::Audio(_) => 0,
         }
     }
 }

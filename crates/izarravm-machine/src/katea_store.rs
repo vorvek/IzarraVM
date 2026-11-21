@@ -174,6 +174,45 @@ fn write_all_at(file: &File, buf: &[u8], off: u64) -> io::Result<()> {
     file.write_all_at(buf, off)
 }
 
+/// Positioned I/O for targets that are neither Windows nor Unix: seek, then
+/// read or write, through `&File` (`Read`, `Write` and `Seek` are all
+/// implemented for it). The seek moves the one shared cursor, so a lock is held
+/// across the seek and the transfer. A panic in another thread cannot leave the
+/// cursor half-moved in a way that matters, because every call seeks first, so a
+/// poisoned lock is recovered. The module is also built for tests, so Windows
+/// and Unix runs cover it.
+#[cfg(any(test, not(any(windows, unix))))]
+mod portable_at {
+    use std::fs::File;
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::sync::{Mutex, MutexGuard};
+
+    pub(super) static SEEK_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> MutexGuard<'static, ()> {
+        SEEK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn read_exact_at(file: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+        let _guard = lock();
+        let mut file = file;
+        file.seek(SeekFrom::Start(off))?;
+        file.read_exact(buf)
+    }
+
+    pub(super) fn write_all_at(file: &File, buf: &[u8], off: u64) -> io::Result<()> {
+        let _guard = lock();
+        let mut file = file;
+        file.seek(SeekFrom::Start(off))?;
+        file.write_all(buf)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+use portable_at::{read_exact_at, write_all_at};
+
 /// A unique spill name per store in this process.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
