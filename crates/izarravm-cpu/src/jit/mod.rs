@@ -97,17 +97,18 @@ pub(crate) struct JitState {
     pub(crate) watch_page_bit: bool,
     /// Emitted stores probe the one-lookup store-bias table and route special pages through
     /// the shared stub pad (`dev_docs/2026-08-07-one-lookup-store-design.md` D3/D4/D5).
-    /// Seeded from `IZARRAVM_ONE_LOOKUP_STORE` (default ON, `=0` restores the classify/resolve
-    /// emission wholesale); a FIELD for `word_at_486`'s testability reason, and CARRIED by
-    /// clone for `watch_page_bit`'s lockstep-comparison reason. Requires `r15_tables` — the
-    /// compile walk enforces that at the pad-build site.
+    /// Always true at construction. A test sets it to false to get the classify/resolve
+    /// emission for each store, which is also the emission of a block whose stub pad did not
+    /// build. A FIELD for `word_at_486`'s testability reason, and CARRIED by clone for
+    /// `watch_page_bit`'s lockstep-comparison reason. Requires `r15_tables` — the compile walk
+    /// enforces that at the pad-build site.
     pub(crate) one_lookup_store: bool,
     /// Emitted reads probe the one-lookup load-bias table and route special pages through the
     /// shared read-resolve pad (`dev_docs/2026-08-07-one-lookup-load-design.md` D3a/D3b/D5).
-    /// Seeded from `IZARRAVM_ONE_LOOKUP_LOAD` (default ON, `=0` restores the classify/resolve
-    /// read emission wholesale); a FIELD for `word_at_486`'s testability reason, CARRIED by
-    /// clone for the lockstep reason. Requires `r15_tables`; independent of `one_lookup_store`
-    /// so either slice A/Bs alone.
+    /// Always true at construction. A test sets it to false to get the classify/resolve read
+    /// emission, which is also the emission of a block whose read pad did not build. A FIELD
+    /// for `word_at_486`'s testability reason, CARRIED by clone for the lockstep reason.
+    /// Requires `r15_tables`; independent of `one_lookup_store`.
     pub(crate) one_lookup_load: bool,
     /// Whether the blocks in this cache were emitted WITH the `NativeBlockTrace` append
     /// preamble — i.e. the answer to `!bus.native_fetches_are_uniform()` that every resident
@@ -242,31 +243,6 @@ pub(crate) struct JitState {
     last_side_exit_reason: Option<u32>,
 }
 
-/// Seed for `JitState::one_lookup_store`, read once per process from
-/// `IZARRAVM_ONE_LOOKUP_STORE` (the retired `IZARRAVM_R15_TABLES` pattern: env knob for the
-/// single-binary A/B, deleted after soak).
-fn one_lookup_store_default() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("IZARRAVM_ONE_LOOKUP_STORE").as_deref(),
-            Ok("0")
-        )
-    })
-}
-
-/// Seed for `JitState::one_lookup_load`, read once per process from
-/// `IZARRAVM_ONE_LOOKUP_LOAD` — the store knob's pattern, on its own retirement clock.
-fn one_lookup_load_default() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("IZARRAVM_ONE_LOOKUP_LOAD").as_deref(),
-            Ok("0")
-        )
-    })
-}
-
 impl JitState {
     pub(crate) fn new(direct: direct::BlockCache) -> Self {
         Self {
@@ -276,8 +252,8 @@ impl JitState {
             word_at_486: direct::word_at_486_default(),
             r15_tables: true,
             watch_page_bit: true,
-            one_lookup_store: one_lookup_store_default(),
-            one_lookup_load: one_lookup_load_default(),
+            one_lookup_store: true,
+            one_lookup_load: true,
             native_fetch_trace: true,
             sixteen_bit_level: direct::sixteen_bit_admission_level(),
             // 1, never 0: 0 is the "no memo" encoding, so a fresh pack can never hit.

@@ -12065,7 +12065,7 @@ pub(crate) fn parse_disp_lanes_arm_for_test(value: Result<String, std::env::VarE
 /// lane arm of `emit_effective_address` stages the displacement through RAX and nothing else, so
 /// a kind whose emitter resolves the address AFTER staging other live state could not carry one.
 /// `Store` is not such a kind, and it is checked at the line rather than assumed: BOTH store
-/// emitters — `emit_store` and, under `IZARRAVM_ONE_LOOKUP_STORE`, `emit_store_fast` — call
+/// emitters — `emit_store` and, on the one-lookup store path, `emit_store_fast` — call
 /// `emit_segmented_linear_address` as their FIRST emission, before `emit_read_store_value`
 /// materialises anything into RDX and before the bias probe touches RCX or RDI. Nothing is live
 /// across the address form, so the lane arm's RAX write and the baked arm's RAX write present
@@ -15967,7 +15967,7 @@ fn emit_eager_publish(e: &mut Encoder, class: usize) {
 //
 // * `emit_store` calls `emit_segmented_linear_address` as its first emission; RCX, RDX, RDI and
 //   the store value are all produced after it.
-// * `emit_store_fast` (the `IZARRAVM_ONE_LOOKUP_STORE` path) does the same: the address is
+// * `emit_store_fast` (the one-lookup store path) does the same: the address is
 //   formed first, then `emit_store_bias_probe` (RCX/RDI) and `emit_read_store_value` (RDX).
 //
 // So nothing is live across the address form at either site, and the lane arm's RAX write is

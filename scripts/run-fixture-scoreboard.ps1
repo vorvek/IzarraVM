@@ -114,18 +114,6 @@ param(
     # every value except exactly "0".
     [ValidateSet("on", "off", "jit16", "word486")]
     [string]$Arm = "on",
-    # The one-lookup store emission arm:
-    # "1" is the shipped default, "0" restores the classic classify/resolve store emission.
-    # Set explicitly on every run for the same inherit-hazard reason as the JIT16 pair -
-    # IZARRAVM_ONE_LOOKUP_STORE is on for every value except exactly "0", so a stray "0" left
-    # in the caller's environment would silently turn an "on" observation into an "off" one.
-    [ValidateSet("1", "0")]
-    [string]$OneLookupStore = "1",
-    # The one-lookup LOAD emission arm:
-    # same contract and the same inherit hazard as the store knob above; independent of it so
-    # either slice A/Bs alone.
-    [ValidateSet("1", "0")]
-    [string]$OneLookupLoad = "1",
     # ARM PASSTHROUGH. Extra IZARRAVM_* knobs to arm on EVERY row, each written
     # as one NAME=VALUE string:
     #
@@ -172,9 +160,9 @@ param(
     # which knob is named. Values are passed through byte for byte: never
     # trimmed, never case-folded, never re-quoted.
     #
-    # Names the board sets itself (IZARRAVM_JIT, the JIT16 pair, the one-lookup
-    # pair, the barrier census, and every observer override) are RESERVED and
-    # rejected loudly. Use -Arm / -OneLookupStore / -OneLookupLoad for those;
+    # Names the board sets itself (IZARRAVM_JIT, the JIT16 pair, the barrier
+    # census, and every observer override) are RESERVED and rejected loudly.
+    # Use -Arm for the JIT16 pair;
     # a caller who reaches for -Knobs to override IZARRAVM_JIT has made a
     # mistake and is told so rather than quietly winning or quietly losing.
     # The reserved set is DERIVED from the board's own table in
@@ -424,11 +412,11 @@ function Format-ScoreboardDecimal([double]$Value) {
 }
 
 function Get-ScoreboardMarkdown($Rows, [string]$BoardLabel, [string]$BoardArm,
-    [string]$StoreArm, [string]$LoadArm, $BoardKnobs = $null, $HostPolicy = $null) {
+    $BoardKnobs = $null, $HostPolicy = $null) {
     $markdown = @()
     $markdown += "# Fixture scoreboard$(if ($BoardLabel) { ": $BoardLabel" })"
     $markdown += ""
-    $markdown += "Recorded $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), JIT arm ``$BoardArm``, one-lookup store ``$StoreArm``, one-lookup load ``$LoadArm``. rt is guest seconds per wall second; 1.0 is real time."
+    $markdown += "Recorded $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')), JIT arm ``$BoardArm``. rt is guest seconds per wall second; 1.0 is real time."
     if ($null -eq $HostPolicy) {
         $markdown += 'Host affinity is unverified; not a product throughput result.'
     } else {
@@ -829,7 +817,7 @@ function Assert-ScoreboardAffinitySelfTest {
     Assert-ScoreboardSelfTestEqual $sparse.allowed_logical_processors 2 'sparse system mask'
     $wide = New-ScoreboardHostPolicy -1 @{} ([uint64]::MaxValue) ([uint64]::MaxValue)
     Assert-ScoreboardSelfTestEqual $wide.allowed_logical_processors 64 'bit 63 preserved'
-    $rendered = (Get-ScoreboardMarkdown @() '' 'on' '1' '1' @{} $single) -join "`n"
+    $rendered = (Get-ScoreboardMarkdown @() '' 'on' @{} $single) -join "`n"
     if ($rendered -notmatch 'diagnostic' -or $rendered -notmatch 'not a product throughput result') {
         throw 'Missing diagnostic label in Markdown'
     }
@@ -1058,7 +1046,7 @@ function Invoke-ScoreboardSelfTest {
     # throw, or a governed run could not be compared against the baseline it is measured against.
     Assert-ScoreboardSelfTestEqual $json.rows[0].governor_backoffs 0 "absent governor counter"
 
-    $markdown = @(Get-ScoreboardMarkdown @([pscustomobject]$row) "self-test" "on" "1" "1")
+    $markdown = @(Get-ScoreboardMarkdown @([pscustomobject]$row) "self-test" "on")
     $rendered = $markdown -join "`n"
     if ($rendered -notmatch '\| governor win/back/probe/rearm \|' -or
         $rendered -notmatch '\| emitted \| helper \| interpreter \|' -or
@@ -1082,7 +1070,7 @@ function Invoke-ScoreboardSelfTest {
 
     # The armed passthrough has to show up on the human-readable board too, or
     # two ladder legs in one directory become indistinguishable.
-    $knobbed = @(Get-ScoreboardMarkdown @([pscustomobject]$row) "self-test" "on" "1" "1" `
+    $knobbed = @(Get-ScoreboardMarkdown @([pscustomobject]$row) "self-test" "on" `
         ([ordered]@{ "IZARRAVM_SEGMENT_RETIRE_GOVERNOR" = "off" })) -join "`n"
     if ($knobbed -notmatch 'Arm passthrough: `IZARRAVM_SEGMENT_RETIRE_GOVERNOR=off`') {
         throw "scoreboard self-test failed: the Markdown board does not state the armed knobs"
@@ -3042,8 +3030,6 @@ function Get-BoardOwnedEnvironment {
         "IZARRAVM_JIT"                   = "1"
         "IZARRAVM_JIT16"                 = $armFlags.jit16
         "IZARRAVM_JIT16_486"             = $armFlags.word486
-        "IZARRAVM_ONE_LOOKUP_STORE"      = $OneLookupStore
-        "IZARRAVM_ONE_LOOKUP_LOAD"       = $OneLookupLoad
         "IZARRAVM_DIRECT_BARRIER_CENSUS" = "0"
         # Instrument and audio observers. None of them belongs in a board row; a
         # stray parent-shell value would otherwise apply to every row, silently.
@@ -3086,8 +3072,10 @@ board that runs an arm nobody asked for and reports it as the arm they did:
                       sailing past a case-sensitive reserved check. Requiring
                       upper case closes that hole at the name test, before the
                       reserved test ever runs.
-  reserved            the board sets it; -Arm / -OneLookupStore /
-                      -OneLookupLoad are the supported ways to move those.
+  reserved            the board sets it; -Arm is the supported way to move
+                      the JIT16 pair.
+  retired             the emulator does not read the name. An entry for it
+                      would label a row with an arm that does not exist.
   repeated            last-one-wins is a silent arm change.
 
 The returned VALUES are always [string], never $null, so nothing that comes out
@@ -3096,6 +3084,11 @@ scrub's alone.
 #>
 function Resolve-KnobPassthrough([string[]]$Specification, $ReservedNames) {
     $resolved = [ordered]@{}
+    # Names that the emulator read in the past and does not read now.
+    $retired = @{
+        "IZARRAVM_ONE_LOOKUP_STORE" = $true
+        "IZARRAVM_ONE_LOOKUP_LOAD"  = $true
+    }
     # Case-insensitive by default, which is the safe direction on Windows.
     $reserved = @{}
     foreach ($name in @($ReservedNames)) { $reserved[[string]$name] = $true }
@@ -3153,11 +3146,16 @@ function Resolve-KnobPassthrough([string[]]$Specification, $ReservedNames) {
                 "case-insensitive, so a lower-case spelling could shadow a name the " +
                 "board sets itself.")
         }
+        if ($retired.ContainsKey($name)) {
+            throw ("-Knobs entry '$entry' names '$name', which is a retired knob. The " +
+                "emulator does not read it, so the entry would change no row and would " +
+                "label the board with an arm that does not exist. Remove the entry.")
+        }
         if ($reserved.ContainsKey($name)) {
             throw ("-Knobs entry '$entry' names '$name', which this board sets itself on " +
                 "every row. Overriding it here would make the board report an arm it did " +
-                "not run. Use -Arm for the JIT16 pair, -OneLookupStore / -OneLookupLoad " +
-                "for the one-lookup pair; the barrier census and the observer overrides " +
+                "not run. Use -Arm for the JIT16 pair; the barrier census and the " +
+                "observer overrides " +
                 "are held off deliberately because they tax the very runs this times. " +
                 "Reserved: " + ((@($ReservedNames) | Sort-Object) -join ', '))
         }
@@ -3344,8 +3342,16 @@ function Assert-ScoreboardKnobPassthroughSelfTest {
     } "which this board sets itself" "the reserved IZARRAVM_JIT"
 
     Assert-ScoreboardSelfTestThrows {
+        Resolve-KnobPassthrough @("IZARRAVM_JIT16=0") $reserved
+    } "which this board sets itself" "the reserved IZARRAVM_JIT16"
+
+    Assert-ScoreboardSelfTestThrows {
         Resolve-KnobPassthrough @("IZARRAVM_ONE_LOOKUP_STORE=0") $reserved
-    } "which this board sets itself" "the reserved one-lookup store knob"
+    } "which is a retired knob" "the retired one-lookup store knob"
+
+    Assert-ScoreboardSelfTestThrows {
+        Resolve-KnobPassthrough @("IZARRAVM_ONE_LOOKUP_LOAD=0") $reserved
+    } "which is a retired knob" "the retired one-lookup load knob"
 
     Assert-ScoreboardSelfTestThrows {
         Resolve-KnobPassthrough @("IZARRAVM_RIP_PROFILE=1") $reserved
@@ -3729,7 +3735,7 @@ function Invoke-Fixture($Fixture, [string]$ExecutablePath, [string]$ScratchRoot,
     $ppmPath = Join-Path $ScratchRoot "$stem.ppm"
     $stdoutPath = Join-Path $ScratchRoot "$stem.out"
     $result = [ordered]@{
-        name = $Fixture.name; arm = $Arm; one_lookup_store = $OneLookupStore; one_lookup_load = $OneLookupLoad
+        name = $Fixture.name; arm = $Arm
         knobs = Resolve-KnobPassthrough $Knobs @((Get-BoardOwnedEnvironment).Keys)
         exit_code = $null; host_wall_s = 0.0; background_load = 0.0; background_peak = 0.0
         load_samples = 0; contaminated = $false; invariant = 'FAIL'; notes = @(); refused_axes = @()
@@ -4025,7 +4031,7 @@ $hostPolicy = if ($IsWindows) {
     @{ measurement_class='diagnostic'; affinity_policy='inherited, unverified';
         allowed_logical_processors=$null; raster_lanes='unverified'; child_affinity_verified=$false }
 }
-if ($Arm -ne 'on' -or $OneLookupStore -ne '1' -or $OneLookupLoad -ne '1') {
+if ($Arm -ne 'on') {
     $hostPolicy.measurement_class = 'diagnostic'
 }
 if ($resolvedKnobs.Count -gt 0) {
@@ -4092,8 +4098,6 @@ $summary = [ordered]@{
     schema           = $scoreboardSchema
     label            = $Label
     arm              = $Arm
-    one_lookup_store = $OneLookupStore
-    one_lookup_load  = $OneLookupLoad
     knobs            = $resolvedKnobs
     recorded_at      = (Get-Date).ToString("o")
     executable       = $executablePath
@@ -4105,7 +4109,7 @@ $summary = [ordered]@{
 $jsonPath = Join-Path $ResultsDirectory "scoreboard.json"
 $summary | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $jsonPath -Encoding utf8
 
-$markdown = @(Get-ScoreboardMarkdown $rows $Label $Arm $OneLookupStore $OneLookupLoad `
+$markdown = @(Get-ScoreboardMarkdown $rows $Label $Arm `
         $resolvedKnobs $hostPolicy)
 $markdownPath = Join-Path $ResultsDirectory "scoreboard.md"
 $markdown -join "`n" | Set-Content -LiteralPath $markdownPath -Encoding utf8

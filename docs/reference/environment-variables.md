@@ -158,8 +158,6 @@ changes the result.
 | `IZARRAVM_DIRECT_HOLD_LOAD_BIAS` | `1`/`on`, `0`/`off`, empty is off. | Off | Keeps the load biases in a host register in integer blocks. |
 | `IZARRAVM_DIRECT_ALIGN_TEST_AL` | `1`/`on`, `0`/`off`, empty is off. | Off | Uses `test al,mask` for the alignment test in emitted code. |
 | `IZARRAVM_DIRECT_EAGER_FLAGS` | `1`/`on`/`true`, `0`/`off`/`false`, empty is on. | On | Writes the flags straight to the CPU state and not to a lazy flags record. |
-| `IZARRAVM_ONE_LOOKUP_STORE` | `0` turns it off. | On | Makes emitted stores use the one-lookup store bias table. |
-| `IZARRAVM_ONE_LOOKUP_LOAD` | `0` turns it off. | On | Makes emitted loads use the one-lookup table. |
 | `IZARRAVM_DECODE_CACHE_LINES` | A power of two. | `65536` | Sets the number of lines in the instruction decode cache. A bad value gives the default. |
 | `IZARRAVM_DECODE_PACK` | Any value other than `0` turns it on. | Off | Takes the first touch of a decode line from a packed side array. |
 | `IZARRAVM_POLL_SKIP_NEG_CACHE` | Empty and `0` turn it off. | On | Turns on the negative cache of the poll skip. |
