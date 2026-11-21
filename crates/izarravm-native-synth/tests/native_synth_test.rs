@@ -32,6 +32,25 @@ fn fluidr3mono_renders_audible_program_zero() {
 }
 
 #[test]
+fn fluidsynth_loads_a_soundfont_from_a_non_ascii_folder() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("ñó");
+    fs::create_dir_all(&folder).unwrap();
+    let copy = folder.join("bank.sf3");
+    fs::copy(embedded_soundfont(), &copy).unwrap();
+
+    let mut synth = FluidSynth::new(&copy).unwrap();
+    synth.send(&[0xC0, 0]).unwrap();
+    synth.send(&[0x90, 60, 100]).unwrap();
+    let mut output = vec![0_i16; (SAMPLE_RATE_HZ / 2 * 2) as usize];
+    synth.render_interleaved_i16(&mut output).unwrap();
+    assert!(output.iter().any(|sample| sample.unsigned_abs() > 16));
+}
+
+#[test]
 fn wrappers_reject_incomplete_midi_and_partial_frames() {
     if !NATIVE_SYNTH_AVAILABLE {
         assert_eq!(
@@ -242,7 +261,16 @@ fn local_munt_roms_render_audio() {
         .expect("set IZARRAVM_MT32_CONTROL_ROM to run this ignored test");
     let pcm = env::var_os("IZARRAVM_MT32_PCM_ROM")
         .expect("set IZARRAVM_MT32_PCM_ROM to run this ignored test");
-    let mut synth = MuntSynth::new(control, pcm).unwrap();
+    // Copy the ROMs into a folder with non-ASCII characters, so the test also
+    // covers a path that the C library could not open by name.
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("ñó");
+    fs::create_dir_all(&folder).unwrap();
+    let control_copy = folder.join("control.rom");
+    let pcm_copy = folder.join("pcm.rom");
+    fs::copy(&control, &control_copy).unwrap();
+    fs::copy(&pcm, &pcm_copy).unwrap();
+    let mut synth = MuntSynth::new(control_copy, pcm_copy).unwrap();
     synth.send(&[0xC1, 0]).unwrap();
     synth.send(&[0x91, 60, 100]).unwrap();
     let mut output = vec![0_i16; SAMPLE_RATE_HZ as usize * 2];
