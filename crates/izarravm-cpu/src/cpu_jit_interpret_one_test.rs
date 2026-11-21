@@ -44,6 +44,8 @@ mod test_word_helper;
 ))]
 #[path = "cpu_jit_live_pm_segments_test.rs"]
 mod live_pm_segments;
+#[path = "cpu_jit_native_callout_rows_test.rs"]
+mod native_callout_rows;
 
 const ENTRY: u32 = 0x100;
 /// A page the block's code is not on, for the stack and for the POP's destination.

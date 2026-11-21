@@ -1031,6 +1031,9 @@ pub(crate) struct BlockCache {
     live_data_segments_arm: u8,
     /// `IZARRAVM_LIVE_PM_DATA_SEGMENTS`, read once per cache. See `live_pm_data_segments_enabled`.
     live_pm_data_segments: bool,
+    /// `IZARRAVM_NATIVE_CALLOUT_ROWS`: the set of call-out rows that compile natively. Read once
+    /// per cache. See `native_callout_rows`.
+    native_callout_rows: u8,
     /// How many indexed layout copies `entry_layout` has taken. Mutant M14's only witness: the
     /// entry check must REPLACE the 116-byte fetch, never add a second one, and "this accessor
     /// reads one `Vec`" is not otherwise assertable in Rust. Atomic rather than `Cell` because
@@ -1472,6 +1475,7 @@ impl BlockCache {
             chain_entry_check_armed: chain_entry_check_armed(),
             live_data_segments_arm: live_data_segments_arm(),
             live_pm_data_segments: live_pm_data_segments_enabled(),
+            native_callout_rows: native_callout_rows(),
             #[cfg(test)]
             entry_layout_fetches: std::sync::atomic::AtomicU32::new(0),
             block_imm_lanes: Vec::new(),
@@ -4143,6 +4147,7 @@ impl Clone for BlockCache {
         cache.entry_cap = self.entry_cap;
         cache.live_data_segments_arm = self.live_data_segments_arm;
         cache.live_pm_data_segments = self.live_pm_data_segments;
+        cache.native_callout_rows = self.native_callout_rows;
         #[cfg(test)]
         {
             cache.defer_short_for_test = self.defer_short_for_test;
@@ -5627,6 +5632,22 @@ pub(crate) enum DirectKind {
     DirectionFlag {
         set: bool,
     },
+    /// CLI (0xFA), behind the `cli` item of `IZARRAVM_NATIVE_CALLOUT_ROWS`. Clears IF in the RBP
+    /// shadow and in the in-memory EFLAGS, as `DirectionFlag` does for DF. `privilege_check` is
+    /// set in protected mode and V86: the block compares the cached CPL with the IOPL of the
+    /// shadow at run time and side exits before any effect when CPL > IOPL, so the interpreter
+    /// raises the #GP.
+    Cli {
+        privilege_check: bool,
+    },
+    /// XCHG between two registers (0x86 and 0x87 with mod = 3, 0x91..=0x97), behind the
+    /// `xchg_reg` item of `IZARRAVM_NATIVE_CALLOUT_ROWS`. `Byte` swaps the byte registers named
+    /// by the two indices (4..=7 are AH, CH, DH, BH). Flags do not change.
+    XchgReg {
+        a: u8,
+        b: u8,
+        width: MemoryWidth,
+    },
     /// PUSH r/m32, MEMORY form (0xFF /6): one dword read at `addr`, one dword write at
     /// `SS:[ESP-4]`, then `ESP -= 4`.
     ///
@@ -5946,6 +5967,10 @@ pub(crate) enum StoreSource {
     /// because it has no CPU, and `stack_width_kind` must not, because resolving early would
     /// throw away the segment identity that `selector_segment` needs to pin the descriptor.
     Selector(SegmentIndex),
+    /// A data segment's SELECTOR read from the CPU state at run time, for the native
+    /// `MOV r/m16, Sreg`. Unlike `Selector` it never becomes an immediate, so the segment needs no
+    /// entry pin and an earlier `MOV Sreg` call-out in the block is seen. Never CS.
+    LiveSelector(SegmentIndex),
     EipDelta(u32),
     /// A byte the SLOT computed before the store's address work started, parked in the native
     /// frame at `STACK_PUSH_MEM_VALUE` and read back here. Today's only producer is `SetCcMem`.
@@ -6087,6 +6112,8 @@ impl DirectKind {
 
             // --- flags and accumulator housekeeping -------------------------
             Self::CarryFlag { .. } | Self::DirectionFlag { .. } => TimingClass::FlagOp,
+            Self::Cli { .. } => TimingClass::Cli,
+            Self::XchgReg { .. } => TimingClass::Xchg,
             Self::Sahf => TimingClass::Sahf,
             Self::Cwde { .. } => TimingClass::Cbw,
             Self::Cdq { .. } => TimingClass::Cwd,
@@ -6164,6 +6191,13 @@ impl DirectKind {
             | Self::Push16 {
                 source: StoreSource::Reg(..) | StoreSource::ParkedByte,
             } => TimingClass::PushReg,
+            // `LiveSelector` is only built for `Store`; the stack arms never see it.
+            Self::Push {
+                source: StoreSource::LiveSelector(..),
+            }
+            | Self::Push16 {
+                source: StoreSource::LiveSelector(..),
+            } => unreachable!("LiveSelector is built for Store only"),
             Self::PushMem { .. } => TimingClass::PushMem,
             Self::Pop { .. } | Self::Pop16 { .. } => TimingClass::PopReg,
             Self::Leave | Self::Leave16 { .. } => TimingClass::Leave,
@@ -6627,6 +6661,12 @@ impl DirectKind {
                 segment: SegmentIndex::Cs,
                 ..
             }
+                // The native `MOV r/m16, CS` is a `Store`. Its data-segment sources read the CPU
+                // state at run time (`LiveSelector`), so only the CS source bakes anything.
+                | Self::Store {
+                    source: StoreSource::Selector(SegmentIndex::Cs),
+                    ..
+                }
                 // `CallFar16` pushes the OLD (pre-transfer) CS selector as a compile-time
                 // immediate baked from this block's entry CS -- exactly the same shape `PUSH CS`
                 // and `MOV r16, CS` bake, just inside a far-call's own emitter arm rather than a
@@ -7444,6 +7484,108 @@ impl DirectUnitPlanner {
             Some(kind) => PlannedInsn::Native(kind),
             None => PlannedInsn::HardBoundary,
         }
+    }
+}
+
+/// The native form of a call-out row that `IZARRAVM_NATIVE_CALLOUT_ROWS` lowers, or the planned
+/// kind unchanged. Runs in the compile walk because it needs the CPU (the mode and privilege for
+/// CLI) and the segment support check for the store, and `classify` has neither. Every refusal
+/// keeps the call-out row, never a hard boundary.
+fn native_callout_row_kind(
+    cpu: &CpuGsw,
+    insn: &DecodedInsn,
+    planned: DirectKind,
+    rows: u8,
+) -> DirectKind {
+    let DirectKind::CallOut {
+        helper: CallOutHelper::InterpretOne { row },
+    } = planned
+    else {
+        return planned;
+    };
+    let native = match row {
+        InterpretOneRow::MovRmSreg if rows & NATIVE_ROW_MOV_RM_SREG != 0 => {
+            mov_rm_sreg_store_kind(insn)
+        }
+        InterpretOneRow::Cli if rows & NATIVE_ROW_CLI != 0 => {
+            // The interpreter faults when CPL > IOPL in protected mode. A site that faults now
+            // keeps the call-out, whose governor demotes a site that always faults. A native
+            // side exit would repeat forever.
+            let protected = cpu.is_protected_mode();
+            if protected && cpu.current_privilege_level() > cpu.iopl() {
+                None
+            } else {
+                Some(DirectKind::Cli {
+                    privilege_check: protected,
+                })
+            }
+        }
+        InterpretOneRow::Xchg if rows & NATIVE_ROW_XCHG_REG != 0 => xchg_reg_kind(insn),
+        _ => None,
+    };
+    match native {
+        // No segment counts as live here. A store through a segment that is not usable at entry
+        // keeps the call-out row.
+        Some(kind) if kind_segment_access_supported(cpu, kind, 0) => kind,
+        _ => planned,
+    }
+}
+
+/// `MOV r/m16, Sreg` with a memory destination as a word store of the selector. The reg fields 6
+/// and 7 stay refused, as in `classify`. A data segment reads its selector at run time, CS bakes
+/// its own.
+fn mov_rm_sreg_store_kind(insn: &DecodedInsn) -> Option<DirectKind> {
+    let segment = match insn.modrm?.reg {
+        0 => SegmentIndex::Es,
+        1 => SegmentIndex::Cs,
+        2 => SegmentIndex::Ss,
+        3 => SegmentIndex::Ds,
+        4 => SegmentIndex::Fs,
+        5 => SegmentIndex::Gs,
+        _ => return None,
+    };
+    let DecodedOperand::Mem(addr) = insn.operand? else {
+        return None;
+    };
+    Some(DirectKind::Store {
+        source: if segment == SegmentIndex::Cs {
+            StoreSource::Selector(segment)
+        } else {
+            StoreSource::LiveSelector(segment)
+        },
+        width: MemoryWidth::Word,
+        addr: direct_addr(addr)?,
+        class: TimingClass::MovRegSreg.index() as u8,
+    })
+}
+
+/// XCHG between two registers. The memory forms (mod != 3) return `None`.
+fn xchg_reg_kind(insn: &DecodedInsn) -> Option<DirectKind> {
+    let width = match insn.operand_size {
+        OperandSize::Word => MemoryWidth::Word,
+        OperandSize::Dword => MemoryWidth::Dword,
+    };
+    match insn.opcode {
+        0x91..=0x97 => Some(DirectKind::XchgReg {
+            a: 0,
+            b: (insn.opcode & 7) as u8,
+            width,
+        }),
+        0x86 | 0x87 => {
+            let DecodedOperand::Reg(rm) = insn.operand? else {
+                return None;
+            };
+            Some(DirectKind::XchgReg {
+                a: rm,
+                b: insn.modrm?.reg,
+                width: if insn.opcode == 0x86 {
+                    MemoryWidth::Byte
+                } else {
+                    width
+                },
+            })
+        }
+        _ => None,
     }
 }
 
@@ -8570,7 +8712,15 @@ fn compile_with_budget(
             );
             break;
         }
-        let planned = DirectUnitPlanner::classify(&insn, lin, entry_lin);
+        let planned = match DirectUnitPlanner::classify(&insn, lin, entry_lin) {
+            PlannedInsn::Native(kind) => PlannedInsn::Native(native_callout_row_kind(
+                cpu,
+                &insn,
+                kind,
+                cpu.jit_direct.native_callout_rows(),
+            )),
+            other => other,
+        };
         // L1, the third `IZARRAVM_ROTATE_ROWS` arm (dev_docs/duke-reprofile-2026-08-19.md §6.1).
         //
         // WHY HERE AND NOT IN `classify`. `classify` takes a `&DecodedInsn` and two LINEAR
@@ -15129,6 +15279,78 @@ fn parse_live_data_segments_arm(value: Result<String, std::env::VarError>) -> u8
     }
 }
 
+/// `IZARRAVM_NATIVE_CALLOUT_ROWS` item bits. Each item lowers one `InterpretOne` row natively.
+pub(crate) const NATIVE_ROW_MOV_RM_SREG: u8 = 1;
+pub(crate) const NATIVE_ROW_CLI: u8 = 2;
+pub(crate) const NATIVE_ROW_XCHG_REG: u8 = 4;
+const NATIVE_ROW_ALL: u8 = NATIVE_ROW_MOV_RM_SREG | NATIVE_ROW_CLI | NATIVE_ROW_XCHG_REG;
+
+/// The item set of `IZARRAVM_NATIVE_CALLOUT_ROWS`. Off (zero) by default. The value is read once
+/// per `BlockCache`.
+pub(crate) fn native_callout_rows() -> u8 {
+    #[cfg(test)]
+    if let Some(forced) = NATIVE_CALLOUT_ROWS_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ROWS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| parse_native_callout_rows(std::env::var("IZARRAVM_NATIVE_CALLOUT_ROWS")))
+}
+
+/// The `IZARRAVM_NATIVE_CALLOUT_ROWS` spelling table. Unset, empty, and `0` name the empty set.
+/// `1` names every item. Otherwise the value is a comma-separated list of `mov_rm_sreg`, `cli`,
+/// and `xchg_reg`.
+fn parse_native_callout_rows(value: Result<String, std::env::VarError>) -> u8 {
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` (off), `1` (every item), \
+                            or a comma-separated list of `mov_rm_sreg`, `cli`, and `xchg_reg`";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return 0,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "IZARRAVM_NATIVE_CALLOUT_ROWS is set to a value that is not valid UTF-8; {ACCEPTED}"
+        ),
+        Ok(raw) => raw,
+    };
+    let raw = raw.trim();
+    match raw {
+        "" | "0" => return 0,
+        "1" => return NATIVE_ROW_ALL,
+        _ => {}
+    }
+    let mut rows = 0;
+    for item in raw.split(',') {
+        rows |= match item.trim() {
+            "mov_rm_sreg" => NATIVE_ROW_MOV_RM_SREG,
+            "cli" => NATIVE_ROW_CLI,
+            "xchg_reg" => NATIVE_ROW_XCHG_REG,
+            other => panic!(
+                "IZARRAVM_NATIVE_CALLOUT_ROWS={raw:?} names no item {other:?}; {ACCEPTED}. \
+                 Refusing to guess: a mistyped value that ran the default would look like a \
+                 change that does nothing"
+            ),
+        };
+    }
+    rows
+}
+
+// Per-thread, like `CHAIN_ENTRY_CHECK_OVERRIDE`. A fixture sets it BEFORE it builds the cache.
+#[cfg(test)]
+thread_local! {
+    static NATIVE_CALLOUT_ROWS_OVERRIDE: std::cell::Cell<Option<u8>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the native call-out row set on this thread; `None` restores the ambient reading. Set it
+/// BEFORE constructing the `BlockCache` under test.
+#[cfg(test)]
+pub(crate) fn set_native_callout_rows_for_test(forced: Option<u8>) {
+    NATIVE_CALLOUT_ROWS_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The spelling table, reachable from the fixtures.
+#[cfg(test)]
+pub(crate) fn parse_native_callout_rows_for_test(value: Result<String, std::env::VarError>) -> u8 {
+    parse_native_callout_rows(value)
+}
+
 // Per-thread, like `CHAIN_ENTRY_CHECK_OVERRIDE`. A fixture sets it BEFORE it builds the cache.
 #[cfg(test)]
 thread_local! {
@@ -20265,6 +20487,19 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             // its EIP advance, all of which the loop tail below charges from the slot list.
             DirectKind::Nop => {}
             DirectKind::DirectionFlag { set } => emit_direction_flag(&mut e, set),
+            // The privilege test comes first and exits before any effect, so the interpreter
+            // re-executes the CLI and delivers the #GP. The exit reuses the `Permission` reason.
+            DirectKind::Cli { privilege_check } => {
+                if privilege_check {
+                    let side = e.label();
+                    let guard = e.label();
+                    emit_cli_privilege_check(&mut e, guard);
+                    side_exit_reason_stubs.push((guard, side, SideExitReason::Permission));
+                    side_exits.push((side, slot.lin.wrapping_sub(span.key.linear), completed));
+                }
+                emit_clear_interrupt_flag(&mut e);
+            }
+            DirectKind::XchgReg { a, b, width } => emit_xchg_reg(&mut e, a, b, width),
             // CLC / STC. The flag shadow gets the constant bit, then `emit_set_cf_only` publishes
             // it exactly as `set_flag(FLAG_CF, ..)` would -- through the pending descriptor's CF
             // override when one is live, straight into EFLAGS when none is, and with the trailing
@@ -24509,11 +24744,11 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
         // `emit_store` rewrites this to `Imm` before it can reach here, because that is the only
         // caller with a `SegmentLayout` to resolve it from. Reaching this arm means a second store
         // path grew and did not.
-        StoreSource::Selector(segment) => {
+        StoreSource::Selector(segment) | StoreSource::LiveSelector(segment) => {
             debug_assert_ne!(
                 segment,
                 SegmentIndex::Cs,
-                "PUSH CS must be resolved to an immediate in emit_store"
+                "CS must be resolved to an immediate in emit_store"
             );
             e.movzx_r32_word_disp32(
                 value,
@@ -24720,6 +24955,10 @@ fn eip_offset() -> i32 {
 
 fn eflags_offset() -> i32 {
     (core::mem::offset_of!(CpuGsw, registers) + core::mem::offset_of!(Registers, eflags)) as i32
+}
+
+fn cpl_offset() -> i32 {
+    core::mem::offset_of!(CpuGsw, cpl) as i32
 }
 
 fn pending_offset() -> i32 {
@@ -26433,6 +26672,57 @@ fn emit_direction_flag(e: &mut Encoder, set: bool) {
         e.and_r32_imm32(Reg::RAX, !crate::FLAG_DF);
     }
     e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RAX);
+}
+
+/// The run-time half of `check_interrupt_flag_privilege` for a protected-mode CLI: jump to `fault`
+/// when the cached CPL is above the IOPL held in the RBP shadow. Nothing is written. The compare
+/// is unsigned, as the interpreter's `u8` compare is.
+fn emit_cli_privilege_check(e: &mut Encoder, fault: Label) {
+    e.mov_r32_r32(Reg::RAX, Reg::RBP);
+    e.shr_r32_imm8(Reg::RAX, 12);
+    e.and_r32_imm32(Reg::RAX, 3);
+    e.movzx_r32_byte_disp32(Reg::RDX, Reg::R15, cpl_offset());
+    e.alu_r32_r32(7, Reg::RDX, Reg::RAX);
+    e.ja(fault);
+}
+
+/// CLI's effect. IF is bit 9 of EFLAGS, outside the lazy arithmetic descriptor, so nothing is
+/// settled. Both copies move for the reason `emit_direction_flag` gives.
+fn emit_clear_interrupt_flag(e: &mut Encoder) {
+    e.and_r32_imm32(Reg::RBP, !crate::FLAG_IF);
+    e.load_r32_disp32(Reg::RAX, Reg::R15, eflags_offset());
+    e.and_r32_imm32(Reg::RAX, !crate::FLAG_IF);
+    e.store_r32_disp32(Reg::R15, eflags_offset(), Reg::RAX);
+}
+
+/// XCHG between two guest registers at the operand size. A word swap leaves bits 31..16 of both
+/// registers alone, and a byte swap leaves the other bytes alone. Both operands are read before
+/// either is written, so AL and AH may name the same host register.
+fn emit_xchg_reg(e: &mut Encoder, a: u8, b: u8, width: MemoryWidth) {
+    if a == b {
+        return;
+    }
+    match width {
+        MemoryWidth::Byte => {
+            emit_read_store_value(e, StoreSource::Reg(a), MemoryWidth::Byte, Reg::RAX);
+            emit_read_store_value(e, StoreSource::Reg(b), MemoryWidth::Byte, Reg::RCX);
+            emit_write_gpr8(e, a, Reg::RCX);
+            emit_write_gpr8(e, b, Reg::RAX);
+        }
+        MemoryWidth::Word => {
+            e.mov_r32_r32(Reg::RAX, home(a));
+            e.mov_r16_r16(home(a), home(b));
+            e.mov_r16_r16(home(b), Reg::RAX);
+        }
+        MemoryWidth::Dword => {
+            e.mov_r32_r32(Reg::RAX, home(a));
+            e.mov_r32_r32(home(a), home(b));
+            e.mov_r32_r32(home(b), Reg::RAX);
+        }
+        MemoryWidth::Qword | MemoryWidth::Tbyte => {
+            unreachable!("register exchanges are never 8- or 10-byte wide")
+        }
+    }
 }
 
 // The pushfq/pop below moves RSP by 8 for one instruction: the accepted unwind gap
@@ -33892,6 +34182,11 @@ impl BlockCache {
     /// Whether `IZARRAVM_LIVE_PM_DATA_SEGMENTS` is on for this cache.
     pub(crate) fn live_pm_data_segments(&self) -> bool {
         self.live_pm_data_segments
+    }
+
+    /// The `IZARRAVM_NATIVE_CALLOUT_ROWS` item set of this cache, as `NATIVE_ROW_*` bits.
+    pub(crate) fn native_callout_rows(&self) -> u8 {
+        self.native_callout_rows
     }
 
     /// Whether the entry check reads the chain requirement. Read once per cache, in
