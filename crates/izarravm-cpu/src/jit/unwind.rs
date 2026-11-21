@@ -116,9 +116,12 @@ pub(crate) struct ArenaUnwind {
     unwind_rva: u32,
 }
 
-// SAFETY: the table handle and entry array are used only from the emulation thread that
-// owns the arena; the OS reads the array but the pointer itself is never shared by us.
+// SAFETY: the table handle and the entry array move with the arena that owns them. The OS
+// reads the array through a pointer that stays valid when the box moves.
 unsafe impl Send for ArenaUnwind {}
+// SAFETY: each method that changes the table takes `&mut self`, so a shared reference cannot
+// change it. An `ExecutableBuffer` holds this type, and the mkII backend keeps such buffers in
+// `static` `OnceLock` values, which need `Sync`.
 unsafe impl Sync for ArenaUnwind {}
 
 impl ArenaUnwind {

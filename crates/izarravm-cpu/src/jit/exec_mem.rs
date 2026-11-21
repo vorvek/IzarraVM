@@ -124,17 +124,18 @@ pub(crate) struct ExecutableArena {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ArenaSlot(usize);
 
-// SAFETY: the buffer holds only plain code bytes; nothing here is interior-mutable shared state.
-// `CpuGsw` (which owns these via `JitBlockCache`) is not itself required to be Send/Sync today,
-// but marking this Send/Sync keeps it from accidentally blocking a future requirement; the
-// pointer is never aliased outside this type.
+// SAFETY: the buffer owns its mapping, and the mapping holds only code bytes. No other value
+// holds the pointer, so the buffer can move to a different thread with its owner.
 unsafe impl Send for ExecutableBuffer {}
+// SAFETY: a shared reference gives only the address and the length of a sealed mapping. No
+// method changes the buffer through `&self`. The mkII backend needs this impl: it keeps its
+// stub buffers in `static` `OnceLock` values.
 unsafe impl Sync for ExecutableBuffer {}
 
-// SAFETY: installing code requires an exclusive borrow, and installed pages are never made
-// writable again. Exposed entry pointers refer only to sealed pages.
+// SAFETY: the arena owns its mapping. Installing code requires an exclusive borrow, and
+// installed pages are never made writable again. Exposed entry pointers refer only to sealed
+// pages. The type is not `Sync`: no code shares an arena between threads.
 unsafe impl Send for ExecutableArena {}
-unsafe impl Sync for ExecutableArena {}
 
 impl ExecutableBuffer {
     /// Allocate `len` bytes (rounded up to a page), write `code` into it, then flip the page to
