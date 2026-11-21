@@ -483,6 +483,7 @@ fn real_main() -> Result<(), Box<dyn Error>> {
         if let Some(path) = cli.profile_json.as_deref() {
             validate_profile_json_parent(path)?;
         }
+        startup.ensure_c_drive();
         return bootprofile::run(
             startup.c_drive(),
             hardware,

@@ -622,7 +622,7 @@ fn hardware_validation_follows_fallback_and_preferences() {
     let observed_fallback = fallback.clone();
 
     let error = resolve_with(&cli, &locations, move |path| {
-        assert!(observed_fallback.is_dir());
+        assert!(!observed_fallback.exists());
         observed_reads.borrow_mut().push(path.to_owned());
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -633,7 +633,7 @@ fn hardware_validation_follows_fallback_and_preferences() {
 
     assert!(matches!(error, StartupError(ConfigError::InvalidMemory(1))));
     assert_eq!(reads.borrow().as_slice(), [expected_prefs]);
-    assert!(fallback.is_dir());
+    assert!(!fallback.exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1058,4 +1058,21 @@ fn rejected_prefs_file_is_copied_aside_only_on_the_gui_path() {
         std::fs::read_to_string(&prefs_path).unwrap(),
         "master_volume = \"loud\"\n"
     );
+}
+
+#[test]
+fn headless_resolve_creates_no_default_folders_until_the_c_drive_is_needed() {
+    let root = startup_test_dir("lazy-c-drive");
+    let state_dir = root.join("state");
+    let locations = StartupLocations {
+        state_dir: state_dir.clone(),
+        executable_dir: root.join("portable"),
+    };
+    let cli = Cli::try_parse_from(["izarravm", "--headless-config-check"]).unwrap();
+
+    let resolved = resolve_with(&cli, &locations, |path| std::fs::read_to_string(path)).unwrap();
+    assert!(!state_dir.exists(), "resolving must not create folders");
+
+    resolved.ensure_c_drive();
+    assert!(state_dir.join("c_drive").is_dir());
 }

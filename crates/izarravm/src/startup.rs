@@ -187,6 +187,8 @@ pub(super) struct ResolvedStartup {
     prefs_rejected: bool,
     prefs_path: PathBuf,
     state_dir: PathBuf,
+    /// The C: folder is the per-user or portable default, so it may not exist yet.
+    create_c_drive: bool,
 }
 
 pub(super) struct GuiLaunch {
@@ -254,11 +256,23 @@ impl ResolvedStartup {
         &self.config.dos.c_drive
     }
 
+    /// Create the default C: folder, and with it the folder that holds
+    /// izarravm.conf and cmos.bin. Call this before the first save of either.
+    /// Modes that do not mount C: never call it.
+    pub(super) fn ensure_c_drive(&self) {
+        if self.create_c_drive
+            && let Err(err) = std::fs::create_dir_all(&self.config.dos.c_drive)
+        {
+            warn!(%err, path = %self.config.dos.c_drive.display(), "could not create the C: folder");
+        }
+    }
+
     pub(super) fn load_global_glide_ovl(&self) -> Option<Vec<u8>> {
         load_state_glide_ovl(&self.state_dir)
     }
 
     pub(super) fn into_gui(self, rom: Vec<u8>, test_pattern: bool) -> GuiLaunch {
+        self.ensure_c_drive();
         let mut rtc_setup = cmos::RtcSetup::from_c_root(&self.config.dos.c_drive);
         rtc_setup.requested = self.requested;
         let glide_ovl = self.load_global_glide_ovl();
@@ -352,7 +366,6 @@ fn resolve_with(
     });
     if uses_default_c_root {
         config.dos.c_drive = locations.default_c_root(cli.portable);
-        let _ = std::fs::create_dir_all(&config.dos.c_drive);
     }
     let prefs_path = prefs::prefs_path(&config.dos.c_drive);
     let (saved_prefs, prefs_rejected) = prefs::GuiPrefs::load_checked(&prefs_path, &mut read_text);
@@ -397,6 +410,7 @@ fn resolve_with(
         prefs_rejected,
         prefs_path,
         state_dir: locations.state_dir.clone(),
+        create_c_drive: uses_default_c_root,
     })
 }
 
