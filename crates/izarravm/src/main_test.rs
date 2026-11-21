@@ -134,6 +134,7 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "fast_map_wipes_direct_data_map",
     "fast_map_wipes_direct_map",
     "fast_map_wipes_tlb_flush",
+    "fast_map_write_fill_refused_translation",
     "fetch_page_hits",
     "fetch_page_misses",
     "flag_materializations",
@@ -1253,6 +1254,7 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         tlb_insert_evicts_other_generation: 146,
         fast_map_two_tables_switches: 147,
         fast_map_two_tables_tag_wipes: 148,
+        fast_map_write_fill_refused_translation: 149,
     };
 
     let code_watch_edges = izarravm_cpu::CodeWatchEdgeCounters {
@@ -1310,6 +1312,7 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         ("tlb_insert_evicts_other_generation", 146),
         ("fast_map_two_tables_switches", 147),
         ("fast_map_two_tables_tag_wipes", 148),
+        ("fast_map_write_fill_refused_translation", 149),
         ("slot_reject_misaligned", 130),
         ("slot_reject_page_cross", 131),
         ("slot_reject_absent", 132),
@@ -1519,6 +1522,7 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         tlb_insert_evicts_other_generation: _,
         fast_map_two_tables_switches: _,
         fast_map_two_tables_tag_wipes: _,
+        fast_map_write_fill_refused_translation: _,
     } = izarravm_cpu::FastMapAuditCounters::default();
     let izarravm_cpu::CodeWatchEdgeCounters {
         sticky_page_edges: _,

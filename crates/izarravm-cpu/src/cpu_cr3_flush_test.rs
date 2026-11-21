@@ -301,8 +301,8 @@ fn pte_edit_with_a_tlb_warm_target_still_retires() {
     .expect("the store under test must retire");
     assert_eq!(
         cpu.fast_map_probe_counters().hits,
-        hits_before + 1,
-        "the translation-page store must use the primed FastMap write hit"
+        hits_before,
+        "the fast map holds no write mapping of a translation page, so the store takes no write hit"
     );
     assert_eq!(
         cpu.perf_counters().translation_a_stores,

@@ -1011,6 +1011,19 @@ impl FastMap {
             )
     }
 
+    /// `physical_page_base` just became a translation page. Invalidate every entry of both tables
+    /// that holds a write mapping of it, watched or not: a native store through such an entry
+    /// would skip the retire the interpreter runs for a page-table write. A later read refills
+    /// the entry without a write mapping. Returns the number of entries cleared.
+    pub(crate) fn clear_write_mappings_of_physical_page(&mut self, physical_page_base: u32) -> u64 {
+        sweep_write_mappings(&mut self.storage, &self.populated_pages, physical_page_base)
+            + sweep_write_mappings(
+                &mut self.dormant.storage,
+                &self.dormant.populated_pages,
+                physical_page_base,
+            )
+    }
+
     /// Copy the live pages into the census buffer of ring slot `slot`, replacing what it held.
     /// Returns how many pages the buffer held before (those never came back) and how many it
     /// holds now. Reuses the buffer allocation.
@@ -1255,6 +1268,16 @@ impl FastMap {
             .is_some_and(|storage| FastMapStorage::bit(&storage.live_pages, index))
     }
 
+    /// Whether the dormant table holds a live entry with a write mapping for `linear`.
+    #[cfg(test)]
+    pub(crate) fn dormant_has_write_mapping_for_test(&self, linear: u32) -> bool {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.dormant.storage.as_ref().is_some_and(|storage| {
+            FastMapStorage::bit(&storage.live_pages, index)
+                && storage.flags[index] & HAS_WRITE_BIAS != 0
+        })
+    }
+
     /// Replace the tag of the dormant table, to force a mismatch.
     #[cfg(test)]
     pub(crate) fn set_dormant_tag_for_test(&mut self, tag: TableTag) {
@@ -1362,6 +1385,30 @@ fn sweep_unwatched(
         let index = page as usize;
         if storage.physical_pages[index] != physical_page_base
             || storage.flags[index] & PAGE_WATCHED != 0
+        {
+            continue;
+        }
+        storage.clear_entry(index);
+        cleared += 1;
+    }
+    cleared
+}
+
+/// Invalidate the entries of one table that map `physical_page_base` and hold a write mapping.
+/// Returns how many it cleared.
+fn sweep_write_mappings(
+    storage: &mut Option<FastMapStorage>,
+    populated_pages: &[u32],
+    physical_page_base: u32,
+) -> u64 {
+    let Some(storage) = storage.as_mut() else {
+        return 0;
+    };
+    let mut cleared = 0;
+    for &page in populated_pages {
+        let index = page as usize;
+        if storage.physical_pages[index] != physical_page_base
+            || storage.flags[index] & HAS_WRITE_BIAS == 0
         {
             continue;
         }
