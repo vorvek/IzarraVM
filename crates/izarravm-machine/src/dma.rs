@@ -17,8 +17,7 @@ use izarravm_bus::Memory;
 use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, MASTER_CLOCK_HZ};
 
 /// Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`): the 8237's per-byte bus cycle, 5 ISA
-/// BCLK at 8.33 MHz = 600 ns, per 86Box `dma.c:265`
-/// (`dev_docs/2026-09-05-device-timing-slice9-design.md` §3.2). This is a
+/// BCLK at 8.33 MHz = 600 ns, per 86Box `dma.c:265`. This is a
 /// DEADLINE-lane bound on the current-count interpolation `count_after` below,
 /// never a charge -- it does not appear in any `clocks(N)` or `scale_*` call.
 /// Rounded to the nearest master tick: 600 ns * `MASTER_CLOCK_HZ` / 1e9.

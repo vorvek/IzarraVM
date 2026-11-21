@@ -860,7 +860,7 @@ fn both_vga_direct_page_backings_are_page_aligned() {
 }
 
 /// Slice 0 of the "skip the VGA's per-frame render while a Voodoo owns the
-/// cable" lever (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md`, lever
+/// cable" lever (lever
 /// C): `advance_cable_aware(_, true)` must render zero rows, and it must do
 /// so without touching beam timing at all -- the frame counter blink derives
 /// from and the retrace bits the guest polls are pure beam-position geometry,

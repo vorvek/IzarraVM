@@ -80,8 +80,7 @@ V86 monitor. A rerun of Pyramid with TOKAEMM removed from CONFIG.SYS
 (`-NoEmm`, results `100-000-pyramid/20260830-152718-census-noemm`) drops
 the census total from 26,374,252 to 7,223 and the dword IRET row to zero.
 
-**Corrections from the design research (2026-08-30 evening,
-`dev_docs/v86-reflection-fastpath-design-2026-08-30.md`):**
+**Corrections from the design research (2026-08-30 evening):**
 
 * The `-NoEmm` control proves ATTRIBUTION, not cost. Removing TOKAEMM
   SLOWED Pyramid (rt 1.2743 -> 1.0984, instructions +11.7%, verified from
@@ -172,5 +171,3 @@ treating it as a regression. The four still-flagged games are capped
 at rt ~2.2-2.5 by monitor-resident clocks (26-43% of guest clocks) -
 the F1 shape, closed as a perf lever; the remaining 2x is CR4.VME
 (fidelity ledger #29) or a lower bar for V86-monitor-heavy titles.
-Full arc: `dev_docs/2026-08-31-overnight-campaign-log.md` and the
-2026-09-01 handoff (local to the main checkout).

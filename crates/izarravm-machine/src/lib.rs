@@ -784,7 +784,7 @@ pub struct PitBulkAdvanceCounters {
 /// ALWAYS ON, machine-side, and every decline names its own cause, so a
 /// zero-win leg is diagnosable without a rebuild. That is not decoration: the
 /// wall number alone cannot tell "the arm never fired" from "the arm fired and
-/// Slice 9A (`dev_docs/2026-09-05-device-timing-slice9-design.md`): the 8259A
+/// Slice 9A of the device-timing design: the 8259A
 /// INTA instrument. Always-on, gated by nothing in `IZARRAVM_DEVICE_TIMING`
 /// (no family in that knob owns this -- it is read-only evidence for slice 8's
 /// future interrupt-entry charge, not a behaviour switch), and cheap: one u64
@@ -951,7 +951,7 @@ impl Drop for AtaPollSkipDiagnostics {
     }
 }
 
-/// Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6):
+/// Slice 9C-pre of the device-timing design:
 /// mechanism counters for the primary-channel (fixed-disk) analogue of the
 /// ATAPI poll skip. All zero unless `IZARRAVM_DEVICE_TIMING` armed the `ata`
 /// family AND the mechanism actually committed a skip -- there is no separate
@@ -1709,7 +1709,7 @@ pub struct Machine {
     // Never read by an emulation decision and never part of canonical state, so
     // unlike `port_bus_batch_clocks` above it does not gate a canonical capture.
     opl_probe: OplProbe,
-    // S1 shadow-tag probe (`dev_docs/2026-09-01-bus-clock-diag.md`): diagnostic
+    // S1 shadow-tag probe: diagnostic
     // ONLY, exactly like `opl_probe` above -- never read by an emulation
     // decision, never part of canonical state. See `shadow_cache` module doc.
     shadow_l1: ShadowL1Probe,
@@ -1906,8 +1906,8 @@ pub struct Machine {
     // drive (see cdredir.rs).
     cd_redirector_dos_ds: Option<u16>,
     // Physical address of the guest kernel's B3 FAT-position request block,
-    // registered by doorbell command 3 (design:
-    // dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.2). None until a kernel
+    // registered by doorbell command 3.
+    // None until a kernel
     // registers; INT 19h clears it.
     hdd_map_block: Option<u32>,
     // The IzarraCD device driver's resident state (the host port of
@@ -3538,7 +3538,7 @@ impl Machine {
         self.cache_model.lookups()
     }
 
-    /// S1 shadow-tag probe counters (`dev_docs/2026-09-01-bus-clock-diag.md`).
+    /// S1 shadow-tag probe counters.
     /// Diagnostic only; see `shadow_cache` module doc for scope and coverage.
     pub fn shadow_l1_diagnostics(&self) -> ShadowL1Diagnostics {
         self.shadow_l1.diagnostics()

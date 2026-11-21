@@ -1,8 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Merge-review nit 7: the D5 (`dev_docs/2026-09-04-reflected-call-slice0b-
-//! review.md` §2) real/IF-edge tag, `run.rs`'s `BatchBoundaryRealTag`, tested
+//! The D5 real/IF-edge tag, `run.rs`'s `BatchBoundaryRealTag`, tested
 //! on its own -- it defaults to "real" every iteration and is marked "not
 //! real" ONLY by the trip's own IF-enable edge (`can_take_before` false, then
 //! true). A wrong default, or a mark that leaks across iterations, would

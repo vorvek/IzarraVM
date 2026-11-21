@@ -16,13 +16,12 @@ default = ["jit"]
 jit = ["izarravm-cpu/jit"]
 dynarec-mkii = ["jit", "izarravm-cpu/dynarec-mkii"]
 poll-head-probe = ["jit", "izarravm-cpu/poll-head-probe"]
-# Slice 0b of the reflected-call HLE design's trip-shape instrument (plan
-# `dev_docs/2026-09-04-reflected-call-slice0b-plan.md` §14 Q2): the ONLY
+# Slice 0b of the reflected-call HLE design's trip-shape instrument: the ONLY
 # reason this diagnostic-only feature is allowed to propagate past the CPU
 # crate is the batch-straddle counter (`on_batch_boundary`, called from
 # `run.rs`'s `event_batch_cap_cached` site). NOT in `default`.
 reflected-call-diagnostic = ["izarravm-cpu/reflected-call-diagnostic"]
-# S1a/b/c/d of dev_docs/2026-09-05-s2-cache-differentiation-design.md: the shadow-
+# S1a/b/c/d of the cache-differentiation design: the shadow-
 # cache probe (persona geometry, L2 shadow, JIT fetch coverage, JIT native-entry
 # sampling). NOT in `default`; the plain build must be byte-identical to a plain
 # main build, which is why every S1a/b/c/d addition lives behind this feature

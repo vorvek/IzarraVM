@@ -1,8 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Boot-screen fixtures for the styled Toka-DOS init screen
-//! (`dev_docs/2026-08-07-tokados-init-screen-design.md`).
+//! Boot-screen fixtures for the styled Toka-DOS init screen.
 //!
 //! Two different boot mechanisms prove two different things, and each test
 //! below picks the one that actually proves its claim:

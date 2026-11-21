@@ -95,7 +95,6 @@ fn glide_tmu_memory_probe_reads_the_selected_texture_base() {
     // register's field is 19 bits (`(val & 0x0007_ffff) << 3`,
     // `raster_view.rs::tex_base_addr_for_tmu`), matching 86Box's
     // non-Banshee `SST_texBaseAddr` handler. One qword short of 4 MB.
-    // (`dev_docs/2026-09-01-tex4mb-review.md` section 1.)
     const TEX_BASE_ADDR_MAX: u32 = 0x7_ffff << 3;
 
     fn sense(distira: &mut Distira, tmu: usize, memory_offset: u32) -> u32 {
@@ -1303,8 +1302,7 @@ fn parallel_raster_output_is_identical_to_single_threaded_output() {
     let serial = draw_scene(1);
     // Lanes 4 is today's default cap; 8 and 16 are the raised-cap A/B arms
     // (`IZARRAVM_DISTIRA_LANES`) the raster-lane-cap lever grades
-    // (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 5, lever
-    // B). Rows partition the frame store the same way at any lane count, so
+    // (lever B). Rows partition the frame store the same way at any lane count, so
     // this must stay byte-identical whether the cap is today's 4 or the
     // raised 8/16.
     for lanes in [4usize, 8, 16] {
@@ -1452,7 +1450,7 @@ fn lfb_aperture_wraps_its_unused_high_address_bit() {
 }
 
 /// Renamed from `lfb_physical_addresses_past_two_megabytes_are_open_bus`
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8's rename shape,
+/// (the rename shape of the 4 MB texture change,
 /// applied to the FBI probe growing FB_SIZE now surfaces): the SAME 800x600
 /// register configuration this test always used put the auxiliary buffer's
 /// origin at raw byte offset 4,186,112 -- past the OLD 2 MB FBI budget, so
@@ -1461,8 +1459,8 @@ fn lfb_aperture_wraps_its_unused_high_address_bit() {
 /// is 4,194,304; 4,186,112 < that), so it now round-trips -- see the first
 /// assertion below.
 ///
-/// THE WRAP-VS-DROP DIVERGENCE
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 8): the FBI address
+/// THE WRAP-VS-DROP DIVERGENCE:
+/// the FBI address
 /// decode wraps modulo its RAM size, the same rule the texture path uses
 /// and the rule 86Box's own FBI write path uses unconditionally
 /// (`vid_voodoo_fb.c`, see `RasterView::framebuffer_pixel_offset`'s doc
@@ -1526,8 +1524,8 @@ fn lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode() {
 
 /// The counterpart to `lfb_physical_addresses_past_four_megabytes_wrap_the_fbi_decode`,
 /// and the read-side contract `lfb_physical_addresses_past_two_megabytes_are_open_bus`
-/// used to pin before its rename discarded it
-/// (`dev_docs/2026-09-01-fb4mb-review.md` section 1): the FBI *write*
+/// used to pin before its rename discarded it:
+/// the FBI *write*
 /// decode wraps, but neither reference wraps the *read* decode. 86Box's
 /// `voodoo_fb_readw`/`readl` return `0xffff`/`0xffffffff` for any
 /// `read_addr > fb_mask`, checked BEFORE the mask is applied at all

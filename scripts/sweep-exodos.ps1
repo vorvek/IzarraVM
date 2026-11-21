@@ -8,7 +8,7 @@
 # fixtures, which cannot say what fraction of the DOS library a lever covers.
 # This runs corpus titles one at a time and archives everything each run
 # produced, so the classification can be recomputed later without running
-# anything again. Design: dev_docs/exodos-sweep-design.md.
+# anything again.
 #
 # WHAT IT IS NOT. No wall figure from this sweep may enter an A/B or a
 # scoreboard claim. It runs under variable load, with phase marks armed, with

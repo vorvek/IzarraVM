@@ -9,7 +9,7 @@ command opens a path under the collection root for write. `translate` and
 
 The companion harness is `scripts/sweep-exodos.ps1`, which extracts, calls this
 tool, runs the emulator, archives every artifact and deletes the extracted game
-files. Design: `dev_docs/exodos-sweep-design.md`.
+files.
 
 ## census
 

@@ -689,8 +689,8 @@ fn image_backed_drive_refuses_fat_chain_mapping() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice 9C (`dev_docs/2026-09-05-device-timing-slice9-design.md`, the 9C row
-// and §5 risk 2): the ATA seek / rotational / drive-buffer / sustained-media
+// Slice 9C of the device-timing design (the 9C row
+// and risk 2): the ATA seek / rotational / drive-buffer / sustained-media
 // model, `charge_pio_transfer`. Every fixture states its `DeviceTimingProfile`
 // arm explicitly, the same discipline the 9C-pre poll-skip fixtures follow.
 // ---------------------------------------------------------------------------
@@ -822,7 +822,7 @@ fn a_transfer_updates_the_modeled_head_even_with_cached_backing() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice 9D (`dev_docs/2026-09-05-device-9d-result.md`): the `pio_transfer_
+// Slice 9D: the `pio_transfer_
 // breakdown` diagnostic and the `IZARRAVM_INT13_PROFILE` call-pattern census
 // it feeds. `pio_transfer_breakdown` must never drift from `charge_pio_
 // transfer` -- both are backed by the same private computation, and this is

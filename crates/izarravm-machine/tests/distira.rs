@@ -230,7 +230,6 @@ fn write_texture_texel(machine: &mut Machine, tmu: usize, byte_address: u32, tex
 /// register's field is 19 bits (`(val & 0x0007_ffff) << 3`,
 /// `raster_view.rs::tex_base_addr_for_tmu`), matching 86Box's non-Banshee
 /// `SST_texBaseAddr` handler. One qword short of 4 MB.
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 1.)
 const TEX_BASE_ADDR_MAX: u32 = 0x7_ffff << 3;
 
 /// Writes one R5G6B5 texel at an absolute byte `address` that may sit at or
@@ -446,7 +445,7 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
 }
 
 /// Pins the guest-visible half of the FBI board-identity decision
-/// (`dev_docs/2026-09-01-mojo-fixture.md` section 5.1: MOJO reported a 2 MB
+/// (MOJO reported a 2 MB
 /// FBI on a dual-TMU board, a config that never shipped). Renamed from
 /// `glide_destructive_framebuffer_probe_reports_two_megabytes`, which
 /// pinned the OLD 2 MB size and went red the moment `DISTIRA_FB_SIZE` grew
@@ -600,8 +599,8 @@ fn distira_texture_aperture_keeps_tmu_stores_independent() {
     assert_eq!(draw_texture_sample(&mut machine, 1), 0x00ff_00ff);
 }
 
-/// Pins the wrap boundary at the NEW 4 MB-per-TMU budget
-/// (`dev_docs/2026-09-01-tex4mb-review.md` section 7), covering both TMUs.
+/// Pins the wrap boundary at the NEW 4 MB-per-TMU budget,
+/// covering both TMUs.
 /// Renamed from `distira_glide_probe_detects_two_megabytes_on_each_tmu`
 /// (landed in #509), which asserted the OLD 2 MB wrap and went red the
 /// moment `DISTIRA_TEX_SIZE` grew -- this is the guest-facing half of that

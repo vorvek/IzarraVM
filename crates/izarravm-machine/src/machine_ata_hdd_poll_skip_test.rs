@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6): the
+//! Slice 9C-pre of the device-timing design: the
 //! primary-channel (fixed-disk) analogue of `machine_atapi_poll_skip_test.rs`.
 //!
 //! **THE BAR THIS FILE CERTIFIES.** 9C-pre is "pure plumbing": the whole

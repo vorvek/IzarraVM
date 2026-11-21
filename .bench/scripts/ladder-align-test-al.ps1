@@ -15,7 +15,6 @@ Wall is REPORT only: a NEUTRAL result does not decline the knob. Identity
 (hash, guest clocks, bus clocks) is a STOP. jit_direct_insns/entries may
 move if occupancy changes; that is logged, not a STOP.
 
-See dev_docs/specs/2026-08-29-align-test-al-design.md section 7.3.
 #>
 
 param(

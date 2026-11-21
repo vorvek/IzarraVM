@@ -2486,8 +2486,7 @@ impl Machine {
     }
 
     /// See `izarravm_video::SwapToNextDrainStats`: the fastfill-after-swap
-    /// census from `dev_docs/2026-09-05-distira-async-overlap-review.md`
-    /// section 2.
+    /// census.
     pub fn distira_swap_to_next_drain_stats(&self) -> izarravm_video::SwapToNextDrainStats {
         self.vega.distira_swap_to_next_drain_stats()
     }

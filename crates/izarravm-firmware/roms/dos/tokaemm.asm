@@ -1854,7 +1854,7 @@ gdtr:
 ; A V86 task is always CPL 3, and the 386 checks the GATE's DPL against CPL for
 ; SOFTWARE interrupts only: "IF software interrupt ... IF gate descriptor
 ; DPL < CPL THEN #GP(vector number * 8+2+EXT)" (i386 PRM, INTERRUPT/EXCEPTION
-; pseudocode -- dev_docs/reference/i386/i386.txt:17766-17771). With DPL-0 gates
+; pseudocode). With DPL-0 gates
 ; every guest INT 21h on real silicon would #GP into vec13_entry and stop the
 ; machine on the 0xD6 tripwire. Hardware IRQs are unaffected either way: the
 ; PRM gates that check on `software interrupt`, so an externally delivered
@@ -1862,8 +1862,8 @@ gdtr:
 ;
 ; The reference monitor pairs the two halves exactly: 386MAX runs its VM
 ; clients at @VMIOPL 3 AND builds its IDT with `CPL0_INTR3 or CPL3` -- a 32-bit
-; interrupt gate at DPL 3 (QMAX_IDT.ASM:226, under
-; dev_docs/reference/386max/386MAX/BIGMEM.BOB/).
+; interrupt gate at DPL 3 (QMAX_IDT.ASM:226 in the
+; 386MAX BIGMEM.BOB tree).
 ;
 ; No gate here is deliberately ring-0-only. This monitor exposes no INT-n
 ; service that the guest must be kept out of: every vector either reflects to
@@ -2207,7 +2207,7 @@ monitor_body:
     ;
     ; For INT n (CD) on REAL SILICON there is a second cause -- the IDT gate the
     ; vector lands on has DPL < CPL, which #GP(vector*8+2)s a CPL-3 guest before
-    ; the handler runs (i386 PRM, dev_docs/reference/i386/i386.txt:17766-17771;
+    ; the handler runs (i386 PRM;
     ; see the IDTGATE comment for why every gate here is DPL 3). THIS EMULATOR
     ; DOES NOT RAISE THAT FAULT: control.rs's software_interrupt path never
     ; compares gate DPL to CPL, so a DPL-0 gate would work here and fail on
@@ -2711,8 +2711,7 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     ; what this monitor used to be -- under VME the INTA has already happened
     ; when the monitor gets control, and the AMD-K5 TRM S3.1.4 (VME) describes
     ; exactly this: with VIF clear, "the operating system holds the interrupt
-    ; pending", saving the vector and setting VIP. Reference, in
-    ; dev_docs/reference/Pentium-K6/ :
+    ; pending", saving the vector and setting VIP. Reference:
     ;     AMD-K5_Processor_Technical_Reference_Manual_(November_1996).txt
     ;
     ; So the old architecture was a software VME, not an invented state. It

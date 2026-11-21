@@ -37,8 +37,8 @@
 //! **Texture-aperture writes ride the same queue.** `write_texture_u32` used
 //! to drain unconditionally -- 65 times a frame on `tombraid3d-586`'s Lara's
 //! Home walk, once per accepted write, which is what actually forced the 60
-//! drains a frame the module doc above is written against (see
-//! `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6). A
+//! drains a frame the module doc above is written against.
+//! A
 //! [`QueuedCommand::TextureWrite`] entry orders a write against the
 //! triangles around it instead: `Distira::drain_raster_queue` walks the
 //! batch in submission order and splits it at every `TextureWrite`, so a
@@ -64,8 +64,8 @@ use super::*;
 /// keep moving without a synchronous drain.
 ///
 /// 512 was sized for a triangle-only queue. `tombraid3d-586`'s Lara's Home
-/// walk pushes ~387 triangles and ~65 texture writes a frame (
-/// `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 4) -- ~452
+/// walk pushes ~387 triangles and ~65 texture writes a frame:
+/// ~452
 /// entries against a 512 cap, one entry-fill from an extra `queue_full`
 /// drain most frames. 1024 buys headroom back without a redesign: each
 /// `QueuedCommand` slot costs ~600 B (`QueuedTriangle`'s size dominates,
@@ -115,7 +115,7 @@ pub(super) enum QueuedCommand {
 #[derive(Default)]
 pub(super) struct RasterQueue {
     pending: Vec<QueuedCommand>,
-    /// S2 of `dev_docs/2026-09-05-distira-async-slice1-review.md`: a
+    /// S2 of the slice 1 review: a
     /// recycled batch allocation parked here when `recycle` ran but
     /// `pending` was not itself available to adopt it. See `recycle`'s doc
     /// comment for why that happens under async and did not before.
@@ -157,7 +157,7 @@ impl RasterQueue {
     /// Take the drained batch's allocation back, so a steady render loop
     /// stops allocating after its first frame.
     ///
-    /// **Widened for S2 of `dev_docs/2026-09-05-distira-async-slice1-review.md`.**
+    /// **Widened for S2 of the slice 1 review.**
     /// The OLD guard (`self.pending.is_empty()` alone) silently dropped the
     /// allocation whenever it did not hold: harmless under the fully
     /// synchronous model (slice 0b and earlier), where a drain always ran

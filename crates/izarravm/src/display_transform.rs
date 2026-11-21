@@ -1,8 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The one function this whole feature turns on. See
-//! `dev_docs/2026-09-01-display-gamma-design.md` for the derivation.
+//! The one function this whole feature turns on.
 //!
 //! Every video path in IzarraVM hands the presenter a byte that means DAC
 //! output level -- linear in analog video voltage. The host panel instead
@@ -74,8 +73,7 @@ pub fn display_transform(code: u8, gamma: Option<f32>) -> u8 {
 /// worst-case residual lift in the log domain (bounded by 1.5/1.7 = 0.88 on one
 /// side and 1.5/1.3 = 1.15 on the other). It was also measured, against the
 /// `SST_GAMMA=1.0` reference frames, to reproduce that guest-side setting to
-/// 0.062 codes mean absolute error --
-/// `dev_docs/2026-09-01-glide-gamma-toggle-design.md` section 2.2.
+/// 0.062 codes mean absolute error.
 pub const GLIDE_COMPAT_EXPONENT: f32 = 1.5;
 
 /// Signal-domain compensation for the Voodoo-era gamma lift:
@@ -86,8 +84,7 @@ pub const GLIDE_COMPAT_EXPONENT: f32 = 1.5;
 /// relative change the guest makes to its CLUT -- including the gamma ramps
 /// games fade the screen with -- survives, merely scaled. Cancelling the
 /// *current* CLUT instead would pin the picture and destroy those fades, which
-/// is the `SST_GAMMA` behaviour recorded in
-/// `dev_docs/2026-09-01-sst-gamma-verification.md`. The design doc measures
+/// is the `SST_GAMMA` behaviour. The design measurement covers
 /// both arms on a real fade.
 ///
 /// `exponent == None` ("Original") is the identity, byte for byte: the

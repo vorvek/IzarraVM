@@ -175,7 +175,6 @@ plus a per-leg fixture copy charged from the tree sizes (nascar1_c 27.2 MB over
 estimate is printed at start and is a LOWER bound: discarded contaminated legs
 are not in it.
 
-See dev_docs/specs/2026-08-27-c1-presence-filter-design.md sections 6.1-6.5.
 Adapted from .bench/scripts/ladder-c2-podkey.ps1 (PR #742), which is itself a
 copy of the untracked .bench/scripts/ladder-d-elision-b.ps1 under its own name
 and its own lock path.

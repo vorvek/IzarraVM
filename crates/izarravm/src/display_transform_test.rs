@@ -11,8 +11,8 @@ fn identity_when_gamma_is_none() {
     }
 }
 
-/// Exact bytes from the design doc's anchor table
-/// (`dev_docs/2026-09-01-display-gamma-design.md` section 2.3), gamma 2.4 --
+/// Exact bytes from the design doc's anchor table,
+/// gamma 2.4 --
 /// the default. Independently recomputed and confirmed to match before being
 /// pinned here.
 #[test]
@@ -150,8 +150,7 @@ fn glide_compensate_is_identity_when_disabled() {
     }
 }
 
-/// Exact bytes at `GLIDE_COMPAT_EXPONENT`, from
-/// `dev_docs/2026-09-01-glide-gamma-toggle-design.md` section 7 slice 1.
+/// Exact bytes at `GLIDE_COMPAT_EXPONENT`.
 #[test]
 fn glide_compensate_golden_ramp() {
     let anchors: [(u8, u8); 11] = [
@@ -204,8 +203,8 @@ fn glide_compensate_is_monotonic() {
     }
 }
 
-/// The measurement this feature was chosen on
-/// (`dev_docs/2026-09-01-glide-gamma-toggle-design.md` section 2.2): pushing
+/// The measurement this feature was chosen on:
+/// pushing
 /// Tomb Raider's measured gamma-1.491 CLUT anchors through the compensation
 /// lands them on the identity ramp, i.e. on what `SST_GAMMA=1.0` produces in
 /// the guest -- without touching `clutData`.

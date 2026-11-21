@@ -124,7 +124,7 @@ const WSS_CONFIG_SIGNATURE: u8 = 0x04;
 /// it drives is the *currently selected* one, so re-selecting while the strobe
 /// is held moves the assertion with it.
 ///
-/// Prior art: `dev_docs/reference/86box/src/sound/snd_azt2316a.c:303-331`, a
+/// Prior art: 86Box `src/sound/snd_azt2316a.c:303-331`, a
 /// board whose own header (`:80-86`) records that "the WSS was completely
 /// cloned here". Plain `snd_wss.c` returns the bit on read and never uses it,
 /// which is what left it looking like scratch.

@@ -3,7 +3,7 @@
 
 //! `IZARRAVM_DEVICE_TIMING`, the slice-9 device-timing knob.
 //!
-//! Slice 9 (`dev_docs/2026-09-05-device-timing-slice9-design.md`) lives on the
+//! Slice 9 (the device-timing design) lives on the
 //! **deadline lane** (`MASTER_CLOCK_HZ` ticks: *when* a device event fires),
 //! never the charge lane (`guest_clocks`, what rt divides). Nothing this knob
 //! controls may touch `level_timing`, `bus_timing`, `wait_states.io` or any

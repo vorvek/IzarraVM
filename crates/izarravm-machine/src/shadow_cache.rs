@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! S1 of `dev_docs/2026-09-01-bus-clock-diag.md`: a SHADOW L1 tag probe for the
+//! S1 of the bus-clock diagnostic: a SHADOW L1 tag probe for the
 //! Approximate timing class (486/586), which charges every cacheable-RAM access
 //! a flat cost and never consults `CacheModel`'s tag arrays
 //! (`cache_tier_lookups` is 0 on every 486/586 run; see `MachineBus::flat_data_cost`).
@@ -12,8 +12,7 @@
 //! 64-byte-line arrays (which price the guest and are untouched by this file):
 //! 8 KiB, 4-way set associative, 16-byte lines, 128 sets, pseudo-LRU
 //! replacement -- Intel i486 Microprocessor Hardware Reference Manual (1990)
-//! §4.2, and the i486DX2 Microprocessor Data Book (Jul 1992) §5/§6.1, both under
-//! `dev_docs/reference/i486/`.
+//! §4.2, and the i486DX2 Microprocessor Data Book (Jul 1992) §5/§6.1.
 //!
 //! Every counter here is diagnostic-only, exactly like `OplProbe`: never read
 //! by any emulation decision, never part of canonical state, and safe to
@@ -266,9 +265,8 @@ impl ShadowTags {
 /// real memory access from compiled code, which is exactly the hot-path cost
 /// S2's design note weighs and rejects for this diagnostic slice. So these
 /// counters describe the address-classified (interpreter / FastMap-direct)
-/// share of the access stream, not the whole one; see
-/// `dev_docs/2026-09-01-bus-clock-diag.md` §1 for the bucket split this
-/// corresponds to (`data_read_flat`, `data_write_flat`, `fetch_icache`,
+/// share of the access stream, not the whole one. The bucket split this
+/// corresponds to is (`data_read_flat`, `data_write_flat`, `fetch_icache`,
 /// `fetch_other`, versus `bulk_native_fetch`/`bulk_native_data`).
 #[derive(Debug)]
 pub struct ShadowL1Probe {

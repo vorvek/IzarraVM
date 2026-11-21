@@ -999,8 +999,7 @@ Margo. They exist because nothing else on either board exercises a single
 triangle of hardware 3D: before them, Distira had register-level unit tests and
 no game had ever driven it.
 
-**CORRECTED 2026-09-01** (`dev_docs/2026-09-01-tr-rush-investigation.md`,
-section 2): this used to claim both rows "ship the BYTE-IDENTICAL `glide2x.ovl`"
+**CORRECTED 2026-09-01**: this used to claim both rows "ship the BYTE-IDENTICAL `glide2x.ovl`"
 and drew an attribution rule from that. False for the Tomb Raider row. The
 fixture's `AUTOEXEC.BAT` runs `TOMB.EXE`, which STATICALLY LINKS Glide 2.1.1
 and never opens an overlay at all -- the `glide2x.ovl` sitting in
@@ -1177,11 +1176,9 @@ the copy redistributed today as bitsundbolts' `mojo_dos.zip` is byte-identical,
 which is the cross-check the recorded hash encodes. **3dfx shipped no licence
 text with the diagnostics and the redistribution terms are unclear**, so the
 binary stays in the git-ignored fixture tree, never enters git history, and
-never ships with IzarraVM -- the same posture as `dev_docs/reference/` and as
+never ships with IzarraVM -- the same posture as the local hardware reference library and as
 `.bench/glide243-tests` itself. The full account, including the oracle
-comparison and the gap list this row came out of, is in
-`dev_docs/2026-09-01-mojo-fixture.md` (local to the main checkout;
-`dev_docs/` is git-ignored) and in the header of
+comparison and the gap list this row came out of, is in the header of
 `scripts/make-mojo-fixture.ps1`.
 
 **Grading is an exact sha256 per file, with ONE line masked, and the mask was
@@ -1268,9 +1265,7 @@ stayed green — no other fixture drives the timer that way.
 A FOURTH Tyrian fixture, `.bench/tyrian_specs_c`, and a fourth row,
 `tyrian-specs-586`. It exists because `tyrian-586` above polls 62x less than
 the Ship Specs screen and cannot show the lever the 09-02/03 CR3-gate and
-reflected-call campaigns work on
-(`dev_docs/2026-09-02-tyrian-586-specs-diag.md`,
-`dev_docs/2026-09-02-tyrian-586-reprofile.md`). This is a DIFFERENT tree from
+reflected-call campaigns work on. This is a DIFFERENT tree from
 `tyrian_c`: the owner's install, TOKAEMM loaded, with save slot 1 preloaded,
 not the plain launcher.
 

@@ -1294,7 +1294,7 @@ fn slave_channel_5_reads_the_buffer_the_driver_programmed() {
 
 // ---------------------------------------------------------------------------
 // Slice 9B (`IZARRAVM_DEVICE_TIMING=dma`): current-count interpolation.
-// `dev_docs/2026-09-05-device-timing-slice9-design.md` §3.4, §4 "DMA count-poll
+// The device-timing design names this the "DMA count-poll
 // test". Every test here programs master channel 1 for a 64 KiB block (count
 // register 0xFFFF -> 65536 bytes, matching the design's SB16 example) and
 // reads the current-count register (port 0x03) through `read_port_timed`.

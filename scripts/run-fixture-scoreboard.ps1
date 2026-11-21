@@ -114,14 +114,14 @@ param(
     # every value except exactly "0".
     [ValidateSet("on", "off", "jit16", "word486")]
     [string]$Arm = "on",
-    # The one-lookup store emission arm (dev_docs/2026-08-07-one-lookup-store-design.md D8):
+    # The one-lookup store emission arm:
     # "1" is the shipped default, "0" restores the classic classify/resolve store emission.
     # Set explicitly on every run for the same inherit-hazard reason as the JIT16 pair -
     # IZARRAVM_ONE_LOOKUP_STORE is on for every value except exactly "0", so a stray "0" left
     # in the caller's environment would silently turn an "on" observation into an "off" one.
     [ValidateSet("1", "0")]
     [string]$OneLookupStore = "1",
-    # The one-lookup LOAD emission arm (dev_docs/2026-08-07-one-lookup-load-design.md D7):
+    # The one-lookup LOAD emission arm:
     # same contract and the same inherit hazard as the store knob above; independent of it so
     # either slice A/Bs alone.
     [ValidateSet("1", "0")]
@@ -1507,13 +1507,13 @@ function Get-FixtureTable {
             qconsole = $false; resultPpm = $true; dukemark = $null
             # 2026-09-02 re-pin, e312f8f3 -> 6cc0d354 (the SAME hash this row pinned before the
             # 2026-08-27 entry below, `90c5e41d` "Re-pin prince-486 and tombraid-loader-586 to
-            # the PR 736 kernel", moved back to it). The CR3 data-side gate's PR #826 (T1+T2,
-            # `dev_docs/2026-09-02-cr3-data-side-design.md`) shifts the fixed 4e9-cycle budget one
+            # the PR 736 kernel", moved back to it). The CR3 data-side gate's PR #826 (T1+T2)
+            # shifts the fixed 4e9-cycle budget one
             # torch-flame frame earlier -- the same class of drift `90c5e41d` describes for the
             # opposite direction (156 of 128000 pixels, all inside the two torch sprites). Content
             # is verified by hash identity to that already-inspected frame, not by a fresh read.
             #
-            # CAUSE, HONESTLY: T1 alone (`dev_docs/2026-09-02-cr3-data-side-design.md` T1)
+            # CAUSE, HONESTLY: T1 alone
             # reproduces the prior `e312f8f3` hash and the prior instruction count UNCHANGED, so
             # T1 is cleared. T1+T2 together move both. Inside T2, three internal mechanisms were
             # tested as the specific cause, individually and in combination -- reverting
@@ -1761,10 +1761,8 @@ function Get-FixtureTable {
         }
         [pscustomobject]@{
             # The Tyrian 2000 Ship Specs dwell, the recipe the 09-02/03 CR3-gate
-            # and reflected-call campaigns are graded on
-            # (dev_docs/2026-09-02-tyrian-586-specs-diag.md,
-            # dev_docs/2026-09-02-tyrian-586-reprofile.md,
-            # dev_docs/2026-09-03-morning-handoff.md). `tyrian-586` above polls
+            # and reflected-call campaigns are graded on.
+            # `tyrian-586` above polls
             # 62x less than this screen and cannot show the lever the campaign
             # works on -- this row exists to be graded on instead.
             #
@@ -2100,7 +2098,7 @@ function Get-FixtureTable {
             # two unused binaries removed moved it 0x29 -> 0x14 and moved
             # NOTHING else in the file.
             #
-            # 2026-09-04 (dev_docs/2026-09-04-red-pins-bisect.md): the same
+            # 2026-09-04: the same
             # beam phase also leaked through `status:` (distira.rs
             # status_value() clears bit 0x40 while in_vretrace(), so
             # 0ffff07f <-> 0ffff03f tracks vRetrace exactly) and through

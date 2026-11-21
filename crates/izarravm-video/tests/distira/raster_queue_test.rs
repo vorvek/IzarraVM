@@ -177,8 +177,8 @@ fn queue_stress_scene(queue_enabled: bool) -> QueueTrace {
 
     // Two triangles with no read between them: the pair the queue actually
     // batches. Then a texture upload -- which now ORDERS against them
-    // instead of draining them (the texture-queue lever,
-    // `dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6): the
+    // instead of draining them (the texture-queue lever):
+    // the
     // upload's 64 writes join the same queue as the triangles ahead of it,
     // so all 66 entries wait together with the queue on.
     submit_triangle(
@@ -690,8 +690,7 @@ fn submit_flat_textured_triangle(distira: &mut Distira, vertices: [(u32, u32); 3
 }
 
 /// THE ORDERING RULE ITSELF
-/// (`dev_docs/2026-09-05-tombraid-glide-foyer-profile.md` section 6, slice
-/// 1): a texture-aperture write must order against the triangles around it
+/// (slice 1): a texture-aperture write must order against the triangles around it
 /// instead of draining them. Triangle A is enqueued, then a write changes
 /// the texel it samples, then triangle B is enqueued sampling the same
 /// texel. Both are queued (not drawn) the whole time -- proved by
@@ -871,9 +870,8 @@ fn a_texture_write_mid_batch_splits_lanes_without_moving_a_pixel() {
 
 /// THE SAFETY CLAIM THE WHOLE LEVER RESTS ON: a queued triangle's texture
 /// coordinates resolve against the register snapshot it was submitted
-/// with, not against live device state at raster time
-/// (`dev_docs/2026-09-05-distira-texture-queue-review.md` section 1/finding
-/// F). Triangle A is enqueued, `SST_TEX_BASE_ADDR` changes (a
+/// with, not against live device state at raster time.
+/// Triangle A is enqueued, `SST_TEX_BASE_ADDR` changes (a
 /// snapshot-covered register -- it does NOT drain), a texture write lands
 /// at the NEW base, then triangle B is enqueued. A must resolve through its
 /// OWN (old) base and see the OLD texel; B must resolve through the NEW

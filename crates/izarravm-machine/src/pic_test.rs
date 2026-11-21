@@ -735,7 +735,7 @@ fn master_initialized_sfnm() -> Pic8259Pair {
 // ---------------------------------------------------------------------------
 // Slice 9A (`IZARRAVM_DEVICE_TIMING`, the INTA instrument):
 // `acknowledge_with_irq`'s reported master-side IRQ line.
-// `dev_docs/2026-09-05-device-timing-slice9-design.md` §3.4, §6 "9A".
+// This is slice 9A of the device-timing design.
 // ---------------------------------------------------------------------------
 
 #[test]

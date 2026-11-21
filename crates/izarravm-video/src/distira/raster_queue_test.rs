@@ -11,7 +11,7 @@ fn texture_write(offset: usize) -> QueuedCommand {
     })
 }
 
-/// S2 of `dev_docs/2026-09-05-distira-async-slice1-review.md`: the OLD
+/// S2 of the slice 1 review: the OLD
 /// `recycle` only adopted a returned batch allocation when `pending` was
 /// ITSELF empty. Under async, the swap-flushed batch is joined at a call
 /// where the guest has ALREADY queued the next frame's first entries --

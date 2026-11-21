@@ -359,8 +359,8 @@ fn requested_execution_backend(
 /// target-cpu=x86-64-v3`, which faults on exactly the non-AVX host this
 /// check exists to catch. Keeping the real body in a separate
 /// `#[inline(never)]` function is what keeps `main` itself empty of
-/// locals; verified by disassembly (`dev_docs/2026-09-04-avx2-preflight-review.md`
-/// F1), not assumed.
+/// locals; verified by disassembly,
+/// not assumed.
 fn main() -> Result<(), Box<dyn Error>> {
     preflight::require_avx2();
     real_main()
@@ -2104,8 +2104,8 @@ fn run_boot_hdd_folder(
         }
     }
     if let Some(path) = mode_census {
-        // Slice 0b of `dev_docs/2026-09-05-distira-async-overlap-review.md`
-        // section 1: this used to read `distira_scanout_state` first
+        // Slice 0b of the async-overlap review:
+        // this used to read `distira_scanout_state` first
         // because THAT call happened to drain Distira's triangle queue and
         // every other accessor below was `&self` and silently read whatever
         // was left over -- an ordering that worked by luck, not by
@@ -2613,7 +2613,7 @@ fn opl_diagnostics_json(
     })
 }
 
-/// OFF-FEATURE: byte-identical to pre-S1a main. S1 (`dev_docs/2026-09-01-bus-clock-diag.md`)
+/// OFF-FEATURE: byte-identical to pre-S1a main. S1
 /// shadow-tag probe counters: hit/miss per access class against the real 486 L1 geometry
 /// (8 KiB, 4-way, 16-byte lines, 128 sets, pseudo-LRU), charging nothing. `enabled` is false
 /// unless `IZARRAVM_SHADOW_L1_PROBE=1`; every count is 0 when disabled, and `hit_ratio`
@@ -2638,7 +2638,7 @@ fn shadow_l1_json(diag: izarravm_machine::ShadowL1Diagnostics) -> serde_json::Va
     })
 }
 
-/// S1a-d (`dev_docs/2026-09-05-s2-cache-differentiation-design.md`) shadow-tag probe
+/// S1a-d shadow-tag probe
 /// counters: hit/miss per access class against the real per-persona L1 geometry (486: 8 KiB
 /// unified, 4-way, 16-byte lines, 128 sets, pseudo-LRU, write-through; 586: split 16+16 KiB,
 /// 2-way, 32-byte lines, 256 sets, 1-bit LRU, write-back with a 512 KiB / 32-byte / 4-way /
@@ -3103,8 +3103,8 @@ fn direct_barrier_census_json(
         );
         report
     };
-    // The `RetryCause::AdmissionMatrix` per-reason split (design note
-    // `dev_docs/descent2-l1-stack-width-design-2026-08-30.md` §2(H)): the two `stack_width_kind`
+    // The `RetryCause::AdmissionMatrix` per-reason split:
+    // the two `stack_width_kind`
     // producers of that cause, told apart. `NEW BLOCK`, not folded into `admission_declines`
     // above -- that array means something else (dispatcher-entry declines) and the corpus already
     // carries legs on disk that read it.
@@ -3168,10 +3168,7 @@ fn direct_link_refusal_census_json(
     })
 }
 
-/// Slice 0b of the reflected-call HLE design's trip-shape instrument
-/// (`dev_docs/2026-09-03-reflected-call-hle-design.md`,
-/// `dev_docs/2026-09-03-reflected-call-hle-review.md`,
-/// `dev_docs/2026-09-04-reflected-call-slice0b-plan.md` §9's key list).
+/// Slice 0b of the reflected-call HLE design's trip-shape instrument.
 /// Additive over slice 0's schema: no `izarravm-hdd-profile-v2` bump, no
 /// `KATEA_COUNTER_KEYS` change (plan §8's file-list note).
 #[cfg(feature = "reflected-call-diagnostic")]
@@ -3718,7 +3715,7 @@ fn pit_bulk_advance_json(machine: &izarravm_machine::Machine) -> serde_json::Val
     })
 }
 
-/// Slice 9 (`dev_docs/2026-09-05-device-timing-slice9-design.md`):
+/// Slice 9 of the device-timing design:
 /// `IZARRAVM_DEVICE_TIMING`'s per-family armed state, so a fixture can confirm
 /// which families a run actually armed without re-deriving the parse from the
 /// raw environment string. Every family is `false` on the knob-unset default.

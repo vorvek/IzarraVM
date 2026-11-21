@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! T1 (`dev_docs/2026-09-05-port-io-repricing-design.md` §5): a table-driven class matrix over
+//! T1: a table-driven class matrix over
 //! every named range plus both sides of each edge. Pure `const fn`, no machine.
 
 use super::*;
@@ -17,7 +17,7 @@ fn class_matrix_named_ranges_and_edges() {
         (0x000F, PortBusClass::IsaXBus, "dma1 high"),
         (0x0080, PortBusClass::IsaXBus, "page regs low"),
         (0x008F, PortBusClass::IsaXBus, "page regs high"),
-        // F12 (`dev_docs/2026-09-05-port-io-repricing-review.md`): the page-register aliases
+        // F12: the page-register aliases
         // at 0x90-0x9F (`dma_page_register_port`), except 0x92 which is its own device.
         (0x0090, PortBusClass::IsaXBus, "page reg alias low"),
         (
@@ -267,7 +267,7 @@ fn epoch_2_charges_the_class_figure_per_byte_cycle() {
     );
 }
 
-/// F3 (`dev_docs/2026-09-05-port-io-repricing-review.md`): under epoch 2, `IN 0x388` (OPL
+/// F3: under epoch 2, `IN 0x388` (OPL
 /// status) must pay exactly the `IsaXBus` class charge once, not twice -- the OPL arm's own
 /// hand-accrual must be epoch-1-only.
 #[test]

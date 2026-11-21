@@ -445,7 +445,7 @@ def main(check: bool = False) -> int:
         ("EDIT.COM", edit, ATTR_ARCHIVE),
         # TokaDesk, the visual workbench (GPL-3, original tools-src). A
         # committed binary in the firmware crate, like TOKAMOUS.COM above;
-        # see toka-dos/tools-src/tokadesk and dev_docs/2026-09-02-tokadesk-ship.md.
+        # see toka-dos/tools-src/tokadesk.
         ("TOKADESK.EXE", tokadesk, ATTR_ARCHIVE),
         ("HELLO.TXT", hello_txt, ATTR_ARCHIVE),
     ]

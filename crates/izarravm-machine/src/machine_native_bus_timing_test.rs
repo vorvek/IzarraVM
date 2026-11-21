@@ -2522,8 +2522,8 @@ fn paged_memory_poll_declines_on_a_not_present_page_without_perturbation() {
         cpu.poll_skip_backedge_housekeeping();
     });
     machine.cpu.reset_perf_counters();
-    // **Updated for the CR3 code-cache gate**
-    // (`dev_docs/2026-09-02-cr3-code-cache-gate-design.md`). This row used to prove the R2 probe
+    // **Updated for the CR3 code-cache gate.**
+    // This row used to prove the R2 probe
     // (TLB miss) was the SOLE reason the executor declines, by first showing the head's structural
     // classification was untouched by clearing `cell_pte`. That is no longer true, correctly: the
     // gate's write watch now treats the `cell_pte` store as the live page-table edit it is (it

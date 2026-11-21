@@ -3,8 +3,8 @@
 
 use super::*;
 
-// B3 FAT-position request-block offsets (design:
-// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.3's 16-byte layout). Named
+// B3 FAT-position request-block offsets (the design's
+// 16-byte layout). Named
 // the way cddriver.rs's `RH_*` request-header offsets are, and shared by
 // `perform_hdd_map_lookup` and its tests (`machine_device_integration_test.rs`).
 pub(crate) const HDD_MAP_UNIT: u32 = 1; // u8, guest writes: DOS unit (A=0; the Katea HDD is 2)
@@ -752,8 +752,8 @@ impl Machine {
     /// holds the DOS data segment, and the host arms the CD redirector with
     /// it (see cdredir.rs).
     ///
-    /// Command 3 registers the B3 FAT-position request block (design:
-    /// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.2), borrowing the same
+    /// Command 3 registers the B3 FAT-position request block,
+    /// borrowing the same
     /// mailbox and far-pointer layout as command 1. Command 4 answers a
     /// lookup from that block (`perform_hdd_map_lookup`).
     ///

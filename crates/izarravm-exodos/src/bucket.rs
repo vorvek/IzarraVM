@@ -8,7 +8,7 @@
 //! index and the frames that index kept into an outcome, a set of bucket flags
 //! with the measured metric behind each one, and reported-only columns.
 //!
-//! The rules are the REPAIRED ones of `dev_docs/exodos-sweep-design.md` §9.2,
+//! The rules are the REPAIRED ones of the sweep design §9.2,
 //! and the acceptance oracle is the leg-A table of §9.5 over the eleven
 //! fixture profiles. Nothing here may be re-tuned to make a row pass: if a
 //! fixture disagrees with the table, one of the two is wrong and the

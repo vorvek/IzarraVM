@@ -218,7 +218,7 @@ fn guest_resetting_fbiinit0_restores_distira_over_a_yielded_vbe_session() {
     // The regression #802 patched around with a `content_drawn_since_yield`
     // activity latch: Tomb Raider Gold sets a VBE mode for each FMV, then
     // resumes Glide gameplay. That latch is deleted here in favour of the
-    // register truth (`dev_docs/2026-09-01-mux-fix-review.md`): on real
+    // register truth: on real
     // hardware neither a VBE mode set, nor SWAPBUFFER, nor a rasterised
     // triangle can move the mux -- only the guest's own FBIINIT0 write can,
     // and the fixture evidence (portlog + presented-frame captures) is that
@@ -1766,7 +1766,7 @@ fn a_short_raster_presents_identically_through_both_frame_paths() {
 /// The GUI publishes frames from a worker thread and consumes them later, so
 /// asking `active_display()` separately at paint time can describe a different
 /// instant than the pixels do. The Glide gamma toggle
-/// (`dev_docs/2026-09-01-glide-gamma-toggle-design.md` section 4.2) applies to
+/// applies to
 /// Distira's output only, so it needs the tag on the frame itself. Both fast
 /// branches must agree with the generic path.
 #[test]

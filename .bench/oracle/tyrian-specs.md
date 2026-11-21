@@ -4,7 +4,7 @@
 
 Verified 2026-09-02. A key/timing schedule only -- no timing or rt number
 recorded here or anywhere else. This screen is the same one measured (and
-withdrawn) in `dev_docs/2026-09-02-tyrian-dosbox-comparison.md`; that
+withdrawn) in the Tyrian DOSBox comparison of 2026-09-02; that
 document's schedule discovery (section 1.3, "Screen identity is now proved
 by picture") is not in question, only its rt numbers were withdrawn. This
 file re-derives and re-verifies the schedule independently against a fresh
@@ -68,7 +68,7 @@ Notes on the pin:
 The stock oracle harness has no framebuffer capture (`PROTOCOL.md` section
 7, "known gaps"). Verification here used the local, GPL-2.0-derivative,
 scratch-only DOSBox-X debug build already documented in
-`dev_docs/2026-09-02-tyrian-dosbox-comparison.md` section 1.2
+the same comparison
 (`D:\ctd\dosbox-x-debug\bin\x64\Release\dosbox-x.exe`, never entering repo
 history), which adds `DOSBOX_SHOT_DIR` / `DOSBOX_SHOT_INTERVAL_MS`
 env-var-driven periodic mode-13h PPM dumps. Pass `-DosboxExe` pointing at

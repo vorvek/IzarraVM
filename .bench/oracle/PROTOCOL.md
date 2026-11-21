@@ -4,8 +4,7 @@
 
 The usage protocol for `.bench/oracle/Invoke-DosboxOracle.ps1`, the traps it
 absorbs, and what has and has not been measured. Carry forward verbatim into
-future oracle sessions. Full findings and the raw measurements behind every
-TESTED claim below live in `dev_docs/2026-08-31-dosbox-oracle-harness.md`.
+future oracle sessions.
 
 ## 1. Purpose
 
@@ -17,7 +16,7 @@ different model), it is also useful for spotting where IzarraVM's own
 behaviour is the outlier.
 
 **Prior art only.** Nothing DOSBox-X produces is a merge gate, and none of its
-code enters IzarraVM. This is the same posture as `dev_docs/reference/` for
+code enters IzarraVM. This is the same posture as the local reference library for
 hardware documentation: read it, never copy from it into a source file that
 ships.
 
@@ -180,12 +179,12 @@ spammer."** 0x3DA polling is precisely the port storm IzarraVM campaigns keep
 landing on, so the stock build cannot see it happen at all.
 
 **The portlog build fixes this — BUILT AND WORKING.** The source change is
-`dev_docs/2026-08-31-dosbox-x-portlog.patch`, whose header carries the
+the local patch `2026-08-31-dosbox-x-portlog.patch`, whose header carries the
 copy/apply/build recipe (robocopy the reference clone to a scratch tree
 outside the repo, `git apply`, then MSBuild with `PlatformToolset=v143`
 retargeted on the command line — the project pins v142/VS2019, not installed
 here). **The patch is LOCAL ONLY: it is a GPL-2.0 derivative of DOSBox-X and
-must never enter repo history.** `dev_docs/` is gitignored and that placement
+must never enter repo history.** Its directory is gitignored and that placement
 is deliberate.
 
 The built exe sits at `D:\ctd\dosbox-x-portlog\bin\x64\Release\dosbox-x.exe`

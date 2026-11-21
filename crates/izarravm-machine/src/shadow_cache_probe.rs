@@ -1,8 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! S1 of `dev_docs/2026-09-05-s2-cache-differentiation-design.md` (predecessor:
-//! `dev_docs/2026-09-01-bus-clock-diag.md`): a SHADOW cache-tag probe for the
+//! S1 of the cache-differentiation design: a SHADOW cache-tag probe for the
 //! Approximate timing class (486/586), which charges every cacheable-RAM access
 //! a flat cost and never consults `CacheModel`'s tag arrays
 //! (`cache_tier_lookups` is 0 on every 486/586 run; see `MachineBus::flat_data_cost`).
@@ -14,14 +13,12 @@
 //! * **486**: 8 KiB, 4-way set associative, 16-byte lines, 128 sets, 3-bit
 //!   tree pseudo-LRU, no-write-allocate, write-through -- Intel i486
 //!   Microprocessor Hardware Reference Manual (1990) §4.2, and the i486DX2
-//!   Microprocessor Data Book (Jul 1992) §5/§6.1, both under
-//!   `dev_docs/reference/i486/`.
+//!   Microprocessor Data Book (Jul 1992) §5/§6.1.
 //! * **586 (Pentium MMX 166, `GSW_MODE_SPECS[3]`)**: split 16 KiB instruction +
 //!   16 KiB data L1, 32-byte lines, 2-way set associative, 256 sets each,
 //!   1-bit LRU -- Pentium Processor Family Developer's Manual Volume 1 (Jul95)
 //!   §3.5 pins the base part's 8+8 KiB / 2-way / 32-byte-line structure
-//!   (`dev_docs/reference/Pentium-K6/241428-004_..._Volume_1_Jul95.txt:3697-3699`,
-//!   "Each of the caches are 8 Kbytes in size and each is organized as a 2-way
+//!   ("Each of the caches are 8 Kbytes in size and each is organized as a 2-way
 //!   set associative ... Each cache line is 32 bytes wide"); the P55C (Pentium
 //!   MMX) doubles each half to 16 KiB while keeping the 2-way/32-byte
 //!   structure, matching `GSW_MODE_SPECS[3]`'s `L1Cache::Split { instruction_kib:
@@ -565,9 +562,8 @@ impl ShadowArrays {
 /// backend emits, which is exactly the hot-path cost the S2 design note §4
 /// weighs and defers to a per-block SAMPLED scheme (§3c) for the timing
 /// charge; S1 measures, it does not charge, but reusing that same emitter
-/// surface safely is out of scope for this slice -- see
-/// `dev_docs/2026-09-05-s1-shadow-miss-results.md` for the measured coverage
-/// fraction this leaves (JIT data accesses are NOT probed; the interpreter/
+/// surface safely is out of scope for this slice. For the coverage
+/// that this leaves: (JIT data accesses are NOT probed; the interpreter/
 /// FastMap-direct data stream and the full JIT+interpreter fetch stream are).
 #[derive(Debug)]
 pub struct ShadowL1Probe {

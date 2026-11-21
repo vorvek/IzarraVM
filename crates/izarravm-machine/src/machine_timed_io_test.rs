@@ -355,7 +355,7 @@ fn ltim_keyboard_request_stays_asserted_until_the_guest_reads_obf() {
 }
 
 // ---------------------------------------------------------------------------
-// Slice 9A (`dev_docs/2026-09-05-device-timing-slice9-design.md`): the 8259A
+// Slice 9A of the device-timing design: the 8259A
 // INTA instrument's PIT-edge-to-IRQ0-handler-entry histogram. Certifies that
 // under TODAY's model (no INTA-turnaround charge -- that belongs to slice 8)
 // a PIT edge immediately followed by the IRQ0 acknowledge records exactly one

@@ -38,7 +38,7 @@ pub struct Memory {
 /// aligned window, so the allocation and alignment use safe Rust.
 ///
 /// The alignment is a PERFORMANCE contract, not a correctness one: the CPU's one-lookup store
-/// table (`dev_docs/2026-08-07-one-lookup-store-design.md` D7) steals the low bits of each
+/// table steals the low bits of each
 /// per-page host bias for its poison/tag encoding, which is only possible when every
 /// `DirectPage::ptr` handed out of this buffer is 4096-aligned; a misaligned backing silently
 /// degrades every page to the slow store path.

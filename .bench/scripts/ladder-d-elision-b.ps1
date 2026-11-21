@@ -15,7 +15,6 @@ re-run bar is cpu_before/after > 25 (this host's idle sits 14-23%).
 Identity (hash, guest clocks, bus clocks) is a STOP. Wall: NEUTRAL does not
 decline; sign worse than 4/8 or mean-wall ratio < 1.0 is a STOP.
 
-See dev_docs/specs/2026-08-29-d-elision-b-design.md section 7.4-7.5.
 #>
 
 param(

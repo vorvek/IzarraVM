@@ -4,8 +4,8 @@
 //! Hard `x86-64-v3` gate, shown to the user as "AVX2" (the owner-approved
 //! wording).
 //!
-//! Per the owner's 2026-09-04 ruling (closing out
-//! `dev_docs/2026-09-04-avx2-divergence-diagnosis.md`), the release build
+//! Per the owner's 2026-09-04 ruling (it closed the
+//! AVX2 divergence diagnosis), the release build
 //! targets `x86-64-v3` (`.cargo/config.toml`'s `[build] rustflags`). That
 //! makes the old `--interpreter` fallback unreachable: a non-AVX2 host
 //! takes `STATUS_ILLEGAL_INSTRUCTION` during CRT startup, before `main`'s

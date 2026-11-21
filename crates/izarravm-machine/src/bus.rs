@@ -143,8 +143,8 @@ impl PortBusClass {
     }
 }
 
-/// Classify a 16-bit port address per the table in
-/// `dev_docs/2026-09-05-port-io-repricing-design.md` §1.2. A `const fn` so the class table
+/// Classify a 16-bit port address per the class table of the
+/// port-I/O repricing design. A `const fn` so the class table
 /// itself can be asserted at compile time as well as by the unit-test matrix
 /// (`machine_port_bus_class_test.rs`).
 pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
@@ -189,7 +189,7 @@ pub(super) const fn port_bus_class(port: u16) -> PortBusClass {
 }
 
 /// The ATA PIO mode-4 cycle time `t0`, in guest clocks at 166.667 MHz: **120 ns minimum**
-/// (`dev_docs/reference/ata/ATA-3_X3.298-1997_std.txt:6708`; `:6625` "shall not report a value
+/// (ATA-3, X3.298-1997: "shall not report a value
 /// less than 120 ns"). Per 16-BIT WORD, which is what an ATA data-register cycle moves.
 ///
 /// The one bus constant in this whole repricing that is READ FROM A DOCUMENT rather than
@@ -2829,7 +2829,7 @@ impl CpuBus for MachineBus<'_> {
         // here, so a lazy read that skipped this would under-predict its own beam.
 
         if let Some(value) = self.pci.read_io(port, width, self.vega) {
-            // F4 (`dev_docs/2026-09-05-port-io-repricing-review.md`): this arm claims
+            // F4: this arm claims
             // 0xCF8-0xCFF above the width split and the general below-the-split charge site,
             // which would otherwise leave PCI configuration cycles unreached at epoch 2.
             // `PciTarget` prices a byte cycle, same as every other class, so a wider access

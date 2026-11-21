@@ -2654,8 +2654,8 @@ impl KateaTreeVolume {
 
     /// Walk `steps` FAT hops from `start` and return the landing cluster.
     ///
-    /// Serves the B3 doorbell hypercall (design:
-    /// dev_docs/tier-b-b3-a2-design-2026-08-28.md §2.4). Uses the same
+    /// Serves the B3 doorbell hypercall.
+    /// Uses the same
     /// overlay-shadowed FAT view as `chain_of`, through a `FatWalk` cursor so a
     /// long walk does not materialize a sector per entry. The step cap is
     /// `max_chain()` -- the same corrupt-chain ceiling `chain_with_token`

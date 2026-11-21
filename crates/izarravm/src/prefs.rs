@@ -203,7 +203,7 @@ impl CrtStyle {
 /// This selects only how the *presented* picture is shaped. The guest's
 /// `clutData` register is untouched under either setting, so a game that reads
 /// its gamma table back, or fades the screen by reprogramming it, behaves
-/// identically. See `dev_docs/2026-09-01-glide-gamma-toggle-design.md`.
+/// identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GlideGamma {
@@ -284,8 +284,7 @@ impl GlideWorkers {
 
 /// Default assumed CRT gamma: the midpoint of the 2.2-2.5 desktop-SVGA band,
 /// and the analytically special value at which the correction collapses to a
-/// pure black-level offset above the sRGB knee (see
-/// `dev_docs/2026-09-01-display-gamma-design.md` section 4.3).
+/// pure black-level offset above the sRGB knee.
 pub const DEFAULT_MONITOR_GAMMA: f32 = 2.4;
 
 /// Accepted range for a free-entry monitor gamma, matching the design's band

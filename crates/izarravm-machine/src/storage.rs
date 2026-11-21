@@ -100,7 +100,7 @@ pub struct Int13Profile {
     pub read_buf_conv: u64,
     pub read_buf_uma: u64,
     pub read_buf_hma: u64,
-    /// Slice 9D call-pattern extension (`dev_docs/2026-09-05-device-9d-result.md`):
+    /// Slice 9D call-pattern extension:
     /// every field below is aggregated over ALL data calls (read, write and
     /// verify alike, matching `stall_ticks`'s own scope), and every field is
     /// computed from `AtaDisk::pio_transfer_breakdown` -- the SAME formula

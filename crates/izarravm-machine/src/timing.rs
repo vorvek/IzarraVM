@@ -39,8 +39,8 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// established (FM against voice against CD) exactly, since a single scalar
 /// divides out of every ratio.
 ///
-/// Making the mix quieter is the point: SNDMIXER.COM owns amplification (see
-/// `dev_docs/sndmixer-spec.md`), and its faders have nothing to raise if the
+/// Making the mix quieter is the point: SNDMIXER.COM owns amplification,
+/// and its faders have nothing to raise if the
 /// defaults already sit on the clamp.
 ///
 /// The shape is not novel: 86Box reserves headroom for the same reason. Its
@@ -48,7 +48,7 @@ pub const DAC_PENDING_FRAME_CAP: usize = 4410;
 /// is the whole argument for one post-sum scalar.
 ///
 /// 86Box attenuates PER LEG, ahead of the sum, and by DIFFERENT amounts
-/// (`src/sound/snd_sb.c`, read as study only under `dev_docs/reference/86box`;
+/// (`src/sound/snd_sb.c`, read as study only;
 /// the concept is cited, no code taken):
 ///
 /// - digital voice, `sb_get_buffer_sb16_awe32`: `dsp * voice_l / 3.0` (-9.54 dB)

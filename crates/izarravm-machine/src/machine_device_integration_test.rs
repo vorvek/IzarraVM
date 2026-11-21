@@ -2146,8 +2146,7 @@ fn izarracd_doorbell_refuses_stray_rings() {
 }
 
 // ---------------------------------------------------------------------------
-// The B3 FAT-position hypercall (Lotura doorbell commands 3/4). Design:
-// dev_docs/tier-b-b3-a2-design-2026-08-28.md sections 2.2-2.4.
+// The B3 FAT-position hypercall (Lotura doorbell commands 3/4).
 
 use crate::dos::{HDD_MAP_RESULT, HDD_MAP_START, HDD_MAP_STEPS, HDD_MAP_UNIT};
 

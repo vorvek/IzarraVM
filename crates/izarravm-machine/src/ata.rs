@@ -60,8 +60,7 @@ pub(crate) fn pio_cable_ticks(words: u64) -> u64 {
 const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 
 // ---------------------------------------------------------------------------
-// Slice 9C (`dev_docs/2026-09-05-device-timing-slice9-design.md` §3.2, §6, §5
-// risk 2): the ATA seek / rotational / drive-buffer / sustained-media model.
+// Slice 9C of the device-timing design: the ATA seek / rotational / drive-buffer / sustained-media model.
 // Every constant below is dark unless `DeviceTimingProfile::ata` is armed --
 // `charge_pio_transfer` below is the ONLY consumer, and it takes today's
 // exact `COMMAND_LATENCY_TICKS` / `pio_sector_ticks()` formula whenever the
@@ -73,8 +72,8 @@ const DMA_COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000;
 const COMMAND_LATENCY_TICKS_PERIOD: u64 = MASTER_CLOCK_HZ / 20_000;
 
 /// Track-to-track seek, the FLOOR of `seek_ticks` for any nonzero distance:
-/// 3.5 ms. Verified against the two 1996-class drives named in the census
-/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2): above the
+/// 3.5 ms. Verified against the two 1996-class drives named in the census:
+/// above the
 /// Quantum Fireball 1280AT (3.1 ms) and 86Box's own 1996-generic preset
 /// (3 ms), just under the Seagate Medalist 1276 (3.8 ms) -- erring toward the
 /// slower drive of the pair, per the owner's anchor rule.
@@ -82,8 +81,8 @@ const SEEK_TRACK_TO_TRACK_TICKS: u64 = MASTER_CLOCK_HZ / 1_000 * 7 / 2;
 
 /// Full-stroke seek, the CEILING `seek_ticks` scales to linearly by distance:
 /// 28 ms, the same shape `ide.rs:934`'s `media_delay` uses for the ATAPI
-/// channel (`distance / total * MAX_SEEK_TICKS`). Verified
-/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2): between
+/// channel (`distance / total * MAX_SEEK_TICKS`). Verified:
+/// between
 /// the Medalist 1276 (25 ms) and the WD Caviar 21600/22100 (30 ms), erring
 /// slower than the Fireball 1280AT (24 ms).
 const SEEK_FULL_STROKE_TICKS: u64 = (MASTER_CLOCK_HZ / 1_000) * 28;
@@ -93,7 +92,7 @@ const SEEK_FULL_STROKE_TICKS: u64 = (MASTER_CLOCK_HZ / 1_000) * 28;
 const ROTATIONAL_LATENCY_TICKS: u64 = (MASTER_CLOCK_HZ / 100_000) * 555;
 
 /// The drive's sequential read-ahead buffer: 128 KiB. Verified
-/// (`dev_docs/2026-09-05-device-9c-constant-verification.md` §1-2) against
+/// against
 /// the real Quantum Fireball 1280AT spec sheet (128 KB) -- the Seagate
 /// Medalist 1276's real buffer is smaller still (64 KB), so 128 KiB errs
 /// toward the larger of the two named period drives while still being the
@@ -113,7 +112,7 @@ const DRIVE_BUFFER_BYTES: u64 = 128 * 1024;
 /// role as the cable-burst rate, used only for buffer hits.
 const MEDIA_BYTES_PER_SECOND: u64 = 5_000_000;
 
-/// Slice 9C-pre (`dev_docs/2026-09-05-device-timing-slice9-design.md` §6): the
+/// Slice 9C-pre of the device-timing design: the
 /// primary-channel analogue of `ide::ATA_POLL_RUN`, reusing the same value --
 /// this is a PORT, not an independent tuning. See `ide.rs`'s doc comment for
 /// the full derivation; it is not repeated here because the rationale is a

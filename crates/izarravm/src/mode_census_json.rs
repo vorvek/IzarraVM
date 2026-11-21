@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 /// One [`DistiraDrainNanos`] (a nanosecond sum per [`DrainCause`]) as JSON,
 /// same field names as the `queue_drain_causes`/`joins_by_cause` histograms
 /// above it. Factored out because slice 1's fix for B1 of
-/// `dev_docs/2026-09-05-distira-async-slice1-review.md` adds three of these
+/// the slice 1 review adds three of these
 /// (`window_ns_by_cause`, `blocked_ns_by_cause`, `overlap_ns_by_cause`).
 fn drain_nanos_json(nanos: &DistiraDrainNanos) -> Value {
     json!({
@@ -165,10 +165,8 @@ pub fn mode_census_json(
                         state.triangles.queue_drain_causes.immediate_triangle,
                     "config": state.triangles.queue_drain_causes.config,
                 },
-                // Slice 1 of the async-overlap review
-                // (`dev_docs/2026-09-05-distira-async-overlap-review.md`
-                // section 2, `dev_docs/2026-09-05-distira-async-overlap-design.md`
-                // section 8): the async-lever win metrics. `async_batches`
+                // Slice 1 of the async-overlap review:
+                // the async-lever win metrics. `async_batches`
                 // is how many batches were handed to the raster pool
                 // instead of drawn on the calling thread; `joins_by_cause`
                 // is how many of THOSE joins actually waited, broken down
@@ -191,7 +189,7 @@ pub fn mode_census_json(
                     "immediate_triangle": state.triangles.joins_by_cause.immediate_triangle,
                     "config": state.triangles.joins_by_cause.config,
                 },
-                // **Fixed per B1 of `dev_docs/2026-09-05-distira-async-slice1-review.md`.**
+                // **Fixed per B1 of the slice 1 review.**
                 // The first cut of `overlap_ns` measured flush-to-join-COMPLETE
                 // elapsed on every join, which on every join point but the
                 // swap (flush and join adjacent) is the batch's own raster
@@ -206,9 +204,8 @@ pub fn mode_census_json(
                 // on the cause of the CALL that performed the join, same as
                 // `joins_by_cause` -- because "one accumulator cannot
                 // distinguish 'the guest gave us a frame' from 'the fastfill
-                // joined immediately'"
-                // (`dev_docs/2026-09-05-distira-async-overlap-review.md`
-                // section 7): a `register_write_uncovered` entry here (the
+                // joined immediately'":
+                // a `register_write_uncovered` entry here (the
                 // fastfill) with `overlap_ns_by_cause` near zero joined
                 // almost immediately; a large value means real guest work
                 // ran first.
@@ -229,8 +226,7 @@ pub fn mode_census_json(
     });
     // The lane-cap ladder's own finding: nothing in the census announced
     // the realized pool size, so "did the knob actually grow the pool?"
-    // could only be inferred from wall-clock deltas
-    // (`dev_docs/2026-09-05-lane-cap-ladder.md`, "Pool sizing" section).
+    // could only be inferred from wall-clock deltas.
     // `lane_count` is this Distira instance's configured cap
     // (`IZARRAVM_DISTIRA_LANES`, or the >=8-core default of 8); `pool_size`
     // is the dedicated raster pool's actual OS thread count, which the
@@ -276,8 +272,7 @@ pub fn mode_census_json(
         },
         "distira_offset_bits_or": offset_bits_or,
         "distira_raster_lanes": distira_raster_lanes,
-        // Slice 0 of the async-overlap review
-        // (`dev_docs/2026-09-05-distira-async-overlap-review.md` section 2):
+        // Slice 0 of the async-overlap review:
         // the swap -> next-drain-call wall-clock window, whole run. Answers
         // whether the fastfill that follows a swap lands microseconds later
         // (a real overlap window an async lever could fill) or effectively

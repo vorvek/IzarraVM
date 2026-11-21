@@ -135,7 +135,7 @@ ways -- a hand-mutated pin fails and names the file; the PR #814 binary (4 MB
 per TMU) fails against main's pins with a two-line diff, `TMU 0 RAM` and
 `TMU 1 RAM`; and a tree that shifts the beam line passes. Full account,
 including the fixture-tree recipe and the MOJO.EXE provenance flag, in
-`PROTOCOL.md` and `dev_docs/2026-09-01-mojo-fixture.md`.
+`PROTOCOL.md`.
 
 The fixture tree is git-ignored like every other; `scripts/make-mojo-fixture.ps1`
 rebuilds it and hard-fails on the sha256 of `mojo.exe`, because the pins are
@@ -437,8 +437,8 @@ Both variables are set EXPLICITLY on every arm. Never unset one to turn it off:
 as ON, and `IZARRAVM_JIT16_486` is on for every value except exactly `"0"`.
 
 `-OneLookupStore 1|0` (default `1`) drives `IZARRAVM_ONE_LOOKUP_STORE` the same
-way — the one-lookup store emission A/B
-(`dev_docs/2026-08-07-one-lookup-store-design.md` D8), orthogonal to `-Arm`,
+way — the one-lookup store emission A/B,
+orthogonal to `-Arm`,
 also set explicitly on every run and on for every value except exactly `"0"`.
 The chosen value is recorded per row and in the summary as `one_lookup_store`.
 

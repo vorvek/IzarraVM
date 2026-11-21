@@ -104,8 +104,6 @@ plus a per-leg fixture copy charged from the tree sizes (wolf3d 2.3 MB, quake 18
 tombraid 15.0 MB, duke3d 46.1 MB). The estimate is printed at start and is a LOWER
 bound: discarded contaminated legs are not in it.
 
-See dev_docs/specs/2026-08-27-c2-podkey-links-design.md section 6 and
-dev_docs/specs/2026-08-27-c2-podkey-links-review.md MAJOR-2 through MAJOR-4.
 Modelled on .bench/scripts/ladder-d-elision-b.ps1 (review MINOR-9: that script is
 untracked, so this is a copy under its own name with its own lock path, not a
 reference to it).
