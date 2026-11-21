@@ -57,8 +57,8 @@ pub struct TrackInfo {
 
 /// The longest track this will measure, in Red Book frames: 100 minutes.
 ///
-/// Longer than any disc a drive will accept -- a 99-minute CD-R is the extreme
-/// of what was ever pressed -- so nothing legitimate is turned away. It exists
+/// Longer than any disc a drive will accept (a 99-minute CD-R is the extreme
+/// of what was ever pressed) so nothing legitimate is turned away. It exists
 /// because the frame count arrives from a container and nothing upstream
 /// constrains it: an Ogg whose final granule position is corrupt hands back a
 /// number near `u64::MAX`, and the sector count derived from it would size both
@@ -147,7 +147,7 @@ fn measure(path: &Path, container: Container) -> Result<TrackInfo, CdAudioError>
     let mut open = open(path, container)?;
     // A declared rate of zero is refused rather than defaulted. It is not a
     // legal stream, its duration is undefined, and it reaches the resampler as
-    // a step of 0.0 -- a loop that emits output forever without consuming
+    // a step of 0.0, a loop that emits output forever without consuming
     // input, on a worker thread, until the allocation fails and takes the
     // process with it. symphonia's RIFF parser does not validate the field, so
     // a WAV with a zeroed fmt chunk gets this far.
@@ -182,7 +182,7 @@ fn measure(path: &Path, container: Container) -> Result<TrackInfo, CdAudioError>
         (Container::Mp3, _) => {
             let coded = walk_packets(&mut open.reader, open.track_id, path)?;
             // The walk counts coded frames, and an MPEG stream begins with the
-            // encoder's own delay and ends padded out to a frame boundary --
+            // encoder's own delay and ends padded out to a frame boundary:
             // 1105 + 443 samples for LAME on a 0.2 s tone, which would put the
             // track three sectors long. Only a Xing/LAME header records those,
             // so a tagless stream keeps them: nothing in it says where the
@@ -223,7 +223,7 @@ fn measure(path: &Path, container: Container) -> Result<TrackInfo, CdAudioError>
     })
 }
 
-/// Sum every packet's duration to the end of the stream. Header parsing only --
+/// Sum every packet's duration to the end of the stream. Header parsing only:
 /// no packet is decoded.
 fn walk_packets(
     reader: &mut Box<dyn FormatReader>,
@@ -241,7 +241,7 @@ fn walk_packets(
             // End of stream. 0.6 reports this as a packet-less Ok rather than
             // as an unexpected-EOF I/O error, so an error arm never sees it.
             Ok(None) => break,
-            // The track list has changed mid-stream -- a chained Ogg. Every
+            // The track list has changed mid-stream: a chained Ogg. Every
             // page after this belongs to a different logical stream, so its
             // frames are not this track's and the walk is finished.
             Err(symphonia::core::errors::Error::ResetRequired) => break,

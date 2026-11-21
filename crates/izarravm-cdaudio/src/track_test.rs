@@ -109,7 +109,7 @@ fn a_frame_past_the_track_is_absent_even_when_fully_decoded() {
 #[test]
 fn the_decode_runs_once_however_many_frames_are_touched() {
     // `frame` starts the worker on each miss, and a track is nothing but misses
-    // until the decode lands -- eighteen thousand of them for a four-minute
+    // until the decode lands: eighteen thousand of them for a four-minute
     // track. The audio would come out right anyway, since every worker decodes
     // the same file to the same bytes, so the count is what has to be asserted:
     // the damage is threads, not sound.
@@ -267,7 +267,7 @@ fn a_track_without_a_registry_keeps_its_buffer() {
 #[test]
 fn a_live_track_is_never_the_one_evicted() {
     // Taking the buffer from a worker that is still writing does not corrupt
-    // anything -- it copies under the same lock and checks the length -- but it
+    // anything (it copies under the same lock and checks the length) but it
     // leaves that track silent for good, because the publish that would have
     // filled it finds nothing to write into, and it clears `started` so a
     // second worker can begin on a file the first is still reading.
@@ -283,7 +283,7 @@ fn a_live_track_is_never_the_one_evicted() {
         // On `finished`, not on the last frame being readable: a worker
         // publishes its final sectors and only then stores the flag, so a
         // readable track can still have a worker about to write `true` over the
-        // `false` this test is about to install -- which hands the registry a
+        // `false` this test is about to install, which hands the registry a
         // fourth candidate and evicts whatever it likes.
         assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
     }
@@ -331,7 +331,7 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
         // out would store `true` after the `false` installed below.
         assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
     }
-    // Three resident with none evictable, and `a` ready to be decoded afresh --
+    // Three resident with none evictable, and `a` ready to be decoded afresh,
     // exactly what an admission during two live decodes leaves behind.
     {
         let mut resident = registry.inner.lock().unwrap();
@@ -347,7 +347,7 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
     let resident = |registry: &Registry| registry.inner.lock().unwrap().len();
     assert_eq!(resident(&registry), 3);
 
-    // Touching `a` admits it, which cannot evict anything -- nothing is
+    // Touching `a` admits it, which cannot evict anything: nothing is
     // finished. Only a worker reaching its end can clear the backlog.
     a.frame(0);
     assert!(
@@ -356,7 +356,7 @@ fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
     );
 
     // `a`'s own worker is not the one that can do it: it leaves exactly one
-    // evictable track behind, and the registry never takes the last one -- from
+    // evictable track behind, and the registry never takes the last one: from
     // here that track is indistinguishable from the one under the play head.
     registry.evict_excess();
     assert_eq!(
@@ -409,7 +409,7 @@ fn a_real_workers_tail_call_is_what_clears_the_backlog() {
             track.shared.finished.store(true, Ordering::SeqCst);
             resident.push(Arc::clone(&track.shared));
         }
-        // `stuck` stands in for a worker that has not reached its end -- the
+        // `stuck` stands in for a worker that has not reached its end, the
         // reason a backlog exists at all.
         stuck.shared.finished.store(false, Ordering::SeqCst);
         // `arriving` is asked for afresh: no readable sector and nothing
@@ -431,8 +431,8 @@ fn a_real_workers_tail_call_is_what_clears_the_backlog() {
     );
     assert!(played.resident_bytes() > 0);
 
-    // Now the real worker. Admission declines again for the same reason -- it
-    // still sees only `played` -- so the count can only come down once
+    // Now the real worker. Admission declines again for the same reason (it
+    // still sees only `played`) so the count can only come down once
     // `arriving` stores its flag, and the tail call is what asks afterwards.
     arriving.frame(0);
 
@@ -521,7 +521,7 @@ fn a_track_being_replayed_is_not_the_one_evicted() {
     // Recency has to count reads, not decode starts. A track played from a
     // buffer it already holds serves nothing but hits, so if only a miss
     // refreshed its place it would sit at the bottom of the order however long
-    // it had been playing -- and the next admission would take its buffer away
+    // it had been playing, and the next admission would take its buffer away
     // mid-song, sending the mixer back to a decode from sector 0.
     let registry = Registry::new();
     let played = registry.track(fixture("tone.wav")).unwrap();
@@ -532,7 +532,7 @@ fn a_track_being_replayed_is_not_the_one_evicted() {
     // the same instant: a worker publishes its last run of sectors and only then
     // stores the flag, so a track can read to its end while the registry still
     // sees it as one a worker is writing into. Waiting on the readable frame
-    // leaves this test's stated precondition -- both tracks decoded and idle --
+    // leaves this test's stated precondition (both tracks decoded and idle)
     // unestablished, and which side of that window `other` was on decided
     // whether the test found the eviction bug or a passing run.
     for track in [&played, &other] {
@@ -545,7 +545,7 @@ fn a_track_being_replayed_is_not_the_one_evicted() {
     assert!(other.frame(other.sectors() - 1).is_some());
 
     // `played` was admitted first, so it is the oldest by admission order. Now
-    // read it the way the mixer would -- every one of these is a hit.
+    // read it the way the mixer would: every one of these is a hit.
     for index in 0..played.sectors() {
         assert!(played.frame(index).is_some());
     }
@@ -568,7 +568,7 @@ fn a_track_being_replayed_is_not_the_one_evicted() {
 fn formatting_a_track_does_not_print_its_audio() {
     // `CdImage` derives `Debug` and holds these behind an `Arc`, so one `{:?}`
     // of a mounted disc reaches the decoded buffer. A derived `Debug` on it
-    // prints every sample byte -- tens of megabytes into a single log line --
+    // prints every sample byte, tens of megabytes into a single log line,
     // which is the hazard the `AudioTrackSource` contract tells implementors to
     // hand-write `Debug` around.
     let track = DecodedTrack::new(fixture("tone.wav")).unwrap();

@@ -9,7 +9,7 @@ use super::*;
 /// `mt32emu_play_msg` and `mt32emu_play_sysex` return only these two failures
 /// (libmt32emu 2.8.2, `c_interface.cpp`: `if (!isOpen()) return NOT_OPENED;
 /// return playMsg(...) ? OK : QUEUE_FULL`). Collapsing both onto one opaque
-/// `NativeCall` -- which is what this used to do -- made a momentarily busy
+/// `NativeCall` (which is what this used to do) made a momentarily busy
 /// synth indistinguishable from a dead one, and `MidiEngine` latches itself
 /// permanently silent on the latter.
 #[test]

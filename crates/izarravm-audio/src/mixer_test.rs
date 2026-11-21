@@ -54,7 +54,7 @@ fn cd_volume_attenuates_via_both_register_paths() {
     let (l, r) = mixer.cd_gain();
     assert!(l > 0.9 && r > 0.9, "full CD volume is near unity: {l},{r}");
     // The CT1345 compat alias maps into the same 5-bit registers, and its max
-    // nibble reaches level 31 -- 0 dB, not the -2 dB a `nibble << 1` would give.
+    // nibble reaches level 31, 0 dB, not the -2 dB a `nibble << 1` would give.
     let mut compat = SbMixer::default();
     // Nibble 0 is level 1, NOT the mute step: the compat registers physically
     // cannot reach level 0, so the quietest they express is the -60 dB floor.
@@ -308,8 +308,8 @@ fn inert_defaults_are_hardware_encoded_not_bare_levels() {
     assert_eq!(read_reg(&mut mixer, 0x0A), 0x05);
 }
 
-/// The FM/MIDI bus has three register paths -- 0x34/0x35 (SB16), 0x26 (SB Pro,
-/// packed nibbles) and 0x06 (SB1/2, one nibble for both channels) -- and they are
+/// The FM/MIDI bus has three register paths (0x34/0x35 (SB16), 0x26 (SB Pro,
+/// packed nibbles) and 0x06 (SB1/2, one nibble for both channels)) and they are
 /// one control. 86Box `sb_ct1745_mixer_write` cases 0x06 and 0x26 copy into
 /// 0x34/0x35. Leaving 0x26/0x06 in the inert store meant an SB Pro-era title
 /// setting its music volume got no attenuation at all, and the register file
@@ -369,7 +369,7 @@ fn fm_compat_aliases_drive_the_same_level_as_0x34_0x35() {
 /// from DUKE3D.CFG that is `0xD8` to the voice pair and `0xC8` to the FM pair.
 /// Reading those bytes as `& 0x1F` decoded the voice as level 24 instead of 27
 /// and, because `0x34`/`0x35` were an inert store, applied no FM attenuation at
-/// all -- 6 dB off the effects and 12 dB of music that should not have been
+/// all: 6 dB off the effects and 12 dB of music that should not have been
 /// there, which is why the game's music played and its digital effects did not.
 #[test]
 fn duke3d_mixer_writes_put_the_effects_above_the_music() {
@@ -403,7 +403,7 @@ fn duke3d_mixer_writes_put_the_effects_above_the_music() {
 
 /// The failure mode the old decode had beyond the few-dB error: any level that
 /// is a multiple of four writes a byte whose low five bits are zero, so
-/// `value & 0x1F` read it as level 0 -- a hard mute. Level 24 is the Guide's own
+/// `value & 0x1F` read it as level 0, a hard mute. Level 24 is the Guide's own
 /// documented power-on value, i.e. a card told to restore its default went
 /// silent.
 #[test]
@@ -502,8 +502,8 @@ fn wavetable_extension_registers_decode_as_five_bit_levels() {
 /// The two rules that make this pair unlike `0x30`-`0x37`: D0 mutes, and a
 /// level of 0 does NOT.
 ///
-/// The wavetable is the one leg in the machine with no second owner -- no GUI
-/// slider, no other register, no game setup screen reaches it -- so a stray
+/// The wavetable is the one leg in the machine with no second owner (no GUI
+/// slider, no other register, no game setup screen reaches it) so a stray
 /// `0x00` from a guest clearing a block of mixer registers would silence its
 /// MIDI for the whole session with nothing to show for it. Flooring that at
 /// the fader's own quietest stop turns an unexplainable silence into an

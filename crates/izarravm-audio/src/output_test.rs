@@ -245,7 +245,7 @@ fn sink_exposes_no_snapshot_when_diagnostics_are_disabled() {
 /// A detached sink is a real queue that simply has no callback behind it.
 ///
 /// It exists so the emulation thread's audio path can be driven and INSPECTED
-/// in a test -- what the pump queues is otherwise only observable by listening,
+/// in a test: what the pump queues is otherwise only observable by listening,
 /// which is how a gain that was never applied went unnoticed.
 #[test]
 fn a_detached_sink_queues_audio_and_hands_it_back_without_the_prefill_padding() {
@@ -268,7 +268,7 @@ fn a_detached_sink_queues_audio_and_hands_it_back_without_the_prefill_padding() 
 /// A stream that fails DURING the open must leave recovery armed.
 ///
 /// `open` starts the stream, so the callback can report a dead device inside
-/// the very call that built it -- an endpoint that vanished between the
+/// the very call that built it: an endpoint that vanished between the
 /// enumeration and the `play()`. Clearing the failed flag AFTER the attempt
 /// wipes that report: the player then holds a stream that will never call back,
 /// believes it is healthy, and never tries again. That is a permanent-silence

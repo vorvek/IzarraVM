@@ -250,7 +250,7 @@ pub struct SbDsp {
     dropped_frames: u64,
     /// Largest absolute PCM sample the DMA path has produced since the last
     /// [`take_peak_abs`]. Answers "is the guest feeding this card real audio,
-    /// or a buffer of silence?" -- the one question `ticked/s` cannot: a DMA
+    /// or a buffer of silence?", the one question `ticked/s` cannot: a DMA
     /// channel pointed at a never-filled buffer ticks at full rate.
     ///
     /// Only maintained when `IZARRAVM_SB_DEBUG` is set (see [`peak_tracking`]);
@@ -412,7 +412,7 @@ impl SbDsp {
             0x05 | 0x0E => 2,
             // Single-cycle Creative ADPCM output: mode byte set by the opcode,
             // 2-byte length inline (like 0x14). Auto-init ADPCM (0x1F/0x7D/0x7F)
-            // takes no args -- it uses the 0x48 block size.
+            // takes no args: it uses the 0x48 block size.
             0x74 | 0x75 | 0x76 | 0x77 | 0x16 | 0x17 => 2,
             0x48 => 2, // set block size for auto-init/high-speed modes
             // The SB16 0xBx/0xCx families (16-bit/8-bit DMA output/input, single
@@ -801,8 +801,8 @@ impl SbDsp {
     {
         if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
             // Per-frame instrument: gated at the call site, not inside a helper.
-            // This runs once per produced PCM frame -- 44100 times a second per
-            // playing channel -- and its only consumer is the `[SB]` report.
+            // This runs once per produced PCM frame (44100 times a second per
+            // playing channel) and its only consumer is the `[SB]` report.
             if self.peak_tracking {
                 let amplitude =
                     i32::from(frame.0.saturating_abs()).max(i32::from(frame.1.saturating_abs()));
@@ -838,7 +838,7 @@ impl SbDsp {
     }
 
     /// Read and clear the peak absolute sample amplitude produced since the last
-    /// call. Diagnostic only, and reads 0 unless `IZARRAVM_SB_DEBUG` is set --
+    /// call. Diagnostic only, and reads 0 unless `IZARRAVM_SB_DEBUG` is set,
     /// the same gate that decides whether the `[SB]` line is printed at all.
     pub fn take_peak_abs(&mut self) -> i32 {
         std::mem::replace(&mut self.peak_abs, 0)

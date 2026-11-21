@@ -68,7 +68,7 @@ fn wrappers_reject_incomplete_midi_and_partial_frames() {
 /// this parallel test process. In a parallel suite another test's synth can
 /// hit the router's event callsite first, on a thread with no dispatcher;
 /// tracing then caches never-interested for that callsite, and on CI timing
-/// the cache survived into this test's scoped subscriber — zero events
+/// the cache survived into this test's scoped subscriber: zero events
 /// captured while the callback demonstrably fired (no stderr lines either).
 /// A fresh process makes the scoped subscriber exist before the first
 /// callsite hit, which is also the shape the GUI guarantees in production
@@ -162,10 +162,10 @@ fn fluidsynth_diagnostics_reach_tracing_not_stderr() {
 /// The ROM loader must say WHICH requirement failed, and take a set however it
 /// is laid out.
 ///
-/// Every distribution of these ROMs names its files differently --
-/// `MT32_CONTROL.ROM`, `CM32L_CONTROL.ROM`, `MT32_1.0.7_control.rom`,
+/// Every distribution of these ROMs names its files differently
+/// (`MT32_CONTROL.ROM`, `CM32L_CONTROL.ROM`, `MT32_1.0.7_control.rom`,
 /// `ctrl_mt32_1_07.rom`, and half-image pairs that have to be merged before
-/// they can be identified at all -- so the loader identifies by CONTENT and
+/// they can be identified at all) so the loader identifies by CONTENT and
 /// accepts a folder as readily as a file. What it must never do is answer a
 /// user with a complete, valid set and a message that says only "The MIDI
 /// output could not be initialized."

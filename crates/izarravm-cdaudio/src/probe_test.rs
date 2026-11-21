@@ -60,7 +60,7 @@ fn an_mpeg_walk_has_the_encoders_delay_and_padding_taken_off_it() {
 
 #[test]
 fn a_tagless_vbr_mp3_is_measured_by_walking_its_packets() {
-    // symphonia does not report "unknown" for a long tagless VBR file -- it
+    // symphonia does not report "unknown" for a long tagless VBR file: it
     // extrapolates a frame count from the average bitrate and returns it as a
     // `Some`, so a fallback conditioned on `None` would never fire. On this
     // fixture it is 19% short. The walk is exact, and the small overshoot that
@@ -142,7 +142,7 @@ fn an_absurd_frame_count_is_refused_rather_than_sized() {
 fn a_zero_sample_rate_is_refused() {
     // Not a legal stream, and symphonia's RIFF parser does not validate the
     // field, so a WAV with a zeroed fmt chunk reaches the probe. Its duration
-    // is undefined and it drives the resampler at a step of 0.0 -- a loop that
+    // is undefined and it drives the resampler at a step of 0.0, a loop that
     // emits output forever without consuming input.
     let path = std::env::temp_dir().join(format!(
         "izarravm-cdaudio-zero-rate-{}.wav",

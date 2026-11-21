@@ -579,8 +579,8 @@ impl Timer {
     /// Return whether `self.expired` would be true after
     /// `micros_elapsed` more microseconds of chip time, without mutating
     /// `self`? `expired` is sticky (only a register-0x04 bit7 write clears it,
-    /// via `OplChip::write_bank`), so the answer is `self.expired` already, OR
-    /// -- when running -- whether the count would cross 0xff within
+    /// via `OplChip::write_bank`), so the answer is `self.expired` already, OR,
+    ///when running, whether the count would cross 0xff within
     /// `micros_elapsed`. Mirrors `advance`'s exact step arithmetic
     /// (accumulated_us + micros, divided by step_us, whole steps added to
     /// count) without the loop: since only the CROSSING matters (not the
@@ -1051,7 +1051,7 @@ impl OplChip {
     /// without stepping either timer. Peeks each timer's `expired_after`
     /// instead of reading the live `expired` flag, then composes the
     /// result through the same `status_bits` the live `status()` call uses, so
-    /// the two paths can never structurally diverge in bit logic -- only in
+    /// the two paths can never structurally diverge in bit logic, only in
     /// which `expired` inputs they feed it.
     pub fn status_after(&self, micros_elapsed: u64) -> u8 {
         let t1_expired = self.timer1.expired_after(micros_elapsed);
@@ -1076,7 +1076,7 @@ impl OplChip {
     /// The mask bits (register 0x04 bits 6/5) come from `self.registers`,
     /// which only a write can change; a write always ends the batch (Task
     /// 3.2), so a mid-batch predicted status read can never observe a mask
-    /// mid-batch write races with -- the mask is exactly as batch-entry-stable
+    /// mid-batch write races with: the mask is exactly as batch-entry-stable
     /// here as it is for the live `status()` call above.
     fn status_bits(&self, t1_expired: bool, t2_expired: bool) -> u8 {
         let control = self.registers[0][0x04];

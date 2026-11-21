@@ -33,7 +33,7 @@ fn peak(pcm: &[u8], frames: usize) -> u16 {
 #[test]
 fn decoded_length_agrees_with_the_probe() {
     // The invariant the TOC rests on. Asserting that the finished buffer holds
-    // `sectors` sectors would be a tautology -- it is allocated at that size --
+    // `sectors` sectors would be a tautology (it is allocated at that size)
     // so this compares what the decoder actually produced, before padding or
     // truncation, against the sector count the mount already published.
     for name in ["tone.wav", "tone.ogg", "tone.flac", "tone-nolength.flac"] {
@@ -67,7 +67,7 @@ fn an_mp3s_length_agrees_too() {
 #[test]
 fn the_probes_subtraction_and_the_readers_trim_are_not_applied_twice() {
     // symphonia's MPEG reader applies the delay and padding itself before a
-    // decoded buffer is handed over -- the first packet of the LAME fixture
+    // decoded buffer is handed over: the first packet of the LAME fixture
     // arrives stamped ts = -1105 and yields 47 of its 1152 frames. The probe
     // arrives at the same 8820 by walking coded frames and subtracting the
     // declared delay and padding.
@@ -91,8 +91,8 @@ fn a_decode_stops_at_the_length_the_mount_published() {
     // Every fixture here happens to run out exactly when the probe said it
     // would, so nothing above can tell whether the decode is bounded by the
     // promise or merely by the end of the file. That distinction matters when
-    // the file has grown since the mount measured it -- a rip being rewritten
-    // under a running emulator -- because the TOC is already published and the
+    // the file has grown since the mount measured it (a rip being rewritten
+    // under a running emulator) because the TOC is already published and the
     // sectors past it belong to the next track.
     //
     // A frame count shorter than the file forces the two apart.
@@ -123,7 +123,7 @@ fn a_mono_22k_source_is_resampled_and_duplicated() {
         compared += 1;
     }
     assert!(compared > 0, "no samples were compared");
-    // And it is not silence -- a resampler bug returning zeros would satisfy
+    // And it is not silence: a resampler bug returning zeros would satisfy
     // the equality above without decoding anything.
     assert!(peak(&pcm, 2000) > 1000, "decoded tone is silent");
 }
@@ -209,7 +209,7 @@ fn a_decode_that_ends_early_does_not_republish_its_silent_tail() {
     // A file replaced or truncated between mount and play stops far short of
     // the length the TOC promised. The bytes past that point were never written
     // and are already zero in both buffers, so handing them to the callback
-    // copies zeros onto zeros -- and `DecodedTrack` does that copy while
+    // copies zeros onto zeros, and `DecodedTrack` does that copy while
     // holding the lock the mixer pull takes, which for a long track is hundreds
     // of megabytes of memcpy stalling the emulation thread.
     let mut info = crate::probe_info(&fixture("tone.wav")).unwrap().unwrap();
@@ -227,8 +227,8 @@ fn a_decode_that_ends_early_does_not_republish_its_silent_tail() {
     })
     .unwrap();
 
-    // The whole track is still declared ready -- the tail is silence, not
-    // pending -- but only the sectors carrying audio were passed along.
+    // The whole track is still declared ready (the tail is silence, not
+    // pending) but only the sectors carrying audio were passed along.
     assert_eq!(last_ready, info.sectors);
     assert!(
         handed_over <= real_bytes + AUDIO_FRAME_BYTES,

@@ -153,8 +153,8 @@ impl AudioSink {
     /// A sink with no output stream behind it, for tests and for any caller
     /// that wants to drive the audio path without a sound device.
     ///
-    /// The queue behaves exactly as a live one does -- same capacity, same
-    /// high-water recovery -- it is simply never drained by a callback. That is
+    /// The queue behaves exactly as a live one does: same capacity, same
+    /// high-water recovery. It is simply never drained by a callback. That is
     /// the point: it makes what the emulation thread QUEUES observable, which is
     /// otherwise only visible by listening.
     pub fn detached() -> Self {
@@ -238,7 +238,7 @@ pub struct AudioPlayer {
     /// `None` while there is no working output stream: either the host had no
     /// default device when the player was built, or the running stream failed
     /// and has not been rebuilt yet. The SINK exists either way, which is what
-    /// makes both states recoverable -- the emulation thread keeps writing to a
+    /// makes both states recoverable: the emulation thread keeps writing to a
     /// queue that a later stream can be attached to.
     stream: Option<cpal::Stream>,
     sink: AudioSink,
@@ -257,7 +257,7 @@ impl AudioPlayer {
     ///
     /// Infallible on purpose. A machine with no sound device at startup used to
     /// get `Err` here and `audio: None` in the GUI for the rest of the session,
-    /// so plugging in a headset after launch did nothing -- the same permanent
+    /// so plugging in a headset after launch did nothing, the same permanent
     /// silence a device change caused mid-run, arrived at from the other side.
     /// The queue is created regardless and [`poll_recover`](Self::poll_recover)
     /// covers both, because from its point of view "the device went" and "the
@@ -307,8 +307,8 @@ impl AudioPlayer {
     ///
     /// A cpal stream that reports an error is finished: it stops calling back
     /// and never resumes, so the machine plays to nothing for the rest of the
-    /// session. That is what a device change does -- unplugging a headset,
-    /// Windows moving the default endpoint, a driver reset -- and it used to be
+    /// session. That is what a device change does (unplugging a headset,
+    /// Windows moving the default endpoint, a driver reset) and it used to be
     /// handled by printing one line to stderr. The default device is re-queried
     /// on every attempt, so the new stream follows the endpoint the host has
     /// moved to rather than reopening the one that vanished.
@@ -395,7 +395,7 @@ impl StreamRecovery {
     /// * The flag is cleared BEFORE the attempt and restored if the attempt
     ///   fails. `open` starts the stream, so the stream can fail inside the
     ///   call; clearing afterwards would wipe that report and leave a player
-    ///   that believes it is healthy and is not -- a permanent-silence hole in
+    ///   that believes it is healthy and is not, a permanent-silence hole in
     ///   the shape of the very bug this path exists to close.
     /// * `retry_after` is set before the attempt and never cleared on success,
     ///   so it bounds BOTH outcomes. A device that opens and then errors
@@ -641,7 +641,7 @@ where
         {
             // A cpal stream never recovers on its own: after an error it stops
             // calling back for good. Raising the flag is what lets the owning
-            // thread notice and rebuild -- printing alone left the machine
+            // thread notice and rebuild: printing alone left the machine
             // playing to a dead device with nothing on screen to say so.
             let failed = Arc::clone(failed);
             move |error| {

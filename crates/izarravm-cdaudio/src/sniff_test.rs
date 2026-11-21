@@ -17,7 +17,7 @@ fn head_of(head: &[u8], len: usize) -> Vec<u8> {
     bytes
 }
 
-/// A sniff buffer carrying two consecutive valid MPEG frame headers -- what a
+/// A sniff buffer carrying two consecutive valid MPEG frame headers, what a
 /// real MP3 with no ID3 tag looks like from the front.
 fn two_mpeg_frames() -> Vec<u8> {
     let mut bytes = vec![0u8; SNIFF_BYTES];
@@ -74,7 +74,7 @@ fn raw_cd_da_whose_bytes_look_exactly_like_mpeg_is_not_mp3() {
     // and across a whole track another one will eventually land exactly a frame
     // length later. Raw audio misidentified as MP3 is a wrong-data mount, the
     // failure class this work exists to remove, so the file's length is an
-    // independent guard -- raw audio is always a whole number of frames.
+    // independent guard: raw audio is always a whole number of frames.
     //
     // The buffer here is byte-for-byte the one that sniffs as MP3 above. Only
     // the length differs, so nothing but the length guard can be rejecting it.
