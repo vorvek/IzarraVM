@@ -8,10 +8,9 @@ use super::*;
 
 // ---- Stack-group golden battery (A4) ----
 
-/// One golden end-state for a stack-group case, captured from the fused reference
-/// (`execute_instruction_legacy`) via `regen_stack_goldens`. Stack ops mutate SS:SP and stack
-/// memory, so this captures the full register file (incl. ESP/EBP), eflags (PUSHF/POPF/POPA
-/// touch flags), eip, memory-write deltas, and the InstructionPrefetch fetch count.
+/// Stack ops mutate SS:SP and stack memory, so this captures the full register file (incl. ESP/EBP),
+/// eflags (PUSHF/POPF/POPA touch flags), eip, memory-write deltas, and the InstructionPrefetch fetch
+/// count.
 struct StackGolden {
     name: &'static str,
     code: &'static [u8],
@@ -44,9 +43,11 @@ fn stack_seed(cpu: &mut CpuGsw) {
     cpu.registers.eflags = 0x02;
 }
 
-/// The stack-group differential battery. Captured from the PRIOR fused reference
-/// (`execute_instruction_legacy`) via `regen_stack_goldens`; see `alu_golden_cases` for the
-/// full capture recipe. Never edit by hand — re-run the regen from the pre-split commit.
+/// The stack-group differential battery.
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_stack_goldens` after an intentional behavior change; never edit one by hand to make a test
+/// pass.
 fn stack_golden_cases() -> &'static [StackGolden] {
     &[
         // PUSH reg (0x50-0x57): SP decrements by 2, then value written at ss:SP.
@@ -310,10 +311,9 @@ fn stack_golden_cases() -> &'static [StackGolden] {
     ]
 }
 
-/// Seed memory for the stack golden battery. Plants 0xBEEF at SS:SP=0x1f0 (the first
-/// word a POP reads) so POP tests have a stable, visible source. Each case gets a fresh
-/// 0x200-byte vector so earlier writes don't bleed into later cases. The POPF case
-/// overwrites this with 0x0097 in the regen/assert loops to give CF+PF+AF+ZF+SF.
+/// Seed memory for the stack golden battery. Plants 0xBEEF at SS:SP=0x1f0 (the first word a POP reads)
+/// so POP tests have a stable, visible source. Each case gets a fresh 0x200-byte vector so earlier
+/// writes don't bleed into later cases.
 fn stack_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[..code.len()].copy_from_slice(code);
     // POP tests: plant 0xBEEF at ss:0x1f0 (the initial SP — the first word a POP reads).
@@ -362,12 +362,16 @@ fn stack_split_matches_golden_across_ops() {
     }
 }
 
-/// Regenerate `stack_golden_cases` from the fused reference. Ignored by default.
-/// Run WHILE the stack group's fused arms still exist in `dispatch_opcode`:
+/// Print the `stack_golden_cases` literals from the current implementation. Ignored by default: it
+/// only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_stack_goldens -- --ignored --nocapture
-/// then paste the output over `stack_golden_cases` and only then do the conversion.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_stack_goldens() {
     for g in stack_golden_cases() {
         let mut mem = vec![0u8; 0x200];
@@ -377,13 +381,13 @@ fn regen_stack_goldens() {
         }
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        stack_seed(&mut fused);
+        let mut cpu = CpuGsw::default();
+        stack_seed(&mut cpu);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run before deleting fused arms",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -400,9 +404,9 @@ fn regen_stack_goldens() {
             "            StackGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
             g.name,
             g.code,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
         );
@@ -441,14 +445,14 @@ fn group_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[0x10..0x12].copy_from_slice(&0x3412u16.to_le_bytes());
 }
 
-/// The arithmetic /ext group (1-4) differential battery. Captured from the PRIOR fused reference
-/// (`execute_instruction_legacy`) via `regen_group_goldens`; see `alu_golden_cases` for the full
-/// capture recipe. Never edit by hand — re-run the regen WHILE the fused arms still exist in
-/// `dispatch_opcode`, then paste, then delete the fused arms. Covers: group 1 ALU r/m,imm
-/// (byte/word, CMP no-writeback, 0x83 sign-extend), group 2 shift/rotate (SHL/SHR/SAR/ROL/RCR
-/// with count 1/CL/imm8), group 3 TEST-with-imm/NOT/NEG/MUL/IMUL and a non-faulting DIV, and
-/// group 4 INC/DEC (CF preserved). The DIV-by-zero #DE fault is a separate test (goldens only
-/// capture success).
+/// The arithmetic /ext group (1-4) differential battery. Covers: group 1 ALU r/m,imm (byte/word, CMP
+/// no-writeback, 0x83 sign-extend), group 2 shift/rotate (SHL/SHR/SAR/ROL/RCR with count 1/CL/imm8),
+/// group 3 TEST-with-imm/NOT/NEG/MUL/IMUL and a non-faulting DIV, and group 4 INC/DEC (CF preserved).
+/// The DIV-by-zero #DE fault is a separate test (goldens only capture success).
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_group_goldens` after an intentional behavior change; never edit one by hand to make a test
+/// pass.
 fn group_golden_cases() -> &'static [GroupGolden] {
     &[
         // Group 1: ALU r/m, imm (0x80/0x81/0x82/0x83). Includes CMP no-writeback and 0x83
@@ -708,26 +712,29 @@ fn group_split_matches_golden_across_ops() {
     }
 }
 
-/// Regenerate `group_golden_cases` from the fused reference. Ignored by default.
-/// Run WHILE the group's fused arms (0x80-0x83, 0xc0/0xc1/0xd0-0xd3, 0xf6/0xf7, 0xfe) still
-/// exist in `dispatch_opcode`:
+/// Print the `group_golden_cases` literals from the current implementation. Ignored by default: it
+/// only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_group_goldens -- --ignored --nocapture
-/// then paste the output over `group_golden_cases` and only then delete the fused arms.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_group_goldens() {
     for g in group_golden_cases() {
         let mut mem = vec![0u8; 0x200];
         group_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        group_seed(&mut fused);
+        let mut cpu = CpuGsw::default();
+        group_seed(&mut cpu);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run before deleting fused arms",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -744,9 +751,9 @@ fn regen_group_goldens() {
             "            GroupGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
             g.name,
             g.code,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
         );
@@ -836,15 +843,14 @@ fn branch_seed(cpu: &mut CpuGsw, cx: u32) {
     cpu.registers.set_ecx(cx);
 }
 
-/// The relative/loop branch differential battery. Captured from the PRIOR fused reference via
-/// `regen_branch_goldens`; see `alu_golden_cases` for the full capture recipe. The branch group's
-/// fused arms (0x70-0x7f, 0xe0-0xe3, 0xe8/0xe9/0xeb, 0F 80-0F 8F) are already deleted on
-/// `perf-decode-cache`, so these were captured from the pre-split base commit (a94ed279): check
-/// it out, run the regen, paste, return. Never hand-edit a golden — re-capture from the reference.
-/// Covers: Jcc short taken/not-taken (JZ/JNZ with ZF set), Jcc near (two-byte) taken/not-taken,
-/// JMP short, JMP near, CALL near (the pushed return address + SP delta), LOOP taken (CX
-/// decremented, nonzero) and not-taken (CX hits 0), LOOPE/LOOPNE (ZF interaction), and JCXZ
-/// taken (CX==0) / not-taken (CX!=0).
+/// The relative/loop branch differential battery. Covers: Jcc short taken/not-taken (JZ/JNZ with ZF set), Jcc near (two-byte)
+/// taken/not-taken, JMP short, JMP near, CALL near (the pushed return address + SP delta), LOOP taken
+/// (CX decremented, nonzero) and not-taken (CX hits 0), LOOPE/LOOPNE (ZF interaction), and JCXZ taken
+/// (CX==0) / not-taken (CX!=0).
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_branch_goldens` after an intentional behavior change; never edit one by hand to make a test
+/// pass.
 fn branch_golden_cases() -> &'static [BranchGolden] {
     &[
         // Jcc short (rel8). ZF is pre-set, so JZ is taken and JNZ falls through.
@@ -1039,27 +1045,29 @@ fn branch_split_matches_golden_across_ops() {
     }
 }
 
-/// Regenerate `branch_golden_cases` from the fused reference. Ignored by default.
-/// The branch fused arms are already deleted on `perf-decode-cache`, so run this from the
-/// pre-split base commit (a94ed279) where they still exist:
-///   git stash && git checkout a94ed279
+/// Print the `branch_golden_cases` literals from the current implementation. Ignored by default: it
+/// only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_branch_goldens -- --ignored --nocapture
-/// then paste the output over `branch_golden_cases`, return to the branch, and only then trust it.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_branch_goldens() {
     for g in branch_golden_cases() {
         let mut mem = vec![0u8; 0x200];
         mem[..g.code.len()].copy_from_slice(g.code);
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        branch_seed(&mut fused, g.cx);
+        let mut cpu = CpuGsw::default();
+        branch_seed(&mut cpu, g.cx);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -1077,9 +1085,9 @@ fn regen_branch_goldens() {
             g.name,
             g.code,
             g.cx,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
         );

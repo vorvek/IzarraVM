@@ -1169,7 +1169,7 @@ fn v86_paging_is_always_user_regardless_of_cs_low_bits() {
 // Paged-mode fetch throughput; the case the TLB targets. Run with:
 // cargo test --release -p izarravm-cpu -- --ignored --nocapture tlb_paged
 #[test]
-#[ignore]
+#[ignore = "throughput benchmark; run with --ignored --nocapture"]
 fn tlb_paged_fetch_throughput() {
     let mut memory = vec![0u8; 0x10000];
     memory[0..3].copy_from_slice(&[0xfa, 0xeb, 0xfe]); // cli; jmp $

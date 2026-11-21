@@ -8,25 +8,7 @@
 //! lowest-priority pointer), and ICW4 special fully nested mode is decoded and
 //! honored in the cascade decision.
 
-use izarravm_core::{CanonicalFieldWriter, CanonicalStateError, MASTER_CLOCK_HZ};
-
-/// Slice 9A (`dev_docs/2026-09-05-device-timing-slice9-design.md` §3.2, §3.4):
-/// the 8259A's `TCHCL` end-of-command-to-next-unlike-command recovery, 500 ns
-/// min per the datasheet (`reference/8259a/8259A.txt:839-845`). An INSTRUMENT
-/// constant only in this slice -- nothing here changes PIC behaviour or reads
-/// this to gate anything; a future slice may count commands issued within this
-/// window of an unlike command, per the design's §3.4.
-#[allow(dead_code)] // Limit: no counter consults this yet; see the doc comment.
-pub(crate) const INTA_RECOVERY_TICKS: u64 = (500 * MASTER_CLOCK_HZ).div_ceil(1_000_000_000);
-
-/// Slice 9A: the 8259A's own INTA-sequence-to-INTA-sequence recovery, ~1 us
-/// (`8259A.txt:845`) -> ~166 clocks at the 586's 166 MHz. **This is a CHARGE,
-/// not a deadline term, and it is NOT applied here.** It is recorded as a
-/// `pub(crate) const` so slice 8 (the CPU-side interrupt-entry charge,
-/// `run.rs:193`'s 61 raw) has an exact number to fold in when it lands; slice 9
-/// hands it over, it does not spend it. See the design's §3.4 "INTA is split".
-#[allow(dead_code)] // Limit: handed to slice 8; not consulted here by design.
-pub(crate) const INTA_SEQUENCE_CLOCKS: u64 = 166;
+use izarravm_core::{CanonicalFieldWriter, CanonicalStateError};
 
 /// One 8259A. The pair owns two of these plus the cascade routing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -535,11 +517,9 @@ impl Pic8259Pair {
         self.master_pending().is_some()
     }
 
-    // Limit: no production caller since slice 9A -- `MachineBus::acknowledge_interrupt`
-    // (bus.rs) now calls `acknowledge_with_irq` directly for the IRQ0 attribution.
-    // Kept as the plain, vector-only API: every existing test (`pic_test.rs` and
-    // the `Pic8259Pair`-level machine tests) still reads more clearly through it.
-    #[allow(dead_code)]
+    // Test-only: `MachineBus::acknowledge_interrupt` (bus.rs) calls `acknowledge_with_irq`
+    // directly for the IRQ0 attribution. Tests use this plain, vector-only form.
+    #[cfg(test)]
     pub(crate) fn acknowledge(&mut self) -> Option<u8> {
         self.acknowledge_with_irq().map(|(vector, _)| vector)
     }

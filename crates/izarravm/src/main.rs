@@ -2206,8 +2206,6 @@ fn katea_counters_json(k: &izarravm_machine::KateaStorageCounters) -> serde_json
         "host_readahead_fills": k.host_readahead_fills,
         "host_file_opens": k.host_file_opens,
         "run_scan_steps": k.run_scan_steps,
-        "fat_sector_reads": k.fat_sector_reads,
-        "dir_or_free_sector_reads": k.dir_or_free_sector_reads,
         "sector_writes": k.sector_writes,
         "int13_read_commands": k.int13_read_commands,
         "int13_read_sectors": k.int13_read_sectors,
@@ -2456,7 +2454,6 @@ fn write_hdd_profile_json(
         "inta": inta_json(machine),
         "katea": machine.katea_storage_counters().as_ref().map(katea_counters_json),
         "direct_stalls": direct_stall_json(&machine.cpu().direct_stall_snapshot()),
-        "vga_wipe_census": vga_wipe_census_json(machine.vga_wipe_census_snapshot()),
         "shadow_l1": shadow_l1_json(machine.shadow_l1_diagnostics()),
         "opl": opl_diagnostics_json(machine.opl_diagnostics(), machine.opl_trace()),
         "sb_dsp": sb_dsp_json(machine.sb_dsp_diagnostics()),
@@ -2755,40 +2752,6 @@ fn sb_dsp_json(sb: izarravm_machine::SbDspDiagnostics) -> serde_json::Value {
         "command_bytes": sb.command_bytes,
         "data_reads": sb.data_reads,
         "status_reads": sb.status_reads,
-    })
-}
-
-/// The VGA direct-write-token wipe attribution, or `null` when `IZARRAVM_VGA_WIPE_CENSUS` was not
-/// set. Transitions and gap buckets are emitted as sparse lists so a run that never moved the token
-/// does not carry a 64-cell matrix of zeros.
-fn vga_wipe_census_json(
-    snapshot: Option<izarravm_machine::VgaWipeCensusSnapshot>,
-) -> serde_json::Value {
-    let Some(snapshot) = snapshot else {
-        return serde_json::Value::Null;
-    };
-    json!({
-        "events": snapshot.events,
-        "key_overflow": snapshot.key_overflow,
-        "applies": snapshot.applies,
-        "applies_same_token": snapshot.applies_same_token,
-        "rows": snapshot.rows.iter().map(|row| json!({
-            "port": format!("0x{:03X}", row.port),
-            "selector": format!("0x{:02X}", row.selector),
-            "value": format!("0x{:02X}", row.value),
-            "count": row.count,
-        })).collect::<Vec<_>>(),
-        "transitions": snapshot.transitions.iter().enumerate().flat_map(|(before, row)| {
-            row.iter().copied().enumerate().filter(|&(_, count)| count != 0).map(move |(after, count)| {
-                json!({ "before": before, "after": after, "count": count })
-            }).collect::<Vec<_>>()
-        }).collect::<Vec<_>>(),
-        "gap_buckets": snapshot.gap_buckets.iter().copied().enumerate()
-            .filter(|&(_, count)| count != 0)
-            .map(|(bucket, count)| json!({
-                "min_instructions": 1u64 << bucket,
-                "count": count,
-            })).collect::<Vec<_>>(),
     })
 }
 
@@ -3894,10 +3857,6 @@ fn phase_mark_series_json(marks: &[izarravm_machine::PhaseMark]) -> serde_json::
                 "katea_host_read_bytes": mark.katea.as_ref().map(|k| k.host_read_bytes),
                 "katea_host_file_opens": mark.katea.as_ref().map(|k| k.host_file_opens),
                 "katea_run_scan_steps": mark.katea.as_ref().map(|k| k.run_scan_steps),
-                // The FAT / directory region split. Zero unless
-                // IZARRAVM_KATEA_REGION_CENSUS=1 armed the volume at mount.
-                "katea_fat_sector_reads": mark.katea.as_ref().map(|k| k.fat_sector_reads),
-                "katea_dir_or_free_sector_reads": mark.katea.as_ref().map(|k| k.dir_or_free_sector_reads),
                 "katea_sector_writes": mark.katea.as_ref().map(|k| k.sector_writes),
                 "katea_int13_read_commands": mark.katea.as_ref().map(|k| k.int13_read_commands),
                 "katea_int13_read_sectors": mark.katea.as_ref().map(|k| k.int13_read_sectors),

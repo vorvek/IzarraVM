@@ -246,7 +246,7 @@ impl DmaChannel {
     /// Write one little-endian word to memory on the slave's word-addressed path
     /// (device->memory, 16-bit DMA) and step the channel. Returns None when
     /// masked, not programmed for a write transfer, or at terminal count.
-    #[allow(dead_code)] // Limit: no Machine-level write wiring yet (see write_byte).
+    #[cfg(test)]
     pub(crate) fn write_word(&mut self, memory: &mut Memory, word: u16) -> Option<()> {
         if self.mask || self.transfer_kind != 1 {
             return None;
@@ -262,7 +262,7 @@ impl DmaChannel {
     /// Verify transfer (transfer_kind 0): step address and count with no memory
     /// access, exactly as the 8237A does for a verify cycle. Returns None when
     /// masked, not programmed for a verify transfer, or already at terminal count.
-    #[allow(dead_code)] // Limit: no Machine-level verify wiring yet (see write_byte).
+    #[cfg(test)]
     pub(crate) fn verify(&mut self) -> Option<()> {
         if self.mask || self.transfer_kind != 0 {
             return None;
@@ -686,7 +686,7 @@ impl DmaChip {
 
     /// Write one 16-bit word from the device (device->memory) on local channel
     /// `ci`, latching terminal-count into the status register.
-    #[allow(dead_code)] // Limit: no Machine-level write wiring yet (see DmaChannel::write_byte).
+    #[cfg(test)]
     fn write_word(&mut self, ci: usize, memory: &mut Memory, word: u16) -> Option<()> {
         if !self.begin_cycle(ci) {
             return None;
@@ -698,7 +698,7 @@ impl DmaChip {
 
     /// Run one verify transfer on local channel `ci`, latching terminal-count
     /// into the status register. No memory is touched.
-    #[allow(dead_code)] // Limit: no Machine-level verify wiring yet (see DmaChannel::write_byte).
+    #[cfg(test)]
     fn verify(&mut self, ci: usize) -> Option<()> {
         if !self.begin_cycle(ci) {
             return None;

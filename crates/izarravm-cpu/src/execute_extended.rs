@@ -1178,8 +1178,8 @@ impl CpuGsw {
                 if self.read_gpr32(1) == MSR_TSC {
                     crate::reflected_call_diag::on_rdtsc_or_rdmsr_tsc();
                 }
+                #[cfg(feature = "reflected-call-memo")]
                 if self.read_gpr32(1) == MSR_TSC {
-                    #[cfg(feature = "reflected-call-memo")]
                     crate::reflected_call_memo::note_rdtsc_or_rdmsr(self);
                 }
                 let value = match self.read_gpr32(1) {
@@ -1201,7 +1201,8 @@ impl CpuGsw {
             // `execute_system_seg_decoded` runs them (the register-form ModRM is parsed in `decode`;
             // the whole-32-bit CR read/write, the `mode != 3` #UD, and the CR0/CR3 TLB flush via the
             // unchanged `flush_tlb_and_code_caches` stay in the executor). Not handled here. 0F 21/23
-            // (MOV reg,DR / MOV DR,reg) remain unimplemented and #UD as `UnsupportedTwoByteOpcode`.
+            // (MOV reg,DR / MOV DR,reg) and 0x63 (ARPL) are also `DecodeGroup::SystemSeg` and run in
+            // `execute_system_seg_decoded` (arms 0x0f21, 0x0f23, 0x63).
             // SETcc (0x90-0x9F) and IMUL reg,r/m (0xAF) use the CondMove split group.
             // P6 CMOVcc remains undefined on P55C.
             // 0x80-0x8f (Jcc near, rel16/32) are converted to the decode/execute split: `decode`

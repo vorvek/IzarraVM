@@ -78,7 +78,7 @@ walkdir = "2.5"
 wgpu = "25"
 winit = "0.30"
 
-# Temporary: release codegen with symbols for the riprofile sampler.
+# Release codegen with symbols for the riprofile sampler.
 [profile.profiling]
 inherits = "release"
 debug = "full"

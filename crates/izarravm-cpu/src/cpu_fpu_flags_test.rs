@@ -80,13 +80,14 @@ fn assert_fpu_state(cpu: &CpuGsw, g: &FpuGolden) {
     assert_eq!(st, g.st, "fpu stack ST(0)..ST(7) mismatch for {}", g.name);
 }
 
-/// The x87 FPU differential battery (task A13). Captured from the PRIOR fused reference
-/// (`execute_instruction_legacy` -> `dispatch_opcode` -> `execute_fpu`) via `regen_fpu_goldens`
-/// (parent commit 0b928034) WHILE the fused 0xD8-0xDF / 0x9B arms still existed. Never edit by
-/// hand — re-run the regen from the pre-split commit. Covers a representative set: a memory load
-/// (FLD m32), a memory store (FST m32), an FPU stack op (FADD ST0,ST1 and FXCH), the control word
-/// (FLDCW / FNSTCW), the status word (FNSTSW AX and FNSTSW m16), a few arithmetic / compare ops,
-/// an integer-operand memory form (FIADD m32), and WAIT/FWAIT (0x9B).
+/// The x87 FPU differential battery (task A13). Covers a representative set: a memory load (FLD m32), a
+/// memory store (FST m32), an FPU stack op (FADD ST0,ST1 and FXCH), the control word (FLDCW / FNSTCW),
+/// the status word (FNSTSW AX and FNSTSW m16), a few arithmetic / compare ops, an integer-operand
+/// memory form (FIADD m32), and WAIT/FWAIT (0x9B).
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_fpu_goldens` after an intentional behavior change; never edit one by hand to make a test
+/// pass.
 fn fpu_golden_cases() -> &'static [FpuGolden] {
     // Captured verbatim from the fused reference at parent 0b928034 via `regen_fpu_goldens`
     // (run in a throwaway worktree). Never edit by hand.
@@ -789,28 +790,29 @@ fn faulting_pusha_restores_sp_past_committed_pushes() {
     );
 }
 
-/// Regenerate `fpu_golden_cases` from the fused reference. Ignored by default. Run WHILE the
-/// x87 fused arms still exist (parent commit 0b928034):
-///   git worktree add ../regen-a13 0b928034
-///   cd ../regen-a13
-///   # paste this test + the cases/seed/struct in, then:
+/// Print the `fpu_golden_cases` literals from the current implementation. Ignored by default: it
+/// only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_fpu_goldens -- --ignored --nocapture
-/// then paste the output over `fpu_golden_cases` and only then delete the fused arms.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_fpu_goldens() {
     for g in fpu_golden_cases() {
         let mut mem = vec![0u8; 0x200];
         fpu_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        fpu_seed(&mut fused);
+        let mut cpu = CpuGsw::default();
+        fpu_seed(&mut cpu);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -823,19 +825,19 @@ fn regen_fpu_goldens() {
             .map(|(i, b)| (i, *b))
             .collect();
         let fetch = seam_fetch_count(&fbus);
-        let st: [u64; 8] = std::array::from_fn(|i| fused.fpu.get(i as u8).to_bits());
+        let st: [u64; 8] = std::array::from_fn(|i| cpu.fpu.get(i as u8).to_bits());
         println!(
             "            FpuGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {}, fpu_control: {:#x}, fpu_status: {:#x}, fpu_tag: {:#x}, st: [{} ] }},",
             g.name,
             g.code,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
-            fused.fpu.control,
-            fused.fpu.status,
-            fused.fpu.tag,
+            cpu.fpu.control,
+            cpu.fpu.status,
+            cpu.fpu.tag,
             st.iter()
                 .map(|b| format!(" {b:#018x},"))
                 .collect::<String>(),
@@ -908,24 +910,22 @@ fn misc_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[0x40..0x48].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes()); // CMPXCHG8B m64
 }
 
-/// The heterogeneous one-off differential battery (task A14). Captured from the PRIOR fused
-/// reference (`execute_instruction_legacy`) via `regen_misc_goldens` at parent commit f1d65e0f
-/// WHILE the fused arms (single-byte 0x27/0x2f/0x37/0x3f/0x69/0x6b/0x6c-0x6f/0xa8/0xa9/0xd4/0xd5/
-/// 0xd6/0xd7/0xf4 and the 0F CMPXCHG8B/CPUID/RDTSC/...) still existed. Never edit by hand —
-/// re-run the regen from the pre-split commit. Covers: DAA/DAS/AAA/AAS (BCD flag effects),
-/// AAM/AAD (incl. the imm8 base), TEST AL/AX,imm (flags only), IMUL r,r/m,imm8/imm16 (OF/CF set),
-/// SALC, XLAT (memory read), HLT, CPUID, RDTSC, and CMPXCHG8B. (The MMX cases the battery once
-/// carried went with the MMX block: the GSW-586 has no SIMD extension, so those encodings are
-/// invalid and their #UD is asserted in `cpu_persona_system_test.rs` instead.)
+/// The heterogeneous one-off differential battery (task A14). Covers: DAA/DAS/AAA/AAS (BCD flag
+/// effects), AAM/AAD (incl. the imm8 base), TEST AL/AX,imm (flags only), IMUL r,r/m,imm8/imm16 (OF/CF
+/// set), SALC, XLAT (memory read), HLT, CPUID, RDTSC, and CMPXCHG8B. (The MMX cases the battery once
+/// carried went with the MMX block: the GSW-586 has no SIMD extension, so those encodings are invalid
+/// and their #UD is asserted in `cpu_persona_system_test.rs` instead.)
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_misc_goldens` after an intentional behavior change; never edit one by hand to make a test
+/// pass.
 fn misc_golden_cases() -> &'static [MiscGolden] {
     // Captured verbatim from the fused reference at parent f1d65e0f via `regen_misc_goldens`
     // (run in a throwaway worktree). Never edit by hand.
     MISC_GOLDEN_CASES
 }
 
-/// The captured Misc golden literals. The `code`/`name` are authored; the remaining fields are
-/// the fused reference's end-state, pasted verbatim from `regen_misc_goldens` (parent f1d65e0f).
-/// gpr/code are the regen's printed (decimal) literals; do not hand-edit.
+/// The captured Misc golden literals.
 const MISC_GOLDEN_CASES: &[MiscGolden] = &[
     MiscGolden {
         name: "daa (27)",
@@ -1118,28 +1118,29 @@ fn misc_aam_base_zero_is_divide_error() {
     );
 }
 
-/// Regenerate `MISC_GOLDEN_CASES` from the fused reference. Ignored by default. Run WHILE the
-/// fused one-off arms still exist (parent commit f1d65e0f):
-///   git worktree add ../regen-a14 f1d65e0f
-///   cd ../regen-a14
-///   # paste this test + the cases/seed/struct in, then:
+/// Print the `MISC_GOLDEN_CASES` literals from the current implementation. Ignored by default: it
+/// only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_misc_goldens -- --ignored --nocapture
-/// then paste the output over `MISC_GOLDEN_CASES` and only then delete the fused arms.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_misc_goldens() {
     for g in misc_golden_cases() {
         let mut mem = vec![0u8; 0x200];
         misc_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        misc_seed(&mut fused);
+        let mut cpu = CpuGsw::default();
+        misc_seed(&mut cpu);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -1156,9 +1157,9 @@ fn regen_misc_goldens() {
             "    MiscGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
             g.name,
             g.code,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
         );

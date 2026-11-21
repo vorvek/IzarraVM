@@ -37,10 +37,9 @@ impl NameTable {
     }
 
     /// Reverse lookup: the host path a folded name came from, if any.
-    // Limit: superseded for writes by `KateaTreeVolume::dir_paths` +
-    // `existing_files` (seeded once at mount, no O(n) scan). Retained for a future
-    // delete/rename milestone, which needs name->host-path resolution.
-    #[allow(dead_code)]
+    // Test-only: writes use `KateaTreeVolume::dir_paths` and `existing_files`, which mount
+    // seeds once, so no scan is needed.
+    #[cfg(test)]
     pub(crate) fn host_path(&self, name: &[u8; 11]) -> Option<&PathBuf> {
         self.map.iter().find(|(n, _)| n == name).map(|(_, p)| p)
     }

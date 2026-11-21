@@ -75,8 +75,8 @@ pub struct Int13Profile {
     /// stall-advance and copy halves (hypotheses c vs d).
     pub host_wall_ns: u64,
     /// 1-sector read commands whose start LBA was in a FAT copy. Katea's
-    /// `fat_sector_reads` is the wrong discriminator: it also fires once per
-    /// cluster of an internal projection walk. This one is INT 13h only.
+    /// A count of FAT sectors served by Katea is the wrong discriminator: it would also
+    /// fire once per cluster of an internal projection walk. This one is INT 13h only.
     pub read1_fat: u64,
     /// 1-sector read commands whose start LBA was in the data region (files
     /// and directories). Unaligned GRP lumps and directory getblk land here.
@@ -707,13 +707,6 @@ impl Machine {
     /// `--hdd-folder` use this when there are no extra global fallback files.
     pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
         self.mount_hdd_folder_with_user_overrides(dir, Vec::new())
-    }
-
-    /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
-    /// interface. INT 25h reads its sectors; INT 26h writes are write-protected
-    /// (the volume is read-only). Build one with `build_fat32`.
-    pub fn mount_fat32(&mut self, volume: Fat32Volume) {
-        self.fat32_c = Some(volume);
     }
 
     /// Eject the hard disk, returning its current image bytes (including any

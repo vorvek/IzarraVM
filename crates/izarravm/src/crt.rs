@@ -6,6 +6,9 @@
 //! when enabled, adds a faithful high-resolution-CRT look — sharp upscale, a
 //! faint gaussian scanline beam, a barely-there shadow mask, and light halation.
 //!
+//! `tools/crt-tuner.html` is a browser page with the same style presets and sliders for the
+//! shader parameters. Open it to try values, then copy them into the per-style values in the fragment shader.
+//!
 //! Drawn through an `egui_wgpu` paint callback so it composites inside egui's own
 //! render pass. `CrtResources` (pipeline, sampler, source texture, uniform, bind
 //! group) lives in the renderer's `callback_resources`; `CrtCallback` carries the

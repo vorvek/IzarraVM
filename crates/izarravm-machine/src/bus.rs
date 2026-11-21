@@ -367,7 +367,6 @@ impl Machine {
             direct_data_map_changed: &mut self.direct_data_map_changed,
             aperture_content_changed: &mut self.aperture_content_changed,
             direct_mapping_epoch: &mut self.direct_mapping_epoch,
-            vga_wipe_census: &mut self.vga_wipe_census,
             core_clocks_so_far: 0,
             prior_runs_core_clocks: 0,
             timeline_at_batch_start: self.timeline,
@@ -819,19 +818,6 @@ impl RamWriteRecorder for RamWriteFootprint {
         }
         self.spans[self.span_count] = (physical, width);
         self.span_count += 1;
-    }
-}
-
-/// Flatten a `direct_write_identity` to the single byte the wipe census records.
-///
-/// The census exists to answer "did the aperture mapping move", so it must see the
-/// COMPOSITE identity, not the raw VGA token: a 4F05 moves the mapping while the
-/// raw token sits still. `lib.rs`'s recorder already logs the composite, and two
-/// scales in one census would make its rows incomparable.
-fn vega_census_token(identity: (u8, Option<u32>)) -> u8 {
-    match identity.1 {
-        Some(base) => 0x80 | ((base >> 16) as u8 & 0x3f),
-        None => identity.0,
     }
 }
 
@@ -3786,13 +3772,6 @@ impl CpuBus for MachineBus<'_> {
         // IDENTITY, not the bare token: a 4F05 that moves margo_bank leaves the token
         // at its banked value while changing which bytes a live pointer means.
         let direct_write_before = self.vega.direct_write_identity();
-        // Sampled BEFORE the write, because writing an index port is what moves the selector. Gated
-        // at the call site: disarmed, this is one bool test on a device port write.
-        let census_selector = if self.vga_wipe_census.enabled && self.vega.port_enabled(port) {
-            self.vega.port_index_selector(port)
-        } else {
-            0
-        };
         if self.vega.port_enabled(port) && self.vega.write_port(port, value as u8) {
             // ANY accepted VGA register write may re-point what the aperture READS as, and the
             // read-side registers (GC read map select, read mode, odd/even) are in NO identity:
@@ -3804,17 +3783,6 @@ impl CpuBus for MachineBus<'_> {
             *self.aperture_content_changed = true;
             let direct_write_after = self.vega.direct_write_identity();
             if direct_write_after != direct_write_before {
-                if self.vga_wipe_census.enabled {
-                    self.vga_wipe_census.record_token_change(
-                        port,
-                        census_selector,
-                        value as u8,
-                        // Composite, matching `lib.rs`'s recorder: two scales in
-                        // one census would make its rows incomparable.
-                        vega_census_token(direct_write_before),
-                        vega_census_token(direct_write_after),
-                    );
-                }
                 self.mark_direct_data_map_changed();
                 *self.io_touched = true;
                 debug_assert!(*self.io_touched);

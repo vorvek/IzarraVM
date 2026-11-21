@@ -28,14 +28,12 @@ fn munt_test_dir(name: &str) -> PathBuf {
 /// key above them they price the folder rather than the session.
 const KATEA_COUNTER_KEYS: &[&str] = &[
     "blocked_projection_keys",
-    "dir_or_free_sector_reads",
     "dma_read_commands",
     "dma_read_sectors",
     "dma_read_wait_ticks",
     "dma_write_commands",
     "dma_write_sectors",
     "dma_write_wait_ticks",
-    "fat_sector_reads",
     "host_bytes",
     "host_file_opens",
     "host_file_reads",
@@ -818,8 +816,8 @@ fn direct_barrier_census_json_carries_dormant_heat_sites_and_their_lane_match() 
     assert_eq!(
         report["dormant_heat"]["sites"],
         serde_json::json!([{
-            // Hex, per the vga_wipe_census_json precedent: a guest linear is cross-referenced
-            // against a map file or a disassembly, and both are hex.
+            // Hex: a guest linear is cross-referenced against a map file or a disassembly, and both
+            // are hex.
             "linear": "0x00001234",
             "static_exits": 2,
             "dynamic_exits": 1,

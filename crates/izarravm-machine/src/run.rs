@@ -1406,7 +1406,6 @@ impl Machine {
                 self.direct_map_changed = false;
                 self.direct_data_map_changed = false;
             } else if self.direct_data_map_changed {
-                self.note_vga_wipe_apply();
                 self.cpu.note_direct_data_map_changed();
                 self.direct_data_map_changed = false;
             }
@@ -1738,7 +1737,6 @@ impl Machine {
                     direct_data_map_changed,
                     aperture_content_changed,
                     direct_mapping_epoch: &mut self.direct_mapping_epoch,
-                    vga_wipe_census: &mut self.vga_wipe_census,
                     core_clocks_so_far: 0,
                     prior_runs_core_clocks: 0,
                     timeline_at_batch_start,
@@ -2213,7 +2211,6 @@ impl Machine {
                         self.direct_map_changed = false;
                         self.direct_data_map_changed = false;
                     } else if self.direct_data_map_changed {
-                        self.note_vga_wipe_apply();
                         self.cpu.note_direct_data_map_changed();
                         self.direct_data_map_changed = false;
                     }
@@ -2232,7 +2229,6 @@ impl Machine {
                         self.direct_map_changed = false;
                         self.direct_data_map_changed = false;
                     } else if self.direct_data_map_changed {
-                        self.note_vga_wipe_apply();
                         self.cpu.note_direct_data_map_changed();
                         self.direct_data_map_changed = false;
                     }

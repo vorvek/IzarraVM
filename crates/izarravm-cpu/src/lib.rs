@@ -113,11 +113,9 @@ pub(crate) use flags::{
     FLAG_SF, FLAG_TF, FLAG_VM, FLAG_ZF, LazyFlagOp, LazyFlags,
 };
 
-#[allow(unused_imports)]
 pub(crate) use paging::{
-    CodePageCache, DIRECT_PAGE_CACHE_LINES, DirectPageCache, DirectPageCacheEntry, FetchPageCache,
-    NO_LAST_WRITTEN_PAGE, PREFETCH_WINDOW_BYTES, PrefetchWindow, TRACKED_WRITE_PAGES, Tlb,
-    TlbEntry,
+    CodePageCache, DirectPageCache, DirectPageCacheEntry, FetchPageCache, NO_LAST_WRITTEN_PAGE,
+    PREFETCH_WINDOW_BYTES, PrefetchWindow, TRACKED_WRITE_PAGES, Tlb, TlbEntry,
 };
 
 /// The modelled TLB's entry count, and therefore its direct-mapped collision stride in pages.
@@ -287,18 +285,13 @@ const CR0_EM: u32 = 0x0000_0004;
 const CR0_TS: u32 = 0x0000_0008;
 const CR0_PG: u32 = 0x8000_0000;
 // 486 control bits added to the 386's PE/PG. WP gates supervisor writes to read-only
-// pages, AM enables #AC, and NE selects native x87 exception delivery. NW and CD are
-// inert storage because cache disabling has no modeled effect.
+// pages, AM enables #AC, and NE selects native x87 exception delivery. NW (bit 29) and CD
+// (bit 30) are inert storage because cache disabling has no modeled effect.
 // CR0 bit 4 is ET (extension type). The existing reset image leaves it clear. The
 // active CPU persona decides whether an x87 unit is present.
 const CR0_WP: u32 = 0x0001_0000; // bit 16
 const CR0_AM: u32 = 0x0004_0000; // bit 18
-#[allow(dead_code)]
 const CR0_NE: u32 = 0x0000_0020; // bit 5
-#[allow(dead_code)]
-const CR0_NW: u32 = 0x2000_0000; // bit 29
-#[allow(dead_code)]
-const CR0_CD: u32 = 0x4000_0000; // bit 30
 
 // GSW-586 CPUID identity. Leaf 0 returns the maximum basic leaf in EAX and the 12-byte
 // vendor string split across EBX, EDX, ECX in the architectural order (EBX first, then
@@ -3820,9 +3813,8 @@ enum DecodeGroup {
     /// LSS additionally arms the one-instruction interrupt shadow (the same shadow MOV SS/POP SS
     /// arm) so a following instruction cannot be interrupted between the offset and selector
     /// halves of the pointer settling. Folded into `insn.opcode` as 0x0F00 | second for the 0F
-    /// forms and dispatched off the full u16. The genuinely-unimplemented neighbours (0F 21/23 MOV
-    /// reg,DR / MOV DR,reg, 0x63 ARPL) are NOT routed here -- they stay on Fallback / TwoByteFallback
-    /// (the fused path #UDs them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
+    /// forms and dispatched off the full u16. The neighbours 0F 21/23 (MOV reg,DR / MOV DR,reg)
+    /// and 0x63 (ARPL) are routed here too (`route_group` and `execute_system_seg_decoded`).
     SystemSeg,
     /// The x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF plus WAIT/FWAIT (0x9B).
     /// Each escape opcode carries a ModRM whose `mod` field selects the form — `mod != 3` is a

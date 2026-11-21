@@ -83,7 +83,6 @@ mod shadow_cache;
 mod timeline;
 mod timing;
 mod vega;
-mod vga_wipe_census;
 mod video;
 mod video_params;
 
@@ -209,7 +208,6 @@ pub use canonical_state::{CanonicalMachineStateCapture, MachineCanonicalCaptureE
 pub use katea_tree::KateaGeometryReport;
 pub use katea_tree::KateaStorageCounters;
 pub use storage::Int13Profile;
-pub use vga_wipe_census::{VgaWipeCensusSnapshot, VgaWipeKeyRow};
 
 pub use cdimage::{CdImage, CueFileType, CueSource, cue_file_list};
 pub use iso9660::{MAX_IMAGE_BYTES as CD_FOLDER_MAX_BYTES, build as build_cd_folder};
@@ -799,8 +797,9 @@ pub struct PitBulkAdvanceCounters {
 /// Today's model charges nothing extra for INTA turnaround (`run.rs`'s 61 raw
 /// hardware-interrupt-entry charge is unaffected by this slice), so every
 /// sample under the current model is expected to land in the ZERO bucket --
-/// that is the certifier slice 8 needs before it can charge `INTA_SEQUENCE_CLOCKS`
-/// and expect the histogram to shift.
+/// that is the certifier slice 8 needs before it can charge the 8259A INTA sequence
+/// (about 166 core clocks at 166 MHz, or 1 us) and expect the histogram to shift. The 8259A also
+/// needs 500 ns of recovery between unlike commands. The PIC does not model either figure.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InterruptEntryDiagnostics {
     /// Total 8259A acknowledge (INTA) cycles serviced across both master and
@@ -1751,9 +1750,6 @@ pub struct Machine {
     // Generation stamped onto every direct host pointer. Any change that can
     // replace or reinterpret a mapping advances it before another CPU batch.
     direct_mapping_epoch: u64,
-    // Env-gated attribution for the VGA direct-write-token wipe seam. Diagnostic only; its
-    // PartialEq is unconditionally true so arming it cannot move canonical-state comparisons.
-    vga_wipe_census: vga_wipe_census::VgaWipeCensus,
     host_profile: MachineHostProfile,
     // Boot-profiler phase boundaries, off unless `enable_phase_marks` armed them.
     // Diagnostic only, and recorded at most a handful of times per run (one INT
@@ -1927,12 +1923,6 @@ pub struct Machine {
     // channel transfers the ATA disk; the secondary bank records legacy IDE
     // interrupts but does not advertise ATAPI DMA.
     bmide: bmide::BusMasterIde,
-    // Synthesized read-only FAT32 volume serving drive C: to the DOS absolute-disk
-    // interface (INT 25h read; INT 26h write is write-protected). Optional and
-    // consulted only by INT 25h/26h for AL=2, so it does not touch the ATA / INT
-    // 13h path. None until one is mounted. The eventual single C: backing (ATA
-    // vs this) remains an install-layout decision.
-    fat32_c: Option<Fat32Volume>,
     cd_accesses: u64,
     // Bytes transferred through the secondary IDE data phases. Unlike
     // cd_accesses, this excludes the legacy INT 2Fh compatibility path and lets
@@ -2307,7 +2297,6 @@ impl Machine {
             direct_map_changed: false,
             direct_data_map_changed: false,
             aperture_content_changed: false,
-            vga_wipe_census: vga_wipe_census::VgaWipeCensus::default(),
             direct_mapping_epoch: 1,
             host_profile: MachineHostProfile::default(),
             phase_marks: Vec::new(),
@@ -2394,7 +2383,6 @@ impl Machine {
             cd_driver: cddriver::CdDriverState::default(),
             ata: None,
             bmide: bmide::BusMasterIde::default(),
-            fat32_c: None,
             cd_accesses: 0,
             cd_pio_bytes: 0,
             cd_audio_sample: 0,
@@ -3434,22 +3422,6 @@ impl Machine {
         self.direct_data_map_changed = true;
     }
 
-    /// Record one batch-boundary application of the direct-data-map wipe, when the census is armed.
-    /// Called from the run loop's two apply sites, immediately before the CPU is told.
-    pub(crate) fn note_vga_wipe_apply(&mut self) {
-        if !self.vga_wipe_census.enabled {
-            return;
-        }
-        let token = self.vega.direct_write_token();
-        let instructions = self.cpu.perf_counters().instructions;
-        self.vga_wipe_census.record_apply(token, instructions);
-    }
-
-    /// The VGA wipe census, or `None` when `IZARRAVM_VGA_WIPE_CENSUS` was not set.
-    pub fn vga_wipe_census_snapshot(&self) -> Option<vga_wipe_census::VgaWipeCensusSnapshot> {
-        self.vga_wipe_census.snapshot()
-    }
-
     /// Guest OPL activity since power-on. Always collected: the counters are six
     /// increments on a port path that already ends the CPU batch, which is many
     /// orders of magnitude more expensive than the count.
@@ -4199,8 +4171,6 @@ struct MachineBus<'a> {
     direct_data_map_changed: &'a mut bool,
     pub(crate) aperture_content_changed: &'a mut bool,
     direct_mapping_epoch: &'a mut u64,
-    // Env-gated attribution for the direct-write-token seam; see `vga_wipe_census`.
-    vga_wipe_census: &'a mut crate::vga_wipe_census::VgaWipeCensus,
     // A copy of the current read_io call's core_clocks_so_far argument (CPU core
     // clocks charged by prior instructions in this straight-line run, not
     // including the in-flight IN). Written at the top of every read_io call so a

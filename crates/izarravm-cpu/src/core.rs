@@ -2773,10 +2773,8 @@ impl CpuGsw {
         if !self.pending_flags.is_none() {
             let arith = flag & ARITH;
             if flag == FLAG_CF {
-                if !self.pending_flags.is_none() {
-                    let p = self.pending_flags; // copy
-                    self.pending_flags = p.with_cf_override(enabled);
-                }
+                let p = self.pending_flags; // copy
+                self.pending_flags = p.with_cf_override(enabled);
                 self.registers.eflags |= 0x2;
                 return;
             }

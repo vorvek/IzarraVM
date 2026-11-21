@@ -61,11 +61,11 @@ fn bitmanip_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[0x44..0x46].copy_from_slice(&0xffffu16.to_le_bytes());
 }
 
-/// The bit-manipulation differential battery (task A10). Captured from the PRIOR fused reference
-/// (`execute_instruction_legacy`) via `regen_bitmanip_goldens`; see `alu_golden_cases` for the
-/// full capture recipe. Never edit by hand — re-run the regen from the pre-split commit
-/// (parent 430a6051) WHILE the fused arms (0F A3/AB/B3/BB/BA/BC/BD/A4/A5/AC/AD/B0/B1/C0/C1)
-/// still exist in `execute_two_byte`, then paste, then delete the fused arms.
+/// The bit-manipulation differential battery (task A10).
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_bitmanip_goldens` after an intentional behavior change; never edit one by hand to make a test
+/// pass.
 fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
     &[
         // BT CX, BX (0F A3 D9): test bit BX=3 of CX=0x0008 (bit 3 set) -> CF=1, no write.
@@ -277,10 +277,9 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
     ]
 }
 
-/// Per-case register overrides applied AFTER `bitmanip_seed`, so a few cases can drive an
-/// operand the default seed doesn't cover (the BT-memory walk needs DX=16; the BSF zero-source
-/// case needs CX=0). Applied identically on both the split and the fused (regen) path so the
-/// goldens stay a faithful differential. Returns None when the default seed suffices.
+/// Per-case register overrides applied AFTER `bitmanip_seed`, so a few cases can drive an operand the
+/// default seed doesn't cover (the BT-memory walk needs DX=16; the BSF zero-source case needs CX=0).
+/// Returns None when the default seed suffices.
 fn bitmanip_case_override(name: &str, cpu: &mut CpuGsw) {
     match name {
         "bts [0x40],dx walk-to-next-word (0f ab 16 40 00)" => {
@@ -338,29 +337,30 @@ fn bitmanip_split_matches_golden_across_ops() {
     }
 }
 
-/// Regenerate `bitmanip_golden_cases` from the fused reference. Ignored by default.
-/// Run WHILE the bit-manipulation fused arms still exist in `execute_two_byte`
-/// (i.e. the parent commit 430a6051):
-///   git worktree add ../regen-a10 430a6051
-///   cd ../regen-a10
+/// Print the `bitmanip_golden_cases` literals from the current implementation. Ignored by default:
+/// it only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_bitmanip_goldens -- --ignored --nocapture
-/// then paste the output over `bitmanip_golden_cases` and only then delete the fused arms.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_bitmanip_goldens() {
     for g in bitmanip_golden_cases() {
         let mut mem = vec![0u8; 0x100];
         bitmanip_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        bitmanip_seed(&mut fused);
-        bitmanip_case_override(g.name, &mut fused);
+        let mut cpu = CpuGsw::default();
+        bitmanip_seed(&mut cpu);
+        bitmanip_case_override(g.name, &mut cpu);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -377,9 +377,9 @@ fn regen_bitmanip_goldens() {
             "            BitManipGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
             g.name,
             g.code,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
         );
@@ -427,10 +427,11 @@ fn condmove_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[..code.len()].copy_from_slice(code);
 }
 
-/// The condmove differential battery (task A11). Captured from the PRIOR fused reference
-/// (`execute_instruction_legacy`) via `regen_condmove_goldens` (parent commit 93bdff3f) WHILE
-/// the fused arms (SETcc 0x90-0x9F and IMUL 0xAF) still existed in
-/// `execute_two_byte`. Never edit by hand — re-run the regen from the pre-split commit.
+/// The condmove differential battery (task A11).
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_condmove_goldens` after an intentional behavior change; never edit one by hand to make a test
+/// pass.
 fn condmove_golden_cases() -> &'static [CondMoveGolden] {
     &[
         // SETcc false: SETZ AL (0F 94 C0): ZF=0 → condition false → AL=0 (AX=0x0000).
@@ -539,28 +540,29 @@ fn condmove_split_matches_golden_across_ops() {
     }
 }
 
-/// Regenerate `condmove_golden_cases` from the fused reference. Ignored by default.
-/// Run WHILE the condmove fused arms still exist in `execute_two_byte`
-/// (i.e. the parent commit 93bdff3f):
-///   git worktree add ../regen-a11 93bdff3f
-///   cd ../regen-a11
+/// Print the `condmove_golden_cases` literals from the current implementation. Ignored by default:
+/// it only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_condmove_goldens -- --ignored --nocapture
-/// then paste the output over `condmove_golden_cases` and only then delete the fused arms.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_condmove_goldens() {
     for g in condmove_golden_cases() {
         let mut mem = vec![0u8; 0x100];
         condmove_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        condmove_seed(&mut fused);
+        let mut cpu = CpuGsw::default();
+        condmove_seed(&mut cpu);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -577,9 +579,9 @@ fn regen_condmove_goldens() {
             "            CondMoveGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
             g.name,
             g.code,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
         );
@@ -678,11 +680,11 @@ fn system_seg_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[0x92..0x94].copy_from_slice(&0x0009u16.to_le_bytes()); // selector (RPL 1 -> sel 0x08)
 }
 
-/// The system/segment differential battery (task A12). Captured from the PRIOR fused reference
-/// (`execute_instruction_legacy` -> `execute_two_byte`/`dispatch_opcode`) via
-/// `regen_system_seg_goldens` (parent commit b0a4262d) WHILE the fused arms (0F 00/01/02/03/06/
-/// 20/22, BOUND 0x62, LES/LDS 0xc4/0xc5) still existed. Never edit by hand — re-run the regen
-/// from the pre-split commit.
+/// The system/segment differential battery (task A12).
+///
+/// The goldens come from the implementation that preceded the decode/execute split. Re-derive them with
+/// `regen_system_seg_goldens` after an intentional behavior change; never edit one by hand to make a
+/// test pass.
 fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
     // Captured verbatim from the fused reference at parent b0a4262d via
     // `regen_system_seg_goldens` (run in a throwaway worktree). Never edit by hand.
@@ -1070,9 +1072,8 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
     ]
 }
 
-/// Per-case register overrides applied AFTER `system_seg_seed`. LLDT needs CX pointing at the
-/// LDT system descriptor (selector 0x18); BOUND and LES/LDS need their default seed. Applied
-/// identically on the split and the regen (fused) path so the goldens stay a faithful diff.
+/// Per-case register overrides applied AFTER `system_seg_seed`. LLDT needs CX pointing at the LDT
+/// system descriptor (selector 0x18); BOUND and LES/LDS need their default seed.
 fn system_seg_case_override(name: &str, cpu: &mut CpuGsw) {
     if name == "lldt cx=0x18 (0f 00 d1)" {
         cpu.write_reg16(Reg16::Cx, 0x18);
@@ -1172,29 +1173,30 @@ fn system_seg_split_matches_golden_across_ops() {
     }
 }
 
-/// Regenerate `system_seg_golden_cases` from the fused reference. Ignored by default.
-/// Run WHILE the system/segment fused arms still exist (parent commit b0a4262d):
-///   git worktree add ../regen-a12 b0a4262d
-///   cd ../regen-a12
-///   # paste this test + the cases/seed/struct in, then:
+/// Print the `system_seg_golden_cases` literals from the current implementation. Ignored by
+/// default: it only prints and asserts nothing.
+/// Run it after an intentional behavior change to re-derive the goldens, then paste the output over
+/// the cases:
 ///   cargo test -p izarravm-cpu --lib regen_system_seg_goldens -- --ignored --nocapture
-/// then paste the output over `system_seg_golden_cases` and only then delete the fused arms.
+/// The output comes from the code under test, so it cannot catch a bug in that code. For an
+/// independent reference, run the test from a commit that predates the split. A case the code
+/// cannot execute prints a TODO marker instead of a literal.
 #[test]
-#[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+#[ignore = "prints golden literals from the current implementation; run with --ignored --nocapture"]
 fn regen_system_seg_goldens() {
     for g in system_seg_golden_cases() {
         let mut mem = vec![0u8; 0x200];
         system_seg_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = CpuGsw::default();
-        system_seg_seed(&mut fused, g.protected);
-        system_seg_case_override(g.name, &mut fused);
+        let mut cpu = CpuGsw::default();
+        system_seg_seed(&mut cpu, g.protected);
+        system_seg_case_override(g.name, &mut cpu);
         let mut fbus = TestBus::with_memory(mem);
-        fused.begin_instruction();
-        if exec_one_split(&mut fused, &mut fbus).is_err() {
+        cpu.begin_instruction();
+        if exec_one_split(&mut cpu, &mut fbus).is_err() {
             println!(
-                "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                "            // TODO regen {}: case not executable here",
                 g.name
             );
             continue;
@@ -1212,20 +1214,20 @@ fn regen_system_seg_goldens() {
             g.name,
             g.code,
             g.protected,
-            fused.registers.gpr,
-            fused.eflags(),
-            fused.registers.eip,
+            cpu.registers.gpr,
+            cpu.eflags(),
+            cpu.registers.eip,
             deltas,
             fetch,
-            fused.control.cr0,
-            fused.gdtr.base,
-            fused.gdtr.limit,
-            fused.idtr.base,
-            fused.idtr.limit,
-            fused.ldtr.selector,
-            fused.tr.selector,
-            fused.registers.segment(SegmentIndex::Es).selector,
-            fused.registers.segment(SegmentIndex::Ds).selector,
+            cpu.control.cr0,
+            cpu.gdtr.base,
+            cpu.gdtr.limit,
+            cpu.idtr.base,
+            cpu.idtr.limit,
+            cpu.ldtr.selector,
+            cpu.tr.selector,
+            cpu.registers.segment(SegmentIndex::Es).selector,
+            cpu.registers.segment(SegmentIndex::Ds).selector,
         );
     }
 }
