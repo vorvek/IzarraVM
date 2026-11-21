@@ -1194,11 +1194,7 @@ impl Machine {
         }
         self.set_eax_ah(status);
         if live_flags {
-            if status == SUCCESS {
-                self.cpu.registers.eflags &= !1;
-            } else {
-                self.cpu.registers.eflags |= 1;
-            }
+            self.cpu.set_carry_flag(status != SUCCESS);
         } else {
             self.set_int_frame_carry(status != SUCCESS);
         }

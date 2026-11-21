@@ -639,7 +639,7 @@ impl CpuGsw {
         source: DeliverySource,
         committed: &mut CommittedCore,
     ) -> ExecResult<()> {
-        let gate_address = self.idtr.base + u32::from(vector) * 8;
+        let gate_address = self.idtr.base.wrapping_add(u32::from(vector) * 8);
         if u32::from(self.idtr.limit) < u32::from(vector) * 8 + 7 {
             // 386 PRM, INT n / INT 3 / INTO, protected-mode arm:
             //
@@ -667,7 +667,7 @@ impl CpuGsw {
         }
 
         let gate_low = self.read_system_linear_u32(bus, gate_address)?;
-        let gate_high = self.read_system_linear_u32(bus, gate_address + 4)?;
+        let gate_high = self.read_system_linear_u32(bus, gate_address.wrapping_add(4))?;
         let selector = ((gate_low >> 16) & 0xffff) as u16;
         // Gate types: 0x6/0xe are interrupt gates (IF-clearing), 0x7/0xf trap
         // gates; bit 3 is the gate width. A 16-bit gate (Borland DPMI16BI hangs
@@ -1128,12 +1128,26 @@ impl CpuGsw {
             CpuPersona::I586 => 0,
         };
         merged = (merged & !fixed) | (old & fixed);
-        self.registers.eflags = merged;
-        // The loaded image is the new truth for every flag bit; any deferred descriptor would
-        // otherwise override the arithmetic bits we just wrote.
+        // The loaded image is the new truth for every flag bit. The dword form can change
+        // EFLAGS.AC (the word form keeps the high half).
+        self.load_eflags(merged);
+    }
+
+    /// Replace the whole EFLAGS image. Bit 1 reads as one. Any deferred arithmetic descriptor
+    /// is dropped, because it would otherwise override the arithmetic bits written here.
+    /// Every writer of a full EFLAGS value, in the CPU or in a host service, goes through this.
+    pub fn load_eflags(&mut self, value: u32) {
+        self.registers.eflags = value | 0x2;
         self.pending_flags = PendingFlags::default();
-        // The dword form can change EFLAGS.AC (the word form keeps the high half).
         self.recompute_alignment_armed();
+    }
+
+    /// Set or clear CF from outside the instruction stream, for example in a host service that
+    /// reports success or failure. The pending flags are settled first, so a later
+    /// materialization cannot overwrite the new value.
+    pub fn set_carry_flag(&mut self, carry: bool) {
+        self.materialize_flags();
+        self.set_flag(FLAG_CF, carry);
     }
 
     /// Restartability wrapper: a fault raised after the frame pops committed
@@ -1680,9 +1694,9 @@ impl CpuGsw {
                 error_code: Some(selector_error_code(selector, in_ldt, false)),
             });
         }
-        let addr = base + index;
+        let addr = base.wrapping_add(index);
         let low = self.read_system_linear_u32(bus, addr)?;
-        let high = self.read_system_linear_u32(bus, addr + 4)?;
+        let high = self.read_system_linear_u32(bus, addr.wrapping_add(4))?;
         Ok((low, high))
     }
 
@@ -1895,14 +1909,14 @@ impl CpuGsw {
         // Keyed on the full 286 type pair, not just bit 3, so an uninitialized
         // TR (access 0) keeps the 386 read it always had.
         let (new_esp, new_ss) = if matches!(self.tr.access & 0x1f, 0x01 | 0x03) {
-            let sp_addr = self.tr.base + 2 + 4 * u32::from(target_dpl);
+            let sp_addr = self.tr.base.wrapping_add(2 + 4 * u32::from(target_dpl));
             let sp = self.read_system_linear(bus, sp_addr, BusWidth::Word)?;
-            let ss = self.read_system_linear(bus, sp_addr + 2, BusWidth::Word)? as u16;
+            let ss = self.read_system_linear(bus, sp_addr.wrapping_add(2), BusWidth::Word)? as u16;
             (sp, ss)
         } else {
-            let esp_addr = self.tr.base + 4 + 8 * u32::from(target_dpl);
+            let esp_addr = self.tr.base.wrapping_add(4 + 8 * u32::from(target_dpl));
             let esp = self.read_system_linear_u32(bus, esp_addr)?;
-            let ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
+            let ss = self.read_system_linear(bus, esp_addr.wrapping_add(4), BusWidth::Word)? as u16;
             (esp, ss)
         };
         // The TSS-supplied SS for `target_dpl` is validated by the gate's own privilege
@@ -2078,19 +2092,34 @@ impl CpuGsw {
         // Settle deferred arithmetic flags so the eflags image saved into the outgoing TSS is live.
         self.materialize_flags();
         let base = self.tr.base;
-        self.write_system_linear(bus, base + 32, BusWidth::Dword, self.registers.eip)?;
-        self.write_system_linear(bus, base + 36, BusWidth::Dword, self.registers.eflags)?;
+        self.write_system_linear(
+            bus,
+            base.wrapping_add(32),
+            BusWidth::Dword,
+            self.registers.eip,
+        )?;
+        self.write_system_linear(
+            bus,
+            base.wrapping_add(36),
+            BusWidth::Dword,
+            self.registers.eflags,
+        )?;
         for i in 0..8u32 {
             let value = self.read_gpr32(i as u8);
-            self.write_system_linear(bus, base + 40 + i * 4, BusWidth::Dword, value)?;
+            self.write_system_linear(bus, base.wrapping_add(40 + i * 4), BusWidth::Dword, value)?;
         }
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
             let selector = u32::from(self.registers.segment(*segment).selector);
-            self.write_system_linear(bus, base + 72 + k as u32 * 4, BusWidth::Word, selector)?;
+            self.write_system_linear(
+                bus,
+                base.wrapping_add(72 + k as u32 * 4),
+                BusWidth::Word,
+                selector,
+            )?;
         }
         self.write_system_linear(
             bus,
-            base + 96,
+            base.wrapping_add(96),
             BusWidth::Word,
             u32::from(self.ldtr.selector),
         )?;
@@ -2102,28 +2131,27 @@ impl CpuGsw {
             // Read through the outgoing task's still-active page tables: CR3 hasn't
             // been reloaded yet, so this TSS field is translated under the old
             // mapping, same as every other field read here.
-            self.control.cr3 = self.read_system_linear_u32(bus, base + 28)?;
+            self.control.cr3 = self.read_system_linear_u32(bus, base.wrapping_add(28))?;
             // The incoming task reloads CR3, so its page mappings replace the old
             // task's: drop the previous task's cached translations.
             self.flush_tlb_and_code_caches(TranslationFlushReason::TaskSwitch);
         }
         // The LDTR is loaded first so segment loads that reference the LDT resolve.
-        let ldtr = self.read_system_linear(bus, base + 96, BusWidth::Word)? as u16;
+        let ldtr = self.read_system_linear(bus, base.wrapping_add(96), BusWidth::Word)? as u16;
         self.load_ldtr(bus, ldtr)?;
-        let eip = self.read_system_linear_u32(bus, base + 32)?;
-        let eflags = self.read_system_linear_u32(bus, base + 36)?;
+        let eip = self.read_system_linear_u32(bus, base.wrapping_add(32))?;
+        let eflags = self.read_system_linear_u32(bus, base.wrapping_add(36))?;
         for i in 0..8u32 {
-            let value = self.read_system_linear_u32(bus, base + 40 + i * 4)?;
+            let value = self.read_system_linear_u32(bus, base.wrapping_add(40 + i * 4))?;
             self.write_gpr32(i as u8, value);
         }
-        self.registers.eflags = eflags | 0x2;
         // The incoming task's eflags is the new truth; drop any stale arithmetic descriptor.
-        self.pending_flags = PendingFlags::default();
-        self.recompute_alignment_armed();
+        self.load_eflags(eflags);
         self.set_eip(eip);
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
             let selector =
-                self.read_system_linear(bus, base + 72 + k as u32 * 4, BusWidth::Word)? as u16;
+                self.read_system_linear(bus, base.wrapping_add(72 + k as u32 * 4), BusWidth::Word)?
+                    as u16;
             // A null data segment (ES/DS/FS/GS) is legal and just unusable; CS and SS
             // must be loadable.
             //
@@ -2178,7 +2206,7 @@ impl CpuGsw {
         if selector & !0x7 == 0 {
             return Ok(());
         }
-        let addr = self.gdtr.base + u32::from(selector & !0x7) + 5;
+        let addr = self.gdtr.base.wrapping_add(u32::from(selector & !0x7) + 5);
         let mut access = self.read_system_linear(bus, addr, BusWidth::Byte)? as u8;
         if busy {
             access |= 0x02;
@@ -2366,9 +2394,9 @@ impl CpuGsw {
                 error_code: Some(selector_error_code(selector, in_ldt, false)),
             });
         }
-        let descriptor_address = table_base + index;
+        let descriptor_address = table_base.wrapping_add(index);
         let low = self.read_system_linear_u32(bus, descriptor_address)?;
-        let high = self.read_system_linear_u32(bus, descriptor_address + 4)?;
+        let high = self.read_system_linear_u32(bus, descriptor_address.wrapping_add(4))?;
         let access = ((high >> 8) & 0xff) as u8;
         let is_segment = access & 0x10 != 0; // S bit: 1 = code/data, 0 = system
         let descriptor_type = access & 0x0f;
@@ -2438,7 +2466,7 @@ impl CpuGsw {
         if access & 0x01 == 0 {
             self.write_system_linear(
                 bus,
-                descriptor_address + 5,
+                descriptor_address.wrapping_add(5),
                 BusWidth::Byte,
                 u32::from(access | 0x01),
             )?;
@@ -2498,9 +2526,9 @@ impl CpuGsw {
         if index + 7 > limit {
             return Ok(None);
         }
-        let addr = base + index;
+        let addr = base.wrapping_add(index);
         let low = self.read_system_linear_u32(bus, addr)?;
-        let high = self.read_system_linear_u32(bus, addr + 4)?;
+        let high = self.read_system_linear_u32(bus, addr.wrapping_add(4))?;
         Ok(Some((low, high)))
     }
 
@@ -2517,9 +2545,9 @@ impl CpuGsw {
                 error_code: Some(selector_error_code(selector, false, false)),
             });
         }
-        let addr = self.gdtr.base + index;
+        let addr = self.gdtr.base.wrapping_add(index);
         let low = self.read_system_linear_u32(bus, addr)?;
-        let high = self.read_system_linear_u32(bus, addr + 4)?;
+        let high = self.read_system_linear_u32(bus, addr.wrapping_add(4))?;
         Ok((low, high))
     }
 
@@ -2639,7 +2667,7 @@ impl CpuGsw {
         let access_byte = (access | 0x02) as u8;
         self.write_system_linear(
             bus,
-            self.gdtr.base + index + 5,
+            self.gdtr.base.wrapping_add(index + 5),
             BusWidth::Byte,
             u32::from(access_byte),
         )?;

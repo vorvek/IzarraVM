@@ -3048,3 +3048,37 @@ fn fossil_write_block_wraps_at_the_end_of_the_caller_segment() {
          comes from the unbacked byte after ES:FFFF and reads 0xFF"
     );
 }
+
+#[test]
+fn pci_bios_clears_carry_that_an_add_left_pending() {
+    // The guest adds with a carry out, then calls the PCI BIOS. The interpreter keeps the carry
+    // as a pending flag descriptor. The service reports success and must clear CF for real, so
+    // the JNC after the call falls through to the next instruction.
+    let prog = [
+        0xB0, 0xFF, // mov al,0FFh
+        0x04, 0x01, // add al,1 (CF=1)
+        0x72, 0x01, // jc +1 (CF=0 after the service, so not taken)
+        0x90, // nop
+        0xF4, // hlt
+    ];
+    let mut m =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &prog).unwrap();
+    let mut cpu = m.cpu.clone();
+    with_bus(&mut m, |bus| {
+        cpu.cycle(bus).unwrap();
+        cpu.cycle(bus).unwrap();
+    });
+    m.cpu = cpu;
+    assert_eq!(m.cpu.eflags() & 1, 1, "the ADD must carry");
+
+    m.cpu.registers.set_eax(0xB101);
+    m.handle_pci_bios(true);
+    assert_eq!(m.cpu.eflags() & 1, 0, "success must clear CF");
+
+    let jc_eip = m.cpu.registers.eip;
+    let mut cpu = m.cpu.clone();
+    with_bus(&mut m, |bus| cpu.cycle(bus).unwrap());
+    m.cpu = cpu;
+    assert_eq!(m.cpu.registers.eip, jc_eip + 2, "JC must see CF clear");
+    assert_eq!(m.cpu.eflags() & 1, 0);
+}
