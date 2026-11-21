@@ -1063,43 +1063,31 @@ fn unprefixed_blocks_compile_to_the_same_bytes_with_the_knob_on_and_off() {
         (Mode::Pm16, program16),
         (Mode::Flat32, program32),
     ] {
-        // One rig, so that the host pointers inside the emitted code are the same each time. Each
-        // compile still writes a different value into a small window of the code (a per-compile
-        // address, which carries into the next bytes now and then), so the window is measured:
-        // the positions that differ between compiles with the knob off, plus the next three bytes.
-        // The compile with the knob on may differ only there.
+        // Each compile allocates new cells and writes their host addresses into the code as 64-bit
+        // immediates. Those exact values are cleared before the compare; every other byte must
+        // be the same.
         let case = Case::new(format!("{mode:?} identity"), mode, insns.clone());
         let mut rig = prepare(&case);
         let mut compile = |on: bool| {
             let _knob = Knob::set(on);
             match jit::direct::compile(&mut rig.native, ENTRY, mode.d()) {
                 jit::direct::CompileOutcome::Compiled(compilation) => {
-                    (compilation.span.instructions, compilation.code.clone())
+                    let (code, cleared) =
+                        super::sixteen_bit::code_without_cell_addresses(&compilation);
+                    (compilation.span.instructions, code, cleared)
                 }
                 _ => panic!("{mode:?}: the unprefixed block must compile"),
             }
         };
         let _warm_up = compile(false);
-        let off_a = compile(false);
-        let off_b = compile(false);
-        let off_c = compile(false);
+        let off = compile(false);
         let on = compile(true);
-        assert_eq!(off_a.0, on.0, "{mode:?}: the slot count moved");
-        assert_eq!(off_a.1.len(), on.1.len(), "{mode:?}: the code length moved");
-        let seen: Vec<usize> = (0..off_a.1.len())
-            .filter(|&k| off_a.1[k] != off_b.1[k] || off_b.1[k] != off_c.1[k])
-            .collect();
-        let first = seen.first().copied().unwrap_or(0);
-        let noise: Vec<usize> = seen.iter().copied().chain(first..first + 4).collect();
-        assert!(
-            noise.len() < 16,
-            "{mode:?}: the per-compile window is small"
-        );
-        for k in 0..off_c.1.len() {
-            assert!(
-                off_c.1[k] == on.1[k] || noise.contains(&k),
-                "{mode:?}: the emitted byte {k} moved with the knob"
-            );
+        assert_eq!(off.0, on.0, "{mode:?}: the slot count moved");
+        assert!(off.2 > 0, "{mode:?}: the code holds its cell addresses");
+        assert_eq!(off.2, on.2, "{mode:?}: the number of cell addresses moved");
+        assert_eq!(off.1.len(), on.1.len(), "{mode:?}: the code length moved");
+        if let Some(k) = (0..off.1.len()).find(|&k| off.1[k] != on.1[k]) {
+            panic!("{mode:?}: the emitted byte {k} moved with the knob");
         }
     }
 }

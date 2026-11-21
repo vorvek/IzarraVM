@@ -4355,6 +4355,22 @@ impl Compilation {
         self.segment_layout.used_for_test()
     }
 
+    /// The host addresses of the cells that this compilation allocated: the two link cells and
+    /// one cell for each `InterpretOne` slot. The emitted code holds them as 64-bit immediates,
+    /// and they differ between two compilations of the same program.
+    #[cfg(test)]
+    pub(crate) fn cell_addresses_for_test(&self) -> Vec<u64> {
+        self.link_cells
+            .iter()
+            .map(|cell| cell.address() as u64)
+            .chain(
+                self.interpret_one_cells
+                    .iter()
+                    .map(|cell| cell.address() as u64),
+            )
+            .collect()
+    }
+
     /// How many mutable lanes this compilation registered — **EVERY family, not the immediate
     /// family alone.** The five sibling accessors below (`disp_lane_count`, `imm8_lane_count`,
     /// `count_lane_count`, `disp_store_lane_count`, `disp_load_widen_lane_count`) are SUBSET
