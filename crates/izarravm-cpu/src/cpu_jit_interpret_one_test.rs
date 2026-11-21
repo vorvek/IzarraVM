@@ -37,6 +37,14 @@ use crate::timing_class::TimingClass;
 #[path = "cpu_jit_test_word_helper_test.rs"]
 mod test_word_helper;
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_live_pm_segments_test.rs"]
+mod live_pm_segments;
+
 const ENTRY: u32 = 0x100;
 /// A page the block's code is not on, for the stack and for the POP's destination.
 const DATA_PAGE: u32 = 0x1000;
@@ -4898,6 +4906,136 @@ fn interpret_one_faults_are_attributed_to_their_own_row() {
         (1, 0, 1),
         "the divide fault must land on the group-3 row"
     );
+}
+
+/// The position of a reason label in the exported reason arrays.
+fn reason_index(label: &str) -> usize {
+    crate::INTERPRET_ONE_RESYNC_REASON_LABELS
+        .iter()
+        .position(|candidate| *candidate == label)
+        .unwrap_or_else(|| panic!("no resync reason labelled {label}"))
+}
+
+/// `mov eax,0x1111; mov ds,dx; mov ax,ds; hlt`. The DS access after the load is what puts DS in
+/// the call-out slot's suffix mask, so a moved DS record is a refusal and not a relaxation.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+const PROTECTED_DS_CODE: &[u8] = &[0xB8, 0x11, 0x11, 0x00, 0x00, 0x8E, 0xDA, 0x8C, 0xD8, 0xF4];
+
+/// A DS load onto a different descriptor is counted under the segment clause, with the register and
+/// the differing fields named, and under the code size and mode of the block.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_segment_refusal_is_classified() {
+    let legs =
+        run_both_protected_program(PROTECTED_DS_CODE, PROTECTED_STARTS, SEL_OTHER, no_perturb);
+    assert_eq!(
+        legs.exit_reason,
+        Some(jit::direct::SideExitReason::CallOutResync as u32)
+    );
+    let counts = row_counts(&legs.native, "0x8e_mov_sreg");
+    assert_eq!(counts.resync, 1);
+    let mut expected = [0u64; 19];
+    expected[reason_index("segment")] = 1;
+    assert_eq!(counts.resync_reasons, expected, "only the segment clause");
+    assert_eq!(
+        counts.segment_changed,
+        [0, 0, 0, 1, 0, 0],
+        "only DS differs"
+    );
+    assert_eq!(
+        counts.segment_field_changed,
+        [1, 0, 1, 0],
+        "the selector and the limit differ; the base and the access do not"
+    );
+    assert_eq!(
+        counts.segment_refusals_by_mode,
+        [0, 0, 0, 0, 0, 1],
+        "a 32-bit block in protected mode"
+    );
+    assert_eq!(counts.demoting_reasons, [0u64; 19]);
+}
+
+/// Reloading the same selector resumes, so no reason counter moves.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_same_selector_reload_counts_no_reason() {
+    let legs =
+        run_both_protected_program(PROTECTED_DS_CODE, PROTECTED_STARTS, SEL_DATA, no_perturb);
+    assert_eq!(legs.exit_reason, None, "the block should have completed");
+    let counts = row_counts(&legs.native, "0x8e_mov_sreg");
+    assert_eq!(counts.executed, 1);
+    assert_eq!(counts.resync, 0);
+    assert_eq!(counts.resync_reasons, [0u64; 19]);
+    assert_eq!(counts.segment_changed, [0u64; 6]);
+    assert_eq!(counts.segment_field_changed, [0u64; 4]);
+    assert_eq!(counts.segment_refusals_by_mode, [0u64; 6]);
+    assert_eq!(counts.demoting_reasons, [0u64; 19]);
+}
+
+/// A call-out that faults counts under `fault` and under no clause.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_fault_is_classified() {
+    fn zero_divisor(cpu: &mut CpuGsw, bus: &mut TestBus) {
+        cpu.registers.set_edx(0);
+        cpu.registers.set_ebx(0);
+        bus.memory[0..4].copy_from_slice(&[0x00, 0x05, 0x00, 0x00]);
+        bus.memory[0x500] = 0xF4;
+    }
+    let (code, starts) = row_program(&[0xF7, 0xF3]);
+    let legs = run_both(&code, &starts, zero_divisor);
+    let counts = row_counts(&legs.native, "0xf7_group3_word");
+    let mut expected = [0u64; 19];
+    expected[reason_index("fault")] = 1;
+    assert_eq!(counts.resync_reasons, expected);
+    assert_eq!(counts.segment_changed, [0u64; 6]);
+}
+
+/// The third resync demotes the slot, and only that resync is counted in `demoting_reasons`.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpret_one_demoting_reason_counts_the_third_resync() {
+    let (mut cpu, mut bus, block) = build_protected_program(PROTECTED_DS_CODE, PROTECTED_STARTS);
+    for run in 1..=3u64 {
+        arm_protected(&mut cpu, &mut bus, SEL_OTHER);
+        cpu.registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::flat(SEL_DATA, 0x93));
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block)
+                .expect("the fixture block must not stop the machine")
+        );
+        let counts = row_counts(&cpu, "0x8e_mov_sreg");
+        assert_eq!(counts.resync, run);
+        assert_eq!(
+            counts.demoting_reasons[reason_index("segment")],
+            u64::from(run == 3),
+            "only the resync that demotes is counted, after run {run}"
+        );
+    }
+    let counts = row_counts(&cpu, "0x8e_mov_sreg");
+    assert_eq!(counts.demoted, 1);
+    assert_eq!(counts.resync_reasons[reason_index("segment")], 3);
+    assert_eq!(counts.segment_changed[3], 3);
 }
 
 // ---------------------------------------------------------------------------

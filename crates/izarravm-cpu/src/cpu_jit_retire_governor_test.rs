@@ -1954,7 +1954,8 @@ fn live_data_pm16_store_live_loads_limit_and_access() {
             &0x2222u16.to_le_bytes()
         );
 
-        let before_exits = cpu.perf_counters().jit_direct_exit_unavailable_or_kind;
+        let before_exits = cpu.jit_direct.stall_snapshot().side_exit_live_pm_access;
+        let before_unavailable = cpu.perf_counters().jit_direct_exit_unavailable_or_kind;
         let stored = bus.memory[DATA as usize..DATA as usize + 2].to_vec();
         stamp_ds(&mut cpu, 0x20, 0, 0x4000, READ_ONLY);
         cpu.set_eip(ENTRY);
@@ -1967,9 +1968,14 @@ fn live_data_pm16_store_live_loads_limit_and_access() {
             "CHAIN_ENTRY_CHECK={armed}: used-strip must let the read-only entry reach the body"
         );
         assert_eq!(
-            cpu.perf_counters().jit_direct_exit_unavailable_or_kind - before_exits,
+            cpu.jit_direct.stall_snapshot().side_exit_live_pm_access - before_exits,
             1,
             "CHAIN_ENTRY_CHECK={armed}: store to a read-only selector side-exits"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_exit_unavailable_or_kind - before_unavailable,
+            0,
+            "CHAIN_ENTRY_CHECK={armed}: the access check exit has its own reason"
         );
         assert_eq!(
             &bus.memory[DATA as usize..DATA as usize + 2],
