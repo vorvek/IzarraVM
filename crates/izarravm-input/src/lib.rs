@@ -1,7 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-#![forbid(unsafe_code)]
+// Denied, not forbidden: the Windows XInput loader makes one audited FFI call.
+#![deny(unsafe_code)]
 
 mod controller;
 #[cfg(windows)]
