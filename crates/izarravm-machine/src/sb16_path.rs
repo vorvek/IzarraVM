@@ -306,6 +306,11 @@ impl Sb16Path {
         Some((active.mixer.selected_irq(), micros))
     }
 
+    /// The oldest MIDI byte the guest wrote through the DSP, if any.
+    pub(crate) fn take_midi_byte(&mut self) -> Option<u8> {
+        self.active.as_mut()?.dsp.take_midi_byte()
+    }
+
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
         let Some(active) = self.active.as_mut() else {
             return false;

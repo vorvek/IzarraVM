@@ -3888,7 +3888,10 @@ impl Machine {
         } else {
             self.midi_mpu.take_message()
         };
-        if let Some(message) = &message {
+        // The MPU counters and trace cover MPU port output only.
+        if let Some(message) = &message
+            && !message.from_sound_blaster
+        {
             self.opl_probe
                 .record_mpu_output(wavetable, &message.bytes, message.guest_tick);
         }

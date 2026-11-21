@@ -300,3 +300,98 @@ fn wss_strobe_release_does_not_drop_an_mpu_held_line_9() {
     );
     assert!(!machine.pic.interrupt_pending());
 }
+
+const SB_DSP_WRITE: u16 = 0x22C;
+
+#[test]
+fn sound_blaster_uart_mode_bytes_reach_the_midi_output() {
+    let mut machine = test_machine();
+    for byte in [0x35, 0x90, 60, 100, 60, 0] {
+        write_byte(&mut machine, SB_DSP_WRITE, byte);
+    }
+    let first = machine.take_midi_message().expect("note on");
+    // Running status carries the second message.
+    let second = machine.take_midi_message().expect("running-status note");
+    assert_eq!(first.bytes, [0x90, 60, 100]);
+    assert_eq!(second.bytes, [0x90, 60, 0]);
+    assert!(first.from_sound_blaster && second.from_sound_blaster);
+    assert!(machine.take_midi_message().is_none());
+    assert!(machine.take_wavetable_midi_message().is_none());
+}
+
+#[test]
+fn sound_blaster_command_38h_bytes_reach_the_midi_output() {
+    let mut machine = test_machine();
+    for byte in [0x90, 62, 90] {
+        write_byte(&mut machine, SB_DSP_WRITE, 0x38);
+        write_byte(&mut machine, SB_DSP_WRITE, byte);
+    }
+    let message = machine.take_midi_message().expect("note on");
+    assert_eq!(message.bytes, [0x90, 62, 90]);
+    assert!(machine.take_midi_message().is_none());
+}
+
+#[test]
+fn sound_blaster_midi_takes_the_tick_of_its_port_write() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+    machine.advance_devices_clocks(7);
+    let expected = with_bus(&mut machine, |bus| {
+        CpuBus::write_io(bus, SB_DSP_WRITE, BusWidth::Byte, 0x35, 10, false).unwrap();
+        CpuBus::write_io(bus, SB_DSP_WRITE, BusWidth::Byte, 0xC0, 20, false).unwrap();
+        CpuBus::write_io(bus, SB_DSP_WRITE, BusWidth::Byte, 5, 30, false).unwrap();
+        bus.guest_tick_now()
+    });
+    let message = machine.take_midi_message().expect("program change");
+    assert_eq!(message.bytes, [0xC0, 5]);
+    assert_eq!(message.guest_tick, expected);
+}
+
+#[test]
+fn mpu_and_sound_blaster_streams_do_not_corrupt_each_other() {
+    let mut machine = test_machine();
+    write_byte(&mut machine, SB_DSP_WRITE, 0x35);
+    // Interleave: each stream has its own running status and partial message.
+    write_byte(&mut machine, MIDI_MPU_BASE + 1, 0x3f); // MPU UART mode
+    let _ = read_byte(&mut machine, MIDI_MPU_BASE);
+    let sequence: [(bool, u8); 6] = [
+        (true, 0x90),
+        (false, 0xB0),
+        (true, 60),
+        (false, 7),
+        (true, 100),
+        (false, 99),
+    ];
+    for (sound_blaster, byte) in sequence {
+        let port = if sound_blaster {
+            SB_DSP_WRITE
+        } else {
+            MIDI_MPU_BASE
+        };
+        write_byte(&mut machine, port, byte);
+    }
+    let mut messages = Vec::new();
+    while let Some(message) = machine.take_midi_message() {
+        messages.push((message.from_sound_blaster, message.bytes));
+    }
+    assert!(
+        messages.contains(&(true, vec![0x90, 60, 100])),
+        "{messages:?}"
+    );
+    assert!(
+        messages.contains(&(false, vec![0xB0, 7, 99])),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn sound_blaster_midi_is_not_counted_as_mpu_output() {
+    let mut machine = test_machine();
+    for byte in [0x35, 0x90, 60, 100] {
+        write_byte(&mut machine, SB_DSP_WRITE, byte);
+    }
+    assert!(machine.take_midi_message().is_some());
+    let (_, midi) = machine.mpu_diagnostics();
+    assert_eq!(midi.output_messages, 0);
+    assert_eq!(midi.output_bytes, 0);
+}
