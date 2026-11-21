@@ -264,7 +264,7 @@ impl AudioPlayer {
     /// device was never there" are the same state.
     pub fn new() -> Self {
         let ring = new_ring();
-        let audio_debug = std::env::var_os("IZARRAVM_AUDIO_DEBUG").is_some();
+        let audio_debug = izarravm_core::env_flag("IZARRAVM_AUDIO_DEBUG");
         let runtime_profile = std::env::var("IZARRAVM_RUNTIME_PROFILE").as_deref() == Ok("1");
         let debug =
             (audio_debug || runtime_profile).then(|| Arc::new(AudioDebugCounters::new(ring.len())));

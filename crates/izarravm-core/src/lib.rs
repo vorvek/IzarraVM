@@ -6,6 +6,7 @@
 mod canonical_state;
 mod cdaudio;
 mod clock;
+mod env_flag;
 mod gsw;
 
 pub use canonical_state::{
@@ -16,6 +17,7 @@ pub use canonical_state::{
 };
 pub use cdaudio::{AUDIO_FRAME_BYTES, AudioTrackSource};
 pub use clock::{ClockRate, MASTER_CLOCK_HZ};
+pub use env_flag::{env_flag, flag_value_is_on};
 pub use gsw::{CacheGeometry, CpuPersona, GSW_MODE_SPECS, GswMode, GswModeSpec, L1Cache};
 
 use serde::{Deserialize, Serialize};

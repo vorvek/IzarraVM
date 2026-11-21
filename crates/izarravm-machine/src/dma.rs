@@ -312,7 +312,7 @@ impl DmaChip {
     fn trace_dma_mode(ci: usize, value: u8, ch: &DmaChannel) {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_CMD_TRACE").is_some()) {
+        if !*ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_SB_CMD_TRACE")) {
             return;
         }
         let kind = match ch.transfer_kind {

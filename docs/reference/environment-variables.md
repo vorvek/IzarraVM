@@ -36,7 +36,7 @@ starts. Change them before you start IzarraVM.
 | Name | Values | Default | Effect |
 | --- | --- | --- | --- |
 | `IZARRAVM_DOSROOT` | A directory path. | Not set | Gives the fallback C: drive folder. The `--c-drive` switch has priority. An empty value counts as not set. |
-| `IZARRAVM_NO_DIALOG` | Any non-empty value. | Not set | On Windows, stops the message box that the AVX2 check shows when no console is attached. |
+| `IZARRAVM_NO_DIALOG` | Any value except empty, `0`, `off` and `false`. | Not set | On Windows, stops the message box that the AVX2 check shows when no console is attached. |
 | `IZARRAVM_CORPUS_ROOT` | A directory path. | Not set | Gives the root folder for the `izarravm-corpus` scanner. The `--corpus-root` switch has priority. |
 
 ## Traces and diagnostics
@@ -46,18 +46,19 @@ build feature. This is stated in the Effect column.
 
 | Name | Values | Default | Effect |
 | --- | --- | --- | --- |
-| `IZARRAVM_FAULT_TRACE` | Set to any value. | Not set | Prints a trace of CPU faults and of the exit of the test device. |
-| `IZARRAVM_DIFF_TRACE` | Set to any value. | Not set | Writes a per-instruction trace for differential checks. |
+| `IZARRAVM_FAULT_TRACE` | Any value except empty, `0`, `off` and `false`. | Not set | Prints a trace of CPU faults and of the exit of the test device. |
+| `IZARRAVM_DIFF_TRACE` | Any value except empty, `0`, `off` and `false`. | Not set | Writes a per-instruction trace for differential checks. |
 | `IZARRAVM_INT_TRACE` | Hexadecimal vectors, separated by commas. | Not set | Prints the arguments and the answer of each traced `INT n`. Needs the `int-trace` build feature. |
 | `IZARRAVM_WATCH_WRITE` | `<hex address>[,<hex length>]`, as physical addresses. | Not set | Reports the guest stores to the address range. The default length is `0x100`. Needs the `watch-write` build feature. |
 | `IZARRAVM_WATCH_WRITE_LIMIT` | A decimal number. | The built-in limit | Sets the maximum number of store reports. |
 | `IZARRAVM_OPL_TRACE` | A decimal number. | `0` (off) | Records up to this number of OPL events. |
 | `IZARRAVM_MIDI_TRACE` | A decimal number. | `0` (off) | Records up to this number of MIDI events. |
 | `IZARRAVM_PIT_TRACE` | A decimal number. | `0` (off) | Records up to this number of timer events. |
-| `IZARRAVM_SB_CMD_TRACE` | Set to any value. | Not set | Prints the Sound Blaster DSP commands, the mixer writes, and the DMA mode writes. |
-| `IZARRAVM_SB_DEBUG` | Set to any value. | Not set | Prints Sound Blaster path statistics. |
-| `IZARRAVM_AUDIO_DEBUG` | Set to any value. | Not set | Counts the events of the host audio output. |
-| `IZARRAVM_VBE_TRACE` | Set to any value. | Not set | Prints the VBE mode set requests. |
+| `IZARRAVM_SB_CMD_TRACE` | Any value except empty, `0`, `off` and `false`. | Not set | Prints the Sound Blaster DSP commands, the mixer writes, and the DMA mode writes. |
+| `IZARRAVM_WSS_TRACE` | Any value except empty, `0`, `off` and `false`. | Not set | Prints each access to the Windows Sound System ports. |
+| `IZARRAVM_SB_DEBUG` | Any value except empty, `0`, `off` and `false`. | Not set | Prints Sound Blaster path statistics. |
+| `IZARRAVM_AUDIO_DEBUG` | Any value except empty, `0`, `off` and `false`. | Not set | Counts the events of the host audio output. |
+| `IZARRAVM_VBE_TRACE` | Any value except empty, `0`, `off` and `false`. | Not set | Prints the VBE mode set requests. |
 | `IZARRAVM_SMC_TRACE` | Any value other than empty or `0` turns it on. | Off | Records the self-modifying code invalidations in a headless run. |
 | `IZARRAVM_SMC_TRACE_OUT` | A file path. | Standard output | Names the file for the report of `IZARRAVM_SMC_TRACE`. |
 | `IZARRAVM_UNIT_SIM` | Any value other than empty or `0` turns it on. | Off | Runs the unit-growth simulator in a headless run. |

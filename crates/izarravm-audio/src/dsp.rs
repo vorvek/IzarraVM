@@ -164,7 +164,7 @@ impl AdpcmState {
 /// the mixer's `[SBMIX]` trace gate.
 fn peak_tracking() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_DEBUG").is_some())
+    *ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_SB_DEBUG"))
 }
 
 /// Reset-settle time in microseconds. The programming guide's bound is
@@ -440,7 +440,7 @@ impl SbDsp {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         static SEEN: AtomicU32 = AtomicU32::new(0);
         const LIMIT: u32 = 400;
-        if !*ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_SB_CMD_TRACE").is_some()) {
+        if !*ENABLED.get_or_init(|| izarravm_core::env_flag("IZARRAVM_SB_CMD_TRACE")) {
             return;
         }
         let n = SEEN.fetch_add(1, Ordering::Relaxed);

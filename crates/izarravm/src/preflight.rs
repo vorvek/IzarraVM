@@ -268,7 +268,14 @@ fn dialog_wanted(no_dialog_env_set: bool, has_console: bool) -> bool {
 
 #[cfg(windows)]
 fn no_dialog_env_is_set() -> bool {
-    std::env::var_os("IZARRAVM_NO_DIALOG").is_some_and(|v| !v.is_empty())
+    no_dialog_requested(std::env::var_os("IZARRAVM_NO_DIALOG"))
+}
+
+/// True when the value of `IZARRAVM_NO_DIALOG` turns the flag on. An empty
+/// value, `0`, `off` and `false` leave the dialog enabled.
+#[cfg(windows)]
+fn no_dialog_requested(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|value| izarravm_core::flag_value_is_on(&value.to_string_lossy()))
 }
 
 /// `GetConsoleWindow` returning non-null is the actual "console attached"

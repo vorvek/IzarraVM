@@ -1112,7 +1112,7 @@ fn duration_ns_u64(duration: std::time::Duration) -> u64 {
 /// port), never per-instruction or per-cycle, so leaving it unset costs one env lookup
 /// on those rare events and nothing anywhere else.
 fn fault_trace_enabled() -> bool {
-    std::env::var_os("IZARRAVM_FAULT_TRACE").is_some()
+    izarravm_core::env_flag("IZARRAVM_FAULT_TRACE")
 }
 
 /// Host-side tally of guest OPL (AdLib/OPL3) activity. Diagnostic ONLY: nothing
