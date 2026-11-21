@@ -626,6 +626,11 @@ impl Vega {
         }
     }
 
+    /// Pointer lifetime: the VGA and Margo buffers behind these pointers are
+    /// heap buffers that are never resized or reassigned, so a pointer stays
+    /// valid while its owner lives. Moving the owner does not move a heap
+    /// buffer. Any future reallocation, or replacing the owner, must advance the
+    /// direct mapping epoch so cached pointers are dropped.
     pub(crate) fn direct_write_page(&mut self, physical_page: u32) -> Option<*mut u8> {
         // Margo's banked window first: while it owns the aperture the VGA token is
         // 0 by construction, so without this arm the function refuses exactly the
@@ -1938,6 +1943,11 @@ impl Vega {
     /// Written in terms of `margo_banked_window_key` rather than repeating its
     /// conditions, so the identity that guards cached copies of this pointer and
     /// the grant itself cannot drift apart.
+    ///
+    /// Pointer lifetime: the Margo frame store is a heap buffer that is never
+    /// resized or reassigned, so the pointer stays valid while the owning
+    /// `Margo` lives. Moving the owner does not move that buffer. Any future
+    /// reallocation must advance the direct mapping epoch.
     pub(crate) fn margo_banked_direct_page(&mut self, physical_page: u32) -> Option<*mut u8> {
         let base = self.margo_banked_window_key()?;
         let offset = physical_page.checked_sub(VGA_MODE13H_BASE)?;

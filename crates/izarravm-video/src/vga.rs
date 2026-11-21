@@ -733,6 +733,14 @@ impl Vga {
     /// Return one directly writable VGA aperture page when the current write
     /// datapath is a transparent byte copy. Mode X points at the sole plane
     /// selected by the map mask. Reads still use the VGA handler and latches.
+    ///
+    /// Pointer lifetime: the `vram` buffer is a heap allocation that is never
+    /// resized or reassigned, so the pointer stays valid while the `Vga` that
+    /// owns it lives. Moving the `Vga` does not move that heap buffer.
+    /// Cloning a `Vga` or assigning a whole new one allocates new buffers, so
+    /// every pointer taken from the old one is stale. Any such change, and any
+    /// future reallocation of the buffer, must advance the direct mapping epoch
+    /// so the direct page caches drop their copies.
     pub fn direct_write_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
         if self.mode13h_direct_page_available() {
             return self.mode13h_direct_page_ptr(offset);
@@ -748,9 +756,14 @@ impl Vga {
         Some(self.vram[plane * VGA_PLANE_SIZE + offset..].as_mut_ptr())
     }
 
-    /// Return one page of the canonical chained Mode 13h aperture. The backing
-    /// buffer is stable for the lifetime of this VGA instance. Callers must use
-    /// `note_mode13h_direct_write` before mutating the returned page.
+    /// Return one page of the canonical chained Mode 13h aperture. Callers must
+    /// use `note_mode13h_direct_write` before mutating the returned page.
+    ///
+    /// Pointer lifetime: the `mode13_linear` heap buffer is never resized or
+    /// reassigned, so the pointer stays valid while the owning `Vga` lives.
+    /// Moving the `Vga` does not move that buffer. Cloning or replacing the
+    /// `Vga`, or any future reallocation of the buffer, must advance the direct
+    /// mapping epoch.
     pub fn mode13h_direct_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
         if !self.mode13h_direct_page_available()
             || offset
