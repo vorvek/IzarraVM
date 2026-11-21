@@ -397,3 +397,38 @@ fn a_partial_last_sector_is_padded_with_silence_in_a_reused_stage() {
     assert!(tail[audio..].iter().all(|b| *b == 0));
     std::fs::remove_file(&path).ok();
 }
+
+/// FNV-1a over the bytes, 64 bits.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+#[test]
+fn chunked_decode_matches_the_recorded_whole_buffer_output() {
+    // Length and hash of the PCM that the whole-buffer decoder produced before
+    // the staging change, one entry per fixture.
+    let odd_length = std::env::temp_dir().join(format!(
+        "izarravm-cdaudio-recorded-odd-{}.wav",
+        std::process::id()
+    ));
+    std::fs::write(&odd_length, surround_wav(4410)).unwrap();
+    let recorded: [(PathBuf, usize, u64); 6] = [
+        (fixture("tone.wav"), 35280, 0xf447_7443_7045_1455),
+        (fixture("tone.flac"), 35280, 0xf447_7443_7045_1455),
+        (fixture("tone.ogg"), 35280, 0xcea1_cbc2_46b7_c45d),
+        (fixture("tone.mp3"), 35280, 0x4a0a_780d_67e1_eb25),
+        (fixture("tone-22k-mono.wav"), 35280, 0x25fb_e9b5_a25f_82d9),
+        (odd_length.clone(), 18816, 0x154c_b6f7_7dd3_3d85),
+    ];
+    for (path, len, hash) in &recorded {
+        let info = crate::probe_info(path).unwrap().unwrap();
+        for stage in [1, 5, STAGE_SECTORS] {
+            let pcm = assemble(info, &chunks_of(path, info, stage));
+            assert_eq!(pcm.len(), *len, "{path:?} length at {stage} sectors");
+            assert_eq!(fnv1a(&pcm), *hash, "{path:?} hash at {stage} sectors");
+        }
+    }
+    std::fs::remove_file(&odd_length).ok();
+}
