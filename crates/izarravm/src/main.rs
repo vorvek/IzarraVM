@@ -4645,6 +4645,7 @@ fn stop_reason_json(stop: &StopReason) -> serde_json::Value {
         StopReason::CpuError(message) => json!({ "kind": "cpu_error", "message": message }),
         StopReason::DosExit { code } => json!({ "kind": "dos_exit", "code": code }),
         StopReason::TestExit { code } => json!({ "kind": "test_exit", "code": code }),
+        StopReason::ResetRequested => json!({ "kind": "reset_requested" }),
     }
 }
 

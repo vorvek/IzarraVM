@@ -48,6 +48,11 @@ pub struct Keyboard8042 {
     // packet. Armed only while the mouse has state to report (see
     // `Ps2Mouse::sample`), so an idle mouse costs no deadline.
     mouse_sample_ticks: Option<u64>,
+    // A guest action pulsed the CPU reset line. Taken by the run loop.
+    reset_requested: bool,
+    // Last value of bit 0 written to port 0x92 (fast reset). Only a 0-to-1
+    // change pulses the reset line.
+    system_control_reset_bit: bool,
 }
 
 impl Default for Keyboard8042 {
@@ -71,6 +76,8 @@ impl Default for Keyboard8042 {
             device_byte_ticks: None,
             device_byte_ready: false,
             mouse_sample_ticks: None,
+            reset_requested: false,
+            system_control_reset_bit: false,
         }
     }
 }
@@ -335,7 +342,13 @@ impl Keyboard8042 {
                     // 0xF4 (enable reporting) may release accumulated state.
                     self.kick_mouse_sample();
                 }
-                0xD1 => self.output_port = value,
+                0xD1 => {
+                    self.output_port = value;
+                    // Output port bit 0 low holds the CPU reset line low.
+                    if value & 0x01 == 0 {
+                        self.reset_requested = true;
+                    }
+                }
                 _ => {}
             }
         } else {
@@ -356,6 +369,9 @@ impl Keyboard8042 {
             0xD0 => self.respond_controller(self.output_port),
             0xC0 => self.respond_controller(0xA0),
             0xE0 => self.respond_controller(0x03),
+            // Commands F0h to FFh pulse the output port lines whose bit is
+            // clear. Bit 0 is the CPU reset line.
+            0xF0..=0xFF if value & 0x01 == 0 => self.reset_requested = true,
             _ => {}
         }
     }
@@ -475,6 +491,29 @@ impl Keyboard8042 {
         } else {
             self.output_port &= !0x02;
         }
+    }
+
+    /// Latch bit 0 of a write to port 0x92. Returns true when it pulsed the
+    /// reset line, which only a 0-to-1 change does.
+    pub(crate) fn write_system_control_a(&mut self, value: u8) -> bool {
+        let bit = value & 0x01 != 0;
+        let rising = bit && !self.system_control_reset_bit;
+        self.system_control_reset_bit = bit;
+        if rising {
+            self.reset_requested = true;
+        }
+        rising
+    }
+
+    /// Port 0x92 as the guest reads it: bit 1 is the A20 gate, bit 0 is the
+    /// latched reset bit.
+    pub(crate) fn read_system_control_a(&self) -> u8 {
+        (u8::from(self.a20_enabled()) << 1) | u8::from(self.system_control_reset_bit)
+    }
+
+    /// Whether the guest pulsed the CPU reset line since the last call.
+    pub(crate) fn take_reset_request(&mut self) -> bool {
+        std::mem::take(&mut self.reset_requested)
     }
 
     #[cfg(test)]

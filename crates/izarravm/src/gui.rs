@@ -1322,6 +1322,10 @@ impl GuiApp {
                 } => {
                     error!(generation, %message, "session finalization failed");
                 }
+                SessionEvent::GuestReset { generation } => {
+                    info!(generation, "guest reset: session restarted the machine");
+                    self.reset_presentation_state();
+                }
             }
         }
         if !self.session_snapshot.powered {
