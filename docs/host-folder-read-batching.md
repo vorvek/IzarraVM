@@ -79,17 +79,17 @@ call at all.
 It is keyed by host path and byte offset rather than by LBA, so it stays correct
 however the guest's clusters are laid out, and it is used only when the requested
 sector lies wholly inside the range it holds. Because the read-ahead covers
-everything the LBA-keyed window would have -- same starting offset, never shorter
-than the command extent -- the window is not filled at all while the read-ahead is
-armed. The buffer is moved into whichever of the two owns it, never copied.
+everything the LBA-keyed window would have, with the same starting offset and
+never shorter than the command extent, the window is not filled at all while the
+read-ahead is armed. The buffer is moved into whichever of the two owns it, never copied.
 
 There are four slots, evicted least-recently-used like the read handles, so two
 interleaved files each keep their own place.
 
 ### How far a fill reads
 
-A fill starts at the extent the command declared -- one sector when nothing
-declared a command at all, which is what a reconcile gather looks like -- and
+A fill starts at the extent the command declared. It is one sector when nothing
+declared a command at all, which is what a reconcile gather looks like. A fill
 doubles, up to 256 KiB, only when the miss that triggers it lands at exactly the
 end of the previous fill for that same path. Any other offset resets it: a
 backward seek, a jump, a first touch.
@@ -103,7 +103,7 @@ its command asked for and no more.
 
 A flat fill has no such bound, which is why it is not what shipped. Measured by
 unit test: thirty-two sequential eight-sector commands read 131,072 physical bytes
-to serve 131,072 -- a ratio of one -- while 128 alternating single-sector reads
+to serve 131,072 (a ratio of one), while 128 alternating single-sector reads
 across two files read 130,048 to serve 65,536. With a flat 256 KiB fill the same
 alternating pattern reads 524,288, and with a single slot it never hits at all.
 
@@ -183,8 +183,9 @@ Native PIO reads (`prepare_read_sector`) are deliberately left unbatched. A PIO
 command serves one sector per DRQ and the guest drains each through the data
 port before the next is scheduled, so a window would have to survive an interval
 bounded by guest execution rather than by a host-side call. That breaks the
-property the whole design rests on -- a host folder cannot change underneath a
-declared range -- and the command has no single exit to close the range at: it
+property the whole design rests on, which is that a host folder cannot change
+underneath a declared range. The command also has no single exit to close the
+range at: it
 ends in `read_data_byte`, in `abort`, in `soft_reset`, or nowhere at all if the
 guest simply stops draining. Lifting this means giving a PIO command one owned
 lifetime, which is a separate change.
@@ -261,7 +262,7 @@ differenced: the difference of two running maxima is not the maximum over the
 interval between them. The boot profiler carries them through undifferenced. In
 the phase-mark series, which is cumulative and is differenced column by column by
 its consumers, they appear as `katea_host_read_max_level_ns` and
-`katea_projection_max_level_ns` -- the suffix is there so a uniform differencer
+`katea_projection_max_level_ns`. The suffix is there so a uniform differencer
 cannot quietly produce a meaningless number.
 
 ## DukeMark results
@@ -360,8 +361,8 @@ Two pre-existing assertions moved, both host-side counters:
   had just read and expected the next sector of it to fail. With a read-ahead
   buffer that sector is already in RAM. The test now puts its failing sector in
   a second file this run has never opened, so the read genuinely reaches the
-  host. What it asserts -- that a degraded read is served as zeros and never
-  cached, and that the restored bytes come back -- is unchanged.
+  host. What it asserts is unchanged: a degraded read is served as zeros and never
+  cached, and the restored bytes come back.
 
 `the_sector_cache_hits_misses_and_charges_on_a_katea_host_folder` did NOT move.
 Its `host_read_bytes == 4 * 512` holds unchanged, because a first touch of a file
@@ -376,9 +377,9 @@ ignored, 231 `izarravm` tests with 92 ignored, and every other crate.
 The library suite was run in both legs of the new switch. With
 `IZARRAVM_HDD_READAHEAD=0`, exactly three tests change result, and all three are
 the ones that exist to assert the read-ahead is doing something. No pre-existing
-test moves at all. The other 1,550 -- every timing, charge, tick,
-status-register, content and determinism test in the machine -- pass identically
-armed and disarmed.
+test moves at all. The other 1,550 tests pass identically armed and
+disarmed. They include every timing, charge, tick, status-register, content and
+determinism test in the machine.
 
 The read-ahead moves physical-read counters and nothing else the guest can
 observe. The handle LRU and the FAT memo have no switch because neither has a
@@ -386,17 +387,17 @@ guest-visible degree of freedom: the LRU only decides whether a file is reopened
 and the memo only decides whether identical bytes are recomputed.
 
 The wall-clock effect on the duke3d-486 hitch has NOT been measured. The
-acceptance instrument is in place -- `projection_max_ns` and `host_read_max_ns`
-in the profile and the phase-mark series -- and the fixture run belongs to
+acceptance instrument is in place (`projection_max_ns` and `host_read_max_ns`
+in the profile and the phase-mark series), and the fixture run belongs to
 whoever grades this.
 
 ### Guest timing, measured rather than argued
 
 The whole library suite was run in both control legs. With
 `IZARRAVM_HDD_COMMAND_READ_BATCH=0`, exactly four tests change result, and all
-four are `host_read_operations` assertions. The other 1,538 -- every timing,
-charge, tick, status-register, content and determinism test in the machine --
-pass identically with batching on and off.
+four are `host_read_operations` assertions. The other 1,538 tests
+pass identically with batching on and off. They include every timing, charge,
+tick, status-register, content and determinism test in the machine.
 
 That is the fidelity claim in its strongest available form: batching moves the
 physical-operation counters and nothing else the guest can observe.
