@@ -124,6 +124,8 @@ const PERF_COUNTER_KEYS: &[&str] = &[
     "fast_map_cr3_census_tlb_live_other_physical",
     "fast_map_cr3_census_tlb_live_same_physical",
     "fast_map_cr3_census_write_not_dirty",
+    "fast_map_two_tables_switches",
+    "fast_map_two_tables_tag_wipes",
     "fast_map_wipe_aperture_pages_cleared",
     "fast_map_wipe_pages_cleared",
     "fast_map_wipe_vga_pages_cleared",
@@ -1249,6 +1251,8 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         cr3_census_write_not_dirty: 144,
         cr3_census_not_reselected: 145,
         tlb_insert_evicts_other_generation: 146,
+        fast_map_two_tables_switches: 147,
+        fast_map_two_tables_tag_wipes: 148,
     };
 
     let code_watch_edges = izarravm_cpu::CodeWatchEdgeCounters {
@@ -1305,6 +1309,8 @@ fn perf_counter_json_exposes_the_complete_counter_surface() {
         ("fast_map_cr3_census_write_not_dirty", 144),
         ("fast_map_cr3_census_not_reselected", 145),
         ("tlb_insert_evicts_other_generation", 146),
+        ("fast_map_two_tables_switches", 147),
+        ("fast_map_two_tables_tag_wipes", 148),
         ("slot_reject_misaligned", 130),
         ("slot_reject_page_cross", 131),
         ("slot_reject_absent", 132),
@@ -1513,6 +1519,8 @@ fn perf_counter_inventory_guard_covers_every_struct_field() {
         cr3_census_write_not_dirty: _,
         cr3_census_not_reselected: _,
         tlb_insert_evicts_other_generation: _,
+        fast_map_two_tables_switches: _,
+        fast_map_two_tables_tag_wipes: _,
     } = izarravm_cpu::FastMapAuditCounters::default();
     let izarravm_cpu::CodeWatchEdgeCounters {
         sticky_page_edges: _,

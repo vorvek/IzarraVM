@@ -1837,6 +1837,12 @@ pub struct FastMapAuditCounters {
     /// TLB inserts that overwrote a valid entry of a different generation that is still live in
     /// a ring slot. Always counted: one compare on the walk path.
     pub tlb_insert_evicts_other_generation: u64,
+    /// Two fast-map tables (`IZARRAVM_FAST_MAP_TWO_TABLES`): MOV CR3 writes that changed the
+    /// live ring slot and swapped the live and the dormant table.
+    pub fast_map_two_tables_switches: u64,
+    /// Switches that found the incoming table tagged for another generation of its slot and
+    /// wiped it.
+    pub fast_map_two_tables_tag_wipes: u64,
 }
 
 impl Default for FastMapAuditCounters {
@@ -1871,6 +1877,8 @@ impl Default for FastMapAuditCounters {
             cr3_census_write_not_dirty: 0,
             cr3_census_not_reselected: 0,
             tlb_insert_evicts_other_generation: 0,
+            fast_map_two_tables_switches: 0,
+            fast_map_two_tables_tag_wipes: 0,
         }
     }
 }
@@ -3533,6 +3541,14 @@ impl Default for CpuGsw {
         // keeps a future change to the initial mode from shipping a silently refusing JIT.
         #[cfg(feature = "jit")]
         cpu.refresh_native_key_admission();
+        // Latched here for the CPU's life: the fast map either keeps one table for each CR3 ring
+        // slot or it does not.
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        cpu.refresh_fast_map_two_tables_latch();
         cpu
     }
 }

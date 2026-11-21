@@ -144,3 +144,50 @@ fn physical_page_cache_tags_collisions_and_invalidates_all_entries() {
     assert!(pages.get(first.physical_page).is_none());
     assert!(pages.get(collision.physical_page).is_none());
 }
+
+#[test]
+fn on_off_knob_spelling_table() {
+    let parse = |value: &str| parse_on_off_knob("KNOB", Ok(value.to_string()));
+    assert!(parse_on_off_knob(
+        "KNOB",
+        Err(std::env::VarError::NotPresent)
+    ));
+    assert!(!parse("0"));
+    assert!(parse("1"));
+    assert!(parse(" 1 "));
+    for bad in ["", "2", "true", "on", "yes", "-1"] {
+        assert!(
+            std::panic::catch_unwind(|| parse_on_off_knob("KNOB", Ok(bad.to_string()))).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+/// A clone is an empty TLB in the state of a new one. It keeps the partition setting.
+#[test]
+fn a_tlb_clone_is_empty_and_in_the_default_state() {
+    let mut tlb = Tlb::default();
+    tlb.set_partition_for_test(true);
+    tlb.allocate_generation(1);
+    tlb.insert(5, 0x5000, true, true, true);
+    assert!(tlb.lookup(5).is_some());
+    assert_eq!(tlb.live_slot(), 1);
+
+    let clone = tlb.clone();
+    let fresh = Tlb::default();
+    assert!(
+        clone.partitioned(),
+        "the partition setting is configuration"
+    );
+    assert_eq!(clone.live_slot(), 0);
+    assert_eq!(clone.generation, fresh.generation);
+    assert_eq!(clone.generations_for_test(), fresh.generations_for_test());
+    assert!(clone.lookup(5).is_none());
+    assert!(
+        (0..2).all(|slot| clone
+            .array_of_slot_for_test(slot)
+            .iter()
+            .all(|entry| entry.generation == 0)),
+        "no entry survives the clone"
+    );
+}

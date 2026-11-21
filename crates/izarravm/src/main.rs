@@ -3,7 +3,7 @@
 
 // The hand-built perf_counters_json object expands one json! recursion level
 // per key; the counter set is large enough to need headroom above the default.
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 mod bench;
 mod bench_reference;

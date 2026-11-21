@@ -127,9 +127,16 @@ impl TlbEntry {
 /// `generations[live]` by every method below; nothing on the hot path reads `generations` or
 /// `live` directly. Capacity stays shared (1024 entries for both directories together); only
 /// LIVENESS is partitioned, exactly as design section (a) A4 argues.
-#[derive(Clone)]
 pub(crate) struct Tlb {
-    pub(crate) entries: [TlbEntry; TLB_ENTRIES],
+    /// Two arrays of `TLB_ENTRIES` entries. With the slot partition off, only the first array is
+    /// ever used (`base` stays 0). With it on, `base` is `live * TLB_ENTRIES`, so each ring slot
+    /// owns one array and a context cannot overwrite the entries of the other.
+    entries: [TlbEntry; TLB_ENTRIES * 2],
+    /// Offset of the live array inside `entries`: 0 or `TLB_ENTRIES`. Changes only when the live
+    /// ring slot changes and the partition is on.
+    base: usize,
+    /// Whether each ring slot has its own array (`IZARRAVM_TLB_SLOT_PARTITION`).
+    partition: bool,
     pub(crate) generation: u32,
     /// The generation each ring slot last held. Restored verbatim on an R1 reselect
     /// (`select_generation`) and re-minted on an R2/R3 allocation (`allocate_generation`).
@@ -145,16 +152,70 @@ pub(crate) struct Tlb {
     /// which is `TlbEntry::EMPTY`'s sentinel (design review D3) -- a slot holding it would make
     /// every empty entry read as live the moment that slot is selected.
     next_generation: u32,
+    /// Set when `mint_generation` wrapped and cleared both arrays; `take_wrapped` reads and resets it.
+    wrapped: bool,
 }
+
+/// Whether each decode-ring slot has its own TLB array (`IZARRAVM_TLB_SLOT_PARTITION`). Read once
+/// per process. On by default. Unset and `1` name the on arm; `0` names the off arm.
+pub(crate) fn tlb_slot_partition_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = TLB_PARTITION_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_tlb_slot_partition(std::env::var("IZARRAVM_TLB_SLOT_PARTITION")))
+}
+
+fn parse_tlb_slot_partition(value: Result<String, std::env::VarError>) -> bool {
+    parse_on_off_knob("IZARRAVM_TLB_SLOT_PARTITION", value)
+}
+
+/// The spelling table shared by the two default-on knobs: unset and `1` are on, `0` is off, and
+/// any other spelling (the empty string too) stops the process, so a typo cannot look like a
+/// knob that did nothing.
+pub(crate) fn parse_on_off_knob(name: &str, value: Result<String, std::env::VarError>) -> bool {
+    const ACCEPTED: &str = "accepted spellings are unset or `1` (on) and `0` (off)";
+    let raw = match value {
+        Err(std::env::VarError::NotPresent) => return true,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("{name} is not valid UTF-8; {ACCEPTED}")
+        }
+        Ok(raw) => raw,
+    };
+    match raw.trim() {
+        "0" => false,
+        "1" => true,
+        other => panic!("{name}={other:?} names no arm; {ACCEPTED}"),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TLB_PARTITION_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force the partition on or off for CPUs built on this thread; `None` restores the ambient value.
+#[cfg(test)]
+pub(crate) fn set_tlb_slot_partition_for_test(forced: Option<bool>) {
+    TLB_PARTITION_OVERRIDE.with(|cell| cell.set(forced));
+}
+
+/// The generation a new TLB holds in slot 0. The fast map's first table tag names it.
+pub(crate) const TLB_INITIAL_GENERATION: u32 = 1;
 
 impl Default for Tlb {
     fn default() -> Self {
         Self {
-            entries: [TlbEntry::EMPTY; TLB_ENTRIES],
-            generation: 1,
+            entries: [TlbEntry::EMPTY; TLB_ENTRIES * 2],
+            base: 0,
+            partition: tlb_slot_partition_enabled(),
+            generation: TLB_INITIAL_GENERATION,
             generations: [1, 2],
             live: 0,
             next_generation: 3,
+            wrapped: false,
         }
     }
 }
@@ -167,7 +228,7 @@ impl Tlb {
 
     #[inline]
     pub(crate) fn lookup(&self, page: u32) -> Option<TlbEntry> {
-        let e = self.entries[Self::slot(page)];
+        let e = self.entries[self.base + Self::slot(page)];
         (e.generation == self.generation && e.tag == page).then_some(e)
     }
 
@@ -199,7 +260,7 @@ impl Tlb {
         user: bool,
         dirty: bool,
     ) -> Option<TlbEntry> {
-        let slot = Self::slot(page);
+        let slot = self.base + Self::slot(page);
         let previous = self.entries[slot];
         self.entries[slot] = TlbEntry {
             tag: page,
@@ -214,7 +275,7 @@ impl Tlb {
 
     #[inline]
     pub(crate) fn invalidate(&mut self, page: u32) {
-        let slot = Self::slot(page);
+        let slot = self.base + Self::slot(page);
         let entry = self.entries[slot];
         if entry.generation == self.generation && entry.tag == page {
             self.entries[slot] = TlbEntry::EMPTY;
@@ -226,12 +287,76 @@ impl Tlb {
     /// pre-wrap generation can alias a freshly-minted one.
     fn mint_generation(&mut self) -> u32 {
         if self.next_generation == 0 {
-            self.entries = [TlbEntry::EMPTY; TLB_ENTRIES];
+            self.entries = [TlbEntry::EMPTY; TLB_ENTRIES * 2];
             self.next_generation = 1;
+            self.wrapped = true;
         }
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         generation
+    }
+
+    /// Whether a generation wrap cleared the arrays since the last call. Resets the flag. The CR3
+    /// switch of the fast map is the only reader: a wrap voids every tag.
+    #[inline]
+    pub(crate) fn take_wrapped(&mut self) -> bool {
+        std::mem::take(&mut self.wrapped)
+    }
+
+    /// Name the live ring slot and, when the partition is on, switch to that slot's array.
+    #[inline]
+    fn set_live(&mut self, slot: u8) {
+        self.live = slot;
+        if self.partition {
+            self.base = usize::from(slot) * TLB_ENTRIES;
+        }
+    }
+
+    /// The entries of the live array, in array order. With the partition off this is the one
+    /// shared array, so the export is the same as before the partition existed.
+    #[inline]
+    pub(crate) fn live_array(&self) -> &[TlbEntry] {
+        &self.entries[self.base..self.base + TLB_ENTRIES]
+    }
+
+    /// The array of ring slot `slot` when the partition is on, else the one shared array.
+    #[cfg(test)]
+    pub(crate) fn array_of_slot_for_test(&self, slot: usize) -> &[TlbEntry] {
+        let base = if self.partition {
+            slot * TLB_ENTRIES
+        } else {
+            0
+        };
+        &self.entries[base..base + TLB_ENTRIES]
+    }
+
+    /// Mutable view of the live array, for tests that plant entries.
+    #[cfg(test)]
+    pub(crate) fn live_array_mut(&mut self) -> &mut [TlbEntry] {
+        let base = self.base;
+        &mut self.entries[base..base + TLB_ENTRIES]
+    }
+
+    /// Switch the partition on or off for a test. Clears every entry and returns to slot 0.
+    #[cfg(test)]
+    pub(crate) fn set_partition_for_test(&mut self, on: bool) {
+        self.partition = on;
+        self.entries = [TlbEntry::EMPTY; TLB_ENTRIES * 2];
+        self.base = if on {
+            usize::from(self.live) * TLB_ENTRIES
+        } else {
+            0
+        };
+    }
+
+    /// Clear the dirty bit of every entry tagged `page`, in both arrays, whatever its generation.
+    #[cfg(test)]
+    pub(crate) fn clear_dirty_for_test(&mut self, page: u32) {
+        for entry in &mut self.entries {
+            if entry.tag == page {
+                entry.dirty = false;
+            }
+        }
     }
 
     /// The ring slot whose generation `generation` mirrors now. The CR3 census reads it to name
@@ -248,6 +373,41 @@ impl Tlb {
         self.generations[0] == generation || self.generations[1] == generation
     }
 
+    /// A copy of every field, for the canonical state rows that mutate a copy of the live TLB.
+    /// Clone starts from an empty TLB.
+    #[cfg(test)]
+    pub(crate) fn verbatim_copy_for_test(&self) -> Self {
+        Self {
+            entries: self.entries,
+            base: self.base,
+            partition: self.partition,
+            generation: self.generation,
+            generations: self.generations,
+            live: self.live,
+            next_generation: self.next_generation,
+            wrapped: self.wrapped,
+        }
+    }
+
+    /// The generation ring slot `slot` holds now.
+    #[inline]
+    pub(crate) fn slot_generation(&self, slot: u8) -> u32 {
+        self.generations[usize::from(slot)]
+    }
+
+    /// Whether `generation` is the one the slot that is not live holds. An insert into the live
+    /// array never displaces such an entry while the partition is on.
+    #[inline]
+    pub(crate) fn is_dormant_generation(&self, generation: u32) -> bool {
+        self.generations[1 - usize::from(self.live)] == generation
+    }
+
+    /// Whether each ring slot has its own array.
+    #[inline]
+    pub(crate) fn partitioned(&self) -> bool {
+        self.partition
+    }
+
     /// R1: reselect a ring slot the caller already knows is occupied. Restores that slot's
     /// stored generation with no other work -- every entry inserted while it was last live is
     /// live again for free, because the generation comparison in `lookup`/`insert` IS the
@@ -258,7 +418,7 @@ impl Tlb {
             usize::from(slot) < self.generations.len(),
             "select_generation given a slot the ring did not report as occupied"
         );
-        self.live = slot;
+        self.set_live(slot);
         self.generation = self.generations[usize::from(slot)];
     }
 
@@ -269,7 +429,7 @@ impl Tlb {
     pub(crate) fn allocate_generation(&mut self, slot: u8) {
         let generation = self.mint_generation();
         self.generations[usize::from(slot)] = generation;
-        self.live = slot;
+        self.set_live(slot);
         self.generation = generation;
     }
 
@@ -304,7 +464,7 @@ impl Tlb {
     pub(crate) fn retire_all_slots(&mut self, _token: crate::RingRetired) {
         self.generations[0] = self.mint_generation();
         self.generations[1] = self.mint_generation();
-        self.live = 0;
+        self.set_live(0);
         self.generation = self.generations[0];
     }
 
@@ -333,6 +493,20 @@ impl Tlb {
     #[cfg(test)]
     pub(crate) fn generations_for_test(&self) -> [u32; 2] {
         self.generations
+    }
+}
+
+/// A clone is an empty TLB in the state of Tlb::default(): no entries, slot 0 live, fresh
+/// generations. It keeps the partition setting, which is configuration and not state. A verbatim
+/// copy would keep the live slot and the generations, so the clone would pick a slot for a
+/// directory that the decode cache of the clone, which starts with no contexts, does not know,
+/// and would bring back the translations of another directory.
+impl Clone for Tlb {
+    fn clone(&self) -> Self {
+        Self {
+            partition: self.partition,
+            ..Self::default()
+        }
     }
 }
 
