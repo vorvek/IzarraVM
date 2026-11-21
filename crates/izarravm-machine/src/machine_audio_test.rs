@@ -3673,3 +3673,88 @@ fn armed_audio_clocks_survive_cpu_mode_changes_and_split_advances() {
         }
     }
 }
+
+/// Programs both PICs the way the AT BIOS does (master base 08h, slave base 70h,
+/// cascade on IR2) and sets both interrupt masks.
+fn init_pic_pair(machine: &mut Machine, master_mask: u8, slave_mask: u8) {
+    let mut bus = machine.make_construction_bus();
+    for (port, value) in [
+        (0x20u16, 0x11u32),
+        (0x21, 0x08),
+        (0x21, 0x04),
+        (0x21, 0x01),
+        (0xa0, 0x11),
+        (0xa1, 0x70),
+        (0xa1, 0x02),
+        (0xa1, 0x01),
+        (0x21, u32::from(master_mask)),
+        (0xa1, u32::from(slave_mask)),
+    ] {
+        bus.write_io(port, BusWidth::Byte, value, false).unwrap();
+    }
+}
+
+#[test]
+fn sb_irq2_reaches_the_slave_pic_as_irq9_vector_0x71() {
+    // The card jumper IRQ 2 is wired to slave input IR1 (IRQ 9) on an AT bus.
+    let mut machine = test_machine();
+    for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+        machine.write_physical_u8(0x1_0000 + i as u32, b);
+    }
+    set_mixer_register(&mut machine, 0x80, 0x01);
+    init_pic_pair(&mut machine, 0x00, 0x00);
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+        for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    });
+    machine.advance_devices_clocks(200_000);
+    let vector = with_bus(&mut machine, |bus| bus.acknowledge_interrupt());
+    assert_eq!(
+        vector,
+        Some(0x71),
+        "the DSP IRQ on card line 2 must arrive as slave IRQ 9, not as a spurious IRQ 15"
+    );
+}
+
+/// Starts a 0x80 pause with the card on IRQ 2 and returns the wake the run loop offers.
+fn sb_irq2_pause_wake(master_mask: u8, slave_mask: u8) -> Option<u64> {
+    let mut machine = test_machine();
+    machine.cpu.registers.eflags |= 0x0200;
+    set_mixer_register(&mut machine, 0x80, 0x01);
+    init_pic_pair(&mut machine, master_mask, slave_mask);
+    {
+        let mut bus = machine.make_construction_bus();
+        for &b in &[0x41u8, 0x27, 0x10, 0x80, 0x09, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                .unwrap();
+        }
+    }
+    let ticks = 1_000 * izarravm_core::MASTER_CLOCK_HZ / 1_000_000;
+    machine.next_timer_wake(machine.master_ticks() + ticks * 4)
+}
+
+#[test]
+fn sb_irq2_with_slave_ir1_open_wakes_a_halted_cpu() {
+    assert!(sb_irq2_pause_wake(0x00, 0xfd).is_some());
+}
+
+#[test]
+fn sb_irq2_with_slave_ir1_masked_does_not_wake_a_halted_cpu() {
+    // Master IR2 is open, slave IR1 is masked: the interrupt cannot reach the CPU.
+    assert_eq!(sb_irq2_pause_wake(0x00, 0xff), None);
+}
+
+#[test]
+fn sb_irq2_with_master_cascade_masked_does_not_wake_a_halted_cpu() {
+    // Slave IR1 is open, master IR2 (the cascade input) is masked.
+    assert_eq!(sb_irq2_pause_wake(0x04, 0x00), None);
+}

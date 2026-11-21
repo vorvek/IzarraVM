@@ -110,6 +110,14 @@ pub(crate) struct Sb16Path {
     active: Option<ActiveSb16Path>,
 }
 
+/// The PIC input that carries a card IRQ line. The mixer and the BLASTER
+/// string name the line by its jumper. On an AT bus the IRQ 2 pin goes to
+/// slave input IR1, which is IRQ 9. Master input 2 is the cascade input, so a
+/// request there never reaches a device handler.
+pub(crate) const fn pic_line(card_line: u8) -> u8 {
+    if card_line == 2 { 9 } else { card_line }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Sb16IrqDeadline {
     line: u8,
@@ -297,13 +305,13 @@ impl Sb16Path {
         }
     }
 
-    /// The mixer-selected IRQ line and the microseconds until a pending 0x80
+    /// The PIC line of the mixer-selected IRQ and the microseconds until a pending 0x80
     /// pause raises it. The pause counts microseconds, not output frames, so
     /// it has its own term beside `irq_deadline`.
     pub(crate) fn pause_irq_deadline_micros(&self) -> Option<(u8, u64)> {
         let active = self.active.as_ref()?;
         let micros = active.dsp.pause_micros_remaining()?;
-        Some((active.mixer.selected_irq(), micros))
+        Some((pic_line(active.mixer.selected_irq()), micros))
     }
 
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
@@ -341,7 +349,7 @@ impl Sb16Path {
     pub(crate) fn irq_deadline(&self) -> Option<Sb16IrqDeadline> {
         let active = self.active.as_ref()?;
         Some(Sb16IrqDeadline {
-            line: active.mixer.selected_irq(),
+            line: pic_line(active.mixer.selected_irq()),
             frames: active.dsp.frames_until_next_irq()?,
             rate_hz: u64::from(active.dsp.output_frame_rate()),
         })
@@ -373,7 +381,7 @@ impl Sb16Path {
             None => 0,
         };
         let due_frames = due_frames - held_frames;
-        let irq_line = active.mixer.selected_irq();
+        let irq_line = pic_line(active.mixer.selected_irq());
         let dma8 = active.mixer.selected_dma_8();
         let dma16 = active.mixer.selected_dma_16();
         let mut irq = None;
