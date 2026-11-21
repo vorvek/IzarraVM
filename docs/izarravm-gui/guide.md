@@ -17,9 +17,9 @@ emulated machine. See the
 cargo run -p izarravm -- --config examples/machine.toml
 ```
 
-The Quick Start section of the README gives the full set of headless flags and
-self-test flags (`--headless-config-check`, `--headless-test-rom`,
-`--headless-boot-suite`).
+The [command-line reference](../reference/command-line.md) gives the full set
+of switches, including the headless and self-test switches
+(`--headless-config-check`, `--headless-test-rom`, `--headless-boot-suite`).
 
 ## Where the files are
 
@@ -64,7 +64,7 @@ There are two config files, and they are not equivalent:
 | What writes it | The GUI, automatically | You |
 | Where it is | Beside `c_drive/`, with `cmos.bin` | Any path that you select |
 | When IzarraVM reads it | Always, at startup | Only with `--config <path>` |
-| Example | — | `examples/machine.toml` |
+| Example | None | `examples/machine.toml` |
 
 IzarraVM refuses an `izarravm.conf` file that you give to `--config`. It shows
 a message about the refusal. It does not show a parse error about a key that
