@@ -1117,7 +1117,7 @@ fn dir_entries(dir: &TreeDir, is_root: bool) -> Vec<[u8; 32]> {
 /// Test-only: the live read path serves directory sectors via `data_sector`,
 /// which inlines this slice math over the precomputed `FlatDir::entries`. The
 /// module tests exercise this standalone helper directly.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn dir_sector(dir: &TreeDir, is_root: bool, sector: u32) -> [u8; SECTOR] {
     let entries = dir_entries(dir, is_root);
     let mut out = [0u8; SECTOR];
@@ -1166,8 +1166,8 @@ enum Role {
 /// not consulted by `read_sector` — that path resolves a cluster through `runs`.
 #[derive(Debug)]
 pub(crate) struct KateaTreeVolume {
-    /// The owned tree; kept for tests and writes, not read by `read_sector`.
-    #[allow(dead_code)]
+    /// The owned tree. Only the test-only `tree()` reads it; `read_sector` does not.
+    #[cfg_attr(not(test), expect(dead_code))]
     tree: HostTree,
     geo: Geometry,
     /// LBA 0: the MBR with the partition entry + 0x55AA stamped in.
@@ -2479,7 +2479,7 @@ impl KateaTreeVolume {
 
     /// How many file bodies `reconcile` has re-read. Test-only: the live path only
     /// ever increments it. See `gathers`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn gathers(&self) -> u64 {
         self.gathers
     }
@@ -2504,8 +2504,8 @@ impl KateaTreeVolume {
         self.geo.total_sectors
     }
 
-    /// The owned tree for tests and writes; `read_sector` does not use it.
-    #[allow(dead_code)]
+    /// The owned tree. Test-only: `read_sector` does not use it.
+    #[cfg(test)]
     pub(crate) fn tree(&self) -> &HostTree {
         &self.tree
     }

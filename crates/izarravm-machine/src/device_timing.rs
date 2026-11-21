@@ -78,10 +78,8 @@ impl DeviceTimingProfile {
 
     /// True when no family is armed -- the knob-unset identity arm, and the
     /// one `9-0`'s fixture certifies.
-    // Limit: no production caller yet. Exercised directly by
-    // `device_timing_test.rs`; a later slice's JSON diagnostics emission is
-    // the natural first production caller.
-    #[allow(dead_code)]
+    // Test-only: `device_timing_test.rs` calls it.
+    #[cfg(test)]
     pub(crate) fn is_none(&self) -> bool {
         *self == Self::none()
     }

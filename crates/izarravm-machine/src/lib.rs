@@ -799,8 +799,9 @@ pub struct PitBulkAdvanceCounters {
 /// Today's model charges nothing extra for INTA turnaround (`run.rs`'s 61 raw
 /// hardware-interrupt-entry charge is unaffected by this slice), so every
 /// sample under the current model is expected to land in the ZERO bucket --
-/// that is the certifier slice 8 needs before it can charge `INTA_SEQUENCE_CLOCKS`
-/// and expect the histogram to shift.
+/// that is the certifier slice 8 needs before it can charge the 8259A INTA sequence
+/// (about 166 core clocks at 166 MHz, or 1 us) and expect the histogram to shift. The 8259A also
+/// needs 500 ns of recovery between unlike commands. The PIC does not model either figure.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InterruptEntryDiagnostics {
     /// Total 8259A acknowledge (INTA) cycles serviced across both master and

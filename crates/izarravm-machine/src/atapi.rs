@@ -48,9 +48,9 @@ pub mod asc {
 /// and cleared when the result phase is ready. The IDE register file (`ide.rs`)
 /// runs each command synchronously, so the busy window is momentary; this device
 /// models the bit so the register file can publish it on the status port.
-// Limit: the synchronous model never opens a real busy window, so ide.rs has
-// no place to publish this bit; it stays defined for fidelity but uncalled.
-#[allow(dead_code)]
+// Test-only: the synchronous model never opens a real busy window, so ide.rs does
+// not publish this bit.
+#[cfg(test)]
 pub const BSY: u8 = 0x80;
 
 /// The ATAPI Interrupt Reason register is the sector-count register, reinterpreted
@@ -316,16 +316,15 @@ impl AtapiDevice {
         )
     }
 
-    // Limit: these two tray/spin queries feed ide.rs (status port), which does
-    // not surface them on any ATA register, so they have no in-crate caller yet.
+    // Test-only: ide.rs does not surface these two tray/spin queries on any ATA register.
     /// Whether PREVENT/ALLOW MEDIUM REMOVAL currently locks the tray.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn removal_prevented(&self) -> bool {
         self.prevent_removal
     }
 
     /// Whether START STOP UNIT has the unit spun up.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn started(&self) -> bool {
         self.started
     }
