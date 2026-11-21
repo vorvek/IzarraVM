@@ -166,10 +166,6 @@ files only if you have the legal right to use them.
 
 ## Development Policy
 
-- Windows is the first target.
-- Keep the architecture portable.
-- Isolate OS-specific code behind a backend trait.
-
 These four commands gate CI. Run them before you submit a change:
 
 ```powershell
