@@ -15,7 +15,7 @@
 //!     cargo test -p izarravm-cpu generate_direct_coverage_matrix -- --ignored --nocapture
 //!
 //! The output path is `IZARRAVM_COVERAGE_MATRIX_OUT`, defaulting to
-//! `dev_docs/coverage-matrix.tsv` at the workspace root.
+//! `target/coverage-matrix.tsv` at the workspace root.
 //!
 //! Axes deliberately NOT enumerated, because each is a blanket policy rather than a per-cell
 //! decision: LOCK/REP/REPNE and the address-size override (always refused), segment-override
@@ -142,7 +142,7 @@ fn opcode_label(opcode: u16) -> String {
 }
 
 #[test]
-#[ignore = "offline report generator, not an assertion — writes dev_docs/coverage-matrix.tsv"]
+#[ignore = "offline report generator, not an assertion — writes target/coverage-matrix.tsv"]
 fn generate_direct_coverage_matrix() {
     /// Prefix bytes and the 0x0f escape never open an instruction cell of their own.
     const PREFIXES: [u8; 11] = [
@@ -229,7 +229,7 @@ fn generate_direct_coverage_matrix() {
 
     let out = std::env::var("IZARRAVM_COVERAGE_MATRIX_OUT").unwrap_or_else(|_| {
         format!(
-            "{}/../../dev_docs/coverage-matrix.tsv",
+            "{}/../../target/coverage-matrix.tsv",
             env!("CARGO_MANIFEST_DIR")
         )
     });
