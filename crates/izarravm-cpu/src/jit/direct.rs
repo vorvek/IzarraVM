@@ -11972,7 +11972,7 @@ pub(crate) fn parse_lane_trial_budget_arm_for_test(
 ///   variable in PowerShell leaves it PRESENT and EMPTY, so a leg that meant to unset the knob
 ///   gets the off arm and a leg that meant the off arm gets it too. `Remove-Item Env:` is the only
 ///   true unset. This is a CHANGE for this knob alone (the bare form read the empty string as ON)
-///  and it is made deliberately, so that all four lane knobs answer a nulled variable the same
+///   and it is made deliberately, so that all four lane knobs answer a nulled variable the same
 ///   way rather than one of them silently disagreeing.
 /// * **anything else PANICS**, for `parse_imm8_lanes_arm`'s reason.
 pub(crate) fn disp_lanes_enabled() -> bool {
@@ -34720,7 +34720,7 @@ fn record_structural_barrier(
 ///   reaches one host page (`EMITTED_BLOCK_FIXED_BYTES`), which on a memory-heavy path binds long
 ///   before `MAX_BLOCK_INSTRUCTIONS`. A scan without the mirror reports the pre-budget length, so
 ///   every row over-reports and the memory-heavy rows (exactly the ones a coverage slice ranks)
-///  over-report most. `SuffixSeed::estimated_bytes` carries the walk's total and the scan
+///   over-report most. `SuffixSeed::estimated_bytes` carries the walk's total and the scan
 ///   continues it.
 ///
 /// * CLOSED, the DEMOTED-SITE stop. A slot the governor demoted is a boundary for every later walk
