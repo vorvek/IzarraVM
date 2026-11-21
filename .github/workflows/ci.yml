@@ -50,6 +50,38 @@ jobs:
       - name: Disk image is reproducible
         run: python scripts/build-freedos-hdd-image.py --check
 
+      # Rebuilds every NASM guest binary and compares it with the committed file.
+      # The NASM version and the zip hash are pinned: other NASM versions can
+      # emit other bytes. The cache key holds the hash, so the download runs
+      # only on a cache miss.
+      - name: Cache NASM
+        id: nasm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/nasm
+          key: nasm-3.01-e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4
+
+      - name: Guest binaries match their sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $dir = Join-Path $env:RUNNER_TEMP 'nasm'
+          if ('${{ steps.nasm-cache.outputs.cache-hit }}' -ne 'true') {
+            $sha = 'e0ba5157007abc7b1a65118a96657a961ddf55f7e3f632ee035366dfce039ca4'
+            $zip = Join-Path $env:RUNNER_TEMP 'nasm-3.01-win64.zip'
+            Invoke-WebRequest 'https://www.nasm.us/pub/nasm/releasebuilds/3.01/win64/nasm-3.01-win64.zip' -OutFile $zip
+            $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $sha) { throw "NASM zip hash mismatch: $got" }
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Expand-Archive $zip -DestinationPath $dir -Force
+          }
+          $exe = Get-ChildItem -Path $dir -Recurse -Filter nasm.exe | Select-Object -First 1
+          if (-not $exe) { throw 'nasm.exe not found' }
+          $exe.DirectoryName | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $env:PATH = "$($exe.DirectoryName);$env:PATH"
+          python scripts/check_guest_binaries.py
+
       - name: Policy self-checks
         shell: pwsh
         run: |

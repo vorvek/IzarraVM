@@ -14,7 +14,7 @@ The suite is capability-revealing. Missing or older hardware reports failed feat
 
 ## Rebuild the image
 
-No script or CI step builds `izarravm-test.img`. Rebuild it by hand after each change to `boot.asm`, `stage2.asm` or `results.inc`. Use NASM. Version 3.01 gives the checked-in bytes.
+No script builds `izarravm-test.img`. Rebuild it by hand after each change to `boot.asm`, `stage2.asm` or `results.inc`. Use NASM. Version 3.01 gives the checked-in bytes. `python scripts/check_guest_binaries.py` and a CI step rebuild the image from the sources and compare it with the checked-in file.
 
 Run these commands in this directory:
 
