@@ -378,7 +378,9 @@ impl Machine {
         self.midi_mpu.advance_to(now_tick);
         self.pic.set_irq_level(
             9,
-            self.wavetable_mpu.irq_level() || self.midi_mpu.irq_level(),
+            self.wavetable_mpu.irq_level()
+                || self.midi_mpu.irq_level()
+                || self.wss.board_irq_level(9),
         );
 
         self.serial.advance_master_ticks(advance.master_ticks);
