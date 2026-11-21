@@ -85,12 +85,14 @@ bios_start:
     add di, 4
     loop .fill_slave
 
-    ; Give IRQ8 and IRQ12 real RTC and PS/2 mouse handlers. The other slave IRQs
-    ; retain the EOI-only stub. DS is 0, so these stores land in the IVT.
+    ; Give IRQ8 (RTC), IRQ9 (IRQ 2 redirect) and IRQ12 (PS/2 mouse) real handlers.
+    ; The other slave IRQs retain the EOI-only stub. DS is 0, so these stores land in the IVT.
     mov word [0x70 * 4], int70
     mov word [0x70 * 4 + 2], ROM_SEG
     mov word [0x74 * 4], int74
     mov word [0x74 * 4 + 2], ROM_SEG
+    mov word [0x71 * 4], int71
+    mov word [0x71 * 4 + 2], ROM_SEG
 
     ; Seed the EBDA mouse packet size to 3 (standard PS/2). The machine zero-fills
     ; the EBDA at reset, so without this the size byte would be 0 and int74 would
@@ -204,6 +206,16 @@ irq_stub_slave:
     out PORT_PIC2_CMD, al        ; EOI the slave first
     out PORT_PIC_CMD, al         ; then the master cascade line (IR2)
     pop ax
+    iret
+
+; int71: IRQ9 handler. The ISA IRQ 2 pin is wired to slave IR1. EOI the slave,
+; then call INT 0Ah. The INT 0Ah handler owes the master EOI for the cascade.
+int71:
+    push ax
+    mov al, 0x20
+    out PORT_PIC2_CMD, al
+    pop ax
+    int 0x0a
     iret
 
 ; INT 70h: acknowledge Register C, dispatch enabled alarms through INT 4Ah, and

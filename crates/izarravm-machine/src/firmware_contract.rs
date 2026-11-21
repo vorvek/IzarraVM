@@ -100,6 +100,8 @@ pub(crate) mod address {
     pub(crate) const BIOS_MASTER_IRQ_ISR_ROM_OFFSET: usize = 0xF080;
     pub(crate) const BIOS_TIMER_ISR_ROM_OFF: u16 = 0x0060;
     pub(crate) const BIOS_MASTER_IRQ_ISR_ROM_OFF: u16 = 0x0080;
+    pub(crate) const BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET: usize = 0xF0A0;
+    pub(crate) const BIOS_SLAVE_IRQ9_ISR_ROM_OFF: u16 = 0x00A0;
     pub(crate) const BIOS_INT_STUB_TABLE_ROM_OFFSET: usize = 0xF200;
     pub(crate) const BIOS_INT_STUB_TABLE_LINEAR: u32 = 0xFF200;
     pub(crate) const BIOS_INT_STUB_TABLE_LEN: u32 = 512;
@@ -237,6 +239,12 @@ const BIOS_TIMER_ISR_STUB: [u8; 25] = [
 
 const BIOS_MASTER_IRQ_ISR_STUB: [u8; 7] = [0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf];
 
+/// The IRQ 9 handler at vector 71h: PUSH AX, EOI to the slave, POP AX, INT 0Ah,
+/// IRET. The ISA IRQ 2 pin is wired to slave input IR1. This redirect lets
+/// software that hooks INT 0Ah receive the interrupt of a card on IRQ 2. The
+/// INT 0Ah handler owes the master EOI for the cascade.
+const BIOS_SLAVE_IRQ9_ISR_STUB: [u8; 9] = [0x50, 0xb0, 0x20, 0xe6, 0xa0, 0x58, 0xcd, 0x0a, 0xcf];
+
 /// The 22-byte IzarraCD device header at `CD_DEVICE_HEADER_ROM_OFFSET`:
 /// dh_next FFFF:FFFF, attribute 0xC800 (character device with IOCTL), the
 /// strategy/interrupt entry offsets (within `CD_DEVICE_HEADER_SEG`), the
@@ -294,7 +302,15 @@ const _: () = {
     );
     assert!(
         BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()
+            <= BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET
+    );
+    assert!(
+        BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET + BIOS_SLAVE_IRQ9_ISR_STUB.len()
             <= BIOS_INT_STUB_TABLE_ROM_OFFSET
+    );
+    assert!(
+        BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET - BIOS_LEGACY_IRET_ROM_OFFSET
+            == BIOS_SLAVE_IRQ9_ISR_ROM_OFF as usize
     );
     assert!(BIOS_INT_STUB_TABLE_ROM_OFFSET + BIOS_INT_STUB_TABLE_LEN as usize <= BIOS_ROM_SIZE);
     // The IzarraCD header block sits directly above the stub table, outside the
@@ -385,6 +401,9 @@ pub(super) fn patch_rom(rom: &mut [u8]) {
     rom[BIOS_MASTER_IRQ_ISR_ROM_OFFSET
         ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()]
         .copy_from_slice(&BIOS_MASTER_IRQ_ISR_STUB);
+    rom[BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET
+        ..BIOS_SLAVE_IRQ9_ISR_ROM_OFFSET + BIOS_SLAVE_IRQ9_ISR_STUB.len()]
+        .copy_from_slice(&BIOS_SLAVE_IRQ9_ISR_STUB);
     rom[CD_DEVICE_HEADER_ROM_OFFSET..CD_DEVICE_HEADER_ROM_OFFSET + CD_DEVICE_HEADER.len()]
         .copy_from_slice(&CD_DEVICE_HEADER);
     rom[CD_DEVICE_STRATEGY_ROM_OFFSET
@@ -469,7 +488,8 @@ pub(super) fn install_boot_memory(memory: &mut Memory, mode: GswMode) -> Result<
     }
 
     write_ivt(memory, 0x70, BIOS_RTC_ISR_ADDRESS as u16, 0)?;
-    for vector in 0x71..=0x77 {
+    write_ivt(memory, 0x71, BIOS_SLAVE_IRQ9_ISR_ROM_OFF, BIOS_ROM_IRET_SEG)?;
+    for vector in 0x72..=0x77 {
         write_ivt(memory, vector, BIOS_SLAVE_IRQ_ISR_ADDRESS as u16, 0)?;
     }
     install_rtc_isr_stub(memory)?;

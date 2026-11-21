@@ -422,7 +422,12 @@ fn bios_seeds_low_exception_and_irq_vectors() {
         assert_eq!(read_u16(&mut machine, base), BIOS_MASTER_IRQ_ISR_ROM_OFF);
         assert_eq!(read_u16(&mut machine, base + 2), BIOS_ROM_IRET_SEG);
     }
-    for vector in [0x71u32, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77] {
+    assert_eq!(
+        read_u16(&mut machine, 0x71 * 4),
+        BIOS_SLAVE_IRQ9_ISR_ROM_OFF
+    );
+    assert_eq!(read_u16(&mut machine, 0x71 * 4 + 2), BIOS_ROM_IRET_SEG);
+    for vector in [0x72u32, 0x73, 0x74, 0x75, 0x76, 0x77] {
         let base = vector * 4;
         assert_eq!(
             read_u16(&mut machine, base),
