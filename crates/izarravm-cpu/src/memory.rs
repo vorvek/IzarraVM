@@ -58,7 +58,7 @@ impl CpuGsw {
     ///
     /// Named "refresh", not "recompute-and-return", because callers outside this module (core.rs,
     /// run.rs) reach it through `pub(super)` without needing to know the predicate itself, which
-    /// stays private -- population and the interpreter's serve gate both anchor on this ONE
+    /// stays private. Population and the interpreter's serve gate both anchor on this ONE
     /// computation so they can never disagree about when the FastMap is live.
     #[cfg(all(
         feature = "jit",
@@ -72,14 +72,14 @@ impl CpuGsw {
     /// Arm the FastMap for a test AND refresh the serve-gate mirror in one step.
     ///
     /// `JitState::set_fast_map_enabled_for_test` moves an INPUT to
-    /// `fast_map_population_enabled()`, so by that predicate's own contract -- "must be called
-    /// from EVERY site that can change this predicate's inputs" -- it owes a refresh. It could not
+    /// `fast_map_population_enabled()`, so by that predicate's own contract ("must be called
+    /// from EVERY site that can change this predicate's inputs") it owes a refresh. It could not
     /// pay one itself: it lives on `JitState`, and the mirror lives on `CpuGsw`. Test call sites
     /// were therefore expected to remember, and roughly half of them did not.
     ///
     /// That was survivable only while every consumer recomputed the predicate instead of reading
     /// the mirror. It stopped being survivable the moment `populate_fast_map_from_cached` started
-    /// reading the mirror (which is the point -- the serve gate should be established once), and
+    /// reading the mirror (which is the point: the serve gate should be established once), and
     /// it surfaced as a JIT block failing to compile because no FastMap entry was ever published.
     /// Bundling the two here means a test cannot arm the map into a stale-mirror state at all.
     #[cfg(all(
@@ -202,16 +202,16 @@ impl CpuGsw {
     }
 
     /// Lever 1: the interpreter's FastMap serve path. Applies exactly the hit predicate native
-    /// code uses (`FastMap::lookup_access`) against the CURRENT accessor state -- CPL and CR0.WP
+    /// code uses (`FastMap::lookup_access`) against the CURRENT accessor state: CPL and CR0.WP
     /// can both move since the mapping was published, so they are read fresh on every probe,
     /// exactly as `translate_linear_checked` rechecks a TLB hit's cached bits against the live
     /// accessor. `Some` means address resolution and page lookup are done: physical address, a
     /// host pointer already biased for `linear`, and whether the page is the Mode13h VGA aperture
     /// (so the caller knows whether it may take the flat RAM charge or must defer to the video
-    /// charge). `None` means the caller must fall through to the unchanged canonical path -- a
+    /// charge). `None` means the caller must fall through to the unchanged canonical path: a
     /// clean-PTE write, an unaligned or page-crossing access, a CPL-3 hit on a supervisor page, a
     /// stale mapping epoch, and a plain unpopulated page (a cold miss, or `fast_map_serve_enabled`
-    /// having gone false since the last population -- see below) all reject here by construction
+    /// having gone false since the last population, see below) all reject here by construction
     /// of `lookup_access`, not by any extra check of ours.
     ///
     /// `fast_map_serve_enabled` (the cached mirror of `fast_map_population_enabled()`, kept in
@@ -219,7 +219,7 @@ impl CpuGsw {
     /// This is NOT the same gate an earlier revision of this function used
     /// (`FastMap::has_storage()`, "has any population ever happened"): storage, once allocated,
     /// is never freed, so `has_storage()` stays `true` for the rest of the CPU's life after the
-    /// first successful population -- including across a LIVE GSW MODE SWITCH into a persona that
+    /// first successful population, including across a LIVE GSW MODE SWITCH into a persona that
     /// can never repopulate (386-slow/386 Accurate), where it wrongly kept paying this function's
     /// preamble (and, transiently, wrongly kept SERVING from surviving entries) on every access.
     /// `fast_map_serve_enabled` tracks the actual persona/admission condition instead, so it goes
@@ -227,7 +227,7 @@ impl CpuGsw {
     /// closing both the transient and the steady-state cost. See the campaign log for the
     /// measured regression this replaced: a JIT-off control run showed the fixed preamble cost
     /// (mapping-epoch load, CPL derivation, CR0.WP read) at ~2.66 ns per interpreter data access,
-    /// a 4.6% wall regression -- almost exactly what the hit path saves elsewhere. The mechanism
+    /// a 4.6% wall regression, almost exactly what the hit path saves elsewhere. The mechanism
     /// was the PREAMBLE running before a guaranteed miss could be rejected, not where the gate
     /// checking `has_storage()` happened to be written (call site vs. here); do not reintroduce
     /// that preamble-before-gate ordering for either gate.
@@ -277,7 +277,7 @@ impl CpuGsw {
             // discriminant already in a register, on the miss side of a branch the hit path
             // predicts perfectly.
             // NOTE for whoever reconciles the counters: this arm bumps `fast_map_probe.misses`
-            // but does NOT call `note_slot_reject`, because `lookup_access` ADMITTED the access --
+            // but does NOT call `note_slot_reject`, because `lookup_access` ADMITTED the access:
             // there is no refused clause to attribute. So the five `slot_reject_*` counters do not
             // sum to `fast_map_probe.misses`; the difference is exactly this arm's count. That is
             // correct, not a discrepancy, and it is written here because it will not look correct
@@ -351,55 +351,55 @@ impl CpuGsw {
     /// This is the pre-check the interpreter does not have and the call-out must. `push_all_gpr`
     /// discovers a bad stack slot by FAULTING on it, part-way, with earlier sub-pushes already
     /// committed to guest memory; a call-out cannot deliver a fault (it returns a status, not an
-    /// `ExecResult`) and must not leave a partial frame, so it refuses instead — the native run
+    /// `ExecResult`) and must not leave a partial frame, so it refuses instead: the native run
     /// ends at the instruction and the interpreter executes it whole, fault included, exactly as
     /// it does today for a block that stopped at a PUSHAD barrier.
     ///
     /// SIDE-EFFECT FREE by construction: `&self`, and every predicate it evaluates
     /// (`segment_linear_range`, `FastMap::lookup_access`, `code_write_watched`) is a pure query.
     /// It deliberately does NOT go through `fast_map_data_slot`, whose only difference is the
-    /// `fast_map_probe` hit/miss counters — a probe here plus the real probe in phase two would
+    /// `fast_map_probe` hit/miss counters: a probe here plus the real probe in phase two would
     /// double-count every access, and a probe here on a REFUSED frame would count an access that
     /// never happened.
     ///
     /// What each clause excludes, in the order the hazards were enumerated:
     ///
-    /// * `stack_is_32bit` — the SS.B = 0 forms address through SP alone and POPAD then merges the
+    /// * `stack_is_32bit`: the SS.B = 0 forms address through SP alone and POPAD then merges the
     ///   discarded slot's high half into ESP. Both are handled by `push_all_gpr`/`pop_all_gpr`, but
     ///   the address arithmetic below would have to fork to match, so the 16-bit-stack population
     ///   is refused rather than mirrored. No fixture and no 32-bit persona reaches it.
-    /// * `fast_map_serve_enabled` — without it `write_linear_fragment` falls to `translate_linear`,
+    /// * `fast_map_serve_enabled`: without it `write_linear_fragment` falls to `translate_linear`,
     ///   which is the page walk this exists to exclude.
-    /// * `esp` 4-aligned — this clause covers `check_alignment`'s CPL-3 `#AC` and NOTHING ELSE.
+    /// * `esp` 4-aligned: this clause covers `check_alignment`'s CPL-3 `#AC` and NOTHING ELSE.
     ///   It does NOT establish that the eight accesses are 4-aligned in LINEAR space, and an
     ///   earlier version of this comment claimed it did: `segment_linear_range` adds
     ///   `descriptor.base`, so an SS with base 2 and ESP 0x1000 puts the first slot at linear
     ///   0xFFE, which is neither 4-aligned nor page-local.
-    /// * **`linear` 4-aligned, per slot — THIS FUNCTION'S OWN CLAUSE, and the reason it exists.**
+    /// * **`linear` 4-aligned, per slot: THIS FUNCTION'S OWN CLAUSE, and the reason it exists.**
     ///   It used to live inside `FastMap::lookup_access`, where it looked like one of five
     ///   redundant spellings of the same alignment refusal and was removed as such. It is not
     ///   redundant HERE. Without it a based-SS frame at linear 0xFFE reaches
     ///   `write_memory_bus_width` unaligned, takes `write_paged_cross_page`, and splits into
-    ///   fragments this function never proved resident -- and this function cannot deliver a
+    ///   fragments this function never proved resident, and this function cannot deliver a
     ///   fault, so it must refuse instead. Since `lookup_access` now SERVES misaligned accesses,
     ///   this clause is the only thing standing between a based-SS frame and a partially
     ///   committed call-out. Do not remove it as redundant a second time.
     ///
     ///   Its page-local half stayed in `lookup_access`, which is still where that credit belongs:
     ///   `offset + width > PAGE_SIZE` is refused there for every caller.
-    /// * `segment_linear_range` per slot — the SS limit and the writability of the descriptor, the
+    /// * `segment_linear_range` per slot: the SS limit and the writability of the descriptor, the
     ///   same call `push`/`pop` will make, evaluated for every slot including the ones an ESP WRAP
     ///   sends to the far end of the address space. Wrapping is not special-cased: the offsets are
     ///   computed with the same `wrapping_sub`/`wrapping_add` `push`/`pop` use, so a wrapped frame
     ///   is either in-limit for all eight (and safe) or refused.
-    /// * `lookup_access` per slot — presence, the committed PTE dirty bit for a write, the live
+    /// * `lookup_access` per slot: presence, the committed PTE dirty bit for a write, the live
     ///   CPL/CR0.WP protection decision and the mapping epoch. A frame CROSSING A PAGE BOUNDARY is
     ///   not a special case either: the slots are resolved individually, so the two pages are both
     ///   proved resident or the frame is refused.
-    /// * `is_mode13` — keeps the frame on plain RAM, so phase two's charge is
+    /// * `is_mode13`: keeps the frame on plain RAM, so phase two's charge is
     ///   `charge_direct_ram_memory` (infallible for every bus in tree) rather than the aperture
     ///   path with its `note_direct_write`.
-    /// * `code_write_watched` — THE hazard this campaign named. A push whose range hits watched
+    /// * `code_write_watched`: THE hazard this campaign named. A push whose range hits watched
     ///   code would reach `note_code_write_hit` with this block's native code live on the stack,
     ///   which is exactly the situation `note_code_write_inner`'s "no compiled block is
     ///   mid-execution" proof rules out. Refused here, so `finish_fast_map_write`'s
@@ -466,7 +466,7 @@ impl CpuGsw {
     /// This exists so a call-out helper can decide whether it may proceed BEFORE it is allowed to
     /// commit anything. The reason the full translator is unusable there is one branch: on a miss
     /// it walks the tables, and `write_page_walk_entry` sets accessed bits through
-    /// `bus.write_memory` + `record_write_page` + `note_code_write` -- with this block's native
+    /// `bus.write_memory` + `record_write_page` + `note_code_write`, with this block's native
     /// code live on the stack, which `note_code_write_inner`'s "no compiled block is
     /// mid-execution" proof says cannot happen. THERE IS NO FALLTHROUGH TO THE WALK HERE. That
     /// absence is the whole zero-partial-effects argument, so do not add one.
@@ -475,7 +475,7 @@ impl CpuGsw {
     /// the accessor is `Supervisor`, so `user = false` and `write = false`, which makes
     /// `translate_linear_checked`'s `permitted` clause `!write || !wp || e.writable` and its
     /// D-bit clause `!write || e.dirty` both unconditionally true. `Tlb::lookup` itself is a
-    /// `&self` array read with no LRU and no generation bump -- it mutates nothing.
+    /// `&self` array read with no LRU and no generation bump: it mutates nothing.
     ///
     /// Paging off returns the linear unchanged, matching that function's own early return, which
     /// takes its `record_write_page` branch only for a write.
@@ -504,8 +504,8 @@ impl CpuGsw {
         None
     }
 
-    /// Fail-closed stand-in where there is no FastMap to prove residency against. Emitted blocks --
-    /// and therefore call-out slots -- do not exist on these targets either, so this is
+    /// Fail-closed stand-in where there is no FastMap to prove residency against. Emitted blocks
+    /// (and therefore call-out slots) do not exist on these targets either, so this is
     /// unreachable; returning `false` keeps the helper's refusal the only possible answer if it
     /// ever becomes reachable.
     #[cfg(not(all(
@@ -597,7 +597,7 @@ impl CpuGsw {
         Ok(Self::read_fast_map_ptr(ptr, width))
     }
 
-    /// The joined tail for a FastMap write hit. Runs, in order: `record_write_page` (invariant 2 --
+    /// The joined tail for a FastMap write hit. Runs, in order: `record_write_page` (invariant 2:
     /// a FastMap write bias only exists after the PTE dirty bit is committed, or the page is
     /// unpaged, exactly like the two `record_write_page` call sites inside
     /// `translate_linear_checked` that this replaces); the cheap `code_write_watched` probe;
@@ -615,13 +615,13 @@ impl CpuGsw {
     /// body (`note_code_write_inner`), and they are not interchangeable: the first permits the
     /// mutable-lane exemption, the second refuses it. This function takes the permitting door at
     /// both widths, and since the L2 arm-1 slice that choice is load-bearing at width one rather
-    /// than merely uniform — a one-byte `0x80` immediate lane accepts a one-byte store, so a byte
+    /// than merely uniform: a one-byte `0x80` immediate lane accepts a one-byte store, so a byte
     /// write served here can be absorbed instead of killing the block. Before that slice no lane
     /// accepted width 1 at all, so the door made no difference at this width.
     ///
     /// The slow byte path's door is ARM-SELECTED rather than fixed, which this function's is not.
     /// `write_linear_u8` routes through `note_code_byte_write_hit` (core.rs), which takes the
-    /// permitting door only when `IZARRAVM_IMM8_LANES` is on — see that function for why the off
+    /// permitting door only when `IZARRAVM_IMM8_LANES` is on. See that function for why the off
     /// arm must keep the refusing one, counters included. This function is unaffected: it has
     /// taken the permitting door at both widths since long before the arm existed, so its
     /// behaviour is the same on either.
@@ -655,7 +655,7 @@ impl CpuGsw {
         // `IZARRAVM_WATCH_WRITE` would otherwise go BLIND on misaligned stores. Its report hooks
         // sit on the slow paths only (`write_linear_u8`, `write_linear_fragment`); this function
         // had none, which was survivable exactly as long as a misaligned write could never reach
-        // it. Now it can, and this instrument's recorded failure mode is "silently sees nothing" --
+        // it. Now it can, and this instrument's recorded failure mode is "silently sees nothing":
         // a debugging tool that answers "no writes here" when the writes moved. The label is
         // distinct from the slow paths' `"sized"`/`"byte"` so a reader of the report can tell
         // which path served the store, which is now diagnostically meaningful. Zero cost on the
@@ -678,7 +678,7 @@ impl CpuGsw {
         // The read-back is GATED ON ITS CONSUMER. `changed` is only ever asked in conjunction
         // with the condition below, and the read has to precede the store, so an ungated read-back
         // put a load, a compare and a live register across the charge on every guest store served
-        // by the fast map -- for an answer the common unwatched store never looks at.
+        // by the fast map, for an answer the common unwatched store never looks at.
         let changed = watched && Self::read_fast_map_ptr(ptr, width) != value;
         Self::write_fast_map_ptr(ptr, width, value);
         if changed {
@@ -723,12 +723,12 @@ impl CpuGsw {
     /// True when the slow-read page histogram is armed.
     ///
     /// Kept as a call-site predicate rather than a test inside `note_slow_read_page`, because a
-    /// gate inside the callee still pays for the CALL on hundreds of millions of accesses -- the
+    /// gate inside the callee still pays for the CALL on hundreds of millions of accesses: the
     /// recorded lesson behind `barrier_census_active` and `census_enabled`.
     ///
     /// **It must be the LAST conjunct at every call site.** This is a load from a `CpuGsw` tail
     /// field; `read.direct` and `kind` are values the caller already holds in registers. Written
-    /// first, the load happens on every read that reaches the site -- 2,769,793,893 of them on
+    /// first, the load happens on every read that reaches the site: 2,769,793,893 of them on
     /// wolf3d-586, of which only 1,371,552,807 are slow. Written last it is short-circuited away
     /// on all 1.4 G direct reads, for an instrument that is OFF on every default run.
     ///
@@ -739,7 +739,7 @@ impl CpuGsw {
     /// exceeded the cross-arm delta, and the same binary drifted from 289.7 s to 331.1 s to
     /// 296.4 s over one session on identical work. Neither number separates from that noise. This
     /// ordering costs nothing, changes no behaviour (`&&` short-circuits and all three conjuncts
-    /// are side-effect-free), and is the shape the default-off-instrument discipline asks for --
+    /// are side-effect-free), and is the shape the default-off-instrument discipline asks for,
     /// which is reason enough without a wall claim it cannot support.
     #[inline]
     pub(super) fn slow_read_histo_armed(&self) -> bool {
@@ -758,7 +758,7 @@ impl CpuGsw {
             // The same predicate `MachineBus::should_split` applies, asked on the CPU side rather
             // than of the bus: a word off an odd address or a dword off a multiple of four is
             // refused a direct page BEFORE the region test runs. It is literally the same
-            // predicate now -- `should_split` forwards to `BusWidth::misaligned_at` too.
+            // predicate now: `should_split` forwards to `BusWidth::misaligned_at` too.
             tally.misaligned += u64::from(width.misaligned_at(linear));
         }
     }
@@ -858,8 +858,8 @@ impl CpuGsw {
         }
     }
 
-    /// Page-locality ALONE. This used to answer two questions -- "does the access stay inside one
-    /// page" and "is it naturally aligned" -- and refusing on the second was one of five sites
+    /// Page-locality ALONE. This used to answer two questions ("does the access stay inside one
+    /// page" and "is it naturally aligned") and refusing on the second was one of five sites
     /// that made the same alignment refusal. The alignment half is now a CLASSIFICATION
     /// (`BusWidth::misaligned_at`) whose only consumer is the charge; the data path never needed
     /// it, because `read_direct_entry`/`write_direct_entry` already use
@@ -924,7 +924,7 @@ impl CpuGsw {
         // CLASSIFY BEFORE POPULATING. Relaxing the alignment half of the top-of-function refusal
         // means a misaligned access now runs further into this function before it can decline, and
         // between the old refusal point and any later decline sit `populate_fast_map_from_cached`,
-        // `data_read_pages.insert` and `populate_fast_map` -- SIDE EFFECTS that are invisible to a
+        // `data_read_pages.insert` and `populate_fast_map`, SIDE EFFECTS that are invisible to a
         // guest-state or clock gate. A populate-then-decline would install a DirectPageCache entry
         // and a FastMap entry for a page it then refuses to serve, changing no guest byte and no
         // clock, only which LATER accesses run fast. Both questions are answerable from `physical`
@@ -1165,7 +1165,7 @@ impl CpuGsw {
         self.perf.direct_data_pointer_writes += 1;
         Ok(Some(changed))
     }
-    // (`read_rm_u8` was removed with the legacy 0x84 TEST r/m8,reg8 handler — its only remaining
+    // (`read_rm_u8` was removed with the legacy 0x84 TEST r/m8,reg8 handler, its only remaining
     // caller. The converted flags-misc executor reads the byte r/m via `read_operand_u8` on the
     // pre-decoded operand instead. `write_rm_u8` was removed earlier with the legacy 0x88 MOV
     // r/m8,r8 handler. The sized/read siblings remain in use by the fallback handlers.)
@@ -1426,7 +1426,7 @@ impl CpuGsw {
     /// `access = 0x93` (`SegmentRegister::real`), so this only ever rejects something in
     /// protected mode; the caller gates on that to skip the check entirely otherwise.
     /// Instruction fetch never routes through here (it uses `code_linear_for_offset`),
-    /// so CS's own readability never needs checking on this path -- only the case of a
+    /// so CS's own readability never needs checking on this path: only the case of a
     /// *data* segment register (DS/ES/FS/GS/SS) that happens to hold a code descriptor.
     #[inline]
     pub(super) fn check_segment_access_kind(
@@ -1535,11 +1535,11 @@ impl CpuGsw {
         // That invariant used to be a comment on `read_linear_fragment`; it is now structural,
         // because there is one probe site per ENTRY POINT and the shared tail
         // (`*_after_probe`) has none. The census gate and the classification belong to the probe
-        // and move WITH it -- the tail must not re-run either.
+        // and move WITH it: the tail must not re-run either.
         //
         // A hoist that left this function falling into the PROBING fragment entry rather than
-        // into the probe-less tail would pay the epoch/CPL/CR0.WP preamble TWICE on every miss --
-        // the ~2.66 ns/access cost behind a recorded 4.6% wall regression -- and would double
+        // into the probe-less tail would pay the epoch/CPL/CR0.WP preamble TWICE on every miss
+        // (the ~2.66 ns/access cost behind a recorded 4.6% wall regression) and would double
         // `fast_map_probe.misses` and the census counts. All of that is invisible to every state
         // assertion, which is why
         // `exactly_one_probe_and_one_census_note_per_page_local_sized_access` exists.
@@ -1552,8 +1552,8 @@ impl CpuGsw {
         // note the census, so noting it here as well would count it 1 + N times where it used to
         // count N. That is not merely an inflated total: `census_note_write` scores a
         // read-modify-write pair when the same instruction already read the same linear PAGE, so
-        // an entry-level note at the first fragment's page -- while `last_read_page` still matches
-        // -- would MANUFACTURE a pair, and an instruction that reads then crossing-writes one page
+        // an entry-level note at the first fragment's page (while `last_read_page` still matches)
+        // would MANUFACTURE a pair, and an instruction that reads then crossing-writes one page
         // would score two where it scores one. A census that silently over-reports is exactly how
         // a slice gets sized against a population that does not exist.
         //
@@ -1570,7 +1570,7 @@ impl CpuGsw {
         // page-local fragments that each reach `read_linear_fragment`, which
         // notes its own address there. Noting here too would count a
         // crossing access 1 + N times where it is N, inflating every
-        // read-set-size number this instrument reports (review N2).
+        // read-set-size number this instrument reports (N2).
         #[cfg(feature = "reflected-call-diagnostic")]
         if !(self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes())) {
             crate::reflected_call_diag::note_read(self, bus, linear);
@@ -1638,11 +1638,11 @@ impl CpuGsw {
         // That invariant used to be a comment on `read_linear_fragment`; it is now structural,
         // because there is one probe site per ENTRY POINT and the shared tail
         // (`*_after_probe`) has none. The census gate and the classification belong to the probe
-        // and move WITH it -- the tail must not re-run either.
+        // and move WITH it: the tail must not re-run either.
         //
         // A hoist that left this function falling into the PROBING fragment entry rather than
-        // into the probe-less tail would pay the epoch/CPL/CR0.WP preamble TWICE on every miss --
-        // the ~2.66 ns/access cost behind a recorded 4.6% wall regression -- and would double
+        // into the probe-less tail would pay the epoch/CPL/CR0.WP preamble TWICE on every miss
+        // (the ~2.66 ns/access cost behind a recorded 4.6% wall regression) and would double
         // `fast_map_probe.misses` and the census counts. All of that is invisible to every state
         // assertion, which is why
         // `exactly_one_probe_and_one_census_note_per_page_local_sized_access` exists.
@@ -1655,8 +1655,8 @@ impl CpuGsw {
         // note the census, so noting it here as well would count it 1 + N times where it used to
         // count N. That is not merely an inflated total: `census_note_write` scores a
         // read-modify-write pair when the same instruction already read the same linear PAGE, so
-        // an entry-level note at the first fragment's page -- while `last_read_page` still matches
-        // -- would MANUFACTURE a pair, and an instruction that reads then crossing-writes one page
+        // an entry-level note at the first fragment's page (while `last_read_page` still matches)
+        // would MANUFACTURE a pair, and an instruction that reads then crossing-writes one page
         // would score two where it scores one. A census that silently over-reports is exactly how
         // a slice gets sized against a population that does not exist.
         //
@@ -1669,7 +1669,7 @@ impl CpuGsw {
             self.census_note_write(linear);
         }
         // Scoped OUT on a crossing access, for the same reason as the read arm
-        // above (review N2): `write_paged_cross_page` splits it into
+        // above (N2): `write_paged_cross_page` splits it into
         // page-local fragments that each note their own address at
         // `write_linear_fragment`.
         #[cfg(feature = "reflected-call-diagnostic")]
@@ -1809,7 +1809,7 @@ impl CpuGsw {
     }
 
     /// The shared, PROBE-LESS tail of a sized read. Reached from `read_memory_bus_width` (which
-    /// probed) and from `read_linear_fragment` (which probed), and it must never probe itself --
+    /// probed) and from `read_linear_fragment` (which probed), and it must never probe itself:
     /// that is what makes "exactly one probe per page-local sized access" structural rather than
     /// a convention. It must not re-run the census gate or the `split` classification either;
     /// both belong to the probe.
@@ -2097,7 +2097,7 @@ impl CpuGsw {
         // CPL (see `translate_linear_system`).
         let user = match accessor {
             // CPL is the cached quantity (`current_privilege_level`/`self.cpl`), not a live
-            // read of CS.selector -- see that method for why a live formula misclassifies
+            // read of CS.selector. See that method for why a live formula misclassifies
             // the monitor's own ring-0 stack pushes as user during V86-source exception
             // delivery (source CS's RPL bits are irrelevant once cpl has already been set
             // to the entered level).
@@ -2115,7 +2115,7 @@ impl CpuGsw {
         // generation. A write to a page whose dirty bit is not yet set falls through
         // to the walk so the PTE's D bit is updated.
         //
-        // A hit NEVER raises the fault itself -- it either serves the access or falls
+        // A hit NEVER raises the fault itself: it either serves the access or falls
         // through to the walk. A cached entry can only be more restrictive than the
         // live tables (a guest that relaxes a PTE and skips the required flush), and
         // this core's TLB is 1024 entries against real silicon's 32-64, so such an
@@ -2123,7 +2123,7 @@ impl CpuGsw {
         // fault from the walk instead costs nothing on the hot path (it runs only when
         // the hit would not have served the access anyway) and keeps the page tables
         // the sole authority on what faults. Repro that found this: TSUMERA (Borland
-        // 32RTM under VCPI) at exit -- its ring-0 DPMI host flips a data page from R/O
+        // 32RTM under VCPI) at exit: its ring-0 DPMI host flips a data page from R/O
         // to R/W without reloading CR3, and the ring-3 refcount decrement that follows
         // took a spurious #PF(7) off the stale entry.
         let page = linear >> 12;
@@ -2145,10 +2145,10 @@ impl CpuGsw {
             }
         }
 
-        // CR3 data-side gate win counter (design T2, review D5): every walk that reaches here is
+        // CR3 data-side gate win counter (design T2, D5): every walk that reaches here is
         // one the TLB fast path above did NOT serve, whether from a cold entry, a permission
         // mismatch, or a dirty-bit miss. A retained entry across an R1 reselect costs no walk, so
-        // this is the direct measure of T2's payoff -- and the direct, non-proxy assertion for a
+        // this is the direct measure of T2's payoff, and the direct, non-proxy assertion for a
         // test that wants to know whether a walk ran.
         self.perf.tlb_walks += 1;
         let directory = self.control.cr3 & 0xffff_f000;
@@ -2176,7 +2176,7 @@ impl CpuGsw {
         // the only site that can see the structure pages behind a decode line before that line
         // exists. Marked AFTER the accessed-bit write above (not before): marking first would
         // make that very store retire the ring it just protected, on the FIRST walk of every
-        // page table -- self-inflicted, not the guest editing a live mapping.
+        // page table, self-inflicted, not the guest editing a live mapping.
         self.mark_translation_page(directory);
 
         // PSE (CR4.PSE / PDE bit 7) is not implemented: this engine always does the two-level

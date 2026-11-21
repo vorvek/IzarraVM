@@ -19,8 +19,7 @@ const BITSET_WORDS: usize = LINEAR_PAGE_COUNT / u64::BITS as usize;
 const UNAVAILABLE_BIAS: usize = usize::MAX;
 const UNAVAILABLE_PHYSICAL_PAGE: u32 = u32::MAX;
 
-/// The store-bias poison (one-lookup store design D1,
-/// `dev_docs/2026-08-07-one-lookup-store-design.md`). In-band with the two tag bits below:
+/// The store-bias poison (one-lookup store design D1). In-band with the two tag bits below:
 /// a poisoned entry has bit 0 set AND cannot collide with a tagged mode13 bias, because a
 /// bias whose low 12 bits are not free is poisoned before tagging.
 const STORE_BIAS_POISON: usize = usize::MAX;
@@ -34,16 +33,15 @@ const STORE_BIAS_MODE13: usize = 1;
 const STORE_BIAS_SUPERVISOR: usize = 2;
 const STORE_BIAS_TAG_MASK: usize = STORE_BIAS_MODE13 | STORE_BIAS_SUPERVISOR;
 
-/// The load-bias twin (one-lookup load design D1,
-/// `dev_docs/2026-08-07-one-lookup-load-design.md`). Same in-band encoding as the store table —
-/// the VALUES are shared so the emitted tag tests are byte-identical between the twins — but the
+/// The load-bias twin (one-lookup load design D1). Same in-band encoding as the store table
+/// (the VALUES are shared so the emitted tag tests are byte-identical between the twins), but the
 /// MEANINGS differ where the read path differs: there is no watch term (no read path consults a
 /// watch table, so a watched page's loads stay fast), and bit 1 is ring 3's READ test alone.
 const LOAD_BIAS_POISON: usize = STORE_BIAS_POISON;
 /// Load-bias tag bit 0: the page is the Mode 13h VGA aperture. The emitted site's inline mode13
 /// arm clears both tag bits before forming the pointer and moves the dynamic mode13 READ lane.
 const LOAD_BIAS_MODE13: usize = STORE_BIAS_MODE13;
-/// Load-bias tag bit 1: the page has a committed read bias but PAGE_USER is clear — ring 3 may
+/// Load-bias tag bit 1: the page has a committed read bias but PAGE_USER is clear; ring 3 may
 /// not read it. Fast for cpl0 sites ONLY (today's cpl0 emitted read path resolves through any
 /// committed read bias with no check, emit_read_permission_check emits nothing at cpl0); cpl3
 /// sites route bit-1 entries to the slow stub.
@@ -55,9 +53,9 @@ const HAS_READ_BIAS: u8 = 0b0000_0100;
 const HAS_WRITE_BIAS: u8 = 0b0000_1000;
 const PAGE_WRITABLE: u8 = 0b0001_0000;
 const PAGE_USER: u8 = 0b0010_0000;
-/// The watched-page bit (design: `dev_docs/2026-08-06-watched-page-bit-design.md`). CLEAR
+/// The watched-page bit. CLEAR
 /// promises that NEITHER code-watch table has an entry for this linear page's physical page, so
-/// an emitted store may skip the code-watch guard entirely. SET promises nothing — the full
+/// an emitted store may skip the code-watch guard entirely. SET promises nothing: the full
 /// guard decides. Recomputed from both watch tables on EVERY `populate` (never carried through
 /// the `same_mapping` access-flags reuse), and kept honest at watch-add edges by
 /// `clear_entries_of_watch_edge_page`: a stale SET bit is a missed optimization, a stale CLEAR
@@ -89,8 +87,8 @@ fn decode_kind(flags: u8) -> PageKind {
 ///
 /// Both fields count entries that were **live at the moment they were cleared**, never list
 /// membership. That distinction is the whole value of the counter: `populated_pages` and
-/// `vga_pages` are registries that outlive the entries they name -- `invalidate_page` (INVLPG) and
-/// `invalidate_vga_pages` both clear an entry and leave it listed -- so counting the list would
+/// `vga_pages` are registries that outlive the entries they name: `invalidate_page` (INVLPG) and
+/// `invalidate_vga_pages` both clear an entry and leave it listed, so counting the list would
 /// charge dead indices, and would charge an aperture page twice once the scoped sweep leaves it
 /// behind for the next global wipe to find.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -180,15 +178,15 @@ struct FastMapStorage {
     read_biases: Box<[usize]>,
     write_biases: Box<[usize]>,
     /// The one-lookup store table: a pure DERIVATION of (`flags`, `write_biases`) computed by
-    /// `derive_store_bias` at the end of every populate and poisoned by `clear_entry` — never
+    /// `derive_store_bias` at the end of every populate and poisoned by `clear_entry`, never
     /// authoritative. Riding those two chokes is the whole coherence story: the strict watch-edge
     /// sweeps kill entries through `clear_entry`, and every refill re-derives from the final
     /// flags byte, so "watched implies poisoned" and the permission encoding can never skew
     /// against the byte they are computed from.
     store_biases: Box<[usize]>,
     /// The one-lookup LOAD table: the store table's poisoned twin, derived by `derive_load_bias`
-    /// from (`flags`, `read_biases`) at the same two chokes — the end of every populate and
-    /// `clear_entry` — and never authoritative. The one deliberate difference from the store
+    /// from (`flags`, `read_biases`) at the same two chokes (the end of every populate and
+    /// `clear_entry`) and never authoritative. The one deliberate difference from the store
     /// twin: no watch term, so a watched page's loads derive FAST (reads have no code-watch
     /// dimension; the fast_map_test twin-difference pin holds the two derivations apart on
     /// exactly this).
@@ -206,7 +204,7 @@ struct FastMapStorage {
 /// populate wiring and the test batteries all read this one function's decision.
 ///
 /// Poison unless the entry has a committed write bias, a RAM or Mode13 kind, a CLEAR
-/// `PAGE_WATCHED` bit, and a bias whose low 12 bits are free (the tag-bit precondition —
+/// `PAGE_WATCHED` bit, and a bias whose low 12 bits are free (the tag-bit precondition:
 /// misaligned host backing degrades to the slow path, never to a wrong tag). Otherwise the
 /// bias itself, tagged: bit 0 for Mode13, bit 1 when ring 3's user+writable test fails.
 fn derive_store_bias(flags: u8, write_bias: usize) -> usize {
@@ -230,13 +228,13 @@ fn derive_store_bias(flags: u8, write_bias: usize) -> usize {
 }
 
 /// Derive the load-bias entry from a FINAL flags byte and the stored read bias (one-lookup load
-/// design D1) — `derive_store_bias` with the watch term DELETED and the permission term reduced
+/// design D1): `derive_store_bias` with the watch term DELETED and the permission term reduced
 /// to ring 3's read test. The single source of the load-poison predicate.
 ///
 /// Poison unless the entry has a committed read bias, a RAM or Mode13 kind, and a bias whose low
 /// 12 bits are free (misaligned host backing degrades to the slow path, never to a wrong tag).
 /// Otherwise the bias itself, tagged: bit 0 for Mode13, bit 1 when PAGE_USER is clear. A watched
-/// page derives FAST — no read path consults a watch table, and INV-R deliberately omits the
+/// page derives FAST: no read path consults a watch table, and INV-R deliberately omits the
 /// watch clause (see the design's D1).
 fn derive_load_bias(flags: u8, read_bias: usize) -> usize {
     let kind_ok = matches!(decode_kind(flags), PageKind::Ram | PageKind::Mode13);
@@ -602,14 +600,14 @@ pub(crate) const NATIVE_LOAD_BIAS_TAG_MASK: usize = LOAD_BIAS_TAG_MASK;
 /// table longer without changing any decision it feeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlotReject {
-    /// `offset + bytes > PAGE_SIZE` -- the access straddles a page boundary.
+    /// `offset + bytes > PAGE_SIZE`: the access straddles a page boundary.
     PageCross,
     /// Not naturally aligned for its width.
     ///
     /// NEVER CONSTRUCTED after the admission slice, and that is the point rather than an
     /// oversight: `lookup_access` no longer has an alignment rung, so nothing can be attributed
     /// to one. The variant and its counter are kept so the collapse is VISIBLE in the report as
-    /// an explicit zero -- a reader comparing a pre-slice run against a post-slice one sees the
+    /// an explicit zero: a reader comparing a pre-slice run against a post-slice one sees the
     /// same key go to zero, instead of a key disappearing, which reads as an instrument change
     /// rather than a result. The population itself moved to `slot_admit_misaligned`.
     #[allow(dead_code)]
@@ -693,7 +691,7 @@ impl FastMap {
 
     /// Why `lookup_access` refused, for the step-0 reject census. Runs ONLY when the census is
     /// armed, so it re-runs the (already-failed, side-effect-free) clauses rather than making
-    /// `lookup_access` widen its hot return value to carry a reason -- a diagnostic field in the
+    /// `lookup_access` widen its hot return value to carry a reason: a diagnostic field in the
     /// return ABI taxes the DISARMED path through register allocation, which is the whole cost
     /// this instrument is trying not to have.
     ///
@@ -792,11 +790,11 @@ impl FastMap {
     }
 
     /// Whether the map has EVER been populated. `storage` allocates lazily inside `populate`
-    /// (`get_or_insert_with`) and is never freed afterward -- `invalidate_page`/`invalidate_all`
+    /// (`get_or_insert_with`) and is never freed afterward: `invalidate_page`/`invalidate_all`
     /// clear entries but leave `storage` itself `Some`. So this is `false` only before the FIRST
     /// successful population on this CPU; it stays `true` for the rest of the CPU's life after
     /// that, through every later invalidation and through a live GSW mode switch into a persona
-    /// that can never populate again. It is NOT a live "can this persona hit right now" test --
+    /// that can never populate again. It is NOT a live "can this persona hit right now" test:
     /// that condition is `CpuGsw::fast_map_serve_enabled` (memory.rs), a separately cached mirror
     /// of `fast_map_population_enabled()` refreshed at every state change that predicate depends
     /// on. Do not use `has_storage()` to gate the interpreter's serve path; it is kept as a
@@ -962,7 +960,7 @@ impl FastMap {
         storage.physical_pages[index] = physical_page;
         storage.mapping_epochs[index] = page.mapping_epoch;
         storage.flags[index] = flags;
-        // The store-bias derivation runs at the END of EVERY populate — read fills included —
+        // The store-bias derivation runs at the END of EVERY populate (read fills included)
         // from the FINAL flags byte. Deriving on write fills only would let a same-mapping read
         // refill that changes the permission bits (flags rebuild from fresh `permissions` each
         // fill) leave a fast entry a ring-3 store may no longer take (design hazard H2).
@@ -987,7 +985,7 @@ impl FastMap {
     /// The strict-edge sweep (watched-page-bit design D4, edges E1/E2): `physical_page_base`
     /// just crossed unwatched -> watched in one of the code-watch tables, so every LIVE entry
     /// mapping it whose `PAGE_WATCHED` bit is CLEAR must be invalidated before native code runs
-    /// again — the next emitted store through such an entry would skip the guard the new watch
+    /// again: the next emitted store through such an entry would skip the guard the new watch
     /// needs. Entries whose bit is already SET are skipped (INV-W already holds for them),
     /// which is what makes doom's once-per-generation re-mark churn affordable when the lazy
     /// edges leave bits set. Invalidation, not patching: a cleared entry routes the in-flight
@@ -1065,7 +1063,7 @@ impl FastMap {
     /// registry lets an alias be listed again after the VGA plane or backing store changes.
     ///
     /// A linear page that has since been re-pointed away from the aperture is skipped rather than
-    /// cleared -- its entry is a RAM mapping now and the aperture move says nothing about it -- but
+    /// cleared: its entry is a RAM mapping now and the aperture move says nothing about it, but
     /// its registry bit is still dropped, so it is re-listed if it ever comes back.
     ///
     /// List membership in `populated_pages` is deliberately NOT dropped: an entry cleared here can
@@ -1293,7 +1291,7 @@ impl FastMap {
             .map(FastMapStorage::native_bases)
     }
 
-    /// Whether the live entry for `linear` carries `PAGE_WATCHED` — the watched-page-bit
+    /// Whether the live entry for `linear` carries `PAGE_WATCHED`: the watched-page-bit
     /// battery's inspector (a dead entry reads false).
     #[cfg(test)]
     pub(crate) fn page_watched_bit_for_test(&self, linear: u32) -> bool {
@@ -1303,7 +1301,7 @@ impl FastMap {
             .is_some_and(|storage| storage.flags[index] & PAGE_WATCHED != 0)
     }
 
-    /// The raw store-bias entry for `linear` — the one-lookup store battery's inspector
+    /// The raw store-bias entry for `linear`: the one-lookup store battery's inspector
     /// (a dead entry reads the poison).
     #[cfg(test)]
     pub(crate) fn store_bias_for_test(&self, linear: u32) -> usize {
@@ -1314,7 +1312,7 @@ impl FastMap {
     }
 
     /// Test-only INV-P violation injector (design T4): make the entry LOOK unwatched to the
-    /// fast path while the flags bit and both watch tables say watched — a state the
+    /// fast path while the flags bit and both watch tables say watched: a state the
     /// derivation can never produce. The differential a fixture builds on this proves the
     /// emitted fast path consults nothing but the store-bias table.
     #[cfg(test)]
@@ -1328,7 +1326,7 @@ impl FastMap {
         storage.store_biases[index] = derive_store_bias(flags, storage.write_biases[index]);
     }
 
-    /// The raw load-bias entry for `linear` — the one-lookup load battery's inspector (a dead
+    /// The raw load-bias entry for `linear`: the one-lookup load battery's inspector (a dead
     /// entry reads the poison).
     #[cfg(test)]
     pub(crate) fn load_bias_for_test(&self, linear: u32) -> usize {
@@ -1339,7 +1337,7 @@ impl FastMap {
     }
 
     /// Test-only INV-R violation injector (load design L4): recompute the entry with PAGE_USER
-    /// forced INTO the derivation input while the real flags byte says supervisor — a state
+    /// forced INTO the derivation input while the real flags byte says supervisor: a state
     /// production cannot produce. The differential a fixture builds on this proves the emitted
     /// fast load path consults nothing but the load-bias table (the flags byte is the one thing
     /// the classic arm reads on that state and the fast arm must not).

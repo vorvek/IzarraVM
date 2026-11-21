@@ -24,7 +24,7 @@ enum Cr3FastMapSelect {
 /// select a counter and nothing else. See `CpuGsw::flush_tlb_and_code_caches`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranslationFlushReason {
-    /// `MOV CR3, r32` -- the page-directory base was reloaded. No PRODUCTION caller constructs
+    /// `MOV CR3, r32`: the page-directory base was reloaded. No PRODUCTION caller constructs
     /// this any more: a real reload executes through
     /// `CpuGsw::flush_tlb_and_code_caches_for_cr3_write`, the ring-gated entry point that needs
     /// the register's old value and so cannot go through this generic, reason-only function. The
@@ -120,7 +120,7 @@ impl CpuGsw {
         self.materialized_eflags()
     }
 
-    /// A CLONE of this CPU with its lazy flags SETTLED — the base carrying the architectural value
+    /// A CLONE of this CPU with its lazy flags SETTLED: the base carrying the architectural value
     /// and the descriptor torn down. The public form of what `cpu_test.rs`'s `settled_state` does
     /// in-crate, exported for the cross-crate fixtures that cannot reach `materialize_flags`.
     ///
@@ -175,14 +175,14 @@ impl CpuGsw {
         // None of this function's callers (A20 toggle, direct-map change, device DMA, aperture
         // remap) flush the whole TLB in the same operation, so `translation_pages` must not clear
         // here (F11): a stale TLB entry could still serve a code translation with no fresh walk
-        // to re-mark it. Keeping the marks is the conservative direction -- more retires, never
-        // fewer -- exactly like retaining `code_bytes`.
+        // to re-mark it. Keeping the marks is the conservative direction: more retires, never
+        // fewer, exactly like retaining `code_bytes`.
         let retired = self.invalidate_decode_frontend(false);
         // None of these causes moves a linear->physical PAGE TABLE mapping (T1's own A1
         // analysis: A20/direct-map/aperture/device-DMA are bus-level), so no `Tlb` entry is made
         // stale by one on its OWN account. But `retire_ring` (inside `invalidate_decode_frontend`
-        // above) still renumbers ring slots regardless of cause (design review D2), and unlike
-        // INVLPG this caller has no narrower, targeted fix for that -- so retire fully. These
+        // above) still renumbers ring slots regardless of cause (D2), and unlike
+        // INVLPG this caller has no narrower, targeted fix for that, so retire fully. These
         // causes are all rare (A20 toggles once at boot; aperture/direct-map track video mode
         // and PCI decode changes, not per-instruction traffic), so the cost is negligible, and it
         // closes the same slot-reoccupation gap D2 names rather than leaving it open.
@@ -210,9 +210,9 @@ impl CpuGsw {
     ///
     /// The SOLE choke point for `invalidate_code_caches_uncounted` (A20, direct-map, aperture)
     /// and `invalidate_translation_code_caches` (CR0/task-switch full flush, INVLPG): the decode
-    /// ring is always fully retired here, which renumbers its slots (design review D2). Returns
+    /// ring is always fully retired here, which renumbers its slots (D2). Returns
     /// the `RingRetired` token instead of consuming it, because what that renumbering means for
-    /// the `Tlb` is NOT the same at every caller -- INVLPG has its OWN narrower, targeted fix
+    /// the `Tlb` is NOT the same at every caller: INVLPG has its OWN narrower, targeted fix
     /// (`retire_dormant_slot`, called in `execute_extended.rs` before this function even runs),
     /// and retiring the whole `Tlb` here too would silently defeat it (a real INVLPG invalidates
     /// exactly one page, not the whole TLB, and `invlpg_invalidates_only_the_addressed_page_at_cpl0`
@@ -644,7 +644,7 @@ impl CpuGsw {
     /// no split counter, so the split can only ever UNDER-count, never over-count.
     ///
     /// The split is diagnostic, not behavioural: every arm does exactly the same work. Nothing
-    /// here gates anything. `dev_docs/2026-09-02-tyrian-586-specs-diag.md` section 4.1 reached
+    /// here gates anything. Section 4.1 of the Tyrian 586 diagnosis reached
     /// "it is CR3" by eliminating the other two from unrelated counters; this makes the same
     /// claim measurable, which is the precondition the diagnosis set for writing any gate.
     ///
@@ -663,9 +663,9 @@ impl CpuGsw {
             TranslationFlushReason::TaskSwitch => self.perf.decode_inval_task_switch += 1,
         }
         self.bump_wipes_tlb_flush_counter();
-        // T1 (design `2026-09-02-cr3-data-side-design.md`): the physical data-page caches
+        // T1 (CR3 data-side design): the physical data-page caches
         // (`data_read_pages`/`data_write_pages`) are keyed by physical page and a bus mapping
-        // epoch, never by CR3, so they are no longer touched by any control-register flush --
+        // epoch, never by CR3, so they are no longer touched by any control-register flush:
         // only their three bus causes (`note_a20_changed`, `note_direct_map_changed`,
         // `note_direct_data_map_changed`) invalidate them.
         #[cfg(all(
@@ -674,8 +674,8 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.record_fast_map_wipe_extent();
-        // The decode ring retires below, unconditionally, which renumbers ring slots (design
-        // review D2) -- this caller (unlike INVLPG) has no narrower `Tlb` fix of its own, so the
+        // The decode ring retires below, unconditionally, which renumbers ring slots
+        // (D2). This caller (unlike INVLPG) has no narrower `Tlb` fix of its own, so the
         // whole `Tlb` retires too, consuming the token `invalidate_translation_code_caches`
         // returns. `translation_pages` may clear here (F11): both the TLB and the decode lines it
         // could back are gone by the time this returns.
@@ -683,28 +683,28 @@ impl CpuGsw {
         self.retire_tlb_slots(retired);
     }
 
-    /// `MOV CR3, r32`, the ring-gated code half (design `2026-09-02-cr3-code-cache-gate-design.md`
+    /// `MOV CR3, r32`, the ring-gated code half (CR3 code-cache gate design
     /// part 2). Unlike `flush_tlb_and_code_caches(Cr3)` above, this is what a REAL reload executes:
     /// it needs the register's OLD value to seed the ring (R8) and to tell a same-directory
     /// reselect (R1) from a genuine third value (R3), so it owns the assignment to
     /// `self.control.cr3` itself. Callers must pass the value about to be written and must NOT
     /// assign the register first.
     ///
-    /// The data side is now split three ways (design `2026-09-02-cr3-data-side-design.md`, T1+T2,
+    /// The data side is now split three ways (CR3 data-side design, T1+T2,
     /// amending the paragraph this replaces). `data_read_pages`/`data_write_pages` are OUT of this
     /// function entirely (T1): they are keyed by physical page and a bus mapping epoch, never by
-    /// CR3, so no arm here touches them any more -- only their three bus causes do. The FastMap
+    /// CR3, so no arm here touches them any more: only their three bus causes do. The FastMap
     /// wipe stays unconditional on BOTH arms below, exactly as before (T3, retaining it across an
     /// R1 reselect, is a later slice). The TLB is now GATED, the same shape as the decode and JIT
     /// halves (T2): `Reselected` restores the reselected slot's generation with `select_generation`,
     /// no walk, no entry lost; `Allocated` mints a fresh generation for the newly occupied slot
-    /// with `allocate_generation`, trusting nothing about who held the slot before (review finding
-    /// P1, PR #826: merging this with `Reselected` let a directory that had just vacated a slot
+    /// with `allocate_generation`, trusting nothing about who held the slot before (P1,
+    /// PR #826: merging this with `Reselected` let a directory that had just vacated a slot
     /// via INVLPG's narrower retire be silently restored for a completely different directory);
     /// `Taken` retires both generations with `retire_all_slots` (consuming the `RingRetired` token
     /// `select_context`'s R3 hands back) and then mints slot 0's fresh one.
     /// The eip-window fetch frontend stays unconditional on every write, both arms, unchanged. The
-    /// JIT half is gated TOO, by slice S-B (design doc `2026-09-02-cr3-jit-half-design.md`): a link
+    /// JIT half is gated TOO, by slice S-B (CR3 JIT-half design): a link
     /// graph built under one directory is retained across an R1 reselect back to it, keyed apart
     /// from a second directory's graph by a per-slot epoch and a `slot`-tagged rendezvous key
     /// rather than being torn down on every write.
@@ -713,12 +713,12 @@ impl CpuGsw {
     /// |---|---|
     /// | L1, `link_epochs: [u64; 2]` plus a live `link_slot` | an R1 reselect restores that slot's own epoch instead of minting a new one, so every block made link-visible under it is visible again with no work; R2 allocate mints a fresh epoch for the newly occupied slot, invalidating nothing because nothing carries it yet |
     /// | L2, `LinkTarget` carries a `context: u8` | partitions `linear_blocks` AND `waiting` by ring slot at zero new comparison sites, so an install under slot B cannot resolve a source parked under slot A |
-    /// | L3, `make_link_visible`'s cross-context arm | a block re-touched under the OTHER slot's live epoch has its outbound cells cleared before this context's admission can rebind them -- **a retained link is a direct jump inside the arena that bypasses every key check**, so without this a stale cell would chain into the wrong context's target with no fault, no counter, wrong answers |
+    /// | L3, `make_link_visible`'s cross-context arm | a block re-touched under the OTHER slot's live epoch has its outbound cells cleared before this context's admission can rebind them: **a retained link is a direct jump inside the arena that bypasses every key check**, so without this a stale cell would chain into the wrong context's target with no fault, no counter, wrong answers |
     /// | L4, root dispatch is the base case | entry always builds its `BlockKey` from the LIVE physical, so no cell can ever be armed FROM a block that was never entered under this context, and `try_link_inner`'s `stale_epoch` refusal (compared against the live slot's epoch alone) is a second, independent barrier behind the key partition |
     /// | L5, every wholesale cause retires both `link_epochs` | `invalidate_translation` (this function's `Taken` arm, the translation-page store arm, the SMC wholesale arm) keeps tearing the WHOLE graph down exactly as before this slice; only the R1 reselect path is new |
     ///
     /// `ContextSelect::Reselected(slot)` is R1 and `ContextSelect::Allocated(slot)` is R2
-    /// (review finding P1, PR #826, split them: `DecodeCache::select_context` used to return one
+    /// (P1, PR #826, split them: `DecodeCache::select_context` used to return one
     /// `Skipped(slot)` for both, and a caller that could not tell them apart could only stay safe
     /// by leaning on an invariant a narrower retire elsewhere could break). `Reselected` calls
     /// `select_link_context`, restoring that slot's saved epoch; `Allocated` calls
@@ -771,7 +771,7 @@ impl CpuGsw {
         self.control.cr3 = new_cr3;
         self.invalidate_fetch_frontend();
         // T2: the TLB is now gated on the SAME ring decision as the decode and JIT halves, so it
-        // has to run AFTER `select_context`, not before -- the reverse of the pre-T2 ordering, in
+        // has to run AFTER `select_context`, not before, the reverse of the pre-T2 ordering, in
         // which the whole data side wiped unconditionally above this match. Write any future
         // reordering's rule here; do not leave a stale comment standing next to it.
         match self
@@ -783,7 +783,7 @@ impl CpuGsw {
                 // R1: the requested directory already owns this slot. RESTORE its saved
                 // generation and epoch; no entry is lost, and the generation/epoch compare in
                 // `lookup`/`insert`/`is_link_visible` IS the restore. Never mint here: see the
-                // `ContextSelect` doc comment (review finding P1, PR #826).
+                // `ContextSelect` doc comment (P1, PR #826).
                 self.tlb.select_generation(slot);
                 #[cfg(all(
                     feature = "jit",
@@ -809,13 +809,13 @@ impl CpuGsw {
                 self.perf.cr3_code_flush_skipped += 1;
                 // R2: a miss took a free slot. MINT a fresh generation and epoch for it; nothing
                 // about that slot's previous occupant, if any, may be trusted. This is the P1
-                // fix (review, PR #826): before this split, this arm called `select_generation`,
+                // fix (PR #826): before this split, this arm called `select_generation`,
                 // which could restore a directory that had just vacated the slot via a narrow
                 // retire (INVLPG's `retire_dormant_slot`) that never re-minted THIS slot's
                 // generation, silently serving one directory's cached translations to another.
-                // Minting costs nothing here -- the slot is, by construction, either virgin
+                // Minting costs nothing here: the slot is, by construction, either virgin
                 // (seeded distinct at `Tlb::default`/`BlockCache::new`) or was already fully
-                // retired -- so this is not a narrower fix, it removes the dependency on every
+                // retired, so this is not a narrower fix, it removes the dependency on every
                 // OTHER caller keeping its own retire paired correctly.
                 self.tlb.allocate_generation(slot);
                 #[cfg(all(
@@ -843,8 +843,8 @@ impl CpuGsw {
                 self.perf.decode_inval_other += 1;
                 self.perf.code_invalidations += 1;
                 self.has_aperture_code.0 = false;
-                // R3: both TLB generations retire together with the decode ring (design review
-                // D2) -- `retire_ring` already renumbered the slots this token came from, so
+                // R3: both TLB generations retire together with the decode ring
+                // (D2): `retire_ring` already renumbered the slots this token came from, so
                 // `slot`'s old occupant, if any, must not be served under the new one. Mint slot
                 // 0's fresh generation only after the retire, exactly as the decode and JIT
                 // halves mint their own fresh state only after their own retire.
@@ -889,37 +889,37 @@ impl CpuGsw {
     /// | `dirty_byte_words` / `dirty_page_words` clear | bookkeeping for the wipe above, bounded by the bitmap size |
     /// | `native_code_watch.clear()` | an armed host write-watch retained is the conservative direction; skipping a clear creates no new watch edges |
     /// | `code_page_lin.clear()` | it maps physical page to linear page; the map did not move, so every entry stays true |
-    /// | `has_aperture_code.0 = false` | the lines survive, so the flag describing them should too -- clearing it while they stay live would be the bug |
+    /// | `has_aperture_code.0 = false` | the lines survive, so the flag describing them should too: clearing it while they stay live would be the bug |
     /// | `jit_direct.invalidate_translation()` | links carry `mode_key`, and no static edge can cross a `mode_key` boundary, so a retained link is unreachable under the new mode |
     ///
     /// The last row also gives up a periodic link-policy amnesty (the chain-layout reset and the
     /// data-segment decline clear that ride inside `invalidate_translation`). Losing an amnesty can
     /// only make link ADMISSION stricter, never admit an edge that should be refused, so it is not
-    /// a soundness question -- but it is why the ladder measures `link_refusals` alongside the win.
+    /// a soundness question, but it is why the ladder measures `link_refusals` alongside the win.
     ///
     /// The DATA half (TLB, FastMap) is now ALSO gated, on a narrower condition than the code half
     /// above: it wipes only when `new_cr0 & CR0_PG != 0`. This branch is reached only when
     /// `cr0_write_moves_code_translation` is false, which forces
     /// `old_cr0 & CR0_PG == new_cr0 & CR0_PG` (the predicate's first disjunct is exactly
-    /// `delta & CR0_PG != 0`) -- so PG is unchanged here, and checking `new_cr0` alone tells us
+    /// `delta & CR0_PG != 0`), so PG is unchanged here, and checking `new_cr0` alone tells us
     /// whether it was already 0 or already 1 on both sides. Two cases:
     ///
     /// - PG stays 1 (paging was already on, e.g. only TS/MP/EM/NE/AM/CD/NW moved): still wipe.
-    ///   CORRECTING THE PRIOR TEXT HERE (design `2026-09-02-cr3-data-side-design.md` section (c)):
+    ///   CORRECTING THE PRIOR TEXT HERE (CR3 data-side design section (c)):
     ///   `data_read_pages`/`data_write_pages` are NOT touched by this function at all any more
-    ///   (T1 -- they are physical-keyed with no permission bits, so no control-register write of
+    ///   (T1: they are physical-keyed with no permission bits, so no control-register write of
     ///   any kind bears on them), and what the FastMap caches is never the filling access's
     ///   privilege, only the PAGE's U/S and R/W bits, re-checked against the LIVE accessor at
     ///   every probe (`memory.rs::lookup_access`). The FastMap still wipes here, but for the
     ///   ordinary reason every unconditional flush wipes it, not because it is "privilege-tagged".
     ///   The TLB (T2) is gated the SAME way the CR3 ring gates it: this path never renumbers ring
     ///   slots (`select_context` is not called here), so only the LIVE slot's generation may
-    ///   retire -- `Tlb::flush_live_slot()`, not `retire_all_slots()`, because there is no
+    ///   retire: `Tlb::flush_live_slot()`, not `retire_all_slots()`, because there is no
     ///   `RingRetired` token to consume and the dormant slot's entries are still valid under their
     ///   own directory. The `memory.rs` WP invariant ("WP changes flush, so `wp` is consistent
-    ///   within a generation") stays exactly as conservative as before for this case --
+    ///   within a generation") stays exactly as conservative as before for this case:
     ///   unconditional.
-    /// - PG stays 0 (paging was already off -- the ONLY way a bare PE toggle reaches this branch,
+    /// - PG stays 0 (paging was already off: the ONLY way a bare PE toggle reaches this branch,
     ///   since PG=1 with PE=0 is `#GP(0)` at the MOV CR0 site): skip the wipe. With paging off,
     ///   `translate_linear_checked`'s early return makes the TLB dead weight (never populated,
     ///   never consulted); `data_read_pages`/`data_write_pages` are keyed by PHYSICAL address alone
@@ -933,9 +933,9 @@ impl CpuGsw {
     ///   off), so keeping it unconditional would buy nothing.
     ///
     /// `wipes_tlb_flush` still counts the EVENT on the skipped arm (`bump_wipes_tlb_flush_counter`
-    /// runs unconditionally, same as the ungated function above) -- only `wipe_pages_cleared` and
-    /// the rest of the wipe's cost collapse. See `dev_docs/2026-09-01-tyrian-transition-diag.md`
-    /// section 7 S2 for the measured motivation (34,112 whole-map wipes per guest second on a
+    /// runs unconditionally, same as the ungated function above): only `wipe_pages_cleared` and
+    /// the rest of the wipe's cost collapse. See the Tyrian transition diagnosis,
+    /// section 7 S2, for the measured motivation (34,112 whole-map wipes per guest second on a
     /// workload that never enables paging) and `cpu_cr0_flush_test.rs`'s `data_caches` module for
     /// the red/anti-regression/correctness rows this rests on.
     fn flush_tlb_keep_code_caches(&mut self, new_cr0: u32) {
@@ -970,7 +970,7 @@ impl CpuGsw {
     /// `jit/x87_avx2_emit.rs`, mirrored on the admission side in `jit/native_x87.rs`); AM is
     /// re-read at every dispatcher entry through the `alignment_armed` mirror, which both call
     /// sites recompute before they flush; CD/NW are inert storage. `CLTS` writes CR0 with no flush
-    /// at all, and a task switch sets `CR0_TS` with no code flush either -- this rule is existing
+    /// at all, and a task switch sets `CR0_TS` with no code flush either: this rule is existing
     /// policy, stated by existing code, and the two CR0 writers were the inconsistency.
     ///
     /// WP IS NOT HERE FOR CODE TRANSLATION. Code fetch is a read; WP is supervisor *write*
@@ -981,7 +981,7 @@ impl CpuGsw {
     /// within a generation. That invariant still holds with the data-side gate in place: a write
     /// where `new & CR0_PG != 0 && delta & CR0_WP != 0` makes this predicate TRUE, so it takes the
     /// `flush_tlb_and_code_caches` arm, which retires the TLB unconditionally via
-    /// `invalidate_translation_code_caches` -- not the gated `flush_tlb_keep_code_caches` at all.
+    /// `invalidate_translation_code_caches`, not the gated `flush_tlb_keep_code_caches` at all.
     /// A WP change can only reach the gated function when
     /// `new & CR0_PG == 0`, at which point the WP bit governs nothing (WP is a paging-only
     /// protection check) and the DATA-side gate's own `new_cr0 & CR0_PG != 0` test is already false,
@@ -1004,8 +1004,8 @@ impl CpuGsw {
     /// at the foot of `cpu_cr0_flush_test.rs` records this as a non-gate rather than as coverage.
     pub(super) fn flush_tlb_for_cr0_write(&mut self, old_cr0: u32, new_cr0: u32) {
         // A CR0 write inside a reflected trip REFUSES the memo outright (slice1 plan
-        // R2.5, narrowed): unlike a CR3 write or an INVLPG -- both pure TLB/decode
-        // teardowns this module can replay by calling the same function -- a CR0 write
+        // R2.5, narrowed): unlike a CR3 write or an INVLPG (both pure TLB/decode
+        // teardowns this module can replay by calling the same function), a CR0 write
         // can move PE, PG or WP, i.e. the guest's whole addressing mode, and replaying
         // "the flush" would reproduce the cache effect while silently dropping every
         // other consequence the writer's own call site carries. The refusal is sound
@@ -1030,15 +1030,15 @@ impl CpuGsw {
     /// Each line's reason, moved with it:
     ///
     /// * `tlb.invalidate` clears the entry only under the LIVE generation, so
-    ///   `retire_dormant_slot` retires the whole dormant ring slot -- INVLPG's own,
+    ///   `retire_dormant_slot` retires the whole dormant ring slot: INVLPG's own,
     ///   narrower T2 fix. The live slot must NOT be retired: a real INVLPG
     ///   invalidates exactly one page, and
     ///   `invlpg_invalidates_only_the_addressed_page_at_cpl0` pins that an unrelated
     ///   page's TLB entry survives.
     /// * `false` to `invalidate_translation_code_caches`: `translation_pages` must
-    ///   not clear here (F11) -- another linear address's TLB entry can still serve a
+    ///   not clear here (F11): another linear address's TLB entry can still serve a
     ///   code translation with no walk to re-mark it. The decode ring and link graph
-    ///   are still torn down wholesale (pre-existing coarseness, design review D2);
+    ///   are still torn down wholesale (pre-existing coarseness, D2);
     ///   the returned token is discarded, deliberately, for the reason above.
     pub(super) fn apply_invlpg(&mut self, linear: u32) {
         self.tlb.invalidate(linear >> 12);
@@ -1120,13 +1120,13 @@ impl CpuGsw {
     }
 
     /// Drop cached data pointers after the VGA direct-write aperture re-points, without discarding
-    /// decoded or compiled guest code -- and without discarding the RAM mappings, which is what
+    /// decoded or compiled guest code, and without discarding the RAM mappings, which is what
     /// makes this worth having separately from `note_direct_map_changed`.
     ///
     /// SCOPE, and why it is exactly this. There are exactly two callers, and BOTH are gated on a
     /// change in `Vega::direct_write_token`: the port-write path in `bus.rs`, and the INT 10h HLE
     /// seam in `video.rs`. The second is the one a reader should worry about, since it wraps a
-    /// whole mode set -- but an INT 10h mode set routes separately through
+    /// whole mode set, but an INT 10h mode set routes separately through
     /// `Machine::set_vga_mode_with_clear`, which raises the COARSE `mark_direct_map_changed`, and
     /// the run loop tests that first. The token check there is a backstop, not the mode-set path.
     ///
@@ -1134,26 +1134,25 @@ impl CpuGsw {
     /// `0xA0000..0xAFFFF` for a data access. `Bus::direct_page` hands out a video pointer for that
     /// range and for no other; every other page resolves through `direct_ram_bytes`, whose answer
     /// is a function of the RAM lookup table, and that table is rebuilt only on a PCI
-    /// memory-decode change -- which routes through the COARSE `note_direct_map_changed` instead.
+    /// memory-decode change, which routes through the COARSE `note_direct_map_changed` instead.
     /// So an aperture-scoped invalidation is not an approximation of the global one for this cause.
     /// It is equivalent to it.
     ///
     /// Because it is scoped, the machine must NOT advance the global direct-mapping epoch for this
     /// cause, and `Machine::mark_direct_data_map_changed` does not. Advancing it would make every
     /// surviving RAM entry stop matching on the next interpreter probe and would empty the
-    /// direct-page caches on their next insert -- exactly the coarse behaviour this replaces. The
+    /// direct-page caches on their next insert: exactly the coarse behaviour this replaces. The
     /// two halves are one change; neither works alone.
     ///
     /// Aperture pages are reached through the FastMap's own VGA registry and through a
     /// physical-range sweep of the direct-page caches, so a linear alias of the aperture is covered
-    /// however the guest got to it. Emitted native code never reads the epoch table -- its only
-    /// guard against a stale aperture mapping is the entry itself being cleared -- and the registry
+    /// however the guest got to it. Emitted native code never reads the epoch table: its only
+    /// guard against a stale aperture mapping is the entry itself being cleared, and the registry
     /// sweep is what clears it.
     ///
     /// HISTORY: doom moves this token 3,425,430 times in one timedemo, all of them the Mode X map
     /// mask (port 0x3C5, sequencer index 2) cycling planes 0-3. The global form threw away 43.3M
     /// live entries doing it, 88.1% of them RAM whose host pointers had not moved.
-    /// Evidence: `.bench/results/fastmap-wipe-20260803/README.md`.
     /// The APERTURE REMAP edge: what physical 0xA0000-0xBFFFF CONTAINS changed without any
     /// memory write, so the SMC marks cannot have seen it. Read-side register moves (GC read map
     /// select, read mode, odd/even), mode-set arms that never touch the direct-write identity,
@@ -1253,7 +1252,7 @@ impl CpuGsw {
     ///
     /// The fetch cache, and ONLY the fetch cache, is the page-kind guard. `Bus::direct_page`
     /// produces a VIDEO pointer (the mode-13h plane window) for `BusAccessKind::DataRead` and
-    /// `DataWrite` and for nothing else, so a fetch-cache entry can never be a device aperture —
+    /// `DataWrite` and for nothing else, so a fetch-cache entry can never be a device aperture,
     /// while `data_read_pages` / `data_write_pages` can be, and are not cleared by
     /// `note_direct_data_map_changed` in a way compiled blocks observe. An earlier revision fell
     /// back to those two caches; a lane baked against a plane buffer could then have outlived a
@@ -1266,7 +1265,7 @@ impl CpuGsw {
     /// do not move for a given physical page.
     ///
     /// Keyed by linear address, so the physical page is matched by scanning the cache's handful of
-    /// entries — compile time only.
+    /// entries. Compile time only.
     #[cfg(feature = "jit")]
     pub(crate) fn direct_host_bytes(&self, physical: u32, len: u32) -> Option<usize> {
         let page = physical & !0x0fff;
@@ -1329,7 +1328,7 @@ impl CpuGsw {
     /// `smc_lane_reject_width` / `smc_lane_reject_address`, and it makes the choke walk the lane
     /// arrays for every block a byte store touches. Taking it unconditionally would move both
     /// counters and add that walk on the SHIPPED arm, which
-    /// `dev_docs/duke-reprofile-2026-08-19.md` reads as a baseline (`smc_lane_reject_width` "reads
+    /// the 2026-08-19 Duke re-profile reads as a baseline (`smc_lane_reject_width` "reads
     /// 0 today") and compares against the 08-16 census. The off arm must be the pre-slice world
     /// bit for bit, counters included, so it keeps the value-less door it always had.
     /// `the_off_arm_moves_no_rejection_counter_on_a_byte_write` is that pin.
@@ -1337,7 +1336,7 @@ impl CpuGsw {
     /// **TWO ARMS OPEN THE SAME DOOR SINCE L2 ARM 2.** `IZARRAVM_COUNT_LANES=1` puts one-byte
     /// GROUP-2 COUNT lanes in blocks (`count_lane_for`), which need the value-aware door for
     /// exactly the reason the `0x80` immediate lanes do, so the test is an OR rather than a second
-    /// knob replacing the first. The shipped world — both knobs off — is unchanged, and each arm
+    /// knob replacing the first. The shipped world (both knobs off) is unchanged, and each arm
     /// alone still opens the door on its own: the two lane classes are independent levers and
     /// neither may require the other to be measurable.
     ///
@@ -1367,7 +1366,7 @@ impl CpuGsw {
     ) -> bool {
         // THE CALL-OUT WINDOW. `InterpretOne` runs one interpreter instruction with a native block
         // live on the host stack, and that instruction is allowed to STORE. The proof this
-        // function's doc comment rests on -- "no compiled block is mid-execution when this runs" --
+        // function's doc comment rests on ("no compiled block is mid-execution when this runs")
         // is exactly what stops holding there, and the consequence is not academic: the block's
         // own page is code-watched, so a store into it reaches `invalidate_physical_range`, which
         // retires the running block, frees its arena bytes and can hand them to the next
@@ -1383,7 +1382,7 @@ impl CpuGsw {
         // sentence this comment used to end with was wrong: "`note_code_write_hit` reaches here
         // only behind `code_write_watched`" is true of the SIZED store path and false of the BYTE
         // one. `write_linear_u8` routes through `note_code_byte_write_hit` on `changed` alone, by
-        // design, so that a one-byte immediate patch can be absorbed as a lane -- see the two-doors
+        // design, so that a one-byte immediate patch can be absorbed as a lane. See the two-doors
         // note in `write_linear_fragment`. Without the probe here, EVERY changed byte store made
         // from inside a call-out would be recorded, R5 would read a non-empty list, and every
         // byte-storing row on the `InterpretOne` allowlist would RESYNC on every execution and be
@@ -1409,14 +1408,14 @@ impl CpuGsw {
         // threaded. `write_linear_fragment` and `finish_fast_map_write` both compute `watched`
         // for their own same-value elision and then call in here, which asks again. Threading
         // the answer through would mean a second entry point: the BYTE door
-        // (`note_code_byte_write_hit`) genuinely does not know -- that is the whole reason this
-        // probe exists -- so a single `watched: bool` parameter would force the byte path to
+        // (`note_code_byte_write_hit`) genuinely does not know (that is the whole reason this
+        // probe exists), so a single `watched: bool` parameter would force the byte path to
         // compute one on every changed store, including the vast majority that never see a
         // window. That trades a cost confined to one probe per InterpretOne store for a cost on
         // the shipped byte-store path, which is the wrong direction. Revisit only if the loader
         // ladder puts `code_write_watched` in the profile.
         // `jit`-gated with the field it reads (`lib.rs:2414-2415`). Without the backend there are
-        // no native blocks, so no call-out window can be open and this branch is dead -- but it
+        // no native blocks, so no call-out window can be open and this branch is dead, but it
         // was not gated, and `cargo check --no-default-features` did not compile because of it.
         #[cfg(feature = "jit")]
         if self.deferred_code_writes.is_open() && self.code_write_watched(physical, width) {
@@ -1481,11 +1480,11 @@ impl CpuGsw {
         // unmarked code never gets, because the ring's soundness rests on the invariant that NO
         // live decode line survives an edit to the structures its translation depended on. A page
         // table holds no code, so this can never overlap the `range_hits_code` branch below on a
-        // real guest. `clear_translation_marks: false` -- this write did not flush the TLB before
+        // real guest. `clear_translation_marks: false`: this write did not flush the TLB before
         // T2, so clearing the bitmap here would leave a future TLB-hit translation's line
         // unprotected (F11); the marks stay set, which only costs a future retire that would have
         // fired anyway. `retire_ring`'s call inside DOES retire both `Tlb` generations now (design
-        // T2, review D2): this arm renumbers ring slots exactly like every other wholesale cause,
+        // T2, D2): this arm renumbers ring slots exactly like every other wholesale cause,
         // and the TLB's per-slot generations must retire with it or a stale generation would
         // survive under the wrong directory.
         if self
@@ -1518,14 +1517,14 @@ impl CpuGsw {
             invalidated = true;
             // The demoted-call-out map, at the second of the two doors. It has to be BOTH because
             // it outlives blocks: a demotion retires its block, so an overwrite that arrives later
-            // often reaches only this one -- the interpreter is still running that instruction, so
+            // often reaches only this one: the interpreter is still running that instruction, so
             // its decode line is live even though its block is gone.
             //
             // And it has to be HERE and not at the top of this function, which is where it was
             // written first: that is the door EVERY changed byte store takes, watched or not, and
             // a `retain` over the map's sixty entries on each of several million stores is not a
             // probe, it is a scan. MEASURED on the tombraid loader, four interleaved pairs of the
-            // two placements, min wall 8.075 s against 7.007 s -- 1.15x, on a host loaded enough
+            // two placements, min wall 8.075 s against 7.007 s, 1.15x, on a host loaded enough
             // that both arms ran a second above their quiet-host figures, which interleaving is
             // what controls for. Both branches it now sits in have already established that the
             // write touches code, which is a tiny fraction of stores.
@@ -1565,10 +1564,10 @@ impl CpuGsw {
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
                     // `false`: an SMC store does not flush the TLB, so `translation_pages` must
-                    // stay set (F11) -- the ring's slots are still retired below via this same
+                    // stay set (F11): the ring's slots are still retired below via this same
                     // call, only the bitmap survives. SMC has no bearing on any linear->physical
                     // map, but `retire_ring` renumbers ring slots regardless of cause (design T2,
-                    // review D2), so the `Tlb`'s per-slot generations must retire here too or a
+                    // D2), so the `Tlb`'s per-slot generations must retire here too or a
                     // stale generation would survive under the wrong directory after the next
                     // `MOV CR3` reoccupies this slot.
                     let retired = self.decode_cache.invalidate_and_clear_code_marks(false);
@@ -1614,21 +1613,21 @@ impl CpuGsw {
         {
             trace.record(physical, width, pre, action);
         }
-        // The reflected-call memo's code watch (slice1 plan R2.4 / BLOCKING finding 4).
+        // The reflected-call memo's code watch (slice1 plan R2.4).
         //
         // `invalidated` is true iff this write hit a compiled block, a cached decode line
-        // or a marked translation page -- i.e. iff it touched CODE the CPU had cached. Any
+        // or a marked translation page, i.e. iff it touched CODE the CPU had cached. Any
         // such write retires EVERY memo, not merely the ones whose own trip fetched from
         // the written range.
         //
         // **Why the whole cache and not a range overlap**, which is what the plan asked
         // for. A per-memo page set has to be COMPLETE or the watch has a hole in it, and
         // the only seam that sees every instruction of a trip is the interpreter's retire
-        // path -- which means forcing the interpreter for every journaled trip. Measured on
+        // path, which means forcing the interpreter for every journaled trip. Measured on
         // `tyrian-specs-586` (2026-09-03), that forcing cost the row 99.4% interpretation
         // in one shape and livelocked the learn cycle in another (a journal trip opens
         // mid-batch, the forcing only takes effect at the next batch entry, and the trip
-        // is then refused as incomplete, resetting the key -- 362,795 times, zero learns).
+        // is then refused as incomplete, resetting the key, 362,795 times, zero learns).
         // Retiring the whole cache is STRICTLY MORE CONSERVATIVE than a range overlap,
         // costs nothing on any path (`invalidated` is already computed), needs no page set,
         // no completeness proof and no backend toggle, and leaves the soundness argument
@@ -1742,7 +1741,7 @@ impl CpuGsw {
     /// TWO CALLERS, and the second is why this is a function. The interpreter reaches it through
     /// `begin_instruction`, once per instruction, which is where it has always lived. An
     /// `InterpretOne` call-out reaches it directly, at the END of its step, because the slot after
-    /// it is NATIVE and will never call `begin_instruction` -- so without this the record would
+    /// it is NATIVE and will never call `begin_instruction`, so without this the record would
     /// accumulate across the rest of the block and the prefetch invalidation below would run at
     /// the first interpreted instruction AFTER the block instead of at the next slot.
     ///
@@ -1781,8 +1780,8 @@ impl CpuGsw {
     /// for implicit stack references" is controlled by SS.B, independent of
     /// operand size, gate size, or CS's D bit). Real mode and V86 always load SS
     /// through `load_segment_real`/`load_segment_real_mode`, both of which stamp
-    /// `default_size_32: false` -- the real-mode load preserves the cached LIMIT
-    /// (unreal mode) but deliberately not the B bit -- so THIS query reads 16-bit
+    /// `default_size_32: false`: the real-mode load preserves the cached LIMIT
+    /// (unreal mode) but deliberately not the B bit, so THIS query reads 16-bit
     /// in every mode without a mode test.
     ///
     /// That is a statement about SS here, not about the field generally:
@@ -1800,13 +1799,13 @@ impl CpuGsw {
         self.registers.segment(SegmentIndex::Ss).default_size_32
     }
 
-    /// True while executing ring-0 protected-mode code that is not a V86 task —
+    /// True while executing ring-0 protected-mode code that is not a V86 task,
     /// i.e., inside a V86 monitor (TOKAEMM). The machine defers deferred HLE
     /// interrupt servicing (`handle_int10`/`handle_int13`/…, which assume a
     /// real-mode INT frame at SS:SP) while this holds, so the HLE runs only once
     /// the monitor has reflected the INT back into the V86 guest.
     ///
-    /// ASSUMPTION: today "ring-0 PM" is *only* the TOKAEMM monitor — every stock
+    /// ASSUMPTION: today "ring-0 PM" is *only* the TOKAEMM monitor: every stock
     /// HLE-served BIOS INT (10h–1Ah) is issued from real mode, so this reads false
     /// there. A future protected-mode guest that legitimately issued an HLE INT at
     /// CPL 0 would have it deferred until it next left ring-0 PM; revisit this gate
@@ -1924,10 +1923,10 @@ impl CpuGsw {
         // `fast_map_population_enabled()` (memory.rs) depends on `mode()`: a live switch INTO an
         // Accurate persona must stop the interpreter's FastMap serve path from probing at all, not
         // merely stop it from populating further. Without this refresh, `fast_map_serve_enabled`
-        // stays stuck at whatever it was on the PREVIOUS persona -- on a switch away from an
+        // stays stuck at whatever it was on the PREVIOUS persona: on a switch away from an
         // Approximate persona this both reinstates the guaranteed-miss preamble cost the serve
         // gate exists to avoid, and lets already-live FastMap entries keep serving under a persona
-        // that must never take this path (both found by adversarial review of the lever-1 slice).
+        // that must never take this path (both found during the lever-1 slice).
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
@@ -2182,7 +2181,7 @@ impl CpuGsw {
         }
     }
 
-    /// Whether EITHER code-watch table holds an entry for this physical address's page — the
+    /// Whether EITHER code-watch table holds an entry for this physical address's page: the
     /// value of the fast-map `PAGE_WATCHED` bit at fill time (watched-page-bit design D2).
     /// Exists under every cfg (the interpreter fast map fills on all builds); reads false where
     /// a watch type is compiled out.
@@ -2275,8 +2274,8 @@ impl CpuGsw {
         self.jit_direct.note_watch_sweep_cleared(cleared);
     }
 
-    /// Slice 0 of the watched-page-bit design (`dev_docs/2026-08-06-watched-page-bit-design.md`
-    /// D6): unwatched <-> watched page-edge rates for both code-watch tables — the design's
+    /// Slice 0 of the watched-page-bit design
+    /// (D6): unwatched <-> watched page-edge rates for both code-watch tables, the design's
     /// go/no-go instrument. Counters live on the watch types themselves so nothing on the store
     /// or interpreter hot paths moves; collection here is a cold per-run read.
     pub fn code_watch_edge_counters(&self) -> CodeWatchEdgeCounters {
@@ -2300,7 +2299,7 @@ impl CpuGsw {
         counters
     }
 
-    /// Test-only sticky mark that routes through the SAME edge choke production uses — mark
+    /// Test-only sticky mark that routes through the SAME edge choke production uses: mark
     /// plus synchronous E1 sweep (design H7). Fixtures must use this, never
     /// `decode_cache.mark_code_range` directly: a bare mark leaves the edge pending, which the
     /// next mark's debug assertion catches, and a fixture that never swept would exercise a
@@ -2353,8 +2352,8 @@ impl CpuGsw {
     ///
     /// **Derived from the LIVE mode, never baked** (F8): the poll skip is unavailable in V86
     /// (`direct.rs`'s `permission.is_none()` decline and `poll_skip_eligible`'s V86 reject), so
-    /// a certified iteration is real-mode or protected `CPL<=IOPL` and the V86 row -- the one
-    /// the design's own §2 arithmetic used -- is exactly the row this path never takes.
+    /// a certified iteration is real-mode or protected `CPL<=IOPL` and the V86 row (the one
+    /// the design's own §2 arithmetic used) is exactly the row this path never takes.
     ///
     /// The `Memory` family has no port slot and is returned unchanged in both epochs.
     #[cfg(feature = "jit")]
@@ -2451,9 +2450,9 @@ impl CpuGsw {
 
     /// True while the reflected-call memo needs the INTERPRETER for the next batch (plan
     /// section 4.2: the batch loop owns the toggle, never the call-out). A journaled trip's
-    /// write set is only complete under the interpreter -- a compiled block's stores go
+    /// write set is only complete under the interpreter: a compiled block's stores go
     /// through the store-stub pad and are bulk-charged at block exit, reaching no journal
-    /// seam -- so the learn cycle's two journaled trips, and any audit trip, must run there.
+    /// seam, so the learn cycle's two journaled trips, and any audit trip, must run there.
     #[cfg(feature = "reflected-call-memo")]
     pub fn reflected_call_wants_interpreter(&self) -> bool {
         self.reflected_call
@@ -2473,7 +2472,7 @@ impl CpuGsw {
         }
     }
 
-    /// The machine's HLE software-interrupt SERVICE seam (Fable review F2).
+    /// The machine's HLE software-interrupt SERVICE seam.
     #[cfg(feature = "reflected-call-memo")]
     pub fn reflected_call_note_soft_int_serviced(&mut self) {
         crate::reflected_call_memo::note_soft_int_serviced(self);
@@ -2482,14 +2481,14 @@ impl CpuGsw {
     /// The reflected-call memo's CODE-MARK EPOCH: `perf.code_invalidations`.
     ///
     /// The memo's code watch rests on its trip's code pages staying MARKED in the decode
-    /// cache -- marks are what route a guest write into `note_code_write_inner` at all,
+    /// cache: marks are what route a guest write into `note_code_write_inner` at all,
     /// which is where the retire lives. Marks are cleared WHOLESALE by
     /// `DecodeCache::retire_ring`, and every CPU-side door that reaches it
     /// (`invalidate_code_caches`, `invalidate_translation_code_caches`,
     /// `flush_tlb_and_code_caches_for_cr3_write`'s R3 take arm, and both wholesale arms of
     /// `note_code_write_inner`) bumps this counter on its way there. So "this counter has
     /// not moved" implies "no wholesale clear has happened", which is exactly the
-    /// condition the write-hit retire needs -- and it is answered with a field the CPU
+    /// condition the write-hit retire needs, and it is answered with a field the CPU
     /// already keeps, adding NOTHING to `CpuGsw`'s layout or to any hot path.
     ///
     /// It is a strict SUPERSET of the wholesale clears: the narrow-SMC-kill arm bumps it
@@ -2509,7 +2508,7 @@ impl CpuGsw {
     /// It is set BEFORE each instruction runs (`cycle_no_interrupt_check_with_budget`
     /// zeroes it for a fresh first instruction; `run_straight_line` assigns the run
     /// total before every continuation), so at the `INT` asking it EXCLUDES that
-    /// `INT`'s own charge -- which is why `reflected_call_gate` holds a margin back
+    /// `INT`'s own charge, which is why `reflected_call_gate` holds a margin back
     /// rather than treating this as exact.
     #[cfg(feature = "reflected-call-memo")]
     pub(crate) fn reflected_call_run_core_clocks(&self, committed: &CommittedCore) -> u64 {
@@ -2521,7 +2520,7 @@ impl CpuGsw {
     /// assign the whole architectural EFLAGS word from the memo. `materialize_flags`
     /// would be wrong here: it writes the OLD flags into the base that is about to be
     /// overwritten, and leaving the descriptor standing would construct a settled base
-    /// with a live descriptor over it -- the state `CpuGsw::settled`'s doc warns is
+    /// with a live descriptor over it, the state `CpuGsw::settled`'s doc warns is
     /// produced by no execution path.
     #[cfg(feature = "reflected-call-memo")]
     pub(crate) fn clear_pending_flags(&mut self) {
@@ -2541,15 +2540,15 @@ impl CpuGsw {
     /// from (a recorded trip instead of a projected poll span) and in what it does
     /// NOT bump (`poll_skip_spans`/`poll_skip_iterations` belong to the poll skip).
     ///
-    /// The raw total goes through the SAME remainder-carry scaler -- `scaled = raw *
-    /// num + timing_rem`, charge `scaled / den`, keep `scaled % den` -- which is the
+    /// The raw total goes through the SAME remainder-carry scaler: `scaled = raw *
+    /// num + timing_rem`, charge `scaled / den`, keep `scaled % den`, which is the
     /// whole reason the memo records RAW clocks rather than a charged delta: the
     /// carry telescopes, so charging the raw total here leaves `elapsed_clocks` AND
     /// `timing_rem` exactly where the real trip left them, and the PIT sees the same
     /// clock stream (slice1 plan section 6, R2.2/R2.15).
     ///
     /// `None` on overflow, PROPAGATED as a fall-through by the caller and never
-    /// unwrapped -- `poll_skip_core_projection`'s own `None` contract (R2.15 trap 3).
+    /// unwrapped: `poll_skip_core_projection`'s own `None` contract (R2.15 trap 3).
     /// Retired-instruction counts are the caller's business: unlike a poll skip, an
     /// answered trip's instructions are charged to `perf.instructions` by the answer
     /// itself, because the guest DID advance past them.
@@ -2700,13 +2699,13 @@ impl CpuGsw {
 
     /// Whether the SS-load shape measurement is being taken at all.
     ///
-    /// GATED with the barrier census since the S4 review round. The pair of counters behind it
+    /// GATED with the barrier census since S4. The pair of counters behind it
     /// sits in two INTERPRETER arms and is read on census legs only, which is the same bargain
     /// every other diagnostic on a hot path takes here; before the gate, `0x8e` paid a segment
     /// compare and `0x17` an unconditional record read on every execution, in every build.
     ///
     /// The measurement itself is answered: the tombraid loader phase split 484,385 same-record
-    /// against 488,498 record-moving, which is what design review 10.1 M5 asked for and what the
+    /// against 488,498 record-moving, which is what 10.1 M5 asked for and what the
     /// two SS call-out rows were built on. It stays because the ladder still reads it, not
     /// because anything is waiting on it.
     #[inline]
@@ -2743,7 +2742,7 @@ impl CpuGsw {
         {
             let mut snapshot = self.jit_direct.stall_snapshot();
             // L8's far-CALL ledger is a `CpuGsw` cell written by emitted code through R15, not a
-            // JIT-frame lane folded in per exit -- see `jit::direct::far_call_ledger_offset`. It
+            // JIT-frame lane folded in per exit. See `jit::direct::far_call_ledger_offset`. It
             // is monotonic, so reading it here IS the ledger; nothing drains it.
             snapshot.far_call_native = self.far_call_ledger.0;
             snapshot
@@ -2852,9 +2851,7 @@ impl CpuGsw {
         self.jit_direct.smc_census_snapshot()
     }
 
-    /// Slice 0 of the reflected-call HLE design's trip-shape instrument
-    /// (dev_docs/2026-09-03-reflected-call-hle-design.md /
-    /// dev_docs/2026-09-03-reflected-call-hle-review.md). `None` when the
+    /// Slice 0 of the reflected-call HLE design's trip-shape instrument. `None` when the
     /// feature is not built in or the run never armed
     /// `IZARRAVM_REFLECTED_CALL_DIAGNOSTIC`.
     #[cfg(feature = "reflected-call-diagnostic")]
@@ -2883,13 +2880,13 @@ impl CpuGsw {
 
     /// Which of Intel's four I/O privilege columns the NEXT `IN`/`OUT` executes in
     /// (`crate::PortIoPrivMode`). Derived live, once per port access, from exactly the three bits
-    /// `check_io_permission` derives its own early return from -- CR0.PE, EFLAGS.VM and
-    /// `cpl <= iopl` -- so the column that pays for a bitmap consult is by construction the
+    /// `check_io_permission` derives its own early return from: CR0.PE, EFLAGS.VM and
+    /// `cpl <= iopl`, so the column that pays for a bitmap consult is by construction the
     /// column that performs one.
     ///
     /// NOT resolvable at JIT compile time, which is why every port charge in the tree is applied
     /// at the call-out and never baked into a block's `raw_clocks`: `jit_mode_key` carries CR0.PE
-    /// and EFLAGS.VM (bits 1 and 2), so it separates `Real` / `V86` / protected -- but it carries
+    /// and EFLAGS.VM (bits 1 and 2), so it separates `Real` / `V86` / protected, but it carries
     /// neither CPL nor IOPL, so a protected block admitted under one mode key spans both
     /// `ProtectedPrivileged` and `ProtectedUnprivileged` and the two differ by 17 clocks on `OUT`.
     /// The call-out sites already return their charge as a runtime `i64`, so this costs nothing
@@ -3322,7 +3319,7 @@ impl CpuGsw {
         let mut v = value & mask;
         // Seeded ONLY for RCL/RCR, the two ops that read the carry IN. Every other arm assigns
         // `cf` on its first iteration and `count` is at least 1 here, so the seed those ops see is
-        // dead -- and `flag(FLAG_CF)` is a full materialisation through the pending descriptor,
+        // dead, and `flag(FLAG_CF)` is a full materialisation through the pending descriptor,
         // not a bit test, which is what made paying for it on every SHL/SHR/SAR/ROL/ROR worth
         // removing.
         let mut cf = matches!(op, 2 | 3) && self.flag(FLAG_CF);
