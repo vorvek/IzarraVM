@@ -124,7 +124,8 @@ By default, the C: drive, `cmos.bin`, and `izarravm.conf` are in the
 `~/.izarravm/screenshots`. Thus the program writes nothing into the working
 directory. Use `--portable` to keep the C: drive, `cmos.bin`, and
 `izarravm.conf` beside the executable. Controller profiles and screenshots
-stay in the application state directory.
+stay in the application state directory. `--c-drive` changes only the C:
+drive. The two files stay where they are.
 
 ## Optional MT-32 and Glide files
 

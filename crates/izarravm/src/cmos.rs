@@ -55,9 +55,9 @@ fn from_offset(now: OffsetDateTime) -> SeedTime {
     }
 }
 
-/// Path to the persisted CMOS image, beside `izarravm.conf`.
-pub fn cmos_path(c_root: &Path) -> PathBuf {
-    c_root.parent().unwrap_or(c_root).join("cmos.bin")
+/// Path to the persisted CMOS image in the settings folder, beside `izarravm.conf`.
+pub fn cmos_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("cmos.bin")
 }
 
 /// The hardware settings a command-line flag asked for THIS run, for the
@@ -125,11 +125,11 @@ pub struct RtcSetup {
 }
 
 impl RtcSetup {
-    /// Read host local time and resolve the cmos.bin path beside the C: root.
-    pub fn from_c_root(c_root: &Path) -> Self {
+    /// Read host local time and resolve the cmos.bin path in the settings folder.
+    pub fn from_config_dir(config_dir: &Path) -> Self {
         Self {
             seed: read_host_time(),
-            cmos_path: cmos_path(c_root),
+            cmos_path: cmos_path(config_dir),
             requested: RequestedHardware::default(),
         }
     }

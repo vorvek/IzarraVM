@@ -97,7 +97,7 @@ fn test_spec(scratch: &TestScratch) -> SessionSpec {
         glide_force_point_sampling: false,
         glide_workers: None,
         sink: None,
-        rtc_setup: crate::cmos::RtcSetup::from_c_root(scratch.path()),
+        rtc_setup: crate::cmos::RtcSetup::from_config_dir(scratch.path()),
         gain: SharedGain::new(1.0),
         finalization_probe: None,
         raster_pool_probe: None,

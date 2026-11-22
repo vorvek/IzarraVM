@@ -56,10 +56,9 @@ fn wrong_size_file_is_treated_as_absent() {
 }
 
 #[test]
-fn cmos_path_sits_beside_c_root() {
-    let c_root = PathBuf::from("/home/user/.izarravm/c_drive");
+fn cmos_path_is_in_the_settings_folder() {
     assert_eq!(
-        cmos_path(&c_root),
+        cmos_path(&PathBuf::from("/home/user/.izarravm")),
         PathBuf::from("/home/user/.izarravm/cmos.bin")
     );
 }
@@ -74,7 +73,7 @@ fn flags_set_the_machine_when_there_is_no_saved_cmos() {
     let c_root = dir.join("c_drive");
     std::fs::create_dir_all(&c_root).unwrap();
 
-    let mut setup = RtcSetup::from_c_root(&c_root);
+    let mut setup = RtcSetup::from_config_dir(&c_root);
     setup.requested = RequestedHardware {
         cpu: Some(GswMode::Gsw486),
         sb_irq: Some(SbIrq::I5),
@@ -134,7 +133,7 @@ fn a_saved_cmos_overrides_the_flags_and_every_ignored_one_is_named() {
 
     // Now start it again asking for something else, plus one flag (DMA 3) that
     // happens to match what was saved.
-    let mut setup = RtcSetup::from_c_root(&c_root);
+    let mut setup = RtcSetup::from_config_dir(&c_root);
     setup.requested = RequestedHardware {
         cpu: Some(GswMode::Gsw386Slow),
         sb_irq: Some(SbIrq::I5),
