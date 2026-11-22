@@ -72,6 +72,8 @@ pub const GPREFLCT_COM: &[u8] = include_bytes!("../roms/dos/gpreflct.com");
 pub const GPREFLCT_COM_SOURCE: &str = include_str!("../roms/dos/gpreflct.asm");
 pub const GPEMUL_COM: &[u8] = include_bytes!("../roms/dos/gpemul.com");
 pub const GPEMUL_COM_SOURCE: &str = include_str!("../roms/dos/gpemul.asm");
+pub const CACHEOP_COM: &[u8] = include_bytes!("../roms/dos/cacheop.com");
+pub const CACHEOP_COM_SOURCE: &str = include_str!("../roms/dos/cacheop.asm");
 pub const GPSTORM_COM: &[u8] = include_bytes!("../roms/dos/gpstorm.com");
 pub const GPSTORM_COM_SOURCE: &str = include_str!("../roms/dos/gpstorm.asm");
 pub const NOINTA_COM: &[u8] = include_bytes!("../roms/dos/nointa.com");
@@ -399,6 +401,13 @@ pub fn gpreflct_com() -> &'static [u8] {
 /// instead of reflecting a fault. Signals 0xA5 / 0xEn.
 pub fn gpemul_com() -> &'static [u8] {
     GPEMUL_COM
+}
+
+/// The V86 cache-flush fixture: runs WBINVD, INVD and prefixed forms from V86
+/// (all #GP at CPL 3 on a 486 or later) and verifies the monitor emulates them
+/// and resumes past each instruction. Signals 0xA5 / 0xEn.
+pub fn cacheop_com() -> &'static [u8] {
+    CACHEOP_COM
 }
 
 /// The ring-0 #GP diagnostic fixture: a minimal VCPI client whose PM->V86

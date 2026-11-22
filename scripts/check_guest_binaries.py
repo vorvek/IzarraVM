@@ -94,7 +94,7 @@ def floppy(path: str, stage2: str) -> Recipe:
 
 
 DOS_TOOLS = (
-    "cdaudio cdprot cdtest echo emmprobe emsfrag emsnone emstest exit42 gpemul "
+    "cacheop cdaudio cdprot cdtest echo emmprobe emsfrag emsnone emstest exit42 gpemul "
     "gpreflct gpstorm gswmode hello hlttest int0drfl int88rmp irq5ip0 isrset "
     "loadtest mark mousegfx mousetst multihlt nointa picstale runner sndctrl "
     "sndmixer sndtst type umbmech umbtest unhalt vcpidet vcpiif vcpilow "

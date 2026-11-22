@@ -1173,6 +1173,53 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
+/// INVD and WBINVD are privileged on the 486 and later, so a V86 task gets
+/// #GP(0). The monitor must run a ring-0 WBINVD, step past the instruction
+/// (with or without legal prefixes) and resume the guest. CACHEOP signals
+/// 0xA5 / 0xEn. There is no 386 row: a 386 raises #UD for these opcodes and
+/// the fixture reports 0xE6 there by design.
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_v86_cache_flush_emulation() {
+    for mode in [GswMode::Gsw586, GswMode::Gsw486] {
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nCACHEOP\r\n".to_vec();
+
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        profile.cpu = mode;
+        let mut scenario = TokaEmmScenario::new(
+            "tokaemm-cacheop",
+            profile,
+            vec![
+                ("CONFIG.SYS".to_string(), config),
+                ("AUTOEXEC.BAT".to_string(), autoexec),
+                (
+                    "TOKAEMM.SYS".to_string(),
+                    izarravm_firmware::tokaemm_sys().to_vec(),
+                ),
+                (
+                    "CACHEOP.COM".to_string(),
+                    izarravm_firmware::cacheop_com().to_vec(),
+                ),
+            ],
+        );
+        let machine = &mut scenario.machine;
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "{mode:?}: V86 cache-flush emulation did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
+}
+
 /// A ring-0 #GP inside the monitor itself must end in the monitor's named
 /// diagnostic exit (0xD3), never in a fault storm. GPSTORM is a minimal
 /// VCPI client whose PM->V86 DE0C return frame carries an EIP above
@@ -1757,16 +1804,18 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         })
         .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
     assert!(
-        tokaemm.contains("(23K)"),
-        "TokaEMM should retain only its ~23 KiB low core: code, state, the \
+        tokaemm.contains("(24K)"),
+        "TokaEMM should retain only its ~24 KiB low core: code, state, the \
          8,304-byte TSS and the monitor stack. EMS function 50h once pushed \
          the rounded figure from 23K to 24K; the IOPL-3 rewrite took it back \
          down, because deleting the sensitive-op emulation arms, the vif/vip \
          hold machinery, maybe_deliver and the VCPI boundary EOI release \
          shrank the driver by 800 bytes (24,288 -> 23,488). The later EMS \
          functions brought the file to 23,840 bytes, and function 4Eh \
-         brought it to 24,016 bytes. MEM lists 24,032 bytes, which is 16 \
-         bytes more than the file and is still 23K. Nothing left in \
+         brought it to 24,016 bytes. The V86 INVD/WBINVD emulation and its \
+         prefix scan brought it to 24,224 bytes. MEM lists 24,240 bytes, \
+         which is 16 bytes more than the file and rounds to 24K. The free \
+         conventional figure does not change. Nothing left in \
          the core scales with installed RAM -- all three tables that did are \
          in the system window -- so this figure is now the same on a 64 MB \
          machine and a \
@@ -1784,15 +1833,16 @@ fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
         "MEM /CLASSIFY should report about 598 KiB conventional free (EMS \
          functions 53h and 59h grew the core across the KiB boundary to 598; \
          the sequential ef_map_multi rewrite shrank it back). Function 4Eh \
-         then added 176 resident bytes. Free memory went from 612,864 bytes \
-         to 612,688 bytes, and MEM rounds that to 598.\n{}",
+         then added 176 resident bytes, and the INVD/WBINVD emulation added \
+         208 more. Free memory went from 612,864 bytes to 612,480 bytes, \
+         and MEM rounds that to 598.\n{}",
         screen.text
     );
     // The rounded figure hides small changes. The byte count shows each one.
     assert_eq!(
         free.split_whitespace().nth(3),
-        Some("612,688"),
-        "MEM /CLASSIFY should report 612,688 bytes of free conventional \
+        Some("612,480"),
+        "MEM /CLASSIFY should report 612,480 bytes of free conventional \
          memory. A different count means that a resident item changed \
          size.\n{}",
         screen.text

@@ -2240,9 +2240,27 @@ monitor_body:
     cmp dl, 0xF4                  ; HLT
     je .hlt
     cmp dl, 0x66                  ; operand-size prefix: the 32-bit flag/stack forms
-    je .prefix66
+    je .prefix_scan               ; (.prefix_scan falls back to .prefix66)
     cmp dl, 0x0F                  ; two-byte privileged op (MOV CRn/CLTS/LMSW)
     je .prefix0f
+    cmp dl, 0x26                  ; legal prefixes: a prefixed INVD/WBINVD
+    je .prefix_scan               ; needs the scan. Anything else falls back
+    cmp dl, 0x2E                  ; to the catch-all below.
+    je .prefix_scan
+    cmp dl, 0x36
+    je .prefix_scan
+    cmp dl, 0x3E
+    je .prefix_scan
+    cmp dl, 0x64
+    je .prefix_scan
+    cmp dl, 0x65
+    je .prefix_scan
+    cmp dl, 0x67
+    je .prefix_scan
+    cmp dl, 0xF2
+    je .prefix_scan
+    cmp dl, 0xF3
+    je .prefix_scan
     ; Unhandled #GP: reflect INT 0Dh to the guest IVT, the real-monitor
     ; convention (386MAX INT0D reflects vector 13; JEMM V86_Exc0D reflects
     ; INT 06h by default and vector 13 under its V86EXC0D build option:
@@ -2257,7 +2275,67 @@ monitor_body:
     call reflect_vector
     jmp .done_gp
 
-; ---- 66-prefixed forms. PUSHFD/POPFD/IRETD are IOPL-sensitive in V86 exactly
+; ---- Legal prefixes in front of a two-byte cache op. EAX = linear address of
+; the first byte, DL = that byte (a prefix). Count prefixes. If 0F 08 or 0F 09
+; follows, run WBINVD and step IP past the whole instruction. Up to 13
+; prefixes (15 bytes) are legal. Otherwise fall back to the old path: 66 goes
+; to .prefix66 (DOS16M's o32 LGDT, 66 0F 01 /2, still reflects INT 0Dh
+; there) and every other prefix reflects INT 0Dh as before.
+; A guest IP above 0xFFF0 skips the scan, so the scan never reads past the
+; 64 KiB IP limit.
+; ECX and EBX are scratch. popad restores them.
+.prefix_scan:
+    movzx ecx, word [ebp]
+    cmp ecx, 0xFFF0
+    ja .ps_fallback
+    xor ecx, ecx
+.ps_next:
+    mov bl, [eax+ecx]
+    cmp bl, 0x26
+    je .ps_skip
+    cmp bl, 0x2E
+    je .ps_skip
+    cmp bl, 0x36
+    je .ps_skip
+    cmp bl, 0x3E
+    je .ps_skip
+    cmp bl, 0x64
+    je .ps_skip
+    cmp bl, 0x65
+    je .ps_skip
+    cmp bl, 0x66
+    je .ps_skip
+    cmp bl, 0x67
+    je .ps_skip
+    cmp bl, 0xF2
+    je .ps_skip
+    cmp bl, 0xF3
+    je .ps_skip
+    cmp bl, 0x0F
+    jne .ps_fallback
+    mov bl, [eax+ecx+1]
+    cmp bl, 0x08
+    je .ps_flush
+    cmp bl, 0x09
+    jne .ps_fallback
+.ps_flush:
+    db 0x0F, 0x09                 ; WBINVD (486+), see .op_cache_flush
+    add ecx, 2
+    add [ebp], cx                 ; IP += prefix count + 2
+    jmp .done_gp
+.ps_skip:
+    inc ecx
+    cmp ecx, 14
+    jb .ps_next
+.ps_fallback:
+    cmp dl, 0x66
+    je .prefix66
+    mov ebx, 13                   ; same as the unprefixed catch-all
+    call reflect_vector
+    jmp .done_gp
+
+; ---- 66-prefixed forms. 66 arrives here from .prefix_scan, and only after the
+; scan found no 0F 08/09. PUSHFD/POPFD/IRETD are IOPL-sensitive in V86 exactly
 ; like their 16-bit forms, so at IOPL 3 they too execute for real and cannot
 ; fault here; reaching one is the same monitor bug the unprefixed set reports
 ; (0xD6). The prefix byte is at [eax], the opcode at [eax+1]. Anything else
@@ -2396,8 +2474,9 @@ monitor_body:
 ; reflect: extenders read CR0 through this path during their real-mode-vs-
 ; V86 probe. Restricted to the 386 privileged set that is both reachable and
 ; assembles in this cpu-386 monitor region: the 486/586 members 386MAX also
-; handles (INVD/WBINVD, RDMSR/WRMSR/RDTSC/RDPMC) and the TRn/EISA/SYSROM/DPMI
-; paths are DROPPED: on a throttled 386 those opcodes #UD at the guest
+; handles (RDMSR/WRMSR/RDTSC/RDPMC) and the TRn/EISA/SYSROM/DPMI
+; paths are DROPPED. INVD/WBINVD, with or without legal prefixes, are
+; emulated as a ring-0 WBINVD (see .op_cache_flush and .prefix_scan): on a throttled 386 those opcodes #UD at the guest
 ; level (never reaching here), no proven client executes them in V86, and DR
 ; state is already reachable through VCPI DE08/DE09. Anything outside the set
 ; reflects INT 0Dh like the single-byte catch-all.
@@ -2420,6 +2499,10 @@ monitor_body:
     je .op_mov_dr_r
     cmp bl, 0x01
     je .op_grp7
+    cmp bl, 0x08                  ; INVD
+    je .op_cache_flush
+    cmp bl, 0x09                  ; WBINVD
+    je .op_cache_flush
 .op0f_reflect:
     mov ebx, 13                   ; unemulated 0F: reflect like the catch-all
     call reflect_vector
@@ -2427,6 +2510,20 @@ monitor_body:
 
 .op_clts:                         ; CLTS: clear CR0.TS at ring 0 (real)
     clts
+    add word [ebp], 2
+    jmp .done_gp
+
+; INVD (0F 08) / WBINVD (0F 09). Both are privileged on the 486 and later,
+; so a V86 guest's cache flush #GPs into this monitor. Run a real WBINVD at
+; ring 0 for BOTH forms: an INVD here would drop dirty write-back lines that
+; belong to the monitor and to other clients, so the monitor never runs INVD
+; for a guest. Then step the guest past the two opcode bytes.
+; The 386 persona never reaches this arm: the CPU raises #UD for 0F 08/09 at
+; decode time on a 386, and exc_ud reflects INT 06h.
+; This region assembles as "cpu 386", where NASM rejects the WBINVD
+; mnemonic, so the opcode is written as bytes.
+.op_cache_flush:
+    db 0x0F, 0x09                 ; WBINVD (486+)
     add word [ebp], 2
     jmp .done_gp
 
