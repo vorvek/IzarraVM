@@ -93,3 +93,7 @@ LicenseRef-Sun-G72x-Unrestricted identifies the Sun Microsystems notice on the
 G72x codec sources compiled by libsndfile. Exact component notices are retained
 in the archives and copied into the vendor license directory when their code is
 compiled.
+The Rust crates that the program links are listed with their license texts in
+a file that goes with each binary release. Run
+`cargo about generate --frozen --fail --threshold 0.93 --all-features about.hbs`
+to produce it. CI produces the same file as the "rust-crate-licenses" artifact.
