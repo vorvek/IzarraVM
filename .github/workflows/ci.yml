@@ -244,6 +244,8 @@ jobs:
     env:
       DENY_VERSION: 0.22.0
       DENY_SHA256: 98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786
+      ABOUT_VERSION: 0.9.3
+      ABOUT_SHA256: 3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4
 
     steps:
       - name: Checkout
@@ -274,3 +276,24 @@ jobs:
       # clear.
       - name: Advisories
         run: cargo deny --locked check advisories
+
+      - name: Install cargo-about
+        run: |
+          archive="cargo-about-${ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl --fail --silent --show-error --location --output "$archive"             "https://github.com/EmbarkStudios/cargo-about/releases/download/${ABOUT_VERSION}/${archive}"
+          echo "${ABOUT_SHA256}  ${archive}" | sha256sum --check
+          tar -xzf "$archive" --strip-components=1 -C "$RUNNER_TEMP"
+
+      # --frozen reads only the crate sources that cargo-deny fetched above.
+      # --fail stops the run when a crate's license text is not found, so the
+      # listing never falls back to a generic text without a copyright line.
+      - name: Rust crate licenses
+        run: >-
+          cargo about generate --frozen --fail --threshold 0.93 --all-features
+          about.hbs -o rust-crate-licenses.txt
+
+      - name: Upload the Rust crate licenses
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-crate-licenses
+          path: rust-crate-licenses.txt

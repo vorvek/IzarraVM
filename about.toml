@@ -1,0 +1,26 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
+# cargo-about config for the Rust crate license listing that goes with a
+# binary release. MIT comes before Apache-2.0: for a crate under both, the MIT
+# text of the crate carries its copyright line, and the Apache text does not.
+accepted = [
+    "MIT",
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true

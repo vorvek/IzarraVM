@@ -1,0 +1,13 @@
+Licenses of the Rust crates in IzarraVM
+
+IzarraVM is licensed under GPL-3.0-only (see LICENSE). The crates below are
+third-party code that the program links. Each block gives one license text and
+the crates that use it.
+{{#each licenses}}{{#unless (eq id "GPL-3.0-only")}}
+================================================================================
+{{{name}}} ({{{id}}})
+Used by:
+{{#each used_by}}  {{{crate.name}}} {{{crate.version}}}
+{{/each}}--------------------------------------------------------------------------------
+{{{text}}}
+{{/unless}}{{/each}}
