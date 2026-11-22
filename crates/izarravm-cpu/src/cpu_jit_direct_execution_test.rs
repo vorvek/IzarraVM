@@ -2624,6 +2624,8 @@ fn link_refusal_census_runtime_id_is_written_only_for_static_unbound() {
 #[cfg(feature = "direct-link-refusal-census")]
 #[test]
 fn link_refusal_census_routes_both_segment_write_jcc_arms() {
+    // The successor bar belongs to the baked form, so this test states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     const ENTRY: u32 = 0x300;
     const FALLTHROUGH: u32 = 0x307;
     const TAKEN: u32 = 0x310;
@@ -2716,6 +2718,8 @@ fn link_refusal_census_routes_both_segment_write_jcc_arms() {
 #[cfg(feature = "direct-link-refusal-census")]
 #[test]
 fn link_refusal_census_uses_segment_write_control_targets() {
+    // The successor bar belongs to the baked form, so this test states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     for (entry, target, opcode, label) in [
         (0x400u32, 0x450u32, 0xe9u8, "Jmp"),
         (0x500u32, 0x550u32, 0xe8u8, "Call"),
