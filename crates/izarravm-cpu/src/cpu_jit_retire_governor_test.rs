@@ -1448,6 +1448,8 @@ fn promote_sixteen_masked(cpu: &mut CpuGsw, bus: &mut TestBus) {
 /// Mutant: restoring the baked immediate on the sticky emit path, or leaving `used` unstripped.
 #[test]
 fn live_data_masked_sixteen_bit_load_runs_both_layouts() {
+    // This test drives the governor promotion, which belongs to the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     for armed in [true, false] {
         let _check = force_entry_check(armed);
         let _guard = force_arm(SegmentRetireGovernor::Cap);
@@ -1509,6 +1511,8 @@ fn live_data_masked_sixteen_bit_load_runs_both_layouts() {
 /// Mutant: live_data read missing from link_source_declined, so the edge re-forms.
 #[test]
 fn live_data_strict_sixteen_bit_load_is_a_leaf() {
+    // This test drives the governor promotion, which belongs to the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     for armed in [true, false] {
         let _check = force_entry_check(armed);
         let _guard = force_arm(SegmentRetireGovernor::Cap);
@@ -2000,6 +2004,8 @@ fn live_data_pm16_store_live_loads_limit_and_access() {
 /// 16-bit `mov bx, ds` still refuses when DS's selector moves, sticky or not.
 #[test]
 fn sixteen_bit_mov_reg_sreg_keeps_the_selector_pin() {
+    // Arm 0 is the baked form: the selector is a pin and the entry refuses.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let _guard = force_arm(SegmentRetireGovernor::Cap);
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize..ENTRY as usize + 2].copy_from_slice(&[0x8c, 0xdb]);
@@ -2031,6 +2037,30 @@ fn sixteen_bit_mov_reg_sreg_keeps_the_selector_pin() {
         0,
         "a selector pin keeps DS in used even if the key later promotes"
     );
+
+    // Arm 2 reads the selector from the CPU state, so the same move runs and sees the new value.
+    jit::direct::set_live_data_segments_for_test(Some(2));
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize..ENTRY as usize + 2].copy_from_slice(&[0x8c, 0xdb]);
+    memory[ENTRY as usize + 2..ENTRY as usize + 5].copy_from_slice(&jmp16(ENTRY + 2, DONE));
+    memory[DONE as usize] = 0xf4;
+    let mut bus = super::sixteen_bit::sixteen_bit_bus(memory);
+    let mut cpu = super::sixteen_bit::sixteen_bit_code_cpu(ENTRY);
+    super::sixteen_bit::arm_native_sixteen_bit(&mut cpu, &mut bus, &[0]);
+    super::sixteen_bit::warm_sixteen_bit(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
+    let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+    ds.selector = 0x1234;
+    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+    let block = compile_sixteen(&mut cpu, ENTRY);
+    ds.selector = 0x5678;
+    cpu.registers.set_segment(SegmentIndex::Ds, ds);
+    cpu.set_eip(ENTRY);
+    cpu.registers.set_ebx(0);
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block).unwrap(),
+        "live: mov bx, ds must run when the selector moves"
+    );
+    assert_eq!(cpu.registers.ebx(), 0x5678);
 }
 
 /// `mov ds, ax` then a DS-relative load still ends the block at the load.

@@ -1140,6 +1140,8 @@ fn sixteen_bit_front_bytes(body: &[u8], ds_limit: u32) -> Vec<u8> {
 ))]
 #[test]
 fn a_word_wrapped_byte_access_elides_the_dead_segment_limit_compare() {
+    // The elision is a property of the baked form, so this half states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     // `mov al,[0x200]`: Byte, DS, 16-bit disp16 addressing.
     let byte = sixteen_bit_front_bytes(&[0x8a, 0x06, 0x00, 0x02], 0xffff);
     assert_eq!(
@@ -1160,6 +1162,30 @@ fn a_word_wrapped_byte_access_elides_the_dead_segment_limit_compare() {
         occurrences(&word, &limit_compare(0xfffe)),
         1,
         "Word's compare is LIVE at offset 0xFFFF and must survive"
+    );
+
+    // Arm 2 compares against the limit in the CPU state: `cmp eax,[r15+disp32]`. The compare
+    // takes no immediate, so the immediate form never appears, and the live compare is always
+    // present because the limit is read when the block runs.
+    jit::direct::set_live_data_segments_for_test(Some(2));
+    const LIVE_LIMIT_COMPARE: [u8; 3] = [0x41, 0x3b, 0x87];
+    let byte = sixteen_bit_front_bytes(&[0x8a, 0x06, 0x00, 0x02], 0xffff);
+    assert_eq!(occurrences(&byte, &WORD_WRAP_MASK), 1, "live byte: mask");
+    assert_eq!(
+        occurrences(&byte, &limit_compare(0xffff)),
+        0,
+        "live byte: no immediate compare"
+    );
+    assert_eq!(
+        occurrences(&byte, &LIVE_LIMIT_COMPARE),
+        1,
+        "live byte: one compare against the limit in the CPU state"
+    );
+    let word = sixteen_bit_front_bytes(&[0x8b, 0x06, 0x00, 0x02], 0xffff);
+    assert_eq!(
+        occurrences(&word, &LIVE_LIMIT_COMPARE),
+        1,
+        "live word: one compare against the limit in the CPU state"
     );
 }
 

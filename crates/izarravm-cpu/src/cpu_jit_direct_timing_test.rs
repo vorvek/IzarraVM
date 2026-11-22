@@ -479,6 +479,9 @@ fn imul_mem_case(target: u32) -> Vec<u8> {
 /// `debug_assert` inside `SegmentLayout::descriptor`.
 #[test]
 fn imul_memory_form_declares_its_read_and_its_segment() {
+    // The data_matches half asserts the baked form, so it states arm 0. The live form is
+    // covered by `live_memory_forms_do_not_pin_the_ds_base`.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     const ENTRY: u32 = 0x101;
     const TARGET: u32 = 0x0003_0000;
     let code = imul_mem_case(TARGET);
@@ -543,6 +546,85 @@ fn imul_memory_form_declares_its_read_and_its_segment() {
     );
 }
 
+/// Under arm 2 a real-mode block bakes no data segment. The four memory forms below read through
+/// DS, so each one must stay valid after the guest reloads the DS base, and DS must stay out of
+/// the segments the block pins.
+#[test]
+fn live_memory_forms_do_not_pin_the_ds_base() {
+    const ENTRY: u32 = 0x101;
+    const TARGET: u32 = 0x0003_0000;
+    jit::direct::set_live_data_segments_for_test(Some(2));
+    select_mul_mem_rows(true);
+    let cases: [(&str, Vec<u8>, [u32; 3]); 5] = [
+        ("imul", imul_mem_case(TARGET), [ENTRY, ENTRY + 7, ENTRY + 9]),
+        (
+            "grp3 imul",
+            grp3_imul_mem_case(TARGET),
+            [ENTRY, ENTRY + 6, ENTRY + 8],
+        ),
+        (
+            "grp3 mul",
+            grp3_mul_mem_case(TARGET),
+            [ENTRY, ENTRY + 6, ENTRY + 8],
+        ),
+        (
+            "fldcw",
+            control_word_case(false, TARGET),
+            [ENTRY, ENTRY + 6, ENTRY + 12],
+        ),
+        (
+            "fnstcw",
+            control_word_case(true, TARGET),
+            [ENTRY, ENTRY + 6, ENTRY + 12],
+        ),
+    ];
+    for (label, code, starts) in cases {
+        let mut memory = vec![0; 0x0004_0000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = fresh();
+        make_data_segments_flat(&mut cpu);
+        cpu.registers.eip = ENTRY;
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        decode_fixture(&mut cpu, &mut bus, &starts);
+        map_direct_page(
+            &mut cpu,
+            &mut bus,
+            TARGET,
+            TARGET,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+        let block = install_fixture_block(&mut cpu, ENTRY);
+        assert_eq!(
+            block.span().instructions,
+            3,
+            "{label}: whole block admitted"
+        );
+        let layout = cpu
+            .jit_direct
+            .segment_layout(block.id())
+            .expect("live block layout");
+        assert_eq!(
+            layout.used_for_test() & jit::direct::LIVE_DATA_BITS,
+            0,
+            "{label}: a live block pins no data segment"
+        );
+        let mut reloaded = cpu.registers.segment(SegmentIndex::Ds);
+        reloaded.base = 0x1_0000;
+        cpu.registers.set_segment(SegmentIndex::Ds, reloaded);
+        assert!(
+            cpu.jit_direct
+                .segment_layout(block.id())
+                .expect("live block layout")
+                .data_matches(&cpu),
+            "{label}: reloading DS must not invalidate a live block"
+        );
+    }
+}
+
 /// THE WIDTH REGISTRATION TEST for the x87 control-word pair, and it has to exist because
 /// `raw_bus_clocks` CANNOT see the width. `BusCycle::clocks_for` underscores its width parameter
 /// and returns `2 + wait_states` for Byte, Word and Dword alike, so a word access charged as a
@@ -569,6 +651,9 @@ fn control_word_case(store: bool, target: u32) -> Vec<u8> {
 
 #[test]
 fn control_word_forms_declare_a_word_access_and_their_segment() {
+    // The data_matches half asserts the baked form, so it states arm 0. The live form is
+    // covered by `live_memory_forms_do_not_pin_the_ds_base`.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     const ENTRY: u32 = 0x101;
     const TARGET: u32 = 0x0003_0000;
     for store in [false, true] {
@@ -1260,6 +1345,9 @@ fn grp3_imul_mem_case(target: u32) -> Vec<u8> {
 /// catches a well-meaning edit that adds one by analogy with ImulMem's 9.
 #[test]
 fn grp3_imul_memory_form_declares_its_read_and_its_segment() {
+    // The data_matches half asserts the baked form, so it states arm 0. The live form is
+    // covered by `live_memory_forms_do_not_pin_the_ds_base`.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     const ENTRY: u32 = 0x101;
     const TARGET: u32 = 0x0003_0000;
     let code = grp3_imul_mem_case(TARGET);
@@ -1766,6 +1854,9 @@ fn grp3_mul_mem_case(target: u32) -> Vec<u8> {
 /// that adds one by analogy with `ImulMem`'s 9.
 #[test]
 fn grp3_mul_memory_form_declares_its_read_and_its_segment() {
+    // The data_matches half asserts the baked form, so it states arm 0. The live form is
+    // covered by `live_memory_forms_do_not_pin_the_ds_base`.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     const ENTRY: u32 = 0x101;
     const TARGET: u32 = 0x0003_0000;
     select_mul_mem_rows(true);

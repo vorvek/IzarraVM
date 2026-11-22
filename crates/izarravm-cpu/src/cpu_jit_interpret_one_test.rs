@@ -6893,6 +6893,8 @@ fn a_block_that_resumes_past_the_sti_breaks_the_run_where_the_interpreter_does()
 ))]
 #[test]
 fn segment_writing_callout_block_publishes_no_successors() {
+    // The bar belongs to the baked form, so the first half states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     // mov ax,0x1111; mov fs,ax; inc ax; hlt: the HLT is the barrier, so the block would
     // otherwise publish its fallthrough.
     let (code, starts) = row_program(&[0x8E, 0xE0]);
@@ -6918,6 +6920,20 @@ fn segment_writing_callout_block_publishes_no_successors() {
         cpu.jit_direct.waiting_len_for_test(),
         1,
         "control: and it must queue its fallthrough"
+    );
+
+    // Arm 2: a live block bakes no data segment, so the call-out does not bar its successors.
+    jit::direct::set_live_data_segments_for_test(Some(2));
+    let (code, starts) = row_program(&[0x8E, 0xE0]);
+    let (cpu, _, block) = build_native(&code, &starts);
+    assert!(
+        !block.is_segment_write_block(),
+        "live: a segment-writing call-out must keep the successors of its block"
+    );
+    assert_eq!(
+        cpu.jit_direct.waiting_len_for_test(),
+        1,
+        "live: and it must queue its fallthrough"
     );
 }
 

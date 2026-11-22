@@ -300,6 +300,7 @@ fn native_real_fdiv_uses_each_personas_sourced_tariff() {
 
 #[test]
 fn epoch_two_native_real_divide_forms_retire_without_a_fallback() {
+    // The m64 rows use `m64_native_insns`: the live form needs a second block for the last `mov`.
     for (label, expected_insns, memory) in [
         ("m32 divide", 3, fadd_or_fdiv_m32_program(6)),
         ("m32 reverse divide", 3, fadd_or_fdiv_m32_program(7)),
@@ -309,8 +310,8 @@ fn epoch_two_native_real_divide_forms_retire_without_a_fallback() {
         ("DC destination divide", 5, dc_sti_program(7)),
         ("DE pop reverse divide", 6, de_pop_program(6)),
         ("DE pop divide", 6, de_pop_program(7)),
-        ("m64 divide", 8, m64_arith_program()),
-        ("m64 reverse divide", 8, {
+        ("m64 divide", m64_native_insns(), m64_arith_program()),
+        ("m64 reverse divide", m64_native_insns(), {
             let mut memory = m64_arith_program();
             let modrm = memory
                 .windows(2)
@@ -3002,6 +3003,18 @@ const DATA2: usize = 0x300;
 /// only the low four bytes as an f32) would read garbage instead of 1e300, diverging from the
 /// interpreter immediately. The round-trip FSTP at the end stores that same value back out,
 /// pinning bit-exact preservation end to end.
+/// The native instruction count of `m64_arith_program`. The live form of the six memory operands
+/// (the default) emits 4101 bytes for all eight instructions, which is 5 bytes over the 4096-byte
+/// host page. The recovery search keeps seven, and the last `mov` starts the next block. The baked
+/// form (`IZARRAVM_LIVE_DATA_SEGMENTS=0`) folds a flat base and fits in one page.
+fn m64_native_insns() -> u64 {
+    if jit::direct::live_data_segments_arm() == 0 {
+        8
+    } else {
+        7
+    }
+}
+
 fn m64_arith_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;
@@ -3039,7 +3052,8 @@ fn fld_fadd_fdiv_and_fstp_m64_match_the_interpreter_and_preserve_the_full_range_
             mode,
             m64_arith_program(),
             0x037f,
-            8, // fld, fld, fadd, fdiv, fstp, fstp, fnstsw, mov; hlt never retires natively
+            // fld, fld, fadd, fdiv, fstp, fstp, fnstsw, mov. See `m64_native_insns`.
+            m64_native_insns(),
         );
         assert_eq!(
             f64::from_bits(u64::from_le_bytes(

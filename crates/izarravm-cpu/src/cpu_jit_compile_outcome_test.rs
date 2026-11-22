@@ -1251,32 +1251,53 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
     // `successors == [None, None]` alone would count this block and be wrong.
     let ret = [0x40, 0x41, 0x42, 0xc3, 0x43, 0x44, 0x45];
 
-    for (label, code, offsets, expected) in [
+    for (arm, label, code, offsets, expected) in [
         (
+            0,
             "segment write",
             writes.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
         ),
         (
+            0,
             "segment-writing call-out",
             callout.as_slice(),
             [0, 1, 2, 4, 5, 6].as_slice(),
             1,
         ),
         (
+            0,
             "fallthrough control",
             control.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
         ),
         (
+            0,
             "dynamic terminal control",
             ret.as_slice(),
             [0, 1, 2, 3, 4, 5].as_slice(),
             0,
         ),
+        // Arm 2: a live block that writes data segments keeps its successors, so it is not a
+        // segment-write block.
+        (
+            2,
+            "live segment write",
+            writes.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            0,
+        ),
+        (
+            2,
+            "live segment-writing call-out",
+            callout.as_slice(),
+            [0, 1, 2, 4, 5, 6].as_slice(),
+            0,
+        ),
     ] {
+        jit::direct::set_live_data_segments_for_test(Some(arm));
         let (mut cpu, mut bus) = fixture(code);
         cpu.registers.set_esp(0x1000);
         let addresses: Vec<_> = offsets.iter().map(|offset| ENTRY + offset).collect();
@@ -1296,30 +1317,33 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
         assert_eq!(
             block.is_segment_write_block(),
             expected == 1,
-            "{label}: the derived predicate disagrees with the fixture"
+            "{label} (arm {arm}): the derived predicate disagrees with the fixture"
         );
 
         cpu.registers.eip = ENTRY;
         let ran = cpu
             .try_run_direct_block_for_test(&mut bus, block)
             .expect("fixture block runs");
-        assert!(ran, "{label}: the block must actually be entered");
+        assert!(
+            ran,
+            "{label} (arm {arm}): the block must actually be entered"
+        );
 
         let stalls = cpu.direct_stall_snapshot();
         assert_eq!(
             stalls.segment_write_block_head_entries, expected,
-            "{label}: segment-write head entries"
+            "{label} (arm {arm}): segment-write head entries"
         );
         if expected == 1 {
             assert!(
                 stalls.segment_write_block_head_insns >= 3,
-                "{label}: the instruction lane must carry the block's retired count, got {}",
+                "{label} (arm {arm}): the instruction lane must carry the block's retired count, got {}",
                 stalls.segment_write_block_head_insns
             );
         } else {
             assert_eq!(
                 stalls.segment_write_block_head_insns, 0,
-                "{label}: control must not deposit into the instruction lane"
+                "{label} (arm {arm}): control must not deposit into the instruction lane"
             );
         }
     }
