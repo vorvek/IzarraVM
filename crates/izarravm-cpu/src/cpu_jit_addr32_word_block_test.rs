@@ -1213,6 +1213,66 @@ fn accesses_at_the_top_of_a_sixty_four_k_segment_match_the_interpreter_in_every_
     }
 }
 
+fn ds_mid_page_limit_0(cpu: &mut CpuGsw) {
+    ds_mid_page(cpu);
+    set_limit(cpu, SegmentIndex::Ds, 0);
+}
+
+fn ds_mid_page_limit_1(cpu: &mut CpuGsw) {
+    ds_mid_page(cpu);
+    set_limit(cpu, SegmentIndex::Ds, 1);
+}
+
+fn ds_mid_page_limit_1ffff(cpu: &mut CpuGsw) {
+    ds_mid_page(cpu);
+    set_limit(cpu, SegmentIndex::Ds, 0x1_ffff);
+}
+
+/// One access through a 0x67 `[ebx]` at each width, around a real-mode DS limit of 0, 1 and
+/// 0x1FFFF: at the limit, limit - (bytes - 1) and limit - (bytes - 2). Without a 64K mask the live
+/// check is the 32-bit sequence. The access is native when it ends inside the limit and exits to
+/// the interpreter otherwise.
+///
+/// Catches: a 32-bit live check that misses a limit below the extent, or compares the start and
+/// not the last byte.
+#[test]
+fn dword_address_accesses_at_a_real_mode_limit_match_the_interpreter_in_every_arm() {
+    let _knob = Knob::set(true);
+    let widths: [(&str, &[u8], u32); 3] = [
+        ("byte", &[A32, 0xf6, 0x03, 0x5a], 1),
+        ("word", &[A32, 0x8b, 0x03], 2),
+        ("dword", &[O32, A32, 0x8b, 0x03], 4),
+    ];
+    type Tweak = fn(&mut CpuGsw);
+    let limits: [(u32, Tweak); 3] = [
+        (0, ds_mid_page_limit_0),
+        (1, ds_mid_page_limit_1),
+        (0x1_ffff, ds_mid_page_limit_1ffff),
+    ];
+    for arm in [0u8, 1, 2] {
+        let _arm = ArmKnob::set(arm);
+        for (limit, tweak) in limits {
+            for (name, body, bytes) in widths {
+                let mut offsets = vec![limit];
+                for back in [bytes - 1, bytes.saturating_sub(2)] {
+                    if let Some(offset) = limit.checked_sub(back) {
+                        offsets.push(offset);
+                    }
+                }
+                offsets.dedup();
+                for offset in offsets {
+                    let label = format!("arm {arm} limit {limit:#x} {name} at {offset:#x}");
+                    let case = Case::middle(label, Mode::Real, body)
+                        .gpr(3, offset)
+                        .tweak(tweak);
+                    let fits = offset + bytes - 1 <= limit;
+                    execute(&if fits { case } else { case.exit_at(1) });
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The knob
 // ---------------------------------------------------------------------------------------------
