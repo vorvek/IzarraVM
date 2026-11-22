@@ -559,7 +559,9 @@ pub(super) fn install_boot_memory(memory: &mut Memory, mode: GswMode) -> Result<
     memory.write_u16(0x41c, 0x001e)?;
     memory.write_u16(0x480, 0x001e)?;
     memory.write_u16(0x482, 0x003e)?;
-    memory.write_u8(0x496, 0)?;
+    // The BIOS answers INT 16h AH=09h, 0Ah and 92h as an MF2 keyboard, so the
+    // BDA must say the same: bit 4 is "enhanced keyboard installed".
+    memory.write_u8(0x496, 0x10)?;
     memory.write_u8(0x497, 0)?;
     memory.write_u8(0x43e, 0)?;
     memory.write_u8(0x441, 0)?;

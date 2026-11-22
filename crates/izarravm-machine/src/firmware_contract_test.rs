@@ -306,7 +306,7 @@ fn committed_izarra_bios_reserves_every_machine_patch_window() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BootMemorySnapshot {
     ivt_00_08: Vec<u8>,
     ivt_0a_15: Vec<u8>,
@@ -537,7 +537,11 @@ fn all_constructors_share_the_firmware_boot_memory_snapshot() {
     let new_snapshot = boot_memory_snapshot(&new_machine);
     let boot_snapshot = boot_memory_snapshot(&boot_machine);
     let raw_snapshot = boot_memory_snapshot(&raw_machine);
-    const SNAPSHOT_CRC32: u32 = 0xdfe5_9de9;
+    // Re-pinned: BDA 0x496 bit 4 (enhanced keyboard) is set at boot.
+    const SNAPSHOT_CRC32: u32 = 0xd906_54fa;
+    let mut old_snapshot = raw_snapshot.clone();
+    old_snapshot.bda_after_disk_count[0x496 - 0x476] = 0;
+    assert_eq!(old_snapshot.crc32(), 0xdfe5_9de9, "only byte 0x496 changed");
     assert_eq!(new_snapshot.crc32(), SNAPSHOT_CRC32);
     assert_eq!(boot_snapshot.crc32(), SNAPSHOT_CRC32);
     assert_eq!(raw_snapshot.crc32(), SNAPSHOT_CRC32);
@@ -713,4 +717,13 @@ fn the_tokaemm_image_keeps_room_under_the_16_bit_driver_ceiling() {
          deliberately.",
         image.len()
     );
+}
+
+#[test]
+fn boot_memory_reports_enhanced_keyboard() {
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let raw_machine = Machine::new_raw_program(profile.clone(), &[0xf4]).unwrap();
+    let new_machine = Machine::new(profile, vec![0; BIOS_ROM_SIZE]).unwrap();
+    assert_eq!(raw_machine.memory.read_u8(0x496).unwrap() & 0x10, 0x10);
+    assert_eq!(new_machine.memory.read_u8(0x496).unwrap() & 0x10, 0x10);
 }

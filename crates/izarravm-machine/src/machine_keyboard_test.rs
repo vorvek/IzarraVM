@@ -323,3 +323,138 @@ fn port_92h_reads_back_the_reset_bit_and_the_a20_bit() {
         assert_eq!(value, read, "wrote {written:#04x}");
     }
 }
+
+#[test]
+fn int16_enhanced_read_returns_f11_f12_codes() {
+    assert_eq!(int16_enhanced_read_after(&[0x57, 0xd7]), 0x8500);
+    assert_eq!(int16_enhanced_read_after(&[0x58, 0xd8]), 0x8600);
+}
+
+#[test]
+fn int16_enhanced_read_translates_f11_f12_modifiers() {
+    assert_eq!(int16_enhanced_read_after(&[0x2a, 0x57, 0xd7, 0xaa]), 0x8700);
+    assert_eq!(int16_enhanced_read_after(&[0x2a, 0x58, 0xd8, 0xaa]), 0x8800);
+    assert_eq!(int16_enhanced_read_after(&[0x1d, 0x57, 0xd7, 0x9d]), 0x8900);
+    assert_eq!(int16_enhanced_read_after(&[0x1d, 0x58, 0xd8, 0x9d]), 0x8a00);
+    assert_eq!(int16_enhanced_read_after(&[0x38, 0x57, 0xd7, 0xb8]), 0x8b00);
+    assert_eq!(int16_enhanced_read_after(&[0x38, 0x58, 0xd8, 0xb8]), 0x8c00);
+    assert_eq!(
+        int16_enhanced_read_after(&[0xe0, 0x38, 0x57, 0xd7, 0xe0, 0xb8]),
+        0x8b00
+    );
+    // Alt wins over Ctrl.
+    assert_eq!(
+        int16_enhanced_read_after(&[0x1d, 0x38, 0x57, 0xd7, 0xb8, 0x9d]),
+        0x8b00
+    );
+}
+
+#[test]
+fn int16_legacy_read_discards_f11_f12() {
+    assert_eq!(int16_read_after(&[0x57, 0xd7, 0x1e, 0x9e]), 0x1e61);
+    assert_eq!(
+        int16_read_after(&[0x2a, 0x58, 0xd8, 0xaa, 0x1e, 0x9e]),
+        0x1e61
+    );
+}
+
+/// Stuff `keys` with INT 16h AH=05h, then run AH=01h and AH=11h, saving AX and
+/// the ZF flag of each. Returns (peek AX, peek ZF, enhanced peek AX, enhanced ZF).
+fn int16_stuffed_peek(keys: &[u16]) -> (u16, bool, u16, bool) {
+    let mut prog: Vec<u8> = Vec::new();
+    for key in keys {
+        // mov cx,key; mov ah,5; int 16h
+        prog.extend_from_slice(&[0xb9, *key as u8, (*key >> 8) as u8, 0xb4, 0x05, 0xcd, 0x16]);
+    }
+    // mov ah,1; int 16h; mov [0200h],ax; pushf; pop ax; mov [0202h],ax
+    prog.extend_from_slice(&[
+        0xb4, 0x01, 0xcd, 0x16, 0xa3, 0x00, 0x02, 0x9c, 0x58, 0xa3, 0x02, 0x02,
+    ]);
+    // mov ah,11h; int 16h; mov [0204h],ax; pushf; pop ax; mov [0206h],ax; int 20h
+    prog.extend_from_slice(&[
+        0xb4, 0x11, 0xcd, 0x16, 0xa3, 0x04, 0x02, 0x9c, 0x58, 0xa3, 0x06, 0x02, 0xcd, 0x20,
+    ]);
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &prog).unwrap();
+    machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    let base = u32::from(DOS_LOAD_SEGMENT) << 4;
+    (
+        read_u16(&mut machine, base + 0x200),
+        read_u16(&mut machine, base + 0x202) & 0x40 != 0,
+        read_u16(&mut machine, base + 0x204),
+        read_u16(&mut machine, base + 0x206) & 0x40 != 0,
+    )
+}
+
+#[test]
+fn int16_legacy_peek_removes_f11_f12() {
+    let (peek_ax, peek_zf, enh_ax, enh_zf) = int16_stuffed_peek(&[0x8500, 0x1e61]);
+    assert_eq!(peek_ax, 0x1e61);
+    assert!(!peek_zf);
+    assert_eq!(enh_ax, 0x1e61, "the legacy peek removed 8500h");
+    assert!(!enh_zf);
+
+    let (_, peek_zf, _, enh_zf) = int16_stuffed_peek(&[0x8500]);
+    assert!(peek_zf, "only an extended key: legacy peek reports empty");
+    assert!(enh_zf, "and the buffer is now empty");
+}
+
+#[test]
+fn int16_enhanced_peek_keeps_f11() {
+    // mov cx,8500h; mov ah,5; int 16h; mov ah,11h; int 16h; mov [0200h],ax;
+    // mov ah,10h; int 16h; mov [0202h],ax; int 20h
+    const PROG: [u8; 23] = [
+        0xb9, 0x00, 0x85, 0xb4, 0x05, 0xcd, 0x16, 0xb4, 0x11, 0xcd, 0x16, 0xa3, 0x00, 0x02, 0xb4,
+        0x10, 0xcd, 0x16, 0xa3, 0x02, 0x02, 0xcd, 0x20,
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
+    machine.run_until_halt_or_cycles(1_000_000).unwrap();
+    let base = u32::from(DOS_LOAD_SEGMENT) << 4;
+    assert_eq!(read_u16(&mut machine, base + 0x200), 0x8500);
+    assert_eq!(read_u16(&mut machine, base + 0x202), 0x8500);
+}
+
+#[test]
+fn int16_translates_f1_f10_modifiers() {
+    let cases: [(&[u8], u16); 14] = [
+        (&[0x3b, 0xbb], 0x3b00),
+        (&[0x44, 0xc4], 0x4400),
+        (&[0x2a, 0x3b, 0xbb, 0xaa], 0x5400),
+        (&[0x2a, 0x44, 0xc4, 0xaa], 0x5d00),
+        (&[0x1d, 0x3b, 0xbb, 0x9d], 0x5e00),
+        (&[0x1d, 0x44, 0xc4, 0x9d], 0x6700),
+        (&[0x38, 0x3b, 0xbb, 0xb8], 0x6800),
+        (&[0x38, 0x44, 0xc4, 0xb8], 0x7100),
+        (&[0x36, 0x3f, 0xbf, 0xb6], 0x5800),
+        (&[0xe0, 0x38, 0x3f, 0xbf, 0xe0, 0xb8], 0x6c00),
+        (&[0x1d, 0x38, 0x3b, 0xbb, 0xb8, 0x9d], 0x6800),
+        (&[0x1d, 0x2a, 0x3b, 0xbb, 0xaa, 0x9d], 0x5e00),
+        (&[0x2a, 0x3c, 0xbc, 0xaa], 0x5500),
+        (&[0x2a, 0x43, 0xc3, 0xaa], 0x5c00),
+    ];
+    for (scancodes, expected) in cases {
+        assert_eq!(
+            int16_read_after(scancodes),
+            expected,
+            "AH=00h {scancodes:02x?}"
+        );
+        assert_eq!(
+            int16_enhanced_read_after(scancodes),
+            expected,
+            "AH=10h {scancodes:02x?}"
+        );
+    }
+    assert_eq!(
+        int16_read_after_with_layout(2, &[0x2a, 0x3b, 0xbb, 0xaa]),
+        0x5400,
+        "layout tables do not matter"
+    );
+}
+
+#[test]
+fn int16_gray_arrow_still_differs_between_reads() {
+    let up = [0xe0, 0x48, 0xe0, 0xc8];
+    assert_eq!(int16_enhanced_read_after(&up), 0x48e0);
+    assert_eq!(int16_read_after(&up), 0x4800);
+}
