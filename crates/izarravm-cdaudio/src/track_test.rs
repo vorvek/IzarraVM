@@ -131,18 +131,24 @@ fn the_decode_runs_once_however_many_frames_are_touched() {
 #[test]
 fn dropping_a_track_cancels_its_worker() {
     // Unmounting a disc must not leave a thread decoding it. The worker owns
-    // its own handle on the shared state, so holding a third one here is how
-    // the flag can be read after the track itself is gone.
+    // its own handle on the shared state, so a weak handle taken here goes dead
+    // exactly when the worker has stopped and let go of it.
     let track = DecodedTrack::new(fixture("tone.flac")).unwrap();
     track.frame(0);
     let shared = Arc::clone(&track.shared);
-    assert!(!shared.cancel.load(Ordering::Relaxed));
+    let before = shared.generation.load(Ordering::SeqCst);
+    let weak = Arc::downgrade(&shared);
 
     drop(track);
 
     assert!(
-        shared.cancel.load(Ordering::Relaxed),
+        shared.generation.load(Ordering::SeqCst) > before,
         "the worker was never told to stop"
+    );
+    drop(shared);
+    assert!(
+        wait_for(|| weak.upgrade().is_none()),
+        "the worker never let go of the track"
     );
 }
 
@@ -168,7 +174,7 @@ fn a_file_that_is_not_a_container_is_refused_by_name() {
 }
 
 #[test]
-fn a_third_track_evicts_the_least_recently_touched_finished_one() {
+fn a_third_track_evicts_the_least_recently_touched_one() {
     // A full CD of audio is about 750 MB decoded, and a front-panel play walks
     // the whole disc, so residency has to be bounded. Two is what boundary
     // prefetch needs: the track being played and the one being read ahead.
@@ -178,8 +184,7 @@ fn a_third_track_evicts_the_least_recently_touched_finished_one() {
     a.frame(0);
     b.frame(0);
     // Waiting on `resident_bytes` alone would prove nothing: the buffer is
-    // allocated when the worker starts, so it is non-zero immediately. What
-    // decides which track is evictable is the decode having finished.
+    // allocated when the worker starts, so it is non-zero immediately.
     assert!(wait_for(|| a.frame(a.sectors() - 1).is_some()));
     assert!(wait_for(|| b.frame(b.sectors() - 1).is_some()));
 
@@ -188,7 +193,7 @@ fn a_third_track_evicts_the_least_recently_touched_finished_one() {
 
     assert!(
         wait_for(|| a.resident_bytes() == 0),
-        "the oldest finished track was never evicted"
+        "the oldest track was never evicted"
     );
     assert!(
         b.resident_bytes() > 0,
@@ -265,255 +270,33 @@ fn a_track_without_a_registry_keeps_its_buffer() {
 }
 
 #[test]
-fn a_live_track_is_never_the_one_evicted() {
-    // Taking the buffer from a worker that is still writing does not corrupt
-    // anything (it copies under the same lock and checks the length) but it
-    // leaves that track silent for good, because the publish that would have
-    // filled it finds nothing to write into, and it clears `started` so a
-    // second worker can begin on a file the first is still reading.
-    //
-    // The fixtures decode faster than that race can be arranged, so the state
-    // is built directly: three residents, the oldest still decoding.
-    let registry = Registry::new();
-    let live = registry.track(fixture("tone.wav")).unwrap();
-    let older = registry.track(fixture("tone.ogg")).unwrap();
-    let newer = registry.track(fixture("tone.flac")).unwrap();
-    for track in [&live, &older, &newer] {
-        track.frame(0);
-        // On `finished`, not on the last frame being readable: a worker
-        // publishes its final sectors and only then stores the flag, so a
-        // readable track can still have a worker about to write `true` over the
-        // `false` this test is about to install, which hands the registry a
-        // fourth candidate and evicts whatever it likes.
-        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
-    }
-    {
-        let mut resident = registry.inner.lock().unwrap();
-        resident.clear();
-        for track in [&live, &older, &newer] {
-            let mut filled = track.shared.filled.lock().unwrap();
-            filled.pcm = vec![0u8; AUDIO_FRAME_BYTES];
-            track.shared.finished.store(true, Ordering::SeqCst);
-            resident.push(Arc::clone(&track.shared));
-        }
-        live.shared.finished.store(false, Ordering::SeqCst);
-    }
-
-    registry.evict_excess();
-
-    assert!(
-        live.resident_bytes() > 0,
-        "the track still being decoded was evicted"
-    );
-    assert_eq!(
-        older.resident_bytes(),
-        0,
-        "the oldest finished one survived"
-    );
-}
-
-#[test]
-fn a_backlog_is_cleared_by_the_next_worker_to_finish() {
-    // When a third track starts while the first two are still decoding, nothing
-    // is evictable at that moment. Evicting only at admission would leave the
-    // disc over its bound for the rest of the mount, so a worker asks again on
-    // its way out.
-    //
-    // Built by hand for the same reason as above: the state is reached by
-    // losing a race these fixtures are too small to lose.
-    let registry = Registry::new();
-    let a = registry.track(fixture("tone.wav")).unwrap();
-    let b = registry.track(fixture("tone.ogg")).unwrap();
-    let c = registry.track(fixture("tone.flac")).unwrap();
-    for track in [&a, &b, &c] {
-        track.frame(0);
-        // On `finished` for the same reason as above: a worker still on its way
-        // out would store `true` after the `false` installed below.
-        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
-    }
-    // Three resident with none evictable, and `a` ready to be decoded afresh,
-    // exactly what an admission during two live decodes leaves behind.
-    {
-        let mut resident = registry.inner.lock().unwrap();
-        resident.clear();
-        for track in [&b, &c, &a] {
-            let mut filled = track.shared.filled.lock().unwrap();
-            filled.pcm = vec![0u8; AUDIO_FRAME_BYTES];
-            track.shared.finished.store(false, Ordering::SeqCst);
-            resident.push(Arc::clone(&track.shared));
-        }
-        a.shared.started.store(false, Ordering::SeqCst);
-    }
-    let resident = |registry: &Registry| registry.inner.lock().unwrap().len();
-    assert_eq!(resident(&registry), 3);
-
-    // Touching `a` admits it, which cannot evict anything: nothing is
-    // finished. Only a worker reaching its end can clear the backlog.
-    a.frame(0);
-    assert!(
-        wait_for(|| a.shared.finished.load(Ordering::SeqCst)),
-        "the worker for the admitted track never reached its end"
-    );
-
-    // `a`'s own worker is not the one that can do it: it leaves exactly one
-    // evictable track behind, and the registry never takes the last one: from
-    // here that track is indistinguishable from the one under the play head.
-    registry.evict_excess();
-    assert_eq!(
-        resident(&registry),
-        3,
-        "the only decoded track was taken while two others were still decoding"
-    );
-
-    // The next worker out is. `c` is not a candidate at this point and never
-    // becomes one here; the live comparison is `b` against `a`, and `b` was
-    // touched first, so `b` is the one that goes.
-    b.shared.finished.store(true, Ordering::SeqCst);
-    registry.evict_excess();
-
-    assert!(
-        resident(&registry) <= MAX_RESIDENT,
-        "the backlog outlived the worker that could have cleared it"
-    );
-    assert_eq!(
-        b.resident_bytes(),
-        0,
-        "the backlog was cleared from the wrong end"
-    );
-}
-
-#[test]
-fn a_real_workers_tail_call_is_what_clears_the_backlog() {
-    // The test above hand-drives the flag and calls `evict_excess` itself, which
-    // pins the ORDER a backlog is cleared in but proves nothing about who calls
-    // it. Deleting the body of the worker's tail call leaves that test green.
-    // This one leaves the call in the worker's hands: nothing else here can
-    // reach `evict_excess` after the flag lands.
-    //
-    // Three residents: one finished and idle, one that never finishes, and one
-    // that takes a real worker.
-    let registry = Registry::new();
-    let played = registry.track(fixture("tone.wav")).unwrap();
-    let stuck = registry.track(fixture("tone.ogg")).unwrap();
-    let arriving = registry.track(fixture("tone.flac")).unwrap();
-    for track in [&played, &stuck, &arriving] {
-        track.frame(0);
-        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
-    }
-    {
-        let mut resident = registry.inner.lock().unwrap();
-        resident.clear();
-        for track in [&played, &stuck, &arriving] {
-            let mut filled = track.shared.filled.lock().unwrap();
-            filled.pcm = vec![0u8; AUDIO_FRAME_BYTES];
-            track.shared.finished.store(true, Ordering::SeqCst);
-            resident.push(Arc::clone(&track.shared));
-        }
-        // `stuck` stands in for a worker that has not reached its end, the
-        // reason a backlog exists at all.
-        stuck.shared.finished.store(false, Ordering::SeqCst);
-        // `arriving` is asked for afresh: no readable sector and nothing
-        // started, so its `frame` misses and a real worker is spawned.
-        let mut filled = arriving.shared.filled.lock().unwrap();
-        filled.ready = 0;
-        arriving.shared.finished.store(false, Ordering::SeqCst);
-        arriving.shared.started.store(false, Ordering::SeqCst);
-    }
-    let resident = |registry: &Registry| registry.inner.lock().unwrap().len();
-
-    // The decline, checked with no worker alive so the count cannot be a race:
-    // one evictable track and the registry leaves it alone.
-    registry.evict_excess();
-    assert_eq!(
-        resident(&registry),
-        3,
-        "the last evictable track was taken at admission"
-    );
-    assert!(played.resident_bytes() > 0);
-
-    // Now the real worker. Admission declines again for the same reason (it
-    // still sees only `played`) so the count can only come down once
-    // `arriving` stores its flag, and the tail call is what asks afterwards.
-    arriving.frame(0);
-
-    assert!(
-        wait_for(|| resident(&registry) <= MAX_RESIDENT),
-        "no worker asked again on its way out, so the backlog is permanent"
-    );
-    assert_eq!(
-        played.resident_bytes(),
-        0,
-        "the backlog was cleared from the wrong end"
-    );
-    assert!(
-        stuck.resident_bytes() > 0,
-        "a track still being written into was evicted"
-    );
-    assert!(
-        arriving.resident_bytes() > 0,
-        "the worker evicted the track it had just filled"
-    );
-}
-
-#[test]
-fn the_track_under_the_play_head_survives_an_older_one_that_has_not_flagged_itself() {
-    // The state a two-core runner reaches on its own: one track fully decoded
-    // and being read frame by frame, an older idle one whose worker has
-    // published its last sector but not yet stored `finished`, and a third
-    // arriving from boundary prefetch. Only the played track is a candidate,
-    // and taking it sends the mixer back to a decode from sector 0 in the middle
-    // of a song. Built by hand because reaching it live is a race lost a few
-    // times in a hundred.
-    let registry = Registry::new();
-    let played = registry.track(fixture("tone.wav")).unwrap();
+fn the_track_under_the_play_head_survives_an_idle_older_one() {
+    // Three tracks, one being played and read frame by frame, an older idle one
+    // whose worker is still alive, and a third arriving from boundary prefetch.
+    // The idle one is the least recently touched, so it goes at once, live or
+    // not. The played track must stay: taking it sends the mixer back to a
+    // decode from sector 0 in the middle of a song.
+    let registry = Registry::gated();
     let idle = registry.track(fixture("tone.ogg")).unwrap();
+    let played = registry.track(fixture("tone.wav")).unwrap();
     let arriving = registry.track(fixture("tone.flac")).unwrap();
-    for track in [&played, &idle, &arriving] {
-        track.frame(0);
-        assert!(wait_for(|| track.shared.finished.load(Ordering::SeqCst)));
-    }
-    {
-        let mut resident = registry.inner.lock().unwrap();
-        resident.clear();
-        for track in [&idle, &played, &arriving] {
-            let mut filled = track.shared.filled.lock().unwrap();
-            filled.pcm = vec![0u8; AUDIO_FRAME_BYTES];
-            track.shared.finished.store(true, Ordering::SeqCst);
-            resident.push(Arc::clone(&track.shared));
-        }
-        // `idle` was touched first and is the one whose flag is late; `arriving`
-        // has only just missed, so it is the newest and still decoding.
-        idle.shared.finished.store(false, Ordering::SeqCst);
-        arriving.shared.finished.store(false, Ordering::SeqCst);
-    }
-    // The mixer reads `played`, which is what makes it the most recent.
-    played.shared.last_touch.store(
-        TOUCH_CLOCK.fetch_add(1, Ordering::Relaxed),
-        Ordering::Relaxed,
-    );
+    idle.frame(0);
+    played.frame(0);
+    // The mixer reads the played track, which makes it the most recent.
+    played.frame(0);
 
-    registry.evict_excess();
+    arriving.frame(0);
 
     assert!(
         played.resident_bytes() > 0,
         "the track being played was evicted out from under the mixer"
     );
-    assert!(idle.resident_bytes() > 0, "an unfinished track was evicted");
-
-    // And the backlog is not permanent: the late flag lands and the older track
-    // goes, which is what a worker's tail call does.
-    idle.shared.finished.store(true, Ordering::SeqCst);
-    registry.evict_excess();
-
     assert_eq!(
         idle.resident_bytes(),
         0,
-        "the older track survived its own worker's tail call"
+        "the idle older track kept its buffer"
     );
-    assert!(
-        played.resident_bytes() > 0,
-        "the played track went on the second pass instead"
-    );
+    registry.open_gate();
 }
 
 #[test]
@@ -528,16 +311,12 @@ fn a_track_being_replayed_is_not_the_one_evicted() {
     let other = registry.track(fixture("tone.ogg")).unwrap();
     played.frame(0);
     other.frame(0);
-    // Waited on `finished`, not on the last frame being readable. Those are not
-    // the same instant: a worker publishes its last run of sectors and only then
-    // stores the flag, so a track can read to its end while the registry still
-    // sees it as one a worker is writing into. Waiting on the readable frame
-    // leaves this test's stated precondition (both tracks decoded and idle)
-    // unestablished, and which side of that window `other` was on decided
-    // whether the test found the eviction bug or a passing run.
+    // Waited on `done`, not on the last frame being readable: a worker
+    // publishes its last run of sectors and only then marks itself done, so
+    // this is what establishes that both tracks are decoded and idle.
     for track in [&played, &other] {
         assert!(
-            wait_for(|| track.shared.finished.load(Ordering::SeqCst)),
+            wait_for(|| is_done(track)),
             "a worker never reached its end"
         );
     }
@@ -591,6 +370,14 @@ fn formatting_a_track_does_not_print_its_audio() {
 // Tests for the worker lifetime model. The gated registries hold workers at
 // their start, so a test keeps several alive at once without sleeping.
 
+fn generation_of(track: &DecodedTrack) -> u64 {
+    track.shared.filled.lock().unwrap().generation
+}
+
+fn is_done(track: &DecodedTrack) -> bool {
+    track.shared.filled.lock().unwrap().done
+}
+
 const FIXTURES: [&str; 4] = ["tone.wav", "tone.ogg", "tone.flac", "tone.mp3"];
 
 fn gated_tracks(registry: &Registry, count: usize) -> Vec<DecodedTrack> {
@@ -630,25 +417,227 @@ fn a_stuck_worker_outlives_its_track_until_the_gate_opens() {
     assert!(wait_for(|| registry.live_workers() == 0));
 }
 
-// MUTATION EVIDENCE for residency eviction (2026-08-19, applied by hand, run, restored). Each row
-// names the fixture that caught it; a mutation nobody catches is a fixture bug, not a free pass.
-//
-// | mutation | caught by |
-// |---|---|
-// | `evict_excess`: the last-candidate guard weakened from `evictable < 2` to `evictable < 1`, which is the pre-fix behaviour exactly | `the_track_under_the_play_head_survives_an_older_one_that_has_not_flagged_itself` AND `a_backlog_is_cleared_by_the_next_worker_to_finish` |
-// | `frame`: the `last_touch` store deleted, so recency counts decode starts and not reads | `a_track_being_replayed_is_not_the_one_evicted` |
-// | `decode_worker`: the tail call to `evict_excess` replaced with `let _ = registry;`, so a backlog is never asked about again | `a_real_workers_tail_call_is_what_clears_the_backlog` |
-//
-// The second row is why the first fixture is not the whole net: with the precondition of
-// `a_track_being_replayed_is_not_the_one_evicted` finally established (it now waits on `finished`,
-// not on the last frame being readable) that test no longer races into the eviction bug, so the
-// deterministic fixture above carries it and the replay test keeps the recency rule honest.
-//
-// The third row was a hole this change opened and then closed, which is worth the ledger space.
-// `a_backlog_is_cleared_by_the_next_worker_to_finish` caught that mutation before this change,
-// when it drove the backlog with a real worker. Restructuring it for the guard meant hand-driving
-// the flag and calling `evict_excess` from the test, and a fixture that makes the call itself
-// cannot notice that the worker stopped making it: the mutation ran green, 47 of 47, until
-// `a_real_workers_tail_call_is_what_clears_the_backlog` was written to leave that one call in the
-// worker's hands. Both were run against the mutation in that order, and the second one fails on
-// the full ten-second wait rather than on an assertion, because the backlog simply never clears.
+fn resident_count(tracks: &[DecodedTrack]) -> usize {
+    tracks.iter().filter(|t| t.resident_bytes() > 0).count()
+}
+
+#[test]
+fn a_scan_over_many_tracks_never_holds_more_than_two_buffers() {
+    let registry = Registry::gated();
+    let tracks = gated_tracks(&registry, 6);
+    for (n, track) in tracks.iter().enumerate() {
+        assert!(track.frame(0).is_none());
+        assert!(
+            resident_count(&tracks) <= MAX_RESIDENT,
+            "{} buffers after touching track {n}",
+            resident_count(&tracks)
+        );
+        assert!(
+            registry.live_workers() <= MAX_LIVE_WORKERS,
+            "{} live workers after touching track {n}",
+            registry.live_workers()
+        );
+    }
+    registry.open_gate();
+}
+
+#[test]
+fn workers_return_to_zero_after_a_scan() {
+    let registry = Registry::gated();
+    let tracks = gated_tracks(&registry, 6);
+    for track in &tracks {
+        track.frame(0);
+        assert!(resident_count(&tracks) <= MAX_RESIDENT);
+    }
+    registry.open_gate();
+    assert!(
+        wait_for(|| registry.live_workers() == 0),
+        "{} workers are still alive",
+        registry.live_workers()
+    );
+    assert!(resident_count(&tracks) <= MAX_RESIDENT);
+}
+
+#[test]
+fn switching_tracks_stops_the_old_worker() {
+    let registry = Registry::gated();
+    let tracks = gated_tracks(&registry, 3);
+    for track in &tracks {
+        track.frame(0);
+    }
+    let [a, _b, _c] = &tracks[..] else { panic!() };
+    assert_eq!(a.resident_bytes(), 0, "the oldest track kept its buffer");
+    assert!(
+        wait_for(|| a.shared.live.load(Ordering::SeqCst) == 0),
+        "the worker of the evicted track never stopped"
+    );
+    registry.open_gate();
+}
+
+#[test]
+fn the_spawn_cap_stops_new_threads() {
+    let registry = Registry::gated_stuck();
+    let tracks = gated_tracks(&registry, 6);
+    for track in &tracks[..4] {
+        track.frame(0);
+    }
+    // Evicted workers stay alive here: they are stuck before a cancel check.
+    assert_eq!(registry.live_workers(), MAX_LIVE_WORKERS);
+    let fifth = &tracks[4];
+    assert!(fifth.frame(0).is_none());
+    assert_eq!(
+        fifth.shared.workers.load(Ordering::Relaxed),
+        0,
+        "a worker started over the cap"
+    );
+    assert_eq!(registry.live_workers(), MAX_LIVE_WORKERS);
+
+    registry.open_gate();
+    assert!(wait_for(|| registry.live_workers() < MAX_LIVE_WORKERS));
+    fifth.frame(0);
+    assert_eq!(
+        fifth.shared.workers.load(Ordering::Relaxed),
+        1,
+        "the track never retried after the cap cleared"
+    );
+}
+
+#[test]
+fn dropping_the_disc_stops_every_worker_and_frees_every_buffer() {
+    let registry = Registry::gated();
+    let tracks = gated_tracks(&registry, 2);
+    for track in &tracks {
+        track.frame(0);
+    }
+    assert_eq!(registry.live_workers(), 2);
+    let weak: Vec<_> = tracks.iter().map(|t| Arc::downgrade(&t.shared)).collect();
+    drop(tracks);
+    // The worker holds the last `Arc<Shared>`, so the handle going dead is the
+    // proof that the worker has let go of the buffer.
+    assert!(
+        wait_for(|| weak.iter().all(|w| w.upgrade().is_none())),
+        "a worker still holds its track after the disc was dropped"
+    );
+    assert!(wait_for(|| registry.live_workers() == 0));
+}
+
+#[test]
+fn the_playing_track_and_the_next_survive_a_scan() {
+    // Part a: the mixer touches the playing track, then the prefetch target, on
+    // every tick. The target walks through the rest of the disc and the playing
+    // track keeps its decode.
+    let registry = Registry::gated();
+    let tracks = gated_tracks(&registry, 5);
+    let playing = &tracks[0];
+    playing.frame(0);
+    let generation = generation_of(playing);
+    for target in &tracks[1..] {
+        playing.frame(0);
+        target.frame(0);
+        assert_eq!(
+            generation_of(playing),
+            generation,
+            "the playing track was evicted"
+        );
+        assert!(playing.resident_bytes() > 0);
+    }
+    registry.open_gate();
+
+    // Part b: the head crosses a short track N into the track behind it. One
+    // tick touches P (the last frame it plays), then N (the head track), then
+    // N+1 (the prefetch). P is the oldest of the three and is the one that
+    // goes. N stays, and so does its decode.
+    let registry = Registry::gated();
+    let p = registry.track(fixture("tone.wav")).unwrap();
+    let n = registry.track(fixture("tone.ogg")).unwrap();
+    let after = registry.track(fixture("tone.flac")).unwrap();
+    p.frame(0);
+    n.frame(0);
+    let n_generation = generation_of(&n);
+
+    p.frame(0);
+    n.frame(0);
+    after.frame(0);
+
+    assert_eq!(
+        generation_of(&n),
+        n_generation,
+        "the next track was evicted"
+    );
+    assert!(n.resident_bytes() > 0);
+    assert_eq!(p.resident_bytes(), 0, "the finished track kept its buffer");
+    registry.open_gate();
+}
+
+#[test]
+fn an_evicted_worker_never_writes_into_the_new_buffer() {
+    let registry = Registry::gated();
+    let tracks = gated_tracks(&registry, 3);
+    let a = &tracks[0];
+    a.frame(0);
+    tracks[1].frame(0);
+    tracks[2].frame(0);
+    assert_eq!(a.resident_bytes(), 0, "the oldest track was not evicted");
+    let evicted_generation = generation_of(a);
+    // The same track again: a new worker with a new generation, while the old
+    // one still waits at the gate.
+    a.frame(0);
+    assert!(generation_of(a) >= evicted_generation);
+    registry.open_gate();
+
+    assert!(wait_for(|| a.frame(a.sectors() - 1).is_some()));
+    assert!(wait_for(|| registry.live_workers() == 0));
+    assert_eq!(a.shared.workers.load(Ordering::Relaxed), 2);
+
+    let path = fixture("tone.wav");
+    let info = probe_info(&path).unwrap().unwrap();
+    let mut reference = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
+    crate::decode_into(&path, info, &mut reference, &mut |_, _| {}).unwrap();
+    for index in 0..a.sectors() {
+        let from = index as usize * AUDIO_FRAME_BYTES;
+        assert_eq!(
+            a.frame(index).unwrap()[..],
+            reference[from..from + AUDIO_FRAME_BYTES],
+            "frame {index} differs from a single clean decode"
+        );
+    }
+}
+
+#[test]
+fn a_full_cap_still_evicts_the_old_tracks() {
+    // Four stuck workers: two on tracks that were evicted long ago, two on the
+    // tracks that are resident now. A fifth track starts. It must still push
+    // the least recently touched resident track out, even though it cannot
+    // start a thread, or the old tracks would stay pinned until the stuck
+    // reads return.
+    let registry = Registry::gated_stuck();
+    let tracks = gated_tracks(&registry, 5);
+    let [s1, s2, p, n, q] = &tracks[..] else {
+        panic!()
+    };
+    for track in [s1, s2, p, n] {
+        track.frame(0);
+    }
+    assert_eq!(registry.live_workers(), MAX_LIVE_WORKERS);
+    let p_generation = generation_of(p);
+
+    assert!(q.frame(0).is_none());
+
+    assert_eq!(q.resident_bytes(), 0, "a track over the cap got a buffer");
+    assert_eq!(
+        p.resident_bytes(),
+        0,
+        "the least recent track kept its buffer"
+    );
+    assert!(generation_of(p) > p_generation);
+    assert!(n.resident_bytes() > 0);
+    assert_eq!(registry.live_workers(), MAX_LIVE_WORKERS);
+    assert_eq!(q.shared.workers.load(Ordering::Relaxed), 0);
+
+    registry.open_gate();
+    assert!(wait_for(|| registry.live_workers() < MAX_LIVE_WORKERS));
+    assert!(
+        wait_for(|| q.frame(0).is_some()),
+        "the track never started once the cap cleared"
+    );
+}

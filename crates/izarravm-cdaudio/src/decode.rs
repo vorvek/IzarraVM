@@ -160,6 +160,12 @@ pub fn decode_chunked(
     let mut pairs: Vec<(i32, i32)> = Vec::new();
 
     while remaining > 0 {
+        // Once per packet, besides the check after each flush. A file that
+        // gives no output (decode errors, empty packets) never reaches a flush,
+        // and a worker that was told to stop would read it to the end.
+        if cancel() {
+            return Ok(produced);
+        }
         let packet = match source.reader.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,

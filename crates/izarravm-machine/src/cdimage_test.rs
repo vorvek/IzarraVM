@@ -748,11 +748,22 @@ struct FakeSource {
     sectors: u32,
     ready: u32,
     touched: std::sync::atomic::AtomicBool,
+    /// Every index `frame` was asked for, in order.
+    indices: std::sync::Mutex<Vec<u32>>,
+    /// An optional tag and a log shared with other sources, so a test can see
+    /// the order in which different tracks were touched.
+    shared_log: Option<(u8, SharedTouchLog)>,
 }
+
+type SharedTouchLog = std::sync::Arc<std::sync::Mutex<Vec<(u8, u32)>>>;
 
 impl FakeSource {
     fn was_touched(&self) -> bool {
         self.touched.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn touched_indices(&self) -> Vec<u32> {
+        self.indices.lock().unwrap().clone()
     }
 }
 
@@ -764,6 +775,10 @@ impl izarravm_core::AudioTrackSource for FakeSource {
     fn frame(&self, index: u32) -> Option<[u8; RAW_SECTOR]> {
         self.touched
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.indices.lock().unwrap().push(index);
+        if let Some((tag, log)) = &self.shared_log {
+            log.lock().unwrap().push((*tag, index));
+        }
         (index < self.ready).then(|| {
             let mut frame = [0u8; RAW_SECTOR];
             frame[0] = 0xF0 | (index as u8 & 0x0F);
@@ -775,10 +790,20 @@ impl izarravm_core::AudioTrackSource for FakeSource {
 /// Build a fake source and return both the `CueSource` and a handle on the
 /// fake, so a test can ask whether it was touched.
 fn fake_pair(sectors: u32, ready: u32) -> (CueSource, std::sync::Arc<FakeSource>) {
+    fake_pair_logged(sectors, ready, None)
+}
+
+fn fake_pair_logged(
+    sectors: u32,
+    ready: u32,
+    shared_log: Option<(u8, SharedTouchLog)>,
+) -> (CueSource, std::sync::Arc<FakeSource>) {
     let source = std::sync::Arc::new(FakeSource {
         sectors,
         ready,
         touched: std::sync::atomic::AtomicBool::new(false),
+        indices: std::sync::Mutex::new(Vec::new()),
+        shared_log,
     });
     (CueSource::Audio(source.clone()), source)
 }
@@ -1020,11 +1045,11 @@ fn approaching_a_track_boundary_warms_the_next_track() {
     let (img, second) = two_track_disc(1000);
 
     // Far from the boundary, nothing ahead is touched.
-    img.warm_upcoming(500);
+    img.warm_upcoming(500, img.total_sectors());
     assert!(!second.was_touched());
 
     // Within the prefetch window of track 2's start at LBA 1000.
-    img.warm_upcoming(1000 - PREFETCH_FRAMES);
+    img.warm_upcoming(1000 - PREFETCH_FRAMES, img.total_sectors());
     assert!(second.was_touched());
 }
 
@@ -1056,7 +1081,7 @@ fn warming_never_reaches_past_the_next_track() {
     )
     .unwrap();
 
-    img.warm_upcoming(0);
+    img.warm_upcoming(0, img.total_sectors());
 
     assert!(b_handle.was_touched(), "the next track was not warmed");
     assert!(!c_handle.was_touched(), "a track two ahead was warmed");
@@ -1064,11 +1089,102 @@ fn warming_never_reaches_past_the_next_track() {
 
 #[test]
 fn warming_at_the_end_of_the_disc_does_not_restart_the_last_track() {
+    // Past the last track the prefetch has nothing to warm. Inside it, only
+    // the head touch happens, and that reads at the head's own index, never at
+    // frame 0 of the track.
     let (img, second) = two_track_disc(1000);
-    for lba in [1999, 5000] {
-        img.warm_upcoming(lba);
-        assert!(!second.was_touched(), "last track warmed at LBA {lba}");
-    }
+    img.warm_upcoming(1999, img.total_sectors());
+    assert_eq!(
+        second.touched_indices(),
+        vec![999],
+        "the prefetch restarted the last track instead of touching the head"
+    );
+    img.warm_upcoming(5000, img.total_sectors());
+    assert_eq!(
+        second.touched_indices(),
+        vec![999],
+        "a head past the disc touched a track"
+    );
+}
+
+#[test]
+fn warming_touches_the_head_track_before_the_next() {
+    // A track shorter than the prefetch window: with the head at its start the
+    // first track that starts after the head is the one behind it. The track
+    // under the head has to be touched too, and first, so that it is newer
+    // than the track it replaces when the decoder evicts the oldest one.
+    let cue = "FILE \"p.ogg\" WAVE
+               TRACK 01 AUDIO
+               INDEX 01 00:00:00
+               FILE \"n.ogg\" WAVE
+               TRACK 02 AUDIO
+               INDEX 01 00:00:00
+               FILE \"m.ogg\" WAVE
+               TRACK 03 AUDIO
+               INDEX 01 00:00:00
+";
+    let log: SharedTouchLog = Default::default();
+    let (p, _) = fake_pair_logged(1000, 1000, Some((1, log.clone())));
+    let (n, _) = fake_pair_logged(100, 100, Some((2, log.clone())));
+    let (m, _) = fake_pair_logged(1000, 1000, Some((3, log.clone())));
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![
+            ("p.ogg".to_string(), p),
+            ("n.ogg".to_string(), n),
+            ("m.ogg".to_string(), m),
+        ],
+    )
+    .unwrap();
+
+    img.warm_upcoming(1000, img.total_sectors());
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![(2, 0), (3, 0)],
+        "the head track must be touched, then the next one"
+    );
+}
+
+#[test]
+fn warming_stops_at_the_end_of_the_play_range() {
+    // A game that loops one track must not decode the track after it: the
+    // prefetch would take one of the two decoded slots from a track the game
+    // goes back to.
+    let cue = "FILE \"a.ogg\" WAVE
+               TRACK 01 AUDIO
+               INDEX 01 00:00:00
+               FILE \"b.ogg\" WAVE
+               TRACK 02 AUDIO
+               INDEX 01 00:00:00
+               FILE \"c.ogg\" WAVE
+               TRACK 03 AUDIO
+               INDEX 01 00:00:00
+";
+    let (a, _) = fake_pair(1000, 1000);
+    let (b, _) = fake_pair(1000, 1000);
+    let (c, c_handle) = fake_pair(1000, 1000);
+    let img = CdImage::from_cue_sources(
+        cue,
+        vec![
+            ("a.ogg".to_string(), a),
+            ("b.ogg".to_string(), b),
+            ("c.ogg".to_string(), c),
+        ],
+    )
+    .unwrap();
+    let track3_start = 2000;
+
+    // The range ends where track 3 begins.
+    img.warm_upcoming(track3_start - 50, track3_start);
+    assert!(!c_handle.was_touched(), "the prefetch ran past the range");
+
+    // The same head with a range that includes track 3 does warm it.
+    img.warm_upcoming(track3_start - 50, track3_start + 100);
+    assert!(
+        c_handle.was_touched(),
+        "the prefetch inside the range is lost"
+    );
 }
 
 #[test]
@@ -1089,8 +1205,8 @@ fn warming_leaves_a_raw_track_alone() {
         )],
     )
     .unwrap();
-    img.warm_upcoming(0);
-    img.warm_upcoming(1);
+    img.warm_upcoming(0, img.total_sectors());
+    img.warm_upcoming(1, img.total_sectors());
 }
 
 #[test]
@@ -1122,11 +1238,11 @@ fn a_pregap_between_tracks_does_not_stop_the_next_one_being_warmed() {
     assert_eq!(img.tracks()[1].start_lba, 1150);
 
     // Still outside the window, measured to the next track's start.
-    img.warm_upcoming(900);
+    img.warm_upcoming(900, img.total_sectors());
     assert!(!second_handle.was_touched());
 
     // Inside the window, and inside the pregap, where no track covers the head.
-    img.warm_upcoming(1010);
+    img.warm_upcoming(1010, img.total_sectors());
     assert!(
         second_handle.was_touched(),
         "the track after a pregap was never warmed"

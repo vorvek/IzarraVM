@@ -33,6 +33,13 @@ struct Filled {
     /// track that is about to arrive would be indistinguishable from silence
     /// the composer wrote.
     ready: u32,
+    /// Which decode owns `pcm`. Eviction bumps it, and a worker writes only
+    /// while its own number is still the current one, so a worker that was told
+    /// to stop can never write into the buffer of the decode that replaced it.
+    generation: u64,
+    /// The worker of this generation has stopped writing: the track is whole,
+    /// or the decode failed and what is there is all there will be.
+    done: bool,
 }
 
 /// Written by hand for the reason the `AudioTrackSource` contract gives: a
@@ -44,6 +51,8 @@ impl std::fmt::Debug for Filled {
         f.debug_struct("Filled")
             .field("bytes", &self.pcm.len())
             .field("ready", &self.ready)
+            .field("generation", &self.generation)
+            .field("done", &self.done)
             .finish()
     }
 }
@@ -52,15 +61,11 @@ impl std::fmt::Debug for Filled {
 struct Shared {
     filled: Mutex<Filled>,
     /// Set when a worker is running or has finished, so the decode is started
-    /// exactly once.
+    /// exactly once per residency. Eviction clears it.
     started: AtomicBool,
-    /// Set by `Drop` and checked by the worker at each publish point.
-    cancel: AtomicBool,
-    /// Set by the worker on its way out, whether it succeeded or failed. Only a
-    /// track no worker is still writing into can have its buffer taken away,
-    /// and a failed one has to be evictable too or a scratched rip would pin
-    /// its buffer for the life of the mount.
-    finished: AtomicBool,
+    /// Mirror of `Filled::generation`, written only under the `filled` lock. A
+    /// worker reads it without the lock to learn that it has been replaced.
+    generation: AtomicU64,
     /// Workers actually spawned for this track. `started` is meant to hold this
     /// at one for the track's whole life, and nothing about the audio would
     /// look wrong if it did not: every worker decodes the same file to the
@@ -126,8 +131,7 @@ impl DecodedTrack {
             shared: Arc::new(Shared {
                 filled: Mutex::new(Filled::default()),
                 started: AtomicBool::new(false),
-                cancel: AtomicBool::new(false),
-                finished: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
                 workers: AtomicU32::new(0),
                 live: AtomicU32::new(0),
                 last_touch: AtomicU64::new(0),
@@ -158,27 +162,36 @@ impl DecodedTrack {
         if self.shared.started.swap(true, Ordering::SeqCst) {
             return;
         }
+        if let Some(registry) = &self.registry {
+            // Admitted first, so that a full thread cap cannot keep old tracks
+            // resident: the least recently touched one loses its buffer and
+            // its worker is told to stop even when no new thread can start.
+            registry.admit(&self.shared);
+            if registry.live_workers() >= MAX_LIVE_WORKERS {
+                // No thread and no buffer now. The track stays admitted and
+                // the next touch tries again, so this frame is silence.
+                self.shared.started.store(false, Ordering::SeqCst);
+                return;
+            }
+        }
         let bytes = self.info.sectors as usize * AUDIO_FRAME_BYTES;
-        {
+        let my_gen = {
             let mut filled = self.shared.filled.lock().unwrap_or_else(|e| e.into_inner());
             filled.pcm = vec![0u8; bytes];
             filled.ready = 0;
-        }
-        // Admitted after the buffer exists and before the worker starts, so
-        // this track is the newest resident by the time anything is written
-        // into it and cannot evict itself.
-        if let Some(registry) = &self.registry {
-            registry.admit(&self.shared);
-        }
+            filled.done = false;
+            filled.generation
+        };
         let path = self.path.clone();
         let info = self.info;
-        let registry = self.registry.clone();
+        #[cfg(test)]
+        let gate = self.registry.as_ref().and_then(|r| r.gate.clone());
         self.shared.workers.fetch_add(1, Ordering::Relaxed);
         // Raised here, before the spawn, so a count read right after `frame`
         // returns already includes the worker. The guard lowers both counts,
         // also when the spawn fails and the closure is dropped unrun.
         self.shared.live.fetch_add(1, Ordering::SeqCst);
-        let registry_live = registry.as_ref().map(|r| Arc::clone(&r.live));
+        let registry_live = self.registry.as_ref().map(|r| Arc::clone(&r.live));
         if let Some(live) = &registry_live {
             live.fetch_add(1, Ordering::SeqCst);
         }
@@ -190,25 +203,28 @@ impl DecodedTrack {
             .name("cd-audio-decode".to_string())
             .spawn(move || {
                 if let Some(shared) = guard.shared.as_ref() {
-                    decode_worker(&path, info, shared, registry.as_ref());
+                    decode_worker(
+                        &path,
+                        info,
+                        shared,
+                        my_gen,
+                        #[cfg(test)]
+                        gate.as_deref(),
+                    );
                 }
             });
         if spawned.is_err() {
-            // KNOWN GAP, deliberately left alone here rather than widened into
-            // this change: the track was admitted above, before the spawn, and
-            // nothing takes it back out. `finished` stays false for a worker
-            // that never existed, so the registry holds a full-size buffer it
-            // can never evict, for the life of the mount. The residency guard
-            // in `evict_excess` raises the price of it (two such zombies pin
-            // three residents where they used to pin two) but it is not the
-            // cause and reverting the guard would not fix it. The fix is to
-            // withdraw the admission on this path; filed as a follow-up.
             self.shared.workers.fetch_sub(1, Ordering::Relaxed);
-            // The thread could not be created, so nothing will ever fill this
-            // track. Clearing the flag lets the next `frame()` try again rather
-            // than leaving the track permanently silent for a condition that is
-            // usually momentary.
-            self.shared.started.store(false, Ordering::SeqCst);
+            // Nothing will ever fill this track, so withdraw it: it must not
+            // keep a full-size buffer that no worker will write. Releasing also
+            // clears `started`, which lets the next `frame()` try again rather
+            // than leaving the track silent for a condition that is usually
+            // momentary. The closure was dropped unrun, so its guard has
+            // already lowered the live counts.
+            if let Some(registry) = &self.registry {
+                registry.forget(&self.shared);
+            }
+            release(&self.shared);
         }
     }
 }
@@ -234,60 +250,80 @@ impl Drop for WorkerGuard {
     }
 }
 
+/// Give back a track's buffer and tell its worker to stop.
+///
+/// The generation bump is what stops the worker: it writes only while its own
+/// number is current. Clearing `started` last lets the next miss start a new
+/// worker with the new number, so two workers can exist on one track for a
+/// moment but only one of them can write.
+fn release(shared: &Shared) {
+    let mut filled = shared.filled.lock().unwrap_or_else(|e| e.into_inner());
+    filled.pcm = Vec::new();
+    filled.ready = 0;
+    filled.done = false;
+    filled.generation += 1;
+    shared
+        .generation
+        .store(filled.generation, Ordering::Release);
+    shared.started.store(false, Ordering::SeqCst);
+}
+
 /// Decode the whole file, publishing each newly finished run of sectors.
-fn decode_worker(path: &Path, info: TrackInfo, shared: &Arc<Shared>, registry: Option<&Registry>) {
+fn decode_worker(
+    path: &Path,
+    info: TrackInfo,
+    shared: &Arc<Shared>,
+    my_gen: u64,
+    #[cfg(test)] gate: Option<&Gate>,
+) {
+    let stopped = || shared.generation.load(Ordering::Acquire) != my_gen;
     #[cfg(test)]
-    if let Some(gate) = registry.and_then(|r| r.gate.as_ref()) {
-        gate.wait(&|| shared.cancel.load(Ordering::Relaxed));
+    if let Some(gate) = gate {
+        gate.wait(&stopped);
+    }
+    // A worker replaced before it began has nothing to decode, and must not
+    // open the file: on a slow share that open is the cost eviction avoids.
+    if stopped() {
+        return;
     }
     // Decode through a small staging buffer and copy each chunk under the
     // lock. Holding the mutex across a decode call would block the mixer pull
     // for as long as a packet takes to decode.
     let mut published = 0usize;
-    // A track told to stop before it began has nothing to decode.
-    let result = if shared.cancel.load(Ordering::Relaxed) {
-        Ok(0)
-    } else {
-        decode_chunked(
-            path,
-            info,
-            info.sectors,
-            STAGE_SECTORS,
-            &mut |ready, new_bytes| {
-                let from = published;
-                let upto = from + new_bytes.len();
-                let mut filled = shared.filled.lock().unwrap_or_else(|e| e.into_inner());
-                // Only what is newly finished is copied, so filling a track costs
-                // one pass over its bytes rather than one per report. A four-minute
-                // track reports some 280 times against a 42 MB buffer; recopying
-                // the prefix each time would be gigabytes of memcpy to move 42 MB
-                // of audio, on a thread that is racing the play head.
-                if let Some(dst) = filled.pcm.get_mut(from..upto) {
-                    dst.copy_from_slice(new_bytes);
-                    filled.ready = ready;
-                    published = upto;
-                }
-            },
-            &mut || shared.cancel.load(Ordering::Relaxed),
-        )
-    };
+    let result = decode_chunked(
+        path,
+        info,
+        info.sectors,
+        STAGE_SECTORS,
+        &mut |ready, new_bytes| {
+            let from = published;
+            let upto = from + new_bytes.len();
+            let mut filled = shared.filled.lock().unwrap_or_else(|e| e.into_inner());
+            if filled.generation != my_gen {
+                return;
+            }
+            // Only what is newly finished is copied, so filling a track costs
+            // one pass over its bytes rather than one per report. A four-minute
+            // track reports some 280 times against a 42 MB buffer; recopying
+            // the prefix each time would be gigabytes of memcpy to move 42 MB
+            // of audio, on a thread that is racing the play head.
+            if let Some(dst) = filled.pcm.get_mut(from..upto) {
+                dst.copy_from_slice(new_bytes);
+                filled.ready = ready;
+                published = upto;
+            }
+        },
+        &mut || stopped(),
+    );
     if let Err(err) = result {
         // A partial track plays what it has and falls silent for the rest. The
         // device path stays up either way, the same posture a folder mount
         // takes when a host file disappears under it.
         tracing::warn!("cd audio decode failed for {}: {err}", path.display());
     }
-    // Last, and on both paths: this is what makes the buffer evictable, and a
-    // track whose decode failed has to become evictable too.
-    shared.finished.store(true, Ordering::SeqCst);
-    // Then ask again whether anything can now be given up. Eviction at
-    // admission alone is not enough: when the third track of a disc starts
-    // while the first two are still decoding, nothing is evictable at that
-    // moment, and without this the disc simply stays over its bound for the
-    // rest of the mount. Playback outruns decoding often enough that this is
-    // the ordinary path, not the unlucky one.
-    if let Some(registry) = registry {
-        registry.evict_excess();
+    let mut filled = shared.filled.lock().unwrap_or_else(|e| e.into_inner());
+    if filled.generation == my_gen {
+        filled.done = true;
     }
 }
 
@@ -300,7 +336,19 @@ fn decode_worker(path: &Path, info: TrackInfo, shared: &Arc<Shared>, registry: O
 /// machinery than this access pattern asks for.
 const MAX_RESIDENT: usize = 2;
 
+/// How many decode threads one mount may have alive at once.
+///
+/// A worker told to stop can still sit in a slow read (a network share, a
+/// sleeping disk) before it reaches its next stop check. Without a cap, a
+/// guest that scans the disc over such a share could pile up threads faster
+/// than they exit.
+const MAX_LIVE_WORKERS: usize = 4;
+
 /// The residency bookkeeping shared by one mount's tracks.
+///
+/// Recency is the order of `last_touch`, which only the emulation thread
+/// writes, through `frame`. A caller that touches a track for another reason
+/// moves that track in the order.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     inner: Arc<Mutex<Vec<Arc<Shared>>>>,
@@ -352,7 +400,8 @@ impl Registry {
         Self::default()
     }
 
-    /// Workers of this mount that are alive right now.
+    /// Workers of this mount that are alive right now. A worker told to stop
+    /// still counts until it has actually exited.
     pub fn live_workers(&self) -> usize {
         self.live.load(Ordering::SeqCst)
     }
@@ -398,90 +447,48 @@ impl Registry {
         track
     }
 
-    /// Note that `started` has just begun decoding, and take the buffer back
-    /// from the oldest track that is no longer among the most recent few.
+    /// Make `started` the newest resident, and take the buffer back from the
+    /// least recently touched tracks until no more than [`MAX_RESIDENT`] hold
+    /// one. A track whose worker is still running loses its buffer too: the
+    /// worker stops at its next check.
     fn admit(&self, started: &Arc<Shared>) {
-        {
-            let mut resident = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            resident.retain(|s| !Arc::ptr_eq(s, started));
-            resident.push(Arc::clone(started));
-        }
-        self.evict_excess();
-    }
-
-    /// Take the buffer back from the oldest tracks until no more than
-    /// [`MAX_RESIDENT`] hold one, skipping any a worker is still writing into
-    /// and never taking the last buffer that is left.
-    fn evict_excess(&self) {
         let mut resident = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        resident.retain(|s| !Arc::ptr_eq(s, started));
+        resident.push(Arc::clone(started));
         while resident.len() > MAX_RESIDENT {
-            // Only a track that has stopped decoding can be evicted. Taking the
-            // buffer from a live worker is safe in itself (it copies under the
-            // same lock and checks the length) but clearing `started`
-            // underneath one would let a second worker begin on the same track.
-            let evictable = resident
-                .iter()
-                .filter(|s| s.finished.load(Ordering::SeqCst))
-                .count();
-            // Never take the last one. `last_touch` orders the candidates
-            // against each other, but it cannot say which track the mixer is
-            // drawing from right now, and when only one candidate is left, it
-            // is the track being played that gets taken, because a track being
-            // read is by definition finished while the ones still decoding are
-            // not. That is the exact shape: an idle track decoded far enough to
-            // read but whose worker has not yet stored `finished` is not a
-            // candidate, so the song under the play head becomes the only one,
-            // and evicting it restarts that song from sector 0 mid-play. It is
-            // an audible dropout in a Quake or Tomb Raider track, and the price
-            // of refusing is one extra decoded track, a few megabytes, held
-            // for as long as it takes the older worker to store its flag, after
-            // which its own tail call clears the backlog. The bound is a memory
-            // ceiling; the music is the product.
-            //
-            // Under the same reasoning as the arm below: a third buffer is a
-            // better answer than a stall, and here also than a skip.
-            //
-            // The hand-built fixtures lean on this too, which is worth knowing
-            // before anyone weakens it. They install a residency directly and
-            // then assert on what eviction does with it; a worker still on its
-            // way out can reach `evict_excess` from its tail call in the middle
-            // of that. With this guard the stray call finds fewer than two
-            // candidates and breaks, so it cannot disturb the state under test.
-            // Weaken the guard and those tests go back to flaking.
-            if evictable < 2 {
-                break;
-            }
+            // Never the track just admitted. Its `last_touch` is the newest
+            // anyway; the filter keeps that from depending on the clock.
             let Some(index) = resident
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.finished.load(Ordering::SeqCst))
+                .filter(|(_, s)| !Arc::ptr_eq(s, started))
                 .min_by_key(|(_, s)| s.last_touch.load(Ordering::Relaxed))
                 .map(|(index, _)| index)
             else {
-                // Nothing evictable. Decoding outruns playback by so wide a
-                // margin that two live workers do not arise in practice, and if
-                // they ever do, a third buffer is a better answer than a stall.
                 break;
             };
             let evicted = resident.remove(index);
-            let mut filled = evicted.filled.lock().unwrap_or_else(|e| e.into_inner());
-            filled.pcm = Vec::new();
-            filled.ready = 0;
-            // The track is now indistinguishable from one never touched, so the
-            // next `frame()` decodes it again rather than serving silence for
-            // the rest of the mount.
-            evicted.finished.store(false, Ordering::SeqCst);
-            evicted.started.store(false, Ordering::SeqCst);
+            release(&evicted);
         }
+    }
+
+    /// Drop one track from the residency list without touching its buffer.
+    fn forget(&self, shared: &Arc<Shared>) {
+        let mut resident = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        resident.retain(|s| !Arc::ptr_eq(s, shared));
     }
 }
 
 impl Drop for DecodedTrack {
     fn drop(&mut self) {
-        // Unmounting or replacing a disc must not leave a thread decoding it.
-        // The worker notices at its next publish point, so it does at most one
-        // more chunk of work before it stops.
-        self.shared.cancel.store(true, Ordering::Relaxed);
+        // Unmounting or replacing a disc must not leave a thread decoding it or
+        // a buffer behind. The buffer goes now. The worker sees the new
+        // generation at its next packet and exits, without anyone waiting for
+        // it: a join here would stall the emulation thread on eject.
+        if let Some(registry) = &self.registry {
+            registry.forget(&self.shared);
+        }
+        release(&self.shared);
     }
 }
 
