@@ -3657,18 +3657,22 @@ fn fault_trace_row_address_wraps_for_error_code_zero() {
     assert_eq!(fault_trace_row_address(0xffff_fff0, 0x10, 1), 0x0);
 }
 
-// Pin tests for the 64 KiB edge of a multi-part operand. LGDT reads a limit word and then a base
-// dword. With a 16-bit address size the interpreter adds 2 to the offset without wrapping it at
-// 64 KiB, so the base dword of an LGDT at offset 0xFFFE is checked and read at offset 0x10000.
+// The 64 KiB edge of a multi-part operand. LGDT reads a limit word and then a base dword. With a
+// 16-bit address size the interpreter adds 2 to the offset without a wrap at 64 KiB. It checks
+// and reads the base dword of an LGDT at offset 0xFFFE at offset 0x10000.
 //
-// OPEN QUESTION: a real part may wrap the second part to offset 0, or fault. The 386 manual says
-// #GP in real mode when a part lies outside 0-FFFFh. There is no hardware vector for LGDT, LIDT,
-// BOUND, the FPU environment and save areas, FBLD, FBSTP, the m64 and m80 helpers or CMPXCHG8B.
-// A trace from a real 386 for any of them settles it. Until then these tests record what the
-// interpreter does today. Change them with the behavior, not before.
+// Source: the 80386 Programmer's Reference Manual, section 14.7 item 7 and the LGDT page. In real
+// mode, an operand with any part outside offsets 0-FFFFh gives exception 13 (12 for SS). Only the
+// 8086 wraps. LIDT, BOUND, LES/LDS and the FPU areas use the same text. The current Intel manual
+// keeps the same limit rule, with no difference between the 386, the 486 and the Pentium. Bochs
+// wraps the second part to offset 0. 86Box, MAME and QEMU do not wrap. No emulator cites a
+// hardware test.
+//
+// With a limit above 0xFFFF the manual gives no rule. The read at offset 0x10000 agrees with
+// 86Box, MAME and QEMU. A run on a real 386 or 486 can confirm both cases.
 
 #[test]
-fn lgdt_at_offset_fffe_with_limit_ffff_faults_today() {
+fn lgdt_at_offset_fffe_with_limit_ffff_faults() {
     // lgdt [0xfffe]: the limit word fits, the base dword ends past the 0xFFFF segment limit.
     let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x01, 0x16, 0xfe, 0xff], 0x2_0000);
     let mut bus = TestBus::with_memory(memory);
@@ -3677,7 +3681,7 @@ fn lgdt_at_offset_fffe_with_limit_ffff_faults_today() {
 }
 
 #[test]
-fn lgdt_at_offset_fffe_with_a_large_limit_reads_offset_10000_today() {
+fn lgdt_at_offset_fffe_with_a_large_limit_reads_offset_10000() {
     let (mut cpu, mut memory) = real_mode_cpu(&[0x0f, 0x01, 0x16, 0xfe, 0xff], 0x3_0000);
     memory[0xfffe..0x1_0000].copy_from_slice(&0x0027u16.to_le_bytes());
     // The base dword that the interpreter reads, at segment offset 0x10000.
