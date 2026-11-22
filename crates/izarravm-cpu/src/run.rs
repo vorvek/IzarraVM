@@ -3036,7 +3036,8 @@ impl CpuGsw {
         // A live block (`IZARRAVM_LIVE_DATA_SEGMENTS`, real mode or V86) bakes no data
         // descriptor, so it takes the masked compare on both arms. `all_data_matches` would
         // reject it at each segment change.
-        // Read only when the chain entry check is off, so the default path does no more work.
+        // The closure reads the arm and the mode key at each unchecked entry. The arm is 2 by
+        // default, so a real-mode or V86 block pays this read.
         let live_block = || {
             self.jit_direct.live_data_segments_arm() != 0
                 && jit::direct::mode_key_is_real_or_v86(span.key.mode_key)

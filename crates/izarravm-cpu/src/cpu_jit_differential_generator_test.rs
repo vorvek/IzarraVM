@@ -4648,9 +4648,9 @@ fn the_live_data_segment_switch_spellings() {
         |value: &str| jit::direct::parse_live_data_segments_arm_for_test(Ok(value.to_string()));
     assert_eq!(
         jit::direct::parse_live_data_segments_arm_for_test(Err(std::env::VarError::NotPresent)),
-        0
+        2
     );
-    assert_eq!(parse(""), 0);
+    assert_eq!(parse(""), 2);
     assert_eq!(parse("0"), 0);
     assert_eq!(parse("1"), 1);
     assert_eq!(parse("2"), 2);

@@ -1017,7 +1017,7 @@ pub(crate) struct BlockCache {
     /// `chain_entry_check_armed` for the arm table and the nulling semantics,
     /// and `BlockCache::entry_layout` for what it selects.
     chain_entry_check_armed: bool,
-    /// `IZARRAVM_LIVE_DATA_SEGMENTS`: 0 off, 1 live operands and selector reads, 2 also links the
+    /// `IZARRAVM_LIVE_DATA_SEGMENTS`: 0 off (escape hatch), 1 live operands and selector reads, 2 also links the
     /// successors of a live block that writes data segments. Read once per cache, so one CPU has
     /// one form for its whole life. See `live_data_segments_arm`.
     live_data_segments_arm: u8,
@@ -8417,7 +8417,7 @@ fn compile_with_budget(
         cpu.jit_direct
             .note_lane_probe(key.linear(), lane_probe::WALKED);
     }
-    // A live block is compiled in real mode or V86 while `IZARRAVM_LIVE_DATA_SEGMENTS` is on.
+    // A live block is compiled in real mode or V86 unless `IZARRAVM_LIVE_DATA_SEGMENTS` is 0.
     // It reads all five data segments from the CPU state and bakes none of them.
     let live_form = live_form_for(cpu);
     // Arm 2 of the live form. Only this arm lets a data segment write stay inside a block, and it
@@ -11053,7 +11053,7 @@ const fn segment_bit(segment: SegmentIndex) -> u8 {
 /// DS and ES only. Sticky keys live-load these two; SS/FS/GS stay baked.
 pub(crate) const LIVE_DATA_BITS: u8 = segment_bit(SegmentIndex::Ds) | segment_bit(SegmentIndex::Es);
 
-/// Whether a block compiled now is a live block: the switch is on and the mode is real mode or
+/// Whether a block compiled now is a live block: the switch is not 0 and the mode is real mode or
 /// V86.
 fn live_form_for(cpu: &CpuGsw) -> bool {
     cpu.jit_direct.live_data_segments_arm() != 0 && !(cpu.is_protected_mode() && !cpu.is_v86_mode())
@@ -15104,10 +15104,12 @@ pub(crate) fn set_chain_entry_check_for_test(forced: Option<bool>) {
     CHAIN_ENTRY_CHECK_OVERRIDE.with(|cell| cell.set(forced));
 }
 
-/// The arm of `IZARRAVM_LIVE_DATA_SEGMENTS`. Off by default. A block compiled in real mode or V86
-/// under arm 1 or 2 reads ES, SS, DS, FS, and GS from the CPU state and bakes none of them. Arm 2
-/// also links the successors of such a block when it writes data segments. The value is read once
-/// per `BlockCache`.
+/// The arm of `IZARRAVM_LIVE_DATA_SEGMENTS`. The default is arm 2. A block compiled in real mode
+/// or V86 under arm 1 or 2 reads ES, SS, DS, FS, and GS from the CPU state and bakes none of
+/// them. Arm 2 also links the successors of such a block when it writes data segments. Arm 0
+/// is an escape hatch that keeps the old baked form. It stays until the stage 1B work. This
+/// differs from stage1-design section 5 step 5, which removes the switch. The value is read
+/// once per `BlockCache`.
 pub(crate) fn live_data_segments_arm() -> u8 {
     #[cfg(test)]
     if let Some(forced) = LIVE_DATA_SEGMENTS_OVERRIDE.with(std::cell::Cell::get) {
@@ -15117,22 +15119,23 @@ pub(crate) fn live_data_segments_arm() -> u8 {
     *ARM.get_or_init(|| parse_live_data_segments_arm(std::env::var("IZARRAVM_LIVE_DATA_SEGMENTS")))
 }
 
-/// The `IZARRAVM_LIVE_DATA_SEGMENTS` spelling table. Unset, empty, and `0` name the off arm.
+/// The `IZARRAVM_LIVE_DATA_SEGMENTS` spelling table. Unset and empty name arm 2. `0` names the
+/// off arm.
 fn parse_live_data_segments_arm(value: Result<String, std::env::VarError>) -> u8 {
-    const ACCEPTED: &str = "accepted spellings are unset or `` / `0` (off), `1` (live operands                             and selector reads), and `2` (also links the successors of a live                             block that writes data segments)";
+    const ACCEPTED: &str = "accepted spellings are unset or `` / `2` (the default: also links the successors of a live block that writes data segments), `1` (live operands and selector reads), and `0` (off: the old baked form)";
     let raw = match value {
-        Err(std::env::VarError::NotPresent) => return 0,
+        Err(std::env::VarError::NotPresent) => return 2,
         Err(std::env::VarError::NotUnicode(_)) => panic!(
             "IZARRAVM_LIVE_DATA_SEGMENTS is set to a value that is not valid UTF-8; {ACCEPTED}"
         ),
         Ok(raw) => raw,
     };
     match raw.trim() {
-        "" | "0" => 0,
+        "" | "2" => 2,
+        "0" => 0,
         "1" => 1,
-        "2" => 2,
         other => panic!(
-            "IZARRAVM_LIVE_DATA_SEGMENTS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a              mistyped value that ran the default would look like a change that does nothing"
+            "IZARRAVM_LIVE_DATA_SEGMENTS={other:?} names no arm; {ACCEPTED}. Refusing to guess: a mistyped value that ran the default would look like a change that does nothing"
         ),
     }
 }
