@@ -32,12 +32,14 @@ carry on a USB stick.
 | File | What it holds | Location |
 | --- | --- | --- |
 | `c_drive/` | The C: hard disk of the Izarra3000, as a host folder. | `~/.izarravm/`, or beside the executable with `--portable` |
-| `cmos.bin` | The 64-byte RTC/NVRAM image: the keyboard layout, the CPU mode, and the other settings that the [setup panel](../izbios/configuration-panel.md) saves. | One level above `c_drive/` |
-| `izarravm.conf` | The host GUI preferences (below). | One level above `c_drive/`, with `cmos.bin` |
+| `cmos.bin` | The 64-byte RTC/NVRAM image: the keyboard layout, the CPU mode, and the other settings that the [setup panel](../izbios/configuration-panel.md) saves. | `~/.izarravm/`, or beside the executable with `--portable` |
+| `izarravm.conf` | The host GUI preferences (below). | With `cmos.bin` |
 | `Controller Profiles/` | One TOML file for each controller profile. | In the application state directory. The normal path is `~/.izarravm/Controller Profiles/`. |
 | `screenshots/` | PNG files made with the screenshot hotkey. | In the application state directory. The normal path is `~/.izarravm/screenshots/`. |
 
 The controller profiles and screenshots do not use the C: drive location.
+`--c-drive` changes only the C: drive folder. `cmos.bin` and `izarravm.conf`
+do not move with it.
 They stay in the application state directory when you use `--portable` or a
 custom C: drive path.
 

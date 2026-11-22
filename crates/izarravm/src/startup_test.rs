@@ -59,7 +59,7 @@ fn resolve_midi_fixture(
 ) -> ResolvedStartup {
     let config_path = root.join(format!("{label}.toml"));
     let c_drive = root.join(label).join("c_drive");
-    let prefs_path = prefs::prefs_path(&c_drive);
+    let prefs_path = prefs::prefs_path(&locations.config_dir(extra_cli.contains(&"--portable")));
     let mut argv = vec![
         "izarravm".to_owned(),
         "--config".to_owned(),
@@ -202,7 +202,7 @@ fn midi_sources_resolve_in_precedence_order() {
         name = "TOML port"
         ordinal = 3
     "#;
-    let prefs_path = prefs::prefs_path(&c_drive);
+    let prefs_path = prefs::prefs_path(&locations.state_dir);
     let prefs_text = r#"
         [midi]
         backend = "munt"
@@ -473,7 +473,8 @@ fn startup_reads_documents_once_and_hands_the_captured_prefs_to_gui() {
     let root = startup_test_dir("single-read");
     let config_path = root.join("settings.toml");
     let c_drive = root.join("c_drive");
-    let prefs_path = prefs::prefs_path(&c_drive);
+    let prefs_path = prefs::prefs_path(&root.join("state"));
+    std::fs::create_dir_all(root.join("state")).unwrap();
     std::fs::write(&config_path, "[machine]\nmemory_mib = 24\n").unwrap();
     std::fs::write(
         &prefs_path,
@@ -724,7 +725,7 @@ fn portable_and_partial_munt_resolution_is_stable() {
     assert_eq!(explicit.config.audio.midi.mt32_pcm_rom, None);
 
     let saved_c_drive = root.join("saved/c_drive");
-    let saved_prefs_path = prefs::prefs_path(&saved_c_drive);
+    let saved_prefs_path = prefs::prefs_path(&locations.state_dir);
     let saved_cli =
         Cli::try_parse_from(["izarravm", "--c-drive", saved_c_drive.to_str().unwrap()]).unwrap();
     let saved = resolve_with(&saved_cli, &locations, |path| {
@@ -1033,8 +1034,9 @@ fn rejected_prefs_file_is_copied_aside_only_on_the_gui_path() {
     };
     let c_drive = root.join("c_drive");
     std::fs::create_dir_all(&c_drive).unwrap();
-    let prefs_path = prefs::prefs_path(&c_drive);
-    let bad_path = root.join("izarravm.conf.bad");
+    std::fs::create_dir_all(&locations.state_dir).unwrap();
+    let prefs_path = prefs::prefs_path(&locations.state_dir);
+    let bad_path = locations.state_dir.join("izarravm.conf.bad");
     std::fs::write(&prefs_path, "master_volume = \"loud\"\n").unwrap();
     let cli = Cli::try_parse_from(["izarravm", "--c-drive", c_drive.to_str().unwrap()]).unwrap();
 
@@ -1075,4 +1077,40 @@ fn headless_resolve_creates_no_default_folders_until_the_c_drive_is_needed() {
 
     resolved.ensure_c_drive();
     assert!(state_dir.join("c_drive").is_dir());
+}
+
+#[test]
+fn config_files_stay_in_the_user_folder_with_a_custom_c_drive() {
+    let root = startup_test_dir("config-dir");
+    let locations = StartupLocations {
+        state_dir: root.join("state"),
+        executable_dir: root.join("portable"),
+    };
+    let c_drive = root.join("games").join("c");
+    for (portable, expected_dir) in [
+        (false, locations.state_dir.clone()),
+        (true, locations.executable_dir.clone()),
+    ] {
+        let mut argv = vec!["izarravm", "--c-drive", c_drive.to_str().unwrap()];
+        if portable {
+            argv.push("--portable");
+        }
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let resolved =
+            resolve_with(&cli, &locations, |path| std::fs::read_to_string(path)).unwrap();
+        assert_eq!(resolved.prefs_path, expected_dir.join("izarravm.conf"));
+
+        let launch = resolved.into_gui(vec![0x42], false);
+        assert_eq!(launch.prefs_path, expected_dir.join("izarravm.conf"));
+        assert_eq!(launch.rtc_setup.cmos_path, expected_dir.join("cmos.bin"));
+        assert!(
+            expected_dir.is_dir(),
+            "the GUI launch creates the folder that holds the two files"
+        );
+    }
+    assert!(
+        !root.join("games").join("izarravm.conf").exists()
+            && !root.join("games").join("cmos.bin").exists(),
+        "nothing goes beside the custom C: folder"
+    );
 }

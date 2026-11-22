@@ -463,9 +463,8 @@ fn retired_keys_still_identify_a_prefs_file_to_the_config_flag() {
 }
 
 #[test]
-fn prefs_path_sits_beside_c_root() {
-    let c_root = PathBuf::from("/home/user/.izarravm/c_drive");
-    let path = prefs_path(&c_root);
+fn prefs_path_is_in_the_settings_folder() {
+    let path = prefs_path(&PathBuf::from("/home/user/.izarravm"));
     assert_eq!(path, PathBuf::from("/home/user/.izarravm/izarravm.conf"));
 }
 

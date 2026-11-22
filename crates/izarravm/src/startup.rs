@@ -35,10 +35,16 @@ impl StartupLocations {
     }
 
     fn default_c_root(&self, portable: bool) -> PathBuf {
+        self.config_dir(portable).join("c_drive")
+    }
+
+    /// The folder that holds izarravm.conf and cmos.bin. It does not follow
+    /// --c-drive, so the two files never go into or beside a game folder.
+    fn config_dir(&self, portable: bool) -> PathBuf {
         if portable {
-            self.executable_dir.join("c_drive")
+            self.executable_dir.clone()
         } else {
-            self.state_dir.join("c_drive")
+            self.state_dir.clone()
         }
     }
 }
@@ -186,6 +192,7 @@ pub(super) struct ResolvedStartup {
     /// The prefs file existed but its contents were rejected.
     prefs_rejected: bool,
     prefs_path: PathBuf,
+    config_dir: PathBuf,
     state_dir: PathBuf,
     /// The C: folder is the per-user or portable default, so it may not exist yet.
     create_c_drive: bool,
@@ -278,7 +285,10 @@ impl ResolvedStartup {
 
     pub(super) fn into_gui(self, rom: Vec<u8>, test_pattern: bool) -> GuiLaunch {
         self.ensure_c_drive();
-        let mut rtc_setup = cmos::RtcSetup::from_c_root(&self.config.dos.c_drive);
+        if let Err(err) = std::fs::create_dir_all(&self.config_dir) {
+            warn!(%err, path = %self.config_dir.display(), "could not create the settings folder");
+        }
+        let mut rtc_setup = cmos::RtcSetup::from_config_dir(&self.config_dir);
         rtc_setup.requested = self.requested;
         let glide_ovl = self.load_global_glide_ovl();
         if self.prefs_rejected {
@@ -372,7 +382,8 @@ fn resolve_with(
     if uses_default_c_root {
         config.dos.c_drive = locations.default_c_root(cli.portable);
     }
-    let prefs_path = prefs::prefs_path(&config.dos.c_drive);
+    let config_dir = locations.config_dir(cli.portable);
+    let prefs_path = prefs::prefs_path(&config_dir);
     let (saved_prefs, prefs_rejected) = prefs::GuiPrefs::load_checked(&prefs_path, &mut read_text);
     let mut midi_presence = presence.midi;
     midi_presence.backend |= cli.midi_backend.is_some();
@@ -414,6 +425,7 @@ fn resolve_with(
         prefs: saved_prefs,
         prefs_rejected,
         prefs_path,
+        config_dir,
         state_dir: locations.state_dir.clone(),
         create_c_drive: uses_default_c_root,
     })

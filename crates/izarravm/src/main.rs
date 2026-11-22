@@ -83,9 +83,8 @@ struct Cli {
     /// Video card. Only vega exists. Older card names still select it.
     #[arg(long)]
     video: Option<VideoCard>,
-    /// Host folder used as the C: drive. cmos.bin and izarravm.conf are kept in the
-    /// parent folder of this path. A drive root such as D:\ has no parent, so the two
-    /// files are written inside it and the guest sees them.
+    /// Host folder used as the C: drive. cmos.bin and izarravm.conf do not move:
+    /// they stay in <home>/.izarravm, or beside the executable with --portable.
     #[arg(long)]
     c_drive: Option<PathBuf>,
     /// Keep the C: drive, cmos.bin, and izarravm.conf beside the executable

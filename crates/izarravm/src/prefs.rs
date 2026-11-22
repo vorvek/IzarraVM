@@ -498,12 +498,10 @@ impl<'de> Deserialize<'de> for GuiPrefs {
     }
 }
 
-/// Resolve the prefs file path from the C: root: the file sits in the directory
-/// that contains the c_drive folder, so it survives alongside cmos.bin and is
-/// shared by both the portable and home-directory C: layouts.
-pub fn prefs_path(c_root: &Path) -> PathBuf {
-    let dir = c_root.parent().unwrap_or(c_root);
-    dir.join(PREFS_FILE)
+/// The prefs file in the settings folder, beside cmos.bin: the per-user
+/// <home>/.izarravm, or the executable folder with --portable.
+pub fn prefs_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(PREFS_FILE)
 }
 
 impl GuiPrefs {
