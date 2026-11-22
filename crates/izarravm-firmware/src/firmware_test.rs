@@ -197,6 +197,18 @@ fn izarra_bios_int16_enhanced_handlers_have_distinct_behavior() {
         0x3c, 0xe0, 0x75, 0x02, 0x30, 0xc0, 0x55, 0x89, 0xe5, 0x83, 0x66, 0x06, 0xbe, 0x5d, 0xcf,
     ];
 
+    // 4. The legacy read and peek discard codes above 84h: cmp ah,84h; ja (read)
+    //    and cmp ah,84h; jbe (peek).
+    let read_discard: &[u8] = &[0x80, 0xfc, 0x84, 0x77];
+    let peek_keep: &[u8] = &[0x80, 0xfc, 0x84, 0x76];
+    // 5. The F1..F12 table: 4 modifier rows of 12 BIOS scan codes.
+    let fkey_table: &[u8] = &[
+        0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x85, 0x86, // plain
+        0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x87, 0x88, // Shift
+        0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x89, 0x8a, // Ctrl
+        0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x8b, 0x8c, // Alt
+    ];
+
     let roms: [(&str, &[u8]); 2] = [
         ("izarra-bios.bin", IZARRA_BIOS),
         ("kbd-resident.bin", super::KBD_RESIDENT_BIOS),
@@ -206,6 +218,9 @@ fn izarra_bios_int16_enhanced_handlers_have_distinct_behavior() {
             ("AH=12h two-byte flags read", flags12),
             ("legacy read 0xE0 collapse", read_collapse),
             ("legacy peek 0xE0 collapse", peek_collapse),
+            ("legacy read discard above 84h", read_discard),
+            ("legacy peek discard above 84h", peek_keep),
+            ("F1..F12 translation table", fkey_table),
         ] {
             assert!(
                 rom.windows(sig.len()).any(|window| window == sig),

@@ -146,6 +146,44 @@ int09:
     mov al, 0xe0
 .enqueue_store:
     mov ah, bl                     ; scancode in AH, ASCII in AL
+    test bh, bh                    ; E0 prefix: not a function key
+    jnz .store_key
+    ; Find the function key column. F1..F10 (make 3Bh-44h) are columns 0-9.
+    ; F11 and F12 (make 57h, 58h) are columns 10 and 11.
+    ; BL below 3Bh wraps in the first subtract, so it fails the compare. Then
+    ; BL-4Dh wraps too, so it takes the "ja". BL 45h-4Ch fails the first
+    ; compare and wraps to F8h or more in the second, so it takes the "ja".
+    ; BL 4Dh-56h gives 0-9 in the second range and leaves through the "jb".
+    ; BL above 58h gives 12 or more and takes the "ja".
+    mov cl, bl
+    sub cl, 0x3b
+    cmp cl, 10
+    jb .fkey
+    mov cl, bl
+    sub cl, 0x57 - 10
+    cmp cl, 10
+    jb .store_key
+    cmp cl, 11
+    ja .store_key
+.fkey:
+    xor al, al                     ; a function key never carries ASCII
+    movzx si, cl
+    test byte [KB_FLAGS], 0x08     ; either Alt
+    jz .fkey_ctrl
+    add si, 36
+    jmp .fkey_load
+.fkey_ctrl:
+    test byte [KB_FLAGS], 0x04     ; either Ctrl
+    jz .fkey_shift
+    add si, 24
+    jmp .fkey_load
+.fkey_shift:
+    test byte [KB_FLAGS], 0x03     ; either Shift
+    jz .fkey_load
+    add si, 12
+.fkey_load:
+    mov ah, [cs:kb_fkey_codes + si]
+.store_key:
     call kb_enqueue
     pop si
     pop cx
@@ -404,6 +442,11 @@ int16:
 .read_store:
     mov [KB_BUF_HEAD], bx
     pop ds
+    ; IBM first maps AH=E0h (gray Enter, gray "/") to 1Ch or 35h. This ISR
+    ; never stores AH=E0h, so only the "above 84h" check is here. Add the E0h
+    ; check before this compare if the ISR ever stores AH=E0h.
+    cmp ah, 0x84                   ; F11 and F12 codes (85h-8Ch) are not 84-key keys:
+    ja .read_wait                  ; already consumed, wait for the next key
     ; Legacy read collapses the MF-II gray-key marker: a key the ISR tagged with
     ; AL=0xE0 (extended key, no normal ASCII) reads back as AL=0 here, so a 1981
     ; program sees the scancode in AH and an empty ASCII byte. Enhanced AH=10h
@@ -455,10 +498,24 @@ int16:
     push ds
     mov bx, 0x0040
     mov ds, bx
+.peek_scan:
     mov bx, [KB_BUF_HEAD]
     cmp bx, [KB_BUF_TAIL]
     je .peek_empty
     mov ax, [bx]
+    ; IBM first maps AH=E0h to 1Ch or 35h. This ISR never stores AH=E0h, so
+    ; only the "above 84h" check is here. Add the E0h check before this
+    ; compare if the ISR ever stores AH=E0h.
+    cmp ah, 0x84                   ; 84-key keystroke: report it
+    jbe .peek_found
+    add bx, 2                      ; F11 or F12 code: remove it and look again
+    cmp bx, KB_BUF_START + 32
+    jb .peek_drop
+    mov bx, KB_BUF_START
+.peek_drop:
+    mov [KB_BUF_HEAD], bx
+    jmp .peek_scan
+.peek_found:
     pop ds
     pop bx
     ; Legacy peek collapses the gray-key marker the same way the legacy read does.
@@ -661,6 +718,14 @@ kb_enqueue:
 
 keypad_num_ascii:
     db '7','8','9',0,'4','5','6',0,'1','2','3','0','.'
+
+; BIOS scan codes for F1..F10, F11, F12 (columns) by modifier (rows).
+; The F11 and F12 codes are above 84h, so INT 16h AH=00h/01h discard them.
+kb_fkey_codes:
+    db 0x3b,0x3c,0x3d,0x3e,0x3f,0x40,0x41,0x42,0x43,0x44, 0x85,0x86 ; plain
+    db 0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x5b,0x5c,0x5d, 0x87,0x88 ; Shift
+    db 0x5e,0x5f,0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67, 0x89,0x8a ; Ctrl
+    db 0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f,0x70,0x71, 0x8b,0x8c ; Alt
 
 ; The Izarra BIOS pulls kbd-layouts.inc through its own frozen include list
 ; (izarra-bios.asm); the standalone keyboard ROMs get it here.
