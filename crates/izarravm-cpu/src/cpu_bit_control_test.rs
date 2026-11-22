@@ -1741,8 +1741,8 @@ fn invd_and_wbinvd_noop_at_cpl0() {
 }
 
 #[test]
-fn invd_at_cpl3_delivers_ud() {
-    // invd (0x0f 0x08) at CPL 3 in protected mode raises #UD (vector 6).
+fn invd_at_cpl3_delivers_gp() {
+    // invd (0x0f 0x08) at CPL 3 in protected mode raises #GP(0).
     let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
@@ -1765,8 +1765,8 @@ fn invd_at_cpl3_delivers_ud() {
         matches!(
             result,
             Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None
+                vector: 13,
+                error_code: Some(0)
             })
         ),
         "{result:?}"
@@ -1774,8 +1774,8 @@ fn invd_at_cpl3_delivers_ud() {
 }
 
 #[test]
-fn wbinvd_at_cpl3_delivers_ud() {
-    // wbinvd (0x0f 0x09) at CPL 3 in protected mode raises #UD (vector 6).
+fn wbinvd_at_cpl3_delivers_gp() {
+    // wbinvd (0x0f 0x09) at CPL 3 in protected mode raises #GP(0).
     let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
@@ -1798,12 +1798,110 @@ fn wbinvd_at_cpl3_delivers_ud() {
         matches!(
             result,
             Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None
+                vector: 13,
+                error_code: Some(0)
             })
         ),
         "{result:?}"
     );
+}
+
+#[test]
+fn prefixed_cache_ops_at_cpl3_deliver_gp() {
+    // A legal prefix in front of 0F 08/09 does not change the opcode, so each form raises
+    // #GP(0) at CPL 3, never #UD. The TOKAEMM prefix scan relies on this.
+    let mut forms: Vec<Vec<u8>> = vec![
+        vec![0x2e, 0x0f, 0x09],
+        vec![0x66, 0x0f, 0x09],
+        vec![0x67, 0x0f, 0x09],
+        vec![0xf3, 0x0f, 0x08],
+        vec![0xf2, 0x0f, 0x09],
+        vec![0x26, 0x66, 0x0f, 0x09],
+    ];
+    // 13 prefixes plus the two opcode bytes make 15 bytes.
+    let mut long = vec![0x2e; 13];
+    long.extend_from_slice(&[0x0f, 0x09]);
+    forms.push(long);
+    for code in &forms {
+        let (mut cpu, mut bus) = cpl3_code(code);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0)
+                })
+            ),
+            "{code:02x?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn v86_cache_ops_without_monitor_raise_gp0() {
+    // A V86 guest is CPL 3, so INVD and WBINVD raise the raw #GP(0). Fault delivery restores EIP; the trap test below checks the saved EIP.
+    // INVLPG is an extra pin: it already raised #GP(0) before this change.
+    let guests: [&[u8]; 3] = [
+        &[0x0f, 0x09],
+        &[0x0f, 0x08],
+        &[0x0f, 0x01, 0x3e, 0x00, 0x00],
+    ];
+    for guest in guests {
+        let (mut cpu, mut bus) = v86_world(&[0xf4], guest, &[0x00]);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0)
+                })
+            ),
+            "{guest:02x?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn v86_guest_wbinvd_traps_to_the_ring0_monitor() {
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &[0x0f, 0x09], &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+
+    cpu.cycle(&mut bus).unwrap();
+
+    assert!(!cpu.is_v86_mode());
+    assert_eq!(cpu.registers.cs().selector, R0_CS);
+    let esp = cpu.registers.esp();
+    assert_eq!(u32::from_le_bytes(cpu_mem(&bus, esp)), 0, "error code");
+    assert_eq!(
+        u32::from_le_bytes(cpu_mem(&bus, esp + 4)),
+        0,
+        "saved V86 EIP"
+    );
+}
+
+#[test]
+fn v86_guest_wbinvd_resumes_past_two_bytes_under_monitor_emulation() {
+    // Same round trip as the HLT test: skip the error code, add 2 to the saved EIP, IRET.
+    let guest = [0x0f, 0x09, 0x90];
+    let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &[0x00]);
+    enter_v86_direct(&mut cpu, 0, 0x1000);
+
+    cpu.cycle(&mut bus).unwrap();
+    assert!(!cpu.is_v86_mode());
+
+    let esp = cpu.registers.esp() + 4;
+    cpu.registers.set_esp(esp);
+    let guest_eip = u32::from_le_bytes(cpu_mem(&bus, esp));
+    assert_eq!(guest_eip, 0);
+    bus.memory[esp as usize..esp as usize + 4].copy_from_slice(&(guest_eip + 2).to_le_bytes());
+    cpu.iret(&mut bus, OperandSize::Dword, &mut CommittedCore::default())
+        .unwrap();
+
+    assert!(cpu.is_v86_mode());
+    assert_eq!(cpu.registers.eip, 2);
 }
 
 #[test]

@@ -1534,6 +1534,43 @@ fn generation_matrix_accepts_only_the_target_isa() {
     }
 }
 
+#[test]
+fn i486_cache_ops_are_ud_not_gp_on_386_at_cpl3() {
+    // The decode ISA gate raises #UD on a 386 before the CPL check can raise #GP(0).
+    // The INVLPG row is an extra pin: it already behaved this way.
+    let ops: &[&[u8]] = &[
+        &[0x0f, 0x08],                   // INVD
+        &[0x0f, 0x09],                   // WBINVD
+        &[0x0f, 0x01, 0x3e, 0x00, 0x00], // INVLPG [0]
+    ];
+    for code in ops {
+        for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
+            let (mut cpu, mut bus) = cpl3_code(code);
+            cpu.set_mode(mode);
+            let result = exec_one_split(&mut cpu, &mut bus);
+            assert!(
+                matches!(result, Err(InternalFault::Exception { vector: 6, .. })),
+                "{code:02x?} {mode:?}: {result:?}"
+            );
+        }
+        for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+            let (mut cpu, mut bus) = cpl3_code(code);
+            cpu.set_mode(mode);
+            let result = exec_one_split(&mut cpu, &mut bus);
+            assert!(
+                matches!(
+                    result,
+                    Err(InternalFault::Exception {
+                        vector: 13,
+                        error_code: Some(0)
+                    })
+                ),
+                "{code:02x?} {mode:?}: {result:?}"
+            );
+        }
+    }
+}
+
 /// The MMX integer-SIMD second bytes (after 0F). The GSW-586 carries no SIMD extension, so this
 /// is the list of encodings that must name no instruction on ANY persona. Kept here, in the test,
 /// rather than in the core: production no longer needs a concept of "MMX", only a set of bytes

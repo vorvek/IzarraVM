@@ -1208,18 +1208,14 @@ impl CpuGsw {
             // `execute_bitmanip_decoded` runs them. Not handled here.
             0x08 | 0x09 => {
                 // INVD (08) / WBINVD (09): flush the internal caches. Both are privileged and
-                // raise #UD outside CPL 0. We model no PRICED cache on the Approximate class, so
+                // raise #GP(0) outside CPL 0 (V86 is CPL 3). The 386 persona never gets here:
+                // the decode ISA gate raises #UD first. We model no PRICED cache on the Approximate class, so
                 // there is no guest-visible timing effect here either way; WBINVD differs from
                 // INVD only by writing dirty lines back first, which has no observable effect on
                 // a write-through part. `note_cache_flush` still fires for both: it flushes the
                 // diagnostic shadow L1 probe (`izarravm_machine::shadow_cache`), which is a real
                 // (if unpriced) tag array and must not carry state across a guest-issued flush.
-                if self.current_privilege_level() != 0 {
-                    return Err(InternalFault::Exception {
-                        vector: 6,
-                        error_code: None,
-                    });
-                }
+                self.require_cpl0()?;
                 bus.note_cache_flush();
                 // Sourced apart, not together: `INVD` is 15 P5 clocks and
                 // `WBINVD` is Intel's printed "2000+" (a floor, not a count),
