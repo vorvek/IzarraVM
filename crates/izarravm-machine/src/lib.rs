@@ -5,7 +5,6 @@ pub use fat32::{
     FAT_ATTR_DIRECTORY, FAT32_EOC, Fat32Geometry, Fat32Table, fat32_boot_sector, fat32_dir_entry,
     fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
 };
-pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, TimedMidiMessage};
 use izarravm_bus::{
     BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CalloutPollDecline,
@@ -138,7 +137,6 @@ pub(crate) use video_params::{
     RAM_LOOKUP_SLOW,
 };
 mod fat32;
-mod fat32_volume;
 mod fat_name;
 mod fdc;
 mod firmware_contract;
