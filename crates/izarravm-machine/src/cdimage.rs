@@ -729,17 +729,41 @@ impl CdImage {
         &self.tracks
     }
 
-    /// Start the next track's decode if the play head at `lba` is within
-    /// [`PREFETCH_FRAMES`] of reaching it.
+    /// Keep the tracks the play head is about to need decoded.
     ///
-    /// Without this a play that spans the disc clips the opening of every track
-    /// after the first: a decode only begins when a frame is asked for, and by
-    /// then the head is already there, advancing in real time whether or not
-    /// anything has caught up.
+    /// Two touches, in this order. First the track that holds `lba`, the next
+    /// frame the mixer reads, at its own index. Then frame 0 of the next track
+    /// by position, when the head is within [`PREFETCH_FRAMES`] of it and it
+    /// starts before `end_lba`, the end of the play range.
+    ///
+    /// Without the prefetch a play that spans the disc clips the opening of
+    /// every track after the first: a decode only begins when a frame is asked
+    /// for, and by then the head is already there, advancing in real time
+    /// whether or not anything has caught up.
+    ///
+    /// The head touch is for the decoder's two-track limit, which evicts the
+    /// least recently touched track. The mixer touches the track it plays, then
+    /// this function touches the head track, then the prefetch target. When a
+    /// track is shorter than the prefetch window the head track is not the
+    /// prefetch target, and without its own touch it would be the oldest one
+    /// just before it plays. Only the emulation thread may call this, in that
+    /// order. A caller that touches tracks for another reason changes which
+    /// track is evicted.
+    ///
+    /// The range limit keeps a game that loops one track from decoding the
+    /// track after it, which would take a slot from a track it goes back to.
     ///
     /// Cheap and idempotent (a source already decoding ignores the touch)
     /// so the mixer can call it on every frame it renders.
-    pub fn warm_upcoming(&self, lba: u32) {
+    pub fn warm_upcoming(&self, lba: u32, end_lba: u32) {
+        // The track the head is about to play. At the end of the range the
+        // mixer will not read this frame, so there is nothing to keep.
+        if lba < end_lba
+            && let Some(head) = self.track_at_lba(lba)
+            && let Some(source) = self.audio_sources.get(&head.number)
+        {
+            let _ = source.frame(lba - head.start_lba);
+        }
         // The next track by position, which is not the same as the track after
         // the one the head is in. A PREGAP belongs to no track at all: `build`
         // counts its frames into the following track's `start_lba` without
@@ -757,7 +781,7 @@ impl CdImage {
         let Some(next) = self.tracks.iter().find(|t| t.start_lba > lba) else {
             return;
         };
-        if next.start_lba.saturating_sub(lba) > PREFETCH_FRAMES {
+        if next.start_lba.saturating_sub(lba) > PREFETCH_FRAMES || next.start_lba >= end_lba {
             return;
         }
         if let Some(source) = self.audio_sources.get(&next.number) {

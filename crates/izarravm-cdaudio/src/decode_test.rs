@@ -163,13 +163,19 @@ fn a_cancelled_decode_stops_where_it_stands() {
     let info = crate::probe_info(&fixture("tone.ogg")).unwrap().unwrap();
     let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
     let mut reports = Vec::new();
+    // Cancel once the first publish has happened, which is the first
+    // opportunity that follows output. A check before any output would stop
+    // the decode before it reported anything.
+    let published = std::cell::Cell::new(false);
     decode_into_cancellable(
         &fixture("tone.ogg"),
         info,
         &mut pcm,
-        &mut |ready, _new| reports.push(ready),
-        // Cancel at the first opportunity.
-        &mut || true,
+        &mut |ready, _new| {
+            published.set(true);
+            reports.push(ready)
+        },
+        &mut || published.get(),
     )
     .unwrap();
     assert_eq!(
@@ -180,6 +186,25 @@ fn a_cancelled_decode_stops_where_it_stands() {
     // The tail it never reached is untouched, which is silence.
     let tail = &pcm[pcm.len() - AUDIO_FRAME_BYTES..];
     assert!(tail.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn a_decode_cancelled_before_the_first_packet_reports_nothing() {
+    let info = crate::probe_info(&fixture("tone.ogg")).unwrap().unwrap();
+    let mut pcm = vec![0u8; info.sectors as usize * AUDIO_FRAME_BYTES];
+    let mut reports = Vec::new();
+    decode_into_cancellable(
+        &fixture("tone.ogg"),
+        info,
+        &mut pcm,
+        &mut |ready, _new| reports.push(ready),
+        &mut || true,
+    )
+    .unwrap();
+    assert!(
+        reports.is_empty(),
+        "reports after an immediate cancel: {reports:?}"
+    );
 }
 
 #[test]

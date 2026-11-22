@@ -437,7 +437,7 @@ impl AtapiDevice {
         // spanning the disc clips the opening of every track after the first,
         // because a decode only starts when a frame is asked for.
         if let Some(image) = self.image.as_ref() {
-            image.warm_upcoming(next);
+            image.warm_upcoming(next, self.play.end_lba);
         }
     }
 
