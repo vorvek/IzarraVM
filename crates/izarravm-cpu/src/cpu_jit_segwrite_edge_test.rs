@@ -188,7 +188,11 @@ fn install_at(cpu: &mut CpuGsw, linear: u32) -> jit::direct::CompiledBlock {
 /// block B's linear address.
 fn stage(builder: fn() -> CpuGsw, body_b: &[u8]) -> (CpuGsw, TestBus, u32) {
     let lengths = vec![2; body_b.len() / 2];
-    stage_with(builder, &MOV_DS_AX, body_b, &lengths)
+    // The guarded edge belongs to the baked form, so these fixtures state arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
+    let staged = stage_with(builder, &MOV_DS_AX, body_b, &lengths);
+    jit::direct::set_live_data_segments_for_test(None);
+    staged
 }
 
 /// As `stage`, with the segment write of block A and the instruction lengths of block B given.
@@ -458,7 +462,9 @@ fn a_two_segment_write_block_still_publishes_no_successor() {
     memory[(ENTRY - 1) as usize] = 0x90;
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
 
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let mut cpu = v86_cpu();
+    jit::direct::set_live_data_segments_for_test(None);
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     bus.direct_page_clocks = true;
@@ -716,7 +722,9 @@ fn a_v86_block_mixing_a_native_write_with_an_fs_callout_still_gets_the_guarded_e
     memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
     memory[0x0400] = 0xa5;
 
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let mut cpu = v86_cpu();
+    jit::direct::set_live_data_segments_for_test(None);
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     bus.direct_page_clocks = true;
@@ -825,8 +833,9 @@ fn stage_under_arm(
 }
 
 /// A reads ES from AX and B reads the selector of ES into AX and onto the stack. The selector
-/// read of a live block comes from the CPU state, so B sees the value that A wrote, and A and B
-/// run as one linked entry.
+/// read of a live block comes from the CPU state, so B sees the value that A wrote. On arm 1 A
+/// and B run as one linked entry in V86. On arm 2 the write does not end A, so A holds B and one
+/// entry runs both with no link.
 #[test]
 fn a_selector_read_is_live_across_a_link_in_real_mode_and_v86() {
     const NEW_SELECTOR: u16 = 0x0040;
@@ -862,8 +871,8 @@ fn a_selector_read_is_live_across_a_link_in_real_mode_and_v86() {
             );
             assert_eq!(
                 cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
-                1,
-                "{label}: a linked transfer from A into B"
+                u64::from(arm == 1),
+                "{label}: a linked transfer from A into B on arm 1 only"
             );
             assert_eq!(
                 cpu.perf_counters().jit_direct_entries - entries_before,
@@ -961,8 +970,12 @@ fn arm_one_links_the_eligible_v86_edge_and_still_bars_real_mode() {
 fn a_linked_live_block_is_entered_after_ds_changed_with_the_chain_entry_check_off() {
     const NEW_SELECTOR: u16 = 0x0040;
     jit::direct::set_chain_entry_check_for_test(Some(false));
-    let (mut cpu, mut bus, b_linear) =
-        stage_under_arm(2, real_cpu, &MOV_ES_AX, &READ_ES_BODY, &[2, 1, 2]);
+    // A `jmp short +0` ends A, so B stays a separate block and A links to it.
+    let mut body_b = vec![0xeb, 0x00];
+    body_b.extend_from_slice(&READ_ES_BODY);
+    let (mut cpu, mut bus, b_start) =
+        stage_under_arm(2, real_cpu, &MOV_ES_AX, &body_b, &[2, 2, 1, 2]);
+    let b_linear = b_start + 2;
     jit::direct::set_chain_entry_check_for_test(None);
     assert!(
         !cpu.jit_direct.chain_entry_check_armed(),
@@ -1000,4 +1013,75 @@ fn a_linked_live_block_is_entered_after_ds_changed_with_the_chain_entry_check_of
         "no data segment reject"
     );
     assert!(cpu.perf_counters().jit_direct_insns > insns_before);
+}
+
+/// On arm 2 a block that writes DS and ends in a jump links to its successor with no selector
+/// guard. The successor is compiled under one selector and entered under another, and it reads
+/// the new one. On arm 0 the same shape in V86 keeps the guard, which refuses the other
+/// selector.
+#[test]
+fn arm_two_links_a_data_segment_write_block_without_a_guard() {
+    const OTHER_SELECTOR: u16 = 0x0050;
+    // `jmp short +0` ends A, so B stays a separate block.
+    let mut body_b = vec![0xeb, 0x00];
+    body_b.extend(block_b_body());
+    for (name, builder) in [
+        ("real mode", real_cpu as fn() -> CpuGsw),
+        ("V86", v86_cpu as fn() -> CpuGsw),
+    ] {
+        let (mut cpu, mut bus, b_start) =
+            stage_under_arm(2, builder, &MOV_DS_AX, &body_b, &[2, 2, 2, 2, 2]);
+        let block_a = install_at(&mut cpu, ENTRY);
+        assert!(
+            !block_a.is_segment_write_block(),
+            "{name}: A publishes a successor"
+        );
+        cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+        install_at(&mut cpu, b_start + 2);
+        cpu.registers.set_eax(u32::from(OTHER_SELECTOR));
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.set_eip(ENTRY);
+        cpu.halted = false;
+        let transfers_before = cpu.perf_counters().jit_direct_linked_transfers;
+        let mismatches_before = cpu.perf_counters().jit_direct_seg_guard_mismatch_exits;
+        assert!(
+            cpu.try_run_direct_block_for_test(&mut bus, block_a)
+                .unwrap()
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_linked_transfers - transfers_before,
+            1,
+            "{name}: A links to B"
+        );
+        assert_eq!(
+            cpu.perf_counters().jit_direct_seg_guard_mismatch_exits,
+            mismatches_before,
+            "{name}: no selector guard"
+        );
+        assert_eq!(
+            cpu.registers.eax() & 0xff,
+            u32::from(bus.memory[usize::from(OTHER_SELECTOR) << 4]),
+            "{name}: B reads through the new DS"
+        );
+    }
+
+    // Arm 0 keeps the guard in V86.
+    let (mut cpu, mut bus, b_linear) = stage(v86_cpu, &block_b_body());
+    let block_a = install_at(&mut cpu, ENTRY);
+    cpu.load_segment_real(SegmentIndex::Ds, TARGET_SELECTOR);
+    install_at(&mut cpu, b_linear);
+    cpu.registers.set_eax(u32::from(OTHER_SELECTOR));
+    cpu.load_segment_real(SegmentIndex::Ds, 0);
+    cpu.set_eip(ENTRY);
+    cpu.halted = false;
+    let mismatches_before = cpu.perf_counters().jit_direct_seg_guard_mismatch_exits;
+    assert!(
+        cpu.try_run_direct_block_for_test(&mut bus, block_a)
+            .unwrap()
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_seg_guard_mismatch_exits - mismatches_before,
+        1,
+        "arm 0: the guard refuses the other selector"
+    );
 }

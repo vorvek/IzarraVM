@@ -780,6 +780,8 @@ fn census_suffix_respects_the_call_out_slot_cap() {
 /// of them and report 0. Reporting 3 is only possible with the rule disabled.
 #[test]
 fn a_dirty_segment_stop_is_censused_and_prices_its_own_removal() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     // inc eax / inc ecx / mov ds, ax / mov eax,[ebx] / mov ecx,[ebx] / mov edx,[ebx] / inc eax
     //                                  ^ barred: DS is dirty and this slot pins it
     let code = [
@@ -1336,6 +1338,8 @@ fn a_segment_write_block_is_counted_at_the_dispatcher_entry() {
 /// inspecting the map directly. That is the path the mis-attribution would actually take.
 #[test]
 fn a_dirty_segment_row_does_not_claim_the_rejected_span_map() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let code = [
         0x40, 0x41, 0x8e, 0xd8, 0x8b, 0x03, 0x8b, 0x0b, 0x8b, 0x13, 0x40,
     ];
@@ -4383,6 +4387,8 @@ fn retry_cause_is_page_cross_when_the_block_leaves_its_page() {
 /// the block is too short to install.
 #[test]
 fn retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 2]);
     assert_eq!(
@@ -4404,6 +4410,8 @@ fn retry_cause_is_too_short_when_a_boundary_leaves_a_one_slot_block() {
 /// MUTATION: fold the arm back into `TooShort` and this reads `too_short`.
 #[test]
 fn a_walk_with_no_slots_reports_the_budget_and_not_the_length_rule() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
     let outcome =
@@ -4676,6 +4684,8 @@ fn a_lifted_decode_miss_key_compiles_once_its_line_is_back() {
 /// land nowhere; count the hits ungated and the census-off leg below reads five instead of zero.
 #[test]
 fn a_dormant_keys_unbound_exits_are_attributed_to_its_retry_cause() {
+    // This test asserts the baked form, so it states arm 0.
+    jit::direct::set_live_data_segments_for_test(Some(0));
     const HITS: u64 = 5;
     for census in [false, true] {
         let (mut cpu, mut bus) = fixture(&[0x8e, 0xd8, 0x8b, 0x00]);

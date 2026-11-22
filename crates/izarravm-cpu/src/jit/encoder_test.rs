@@ -1624,3 +1624,19 @@ fn bt_r32_r32_known_bytes() {
     e.bt_r32_r32(Reg::R13, Reg::R12);
     assert_eq!(e.finish(), vec![0x45, 0x0F, 0xA3, 0xE5]);
 }
+
+#[test]
+fn alu_r32_disp32_known_bytes() {
+    // cmp eax, [r15+0x100]: REX.B, 3B /r, mod=10, reg=eax(0), rm=r15&7=7 -> 0x87.
+    let mut e = Encoder::new();
+    e.alu_r32_disp32(7, Reg::RAX, Reg::R15, 0x100);
+    assert_eq!(e.finish(), vec![0x41, 0x3B, 0x87, 0x00, 0x01, 0x00, 0x00]);
+    // add eax, [r15+4]: opcode 03.
+    let mut e = Encoder::new();
+    e.alu_r32_disp32(0, Reg::RAX, Reg::R15, 4);
+    assert_eq!(e.finish(), vec![0x41, 0x03, 0x87, 0x04, 0x00, 0x00, 0x00]);
+    // cmp edx, [r15+8]: reg=edx(2) -> ModRM 0x97.
+    let mut e = Encoder::new();
+    e.alu_r32_disp32(7, Reg::RDX, Reg::R15, 8);
+    assert_eq!(e.finish(), vec![0x41, 0x3B, 0x97, 0x08, 0x00, 0x00, 0x00]);
+}

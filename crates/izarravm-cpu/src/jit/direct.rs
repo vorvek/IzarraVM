@@ -8420,6 +8420,9 @@ fn compile_with_budget(
     // A live block is compiled in real mode or V86 while `IZARRAVM_LIVE_DATA_SEGMENTS` is on.
     // It reads all five data segments from the CPU state and bakes none of them.
     let live_form = live_form_for(cpu);
+    // Arm 2 of the live form. Only this arm lets a data segment write stay inside a block, and it
+    // does so because the block bakes no data segment. Arm 1 keeps every segment write rule.
+    let live_arm2 = live_form && cpu.jit_direct.live_data_segments_arm() == 2;
     // A 16-bit protected-mode block may take the live form after the walk, if it holds a
     // `MOV Sreg,r/m16` call-out (`IZARRAVM_LIVE_PM_DATA_SEGMENTS`). This is the part of that
     // test that the mode and the knob decide. The call-out itself is known only during the walk.
@@ -9009,7 +9012,14 @@ fn compile_with_budget(
         // segment the block does not use: extra `data_matches` comparisons and a retirement every
         // time that unrelated segment moves, or a spurious Retry out of `segment_access_supported`
         // for a descriptor nothing in the block reaches.
-        let dirty_segment_hit = kind.pinned_segments() & dirty_segments != 0;
+        // A live arm 2 block bakes no data segment, so a data segment write cannot make a later
+        // slot stale. CS and the CS selector bit keep the rule.
+        let dirty_for_rule = if live_arm2 {
+            dirty_segments & !ALL_DATA_SEGMENTS
+        } else {
+            dirty_segments
+        };
+        let dirty_segment_hit = kind.pinned_segments() & dirty_for_rule != 0;
         #[cfg(test)]
         let dirty_segment_hit = dirty_segment_hit && !dirty_segment_rule_disabled();
         if dirty_segment_hit {
@@ -9474,7 +9484,8 @@ fn compile_with_budget(
     // know which row a cell belongs to, so the per-cell loop below selects the cells that get a
     // mask. `MovSsReg` and `PopSs` cells, and any `MovSreg` cell inside a V86 block, keep their
     // `u8::MAX` defaults: R2 compares all six records for them.
-    let callout_mov_sreg_present = movsreg_block_keyed_eligible
+    let movsreg_masks_eligible = movsreg_block_keyed_eligible || live_arm2;
+    let callout_mov_sreg_present = movsreg_masks_eligible
         && interpret_one_cells
             .iter()
             .any(|(_, cell)| cell.row() == InterpretOneRow::MovSreg);
@@ -9563,7 +9574,7 @@ fn compile_with_budget(
         // `InterpretOneCell::new` built it.
         for (position, (_, cell)) in interpret_one_cells.iter_mut().enumerate() {
             let movsreg_block_keyed_cell =
-                movsreg_block_keyed_eligible && cell.row() == InterpretOneRow::MovSreg;
+                movsreg_masks_eligible && cell.row() == InterpretOneRow::MovSreg;
             if !movsreg_block_keyed_cell {
                 continue;
             }
@@ -9571,9 +9582,13 @@ fn compile_with_budget(
                 .expect("the compile walk owns its cells until install clones them");
             // A segment the block reads live, data and selector both, is not a record the block
             // depends on, so the resume predicate must not compare it. Only the protected-mode
-            // live form drops bits here; the real mode and V86 live blocks keep their masks.
+            // live form drops bits here. Arm 2 of the real mode and V86 live form drops every data
+            // segment, because such a block bakes none of them. CS and SS stay compared:
+            // `segment_refusal` adds both. Arm 1 keeps its masks.
             let live_drop = if pm_live_form {
                 live_data & live_selectors
+            } else if live_arm2 {
+                ALL_DATA_SEGMENTS
             } else {
                 0
             };
@@ -9597,7 +9612,7 @@ fn compile_with_budget(
             interpret_one_cells
                 .iter()
                 .filter(|(_, cell)| {
-                    movsreg_block_keyed_eligible && cell.row() == InterpretOneRow::MovSreg
+                    movsreg_masks_eligible && cell.row() == InterpretOneRow::MovSreg
                 })
                 .fold(0u8, |mask, (_, cell)| mask | cell.used_by_others())
                 & !pinned_segments,
@@ -9653,8 +9668,13 @@ fn compile_with_budget(
     //
     // Silent wrong address, no fault, no counter. Barring the shape leaves the block compiled and
     // correct, re-entered per iteration like any other.
+    // A live arm 2 block may write data segments and still loop: no slot of it bakes a data
+    // segment, so the second iteration reads the segment the write loaded. A CS write keeps the
+    // bar.
+    let self_loop_segment_writes_ok =
+        segment_writes == 0 || (live_arm2 && dirty_segments & !ALL_DATA_SEGMENTS == 0);
     let self_loop = callout_slots == 0
-        && segment_writes == 0
+        && self_loop_segment_writes_ok
         && matches!(
             slots.last().map(|slot| slot.kind),
             Some(
@@ -9842,10 +9862,9 @@ fn compile_with_budget(
     // selector-equality guard suffices for a whole descriptor; `load_segment_real_mode` does not,
     // which is what unreal mode IS and why L9's B1 killed a selector-only guard there).
     //
-    // No separate self-loop term: `self_loop` above already requires `segment_writes == 0`, so a
-    // block carrying a native segment-write lowering can never BE a self loop, and this predicate
-    // requires `segment_writes != 0`. The two are mutually exclusive by construction, not by an
-    // extra check here.
+    // No separate self-loop term. `self_loop` above allows a segment write only in a live arm 2
+    // block, and its terminal is a conditional branch, which is not a plain fallthrough. The
+    // `debug_assert` after this predicate states the exclusion that the edge relies on.
     //
     // `callout_segment_writes == 0` IS ALWAYS TRUE FOR A V86 BLOCK. Only a `MovSreg` cell under
     // `movsreg_block_keyed_eligible` (`key.mode_key` V86 bit CLEAR) feeds the counter, and this
@@ -9863,6 +9882,10 @@ fn compile_with_budget(
         && callout_segment_writes == 0
         && key.mode_key & JIT_MODE_KEY_V86_BIT != 0
         && is_plain_fallthrough_terminal(slots.last().map(|slot| slot.kind));
+    debug_assert!(
+        !(self_loop && seg_write_edge_eligible),
+        "a self-loop block cannot also take the guarded segment write edge"
+    );
     // The one segment this edge would guard. `None` whenever `seg_write_edge_eligible` is false,
     // in which case nothing reads it.
     //
@@ -9889,10 +9912,8 @@ fn compile_with_budget(
     // `data_matches` would need to check. A block that writes CS keeps the bar and its own rules.
     // This sees native segment loads only, because call-out rows do not feed `dirty_segments`. A
     // call-out row that can change CS always resyncs.
-    let successor_bar = segment_write_block
-        && !(live_form
-            && cpu.jit_direct.live_data_segments_arm() == 2
-            && dirty_segments & segment_bit(SegmentIndex::Cs) == 0);
+    let successor_bar =
+        segment_write_block && !(live_arm2 && dirty_segments & segment_bit(SegmentIndex::Cs) == 0);
     // THE ONE STRUCTURAL RELAXATION OF THE FAR-RETURN SLICE. A `RetFar16` block IS a
     // segment-write block: it writes CS, which is the whole point, so the `!segment_write_block`
     // term above would make the far cell unreachable and the slice inert.
@@ -19789,6 +19810,18 @@ struct MemorySideExits {
     live_pm_access: Option<Label>,
 }
 
+impl MemoryEmitContext {
+    /// The captured descriptor of `segment`. A segment the block reads live has no captured
+    /// descriptor to read, so a read of one is a bug in the emitter.
+    fn descriptor(&self, segment: SegmentIndex) -> SegmentRegister {
+        debug_assert!(
+            self.live_data & segment_bit(segment) == 0,
+            "the captured descriptor of a live data segment was read"
+        );
+        self.segments.descriptor(segment)
+    }
+}
+
 impl MemorySideExits {
     fn new(e: &mut Encoder, memory: MemoryEmitContext, addr: Option<DirectAddr>) -> Self {
         Self {
@@ -19799,7 +19832,7 @@ impl MemorySideExits {
             segment_limit: addr
                 .filter(|addr| {
                     memory.live_data & segment_bit(addr.segment) != 0
-                        || memory.segments.descriptor(addr.segment).limit != u32::MAX
+                        || memory.descriptor(addr.segment).limit != u32::MAX
                 })
                 .map(|_| e.label()),
             live_pm_access: addr
@@ -23959,7 +23992,7 @@ fn emit_segmented_linear_address(
         emit_live_segmented_linear_address(e, addr, width, memory, sides, wrap, write);
         return;
     }
-    let descriptor = memory.segments.descriptor(addr.segment);
+    let descriptor = memory.descriptor(addr.segment);
     // Folding the segment base into the address-forming instruction's own displacement field is
     // licensed only when NOTHING has to sit between the effective address and the base add:
     //
@@ -24062,8 +24095,21 @@ fn emit_live_segmented_linear_address(
     let limit_exit = sides
         .segment_limit
         .expect("live descriptors always allocate a segment_limit label");
-    e.load_r32_disp32(Reg::RDX, Reg::R15, field + limit_offset());
     let extent = width.bytes() - 1;
+    if wrap == AddressWrap::Word {
+        // The offset is already masked to 0xFFFF, so offset + extent cannot overflow 32 bits.
+        // One compare against the limit in the CPU state is enough. RDX is free scratch here.
+        if extent == 0 {
+            e.alu_r32_disp32(7, Reg::RAX, Reg::R15, field + limit_offset());
+        } else {
+            e.lea_r32(Reg::RDX, Some(Reg::RAX), None, extent);
+            e.alu_r32_disp32(7, Reg::RDX, Reg::R15, field + limit_offset());
+        }
+        e.jcc(7, limit_exit);
+        e.alu_r32_disp32(0, Reg::RAX, Reg::R15, field + base_offset());
+        return;
+    }
+    e.load_r32_disp32(Reg::RDX, Reg::R15, field + limit_offset());
     if extent != 0 {
         e.cmp_r32_imm32(Reg::RDX, extent);
         e.jcc(2, limit_exit);
