@@ -84,7 +84,7 @@ izarravm-machine = { path = "../izarravm-machine", default-features = false }
 izarravm-video = { path = "../izarravm-video" }
 serde.workspace = true
 serde_json.workspace = true
-time = { version = "0.3.45", default-features = false, features = ["std", "local-offset"] }
+time = { version = "0.3.47", default-features = false, features = ["std", "local-offset"] }
 toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]
