@@ -588,6 +588,48 @@ fn formatting_a_track_does_not_print_its_audio() {
     );
 }
 
+// Tests for the worker lifetime model. The gated registries hold workers at
+// their start, so a test keeps several alive at once without sleeping.
+
+const FIXTURES: [&str; 4] = ["tone.wav", "tone.ogg", "tone.flac", "tone.mp3"];
+
+fn gated_tracks(registry: &Registry, count: usize) -> Vec<DecodedTrack> {
+    FIXTURES
+        .iter()
+        .cycle()
+        .take(count)
+        .map(|name| registry.track(fixture(name)).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_gated_worker_is_counted_live_until_the_gate_opens() {
+    let registry = Registry::gated();
+    let tracks = gated_tracks(&registry, 1);
+    assert!(tracks[0].frame(0).is_none());
+    // Raised before the spawn, so the count is exact right after the touch.
+    assert_eq!(registry.live_workers(), 1);
+    assert_eq!(tracks[0].shared.live.load(Ordering::SeqCst), 1);
+    registry.open_gate();
+    assert!(wait_for(|| registry.live_workers() == 0));
+    assert!(wait_for(
+        || tracks[0].shared.live.load(Ordering::SeqCst) == 0
+    ));
+}
+
+#[test]
+fn a_stuck_worker_outlives_its_track_until_the_gate_opens() {
+    let registry = Registry::gated_stuck();
+    let tracks = gated_tracks(&registry, 1);
+    tracks[0].frame(0);
+    drop(tracks);
+    // The stuck gate ignores the stop signal, as a worker blocked in a slow
+    // read would, so the count stays up after the track is gone.
+    assert_eq!(registry.live_workers(), 1);
+    registry.open_gate();
+    assert!(wait_for(|| registry.live_workers() == 0));
+}
+
 // MUTATION EVIDENCE for residency eviction (2026-08-19, applied by hand, run, restored). Each row
 // names the fixture that caught it; a mutation nobody catches is a fixture bug, not a free pass.
 //

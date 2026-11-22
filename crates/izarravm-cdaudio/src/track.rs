@@ -21,7 +21,7 @@ use crate::decode::{STAGE_SECTORS, decode_chunked};
 use crate::probe::{CdAudioError, TrackInfo, probe_info};
 use izarravm_core::{AUDIO_FRAME_BYTES, AudioTrackSource};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The buffer and how much of it is real, together under one lock.
@@ -70,6 +70,10 @@ struct Shared {
     /// decoding the same file, not a sound anyone can hear. Counted so a test
     /// can see it.
     workers: AtomicU32,
+    /// Workers of this track that are alive right now. Raised before the thread
+    /// spawns and lowered by the worker's guard, so a test cannot read zero
+    /// while a worker is still on its way in.
+    live: AtomicU32,
     /// When this track was last asked for a frame, on [`TOUCH_CLOCK`]'s scale.
     ///
     /// Eviction takes the least recently touched track, and "touched" has to
@@ -125,6 +129,7 @@ impl DecodedTrack {
                 cancel: AtomicBool::new(false),
                 finished: AtomicBool::new(false),
                 workers: AtomicU32::new(0),
+                live: AtomicU32::new(0),
                 last_touch: AtomicU64::new(0),
             }),
         }
@@ -165,14 +170,29 @@ impl DecodedTrack {
         if let Some(registry) = &self.registry {
             registry.admit(&self.shared);
         }
-        let shared = Arc::clone(&self.shared);
         let path = self.path.clone();
         let info = self.info;
         let registry = self.registry.clone();
         self.shared.workers.fetch_add(1, Ordering::Relaxed);
+        // Raised here, before the spawn, so a count read right after `frame`
+        // returns already includes the worker. The guard lowers both counts,
+        // also when the spawn fails and the closure is dropped unrun.
+        self.shared.live.fetch_add(1, Ordering::SeqCst);
+        let registry_live = registry.as_ref().map(|r| Arc::clone(&r.live));
+        if let Some(live) = &registry_live {
+            live.fetch_add(1, Ordering::SeqCst);
+        }
+        let guard = WorkerGuard {
+            shared: Some(Arc::clone(&self.shared)),
+            registry_live,
+        };
         let spawned = std::thread::Builder::new()
             .name("cd-audio-decode".to_string())
-            .spawn(move || decode_worker(&path, info, &shared, registry.as_ref()));
+            .spawn(move || {
+                if let Some(shared) = guard.shared.as_ref() {
+                    decode_worker(&path, info, shared, registry.as_ref());
+                }
+            });
         if spawned.is_err() {
             // KNOWN GAP, deliberately left alone here rather than widened into
             // this change: the track was admitted above, before the spawn, and
@@ -193,34 +213,64 @@ impl DecodedTrack {
     }
 }
 
+/// Owned by a worker thread. Lowers the live counts when the worker ends, and
+/// only after it has let go of the track state, so a registry count of zero
+/// means no worker still holds any track.
+struct WorkerGuard {
+    shared: Option<Arc<Shared>>,
+    registry_live: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            // The count lives inside `Shared`, so it has to go down first.
+            shared.live.fetch_sub(1, Ordering::SeqCst);
+            drop(shared);
+        }
+        if let Some(live) = &self.registry_live {
+            live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Decode the whole file, publishing each newly finished run of sectors.
 fn decode_worker(path: &Path, info: TrackInfo, shared: &Arc<Shared>, registry: Option<&Registry>) {
+    #[cfg(test)]
+    if let Some(gate) = registry.and_then(|r| r.gate.as_ref()) {
+        gate.wait(&|| shared.cancel.load(Ordering::Relaxed));
+    }
     // Decode through a small staging buffer and copy each chunk under the
     // lock. Holding the mutex across a decode call would block the mixer pull
     // for as long as a packet takes to decode.
     let mut published = 0usize;
-    let result = decode_chunked(
-        path,
-        info,
-        info.sectors,
-        STAGE_SECTORS,
-        &mut |ready, new_bytes| {
-            let from = published;
-            let upto = from + new_bytes.len();
-            let mut filled = shared.filled.lock().unwrap_or_else(|e| e.into_inner());
-            // Only what is newly finished is copied, so filling a track costs
-            // one pass over its bytes rather than one per report. A four-minute
-            // track reports some 280 times against a 42 MB buffer; recopying
-            // the prefix each time would be gigabytes of memcpy to move 42 MB
-            // of audio, on a thread that is racing the play head.
-            if let Some(dst) = filled.pcm.get_mut(from..upto) {
-                dst.copy_from_slice(new_bytes);
-                filled.ready = ready;
-                published = upto;
-            }
-        },
-        &mut || shared.cancel.load(Ordering::Relaxed),
-    );
+    // A track told to stop before it began has nothing to decode.
+    let result = if shared.cancel.load(Ordering::Relaxed) {
+        Ok(0)
+    } else {
+        decode_chunked(
+            path,
+            info,
+            info.sectors,
+            STAGE_SECTORS,
+            &mut |ready, new_bytes| {
+                let from = published;
+                let upto = from + new_bytes.len();
+                let mut filled = shared.filled.lock().unwrap_or_else(|e| e.into_inner());
+                // Only what is newly finished is copied, so filling a track costs
+                // one pass over its bytes rather than one per report. A four-minute
+                // track reports some 280 times against a 42 MB buffer; recopying
+                // the prefix each time would be gigabytes of memcpy to move 42 MB
+                // of audio, on a thread that is racing the play head.
+                if let Some(dst) = filled.pcm.get_mut(from..upto) {
+                    dst.copy_from_slice(new_bytes);
+                    filled.ready = ready;
+                    published = upto;
+                }
+            },
+            &mut || shared.cancel.load(Ordering::Relaxed),
+        )
+    };
     if let Err(err) = result {
         // A partial track plays what it has and falls silent for the rest. The
         // device path stays up either way, the same posture a folder mount
@@ -254,11 +304,84 @@ const MAX_RESIDENT: usize = 2;
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     inner: Arc<Mutex<Vec<Arc<Shared>>>>,
+    /// Workers of this mount that are alive right now.
+    live: Arc<AtomicUsize>,
+    #[cfg(test)]
+    gate: Option<Arc<Gate>>,
+}
+
+/// Holds test workers at their start so a test can keep several alive at once
+/// with fixtures that would otherwise decode in microseconds.
+#[cfg(test)]
+#[derive(Debug)]
+struct Gate {
+    open: Mutex<bool>,
+    changed: std::sync::Condvar,
+    /// A stuck gate ignores the stop signal. It stands for a worker blocked in
+    /// a slow read before its first cancel check.
+    stuck: bool,
+}
+
+#[cfg(test)]
+impl Gate {
+    fn new(stuck: bool) -> Arc<Self> {
+        Arc::new(Self {
+            open: Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+            stuck,
+        })
+    }
+
+    fn wait(&self, stop: &dyn Fn() -> bool) {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        while !*open {
+            if !self.stuck && stop() {
+                return;
+            }
+            open = self
+                .changed
+                .wait_timeout(open, std::time::Duration::from_millis(2))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
 }
 
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Workers of this mount that are alive right now.
+    pub fn live_workers(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// A registry whose workers wait at their start until
+    /// [`Registry::open_gate`], or until they are told to stop.
+    #[cfg(test)]
+    fn gated() -> Self {
+        Self {
+            gate: Some(Gate::new(false)),
+            ..Self::default()
+        }
+    }
+
+    /// As [`Registry::gated`], but the workers ignore the stop signal.
+    #[cfg(test)]
+    fn gated_stuck() -> Self {
+        Self {
+            gate: Some(Gate::new(true)),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn open_gate(&self) {
+        if let Some(gate) = &self.gate {
+            *gate.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            gate.changed.notify_all();
+        }
     }
 
     /// Prepare a track that participates in this mount's residency.
