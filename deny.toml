@@ -1,0 +1,54 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
+# Dependency policy for cargo-deny. CI runs `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+    # quick-xml is used only by wayland-scanner, a proc-macro that parses the
+    # fixed Wayland protocol XML at build time on Linux. The fix needs a
+    # wayland-scanner release that moves to quick-xml 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "build-time proc-macro input only" },
+    { id = "RUSTSEC-2026-0195", reason = "build-time proc-macro input only" },
+]
+
+[licenses]
+# Every license here allows distribution of the binary under GPL-3.0-only.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+exceptions = [
+    # The default egui fonts.
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
+
+[bans]
+# Duplicate versions come from upstream crates. A failure here would block
+# every dependency update.
+multiple-versions = "warn"
+# The workspace path dependencies have no version. [sources] still refuses
+# other registries and git sources.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
